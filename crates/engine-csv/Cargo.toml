@@ -1,0 +1,9 @@
+[package]
+name = "engine-csv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ds-core = { path = "../core" }
+csv = "1"
+chrono = { version = "0.4", features = ["serde"] }
