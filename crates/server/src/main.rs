@@ -18,6 +18,9 @@ async fn main() {
     let config = ds_core::config::ServerConfig::from_file("config.toml")
         .expect("Failed to load config.toml");
 
+    let base_url = config.server.base_url();
+    info!("Base URL: {base_url}");
+
     let mut edr_engines: HashMap<String, Arc<dyn ds_core::engine::Engine>> = HashMap::new();
     let mut edr_collections: HashMap<String, ds_core::config::CollectionConfig> = HashMap::new();
     let mut feature_engines: HashMap<String, Arc<dyn ds_core::feature_engine::FeatureEngine>> =
@@ -96,20 +99,33 @@ async fn main() {
     let edr_state = Arc::new(EdrState {
         engines: edr_engines,
         collections: edr_collections,
+        base_url: base_url.clone(),
     });
 
     let features_state = Arc::new(FeaturesState {
         engines: feature_engines,
         collections: feature_collections,
+        base_url: base_url.clone(),
     });
 
+    let root_base_url = Arc::new(base_url);
+
     let app = Router::new()
-        .route("/", get(root_landing_page))
-        .nest("/edr", api_edr::router(edr_state))
-        .nest("/features", api_features::router(features_state))
+        .route(
+            "/",
+            get({
+                let base = root_base_url.clone();
+                move || root_landing_page(base)
+            }),
+        )
+        .nest("/edr", api_edr::router(edr_state.clone()))
+        .nest("/features", api_features::router(features_state.clone()))
         // Trailing-slash variants so /edr/ and /features/ also work
-        .route("/edr/", get(api_edr::handlers::landing_page))
-        .route("/features/", get(api_features::handlers::landing_page))
+        .route("/edr/", get(api_edr::handlers::landing_page).with_state(edr_state))
+        .route(
+            "/features/",
+            get(api_features::handlers::landing_page).with_state(features_state),
+        )
         .layer(CorsLayer::permissive());
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -122,25 +138,26 @@ async fn main() {
     axum::serve(listener, app).await.expect("Server error");
 }
 
-async fn root_landing_page() -> impl IntoResponse {
+async fn root_landing_page(base_url: Arc<String>) -> impl IntoResponse {
+    let base = &*base_url;
     Json(json!({
         "title": "Metocean Data Server",
         "description": "OGC API server providing EDR and Features access to metocean data",
         "links": [
             {
-                "href": "/",
+                "href": format!("{base}/"),
                 "rel": "self",
                 "type": "application/json",
                 "title": "This document"
             },
             {
-                "href": "/edr/",
+                "href": format!("{base}/edr/"),
                 "rel": "service-desc",
                 "type": "application/json",
                 "title": "EDR API"
             },
             {
-                "href": "/features/",
+                "href": format!("{base}/features/"),
                 "rel": "service-desc",
                 "type": "application/json",
                 "title": "Features API"

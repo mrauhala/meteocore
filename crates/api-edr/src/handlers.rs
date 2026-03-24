@@ -19,6 +19,8 @@ use crate::response::{locations_to_geojson, query_result_to_coverage_json, Locat
 pub struct EdrState {
     pub engines: HashMap<String, Arc<dyn Engine>>,
     pub collections: HashMap<String, CollectionConfig>,
+    /// Base URL for generating absolute links (e.g. "https://api.example.com").
+    pub base_url: String,
 }
 
 pub type AppState = Arc<EdrState>;
@@ -37,25 +39,26 @@ fn lookup_collection<'a>(
     Ok((engine, config))
 }
 
-pub async fn landing_page() -> impl IntoResponse {
+pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
+    let base = &state.base_url;
     Json(json!({
         "title": "Metocean Data Server - EDR",
         "description": "OGC API - Environmental Data Retrieval",
         "links": [
             {
-                "href": "/edr/",
+                "href": format!("{base}/edr/"),
                 "rel": "self",
                 "type": "application/json",
                 "title": "This document"
             },
             {
-                "href": "/edr/conformance",
+                "href": format!("{base}/edr/conformance"),
                 "rel": "conformance",
                 "type": "application/json",
                 "title": "Conformance classes"
             },
             {
-                "href": "/edr/collections",
+                "href": format!("{base}/edr/collections"),
                 "rel": "data",
                 "type": "application/json",
                 "title": "Collections"
@@ -80,17 +83,18 @@ pub async fn conformance() -> impl IntoResponse {
 }
 
 pub async fn collections(State(state): State<AppState>) -> impl IntoResponse {
+    let base = &state.base_url;
     let collections: Vec<serde_json::Value> = state
         .collections
         .values()
-        .map(|config| build_collection_metadata(state.engines.get(&config.id).unwrap().as_ref(), config))
+        .map(|config| build_collection_metadata(state.engines.get(&config.id).unwrap().as_ref(), config, base))
         .collect();
 
     Json(json!({
         "collections": collections,
         "links": [
             {
-                "href": "/edr/collections",
+                "href": format!("{}/edr/collections", state.base_url),
                 "rel": "self",
                 "type": "application/json"
             }
@@ -103,7 +107,11 @@ pub async fn collection(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let (engine, config) = lookup_collection(&state, &id)?;
-    Ok(Json(build_collection_metadata(engine.as_ref(), config)))
+    Ok(Json(build_collection_metadata(
+        engine.as_ref(),
+        config,
+        &state.base_url,
+    )))
 }
 
 pub async fn locations(
@@ -126,6 +134,7 @@ pub async fn locations(
         collection_id: &id,
         parameter_names: &params,
         temporal_extent: temporal,
+        base_url: &state.base_url,
     };
     let body = serde_json::to_string(&locations_to_geojson(&locs, &ctx)).unwrap();
     Ok(([(header::CONTENT_TYPE, "application/geo+json")], body))
@@ -175,7 +184,7 @@ pub async fn location_query(
     ))
 }
 
-fn build_collection_metadata(engine: &dyn Engine, config: &CollectionConfig) -> serde_json::Value {
+fn build_collection_metadata(engine: &dyn Engine, config: &CollectionConfig, base_url: &str) -> serde_json::Value {
     let param_descs = engine.get_parameter_descriptions();
     let temporal = engine.get_temporal_extent();
     let spatial = engine.get_spatial_extent();
@@ -222,7 +231,7 @@ fn build_collection_metadata(engine: &dyn Engine, config: &CollectionConfig) -> 
         "description": config.description,
         "links": [
             {
-                "href": format!("/edr/collections/{}", config.id),
+                "href": format!("{base_url}/edr/collections/{}", config.id),
                 "rel": "self",
                 "type": "application/json",
                 "title": config.title
@@ -232,7 +241,7 @@ fn build_collection_metadata(engine: &dyn Engine, config: &CollectionConfig) -> 
         "data_queries": {
             "locations": {
                 "link": {
-                    "href": format!("/edr/collections/{}/locations", config.id),
+                    "href": format!("{base_url}/edr/collections/{}/locations", config.id),
                     "rel": "data",
                     "variables": {
                         "query_type": "locations",

@@ -159,6 +159,7 @@ lon, lat = transformer.transform(easting, northing)
 [server]
 host = "0.0.0.0"
 port = 8000
+# base_url = "https://api.example.com"  # optional, for absolute links behind a proxy
 
 [[collections]]
 id = "weather"
@@ -187,6 +188,14 @@ apis = ["features"]
 | `data_path` | yes | — | Path to data file (CSV or GeoJSON) |
 | `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, or both |
 | `engine_type` | no | `"csv"` | Data engine: `"csv"` or `"geojson"` |
+
+Server-level fields:
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `host` | yes | — | Bind address |
+| `port` | yes | — | Bind port |
+| `base_url` | no | `http://{host}:{port}` | External base URL for absolute links (set when behind a reverse proxy) |
 
 ## API State Architecture
 

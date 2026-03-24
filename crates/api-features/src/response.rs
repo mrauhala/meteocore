@@ -51,7 +51,7 @@ fn geometry_to_json(g: &Geometry) -> Value {
     }
 }
 
-pub fn feature_to_geojson(feature: &Feature, collection_id: &str) -> Value {
+pub fn feature_to_geojson(feature: &Feature, collection_id: &str, base_url: &str) -> Value {
     let properties: serde_json::Map<String, Value> = feature
         .properties
         .iter()
@@ -65,12 +65,12 @@ pub fn feature_to_geojson(feature: &Feature, collection_id: &str) -> Value {
         "properties": properties,
         "links": [
             {
-                "href": format!("/features/collections/{}/items/{}", collection_id, feature.id),
+                "href": format!("{base_url}/features/collections/{}/items/{}", collection_id, feature.id),
                 "rel": "self",
                 "type": "application/geo+json"
             },
             {
-                "href": format!("/features/collections/{}", collection_id),
+                "href": format!("{base_url}/features/collections/{}", collection_id),
                 "rel": "collection",
                 "type": "application/json"
             }
@@ -84,22 +84,23 @@ pub fn feature_page_to_geojson(
     limit: usize,
     offset: usize,
     timestamp: &str,
+    base_url: &str,
 ) -> Value {
     let features: Vec<Value> = page
         .features
         .iter()
-        .map(|f| feature_to_geojson(f, collection_id))
+        .map(|f| feature_to_geojson(f, collection_id, base_url))
         .collect();
 
     let mut links = vec![json!({
-        "href": format!("/features/collections/{}/items?offset={}&limit={}", collection_id, offset, limit),
+        "href": format!("{base_url}/features/collections/{}/items?offset={}&limit={}", collection_id, offset, limit),
         "rel": "self",
         "type": "application/geo+json"
     })];
 
     if let Some(next) = page.next_offset {
         links.push(json!({
-            "href": format!("/features/collections/{}/items?offset={}&limit={}", collection_id, next, limit),
+            "href": format!("{base_url}/features/collections/{}/items?offset={}&limit={}", collection_id, next, limit),
             "rel": "next",
             "type": "application/geo+json"
         }));
@@ -108,7 +109,7 @@ pub fn feature_page_to_geojson(
     if offset > 0 {
         let prev_offset = offset.saturating_sub(limit);
         links.push(json!({
-            "href": format!("/features/collections/{}/items?offset={}&limit={}", collection_id, prev_offset, limit),
+            "href": format!("{base_url}/features/collections/{}/items?offset={}&limit={}", collection_id, prev_offset, limit),
             "rel": "prev",
             "type": "application/geo+json"
         }));
@@ -149,7 +150,7 @@ mod tests {
     #[test]
     fn feature_geojson_structure() {
         let f = sample_feature();
-        let json = feature_to_geojson(&f, "weather");
+        let json = feature_to_geojson(&f, "weather", "");
 
         assert_eq!(json["type"], "Feature");
         assert_eq!(json["id"], "Helsinki");
@@ -170,7 +171,7 @@ mod tests {
             number_returned: 1,
             next_offset: Some(1),
         };
-        let json = feature_page_to_geojson(&page, "weather", 1, 0, "2024-01-01T00:00:00Z");
+        let json = feature_page_to_geojson(&page, "weather", 1, 0, "2024-01-01T00:00:00Z", "");
 
         assert_eq!(json["type"], "FeatureCollection");
         assert_eq!(json["numberMatched"], 3);
@@ -191,7 +192,7 @@ mod tests {
             number_returned: 1,
             next_offset: None,
         };
-        let json = feature_page_to_geojson(&page, "weather", 10, 0, "2024-01-01T00:00:00Z");
+        let json = feature_page_to_geojson(&page, "weather", 10, 0, "2024-01-01T00:00:00Z", "");
 
         let links = json["links"].as_array().unwrap();
         assert!(links.iter().any(|l| l["rel"] == "self"));
@@ -206,7 +207,7 @@ mod tests {
             number_returned: 1,
             next_offset: Some(2),
         };
-        let json = feature_page_to_geojson(&page, "weather", 1, 1, "2024-01-01T00:00:00Z");
+        let json = feature_page_to_geojson(&page, "weather", 1, 1, "2024-01-01T00:00:00Z", "");
 
         let links = json["links"].as_array().unwrap();
         assert!(links.iter().any(|l| l["rel"] == "prev"));
@@ -220,7 +221,7 @@ mod tests {
             number_returned: 0,
             next_offset: None,
         };
-        let json = feature_page_to_geojson(&page, "weather", 10, 0, "2024-01-01T00:00:00Z");
+        let json = feature_page_to_geojson(&page, "weather", 10, 0, "2024-01-01T00:00:00Z", "");
 
         assert_eq!(json["type"], "FeatureCollection");
         assert_eq!(json["numberMatched"], 0);

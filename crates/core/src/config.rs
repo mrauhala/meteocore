@@ -10,6 +10,19 @@ pub struct ServerConfig {
 pub struct ServerSettings {
     pub host: String,
     pub port: u16,
+    /// External base URL for generating absolute links (e.g. "https://api.example.com").
+    /// If not set, defaults to "http://{host}:{port}".
+    pub base_url: Option<String>,
+}
+
+impl ServerSettings {
+    /// Resolved base URL with no trailing slash.
+    pub fn base_url(&self) -> String {
+        match &self.base_url {
+            Some(url) => url.trim_end_matches('/').to_string(),
+            None => format!("http://{}:{}", self.host, self.port),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

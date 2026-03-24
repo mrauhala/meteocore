@@ -143,6 +143,7 @@ fn build_router() -> axum::Router {
     let state = Arc::new(FeaturesState {
         engines,
         collections,
+        base_url: String::new(),
     });
     api_features::router(state)
 }

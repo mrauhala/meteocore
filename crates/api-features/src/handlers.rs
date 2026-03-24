@@ -20,6 +20,8 @@ use crate::response::{feature_page_to_geojson, feature_to_geojson};
 pub struct FeaturesState {
     pub engines: HashMap<String, Arc<dyn FeatureEngine>>,
     pub collections: HashMap<String, CollectionConfig>,
+    /// Base URL for generating absolute links (e.g. "https://api.example.com").
+    pub base_url: String,
 }
 
 pub type AppState = Arc<FeaturesState>;
@@ -58,31 +60,32 @@ fn lookup_collection<'a>(
     Ok((engine, config))
 }
 
-pub async fn landing_page() -> impl IntoResponse {
+pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
+    let base = &state.base_url;
     Json(json!({
         "title": "Metocean Data Server - Features",
         "description": "OGC API - Features",
         "links": [
             {
-                "href": "/features/",
+                "href": format!("{base}/features/"),
                 "rel": "self",
                 "type": "application/json",
                 "title": "This document"
             },
             {
-                "href": "/features/api",
+                "href": format!("{base}/features/api"),
                 "rel": "service-desc",
                 "type": "application/vnd.oai.openapi+json;version=3.0",
                 "title": "API definition"
             },
             {
-                "href": "/features/conformance",
+                "href": format!("{base}/features/conformance"),
                 "rel": "conformance",
                 "type": "application/json",
                 "title": "Conformance classes"
             },
             {
-                "href": "/features/collections",
+                "href": format!("{base}/features/collections"),
                 "rel": "data",
                 "type": "application/json",
                 "title": "Collections"
@@ -296,12 +299,13 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
 }
 
 pub async fn collections(State(state): State<AppState>) -> impl IntoResponse {
+    let base = &state.base_url;
     let mut collections: Vec<serde_json::Value> = state
         .collections
         .values()
         .filter_map(|config| {
             let engine = state.engines.get(&config.id)?;
-            Some(build_collection_metadata(engine.as_ref(), config))
+            Some(build_collection_metadata(engine.as_ref(), config, base))
         })
         .collect();
 
@@ -317,7 +321,7 @@ pub async fn collections(State(state): State<AppState>) -> impl IntoResponse {
         "collections": collections,
         "links": [
             {
-                "href": "/features/collections",
+                "href": format!("{base}/features/collections"),
                 "rel": "self",
                 "type": "application/json"
             }
@@ -330,7 +334,11 @@ pub async fn collection(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let (engine, config) = lookup_collection(&state, &id)?;
-    Ok(Json(build_collection_metadata(engine.as_ref(), config)))
+    Ok(Json(build_collection_metadata(
+        engine.as_ref(),
+        config,
+        &state.base_url,
+    )))
 }
 
 pub async fn items(
@@ -387,7 +395,12 @@ pub async fn items(
 
     let timestamp = Utc::now().to_rfc3339();
     Ok(GeoJsonResponse(feature_page_to_geojson(
-        &page, &id, limit, offset, &timestamp,
+        &page,
+        &id,
+        limit,
+        offset,
+        &timestamp,
+        &state.base_url,
     )))
 }
 
@@ -408,12 +421,17 @@ pub async fn item(
         ),
     })?;
 
-    Ok(GeoJsonResponse(feature_to_geojson(&feature, &id)))
+    Ok(GeoJsonResponse(feature_to_geojson(
+        &feature,
+        &id,
+        &state.base_url,
+    )))
 }
 
 fn build_collection_metadata(
     engine: &dyn FeatureEngine,
     config: &CollectionConfig,
+    base_url: &str,
 ) -> serde_json::Value {
     let total = engine.feature_count();
 
@@ -428,13 +446,13 @@ fn build_collection_metadata(
         "storageCrs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
         "links": [
             {
-                "href": format!("/features/collections/{}", config.id),
+                "href": format!("{base_url}/features/collections/{}", config.id),
                 "rel": "self",
                 "type": "application/json",
                 "title": config.title
             },
             {
-                "href": format!("/features/collections/{}/items", config.id),
+                "href": format!("{base_url}/features/collections/{}/items", config.id),
                 "rel": "items",
                 "type": "application/geo+json",
                 "title": "Items"

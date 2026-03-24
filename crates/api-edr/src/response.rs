@@ -96,6 +96,7 @@ pub struct LocationsContext<'a> {
     pub collection_id: &'a str,
     pub parameter_names: &'a [String],
     pub temporal_extent: Option<(String, String)>,
+    pub base_url: &'a str,
 }
 
 pub fn locations_to_geojson(locations: &[Location], ctx: &LocationsContext) -> Value {
@@ -104,12 +105,13 @@ pub fn locations_to_geojson(locations: &[Location], ctx: &LocationsContext) -> V
         .as_ref()
         .map(|(start, end)| format!("{start}/{end}"))
         .unwrap_or_default();
+    let base = ctx.base_url;
 
     let features: Vec<Value> = locations
         .iter()
         .map(|loc| {
             let edr_endpoint = format!(
-                "/edr/collections/{}/locations/{}",
+                "{base}/edr/collections/{}/locations/{}",
                 ctx.collection_id, loc.id
             );
             json!({
@@ -142,7 +144,7 @@ pub fn locations_to_geojson(locations: &[Location], ctx: &LocationsContext) -> V
         "features": features,
         "links": [
             {
-                "href": format!("/edr/collections/{}/locations", ctx.collection_id),
+                "href": format!("{base}/edr/collections/{}/locations", ctx.collection_id),
                 "rel": "self",
                 "type": "application/geo+json",
                 "title": "Locations"

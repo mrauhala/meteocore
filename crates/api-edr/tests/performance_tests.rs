@@ -163,7 +163,7 @@ fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<EdrState> {
         apis: vec!["edr".to_string()],
         engine_type: "csv".to_string(),
     });
-    Arc::new(EdrState { engines, collections })
+    Arc::new(EdrState { engines, collections, base_url: String::new() })
 }
 
 fn build_app(engine: ScalableEngine) -> axum::Router {
