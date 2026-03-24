@@ -11,7 +11,7 @@ use ds_core::config::CollectionConfig;
 use ds_core::datetime::parse_datetime_interval;
 use ds_core::engine::Engine;
 
-use crate::params::LocationQueryParams;
+use crate::params::{LocationQueryParams, PositionQueryParams};
 use crate::response::{locations_to_geojson, query_result_to_coverage_json, LocationsContext};
 
 /// Shared state for the EDR API: a registry of collection engines + metadata.
@@ -184,6 +184,50 @@ pub async fn location_query(
     ))
 }
 
+pub async fn position_query(
+    Path(id): Path<String>,
+    Query(params): Query<PositionQueryParams>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let (engine, _config) = lookup_collection(&state, &id)?;
+
+    let datetime = params
+        .datetime
+        .as_deref()
+        .map(parse_datetime_interval)
+        .transpose()
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+            )
+        })?;
+
+    let param_names: Option<Vec<String>> = params
+        .parameter_name
+        .as_deref()
+        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
+
+    let result = engine
+        .query_position(&params.coords, datetime, param_names.as_deref())
+        .map_err(|e| match &e {
+            ds_core::error::DataServerError::InvalidParameter(_) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+            ),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "code": "ServerError", "description": "Internal server error" })),
+            ),
+        })?;
+
+    let body = serde_json::to_string(&query_result_to_coverage_json(&result)).unwrap();
+    Ok((
+        [(header::CONTENT_TYPE, "application/prs.coverage+json")],
+        body,
+    ))
+}
+
 fn build_collection_metadata(engine: &dyn Engine, config: &CollectionConfig, base_url: &str) -> serde_json::Value {
     let param_descs = engine.get_parameter_descriptions();
     let temporal = engine.get_temporal_extent();
@@ -225,6 +269,35 @@ fn build_collection_metadata(engine: &dyn Engine, config: &CollectionConfig, bas
         })
         .collect();
 
+    let query_types = engine.supported_query_types();
+    let mut data_queries = serde_json::Map::new();
+    for qt in &query_types {
+        let (endpoint, output_formats) = match qt.as_str() {
+            "locations" => (
+                format!("{base_url}/edr/collections/{}/locations", config.id),
+                json!(["CoverageJSON", "GeoJSON"]),
+            ),
+            "position" => (
+                format!("{base_url}/edr/collections/{}/position", config.id),
+                json!(["CoverageJSON"]),
+            ),
+            _ => continue,
+        };
+        data_queries.insert(
+            qt.clone(),
+            json!({
+                "link": {
+                    "href": endpoint,
+                    "rel": "data",
+                    "variables": {
+                        "query_type": qt,
+                        "output_formats": output_formats
+                    }
+                }
+            }),
+        );
+    }
+
     json!({
         "id": config.id,
         "title": config.title,
@@ -238,18 +311,7 @@ fn build_collection_metadata(engine: &dyn Engine, config: &CollectionConfig, bas
             }
         ],
         "extent": extent,
-        "data_queries": {
-            "locations": {
-                "link": {
-                    "href": format!("{base_url}/edr/collections/{}/locations", config.id),
-                    "rel": "data",
-                    "variables": {
-                        "query_type": "locations",
-                        "output_formats": ["CoverageJSON", "GeoJSON"]
-                    }
-                }
-            }
-        },
+        "data_queries": data_queries,
         "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
         "parameter_names": parameter_names,
         "output_formats": ["CoverageJSON", "GeoJSON"]

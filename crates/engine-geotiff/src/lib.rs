@@ -148,22 +148,15 @@ impl GeoTiffEngine {
     }
 }
 
-impl Engine for GeoTiffEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        // Raster data has no discrete locations.
-        Ok(vec![])
-    }
-
-    fn query_location(
+impl GeoTiffEngine {
+    /// Core query: extract a time series of pixel values at a given (lat, lon).
+    fn query_point(
         &self,
-        location_id: &str,
+        lat: f64,
+        lon: f64,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
     ) -> Result<QueryResult, DataServerError> {
-        // Parse location_id as "lat,lon" (EDR convention)
-        let (lat, lon) = parse_location_id(location_id)?;
-
-        // Check parameter filter
         if let Some(params) = parameters {
             if !params.iter().any(|p| p == &self.parameter) {
                 return Err(DataServerError::InvalidParameter(format!(
@@ -179,7 +172,6 @@ impl Engine for GeoTiffEngine {
             return Err(DataServerError::GeoTiff("No data available".into()));
         }
 
-        // Filter entries by datetime range
         let entries: Vec<_> = if let Some((start, end)) = datetime {
             catalog.entries.range(start..=end).collect()
         } else {
@@ -192,16 +184,13 @@ impl Engine for GeoTiffEngine {
             ));
         }
 
-        // Extract pixel values across all matching timesteps
         let mut times = Vec::with_capacity(entries.len());
         let mut values = Vec::with_capacity(entries.len());
 
         for (timestamp, entry) in &entries {
             times.push(**timestamp);
 
-            // Map world coordinate to pixel
             let pixel = entry.metadata.geo_transform.world_to_pixel(lon, lat);
-
             let value = match pixel {
                 Some((col, row)) => {
                     match reader::read_pixel(&entry.path, &entry.metadata, col, row) {
@@ -212,16 +201,15 @@ impl Engine for GeoTiffEngine {
                         }
                     }
                 }
-                None => None, // Outside raster bounds
+                None => None,
             };
-
             values.push(value);
         }
 
         let domain = DomainDescription::PointSeries {
             x: lon,
             y: lat,
-            t: times.clone(),
+            t: times,
         };
 
         let mut param_descs = HashMap::new();
@@ -250,6 +238,37 @@ impl Engine for GeoTiffEngine {
             ranges,
         })
     }
+}
+
+impl Engine for GeoTiffEngine {
+    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        Ok(vec![])
+    }
+
+    fn query_location(
+        &self,
+        location_id: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+    ) -> Result<QueryResult, DataServerError> {
+        // Fallback: parse location_id as "lat,lon" and delegate to query_point
+        let (lat, lon) = parse_location_id(location_id)?;
+        self.query_point(lat, lon, datetime, parameters)
+    }
+
+    fn query_position(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+    ) -> Result<QueryResult, DataServerError> {
+        let (lat, lon) = parse_coords(coords)?;
+        self.query_point(lat, lon, datetime, parameters)
+    }
+
+    fn supported_query_types(&self) -> Vec<String> {
+        vec!["position".to_string()]
+    }
 
     fn get_parameters(&self) -> Vec<String> {
         vec![self.parameter.clone()]
@@ -275,6 +294,59 @@ impl Engine for GeoTiffEngine {
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
         self.catalog.load().spatial_extent
     }
+}
+
+/// Parse EDR position query coordinates.
+/// Accepts `POINT(lon lat)` (WKT) or `lon,lat` format.
+/// Returns (lat, lon).
+fn parse_coords(coords: &str) -> Result<(f64, f64), DataServerError> {
+    let trimmed = coords.trim();
+
+    // Try WKT POINT format: POINT(lon lat)
+    if let Some(inner) = trimmed
+        .strip_prefix("POINT(")
+        .or_else(|| trimmed.strip_prefix("POINT ("))
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let parts: Vec<&str> = inner.trim().split_whitespace().collect();
+        if parts.len() != 2 {
+            return Err(DataServerError::InvalidParameter(
+                "Expected POINT(lon lat) format".into(),
+            ));
+        }
+        let lon: f64 = parts[0].parse().map_err(|_| {
+            DataServerError::InvalidParameter(format!("Invalid longitude: {}", parts[0]))
+        })?;
+        let lat: f64 = parts[1].parse().map_err(|_| {
+            DataServerError::InvalidParameter(format!("Invalid latitude: {}", parts[1]))
+        })?;
+        return validate_coords(lat, lon);
+    }
+
+    // Try simple "lon,lat" format
+    let parts: Vec<&str> = trimmed.split(',').collect();
+    if parts.len() == 2 {
+        let lon: f64 = parts[0].trim().parse().map_err(|_| {
+            DataServerError::InvalidParameter(format!("Invalid longitude: {}", parts[0]))
+        })?;
+        let lat: f64 = parts[1].trim().parse().map_err(|_| {
+            DataServerError::InvalidParameter(format!("Invalid latitude: {}", parts[1]))
+        })?;
+        return validate_coords(lat, lon);
+    }
+
+    Err(DataServerError::InvalidParameter(
+        "Expected coords as POINT(lon lat) or lon,lat".into(),
+    ))
+}
+
+fn validate_coords(lat: f64, lon: f64) -> Result<(f64, f64), DataServerError> {
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return Err(DataServerError::InvalidParameter(format!(
+            "Coordinates out of range: lat={lat}, lon={lon}"
+        )));
+    }
+    Ok((lat, lon))
 }
 
 fn parse_location_id(id: &str) -> Result<(f64, f64), DataServerError> {

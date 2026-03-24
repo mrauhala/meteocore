@@ -438,14 +438,14 @@ async fn finding_10_collection_id_hardcoded() {
 //   is the most commonly expected query type.
 
 #[tokio::test]
-async fn finding_11_position_query_not_implemented() {
+async fn finding_11_position_query_returns_400_for_unsupported_engine() {
     // URL-encode WKT parentheses: POINT(x y) -> POINT%2824.9384%2060.1699%29
     let (status, _) = get_json("/collections/weather/position?coords=POINT%2824.9384%2060.1699%29").await;
-    // Currently returns 404 because the route does not exist
+    // The CSV engine does not support position queries, so it returns 400
     assert_eq!(
         status,
-        StatusCode::NOT_FOUND,
-        "Position query endpoint is not implemented"
+        StatusCode::BAD_REQUEST,
+        "Position query should return 400 for engines that do not support it"
     );
 }
 

@@ -36,4 +36,24 @@ pub trait Engine: Send + Sync {
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)>;
 
     fn get_spatial_extent(&self) -> Option<[f64; 4]>;
+
+    /// Returns the EDR query types this engine supports.
+    /// Default: `["locations"]`. Override for engines that support position, area, etc.
+    fn supported_query_types(&self) -> Vec<String> {
+        vec!["locations".to_string()]
+    }
+
+    /// Execute a position query at the given coordinates.
+    /// Default implementation returns an error.
+    fn query_position(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+    ) -> Result<QueryResult, DataServerError> {
+        let _ = (coords, datetime, parameters);
+        Err(DataServerError::InvalidParameter(
+            "Position query not supported by this engine".into(),
+        ))
+    }
 }
