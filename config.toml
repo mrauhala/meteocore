@@ -8,3 +8,11 @@ title = "Finnish Weather Observations"
 description = "Hourly weather observations from Finnish weather stations"
 data_path = "testdata/weather.csv"
 apis = ["edr", "features"]
+
+[[collections]]
+id = "municipalities"
+title = "Finnish Municipalities"
+description = "Municipality boundaries from Statistics Finland (1:1M scale)"
+data_path = "testdata/municipalities.geojson"
+engine_type = "geojson"
+apis = ["features"]

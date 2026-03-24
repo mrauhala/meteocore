@@ -26,6 +26,9 @@ pub enum DataServerError {
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
 
+    #[error("GeoJSON error: {0}")]
+    GeoJson(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }

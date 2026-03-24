@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::response::IntoResponse;
@@ -7,6 +8,9 @@ use serde_json::json;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
+use api_edr::handlers::EdrState;
+use api_features::handlers::FeaturesState;
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -14,27 +18,95 @@ async fn main() {
     let config = ds_core::config::ServerConfig::from_file("config.toml")
         .expect("Failed to load config.toml");
 
-    let collection = &config.collections[0];
-    info!("Loading collection '{}' from {}", collection.id, collection.data_path);
+    let mut edr_engines: HashMap<String, Arc<dyn ds_core::engine::Engine>> = HashMap::new();
+    let mut edr_collections: HashMap<String, ds_core::config::CollectionConfig> = HashMap::new();
+    let mut feature_engines: HashMap<String, Arc<dyn ds_core::feature_engine::FeatureEngine>> =
+        HashMap::new();
+    let mut feature_collections: HashMap<String, ds_core::config::CollectionConfig> =
+        HashMap::new();
 
-    let store = engine_csv::CsvDataStore::load(&collection.data_path)
-        .expect("Failed to load CSV data");
+    for collection in &config.collections {
+        info!(
+            "Loading collection '{}' ({}) from {}",
+            collection.id, collection.engine_type, collection.data_path
+        );
 
-    info!(
-        "Loaded {} rows, {} locations, {} parameters",
-        store.rows.len(),
-        store.location_index.len(),
-        store.parameter_names.len()
-    );
+        match collection.engine_type.as_str() {
+            "csv" => {
+                let store = engine_csv::CsvDataStore::load(&collection.data_path)
+                    .expect("Failed to load CSV data");
 
-    let engine = Arc::new(engine_csv::CsvEngine::new(store));
-    let edr_engine = engine.clone() as Arc<dyn ds_core::engine::Engine>;
-    let feature_engine = engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>;
+                info!(
+                    "Loaded {} rows, {} locations, {} parameters",
+                    store.rows.len(),
+                    store.location_index.len(),
+                    store.parameter_names.len()
+                );
+
+                let engine = Arc::new(engine_csv::CsvEngine::new(store));
+
+                if collection.apis.contains(&"edr".to_string()) {
+                    edr_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::engine::Engine>,
+                    );
+                    edr_collections.insert(collection.id.clone(), collection.clone());
+                }
+                if collection.apis.contains(&"features".to_string()) {
+                    feature_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
+                    );
+                    feature_collections.insert(collection.id.clone(), collection.clone());
+                }
+            }
+            "geojson" => {
+                let engine = Arc::new(
+                    engine_geojson::GeoJsonEngine::load(&collection.data_path)
+                        .expect("Failed to load GeoJSON data"),
+                );
+
+                info!(
+                    "Loaded {} features, extent: {:?}",
+                    engine.feature_count(),
+                    engine.spatial_extent()
+                );
+
+                if collection.apis.contains(&"features".to_string()) {
+                    feature_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
+                    );
+                    feature_collections.insert(collection.id.clone(), collection.clone());
+                }
+                if collection.apis.contains(&"edr".to_string()) {
+                    info!(
+                        "Warning: GeoJSON engine does not support EDR API, \
+                         skipping EDR wiring for collection '{}'",
+                        collection.id
+                    );
+                }
+            }
+            other => {
+                panic!("Unknown engine type '{other}' for collection '{}'", collection.id);
+            }
+        }
+    }
+
+    let edr_state = Arc::new(EdrState {
+        engines: edr_engines,
+        collections: edr_collections,
+    });
+
+    let features_state = Arc::new(FeaturesState {
+        engines: feature_engines,
+        collections: feature_collections,
+    });
 
     let app = Router::new()
         .route("/", get(root_landing_page))
-        .nest("/edr", api_edr::router(edr_engine.clone()))
-        .nest("/features", api_features::router(feature_engine.clone()))
+        .nest("/edr", api_edr::router(edr_state))
+        .nest("/features", api_features::router(features_state))
         // Trailing-slash variants so /edr/ and /features/ also work
         .route("/edr/", get(api_edr::handlers::landing_page))
         .route("/features/", get(api_features::handlers::landing_page))

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/engine-csv",
+    "crates/engine-geojson",
     "crates/api-edr",
     "crates/api-features",
     "crates/server",

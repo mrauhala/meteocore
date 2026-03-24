@@ -7,9 +7,9 @@ use std::sync::Arc;
 use axum::routing::get;
 use axum::Router;
 
-use ds_core::engine::Engine;
+use handlers::EdrState;
 
-pub fn router(engine: Arc<dyn Engine>) -> Router {
+pub fn router(state: Arc<EdrState>) -> Router {
     Router::new()
         .route("/", get(handlers::landing_page))
         .route("/conformance", get(handlers::conformance))
@@ -20,5 +20,5 @@ pub fn router(engine: Arc<dyn Engine>) -> Router {
             "/collections/{id}/locations/{loc_id}",
             get(handlers::location_query),
         )
-        .with_state(engine)
+        .with_state(state)
 }

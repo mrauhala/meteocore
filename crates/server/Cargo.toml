@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 ds-core = { path = "../core" }
 engine-csv = { path = "../engine-csv" }
+engine-geojson = { path = "../engine-geojson" }
 api-edr = { path = "../api-edr" }
 api-features = { path = "../api-features" }
 axum = "0.8"

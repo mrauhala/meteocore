@@ -12,7 +12,7 @@ pub struct ServerSettings {
     pub port: u16,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CollectionConfig {
     pub id: String,
     pub title: String,
@@ -20,6 +20,12 @@ pub struct CollectionConfig {
     pub data_path: String,
     #[serde(default = "default_apis")]
     pub apis: Vec<String>,
+    #[serde(default = "default_engine_type")]
+    pub engine_type: String,
+}
+
+fn default_engine_type() -> String {
+    "csv".to_string()
 }
 
 fn default_apis() -> Vec<String> {

@@ -396,6 +396,7 @@ mod tests {
                 assert!((x - 24.9384).abs() < 0.001);
                 assert!((y - 60.1699).abs() < 0.001);
             }
+            _ => panic!("Expected Point geometry"),
         }
     }
 

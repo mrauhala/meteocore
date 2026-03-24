@@ -2,14 +2,14 @@
 
 ## What This Is
 
-Rust workspace implementing OGC API - EDR and OGC API - Features servers. Five crates: `ds-core` (traits + types), `engine-csv` (CSV data engine), `api-edr` (EDR HTTP layer), `api-features` (Features HTTP layer), `server` (binary).
+Rust workspace implementing OGC API - EDR and OGC API - Features servers. Six crates: `ds-core` (traits + types), `engine-csv` (CSV data engine), `engine-geojson` (GeoJSON data engine), `api-edr` (EDR HTTP layer), `api-features` (Features HTTP layer), `server` (binary).
 
 ## Build & Run
 
 ```bash
 cargo build                  # Build all crates
 cargo test                   # Run all tests
-cargo run -p server          # Start server on port 3000 (reads config.toml)
+cargo run -p server          # Start server (reads config.toml)
 cargo check -p <crate>       # Type-check a single crate
 ```
 
@@ -17,10 +17,12 @@ cargo check -p <crate>       # Type-check a single crate
 
 - **Two core traits: `Engine` (EDR) and `FeatureEngine` (Features).** They are separate traits — not all engines need to support both APIs. Engines return domain types, never JSON. Serialization belongs in the API crates.
 - **ds-core has no framework dependencies.** Only chrono, serde, thiserror, toml. Keep it that way. Use `PropertyValue` enum instead of `serde_json::Value` for feature properties.
-- **API crates depend only on ds-core**, not on any engine crate. `api-edr` receives `Arc<dyn Engine>`, `api-features` receives `Arc<dyn FeatureEngine>` as axum state.
+- **API crates depend only on ds-core**, not on any engine crate. API state is a registry of engines keyed by collection ID (`EdrState` / `FeaturesState`), not a single engine.
 - **EDR and Features are separate services** with separate base routes (`/edr/...` and `/features/...`). They share data sources but have independent landing pages, conformance endpoints, and collection listings.
 - **CORS is applied at the server level**, not in individual API crates. The `CorsLayer` lives in `server/src/main.rs`.
 - **New engines** implement `Engine` and/or `FeatureEngine` traits in their own crate, get wired up in `server/src/main.rs`.
+- **Collection routing is dynamic.** Handlers look up engines from a `HashMap<String, Arc<dyn Engine/FeatureEngine>>` by collection ID from the URL path. No collection IDs are hardcoded.
+- **The `apis` config field is enforced.** Only collections listing a given API in their `apis` array are wired to that API's router. A GeoJSON collection with `apis = ["features"]` will not appear in EDR.
 
 ## Crate Name
 
@@ -50,7 +52,9 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 1. Create `crates/engine-<name>/` with `Cargo.toml` depending on `ds-core`
 2. Implement `Engine` and/or `FeatureEngine` traits from `ds_core::engine` / `ds_core::feature_engine`
 3. Add the crate to workspace members in root `Cargo.toml`
-4. Wire it up in `server/src/main.rs` — cast to `Arc<dyn Engine>` and/or `Arc<dyn FeatureEngine>`
+4. Add the crate as a dependency of `crates/server/Cargo.toml`
+5. Add a match arm for the new `engine_type` in `server/src/main.rs`
+6. Wire it into the appropriate registries (`edr_engines` / `feature_engines`) based on the collection's `apis` config
 
 ## Adding a New EDR Endpoint
 
@@ -74,26 +78,116 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 | `limit` | integer | Page size. Default 100, max 1000. Clamped silently if exceeded |
 | `offset` | integer | Pagination offset. Default 0 |
 
+## Geometry Types
+
+The `Geometry` enum in `ds_core::feature` supports:
+
+- **`Point { x, y }`** — Single coordinate pair (lon, lat).
+- **`Polygon { exterior, holes }`** — Exterior ring as `Vec<[f64; 2]>` plus optional hole rings. Coordinates are `[lon, lat]` pairs.
+- **`MultiPolygon { polygons }`** — Vec of `(exterior, holes)` tuples.
+
+Helper methods on `Geometry`:
+- `bbox() -> [f64; 4]` — Computes bounding box `[west, south, east, north]`.
+- `centroid() -> (f64, f64)` — Computes centroid `(lon, lat)`. Uses area-weighted centroid for MultiPolygon.
+
+The `Bbox` struct provides:
+- `contains(x, y) -> bool` — Point-in-bbox test.
+- `intersects_bbox(&[f64; 4]) -> bool` — AABB intersection test for polygon bbox queries.
+
 ## CSV Data Format
 
 Fixed columns: `location, latitude, longitude, time` (in that order). All remaining columns become parameters. Parameter units are mapped in `engine-csv/src/loader.rs`.
+
+## GeoJSON Data Format
+
+Standard GeoJSON FeatureCollection files (RFC 7946). Requirements:
+
+- **Coordinates must be in WGS84 (EPSG:4326).** The engine validates all coordinates fall within lon -180..180, lat -90..90 and rejects files in projected CRS with a helpful error message.
+- **Supported geometry types:** Point, Polygon, MultiPolygon.
+- **Feature IDs:** Extracted from the top-level `"id"` field on each GeoJSON feature object. Falls back to array index if absent.
+- **Properties:** Mapped to `PropertyValue` enum (String, Integer, Float, Bool, Null). Nested objects/arrays are serialized to string.
+
+### Security limits (hardcoded in `engine-geojson/src/loader.rs`)
+
+| Limit | Value | Purpose |
+|-------|-------|---------|
+| Max file size | 500 MB | Prevents memory exhaustion |
+| Max features | 1,000,000 | Prevents excessive load time |
+| Max coords per geometry | 100,000 | Prevents geometry bombs |
+
+### Spatial indexing
+
+The GeoJSON engine uses an R-tree (`rstar` crate) built from per-feature bounding boxes. Bbox queries use AABB envelope intersection (not exact polygon intersection), which is both fast and OGC API Features spec-compliant. The R-tree is bulk-loaded at startup in O(n log n).
+
+### Converting projected data to WGS84
+
+If your source data uses a projected CRS (e.g., EPSG:3067 for Finnish data), convert it before loading:
+
+```bash
+ogr2ogr -f GeoJSON -t_srs EPSG:4326 output.geojson input.geojson
+```
+
+Or with Python:
+```python
+from pyproj import Transformer
+transformer = Transformer.from_crs("EPSG:3067", "EPSG:4326", always_xy=True)
+lon, lat = transformer.transform(easting, northing)
+```
 
 ## Config Format
 
 ```toml
 [server]
 host = "0.0.0.0"
-port = 3000
+port = 8000
 
 [[collections]]
 id = "weather"
 title = "Finnish Weather Observations"
 description = "Hourly weather observations from Finnish weather stations"
 data_path = "testdata/weather.csv"
-apis = ["edr", "features"]   # optional, defaults to ["edr"]
+apis = ["edr", "features"]     # optional, defaults to ["edr"]
+engine_type = "csv"             # optional, defaults to "csv"
+
+[[collections]]
+id = "municipalities"
+title = "Finnish Municipalities"
+description = "Municipality boundaries from Statistics Finland"
+data_path = "testdata/municipalities.geojson"
+engine_type = "geojson"
+apis = ["features"]
 ```
 
-The `apis` field controls which services expose a collection. Currently both APIs are wired unconditionally in the server.
+### Config fields
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `id` | yes | — | Unique collection identifier, used in URL paths |
+| `title` | yes | — | Human-readable collection title |
+| `description` | yes | — | Collection description |
+| `data_path` | yes | — | Path to data file (CSV or GeoJSON) |
+| `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, or both |
+| `engine_type` | no | `"csv"` | Data engine: `"csv"` or `"geojson"` |
+
+## API State Architecture
+
+Both API crates use registry-based state instead of a single engine:
+
+```rust
+// api-edr
+pub struct EdrState {
+    pub engines: HashMap<String, Arc<dyn Engine>>,
+    pub collections: HashMap<String, CollectionConfig>,
+}
+
+// api-features
+pub struct FeaturesState {
+    pub engines: HashMap<String, Arc<dyn FeatureEngine>>,
+    pub collections: HashMap<String, CollectionConfig>,
+}
+```
+
+Handlers look up the engine by collection ID from the URL path parameter. Unknown collection IDs return 404. Collection metadata (title, description, links) is built from `CollectionConfig`, not hardcoded.
 
 ## CoverageJSON Schema Compliance
 
@@ -157,14 +251,13 @@ When implementing a new domain type (Point, Grid, Trajectory, VerticalProfile, e
 - Forgetting `referencing` on an inline domain object (required when domain is an object, not a URL string)
 - Using non-BCP47 keys in i18n objects (use `"en"`, not `"english"`)
 
-## Known Limitations (POC)
+## Known Limitations
 
-- Collection ID is hardcoded to `"weather"` in handlers — needs a registry for multi-collection support
 - Parameter units are hardcoded in the CSV loader's match statement
 - All data loaded into memory at startup
 - Only the `locations` query type is implemented for EDR (no position, area, radius, trajectory, corridor)
-- Features API serves locations as point features only (no complex geometries from CSV)
-- CRS hardcoded to CRS84
+- CRS hardcoded to CRS84 (no on-the-fly reprojection)
+- GeoJSON engine implements `FeatureEngine` only (not `Engine`/EDR) — polygon boundary data has no time-series parameters
 
 ## Code Style
 

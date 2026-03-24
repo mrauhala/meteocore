@@ -47,6 +47,8 @@ use chrono::{DateTime, Utc};
 use tower::ServiceExt;
 
 use api_edr;
+use api_edr::handlers::EdrState;
+use ds_core::config::CollectionConfig;
 use ds_core::engine::Engine;
 use ds_core::error::DataServerError;
 use ds_core::model::*;
@@ -149,9 +151,24 @@ impl Engine for ScalableEngine {
     }
 }
 
+fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<EdrState> {
+    let mut engines = HashMap::new();
+    let mut collections = HashMap::new();
+    engines.insert("weather".to_string(), engine);
+    collections.insert("weather".to_string(), CollectionConfig {
+        id: "weather".to_string(),
+        title: "Finnish Weather Observations".to_string(),
+        description: "Test collection".to_string(),
+        data_path: String::new(),
+        apis: vec!["edr".to_string()],
+        engine_type: "csv".to_string(),
+    });
+    Arc::new(EdrState { engines, collections })
+}
+
 fn build_app(engine: ScalableEngine) -> axum::Router {
     let engine: Arc<dyn Engine> = Arc::new(engine);
-    api_edr::router(engine)
+    api_edr::router(make_edr_state(engine))
 }
 
 // ===========================================================================
@@ -558,7 +575,7 @@ async fn concurrent_location_queries_all_succeed() {
         parameter_count: 3,
     });
 
-    let app = api_edr::router(engine);
+    let app = api_edr::router(make_edr_state(engine));
 
     // Spawn 20 concurrent requests to different locations
     let mut handles = Vec::new();
@@ -598,7 +615,7 @@ async fn concurrent_mixed_endpoint_requests_all_succeed() {
         parameter_count: 2,
     });
 
-    let app = api_edr::router(engine);
+    let app = api_edr::router(make_edr_state(engine));
 
     let uris = vec![
         "/collections/weather/locations",

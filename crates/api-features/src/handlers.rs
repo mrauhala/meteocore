@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -6,13 +7,36 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::json;
 
+use ds_core::config::CollectionConfig;
 use ds_core::feature::FeatureQuery;
 use ds_core::feature_engine::FeatureEngine;
 
 use crate::params::{parse_bbox, ItemsQueryParams, DEFAULT_LIMIT, MAX_LIMIT};
 use crate::response::{feature_page_to_geojson, feature_to_geojson};
 
-pub type AppState = Arc<dyn FeatureEngine>;
+/// Shared state for the Features API: a registry of collection engines + metadata.
+#[derive(Clone)]
+pub struct FeaturesState {
+    pub engines: HashMap<String, Arc<dyn FeatureEngine>>,
+    pub collections: HashMap<String, CollectionConfig>,
+}
+
+pub type AppState = Arc<FeaturesState>;
+
+fn lookup_collection<'a>(
+    state: &'a FeaturesState,
+    id: &str,
+) -> Result<(&'a Arc<dyn FeatureEngine>, &'a CollectionConfig), (StatusCode, Json<serde_json::Value>)>
+{
+    let engine = state.engines.get(id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "code": "NotFound", "description": "Collection not found" })),
+        )
+    })?;
+    let config = state.collections.get(id).unwrap();
+    Ok((engine, config))
+}
 
 pub async fn landing_page() -> impl IntoResponse {
     Json(json!({
@@ -51,10 +75,15 @@ pub async fn conformance() -> impl IntoResponse {
     }))
 }
 
-pub async fn collections(State(engine): State<AppState>) -> impl IntoResponse {
-    let collection = build_collection_metadata(&*engine);
+pub async fn collections(State(state): State<AppState>) -> impl IntoResponse {
+    let collections: Vec<serde_json::Value> = state
+        .collections
+        .values()
+        .map(|config| build_collection_metadata(state.engines.get(&config.id).unwrap().as_ref(), config))
+        .collect();
+
     Json(json!({
-        "collections": [collection],
+        "collections": collections,
         "links": [
             {
                 "href": "/features/collections",
@@ -67,28 +96,18 @@ pub async fn collections(State(engine): State<AppState>) -> impl IntoResponse {
 
 pub async fn collection(
     Path(id): Path<String>,
-    State(engine): State<AppState>,
+    State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    if id != "weather" {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "code": "NotFound", "description": "Collection not found" })),
-        ));
-    }
-    Ok(Json(build_collection_metadata(&*engine)))
+    let (engine, config) = lookup_collection(&state, &id)?;
+    Ok(Json(build_collection_metadata(engine.as_ref(), config)))
 }
 
 pub async fn items(
     Path(id): Path<String>,
     Query(params): Query<ItemsQueryParams>,
-    State(engine): State<AppState>,
+    State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    if id != "weather" {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "code": "NotFound", "description": "Collection not found" })),
-        ));
-    }
+    let (engine, _config) = lookup_collection(&state, &id)?;
 
     let bbox = params
         .bbox
@@ -124,14 +143,9 @@ pub async fn items(
 
 pub async fn item(
     Path((id, feature_id)): Path<(String, String)>,
-    State(engine): State<AppState>,
+    State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    if id != "weather" {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "code": "NotFound", "description": "Collection not found" })),
-        ));
-    }
+    let (engine, _config) = lookup_collection(&state, &id)?;
 
     let feature = engine.get_feature(&feature_id).map_err(|e| match &e {
         ds_core::error::DataServerError::FeatureNotFound(_) => (
@@ -147,8 +161,7 @@ pub async fn item(
     Ok(Json(feature_to_geojson(&feature, &id)))
 }
 
-fn build_collection_metadata(engine: &dyn FeatureEngine) -> serde_json::Value {
-    // Get spatial extent from a full feature query
+fn build_collection_metadata(engine: &dyn FeatureEngine, config: &CollectionConfig) -> serde_json::Value {
     let page = engine
         .get_features(&FeatureQuery {
             limit: 0,
@@ -159,18 +172,18 @@ fn build_collection_metadata(engine: &dyn FeatureEngine) -> serde_json::Value {
     let total = page.as_ref().map(|p| p.number_matched).unwrap_or(0);
 
     json!({
-        "id": "weather",
-        "title": "Finnish Weather Observations",
-        "description": "Weather station locations as point features",
+        "id": config.id,
+        "title": config.title,
+        "description": config.description,
         "itemType": "feature",
         "links": [
             {
-                "href": "/features/collections/weather",
+                "href": format!("/features/collections/{}", config.id),
                 "rel": "self",
                 "type": "application/json"
             },
             {
-                "href": "/features/collections/weather/items",
+                "href": format!("/features/collections/{}/items", config.id),
                 "rel": "items",
                 "type": "application/geo+json"
             }

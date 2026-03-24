@@ -7,9 +7,9 @@ use std::sync::Arc;
 use axum::routing::get;
 use axum::Router;
 
-use ds_core::feature_engine::FeatureEngine;
+use handlers::FeaturesState;
 
-pub fn router(engine: Arc<dyn FeatureEngine>) -> Router {
+pub fn router(state: Arc<FeaturesState>) -> Router {
     Router::new()
         .route("/", get(handlers::landing_page))
         .route("/conformance", get(handlers::conformance))
@@ -20,5 +20,5 @@ pub fn router(engine: Arc<dyn FeatureEngine>) -> Router {
             "/collections/{id}/items/{feature_id}",
             get(handlers::item),
         )
-        .with_state(engine)
+        .with_state(state)
 }

@@ -11,12 +11,42 @@ fn property_value_to_json(v: &PropertyValue) -> Value {
     }
 }
 
+fn coords_to_json(ring: &[[f64; 2]]) -> Value {
+    Value::Array(ring.iter().map(|c| json!([c[0], c[1]])).collect())
+}
+
 fn geometry_to_json(g: &Geometry) -> Value {
     match g {
         Geometry::Point { x, y } => json!({
             "type": "Point",
             "coordinates": [x, y]
         }),
+        Geometry::Polygon { exterior, holes } => {
+            let mut rings = vec![coords_to_json(exterior)];
+            for hole in holes {
+                rings.push(coords_to_json(hole));
+            }
+            json!({
+                "type": "Polygon",
+                "coordinates": rings
+            })
+        }
+        Geometry::MultiPolygon { polygons } => {
+            let polys: Vec<Value> = polygons
+                .iter()
+                .map(|(ext, holes)| {
+                    let mut rings = vec![coords_to_json(ext)];
+                    for hole in holes {
+                        rings.push(coords_to_json(hole));
+                    }
+                    Value::Array(rings)
+                })
+                .collect();
+            json!({
+                "type": "MultiPolygon",
+                "coordinates": polys
+            })
+        }
     }
 }
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -6,13 +7,35 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::json;
 
+use ds_core::config::CollectionConfig;
 use ds_core::datetime::parse_datetime_interval;
 use ds_core::engine::Engine;
 
 use crate::params::LocationQueryParams;
 use crate::response::{locations_to_geojson, query_result_to_coverage_json, LocationsContext};
 
-pub type AppState = Arc<dyn Engine>;
+/// Shared state for the EDR API: a registry of collection engines + metadata.
+#[derive(Clone)]
+pub struct EdrState {
+    pub engines: HashMap<String, Arc<dyn Engine>>,
+    pub collections: HashMap<String, CollectionConfig>,
+}
+
+pub type AppState = Arc<EdrState>;
+
+fn lookup_collection<'a>(
+    state: &'a EdrState,
+    id: &str,
+) -> Result<(&'a Arc<dyn Engine>, &'a CollectionConfig), (StatusCode, Json<serde_json::Value>)> {
+    let engine = state.engines.get(id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "code": "NotFound", "description": format!("Collection '{id}' not found") })),
+        )
+    })?;
+    let config = state.collections.get(id).unwrap();
+    Ok((engine, config))
+}
 
 pub async fn landing_page() -> impl IntoResponse {
     Json(json!({
@@ -56,10 +79,15 @@ pub async fn conformance() -> impl IntoResponse {
     }))
 }
 
-pub async fn collections(State(engine): State<AppState>) -> impl IntoResponse {
-    let collection = build_collection_metadata(&*engine);
+pub async fn collections(State(state): State<AppState>) -> impl IntoResponse {
+    let collections: Vec<serde_json::Value> = state
+        .collections
+        .values()
+        .map(|config| build_collection_metadata(state.engines.get(&config.id).unwrap().as_ref(), config))
+        .collect();
+
     Json(json!({
-        "collections": [collection],
+        "collections": collections,
         "links": [
             {
                 "href": "/edr/collections",
@@ -72,58 +100,43 @@ pub async fn collections(State(engine): State<AppState>) -> impl IntoResponse {
 
 pub async fn collection(
     Path(id): Path<String>,
-    State(engine): State<AppState>,
+    State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    if id != "weather" {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "code": "NotFound", "description": format!("Collection '{id}' not found") })),
-        ));
-    }
-    Ok(Json(build_collection_metadata(&*engine)))
+    let (engine, config) = lookup_collection(&state, &id)?;
+    Ok(Json(build_collection_metadata(engine.as_ref(), config)))
 }
 
 pub async fn locations(
     Path(id): Path<String>,
-    State(engine): State<AppState>,
+    State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    if id != "weather" {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "code": "NotFound", "description": format!("Collection '{id}' not found") })),
-        ));
-    }
-    let locs = engine.get_locations().map_err(|e| {
+    let (engine, _config) = lookup_collection(&state, &id)?;
+
+    let locs = engine.get_locations().map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "code": "ServerError", "description": e.to_string() })),
+            Json(json!({ "code": "ServerError", "description": "Internal server error" })),
         )
     })?;
     let params = engine.get_parameters();
-    let temporal = engine.get_temporal_extent().map(|(s, e)| (s.to_rfc3339(), e.to_rfc3339()));
+    let temporal = engine
+        .get_temporal_extent()
+        .map(|(s, e)| (s.to_rfc3339(), e.to_rfc3339()));
     let ctx = LocationsContext {
         collection_id: &id,
         parameter_names: &params,
         temporal_extent: temporal,
     };
     let body = serde_json::to_string(&locations_to_geojson(&locs, &ctx)).unwrap();
-    Ok((
-        [(header::CONTENT_TYPE, "application/geo+json")],
-        body,
-    ))
+    Ok(([(header::CONTENT_TYPE, "application/geo+json")], body))
 }
 
 pub async fn location_query(
     Path((id, loc_id)): Path<(String, String)>,
     Query(params): Query<LocationQueryParams>,
-    State(engine): State<AppState>,
+    State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    if id != "weather" {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "code": "NotFound", "description": format!("Collection '{id}' not found") })),
-        ));
-    }
+    let (engine, _config) = lookup_collection(&state, &id)?;
 
     let datetime = params
         .datetime
@@ -143,11 +156,7 @@ pub async fn location_query(
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
     let result = engine
-        .query_location(
-            &loc_id,
-            datetime,
-            param_names.as_deref(),
-        )
+        .query_location(&loc_id, datetime, param_names.as_deref())
         .map_err(|e| match &e {
             ds_core::error::DataServerError::LocationNotFound(_) => (
                 StatusCode::NOT_FOUND,
@@ -155,7 +164,7 @@ pub async fn location_query(
             ),
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "code": "ServerError", "description": e.to_string() })),
+                Json(json!({ "code": "ServerError", "description": "Internal server error" })),
             ),
         })?;
 
@@ -166,7 +175,7 @@ pub async fn location_query(
     ))
 }
 
-fn build_collection_metadata(engine: &dyn Engine) -> serde_json::Value {
+fn build_collection_metadata(engine: &dyn Engine, config: &CollectionConfig) -> serde_json::Value {
     let param_descs = engine.get_parameter_descriptions();
     let temporal = engine.get_temporal_extent();
     let spatial = engine.get_spatial_extent();
@@ -208,22 +217,22 @@ fn build_collection_metadata(engine: &dyn Engine) -> serde_json::Value {
         .collect();
 
     json!({
-        "id": "weather",
-        "title": "Finnish Weather Observations",
-        "description": "Hourly weather observations from Finnish weather stations",
+        "id": config.id,
+        "title": config.title,
+        "description": config.description,
         "links": [
             {
-                "href": "/edr/collections/weather",
+                "href": format!("/edr/collections/{}", config.id),
                 "rel": "self",
                 "type": "application/json",
-                "title": "Finnish Weather Observations"
+                "title": config.title
             }
         ],
         "extent": extent,
         "data_queries": {
             "locations": {
                 "link": {
-                    "href": "/edr/collections/weather/locations",
+                    "href": format!("/edr/collections/{}/locations", config.id),
                     "rel": "data",
                     "variables": {
                         "query_type": "locations",
