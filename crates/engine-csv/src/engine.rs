@@ -261,7 +261,7 @@ impl FeatureEngine for CsvEngine {
 
         let number_matched = all_features.len();
         let offset = query.offset.min(number_matched);
-        let end = (offset + query.limit).min(number_matched);
+        let end = offset.saturating_add(query.limit).min(number_matched);
         let page = all_features[offset..end].to_vec();
         let number_returned = page.len();
         let next_offset = if end < number_matched {

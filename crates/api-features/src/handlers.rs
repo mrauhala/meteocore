@@ -2,16 +2,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
+use chrono::Utc;
 use serde_json::json;
 
 use ds_core::config::CollectionConfig;
 use ds_core::feature::FeatureQuery;
 use ds_core::feature_engine::FeatureEngine;
 
-use crate::params::{parse_bbox, ItemsQueryParams, DEFAULT_LIMIT, MAX_LIMIT};
+use crate::params::{parse_bbox, parse_datetime, ItemsQueryParams, DEFAULT_LIMIT, MAX_LIMIT};
 use crate::response::{feature_page_to_geojson, feature_to_geojson};
 
 /// Shared state for the Features API: a registry of collection engines + metadata.
@@ -22,6 +23,20 @@ pub struct FeaturesState {
 }
 
 pub type AppState = Arc<FeaturesState>;
+
+/// Custom response type for GeoJSON with correct Content-Type.
+pub struct GeoJsonResponse(pub serde_json::Value);
+
+impl IntoResponse for GeoJsonResponse {
+    fn into_response(self) -> axum::response::Response {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/geo+json"),
+        );
+        (headers, Json(self.0)).into_response()
+    }
+}
 
 fn lookup_collection<'a>(
     state: &'a FeaturesState,
@@ -34,7 +49,12 @@ fn lookup_collection<'a>(
             Json(json!({ "code": "NotFound", "description": "Collection not found" })),
         )
     })?;
-    let config = state.collections.get(id).unwrap();
+    let config = state.collections.get(id).ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "code": "ServerError", "description": "Internal server error" })),
+        )
+    })?;
     Ok((engine, config))
 }
 
@@ -48,6 +68,12 @@ pub async fn landing_page() -> impl IntoResponse {
                 "rel": "self",
                 "type": "application/json",
                 "title": "This document"
+            },
+            {
+                "href": "/features/api",
+                "rel": "service-desc",
+                "type": "application/vnd.oai.openapi+json;version=3.0",
+                "title": "API definition"
             },
             {
                 "href": "/features/conformance",
@@ -75,12 +101,217 @@ pub async fn conformance() -> impl IntoResponse {
     }))
 }
 
+pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
+    let mut collection_paths = json!({});
+    for config in state.collections.values() {
+        let id = &config.id;
+        let items_path = format!("/features/collections/{id}/items");
+        let item_path = format!("/features/collections/{id}/items/{{featureId}}");
+
+        collection_paths[&items_path] = json!({
+            "get": {
+                "summary": format!("Get features from {}", config.title),
+                "operationId": format!("getFeatures_{id}"),
+                "tags": [id],
+                "parameters": [
+                    {"$ref": "#/components/parameters/bbox"},
+                    {"$ref": "#/components/parameters/limit"},
+                    {"$ref": "#/components/parameters/offset"},
+                    {"$ref": "#/components/parameters/datetime"}
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Features in GeoJSON format",
+                        "content": {
+                            "application/geo+json": {
+                                "schema": {"$ref": "#/components/schemas/featureCollectionGeoJSON"}
+                            }
+                        }
+                    },
+                    "400": {"description": "Bad request"},
+                    "404": {"description": "Collection not found"},
+                    "500": {"description": "Server error"}
+                }
+            }
+        });
+        collection_paths[&item_path] = json!({
+            "get": {
+                "summary": format!("Get a single feature from {}", config.title),
+                "operationId": format!("getFeature_{id}"),
+                "tags": [id],
+                "parameters": [
+                    {
+                        "name": "featureId",
+                        "in": "path",
+                        "required": true,
+                        "schema": {"type": "string"}
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "A single feature in GeoJSON format",
+                        "content": {
+                            "application/geo+json": {
+                                "schema": {"$ref": "#/components/schemas/featureGeoJSON"}
+                            }
+                        }
+                    },
+                    "404": {"description": "Feature not found"},
+                    "500": {"description": "Server error"}
+                }
+            }
+        });
+    }
+
+    let mut paths = json!({
+        "/features/": {
+            "get": {
+                "summary": "Landing page",
+                "operationId": "getLandingPage",
+                "responses": {
+                    "200": {"description": "Landing page"}
+                }
+            }
+        },
+        "/features/conformance": {
+            "get": {
+                "summary": "Conformance classes",
+                "operationId": "getConformance",
+                "responses": {
+                    "200": {"description": "Conformance classes"}
+                }
+            }
+        },
+        "/features/collections": {
+            "get": {
+                "summary": "List collections",
+                "operationId": "getCollections",
+                "responses": {
+                    "200": {"description": "List of collections"}
+                }
+            }
+        }
+    });
+
+    // Merge collection paths into main paths
+    if let (Some(main_obj), Some(coll_obj)) =
+        (paths.as_object_mut(), collection_paths.as_object())
+    {
+        for (k, v) in coll_obj {
+            main_obj.insert(k.clone(), v.clone());
+        }
+    }
+
+    let openapi = json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": "Metocean Data Server - OGC API Features",
+            "version": "1.0.0",
+            "description": "OGC API - Features implementation"
+        },
+        "paths": paths,
+        "components": {
+            "parameters": {
+                "bbox": {
+                    "name": "bbox",
+                    "in": "query",
+                    "required": false,
+                    "schema": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "minItems": 4,
+                        "maxItems": 6
+                    },
+                    "style": "form",
+                    "explode": false
+                },
+                "limit": {
+                    "name": "limit",
+                    "in": "query",
+                    "required": false,
+                    "schema": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1000,
+                        "default": 100
+                    }
+                },
+                "offset": {
+                    "name": "offset",
+                    "in": "query",
+                    "required": false,
+                    "schema": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0
+                    }
+                },
+                "datetime": {
+                    "name": "datetime",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "description": "RFC 3339 datetime or interval (start/end, ../end, start/..)"
+                }
+            },
+            "schemas": {
+                "featureCollectionGeoJSON": {
+                    "type": "object",
+                    "required": ["type", "features"],
+                    "properties": {
+                        "type": {"type": "string", "enum": ["FeatureCollection"]},
+                        "features": {"type": "array", "items": {"$ref": "#/components/schemas/featureGeoJSON"}},
+                        "numberMatched": {"type": "integer"},
+                        "numberReturned": {"type": "integer"},
+                        "timeStamp": {"type": "string", "format": "date-time"},
+                        "links": {"type": "array", "items": {"$ref": "#/components/schemas/link"}}
+                    }
+                },
+                "featureGeoJSON": {
+                    "type": "object",
+                    "required": ["type", "geometry", "properties"],
+                    "properties": {
+                        "type": {"type": "string", "enum": ["Feature"]},
+                        "id": {"oneOf": [{"type": "string"}, {"type": "number"}]},
+                        "geometry": {"nullable": true},
+                        "properties": {"type": "object", "nullable": true},
+                        "links": {"type": "array", "items": {"$ref": "#/components/schemas/link"}}
+                    }
+                },
+                "link": {
+                    "type": "object",
+                    "required": ["href"],
+                    "properties": {
+                        "href": {"type": "string"},
+                        "rel": {"type": "string"},
+                        "type": {"type": "string"},
+                        "title": {"type": "string"}
+                    }
+                }
+            }
+        }
+    });
+
+    Json(openapi)
+}
+
 pub async fn collections(State(state): State<AppState>) -> impl IntoResponse {
-    let collections: Vec<serde_json::Value> = state
+    let mut collections: Vec<serde_json::Value> = state
         .collections
         .values()
-        .map(|config| build_collection_metadata(state.engines.get(&config.id).unwrap().as_ref(), config))
+        .filter_map(|config| {
+            let engine = state.engines.get(&config.id)?;
+            Some(build_collection_metadata(engine.as_ref(), config))
+        })
         .collect();
+
+    // Sort by id for deterministic ordering
+    collections.sort_by(|a, b| {
+        a["id"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["id"].as_str().unwrap_or(""))
+    });
 
     Json(json!({
         "collections": collections,
@@ -121,14 +352,30 @@ pub async fn items(
             )
         })?;
 
-    let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+    let datetime = params
+        .datetime
+        .as_deref()
+        .map(parse_datetime)
+        .transpose()
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+            )
+        })?;
+
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_LIMIT)
+        .max(1) // spec minimum is 1
+        .min(MAX_LIMIT);
     let offset = params.offset.unwrap_or(0);
 
     let query = FeatureQuery {
         bbox,
         limit,
         offset,
-        datetime: None,
+        datetime,
     };
 
     let page = engine.get_features(&query).map_err(|_| {
@@ -138,7 +385,10 @@ pub async fn items(
         )
     })?;
 
-    Ok(Json(feature_page_to_geojson(&page, &id, limit, offset)))
+    let timestamp = Utc::now().to_rfc3339();
+    Ok(GeoJsonResponse(feature_page_to_geojson(
+        &page, &id, limit, offset, &timestamp,
+    )))
 }
 
 pub async fn item(
@@ -158,36 +408,50 @@ pub async fn item(
         ),
     })?;
 
-    Ok(Json(feature_to_geojson(&feature, &id)))
+    Ok(GeoJsonResponse(feature_to_geojson(&feature, &id)))
 }
 
-fn build_collection_metadata(engine: &dyn FeatureEngine, config: &CollectionConfig) -> serde_json::Value {
-    let page = engine
-        .get_features(&FeatureQuery {
-            limit: 0,
-            ..Default::default()
-        })
-        .ok();
+fn build_collection_metadata(
+    engine: &dyn FeatureEngine,
+    config: &CollectionConfig,
+) -> serde_json::Value {
+    let total = engine.feature_count();
 
-    let total = page.as_ref().map(|p| p.number_matched).unwrap_or(0);
-
-    json!({
+    let mut metadata = json!({
         "id": config.id,
         "title": config.title,
         "description": config.description,
         "itemType": "feature",
+        "crs": [
+            "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
+        ],
+        "storageCrs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
         "links": [
             {
                 "href": format!("/features/collections/{}", config.id),
                 "rel": "self",
-                "type": "application/json"
+                "type": "application/json",
+                "title": config.title
             },
             {
                 "href": format!("/features/collections/{}/items", config.id),
                 "rel": "items",
-                "type": "application/geo+json"
+                "type": "application/geo+json",
+                "title": "Items"
             }
         ],
         "numberItems": total
-    })
+    });
+
+    // Add spatial extent if available
+    if let Some(bbox) = engine.spatial_extent() {
+        metadata["extent"] = json!({
+            "spatial": {
+                "bbox": [bbox],
+                "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
+            }
+        });
+    }
+
+    metadata
 }

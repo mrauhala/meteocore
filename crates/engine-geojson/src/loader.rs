@@ -20,7 +20,8 @@ struct StoredFeature {
     id: String,
     geometry: Geometry,
     properties: HashMap<String, PropertyValue>,
-    bbox: [f64; 4],
+    /// None for null-geometry features.
+    bbox: Option<[f64; 4]>,
 }
 
 pub struct GeoJsonEngine {
@@ -85,7 +86,9 @@ impl GeoJsonEngine {
             let bbox = geometry.bbox();
 
             // Validate coordinates are in WGS84 range
-            validate_wgs84_bbox(&bbox)?;
+            if let Some(ref b) = bbox {
+                validate_wgs84_bbox(b)?;
+            }
 
             if let std::collections::hash_map::Entry::Vacant(e) = id_index.entry(id.clone()) {
                 e.insert(features.len());
@@ -100,22 +103,33 @@ impl GeoJsonEngine {
             });
         }
 
-        // Build spatial index from bboxes
-        let bboxes: Vec<[f64; 4]> = features.iter().map(|f| f.bbox).collect();
-        let spatial_index = SpatialIndex::build(&bboxes);
+        // Build spatial index from features that have geometry.
+        // Collect (original_index, bbox) pairs so the spatial index maps back correctly.
+        let indexed_bboxes: Vec<(usize, [f64; 4])> = features
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| f.bbox.map(|b| (i, b)))
+            .collect();
+        let spatial_index = SpatialIndex::build_indexed(&indexed_bboxes);
 
-        // Compute overall extent
-        let spatial_extent = if features.is_empty() {
-            None
-        } else {
+        // Compute overall extent from features with geometry
+        let spatial_extent = {
             let mut extent = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+            let mut has_geometry = false;
             for f in &features {
-                extent[0] = extent[0].min(f.bbox[0]);
-                extent[1] = extent[1].min(f.bbox[1]);
-                extent[2] = extent[2].max(f.bbox[2]);
-                extent[3] = extent[3].max(f.bbox[3]);
+                if let Some(b) = f.bbox {
+                    has_geometry = true;
+                    extent[0] = extent[0].min(b[0]);
+                    extent[1] = extent[1].min(b[1]);
+                    extent[2] = extent[2].max(b[2]);
+                    extent[3] = extent[3].max(b[3]);
+                }
             }
-            Some(extent)
+            if has_geometry {
+                Some(extent)
+            } else {
+                None
+            }
         };
 
         Ok(GeoJsonEngine {
@@ -147,22 +161,19 @@ impl GeoJsonEngine {
 
 impl FeatureEngine for GeoJsonEngine {
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
-        let mut indices: Vec<usize> = match &query.bbox {
+        let indices: Vec<usize> = match &query.bbox {
             Some(bbox) => {
                 let mut hits = self.spatial_index.query(bbox);
                 hits.sort_unstable();
+                hits.dedup();
                 hits
             }
             None => (0..self.features.len()).collect(),
         };
 
-        // Stable ordering for deterministic pagination
-        indices.sort_unstable();
-        indices.dedup();
-
         let number_matched = indices.len();
         let offset = query.offset.min(number_matched);
-        let end = (offset + query.limit).min(number_matched);
+        let end = offset.saturating_add(query.limit).min(number_matched);
 
         let features: Vec<Feature> = indices[offset..end]
             .iter()
@@ -191,6 +202,14 @@ impl FeatureEngine for GeoJsonEngine {
             .ok_or_else(|| DataServerError::FeatureNotFound(feature_id.to_string()))?;
         Ok(self.to_feature(&self.features[idx]))
     }
+
+    fn feature_count(&self) -> usize {
+        self.features.len()
+    }
+
+    fn spatial_extent(&self) -> Option<[f64; 4]> {
+        self.spatial_extent
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -214,9 +233,7 @@ fn parse_geometry(geom: Option<&serde_json::Value>) -> Result<Geometry, DataServ
     let geom = geom.ok_or_else(|| DataServerError::GeoJson("Feature missing geometry".into()))?;
 
     if geom.is_null() {
-        return Err(DataServerError::GeoJson(
-            "Null geometry not supported".into(),
-        ));
+        return Ok(Geometry::Null);
     }
 
     let geom_type = geom

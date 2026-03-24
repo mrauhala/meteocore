@@ -40,6 +40,7 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 /edr/collections/{id}/locations/{loc_id}       EDR location data query (CoverageJSON)
 
 /features/                                     Features landing page
+/features/api                                  Features OpenAPI definition
 /features/conformance                          Features conformance classes
 /features/collections                          Features collection listing
 /features/collections/{id}                     Features collection detail
@@ -74,9 +75,19 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 
 | Parameter | Format | Description |
 |-----------|--------|-------------|
-| `bbox` | `west,south,east,north` | Bounding box filter. Validated: finite numbers, lon -180..180, lat -90..90, west<=east, south<=north |
-| `limit` | integer | Page size. Default 100, max 1000. Clamped silently if exceeded |
+| `bbox` | `west,south,east,north` or `west,south,min-h,east,north,max-h` | Bounding box filter. Supports 4-value (2D) and 6-value (3D, height ignored). Supports antimeridian-crossing (west > east). |
+| `limit` | integer | Page size. Default 100, max 1000, min 1. Clamped silently if out of range |
 | `offset` | integer | Pagination offset. Default 0 |
+| `datetime` | RFC 3339 instant or interval | Temporal filter. Supports instants, intervals (`start/end`), and open bounds (`../end`, `start/..`, `../..`) |
+
+## Features API Response Details
+
+- **Content-Type**: Items/item endpoints return `application/geo+json` (not `application/json`)
+- **`timeStamp`**: FeatureCollection responses include `timeStamp` (RFC 3339)
+- **`numberMatched`/`numberReturned`**: Always present in FeatureCollection responses
+- **Collection metadata**: Includes `extent.spatial.bbox`, `crs`, `storageCrs`
+- **OpenAPI**: Served at `/features/api` (linked from landing page via `rel: service-desc`)
+- **Conformance**: Declares `core`, `oas30`, `geojson`
 
 ## Geometry Types
 
@@ -85,14 +96,22 @@ The `Geometry` enum in `ds_core::feature` supports:
 - **`Point { x, y }`** — Single coordinate pair (lon, lat).
 - **`Polygon { exterior, holes }`** — Exterior ring as `Vec<[f64; 2]>` plus optional hole rings. Coordinates are `[lon, lat]` pairs.
 - **`MultiPolygon { polygons }`** — Vec of `(exterior, holes)` tuples.
+- **`Null`** — Null geometry for features without spatial location (RFC 7946 §3.2).
 
 Helper methods on `Geometry`:
-- `bbox() -> [f64; 4]` — Computes bounding box `[west, south, east, north]`.
-- `centroid() -> (f64, f64)` — Computes centroid `(lon, lat)`. Uses area-weighted centroid for MultiPolygon.
+- `bbox() -> Option<[f64; 4]>` — Computes bounding box `[west, south, east, north]`. Returns `None` for null geometry.
+- `centroid() -> Option<(f64, f64)>` — Computes centroid `(lon, lat)`. Returns `None` for null geometry.
 
 The `Bbox` struct provides:
-- `contains(x, y) -> bool` — Point-in-bbox test.
-- `intersects_bbox(&[f64; 4]) -> bool` — AABB intersection test for polygon bbox queries.
+- `contains(x, y) -> bool` — Point-in-bbox test. Handles antimeridian-crossing bboxes.
+- `intersects_bbox(&[f64; 4]) -> bool` — AABB intersection test. Handles antimeridian-crossing bboxes.
+- `crosses_antimeridian() -> bool` — True when west > east.
+
+The `FeatureEngine` trait provides:
+- `get_features(&self, query) -> Result<FeaturePage>` — Paginated feature query with bbox/datetime filtering.
+- `get_feature(&self, id) -> Result<Feature>` — Single feature by ID.
+- `feature_count(&self) -> usize` — Total features (default: delegates to get_features with limit=0).
+- `spatial_extent(&self) -> Option<[f64; 4]>` — Overall spatial extent (default: None).
 
 ## CSV Data Format
 

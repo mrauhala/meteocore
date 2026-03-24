@@ -19,14 +19,17 @@ pub enum Geometry {
         /// Each polygon is (exterior ring, holes).
         polygons: Vec<(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>)>,
     },
+    /// Null geometry for features without spatial location (RFC 7946 §3.2).
+    Null,
 }
 
 impl Geometry {
     /// Compute the bounding box [west, south, east, north] of this geometry.
-    pub fn bbox(&self) -> [f64; 4] {
+    /// Returns None for null geometries.
+    pub fn bbox(&self) -> Option<[f64; 4]> {
         match self {
-            Geometry::Point { x, y } => [*x, *y, *x, *y],
-            Geometry::Polygon { exterior, .. } => ring_bbox(exterior),
+            Geometry::Point { x, y } => Some([*x, *y, *x, *y]),
+            Geometry::Polygon { exterior, .. } => Some(ring_bbox(exterior)),
             Geometry::MultiPolygon { polygons } => {
                 let mut bbox = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
                 for (ext, _) in polygons {
@@ -36,16 +39,18 @@ impl Geometry {
                     bbox[2] = bbox[2].max(b[2]);
                     bbox[3] = bbox[3].max(b[3]);
                 }
-                bbox
+                Some(bbox)
             }
+            Geometry::Null => None,
         }
     }
 
     /// Compute the centroid (lon, lat) of this geometry.
-    pub fn centroid(&self) -> (f64, f64) {
+    /// Returns None for null geometries.
+    pub fn centroid(&self) -> Option<(f64, f64)> {
         match self {
-            Geometry::Point { x, y } => (*x, *y),
-            Geometry::Polygon { exterior, .. } => ring_centroid(exterior),
+            Geometry::Point { x, y } => Some((*x, *y)),
+            Geometry::Polygon { exterior, .. } => Some(ring_centroid(exterior)),
             Geometry::MultiPolygon { polygons } => {
                 // Area-weighted centroid across all polygons
                 let mut total_area = 0.0_f64;
@@ -59,15 +64,16 @@ impl Geometry {
                     cy += py * area;
                 }
                 if total_area > 0.0 {
-                    (cx / total_area, cy / total_area)
+                    Some((cx / total_area, cy / total_area))
                 } else {
                     // Degenerate: average of first points
                     let n = polygons.len() as f64;
                     let sx: f64 = polygons.iter().map(|(ext, _)| ext[0][0]).sum();
                     let sy: f64 = polygons.iter().map(|(ext, _)| ext[0][1]).sum();
-                    (sx / n, sy / n)
+                    Some((sx / n, sy / n))
                 }
             }
+            Geometry::Null => None,
         }
     }
 }
@@ -149,6 +155,7 @@ pub struct FeaturePage {
 }
 
 /// Bounding box: west, south, east, north.
+/// Supports antimeridian-crossing bboxes where west > east (OGC API Features §7.15.3).
 #[derive(Debug, Clone, Copy)]
 pub struct Bbox {
     pub west: f64,
@@ -164,15 +171,16 @@ impl Bbox {
                 return Err("bbox coordinates must be finite numbers".into());
             }
         }
-        if west < -180.0 || east > 180.0 || south < -90.0 || north > 90.0 {
-            return Err("bbox coordinates out of range (lon: -180..180, lat: -90..90)".into());
+        if west < -180.0 || west > 180.0 || east < -180.0 || east > 180.0 {
+            return Err("bbox longitude out of range (-180..180)".into());
         }
-        if west > east {
-            return Err("bbox west must be <= east".into());
+        if south < -90.0 || north > 90.0 {
+            return Err("bbox latitude out of range (-90..90)".into());
         }
         if south > north {
             return Err("bbox south must be <= north".into());
         }
+        // Note: west > east is valid — it indicates an antimeridian-crossing bbox.
         Ok(Self {
             west,
             south,
@@ -181,18 +189,38 @@ impl Bbox {
         })
     }
 
+    /// Whether this bbox crosses the antimeridian (west > east).
+    pub fn crosses_antimeridian(&self) -> bool {
+        self.west > self.east
+    }
+
     /// Check if a point falls within this bbox.
     pub fn contains(&self, x: f64, y: f64) -> bool {
-        x >= self.west && x <= self.east && y >= self.south && y <= self.north
+        let lon_ok = if self.crosses_antimeridian() {
+            x >= self.west || x <= self.east
+        } else {
+            x >= self.west && x <= self.east
+        };
+        lon_ok && y >= self.south && y <= self.north
     }
 
     /// Check if this bbox intersects another bbox (as [west, south, east, north]).
     pub fn intersects_bbox(&self, other: &[f64; 4]) -> bool {
-        self.west <= other[2]
-            && self.east >= other[0]
-            && self.south <= other[3]
-            && self.north >= other[1]
+        let lon_ok = if self.crosses_antimeridian() {
+            // Antimeridian-crossing: intersects if other doesn't fall entirely in the gap
+            !(other[2] < self.west && other[0] > self.east)
+        } else {
+            self.west <= other[2] && self.east >= other[0]
+        };
+        lon_ok && self.south <= other[3] && self.north >= other[1]
     }
+}
+
+/// A datetime interval with optional open bounds.
+#[derive(Debug, Clone)]
+pub struct DatetimeInterval {
+    pub start: Option<DateTime<Utc>>,
+    pub end: Option<DateTime<Utc>>,
 }
 
 /// Query parameters for feature retrieval.
@@ -201,7 +229,7 @@ pub struct FeatureQuery {
     pub bbox: Option<Bbox>,
     pub limit: usize,
     pub offset: usize,
-    pub datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    pub datetime: Option<DatetimeInterval>,
 }
 
 impl Default for FeatureQuery {
@@ -237,8 +265,23 @@ mod tests {
     }
 
     #[test]
-    fn bbox_rejects_reversed_lon() {
-        assert!(Bbox::new(25.0, 60.0, 24.0, 61.0).is_err());
+    fn bbox_antimeridian_crossing() {
+        // west > east = antimeridian-crossing bbox (e.g., Russia to Alaska)
+        let bbox = Bbox::new(170.0, -10.0, -170.0, 10.0).unwrap();
+        assert!(bbox.crosses_antimeridian());
+        assert!(bbox.contains(175.0, 0.0)); // east of antimeridian
+        assert!(bbox.contains(-175.0, 0.0)); // west of antimeridian
+        assert!(!bbox.contains(0.0, 0.0)); // in the gap
+    }
+
+    #[test]
+    fn bbox_antimeridian_intersects() {
+        let bbox = Bbox::new(170.0, -10.0, -170.0, 10.0).unwrap();
+        // Feature bbox near antimeridian should intersect
+        assert!(bbox.intersects_bbox(&[175.0, -5.0, 179.0, 5.0]));
+        assert!(bbox.intersects_bbox(&[-179.0, -5.0, -175.0, 5.0]));
+        // Feature bbox in the gap should not
+        assert!(!bbox.intersects_bbox(&[0.0, -5.0, 10.0, 5.0]));
     }
 
     #[test]
@@ -250,5 +293,21 @@ mod tests {
     fn bbox_rejects_out_of_range() {
         assert!(Bbox::new(-200.0, 60.0, 25.0, 61.0).is_err());
         assert!(Bbox::new(24.0, -100.0, 25.0, 61.0).is_err());
+    }
+
+    #[test]
+    fn null_geometry_bbox_is_none() {
+        assert!(Geometry::Null.bbox().is_none());
+    }
+
+    #[test]
+    fn null_geometry_centroid_is_none() {
+        assert!(Geometry::Null.centroid().is_none());
+    }
+
+    #[test]
+    fn point_geometry_bbox() {
+        let g = Geometry::Point { x: 24.0, y: 60.0 };
+        assert_eq!(g.bbox(), Some([24.0, 60.0, 24.0, 60.0]));
     }
 }

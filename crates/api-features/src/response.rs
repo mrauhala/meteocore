@@ -47,6 +47,7 @@ fn geometry_to_json(g: &Geometry) -> Value {
                 "coordinates": polys
             })
         }
+        Geometry::Null => Value::Null,
     }
 }
 
@@ -82,6 +83,7 @@ pub fn feature_page_to_geojson(
     collection_id: &str,
     limit: usize,
     offset: usize,
+    timestamp: &str,
 ) -> Value {
     let features: Vec<Value> = page
         .features
@@ -114,6 +116,7 @@ pub fn feature_page_to_geojson(
 
     json!({
         "type": "FeatureCollection",
+        "timeStamp": timestamp,
         "numberMatched": page.number_matched,
         "numberReturned": page.number_returned,
         "features": features,
@@ -167,7 +170,7 @@ mod tests {
             number_returned: 1,
             next_offset: Some(1),
         };
-        let json = feature_page_to_geojson(&page, "weather", 1, 0);
+        let json = feature_page_to_geojson(&page, "weather", 1, 0, "2024-01-01T00:00:00Z");
 
         assert_eq!(json["type"], "FeatureCollection");
         assert_eq!(json["numberMatched"], 3);
@@ -188,7 +191,7 @@ mod tests {
             number_returned: 1,
             next_offset: None,
         };
-        let json = feature_page_to_geojson(&page, "weather", 10, 0);
+        let json = feature_page_to_geojson(&page, "weather", 10, 0, "2024-01-01T00:00:00Z");
 
         let links = json["links"].as_array().unwrap();
         assert!(links.iter().any(|l| l["rel"] == "self"));
@@ -203,7 +206,7 @@ mod tests {
             number_returned: 1,
             next_offset: Some(2),
         };
-        let json = feature_page_to_geojson(&page, "weather", 1, 1);
+        let json = feature_page_to_geojson(&page, "weather", 1, 1, "2024-01-01T00:00:00Z");
 
         let links = json["links"].as_array().unwrap();
         assert!(links.iter().any(|l| l["rel"] == "prev"));
@@ -217,7 +220,7 @@ mod tests {
             number_returned: 0,
             next_offset: None,
         };
-        let json = feature_page_to_geojson(&page, "weather", 10, 0);
+        let json = feature_page_to_geojson(&page, "weather", 10, 0, "2024-01-01T00:00:00Z");
 
         assert_eq!(json["type"], "FeatureCollection");
         assert_eq!(json["numberMatched"], 0);

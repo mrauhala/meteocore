@@ -12,6 +12,7 @@ use handlers::FeaturesState;
 pub fn router(state: Arc<FeaturesState>) -> Router {
     Router::new()
         .route("/", get(handlers::landing_page))
+        .route("/api", get(handlers::api_definition))
         .route("/conformance", get(handlers::conformance))
         .route("/collections", get(handlers::collections))
         .route("/collections/{id}", get(handlers::collection))

@@ -20,13 +20,12 @@ pub struct SpatialIndex {
 }
 
 impl SpatialIndex {
-    /// Build an R-tree from per-feature bounding boxes [west, south, east, north].
-    pub fn build(bboxes: &[[f64; 4]]) -> Self {
-        let entries: Vec<IndexedFeature> = bboxes
+    /// Build an R-tree from (original_index, bbox) pairs.
+    pub fn build_indexed(indexed_bboxes: &[(usize, [f64; 4])]) -> Self {
+        let entries: Vec<IndexedFeature> = indexed_bboxes
             .iter()
-            .enumerate()
             .map(|(i, bbox)| IndexedFeature {
-                index: i,
+                index: *i,
                 envelope: AABB::from_corners([bbox[0], bbox[1]], [bbox[2], bbox[3]]),
             })
             .collect();
