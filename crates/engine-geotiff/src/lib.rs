@@ -168,10 +168,6 @@ impl GeoTiffEngine {
 
         let catalog = self.catalog.load();
 
-        if catalog.entries.is_empty() {
-            return Err(DataServerError::GeoTiff("No data available".into()));
-        }
-
         let entries: Vec<_> = if let Some((start, end)) = datetime {
             catalog.entries.range(start..=end).collect()
         } else {
@@ -179,8 +175,8 @@ impl GeoTiffEngine {
         };
 
         if entries.is_empty() {
-            return Err(DataServerError::GeoTiff(
-                "No data available for the requested time range".into(),
+            return Err(DataServerError::LocationNotFound(
+                "No data available for the requested coordinates/time range".into(),
             ));
         }
 

@@ -171,10 +171,17 @@ pub async fn location_query(
                 StatusCode::NOT_FOUND,
                 Json(json!({ "code": "NotFound", "description": e.to_string() })),
             ),
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "code": "ServerError", "description": "Internal server error" })),
+            ds_core::error::DataServerError::InvalidParameter(_) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
             ),
+            _ => {
+                tracing::error!("Location query error: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "code": "ServerError", "description": "Internal server error" })),
+                )
+            }
         })?;
 
     let body = serde_json::to_string(&query_result_to_coverage_json(&result)).unwrap();
@@ -211,14 +218,25 @@ pub async fn position_query(
     let result = engine
         .query_position(&params.coords, datetime, param_names.as_deref())
         .map_err(|e| match &e {
-            ds_core::error::DataServerError::InvalidParameter(_) => (
+            ds_core::error::DataServerError::InvalidParameter(_)
+            | ds_core::error::DataServerError::InvalidBbox(_)
+            | ds_core::error::DataServerError::InvalidDatetime(_) => (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "code": "BadRequest", "description": e.to_string() })),
             ),
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "code": "ServerError", "description": "Internal server error" })),
+            ds_core::error::DataServerError::LocationNotFound(_)
+            | ds_core::error::DataServerError::CollectionNotFound(_)
+            | ds_core::error::DataServerError::FeatureNotFound(_) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "code": "NotFound", "description": e.to_string() })),
             ),
+            _ => {
+                tracing::error!("Position query error: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "code": "ServerError", "description": "Internal server error" })),
+                )
+            }
         })?;
 
     let body = serde_json::to_string(&query_result_to_coverage_json(&result)).unwrap();
