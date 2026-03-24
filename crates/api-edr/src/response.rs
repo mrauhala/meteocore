@@ -91,10 +91,27 @@ pub fn query_result_to_coverage_json(result: &QueryResult) -> Value {
     })
 }
 
-pub fn locations_to_geojson(locations: &[Location], collection_id: &str) -> Value {
+/// Metadata needed for building EDR location features.
+pub struct LocationsContext<'a> {
+    pub collection_id: &'a str,
+    pub parameter_names: &'a [String],
+    pub temporal_extent: Option<(String, String)>,
+}
+
+pub fn locations_to_geojson(locations: &[Location], ctx: &LocationsContext) -> Value {
+    let datetime = ctx
+        .temporal_extent
+        .as_ref()
+        .map(|(start, end)| format!("{start}/{end}"))
+        .unwrap_or_default();
+
     let features: Vec<Value> = locations
         .iter()
         .map(|loc| {
+            let edr_endpoint = format!(
+                "/edr/collections/{}/locations/{}",
+                ctx.collection_id, loc.id
+            );
             json!({
                 "type": "Feature",
                 "id": loc.id,
@@ -103,11 +120,14 @@ pub fn locations_to_geojson(locations: &[Location], collection_id: &str) -> Valu
                     "coordinates": [loc.longitude, loc.latitude]
                 },
                 "properties": {
-                    "name": loc.label
+                    "label": loc.label,
+                    "datetime": datetime,
+                    "parameter-name": ctx.parameter_names,
+                    "edrqueryendpoint": edr_endpoint
                 },
                 "links": [
                     {
-                        "href": format!("/edr/collections/{}/locations/{}", collection_id, loc.id),
+                        "href": edr_endpoint,
                         "rel": "data",
                         "type": "application/prs.coverage+json",
                         "title": format!("Data for {}", loc.label)
@@ -122,7 +142,7 @@ pub fn locations_to_geojson(locations: &[Location], collection_id: &str) -> Valu
         "features": features,
         "links": [
             {
-                "href": format!("/edr/collections/{}/locations", collection_id),
+                "href": format!("/edr/collections/{}/locations", ctx.collection_id),
                 "rel": "self",
                 "type": "application/geo+json",
                 "title": "Locations"

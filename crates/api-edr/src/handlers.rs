@@ -10,7 +10,7 @@ use ds_core::datetime::parse_datetime_interval;
 use ds_core::engine::Engine;
 
 use crate::params::LocationQueryParams;
-use crate::response::{locations_to_geojson, query_result_to_coverage_json};
+use crate::response::{locations_to_geojson, query_result_to_coverage_json, LocationsContext};
 
 pub type AppState = Arc<dyn Engine>;
 
@@ -99,7 +99,14 @@ pub async fn locations(
             Json(json!({ "code": "ServerError", "description": e.to_string() })),
         )
     })?;
-    let body = serde_json::to_string(&locations_to_geojson(&locs, &id)).unwrap();
+    let params = engine.get_parameters();
+    let temporal = engine.get_temporal_extent().map(|(s, e)| (s.to_rfc3339(), e.to_rfc3339()));
+    let ctx = LocationsContext {
+        collection_id: &id,
+        parameter_names: &params,
+        temporal_extent: temporal,
+    };
+    let body = serde_json::to_string(&locations_to_geojson(&locs, &ctx)).unwrap();
     Ok((
         [(header::CONTENT_TYPE, "application/geo+json")],
         body,

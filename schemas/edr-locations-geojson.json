@@ -1,0 +1,726 @@
+{
+  "type": "object",
+  "required": [
+    "type",
+    "features"
+  ],
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": [
+        "FeatureCollection"
+      ]
+    },
+    "features": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "type",
+          "geometry",
+          "properties"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "Feature"
+            ]
+          },
+          "geometry": {
+            "oneOf": [
+              {
+                "type": "object",
+                "required": [
+                  "type",
+                  "coordinates"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "Point"
+                    ]
+                  },
+                  "coordinates": {
+                    "type": "array",
+                    "minItems": 2,
+                    "items": {
+                      "type": "number"
+                    }
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type",
+                  "coordinates"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "MultiPoint"
+                    ]
+                  },
+                  "coordinates": {
+                    "type": "array",
+                    "items": {
+                      "type": "array",
+                      "minItems": 2,
+                      "items": {
+                        "type": "number"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type",
+                  "coordinates"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "LineString",
+                      "LineStringM",
+                      "LineStringZ",
+                      "LineStringZM"
+                    ]
+                  },
+                  "coordinates": {
+                    "type": "array",
+                    "items": {
+                      "type": "array",
+                      "minItems": 2,
+                      "items": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 4,
+                        "items": {
+                          "type": "number"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type",
+                  "coordinates"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "MultiLineString"
+                    ]
+                  },
+                  "coordinates": {
+                    "type": "array",
+                    "items": {
+                      "type": "array",
+                      "minItems": 2,
+                      "items": {
+                        "type": "array",
+                        "minItems": 2,
+                        "items": {
+                          "type": "number"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type",
+                  "coordinates"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "Polygon"
+                    ]
+                  },
+                  "coordinates": {
+                    "type": "array",
+                    "items": {
+                      "type": "array",
+                      "minItems": 4,
+                      "items": {
+                        "type": "array",
+                        "minItems": 2,
+                        "items": {
+                          "type": "number"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type",
+                  "coordinates"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "MultiPolygon"
+                    ]
+                  },
+                  "coordinates": {
+                    "type": "array",
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "array",
+                        "minItems": 4,
+                        "items": {
+                          "type": "array",
+                          "minItems": 2,
+                          "items": {
+                            "type": "number"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type",
+                  "geometries"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "GeometryCollection"
+                    ]
+                  },
+                  "geometries": {
+                    "type": "array",
+                    "items": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "required": [
+                            "type",
+                            "coordinates"
+                          ],
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "enum": [
+                                "Point"
+                              ]
+                            },
+                            "coordinates": {
+                              "type": "array",
+                              "minItems": 2,
+                              "items": {
+                                "type": "number"
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "required": [
+                            "type",
+                            "coordinates"
+                          ],
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "enum": [
+                                "MultiPoint"
+                              ]
+                            },
+                            "coordinates": {
+                              "type": "array",
+                              "items": {
+                                "type": "array",
+                                "minItems": 2,
+                                "items": {
+                                  "type": "number"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "required": [
+                            "type",
+                            "coordinates"
+                          ],
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "enum": [
+                                "LineString",
+                                "LineStringM",
+                                "LineStringZ",
+                                "LineStringZM"
+                              ]
+                            },
+                            "coordinates": {
+                              "type": "array",
+                              "items": {
+                                "type": "array",
+                                "minItems": 2,
+                                "items": {
+                                  "type": "array",
+                                  "minItems": 2,
+                                  "maxItems": 4,
+                                  "items": {
+                                    "type": "number"
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "required": [
+                            "type",
+                            "coordinates"
+                          ],
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "enum": [
+                                "MultiLineString"
+                              ]
+                            },
+                            "coordinates": {
+                              "type": "array",
+                              "items": {
+                                "type": "array",
+                                "minItems": 2,
+                                "items": {
+                                  "type": "array",
+                                  "minItems": 2,
+                                  "items": {
+                                    "type": "number"
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "required": [
+                            "type",
+                            "coordinates"
+                          ],
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "enum": [
+                                "Polygon"
+                              ]
+                            },
+                            "coordinates": {
+                              "type": "array",
+                              "items": {
+                                "type": "array",
+                                "minItems": 4,
+                                "items": {
+                                  "type": "array",
+                                  "minItems": 2,
+                                  "items": {
+                                    "type": "number"
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "type": "object",
+                          "required": [
+                            "type",
+                            "coordinates"
+                          ],
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "enum": [
+                                "MultiPolygon"
+                              ]
+                            },
+                            "coordinates": {
+                              "type": "array",
+                              "items": {
+                                "type": "array",
+                                "items": {
+                                  "type": "array",
+                                  "minItems": 4,
+                                  "items": {
+                                    "type": "array",
+                                    "minItems": 2,
+                                    "items": {
+                                      "type": "number"
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "properties": {
+            "type": "object",
+            "title": "EDR GeoJSON Properties",
+            "description": "Properties to describe existing EDR features -- may be real-world or virtual sampling features.",
+            "example": [
+              {
+                "datetime": "2018-02-12T00:00:00Z/2018-03-18T12:31:12Z",
+                "label": "Monitoring site name",
+                "parameter-name": [
+                  "velocity",
+                  "temperature"
+                ],
+                "edrqueryendpoint": "https://example.org/api/collections/collection/locations/location_123"
+              }
+            ],
+            "required": [
+              "datetime",
+              "parameter-name",
+              "label",
+              "edrqueryendpoint"
+            ],
+            "properties": {
+              "datetime": {
+                "type": "string",
+                "title": "Date/time Domain",
+                "description": "Either a date-time or a period string that adheres to RFC 3339. Indicates the time instant or period for which data are available from the EDR feature.",
+                "default": "",
+                "example": [
+                  "2018-02-12T00:00:00Z/2018-03-18T12:31:12Z"
+                ]
+              },
+              "parameter-name": {
+                "type": "array",
+                "title": "Available Parameters",
+                "description": "Unique IDs of available parameters, this is the value used for querying the data and corresponds to an ID in the parameter metadata of the collection.",
+                "items": {
+                  "type": "string",
+                  "title": "Parameter ID list",
+                  "description": "Each entry should contain one parameter ID that can be used to query against the feature.",
+                  "default": "",
+                  "example": [
+                    "velocity",
+                    "temperature"
+                  ]
+                }
+              },
+              "label": {
+                "type": "string",
+                "title": "Label",
+                "description": "A label such as a site name or other text to use on a link.",
+                "default": "",
+                "example": [
+                  "Site A"
+                ]
+              },
+              "edrqueryendpoint": {
+                "type": "string",
+                "title": "EDR Query Endpoint",
+                "description": "A URI identifying the query end point. May identify a specific location.",
+                "default": "",
+                "example": [
+                  "https://example.org/api/collections/collection/locations/location_123d}"
+                ]
+              }
+            }
+          },
+          "id": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              }
+            ]
+          },
+          "links": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "href",
+                "rel"
+              ],
+              "properties": {
+                "href": {
+                  "type": "string",
+                  "example": "https://example.com/collections/monitoringsites/locations/1234"
+                },
+                "rel": {
+                  "type": "string",
+                  "example": "alternate"
+                },
+                "type": {
+                  "type": "string",
+                  "example": "application/geo+json"
+                },
+                "hreflang": {
+                  "type": "string",
+                  "example": "en"
+                },
+                "title": {
+                  "type": "string",
+                  "example": "Monitoring site name"
+                },
+                "length": {
+                  "type": "integer"
+                },
+                "templated": {
+                  "description": "defines if the link href value is a template with values requiring replacement",
+                  "type": "boolean"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "parameters": {
+      "description": "list of the data parameters available in the collection",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "description": "Represents metadata about the values of the coverage",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "type": {
+            "description": "Type of the parameter object, shall be \"Parameter\"",
+            "type": "string",
+            "enum": [
+              "Parameter"
+            ]
+          },
+          "description": {
+            "type": "object",
+            "description": "Object representing an internationalised string.",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "observedProperty": {
+            "type": "object",
+            "description": "A definition of the quantity being measured.",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "label": {
+                "type": "object",
+                "description": "Object representing an internationalised string.",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              },
+              "description": {
+                "type": "object",
+                "description": "Object representing an internationalised string.",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              },
+              "categories": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "label": {
+                      "type": "object",
+                      "description": "Object representing an internationalised string.",
+                      "additionalProperties": {
+                        "type": "string"
+                      }
+                    },
+                    "description": {
+                      "type": "object",
+                      "description": "Object representing an internationalised string.",
+                      "additionalProperties": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "label"
+                  ]
+                },
+                "minItems": 1
+              }
+            },
+            "required": [
+              "label"
+            ]
+          },
+          "unit": {
+            "type": "object",
+            "description": "The units of measure",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "label": {
+                "type": "object",
+                "description": "Object representing an internationalised string.",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              },
+              "symbol": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "type": {
+                        "type": "string"
+                      },
+                      "value": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "type",
+                      "value"
+                    ]
+                  }
+                ]
+              }
+            },
+            "anyOf": [
+              {
+                "required": [
+                  "label"
+                ]
+              },
+              {
+                "required": [
+                  "symbol"
+                ]
+              }
+            ]
+          },
+          "categoryEncoding": {
+            "type": "object",
+            "description": "Maps IDs of categories in the observedProperty to range values",
+            "additionalProperties": {
+              "oneOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "integer"
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "type",
+          "observedProperty"
+        ]
+      }
+    },
+    "links": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "href",
+          "rel"
+        ],
+        "properties": {
+          "href": {
+            "type": "string",
+            "example": "https://example.com/collections/monitoringsites/locations/1234"
+          },
+          "rel": {
+            "type": "string",
+            "example": "alternate"
+          },
+          "type": {
+            "type": "string",
+            "example": "application/geo+json"
+          },
+          "hreflang": {
+            "type": "string",
+            "example": "en"
+          },
+          "title": {
+            "type": "string",
+            "example": "Monitoring site name"
+          },
+          "length": {
+            "type": "integer"
+          },
+          "templated": {
+            "description": "defines if the link href value is a template with values requiring replacement",
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "timeStamp": {
+      "description": "This property indicates the time and date when the response was generated.",
+      "type": "string",
+      "format": "date-time",
+      "example": "2017-08-17T08:05:32Z"
+    },
+    "numberMatched": {
+      "description": "The number of features of the feature type that match the selection\nparameters like `bbox`.",
+      "type": "integer",
+      "minimum": 0,
+      "example": 127
+    },
+    "numberReturned": {
+      "type": "integer",
+      "description": "The number of features in the feature collection.\n\nA server may omit this information in a response, if the information\nabout the number of features is not known or difficult to compute.\n\nIf the value is provided, the value shall be identical to the number\nof items in the \"features\" array.",
+      "minimum": 0,
+      "example": 10
+    }
+  }
+}

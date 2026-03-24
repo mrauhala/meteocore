@@ -555,6 +555,58 @@ mod locations {
             "Error response must have 'description'"
         );
     }
+
+    #[tokio::test]
+    async fn features_have_required_edr_properties() {
+        let (_, json) = get("/collections/weather/locations").await;
+        let features = json["features"].as_array().unwrap();
+        for feature in features {
+            let props = &feature["properties"];
+            assert!(
+                props.get("label").is_some() && props["label"].is_string(),
+                "Feature properties must have 'label' string"
+            );
+            assert!(
+                props.get("datetime").is_some() && props["datetime"].is_string(),
+                "Feature properties must have 'datetime' string"
+            );
+            assert!(
+                props.get("parameter-name").is_some() && props["parameter-name"].is_array(),
+                "Feature properties must have 'parameter-name' array"
+            );
+            assert!(
+                props.get("edrqueryendpoint").is_some() && props["edrqueryendpoint"].is_string(),
+                "Feature properties must have 'edrqueryendpoint' string"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn validates_against_edr_locations_schema() {
+        let schema_str = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../schemas/edr-locations-geojson.json"
+        ))
+        .expect("Failed to read EDR locations GeoJSON schema");
+        let schema: Value = serde_json::from_str(&schema_str).unwrap();
+        let validator =
+            jsonschema::Validator::new(&schema).expect("Failed to compile schema");
+
+        let (_, json) = get("/collections/weather/locations").await;
+
+        let errors: Vec<_> = validator.iter_errors(&json).collect();
+        if !errors.is_empty() {
+            let msgs: Vec<String> = errors
+                .iter()
+                .map(|e| format!("  - {e} (at {})", e.instance_path))
+                .collect();
+            panic!(
+                "Locations GeoJSON schema validation failed:\n{}\n\nJSON:\n{}",
+                msgs.join("\n"),
+                serde_json::to_string_pretty(&json).unwrap()
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
