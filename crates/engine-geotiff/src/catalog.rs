@@ -120,22 +120,25 @@ pub fn scan_directory(
             Err(_) => continue,
         };
 
-        // File readiness: check size stability
-        if let Some(prev) = pending.get(&path) {
-            if prev.size != file_size {
-                // Size changed — still being written, update pending
-                pending.insert(path, PendingFile { size: file_size });
-                continue;
-            }
-            // Size stable — promote from pending
-            pending.remove(&path);
-        } else {
-            // First time seeing this file — add to pending, skip this cycle
-            // Exception: at initial scan (existing_metadata is empty), accept immediately
-            if !existing_metadata.is_empty() {
+        // File readiness: check size stability for genuinely NEW files only.
+        // Files already in the catalog (existing_metadata) skip the readiness check.
+        let is_known_file = existing_metadata.contains_key(&path);
+
+        if !is_known_file {
+            if let Some(prev) = pending.get(&path) {
+                if prev.size != file_size {
+                    // Size changed — still being written, update pending
+                    pending.insert(path, PendingFile { size: file_size });
+                    continue;
+                }
+                // Size stable — promote from pending
+                pending.remove(&path);
+            } else if !existing_metadata.is_empty() {
+                // Genuinely new file during a poll cycle — add to pending, skip this cycle
                 pending.insert(path.clone(), PendingFile { size: file_size });
                 continue;
             }
+            // else: initial scan (existing_metadata empty) — accept immediately
         }
 
         // Reuse cached metadata if file size unchanged
