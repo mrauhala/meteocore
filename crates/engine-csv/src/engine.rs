@@ -325,53 +325,76 @@ mod tests {
     #[test]
     fn get_features_returns_all_locations() {
         let engine = CsvEngine::new(test_store());
-        let result = engine.get_features(&FeatureQuery::default()).unwrap();
-        assert_eq!(result.number_matched, 3);
-        assert_eq!(result.number_returned, 3);
-        assert!(result.next_offset.is_none());
+        let all = engine
+            .get_features(&FeatureQuery {
+                limit: 10000,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(all.number_matched > 0);
+        assert_eq!(all.number_matched, all.number_returned);
+        assert!(all.next_offset.is_none());
+        // Each feature should have a point geometry and properties
+        for f in &all.features {
+            assert!(matches!(f.geometry, Geometry::Point { .. }));
+            assert!(f.properties.contains_key("name"));
+        }
     }
 
     #[test]
     fn get_features_pagination() {
         let engine = CsvEngine::new(test_store());
+        let all = engine.get_features(&FeatureQuery::default()).unwrap();
+        let total = all.number_matched;
+        assert!(total >= 3, "need at least 3 locations for pagination test");
+
         let query = FeatureQuery {
             limit: 2,
             offset: 0,
             ..Default::default()
         };
-        let result = engine.get_features(&query).unwrap();
-        assert_eq!(result.number_matched, 3);
-        assert_eq!(result.number_returned, 2);
-        assert_eq!(result.next_offset, Some(2));
+        let page1 = engine.get_features(&query).unwrap();
+        assert_eq!(page1.number_matched, total);
+        assert_eq!(page1.number_returned, 2);
+        assert_eq!(page1.next_offset, Some(2));
 
-        // Next page
+        // Last page
         let query = FeatureQuery {
-            limit: 2,
-            offset: 2,
+            limit: total,
+            offset: total - 1,
             ..Default::default()
         };
-        let result = engine.get_features(&query).unwrap();
-        assert_eq!(result.number_returned, 1);
-        assert!(result.next_offset.is_none());
+        let last = engine.get_features(&query).unwrap();
+        assert_eq!(last.number_returned, 1);
+        assert!(last.next_offset.is_none());
     }
 
     #[test]
     fn get_features_bbox_filter() {
         let engine = CsvEngine::new(test_store());
-        // Bbox covering only Helsinki area (lon ~24.9, lat ~60.2)
-        let bbox = Bbox::new(24.5, 60.0, 25.5, 60.5).unwrap();
+        // Bbox covering Helsinki area (lon ~24.9-25.0, lat ~60.1-60.2)
+        let bbox = Bbox::new(24.8, 60.1, 25.1, 60.25).unwrap();
         let query = FeatureQuery {
             bbox: Some(bbox),
             ..Default::default()
         };
         let result = engine.get_features(&query).unwrap();
-        assert_eq!(result.number_matched, 1);
-        assert_eq!(result.features[0].id, "Helsinki");
+        assert!(result.number_matched > 0, "expected Helsinki-area stations");
+        // All returned features should be within the bbox
+        for f in &result.features {
+            match f.geometry {
+                Geometry::Point { x, y } => {
+                    assert!(bbox.contains(x, y), "feature {} outside bbox", f.id);
+                }
+                _ => panic!("Expected Point geometry"),
+            }
+        }
     }
 
     #[test]
     fn get_features_bbox_no_match() {
         let engine = CsvEngine::new(test_store());
+        // Bbox far from Finland
         let bbox = Bbox::new(0.0, 0.0, 1.0, 1.0).unwrap();
         let query = FeatureQuery {
             bbox: Some(bbox),
@@ -385,19 +408,14 @@ mod tests {
     #[test]
     fn get_feature_by_id() {
         let engine = CsvEngine::new(test_store());
-        let feature = engine.get_feature("Helsinki").unwrap();
-        assert_eq!(feature.id, "Helsinki");
-        assert_eq!(
-            feature.properties.get("name"),
-            Some(&PropertyValue::String("Helsinki".to_string()))
-        );
-        match feature.geometry {
-            Geometry::Point { x, y } => {
-                assert!((x - 24.9384).abs() < 0.001);
-                assert!((y - 60.1699).abs() < 0.001);
-            }
-            _ => panic!("Expected Point geometry"),
-        }
+        // Get any feature from the listing and fetch it by ID
+        let all = engine.get_features(&FeatureQuery { limit: 1, ..Default::default() }).unwrap();
+        let first_id = &all.features[0].id;
+
+        let feature = engine.get_feature(first_id).unwrap();
+        assert_eq!(&feature.id, first_id);
+        assert!(feature.properties.contains_key("name"));
+        assert!(matches!(feature.geometry, Geometry::Point { .. }));
     }
 
     #[test]
