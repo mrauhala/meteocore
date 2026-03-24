@@ -92,11 +92,10 @@ impl Engine for CsvEngine {
         times.dedup();
 
         // Build domain
-        let domain = DomainDescription {
-            domain_type: "PointSeries".to_string(),
-            axes_x: first_row.longitude,
-            axes_y: first_row.latitude,
-            axes_t: times.clone(),
+        let domain = DomainDescription::PointSeries {
+            x: first_row.longitude,
+            y: first_row.latitude,
+            t: times.clone(),
         };
 
         // Build parameter descriptions

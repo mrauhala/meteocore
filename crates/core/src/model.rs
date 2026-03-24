@@ -10,11 +10,19 @@ pub struct Location {
 }
 
 #[derive(Debug, Clone)]
-pub struct DomainDescription {
-    pub domain_type: String,
-    pub axes_x: f64,
-    pub axes_y: f64,
-    pub axes_t: Vec<DateTime<Utc>>,
+pub enum DomainDescription {
+    /// A time series at a single point (x, y fixed, t varies).
+    PointSeries {
+        x: f64,
+        y: f64,
+        t: Vec<DateTime<Utc>>,
+    },
+    /// A regular grid, optionally with a time dimension.
+    Grid {
+        x: Vec<f64>,
+        y: Vec<f64>,
+        t: Option<Vec<DateTime<Utc>>>,
+    },
 }
 
 #[derive(Debug, Clone)]

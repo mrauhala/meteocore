@@ -68,11 +68,10 @@ impl MockEngine {
         );
 
         QueryResult {
-            domain: DomainDescription {
-                domain_type: "PointSeries".into(),
-                axes_x: 24.9384,
-                axes_y: 60.1699,
-                axes_t: times,
+            domain: DomainDescription::PointSeries {
+                x: 24.9384,
+                y: 60.1699,
+                t: times,
             },
             parameters,
             ranges,

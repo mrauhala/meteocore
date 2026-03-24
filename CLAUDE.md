@@ -239,11 +239,17 @@ Integration tests in `crates/api-edr/tests/covjson_validation.rs` validate seria
 - `domainType` triggers axis constraints (e.g. PointSeries requires x, y, t)
 - `referencing` array connects coordinate names to reference systems
 
-**PointSeries domain** (currently implemented):
+**PointSeries domain**:
 - `x` axis: `numericSingleValueAxis` — `{"values": [<single number>]}`
 - `y` axis: `numericSingleValueAxis` — `{"values": [<single number>]}`
 - `t` axis: `stringValuesAxis` — `{"values": ["2024-01-01T00:00:00+00:00", ...]}`
 - No additional axes allowed (`additionalProperties: false`)
+
+**Grid domain**:
+- `x` axis: `numericValuesAxis` — `{"values": [10.0, 10.5, 11.0, ...]}`
+- `y` axis: `numericValuesAxis` — `{"values": [60.0, 60.5, 61.0, ...]}`
+- `t` axis: optional `stringValuesAxis` (omitted for single-timestep grids)
+- NdArray shape: `[t, y, x]` (with time) or `[y, x]` (without time)
 
 **Parameter object**:
 - Required: `type` ("Parameter"), `observedProperty`
@@ -265,12 +271,15 @@ Integration tests in `crates/api-edr/tests/covjson_validation.rs` validate seria
 
 ### Adding new domain types
 
-When implementing a new domain type (Point, Grid, Trajectory, VerticalProfile, etc.):
+When implementing a new domain type (Point, Trajectory, VerticalProfile, etc.):
 
-1. Check the schema's `domainBase.dependencies.domainType` section for that type's axis requirements
-2. Implement the serializer in `response.rs`
-3. Add a validation test in `covjson_validation.rs` using `make_query_result` or a new helper
-4. The schema enforces `additionalProperties: false` on axes for typed domains — only the specified axes are allowed
+1. Add a variant to `DomainDescription` enum in `ds-core/src/model.rs`
+2. Add a match arm in `build_domain()` in `api-edr/src/response.rs`
+3. Check the schema's `domainBase.dependencies.domainType` section for that type's axis requirements
+4. Add a validation test in `covjson_validation.rs` using a helper like `make_grid_query_result`
+5. The schema enforces `additionalProperties: false` on axes for typed domains — only the specified axes are allowed
+
+Currently implemented: `PointSeries`, `Grid`.
 
 ### Common pitfalls
 
