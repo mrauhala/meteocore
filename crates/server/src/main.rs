@@ -90,6 +90,50 @@ async fn main() {
                     );
                 }
             }
+            "geotiff" => {
+                let geotiff_config = collection.geotiff.as_ref().unwrap_or_else(|| {
+                    panic!(
+                        "Collection '{}' has engine_type 'geotiff' but missing [collections.geotiff] config",
+                        collection.id
+                    );
+                });
+
+                let engine = Arc::new(
+                    engine_geotiff::GeoTiffEngine::new(&collection.data_path, geotiff_config)
+                        .expect("Failed to initialize GeoTIFF engine"),
+                );
+
+                // get_temporal_extent is from the Engine trait, already in scope
+                // via ds_core::engine::Engine. Use the catalog's temporal extent
+                // to report file count indirectly.
+                if let Some((start, end)) = ds_core::engine::Engine::get_temporal_extent(engine.as_ref()) {
+                    info!(
+                        "Collection '{}': temporal extent {} to {}",
+                        collection.id, start, end
+                    );
+                }
+
+                // Spawn the background polling task
+                let poller = engine.clone();
+                tokio::spawn(async move {
+                    poller.poll_loop().await;
+                });
+
+                if collection.apis.contains(&"edr".to_string()) {
+                    edr_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::engine::Engine>,
+                    );
+                    edr_collections.insert(collection.id.clone(), collection.clone());
+                }
+                if collection.apis.contains(&"features".to_string()) {
+                    info!(
+                        "Warning: GeoTIFF engine does not support Features API, \
+                         skipping Features wiring for collection '{}'",
+                        collection.id
+                    );
+                }
+            }
             other => {
                 panic!("Unknown engine type '{other}' for collection '{}'", collection.id);
             }

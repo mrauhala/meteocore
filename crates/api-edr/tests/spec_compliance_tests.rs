@@ -119,6 +119,7 @@ fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<EdrState> {
         data_path: String::new(),
         apis: vec!["edr".to_string()],
         engine_type: "csv".to_string(),
+        geotiff: None,
     });
     Arc::new(EdrState { engines, collections, base_url: String::new() })
 }

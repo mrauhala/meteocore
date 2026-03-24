@@ -7,6 +7,7 @@ edition = "2021"
 ds-core = { path = "../core" }
 engine-csv = { path = "../engine-csv" }
 engine-geojson = { path = "../engine-geojson" }
+engine-geotiff = { path = "../engine-geotiff" }
 api-edr = { path = "../api-edr" }
 api-features = { path = "../api-features" }
 axum = "0.8"
