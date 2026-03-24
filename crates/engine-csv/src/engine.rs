@@ -152,6 +152,29 @@ impl Engine for CsvEngine {
         self.store.parameter_names.clone()
     }
 
+    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
+        self.store
+            .parameter_names
+            .iter()
+            .map(|name| {
+                let unit = self
+                    .store
+                    .parameter_units
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default();
+                (
+                    name.clone(),
+                    ParameterDescription {
+                        label: name.replace('_', " "),
+                        unit,
+                        observed_property: name.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
         let mut min = DateTime::<Utc>::MAX_UTC;
         let mut max = DateTime::<Utc>::MIN_UTC;

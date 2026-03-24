@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::json;
@@ -44,6 +44,9 @@ pub async fn landing_page() -> impl IntoResponse {
 pub async fn conformance() -> impl IntoResponse {
     Json(json!({
         "conformsTo": [
+            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
+            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page",
+            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/oas30",
             "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/core",
             "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/collections",
             "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/json",
@@ -96,7 +99,11 @@ pub async fn locations(
             Json(json!({ "code": "ServerError", "description": e.to_string() })),
         )
     })?;
-    Ok(Json(locations_to_geojson(&locs)))
+    let body = serde_json::to_string(&locations_to_geojson(&locs, &id)).unwrap();
+    Ok((
+        [(header::CONTENT_TYPE, "application/geo+json")],
+        body,
+    ))
 }
 
 pub async fn location_query(
@@ -145,11 +152,15 @@ pub async fn location_query(
             ),
         })?;
 
-    Ok(Json(query_result_to_coverage_json(&result)))
+    let body = serde_json::to_string(&query_result_to_coverage_json(&result)).unwrap();
+    Ok((
+        [(header::CONTENT_TYPE, "application/prs.coverage+json")],
+        body,
+    ))
 }
 
 fn build_collection_metadata(engine: &dyn Engine) -> serde_json::Value {
-    let params = engine.get_parameters();
+    let param_descs = engine.get_parameter_descriptions();
     let temporal = engine.get_temporal_extent();
     let spatial = engine.get_spatial_extent();
 
@@ -157,28 +168,35 @@ fn build_collection_metadata(engine: &dyn Engine) -> serde_json::Value {
     if let Some(bbox) = spatial {
         extent.insert(
             "spatial".to_string(),
-            json!({ "bbox": [bbox], "crs": "CRS84" }),
+            json!({ "bbox": [bbox], "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84" }),
         );
     }
     if let Some((start, end)) = temporal {
         extent.insert(
             "temporal".to_string(),
-            json!({ "interval": [[start.to_rfc3339(), end.to_rfc3339()]], "trs": "TIMECRS[\"DateTime\",TDATUM[\"Gregorian Calendar\"],CS[TemporalDateTime,1],AXIS[\"Time (T)\",future]]" }),
+            json!({ "interval": [[start.to_rfc3339(), end.to_rfc3339()]], "trs": "http://www.opengis.net/def/uom/ISO-8601/0/Gregorian" }),
         );
     }
 
-    let parameter_names: serde_json::Map<String, serde_json::Value> = params
+    let parameter_names: serde_json::Map<String, serde_json::Value> = param_descs
         .iter()
-        .map(|p| {
-            (
-                p.clone(),
-                json!({
-                    "type": "Parameter",
-                    "observedProperty": {
-                        "label": { "en": p.replace('_', " ") }
+        .map(|(name, desc)| {
+            let mut param = json!({
+                "type": "Parameter",
+                "observedProperty": {
+                    "label": { "en": desc.label }
+                }
+            });
+            if !desc.unit.is_empty() {
+                param["unit"] = json!({
+                    "label": { "en": desc.unit },
+                    "symbol": {
+                        "value": desc.unit,
+                        "type": "http://www.opengis.net/def/uom/UCUM/"
                     }
-                }),
-            )
+                });
+            }
+            (name.clone(), param)
         })
         .collect();
 
@@ -190,7 +208,8 @@ fn build_collection_metadata(engine: &dyn Engine) -> serde_json::Value {
             {
                 "href": "/edr/collections/weather",
                 "rel": "self",
-                "type": "application/json"
+                "type": "application/json",
+                "title": "Finnish Weather Observations"
             }
         ],
         "extent": extent,
@@ -206,6 +225,7 @@ fn build_collection_metadata(engine: &dyn Engine) -> serde_json::Value {
                 }
             }
         },
+        "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
         "parameter_names": parameter_names,
         "output_formats": ["CoverageJSON", "GeoJSON"]
     })

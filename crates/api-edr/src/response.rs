@@ -91,7 +91,7 @@ pub fn query_result_to_coverage_json(result: &QueryResult) -> Value {
     })
 }
 
-pub fn locations_to_geojson(locations: &[Location]) -> Value {
+pub fn locations_to_geojson(locations: &[Location], collection_id: &str) -> Value {
     let features: Vec<Value> = locations
         .iter()
         .map(|loc| {
@@ -104,13 +104,29 @@ pub fn locations_to_geojson(locations: &[Location]) -> Value {
                 },
                 "properties": {
                     "name": loc.label
-                }
+                },
+                "links": [
+                    {
+                        "href": format!("/edr/collections/{}/locations/{}", collection_id, loc.id),
+                        "rel": "data",
+                        "type": "application/prs.coverage+json",
+                        "title": format!("Data for {}", loc.label)
+                    }
+                ]
             })
         })
         .collect();
 
     json!({
         "type": "FeatureCollection",
-        "features": features
+        "features": features,
+        "links": [
+            {
+                "href": format!("/edr/collections/{}/locations", collection_id),
+                "rel": "self",
+                "type": "application/geo+json",
+                "title": "Locations"
+            }
+        ]
     })
 }
