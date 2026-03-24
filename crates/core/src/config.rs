@@ -18,6 +18,12 @@ pub struct CollectionConfig {
     pub title: String,
     pub description: String,
     pub data_path: String,
+    #[serde(default = "default_apis")]
+    pub apis: Vec<String>,
+}
+
+fn default_apis() -> Vec<String> {
+    vec!["edr".to_string()]
 }
 
 impl ServerConfig {

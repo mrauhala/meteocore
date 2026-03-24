@@ -17,6 +17,15 @@ pub enum DataServerError {
     #[error("Config error: {0}")]
     Config(String),
 
+    #[error("Feature not found: {0}")]
+    FeatureNotFound(String),
+
+    #[error("Invalid bbox: {0}")]
+    InvalidBbox(String),
+
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }

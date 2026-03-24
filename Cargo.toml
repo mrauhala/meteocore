@@ -4,5 +4,6 @@ members = [
     "crates/core",
     "crates/engine-csv",
     "crates/api-edr",
+    "crates/api-features",
     "crates/server",
 ]

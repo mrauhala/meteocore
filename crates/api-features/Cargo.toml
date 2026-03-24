@@ -1,5 +1,5 @@
 [package]
-name = "api-edr"
+name = "api-features"
 version = "0.1.0"
 edition = "2021"
 
@@ -11,5 +11,4 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
-jsonschema = "0.28"
 serde_json = "1"

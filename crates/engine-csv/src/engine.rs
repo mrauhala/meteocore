@@ -3,6 +3,8 @@ use std::collections::HashMap;
 
 use ds_core::engine::Engine;
 use ds_core::error::DataServerError;
+use ds_core::feature::{Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue};
+use ds_core::feature_engine::FeatureEngine;
 use ds_core::model::*;
 
 use crate::loader::CsvDataStore;
@@ -188,5 +190,196 @@ impl Engine for CsvEngine {
         }
 
         Some([min_lon, min_lat, max_lon, max_lat])
+    }
+}
+
+impl FeatureEngine for CsvEngine {
+    fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+        // Build unique locations as features
+        let mut seen = HashMap::new();
+        let mut all_features = Vec::new();
+
+        for row in &self.store.rows {
+            if seen.contains_key(&row.location) {
+                continue;
+            }
+            seen.insert(&row.location, true);
+
+            // Apply bbox filter
+            if let Some(bbox) = &query.bbox {
+                if !bbox.contains(row.longitude, row.latitude) {
+                    continue;
+                }
+            }
+
+            let mut properties = HashMap::new();
+            properties.insert(
+                "name".to_string(),
+                PropertyValue::String(row.location.clone()),
+            );
+            properties.insert(
+                "latitude".to_string(),
+                PropertyValue::Float(row.latitude),
+            );
+            properties.insert(
+                "longitude".to_string(),
+                PropertyValue::Float(row.longitude),
+            );
+
+            all_features.push(Feature {
+                id: row.location.clone(),
+                geometry: Geometry::Point {
+                    x: row.longitude,
+                    y: row.latitude,
+                },
+                properties,
+            });
+        }
+
+        let number_matched = all_features.len();
+        let offset = query.offset.min(number_matched);
+        let end = (offset + query.limit).min(number_matched);
+        let page = all_features[offset..end].to_vec();
+        let number_returned = page.len();
+        let next_offset = if end < number_matched {
+            Some(end)
+        } else {
+            None
+        };
+
+        Ok(FeaturePage {
+            features: page,
+            number_matched,
+            number_returned,
+            next_offset,
+        })
+    }
+
+    fn get_feature(&self, feature_id: &str) -> Result<Feature, DataServerError> {
+        // Find the first row for this location
+        let indices = self
+            .store
+            .location_index
+            .get(feature_id)
+            .ok_or_else(|| DataServerError::FeatureNotFound(feature_id.to_string()))?;
+
+        let row = &self.store.rows[indices[0]];
+
+        let mut properties = HashMap::new();
+        properties.insert(
+            "name".to_string(),
+            PropertyValue::String(row.location.clone()),
+        );
+        properties.insert(
+            "latitude".to_string(),
+            PropertyValue::Float(row.latitude),
+        );
+        properties.insert(
+            "longitude".to_string(),
+            PropertyValue::Float(row.longitude),
+        );
+
+        Ok(Feature {
+            id: row.location.clone(),
+            geometry: Geometry::Point {
+                x: row.longitude,
+                y: row.latitude,
+            },
+            properties,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ds_core::feature::Bbox;
+
+    fn test_store() -> CsvDataStore {
+        CsvDataStore::load("../../testdata/weather.csv").unwrap()
+    }
+
+    #[test]
+    fn get_features_returns_all_locations() {
+        let engine = CsvEngine::new(test_store());
+        let result = engine.get_features(&FeatureQuery::default()).unwrap();
+        assert_eq!(result.number_matched, 3);
+        assert_eq!(result.number_returned, 3);
+        assert!(result.next_offset.is_none());
+    }
+
+    #[test]
+    fn get_features_pagination() {
+        let engine = CsvEngine::new(test_store());
+        let query = FeatureQuery {
+            limit: 2,
+            offset: 0,
+            ..Default::default()
+        };
+        let result = engine.get_features(&query).unwrap();
+        assert_eq!(result.number_matched, 3);
+        assert_eq!(result.number_returned, 2);
+        assert_eq!(result.next_offset, Some(2));
+
+        // Next page
+        let query = FeatureQuery {
+            limit: 2,
+            offset: 2,
+            ..Default::default()
+        };
+        let result = engine.get_features(&query).unwrap();
+        assert_eq!(result.number_returned, 1);
+        assert!(result.next_offset.is_none());
+    }
+
+    #[test]
+    fn get_features_bbox_filter() {
+        let engine = CsvEngine::new(test_store());
+        // Bbox covering only Helsinki area (lon ~24.9, lat ~60.2)
+        let bbox = Bbox::new(24.5, 60.0, 25.5, 60.5).unwrap();
+        let query = FeatureQuery {
+            bbox: Some(bbox),
+            ..Default::default()
+        };
+        let result = engine.get_features(&query).unwrap();
+        assert_eq!(result.number_matched, 1);
+        assert_eq!(result.features[0].id, "Helsinki");
+    }
+
+    #[test]
+    fn get_features_bbox_no_match() {
+        let engine = CsvEngine::new(test_store());
+        let bbox = Bbox::new(0.0, 0.0, 1.0, 1.0).unwrap();
+        let query = FeatureQuery {
+            bbox: Some(bbox),
+            ..Default::default()
+        };
+        let result = engine.get_features(&query).unwrap();
+        assert_eq!(result.number_matched, 0);
+        assert!(result.features.is_empty());
+    }
+
+    #[test]
+    fn get_feature_by_id() {
+        let engine = CsvEngine::new(test_store());
+        let feature = engine.get_feature("Helsinki").unwrap();
+        assert_eq!(feature.id, "Helsinki");
+        assert_eq!(
+            feature.properties.get("name"),
+            Some(&PropertyValue::String("Helsinki".to_string()))
+        );
+        match feature.geometry {
+            Geometry::Point { x, y } => {
+                assert!((x - 24.9384).abs() < 0.001);
+                assert!((y - 60.1699).abs() < 0.001);
+            }
+        }
+    }
+
+    #[test]
+    fn get_feature_not_found() {
+        let engine = CsvEngine::new(test_store());
+        let result = engine.get_feature("NonExistent");
+        assert!(result.is_err());
     }
 }

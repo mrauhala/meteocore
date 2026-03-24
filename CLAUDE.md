@@ -2,7 +2,7 @@
 
 ## What This Is
 
-Rust workspace implementing an OGC API - EDR server. Four crates: `ds-core` (traits + types), `engine-csv` (CSV data engine), `api-edr` (HTTP layer), `server` (binary).
+Rust workspace implementing OGC API - EDR and OGC API - Features servers. Five crates: `ds-core` (traits + types), `engine-csv` (CSV data engine), `api-edr` (EDR HTTP layer), `api-features` (Features HTTP layer), `server` (binary).
 
 ## Build & Run
 
@@ -15,32 +15,85 @@ cargo check -p <crate>       # Type-check a single crate
 
 ## Architecture Rules
 
-- **Engine trait is the core abstraction.** Engines return domain types (`QueryResult`, `Location`), never JSON. Serialization belongs in `api-edr`.
-- **ds-core has no framework dependencies.** Only chrono, serde, thiserror, toml. Keep it that way.
-- **api-edr depends only on ds-core**, not on any engine crate. It receives `Arc<dyn Engine>` as axum state.
-- **New engines** implement the `Engine` trait in their own crate, get wired up in `server/src/main.rs`.
+- **Two core traits: `Engine` (EDR) and `FeatureEngine` (Features).** They are separate traits — not all engines need to support both APIs. Engines return domain types, never JSON. Serialization belongs in the API crates.
+- **ds-core has no framework dependencies.** Only chrono, serde, thiserror, toml. Keep it that way. Use `PropertyValue` enum instead of `serde_json::Value` for feature properties.
+- **API crates depend only on ds-core**, not on any engine crate. `api-edr` receives `Arc<dyn Engine>`, `api-features` receives `Arc<dyn FeatureEngine>` as axum state.
+- **EDR and Features are separate services** with separate base routes (`/edr/...` and `/features/...`). They share data sources but have independent landing pages, conformance endpoints, and collection listings.
+- **CORS is applied at the server level**, not in individual API crates. The `CorsLayer` lives in `server/src/main.rs`.
+- **New engines** implement `Engine` and/or `FeatureEngine` traits in their own crate, get wired up in `server/src/main.rs`.
 
 ## Crate Name
 
 The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust). It was renamed from `core` to avoid shadowing Rust's built-in `core` crate, which breaks proc macros like `#[tokio::main]`.
 
+## Route Structure
+
+```
+/                                              Root landing page (links to both services)
+/edr/                                          EDR landing page
+/edr/conformance                               EDR conformance classes
+/edr/collections                               EDR collection listing
+/edr/collections/{id}                          EDR collection detail
+/edr/collections/{id}/locations                EDR locations query
+/edr/collections/{id}/locations/{loc_id}       EDR location data query (CoverageJSON)
+
+/features/                                     Features landing page
+/features/conformance                          Features conformance classes
+/features/collections                          Features collection listing
+/features/collections/{id}                     Features collection detail
+/features/collections/{id}/items               Feature items (paginated GeoJSON)
+/features/collections/{id}/items/{feature_id}  Single feature (GeoJSON)
+```
+
 ## Adding a New Engine
 
 1. Create `crates/engine-<name>/` with `Cargo.toml` depending on `ds-core`
-2. Implement the `Engine` trait from `ds_core::engine`
+2. Implement `Engine` and/or `FeatureEngine` traits from `ds_core::engine` / `ds_core::feature_engine`
 3. Add the crate to workspace members in root `Cargo.toml`
-4. Wire it up in `server/src/main.rs` based on config
+4. Wire it up in `server/src/main.rs` — cast to `Arc<dyn Engine>` and/or `Arc<dyn FeatureEngine>`
 
-## Adding a New Endpoint
+## Adding a New EDR Endpoint
 
 1. Add the handler function in `crates/api-edr/src/handlers.rs`
 2. Add the route in `crates/api-edr/src/lib.rs`
 3. If new query params are needed, add them in `params.rs`
 4. If new response formats are needed, add serializers in `response.rs`
 
+## Adding a New Features Endpoint
+
+1. Add the handler function in `crates/api-features/src/handlers.rs`
+2. Add the route in `crates/api-features/src/lib.rs`
+3. If new query params are needed, add them in `params.rs`
+4. If new response formats are needed, add serializers in `response.rs`
+
+## Features API Query Parameters
+
+| Parameter | Format | Description |
+|-----------|--------|-------------|
+| `bbox` | `west,south,east,north` | Bounding box filter. Validated: finite numbers, lon -180..180, lat -90..90, west<=east, south<=north |
+| `limit` | integer | Page size. Default 100, max 1000. Clamped silently if exceeded |
+| `offset` | integer | Pagination offset. Default 0 |
+
 ## CSV Data Format
 
 Fixed columns: `location, latitude, longitude, time` (in that order). All remaining columns become parameters. Parameter units are mapped in `engine-csv/src/loader.rs`.
+
+## Config Format
+
+```toml
+[server]
+host = "0.0.0.0"
+port = 3000
+
+[[collections]]
+id = "weather"
+title = "Finnish Weather Observations"
+description = "Hourly weather observations from Finnish weather stations"
+data_path = "testdata/weather.csv"
+apis = ["edr", "features"]   # optional, defaults to ["edr"]
+```
+
+The `apis` field controls which services expose a collection. Currently both APIs are wired unconditionally in the server.
 
 ## CoverageJSON Schema Compliance
 
@@ -109,7 +162,9 @@ When implementing a new domain type (Point, Grid, Trajectory, VerticalProfile, e
 - Collection ID is hardcoded to `"weather"` in handlers — needs a registry for multi-collection support
 - Parameter units are hardcoded in the CSV loader's match statement
 - All data loaded into memory at startup
-- Only the `locations` query type is implemented (no position, area, radius, trajectory, corridor)
+- Only the `locations` query type is implemented for EDR (no position, area, radius, trajectory, corridor)
+- Features API serves locations as point features only (no complex geometries from CSV)
+- CRS hardcoded to CRS84
 
 ## Code Style
 
@@ -117,3 +172,4 @@ When implementing a new domain type (Point, Grid, Trajectory, VerticalProfile, e
 - Prefer returning `Result<T, DataServerError>` from engine methods
 - Keep handlers thin — delegate logic to the engine, map errors to HTTP status codes
 - Use `serde_json::json!` macro for building JSON responses
+- Do not leak internal error details to clients — use generic messages for 500 errors

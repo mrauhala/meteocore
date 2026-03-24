@@ -16,23 +16,23 @@ pub type AppState = Arc<dyn Engine>;
 
 pub async fn landing_page() -> impl IntoResponse {
     Json(json!({
-        "title": "Metocean Data Server",
+        "title": "Metocean Data Server - EDR",
         "description": "OGC API - Environmental Data Retrieval",
         "links": [
             {
-                "href": "/",
+                "href": "/edr/",
                 "rel": "self",
                 "type": "application/json",
                 "title": "This document"
             },
             {
-                "href": "/conformance",
+                "href": "/edr/conformance",
                 "rel": "conformance",
                 "type": "application/json",
                 "title": "Conformance classes"
             },
             {
-                "href": "/collections",
+                "href": "/edr/collections",
                 "rel": "data",
                 "type": "application/json",
                 "title": "Collections"
@@ -59,7 +59,7 @@ pub async fn collections(State(engine): State<AppState>) -> impl IntoResponse {
         "collections": [collection],
         "links": [
             {
-                "href": "/collections",
+                "href": "/edr/collections",
                 "rel": "self",
                 "type": "application/json"
             }
@@ -188,7 +188,7 @@ fn build_collection_metadata(engine: &dyn Engine) -> serde_json::Value {
         "description": "Hourly weather observations from Finnish weather stations",
         "links": [
             {
-                "href": "/collections/weather",
+                "href": "/edr/collections/weather",
                 "rel": "self",
                 "type": "application/json"
             }
@@ -197,7 +197,7 @@ fn build_collection_metadata(engine: &dyn Engine) -> serde_json::Value {
         "data_queries": {
             "locations": {
                 "link": {
-                    "href": "/collections/weather/locations",
+                    "href": "/edr/collections/weather/locations",
                     "rel": "data",
                     "variables": {
                         "query_type": "locations",
