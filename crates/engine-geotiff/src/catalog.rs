@@ -259,6 +259,7 @@ pub fn scan_remote_with_limit(
     timestamp_format: &str,
     existing_entries: &BTreeMap<PathBuf, FileEntry>,
     max_files: Option<usize>,
+    time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Result<Catalog, DataServerError> {
     let entries_list = store.list(prefix)?;
 
@@ -287,6 +288,13 @@ pub fn scan_remote_with_limit(
             Ok(dt) => dt.and_utc(),
             Err(_) => continue,
         };
+
+        // Filter by time window before downloading anything
+        if let Some((start, end)) = time_filter {
+            if datetime < start || datetime > end {
+                continue;
+            }
+        }
 
         if obj.size > MAX_REMOTE_FILE_SIZE {
             continue;

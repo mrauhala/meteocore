@@ -87,18 +87,19 @@ pub struct GeoTiffConfig {
     /// E.g. `"%Y/%m/%d/OPERA/COMP/"` expands to `"2026/03/25/OPERA/COMP/"`.
     /// Re-evaluated on each poll cycle so it stays current across date boundaries.
     pub prefix_pattern: Option<String>,
+    /// ISO 8601 duration defining the time window for file selection.
+    /// Negative = past (observations), positive = future (forecasts).
+    /// E.g. `-PT2H` keeps files from the past 2 hours, `PT6H` keeps the next 6 hours.
+    /// Also determines how many date-prefixes to scan automatically.
+    /// When not set, all files are kept (subject to max_files).
+    pub time_window: Option<String>,
     /// Number of days to scan when prefix_pattern contains date templates.
-    /// Default: 2 (today + yesterday). Ensures coverage across midnight.
-    #[serde(default = "default_scan_days")]
-    pub scan_days: u32,
+    /// Default: auto-derived from time_window. Override if needed.
+    pub scan_days: Option<u32>,
 }
 
 fn default_tile_cache_mb() -> u64 {
     64
-}
-
-fn default_scan_days() -> u32 {
-    2
 }
 
 fn default_band() -> u32 {

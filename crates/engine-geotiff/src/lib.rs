@@ -2,6 +2,7 @@ mod cache;
 mod catalog;
 mod geo;
 mod reader;
+mod time_window;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -39,6 +40,7 @@ enum StoreMode {
         store: ds_storage::DataStore,
         prefix_pattern: String,
         scan_days: u32,
+        time_window: Option<time_window::TimeWindow>,
     },
 }
 
@@ -76,15 +78,27 @@ impl GeoTiffEngine {
         }
 
         // Determine store mode from config
+        // Parse time_window if configured
+        let parsed_time_window = config.time_window.as_deref()
+            .map(time_window::TimeWindow::parse)
+            .transpose()?;
+
         let (store_mode, display) = if let (Some(endpoint), Some(bucket)) = (&config.endpoint, &config.bucket) {
             let store = ds_storage::build_s3_store_from_parts(endpoint, bucket)?;
             let prefix_pattern = config.prefix_pattern.clone().unwrap_or_default();
             let display = format!("s3://{}/{}", bucket, prefix_pattern);
+
+            // Derive scan_days: explicit config > time_window-derived > default 2
+            let scan_days = config.scan_days
+                .or_else(|| parsed_time_window.as_ref().map(|tw| tw.scan_days()))
+                .unwrap_or(2);
+
             (
                 StoreMode::RemoteDynamic {
                     store,
                     prefix_pattern,
-                    scan_days: config.scan_days,
+                    scan_days,
+                    time_window: parsed_time_window.clone(),
                 },
                 display,
             )
@@ -181,10 +195,12 @@ impl GeoTiffEngine {
                     &self.timestamp_format,
                     remote_existing,
                     self.max_files,
+                    None,
                 )?
             }
-            StoreMode::RemoteDynamic { store, prefix_pattern, scan_days } => {
+            StoreMode::RemoteDynamic { store, prefix_pattern, scan_days, time_window } => {
                 let prefixes = expand_prefix_pattern(prefix_pattern, *scan_days);
+                let time_filter = time_window.as_ref().map(|tw| tw.to_range(Utc::now()));
                 let mut merged = Catalog::empty();
                 for prefix_str in &prefixes {
                     let prefix = ds_storage::object_store::path::Path::from(prefix_str.as_str());
@@ -195,6 +211,7 @@ impl GeoTiffEngine {
                         &self.timestamp_format,
                         remote_existing,
                         None, // no per-prefix limit; apply max_files after merge
+                        time_filter,
                     ) {
                         Ok(partial) => {
                             merged.entries.extend(partial.entries);
