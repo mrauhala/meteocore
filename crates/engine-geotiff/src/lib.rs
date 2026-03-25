@@ -13,6 +13,7 @@ use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use std::sync::Arc;
+use tokio::sync::watch;
 
 use ds_core::config::GeoTiffConfig;
 use ds_core::engine::Engine;
@@ -62,6 +63,8 @@ pub struct GeoTiffEngine {
     override_nodata: Option<f64>,
     override_scale: Option<f64>,
     override_offset: Option<f64>,
+    /// Shutdown signal for the polling loop.
+    shutdown_tx: watch::Sender<()>,
 }
 
 impl GeoTiffEngine {
@@ -142,6 +145,8 @@ impl GeoTiffEngine {
 
         let band_index = (config.band.max(1) - 1) as usize; // 1-based config → 0-based index
 
+        let (shutdown_tx, _) = watch::channel(());
+
         let engine = GeoTiffEngine {
             collection_id: collection_id.to_string(),
             catalog: ArcSwap::from_pointee(Catalog::empty()),
@@ -159,6 +164,7 @@ impl GeoTiffEngine {
             override_nodata: config.nodata,
             override_scale: config.scale,
             override_offset: config.offset,
+            shutdown_tx,
         };
 
         // Initial scan
@@ -189,7 +195,13 @@ impl GeoTiffEngine {
     ) -> Result<Catalog, DataServerError> {
         let mut catalog = match &self.store_mode {
             StoreMode::Local { directory, pending } => {
-                let mut pending = pending.lock().unwrap();
+                let mut pending = match pending.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        tracing::warn!("[{}] Pending file tracker poisoned, recovering", self.collection_id);
+                        poisoned.into_inner()
+                    }
+                };
                 scan_directory(
                     directory,
                     &self.filename_pattern,
@@ -220,6 +232,7 @@ impl GeoTiffEngine {
                     (expand_prefix_pattern(prefix_pattern, *scan_days), None)
                 };
                 let mut merged = Catalog::empty();
+                let mut scan_errors: Vec<(String, DataServerError)> = Vec::new();
                 for prefix_str in &prefixes {
                     let prefix = ds_storage::object_store::path::Path::from(prefix_str.as_str());
                     match scan_remote_with_limit(
@@ -236,20 +249,23 @@ impl GeoTiffEngine {
                             merged.entries.extend(partial.entries);
                         }
                         Err(e) => {
-                            tracing::warn!("[{}] Scan failed for prefix '{}': {e}", self.collection_id, prefix_str);
+                            scan_errors.push((prefix_str.clone(), e));
                         }
                     }
                 }
-                // Recompute extents from merged entries
-                merged.temporal_extent = if merged.entries.is_empty() {
-                    None
-                } else {
-                    let first = *merged.entries.keys().next().unwrap();
-                    let last = *merged.entries.keys().next_back().unwrap();
-                    Some((first, last))
-                };
-                merged.spatial_extent = merged.entries.values().next()
-                    .map(|e| e.metadata.geo_transform.bbox());
+                if !scan_errors.is_empty() {
+                    tracing::warn!(
+                        "[{}] {}/{} prefix scan(s) failed: {}",
+                        self.collection_id,
+                        scan_errors.len(),
+                        prefixes.len(),
+                        scan_errors.iter()
+                            .map(|(p, e)| format!("'{}': {}", p, e))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    );
+                }
+                merged.recompute_extents();
                 merged
             }
         };
@@ -273,14 +289,26 @@ impl GeoTiffEngine {
     }
 
     /// Run the polling loop. Call this from a tokio::spawn task.
+    /// The loop exits gracefully when `shutdown()` is called.
     pub async fn poll_loop(&self) {
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mut interval = tokio::time::interval(self.poll_interval);
         interval.tick().await;
 
         loop {
-            interval.tick().await;
-            self.poll_once();
+            tokio::select! {
+                _ = interval.tick() => self.poll_once(),
+                _ = shutdown_rx.changed() => {
+                    tracing::info!("[{}] Poll loop shutting down", self.collection_id);
+                    break;
+                }
+            }
         }
+    }
+
+    /// Signal the polling loop to stop.
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(());
     }
 
     fn poll_once(&self) {
@@ -307,8 +335,19 @@ impl GeoTiffEngine {
 
         match result {
             Ok(new_catalog) => {
+                let old_count = current.entries.len();
                 let count = new_catalog.entries.len();
                 let total_bytes: u64 = new_catalog.entries.values().map(|e| e.file_size).sum();
+
+                if count == 0 && old_count > 0 {
+                    tracing::warn!(
+                        "[{}] Poll returned 0 files (was {}); keeping old catalog. \
+                         Check data source connectivity and filename pattern.",
+                        self.collection_id, old_count
+                    );
+                    return;
+                }
+
                 self.catalog.store(Arc::new(new_catalog));
                 let (hits, misses) = self.tile_cache.stats();
                 tracing::debug!(

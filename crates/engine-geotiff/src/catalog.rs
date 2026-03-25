@@ -36,6 +36,15 @@ impl Catalog {
         }
     }
 
+    /// Recompute temporal and spatial extents from current entries.
+    pub fn recompute_extents(&mut self) {
+        self.temporal_extent = match (self.entries.keys().next(), self.entries.keys().next_back()) {
+            (Some(&first), Some(&last)) => Some((first, last)),
+            _ => None,
+        };
+        self.spatial_extent = compute_spatial_union(self.entries.values());
+    }
+
     /// Trim to keep only the most recent `max` entries by timestamp.
     pub fn trim_to_latest(&mut self, max: usize) {
         if self.entries.len() <= max {
@@ -45,16 +54,27 @@ impl Catalog {
         if let Some(cutoff) = keep_from {
             self.entries = self.entries.split_off(&cutoff);
         }
-        // Recompute extents
-        self.temporal_extent = if self.entries.is_empty() {
-            None
-        } else {
-            let first = *self.entries.keys().next().unwrap();
-            let last = *self.entries.keys().next_back().unwrap();
-            Some((first, last))
-        };
-        self.spatial_extent = self.entries.values().next().map(|e| e.metadata.geo_transform.bbox());
+        self.recompute_extents();
     }
+}
+
+/// Compute the union bounding box across all file entries.
+/// Returns None if there are no entries.
+fn compute_spatial_union<'a>(entries: impl Iterator<Item = &'a FileEntry>) -> Option<[f64; 4]> {
+    let mut result: Option<[f64; 4]> = None;
+    for entry in entries {
+        let bbox = entry.metadata.geo_transform.bbox();
+        result = Some(match result {
+            None => bbox,
+            Some([w, s, e, n]) => [
+                w.min(bbox[0]),
+                s.min(bbox[1]),
+                e.max(bbox[2]),
+                n.max(bbox[3]),
+            ],
+        });
+    }
+    result
 }
 
 /// Tracks files seen but not yet confirmed as fully written.
@@ -205,15 +225,12 @@ pub fn scan_directory(
     pending.retain(|p, _| p.exists());
 
     // Compute extents
-    let temporal_extent = if entries.is_empty() {
-        None
-    } else {
-        let first = *entries.keys().next().unwrap();
-        let last = *entries.keys().next_back().unwrap();
-        Some((first, last))
+    let temporal_extent = match (entries.keys().next(), entries.keys().next_back()) {
+        (Some(&first), Some(&last)) => Some((first, last)),
+        _ => None,
     };
 
-    let spatial_extent = entries.values().next().map(|e| e.metadata.geo_transform.bbox());
+    let spatial_extent = compute_spatial_union(entries.values());
 
     Ok(Catalog {
         entries,
@@ -384,15 +401,12 @@ pub fn scan_remote_with_limit(
         });
     }
 
-    let temporal_extent = if entries.is_empty() {
-        None
-    } else {
-        let first = *entries.keys().next().unwrap();
-        let last = *entries.keys().next_back().unwrap();
-        Some((first, last))
+    let temporal_extent = match (entries.keys().next(), entries.keys().next_back()) {
+        (Some(&first), Some(&last)) => Some((first, last)),
+        _ => None,
     };
 
-    let spatial_extent = entries.values().next().map(|e| e.metadata.geo_transform.bbox());
+    let spatial_extent = compute_spatial_union(entries.values());
 
     Ok(Catalog {
         entries,
