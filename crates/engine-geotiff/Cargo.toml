@@ -11,3 +11,4 @@ arc-swap = "1"
 regex = "1"
 tokio = { version = "1", features = ["rt", "sync", "time", "fs"] }
 tracing = "0.1"
+bytes = "1"

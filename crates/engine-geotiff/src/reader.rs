@@ -1,7 +1,8 @@
 use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
+use std::io::{BufReader, Cursor};
+use std::path::{Path, PathBuf};
 
+use bytes::Bytes;
 use ds_core::error::DataServerError;
 use tiff::decoder::{Decoder, DecodingResult};
 use tiff::tags::Tag;
@@ -14,6 +15,92 @@ const MAX_DECODED_TILE_BYTES: usize = 64 * 1024 * 1024; // 64 MB
 
 /// Maximum number of pixels in an area query result.
 const MAX_AREA_PIXELS: usize = 1_000_000;
+
+/// Data source for reading GeoTIFF data.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum DataSource {
+    /// Local filesystem path.
+    LocalFile(PathBuf),
+    /// In-memory bytes (downloaded from S3/HTTP).
+    InMemory(Bytes),
+}
+
+impl DataSource {
+    pub fn from_path(path: &Path) -> Self {
+        DataSource::LocalFile(path.to_path_buf())
+    }
+
+    #[allow(dead_code)]
+    pub fn from_bytes(data: Bytes) -> Self {
+        DataSource::InMemory(data)
+    }
+
+    /// Open a decoder for this data source.
+    fn open_decoder(&self) -> Result<DecoderWrapper, DataServerError> {
+        match self {
+            DataSource::LocalFile(path) => {
+                let file = File::open(path)
+                    .map_err(|e| DataServerError::GeoTiff(format!("Cannot open {}: {e}", path.display())))?;
+                Ok(DecoderWrapper::File(
+                    Decoder::new(BufReader::new(file))
+                        .map_err(|e| DataServerError::GeoTiff(format!("Invalid TIFF {}: {e}", path.display())))?,
+                ))
+            }
+            DataSource::InMemory(bytes) => {
+                let cursor = Cursor::new(bytes.to_vec());
+                Ok(DecoderWrapper::Memory(
+                    Decoder::new(cursor)
+                        .map_err(|e| DataServerError::GeoTiff(format!("Invalid TIFF (in-memory): {e}")))?,
+                ))
+            }
+        }
+    }
+
+    fn display_name(&self) -> String {
+        match self {
+            DataSource::LocalFile(p) => p.display().to_string(),
+            DataSource::InMemory(_) => "<in-memory>".to_string(),
+        }
+    }
+}
+
+/// Wraps Decoder over different reader types to avoid generics leaking everywhere.
+enum DecoderWrapper {
+    File(Decoder<BufReader<File>>),
+    Memory(Decoder<Cursor<Vec<u8>>>),
+}
+
+impl DecoderWrapper {
+    fn dimensions(&mut self) -> Result<(u32, u32), DataServerError> {
+        match self {
+            Self::File(d) => d.dimensions().map_err(|e| DataServerError::GeoTiff(format!("{e}"))),
+            Self::Memory(d) => d.dimensions().map_err(|e| DataServerError::GeoTiff(format!("{e}"))),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn colortype(&mut self) -> Result<tiff::ColorType, DataServerError> {
+        match self {
+            Self::File(d) => d.colortype().map_err(|e| DataServerError::GeoTiff(format!("{e}"))),
+            Self::Memory(d) => d.colortype().map_err(|e| DataServerError::GeoTiff(format!("{e}"))),
+        }
+    }
+
+    fn get_tag(&mut self, tag: Tag) -> Result<tiff::decoder::ifd::Value, tiff::TiffError> {
+        match self {
+            Self::File(d) => d.get_tag(tag),
+            Self::Memory(d) => d.get_tag(tag),
+        }
+    }
+
+    fn read_chunk(&mut self, idx: u32) -> Result<DecodingResult, tiff::TiffError> {
+        match self {
+            Self::File(d) => d.read_chunk(idx),
+            Self::Memory(d) => d.read_chunk(idx),
+        }
+    }
+}
 
 /// Parsed metadata from a GeoTIFF file's IFD headers.
 #[derive(Debug, Clone)]
@@ -32,18 +119,19 @@ pub struct TiffMetadata {
 }
 
 impl TiffMetadata {
-    /// Parse metadata from a GeoTIFF file.
+    /// Parse metadata from a GeoTIFF file path.
     pub fn from_file(path: &Path) -> Result<Self, DataServerError> {
-        let file = File::open(path)
-            .map_err(|e| DataServerError::GeoTiff(format!("Cannot open {}: {e}", path.display())))?;
-        let mut decoder = Decoder::new(BufReader::new(file))
-            .map_err(|e| DataServerError::GeoTiff(format!("Invalid TIFF {}: {e}", path.display())))?;
-
-        Self::from_decoder(&mut decoder, path.display().to_string())
+        Self::from_source(&DataSource::LocalFile(path.to_path_buf()))
     }
 
-    fn from_decoder<R: std::io::Read + std::io::Seek>(
-        decoder: &mut Decoder<R>,
+    /// Parse metadata from any data source.
+    pub fn from_source(source: &DataSource) -> Result<Self, DataServerError> {
+        let mut decoder = source.open_decoder()?;
+        Self::from_decoder_wrapper(&mut decoder, source.display_name())
+    }
+
+    fn from_decoder_wrapper(
+        decoder: &mut DecoderWrapper,
         source_name: String,
     ) -> Result<Self, DataServerError> {
         let (width, height) = decoder.dimensions()
@@ -113,8 +201,8 @@ impl TiffMetadata {
 
 /// Decode a chunk into Vec<f64>, applying scale/offset.
 /// Returns None for nodata/NaN values.
-fn decode_chunk_f64<R: std::io::Read + std::io::Seek>(
-    decoder: &mut Decoder<R>,
+fn decode_chunk_f64(
+    decoder: &mut DecoderWrapper,
     chunk_index: u32,
     metadata: &TiffMetadata,
 ) -> Result<Vec<Option<f64>>, DataServerError> {
@@ -174,7 +262,7 @@ fn decode_chunk_f64<R: std::io::Read + std::io::Seek>(
 }
 
 /// Read a single pixel value from a GeoTIFF at a given pixel coordinate.
-pub fn read_pixel(path: &Path, metadata: &TiffMetadata, col: u32, row: u32) -> Result<Option<f64>, DataServerError> {
+pub fn read_pixel(source: &DataSource, metadata: &TiffMetadata, col: u32, row: u32) -> Result<Option<f64>, DataServerError> {
     let tile_col = col / metadata.tile_width;
     let tile_row = row / metadata.tile_height;
     let chunk_index = tile_row * metadata.tiles_across + tile_col;
@@ -183,11 +271,7 @@ pub fn read_pixel(path: &Path, metadata: &TiffMetadata, col: u32, row: u32) -> R
     let local_row = row % metadata.tile_height;
     let local_idx = (local_row * metadata.tile_width + local_col) as usize;
 
-    let file = File::open(path)
-        .map_err(|e| DataServerError::GeoTiff(format!("Cannot open {}: {e}", path.display())))?;
-    let mut decoder = Decoder::new(BufReader::new(file))
-        .map_err(|e| DataServerError::GeoTiff(format!("Invalid TIFF: {e}")))?;
-
+    let mut decoder = source.open_decoder()?;
     let values = decode_chunk_f64(&mut decoder, chunk_index, metadata)?;
 
     if local_idx >= values.len() {
@@ -196,10 +280,10 @@ pub fn read_pixel(path: &Path, metadata: &TiffMetadata, col: u32, row: u32) -> R
     Ok(values[local_idx])
 }
 
-/// Read pixel values within a bounding box from a GeoTIFF file.
+/// Read pixel values within a bounding box from a GeoTIFF data source.
 /// Returns a row-major grid of values [row_start..row_end, col_start..col_end].
 pub fn read_bbox(
-    path: &Path,
+    source: &DataSource,
     metadata: &TiffMetadata,
     col_start: u32,
     row_start: u32,
@@ -217,10 +301,7 @@ pub fn read_bbox(
         )));
     }
 
-    let file = File::open(path)
-        .map_err(|e| DataServerError::GeoTiff(format!("Cannot open {}: {e}", path.display())))?;
-    let mut decoder = Decoder::new(BufReader::new(file))
-        .map_err(|e| DataServerError::GeoTiff(format!("Invalid TIFF: {e}")))?;
+    let mut decoder = source.open_decoder()?;
 
     let mut result = vec![None; total_pixels];
 
@@ -268,7 +349,7 @@ pub fn read_bbox(
 // GeoTIFF metadata parsing
 // ============================================================================
 
-fn read_tag_u32<R: std::io::Read + std::io::Seek>(decoder: &mut Decoder<R>, tag: Tag) -> Option<u32> {
+fn read_tag_u32(decoder: &mut DecoderWrapper, tag: Tag) -> Option<u32> {
     match decoder.get_tag(tag) {
         Ok(tiff::decoder::ifd::Value::Short(v)) => Some(v as u32),
         Ok(tiff::decoder::ifd::Value::Unsigned(v)) => Some(v),
@@ -276,8 +357,8 @@ fn read_tag_u32<R: std::io::Read + std::io::Seek>(decoder: &mut Decoder<R>, tag:
     }
 }
 
-fn parse_geo_transform<R: std::io::Read + std::io::Seek>(
-    decoder: &mut Decoder<R>,
+fn parse_geo_transform(
+    decoder: &mut DecoderWrapper,
     width: u32,
     height: u32,
 ) -> Result<GeoTransform, DataServerError> {
@@ -315,7 +396,7 @@ fn parse_geo_transform<R: std::io::Read + std::io::Seek>(
 }
 
 /// Parse the CRS from GeoTIFF GeoKey Directory.
-fn parse_crs<R: std::io::Read + std::io::Seek>(decoder: &mut Decoder<R>) -> Result<Crs, DataServerError> {
+fn parse_crs(decoder: &mut DecoderWrapper) -> Result<Crs, DataServerError> {
     let geokeys = match decoder.get_tag(Tag::Unknown(34735)) {
         Ok(v) => extract_shorts(&v).unwrap_or_default(),
         Err(_) => return Ok(Crs::Wgs84), // No GeoKeys → assume WGS84
@@ -462,14 +543,14 @@ fn get_double_key(keys: &std::collections::HashMap<u16, GeoKeyValue>, key_id: u1
     }
 }
 
-fn parse_nodata<R: std::io::Read + std::io::Seek>(decoder: &mut Decoder<R>) -> Option<f64> {
+fn parse_nodata(decoder: &mut DecoderWrapper) -> Option<f64> {
     match decoder.get_tag(Tag::Unknown(42113)) {
         Ok(tiff::decoder::ifd::Value::Ascii(s)) => s.trim().parse::<f64>().ok(),
         _ => None,
     }
 }
 
-fn parse_scale_offset<R: std::io::Read + std::io::Seek>(decoder: &mut Decoder<R>) -> (Option<f64>, Option<f64>) {
+fn parse_scale_offset(decoder: &mut DecoderWrapper) -> (Option<f64>, Option<f64>) {
     // Try GDAL metadata XML tag (42112)
     if let Ok(tiff::decoder::ifd::Value::Ascii(xml)) = decoder.get_tag(Tag::Unknown(42112)) {
         let scale = extract_xml_item(&xml, "SCALE");

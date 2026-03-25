@@ -189,7 +189,7 @@ impl GeoTiffEngine {
             let pixel = entry.metadata.geo_transform.world_to_pixel(lon, lat);
             let value = match pixel {
                 Some((col, row)) => {
-                    match reader::read_pixel(&entry.path, &entry.metadata, col, row) {
+                    match reader::read_pixel(&entry.source, &entry.metadata, col, row) {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!("Failed to read pixel from {}: {e}", entry.path.display());
@@ -298,7 +298,7 @@ impl GeoTiffEngine {
         for (timestamp, entry) in &entries {
             times.push(**timestamp);
 
-            match reader::read_bbox(&entry.path, &entry.metadata, col_start, row_start, col_end, row_end) {
+            match reader::read_bbox(&entry.source, &entry.metadata, col_start, row_start, col_end, row_end) {
                 Ok(grid_values) => {
                     all_values.extend(grid_values);
                 }

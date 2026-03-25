@@ -5,7 +5,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use ds_core::error::DataServerError;
 use regex::Regex;
 
-use crate::reader::TiffMetadata;
+use crate::reader::{DataSource, TiffMetadata};
 
 /// Maximum filename length to prevent abuse.
 const MAX_FILENAME_LENGTH: usize = 255;
@@ -14,6 +14,7 @@ const MAX_FILENAME_LENGTH: usize = 255;
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub path: PathBuf,
+    pub source: DataSource,
     pub metadata: TiffMetadata,
     pub file_size: u64,
 }
@@ -176,7 +177,8 @@ pub fn scan_directory(
             );
         }
 
-        entries.insert(datetime, FileEntry { path, metadata, file_size });
+        let source = DataSource::from_path(&path);
+        entries.insert(datetime, FileEntry { path, source, metadata, file_size });
     }
 
     // Clean pending files that no longer exist in the directory
