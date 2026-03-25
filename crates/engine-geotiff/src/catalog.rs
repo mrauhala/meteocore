@@ -222,6 +222,118 @@ fn is_excluded(filename: &str, patterns: &[String]) -> bool {
     false
 }
 
+/// Maximum file size for remote downloads (50 MB).
+const MAX_REMOTE_FILE_SIZE: usize = 50 * 1024 * 1024;
+
+/// Scan a remote object store for GeoTIFF files matching a filename pattern.
+///
+/// Downloads each matching file into memory and parses metadata.
+/// Reuses cached data for files already in the catalog with the same size.
+pub fn scan_remote(
+    store: &ds_storage::DataStore,
+    prefix: &ds_storage::object_store::path::Path,
+    pattern: &Regex,
+    timestamp_format: &str,
+    existing_metadata: &BTreeMap<PathBuf, (u64, TiffMetadata, bytes::Bytes)>,
+) -> Result<Catalog, DataServerError> {
+    let entries_list = store.list(prefix)?;
+
+    let mut entries = BTreeMap::new();
+
+    for obj in &entries_list {
+        let key = obj.location.to_string();
+        let filename = key.rsplit('/').next().unwrap_or(&key);
+
+        if filename.len() > MAX_FILENAME_LENGTH {
+            continue;
+        }
+
+        let caps = match pattern.captures(filename) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let timestamp_str = match caps.name("timestamp") {
+            Some(m) => m.as_str().to_string(),
+            None => continue,
+        };
+
+        let datetime = match NaiveDateTime::parse_from_str(&timestamp_str, timestamp_format) {
+            Ok(dt) => dt.and_utc(),
+            Err(_) => {
+                tracing::warn!("Cannot parse timestamp '{}' from '{}'", timestamp_str, filename);
+                continue;
+            }
+        };
+
+        let file_size = obj.size as u64;
+        let pseudo_path = PathBuf::from(&key);
+
+        // Check security limit
+        if obj.size > MAX_REMOTE_FILE_SIZE {
+            tracing::warn!("Skipping {} — size {} exceeds maximum {}", key, obj.size, MAX_REMOTE_FILE_SIZE);
+            continue;
+        }
+
+        // Reuse cached data if file size unchanged
+        if let Some((cached_size, cached_meta, cached_bytes)) = existing_metadata.get(&pseudo_path) {
+            if *cached_size == file_size {
+                let source = DataSource::from_bytes(cached_bytes.clone());
+                entries.insert(datetime, FileEntry {
+                    path: pseudo_path,
+                    source,
+                    metadata: cached_meta.clone(),
+                    file_size,
+                });
+                continue;
+            }
+        }
+
+        // Download the file
+        tracing::info!("Downloading {} ({} bytes)", key, obj.size);
+        let data = match store.get(&obj.location) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("Failed to download {}: {e}", key);
+                continue;
+            }
+        };
+
+        // Parse metadata from downloaded bytes
+        let source = DataSource::from_bytes(data.clone());
+        let metadata = match TiffMetadata::from_source(&source) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("Skipping {}: {e}", key);
+                continue;
+            }
+        };
+
+        entries.insert(datetime, FileEntry {
+            path: pseudo_path,
+            source,
+            metadata,
+            file_size,
+        });
+    }
+
+    let temporal_extent = if entries.is_empty() {
+        None
+    } else {
+        let first = *entries.keys().next().unwrap();
+        let last = *entries.keys().next_back().unwrap();
+        Some((first, last))
+    };
+
+    let spatial_extent = entries.values().next().map(|e| e.metadata.geo_transform.bbox());
+
+    Ok(Catalog {
+        entries,
+        temporal_extent,
+        spatial_extent,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

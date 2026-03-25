@@ -102,11 +102,19 @@ impl std::fmt::Debug for DataStore {
 pub fn build_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServerError> {
     if data_path.starts_with("s3://") {
         build_s3_store(data_path)
+    } else if is_s3_http_url(data_path) {
+        build_s3_from_http_url(data_path)
     } else if data_path.starts_with("http://") || data_path.starts_with("https://") {
         build_http_store(data_path)
     } else {
         build_local_store(data_path)
     }
+}
+
+/// Detect S3-style HTTP URLs like https://s3-eu-west-1.amazonaws.com/bucket/...
+/// or https://bucket.s3.region.amazonaws.com/...
+fn is_s3_http_url(url: &str) -> bool {
+    url.contains(".amazonaws.com/") || url.contains(".cloudferro.com/")
 }
 
 fn build_local_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServerError> {
@@ -135,6 +143,73 @@ fn build_s3_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServer
         .with_bucket_name(bucket)
         .build()
         .map_err(|e| DataServerError::Storage(format!("Cannot create S3 store for bucket '{bucket}': {e}")))?;
+
+    let prefix_path = ObjectPath::from(prefix.trim_end_matches('/'));
+    Ok((DataStore::new(Arc::new(store)), prefix_path))
+}
+
+/// Parse an S3 HTTP URL into bucket + prefix and build an S3 store.
+/// Handles both path-style (s3-region.amazonaws.com/bucket/prefix)
+/// and virtual-hosted (bucket.s3.region.amazonaws.com/prefix) formats.
+fn build_s3_from_http_url(data_path: &str) -> Result<(DataStore, ObjectPath), DataServerError> {
+    let url = url::Url::parse(data_path)
+        .map_err(|e| DataServerError::Storage(format!("Invalid URL {data_path}: {e}")))?;
+
+    let host = url.host_str().unwrap_or("");
+    let path = url.path().trim_start_matches('/');
+
+    // Determine endpoint, bucket, prefix, and region
+    let (endpoint, bucket, prefix, region) = if host.starts_with("s3") && host.contains(".amazonaws.com") {
+        // Path-style: s3-eu-west-1.amazonaws.com/bucket/prefix
+        // or s3.eu-west-1.amazonaws.com/bucket/prefix
+        let region = host
+            .trim_start_matches("s3-")
+            .trim_start_matches("s3.")
+            .trim_end_matches(".amazonaws.com")
+            .to_string();
+        let parts: Vec<&str> = path.splitn(2, '/').collect();
+        let bucket = parts[0].to_string();
+        let prefix = if parts.len() > 1 { parts[1] } else { "" };
+        let endpoint = format!("{}://{}", url.scheme(), host);
+        (endpoint, bucket, prefix.to_string(), region)
+    } else if host.contains(".s3.") && host.ends_with(".amazonaws.com") {
+        // Virtual-hosted: bucket.s3.region.amazonaws.com/prefix
+        let bucket = host.split(".s3.").next().unwrap_or("").to_string();
+        let region = host
+            .split(".s3.")
+            .nth(1)
+            .unwrap_or("")
+            .trim_end_matches(".amazonaws.com")
+            .to_string();
+        let endpoint = format!("{}://s3.{}.amazonaws.com", url.scheme(), region);
+        (endpoint, bucket, path.to_string(), region)
+    } else if host.contains(".cloudferro.com") {
+        // CloudFerro S3-compatible: s3.waw3-1.cloudferro.com/bucket/prefix
+        let parts: Vec<&str> = path.splitn(2, '/').collect();
+        let bucket = parts[0].to_string();
+        let prefix = if parts.len() > 1 { parts[1] } else { "" };
+        let endpoint = format!("{}://{}", url.scheme(), host);
+        (endpoint, bucket, prefix.to_string(), "auto".to_string())
+    } else {
+        return Err(DataServerError::Storage(format!(
+            "Cannot parse S3 URL: {data_path}"
+        )));
+    };
+
+    tracing::info!("S3 store: endpoint={}, bucket={}, prefix={}, region={}", endpoint, bucket, prefix, region);
+
+    let mut builder = object_store::aws::AmazonS3Builder::new()
+        .with_bucket_name(&bucket)
+        .with_region(&region)
+        .with_endpoint(&endpoint)
+        .with_allow_http(url.scheme() == "http");
+
+    // For public buckets, skip signing
+    builder = builder.with_skip_signature(true);
+
+    let store = builder
+        .build()
+        .map_err(|e| DataServerError::Storage(format!("Cannot create S3 store: {e}")))?;
 
     let prefix_path = ObjectPath::from(prefix.trim_end_matches('/'));
     Ok((DataStore::new(Arc::new(store)), prefix_path))

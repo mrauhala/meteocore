@@ -39,3 +39,36 @@ timestamp_format = "%Y%m%dT%H%MZ"
 parameter = "reflectivity"
 unit = "dBZ"
 poll_interval_secs = 30
+
+[[collections]]
+id = "radar-norway"
+title = "MET Norway Radar (native LCC projection)"
+description = "Radar composite in Lambert Conformal Conic, served without reprojection"
+data_path = "testdata/radar-native"
+engine_type = "geotiff"
+apis = ["edr"]
+
+[collections.geotiff]
+filename_pattern = 'norway_(?P<timestamp>\d{8}T\d{4}Z)\.tiff'
+timestamp_format = "%Y%m%dT%H%MZ"
+parameter = "reflectivity"
+unit = "dBZ"
+poll_interval_secs = 60
+
+[[collections]]
+id = "fmi-radar"
+title = "FMI Radar (S3, EPSG:3067)"
+description = "Finnish radar composite from FMI S3 bucket, Transverse Mercator projection"
+data_path = "https://s3-eu-west-1.amazonaws.com/fmi-opendata-radar-geotiff/2026/03/25/finrad/"
+# Note: this bucket has ~300 files per day (5min interval). Loading all takes time.
+# Consider using a time-limited prefix or filtering.
+engine_type = "geotiff"
+apis = ["edr"]
+
+[collections.geotiff]
+# Limit to 00:00-00:15 to avoid downloading hundreds of files
+filename_pattern = '(?P<timestamp>2026032500[01]\d)_composite_cappi_600_dbzh_finrad_qc\.tif'
+timestamp_format = "%Y%m%d%H%M"
+parameter = "reflectivity"
+unit = "dBZ"
+poll_interval_secs = 300

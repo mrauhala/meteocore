@@ -460,10 +460,52 @@ fn parse_crs(decoder: &mut DecoderWrapper) -> Result<Crs, DataServerError> {
     };
 
     // Key 3072: ProjectedCSTypeGeoKey (EPSG code for the projected CRS)
-    let _epsg = match keys.get(&3072) {
+    let epsg = match keys.get(&3072) {
         Some(GeoKeyValue::Short(v)) => *v,
         _ => 0,
     };
+
+    // If projection method is missing/user-defined, try to identify by EPSG code
+    let proj_method = if proj_method == 0 && epsg != 0 && epsg != 32767 {
+        match epsg {
+            // EPSG:3067 (TM35FIN) and UTM zones 1-60 N/S
+            3067 => 1, // Transverse Mercator
+            e if (32601..=32660).contains(&e) => 1, // UTM North
+            e if (32701..=32760).contains(&e) => 1, // UTM South
+            // EPSG:3035 (ETRS89-LAEA Europe)
+            3035 => 10, // Lambert Azimuthal Equal Area
+            _ => {
+                tracing::warn!("Unknown EPSG:{}, attempting to read projection params from GeoKeys", epsg);
+                0
+            }
+        }
+    } else {
+        proj_method
+    };
+
+    // For well-known EPSG codes, provide hardcoded parameters as fallback
+    if proj_method == 0 && epsg != 0 && epsg != 32767 {
+        return match epsg {
+            3067 => Ok(Crs::TransverseMercator {
+                lat0: 0.0,
+                lon0: 27.0_f64.to_radians(),
+                k0: 0.9996,
+                false_e: 500_000.0,
+                false_n: 0.0,
+            }),
+            3035 => Ok(Crs::LambertAzimuthalEqualArea {
+                lat0: 52.0_f64.to_radians(),
+                lon0: 10.0_f64.to_radians(),
+                false_e: 4_321_000.0,
+                false_n: 3_210_000.0,
+            }),
+            _ => Err(DataServerError::GeoTiff(format!(
+                "EPSG:{} is not supported and GeoKeys lack projection parameters. \
+                 Convert with: gdalwarp -t_srs EPSG:4326 -of COG input.tif output.tif",
+                epsg
+            ))),
+        };
+    }
 
     match proj_method {
         // CT_TransverseMercator = 1
