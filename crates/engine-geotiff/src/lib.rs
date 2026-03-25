@@ -234,6 +234,134 @@ impl GeoTiffEngine {
             ranges,
         })
     }
+
+    /// Area query: extract a grid of pixel values within a bounding box.
+    fn query_bbox(
+        &self,
+        west: f64,
+        south: f64,
+        east: f64,
+        north: f64,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+    ) -> Result<QueryResult, DataServerError> {
+        if let Some(params) = parameters {
+            if !params.iter().any(|p| p == &self.parameter) {
+                return Err(DataServerError::InvalidParameter(format!(
+                    "Unknown parameter. Available: {}",
+                    self.parameter
+                )));
+            }
+        }
+
+        let catalog = self.catalog.load();
+
+        let entries: Vec<_> = if let Some((start, end)) = datetime {
+            catalog.entries.range(start..=end).collect()
+        } else {
+            catalog.entries.iter().collect()
+        };
+
+        if entries.is_empty() {
+            return Err(DataServerError::LocationNotFound(
+                "No data available for the requested time range".into(),
+            ));
+        }
+
+        // Use first entry's geo_transform to compute pixel range and axis values
+        let first_entry = entries[0].1;
+        let (col_start, row_start, col_end, row_end) = first_entry
+            .metadata
+            .geo_transform
+            .bbox_to_pixels(west, south, east, north)
+            .ok_or_else(|| {
+                DataServerError::InvalidParameter(
+                    "Requested bbox does not intersect the raster".into(),
+                )
+            })?;
+
+        let nx = (col_end - col_start) as usize;
+        let ny = (row_end - row_start) as usize;
+
+        // Build x and y axis values (pixel centers)
+        let x_values: Vec<f64> = (col_start..col_end)
+            .map(|c| first_entry.metadata.geo_transform.pixel_to_world(c, 0).0)
+            .collect();
+        let y_values: Vec<f64> = (row_start..row_end)
+            .map(|r| first_entry.metadata.geo_transform.pixel_to_world(0, r).1)
+            .collect();
+
+        let has_time = entries.len() > 1;
+        let mut times = Vec::with_capacity(entries.len());
+        let mut all_values = Vec::new();
+
+        for (timestamp, entry) in &entries {
+            times.push(**timestamp);
+
+            match reader::read_bbox(&entry.path, &entry.metadata, col_start, row_start, col_end, row_end) {
+                Ok(grid_values) => {
+                    all_values.extend(grid_values);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to read bbox from {}: {e}", entry.path.display());
+                    // Fill with None for this timestep
+                    all_values.extend(std::iter::repeat(None).take(nx * ny));
+                }
+            }
+        }
+
+        let domain = if has_time {
+            DomainDescription::Grid {
+                x: x_values.clone(),
+                y: y_values.clone(),
+                t: Some(times),
+            }
+        } else {
+            DomainDescription::Grid {
+                x: x_values.clone(),
+                y: y_values.clone(),
+                t: None,
+            }
+        };
+
+        let (shape, axis_names) = if has_time {
+            (
+                vec![entries.len(), ny, nx],
+                vec!["t".to_string(), "y".to_string(), "x".to_string()],
+            )
+        } else {
+            (
+                vec![ny, nx],
+                vec!["y".to_string(), "x".to_string()],
+            )
+        };
+
+        let mut param_descs = HashMap::new();
+        param_descs.insert(
+            self.parameter.clone(),
+            ParameterDescription {
+                label: self.parameter.replace('_', " "),
+                unit: self.unit.clone(),
+                observed_property: self.parameter.clone(),
+            },
+        );
+
+        let mut ranges = HashMap::new();
+        ranges.insert(
+            self.parameter.clone(),
+            NdArray {
+                shape,
+                axis_names,
+                values: all_values,
+            },
+        );
+
+        Ok(QueryResult {
+            domain,
+            parameters: param_descs,
+            ranges,
+        })
+    }
 }
 
 impl Engine for GeoTiffEngine {
@@ -262,8 +390,18 @@ impl Engine for GeoTiffEngine {
         self.query_point(lat, lon, datetime, parameters)
     }
 
+    fn query_area(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+    ) -> Result<QueryResult, DataServerError> {
+        let (west, south, east, north) = parse_bbox_coords(coords)?;
+        self.query_bbox(west, south, east, north, datetime, parameters)
+    }
+
     fn supported_query_types(&self) -> Vec<String> {
-        vec!["position".to_string()]
+        vec!["position".to_string(), "area".to_string()]
     }
 
     fn get_parameters(&self) -> Vec<String> {
@@ -343,6 +481,76 @@ fn validate_coords(lat: f64, lon: f64) -> Result<(f64, f64), DataServerError> {
         )));
     }
     Ok((lat, lon))
+}
+
+/// Parse EDR area query coordinates.
+/// Accepts `POLYGON((lon1 lat1, lon2 lat2, ...))` (WKT) — extracts the bounding box.
+/// Also accepts `bbox` format `west,south,east,north`.
+/// Returns (west, south, east, north).
+fn parse_bbox_coords(coords: &str) -> Result<(f64, f64, f64, f64), DataServerError> {
+    let trimmed = coords.trim();
+
+    // Try WKT POLYGON format
+    if let Some(inner) = trimmed
+        .strip_prefix("POLYGON((")
+        .or_else(|| trimmed.strip_prefix("POLYGON (("))
+        .and_then(|s| s.strip_suffix("))"))
+    {
+        let points: Vec<&str> = inner.split(',').collect();
+        if points.len() < 3 {
+            return Err(DataServerError::InvalidParameter(
+                "POLYGON must have at least 3 coordinate pairs".into(),
+            ));
+        }
+
+        let mut min_lon = f64::MAX;
+        let mut max_lon = f64::MIN;
+        let mut min_lat = f64::MAX;
+        let mut max_lat = f64::MIN;
+
+        for point in &points {
+            let parts: Vec<&str> = point.trim().split_whitespace().collect();
+            if parts.len() != 2 {
+                return Err(DataServerError::InvalidParameter(format!(
+                    "Invalid coordinate pair: '{}'", point.trim()
+                )));
+            }
+            let lon: f64 = parts[0].parse().map_err(|_| {
+                DataServerError::InvalidParameter(format!("Invalid longitude: {}", parts[0]))
+            })?;
+            let lat: f64 = parts[1].parse().map_err(|_| {
+                DataServerError::InvalidParameter(format!("Invalid latitude: {}", parts[1]))
+            })?;
+            min_lon = min_lon.min(lon);
+            max_lon = max_lon.max(lon);
+            min_lat = min_lat.min(lat);
+            max_lat = max_lat.max(lat);
+        }
+
+        return Ok((min_lon, min_lat, max_lon, max_lat));
+    }
+
+    // Try simple bbox format: west,south,east,north
+    let parts: Vec<&str> = trimmed.split(',').collect();
+    if parts.len() == 4 {
+        let west: f64 = parts[0].trim().parse().map_err(|_| {
+            DataServerError::InvalidParameter(format!("Invalid west: {}", parts[0]))
+        })?;
+        let south: f64 = parts[1].trim().parse().map_err(|_| {
+            DataServerError::InvalidParameter(format!("Invalid south: {}", parts[1]))
+        })?;
+        let east: f64 = parts[2].trim().parse().map_err(|_| {
+            DataServerError::InvalidParameter(format!("Invalid east: {}", parts[2]))
+        })?;
+        let north: f64 = parts[3].trim().parse().map_err(|_| {
+            DataServerError::InvalidParameter(format!("Invalid north: {}", parts[3]))
+        })?;
+        return Ok((west, south, east, north));
+    }
+
+    Err(DataServerError::InvalidParameter(
+        "Expected coords as POLYGON((lon1 lat1, lon2 lat2, ...)) or west,south,east,north".into(),
+    ))
 }
 
 fn parse_location_id(id: &str) -> Result<(f64, f64), DataServerError> {

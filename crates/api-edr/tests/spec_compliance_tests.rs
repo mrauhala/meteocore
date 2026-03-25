@@ -460,12 +460,12 @@ async fn finding_11b_radius_query_not_implemented() {
 }
 
 #[tokio::test]
-async fn finding_11c_area_query_not_implemented() {
+async fn finding_11c_area_query_returns_400_for_unsupported_engine() {
     let (status, _) = get_json("/collections/weather/area?coords=POLYGON%28%2820%2059%2C32%2059%2C32%2071%2C20%2071%2C20%2059%29%29").await;
     assert_eq!(
         status,
-        StatusCode::NOT_FOUND,
-        "Area query endpoint is not implemented"
+        StatusCode::BAD_REQUEST,
+        "Area query should return 400 for engines that do not support it"
     );
 }
 

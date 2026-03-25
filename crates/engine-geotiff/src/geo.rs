@@ -35,6 +35,29 @@ impl GeoTransform {
         let south = self.origin_y - self.height as f64 * self.pixel_height;
         [west, south, east, north]
     }
+
+    /// Convert pixel coordinate to world coordinate (center of pixel).
+    pub fn pixel_to_world(&self, col: u32, row: u32) -> (f64, f64) {
+        let lon = self.origin_x + (col as f64 + 0.5) * self.pixel_width;
+        let lat = self.origin_y - (row as f64 + 0.5) * self.pixel_height;
+        (lon, lat)
+    }
+
+    /// Convert a world bbox [west, south, east, north] to pixel range.
+    /// Returns (col_start, row_start, col_end, row_end) clamped to raster bounds.
+    /// col_end and row_end are exclusive.
+    pub fn bbox_to_pixels(&self, west: f64, south: f64, east: f64, north: f64) -> Option<(u32, u32, u32, u32)> {
+        let col_start = ((west - self.origin_x) / self.pixel_width).floor().max(0.0) as u32;
+        let col_end = ((east - self.origin_x) / self.pixel_width).ceil().min(self.width as f64) as u32;
+        let row_start = ((self.origin_y - north) / self.pixel_height).floor().max(0.0) as u32;
+        let row_end = ((self.origin_y - south) / self.pixel_height).ceil().min(self.height as f64) as u32;
+
+        if col_start >= col_end || row_start >= row_end {
+            return None;
+        }
+
+        Some((col_start, row_start, col_end, row_end))
+    }
 }
 
 #[cfg(test)]

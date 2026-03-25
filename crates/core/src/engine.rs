@@ -43,6 +43,20 @@ pub trait Engine: Send + Sync {
         vec!["locations".to_string()]
     }
 
+    /// Execute an area query within the given bounding box / polygon.
+    /// Default implementation returns an error.
+    fn query_area(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+    ) -> Result<QueryResult, DataServerError> {
+        let _ = (coords, datetime, parameters);
+        Err(DataServerError::InvalidParameter(
+            "Area query not supported by this engine".into(),
+        ))
+    }
+
     /// Execute a position query at the given coordinates.
     /// Default implementation returns an error.
     fn query_position(

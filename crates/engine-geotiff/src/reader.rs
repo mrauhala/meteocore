@@ -132,6 +132,97 @@ pub fn read_pixel(path: &Path, metadata: &TiffMetadata, col: u32, row: u32) -> R
     }
 }
 
+/// Maximum number of pixels in an area query result.
+const MAX_AREA_PIXELS: usize = 1_000_000;
+
+/// Read pixel values within a bounding box from a GeoTIFF file.
+/// Returns a row-major grid of values [row_start..row_end, col_start..col_end].
+pub fn read_bbox(
+    path: &Path,
+    metadata: &TiffMetadata,
+    col_start: u32,
+    row_start: u32,
+    col_end: u32,
+    row_end: u32,
+) -> Result<Vec<Option<f64>>, DataServerError> {
+    let nx = (col_end - col_start) as usize;
+    let ny = (row_end - row_start) as usize;
+    let total_pixels = nx * ny;
+
+    if total_pixels > MAX_AREA_PIXELS {
+        return Err(DataServerError::InvalidParameter(format!(
+            "Area query would return {} pixels, maximum is {}. Use a smaller bbox.",
+            total_pixels, MAX_AREA_PIXELS
+        )));
+    }
+
+    let file = File::open(path)
+        .map_err(|e| DataServerError::GeoTiff(format!("Cannot open {}: {e}", path.display())))?;
+    let mut decoder = Decoder::new(BufReader::new(file))
+        .map_err(|e| DataServerError::GeoTiff(format!("Invalid TIFF: {e}")))?;
+
+    let mut result = vec![None; total_pixels];
+
+    // Determine which tiles we need to read
+    let tile_col_start = col_start / metadata.tile_width;
+    let tile_col_end = (col_end - 1) / metadata.tile_width + 1;
+    let tile_row_start = row_start / metadata.tile_height;
+    let tile_row_end = (row_end - 1) / metadata.tile_height + 1;
+
+    for tile_row in tile_row_start..tile_row_end {
+        for tile_col in tile_col_start..tile_col_end {
+            let chunk_index = tile_row * metadata.tiles_across + tile_col;
+
+            let tile_data = match decoder.read_chunk(chunk_index) {
+                Ok(DecodingResult::F32(data)) => data.iter().map(|v| *v as f64).collect::<Vec<_>>(),
+                Ok(DecodingResult::F64(data)) => data.to_vec(),
+                Ok(_) => return Err(DataServerError::GeoTiff(
+                    "Unsupported data type (expected Float32 or Float64)".into(),
+                )),
+                Err(e) => return Err(DataServerError::GeoTiff(format!("Failed to read tile: {e}"))),
+            };
+
+            // Extract pixels from this tile that fall within our bbox
+            let tile_pixel_col_start = tile_col * metadata.tile_width;
+            let tile_pixel_row_start = tile_row * metadata.tile_height;
+
+            let overlap_col_start = col_start.max(tile_pixel_col_start);
+            let overlap_col_end = col_end.min(tile_pixel_col_start + metadata.tile_width);
+            let overlap_row_start = row_start.max(tile_pixel_row_start);
+            let overlap_row_end = row_end.min(tile_pixel_row_start + metadata.tile_height);
+
+            for row in overlap_row_start..overlap_row_end {
+                for col in overlap_col_start..overlap_col_end {
+                    let local_col = col - tile_pixel_col_start;
+                    let local_row = row - tile_pixel_row_start;
+                    let tile_idx = (local_row * metadata.tile_width + local_col) as usize;
+
+                    if tile_idx >= tile_data.len() {
+                        continue;
+                    }
+
+                    let value = tile_data[tile_idx];
+                    let out_col = (col - col_start) as usize;
+                    let out_row = (row - row_start) as usize;
+                    let out_idx = out_row * nx + out_col;
+
+                    if value.is_nan() {
+                        continue; // leave as None
+                    }
+                    if let Some(nodata) = metadata.nodata {
+                        if (value - nodata).abs() < 1e-10 {
+                            continue;
+                        }
+                    }
+                    result[out_idx] = Some(value);
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
 /// Validate that the GeoTIFF has a reasonable number of overview IFDs (security check).
 #[allow(dead_code)]
 pub fn count_overviews(path: &Path) -> Result<usize, DataServerError> {
