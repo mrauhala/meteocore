@@ -1,0 +1,7 @@
+target/
+spike-geotiff/
+server.log
+*.excalidraw
+fetch_fmi_data.py
+.git/
+REVIEW-geotiff-engine.md

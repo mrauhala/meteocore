@@ -1,0 +1,10 @@
+services:
+  dataserver:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config.toml:/data/config.toml:ro
+      - ./testdata:/data/testdata:ro
+    environment:
+      - RUST_LOG=info
