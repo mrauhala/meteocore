@@ -1,18 +1,106 @@
 use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
+use std::io::{BufReader, Cursor};
+use std::path::{Path, PathBuf};
 
+use bytes::Bytes;
 use ds_core::error::DataServerError;
 use tiff::decoder::{Decoder, DecodingResult};
 use tiff::tags::Tag;
 
-use crate::geo::GeoTransform;
+use crate::geo::{Crs, GeoTransform};
 
 /// Security limits
 const MAX_RASTER_DIMENSION: u32 = 100_000;
 const MAX_DECODED_TILE_BYTES: usize = 64 * 1024 * 1024; // 64 MB
+
+/// Maximum number of pixels in an area query result.
+const MAX_AREA_PIXELS: usize = 1_000_000;
+
+/// Data source for reading GeoTIFF data.
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
-const MAX_IFD_CHAIN_DEPTH: usize = 1_000; // used by count_overviews
+pub enum DataSource {
+    /// Local filesystem path.
+    LocalFile(PathBuf),
+    /// In-memory bytes (downloaded from S3/HTTP).
+    InMemory(Bytes),
+}
+
+impl DataSource {
+    pub fn from_path(path: &Path) -> Self {
+        DataSource::LocalFile(path.to_path_buf())
+    }
+
+    #[allow(dead_code)]
+    pub fn from_bytes(data: Bytes) -> Self {
+        DataSource::InMemory(data)
+    }
+
+    /// Open a decoder for this data source.
+    fn open_decoder(&self) -> Result<DecoderWrapper, DataServerError> {
+        match self {
+            DataSource::LocalFile(path) => {
+                let file = File::open(path)
+                    .map_err(|e| DataServerError::GeoTiff(format!("Cannot open {}: {e}", path.display())))?;
+                Ok(DecoderWrapper::File(
+                    Decoder::new(BufReader::new(file))
+                        .map_err(|e| DataServerError::GeoTiff(format!("Invalid TIFF {}: {e}", path.display())))?,
+                ))
+            }
+            DataSource::InMemory(bytes) => {
+                let cursor = Cursor::new(bytes.to_vec());
+                Ok(DecoderWrapper::Memory(
+                    Decoder::new(cursor)
+                        .map_err(|e| DataServerError::GeoTiff(format!("Invalid TIFF (in-memory): {e}")))?,
+                ))
+            }
+        }
+    }
+
+    fn display_name(&self) -> String {
+        match self {
+            DataSource::LocalFile(p) => p.display().to_string(),
+            DataSource::InMemory(_) => "<in-memory>".to_string(),
+        }
+    }
+}
+
+/// Wraps Decoder over different reader types to avoid generics leaking everywhere.
+enum DecoderWrapper {
+    File(Decoder<BufReader<File>>),
+    Memory(Decoder<Cursor<Vec<u8>>>),
+}
+
+impl DecoderWrapper {
+    fn dimensions(&mut self) -> Result<(u32, u32), DataServerError> {
+        match self {
+            Self::File(d) => d.dimensions().map_err(|e| DataServerError::GeoTiff(format!("{e}"))),
+            Self::Memory(d) => d.dimensions().map_err(|e| DataServerError::GeoTiff(format!("{e}"))),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn colortype(&mut self) -> Result<tiff::ColorType, DataServerError> {
+        match self {
+            Self::File(d) => d.colortype().map_err(|e| DataServerError::GeoTiff(format!("{e}"))),
+            Self::Memory(d) => d.colortype().map_err(|e| DataServerError::GeoTiff(format!("{e}"))),
+        }
+    }
+
+    fn get_tag(&mut self, tag: Tag) -> Result<tiff::decoder::ifd::Value, tiff::TiffError> {
+        match self {
+            Self::File(d) => d.get_tag(tag),
+            Self::Memory(d) => d.get_tag(tag),
+        }
+    }
+
+    fn read_chunk(&mut self, idx: u32) -> Result<DecodingResult, tiff::TiffError> {
+        match self {
+            Self::File(d) => d.read_chunk(idx),
+            Self::Memory(d) => d.read_chunk(idx),
+        }
+    }
+}
 
 /// Parsed metadata from a GeoTIFF file's IFD headers.
 #[derive(Debug, Clone)]
@@ -26,20 +114,29 @@ pub struct TiffMetadata {
     pub tiles_down: u32,
     pub geo_transform: GeoTransform,
     pub nodata: Option<f64>,
+    pub scale: Option<f64>,
+    pub offset: Option<f64>,
 }
 
 impl TiffMetadata {
-    /// Parse metadata from a GeoTIFF file.
+    /// Parse metadata from a GeoTIFF file path.
     pub fn from_file(path: &Path) -> Result<Self, DataServerError> {
-        let file = File::open(path)
-            .map_err(|e| DataServerError::GeoTiff(format!("Cannot open {}: {e}", path.display())))?;
-        let mut decoder = Decoder::new(BufReader::new(file))
-            .map_err(|e| DataServerError::GeoTiff(format!("Invalid TIFF {}: {e}", path.display())))?;
+        Self::from_source(&DataSource::LocalFile(path.to_path_buf()))
+    }
 
+    /// Parse metadata from any data source.
+    pub fn from_source(source: &DataSource) -> Result<Self, DataServerError> {
+        let mut decoder = source.open_decoder()?;
+        Self::from_decoder_wrapper(&mut decoder, source.display_name())
+    }
+
+    fn from_decoder_wrapper(
+        decoder: &mut DecoderWrapper,
+        source_name: String,
+    ) -> Result<Self, DataServerError> {
         let (width, height) = decoder.dimensions()
             .map_err(|e| DataServerError::GeoTiff(format!("Cannot read dimensions: {e}")))?;
 
-        // Security: reject oversized rasters
         if width > MAX_RASTER_DIMENSION || height > MAX_RASTER_DIMENSION {
             return Err(DataServerError::GeoTiff(format!(
                 "Raster dimensions {}x{} exceed maximum {}",
@@ -47,13 +144,13 @@ impl TiffMetadata {
             )));
         }
 
-        let tile_width = read_tag_u32(&mut decoder, Tag::TileWidth)
-            .ok_or_else(|| DataServerError::GeoTiff("Not a tiled TIFF (TileWidth missing)".into()))?;
-        let tile_height = read_tag_u32(&mut decoder, Tag::TileLength)
-            .ok_or_else(|| DataServerError::GeoTiff("Not a tiled TIFF (TileLength missing)".into()))?;
+        let tile_width = read_tag_u32(decoder, Tag::TileWidth)
+            .ok_or_else(|| DataServerError::GeoTiff(format!("{source_name}: Not a tiled TIFF (TileWidth missing)")))?;
+        let tile_height = read_tag_u32(decoder, Tag::TileLength)
+            .ok_or_else(|| DataServerError::GeoTiff(format!("{source_name}: Not a tiled TIFF (TileLength missing)")))?;
 
-        // Security: check decoded tile size
-        let decoded_tile_bytes = tile_width as usize * tile_height as usize * 4; // Float32 = 4 bytes
+        // Security: check decoded tile size (assuming worst case 8 bytes/pixel)
+        let decoded_tile_bytes = tile_width as usize * tile_height as usize * 8;
         if decoded_tile_bytes > MAX_DECODED_TILE_BYTES {
             return Err(DataServerError::GeoTiff(format!(
                 "Decoded tile size {} bytes exceeds maximum {}",
@@ -64,8 +161,9 @@ impl TiffMetadata {
         let tiles_across = (width + tile_width - 1) / tile_width;
         let tiles_down = (height + tile_height - 1) / tile_height;
 
-        let geo_transform = parse_geo_transform(&mut decoder, width, height)?;
-        let nodata = parse_nodata(&mut decoder);
+        let geo_transform = parse_geo_transform(decoder, width, height)?;
+        let nodata = parse_nodata(decoder);
+        let (scale, offset) = parse_scale_offset(decoder);
 
         Ok(TiffMetadata {
             width,
@@ -76,13 +174,95 @@ impl TiffMetadata {
             tiles_down,
             geo_transform,
             nodata,
+            scale,
+            offset,
         })
+    }
+
+    /// Apply scale/offset to convert raw value to physical value.
+    fn to_physical(&self, raw: f64) -> f64 {
+        match (self.scale, self.offset) {
+            (Some(s), Some(o)) => raw * s + o,
+            (Some(s), None) => raw * s,
+            (None, Some(o)) => raw + o,
+            (None, None) => raw,
+        }
+    }
+
+    /// Check if a raw value is nodata (before scale/offset).
+    fn is_nodata_raw(&self, raw: f64) -> bool {
+        if let Some(nd) = self.nodata {
+            (raw - nd).abs() < 1e-10
+        } else {
+            false
+        }
     }
 }
 
-/// Read a single Float32 pixel value from a GeoTIFF at a given pixel coordinate.
-/// Opens the file, seeks to the correct tile, decompresses it, and extracts the value.
-pub fn read_pixel(path: &Path, metadata: &TiffMetadata, col: u32, row: u32) -> Result<Option<f64>, DataServerError> {
+/// Decode a chunk into Vec<f64>, applying scale/offset.
+/// Returns None for nodata/NaN values.
+fn decode_chunk_f64(
+    decoder: &mut DecoderWrapper,
+    chunk_index: u32,
+    metadata: &TiffMetadata,
+) -> Result<Vec<Option<f64>>, DataServerError> {
+    let result = decoder.read_chunk(chunk_index)
+        .map_err(|e| DataServerError::GeoTiff(format!("Failed to read tile: {e}")))?;
+
+    let values = match result {
+        DecodingResult::F32(data) => {
+            data.iter().map(|&v| {
+                if v.is_nan() || metadata.is_nodata_raw(v as f64) {
+                    None
+                } else {
+                    Some(metadata.to_physical(v as f64))
+                }
+            }).collect()
+        }
+        DecodingResult::F64(data) => {
+            data.iter().map(|&v| {
+                if v.is_nan() || metadata.is_nodata_raw(v) {
+                    None
+                } else {
+                    Some(metadata.to_physical(v))
+                }
+            }).collect()
+        }
+        DecodingResult::U8(data) => {
+            data.iter().map(|&v| {
+                if metadata.is_nodata_raw(v as f64) {
+                    None
+                } else {
+                    Some(metadata.to_physical(v as f64))
+                }
+            }).collect()
+        }
+        DecodingResult::U16(data) => {
+            data.iter().map(|&v| {
+                if metadata.is_nodata_raw(v as f64) {
+                    None
+                } else {
+                    Some(metadata.to_physical(v as f64))
+                }
+            }).collect()
+        }
+        DecodingResult::I16(data) => {
+            data.iter().map(|&v| {
+                if metadata.is_nodata_raw(v as f64) {
+                    None
+                } else {
+                    Some(metadata.to_physical(v as f64))
+                }
+            }).collect()
+        }
+        _ => return Err(DataServerError::GeoTiff("Unsupported data type".into())),
+    };
+
+    Ok(values)
+}
+
+/// Read a single pixel value from a GeoTIFF at a given pixel coordinate.
+pub fn read_pixel(source: &DataSource, metadata: &TiffMetadata, col: u32, row: u32) -> Result<Option<f64>, DataServerError> {
     let tile_col = col / metadata.tile_width;
     let tile_row = row / metadata.tile_height;
     let chunk_index = tile_row * metadata.tiles_across + tile_col;
@@ -91,54 +271,19 @@ pub fn read_pixel(path: &Path, metadata: &TiffMetadata, col: u32, row: u32) -> R
     let local_row = row % metadata.tile_height;
     let local_idx = (local_row * metadata.tile_width + local_col) as usize;
 
-    let file = File::open(path)
-        .map_err(|e| DataServerError::GeoTiff(format!("Cannot open {}: {e}", path.display())))?;
-    let mut decoder = Decoder::new(BufReader::new(file))
-        .map_err(|e| DataServerError::GeoTiff(format!("Invalid TIFF: {e}")))?;
+    let mut decoder = source.open_decoder()?;
+    let values = decode_chunk_f64(&mut decoder, chunk_index, metadata)?;
 
-    match decoder.read_chunk(chunk_index) {
-        Ok(DecodingResult::F32(data)) => {
-            if local_idx >= data.len() {
-                return Ok(None);
-            }
-            let value = data[local_idx];
-            if value.is_nan() {
-                return Ok(None);
-            }
-            if let Some(nodata) = metadata.nodata {
-                if (value as f64 - nodata).abs() < 1e-10 {
-                    return Ok(None);
-                }
-            }
-            Ok(Some(value as f64))
-        }
-        Ok(DecodingResult::F64(data)) => {
-            if local_idx >= data.len() {
-                return Ok(None);
-            }
-            let value = data[local_idx];
-            if value.is_nan() {
-                return Ok(None);
-            }
-            if let Some(nodata) = metadata.nodata {
-                if (value - nodata).abs() < 1e-10 {
-                    return Ok(None);
-                }
-            }
-            Ok(Some(value))
-        }
-        Ok(_) => Err(DataServerError::GeoTiff("Unsupported data type (expected Float32 or Float64)".into())),
-        Err(e) => Err(DataServerError::GeoTiff(format!("Failed to read tile: {e}"))),
+    if local_idx >= values.len() {
+        return Ok(None);
     }
+    Ok(values[local_idx])
 }
 
-/// Maximum number of pixels in an area query result.
-const MAX_AREA_PIXELS: usize = 1_000_000;
-
-/// Read pixel values within a bounding box from a GeoTIFF file.
+/// Read pixel values within a bounding box from a GeoTIFF data source.
 /// Returns a row-major grid of values [row_start..row_end, col_start..col_end].
 pub fn read_bbox(
-    path: &Path,
+    source: &DataSource,
     metadata: &TiffMetadata,
     col_start: u32,
     row_start: u32,
@@ -156,14 +301,10 @@ pub fn read_bbox(
         )));
     }
 
-    let file = File::open(path)
-        .map_err(|e| DataServerError::GeoTiff(format!("Cannot open {}: {e}", path.display())))?;
-    let mut decoder = Decoder::new(BufReader::new(file))
-        .map_err(|e| DataServerError::GeoTiff(format!("Invalid TIFF: {e}")))?;
+    let mut decoder = source.open_decoder()?;
 
     let mut result = vec![None; total_pixels];
 
-    // Determine which tiles we need to read
     let tile_col_start = col_start / metadata.tile_width;
     let tile_col_end = (col_end - 1) / metadata.tile_width + 1;
     let tile_row_start = row_start / metadata.tile_height;
@@ -172,17 +313,8 @@ pub fn read_bbox(
     for tile_row in tile_row_start..tile_row_end {
         for tile_col in tile_col_start..tile_col_end {
             let chunk_index = tile_row * metadata.tiles_across + tile_col;
+            let tile_data = decode_chunk_f64(&mut decoder, chunk_index, metadata)?;
 
-            let tile_data = match decoder.read_chunk(chunk_index) {
-                Ok(DecodingResult::F32(data)) => data.iter().map(|v| *v as f64).collect::<Vec<_>>(),
-                Ok(DecodingResult::F64(data)) => data.to_vec(),
-                Ok(_) => return Err(DataServerError::GeoTiff(
-                    "Unsupported data type (expected Float32 or Float64)".into(),
-                )),
-                Err(e) => return Err(DataServerError::GeoTiff(format!("Failed to read tile: {e}"))),
-            };
-
-            // Extract pixels from this tile that fall within our bbox
             let tile_pixel_col_start = tile_col * metadata.tile_width;
             let tile_pixel_row_start = tile_row * metadata.tile_height;
 
@@ -201,20 +333,10 @@ pub fn read_bbox(
                         continue;
                     }
 
-                    let value = tile_data[tile_idx];
                     let out_col = (col - col_start) as usize;
                     let out_row = (row - row_start) as usize;
                     let out_idx = out_row * nx + out_col;
-
-                    if value.is_nan() {
-                        continue; // leave as None
-                    }
-                    if let Some(nodata) = metadata.nodata {
-                        if (value - nodata).abs() < 1e-10 {
-                            continue;
-                        }
-                    }
-                    result[out_idx] = Some(value);
+                    result[out_idx] = tile_data[tile_idx];
                 }
             }
         }
@@ -223,27 +345,11 @@ pub fn read_bbox(
     Ok(result)
 }
 
-/// Validate that the GeoTIFF has a reasonable number of overview IFDs (security check).
-#[allow(dead_code)]
-pub fn count_overviews(path: &Path) -> Result<usize, DataServerError> {
-    let file = File::open(path)
-        .map_err(|e| DataServerError::GeoTiff(format!("Cannot open {}: {e}", path.display())))?;
-    let mut decoder = Decoder::new(BufReader::new(file))
-        .map_err(|e| DataServerError::GeoTiff(format!("Invalid TIFF: {e}")))?;
+// ============================================================================
+// GeoTIFF metadata parsing
+// ============================================================================
 
-    let mut count = 0;
-    while decoder.next_image().is_ok() {
-        count += 1;
-        if count >= MAX_IFD_CHAIN_DEPTH {
-            return Err(DataServerError::GeoTiff(format!(
-                "IFD chain exceeds maximum depth {MAX_IFD_CHAIN_DEPTH}"
-            )));
-        }
-    }
-    Ok(count)
-}
-
-fn read_tag_u32(decoder: &mut Decoder<BufReader<File>>, tag: Tag) -> Option<u32> {
+fn read_tag_u32(decoder: &mut DecoderWrapper, tag: Tag) -> Option<u32> {
     match decoder.get_tag(tag) {
         Ok(tiff::decoder::ifd::Value::Short(v)) => Some(v as u32),
         Ok(tiff::decoder::ifd::Value::Unsigned(v)) => Some(v),
@@ -252,7 +358,7 @@ fn read_tag_u32(decoder: &mut Decoder<BufReader<File>>, tag: Tag) -> Option<u32>
 }
 
 fn parse_geo_transform(
-    decoder: &mut Decoder<BufReader<File>>,
+    decoder: &mut DecoderWrapper,
     width: u32,
     height: u32,
 ) -> Result<GeoTransform, DataServerError> {
@@ -275,19 +381,9 @@ fn parse_geo_transform(
     let origin_x = tp[3] - tp[0] * ps[0];
     let origin_y = tp[4] + tp[1] * ps[1];
 
-    // Validate that coordinates look like WGS84 (lon: -180..360, lat: -90..90)
-    // We allow up to 360 for origin_x to handle some edge cases
-    let bbox_east = origin_x + width as f64 * ps[0];
-    let bbox_south = origin_y - height as f64 * ps[1];
-    if origin_x < -180.0 || bbox_east > 360.0 || bbox_south < -90.0 || origin_y > 90.0 {
-        // Likely a projected CRS
-        return Err(DataServerError::GeoTiff(format!(
-            "Coordinates suggest a projected CRS (origin: {}, {}). \
-             Only WGS84 (EPSG:4326) is supported. Convert with: \
-             gdalwarp -t_srs EPSG:4326 -of COG input.tif output.tif",
-            origin_x, origin_y
-        )));
-    }
+    // Parse CRS from GeoKeys
+    let crs = parse_crs(decoder)?;
+    tracing::info!("Parsed CRS: {:?}", crs);
 
     Ok(GeoTransform {
         origin_x,
@@ -296,12 +392,238 @@ fn parse_geo_transform(
         pixel_height: ps[1],
         width,
         height,
+        crs,
     })
 }
 
-fn parse_nodata(decoder: &mut Decoder<BufReader<File>>) -> Option<f64> {
+/// Parse the CRS from GeoTIFF GeoKey Directory.
+fn parse_crs(decoder: &mut DecoderWrapper) -> Result<Crs, DataServerError> {
+    let geokeys = match decoder.get_tag(Tag::Unknown(34735)) {
+        Ok(v) => extract_shorts(&v).unwrap_or_default(),
+        Err(_) => return Ok(Crs::Wgs84), // No GeoKeys → assume WGS84
+    };
+
+    let double_params = match decoder.get_tag(Tag::Unknown(34736)) {
+        Ok(v) => extract_doubles(&v).unwrap_or_default(),
+        Err(_) => vec![],
+    };
+
+    if geokeys.len() < 4 {
+        return Ok(Crs::Wgs84);
+    }
+
+    // GeoKey directory: [version, revision, minor_revision, num_keys, key1_id, key1_tiff_tag, key1_count, key1_value, ...]
+    let num_keys = geokeys[3] as usize;
+    let mut keys = std::collections::HashMap::new();
+
+    for i in 0..num_keys {
+        let base = 4 + i * 4;
+        if base + 3 >= geokeys.len() {
+            break;
+        }
+        let key_id = geokeys[base];
+        let tiff_tag = geokeys[base + 1];
+        let count = geokeys[base + 2] as usize;
+        let value_offset = geokeys[base + 3] as usize;
+
+        if tiff_tag == 0 {
+            // Value is stored directly in the value_offset field
+            keys.insert(key_id, GeoKeyValue::Short(value_offset as u16));
+        } else if tiff_tag == 34736 {
+            // Value is in GeoDoubleParamsTag
+            if value_offset < double_params.len() {
+                if count == 1 {
+                    keys.insert(key_id, GeoKeyValue::Double(double_params[value_offset]));
+                } else {
+                    keys.insert(key_id, GeoKeyValue::Doubles(
+                        double_params[value_offset..value_offset + count].to_vec()
+                    ));
+                }
+            }
+        }
+    }
+
+    // Key 1024: GTModelTypeGeoKey (1=Projected, 2=Geographic)
+    let model_type = match keys.get(&1024) {
+        Some(GeoKeyValue::Short(v)) => *v,
+        _ => 2, // default geographic
+    };
+
+    if model_type == 2 {
+        // Geographic CRS — check if it's WGS84-like
+        return Ok(Crs::Wgs84);
+    }
+
+    // Key 3075: ProjCoordTransGeoKey (projection method)
+    let proj_method = match keys.get(&3075) {
+        Some(GeoKeyValue::Short(v)) => *v,
+        _ => 0,
+    };
+
+    // Key 3072: ProjectedCSTypeGeoKey (EPSG code for the projected CRS)
+    let epsg = match keys.get(&3072) {
+        Some(GeoKeyValue::Short(v)) => *v,
+        _ => 0,
+    };
+
+    // If projection method is missing/user-defined, try to identify by EPSG code
+    if proj_method == 0 && epsg != 0 && epsg != 32767 {
+        // Use hardcoded parameters for well-known EPSG codes
+        return match epsg {
+            3067 => Ok(Crs::TransverseMercator {
+                lat0: 0.0,
+                lon0: 27.0_f64.to_radians(),
+                k0: 0.9996,
+                false_e: 500_000.0,
+                false_n: 0.0,
+            }),
+            3035 => Ok(Crs::LambertAzimuthalEqualArea {
+                lat0: 52.0_f64.to_radians(),
+                lon0: 10.0_f64.to_radians(),
+                false_e: 4_321_000.0,
+                false_n: 3_210_000.0,
+            }),
+            _ => Err(DataServerError::GeoTiff(format!(
+                "EPSG:{} is not supported and GeoKeys lack projection parameters. \
+                 Convert with: gdalwarp -t_srs EPSG:4326 -of COG input.tif output.tif",
+                epsg
+            ))),
+        };
+    }
+
+    match proj_method {
+        // CT_TransverseMercator = 1
+        1 => {
+            let lat0 = get_double_key(&keys, 3081).unwrap_or(0.0).to_radians();  // NatOriginLat
+            let lon0 = get_double_key(&keys, 3080).unwrap_or(0.0).to_radians();  // NatOriginLong
+            // Try ProjNatOriginLong (3080), fall back to ProjCenterLong (3088)
+            let lon0 = if lon0 == 0.0 {
+                get_double_key(&keys, 3088).unwrap_or(0.0).to_radians()
+            } else {
+                lon0
+            };
+            let k0 = get_double_key(&keys, 3092).unwrap_or(1.0);                 // ScaleAtNatOrigin
+            let false_e = get_double_key(&keys, 3082).unwrap_or(0.0);             // FalseEasting
+            let false_n = get_double_key(&keys, 3083).unwrap_or(0.0);             // FalseNorthing
+
+            Ok(Crs::TransverseMercator { lat0, lon0, k0, false_e, false_n })
+        }
+        // CT_LambertConfConic_2SP = 8
+        8 => {
+            let lat1 = get_double_key(&keys, 3078).unwrap_or(0.0).to_radians();  // StdParallel1
+            let lat2 = get_double_key(&keys, 3079).unwrap_or(0.0).to_radians();  // StdParallel2
+            let lat0 = get_double_key(&keys, 3081).unwrap_or(0.0).to_radians();  // FalseOriginLat
+            // Try NatOriginLong (3080), fall back to FalseOriginLong (3084)
+            let lon0_nat = get_double_key(&keys, 3080);
+            let lon0_false = get_double_key(&keys, 3084);
+            let lon0 = lon0_nat.or(lon0_false).unwrap_or(0.0).to_radians();
+            let false_e = get_double_key(&keys, 3082)
+                .or_else(|| get_double_key(&keys, 3086))
+                .unwrap_or(0.0);
+            let false_n = get_double_key(&keys, 3083)
+                .or_else(|| get_double_key(&keys, 3087))
+                .unwrap_or(0.0);
+
+            Ok(Crs::LambertConformalConic { lat1, lat2, lat0, lon0, false_e, false_n })
+        }
+        // CT_LambertAzimEqualArea = 10
+        10 => {
+            // Try NatOriginLat (3081), then CenterLat (3089)
+            let lat0 = get_double_key(&keys, 3081)
+                .or_else(|| get_double_key(&keys, 3089))
+                .unwrap_or(0.0).to_radians();
+            // Try NatOriginLong (3080), then CenterLong (3088)
+            let lon0 = get_double_key(&keys, 3080)
+                .or_else(|| get_double_key(&keys, 3088))
+                .unwrap_or(0.0).to_radians();
+            let false_e = get_double_key(&keys, 3082)
+                .or_else(|| get_double_key(&keys, 3086))
+                .unwrap_or(0.0);
+            let false_n = get_double_key(&keys, 3083)
+                .or_else(|| get_double_key(&keys, 3087))
+                .unwrap_or(0.0);
+
+            Ok(Crs::LambertAzimuthalEqualArea { lat0, lon0, false_e, false_n })
+        }
+        _ => {
+            Err(DataServerError::GeoTiff(format!(
+                "Unsupported projection method {} (GeoKey 3075). \
+                 Supported: Transverse Mercator (1), Lambert Conformal Conic 2SP (8), \
+                 Lambert Azimuthal Equal Area (10). \
+                 Convert with: gdalwarp -t_srs EPSG:4326 -of COG input.tif output.tif",
+                proj_method
+            )))
+        }
+    }
+}
+
+#[derive(Debug)]
+enum GeoKeyValue {
+    Short(u16),
+    Double(f64),
+    #[allow(dead_code)]
+    Doubles(Vec<f64>),
+}
+
+fn get_double_key(keys: &std::collections::HashMap<u16, GeoKeyValue>, key_id: u16) -> Option<f64> {
+    match keys.get(&key_id) {
+        Some(GeoKeyValue::Double(v)) => Some(*v),
+        Some(GeoKeyValue::Short(v)) => Some(*v as f64),
+        _ => None,
+    }
+}
+
+fn parse_nodata(decoder: &mut DecoderWrapper) -> Option<f64> {
     match decoder.get_tag(Tag::Unknown(42113)) {
         Ok(tiff::decoder::ifd::Value::Ascii(s)) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn parse_scale_offset(decoder: &mut DecoderWrapper) -> (Option<f64>, Option<f64>) {
+    // Try GDAL metadata XML tag (42112)
+    if let Ok(tiff::decoder::ifd::Value::Ascii(xml)) = decoder.get_tag(Tag::Unknown(42112)) {
+        let scale = extract_xml_item(&xml, "SCALE");
+        let offset = extract_xml_item(&xml, "OFFSET");
+        if scale.is_some() || offset.is_some() {
+            return (scale, offset);
+        }
+    }
+
+    // Try TIFF SMinSampleValue/SMaxSampleValue as fallback — these aren't scale/offset
+    // but some producers put scale in tag 34264 etc. For now, skip.
+
+    (None, None)
+}
+
+/// Extract a named item from GDAL metadata XML like:
+/// `<GDALMetadata><Item name="SCALE">0.5</Item><Item name="OFFSET">-32</Item></GDALMetadata>`
+fn extract_xml_item(xml: &str, name: &str) -> Option<f64> {
+    let pattern = format!("name=\"{}\"", name);
+    if let Some(pos) = xml.find(&pattern) {
+        if let Some(gt) = xml[pos..].find('>') {
+            let after = &xml[pos + gt + 1..];
+            if let Some(lt) = after.find('<') {
+                return after[..lt].trim().parse().ok();
+            }
+        }
+    }
+    None
+}
+
+fn extract_shorts(value: &tiff::decoder::ifd::Value) -> Option<Vec<u16>> {
+    match value {
+        tiff::decoder::ifd::Value::List(items) => {
+            let mut result = Vec::new();
+            for item in items {
+                match item {
+                    tiff::decoder::ifd::Value::Short(v) => result.push(*v),
+                    tiff::decoder::ifd::Value::Unsigned(v) => result.push(*v as u16),
+                    _ => return None,
+                }
+            }
+            Some(result)
+        }
         _ => None,
     }
 }
@@ -323,10 +645,4 @@ fn extract_doubles(value: &tiff::decoder::ifd::Value) -> Option<Vec<f64>> {
         }
         _ => None,
     }
-}
-
-#[cfg(test)]
-mod tests {
-    // Integration tests require actual GeoTIFF files.
-    // These are tested via the spike-geotiff project and engine-level tests.
 }

@@ -5,7 +5,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use ds_core::error::DataServerError;
 use regex::Regex;
 
-use crate::reader::TiffMetadata;
+use crate::reader::{DataSource, TiffMetadata};
 
 /// Maximum filename length to prevent abuse.
 const MAX_FILENAME_LENGTH: usize = 255;
@@ -14,6 +14,7 @@ const MAX_FILENAME_LENGTH: usize = 255;
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub path: PathBuf,
+    pub source: DataSource,
     pub metadata: TiffMetadata,
     pub file_size: u64,
 }
@@ -33,6 +34,26 @@ impl Catalog {
             temporal_extent: None,
             spatial_extent: None,
         }
+    }
+
+    /// Trim to keep only the most recent `max` entries by timestamp.
+    pub fn trim_to_latest(&mut self, max: usize) {
+        if self.entries.len() <= max {
+            return;
+        }
+        let keep_from = self.entries.keys().rev().nth(max - 1).copied();
+        if let Some(cutoff) = keep_from {
+            self.entries = self.entries.split_off(&cutoff);
+        }
+        // Recompute extents
+        self.temporal_extent = if self.entries.is_empty() {
+            None
+        } else {
+            let first = *self.entries.keys().next().unwrap();
+            let last = *self.entries.keys().next_back().unwrap();
+            Some((first, last))
+        };
+        self.spatial_extent = self.entries.values().next().map(|e| e.metadata.geo_transform.bbox());
     }
 }
 
@@ -176,7 +197,8 @@ pub fn scan_directory(
             );
         }
 
-        entries.insert(datetime, FileEntry { path, metadata, file_size });
+        let source = DataSource::from_path(&path);
+        entries.insert(datetime, FileEntry { path, source, metadata, file_size });
     }
 
     // Clean pending files that no longer exist in the directory
@@ -218,6 +240,135 @@ fn is_excluded(filename: &str, patterns: &[String]) -> bool {
         }
     }
     false
+}
+
+/// Maximum file size for remote downloads (50 MB).
+const MAX_REMOTE_FILE_SIZE: usize = 50 * 1024 * 1024;
+
+/// Scan a remote object store for GeoTIFF files matching a filename pattern.
+///
+/// Downloads each matching file into memory and parses metadata.
+/// Reuses cached data for files already in the catalog with the same size.
+pub fn scan_remote_with_limit(
+    store: &ds_storage::DataStore,
+    prefix: &ds_storage::object_store::path::Path,
+    pattern: &Regex,
+    timestamp_format: &str,
+    existing_metadata: &BTreeMap<PathBuf, (u64, TiffMetadata, bytes::Bytes)>,
+    max_files: Option<usize>,
+) -> Result<Catalog, DataServerError> {
+    let entries_list = store.list(prefix)?;
+
+    // First pass: match filenames and parse timestamps without downloading
+    let mut candidates: Vec<(DateTime<Utc>, String, u64, ds_storage::object_store::path::Path)> = Vec::new();
+
+    for obj in &entries_list {
+        let key = obj.location.to_string();
+        let filename = key.rsplit('/').next().unwrap_or(&key);
+
+        if filename.len() > MAX_FILENAME_LENGTH {
+            continue;
+        }
+
+        let caps = match pattern.captures(filename) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let timestamp_str = match caps.name("timestamp") {
+            Some(m) => m.as_str().to_string(),
+            None => continue,
+        };
+
+        let datetime = match NaiveDateTime::parse_from_str(&timestamp_str, timestamp_format) {
+            Ok(dt) => dt.and_utc(),
+            Err(_) => continue,
+        };
+
+        if obj.size > MAX_REMOTE_FILE_SIZE {
+            continue;
+        }
+
+        candidates.push((datetime, key, obj.size as u64, obj.location.clone()));
+    }
+
+    // Sort by timestamp descending and take only max_files most recent
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    if let Some(max) = max_files {
+        candidates.truncate(max);
+    }
+    // Re-sort ascending for the BTreeMap
+    candidates.sort_by_key(|c| c.0);
+
+    tracing::info!(
+        "Found {} matching files (keeping {})",
+        entries_list.len(),
+        candidates.len()
+    );
+
+    // Second pass: download and parse metadata
+    let mut entries = BTreeMap::new();
+
+    for (datetime, key, file_size, location) in &candidates {
+        let pseudo_path = PathBuf::from(key);
+
+        // Reuse cached data if file size unchanged
+        if let Some((cached_size, cached_meta, cached_bytes)) = existing_metadata.get(&pseudo_path) {
+            if *cached_size == *file_size {
+                let source = DataSource::from_bytes(cached_bytes.clone());
+                entries.insert(*datetime, FileEntry {
+                    path: pseudo_path,
+                    source,
+                    metadata: cached_meta.clone(),
+                    file_size: *file_size,
+                });
+                continue;
+            }
+        }
+
+        // Download the file
+        tracing::info!("Downloading {} ({} bytes)", key, file_size);
+        let data = match store.get(location) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("Failed to download {}: {e}", key);
+                continue;
+            }
+        };
+
+        // Parse metadata from downloaded bytes
+        let source = DataSource::from_bytes(data.clone());
+        let metadata = match TiffMetadata::from_source(&source) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("Skipping {}: {e}", key);
+                continue;
+            }
+        };
+
+        entries.insert(*datetime, FileEntry {
+            path: pseudo_path,
+            source,
+            metadata,
+            file_size: *file_size,
+        });
+    }
+
+    let temporal_extent = if entries.is_empty() {
+        None
+    } else {
+        let first = *entries.keys().next().unwrap();
+        let last = *entries.keys().next_back().unwrap();
+        Some((first, last))
+    };
+
+    let spatial_extent = entries.values().next().map(|e| e.metadata.geo_transform.bbox());
+
+    Ok(Catalog {
+        entries,
+        temporal_extent,
+        spatial_extent,
+    })
 }
 
 #[cfg(test)]

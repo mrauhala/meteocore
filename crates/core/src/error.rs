@@ -32,6 +32,9 @@ pub enum DataServerError {
     #[error("GeoTIFF error: {0}")]
     GeoTiff(String),
 
+    #[error("Storage error: {0}")]
+    Storage(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }

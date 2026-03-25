@@ -17,97 +17,140 @@ use ds_core::engine::Engine;
 use ds_core::error::DataServerError;
 use ds_core::model::*;
 
-use crate::catalog::{scan_directory, Catalog, PendingFile};
+use crate::catalog::{scan_directory, scan_remote_with_limit, Catalog, PendingFile};
 use crate::reader::TiffMetadata;
+
+/// Whether the data source is local or remote.
+#[derive(Debug)]
+enum StoreMode {
+    Local {
+        directory: PathBuf,
+        pending: Mutex<BTreeMap<PathBuf, PendingFile>>,
+    },
+    Remote {
+        store: ds_storage::DataStore,
+        prefix: ds_storage::object_store::path::Path,
+    },
+}
 
 pub struct GeoTiffEngine {
     catalog: ArcSwap<Catalog>,
-    directory: PathBuf,
+    store_mode: StoreMode,
     filename_pattern: Regex,
     timestamp_format: String,
     parameter: String,
     unit: String,
     poll_interval: Duration,
     exclude_patterns: Vec<String>,
-    /// Pending files (being written). Protected by Mutex for the poller.
-    pending: Mutex<BTreeMap<PathBuf, PendingFile>>,
+    max_files: Option<usize>,
+    data_path_display: String,
 }
 
 impl GeoTiffEngine {
-    /// Create a new GeoTIFF engine, performing an initial directory scan.
+    /// Create a new GeoTIFF engine, performing an initial scan.
+    /// Supports local paths, s3:// URLs, and https:// URLs.
     pub fn new(data_path: &str, config: &GeoTiffConfig) -> Result<Self, DataServerError> {
-        let directory = PathBuf::from(data_path);
-        if !directory.is_dir() {
-            return Err(DataServerError::GeoTiff(format!(
-                "{data_path} is not a directory"
-            )));
-        }
-
-        // Security: canonicalize the directory path to prevent traversal
-        let directory = directory.canonicalize().map_err(|e| {
-            DataServerError::GeoTiff(format!("Cannot resolve directory {data_path}: {e}"))
-        })?;
-
         let filename_pattern = Regex::new(&config.filename_pattern).map_err(|e| {
             DataServerError::GeoTiff(format!("Invalid filename_pattern: {e}"))
         })?;
 
-        // Validate that the pattern has a 'timestamp' capture group
         if !config.filename_pattern.contains("(?P<timestamp>") {
             return Err(DataServerError::GeoTiff(
                 "filename_pattern must contain a named capture group (?P<timestamp>...)".into(),
             ));
         }
 
+        let is_remote = data_path.starts_with("s3://")
+            || data_path.starts_with("http://")
+            || data_path.starts_with("https://");
+
+        let store_mode = if is_remote {
+            let (store, prefix) = ds_storage::build_store(data_path)?;
+            StoreMode::Remote { store, prefix }
+        } else {
+            let directory = PathBuf::from(data_path);
+            if !directory.is_dir() {
+                return Err(DataServerError::GeoTiff(format!(
+                    "{data_path} is not a directory"
+                )));
+            }
+            let directory = directory.canonicalize().map_err(|e| {
+                DataServerError::GeoTiff(format!("Cannot resolve directory {data_path}: {e}"))
+            })?;
+            StoreMode::Local {
+                directory,
+                pending: Mutex::new(BTreeMap::new()),
+            }
+        };
+
         let engine = GeoTiffEngine {
             catalog: ArcSwap::from_pointee(Catalog::empty()),
-            directory,
+            store_mode,
             filename_pattern,
             timestamp_format: config.timestamp_format.clone(),
             parameter: config.parameter.clone(),
             unit: config.unit.clone(),
             poll_interval: Duration::from_secs(config.poll_interval_secs),
             exclude_patterns: config.exclude_patterns.clone(),
-            pending: Mutex::new(BTreeMap::new()),
+            max_files: config.max_files,
+            data_path_display: data_path.to_string(),
         };
 
-        // Initial scan — accept all files immediately (no readiness check)
-        let initial_catalog = {
-            let mut pending = engine.pending.lock().unwrap();
-            let empty_existing = BTreeMap::new();
-            scan_directory(
-                &engine.directory,
-                &engine.filename_pattern,
-                &engine.timestamp_format,
-                &engine.exclude_patterns,
-                &mut pending,
-                &empty_existing,
-            )?
-        };
-
+        // Initial scan
+        let initial_catalog = engine.do_scan(&BTreeMap::new(), &BTreeMap::new())?;
         let file_count = initial_catalog.entries.len();
         engine.catalog.store(Arc::new(initial_catalog));
 
         if file_count == 0 {
-            tracing::warn!(
-                "No matching GeoTIFF files found in {}",
-                engine.directory.display()
-            );
+            tracing::warn!("No matching GeoTIFF files found in {}", engine.data_path_display);
         } else {
-            tracing::info!(
-                "Loaded {} GeoTIFF files from {}",
-                file_count,
-                engine.directory.display()
-            );
+            tracing::info!("Loaded {} GeoTIFF files from {}", file_count, engine.data_path_display);
         }
 
         Ok(engine)
     }
 
+    /// Perform a scan appropriate to the store mode.
+    /// Applies max_files limit if configured.
+    fn do_scan(
+        &self,
+        local_existing: &BTreeMap<PathBuf, (u64, TiffMetadata)>,
+        remote_existing: &BTreeMap<PathBuf, (u64, TiffMetadata, bytes::Bytes)>,
+    ) -> Result<Catalog, DataServerError> {
+        let mut catalog = match &self.store_mode {
+            StoreMode::Local { directory, pending } => {
+                let mut pending = pending.lock().unwrap();
+                scan_directory(
+                    directory,
+                    &self.filename_pattern,
+                    &self.timestamp_format,
+                    &self.exclude_patterns,
+                    &mut pending,
+                    local_existing,
+                )?
+            }
+            StoreMode::Remote { store, prefix } => {
+                scan_remote_with_limit(
+                    store,
+                    prefix,
+                    &self.filename_pattern,
+                    &self.timestamp_format,
+                    remote_existing,
+                    self.max_files,
+                )?
+            }
+        };
+
+        if let Some(max) = self.max_files {
+            catalog.trim_to_latest(max);
+        }
+
+        Ok(catalog)
+    }
+
     /// Run the polling loop. Call this from a tokio::spawn task.
     pub async fn poll_loop(&self) {
         let mut interval = tokio::time::interval(self.poll_interval);
-        // Skip the first tick (we already scanned at startup)
         interval.tick().await;
 
         loop {
@@ -119,30 +162,39 @@ impl GeoTiffEngine {
     fn poll_once(&self) {
         let current = self.catalog.load();
 
-        // Build existing metadata cache from current catalog
-        let existing_metadata: BTreeMap<PathBuf, (u64, TiffMetadata)> = current
-            .entries
-            .values()
-            .map(|e| (e.path.clone(), (e.file_size, e.metadata.clone())))
-            .collect();
+        let result = match &self.store_mode {
+            StoreMode::Local { .. } => {
+                let existing: BTreeMap<PathBuf, (u64, TiffMetadata)> = current
+                    .entries
+                    .values()
+                    .map(|e| (e.path.clone(), (e.file_size, e.metadata.clone())))
+                    .collect();
+                self.do_scan(&existing, &BTreeMap::new())
+            }
+            StoreMode::Remote { .. } => {
+                let existing: BTreeMap<PathBuf, (u64, TiffMetadata, bytes::Bytes)> = current
+                    .entries
+                    .values()
+                    .filter_map(|e| {
+                        if let crate::reader::DataSource::InMemory(bytes) = &e.source {
+                            Some((e.path.clone(), (e.file_size, e.metadata.clone(), bytes.clone())))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                self.do_scan(&BTreeMap::new(), &existing)
+            }
+        };
 
-        let mut pending = self.pending.lock().unwrap();
-
-        match scan_directory(
-            &self.directory,
-            &self.filename_pattern,
-            &self.timestamp_format,
-            &self.exclude_patterns,
-            &mut pending,
-            &existing_metadata,
-        ) {
+        match result {
             Ok(new_catalog) => {
                 let count = new_catalog.entries.len();
                 self.catalog.store(Arc::new(new_catalog));
                 tracing::debug!("Catalog updated: {} files", count);
             }
             Err(e) => {
-                tracing::warn!("Directory scan failed, keeping old catalog: {e}");
+                tracing::warn!("Scan failed, keeping old catalog: {e}");
             }
         }
     }
@@ -189,7 +241,7 @@ impl GeoTiffEngine {
             let pixel = entry.metadata.geo_transform.world_to_pixel(lon, lat);
             let value = match pixel {
                 Some((col, row)) => {
-                    match reader::read_pixel(&entry.path, &entry.metadata, col, row) {
+                    match reader::read_pixel(&entry.source, &entry.metadata, col, row) {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!("Failed to read pixel from {}: {e}", entry.path.display());
@@ -298,7 +350,7 @@ impl GeoTiffEngine {
         for (timestamp, entry) in &entries {
             times.push(**timestamp);
 
-            match reader::read_bbox(&entry.path, &entry.metadata, col_start, row_start, col_end, row_end) {
+            match reader::read_bbox(&entry.source, &entry.metadata, col_start, row_start, col_end, row_end) {
                 Ok(grid_values) => {
                     all_values.extend(grid_values);
                 }
