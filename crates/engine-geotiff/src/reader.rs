@@ -185,6 +185,11 @@ impl TiffMetadata {
         Self::from_decoder_wrapper(&mut decoder, source.display_name())
     }
 
+    /// Read BitsPerSample from decoder, defaulting to 8 if missing.
+    fn bits_per_sample_from_decoder(decoder: &mut DecoderWrapper) -> u32 {
+        read_tag_u32(decoder, Tag::BitsPerSample).unwrap_or(8)
+    }
+
     fn from_decoder_wrapper(
         decoder: &mut DecoderWrapper,
         source_name: String,
@@ -204,18 +209,26 @@ impl TiffMetadata {
         let tile_height = read_tag_u32(decoder, Tag::TileLength)
             .ok_or_else(|| DataServerError::GeoTiff(format!("{source_name}: Not a tiled TIFF (TileLength missing)")))?;
 
-        // Security: check decoded tile size (assuming worst case 8 bytes/pixel)
-        let decoded_tile_bytes = tile_width as usize * tile_height as usize * 8;
-        if decoded_tile_bytes > MAX_DECODED_TILE_BYTES {
-            return Err(DataServerError::GeoTiff(format!(
-                "Decoded tile size {} bytes exceeds maximum {}",
-                decoded_tile_bytes, MAX_DECODED_TILE_BYTES
-            )));
-        }
-
         let tiles_across = (width + tile_width - 1) / tile_width;
         let tiles_down = (height + tile_height - 1) / tile_height;
         let samples_per_pixel = read_tag_u32(decoder, Tag::SamplesPerPixel).unwrap_or(1);
+
+        // Security: check decoded tile size using actual sample size and band count.
+        // samples_per_pixel could be large in multi-band files, so we use
+        // the real value rather than assuming worst-case 8 bytes/sample.
+        let bps = Self::bits_per_sample_from_decoder(decoder);
+        let bytes_per_sample = (bps as usize + 7) / 8; // ceil(bits / 8)
+        let decoded_tile_bytes = tile_width as usize
+            * tile_height as usize
+            * bytes_per_sample
+            * samples_per_pixel as usize;
+        if decoded_tile_bytes > MAX_DECODED_TILE_BYTES {
+            return Err(DataServerError::GeoTiff(format!(
+                "Decoded tile size {} bytes ({}x{} px, {} bands, {} bytes/sample) exceeds maximum {}",
+                decoded_tile_bytes, tile_width, tile_height, samples_per_pixel, bytes_per_sample,
+                MAX_DECODED_TILE_BYTES
+            )));
+        }
 
         let geo_transform = parse_geo_transform(decoder, width, height)?;
         let nodata = parse_nodata(decoder);
@@ -429,6 +442,7 @@ fn extract_u64_list(value: &tiff::decoder::ifd::Value) -> Option<Vec<u64>> {
 }
 
 /// Decompress raw tile bytes based on compression type.
+/// Enforces MAX_DECODED_TILE_BYTES to prevent decompression bombs.
 fn decompress_tile(
     compressed: &[u8],
     compression: TiffCompression,
@@ -437,18 +451,29 @@ fn decompress_tile(
         TiffCompression::None => Ok(compressed.to_vec()),
         TiffCompression::Deflate => {
             use std::io::Read;
-            let mut decoder = flate2::read::ZlibDecoder::new(compressed);
-            let mut decompressed = Vec::new();
-            decoder.read_to_end(&mut decompressed)
+            let decoder = flate2::read::ZlibDecoder::new(compressed);
+            let mut decompressed = Vec::with_capacity(compressed.len().min(1024 * 1024));
+            decoder.take(MAX_DECODED_TILE_BYTES as u64).read_to_end(&mut decompressed)
                 .map_err(|e| DataServerError::GeoTiff(format!("Deflate decompression failed: {e}")))?;
+            if decompressed.len() >= MAX_DECODED_TILE_BYTES {
+                return Err(DataServerError::GeoTiff(format!(
+                    "Decompressed tile exceeds maximum size ({} bytes)", MAX_DECODED_TILE_BYTES
+                )));
+            }
             Ok(decompressed)
         }
         TiffCompression::Lzw => {
             // TIFF LZW uses an early code size increase compared to standard LZW.
             // with_tiff_size_switch enables this TIFF-specific behavior.
             let mut decoder = weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8);
-            decoder.decode(compressed)
-                .map_err(|e| DataServerError::GeoTiff(format!("LZW decompression failed: {e}")))
+            let decompressed = decoder.decode(compressed)
+                .map_err(|e| DataServerError::GeoTiff(format!("LZW decompression failed: {e}")))?;
+            if decompressed.len() > MAX_DECODED_TILE_BYTES {
+                return Err(DataServerError::GeoTiff(format!(
+                    "Decompressed tile exceeds maximum size ({} bytes)", MAX_DECODED_TILE_BYTES
+                )));
+            }
+            Ok(decompressed)
         }
     }
 }
@@ -484,7 +509,24 @@ fn decode_raw_tile_f64(
     let spp = metadata.samples_per_pixel as usize;
     let sample_stride = bps * spp; // bytes per pixel (all bands)
     let band_byte_offset = band_index * bps;
+
+    // Validate buffer is large enough for at least one pixel
+    if sample_stride == 0 {
+        return Err(DataServerError::GeoTiff("Invalid tile: zero sample stride".into()));
+    }
     let pixel_count = raw.len() / sample_stride;
+
+    // Validate that every pixel access is within bounds (last pixel's last byte)
+    if pixel_count > 0 {
+        let last_offset = (pixel_count - 1) * sample_stride + band_byte_offset + bps;
+        if last_offset > raw.len() {
+            return Err(DataServerError::GeoTiff(format!(
+                "Truncated tile data: need {} bytes for {} pixels but got {}",
+                last_offset, pixel_count, raw.len()
+            )));
+        }
+    }
+
     let mut values = Vec::with_capacity(pixel_count);
 
     match tile_info.sample_type {
@@ -568,18 +610,25 @@ fn read_remote_chunk_f64(
         return Ok(vec![None; pixel_count]);
     }
 
+    // Validate range doesn't overflow
+    let end = offset.checked_add(byte_count).ok_or_else(|| {
+        DataServerError::GeoTiff(format!(
+            "Tile {} byte range overflow: offset={} + count={}", idx, offset, byte_count
+        ))
+    })?;
+
     // Check cache for compressed bytes
     let compressed = if let Some(c) = cache {
         if let Some(cached) = c.get(file_path, chunk_index) {
             cached
         } else {
-            let fetched = store.get_range(obj_path, offset..offset + byte_count)
+            let fetched = store.get_range(obj_path, offset..end)
                 .map_err(|e| DataServerError::GeoTiff(format!("Failed to read tile range: {e}")))?;
             c.insert(file_path, chunk_index, fetched.clone());
             fetched
         }
     } else {
-        store.get_range(obj_path, offset..offset + byte_count)
+        store.get_range(obj_path, offset..end)
             .map_err(|e| DataServerError::GeoTiff(format!("Failed to read tile range: {e}")))?
     };
 
