@@ -34,8 +34,7 @@ engine_type = "geotiff"
 apis = ["edr"]
 
 [collections.geotiff]
-filename_pattern = 'radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif'
-timestamp_format = "%Y%m%dT%H%MZ"
+filename_template = "radar_%Y%m%dT%H%MZ.tif"
 parameter = "reflectivity"
 unit = "dBZ"
 poll_interval_secs = 30
@@ -49,8 +48,7 @@ engine_type = "geotiff"
 apis = ["edr"]
 
 [collections.geotiff]
-filename_pattern = 'norway_(?P<timestamp>\d{8}T\d{4}Z)\.tiff'
-timestamp_format = "%Y%m%dT%H%MZ"
+filename_template = "norway_%Y%m%dT%H%MZ.tiff"
 parameter = "reflectivity"
 unit = "dBZ"
 poll_interval_secs = 60
@@ -67,14 +65,13 @@ endpoint = "https://s3-eu-west-1.amazonaws.com"
 bucket = "fmi-opendata-radar-geotiff"
 prefix_pattern = "%Y/%m/%d/finrad/"
 time_window = "-PT2H"
-filename_pattern = '(?P<timestamp>\d{12})_composite_cappi_600_dbzh_finrad_qc\.tif'
-timestamp_format = "%Y%m%d%H%M"
+filename_template = "%Y%m%d%H%M_composite_cappi_600_dbzh_finrad_qc.tif"
 parameter = "reflectivity"
 unit = "dBZ"
 poll_interval_secs = 300
 
 [[collections]]
-id = "opera-radar"
+id = "opera-precipitation"
 title = "OPERA European Radar Composite"
 description = "1h accumulated precipitation from EUMETNET OPERA, LAEA projection (CloudFerro S3)"
 engine_type = "geotiff"
@@ -85,8 +82,7 @@ endpoint = "https://s3.waw3-1.cloudferro.com"
 bucket = "openradar-24h"
 prefix_pattern = "%Y/%m/%d/OPERA/COMP/"
 time_window = "-PT2H"
-filename_pattern = 'OPERA@(?P<timestamp>\d{8}T\d{4})@0@ACRR\.tiff'
-timestamp_format = "%Y%m%dT%H%M"
+filename_template = "OPERA@%Y%m%dT%H%M@0@ACRR.tiff"
 parameter = "precipitation"
 unit = "mm"
 poll_interval_secs = 300
@@ -103,8 +99,7 @@ endpoint = "https://s3.waw3-1.cloudferro.com"
 bucket = "openradar-24h"
 prefix_pattern = "%Y/%m/%d/OPERA/COMP/"
 time_window = "-PT2H"
-filename_pattern = 'OPERA@(?P<timestamp>\d{8}T\d{4})@0@DBZH\.tiff'
-timestamp_format = "%Y%m%dT%H%M"
+filename_template = "OPERA@%Y%m%dT%H%M@0@DBZH.tiff"
 parameter = "reflectivity"
 unit = "dBZ"
 poll_interval_secs = 300

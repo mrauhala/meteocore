@@ -72,15 +72,12 @@ impl GeoTiffEngine {
     /// - `data_path` starting with `s3://` or `http(s)://`: S3/HTTP with fixed prefix
     /// - `data_path` otherwise: local directory
     pub fn new(collection_id: &str, data_path: Option<&str>, config: &GeoTiffConfig) -> Result<Self, DataServerError> {
-        let filename_pattern = Regex::new(&config.filename_pattern).map_err(|e| {
-            DataServerError::GeoTiff(format!("Invalid filename_pattern: {e}"))
-        })?;
+        // Derive filename_pattern and timestamp_format from template or explicit fields
+        let (pattern_str, timestamp_format) = resolve_filename_config(config)?;
 
-        if !config.filename_pattern.contains("(?P<timestamp>") {
-            return Err(DataServerError::GeoTiff(
-                "filename_pattern must contain a named capture group (?P<timestamp>...)".into(),
-            ));
-        }
+        let filename_pattern = Regex::new(&pattern_str).map_err(|e| {
+            DataServerError::GeoTiff(format!("Invalid filename pattern '{}': {e}", pattern_str))
+        })?;
 
         // Determine store mode from config
         // Parse time_window if configured
@@ -151,7 +148,7 @@ impl GeoTiffEngine {
             tile_cache,
             store_mode,
             filename_pattern,
-            timestamp_format: config.timestamp_format.clone(),
+            timestamp_format,
             parameter: config.parameter.clone(),
             unit: config.unit.clone(),
             poll_interval: Duration::from_secs(config.poll_interval_secs),
@@ -608,6 +605,131 @@ impl Engine for GeoTiffEngine {
     }
 }
 
+/// Resolve filename_template or filename_pattern + timestamp_format from config.
+/// Returns (regex_pattern, timestamp_format).
+fn resolve_filename_config(config: &GeoTiffConfig) -> Result<(String, String), DataServerError> {
+    if let Some(template) = &config.filename_template {
+        let (regex, format) = expand_filename_template(template)?;
+        tracing::debug!("Expanded filename_template '{}' → regex='{}', format='{}'", template, regex, format);
+        Ok((regex, format))
+    } else if let (Some(pattern), Some(format)) = (&config.filename_pattern, &config.timestamp_format) {
+        if !pattern.contains("(?P<timestamp>") {
+            return Err(DataServerError::GeoTiff(
+                "filename_pattern must contain a named capture group (?P<timestamp>...)".into(),
+            ));
+        }
+        Ok((pattern.clone(), format.clone()))
+    } else {
+        Err(DataServerError::GeoTiff(
+            "Either filename_template or both filename_pattern + timestamp_format must be set".into(),
+        ))
+    }
+}
+
+/// Expand a filename template with strftime placeholders into a regex + timestamp format.
+///
+/// E.g. `"OPERA@%Y%m%dT%H%M@0@ACRR.tiff"` produces:
+/// - regex: `OPERA@(?P<timestamp>\d{8}T\d{4})@0@ACRR\.tiff`
+/// - format: `%Y%m%dT%H%M`
+fn expand_filename_template(template: &str) -> Result<(String, String), DataServerError> {
+    // Known strftime codes and their regex equivalents
+    let codes: &[(&str, &str)] = &[
+        ("%Y", r"\d{4}"),
+        ("%m", r"\d{2}"),
+        ("%d", r"\d{2}"),
+        ("%H", r"\d{2}"),
+        ("%M", r"\d{2}"),
+        ("%S", r"\d{2}"),
+        ("%j", r"\d{3}"),
+    ];
+
+    // Find the contiguous region of strftime codes in the template
+    // (the timestamp part) and build regex + format from it
+    let mut i = 0;
+    let bytes = template.as_bytes();
+    let mut regex = String::new();
+    let mut timestamp_format = String::new();
+    let mut in_timestamp = false;
+    let mut timestamp_started = false;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 1 < bytes.len() {
+            // Check if this is a known strftime code
+            let mut matched = false;
+            for &(code, _regex_part) in codes {
+                if template[i..].starts_with(code) {
+                    if !in_timestamp {
+                        in_timestamp = true;
+                        regex.push_str("(?P<timestamp>");
+                    }
+                    timestamp_started = true;
+                    timestamp_format.push_str(code);
+                    regex.push_str(_regex_part);
+                    i += code.len();
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                return Err(DataServerError::GeoTiff(format!(
+                    "Unknown strftime code '{}' in filename_template", &template[i..i+2]
+                )));
+            }
+        } else {
+            // Literal character
+            if in_timestamp {
+                // Check if this is a separator within the timestamp (e.g., T, -, :)
+                // or the end of the timestamp region
+                let ch = bytes[i] as char;
+                let is_separator = matches!(ch, 'T' | '-' | ':' | '_' | 'Z');
+                // Peek ahead: is there another % code coming?
+                let next_has_code = (i + 1 < bytes.len()) && {
+                    let rest = &template[i+1..];
+                    codes.iter().any(|&(code, _)| rest.starts_with(code))
+                };
+
+                if is_separator && next_has_code {
+                    // Separator within timestamp (e.g., the T in %Y%m%dT%H%M)
+                    timestamp_format.push(ch);
+                    regex.push_str(&regex::escape(&ch.to_string()));
+                    i += 1;
+                } else if ch == 'Z' && !next_has_code {
+                    // Trailing Z (UTC marker) is part of the timestamp
+                    timestamp_format.push('Z');
+                    regex.push('Z');
+                    i += 1;
+                    // Close timestamp group
+                    regex.push(')');
+                    in_timestamp = false;
+                } else {
+                    // End of timestamp region
+                    regex.push(')');
+                    in_timestamp = false;
+                    regex.push_str(&regex::escape(&(ch).to_string()));
+                    i += 1;
+                }
+            } else {
+                // Not in timestamp — escape for regex
+                regex.push_str(&regex::escape(&(bytes[i] as char).to_string()));
+                i += 1;
+            }
+        }
+    }
+
+    // Close timestamp group if template ends with strftime codes
+    if in_timestamp {
+        regex.push(')');
+    }
+
+    if !timestamp_started {
+        return Err(DataServerError::GeoTiff(format!(
+            "filename_template '{}' contains no strftime codes (%%Y, %%m, etc.)", template
+        )));
+    }
+
+    Ok((regex, timestamp_format))
+}
+
 /// Format byte count as human-readable string.
 fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
@@ -825,5 +947,47 @@ mod tests {
     fn expand_prefix_zero_days_defaults_to_one() {
         let result = expand_prefix_pattern("%Y/%m/%d/data/", 0);
         assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn template_opera_acrr() {
+        let (regex, fmt) = expand_filename_template("OPERA@%Y%m%dT%H%M@0@ACRR.tiff").unwrap();
+        assert_eq!(fmt, "%Y%m%dT%H%M");
+        // Verify the regex actually matches real filenames
+        let re = Regex::new(&regex).unwrap();
+        let caps = re.captures("OPERA@20260324T2040@0@ACRR.tiff").unwrap();
+        assert_eq!(caps.name("timestamp").unwrap().as_str(), "20260324T2040");
+    }
+
+    #[test]
+    fn template_radar_with_trailing_z() {
+        let (regex, fmt) = expand_filename_template("radar_%Y%m%dT%H%MZ.tif").unwrap();
+        assert_eq!(fmt, "%Y%m%dT%H%MZ");
+        let re = Regex::new(&regex).unwrap();
+        let caps = re.captures("radar_20260324T2315Z.tif").unwrap();
+        assert_eq!(caps.name("timestamp").unwrap().as_str(), "20260324T2315Z");
+    }
+
+    #[test]
+    fn template_fmi_leading_timestamp() {
+        let (regex, fmt) = expand_filename_template("%Y%m%d%H%M_composite_cappi_600_dbzh_finrad_qc.tif").unwrap();
+        assert_eq!(fmt, "%Y%m%d%H%M");
+        let re = Regex::new(&regex).unwrap();
+        let caps = re.captures("202603251955_composite_cappi_600_dbzh_finrad_qc.tif").unwrap();
+        assert_eq!(caps.name("timestamp").unwrap().as_str(), "202603251955");
+    }
+
+    #[test]
+    fn template_with_dashes() {
+        let (regex, fmt) = expand_filename_template("data_%Y-%m-%dT%H:%M:%S.tif").unwrap();
+        assert_eq!(fmt, "%Y-%m-%dT%H:%M:%S");
+        let re = Regex::new(&regex).unwrap();
+        let caps = re.captures("data_2026-03-25T19:30:00.tif").unwrap();
+        assert_eq!(caps.name("timestamp").unwrap().as_str(), "2026-03-25T19:30:00");
+    }
+
+    #[test]
+    fn template_no_codes_rejected() {
+        assert!(expand_filename_template("radar_data.tif").is_err());
     }
 }

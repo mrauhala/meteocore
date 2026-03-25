@@ -44,12 +44,17 @@ pub struct CollectionConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GeoTiffConfig {
+    /// Simple filename template with strftime placeholders.
+    /// E.g. `"OPERA@%Y%m%dT%H%M@0@ACRR.tiff"` or `"radar_%Y%m%dT%H%MZ.tif"`
+    /// Auto-derives regex and timestamp format. Preferred over filename_pattern.
+    pub filename_template: Option<String>,
     /// Regex pattern with a named capture group `timestamp` for extracting
     /// timestamps from filenames. E.g. `radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif`
-    pub filename_pattern: String,
+    /// Only needed for complex patterns that filename_template can't express.
+    pub filename_pattern: Option<String>,
     /// chrono strftime format for parsing the captured timestamp string.
-    /// E.g. `%Y%m%dT%H%MZ`
-    pub timestamp_format: String,
+    /// E.g. `%Y%m%dT%H%MZ`. Only needed when using filename_pattern.
+    pub timestamp_format: Option<String>,
     /// The parameter name this collection represents. E.g. "reflectivity"
     pub parameter: String,
     /// Unit of measurement. E.g. "dBZ"
