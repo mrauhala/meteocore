@@ -16,14 +16,65 @@ const MAX_DECODED_TILE_BYTES: usize = 64 * 1024 * 1024; // 64 MB
 /// Maximum number of pixels in an area query result.
 const MAX_AREA_PIXELS: usize = 1_000_000;
 
+/// Size of the initial header read for COG range reads (64 KB).
+/// This is enough for the IFD and all tag values in typical COGs.
+pub(crate) const HEADER_READ_SIZE: usize = 64 * 1024;
+
+/// TIFF compression methods we support for manual decompression.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TiffCompression {
+    None,
+    Deflate,
+    Lzw,
+}
+
+/// Sample data type from BitsPerSample + SampleFormat.
+#[derive(Debug, Clone, Copy)]
+pub enum SampleType {
+    U8,
+    U16,
+    I16,
+    F32,
+    F64,
+}
+
+impl SampleType {
+    fn bytes_per_sample(self) -> usize {
+        match self {
+            SampleType::U8 => 1,
+            SampleType::U16 | SampleType::I16 => 2,
+            SampleType::F32 => 4,
+            SampleType::F64 => 8,
+        }
+    }
+}
+
+/// Tile layout info extracted from the IFD for range-read-based tile access.
+#[derive(Debug, Clone)]
+pub struct RemoteTileInfo {
+    pub tile_offsets: Vec<u64>,
+    pub tile_byte_counts: Vec<u64>,
+    pub compression: TiffCompression,
+    pub sample_type: SampleType,
+    pub predictor: u16,
+    pub tile_width: u32,
+    pub tile_height: u32,
+}
+
 /// Data source for reading GeoTIFF data.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum DataSource {
     /// Local filesystem path.
     LocalFile(PathBuf),
-    /// In-memory bytes (downloaded from S3/HTTP).
+    /// In-memory bytes (downloaded from S3/HTTP). Used as fallback.
     InMemory(Bytes),
+    /// Remote file accessed via byte-range reads. Only IFD metadata is cached;
+    /// tile data is fetched on demand.
+    Remote {
+        store: ds_storage::DataStore,
+        path: ds_storage::object_store::path::Path,
+        tile_info: RemoteTileInfo,
+    },
 }
 
 impl DataSource {
@@ -31,12 +82,11 @@ impl DataSource {
         DataSource::LocalFile(path.to_path_buf())
     }
 
-    #[allow(dead_code)]
     pub fn from_bytes(data: Bytes) -> Self {
         DataSource::InMemory(data)
     }
 
-    /// Open a decoder for this data source.
+    /// Open a decoder for this data source (LocalFile and InMemory only).
     fn open_decoder(&self) -> Result<DecoderWrapper, DataServerError> {
         match self {
             DataSource::LocalFile(path) => {
@@ -54,6 +104,9 @@ impl DataSource {
                         .map_err(|e| DataServerError::GeoTiff(format!("Invalid TIFF (in-memory): {e}")))?,
                 ))
             }
+            DataSource::Remote { .. } => {
+                Err(DataServerError::GeoTiff("Cannot open decoder for Remote source; use range reads".into()))
+            }
         }
     }
 
@@ -61,6 +114,7 @@ impl DataSource {
         match self {
             DataSource::LocalFile(p) => p.display().to_string(),
             DataSource::InMemory(_) => "<in-memory>".to_string(),
+            DataSource::Remote { path, .. } => format!("<remote:{}>", path),
         }
     }
 }
@@ -179,6 +233,32 @@ impl TiffMetadata {
         })
     }
 
+    /// Parse metadata from a partial header read (COG range read).
+    ///
+    /// Reads the first `HEADER_READ_SIZE` bytes from the remote file and
+    /// parses the IFD. Also extracts tile offsets, byte counts, compression,
+    /// and sample type for on-demand tile reading.
+    ///
+    /// Returns `None` if parsing fails (caller should fall back to full download).
+    pub fn from_header_read(
+        store: &ds_storage::DataStore,
+        path: &ds_storage::object_store::path::Path,
+        file_size: u64,
+    ) -> Option<(Self, RemoteTileInfo)> {
+        let read_size = HEADER_READ_SIZE.min(file_size as usize);
+        let header_bytes = store.get_range(path, 0..read_size).ok()?;
+        let cursor = Cursor::new(header_bytes.to_vec());
+        let mut decoder = DecoderWrapper::Memory(
+            Decoder::new(cursor).ok()?,
+        );
+
+        let metadata = Self::from_decoder_wrapper(&mut decoder, format!("<remote:{}>", path)).ok()?;
+
+        let tile_info = extract_tile_info(&mut decoder, &metadata)?;
+
+        Some((metadata, tile_info))
+    }
+
     /// Apply scale/offset to convert raw value to physical value.
     fn to_physical(&self, raw: f64) -> f64 {
         match (self.scale, self.offset) {
@@ -261,6 +341,226 @@ fn decode_chunk_f64(
     Ok(values)
 }
 
+/// Extract tile layout info from a decoder for remote range-read access.
+fn extract_tile_info(decoder: &mut DecoderWrapper, metadata: &TiffMetadata) -> Option<RemoteTileInfo> {
+    let tile_offsets = extract_u64_list(&decoder.get_tag(Tag::TileOffsets).ok()?)?;
+    let tile_byte_counts = extract_u64_list(&decoder.get_tag(Tag::TileByteCounts).ok()?)?;
+
+    if tile_offsets.is_empty() || tile_offsets.len() != tile_byte_counts.len() {
+        return None;
+    }
+
+    let compression_code = read_tag_u32(decoder, Tag::Compression).unwrap_or(1);
+    let compression = match compression_code {
+        1 => TiffCompression::None,
+        5 => TiffCompression::Lzw,
+        8 | 32946 => TiffCompression::Deflate,
+        _ => return None, // unsupported compression — caller falls back to full download
+    };
+
+    let bits_per_sample = read_tag_u32(decoder, Tag::BitsPerSample).unwrap_or(8) as u16;
+    let sample_format = read_tag_u32(decoder, Tag::SampleFormat).unwrap_or(1);
+
+    let sample_type = match (bits_per_sample, sample_format) {
+        (8, 1) => SampleType::U8,
+        (16, 1) => SampleType::U16,
+        (16, 2) => SampleType::I16,
+        (32, 3) => SampleType::F32,
+        (64, 3) => SampleType::F64,
+        _ => return None, // unsupported sample type
+    };
+
+    let predictor = read_tag_u32(decoder, Tag::Predictor).unwrap_or(1) as u16;
+    if predictor > 2 {
+        return None; // floating point prediction not supported
+    }
+
+    Some(RemoteTileInfo {
+        tile_offsets,
+        tile_byte_counts,
+        compression,
+        sample_type,
+        predictor,
+        tile_width: metadata.tile_width,
+        tile_height: metadata.tile_height,
+    })
+}
+
+/// Extract a Vec<u64> from a TIFF IFD Value (for TileOffsets/TileByteCounts).
+fn extract_u64_list(value: &tiff::decoder::ifd::Value) -> Option<Vec<u64>> {
+    match value {
+        tiff::decoder::ifd::Value::List(items) => {
+            let mut result = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    tiff::decoder::ifd::Value::Unsigned(v) => result.push(*v as u64),
+                    tiff::decoder::ifd::Value::UnsignedBig(v) => result.push(*v),
+                    tiff::decoder::ifd::Value::Short(v) => result.push(*v as u64),
+                    _ => return None,
+                }
+            }
+            Some(result)
+        }
+        tiff::decoder::ifd::Value::Unsigned(v) => Some(vec![*v as u64]),
+        tiff::decoder::ifd::Value::UnsignedBig(v) => Some(vec![*v]),
+        _ => None,
+    }
+}
+
+/// Decompress raw tile bytes based on compression type.
+fn decompress_tile(
+    compressed: &[u8],
+    compression: TiffCompression,
+) -> Result<Vec<u8>, DataServerError> {
+    match compression {
+        TiffCompression::None => Ok(compressed.to_vec()),
+        TiffCompression::Deflate => {
+            use std::io::Read;
+            let mut decoder = flate2::read::ZlibDecoder::new(compressed);
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed)
+                .map_err(|e| DataServerError::GeoTiff(format!("Deflate decompression failed: {e}")))?;
+            Ok(decompressed)
+        }
+        TiffCompression::Lzw => {
+            let mut decoder = weezl::decode::Decoder::new(weezl::BitOrder::Msb, 8);
+            decoder.decode(compressed)
+                .map_err(|e| DataServerError::GeoTiff(format!("LZW decompression failed: {e}")))
+        }
+    }
+}
+
+/// Apply horizontal differencing predictor (TIFF predictor=2).
+/// Undoes the differencing: each sample = prev_sample + delta.
+fn undo_horizontal_predictor(data: &mut [u8], tile_width: u32, bytes_per_sample: usize) {
+    let row_bytes = tile_width as usize * bytes_per_sample;
+    for row_start in (0..data.len()).step_by(row_bytes) {
+        let row_end = (row_start + row_bytes).min(data.len());
+        if row_end - row_start < 2 * bytes_per_sample {
+            continue;
+        }
+        // For each byte position within the sample size, accumulate independently.
+        // This matches TIFF spec: differencing is per byte position.
+        for b in 0..bytes_per_sample {
+            for i in (row_start + bytes_per_sample + b..row_end).step_by(bytes_per_sample) {
+                data[i] = data[i].wrapping_add(data[i - bytes_per_sample]);
+            }
+        }
+    }
+}
+
+/// Decode a raw (decompressed) tile into Vec<Option<f64>> values.
+fn decode_raw_tile_f64(
+    raw: &[u8],
+    tile_info: &RemoteTileInfo,
+    metadata: &TiffMetadata,
+) -> Result<Vec<Option<f64>>, DataServerError> {
+    let bps = tile_info.sample_type.bytes_per_sample();
+    let pixel_count = raw.len() / bps;
+    let mut values = Vec::with_capacity(pixel_count);
+
+    match tile_info.sample_type {
+        SampleType::U8 => {
+            for &v in raw {
+                let fv = v as f64;
+                if metadata.is_nodata_raw(fv) {
+                    values.push(None);
+                } else {
+                    values.push(Some(metadata.to_physical(fv)));
+                }
+            }
+        }
+        SampleType::U16 => {
+            for chunk in raw.chunks_exact(2) {
+                let v = u16::from_le_bytes([chunk[0], chunk[1]]);
+                let fv = v as f64;
+                if metadata.is_nodata_raw(fv) {
+                    values.push(None);
+                } else {
+                    values.push(Some(metadata.to_physical(fv)));
+                }
+            }
+        }
+        SampleType::I16 => {
+            for chunk in raw.chunks_exact(2) {
+                let v = i16::from_le_bytes([chunk[0], chunk[1]]);
+                let fv = v as f64;
+                if metadata.is_nodata_raw(fv) {
+                    values.push(None);
+                } else {
+                    values.push(Some(metadata.to_physical(fv)));
+                }
+            }
+        }
+        SampleType::F32 => {
+            for chunk in raw.chunks_exact(4) {
+                let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let fv = v as f64;
+                if v.is_nan() || metadata.is_nodata_raw(fv) {
+                    values.push(None);
+                } else {
+                    values.push(Some(metadata.to_physical(fv)));
+                }
+            }
+        }
+        SampleType::F64 => {
+            for chunk in raw.chunks_exact(8) {
+                let v = f64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3],
+                    chunk[4], chunk[5], chunk[6], chunk[7],
+                ]);
+                if v.is_nan() || metadata.is_nodata_raw(v) {
+                    values.push(None);
+                } else {
+                    values.push(Some(metadata.to_physical(v)));
+                }
+            }
+        }
+    }
+
+    Ok(values)
+}
+
+/// Read and decode a tile from a remote source via byte-range read.
+fn read_remote_chunk_f64(
+    store: &ds_storage::DataStore,
+    path: &ds_storage::object_store::path::Path,
+    tile_info: &RemoteTileInfo,
+    metadata: &TiffMetadata,
+    chunk_index: u32,
+) -> Result<Vec<Option<f64>>, DataServerError> {
+    let idx = chunk_index as usize;
+    if idx >= tile_info.tile_offsets.len() {
+        return Err(DataServerError::GeoTiff(format!(
+            "Tile index {} out of range ({})", idx, tile_info.tile_offsets.len()
+        )));
+    }
+
+    let offset = tile_info.tile_offsets[idx] as usize;
+    let byte_count = tile_info.tile_byte_counts[idx] as usize;
+
+    if byte_count == 0 {
+        // Empty tile — return all nodata
+        let pixel_count = (tile_info.tile_width * tile_info.tile_height) as usize;
+        return Ok(vec![None; pixel_count]);
+    }
+
+    let compressed = store.get_range(path, offset..offset + byte_count)
+        .map_err(|e| DataServerError::GeoTiff(format!("Failed to read tile range: {e}")))?;
+
+    let mut raw = decompress_tile(&compressed, tile_info.compression)?;
+
+    if tile_info.predictor == 2 {
+        undo_horizontal_predictor(
+            &mut raw,
+            tile_info.tile_width,
+            tile_info.sample_type.bytes_per_sample(),
+        );
+    }
+
+    decode_raw_tile_f64(&raw, tile_info, metadata)
+}
+
 /// Read a single pixel value from a GeoTIFF at a given pixel coordinate.
 pub fn read_pixel(source: &DataSource, metadata: &TiffMetadata, col: u32, row: u32) -> Result<Option<f64>, DataServerError> {
     let tile_col = col / metadata.tile_width;
@@ -271,8 +571,15 @@ pub fn read_pixel(source: &DataSource, metadata: &TiffMetadata, col: u32, row: u
     let local_row = row % metadata.tile_height;
     let local_idx = (local_row * metadata.tile_width + local_col) as usize;
 
-    let mut decoder = source.open_decoder()?;
-    let values = decode_chunk_f64(&mut decoder, chunk_index, metadata)?;
+    let values = match source {
+        DataSource::Remote { store, path, tile_info } => {
+            read_remote_chunk_f64(store, path, tile_info, metadata, chunk_index)?
+        }
+        _ => {
+            let mut decoder = source.open_decoder()?;
+            decode_chunk_f64(&mut decoder, chunk_index, metadata)?
+        }
+    };
 
     if local_idx >= values.len() {
         return Ok(None);
@@ -301,7 +608,11 @@ pub fn read_bbox(
         )));
     }
 
-    let mut decoder = source.open_decoder()?;
+    // Open decoder once for non-remote sources
+    let mut decoder = match source {
+        DataSource::Remote { .. } => None,
+        _ => Some(source.open_decoder()?),
+    };
 
     let mut result = vec![None; total_pixels];
 
@@ -313,7 +624,12 @@ pub fn read_bbox(
     for tile_row in tile_row_start..tile_row_end {
         for tile_col in tile_col_start..tile_col_end {
             let chunk_index = tile_row * metadata.tiles_across + tile_col;
-            let tile_data = decode_chunk_f64(&mut decoder, chunk_index, metadata)?;
+            let tile_data = match source {
+                DataSource::Remote { store, path, tile_info } => {
+                    read_remote_chunk_f64(store, path, tile_info, metadata, chunk_index)?
+                }
+                _ => decode_chunk_f64(decoder.as_mut().unwrap(), chunk_index, metadata)?,
+            };
 
             let tile_pixel_col_start = tile_col * metadata.tile_width;
             let tile_pixel_row_start = tile_row * metadata.tile_height;
@@ -644,5 +960,110 @@ fn extract_doubles(value: &tiff::decoder::ifd::Value) -> Option<Vec<f64>> {
             Some(result)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn find_test_radar_dir() -> PathBuf {
+        let candidates = ["testdata/radar", "../../testdata/radar"];
+        for c in &candidates {
+            let p = PathBuf::from(c);
+            if p.is_dir() {
+                return p;
+            }
+        }
+        panic!("Cannot find testdata/radar directory");
+    }
+
+    fn find_first_tif(dir: &Path) -> PathBuf {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            if name.ends_with(".tif") {
+                return entry.path();
+            }
+        }
+        panic!("No .tif files found in {}", dir.display());
+    }
+
+    #[test]
+    fn header_read_parses_same_metadata_as_full_file() {
+        let dir = find_test_radar_dir();
+        let tif_path = find_first_tif(&dir);
+
+        // Full-file path: parse from local file
+        let full_meta = TiffMetadata::from_file(&tif_path).unwrap();
+
+        // Range-read path: use local store + get_range
+        let (store, _prefix) = ds_storage::build_store(dir.to_str().unwrap()).unwrap();
+        let filename = tif_path.file_name().unwrap().to_str().unwrap();
+        let obj_path = ds_storage::object_store::path::Path::from(filename);
+        let file_size = std::fs::metadata(&tif_path).unwrap().len();
+
+        let (header_meta, tile_info) =
+            TiffMetadata::from_header_read(&store, &obj_path, file_size)
+                .expect("from_header_read should succeed on test COG");
+
+        // Metadata should match
+        assert_eq!(full_meta.width, header_meta.width);
+        assert_eq!(full_meta.height, header_meta.height);
+        assert_eq!(full_meta.tile_width, header_meta.tile_width);
+        assert_eq!(full_meta.tile_height, header_meta.tile_height);
+        assert_eq!(full_meta.tiles_across, header_meta.tiles_across);
+        assert_eq!(full_meta.tiles_down, header_meta.tiles_down);
+        assert_eq!(full_meta.nodata, header_meta.nodata);
+        assert_eq!(full_meta.scale, header_meta.scale);
+        assert_eq!(full_meta.offset, header_meta.offset);
+
+        // Tile info should be populated
+        let total_tiles = (header_meta.tiles_across * header_meta.tiles_down) as usize;
+        assert_eq!(tile_info.tile_offsets.len(), total_tiles);
+        assert_eq!(tile_info.tile_byte_counts.len(), total_tiles);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn range_read_pixel_matches_full_file_pixel() {
+        let dir = find_test_radar_dir();
+        let tif_path = find_first_tif(&dir);
+
+        // Full-file read
+        let full_meta = TiffMetadata::from_file(&tif_path).unwrap();
+        let full_source = DataSource::from_path(&tif_path);
+
+        // Range-read setup
+        let (store, _prefix) = ds_storage::build_store(dir.to_str().unwrap()).unwrap();
+        let filename = tif_path.file_name().unwrap().to_str().unwrap();
+        let obj_path = ds_storage::object_store::path::Path::from(filename);
+        let file_size = std::fs::metadata(&tif_path).unwrap().len();
+
+        let (header_meta, tile_info) =
+            TiffMetadata::from_header_read(&store, &obj_path, file_size).unwrap();
+
+        let remote_source = DataSource::Remote {
+            store: store.clone(),
+            path: obj_path,
+            tile_info,
+        };
+
+        // Compare several pixel values
+        let test_coords = [
+            (0, 0),
+            (full_meta.width / 2, full_meta.height / 2),
+            (full_meta.width - 1, full_meta.height - 1),
+            (full_meta.tile_width, full_meta.tile_height), // second tile
+        ];
+
+        for (col, row) in test_coords {
+            let full_val = read_pixel(&full_source, &full_meta, col, row).unwrap();
+            let range_val = read_pixel(&remote_source, &header_meta, col, row).unwrap();
+            assert_eq!(
+                full_val, range_val,
+                "Pixel mismatch at ({}, {}): full={:?} vs range={:?}",
+                col, row, full_val, range_val
+            );
+        }
     }
 }

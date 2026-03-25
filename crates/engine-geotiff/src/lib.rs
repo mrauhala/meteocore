@@ -115,7 +115,7 @@ impl GeoTiffEngine {
     fn do_scan(
         &self,
         local_existing: &BTreeMap<PathBuf, (u64, TiffMetadata)>,
-        remote_existing: &BTreeMap<PathBuf, (u64, TiffMetadata, bytes::Bytes)>,
+        remote_existing: &BTreeMap<PathBuf, catalog::FileEntry>,
     ) -> Result<Catalog, DataServerError> {
         let mut catalog = match &self.store_mode {
             StoreMode::Local { directory, pending } => {
@@ -172,16 +172,10 @@ impl GeoTiffEngine {
                 self.do_scan(&existing, &BTreeMap::new())
             }
             StoreMode::Remote { .. } => {
-                let existing: BTreeMap<PathBuf, (u64, TiffMetadata, bytes::Bytes)> = current
+                let existing: BTreeMap<PathBuf, catalog::FileEntry> = current
                     .entries
                     .values()
-                    .filter_map(|e| {
-                        if let crate::reader::DataSource::InMemory(bytes) = &e.source {
-                            Some((e.path.clone(), (e.file_size, e.metadata.clone(), bytes.clone())))
-                        } else {
-                            None
-                        }
-                    })
+                    .map(|e| (e.path.clone(), e.clone()))
                     .collect();
                 self.do_scan(&BTreeMap::new(), &existing)
             }

@@ -14,3 +14,5 @@ tracing = "0.1"
 bytes = "1"
 ds-storage = { path = "../storage" }
 futures = "0.3"
+flate2 = "1"
+weezl = "0.1"
