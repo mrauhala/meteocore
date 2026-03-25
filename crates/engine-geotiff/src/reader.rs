@@ -430,7 +430,9 @@ fn decompress_tile(
             Ok(decompressed)
         }
         TiffCompression::Lzw => {
-            let mut decoder = weezl::decode::Decoder::new(weezl::BitOrder::Msb, 8);
+            // TIFF LZW uses an early code size increase compared to standard LZW.
+            // with_tiff_size_switch enables this TIFF-specific behavior.
+            let mut decoder = weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8);
             decoder.decode(compressed)
                 .map_err(|e| DataServerError::GeoTiff(format!("LZW decompression failed: {e}")))
         }
