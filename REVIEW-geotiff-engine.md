@@ -260,6 +260,6 @@ All reviewers noted these positive aspects:
 | Tier | Focus | Items | Status |
 |------|-------|-------|--------|
 | **1** | Safety | #1-5 | **DONE** |
-| **2** | Reliability | #6-10 | TODO |
-| **3** | Performance | #11-15 | TODO |
-| **4** | UX & Maintainability | #16-25 | TODO |
+| **2** | Reliability | #6-10 | **DONE** |
+| **3** | Performance | #11-15 | **DONE** |
+| **4** | UX & Maintainability | #16-25 | **DONE** |

@@ -1,6 +1,7 @@
 mod cache;
 mod catalog;
 mod geo;
+mod parse;
 mod reader;
 mod time_window;
 
@@ -74,6 +75,9 @@ impl GeoTiffEngine {
     /// - `data_path` starting with `s3://` or `http(s)://`: S3/HTTP with fixed prefix
     /// - `data_path` otherwise: local directory
     pub fn new(collection_id: &str, data_path: Option<&str>, config: &GeoTiffConfig) -> Result<Self, DataServerError> {
+        // Validate config early
+        validate_config(collection_id, data_path, config)?;
+
         // Derive filename_pattern and timestamp_format from template or explicit fields
         let (pattern_str, timestamp_format) = resolve_filename_config(config)?;
 
@@ -370,12 +374,7 @@ impl GeoTiffEngine {
         }
 
         let catalog = self.catalog.load();
-
-        let entries: Vec<_> = if let Some((start, end)) = datetime {
-            catalog.entries.range(start..=end).collect()
-        } else {
-            catalog.entries.iter().collect()
-        };
+        let entries = filter_by_datetime(&catalog.entries, datetime);
 
         if entries.is_empty() {
             return Err(DataServerError::LocationNotFound(
@@ -458,12 +457,7 @@ impl GeoTiffEngine {
         }
 
         let catalog = self.catalog.load();
-
-        let entries: Vec<_> = if let Some((start, end)) = datetime {
-            catalog.entries.range(start..=end).collect()
-        } else {
-            catalog.entries.iter().collect()
-        };
+        let entries = filter_by_datetime(&catalog.entries, datetime);
 
         if entries.is_empty() {
             return Err(DataServerError::LocationNotFound(
@@ -567,6 +561,18 @@ impl GeoTiffEngine {
     }
 }
 
+/// Filter catalog entries by an optional datetime range.
+/// Returns references to matching (timestamp, entry) pairs.
+fn filter_by_datetime<'a>(
+    entries: &'a BTreeMap<DateTime<Utc>, catalog::FileEntry>,
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Vec<(&'a DateTime<Utc>, &'a catalog::FileEntry)> {
+    match datetime {
+        Some((start, end)) => entries.range(start..=end).collect(),
+        None => entries.iter().collect(),
+    }
+}
+
 impl Engine for GeoTiffEngine {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
         Ok(vec![])
@@ -574,13 +580,15 @@ impl Engine for GeoTiffEngine {
 
     fn query_location(
         &self,
-        location_id: &str,
-        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
-        parameters: Option<&[String]>,
+        _location_id: &str,
+        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
     ) -> Result<QueryResult, DataServerError> {
-        // Fallback: parse location_id as "lat,lon" and delegate to query_point
-        let (lat, lon) = parse_location_id(location_id)?;
-        self.query_point(lat, lon, datetime, parameters)
+        Err(DataServerError::InvalidParameter(
+            "GeoTIFF engine does not support named location queries. \
+             Use the position query endpoint instead (e.g., /position?coords=POINT(lon lat))."
+                .into(),
+        ))
     }
 
     fn query_position(
@@ -631,6 +639,47 @@ impl Engine for GeoTiffEngine {
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
         self.catalog.load().spatial_extent
     }
+}
+
+/// Validate GeoTIFF config for common mistakes that would otherwise cause
+/// confusing runtime behavior.
+fn validate_config(collection_id: &str, data_path: Option<&str>, config: &GeoTiffConfig) -> Result<(), DataServerError> {
+    // endpoint and bucket must both be set or both absent
+    match (&config.endpoint, &config.bucket) {
+        (Some(_), None) => {
+            return Err(DataServerError::GeoTiff(format!(
+                "[{collection_id}] 'endpoint' is set but 'bucket' is missing — both are required for S3 access"
+            )));
+        }
+        (None, Some(_)) => {
+            return Err(DataServerError::GeoTiff(format!(
+                "[{collection_id}] 'bucket' is set but 'endpoint' is missing — both are required for S3 access"
+            )));
+        }
+        _ => {}
+    }
+
+    // Warn if both endpoint+bucket and data_path are set (data_path is silently ignored)
+    if config.endpoint.is_some() && data_path.is_some() {
+        tracing::warn!(
+            "[{}] Both endpoint+bucket and data_path are set; data_path will be ignored in favor of S3",
+            collection_id
+        );
+    }
+
+    if config.poll_interval_secs == 0 {
+        return Err(DataServerError::GeoTiff(format!(
+            "[{collection_id}] poll_interval_secs must be > 0"
+        )));
+    }
+
+    if config.band == 0 {
+        return Err(DataServerError::GeoTiff(format!(
+            "[{collection_id}] band must be >= 1 (1-based index)"
+        )));
+    }
+
+    Ok(())
 }
 
 /// Resolve filename_template or filename_pattern + timestamp_format from config.
@@ -796,151 +845,7 @@ fn expand_prefix_pattern(pattern: &str, scan_days: u32) -> Vec<String> {
     expand_prefix_for_dates(pattern, &dates)
 }
 
-/// Parse EDR position query coordinates.
-/// Accepts `POINT(lon lat)` (WKT) or `lon,lat` format.
-/// Returns (lat, lon).
-fn parse_coords(coords: &str) -> Result<(f64, f64), DataServerError> {
-    let trimmed = coords.trim();
-
-    // Try WKT POINT format: POINT(lon lat)
-    if let Some(inner) = trimmed
-        .strip_prefix("POINT(")
-        .or_else(|| trimmed.strip_prefix("POINT ("))
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        let parts: Vec<&str> = inner.trim().split_whitespace().collect();
-        if parts.len() != 2 {
-            return Err(DataServerError::InvalidParameter(
-                "Expected POINT(lon lat) format".into(),
-            ));
-        }
-        let lon: f64 = parts[0].parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid longitude: {}", parts[0]))
-        })?;
-        let lat: f64 = parts[1].parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid latitude: {}", parts[1]))
-        })?;
-        return validate_coords(lat, lon);
-    }
-
-    // Try simple "lon,lat" format
-    let parts: Vec<&str> = trimmed.split(',').collect();
-    if parts.len() == 2 {
-        let lon: f64 = parts[0].trim().parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid longitude: {}", parts[0]))
-        })?;
-        let lat: f64 = parts[1].trim().parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid latitude: {}", parts[1]))
-        })?;
-        return validate_coords(lat, lon);
-    }
-
-    Err(DataServerError::InvalidParameter(
-        "Expected coords as POINT(lon lat) or lon,lat".into(),
-    ))
-}
-
-fn validate_coords(lat: f64, lon: f64) -> Result<(f64, f64), DataServerError> {
-    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
-        return Err(DataServerError::InvalidParameter(format!(
-            "Coordinates out of range: lat={lat}, lon={lon}"
-        )));
-    }
-    Ok((lat, lon))
-}
-
-/// Parse EDR area query coordinates.
-/// Accepts `POLYGON((lon1 lat1, lon2 lat2, ...))` (WKT) — extracts the bounding box.
-/// Also accepts `bbox` format `west,south,east,north`.
-/// Returns (west, south, east, north).
-fn parse_bbox_coords(coords: &str) -> Result<(f64, f64, f64, f64), DataServerError> {
-    let trimmed = coords.trim();
-
-    // Try WKT POLYGON format
-    if let Some(inner) = trimmed
-        .strip_prefix("POLYGON((")
-        .or_else(|| trimmed.strip_prefix("POLYGON (("))
-        .and_then(|s| s.strip_suffix("))"))
-    {
-        let points: Vec<&str> = inner.split(',').collect();
-        if points.len() < 3 {
-            return Err(DataServerError::InvalidParameter(
-                "POLYGON must have at least 3 coordinate pairs".into(),
-            ));
-        }
-
-        let mut min_lon = f64::MAX;
-        let mut max_lon = f64::MIN;
-        let mut min_lat = f64::MAX;
-        let mut max_lat = f64::MIN;
-
-        for point in &points {
-            let parts: Vec<&str> = point.trim().split_whitespace().collect();
-            if parts.len() != 2 {
-                return Err(DataServerError::InvalidParameter(format!(
-                    "Invalid coordinate pair: '{}'", point.trim()
-                )));
-            }
-            let lon: f64 = parts[0].parse().map_err(|_| {
-                DataServerError::InvalidParameter(format!("Invalid longitude: {}", parts[0]))
-            })?;
-            let lat: f64 = parts[1].parse().map_err(|_| {
-                DataServerError::InvalidParameter(format!("Invalid latitude: {}", parts[1]))
-            })?;
-            min_lon = min_lon.min(lon);
-            max_lon = max_lon.max(lon);
-            min_lat = min_lat.min(lat);
-            max_lat = max_lat.max(lat);
-        }
-
-        return Ok((min_lon, min_lat, max_lon, max_lat));
-    }
-
-    // Try simple bbox format: west,south,east,north
-    let parts: Vec<&str> = trimmed.split(',').collect();
-    if parts.len() == 4 {
-        let west: f64 = parts[0].trim().parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid west: {}", parts[0]))
-        })?;
-        let south: f64 = parts[1].trim().parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid south: {}", parts[1]))
-        })?;
-        let east: f64 = parts[2].trim().parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid east: {}", parts[2]))
-        })?;
-        let north: f64 = parts[3].trim().parse().map_err(|_| {
-            DataServerError::InvalidParameter(format!("Invalid north: {}", parts[3]))
-        })?;
-        return Ok((west, south, east, north));
-    }
-
-    Err(DataServerError::InvalidParameter(
-        "Expected coords as POLYGON((lon1 lat1, lon2 lat2, ...)) or west,south,east,north".into(),
-    ))
-}
-
-fn parse_location_id(id: &str) -> Result<(f64, f64), DataServerError> {
-    let parts: Vec<&str> = id.split(',').collect();
-    if parts.len() != 2 {
-        return Err(DataServerError::LocationNotFound(format!(
-            "Expected 'lat,lon' format, got: {id}"
-        )));
-    }
-    let lat: f64 = parts[0].trim().parse().map_err(|_| {
-        DataServerError::LocationNotFound(format!("Invalid latitude in: {id}"))
-    })?;
-    let lon: f64 = parts[1].trim().parse().map_err(|_| {
-        DataServerError::LocationNotFound(format!("Invalid longitude in: {id}"))
-    })?;
-
-    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
-        return Err(DataServerError::LocationNotFound(format!(
-            "Coordinates out of range: lat={lat}, lon={lon}"
-        )));
-    }
-
-    Ok((lat, lon))
-}
+use parse::{parse_coords, parse_bbox_coords};
 
 #[cfg(test)]
 mod tests {

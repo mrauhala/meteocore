@@ -205,9 +205,15 @@ impl TiffMetadata {
         }
 
         let tile_width = read_tag_u32(decoder, Tag::TileWidth)
-            .ok_or_else(|| DataServerError::GeoTiff(format!("{source_name}: Not a tiled TIFF (TileWidth missing)")))?;
+            .ok_or_else(|| DataServerError::GeoTiff(format!(
+                "{source_name}: Not a tiled TIFF (TileWidth missing). \
+                 Convert to tiled COG with: gdal_translate -co TILED=YES -co COMPRESS=DEFLATE input.tif output.tif"
+            )))?;
         let tile_height = read_tag_u32(decoder, Tag::TileLength)
-            .ok_or_else(|| DataServerError::GeoTiff(format!("{source_name}: Not a tiled TIFF (TileLength missing)")))?;
+            .ok_or_else(|| DataServerError::GeoTiff(format!(
+                "{source_name}: Not a tiled TIFF (TileLength missing). \
+                 Convert to tiled COG with: gdal_translate -co TILED=YES -co COMPRESS=DEFLATE input.tif output.tif"
+            )))?;
 
         let tiles_across = (width + tile_width - 1) / tile_width;
         let tiles_down = (height + tile_height - 1) / tile_height;
