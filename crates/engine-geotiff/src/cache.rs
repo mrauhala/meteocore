@@ -5,15 +5,17 @@
 //! compressed bytes gives 58x better memory efficiency than decoded tiles
 //! with negligible CPU overhead on cache hits.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use bytes::Bytes;
 
 /// Cache key: uniquely identifies a compressed tile across all files.
+/// Uses Arc<str> instead of PathBuf to avoid allocation on every lookup.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TileCacheKey {
-    file_path: PathBuf,
+    file_path: Arc<str>,
     chunk_index: u32,
 }
 
@@ -59,7 +61,7 @@ impl TileCache {
     /// Look up a cached compressed tile.
     pub fn get(&self, file_path: &Path, chunk_index: u32) -> Option<Bytes> {
         let key = TileCacheKey {
-            file_path: file_path.to_path_buf(),
+            file_path: Arc::from(file_path.to_string_lossy().as_ref()),
             chunk_index,
         };
         let result = self.inner.get(&key);
@@ -74,7 +76,7 @@ impl TileCache {
     /// Insert compressed tile bytes into the cache.
     pub fn insert(&self, file_path: &Path, chunk_index: u32, data: Bytes) {
         let key = TileCacheKey {
-            file_path: file_path.to_path_buf(),
+            file_path: Arc::from(file_path.to_string_lossy().as_ref()),
             chunk_index,
         };
         self.inner.insert(key, data);

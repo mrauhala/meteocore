@@ -5,7 +5,7 @@ mod reader;
 mod time_window;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -21,7 +21,6 @@ use ds_core::error::DataServerError;
 use ds_core::model::*;
 
 use crate::catalog::{scan_directory, scan_remote_with_limit, Catalog, PendingFile};
-use crate::reader::TiffMetadata;
 
 /// Whether the data source is local or remote.
 #[derive(Debug)]
@@ -168,7 +167,8 @@ impl GeoTiffEngine {
         };
 
         // Initial scan
-        let initial_catalog = engine.do_scan(&BTreeMap::new(), &BTreeMap::new())?;
+        let empty = Catalog::empty();
+        let initial_catalog = engine.do_scan(&empty)?;
         let file_count = initial_catalog.entries.len();
         let total_bytes: u64 = initial_catalog.entries.values().map(|e| e.file_size).sum();
         engine.catalog.store(Arc::new(initial_catalog));
@@ -188,11 +188,18 @@ impl GeoTiffEngine {
 
     /// Perform a scan appropriate to the store mode.
     /// Applies max_files limit if configured.
+    /// `current` is the previous catalog, used to reuse metadata for unchanged files.
     fn do_scan(
         &self,
-        local_existing: &BTreeMap<PathBuf, (u64, TiffMetadata)>,
-        remote_existing: &BTreeMap<PathBuf, catalog::FileEntry>,
+        current: &Catalog,
     ) -> Result<Catalog, DataServerError> {
+        // Build path-based index from current catalog (references only, no cloning)
+        let path_index: HashMap<&Path, &catalog::FileEntry> = current
+            .entries
+            .values()
+            .map(|e| (e.path.as_path(), e))
+            .collect();
+
         let mut catalog = match &self.store_mode {
             StoreMode::Local { directory, pending } => {
                 let mut pending = match pending.lock() {
@@ -208,7 +215,7 @@ impl GeoTiffEngine {
                     &self.timestamp_format,
                     &self.exclude_patterns,
                     &mut pending,
-                    local_existing,
+                    &path_index,
                 )?
             }
             StoreMode::Remote { store, prefix } => {
@@ -217,7 +224,7 @@ impl GeoTiffEngine {
                     prefix,
                     &self.filename_pattern,
                     &self.timestamp_format,
-                    remote_existing,
+                    &path_index,
                     self.max_files,
                     None,
                     &self.collection_id,
@@ -240,7 +247,7 @@ impl GeoTiffEngine {
                         &prefix,
                         &self.filename_pattern,
                         &self.timestamp_format,
-                        remote_existing,
+                        &path_index,
                         None, // no per-prefix limit; apply max_files after merge
                         time_filter,
                         &self.collection_id,
@@ -313,25 +320,7 @@ impl GeoTiffEngine {
 
     fn poll_once(&self) {
         let current = self.catalog.load();
-
-        let result = match &self.store_mode {
-            StoreMode::Local { .. } => {
-                let existing: BTreeMap<PathBuf, (u64, TiffMetadata)> = current
-                    .entries
-                    .values()
-                    .map(|e| (e.path.clone(), (e.file_size, e.metadata.clone())))
-                    .collect();
-                self.do_scan(&existing, &BTreeMap::new())
-            }
-            StoreMode::Remote { .. } | StoreMode::RemoteDynamic { .. } => {
-                let existing: BTreeMap<PathBuf, catalog::FileEntry> = current
-                    .entries
-                    .values()
-                    .map(|e| (e.path.clone(), e.clone()))
-                    .collect();
-                self.do_scan(&BTreeMap::new(), &existing)
-            }
-        };
+        let result = self.do_scan(&current);
 
         match result {
             Ok(new_catalog) => {

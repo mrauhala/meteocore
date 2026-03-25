@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -88,15 +88,15 @@ pub struct PendingFile {
 /// Returns a new Catalog containing all valid files. Files that fail to parse
 /// are logged and skipped.
 ///
-/// `existing_metadata` provides cached metadata for files already known, keyed
-/// by path. Files with unchanged size reuse their cached metadata.
+/// `existing` provides a path-based index of entries already in the catalog.
+/// Files with unchanged size reuse their cached metadata (no re-parse).
 pub fn scan_directory(
     dir: &Path,
     pattern: &Regex,
     timestamp_format: &str,
     exclude_patterns: &[String],
     pending: &mut BTreeMap<PathBuf, PendingFile>,
-    existing_metadata: &BTreeMap<PathBuf, (u64, TiffMetadata)>,
+    existing: &HashMap<&Path, &FileEntry>,
 ) -> Result<Catalog, DataServerError> {
     let read_dir = std::fs::read_dir(dir)
         .map_err(|e| DataServerError::GeoTiff(format!("Cannot read directory {}: {e}", dir.display())))?;
@@ -162,10 +162,10 @@ pub fn scan_directory(
         };
 
         // File readiness: check size stability for genuinely NEW files only.
-        // Files already in the catalog (existing_metadata) skip the readiness check.
-        let is_known_file = existing_metadata.contains_key(&path);
+        // Files already in the catalog (existing) skip the readiness check.
+        let existing_entry = existing.get(path.as_path());
 
-        if !is_known_file {
+        if existing_entry.is_none() {
             if let Some(prev) = pending.get(&path) {
                 if prev.size != file_size {
                     // Size changed — still being written, update pending
@@ -174,18 +174,18 @@ pub fn scan_directory(
                 }
                 // Size stable — promote from pending
                 pending.remove(&path);
-            } else if !existing_metadata.is_empty() {
+            } else if !existing.is_empty() {
                 // Genuinely new file during a poll cycle — add to pending, skip this cycle
                 pending.insert(path.clone(), PendingFile { size: file_size });
                 continue;
             }
-            // else: initial scan (existing_metadata empty) — accept immediately
+            // else: initial scan (existing empty) — accept immediately
         }
 
         // Reuse cached metadata if file size unchanged
-        let metadata = if let Some((cached_size, cached_meta)) = existing_metadata.get(&path) {
-            if *cached_size == file_size {
-                cached_meta.clone()
+        let metadata = if let Some(entry) = existing_entry {
+            if entry.file_size == file_size {
+                entry.metadata.clone()
             } else {
                 match TiffMetadata::from_file(&path) {
                     Ok(m) => m,
@@ -268,13 +268,14 @@ const MAX_REMOTE_FILE_SIZE: usize = 50 * 1024 * 1024;
 /// instead of downloading entire files. Falls back to full download if the
 /// header-only parse fails (e.g., non-COG layout or unsupported compression).
 ///
-/// Reuses cached entries for files already in the catalog with the same size.
+/// `existing` provides a path-based index of entries already in the catalog.
+/// Files with unchanged size reuse their cached entry (no re-download).
 pub fn scan_remote_with_limit(
     store: &ds_storage::DataStore,
     prefix: &ds_storage::object_store::path::Path,
     pattern: &Regex,
     timestamp_format: &str,
-    existing_entries: &BTreeMap<PathBuf, FileEntry>,
+    existing: &HashMap<&Path, &FileEntry>,
     max_files: Option<usize>,
     time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
     collection_id: &str,
@@ -350,9 +351,9 @@ pub fn scan_remote_with_limit(
         let pseudo_path = PathBuf::from(key);
 
         // Reuse cached entry if file size unchanged
-        if let Some(existing) = existing_entries.get(&pseudo_path) {
-            if existing.file_size == *file_size {
-                entries.insert(*datetime, existing.clone());
+        if let Some(entry) = existing.get(pseudo_path.as_path()) {
+            if entry.file_size == *file_size {
+                entries.insert(*datetime, (*entry).clone());
                 continue;
             }
         }
