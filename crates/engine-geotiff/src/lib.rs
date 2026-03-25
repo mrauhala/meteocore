@@ -88,9 +88,10 @@ impl GeoTiffEngine {
             let prefix_pattern = config.prefix_pattern.clone().unwrap_or_default();
             let display = format!("s3://{}/{}", bucket, prefix_pattern);
 
-            // Derive scan_days: explicit config > time_window-derived > default 2
+            // scan_days is only used as fallback when time_window is not set.
+            // When time_window is set, scan_dates() computes exact dates at scan time.
             let scan_days = config.scan_days
-                .or_else(|| parsed_time_window.as_ref().map(|tw| tw.scan_days()))
+                .or_else(|| parsed_time_window.as_ref().map(|tw| tw.max_scan_days()))
                 .unwrap_or(2);
 
             (
@@ -199,8 +200,13 @@ impl GeoTiffEngine {
                 )?
             }
             StoreMode::RemoteDynamic { store, prefix_pattern, scan_days, time_window } => {
-                let prefixes = expand_prefix_pattern(prefix_pattern, *scan_days);
-                let time_filter = time_window.as_ref().map(|tw| tw.to_range(Utc::now()));
+                let now = Utc::now();
+                let (prefixes, time_filter) = if let Some(tw) = time_window {
+                    let dates = tw.scan_dates(now);
+                    (expand_prefix_for_dates(prefix_pattern, &dates), Some(tw.to_range(now)))
+                } else {
+                    (expand_prefix_pattern(prefix_pattern, *scan_days), None)
+                };
                 let mut merged = Catalog::empty();
                 for prefix_str in &prefixes {
                     let prefix = ds_storage::object_store::path::Path::from(prefix_str.as_str());
@@ -571,28 +577,29 @@ impl Engine for GeoTiffEngine {
     }
 }
 
-/// Expand a prefix pattern with strftime templates for the last `scan_days` days.
+/// Expand a prefix pattern for specific dates.
 ///
-/// E.g. `"%Y/%m/%d/OPERA/COMP/"` with `scan_days=2` on 2026-03-25 produces:
-/// `["2026/03/25/OPERA/COMP/", "2026/03/24/OPERA/COMP/"]`
+/// E.g. `"%Y/%m/%d/OPERA/COMP/"` with dates [2026-03-25, 2026-03-24] produces:
+/// `["2026/03/25/OPERA/COMP", "2026/03/24/OPERA/COMP"]`
 ///
 /// If the pattern contains no `%` characters, returns it as-is (single prefix).
-fn expand_prefix_pattern(pattern: &str, scan_days: u32) -> Vec<String> {
+fn expand_prefix_for_dates(pattern: &str, dates: &[chrono::NaiveDate]) -> Vec<String> {
     if !pattern.contains('%') {
         return vec![pattern.trim_end_matches('/').to_string()];
     }
 
+    dates.iter().map(|date| {
+        date.format(pattern).to_string().trim_end_matches('/').to_string()
+    }).collect()
+}
+
+/// Expand a prefix pattern for the last `scan_days` days (fallback when no time_window).
+fn expand_prefix_pattern(pattern: &str, scan_days: u32) -> Vec<String> {
     let today = Utc::now().date_naive();
-    let days = scan_days.max(1);
-    let mut prefixes = Vec::with_capacity(days as usize);
-
-    for offset in 0..days {
-        let date = today - chrono::Duration::days(offset as i64);
-        let expanded = date.format(pattern).to_string();
-        prefixes.push(expanded.trim_end_matches('/').to_string());
-    }
-
-    prefixes
+    let dates: Vec<_> = (0..scan_days.max(1))
+        .map(|offset| today - chrono::Duration::days(offset as i64))
+        .collect();
+    expand_prefix_for_dates(pattern, &dates)
 }
 
 /// Parse EDR position query coordinates.

@@ -90,12 +90,28 @@ impl TimeWindow {
         }
     }
 
-    /// Number of days of prefixes needed to cover this time window.
-    /// Always includes today + enough past/future days.
-    pub fn scan_days(&self) -> u32 {
+    /// Compute the distinct dates that need prefix expansion.
+    /// Based on the actual time range (now ± duration), not a fixed day count.
+    /// E.g. at 15:00 UTC with `-PT2H`, only today is needed.
+    /// At 01:00 UTC with `-PT2H`, both today and yesterday are needed.
+    pub fn scan_dates(&self, now: DateTime<Utc>) -> Vec<chrono::NaiveDate> {
+        let (start, end) = self.to_range(now);
+        let start_date = start.date_naive();
+        let end_date = end.date_naive();
+
+        let mut dates = Vec::new();
+        let mut d = start_date;
+        while d <= end_date {
+            dates.push(d);
+            d += chrono::Duration::days(1);
+        }
+        dates
+    }
+
+    /// Maximum number of days this window could span (for config validation / static fallback).
+    pub fn max_scan_days(&self) -> u32 {
         let hours = self.seconds.unsigned_abs() / 3600;
         let days = (hours / 24) as u32;
-        // +1 for the current day, +1 for midnight crossing
         (days + 2).max(2)
     }
 }
@@ -117,35 +133,35 @@ mod tests {
     fn parse_past_2_hours() {
         let tw = TimeWindow::parse("-PT2H").unwrap();
         assert_eq!(tw.seconds, -7200);
-        assert_eq!(tw.scan_days(), 2);
+        assert_eq!(tw.max_scan_days(), 2);
     }
 
     #[test]
     fn parse_future_6_hours() {
         let tw = TimeWindow::parse("PT6H").unwrap();
         assert_eq!(tw.seconds, 21600);
-        assert_eq!(tw.scan_days(), 2);
+        assert_eq!(tw.max_scan_days(), 2);
     }
 
     #[test]
     fn parse_past_30_minutes() {
         let tw = TimeWindow::parse("-PT30M").unwrap();
         assert_eq!(tw.seconds, -1800);
-        assert_eq!(tw.scan_days(), 2);
+        assert_eq!(tw.max_scan_days(), 2);
     }
 
     #[test]
     fn parse_past_2_days() {
         let tw = TimeWindow::parse("-P2D").unwrap();
         assert_eq!(tw.seconds, -172800);
-        assert_eq!(tw.scan_days(), 4); // 2 days + today + midnight buffer
+        assert_eq!(tw.max_scan_days(), 4);
     }
 
     #[test]
     fn parse_combined() {
         let tw = TimeWindow::parse("-P1DT6H").unwrap();
         assert_eq!(tw.seconds, -(86400 + 21600));
-        assert_eq!(tw.scan_days(), 3);
+        assert_eq!(tw.max_scan_days(), 3);
     }
 
     #[test]
@@ -185,5 +201,41 @@ mod tests {
         assert!(TimeWindow::parse("2H").is_err());
         assert!(TimeWindow::parse("").is_err());
         assert!(TimeWindow::parse("P").is_err());
+    }
+
+    #[test]
+    fn scan_dates_midday_only_today() {
+        use chrono::NaiveDate;
+        let tw = TimeWindow::parse("-PT2H").unwrap();
+        // 15:00 UTC - 2h = 13:00 UTC, same day
+        let now = NaiveDate::from_ymd_opt(2026, 3, 25).unwrap()
+            .and_hms_opt(15, 0, 0).unwrap().and_utc();
+        let dates = tw.scan_dates(now);
+        assert_eq!(dates.len(), 1, "At 15:00, -PT2H should only scan today");
+        assert_eq!(dates[0], NaiveDate::from_ymd_opt(2026, 3, 25).unwrap());
+    }
+
+    #[test]
+    fn scan_dates_early_morning_includes_yesterday() {
+        use chrono::NaiveDate;
+        let tw = TimeWindow::parse("-PT2H").unwrap();
+        // 01:00 UTC - 2h = 23:00 yesterday
+        let now = NaiveDate::from_ymd_opt(2026, 3, 25).unwrap()
+            .and_hms_opt(1, 0, 0).unwrap().and_utc();
+        let dates = tw.scan_dates(now);
+        assert_eq!(dates.len(), 2, "At 01:00, -PT2H should scan yesterday+today");
+        assert_eq!(dates[0], NaiveDate::from_ymd_opt(2026, 3, 24).unwrap());
+        assert_eq!(dates[1], NaiveDate::from_ymd_opt(2026, 3, 25).unwrap());
+    }
+
+    #[test]
+    fn scan_dates_midnight_exact() {
+        use chrono::NaiveDate;
+        let tw = TimeWindow::parse("-PT2H").unwrap();
+        // 00:00 UTC - 2h = 22:00 yesterday
+        let now = NaiveDate::from_ymd_opt(2026, 3, 25).unwrap()
+            .and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let dates = tw.scan_dates(now);
+        assert_eq!(dates.len(), 2);
     }
 }

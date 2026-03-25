@@ -311,11 +311,19 @@ pub fn scan_remote_with_limit(
     // Re-sort ascending for the BTreeMap
     candidates.sort_by_key(|c| c.0);
 
-    tracing::info!(
-        "Found {} matching files (keeping {})",
-        entries_list.len(),
-        candidates.len()
-    );
+    let listed = entries_list.len();
+    let kept = candidates.len();
+    if time_filter.is_some() {
+        tracing::info!(
+            "Prefix '{}': {} objects listed, {} within time window",
+            prefix, listed, kept
+        );
+    } else {
+        tracing::info!(
+            "Prefix '{}': {} objects listed, {} matching",
+            prefix, listed, kept
+        );
+    }
 
     // Second pass: parse metadata (range read, falling back to full download)
     let mut entries = BTreeMap::new();
