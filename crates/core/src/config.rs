@@ -58,6 +58,11 @@ pub struct GeoTiffConfig {
     /// Default: ["*.tmp", "*.part"]
     #[serde(default = "default_exclude_patterns")]
     pub exclude_patterns: Vec<String>,
+    /// Maximum number of files to keep in the catalog (most recent by timestamp).
+    /// Default: None (no limit). Useful for S3 sources to avoid downloading
+    /// hundreds of files. E.g. `max_files = 24` keeps the latest 2 hours of
+    /// 5-minute radar data.
+    pub max_files: Option<usize>,
 }
 
 fn default_poll_interval() -> u64 {

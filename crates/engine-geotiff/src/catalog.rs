@@ -35,6 +35,26 @@ impl Catalog {
             spatial_extent: None,
         }
     }
+
+    /// Trim to keep only the most recent `max` entries by timestamp.
+    pub fn trim_to_latest(&mut self, max: usize) {
+        if self.entries.len() <= max {
+            return;
+        }
+        let keep_from = self.entries.keys().rev().nth(max - 1).copied();
+        if let Some(cutoff) = keep_from {
+            self.entries = self.entries.split_off(&cutoff);
+        }
+        // Recompute extents
+        self.temporal_extent = if self.entries.is_empty() {
+            None
+        } else {
+            let first = *self.entries.keys().next().unwrap();
+            let last = *self.entries.keys().next_back().unwrap();
+            Some((first, last))
+        };
+        self.spatial_extent = self.entries.values().next().map(|e| e.metadata.geo_transform.bbox());
+    }
 }
 
 /// Tracks files seen but not yet confirmed as fully written.
@@ -229,16 +249,18 @@ const MAX_REMOTE_FILE_SIZE: usize = 50 * 1024 * 1024;
 ///
 /// Downloads each matching file into memory and parses metadata.
 /// Reuses cached data for files already in the catalog with the same size.
-pub fn scan_remote(
+pub fn scan_remote_with_limit(
     store: &ds_storage::DataStore,
     prefix: &ds_storage::object_store::path::Path,
     pattern: &Regex,
     timestamp_format: &str,
     existing_metadata: &BTreeMap<PathBuf, (u64, TiffMetadata, bytes::Bytes)>,
+    max_files: Option<usize>,
 ) -> Result<Catalog, DataServerError> {
     let entries_list = store.list(prefix)?;
 
-    let mut entries = BTreeMap::new();
+    // First pass: match filenames and parse timestamps without downloading
+    let mut candidates: Vec<(DateTime<Utc>, String, u64, ds_storage::object_store::path::Path)> = Vec::new();
 
     for obj in &entries_list {
         let key = obj.location.to_string();
@@ -260,38 +282,53 @@ pub fn scan_remote(
 
         let datetime = match NaiveDateTime::parse_from_str(&timestamp_str, timestamp_format) {
             Ok(dt) => dt.and_utc(),
-            Err(_) => {
-                tracing::warn!("Cannot parse timestamp '{}' from '{}'", timestamp_str, filename);
-                continue;
-            }
+            Err(_) => continue,
         };
 
-        let file_size = obj.size as u64;
-        let pseudo_path = PathBuf::from(&key);
-
-        // Check security limit
         if obj.size > MAX_REMOTE_FILE_SIZE {
-            tracing::warn!("Skipping {} — size {} exceeds maximum {}", key, obj.size, MAX_REMOTE_FILE_SIZE);
             continue;
         }
 
+        candidates.push((datetime, key, obj.size as u64, obj.location.clone()));
+    }
+
+    // Sort by timestamp descending and take only max_files most recent
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    if let Some(max) = max_files {
+        candidates.truncate(max);
+    }
+    // Re-sort ascending for the BTreeMap
+    candidates.sort_by_key(|c| c.0);
+
+    tracing::info!(
+        "Found {} matching files (keeping {})",
+        entries_list.len(),
+        candidates.len()
+    );
+
+    // Second pass: download and parse metadata
+    let mut entries = BTreeMap::new();
+
+    for (datetime, key, file_size, location) in &candidates {
+        let pseudo_path = PathBuf::from(key);
+
         // Reuse cached data if file size unchanged
         if let Some((cached_size, cached_meta, cached_bytes)) = existing_metadata.get(&pseudo_path) {
-            if *cached_size == file_size {
+            if *cached_size == *file_size {
                 let source = DataSource::from_bytes(cached_bytes.clone());
-                entries.insert(datetime, FileEntry {
+                entries.insert(*datetime, FileEntry {
                     path: pseudo_path,
                     source,
                     metadata: cached_meta.clone(),
-                    file_size,
+                    file_size: *file_size,
                 });
                 continue;
             }
         }
 
         // Download the file
-        tracing::info!("Downloading {} ({} bytes)", key, obj.size);
-        let data = match store.get(&obj.location) {
+        tracing::info!("Downloading {} ({} bytes)", key, file_size);
+        let data = match store.get(location) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("Failed to download {}: {e}", key);
@@ -309,11 +346,11 @@ pub fn scan_remote(
             }
         };
 
-        entries.insert(datetime, FileEntry {
+        entries.insert(*datetime, FileEntry {
             path: pseudo_path,
             source,
             metadata,
-            file_size,
+            file_size: *file_size,
         });
     }
 

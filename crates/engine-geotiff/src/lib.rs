@@ -17,7 +17,7 @@ use ds_core::engine::Engine;
 use ds_core::error::DataServerError;
 use ds_core::model::*;
 
-use crate::catalog::{scan_directory, scan_remote, Catalog, PendingFile};
+use crate::catalog::{scan_directory, scan_remote_with_limit, Catalog, PendingFile};
 use crate::reader::TiffMetadata;
 
 /// Whether the data source is local or remote.
@@ -42,6 +42,7 @@ pub struct GeoTiffEngine {
     unit: String,
     poll_interval: Duration,
     exclude_patterns: Vec<String>,
+    max_files: Option<usize>,
     data_path_display: String,
 }
 
@@ -91,6 +92,7 @@ impl GeoTiffEngine {
             unit: config.unit.clone(),
             poll_interval: Duration::from_secs(config.poll_interval_secs),
             exclude_patterns: config.exclude_patterns.clone(),
+            max_files: config.max_files,
             data_path_display: data_path.to_string(),
         };
 
@@ -109,12 +111,13 @@ impl GeoTiffEngine {
     }
 
     /// Perform a scan appropriate to the store mode.
+    /// Applies max_files limit if configured.
     fn do_scan(
         &self,
         local_existing: &BTreeMap<PathBuf, (u64, TiffMetadata)>,
         remote_existing: &BTreeMap<PathBuf, (u64, TiffMetadata, bytes::Bytes)>,
     ) -> Result<Catalog, DataServerError> {
-        match &self.store_mode {
+        let mut catalog = match &self.store_mode {
             StoreMode::Local { directory, pending } => {
                 let mut pending = pending.lock().unwrap();
                 scan_directory(
@@ -124,18 +127,25 @@ impl GeoTiffEngine {
                     &self.exclude_patterns,
                     &mut pending,
                     local_existing,
-                )
+                )?
             }
             StoreMode::Remote { store, prefix } => {
-                scan_remote(
+                scan_remote_with_limit(
                     store,
                     prefix,
                     &self.filename_pattern,
                     &self.timestamp_format,
                     remote_existing,
-                )
+                    self.max_files,
+                )?
             }
+        };
+
+        if let Some(max) = self.max_files {
+            catalog.trim_to_latest(max);
         }
+
+        Ok(catalog)
     }
 
     /// Run the polling loop. Call this from a tokio::spawn task.

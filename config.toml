@@ -66,12 +66,12 @@ engine_type = "geotiff"
 apis = ["edr"]
 
 [collections.geotiff]
-# Limit to 00:00-00:15 to avoid downloading hundreds of files
-filename_pattern = '(?P<timestamp>2026032500[01]\d)_composite_cappi_600_dbzh_finrad_qc\.tif'
+filename_pattern = '(?P<timestamp>\d{12})_composite_cappi_600_dbzh_finrad_qc\.tif'
 timestamp_format = "%Y%m%d%H%M"
 parameter = "reflectivity"
 unit = "dBZ"
 poll_interval_secs = 300
+max_files = 12
 
 [[collections]]
 id = "opera-radar"
@@ -82,12 +82,12 @@ engine_type = "geotiff"
 apis = ["edr"]
 
 [collections.geotiff]
-# Match only ACRR (accumulation) TIFF files, limit to 00:00-01:00 UTC
-filename_pattern = 'OPERA@(?P<timestamp>\d{8}T0[01]\d{2})@0@ACRR\.tiff'
+filename_pattern = 'OPERA@(?P<timestamp>\d{8}T\d{4})@0@ACRR\.tiff'
 timestamp_format = "%Y%m%dT%H%M"
 parameter = "precipitation"
 unit = "mm"
 poll_interval_secs = 300
+max_files = 12
 
 # MET Norway radar cannot be listed via S3 (AccessDenied on list).
 # Individual files are accessible but discovery requires STAC API (Phase 4).
