@@ -1,5 +1,6 @@
 services:
   dataserver:
+    image: ghcr.io/mrauhala/meteocore:main
     build: .
     ports:
       - "8000:8000"
