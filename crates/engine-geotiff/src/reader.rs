@@ -703,6 +703,15 @@ fn read_tag_u32(decoder: &mut DecoderWrapper, tag: Tag) -> Option<u32> {
     match decoder.get_tag(tag) {
         Ok(tiff::decoder::ifd::Value::Short(v)) => Some(v as u32),
         Ok(tiff::decoder::ifd::Value::Unsigned(v)) => Some(v),
+        // Multi-value tags (e.g., BitsPerSample, SampleFormat for multi-band files):
+        // return the first element.
+        Ok(tiff::decoder::ifd::Value::List(items)) => {
+            match items.first() {
+                Some(tiff::decoder::ifd::Value::Short(v)) => Some(*v as u32),
+                Some(tiff::decoder::ifd::Value::Unsigned(v)) => Some(*v),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
