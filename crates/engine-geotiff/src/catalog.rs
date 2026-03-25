@@ -5,7 +5,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use ds_core::error::DataServerError;
 use regex::Regex;
 
-use crate::reader::{DataSource, TiffMetadata, HEADER_READ_SIZE};
+use crate::reader::{DataSource, TiffMetadata};
 
 /// Maximum filename length to prevent abuse.
 const MAX_FILENAME_LENGTH: usize = 255;
@@ -260,6 +260,7 @@ pub fn scan_remote_with_limit(
     existing_entries: &BTreeMap<PathBuf, FileEntry>,
     max_files: Option<usize>,
     time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    collection_id: &str,
 ) -> Result<Catalog, DataServerError> {
     let entries_list = store.list(prefix)?;
 
@@ -315,13 +316,13 @@ pub fn scan_remote_with_limit(
     let kept = candidates.len();
     if time_filter.is_some() {
         tracing::info!(
-            "Prefix '{}': {} objects listed, {} within time window",
-            prefix, listed, kept
+            "[{}] Prefix '{}': {} listed, {} within time window",
+            collection_id, prefix, listed, kept
         );
     } else {
         tracing::info!(
-            "Prefix '{}': {} objects listed, {} matching",
-            prefix, listed, kept
+            "[{}] Prefix '{}': {} listed, {} matching",
+            collection_id, prefix, listed, kept
         );
     }
 
@@ -341,7 +342,7 @@ pub fn scan_remote_with_limit(
 
         // Try COG range read first (header only)
         if let Some((metadata, tile_info)) = TiffMetadata::from_header_read(store, location, *file_size) {
-            tracing::info!("Parsed {} via range read ({} bytes header)", key, HEADER_READ_SIZE.min(*file_size as usize));
+            tracing::debug!("[{}] {} — range read OK", collection_id, key);
             let source = DataSource::Remote {
                 store: store.clone(),
                 path: location.clone(),
@@ -357,11 +358,11 @@ pub fn scan_remote_with_limit(
         }
 
         // Fallback: download full file
-        tracing::info!("Range read failed for {}, downloading full file ({} bytes)", key, file_size);
+        tracing::info!("[{}] {} — range read failed, downloading full file ({})", collection_id, key, super::format_bytes(*file_size));
         let data = match store.get(location) {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!("Failed to download {}: {e}", key);
+                tracing::warn!("[{}] Failed to download {}: {e}", collection_id, key);
                 continue;
             }
         };
@@ -370,7 +371,7 @@ pub fn scan_remote_with_limit(
         let metadata = match TiffMetadata::from_source(&source) {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("Skipping {}: {e}", key);
+                tracing::warn!("[{}] Skipping {}: {e}", collection_id, key);
                 continue;
             }
         };

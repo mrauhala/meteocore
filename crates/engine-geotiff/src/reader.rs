@@ -744,7 +744,7 @@ fn parse_geo_transform(
 
     // Parse CRS from GeoKeys
     let crs = parse_crs(decoder)?;
-    tracing::info!("Parsed CRS: {:?}", crs);
+    tracing::debug!("Parsed CRS: {:?}", crs);
 
     Ok(GeoTransform {
         origin_x,

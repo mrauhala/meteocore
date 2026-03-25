@@ -106,7 +106,7 @@ async fn main() {
                 });
 
                 let engine = Arc::new(
-                    engine_geotiff::GeoTiffEngine::new(collection.data_path.as_deref(), geotiff_config)
+                    engine_geotiff::GeoTiffEngine::new(&collection.id, collection.data_path.as_deref(), geotiff_config)
                         .expect("Failed to initialize GeoTIFF engine"),
                 );
 

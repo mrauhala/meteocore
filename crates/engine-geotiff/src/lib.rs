@@ -45,6 +45,7 @@ enum StoreMode {
 }
 
 pub struct GeoTiffEngine {
+    collection_id: String,
     catalog: ArcSwap<Catalog>,
     tile_cache: cache::TileCache,
     store_mode: StoreMode,
@@ -66,7 +67,7 @@ impl GeoTiffEngine {
     /// - `endpoint` + `bucket` (+ optional `prefix_pattern`): S3 with dynamic prefix
     /// - `data_path` starting with `s3://` or `http(s)://`: S3/HTTP with fixed prefix
     /// - `data_path` otherwise: local directory
-    pub fn new(data_path: Option<&str>, config: &GeoTiffConfig) -> Result<Self, DataServerError> {
+    pub fn new(collection_id: &str, data_path: Option<&str>, config: &GeoTiffConfig) -> Result<Self, DataServerError> {
         let filename_pattern = Regex::new(&config.filename_pattern).map_err(|e| {
             DataServerError::GeoTiff(format!("Invalid filename_pattern: {e}"))
         })?;
@@ -141,6 +142,7 @@ impl GeoTiffEngine {
         let band_index = (config.band.max(1) - 1) as usize; // 1-based config → 0-based index
 
         let engine = GeoTiffEngine {
+            collection_id: collection_id.to_string(),
             catalog: ArcSwap::from_pointee(Catalog::empty()),
             tile_cache,
             store_mode,
@@ -158,12 +160,17 @@ impl GeoTiffEngine {
         // Initial scan
         let initial_catalog = engine.do_scan(&BTreeMap::new(), &BTreeMap::new())?;
         let file_count = initial_catalog.entries.len();
+        let total_bytes: u64 = initial_catalog.entries.values().map(|e| e.file_size).sum();
         engine.catalog.store(Arc::new(initial_catalog));
 
         if file_count == 0 {
-            tracing::warn!("No matching GeoTIFF files found in {}", engine.data_path_display);
+            tracing::warn!("[{}] No matching GeoTIFF files found in {}", collection_id, engine.data_path_display);
         } else {
-            tracing::info!("Loaded {} GeoTIFF files from {}", file_count, engine.data_path_display);
+            tracing::info!(
+                "[{}] Loaded {} files from {} (metadata: {})",
+                collection_id, file_count, engine.data_path_display,
+                format_bytes(total_bytes)
+            );
         }
 
         Ok(engine)
@@ -197,6 +204,7 @@ impl GeoTiffEngine {
                     remote_existing,
                     self.max_files,
                     None,
+                    &self.collection_id,
                 )?
             }
             StoreMode::RemoteDynamic { store, prefix_pattern, scan_days, time_window } => {
@@ -218,12 +226,13 @@ impl GeoTiffEngine {
                         remote_existing,
                         None, // no per-prefix limit; apply max_files after merge
                         time_filter,
+                        &self.collection_id,
                     ) {
                         Ok(partial) => {
                             merged.entries.extend(partial.entries);
                         }
                         Err(e) => {
-                            tracing::warn!("Scan failed for prefix '{}': {e}", prefix_str);
+                            tracing::warn!("[{}] Scan failed for prefix '{}': {e}", self.collection_id, prefix_str);
                         }
                     }
                 }
@@ -284,12 +293,16 @@ impl GeoTiffEngine {
         match result {
             Ok(new_catalog) => {
                 let count = new_catalog.entries.len();
+                let total_bytes: u64 = new_catalog.entries.values().map(|e| e.file_size).sum();
                 self.catalog.store(Arc::new(new_catalog));
                 let (hits, misses) = self.tile_cache.stats();
-                tracing::debug!("Catalog updated: {} files, tile cache: {} hits / {} misses", count, hits, misses);
+                tracing::debug!(
+                    "[{}] Poll: {} files ({}), tile cache: {} hits / {} misses",
+                    self.collection_id, count, format_bytes(total_bytes), hits, misses
+                );
             }
             Err(e) => {
-                tracing::warn!("Scan failed, keeping old catalog: {e}");
+                tracing::warn!("[{}] Scan failed, keeping old catalog: {e}", self.collection_id);
             }
         }
     }
@@ -574,6 +587,19 @@ impl Engine for GeoTiffEngine {
 
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
         self.catalog.load().spatial_extent
+    }
+}
+
+/// Format byte count as human-readable string.
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
 }
 
