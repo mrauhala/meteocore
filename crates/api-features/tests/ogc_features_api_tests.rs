@@ -134,7 +134,7 @@ fn build_router() -> axum::Router {
             id: "cities".to_string(),
             title: "Finnish Cities".to_string(),
             description: "City points for testing".to_string(),
-            data_path: String::new(),
+            data_path: None,
             apis: vec!["features".to_string()],
             engine_type: "mock".to_string(),
             geotiff: None,

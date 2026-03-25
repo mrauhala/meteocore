@@ -29,14 +29,18 @@ async fn main() {
         HashMap::new();
 
     for collection in &config.collections {
+        let data_path_display = collection.data_path.as_deref().unwrap_or("<configured in engine>");
         info!(
             "Loading collection '{}' ({}) from {}",
-            collection.id, collection.engine_type, collection.data_path
+            collection.id, collection.engine_type, data_path_display
         );
 
         match collection.engine_type.as_str() {
             "csv" => {
-                let store = engine_csv::CsvDataStore::load(&collection.data_path)
+                let data_path = collection.data_path.as_deref().unwrap_or_else(|| {
+                    panic!("Collection '{}': csv engine requires data_path", collection.id);
+                });
+                let store = engine_csv::CsvDataStore::load(data_path)
                     .expect("Failed to load CSV data");
 
                 info!(
@@ -64,8 +68,11 @@ async fn main() {
                 }
             }
             "geojson" => {
+                let data_path = collection.data_path.as_deref().unwrap_or_else(|| {
+                    panic!("Collection '{}': geojson engine requires data_path", collection.id);
+                });
                 let engine = Arc::new(
-                    engine_geojson::GeoJsonEngine::load(&collection.data_path)
+                    engine_geojson::GeoJsonEngine::load(data_path)
                         .expect("Failed to load GeoJSON data"),
                 );
 
@@ -99,7 +106,7 @@ async fn main() {
                 });
 
                 let engine = Arc::new(
-                    engine_geotiff::GeoTiffEngine::new(&collection.data_path, geotiff_config)
+                    engine_geotiff::GeoTiffEngine::new(collection.data_path.as_deref(), geotiff_config)
                         .expect("Failed to initialize GeoTIFF engine"),
                 );
 

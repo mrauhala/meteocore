@@ -30,7 +30,10 @@ pub struct CollectionConfig {
     pub id: String,
     pub title: String,
     pub description: String,
-    pub data_path: String,
+    /// Path or URL to the data source. Required for csv/geojson engines.
+    /// Optional for geotiff when endpoint+bucket are specified in [geotiff].
+    #[serde(default)]
+    pub data_path: Option<String>,
     #[serde(default = "default_apis")]
     pub apis: Vec<String>,
     #[serde(default = "default_engine_type")]
@@ -68,10 +71,28 @@ pub struct GeoTiffConfig {
     /// Default: 64 MB (~3700 tiles). Set to 0 to disable.
     #[serde(default = "default_tile_cache_mb")]
     pub tile_cache_mb: u64,
+
+    /// S3-compatible endpoint URL. When set with `bucket`, replaces `data_path`
+    /// for remote access. E.g. `"https://s3.waw3-1.cloudferro.com"`
+    pub endpoint: Option<String>,
+    /// S3 bucket name. Required when `endpoint` is set.
+    pub bucket: Option<String>,
+    /// Object prefix pattern, optionally with strftime date templates.
+    /// E.g. `"%Y/%m/%d/OPERA/COMP/"` expands to `"2026/03/25/OPERA/COMP/"`.
+    /// Re-evaluated on each poll cycle so it stays current across date boundaries.
+    pub prefix_pattern: Option<String>,
+    /// Number of days to scan when prefix_pattern contains date templates.
+    /// Default: 2 (today + yesterday). Ensures coverage across midnight.
+    #[serde(default = "default_scan_days")]
+    pub scan_days: u32,
 }
 
 fn default_tile_cache_mb() -> u64 {
     64
+}
+
+fn default_scan_days() -> u32 {
+    2
 }
 
 fn default_poll_interval() -> u64 {

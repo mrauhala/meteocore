@@ -28,9 +28,17 @@ enum StoreMode {
         directory: PathBuf,
         pending: Mutex<BTreeMap<PathBuf, PendingFile>>,
     },
+    /// Fixed prefix (from data_path URL).
     Remote {
         store: ds_storage::DataStore,
         prefix: ds_storage::object_store::path::Path,
+    },
+    /// Dynamic prefix with strftime date templates (from endpoint+bucket+prefix_pattern).
+    /// Prefix is expanded on each poll cycle so it stays current across date boundaries.
+    RemoteDynamic {
+        store: ds_storage::DataStore,
+        prefix_pattern: String,
+        scan_days: u32,
     },
 }
 
@@ -50,8 +58,12 @@ pub struct GeoTiffEngine {
 
 impl GeoTiffEngine {
     /// Create a new GeoTIFF engine, performing an initial scan.
-    /// Supports local paths, s3:// URLs, and https:// URLs.
-    pub fn new(data_path: &str, config: &GeoTiffConfig) -> Result<Self, DataServerError> {
+    ///
+    /// Data source is determined by config:
+    /// - `endpoint` + `bucket` (+ optional `prefix_pattern`): S3 with dynamic prefix
+    /// - `data_path` starting with `s3://` or `http(s)://`: S3/HTTP with fixed prefix
+    /// - `data_path` otherwise: local directory
+    pub fn new(data_path: Option<&str>, config: &GeoTiffConfig) -> Result<Self, DataServerError> {
         let filename_pattern = Regex::new(&config.filename_pattern).map_err(|e| {
             DataServerError::GeoTiff(format!("Invalid filename_pattern: {e}"))
         })?;
@@ -62,27 +74,49 @@ impl GeoTiffEngine {
             ));
         }
 
-        let is_remote = data_path.starts_with("s3://")
-            || data_path.starts_with("http://")
-            || data_path.starts_with("https://");
+        // Determine store mode from config
+        let (store_mode, display) = if let (Some(endpoint), Some(bucket)) = (&config.endpoint, &config.bucket) {
+            let store = ds_storage::build_s3_store_from_parts(endpoint, bucket)?;
+            let prefix_pattern = config.prefix_pattern.clone().unwrap_or_default();
+            let display = format!("s3://{}/{}", bucket, prefix_pattern);
+            (
+                StoreMode::RemoteDynamic {
+                    store,
+                    prefix_pattern,
+                    scan_days: config.scan_days,
+                },
+                display,
+            )
+        } else if let Some(data_path) = data_path {
+            let is_remote = data_path.starts_with("s3://")
+                || data_path.starts_with("http://")
+                || data_path.starts_with("https://");
 
-        let store_mode = if is_remote {
-            let (store, prefix) = ds_storage::build_store(data_path)?;
-            StoreMode::Remote { store, prefix }
+            if is_remote {
+                let (store, prefix) = ds_storage::build_store(data_path)?;
+                (StoreMode::Remote { store, prefix }, data_path.to_string())
+            } else {
+                let directory = PathBuf::from(data_path);
+                if !directory.is_dir() {
+                    return Err(DataServerError::GeoTiff(format!(
+                        "{data_path} is not a directory"
+                    )));
+                }
+                let directory = directory.canonicalize().map_err(|e| {
+                    DataServerError::GeoTiff(format!("Cannot resolve directory {data_path}: {e}"))
+                })?;
+                (
+                    StoreMode::Local {
+                        directory,
+                        pending: Mutex::new(BTreeMap::new()),
+                    },
+                    data_path.to_string(),
+                )
+            }
         } else {
-            let directory = PathBuf::from(data_path);
-            if !directory.is_dir() {
-                return Err(DataServerError::GeoTiff(format!(
-                    "{data_path} is not a directory"
-                )));
-            }
-            let directory = directory.canonicalize().map_err(|e| {
-                DataServerError::GeoTiff(format!("Cannot resolve directory {data_path}: {e}"))
-            })?;
-            StoreMode::Local {
-                directory,
-                pending: Mutex::new(BTreeMap::new()),
-            }
+            return Err(DataServerError::GeoTiff(
+                "Either data_path or endpoint+bucket must be configured".into(),
+            ));
         };
 
         let cache_bytes = config.tile_cache_mb * 1024 * 1024;
@@ -99,7 +133,7 @@ impl GeoTiffEngine {
             poll_interval: Duration::from_secs(config.poll_interval_secs),
             exclude_patterns: config.exclude_patterns.clone(),
             max_files: config.max_files,
-            data_path_display: data_path.to_string(),
+            data_path_display: display,
         };
 
         // Initial scan
@@ -145,6 +179,39 @@ impl GeoTiffEngine {
                     self.max_files,
                 )?
             }
+            StoreMode::RemoteDynamic { store, prefix_pattern, scan_days } => {
+                let prefixes = expand_prefix_pattern(prefix_pattern, *scan_days);
+                let mut merged = Catalog::empty();
+                for prefix_str in &prefixes {
+                    let prefix = ds_storage::object_store::path::Path::from(prefix_str.as_str());
+                    match scan_remote_with_limit(
+                        store,
+                        &prefix,
+                        &self.filename_pattern,
+                        &self.timestamp_format,
+                        remote_existing,
+                        None, // no per-prefix limit; apply max_files after merge
+                    ) {
+                        Ok(partial) => {
+                            merged.entries.extend(partial.entries);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Scan failed for prefix '{}': {e}", prefix_str);
+                        }
+                    }
+                }
+                // Recompute extents from merged entries
+                merged.temporal_extent = if merged.entries.is_empty() {
+                    None
+                } else {
+                    let first = *merged.entries.keys().next().unwrap();
+                    let last = *merged.entries.keys().next_back().unwrap();
+                    Some((first, last))
+                };
+                merged.spatial_extent = merged.entries.values().next()
+                    .map(|e| e.metadata.geo_transform.bbox());
+                merged
+            }
         };
 
         if let Some(max) = self.max_files {
@@ -177,7 +244,7 @@ impl GeoTiffEngine {
                     .collect();
                 self.do_scan(&existing, &BTreeMap::new())
             }
-            StoreMode::Remote { .. } => {
+            StoreMode::Remote { .. } | StoreMode::RemoteDynamic { .. } => {
                 let existing: BTreeMap<PathBuf, catalog::FileEntry> = current
                     .entries
                     .values()
@@ -483,6 +550,30 @@ impl Engine for GeoTiffEngine {
     }
 }
 
+/// Expand a prefix pattern with strftime templates for the last `scan_days` days.
+///
+/// E.g. `"%Y/%m/%d/OPERA/COMP/"` with `scan_days=2` on 2026-03-25 produces:
+/// `["2026/03/25/OPERA/COMP/", "2026/03/24/OPERA/COMP/"]`
+///
+/// If the pattern contains no `%` characters, returns it as-is (single prefix).
+fn expand_prefix_pattern(pattern: &str, scan_days: u32) -> Vec<String> {
+    if !pattern.contains('%') {
+        return vec![pattern.trim_end_matches('/').to_string()];
+    }
+
+    let today = Utc::now().date_naive();
+    let days = scan_days.max(1);
+    let mut prefixes = Vec::with_capacity(days as usize);
+
+    for offset in 0..days {
+        let date = today - chrono::Duration::days(offset as i64);
+        let expanded = date.format(pattern).to_string();
+        prefixes.push(expanded.trim_end_matches('/').to_string());
+    }
+
+    prefixes
+}
+
 /// Parse EDR position query coordinates.
 /// Accepts `POINT(lon lat)` (WKT) or `lon,lat` format.
 /// Returns (lat, lon).
@@ -627,4 +718,40 @@ fn parse_location_id(id: &str) -> Result<(f64, f64), DataServerError> {
     }
 
     Ok((lat, lon))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_prefix_static() {
+        let result = expand_prefix_pattern("some/fixed/prefix", 2);
+        assert_eq!(result, vec!["some/fixed/prefix"]);
+    }
+
+    #[test]
+    fn expand_prefix_with_date() {
+        let result = expand_prefix_pattern("%Y/%m/%d/OPERA/COMP/", 2);
+        assert_eq!(result.len(), 2);
+        // Both should be date-formatted paths
+        for p in &result {
+            assert!(p.ends_with("/OPERA/COMP"), "unexpected prefix: {}", p);
+            assert_eq!(p.len(), "2026/03/25/OPERA/COMP".len());
+        }
+        // First should be today, second yesterday
+        assert_ne!(result[0], result[1]);
+    }
+
+    #[test]
+    fn expand_prefix_single_day() {
+        let result = expand_prefix_pattern("%Y/%m/%d/data/", 1);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn expand_prefix_zero_days_defaults_to_one() {
+        let result = expand_prefix_pattern("%Y/%m/%d/data/", 0);
+        assert_eq!(result.len(), 1);
+    }
 }

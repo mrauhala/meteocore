@@ -59,13 +59,14 @@ poll_interval_secs = 60
 id = "fmi-radar"
 title = "FMI Radar (S3, EPSG:3067)"
 description = "Finnish radar composite from FMI S3 bucket, Transverse Mercator projection"
-data_path = "https://s3-eu-west-1.amazonaws.com/fmi-opendata-radar-geotiff/2026/03/25/finrad/"
-# Note: this bucket has ~300 files per day (5min interval). Loading all takes time.
-# Consider using a time-limited prefix or filtering.
 engine_type = "geotiff"
 apis = ["edr"]
 
 [collections.geotiff]
+endpoint = "https://s3-eu-west-1.amazonaws.com"
+bucket = "fmi-opendata-radar-geotiff"
+prefix_pattern = "%Y/%m/%d/finrad/"
+scan_days = 2
 filename_pattern = '(?P<timestamp>\d{12})_composite_cappi_600_dbzh_finrad_qc\.tif'
 timestamp_format = "%Y%m%d%H%M"
 parameter = "reflectivity"
@@ -77,17 +78,20 @@ max_files = 12
 id = "opera-radar"
 title = "OPERA European Radar Composite"
 description = "1h accumulated precipitation from EUMETNET OPERA, LAEA projection (CloudFerro S3)"
-data_path = "https://s3.waw3-1.cloudferro.com/openradar-24h/2026/03/25/OPERA/COMP/"
 engine_type = "geotiff"
 apis = ["edr"]
 
 [collections.geotiff]
+endpoint = "https://s3.waw3-1.cloudferro.com"
+bucket = "openradar-24h"
+prefix_pattern = "%Y/%m/%d/OPERA/COMP/"
+scan_days = 2
 filename_pattern = 'OPERA@(?P<timestamp>\d{8}T\d{4})@0@ACRR\.tiff'
 timestamp_format = "%Y%m%dT%H%M"
 parameter = "precipitation"
 unit = "mm"
 poll_interval_secs = 300
-max_files = 12
+max_files = 24
 
 # MET Norway radar cannot be listed via S3 (AccessDenied on list).
 # Individual files are accessible but discovery requires STAC API (Phase 4).
