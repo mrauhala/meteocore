@@ -15,8 +15,14 @@ use api_features::handlers::FeaturesState;
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let config = ds_core::config::ServerConfig::from_file("config.toml")
-        .expect("Failed to load config.toml");
+    let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
+    let config = match ds_core::config::ServerConfig::from_file(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to load {}: {}", config_path, e);
+            std::process::exit(1);
+        }
+    };
 
     let base_url = config.server.base_url();
     info!("Base URL: {base_url}");
@@ -37,11 +43,20 @@ async fn main() {
 
         match collection.engine_type.as_str() {
             "csv" => {
-                let data_path = collection.data_path.as_deref().unwrap_or_else(|| {
-                    panic!("Collection '{}': csv engine requires data_path", collection.id);
-                });
-                let store = engine_csv::CsvDataStore::load(data_path)
-                    .expect("Failed to load CSV data");
+                let data_path = match collection.data_path.as_deref() {
+                    Some(p) => p,
+                    None => {
+                        tracing::error!("Collection '{}': csv engine requires data_path, skipping", collection.id);
+                        continue;
+                    }
+                };
+                let store = match engine_csv::CsvDataStore::load(data_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("Collection '{}': failed to load CSV from {}: {}", collection.id, data_path, e);
+                        continue;
+                    }
+                };
 
                 info!(
                     "Loaded {} rows, {} locations, {} parameters",
@@ -68,13 +83,20 @@ async fn main() {
                 }
             }
             "geojson" => {
-                let data_path = collection.data_path.as_deref().unwrap_or_else(|| {
-                    panic!("Collection '{}': geojson engine requires data_path", collection.id);
-                });
-                let engine = Arc::new(
-                    engine_geojson::GeoJsonEngine::load(data_path)
-                        .expect("Failed to load GeoJSON data"),
-                );
+                let data_path = match collection.data_path.as_deref() {
+                    Some(p) => p,
+                    None => {
+                        tracing::error!("Collection '{}': geojson engine requires data_path, skipping", collection.id);
+                        continue;
+                    }
+                };
+                let engine = match engine_geojson::GeoJsonEngine::load(data_path) {
+                    Ok(e) => Arc::new(e),
+                    Err(e) => {
+                        tracing::error!("Collection '{}': failed to load GeoJSON from {}: {}", collection.id, data_path, e);
+                        continue;
+                    }
+                };
 
                 info!(
                     "Loaded {} features, extent: {:?}",
@@ -98,21 +120,25 @@ async fn main() {
                 }
             }
             "geotiff" => {
-                let geotiff_config = collection.geotiff.as_ref().unwrap_or_else(|| {
-                    panic!(
-                        "Collection '{}' has engine_type 'geotiff' but missing [collections.geotiff] config",
-                        collection.id
-                    );
-                });
+                let geotiff_config = match collection.geotiff.as_ref() {
+                    Some(c) => c,
+                    None => {
+                        tracing::error!(
+                            "Collection '{}': engine_type 'geotiff' but missing [collections.geotiff] config, skipping",
+                            collection.id
+                        );
+                        continue;
+                    }
+                };
 
-                let engine = Arc::new(
-                    engine_geotiff::GeoTiffEngine::new(&collection.id, collection.data_path.as_deref(), geotiff_config)
-                        .expect("Failed to initialize GeoTIFF engine"),
-                );
+                let engine = match engine_geotiff::GeoTiffEngine::new(&collection.id, collection.data_path.as_deref(), geotiff_config) {
+                    Ok(e) => Arc::new(e),
+                    Err(e) => {
+                        tracing::error!("Collection '{}': failed to initialize GeoTIFF engine: {}", collection.id, e);
+                        continue;
+                    }
+                };
 
-                // get_temporal_extent is from the Engine trait, already in scope
-                // via ds_core::engine::Engine. Use the catalog's temporal extent
-                // to report file count indirectly.
                 if let Some((start, end)) = ds_core::engine::Engine::get_temporal_extent(engine.as_ref()) {
                     info!(
                         "Collection '{}': temporal extent {} to {}",
@@ -142,7 +168,8 @@ async fn main() {
                 }
             }
             other => {
-                panic!("Unknown engine type '{other}' for collection '{}'", collection.id);
+                tracing::error!("Collection '{}': unknown engine type '{}', skipping", collection.id, other);
+                continue;
             }
         }
     }
