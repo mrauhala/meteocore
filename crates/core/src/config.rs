@@ -78,6 +78,15 @@ pub struct GeoTiffConfig {
     #[serde(default = "default_band")]
     pub band: u32,
 
+    /// Override nodata value. Takes precedence over the file's GDAL_NODATA tag.
+    /// Use when files lack a nodata tag (e.g., SMHI radar uses 255 but doesn't declare it).
+    pub nodata: Option<f64>,
+    /// Override scale factor. Takes precedence over the file's GDAL_METADATA SCALE.
+    /// Physical value = raw * scale + offset.
+    pub scale: Option<f64>,
+    /// Override offset. Takes precedence over the file's GDAL_METADATA OFFSET.
+    pub offset: Option<f64>,
+
     /// S3-compatible endpoint URL. When set with `bucket`, replaces `data_path`
     /// for remote access. E.g. `"https://s3.waw3-1.cloudferro.com"`
     pub endpoint: Option<String>,

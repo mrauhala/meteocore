@@ -58,6 +58,10 @@ pub struct GeoTiffEngine {
     max_files: Option<usize>,
     band_index: usize,
     data_path_display: String,
+    /// Config overrides for metadata values (applied after file parsing).
+    override_nodata: Option<f64>,
+    override_scale: Option<f64>,
+    override_offset: Option<f64>,
 }
 
 impl GeoTiffEngine {
@@ -155,6 +159,9 @@ impl GeoTiffEngine {
             max_files: config.max_files,
             band_index,
             data_path_display: display,
+            override_nodata: config.nodata,
+            override_scale: config.scale,
+            override_offset: config.offset,
         };
 
         // Initial scan
@@ -249,6 +256,17 @@ impl GeoTiffEngine {
                 merged
             }
         };
+
+        // Apply config overrides for nodata/scale/offset
+        if self.override_nodata.is_some() || self.override_scale.is_some() || self.override_offset.is_some() {
+            for entry in catalog.entries.values_mut() {
+                entry.metadata.apply_overrides(
+                    self.override_nodata,
+                    self.override_scale,
+                    self.override_offset,
+                );
+            }
+        }
 
         if let Some(max) = self.max_files {
             catalog.trim_to_latest(max);

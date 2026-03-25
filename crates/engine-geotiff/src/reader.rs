@@ -280,6 +280,20 @@ impl TiffMetadata {
             false
         }
     }
+
+    /// Apply config overrides for nodata, scale, and offset.
+    /// Config values take precedence over file-embedded values.
+    pub fn apply_overrides(&mut self, nodata: Option<f64>, scale: Option<f64>, offset: Option<f64>) {
+        if let Some(nd) = nodata {
+            self.nodata = Some(nd);
+        }
+        if let Some(s) = scale {
+            self.scale = Some(s);
+        }
+        if let Some(o) = offset {
+            self.offset = Some(o);
+        }
+    }
 }
 
 /// Decode a chunk into Vec<f64>, applying scale/offset.
