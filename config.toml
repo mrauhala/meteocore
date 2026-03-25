@@ -72,3 +72,23 @@ timestamp_format = "%Y%m%d%H%M"
 parameter = "reflectivity"
 unit = "dBZ"
 poll_interval_secs = 300
+
+[[collections]]
+id = "opera-radar"
+title = "OPERA European Radar Composite"
+description = "1h accumulated precipitation from EUMETNET OPERA, LAEA projection (CloudFerro S3)"
+data_path = "https://s3.waw3-1.cloudferro.com/openradar-24h/2026/03/25/OPERA/COMP/"
+engine_type = "geotiff"
+apis = ["edr"]
+
+[collections.geotiff]
+# Match only ACRR (accumulation) TIFF files, limit to 00:00-01:00 UTC
+filename_pattern = 'OPERA@(?P<timestamp>\d{8}T0[01]\d{2})@0@ACRR\.tiff'
+timestamp_format = "%Y%m%dT%H%M"
+parameter = "precipitation"
+unit = "mm"
+poll_interval_secs = 300
+
+# MET Norway radar cannot be listed via S3 (AccessDenied on list).
+# Individual files are accessible but discovery requires STAC API (Phase 4).
+# Use local files or the STAC catalog URL once implemented.

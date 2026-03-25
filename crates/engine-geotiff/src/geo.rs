@@ -107,26 +107,41 @@ impl GeoTransform {
     }
 
     /// Compute the bounding box in WGS84 [west, south, east, north].
-    /// For projected CRS, inverse-transforms the four corners and takes the envelope.
+    /// For projected CRS, samples points along all edges (not just corners)
+    /// to handle projection distortion.
     pub fn bbox(&self) -> [f64; 4] {
-        let corners = [
-            (self.origin_x, self.origin_y),
-            (self.origin_x + self.width as f64 * self.pixel_width, self.origin_y),
-            (self.origin_x, self.origin_y - self.height as f64 * self.pixel_height),
-            (self.origin_x + self.width as f64 * self.pixel_width, self.origin_y - self.height as f64 * self.pixel_height),
-        ];
+        let x_min = self.origin_x;
+        let x_max = self.origin_x + self.width as f64 * self.pixel_width;
+        let y_max = self.origin_y;
+        let y_min = self.origin_y - self.height as f64 * self.pixel_height;
 
         let mut min_lon = f64::MAX;
         let mut max_lon = f64::MIN;
         let mut min_lat = f64::MAX;
         let mut max_lat = f64::MIN;
 
-        for (x, y) in &corners {
-            let (lon, lat) = self.crs.inverse(*x, *y);
-            min_lon = min_lon.min(lon);
-            max_lon = max_lon.max(lon);
-            min_lat = min_lat.min(lat);
-            max_lat = max_lat.max(lat);
+        // Sample N points along each edge
+        let n = 20;
+        for i in 0..=n {
+            let frac = i as f64 / n as f64;
+            // Top and bottom edges
+            let x = x_min + frac * (x_max - x_min);
+            for &y in &[y_max, y_min] {
+                let (lon, lat) = self.crs.inverse(x, y);
+                min_lon = min_lon.min(lon);
+                max_lon = max_lon.max(lon);
+                min_lat = min_lat.min(lat);
+                max_lat = max_lat.max(lat);
+            }
+            // Left and right edges
+            let y = y_min + frac * (y_max - y_min);
+            for &x in &[x_min, x_max] {
+                let (lon, lat) = self.crs.inverse(x, y);
+                min_lon = min_lon.min(lon);
+                max_lon = max_lon.max(lon);
+                min_lat = min_lat.min(lat);
+                max_lat = max_lat.max(lat);
+            }
         }
 
         [min_lon, min_lat, max_lon, max_lat]
