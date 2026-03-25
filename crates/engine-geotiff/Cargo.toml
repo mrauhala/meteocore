@@ -1,0 +1,13 @@
+[package]
+name = "engine-geotiff"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ds-core = { path = "../core" }
+chrono = { version = "0.4", features = ["serde"] }
+tiff = "0.11"
+arc-swap = "1"
+regex = "1"
+tokio = { version = "1", features = ["rt", "sync", "time", "fs"] }
+tracing = "0.1"

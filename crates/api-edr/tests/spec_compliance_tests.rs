@@ -82,11 +82,10 @@ impl Engine for MockEngine {
             },
         );
         Ok(QueryResult {
-            domain: DomainDescription {
-                domain_type: "PointSeries".to_string(),
-                axes_x: 24.9384,
-                axes_y: 60.1699,
-                axes_t: times,
+            domain: DomainDescription::PointSeries {
+                x: 24.9384,
+                y: 60.1699,
+                t: times,
             },
             parameters,
             ranges,
@@ -120,6 +119,7 @@ fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<EdrState> {
         data_path: String::new(),
         apis: vec!["edr".to_string()],
         engine_type: "csv".to_string(),
+        geotiff: None,
     });
     Arc::new(EdrState { engines, collections, base_url: String::new() })
 }
@@ -438,14 +438,14 @@ async fn finding_10_collection_id_hardcoded() {
 //   is the most commonly expected query type.
 
 #[tokio::test]
-async fn finding_11_position_query_not_implemented() {
+async fn finding_11_position_query_returns_400_for_unsupported_engine() {
     // URL-encode WKT parentheses: POINT(x y) -> POINT%2824.9384%2060.1699%29
     let (status, _) = get_json("/collections/weather/position?coords=POINT%2824.9384%2060.1699%29").await;
-    // Currently returns 404 because the route does not exist
+    // The CSV engine does not support position queries, so it returns 400
     assert_eq!(
         status,
-        StatusCode::NOT_FOUND,
-        "Position query endpoint is not implemented"
+        StatusCode::BAD_REQUEST,
+        "Position query should return 400 for engines that do not support it"
     );
 }
 
@@ -460,12 +460,12 @@ async fn finding_11b_radius_query_not_implemented() {
 }
 
 #[tokio::test]
-async fn finding_11c_area_query_not_implemented() {
+async fn finding_11c_area_query_returns_400_for_unsupported_engine() {
     let (status, _) = get_json("/collections/weather/area?coords=POLYGON%28%2820%2059%2C32%2059%2C32%2071%2C20%2071%2C20%2059%29%29").await;
     assert_eq!(
         status,
-        StatusCode::NOT_FOUND,
-        "Area query endpoint is not implemented"
+        StatusCode::BAD_REQUEST,
+        "Area query should return 400 for engines that do not support it"
     );
 }
 

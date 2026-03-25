@@ -24,3 +24,18 @@ description = "Regional boundaries (maakunta) from Statistics Finland (1:1M scal
 data_path = "testdata/regions.geojson"
 engine_type = "geojson"
 apis = ["features"]
+
+[[collections]]
+id = "radar"
+title = "Weather Radar Reflectivity"
+description = "Radar composite from MET Norway (preprocessed to WGS84)"
+data_path = "testdata/radar"
+engine_type = "geotiff"
+apis = ["edr"]
+
+[collections.geotiff]
+filename_pattern = 'radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif'
+timestamp_format = "%Y%m%dT%H%MZ"
+parameter = "reflectivity"
+unit = "dBZ"
+poll_interval_secs = 30

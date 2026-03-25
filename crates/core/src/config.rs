@@ -35,6 +35,37 @@ pub struct CollectionConfig {
     pub apis: Vec<String>,
     #[serde(default = "default_engine_type")]
     pub engine_type: String,
+    /// GeoTIFF-specific configuration. Required when engine_type = "geotiff".
+    pub geotiff: Option<GeoTiffConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GeoTiffConfig {
+    /// Regex pattern with a named capture group `timestamp` for extracting
+    /// timestamps from filenames. E.g. `radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif`
+    pub filename_pattern: String,
+    /// chrono strftime format for parsing the captured timestamp string.
+    /// E.g. `%Y%m%dT%H%MZ`
+    pub timestamp_format: String,
+    /// The parameter name this collection represents. E.g. "reflectivity"
+    pub parameter: String,
+    /// Unit of measurement. E.g. "dBZ"
+    pub unit: String,
+    /// Directory poll interval in seconds. Default: 30
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// Glob patterns for files to exclude (e.g. temporary files).
+    /// Default: ["*.tmp", "*.part"]
+    #[serde(default = "default_exclude_patterns")]
+    pub exclude_patterns: Vec<String>,
+}
+
+fn default_poll_interval() -> u64 {
+    30
+}
+
+fn default_exclude_patterns() -> Vec<String> {
+    vec!["*.tmp".to_string(), "*.part".to_string()]
 }
 
 fn default_engine_type() -> String {

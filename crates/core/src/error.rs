@@ -29,6 +29,9 @@ pub enum DataServerError {
     #[error("GeoJSON error: {0}")]
     GeoJson(String),
 
+    #[error("GeoTIFF error: {0}")]
+    GeoTiff(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }

@@ -122,11 +122,10 @@ impl Engine for ScalableEngine {
         }
 
         Ok(QueryResult {
-            domain: DomainDescription {
-                domain_type: "PointSeries".to_string(),
-                axes_x: 24.0 + (idx as f64 * 0.01),
-                axes_y: 60.0 + (idx as f64 * 0.01),
-                axes_t: times,
+            domain: DomainDescription::PointSeries {
+                x: 24.0 + (idx as f64 * 0.01),
+                y: 60.0 + (idx as f64 * 0.01),
+                t: times,
             },
             parameters,
             ranges,
@@ -162,6 +161,7 @@ fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<EdrState> {
         data_path: String::new(),
         apis: vec!["edr".to_string()],
         engine_type: "csv".to_string(),
+        geotiff: None,
     });
     Arc::new(EdrState { engines, collections, base_url: String::new() })
 }

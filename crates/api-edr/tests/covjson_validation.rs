@@ -63,11 +63,10 @@ fn make_query_result(
     }
 
     QueryResult {
-        domain: DomainDescription {
-            domain_type: "PointSeries".to_string(),
-            axes_x: 24.9384,
-            axes_y: 60.1699,
-            axes_t: times,
+        domain: DomainDescription::PointSeries {
+            x: 24.9384,
+            y: 60.1699,
+            t: times,
         },
         parameters,
         ranges,
@@ -229,4 +228,161 @@ fn coverage_time_axis_matches_values_count() {
         range_values.len(),
         "time axis values count must match range values count for 1D PointSeries"
     );
+}
+
+// --- Grid domain tests ---
+
+fn make_grid_query_result(
+    x: Vec<f64>,
+    y: Vec<f64>,
+    t: Option<Vec<DateTime<Utc>>>,
+    params: Vec<(&str, &str, Vec<Option<f64>>)>,
+) -> QueryResult {
+    let mut parameters = HashMap::new();
+    let mut ranges = HashMap::new();
+
+    for (name, unit, values) in &params {
+        parameters.insert(
+            name.to_string(),
+            ParameterDescription {
+                label: name.replace('_', " "),
+                unit: unit.to_string(),
+                observed_property: name.to_string(),
+            },
+        );
+
+        let (shape, axis_names) = match &t {
+            Some(times) => (
+                vec![times.len(), y.len(), x.len()],
+                vec!["t".to_string(), "y".to_string(), "x".to_string()],
+            ),
+            None => (
+                vec![y.len(), x.len()],
+                vec!["y".to_string(), "x".to_string()],
+            ),
+        };
+
+        ranges.insert(
+            name.to_string(),
+            NdArray {
+                shape,
+                axis_names,
+                values: values.clone(),
+            },
+        );
+    }
+
+    QueryResult {
+        domain: DomainDescription::Grid { x, y, t },
+        parameters,
+        ranges,
+    }
+}
+
+#[test]
+fn grid_coverage_without_time_validates() {
+    let schema = load_schema();
+    let x = vec![10.0, 10.5, 11.0];
+    let y = vec![60.0, 60.5];
+    // 2 rows * 3 cols = 6 values
+    let values: Vec<Option<f64>> = vec![
+        Some(1.0), Some(2.0), Some(3.0),
+        Some(4.0), Some(5.0), Some(6.0),
+    ];
+    let result = make_grid_query_result(
+        x, y, None,
+        vec![("temperature", "K", values)],
+    );
+    let json = query_result_to_coverage_json(&result);
+    validate(&json, &schema);
+}
+
+#[test]
+fn grid_coverage_with_time_validates() {
+    let schema = load_schema();
+    let x = vec![10.0, 10.5];
+    let y = vec![60.0, 60.5];
+    let t = vec![make_time(0), make_time(1)];
+    // 2 times * 2 rows * 2 cols = 8 values
+    let values: Vec<Option<f64>> = vec![
+        Some(1.0), Some(2.0), Some(3.0), Some(4.0),
+        Some(5.0), Some(6.0), Some(7.0), Some(8.0),
+    ];
+    let result = make_grid_query_result(
+        x, y, Some(t),
+        vec![("reflectivity", "dBZ", values)],
+    );
+    let json = query_result_to_coverage_json(&result);
+    validate(&json, &schema);
+}
+
+#[test]
+fn grid_coverage_with_nulls_validates() {
+    let schema = load_schema();
+    let x = vec![10.0, 10.5, 11.0];
+    let y = vec![60.0, 60.5];
+    let values: Vec<Option<f64>> = vec![
+        Some(1.0), None, Some(3.0),
+        None, Some(5.0), None,
+    ];
+    let result = make_grid_query_result(
+        x, y, None,
+        vec![("temperature", "K", values)],
+    );
+    let json = query_result_to_coverage_json(&result);
+    validate(&json, &schema);
+}
+
+#[test]
+fn grid_ndarray_shape_matches_values() {
+    let x = vec![10.0, 10.5, 11.0];
+    let y = vec![60.0, 60.5];
+    let t = vec![make_time(0), make_time(1), make_time(2)];
+    // 3 times * 2 rows * 3 cols = 18 values
+    let values: Vec<Option<f64>> = (0..18).map(|i| Some(i as f64)).collect();
+    let result = make_grid_query_result(
+        x, y, Some(t),
+        vec![("temperature", "K", values)],
+    );
+    let json = query_result_to_coverage_json(&result);
+
+    let range = &json["ranges"]["temperature"];
+    let shape: Vec<usize> = range["shape"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as usize)
+        .collect();
+    let values_len = range["values"].as_array().unwrap().len();
+    let expected_len: usize = shape.iter().product();
+    assert_eq!(values_len, expected_len);
+}
+
+#[test]
+fn grid_domain_structure() {
+    let x = vec![10.0, 10.5];
+    let y = vec![60.0, 60.5];
+    let result = make_grid_query_result(
+        x.clone(), y.clone(), None,
+        vec![("temperature", "K", vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0)])],
+    );
+    let json = query_result_to_coverage_json(&result);
+
+    let domain = &json["domain"];
+    assert_eq!(domain["type"], "Domain");
+    assert_eq!(domain["domainType"], "Grid");
+
+    let axes = &domain["axes"];
+    let x_vals: Vec<f64> = axes["x"]["values"].as_array().unwrap()
+        .iter().map(|v| v.as_f64().unwrap()).collect();
+    let y_vals: Vec<f64> = axes["y"]["values"].as_array().unwrap()
+        .iter().map(|v| v.as_f64().unwrap()).collect();
+    assert_eq!(x_vals, x);
+    assert_eq!(y_vals, y);
+    assert!(axes.get("t").is_none() || axes["t"].is_null());
+
+    // Referencing should have spatial but no temporal
+    let refs = domain["referencing"].as_array().unwrap();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0]["system"]["type"], "GeographicCRS");
 }

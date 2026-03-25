@@ -1,0 +1,234 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, NaiveDateTime, Utc};
+use ds_core::error::DataServerError;
+use regex::Regex;
+
+use crate::reader::TiffMetadata;
+
+/// Maximum filename length to prevent abuse.
+const MAX_FILENAME_LENGTH: usize = 255;
+
+/// An entry in the file catalog: one GeoTIFF file with a parsed timestamp.
+#[derive(Debug, Clone)]
+pub struct FileEntry {
+    pub path: PathBuf,
+    pub metadata: TiffMetadata,
+    pub file_size: u64,
+}
+
+/// Immutable snapshot of discovered GeoTIFF files, sorted by timestamp.
+#[derive(Debug, Clone)]
+pub struct Catalog {
+    pub entries: BTreeMap<DateTime<Utc>, FileEntry>,
+    pub temporal_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    pub spatial_extent: Option<[f64; 4]>,
+}
+
+impl Catalog {
+    pub fn empty() -> Self {
+        Catalog {
+            entries: BTreeMap::new(),
+            temporal_extent: None,
+            spatial_extent: None,
+        }
+    }
+}
+
+/// Tracks files seen but not yet confirmed as fully written.
+#[derive(Debug)]
+pub struct PendingFile {
+    pub size: u64,
+}
+
+/// Scan a directory for GeoTIFF files matching a filename pattern.
+///
+/// Returns a new Catalog containing all valid files. Files that fail to parse
+/// are logged and skipped.
+///
+/// `existing_metadata` provides cached metadata for files already known, keyed
+/// by path. Files with unchanged size reuse their cached metadata.
+pub fn scan_directory(
+    dir: &Path,
+    pattern: &Regex,
+    timestamp_format: &str,
+    exclude_patterns: &[String],
+    pending: &mut BTreeMap<PathBuf, PendingFile>,
+    existing_metadata: &BTreeMap<PathBuf, (u64, TiffMetadata)>,
+) -> Result<Catalog, DataServerError> {
+    let read_dir = std::fs::read_dir(dir)
+        .map_err(|e| DataServerError::GeoTiff(format!("Cannot read directory {}: {e}", dir.display())))?;
+
+    let mut entries = BTreeMap::new();
+
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        let file_name = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue, // non-UTF8 filename
+        };
+
+        // Security: skip overly long filenames
+        if file_name.len() > MAX_FILENAME_LENGTH {
+            continue;
+        }
+
+        // Skip excluded patterns
+        if is_excluded(&file_name, exclude_patterns) {
+            continue;
+        }
+
+        // Skip non-files (directories, symlinks)
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+
+        // Match filename against pattern
+        let caps = match pattern.captures(&file_name) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let timestamp_str = match caps.name("timestamp") {
+            Some(m) => m.as_str().to_string(),
+            None => continue,
+        };
+
+        // Parse timestamp
+        let datetime = match NaiveDateTime::parse_from_str(&timestamp_str, timestamp_format) {
+            Ok(dt) => dt.and_utc(),
+            Err(_) => {
+                tracing::warn!("Cannot parse timestamp '{}' from file '{}'", timestamp_str, file_name);
+                continue;
+            }
+        };
+
+        let path = entry.path();
+
+        // Get file size
+        let file_size = match entry.metadata() {
+            Ok(m) => m.len(),
+            Err(_) => continue,
+        };
+
+        // File readiness: check size stability for genuinely NEW files only.
+        // Files already in the catalog (existing_metadata) skip the readiness check.
+        let is_known_file = existing_metadata.contains_key(&path);
+
+        if !is_known_file {
+            if let Some(prev) = pending.get(&path) {
+                if prev.size != file_size {
+                    // Size changed — still being written, update pending
+                    pending.insert(path, PendingFile { size: file_size });
+                    continue;
+                }
+                // Size stable — promote from pending
+                pending.remove(&path);
+            } else if !existing_metadata.is_empty() {
+                // Genuinely new file during a poll cycle — add to pending, skip this cycle
+                pending.insert(path.clone(), PendingFile { size: file_size });
+                continue;
+            }
+            // else: initial scan (existing_metadata empty) — accept immediately
+        }
+
+        // Reuse cached metadata if file size unchanged
+        let metadata = if let Some((cached_size, cached_meta)) = existing_metadata.get(&path) {
+            if *cached_size == file_size {
+                cached_meta.clone()
+            } else {
+                match TiffMetadata::from_file(&path) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!("Skipping {}: {e}", path.display());
+                        continue;
+                    }
+                }
+            }
+        } else {
+            match TiffMetadata::from_file(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("Skipping {}: {e}", path.display());
+                    continue;
+                }
+            }
+        };
+
+        // Handle duplicate timestamps: keep lexicographically last filename
+        if let Some(existing) = entries.get(&datetime) {
+            let existing_entry: &FileEntry = existing;
+            if path.to_string_lossy() <= existing_entry.path.to_string_lossy() {
+                continue;
+            }
+            tracing::warn!(
+                "Duplicate timestamp {}: using {}, replacing {}",
+                datetime, path.display(), existing_entry.path.display()
+            );
+        }
+
+        entries.insert(datetime, FileEntry { path, metadata, file_size });
+    }
+
+    // Clean pending files that no longer exist in the directory
+    pending.retain(|p, _| p.exists());
+
+    // Compute extents
+    let temporal_extent = if entries.is_empty() {
+        None
+    } else {
+        let first = *entries.keys().next().unwrap();
+        let last = *entries.keys().next_back().unwrap();
+        Some((first, last))
+    };
+
+    let spatial_extent = entries.values().next().map(|e| e.metadata.geo_transform.bbox());
+
+    Ok(Catalog {
+        entries,
+        temporal_extent,
+        spatial_extent,
+    })
+}
+
+fn is_excluded(filename: &str, patterns: &[String]) -> bool {
+    for pattern in patterns {
+        if pattern.starts_with("*.") {
+            // Extension match
+            let ext = &pattern[1..]; // e.g. ".tmp"
+            if filename.ends_with(ext) {
+                return true;
+            }
+        } else if pattern.starts_with('.') {
+            // Hidden file match
+            if filename.starts_with('.') {
+                return true;
+            }
+        } else if filename == pattern {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exclude_patterns() {
+        assert!(is_excluded("data.tmp", &["*.tmp".into()]));
+        assert!(is_excluded("data.part", &["*.part".into()]));
+        assert!(is_excluded(".hidden", &[".*".into()]));
+        assert!(!is_excluded("radar_20240101T0000Z.tif", &["*.tmp".into(), "*.part".into()]));
+    }
+}

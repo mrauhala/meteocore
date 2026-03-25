@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/engine-csv",
     "crates/engine-geojson",
+    "crates/engine-geotiff",
     "crates/api-edr",
     "crates/api-features",
     "crates/server",

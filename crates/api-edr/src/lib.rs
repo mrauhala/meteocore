@@ -20,5 +20,13 @@ pub fn router(state: Arc<EdrState>) -> Router {
             "/collections/{id}/locations/{loc_id}",
             get(handlers::location_query),
         )
+        .route(
+            "/collections/{id}/position",
+            get(handlers::position_query),
+        )
+        .route(
+            "/collections/{id}/area",
+            get(handlers::area_query),
+        )
         .with_state(state)
 }

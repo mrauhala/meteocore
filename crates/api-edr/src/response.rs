@@ -1,14 +1,7 @@
-use ds_core::model::{Location, QueryResult};
+use ds_core::model::{DomainDescription, Location, QueryResult};
 use serde_json::{json, Value};
 
 pub fn query_result_to_coverage_json(result: &QueryResult) -> Value {
-    let times: Vec<String> = result
-        .domain
-        .axes_t
-        .iter()
-        .map(|t| t.to_rfc3339())
-        .collect();
-
     let mut parameters = serde_json::Map::new();
     for (name, desc) in &result.parameters {
         parameters.insert(
@@ -59,36 +52,67 @@ pub fn query_result_to_coverage_json(result: &QueryResult) -> Value {
         );
     }
 
+    let domain = build_domain(&result.domain);
+
     json!({
         "type": "Coverage",
-        "domain": {
-            "type": "Domain",
-            "domainType": result.domain.domain_type,
-            "axes": {
-                "x": { "values": [result.domain.axes_x] },
-                "y": { "values": [result.domain.axes_y] },
-                "t": { "values": times }
-            },
-            "referencing": [
-                {
-                    "coordinates": ["x", "y"],
-                    "system": {
-                        "type": "GeographicCRS",
-                        "id": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
-                    }
-                },
-                {
-                    "coordinates": ["t"],
-                    "system": {
-                        "type": "TemporalRS",
-                        "calendar": "Gregorian"
-                    }
-                }
-            ]
-        },
+        "domain": domain,
         "parameters": parameters,
         "ranges": ranges
     })
+}
+
+fn build_domain(desc: &DomainDescription) -> Value {
+    let spatial_ref = json!({
+        "coordinates": ["x", "y"],
+        "system": {
+            "type": "GeographicCRS",
+            "id": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
+        }
+    });
+    let temporal_ref = json!({
+        "coordinates": ["t"],
+        "system": {
+            "type": "TemporalRS",
+            "calendar": "Gregorian"
+        }
+    });
+
+    match desc {
+        DomainDescription::PointSeries { x, y, t } => {
+            let times: Vec<String> = t.iter().map(|t| t.to_rfc3339()).collect();
+            json!({
+                "type": "Domain",
+                "domainType": "PointSeries",
+                "axes": {
+                    "x": { "values": [x] },
+                    "y": { "values": [y] },
+                    "t": { "values": times }
+                },
+                "referencing": [spatial_ref, temporal_ref]
+            })
+        }
+        DomainDescription::Grid { x, y, t } => {
+            let mut axes = serde_json::Map::new();
+            axes.insert("x".to_string(), json!({ "values": x }));
+            axes.insert("y".to_string(), json!({ "values": y }));
+
+            let mut referencing = vec![spatial_ref];
+
+            if let Some(times) = t {
+                let time_strings: Vec<String> = times.iter().map(|t| t.to_rfc3339()).collect();
+                axes.insert("t".to_string(), json!({ "values": time_strings }));
+                referencing.push(temporal_ref);
+            }
+
+            json!({
+                "type": "Domain",
+                "domainType": "Grid",
+                "axes": axes,
+                "referencing": referencing
+            })
+        }
+    }
 }
 
 /// Metadata needed for building EDR location features.

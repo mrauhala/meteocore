@@ -60,11 +60,10 @@ impl Engine for MockEngine {
         );
 
         Ok(QueryResult {
-            domain: DomainDescription {
-                domain_type: "PointSeries".to_string(),
-                axes_x: 24.9384,
-                axes_y: 60.1699,
-                axes_t: vec![time],
+            domain: DomainDescription::PointSeries {
+                x: 24.9384,
+                y: 60.1699,
+                t: vec![time],
             },
             parameters,
             ranges,
@@ -101,6 +100,7 @@ fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<EdrState> {
         data_path: String::new(),
         apis: vec!["edr".to_string()],
         engine_type: "csv".to_string(),
+        geotiff: None,
     });
     Arc::new(EdrState { engines, collections, base_url: String::new() })
 }
