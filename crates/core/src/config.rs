@@ -17,7 +17,12 @@ pub struct ServerSettings {
 
 impl ServerSettings {
     /// Resolved base URL with no trailing slash.
+    ///
+    /// Priority: `BASE_URL` env var > config `base_url` field > `http://{host}:{port}`.
     pub fn base_url(&self) -> String {
+        if let Ok(url) = std::env::var("BASE_URL") {
+            return url.trim_end_matches('/').to_string();
+        }
         match &self.base_url {
             Some(url) => url.trim_end_matches('/').to_string(),
             None => format!("http://{}:{}", self.host, self.port),
