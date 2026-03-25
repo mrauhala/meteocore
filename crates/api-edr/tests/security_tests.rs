@@ -97,7 +97,7 @@ fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<EdrState> {
         id: "weather".to_string(),
         title: "Finnish Weather Observations".to_string(),
         description: "Test collection".to_string(),
-        data_path: String::new(),
+        data_path: None,
         apis: vec!["edr".to_string()],
         engine_type: "csv".to_string(),
         geotiff: None,

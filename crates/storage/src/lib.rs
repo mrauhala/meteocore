@@ -111,6 +111,35 @@ pub fn build_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServe
     }
 }
 
+/// Build a `DataStore` from explicit S3 endpoint and bucket.
+///
+/// Use this when endpoint and bucket are configured separately (not parsed
+/// from a URL). The returned store has no prefix — callers supply the prefix
+/// at query time.
+///
+/// Skips request signing (for public buckets). Add credential support later
+/// if needed.
+pub fn build_s3_store_from_parts(
+    endpoint: &str,
+    bucket: &str,
+) -> Result<DataStore, DataServerError> {
+    let allow_http = endpoint.starts_with("http://");
+
+    let store = object_store::aws::AmazonS3Builder::new()
+        .with_bucket_name(bucket)
+        .with_region("auto")
+        .with_endpoint(endpoint)
+        .with_allow_http(allow_http)
+        .with_skip_signature(true)
+        .build()
+        .map_err(|e| DataServerError::Storage(format!(
+            "Cannot create S3 store for endpoint={endpoint} bucket={bucket}: {e}"
+        )))?;
+
+    tracing::info!("S3 store: endpoint={endpoint}, bucket={bucket}");
+    Ok(DataStore::new(Arc::new(store)))
+}
+
 /// Detect S3-style HTTP URLs like https://s3-eu-west-1.amazonaws.com/bucket/...
 /// or https://bucket.s3.region.amazonaws.com/...
 fn is_s3_http_url(url: &str) -> bool {

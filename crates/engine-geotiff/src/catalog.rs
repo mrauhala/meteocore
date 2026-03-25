@@ -247,15 +247,20 @@ const MAX_REMOTE_FILE_SIZE: usize = 50 * 1024 * 1024;
 
 /// Scan a remote object store for GeoTIFF files matching a filename pattern.
 ///
-/// Downloads each matching file into memory and parses metadata.
-/// Reuses cached data for files already in the catalog with the same size.
+/// Uses COG-style byte-range reads to fetch only the IFD metadata (first 64 KB)
+/// instead of downloading entire files. Falls back to full download if the
+/// header-only parse fails (e.g., non-COG layout or unsupported compression).
+///
+/// Reuses cached entries for files already in the catalog with the same size.
 pub fn scan_remote_with_limit(
     store: &ds_storage::DataStore,
     prefix: &ds_storage::object_store::path::Path,
     pattern: &Regex,
     timestamp_format: &str,
-    existing_metadata: &BTreeMap<PathBuf, (u64, TiffMetadata, bytes::Bytes)>,
+    existing_entries: &BTreeMap<PathBuf, FileEntry>,
     max_files: Option<usize>,
+    time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    collection_id: &str,
 ) -> Result<Catalog, DataServerError> {
     let entries_list = store.list(prefix)?;
 
@@ -285,6 +290,13 @@ pub fn scan_remote_with_limit(
             Err(_) => continue,
         };
 
+        // Filter by time window before downloading anything
+        if let Some((start, end)) = time_filter {
+            if datetime < start || datetime > end {
+                continue;
+            }
+        }
+
         if obj.size > MAX_REMOTE_FILE_SIZE {
             continue;
         }
@@ -300,48 +312,66 @@ pub fn scan_remote_with_limit(
     // Re-sort ascending for the BTreeMap
     candidates.sort_by_key(|c| c.0);
 
-    tracing::info!(
-        "Found {} matching files (keeping {})",
-        entries_list.len(),
-        candidates.len()
-    );
+    let listed = entries_list.len();
+    let kept = candidates.len();
+    if time_filter.is_some() {
+        tracing::info!(
+            "[{}] Prefix '{}': {} listed, {} within time window",
+            collection_id, prefix, listed, kept
+        );
+    } else {
+        tracing::info!(
+            "[{}] Prefix '{}': {} listed, {} matching",
+            collection_id, prefix, listed, kept
+        );
+    }
 
-    // Second pass: download and parse metadata
+    // Second pass: parse metadata (range read, falling back to full download)
     let mut entries = BTreeMap::new();
 
     for (datetime, key, file_size, location) in &candidates {
         let pseudo_path = PathBuf::from(key);
 
-        // Reuse cached data if file size unchanged
-        if let Some((cached_size, cached_meta, cached_bytes)) = existing_metadata.get(&pseudo_path) {
-            if *cached_size == *file_size {
-                let source = DataSource::from_bytes(cached_bytes.clone());
-                entries.insert(*datetime, FileEntry {
-                    path: pseudo_path,
-                    source,
-                    metadata: cached_meta.clone(),
-                    file_size: *file_size,
-                });
+        // Reuse cached entry if file size unchanged
+        if let Some(existing) = existing_entries.get(&pseudo_path) {
+            if existing.file_size == *file_size {
+                entries.insert(*datetime, existing.clone());
                 continue;
             }
         }
 
-        // Download the file
-        tracing::info!("Downloading {} ({} bytes)", key, file_size);
+        // Try COG range read first (header only)
+        if let Some((metadata, tile_info)) = TiffMetadata::from_header_read(store, location, *file_size) {
+            tracing::debug!("[{}] {} — range read OK", collection_id, key);
+            let source = DataSource::Remote {
+                store: store.clone(),
+                path: location.clone(),
+                tile_info,
+            };
+            entries.insert(*datetime, FileEntry {
+                path: pseudo_path,
+                source,
+                metadata,
+                file_size: *file_size,
+            });
+            continue;
+        }
+
+        // Fallback: download full file
+        tracing::info!("[{}] {} — range read failed, downloading full file ({})", collection_id, key, super::format_bytes(*file_size));
         let data = match store.get(location) {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!("Failed to download {}: {e}", key);
+                tracing::warn!("[{}] Failed to download {}: {e}", collection_id, key);
                 continue;
             }
         };
 
-        // Parse metadata from downloaded bytes
-        let source = DataSource::from_bytes(data.clone());
+        let source = DataSource::from_bytes(data);
         let metadata = match TiffMetadata::from_source(&source) {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("Skipping {}: {e}", key);
+                tracing::warn!("[{}] Skipping {}: {e}", collection_id, key);
                 continue;
             }
         };
