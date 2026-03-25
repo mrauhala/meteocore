@@ -63,6 +63,15 @@ pub struct GeoTiffConfig {
     /// hundreds of files. E.g. `max_files = 24` keeps the latest 2 hours of
     /// 5-minute radar data.
     pub max_files: Option<usize>,
+    /// Tile cache size in megabytes for remote COG byte-range reads.
+    /// Caches compressed tile bytes to avoid repeated S3/HTTP fetches.
+    /// Default: 64 MB (~3700 tiles). Set to 0 to disable.
+    #[serde(default = "default_tile_cache_mb")]
+    pub tile_cache_mb: u64,
+}
+
+fn default_tile_cache_mb() -> u64 {
+    64
 }
 
 fn default_poll_interval() -> u64 {

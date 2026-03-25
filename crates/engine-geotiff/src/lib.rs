@@ -1,3 +1,4 @@
+mod cache;
 mod catalog;
 mod geo;
 mod reader;
@@ -35,6 +36,7 @@ enum StoreMode {
 
 pub struct GeoTiffEngine {
     catalog: ArcSwap<Catalog>,
+    tile_cache: cache::TileCache,
     store_mode: StoreMode,
     filename_pattern: Regex,
     timestamp_format: String,
@@ -83,8 +85,12 @@ impl GeoTiffEngine {
             }
         };
 
+        let cache_bytes = config.tile_cache_mb * 1024 * 1024;
+        let tile_cache = cache::TileCache::new(cache_bytes);
+
         let engine = GeoTiffEngine {
             catalog: ArcSwap::from_pointee(Catalog::empty()),
+            tile_cache,
             store_mode,
             filename_pattern,
             timestamp_format: config.timestamp_format.clone(),
@@ -185,7 +191,8 @@ impl GeoTiffEngine {
             Ok(new_catalog) => {
                 let count = new_catalog.entries.len();
                 self.catalog.store(Arc::new(new_catalog));
-                tracing::debug!("Catalog updated: {} files", count);
+                let (hits, misses) = self.tile_cache.stats();
+                tracing::debug!("Catalog updated: {} files, tile cache: {} hits / {} misses", count, hits, misses);
             }
             Err(e) => {
                 tracing::warn!("Scan failed, keeping old catalog: {e}");
@@ -235,7 +242,7 @@ impl GeoTiffEngine {
             let pixel = entry.metadata.geo_transform.world_to_pixel(lon, lat);
             let value = match pixel {
                 Some((col, row)) => {
-                    match reader::read_pixel(&entry.source, &entry.metadata, col, row) {
+                    match reader::read_pixel(&entry.source, &entry.metadata, col, row, Some(&self.tile_cache), &entry.path) {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!("Failed to read pixel from {}: {e}", entry.path.display());
@@ -344,7 +351,7 @@ impl GeoTiffEngine {
         for (timestamp, entry) in &entries {
             times.push(**timestamp);
 
-            match reader::read_bbox(&entry.source, &entry.metadata, col_start, row_start, col_end, row_end) {
+            match reader::read_bbox(&entry.source, &entry.metadata, col_start, row_start, col_end, row_end, Some(&self.tile_cache), &entry.path) {
                 Ok(grid_values) => {
                     all_values.extend(grid_values);
                 }

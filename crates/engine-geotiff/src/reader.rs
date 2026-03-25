@@ -522,12 +522,15 @@ fn decode_raw_tile_f64(
 }
 
 /// Read and decode a tile from a remote source via byte-range read.
+/// If a tile cache is provided, checks it first and stores fetched tiles in it.
 fn read_remote_chunk_f64(
     store: &ds_storage::DataStore,
-    path: &ds_storage::object_store::path::Path,
+    obj_path: &ds_storage::object_store::path::Path,
     tile_info: &RemoteTileInfo,
     metadata: &TiffMetadata,
     chunk_index: u32,
+    cache: Option<&crate::cache::TileCache>,
+    file_path: &Path,
 ) -> Result<Vec<Option<f64>>, DataServerError> {
     let idx = chunk_index as usize;
     if idx >= tile_info.tile_offsets.len() {
@@ -545,8 +548,20 @@ fn read_remote_chunk_f64(
         return Ok(vec![None; pixel_count]);
     }
 
-    let compressed = store.get_range(path, offset..offset + byte_count)
-        .map_err(|e| DataServerError::GeoTiff(format!("Failed to read tile range: {e}")))?;
+    // Check cache for compressed bytes
+    let compressed = if let Some(c) = cache {
+        if let Some(cached) = c.get(file_path, chunk_index) {
+            cached
+        } else {
+            let fetched = store.get_range(obj_path, offset..offset + byte_count)
+                .map_err(|e| DataServerError::GeoTiff(format!("Failed to read tile range: {e}")))?;
+            c.insert(file_path, chunk_index, fetched.clone());
+            fetched
+        }
+    } else {
+        store.get_range(obj_path, offset..offset + byte_count)
+            .map_err(|e| DataServerError::GeoTiff(format!("Failed to read tile range: {e}")))?
+    };
 
     let mut raw = decompress_tile(&compressed, tile_info.compression)?;
 
@@ -562,7 +577,16 @@ fn read_remote_chunk_f64(
 }
 
 /// Read a single pixel value from a GeoTIFF at a given pixel coordinate.
-pub fn read_pixel(source: &DataSource, metadata: &TiffMetadata, col: u32, row: u32) -> Result<Option<f64>, DataServerError> {
+/// For remote sources, `cache` enables compressed tile caching and `file_path`
+/// identifies the file in the cache.
+pub fn read_pixel(
+    source: &DataSource,
+    metadata: &TiffMetadata,
+    col: u32,
+    row: u32,
+    cache: Option<&crate::cache::TileCache>,
+    file_path: &Path,
+) -> Result<Option<f64>, DataServerError> {
     let tile_col = col / metadata.tile_width;
     let tile_row = row / metadata.tile_height;
     let chunk_index = tile_row * metadata.tiles_across + tile_col;
@@ -573,7 +597,7 @@ pub fn read_pixel(source: &DataSource, metadata: &TiffMetadata, col: u32, row: u
 
     let values = match source {
         DataSource::Remote { store, path, tile_info } => {
-            read_remote_chunk_f64(store, path, tile_info, metadata, chunk_index)?
+            read_remote_chunk_f64(store, path, tile_info, metadata, chunk_index, cache, file_path)?
         }
         _ => {
             let mut decoder = source.open_decoder()?;
@@ -596,6 +620,8 @@ pub fn read_bbox(
     row_start: u32,
     col_end: u32,
     row_end: u32,
+    cache: Option<&crate::cache::TileCache>,
+    file_path: &Path,
 ) -> Result<Vec<Option<f64>>, DataServerError> {
     let nx = (col_end - col_start) as usize;
     let ny = (row_end - row_start) as usize;
@@ -626,7 +652,7 @@ pub fn read_bbox(
             let chunk_index = tile_row * metadata.tiles_across + tile_col;
             let tile_data = match source {
                 DataSource::Remote { store, path, tile_info } => {
-                    read_remote_chunk_f64(store, path, tile_info, metadata, chunk_index)?
+                    read_remote_chunk_f64(store, path, tile_info, metadata, chunk_index, cache, file_path)?
                 }
                 _ => decode_chunk_f64(decoder.as_mut().unwrap(), chunk_index, metadata)?,
             };
@@ -1057,13 +1083,49 @@ mod tests {
         ];
 
         for (col, row) in test_coords {
-            let full_val = read_pixel(&full_source, &full_meta, col, row).unwrap();
-            let range_val = read_pixel(&remote_source, &header_meta, col, row).unwrap();
+            let full_val = read_pixel(&full_source, &full_meta, col, row, None, &tif_path).unwrap();
+            let range_val = read_pixel(&remote_source, &header_meta, col, row, None, &tif_path).unwrap();
             assert_eq!(
                 full_val, range_val,
                 "Pixel mismatch at ({}, {}): full={:?} vs range={:?}",
                 col, row, full_val, range_val
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tile_cache_avoids_refetch() {
+        let dir = find_test_radar_dir();
+        let tif_path = find_first_tif(&dir);
+
+        let (store, _prefix) = ds_storage::build_store(dir.to_str().unwrap()).unwrap();
+        let filename = tif_path.file_name().unwrap().to_str().unwrap();
+        let obj_path = ds_storage::object_store::path::Path::from(filename);
+        let file_size = std::fs::metadata(&tif_path).unwrap().len();
+
+        let (meta, tile_info) =
+            TiffMetadata::from_header_read(&store, &obj_path, file_size).unwrap();
+
+        let remote_source = DataSource::Remote {
+            store: store.clone(),
+            path: obj_path,
+            tile_info,
+        };
+
+        let cache = crate::cache::TileCache::new(64 * 1024 * 1024);
+        let pseudo_path = PathBuf::from(filename);
+
+        // First read: cache miss
+        let val1 = read_pixel(&remote_source, &meta, 0, 0, Some(&cache), &pseudo_path).unwrap();
+        let (hits, misses) = cache.stats();
+        assert_eq!(misses, 1);
+        assert_eq!(hits, 0);
+
+        // Second read: cache hit, same value
+        let val2 = read_pixel(&remote_source, &meta, 0, 0, Some(&cache), &pseudo_path).unwrap();
+        assert_eq!(val1, val2);
+        let (hits, misses) = cache.stats();
+        assert_eq!(hits, 1);
+        assert_eq!(misses, 1);
     }
 }
