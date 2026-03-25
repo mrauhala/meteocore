@@ -228,6 +228,8 @@ fn tm_forward(lat: f64, lon: f64, lat0: f64, lon0: f64, k0: f64, false_e: f64, f
 }
 
 fn tm_inverse(x: f64, y: f64, lat0: f64, lon0: f64, k0: f64, false_e: f64, false_n: f64) -> (f64, f64) {
+    // Newton iteration approach — works at any distance from central meridian.
+    // Start with the footpoint latitude, then iterate to find (lat, lon).
     let e2 = WGS84_E2;
     let ep2 = e2 / (1.0 - e2);
     let e1 = (1.0 - (1.0 - e2).sqrt()) / (1.0 + (1.0 - e2).sqrt());
@@ -235,34 +237,63 @@ fn tm_inverse(x: f64, y: f64, lat0: f64, lon0: f64, k0: f64, false_e: f64, false
     let m0 = meridian_arc(lat0);
     let m = m0 + (y - false_n) / k0;
 
+    // Footpoint latitude from meridian arc
     let mu = m / (WGS84_A * (1.0 - e2 / 4.0 - 3.0 * e2 * e2 / 64.0 - 5.0 * e2 * e2 * e2 / 256.0));
-
     let lat1 = mu
         + (3.0 * e1 / 2.0 - 27.0 * e1 * e1 * e1 / 32.0) * (2.0 * mu).sin()
         + (21.0 * e1 * e1 / 16.0 - 55.0 * e1 * e1 * e1 * e1 / 32.0) * (4.0 * mu).sin()
         + (151.0 * e1 * e1 * e1 / 96.0) * (6.0 * mu).sin()
         + (1097.0 * e1 * e1 * e1 * e1 / 512.0) * (8.0 * mu).sin();
 
+    // Use series for initial guess, then refine with Newton iteration
     let sin_lat1 = lat1.sin();
     let cos_lat1 = lat1.cos();
     let tan_lat1 = lat1.tan();
     let n1 = WGS84_A / (1.0 - e2 * sin_lat1 * sin_lat1).sqrt();
     let r1 = WGS84_A * (1.0 - e2) / (1.0 - e2 * sin_lat1 * sin_lat1).powf(1.5);
-    let t1 = tan_lat1;
-    let t12 = t1 * t1;
+    let t12 = tan_lat1 * tan_lat1;
     let c1 = ep2 * cos_lat1 * cos_lat1;
     let d = (x - false_e) / (n1 * k0);
     let d2 = d * d;
 
-    let lat = lat1
+    // Series initial guess
+    let mut lat = lat1
         - (n1 * tan_lat1 / r1) * (d2 / 2.0
             - (5.0 + 3.0 * t12 + 10.0 * c1 - 4.0 * c1 * c1 - 9.0 * ep2) * d2 * d2 / 24.0
             + (61.0 + 90.0 * t12 + 298.0 * c1 + 45.0 * t12 * t12 - 252.0 * ep2 - 3.0 * c1 * c1) * d2 * d2 * d2 / 720.0);
 
-    let lon = lon0
+    let mut lon = lon0
         + (d - (1.0 + 2.0 * t12 + c1) * d2 * d / 6.0
             + (5.0 - 2.0 * c1 + 28.0 * t12 - 3.0 * c1 * c1 + 8.0 * ep2 + 24.0 * t12 * t12) * d2 * d2 * d / 120.0)
         / cos_lat1;
+
+    // Newton refinement: iterate forward(lat,lon) towards target (x,y)
+    for _ in 0..20 {
+        let (fx, fy) = tm_forward(lat, lon, lat0, lon0, k0, false_e, false_n);
+        let ex = x - fx; // easting residual
+        let ey = y - fy; // northing residual
+        if ex.abs() < 0.001 && ey.abs() < 0.001 {
+            break;
+        }
+        // Numerical Jacobian: d(easting,northing)/d(lat,lon)
+        let h = 1e-8;
+        let (fx_dlat, fy_dlat) = tm_forward(lat + h, lon, lat0, lon0, k0, false_e, false_n);
+        let (fx_dlon, fy_dlon) = tm_forward(lat, lon + h, lat0, lon0, k0, false_e, false_n);
+        // J = [[de/dlat, de/dlon], [dn/dlat, dn/dlon]]
+        let de_dlat = (fx_dlat - fx) / h;
+        let de_dlon = (fx_dlon - fx) / h;
+        let dn_dlat = (fy_dlat - fy) / h;
+        let dn_dlon = (fy_dlon - fy) / h;
+        let det = de_dlat * dn_dlon - de_dlon * dn_dlat;
+        if det.abs() < 1e-30 {
+            break;
+        }
+        // J^-1 * [ex, ey]
+        let dlat = (dn_dlon * ex - de_dlon * ey) / det;
+        let dlon = (-dn_dlat * ex + de_dlat * ey) / det;
+        lat += dlat;
+        lon += dlon;
+    }
 
     (lat, lon)
 }
@@ -310,34 +341,31 @@ fn laea_forward(lat: f64, lon: f64, lat0: f64, lon0: f64, false_e: f64, false_n:
 }
 
 fn laea_inverse(x: f64, y: f64, lat0: f64, lon0: f64, false_e: f64, false_n: f64) -> (f64, f64) {
-    let e2 = WGS84_E2;
-    let e = e2.sqrt();
+    // Newton iteration from projection center — robust at any distance.
+    let mut lat = lat0;
+    let mut lon = lon0;
 
-    let q0 = q_authalic(lat0, e);
-    let qp = q_authalic(PI / 2.0, e);
-
-    let beta0 = (q0 / qp).clamp(-1.0, 1.0).asin();
-    let rq = WGS84_A * (qp / 2.0).sqrt();
-    let m0 = lat0.cos() / (1.0 - e2 * lat0.sin().powi(2)).sqrt();
-    let dd = WGS84_A * m0 / (rq * beta0.cos());
-
-    let xp = (x - false_e) / dd;
-    let yp = (y - false_n) * dd;
-
-    let rho = (xp * xp + yp * yp).sqrt();
-    if rho < 1e-10 {
-        return (lat0, lon0);
+    for _ in 0..20 {
+        let (fx, fy) = laea_forward(lat, lon, lat0, lon0, false_e, false_n);
+        let ex = x - fx;
+        let ey = y - fy;
+        if ex.abs() < 0.01 && ey.abs() < 0.01 {
+            break;
+        }
+        let h = 1e-8;
+        let (fx_dlat, fy_dlat) = laea_forward(lat + h, lon, lat0, lon0, false_e, false_n);
+        let (fx_dlon, fy_dlon) = laea_forward(lat, lon + h, lat0, lon0, false_e, false_n);
+        let de_dlat = (fx_dlat - fx) / h;
+        let de_dlon = (fx_dlon - fx) / h;
+        let dn_dlat = (fy_dlat - fy) / h;
+        let dn_dlon = (fy_dlon - fy) / h;
+        let det = de_dlat * dn_dlon - de_dlon * dn_dlat;
+        if det.abs() < 1e-30 {
+            break;
+        }
+        lat += (dn_dlon * ex - de_dlon * ey) / det;
+        lon += (-dn_dlat * ex + de_dlat * ey) / det;
     }
-
-    let c = 2.0 * (rho / (2.0 * rq)).asin();
-    let sin_c = c.sin();
-    let cos_c = c.cos();
-
-    let sin_beta = cos_c * beta0.sin() + yp * sin_c * beta0.cos() / rho;
-    let lon = lon0 + (xp * sin_c).atan2(rho * beta0.cos() * cos_c - yp * beta0.sin() * sin_c);
-
-    let q_inv = qp * sin_beta;
-    let lat = authalic_inverse(q_inv, e);
 
     (lat, lon)
 }
@@ -348,6 +376,7 @@ fn q_authalic(lat: f64, e: f64) -> f64 {
     (1.0 - e * e) * (sin_lat / (1.0 - e_sin * e_sin) - (1.0 / (2.0 * e)) * ((1.0 - e_sin) / (1.0 + e_sin)).ln())
 }
 
+#[allow(dead_code)]
 fn authalic_inverse(q: f64, e: f64) -> f64 {
     let e2 = e * e;
     let e4 = e2 * e2;
@@ -551,6 +580,52 @@ mod tests {
         let (lon, lat) = crs.inverse(e, n);
         assert!((lon - 10.75).abs() < 0.001, "lon={lon}");
         assert!((lat - 59.91).abs() < 0.001, "lat={lat}");
+    }
+
+    // FMI radar extreme corners — verified against GDAL gdaltransform
+    #[test]
+    fn tm35fin_extreme_inverse() {
+        let crs = Crs::TransverseMercator {
+            lat0: 0.0,
+            lon0: 27.0_f64.to_radians(),
+            k0: 0.9996,
+            false_e: 500_000.0,
+            false_n: 0.0,
+        };
+        // UL: (-208000, 7926000) should be ~(7.79, 70.42)
+        let (lon, lat) = crs.inverse(-208_000.0, 7_926_000.0);
+        assert!((lon - 7.79).abs() < 0.5, "UL lon={lon}, expected ~7.79");
+        assert!((lat - 70.42).abs() < 0.5, "UL lat={lat}, expected ~70.42");
+
+        // LR: (1072000, 6390000) should be ~(36.51, 57.29)
+        let (lon, lat) = crs.inverse(1_072_000.0, 6_390_000.0);
+        assert!((lon - 36.51).abs() < 0.5, "LR lon={lon}, expected ~36.51");
+        assert!((lat - 57.29).abs() < 0.5, "LR lat={lat}, expected ~57.29");
+
+        // UR: (1072000, 7926000) should be ~(42.71, 70.77)
+        let (lon, lat) = crs.inverse(1_072_000.0, 7_926_000.0);
+        assert!((lon - 42.71).abs() < 0.5, "UR lon={lon}, expected ~42.71");
+        assert!((lat - 70.77).abs() < 0.5, "UR lat={lat}, expected ~70.77");
+    }
+
+    // OPERA LAEA extreme corners — verified against GDAL
+    #[test]
+    fn laea_extreme_inverse() {
+        let crs = Crs::LambertAzimuthalEqualArea {
+            lat0: 55.0_f64.to_radians(),
+            lon0: 10.0_f64.to_radians(),
+            false_e: 1_950_000.0,
+            false_n: -2_100_000.0,
+        };
+        // UL: (-1000, 1000) should be ~(-39.57, 67.02)
+        let (lon, lat) = crs.inverse(-1000.0, 1000.0);
+        assert!((lon - (-39.57)).abs() < 1.0, "UL lon={lon}, expected ~-39.57");
+        assert!((lat - 67.02).abs() < 1.0, "UL lat={lat}, expected ~67.02");
+
+        // LR: (3799000, -4399000) should be ~(29.41, 31.99)
+        let (lon, lat) = crs.inverse(3_799_000.0, -4_399_000.0);
+        assert!((lon - 29.41).abs() < 1.0, "LR lon={lon}, expected ~29.41");
+        assert!((lat - 31.99).abs() < 1.0, "LR lat={lat}, expected ~31.99");
     }
 
     // Test GeoTransform with projected CRS

@@ -383,6 +383,7 @@ fn parse_geo_transform(
 
     // Parse CRS from GeoKeys
     let crs = parse_crs(decoder)?;
+    tracing::info!("Parsed CRS: {:?}", crs);
 
     Ok(GeoTransform {
         origin_x,
@@ -466,25 +467,8 @@ fn parse_crs(decoder: &mut DecoderWrapper) -> Result<Crs, DataServerError> {
     };
 
     // If projection method is missing/user-defined, try to identify by EPSG code
-    let proj_method = if proj_method == 0 && epsg != 0 && epsg != 32767 {
-        match epsg {
-            // EPSG:3067 (TM35FIN) and UTM zones 1-60 N/S
-            3067 => 1, // Transverse Mercator
-            e if (32601..=32660).contains(&e) => 1, // UTM North
-            e if (32701..=32760).contains(&e) => 1, // UTM South
-            // EPSG:3035 (ETRS89-LAEA Europe)
-            3035 => 10, // Lambert Azimuthal Equal Area
-            _ => {
-                tracing::warn!("Unknown EPSG:{}, attempting to read projection params from GeoKeys", epsg);
-                0
-            }
-        }
-    } else {
-        proj_method
-    };
-
-    // For well-known EPSG codes, provide hardcoded parameters as fallback
     if proj_method == 0 && epsg != 0 && epsg != 32767 {
+        // Use hardcoded parameters for well-known EPSG codes
         return match epsg {
             3067 => Ok(Crs::TransverseMercator {
                 lat0: 0.0,
@@ -544,7 +528,11 @@ fn parse_crs(decoder: &mut DecoderWrapper) -> Result<Crs, DataServerError> {
         }
         // CT_LambertAzimEqualArea = 10
         10 => {
-            let lat0 = get_double_key(&keys, 3081).unwrap_or(0.0).to_radians();  // CenterLat
+            // Try NatOriginLat (3081), then CenterLat (3089)
+            let lat0 = get_double_key(&keys, 3081)
+                .or_else(|| get_double_key(&keys, 3089))
+                .unwrap_or(0.0).to_radians();
+            // Try NatOriginLong (3080), then CenterLong (3088)
             let lon0 = get_double_key(&keys, 3080)
                 .or_else(|| get_double_key(&keys, 3088))
                 .unwrap_or(0.0).to_radians();
