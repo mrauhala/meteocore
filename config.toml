@@ -93,6 +93,25 @@ unit = "mm"
 poll_interval_secs = 300
 max_files = 24
 
+[[collections]]
+id = "opera-reflectivity"
+title = "OPERA European Radar Reflectivity"
+description = "Radar reflectivity composite (DBZH) from EUMETNET OPERA, LAEA projection (CloudFerro S3)"
+engine_type = "geotiff"
+apis = ["edr"]
+
+[collections.geotiff]
+endpoint = "https://s3.waw3-1.cloudferro.com"
+bucket = "openradar-24h"
+prefix_pattern = "%Y/%m/%d/OPERA/COMP/"
+scan_days = 2
+filename_pattern = 'OPERA@(?P<timestamp>\d{8}T\d{4})@0@DBZH\.tiff'
+timestamp_format = "%Y%m%dT%H%M"
+parameter = "reflectivity"
+unit = "dBZ"
+poll_interval_secs = 300
+max_files = 24
+
 # MET Norway radar cannot be listed via S3 (AccessDenied on list).
 # Individual files are accessible but discovery requires STAC API (Phase 4).
 # Use local files or the STAC catalog URL once implemented.

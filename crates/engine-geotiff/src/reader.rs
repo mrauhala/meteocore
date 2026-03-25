@@ -166,6 +166,7 @@ pub struct TiffMetadata {
     pub tile_height: u32,
     pub tiles_across: u32,
     pub tiles_down: u32,
+    pub samples_per_pixel: u32,
     pub geo_transform: GeoTransform,
     pub nodata: Option<f64>,
     pub scale: Option<f64>,
@@ -214,6 +215,7 @@ impl TiffMetadata {
 
         let tiles_across = (width + tile_width - 1) / tile_width;
         let tiles_down = (height + tile_height - 1) / tile_height;
+        let samples_per_pixel = read_tag_u32(decoder, Tag::SamplesPerPixel).unwrap_or(1);
 
         let geo_transform = parse_geo_transform(decoder, width, height)?;
         let nodata = parse_nodata(decoder);
@@ -226,6 +228,7 @@ impl TiffMetadata {
             tile_height,
             tiles_across,
             tiles_down,
+            samples_per_pixel,
             geo_transform,
             nodata,
             scale,
@@ -281,17 +284,21 @@ impl TiffMetadata {
 
 /// Decode a chunk into Vec<f64>, applying scale/offset.
 /// Returns None for nodata/NaN values.
+/// For multi-band files, `band_index` selects which band (0-based).
 fn decode_chunk_f64(
     decoder: &mut DecoderWrapper,
     chunk_index: u32,
     metadata: &TiffMetadata,
+    band_index: usize,
 ) -> Result<Vec<Option<f64>>, DataServerError> {
     let result = decoder.read_chunk(chunk_index)
         .map_err(|e| DataServerError::GeoTiff(format!("Failed to read tile: {e}")))?;
 
+    let spp = metadata.samples_per_pixel as usize;
+
     let values = match result {
         DecodingResult::F32(data) => {
-            data.iter().map(|&v| {
+            data.iter().skip(band_index).step_by(spp).map(|&v| {
                 if v.is_nan() || metadata.is_nodata_raw(v as f64) {
                     None
                 } else {
@@ -300,7 +307,7 @@ fn decode_chunk_f64(
             }).collect()
         }
         DecodingResult::F64(data) => {
-            data.iter().map(|&v| {
+            data.iter().skip(band_index).step_by(spp).map(|&v| {
                 if v.is_nan() || metadata.is_nodata_raw(v) {
                     None
                 } else {
@@ -309,7 +316,7 @@ fn decode_chunk_f64(
             }).collect()
         }
         DecodingResult::U8(data) => {
-            data.iter().map(|&v| {
+            data.iter().skip(band_index).step_by(spp).map(|&v| {
                 if metadata.is_nodata_raw(v as f64) {
                     None
                 } else {
@@ -318,7 +325,7 @@ fn decode_chunk_f64(
             }).collect()
         }
         DecodingResult::U16(data) => {
-            data.iter().map(|&v| {
+            data.iter().skip(band_index).step_by(spp).map(|&v| {
                 if metadata.is_nodata_raw(v as f64) {
                     None
                 } else {
@@ -327,7 +334,7 @@ fn decode_chunk_f64(
             }).collect()
         }
         DecodingResult::I16(data) => {
-            data.iter().map(|&v| {
+            data.iter().skip(band_index).step_by(spp).map(|&v| {
                 if metadata.is_nodata_raw(v as f64) {
                     None
                 } else {
@@ -450,70 +457,65 @@ fn undo_horizontal_predictor(data: &mut [u8], tile_width: u32, bytes_per_sample:
 }
 
 /// Decode a raw (decompressed) tile into Vec<Option<f64>> values.
+/// For multi-band files, `band_index` selects which band (0-based).
 fn decode_raw_tile_f64(
     raw: &[u8],
     tile_info: &RemoteTileInfo,
     metadata: &TiffMetadata,
+    band_index: usize,
 ) -> Result<Vec<Option<f64>>, DataServerError> {
     let bps = tile_info.sample_type.bytes_per_sample();
-    let pixel_count = raw.len() / bps;
+    let spp = metadata.samples_per_pixel as usize;
+    let sample_stride = bps * spp; // bytes per pixel (all bands)
+    let band_byte_offset = band_index * bps;
+    let pixel_count = raw.len() / sample_stride;
     let mut values = Vec::with_capacity(pixel_count);
 
     match tile_info.sample_type {
         SampleType::U8 => {
-            for &v in raw {
+            for i in 0..pixel_count {
+                let v = raw[i * spp + band_index];
                 let fv = v as f64;
-                if metadata.is_nodata_raw(fv) {
-                    values.push(None);
-                } else {
-                    values.push(Some(metadata.to_physical(fv)));
-                }
+                if metadata.is_nodata_raw(fv) { values.push(None); }
+                else { values.push(Some(metadata.to_physical(fv))); }
             }
         }
         SampleType::U16 => {
-            for chunk in raw.chunks_exact(2) {
-                let v = u16::from_le_bytes([chunk[0], chunk[1]]);
+            for i in 0..pixel_count {
+                let off = i * sample_stride + band_byte_offset;
+                let v = u16::from_le_bytes([raw[off], raw[off + 1]]);
                 let fv = v as f64;
-                if metadata.is_nodata_raw(fv) {
-                    values.push(None);
-                } else {
-                    values.push(Some(metadata.to_physical(fv)));
-                }
+                if metadata.is_nodata_raw(fv) { values.push(None); }
+                else { values.push(Some(metadata.to_physical(fv))); }
             }
         }
         SampleType::I16 => {
-            for chunk in raw.chunks_exact(2) {
-                let v = i16::from_le_bytes([chunk[0], chunk[1]]);
+            for i in 0..pixel_count {
+                let off = i * sample_stride + band_byte_offset;
+                let v = i16::from_le_bytes([raw[off], raw[off + 1]]);
                 let fv = v as f64;
-                if metadata.is_nodata_raw(fv) {
-                    values.push(None);
-                } else {
-                    values.push(Some(metadata.to_physical(fv)));
-                }
+                if metadata.is_nodata_raw(fv) { values.push(None); }
+                else { values.push(Some(metadata.to_physical(fv))); }
             }
         }
         SampleType::F32 => {
-            for chunk in raw.chunks_exact(4) {
-                let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            for i in 0..pixel_count {
+                let off = i * sample_stride + band_byte_offset;
+                let v = f32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
                 let fv = v as f64;
-                if v.is_nan() || metadata.is_nodata_raw(fv) {
-                    values.push(None);
-                } else {
-                    values.push(Some(metadata.to_physical(fv)));
-                }
+                if v.is_nan() || metadata.is_nodata_raw(fv) { values.push(None); }
+                else { values.push(Some(metadata.to_physical(fv))); }
             }
         }
         SampleType::F64 => {
-            for chunk in raw.chunks_exact(8) {
+            for i in 0..pixel_count {
+                let off = i * sample_stride + band_byte_offset;
                 let v = f64::from_le_bytes([
-                    chunk[0], chunk[1], chunk[2], chunk[3],
-                    chunk[4], chunk[5], chunk[6], chunk[7],
+                    raw[off], raw[off+1], raw[off+2], raw[off+3],
+                    raw[off+4], raw[off+5], raw[off+6], raw[off+7],
                 ]);
-                if v.is_nan() || metadata.is_nodata_raw(v) {
-                    values.push(None);
-                } else {
-                    values.push(Some(metadata.to_physical(v)));
-                }
+                if v.is_nan() || metadata.is_nodata_raw(v) { values.push(None); }
+                else { values.push(Some(metadata.to_physical(v))); }
             }
         }
     }
@@ -523,6 +525,7 @@ fn decode_raw_tile_f64(
 
 /// Read and decode a tile from a remote source via byte-range read.
 /// If a tile cache is provided, checks it first and stores fetched tiles in it.
+/// `band_index` selects which band (0-based) for multi-band files.
 fn read_remote_chunk_f64(
     store: &ds_storage::DataStore,
     obj_path: &ds_storage::object_store::path::Path,
@@ -531,6 +534,7 @@ fn read_remote_chunk_f64(
     chunk_index: u32,
     cache: Option<&crate::cache::TileCache>,
     file_path: &Path,
+    band_index: usize,
 ) -> Result<Vec<Option<f64>>, DataServerError> {
     let idx = chunk_index as usize;
     if idx >= tile_info.tile_offsets.len() {
@@ -573,12 +577,13 @@ fn read_remote_chunk_f64(
         );
     }
 
-    decode_raw_tile_f64(&raw, tile_info, metadata)
+    decode_raw_tile_f64(&raw, tile_info, metadata, band_index)
 }
 
 /// Read a single pixel value from a GeoTIFF at a given pixel coordinate.
 /// For remote sources, `cache` enables compressed tile caching and `file_path`
 /// identifies the file in the cache.
+/// `band_index` selects which band (0-based) for multi-band files.
 pub fn read_pixel(
     source: &DataSource,
     metadata: &TiffMetadata,
@@ -586,6 +591,7 @@ pub fn read_pixel(
     row: u32,
     cache: Option<&crate::cache::TileCache>,
     file_path: &Path,
+    band_index: usize,
 ) -> Result<Option<f64>, DataServerError> {
     let tile_col = col / metadata.tile_width;
     let tile_row = row / metadata.tile_height;
@@ -597,11 +603,11 @@ pub fn read_pixel(
 
     let values = match source {
         DataSource::Remote { store, path, tile_info } => {
-            read_remote_chunk_f64(store, path, tile_info, metadata, chunk_index, cache, file_path)?
+            read_remote_chunk_f64(store, path, tile_info, metadata, chunk_index, cache, file_path, band_index)?
         }
         _ => {
             let mut decoder = source.open_decoder()?;
-            decode_chunk_f64(&mut decoder, chunk_index, metadata)?
+            decode_chunk_f64(&mut decoder, chunk_index, metadata, band_index)?
         }
     };
 
@@ -613,6 +619,7 @@ pub fn read_pixel(
 
 /// Read pixel values within a bounding box from a GeoTIFF data source.
 /// Returns a row-major grid of values [row_start..row_end, col_start..col_end].
+/// `band_index` selects which band (0-based) for multi-band files.
 pub fn read_bbox(
     source: &DataSource,
     metadata: &TiffMetadata,
@@ -622,6 +629,7 @@ pub fn read_bbox(
     row_end: u32,
     cache: Option<&crate::cache::TileCache>,
     file_path: &Path,
+    band_index: usize,
 ) -> Result<Vec<Option<f64>>, DataServerError> {
     let nx = (col_end - col_start) as usize;
     let ny = (row_end - row_start) as usize;
@@ -652,9 +660,9 @@ pub fn read_bbox(
             let chunk_index = tile_row * metadata.tiles_across + tile_col;
             let tile_data = match source {
                 DataSource::Remote { store, path, tile_info } => {
-                    read_remote_chunk_f64(store, path, tile_info, metadata, chunk_index, cache, file_path)?
+                    read_remote_chunk_f64(store, path, tile_info, metadata, chunk_index, cache, file_path, band_index)?
                 }
-                _ => decode_chunk_f64(decoder.as_mut().unwrap(), chunk_index, metadata)?,
+                _ => decode_chunk_f64(decoder.as_mut().unwrap(), chunk_index, metadata, band_index)?,
             };
 
             let tile_pixel_col_start = tile_col * metadata.tile_width;
@@ -1083,8 +1091,8 @@ mod tests {
         ];
 
         for (col, row) in test_coords {
-            let full_val = read_pixel(&full_source, &full_meta, col, row, None, &tif_path).unwrap();
-            let range_val = read_pixel(&remote_source, &header_meta, col, row, None, &tif_path).unwrap();
+            let full_val = read_pixel(&full_source, &full_meta, col, row, None, &tif_path, 0).unwrap();
+            let range_val = read_pixel(&remote_source, &header_meta, col, row, None, &tif_path, 0).unwrap();
             assert_eq!(
                 full_val, range_val,
                 "Pixel mismatch at ({}, {}): full={:?} vs range={:?}",
@@ -1116,13 +1124,13 @@ mod tests {
         let pseudo_path = PathBuf::from(filename);
 
         // First read: cache miss
-        let val1 = read_pixel(&remote_source, &meta, 0, 0, Some(&cache), &pseudo_path).unwrap();
+        let val1 = read_pixel(&remote_source, &meta, 0, 0, Some(&cache), &pseudo_path, 0).unwrap();
         let (hits, misses) = cache.stats();
         assert_eq!(misses, 1);
         assert_eq!(hits, 0);
 
         // Second read: cache hit, same value
-        let val2 = read_pixel(&remote_source, &meta, 0, 0, Some(&cache), &pseudo_path).unwrap();
+        let val2 = read_pixel(&remote_source, &meta, 0, 0, Some(&cache), &pseudo_path, 0).unwrap();
         assert_eq!(val1, val2);
         let (hits, misses) = cache.stats();
         assert_eq!(hits, 1);

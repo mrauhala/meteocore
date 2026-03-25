@@ -53,6 +53,7 @@ pub struct GeoTiffEngine {
     poll_interval: Duration,
     exclude_patterns: Vec<String>,
     max_files: Option<usize>,
+    band_index: usize,
     data_path_display: String,
 }
 
@@ -122,6 +123,8 @@ impl GeoTiffEngine {
         let cache_bytes = config.tile_cache_mb * 1024 * 1024;
         let tile_cache = cache::TileCache::new(cache_bytes);
 
+        let band_index = (config.band.max(1) - 1) as usize; // 1-based config → 0-based index
+
         let engine = GeoTiffEngine {
             catalog: ArcSwap::from_pointee(Catalog::empty()),
             tile_cache,
@@ -133,6 +136,7 @@ impl GeoTiffEngine {
             poll_interval: Duration::from_secs(config.poll_interval_secs),
             exclude_patterns: config.exclude_patterns.clone(),
             max_files: config.max_files,
+            band_index,
             data_path_display: display,
         };
 
@@ -309,7 +313,7 @@ impl GeoTiffEngine {
             let pixel = entry.metadata.geo_transform.world_to_pixel(lon, lat);
             let value = match pixel {
                 Some((col, row)) => {
-                    match reader::read_pixel(&entry.source, &entry.metadata, col, row, Some(&self.tile_cache), &entry.path) {
+                    match reader::read_pixel(&entry.source, &entry.metadata, col, row, Some(&self.tile_cache), &entry.path, self.band_index) {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!("Failed to read pixel from {}: {e}", entry.path.display());
@@ -418,7 +422,7 @@ impl GeoTiffEngine {
         for (timestamp, entry) in &entries {
             times.push(**timestamp);
 
-            match reader::read_bbox(&entry.source, &entry.metadata, col_start, row_start, col_end, row_end, Some(&self.tile_cache), &entry.path) {
+            match reader::read_bbox(&entry.source, &entry.metadata, col_start, row_start, col_end, row_end, Some(&self.tile_cache), &entry.path, self.band_index) {
                 Ok(grid_values) => {
                     all_values.extend(grid_values);
                 }

@@ -72,6 +72,12 @@ pub struct GeoTiffConfig {
     #[serde(default = "default_tile_cache_mb")]
     pub tile_cache_mb: u64,
 
+    /// Band number to read (1-based). Default: 1.
+    /// For multi-band files, selects which band contains the parameter values.
+    /// E.g. OPERA radar files have band 1 = data, band 2 = quality.
+    #[serde(default = "default_band")]
+    pub band: u32,
+
     /// S3-compatible endpoint URL. When set with `bucket`, replaces `data_path`
     /// for remote access. E.g. `"https://s3.waw3-1.cloudferro.com"`
     pub endpoint: Option<String>,
@@ -93,6 +99,10 @@ fn default_tile_cache_mb() -> u64 {
 
 fn default_scan_days() -> u32 {
     2
+}
+
+fn default_band() -> u32 {
+    1
 }
 
 fn default_poll_interval() -> u64 {
