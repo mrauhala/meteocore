@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
@@ -323,11 +324,13 @@ pub enum PropertyValue {
 }
 
 /// A single feature with geometry and properties.
+/// Geometry and properties are wrapped in `Arc` for cheap cloning
+/// (pagination returns owned features, so clone cost matters at scale).
 #[derive(Debug, Clone)]
 pub struct Feature {
     pub id: String,
-    pub geometry: Geometry,
-    pub properties: HashMap<String, PropertyValue>,
+    pub geometry: Arc<Geometry>,
+    pub properties: Arc<HashMap<String, PropertyValue>>,
 }
 
 /// A page of features with pagination metadata.
@@ -391,11 +394,24 @@ impl Bbox {
 
     /// Check if this bbox intersects another bbox (as [west, south, east, north]).
     pub fn intersects_bbox(&self, other: &[f64; 4]) -> bool {
-        let lon_ok = if self.crosses_antimeridian() {
-            // Antimeridian-crossing: intersects if other doesn't fall entirely in the gap
-            !(other[2] < self.west && other[0] > self.east)
-        } else {
-            self.west <= other[2] && self.east >= other[0]
+        let other_crosses = other[0] > other[2]; // other west > other east
+        let lon_ok = match (self.crosses_antimeridian(), other_crosses) {
+            (false, false) => {
+                // Neither crosses: standard overlap test
+                self.west <= other[2] && self.east >= other[0]
+            }
+            (true, false) => {
+                // Self crosses, other doesn't: intersects unless other is entirely in the gap
+                !(other[2] < self.west && other[0] > self.east)
+            }
+            (false, true) => {
+                // Other crosses, self doesn't: intersects unless self is entirely in the gap
+                !(self.east < other[0] && self.west > other[2])
+            }
+            (true, true) => {
+                // Both cross: always intersects (they share the antimeridian region)
+                true
+            }
         };
         lon_ok && self.south <= other[3] && self.north >= other[1]
     }

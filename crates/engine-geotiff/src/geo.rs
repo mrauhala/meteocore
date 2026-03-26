@@ -92,8 +92,9 @@ impl Crs {
 
     /// Inverse-transform projected (easting, northing) to WGS84 (lon_deg, lat_deg).
     /// For Wgs84, returns (x, y) unchanged.
-    pub fn inverse(&self, x: f64, y: f64) -> (f64, f64) {
-        match self {
+    /// Returns `None` if the projection math produces NaN/Inf (e.g., near poles).
+    pub fn inverse(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let result = match self {
             Crs::Wgs84 => (x, y),
             Crs::TransverseMercator {
                 lat0,
@@ -125,6 +126,11 @@ impl Crs {
                 let (lat, lon) = lcc_inverse(x, y, *lat1, *lat2, *lat0, *lon0, *false_e, *false_n);
                 (lon.to_degrees(), lat.to_degrees())
             }
+        };
+        if result.0.is_finite() && result.1.is_finite() {
+            Some(result)
+        } else {
+            None
         }
     }
 }
@@ -162,7 +168,7 @@ impl GeoTransform {
 
     /// Compute the bounding box in WGS84 [west, south, east, north].
     /// For projected CRS, samples points along all edges (not just corners)
-    /// to handle projection distortion.
+    /// to handle projection distortion. Skips points that fail to reproject.
     pub fn bbox(&self) -> [f64; 4] {
         let x_min = self.origin_x;
         let x_max = self.origin_x + self.width as f64 * self.pixel_width;
@@ -181,20 +187,22 @@ impl GeoTransform {
             // Top and bottom edges
             let x = x_min + frac * (x_max - x_min);
             for &y in &[y_max, y_min] {
-                let (lon, lat) = self.crs.inverse(x, y);
-                min_lon = min_lon.min(lon);
-                max_lon = max_lon.max(lon);
-                min_lat = min_lat.min(lat);
-                max_lat = max_lat.max(lat);
+                if let Some((lon, lat)) = self.crs.inverse(x, y) {
+                    min_lon = min_lon.min(lon);
+                    max_lon = max_lon.max(lon);
+                    min_lat = min_lat.min(lat);
+                    max_lat = max_lat.max(lat);
+                }
             }
             // Left and right edges
             let y = y_min + frac * (y_max - y_min);
             for &x in &[x_min, x_max] {
-                let (lon, lat) = self.crs.inverse(x, y);
-                min_lon = min_lon.min(lon);
-                max_lon = max_lon.max(lon);
-                min_lat = min_lat.min(lat);
-                max_lat = max_lat.max(lat);
+                if let Some((lon, lat)) = self.crs.inverse(x, y) {
+                    min_lon = min_lon.min(lon);
+                    max_lon = max_lon.max(lon);
+                    min_lat = min_lat.min(lat);
+                    max_lat = max_lat.max(lat);
+                }
             }
         }
 
@@ -202,10 +210,11 @@ impl GeoTransform {
     }
 
     /// Convert pixel coordinate to WGS84 (lon, lat) at pixel center.
+    /// Returns (0, 0) if reprojection fails (degenerate edge case).
     pub fn pixel_to_world(&self, col: u32, row: u32) -> (f64, f64) {
         let x = self.origin_x + (col as f64 + 0.5) * self.pixel_width;
         let y = self.origin_y - (row as f64 + 0.5) * self.pixel_height;
-        self.crs.inverse(x, y)
+        self.crs.inverse(x, y).unwrap_or((0.0, 0.0))
     }
 
     /// Convert a WGS84 bbox [west, south, east, north] to pixel range.
@@ -671,7 +680,7 @@ mod tests {
         assert!((e - 385_597.0).abs() < 500.0, "easting={e}");
         assert!((n - 6_672_097.0).abs() < 500.0, "northing={n}");
 
-        let (lon, lat) = crs.inverse(e, n);
+        let (lon, lat) = crs.inverse(e, n).unwrap();
         assert!((lon - 24.9384).abs() < 0.001, "lon={lon}");
         assert!((lat - 60.1699).abs() < 0.001, "lat={lat}");
     }
@@ -693,7 +702,7 @@ mod tests {
 
         // Helsinki roundtrip
         let (e, n) = crs.forward(24.9384, 60.1699);
-        let (lon, lat) = crs.inverse(e, n);
+        let (lon, lat) = crs.inverse(e, n).unwrap();
         assert!((lon - 24.9384).abs() < 0.001, "lon={lon}");
         assert!((lat - 60.1699).abs() < 0.001, "lat={lat}");
     }
@@ -711,7 +720,7 @@ mod tests {
         };
         // Oslo roundtrip
         let (e, n) = crs.forward(10.75, 59.91);
-        let (lon, lat) = crs.inverse(e, n);
+        let (lon, lat) = crs.inverse(e, n).unwrap();
         assert!((lon - 10.75).abs() < 0.001, "lon={lon}");
         assert!((lat - 59.91).abs() < 0.001, "lat={lat}");
     }
@@ -727,17 +736,17 @@ mod tests {
             false_n: 0.0,
         };
         // UL: (-208000, 7926000) should be ~(7.79, 70.42)
-        let (lon, lat) = crs.inverse(-208_000.0, 7_926_000.0);
+        let (lon, lat) = crs.inverse(-208_000.0, 7_926_000.0).unwrap();
         assert!((lon - 7.79).abs() < 0.5, "UL lon={lon}, expected ~7.79");
         assert!((lat - 70.42).abs() < 0.5, "UL lat={lat}, expected ~70.42");
 
         // LR: (1072000, 6390000) should be ~(36.51, 57.29)
-        let (lon, lat) = crs.inverse(1_072_000.0, 6_390_000.0);
+        let (lon, lat) = crs.inverse(1_072_000.0, 6_390_000.0).unwrap();
         assert!((lon - 36.51).abs() < 0.5, "LR lon={lon}, expected ~36.51");
         assert!((lat - 57.29).abs() < 0.5, "LR lat={lat}, expected ~57.29");
 
         // UR: (1072000, 7926000) should be ~(42.71, 70.77)
-        let (lon, lat) = crs.inverse(1_072_000.0, 7_926_000.0);
+        let (lon, lat) = crs.inverse(1_072_000.0, 7_926_000.0).unwrap();
         assert!((lon - 42.71).abs() < 0.5, "UR lon={lon}, expected ~42.71");
         assert!((lat - 70.77).abs() < 0.5, "UR lat={lat}, expected ~70.77");
     }
@@ -752,7 +761,7 @@ mod tests {
             false_n: -2_100_000.0,
         };
         // UL: (-1000, 1000) should be ~(-39.57, 67.02)
-        let (lon, lat) = crs.inverse(-1000.0, 1000.0);
+        let (lon, lat) = crs.inverse(-1000.0, 1000.0).unwrap();
         assert!(
             (lon - (-39.57)).abs() < 1.0,
             "UL lon={lon}, expected ~-39.57"
@@ -760,7 +769,7 @@ mod tests {
         assert!((lat - 67.02).abs() < 1.0, "UL lat={lat}, expected ~67.02");
 
         // LR: (3799000, -4399000) should be ~(29.41, 31.99)
-        let (lon, lat) = crs.inverse(3_799_000.0, -4_399_000.0);
+        let (lon, lat) = crs.inverse(3_799_000.0, -4_399_000.0).unwrap();
         assert!((lon - 29.41).abs() < 1.0, "LR lon={lon}, expected ~29.41");
         assert!((lat - 31.99).abs() < 1.0, "LR lat={lat}, expected ~31.99");
     }

@@ -64,21 +64,34 @@ impl DataStore {
         self.block_on(async { Ok(self.inner.head(path).await?) })
     }
 
+    /// Default timeout for individual storage operations (30 seconds).
+    const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Bridge async to sync. Uses `block_in_place` when inside a tokio runtime
     /// (safe from async handlers via multi-threaded scheduler), or creates a
     /// temporary runtime otherwise (for use in non-async contexts like startup).
+    /// All operations are subject to a 30-second timeout to prevent hung connections.
     fn block_on<F, T>(&self, future: F) -> Result<T, DataServerError>
     where
         F: std::future::Future<Output = Result<T, object_store::Error>>,
     {
+        let timed = async {
+            match tokio::time::timeout(Self::REQUEST_TIMEOUT, future).await {
+                Ok(result) => result,
+                Err(_) => Err(object_store::Error::Generic {
+                    store: "DataStore",
+                    source: "Request timed out after 30s".into(),
+                }),
+            }
+        };
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future))
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(timed))
                 .map_err(|e| DataServerError::Storage(format!("{e}"))),
             Err(_) => {
                 // No runtime — create a temporary one (e.g., in tests or CLI tools)
                 let rt = tokio::runtime::Runtime::new()
                     .map_err(|e| DataServerError::Storage(format!("Cannot create runtime: {e}")))?;
-                rt.block_on(future)
+                rt.block_on(timed)
                     .map_err(|e| DataServerError::Storage(format!("{e}")))
             }
         }

@@ -81,6 +81,8 @@ fn compute_spatial_union<'a>(entries: impl Iterator<Item = &'a FileEntry>) -> Op
 #[derive(Debug)]
 pub struct PendingFile {
     pub size: u64,
+    /// Number of consecutive polls with the same size.
+    pub stable_count: u8,
 }
 
 /// Scan a directory for GeoTIFF files matching a filename pattern.
@@ -171,17 +173,29 @@ pub fn scan_directory(
         let existing_entry = existing.get(path.as_path());
 
         if existing_entry.is_none() {
-            if let Some(prev) = pending.get(&path) {
+            if let Some(prev) = pending.get_mut(&path) {
                 if prev.size != file_size {
-                    // Size changed — still being written, update pending
-                    pending.insert(path, PendingFile { size: file_size });
+                    // Size changed — still being written, reset counter
+                    prev.size = file_size;
+                    prev.stable_count = 0;
                     continue;
                 }
-                // Size stable — promote from pending
+                prev.stable_count += 1;
+                if prev.stable_count < 2 {
+                    // Need 2 consecutive stable polls before accepting
+                    continue;
+                }
+                // Size stable for 2 polls — promote from pending
                 pending.remove(&path);
             } else if !existing.is_empty() {
                 // Genuinely new file during a poll cycle — add to pending, skip this cycle
-                pending.insert(path.clone(), PendingFile { size: file_size });
+                pending.insert(
+                    path.clone(),
+                    PendingFile {
+                        size: file_size,
+                        stable_count: 0,
+                    },
+                );
                 continue;
             }
             // else: initial scan (existing empty) — accept immediately

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::BufReader;
+use std::sync::Arc;
 
 use ds_core::error::DataServerError;
 use ds_core::feature::{Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue};
@@ -18,8 +19,8 @@ const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
 
 struct StoredFeature {
     id: String,
-    geometry: Geometry,
-    properties: HashMap<String, PropertyValue>,
+    geometry: Arc<Geometry>,
+    properties: Arc<HashMap<String, PropertyValue>>,
     /// None for null-geometry features.
     bbox: Option<[f64; 4]>,
 }
@@ -86,15 +87,14 @@ impl GeoJsonEngine {
                 validate_wgs84_bbox(b)?;
             }
 
-            if let std::collections::hash_map::Entry::Vacant(e) = id_index.entry(id.clone()) {
-                e.insert(features.len());
-            }
-            // Duplicate IDs: first one wins in the index, but all are stored
+            // Update index to point at the latest feature with this ID.
+            // This ensures get_feature(id) and iteration return consistent data.
+            id_index.insert(id.clone(), features.len());
 
             features.push(StoredFeature {
                 id,
-                geometry,
-                properties,
+                geometry: Arc::new(geometry),
+                properties: Arc::new(properties),
                 bbox,
             });
         }
@@ -149,8 +149,8 @@ impl GeoJsonEngine {
     fn to_feature(&self, stored: &StoredFeature) -> Feature {
         Feature {
             id: stored.id.clone(),
-            geometry: stored.geometry.clone(),
-            properties: stored.properties.clone(),
+            geometry: Arc::clone(&stored.geometry),
+            properties: Arc::clone(&stored.properties),
         }
     }
 }
@@ -525,7 +525,7 @@ mod tests {
     fn polygon_geometry_preserved() {
         let engine = load_from_string(sample_geojson());
         let f = engine.get_feature("area.1").unwrap();
-        match &f.geometry {
+        match &*f.geometry {
             Geometry::Polygon { exterior, holes } => {
                 assert_eq!(exterior.len(), 5);
                 assert!(holes.is_empty());
@@ -539,7 +539,7 @@ mod tests {
     fn multipolygon_geometry_preserved() {
         let engine = load_from_string(sample_geojson());
         let f = engine.get_feature("multi.1").unwrap();
-        match &f.geometry {
+        match &*f.geometry {
             Geometry::MultiPolygon { polygons } => {
                 assert_eq!(polygons.len(), 2);
                 assert_eq!(polygons[0].0.len(), 5); // first polygon exterior

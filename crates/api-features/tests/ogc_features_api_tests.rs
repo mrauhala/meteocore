@@ -30,12 +30,13 @@ impl MockFeatureEngine {
                 geometry: Geometry::Point {
                     x: 24.9384,
                     y: 60.1699,
-                },
+                }
+                .into(),
                 properties: {
                     let mut m = HashMap::new();
                     m.insert("name".into(), PropertyValue::String("Helsinki".into()));
                     m.insert("population".into(), PropertyValue::Integer(658457));
-                    m
+                    m.into()
                 },
             },
             Feature {
@@ -43,21 +44,22 @@ impl MockFeatureEngine {
                 geometry: Geometry::Point {
                     x: 23.7610,
                     y: 61.4978,
-                },
+                }
+                .into(),
                 properties: {
                     let mut m = HashMap::new();
                     m.insert("name".into(), PropertyValue::String("Tampere".into()));
                     m.insert("population".into(), PropertyValue::Integer(244315));
-                    m
+                    m.into()
                 },
             },
             Feature {
                 id: "no-location".into(),
-                geometry: Geometry::Null,
+                geometry: Geometry::Null.into(),
                 properties: {
                     let mut m = HashMap::new();
                     m.insert("name".into(), PropertyValue::String("Unknown".into()));
-                    m
+                    m.into()
                 },
             },
         ];

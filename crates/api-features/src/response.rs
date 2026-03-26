@@ -139,11 +139,11 @@ mod tests {
 
         Feature {
             id: "Helsinki".into(),
-            geometry: Geometry::Point {
+            geometry: std::sync::Arc::new(Geometry::Point {
                 x: 24.9384,
                 y: 60.1699,
-            },
-            properties,
+            }),
+            properties: std::sync::Arc::new(properties),
         }
     }
 

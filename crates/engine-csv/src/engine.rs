@@ -3,6 +3,8 @@ use std::collections::HashMap;
 
 use ds_core::engine::Engine;
 use ds_core::error::DataServerError;
+use std::sync::Arc;
+
 use ds_core::feature::{
     parse_area_coords, Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue,
 };
@@ -301,11 +303,11 @@ impl FeatureEngine for CsvEngine {
 
             all_features.push(Feature {
                 id: row.location.clone(),
-                geometry: Geometry::Point {
+                geometry: Arc::new(Geometry::Point {
                     x: row.longitude,
                     y: row.latitude,
-                },
-                properties,
+                }),
+                properties: Arc::new(properties),
             });
         }
 
@@ -348,11 +350,11 @@ impl FeatureEngine for CsvEngine {
 
         Ok(Feature {
             id: row.location.clone(),
-            geometry: Geometry::Point {
+            geometry: Arc::new(Geometry::Point {
                 x: row.longitude,
                 y: row.latitude,
-            },
-            properties,
+            }),
+            properties: Arc::new(properties),
         })
     }
 }
@@ -380,7 +382,7 @@ mod tests {
         assert!(all.next_offset.is_none());
         // Each feature should have a point geometry and properties
         for f in &all.features {
-            assert!(matches!(f.geometry, Geometry::Point { .. }));
+            assert!(matches!(*f.geometry, Geometry::Point { .. }));
             assert!(f.properties.contains_key("name"));
         }
     }
@@ -426,7 +428,7 @@ mod tests {
         assert!(result.number_matched > 0, "expected Helsinki-area stations");
         // All returned features should be within the bbox
         for f in &result.features {
-            match f.geometry {
+            match *f.geometry {
                 Geometry::Point { x, y } => {
                     assert!(bbox.contains(x, y), "feature {} outside bbox", f.id);
                 }
@@ -464,7 +466,7 @@ mod tests {
         let feature = engine.get_feature(first_id).unwrap();
         assert_eq!(&feature.id, first_id);
         assert!(feature.properties.contains_key("name"));
-        assert!(matches!(feature.geometry, Geometry::Point { .. }));
+        assert!(matches!(*feature.geometry, Geometry::Point { .. }));
     }
 
     #[test]
