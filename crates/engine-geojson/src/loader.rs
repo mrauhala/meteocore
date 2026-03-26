@@ -157,38 +157,56 @@ impl GeoJsonEngine {
 
 impl FeatureEngine for GeoJsonEngine {
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
-        let indices: Vec<usize> = match &query.bbox {
-            Some(bbox) => {
-                let mut hits = self.spatial_index.query(bbox);
-                hits.sort_unstable();
-                hits.dedup();
-                hits
-            }
-            None => (0..self.features.len()).collect(),
-        };
+        // When bbox is set, query the spatial index; otherwise iterate all features directly.
+        // R-tree results are already unique (each feature is indexed once).
+        if let Some(bbox) = &query.bbox {
+            let indices = self.spatial_index.query(bbox);
+            let number_matched = indices.len();
+            let offset = query.offset.min(number_matched);
+            let end = offset.saturating_add(query.limit).min(number_matched);
 
-        let number_matched = indices.len();
-        let offset = query.offset.min(number_matched);
-        let end = offset.saturating_add(query.limit).min(number_matched);
+            let features: Vec<Feature> = indices[offset..end]
+                .iter()
+                .map(|&i| self.to_feature(&self.features[i]))
+                .collect();
 
-        let features: Vec<Feature> = indices[offset..end]
-            .iter()
-            .map(|&i| self.to_feature(&self.features[i]))
-            .collect();
+            let number_returned = features.len();
+            let next_offset = if end < number_matched {
+                Some(end)
+            } else {
+                None
+            };
 
-        let number_returned = features.len();
-        let next_offset = if end < number_matched {
-            Some(end)
+            Ok(FeaturePage {
+                features,
+                number_matched,
+                number_returned,
+                next_offset,
+            })
         } else {
-            None
-        };
+            let number_matched = self.features.len();
+            let offset = query.offset.min(number_matched);
+            let end = offset.saturating_add(query.limit).min(number_matched);
 
-        Ok(FeaturePage {
-            features,
-            number_matched,
-            number_returned,
-            next_offset,
-        })
+            let features: Vec<Feature> = self.features[offset..end]
+                .iter()
+                .map(|stored| self.to_feature(stored))
+                .collect();
+
+            let number_returned = features.len();
+            let next_offset = if end < number_matched {
+                Some(end)
+            } else {
+                None
+            };
+
+            Ok(FeaturePage {
+                features,
+                number_matched,
+                number_returned,
+                next_offset,
+            })
+        }
     }
 
     fn get_feature(&self, feature_id: &str) -> Result<Feature, DataServerError> {

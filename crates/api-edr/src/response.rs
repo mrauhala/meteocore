@@ -1,65 +1,125 @@
 use ds_core::model::{AreaQueryResult, DomainDescription, Location, QueryResult};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Number, Value};
+
+/// Pre-built reference system objects (shared across all responses).
+fn spatial_ref() -> Value {
+    json!({
+        "coordinates": ["x", "y"],
+        "system": {
+            "type": "GeographicCRS",
+            "id": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
+        }
+    })
+}
+
+fn temporal_ref() -> Value {
+    json!({
+        "coordinates": ["t"],
+        "system": {
+            "type": "TemporalRS",
+            "calendar": "Gregorian"
+        }
+    })
+}
+
+fn build_parameter(label: &str, unit: &str, observed_property: &str) -> Value {
+    let mut param = Map::with_capacity(4);
+    param.insert("type".into(), Value::String("Parameter".into()));
+    param.insert(
+        "description".into(),
+        Value::Object({
+            let mut m = Map::with_capacity(1);
+            m.insert("en".into(), Value::String(label.into()));
+            m
+        }),
+    );
+    param.insert(
+        "unit".into(),
+        Value::Object({
+            let mut m = Map::with_capacity(2);
+            m.insert(
+                "label".into(),
+                Value::Object({
+                    let mut lm = Map::with_capacity(1);
+                    lm.insert("en".into(), Value::String(unit.into()));
+                    lm
+                }),
+            );
+            m.insert(
+                "symbol".into(),
+                Value::Object({
+                    let mut sm = Map::with_capacity(2);
+                    sm.insert("value".into(), Value::String(unit.into()));
+                    sm.insert(
+                        "type".into(),
+                        Value::String("http://www.opengis.net/def/uom/UCUM/".into()),
+                    );
+                    sm
+                }),
+            );
+            m
+        }),
+    );
+    param.insert(
+        "observedProperty".into(),
+        Value::Object({
+            let mut m = Map::with_capacity(2);
+            m.insert("id".into(), Value::String(observed_property.into()));
+            m.insert(
+                "label".into(),
+                Value::Object({
+                    let mut lm = Map::with_capacity(1);
+                    lm.insert("en".into(), Value::String(label.into()));
+                    lm
+                }),
+            );
+            m
+        }),
+    );
+    Value::Object(param)
+}
+
+fn build_ndarray(ndarray: &ds_core::model::NdArray) -> Value {
+    let values: Vec<Value> = ndarray
+        .values
+        .iter()
+        .map(|v| match v {
+            Some(f) => Value::Number(Number::from_f64(*f).unwrap_or(Number::from(0))),
+            None => Value::Null,
+        })
+        .collect();
+
+    let mut obj = Map::with_capacity(5);
+    obj.insert("type".into(), Value::String("NdArray".into()));
+    obj.insert("dataType".into(), Value::String("float".into()));
+    obj.insert("axisNames".into(), json!(ndarray.axis_names));
+    obj.insert("shape".into(), json!(ndarray.shape));
+    obj.insert("values".into(), Value::Array(values));
+    Value::Object(obj)
+}
 
 pub fn query_result_to_coverage_json(result: &QueryResult) -> Value {
-    let mut parameters = serde_json::Map::new();
+    let mut parameters = Map::with_capacity(result.parameters.len());
     for (name, desc) in &result.parameters {
         parameters.insert(
             name.clone(),
-            json!({
-                "type": "Parameter",
-                "description": {
-                    "en": desc.label
-                },
-                "unit": {
-                    "label": {
-                        "en": desc.unit
-                    },
-                    "symbol": {
-                        "value": desc.unit,
-                        "type": "http://www.opengis.net/def/uom/UCUM/"
-                    }
-                },
-                "observedProperty": {
-                    "id": desc.observed_property,
-                    "label": {
-                        "en": desc.label
-                    }
-                }
-            }),
+            build_parameter(&desc.label, &desc.unit, &desc.observed_property),
         );
     }
 
-    let mut ranges = serde_json::Map::new();
+    let mut ranges = Map::with_capacity(result.ranges.len());
     for (name, ndarray) in &result.ranges {
-        let values: Vec<Value> = ndarray
-            .values
-            .iter()
-            .map(|v| match v {
-                Some(f) => json!(f),
-                None => Value::Null,
-            })
-            .collect();
-        ranges.insert(
-            name.clone(),
-            json!({
-                "type": "NdArray",
-                "dataType": "float",
-                "axisNames": ndarray.axis_names,
-                "shape": ndarray.shape,
-                "values": values
-            }),
-        );
+        ranges.insert(name.clone(), build_ndarray(ndarray));
     }
 
     let domain = build_domain(&result.domain);
 
-    json!({
-        "type": "Coverage",
-        "domain": domain,
-        "parameters": parameters,
-        "ranges": ranges
-    })
+    let mut coverage = Map::with_capacity(4);
+    coverage.insert("type".into(), Value::String("Coverage".into()));
+    coverage.insert("domain".into(), domain);
+    coverage.insert("parameters".into(), Value::Object(parameters));
+    coverage.insert("ranges".into(), Value::Object(ranges));
+    Value::Object(coverage)
 }
 
 pub fn area_query_result_to_json(result: &AreaQueryResult) -> Value {
@@ -75,75 +135,29 @@ pub fn area_query_result_to_json(result: &AreaQueryResult) -> Value {
 
             // Hoist shared parameters and referencing to collection level
             let first = &coverages[0];
-            let mut parameters = serde_json::Map::new();
+            let mut parameters = Map::with_capacity(first.parameters.len());
             for (name, desc) in &first.parameters {
                 parameters.insert(
                     name.clone(),
-                    json!({
-                        "type": "Parameter",
-                        "description": { "en": desc.label },
-                        "unit": {
-                            "label": { "en": desc.unit },
-                            "symbol": {
-                                "value": desc.unit,
-                                "type": "http://www.opengis.net/def/uom/UCUM/"
-                            }
-                        },
-                        "observedProperty": {
-                            "id": desc.observed_property,
-                            "label": { "en": desc.label }
-                        }
-                    }),
+                    build_parameter(&desc.label, &desc.unit, &desc.observed_property),
                 );
             }
-
-            let spatial_ref = json!({
-                "coordinates": ["x", "y"],
-                "system": {
-                    "type": "GeographicCRS",
-                    "id": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
-                }
-            });
-            let temporal_ref = json!({
-                "coordinates": ["t"],
-                "system": {
-                    "type": "TemporalRS",
-                    "calendar": "Gregorian"
-                }
-            });
 
             let coverage_items: Vec<Value> = coverages
                 .iter()
                 .map(|qr| {
                     let domain = build_domain(&qr.domain);
 
-                    let mut ranges = serde_json::Map::new();
+                    let mut ranges = Map::with_capacity(qr.ranges.len());
                     for (name, ndarray) in &qr.ranges {
-                        let values: Vec<Value> = ndarray
-                            .values
-                            .iter()
-                            .map(|v| match v {
-                                Some(f) => json!(f),
-                                None => Value::Null,
-                            })
-                            .collect();
-                        ranges.insert(
-                            name.clone(),
-                            json!({
-                                "type": "NdArray",
-                                "dataType": "float",
-                                "axisNames": ndarray.axis_names,
-                                "shape": ndarray.shape,
-                                "values": values
-                            }),
-                        );
+                        ranges.insert(name.clone(), build_ndarray(ndarray));
                     }
 
-                    json!({
-                        "type": "Coverage",
-                        "domain": domain,
-                        "ranges": ranges
-                    })
+                    let mut cov = Map::with_capacity(3);
+                    cov.insert("type".into(), Value::String("Coverage".into()));
+                    cov.insert("domain".into(), domain);
+                    cov.insert("ranges".into(), Value::Object(ranges));
+                    Value::Object(cov)
                 })
                 .collect();
 
@@ -151,7 +165,7 @@ pub fn area_query_result_to_json(result: &AreaQueryResult) -> Value {
                 "type": "CoverageCollection",
                 "domainType": "PointSeries",
                 "parameters": parameters,
-                "referencing": [spatial_ref, temporal_ref],
+                "referencing": [spatial_ref(), temporal_ref()],
                 "coverages": coverage_items
             })
         }
@@ -159,21 +173,6 @@ pub fn area_query_result_to_json(result: &AreaQueryResult) -> Value {
 }
 
 fn build_domain(desc: &DomainDescription) -> Value {
-    let spatial_ref = json!({
-        "coordinates": ["x", "y"],
-        "system": {
-            "type": "GeographicCRS",
-            "id": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
-        }
-    });
-    let temporal_ref = json!({
-        "coordinates": ["t"],
-        "system": {
-            "type": "TemporalRS",
-            "calendar": "Gregorian"
-        }
-    });
-
     match desc {
         DomainDescription::PointSeries { x, y, t } => {
             let times: Vec<String> = t.iter().map(|t| t.to_rfc3339()).collect();
@@ -185,20 +184,20 @@ fn build_domain(desc: &DomainDescription) -> Value {
                     "y": { "values": [y] },
                     "t": { "values": times }
                 },
-                "referencing": [spatial_ref, temporal_ref]
+                "referencing": [spatial_ref(), temporal_ref()]
             })
         }
         DomainDescription::Grid { x, y, t } => {
-            let mut axes = serde_json::Map::new();
-            axes.insert("x".to_string(), json!({ "values": x }));
-            axes.insert("y".to_string(), json!({ "values": y }));
+            let mut axes = Map::new();
+            axes.insert("x".into(), json!({ "values": x }));
+            axes.insert("y".into(), json!({ "values": y }));
 
-            let mut referencing = vec![spatial_ref];
+            let mut referencing = vec![spatial_ref()];
 
             if let Some(times) = t {
                 let time_strings: Vec<String> = times.iter().map(|t| t.to_rfc3339()).collect();
-                axes.insert("t".to_string(), json!({ "values": time_strings }));
-                referencing.push(temporal_ref);
+                axes.insert("t".into(), json!({ "values": time_strings }));
+                referencing.push(temporal_ref());
             }
 
             json!({
