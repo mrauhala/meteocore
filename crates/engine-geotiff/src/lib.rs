@@ -606,9 +606,38 @@ impl Engine for GeoTiffEngine {
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
-        let (west, south, east, north) = parse_bbox_coords(coords)?;
-        self.query_bbox(west, south, east, north, datetime, parameters)
+    ) -> Result<AreaQueryResult, DataServerError> {
+        let polygon = ds_core::feature::parse_area_coords(coords)?;
+        let mut result = self.query_bbox(
+            polygon.bbox.west,
+            polygon.bbox.south,
+            polygon.bbox.east,
+            polygon.bbox.north,
+            datetime,
+            parameters,
+        )?;
+
+        // Mask pixels outside the polygon
+        if let DomainDescription::Grid { ref x, ref y, ref t } = result.domain {
+            let nt = t.as_ref().map_or(1, |tv| tv.len());
+            let ny = y.len();
+            let nx = x.len();
+            for (_name, ndarray) in result.ranges.iter_mut() {
+                for iy in 0..ny {
+                    for ix in 0..nx {
+                        if !polygon.contains(x[ix], y[iy]) {
+                            // Null out all timesteps for this pixel
+                            for it in 0..nt {
+                                let idx = it * ny * nx + iy * nx + ix;
+                                ndarray.values[idx] = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(AreaQueryResult::Single(result))
     }
 
     fn supported_query_types(&self) -> Vec<String> {
@@ -845,7 +874,7 @@ fn expand_prefix_pattern(pattern: &str, scan_days: u32) -> Vec<String> {
     expand_prefix_for_dates(pattern, &dates)
 }
 
-use parse::{parse_coords, parse_bbox_coords};
+use parse::parse_coords;
 
 #[cfg(test)]
 mod tests {

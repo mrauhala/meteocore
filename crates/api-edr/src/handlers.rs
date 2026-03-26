@@ -12,7 +12,7 @@ use ds_core::datetime::parse_datetime_interval;
 use ds_core::engine::Engine;
 
 use crate::params::{AreaQueryParams, LocationQueryParams, PositionQueryParams};
-use crate::response::{locations_to_geojson, query_result_to_coverage_json, LocationsContext};
+use crate::response::{area_query_result_to_json, locations_to_geojson, query_result_to_coverage_json, LocationsContext};
 
 /// Shared state for the EDR API: a registry of collection engines + metadata.
 #[derive(Clone)]
@@ -293,7 +293,7 @@ pub async fn area_query(
             }
         })?;
 
-    let body = serde_json::to_string(&query_result_to_coverage_json(&result)).unwrap();
+    let body = serde_json::to_string(&area_query_result_to_json(&result)).unwrap();
     Ok((
         [(header::CONTENT_TYPE, "application/prs.coverage+json")],
         body,

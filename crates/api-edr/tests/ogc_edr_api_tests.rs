@@ -111,6 +111,31 @@ impl Engine for MockEngine {
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
         Some([23.7610, 60.1699, 24.9384, 61.4978])
     }
+
+    fn supported_query_types(&self) -> Vec<String> {
+        vec!["locations".to_string(), "area".to_string()]
+    }
+
+    fn query_area(
+        &self,
+        coords: &str,
+        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
+    ) -> Result<AreaQueryResult, DataServerError> {
+        let polygon = ds_core::feature::parse_area_coords(coords)?;
+        let mut coverages = Vec::new();
+        for loc in Self::sample_locations() {
+            if polygon.contains(loc.longitude, loc.latitude) {
+                coverages.push(Self::sample_query_result());
+            }
+        }
+        if coverages.is_empty() {
+            return Err(DataServerError::LocationNotFound(
+                "No locations found within the requested area".into(),
+            ));
+        }
+        Ok(AreaQueryResult::Collection(coverages))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -895,14 +920,41 @@ mod unimplemented_queries {
     }
 
     #[tokio::test]
-    #[ignore = "area query not yet implemented"]
     async fn area_query() {
-        // GET /collections/{id}/area?coords=POLYGON((24 60,25 60,25 61,24 61,24 60))
-        let (status, _) = get(
-            "/collections/weather/area?coords=POLYGON((24 60,25 60,25 61,24 61,24 60))",
+        // POLYGON covering Helsinki (24.9, 60.1) — should match Helsinki but not Tampere
+        let (status, json) = get(
+            "/collections/weather/area?coords=POLYGON%28%2824.5%2060.0%2C25.5%2060.0%2C25.5%2060.5%2C24.5%2060.5%2C24.5%2060.0%29%29",
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["type"], "CoverageCollection");
+        assert_eq!(json["domainType"], "PointSeries");
+        let coverages = json["coverages"].as_array().unwrap();
+        assert_eq!(coverages.len(), 1, "should match Helsinki only");
+        assert_eq!(coverages[0]["type"], "Coverage");
+    }
+
+    #[tokio::test]
+    async fn area_query_bbox_format() {
+        // bbox covering both Helsinki and Tampere
+        let (status, json) = get(
+            "/collections/weather/area?coords=23.0,59.0,25.5,62.0",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["type"], "CoverageCollection");
+        let coverages = json["coverages"].as_array().unwrap();
+        assert_eq!(coverages.len(), 2, "should match both locations");
+    }
+
+    #[tokio::test]
+    async fn area_query_no_match() {
+        // POLYGON far from any stations
+        let (status, _) = get(
+            "/collections/weather/area?coords=POLYGON%28%280%200%2C1%200%2C1%201%2C0%201%2C0%200%29%29",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

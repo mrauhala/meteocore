@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use jsonschema::Validator;
 use serde_json::Value;
 
-use api_edr::response::query_result_to_coverage_json;
+use api_edr::response::{area_query_result_to_json, query_result_to_coverage_json};
 use ds_core::model::*;
 
 fn load_schema() -> Value {
@@ -385,4 +385,84 @@ fn grid_domain_structure() {
     let refs = domain["referencing"].as_array().unwrap();
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0]["system"]["type"], "GeographicCRS");
+}
+
+// --- CoverageCollection tests ---
+
+#[test]
+fn coverage_collection_validates() {
+    let schema = load_schema();
+    let times = vec![make_time(0), make_time(1), make_time(2)];
+
+    let coverages = vec![
+        make_query_result(
+            times.clone(),
+            vec![("temperature", "°C", vec![Some(-2.5), Some(-2.8), Some(-3.1)])],
+        ),
+        make_query_result(
+            times.clone(),
+            vec![("temperature", "°C", vec![Some(1.0), Some(1.5), Some(2.0)])],
+        ),
+    ];
+
+    let result = AreaQueryResult::Collection(coverages);
+    let json = area_query_result_to_json(&result);
+
+    assert_eq!(json["type"], "CoverageCollection");
+    assert_eq!(json["domainType"], "PointSeries");
+    assert!(json["parameters"].is_object());
+    assert!(json["referencing"].is_array());
+    let items = json["coverages"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    for item in items {
+        assert_eq!(item["type"], "Coverage");
+        assert!(item["domain"].is_object());
+        assert!(item["ranges"].is_object());
+    }
+
+    validate(&json, &schema);
+}
+
+#[test]
+fn coverage_collection_single_station_validates() {
+    let schema = load_schema();
+    let times = vec![make_time(0), make_time(1)];
+
+    let coverages = vec![make_query_result(
+        times,
+        vec![
+            ("temperature", "°C", vec![Some(5.0), Some(6.0)]),
+            ("humidity", "%", vec![Some(80.0), Some(82.0)]),
+        ],
+    )];
+
+    let result = AreaQueryResult::Collection(coverages);
+    let json = area_query_result_to_json(&result);
+    validate(&json, &schema);
+}
+
+#[test]
+fn coverage_collection_empty_validates() {
+    let schema = load_schema();
+    let result = AreaQueryResult::Collection(vec![]);
+    let json = area_query_result_to_json(&result);
+    assert_eq!(json["type"], "CoverageCollection");
+    assert!(json["coverages"].as_array().unwrap().is_empty());
+    validate(&json, &schema);
+}
+
+#[test]
+fn area_query_single_result_validates() {
+    let schema = load_schema();
+    let x = vec![10.0, 10.5, 11.0];
+    let y = vec![60.0, 60.5];
+    let values: Vec<Option<f64>> = vec![
+        Some(1.0), Some(2.0), Some(3.0),
+        Some(4.0), None, Some(6.0),
+    ];
+    let qr = make_grid_query_result(x, y, None, vec![("reflectivity", "dBZ", values)]);
+    let result = AreaQueryResult::Single(qr);
+    let json = area_query_result_to_json(&result);
+    assert_eq!(json["type"], "Coverage");
+    validate(&json, &schema);
 }

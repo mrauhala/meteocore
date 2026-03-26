@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use ds_core::engine::Engine;
 use ds_core::error::DataServerError;
-use ds_core::feature::{Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue};
+use ds_core::feature::{parse_area_coords, Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue};
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::model::*;
 
@@ -192,6 +192,57 @@ impl Engine for CsvEngine {
         } else {
             None
         }
+    }
+
+    fn supported_query_types(&self) -> Vec<String> {
+        vec!["locations".to_string(), "area".to_string()]
+    }
+
+    fn query_area(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+    ) -> Result<AreaQueryResult, DataServerError> {
+        const MAX_LOCATIONS: usize = 500;
+
+        let polygon = parse_area_coords(coords)?;
+
+        // Find unique locations within the polygon
+        let mut seen = HashMap::new();
+        let mut matching_locations = Vec::new();
+
+        for row in &self.store.rows {
+            if seen.contains_key(&row.location) {
+                continue;
+            }
+            seen.insert(&row.location, true);
+            if polygon.contains(row.longitude, row.latitude) {
+                matching_locations.push(row.location.clone());
+            }
+        }
+
+        if matching_locations.is_empty() {
+            return Err(DataServerError::LocationNotFound(
+                "No locations found within the requested area".into(),
+            ));
+        }
+
+        if matching_locations.len() > MAX_LOCATIONS {
+            return Err(DataServerError::InvalidParameter(format!(
+                "Area query matched {} locations, maximum is {}. Use a smaller area.",
+                matching_locations.len(),
+                MAX_LOCATIONS
+            )));
+        }
+
+        // Build a PointSeries QueryResult for each matching location
+        let mut coverages = Vec::with_capacity(matching_locations.len());
+        for loc_id in &matching_locations {
+            coverages.push(self.query_location(loc_id, datetime, parameters)?);
+        }
+
+        Ok(AreaQueryResult::Collection(coverages))
     }
 
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
