@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 use crate::error::DataServerError;
-use crate::model::{Location, ParameterDescription, QueryResult};
+use crate::model::{AreaQueryResult, Location, ParameterDescription, QueryResult};
 
 pub trait Engine: Send + Sync {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError>;
@@ -50,7 +50,7 @@ pub trait Engine: Send + Sync {
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
+    ) -> Result<AreaQueryResult, DataServerError> {
         let _ = (coords, datetime, parameters);
         Err(DataServerError::InvalidParameter(
             "Area query not supported by this engine".into(),

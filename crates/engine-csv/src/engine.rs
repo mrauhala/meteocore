@@ -3,7 +3,9 @@ use std::collections::HashMap;
 
 use ds_core::engine::Engine;
 use ds_core::error::DataServerError;
-use ds_core::feature::{Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue};
+use ds_core::feature::{
+    parse_area_coords, Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue,
+};
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::model::*;
 
@@ -194,6 +196,57 @@ impl Engine for CsvEngine {
         }
     }
 
+    fn supported_query_types(&self) -> Vec<String> {
+        vec!["locations".to_string(), "area".to_string()]
+    }
+
+    fn query_area(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+    ) -> Result<AreaQueryResult, DataServerError> {
+        const MAX_LOCATIONS: usize = 500;
+
+        let polygon = parse_area_coords(coords)?;
+
+        // Find unique locations within the polygon
+        let mut seen = HashMap::new();
+        let mut matching_locations = Vec::new();
+
+        for row in &self.store.rows {
+            if seen.contains_key(&row.location) {
+                continue;
+            }
+            seen.insert(&row.location, true);
+            if polygon.contains(row.longitude, row.latitude) {
+                matching_locations.push(row.location.clone());
+            }
+        }
+
+        if matching_locations.is_empty() {
+            return Err(DataServerError::LocationNotFound(
+                "No locations found within the requested area".into(),
+            ));
+        }
+
+        if matching_locations.len() > MAX_LOCATIONS {
+            return Err(DataServerError::InvalidParameter(format!(
+                "Area query matched {} locations, maximum is {}. Use a smaller area.",
+                matching_locations.len(),
+                MAX_LOCATIONS
+            )));
+        }
+
+        // Build a PointSeries QueryResult for each matching location
+        let mut coverages = Vec::with_capacity(matching_locations.len());
+        for loc_id in &matching_locations {
+            coverages.push(self.query_location(loc_id, datetime, parameters)?);
+        }
+
+        Ok(AreaQueryResult::Collection(coverages))
+    }
+
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
         if self.store.rows.is_empty() {
             return None;
@@ -239,14 +292,8 @@ impl FeatureEngine for CsvEngine {
                 "name".to_string(),
                 PropertyValue::String(row.location.clone()),
             );
-            properties.insert(
-                "latitude".to_string(),
-                PropertyValue::Float(row.latitude),
-            );
-            properties.insert(
-                "longitude".to_string(),
-                PropertyValue::Float(row.longitude),
-            );
+            properties.insert("latitude".to_string(), PropertyValue::Float(row.latitude));
+            properties.insert("longitude".to_string(), PropertyValue::Float(row.longitude));
 
             all_features.push(Feature {
                 id: row.location.clone(),
@@ -292,14 +339,8 @@ impl FeatureEngine for CsvEngine {
             "name".to_string(),
             PropertyValue::String(row.location.clone()),
         );
-        properties.insert(
-            "latitude".to_string(),
-            PropertyValue::Float(row.latitude),
-        );
-        properties.insert(
-            "longitude".to_string(),
-            PropertyValue::Float(row.longitude),
-        );
+        properties.insert("latitude".to_string(), PropertyValue::Float(row.latitude));
+        properties.insert("longitude".to_string(), PropertyValue::Float(row.longitude));
 
         Ok(Feature {
             id: row.location.clone(),
@@ -408,7 +449,12 @@ mod tests {
     fn get_feature_by_id() {
         let engine = CsvEngine::new(test_store());
         // Get any feature from the listing and fetch it by ID
-        let all = engine.get_features(&FeatureQuery { limit: 1, ..Default::default() }).unwrap();
+        let all = engine
+            .get_features(&FeatureQuery {
+                limit: 1,
+                ..Default::default()
+            })
+            .unwrap();
         let first_id = &all.features[0].id;
 
         let feature = engine.get_feature(first_id).unwrap();

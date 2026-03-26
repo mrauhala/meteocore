@@ -57,11 +57,7 @@ impl Engine for MockEngine {
             return Err(DataServerError::LocationNotFound(location_id.to_string()));
         }
         let times: Vec<DateTime<Utc>> = (0..3)
-            .map(|h| {
-                format!("2024-01-01T{h:02}:00:00Z")
-                    .parse()
-                    .unwrap()
-            })
+            .map(|h| format!("2024-01-01T{h:02}:00:00Z").parse().unwrap())
             .collect();
         let mut parameters = HashMap::new();
         parameters.insert(
@@ -112,16 +108,23 @@ fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<EdrState> {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     engines.insert("weather".to_string(), engine);
-    collections.insert("weather".to_string(), CollectionConfig {
-        id: "weather".to_string(),
-        title: "Finnish Weather Observations".to_string(),
-        description: "Test collection".to_string(),
-        data_path: None,
-        apis: vec!["edr".to_string()],
-        engine_type: "csv".to_string(),
-        geotiff: None,
-    });
-    Arc::new(EdrState { engines, collections, base_url: String::new() })
+    collections.insert(
+        "weather".to_string(),
+        CollectionConfig {
+            id: "weather".to_string(),
+            title: "Finnish Weather Observations".to_string(),
+            description: "Test collection".to_string(),
+            data_path: None,
+            apis: vec!["edr".to_string()],
+            engine_type: "csv".to_string(),
+            geotiff: None,
+        },
+    );
+    Arc::new(EdrState {
+        engines,
+        collections,
+        base_url: String::new(),
+    })
 }
 
 fn app() -> axum::Router {
@@ -401,7 +404,10 @@ async fn finding_09_location_features_have_data_links() {
         );
         let links = feature["links"].as_array().unwrap();
         let has_data_link = links.iter().any(|l| l["rel"] == "data");
-        assert!(has_data_link, "Feature should have a 'data' link to its query endpoint");
+        assert!(
+            has_data_link,
+            "Feature should have a 'data' link to its query endpoint"
+        );
     }
 }
 
@@ -440,7 +446,8 @@ async fn finding_10_collection_id_hardcoded() {
 #[tokio::test]
 async fn finding_11_position_query_returns_400_for_unsupported_engine() {
     // URL-encode WKT parentheses: POINT(x y) -> POINT%2824.9384%2060.1699%29
-    let (status, _) = get_json("/collections/weather/position?coords=POINT%2824.9384%2060.1699%29").await;
+    let (status, _) =
+        get_json("/collections/weather/position?coords=POINT%2824.9384%2060.1699%29").await;
     // The CSV engine does not support position queries, so it returns 400
     assert_eq!(
         status,
@@ -451,7 +458,10 @@ async fn finding_11_position_query_returns_400_for_unsupported_engine() {
 
 #[tokio::test]
 async fn finding_11b_radius_query_not_implemented() {
-    let (status, _) = get_json("/collections/weather/radius?coords=POINT%2824.9384%2060.1699%29&within=50&within-units=km").await;
+    let (status, _) = get_json(
+        "/collections/weather/radius?coords=POINT%2824.9384%2060.1699%29&within=50&within-units=km",
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
@@ -614,10 +624,7 @@ async fn finding_17_collections_missing_count_fields() {
 async fn finding_18_conformance_has_ogc_common_classes() {
     let (_status, json) = get_json("/conformance").await;
     let conforms_to = json["conformsTo"].as_array().unwrap();
-    let uris: Vec<&str> = conforms_to
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect();
+    let uris: Vec<&str> = conforms_to.iter().filter_map(|v| v.as_str()).collect();
 
     assert!(uris.iter().any(|u| u.contains("ogcapi-edr")));
     assert!(
@@ -674,8 +681,7 @@ async fn finding_21_location_query_params_incomplete() {
 
     // "crs" param is not supported but should be accepted without error
     // (axum by default ignores unknown query params, so this passes)
-    let (status, _) =
-        get_json("/collections/weather/locations/station1?crs=CRS84").await;
+    let (status, _) = get_json("/collections/weather/locations/station1?crs=CRS84").await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -850,16 +856,14 @@ async fn finding_30_404_error_format() {
 
 #[tokio::test]
 async fn finding_30b_400_error_format() {
-    let (status, json) =
-        get_json("/collections/weather/locations/station1?datetime=invalid").await;
+    let (status, json) = get_json("/collections/weather/locations/station1?datetime=invalid").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(json["code"].is_string());
 }
 
 #[tokio::test]
 async fn finding_30c_404_location_not_found() {
-    let (status, json) =
-        get_json("/collections/weather/locations/nonexistent_station").await;
+    let (status, json) = get_json("/collections/weather/locations/nonexistent_station").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(json["code"], "NotFound");
 }

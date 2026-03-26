@@ -17,9 +17,6 @@ pub fn router(state: Arc<FeaturesState>) -> Router {
         .route("/collections", get(handlers::collections))
         .route("/collections/{id}", get(handlers::collection))
         .route("/collections/{id}/items", get(handlers::items))
-        .route(
-            "/collections/{id}/items/{feature_id}",
-            get(handlers::item),
-        )
+        .route("/collections/{id}/items/{feature_id}", get(handlers::item))
         .with_state(state)
 }

@@ -36,9 +36,8 @@ impl GeoJsonEngine {
     /// Coordinates must be in WGS84 (EPSG:4326).
     pub fn load(path: &str) -> Result<Self, DataServerError> {
         // Check file size
-        let metadata = std::fs::metadata(path).map_err(|e| {
-            DataServerError::GeoJson(format!("Failed to read file metadata: {e}"))
-        })?;
+        let metadata = std::fs::metadata(path)
+            .map_err(|e| DataServerError::GeoJson(format!("Failed to read file metadata: {e}")))?;
         if metadata.len() > MAX_FILE_SIZE {
             return Err(DataServerError::GeoJson(format!(
                 "File exceeds maximum size of {} MB",
@@ -53,10 +52,7 @@ impl GeoJsonEngine {
         let geojson: serde_json::Value = serde_json::from_reader(reader)
             .map_err(|e| DataServerError::GeoJson(format!("Invalid JSON: {e}")))?;
 
-        let fc_type = geojson
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let fc_type = geojson.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if fc_type != "FeatureCollection" {
             return Err(DataServerError::GeoJson(
                 "Expected a GeoJSON FeatureCollection".into(),
@@ -236,10 +232,7 @@ fn parse_geometry(geom: Option<&serde_json::Value>) -> Result<Geometry, DataServ
         return Ok(Geometry::Null);
     }
 
-    let geom_type = geom
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let geom_type = geom.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match geom_type {
         "Point" => {
@@ -262,9 +255,7 @@ fn parse_geometry(geom: Option<&serde_json::Value>) -> Result<Geometry, DataServ
             let rings = geom
                 .get("coordinates")
                 .and_then(|v| v.as_array())
-                .ok_or_else(|| {
-                    DataServerError::GeoJson("Polygon missing coordinates".into())
-                })?;
+                .ok_or_else(|| DataServerError::GeoJson("Polygon missing coordinates".into()))?;
             let (exterior, holes) = parse_polygon_rings(rings)?;
             Ok(Geometry::Polygon { exterior, holes })
         }
@@ -305,6 +296,7 @@ fn parse_geometry(geom: Option<&serde_json::Value>) -> Result<Geometry, DataServ
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_polygon_rings(
     rings: &[serde_json::Value],
 ) -> Result<(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>), DataServerError> {
@@ -354,7 +346,7 @@ fn validate_coord(x: f64, y: f64) -> Result<(), DataServerError> {
             "Coordinates must be finite numbers".into(),
         ));
     }
-    if x < -180.0 || x > 180.0 || y < -90.0 || y > 90.0 {
+    if !(-180.0..=180.0).contains(&x) || !(-90.0..=90.0).contains(&y) {
         return Err(DataServerError::GeoJson(format!(
             "Coordinates ({x}, {y}) outside WGS84 range. \
              If your data uses a projected CRS, convert to WGS84 first."
@@ -544,8 +536,7 @@ mod tests {
         let engine = load_from_string(sample_geojson());
 
         // Bbox that covers only the Helsinki point and the Test Area polygon
-        let bbox =
-            ds_core::feature::Bbox::new(24.0, 60.0, 25.5, 61.5).unwrap();
+        let bbox = ds_core::feature::Bbox::new(24.0, 60.0, 25.5, 61.5).unwrap();
         let query = FeatureQuery {
             bbox: Some(bbox),
             ..Default::default()

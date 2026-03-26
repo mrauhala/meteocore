@@ -40,6 +40,7 @@ impl IntoResponse for GeoJsonResponse {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn lookup_collection<'a>(
     state: &'a FeaturesState,
     id: &str,
@@ -197,8 +198,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
     });
 
     // Merge collection paths into main paths
-    if let (Some(main_obj), Some(coll_obj)) =
-        (paths.as_object_mut(), collection_paths.as_object())
+    if let (Some(main_obj), Some(coll_obj)) = (paths.as_object_mut(), collection_paths.as_object())
     {
         for (k, v) in coll_obj {
             main_obj.insert(k.clone(), v.clone());
@@ -372,11 +372,7 @@ pub async fn items(
             )
         })?;
 
-    let limit = params
-        .limit
-        .unwrap_or(DEFAULT_LIMIT)
-        .max(1) // spec minimum is 1
-        .min(MAX_LIMIT);
+    let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = params.offset.unwrap_or(0);
 
     let query = FeatureQuery {

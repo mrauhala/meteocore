@@ -31,6 +31,7 @@ impl DataStore {
     }
 
     /// Get the entire contents of an object.
+    #[allow(clippy::needless_question_mark)]
     pub fn get(&self, path: &ObjectPath) -> Result<Bytes, DataServerError> {
         self.block_on(async {
             let result = self.inner.get(path).await?;
@@ -39,11 +40,17 @@ impl DataStore {
     }
 
     /// Get a byte range from an object.
-    pub fn get_range(&self, path: &ObjectPath, range: Range<usize>) -> Result<Bytes, DataServerError> {
+    #[allow(clippy::needless_question_mark)]
+    pub fn get_range(
+        &self,
+        path: &ObjectPath,
+        range: Range<usize>,
+    ) -> Result<Bytes, DataServerError> {
         self.block_on(async { Ok(self.inner.get_range(path, range).await?) })
     }
 
     /// List objects under a prefix.
+    #[allow(clippy::needless_question_mark)]
     pub fn list(&self, prefix: &ObjectPath) -> Result<Vec<ObjectMeta>, DataServerError> {
         self.block_on(async {
             use futures::TryStreamExt;
@@ -52,6 +59,7 @@ impl DataStore {
     }
 
     /// Get object metadata (size, last modified, etc.).
+    #[allow(clippy::needless_question_mark)]
     pub fn head(&self, path: &ObjectPath) -> Result<ObjectMeta, DataServerError> {
         self.block_on(async { Ok(self.inner.head(path).await?) })
     }
@@ -64,10 +72,8 @@ impl DataStore {
         F: std::future::Future<Output = Result<T, object_store::Error>>,
     {
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(future)
-            })
-            .map_err(|e| DataServerError::Storage(format!("{e}"))),
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future))
+                .map_err(|e| DataServerError::Storage(format!("{e}"))),
             Err(_) => {
                 // No runtime — create a temporary one (e.g., in tests or CLI tools)
                 let rt = tokio::runtime::Runtime::new()
@@ -132,9 +138,11 @@ pub fn build_s3_store_from_parts(
         .with_allow_http(allow_http)
         .with_skip_signature(true)
         .build()
-        .map_err(|e| DataServerError::Storage(format!(
-            "Cannot create S3 store for endpoint={endpoint} bucket={bucket}: {e}"
-        )))?;
+        .map_err(|e| {
+            DataServerError::Storage(format!(
+                "Cannot create S3 store for endpoint={endpoint} bucket={bucket}: {e}"
+            ))
+        })?;
 
     tracing::info!("S3 store: endpoint={endpoint}, bucket={bucket}");
     Ok(DataStore::new(Arc::new(store)))
@@ -151,8 +159,9 @@ fn build_local_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataSer
         .canonicalize()
         .map_err(|e| DataServerError::Storage(format!("Cannot resolve path {data_path}: {e}")))?;
 
-    let store = object_store::local::LocalFileSystem::new_with_prefix(&abs_path)
-        .map_err(|e| DataServerError::Storage(format!("Cannot create local store at {data_path}: {e}")))?;
+    let store = object_store::local::LocalFileSystem::new_with_prefix(&abs_path).map_err(|e| {
+        DataServerError::Storage(format!("Cannot create local store at {data_path}: {e}"))
+    })?;
 
     Ok((DataStore::new(Arc::new(store)), ObjectPath::from("")))
 }
@@ -171,7 +180,9 @@ fn build_s3_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServer
     let store = object_store::aws::AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
         .build()
-        .map_err(|e| DataServerError::Storage(format!("Cannot create S3 store for bucket '{bucket}': {e}")))?;
+        .map_err(|e| {
+            DataServerError::Storage(format!("Cannot create S3 store for bucket '{bucket}': {e}"))
+        })?;
 
     let prefix_path = ObjectPath::from(prefix.trim_end_matches('/'));
     Ok((DataStore::new(Arc::new(store)), prefix_path))
@@ -188,44 +199,51 @@ fn build_s3_from_http_url(data_path: &str) -> Result<(DataStore, ObjectPath), Da
     let path = url.path().trim_start_matches('/');
 
     // Determine endpoint, bucket, prefix, and region
-    let (endpoint, bucket, prefix, region) = if host.starts_with("s3") && host.contains(".amazonaws.com") {
-        // Path-style: s3-eu-west-1.amazonaws.com/bucket/prefix
-        // or s3.eu-west-1.amazonaws.com/bucket/prefix
-        let region = host
-            .trim_start_matches("s3-")
-            .trim_start_matches("s3.")
-            .trim_end_matches(".amazonaws.com")
-            .to_string();
-        let parts: Vec<&str> = path.splitn(2, '/').collect();
-        let bucket = parts[0].to_string();
-        let prefix = if parts.len() > 1 { parts[1] } else { "" };
-        let endpoint = format!("{}://{}", url.scheme(), host);
-        (endpoint, bucket, prefix.to_string(), region)
-    } else if host.contains(".s3.") && host.ends_with(".amazonaws.com") {
-        // Virtual-hosted: bucket.s3.region.amazonaws.com/prefix
-        let bucket = host.split(".s3.").next().unwrap_or("").to_string();
-        let region = host
-            .split(".s3.")
-            .nth(1)
-            .unwrap_or("")
-            .trim_end_matches(".amazonaws.com")
-            .to_string();
-        let endpoint = format!("{}://s3.{}.amazonaws.com", url.scheme(), region);
-        (endpoint, bucket, path.to_string(), region)
-    } else if host.contains(".cloudferro.com") {
-        // CloudFerro S3-compatible: s3.waw3-1.cloudferro.com/bucket/prefix
-        let parts: Vec<&str> = path.splitn(2, '/').collect();
-        let bucket = parts[0].to_string();
-        let prefix = if parts.len() > 1 { parts[1] } else { "" };
-        let endpoint = format!("{}://{}", url.scheme(), host);
-        (endpoint, bucket, prefix.to_string(), "auto".to_string())
-    } else {
-        return Err(DataServerError::Storage(format!(
-            "Cannot parse S3 URL: {data_path}"
-        )));
-    };
+    let (endpoint, bucket, prefix, region) =
+        if host.starts_with("s3") && host.contains(".amazonaws.com") {
+            // Path-style: s3-eu-west-1.amazonaws.com/bucket/prefix
+            // or s3.eu-west-1.amazonaws.com/bucket/prefix
+            let region = host
+                .trim_start_matches("s3-")
+                .trim_start_matches("s3.")
+                .trim_end_matches(".amazonaws.com")
+                .to_string();
+            let parts: Vec<&str> = path.splitn(2, '/').collect();
+            let bucket = parts[0].to_string();
+            let prefix = if parts.len() > 1 { parts[1] } else { "" };
+            let endpoint = format!("{}://{}", url.scheme(), host);
+            (endpoint, bucket, prefix.to_string(), region)
+        } else if host.contains(".s3.") && host.ends_with(".amazonaws.com") {
+            // Virtual-hosted: bucket.s3.region.amazonaws.com/prefix
+            let bucket = host.split(".s3.").next().unwrap_or("").to_string();
+            let region = host
+                .split(".s3.")
+                .nth(1)
+                .unwrap_or("")
+                .trim_end_matches(".amazonaws.com")
+                .to_string();
+            let endpoint = format!("{}://s3.{}.amazonaws.com", url.scheme(), region);
+            (endpoint, bucket, path.to_string(), region)
+        } else if host.contains(".cloudferro.com") {
+            // CloudFerro S3-compatible: s3.waw3-1.cloudferro.com/bucket/prefix
+            let parts: Vec<&str> = path.splitn(2, '/').collect();
+            let bucket = parts[0].to_string();
+            let prefix = if parts.len() > 1 { parts[1] } else { "" };
+            let endpoint = format!("{}://{}", url.scheme(), host);
+            (endpoint, bucket, prefix.to_string(), "auto".to_string())
+        } else {
+            return Err(DataServerError::Storage(format!(
+                "Cannot parse S3 URL: {data_path}"
+            )));
+        };
 
-    tracing::info!("S3 store: endpoint={}, bucket={}, prefix={}, region={}", endpoint, bucket, prefix, region);
+    tracing::info!(
+        "S3 store: endpoint={}, bucket={}, prefix={}, region={}",
+        endpoint,
+        bucket,
+        prefix,
+        region
+    );
 
     let mut builder = object_store::aws::AmazonS3Builder::new()
         .with_bucket_name(&bucket)
@@ -255,7 +273,9 @@ fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServ
     let store = object_store::http::HttpBuilder::new()
         .with_url(&base_url)
         .build()
-        .map_err(|e| DataServerError::Storage(format!("Cannot create HTTP store for {base_url}: {e}")))?;
+        .map_err(|e| {
+            DataServerError::Storage(format!("Cannot create HTTP store for {base_url}: {e}"))
+        })?;
 
     let path = url.path().trim_start_matches('/').trim_end_matches('/');
     Ok((DataStore::new(Arc::new(store)), ObjectPath::from(path)))

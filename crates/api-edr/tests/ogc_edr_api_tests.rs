@@ -111,6 +111,31 @@ impl Engine for MockEngine {
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
         Some([23.7610, 60.1699, 24.9384, 61.4978])
     }
+
+    fn supported_query_types(&self) -> Vec<String> {
+        vec!["locations".to_string(), "area".to_string()]
+    }
+
+    fn query_area(
+        &self,
+        coords: &str,
+        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
+    ) -> Result<AreaQueryResult, DataServerError> {
+        let polygon = ds_core::feature::parse_area_coords(coords)?;
+        let mut coverages = Vec::new();
+        for loc in Self::sample_locations() {
+            if polygon.contains(loc.longitude, loc.latitude) {
+                coverages.push(Self::sample_query_result());
+            }
+        }
+        if coverages.is_empty() {
+            return Err(DataServerError::LocationNotFound(
+                "No locations found within the requested area".into(),
+            ));
+        }
+        Ok(AreaQueryResult::Collection(coverages))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -121,16 +146,23 @@ fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<EdrState> {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     engines.insert("weather".to_string(), engine);
-    collections.insert("weather".to_string(), CollectionConfig {
-        id: "weather".to_string(),
-        title: "Finnish Weather Observations".to_string(),
-        description: "Test collection".to_string(),
-        data_path: None,
-        apis: vec!["edr".to_string()],
-        engine_type: "csv".to_string(),
-        geotiff: None,
-    });
-    Arc::new(EdrState { engines, collections, base_url: String::new() })
+    collections.insert(
+        "weather".to_string(),
+        CollectionConfig {
+            id: "weather".to_string(),
+            title: "Finnish Weather Observations".to_string(),
+            description: "Test collection".to_string(),
+            data_path: None,
+            apis: vec!["edr".to_string()],
+            engine_type: "csv".to_string(),
+            geotiff: None,
+        },
+    );
+    Arc::new(EdrState {
+        engines,
+        collections,
+        base_url: String::new(),
+    })
 }
 
 fn build_router() -> axum::Router {
@@ -140,10 +172,7 @@ fn build_router() -> axum::Router {
 
 async fn get(uri: &str) -> (StatusCode, Value) {
     let app = build_router();
-    let req = Request::builder()
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
+    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
     let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -194,7 +223,10 @@ mod landing_page {
     #[tokio::test]
     async fn has_title() {
         let (_, json) = get("/").await;
-        assert!(json.get("title").is_some(), "Landing page should have a title");
+        assert!(
+            json.get("title").is_some(),
+            "Landing page should have a title"
+        );
     }
 
     #[tokio::test]
@@ -202,7 +234,10 @@ mod landing_page {
         let (_, json) = get("/").await;
         let links = json["links"].as_array().unwrap();
         let has_self = links.iter().any(|l| l["rel"] == "self");
-        assert!(has_self, "Landing page should include a 'self' link relation");
+        assert!(
+            has_self,
+            "Landing page should include a 'self' link relation"
+        );
     }
 
     #[tokio::test]
@@ -268,21 +303,17 @@ mod conformance {
         let has_core = conforms
             .iter()
             .any(|v| v.as_str().unwrap().contains("ogcapi-edr-1"));
-        assert!(
-            has_core,
-            "Must declare OGC API - EDR conformance class"
-        );
+        assert!(has_core, "Must declare OGC API - EDR conformance class");
     }
 
     #[tokio::test]
     async fn declares_covjson_conformance() {
         let (_, json) = get("/conformance").await;
         let conforms = json["conformsTo"].as_array().unwrap();
-        let has_covjson = conforms.iter().any(|v| v.as_str().unwrap().contains("covjson"));
-        assert!(
-            has_covjson,
-            "Must declare CoverageJSON conformance class"
-        );
+        let has_covjson = conforms
+            .iter()
+            .any(|v| v.as_str().unwrap().contains("covjson"));
+        assert!(has_covjson, "Must declare CoverageJSON conformance class");
     }
 }
 
@@ -322,7 +353,10 @@ mod collections {
     async fn listing_collections_not_empty() {
         let (_, json) = get("/collections").await;
         let cols = json["collections"].as_array().unwrap();
-        assert!(!cols.is_empty(), "Mock engine should yield at least one collection");
+        assert!(
+            !cols.is_empty(),
+            "Mock engine should yield at least one collection"
+        );
     }
 
     #[tokio::test]
@@ -521,7 +555,10 @@ mod locations {
         let features = json["features"].as_array().unwrap();
         assert!(!features.is_empty());
         for feature in features {
-            assert_eq!(feature["type"], "Feature", "Each feature must have type 'Feature'");
+            assert_eq!(
+                feature["type"], "Feature",
+                "Each feature must have type 'Feature'"
+            );
             assert!(
                 feature.get("geometry").is_some(),
                 "Each feature must have 'geometry'"
@@ -530,10 +567,7 @@ mod locations {
                 feature.get("properties").is_some(),
                 "Each feature must have 'properties'"
             );
-            assert!(
-                feature.get("id").is_some(),
-                "Each feature must have 'id'"
-            );
+            assert!(feature.get("id").is_some(), "Each feature must have 'id'");
         }
     }
 
@@ -554,10 +588,7 @@ mod locations {
         let (_, json) = get("/collections/weather/locations").await;
         let features = json["features"].as_array().unwrap();
         assert_eq!(features.len(), 2);
-        let ids: Vec<&str> = features
-            .iter()
-            .map(|f| f["id"].as_str().unwrap())
-            .collect();
+        let ids: Vec<&str> = features.iter().map(|f| f["id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"helsinki"));
         assert!(ids.contains(&"tampere"));
     }
@@ -566,7 +597,10 @@ mod locations {
     async fn unknown_collection_returns_404() {
         let (status, json) = get("/collections/nonexistent/locations").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(json.get("code").is_some(), "Error response must have 'code'");
+        assert!(
+            json.get("code").is_some(),
+            "Error response must have 'code'"
+        );
         assert!(
             json.get("description").is_some(),
             "Error response must have 'description'"
@@ -606,8 +640,7 @@ mod locations {
         ))
         .expect("Failed to read EDR locations GeoJSON schema");
         let schema: Value = serde_json::from_str(&schema_str).unwrap();
-        let validator =
-            jsonschema::Validator::new(&schema).expect("Failed to compile schema");
+        let validator = jsonschema::Validator::new(&schema).expect("Failed to compile schema");
 
         let (_, json) = get("/collections/weather/locations").await;
 
@@ -746,7 +779,10 @@ mod location_data {
                 .collect();
             let expected: u64 = shape.iter().product();
             let actual = range["values"].as_array().unwrap().len() as u64;
-            assert_eq!(actual, expected, "values length must equal product of shape");
+            assert_eq!(
+                actual, expected,
+                "values length must equal product of shape"
+            );
         }
     }
 
@@ -788,7 +824,10 @@ mod location_data {
         let (_, json) = get("/collections/weather/locations/helsinki").await;
         let values = json["ranges"]["temperature"]["values"].as_array().unwrap();
         // Our mock has [Some(-2.5), Some(-2.8), None]
-        assert!(values[2].is_null(), "None values must be serialized as JSON null");
+        assert!(
+            values[2].is_null(),
+            "None values must be serialized as JSON null"
+        );
     }
 }
 
@@ -803,7 +842,10 @@ mod error_responses {
     async fn collection_not_found_returns_404() {
         let (status, json) = get("/collections/nonexistent").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(json.get("code").is_some(), "Error must have 'code' per OGC EDR spec");
+        assert!(
+            json.get("code").is_some(),
+            "Error must have 'code' per OGC EDR spec"
+        );
         assert!(json["code"].is_string());
         assert!(
             json.get("description").is_some(),
@@ -826,7 +868,10 @@ mod error_responses {
             get("/collections/weather/locations/helsinki?datetime=not-a-date").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(json.get("code").is_some(), "400 error must have 'code'");
-        assert!(json.get("description").is_some(), "400 error must have 'description'");
+        assert!(
+            json.get("description").is_some(),
+            "400 error must have 'description'"
+        );
     }
 
     #[tokio::test]
@@ -878,8 +923,7 @@ mod unimplemented_queries {
     #[ignore = "position query not yet implemented"]
     async fn position_query() {
         // GET /collections/{id}/position?coords=POINT(24.9384 60.1699)
-        let (status, _) =
-            get("/collections/weather/position?coords=POINT(24.9384 60.1699)").await;
+        let (status, _) = get("/collections/weather/position?coords=POINT(24.9384 60.1699)").await;
         assert_eq!(status, StatusCode::OK);
     }
 
@@ -895,14 +939,38 @@ mod unimplemented_queries {
     }
 
     #[tokio::test]
-    #[ignore = "area query not yet implemented"]
     async fn area_query() {
-        // GET /collections/{id}/area?coords=POLYGON((24 60,25 60,25 61,24 61,24 60))
-        let (status, _) = get(
-            "/collections/weather/area?coords=POLYGON((24 60,25 60,25 61,24 61,24 60))",
+        // POLYGON covering Helsinki (24.9, 60.1) — should match Helsinki but not Tampere
+        let (status, json) = get(
+            "/collections/weather/area?coords=POLYGON%28%2824.5%2060.0%2C25.5%2060.0%2C25.5%2060.5%2C24.5%2060.5%2C24.5%2060.0%29%29",
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["type"], "CoverageCollection");
+        assert_eq!(json["domainType"], "PointSeries");
+        let coverages = json["coverages"].as_array().unwrap();
+        assert_eq!(coverages.len(), 1, "should match Helsinki only");
+        assert_eq!(coverages[0]["type"], "Coverage");
+    }
+
+    #[tokio::test]
+    async fn area_query_bbox_format() {
+        // bbox covering both Helsinki and Tampere
+        let (status, json) = get("/collections/weather/area?coords=23.0,59.0,25.5,62.0").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["type"], "CoverageCollection");
+        let coverages = json["coverages"].as_array().unwrap();
+        assert_eq!(coverages.len(), 2, "should match both locations");
+    }
+
+    #[tokio::test]
+    async fn area_query_no_match() {
+        // POLYGON far from any stations
+        let (status, _) = get(
+            "/collections/weather/area?coords=POLYGON%28%280%200%2C1%200%2C1%201%2C0%201%2C0%200%29%29",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

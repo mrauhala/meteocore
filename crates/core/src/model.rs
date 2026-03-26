@@ -45,3 +45,12 @@ pub struct QueryResult {
     pub parameters: HashMap<String, ParameterDescription>,
     pub ranges: HashMap<String, NdArray>,
 }
+
+/// Result of an area query — either a single coverage (grid) or a collection of coverages (stations).
+#[derive(Debug, Clone)]
+pub enum AreaQueryResult {
+    /// A single coverage, e.g. a Grid from GeoTIFF.
+    Single(QueryResult),
+    /// Multiple coverages (one per location), e.g. PointSeries from CSV stations.
+    Collection(Vec<QueryResult>),
+}

@@ -35,7 +35,10 @@ async fn main() {
         HashMap::new();
 
     for collection in &config.collections {
-        let data_path_display = collection.data_path.as_deref().unwrap_or("<configured in engine>");
+        let data_path_display = collection
+            .data_path
+            .as_deref()
+            .unwrap_or("<configured in engine>");
         info!(
             "Loading collection '{}' ({}) from {}",
             collection.id, collection.engine_type, data_path_display
@@ -46,14 +49,22 @@ async fn main() {
                 let data_path = match collection.data_path.as_deref() {
                     Some(p) => p,
                     None => {
-                        tracing::error!("Collection '{}': csv engine requires data_path, skipping", collection.id);
+                        tracing::error!(
+                            "Collection '{}': csv engine requires data_path, skipping",
+                            collection.id
+                        );
                         continue;
                     }
                 };
                 let store = match engine_csv::CsvDataStore::load(data_path) {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::error!("Collection '{}': failed to load CSV from {}: {}", collection.id, data_path, e);
+                        tracing::error!(
+                            "Collection '{}': failed to load CSV from {}: {}",
+                            collection.id,
+                            data_path,
+                            e
+                        );
                         continue;
                     }
                 };
@@ -86,14 +97,22 @@ async fn main() {
                 let data_path = match collection.data_path.as_deref() {
                     Some(p) => p,
                     None => {
-                        tracing::error!("Collection '{}': geojson engine requires data_path, skipping", collection.id);
+                        tracing::error!(
+                            "Collection '{}': geojson engine requires data_path, skipping",
+                            collection.id
+                        );
                         continue;
                     }
                 };
                 let engine = match engine_geojson::GeoJsonEngine::load(data_path) {
                     Ok(e) => Arc::new(e),
                     Err(e) => {
-                        tracing::error!("Collection '{}': failed to load GeoJSON from {}: {}", collection.id, data_path, e);
+                        tracing::error!(
+                            "Collection '{}': failed to load GeoJSON from {}: {}",
+                            collection.id,
+                            data_path,
+                            e
+                        );
                         continue;
                     }
                 };
@@ -131,15 +150,25 @@ async fn main() {
                     }
                 };
 
-                let engine = match engine_geotiff::GeoTiffEngine::new(&collection.id, collection.data_path.as_deref(), geotiff_config) {
+                let engine = match engine_geotiff::GeoTiffEngine::new(
+                    &collection.id,
+                    collection.data_path.as_deref(),
+                    geotiff_config,
+                ) {
                     Ok(e) => Arc::new(e),
                     Err(e) => {
-                        tracing::error!("Collection '{}': failed to initialize GeoTIFF engine: {}", collection.id, e);
+                        tracing::error!(
+                            "Collection '{}': failed to initialize GeoTIFF engine: {}",
+                            collection.id,
+                            e
+                        );
                         continue;
                     }
                 };
 
-                if let Some((start, end)) = ds_core::engine::Engine::get_temporal_extent(engine.as_ref()) {
+                if let Some((start, end)) =
+                    ds_core::engine::Engine::get_temporal_extent(engine.as_ref())
+                {
                     info!(
                         "Collection '{}': temporal extent {} to {}",
                         collection.id, start, end
@@ -168,7 +197,11 @@ async fn main() {
                 }
             }
             other => {
-                tracing::error!("Collection '{}': unknown engine type '{}', skipping", collection.id, other);
+                tracing::error!(
+                    "Collection '{}': unknown engine type '{}', skipping",
+                    collection.id,
+                    other
+                );
                 continue;
             }
         }
@@ -199,7 +232,10 @@ async fn main() {
         .nest("/edr", api_edr::router(edr_state.clone()))
         .nest("/features", api_features::router(features_state.clone()))
         // Trailing-slash variants so /edr/ and /features/ also work
-        .route("/edr/", get(api_edr::handlers::landing_page).with_state(edr_state))
+        .route(
+            "/edr/",
+            get(api_edr::handlers::landing_page).with_state(edr_state),
+        )
         .route(
             "/features/",
             get(api_features::handlers::landing_page).with_state(features_state),

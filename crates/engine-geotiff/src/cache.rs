@@ -127,7 +127,11 @@ mod tests {
                 found += 1;
             }
         }
-        assert!(found < 20, "Expected some evictions, but all {} entries survived", found);
+        assert!(
+            found < 20,
+            "Expected some evictions, but all {} entries survived",
+            found
+        );
         assert!(found > 0, "Expected some entries to survive");
     }
 

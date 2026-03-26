@@ -74,7 +74,11 @@ impl GeoTiffEngine {
     /// - `endpoint` + `bucket` (+ optional `prefix_pattern`): S3 with dynamic prefix
     /// - `data_path` starting with `s3://` or `http(s)://`: S3/HTTP with fixed prefix
     /// - `data_path` otherwise: local directory
-    pub fn new(collection_id: &str, data_path: Option<&str>, config: &GeoTiffConfig) -> Result<Self, DataServerError> {
+    pub fn new(
+        collection_id: &str,
+        data_path: Option<&str>,
+        config: &GeoTiffConfig,
+    ) -> Result<Self, DataServerError> {
         // Validate config early
         validate_config(collection_id, data_path, config)?;
 
@@ -87,18 +91,23 @@ impl GeoTiffEngine {
 
         // Determine store mode from config
         // Parse time_window if configured
-        let parsed_time_window = config.time_window.as_deref()
+        let parsed_time_window = config
+            .time_window
+            .as_deref()
             .map(time_window::TimeWindow::parse)
             .transpose()?;
 
-        let (store_mode, display) = if let (Some(endpoint), Some(bucket)) = (&config.endpoint, &config.bucket) {
+        let (store_mode, display) = if let (Some(endpoint), Some(bucket)) =
+            (&config.endpoint, &config.bucket)
+        {
             let store = ds_storage::build_s3_store_from_parts(endpoint, bucket)?;
             let prefix_pattern = config.prefix_pattern.clone().unwrap_or_default();
             let display = format!("s3://{}/{}", bucket, prefix_pattern);
 
             // scan_days is only used as fallback when time_window is not set.
             // When time_window is set, scan_dates() computes exact dates at scan time.
-            let scan_days = config.scan_days
+            let scan_days = config
+                .scan_days
                 .or_else(|| parsed_time_window.as_ref().map(|tw| tw.max_scan_days()))
                 .unwrap_or(2);
 
@@ -178,11 +187,17 @@ impl GeoTiffEngine {
         engine.catalog.store(Arc::new(initial_catalog));
 
         if file_count == 0 {
-            tracing::warn!("[{}] No matching GeoTIFF files found in {}", collection_id, engine.data_path_display);
+            tracing::warn!(
+                "[{}] No matching GeoTIFF files found in {}",
+                collection_id,
+                engine.data_path_display
+            );
         } else {
             tracing::info!(
                 "[{}] Loaded {} files from {} (metadata: {})",
-                collection_id, file_count, engine.data_path_display,
+                collection_id,
+                file_count,
+                engine.data_path_display,
                 format_bytes(total_bytes)
             );
         }
@@ -193,10 +208,7 @@ impl GeoTiffEngine {
     /// Perform a scan appropriate to the store mode.
     /// Applies max_files limit if configured.
     /// `current` is the previous catalog, used to reuse metadata for unchanged files.
-    fn do_scan(
-        &self,
-        current: &Catalog,
-    ) -> Result<Catalog, DataServerError> {
+    fn do_scan(&self, current: &Catalog) -> Result<Catalog, DataServerError> {
         // Build path-based index from current catalog (references only, no cloning)
         let path_index: HashMap<&Path, &catalog::FileEntry> = current
             .entries
@@ -209,7 +221,10 @@ impl GeoTiffEngine {
                 let mut pending = match pending.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => {
-                        tracing::warn!("[{}] Pending file tracker poisoned, recovering", self.collection_id);
+                        tracing::warn!(
+                            "[{}] Pending file tracker poisoned, recovering",
+                            self.collection_id
+                        );
                         poisoned.into_inner()
                     }
                 };
@@ -222,23 +237,29 @@ impl GeoTiffEngine {
                     &path_index,
                 )?
             }
-            StoreMode::Remote { store, prefix } => {
-                scan_remote_with_limit(
-                    store,
-                    prefix,
-                    &self.filename_pattern,
-                    &self.timestamp_format,
-                    &path_index,
-                    self.max_files,
-                    None,
-                    &self.collection_id,
-                )?
-            }
-            StoreMode::RemoteDynamic { store, prefix_pattern, scan_days, time_window } => {
+            StoreMode::Remote { store, prefix } => scan_remote_with_limit(
+                store,
+                prefix,
+                &self.filename_pattern,
+                &self.timestamp_format,
+                &path_index,
+                self.max_files,
+                None,
+                &self.collection_id,
+            )?,
+            StoreMode::RemoteDynamic {
+                store,
+                prefix_pattern,
+                scan_days,
+                time_window,
+            } => {
                 let now = Utc::now();
                 let (prefixes, time_filter) = if let Some(tw) = time_window {
                     let dates = tw.scan_dates(now);
-                    (expand_prefix_for_dates(prefix_pattern, &dates), Some(tw.to_range(now)))
+                    (
+                        expand_prefix_for_dates(prefix_pattern, &dates),
+                        Some(tw.to_range(now)),
+                    )
                 } else {
                     (expand_prefix_pattern(prefix_pattern, *scan_days), None)
                 };
@@ -270,7 +291,8 @@ impl GeoTiffEngine {
                         self.collection_id,
                         scan_errors.len(),
                         prefixes.len(),
-                        scan_errors.iter()
+                        scan_errors
+                            .iter()
                             .map(|(p, e)| format!("'{}': {}", p, e))
                             .collect::<Vec<_>>()
                             .join("; ")
@@ -282,7 +304,10 @@ impl GeoTiffEngine {
         };
 
         // Apply config overrides for nodata/scale/offset
-        if self.override_nodata.is_some() || self.override_scale.is_some() || self.override_offset.is_some() {
+        if self.override_nodata.is_some()
+            || self.override_scale.is_some()
+            || self.override_offset.is_some()
+        {
             for entry in catalog.entries.values_mut() {
                 entry.metadata.apply_overrides(
                     self.override_nodata,
@@ -336,7 +361,8 @@ impl GeoTiffEngine {
                     tracing::warn!(
                         "[{}] Poll returned 0 files (was {}); keeping old catalog. \
                          Check data source connectivity and filename pattern.",
-                        self.collection_id, old_count
+                        self.collection_id,
+                        old_count
                     );
                     return;
                 }
@@ -345,11 +371,18 @@ impl GeoTiffEngine {
                 let (hits, misses) = self.tile_cache.stats();
                 tracing::debug!(
                     "[{}] Poll: {} files ({}), tile cache: {} hits / {} misses",
-                    self.collection_id, count, format_bytes(total_bytes), hits, misses
+                    self.collection_id,
+                    count,
+                    format_bytes(total_bytes),
+                    hits,
+                    misses
                 );
             }
             Err(e) => {
-                tracing::warn!("[{}] Scan failed, keeping old catalog: {e}", self.collection_id);
+                tracing::warn!(
+                    "[{}] Scan failed, keeping old catalog: {e}",
+                    self.collection_id
+                );
             }
         }
     }
@@ -391,10 +424,21 @@ impl GeoTiffEngine {
             let pixel = entry.metadata.geo_transform.world_to_pixel(lon, lat);
             let value = match pixel {
                 Some((col, row)) => {
-                    match reader::read_pixel(&entry.source, &entry.metadata, col, row, Some(&self.tile_cache), &entry.path, self.band_index) {
+                    match reader::read_pixel(
+                        &entry.source,
+                        &entry.metadata,
+                        col,
+                        row,
+                        Some(&self.tile_cache),
+                        &entry.path,
+                        self.band_index,
+                    ) {
                         Ok(v) => v,
                         Err(e) => {
-                            tracing::warn!("Failed to read pixel from {}: {e}", entry.path.display());
+                            tracing::warn!(
+                                "Failed to read pixel from {}: {e}",
+                                entry.path.display()
+                            );
                             None
                         }
                     }
@@ -495,14 +539,24 @@ impl GeoTiffEngine {
         for (timestamp, entry) in &entries {
             times.push(**timestamp);
 
-            match reader::read_bbox(&entry.source, &entry.metadata, col_start, row_start, col_end, row_end, Some(&self.tile_cache), &entry.path, self.band_index) {
+            match reader::read_bbox(
+                &entry.source,
+                &entry.metadata,
+                col_start,
+                row_start,
+                col_end,
+                row_end,
+                Some(&self.tile_cache),
+                &entry.path,
+                self.band_index,
+            ) {
                 Ok(grid_values) => {
                     all_values.extend(grid_values);
                 }
                 Err(e) => {
                     tracing::warn!("Failed to read bbox from {}: {e}", entry.path.display());
                     // Fill with None for this timestep
-                    all_values.extend(std::iter::repeat(None).take(nx * ny));
+                    all_values.extend(std::iter::repeat_n(None, nx * ny));
                 }
             }
         }
@@ -527,10 +581,7 @@ impl GeoTiffEngine {
                 vec!["t".to_string(), "y".to_string(), "x".to_string()],
             )
         } else {
-            (
-                vec![ny, nx],
-                vec!["y".to_string(), "x".to_string()],
-            )
+            (vec![ny, nx], vec!["y".to_string(), "x".to_string()])
         };
 
         let mut param_descs = HashMap::new();
@@ -563,10 +614,10 @@ impl GeoTiffEngine {
 
 /// Filter catalog entries by an optional datetime range.
 /// Returns references to matching (timestamp, entry) pairs.
-fn filter_by_datetime<'a>(
-    entries: &'a BTreeMap<DateTime<Utc>, catalog::FileEntry>,
+fn filter_by_datetime(
+    entries: &BTreeMap<DateTime<Utc>, catalog::FileEntry>,
     datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
-) -> Vec<(&'a DateTime<Utc>, &'a catalog::FileEntry)> {
+) -> Vec<(&DateTime<Utc>, &catalog::FileEntry)> {
     match datetime {
         Some((start, end)) => entries.range(start..=end).collect(),
         None => entries.iter().collect(),
@@ -606,9 +657,43 @@ impl Engine for GeoTiffEngine {
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
-        let (west, south, east, north) = parse_bbox_coords(coords)?;
-        self.query_bbox(west, south, east, north, datetime, parameters)
+    ) -> Result<AreaQueryResult, DataServerError> {
+        let polygon = ds_core::feature::parse_area_coords(coords)?;
+        let mut result = self.query_bbox(
+            polygon.bbox.west,
+            polygon.bbox.south,
+            polygon.bbox.east,
+            polygon.bbox.north,
+            datetime,
+            parameters,
+        )?;
+
+        // Mask pixels outside the polygon
+        if let DomainDescription::Grid {
+            ref x,
+            ref y,
+            ref t,
+        } = result.domain
+        {
+            let nt = t.as_ref().map_or(1, |tv| tv.len());
+            let ny = y.len();
+            let nx = x.len();
+            for (_name, ndarray) in result.ranges.iter_mut() {
+                for (iy, y_val) in y.iter().enumerate() {
+                    for (ix, x_val) in x.iter().enumerate() {
+                        if !polygon.contains(*x_val, *y_val) {
+                            // Null out all timesteps for this pixel
+                            for it in 0..nt {
+                                let idx = it * ny * nx + iy * nx + ix;
+                                ndarray.values[idx] = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(AreaQueryResult::Single(result))
     }
 
     fn supported_query_types(&self) -> Vec<String> {
@@ -643,7 +728,11 @@ impl Engine for GeoTiffEngine {
 
 /// Validate GeoTIFF config for common mistakes that would otherwise cause
 /// confusing runtime behavior.
-fn validate_config(collection_id: &str, data_path: Option<&str>, config: &GeoTiffConfig) -> Result<(), DataServerError> {
+fn validate_config(
+    collection_id: &str,
+    data_path: Option<&str>,
+    config: &GeoTiffConfig,
+) -> Result<(), DataServerError> {
     // endpoint and bucket must both be set or both absent
     match (&config.endpoint, &config.bucket) {
         (Some(_), None) => {
@@ -687,9 +776,16 @@ fn validate_config(collection_id: &str, data_path: Option<&str>, config: &GeoTif
 fn resolve_filename_config(config: &GeoTiffConfig) -> Result<(String, String), DataServerError> {
     if let Some(template) = &config.filename_template {
         let (regex, format) = expand_filename_template(template)?;
-        tracing::debug!("Expanded filename_template '{}' → regex='{}', format='{}'", template, regex, format);
+        tracing::debug!(
+            "Expanded filename_template '{}' → regex='{}', format='{}'",
+            template,
+            regex,
+            format
+        );
         Ok((regex, format))
-    } else if let (Some(pattern), Some(format)) = (&config.filename_pattern, &config.timestamp_format) {
+    } else if let (Some(pattern), Some(format)) =
+        (&config.filename_pattern, &config.timestamp_format)
+    {
         if !pattern.contains("(?P<timestamp>") {
             return Err(DataServerError::GeoTiff(
                 "filename_pattern must contain a named capture group (?P<timestamp>...)".into(),
@@ -698,7 +794,8 @@ fn resolve_filename_config(config: &GeoTiffConfig) -> Result<(String, String), D
         Ok((pattern.clone(), format.clone()))
     } else {
         Err(DataServerError::GeoTiff(
-            "Either filename_template or both filename_pattern + timestamp_format must be set".into(),
+            "Either filename_template or both filename_pattern + timestamp_format must be set"
+                .into(),
         ))
     }
 }
@@ -749,7 +846,8 @@ fn expand_filename_template(template: &str) -> Result<(String, String), DataServ
             }
             if !matched {
                 return Err(DataServerError::GeoTiff(format!(
-                    "Unknown strftime code '{}' in filename_template", &template[i..i+2]
+                    "Unknown strftime code '{}' in filename_template",
+                    &template[i..i + 2]
                 )));
             }
         } else {
@@ -761,7 +859,7 @@ fn expand_filename_template(template: &str) -> Result<(String, String), DataServ
                 let is_separator = matches!(ch, 'T' | '-' | ':' | '_' | 'Z');
                 // Peek ahead: is there another % code coming?
                 let next_has_code = (i + 1 < bytes.len()) && {
-                    let rest = &template[i+1..];
+                    let rest = &template[i + 1..];
                     codes.iter().any(|&(code, _)| rest.starts_with(code))
                 };
 
@@ -800,7 +898,8 @@ fn expand_filename_template(template: &str) -> Result<(String, String), DataServ
 
     if !timestamp_started {
         return Err(DataServerError::GeoTiff(format!(
-            "filename_template '{}' contains no strftime codes (%%Y, %%m, etc.)", template
+            "filename_template '{}' contains no strftime codes (%%Y, %%m, etc.)",
+            template
         )));
     }
 
@@ -831,9 +930,15 @@ fn expand_prefix_for_dates(pattern: &str, dates: &[chrono::NaiveDate]) -> Vec<St
         return vec![pattern.trim_end_matches('/').to_string()];
     }
 
-    dates.iter().map(|date| {
-        date.format(pattern).to_string().trim_end_matches('/').to_string()
-    }).collect()
+    dates
+        .iter()
+        .map(|date| {
+            date.format(pattern)
+                .to_string()
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .collect()
 }
 
 /// Expand a prefix pattern for the last `scan_days` days (fallback when no time_window).
@@ -845,7 +950,7 @@ fn expand_prefix_pattern(pattern: &str, scan_days: u32) -> Vec<String> {
     expand_prefix_for_dates(pattern, &dates)
 }
 
-use parse::{parse_coords, parse_bbox_coords};
+use parse::parse_coords;
 
 #[cfg(test)]
 mod tests {
@@ -903,10 +1008,13 @@ mod tests {
 
     #[test]
     fn template_fmi_leading_timestamp() {
-        let (regex, fmt) = expand_filename_template("%Y%m%d%H%M_composite_cappi_600_dbzh_finrad_qc.tif").unwrap();
+        let (regex, fmt) =
+            expand_filename_template("%Y%m%d%H%M_composite_cappi_600_dbzh_finrad_qc.tif").unwrap();
         assert_eq!(fmt, "%Y%m%d%H%M");
         let re = Regex::new(&regex).unwrap();
-        let caps = re.captures("202603251955_composite_cappi_600_dbzh_finrad_qc.tif").unwrap();
+        let caps = re
+            .captures("202603251955_composite_cappi_600_dbzh_finrad_qc.tif")
+            .unwrap();
         assert_eq!(caps.name("timestamp").unwrap().as_str(), "202603251955");
     }
 
@@ -916,7 +1024,10 @@ mod tests {
         assert_eq!(fmt, "%Y-%m-%dT%H:%M:%S");
         let re = Regex::new(&regex).unwrap();
         let caps = re.captures("data_2026-03-25T19:30:00.tif").unwrap();
-        assert_eq!(caps.name("timestamp").unwrap().as_str(), "2026-03-25T19:30:00");
+        assert_eq!(
+            caps.name("timestamp").unwrap().as_str(),
+            "2026-03-25T19:30:00"
+        );
     }
 
     #[test]

@@ -46,7 +46,6 @@ use axum::http::{Request, StatusCode};
 use chrono::{DateTime, Utc};
 use tower::ServiceExt;
 
-use api_edr;
 use api_edr::handlers::EdrState;
 use ds_core::config::CollectionConfig;
 use ds_core::engine::Engine;
@@ -154,16 +153,23 @@ fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<EdrState> {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     engines.insert("weather".to_string(), engine);
-    collections.insert("weather".to_string(), CollectionConfig {
-        id: "weather".to_string(),
-        title: "Finnish Weather Observations".to_string(),
-        description: "Test collection".to_string(),
-        data_path: None,
-        apis: vec!["edr".to_string()],
-        engine_type: "csv".to_string(),
-        geotiff: None,
-    });
-    Arc::new(EdrState { engines, collections, base_url: String::new() })
+    collections.insert(
+        "weather".to_string(),
+        CollectionConfig {
+            id: "weather".to_string(),
+            title: "Finnish Weather Observations".to_string(),
+            description: "Test collection".to_string(),
+            data_path: None,
+            apis: vec!["edr".to_string()],
+            engine_type: "csv".to_string(),
+            geotiff: None,
+        },
+    );
+    Arc::new(EdrState {
+        engines,
+        collections,
+        base_url: String::new(),
+    })
 }
 
 fn build_app(engine: ScalableEngine) -> axum::Router {
@@ -332,9 +338,7 @@ async fn locations_endpoint_returns_all_results_without_pagination() {
         json.get("links").is_none()
             || json["links"]
                 .as_array()
-                .map_or(true, |links| !links
-                    .iter()
-                    .any(|l| l["rel"] == "next")),
+                .is_none_or(|links| !links.iter().any(|l| l["rel"] == "next")),
         "no 'next' pagination link exists (pagination not implemented)"
     );
 }
@@ -634,12 +638,7 @@ async fn concurrent_mixed_endpoint_requests_all_succeed() {
         let uri = uri.to_string();
         handles.push(tokio::spawn(async move {
             let response = app
-                .oneshot(
-                    Request::builder()
-                        .uri(&uri)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
             (uri, response.status())

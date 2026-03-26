@@ -93,16 +93,23 @@ fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<EdrState> {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     engines.insert("weather".to_string(), engine);
-    collections.insert("weather".to_string(), CollectionConfig {
-        id: "weather".to_string(),
-        title: "Finnish Weather Observations".to_string(),
-        description: "Test collection".to_string(),
-        data_path: None,
-        apis: vec!["edr".to_string()],
-        engine_type: "csv".to_string(),
-        geotiff: None,
-    });
-    Arc::new(EdrState { engines, collections, base_url: String::new() })
+    collections.insert(
+        "weather".to_string(),
+        CollectionConfig {
+            id: "weather".to_string(),
+            title: "Finnish Weather Observations".to_string(),
+            description: "Test collection".to_string(),
+            data_path: None,
+            apis: vec!["edr".to_string()],
+            engine_type: "csv".to_string(),
+            geotiff: None,
+        },
+    );
+    Arc::new(EdrState {
+        engines,
+        collections,
+        base_url: String::new(),
+    })
 }
 
 fn app() -> axum::Router {
@@ -126,9 +133,7 @@ async fn get_response(uri: &str) -> (StatusCode, String) {
     (status, String::from_utf8_lossy(&body).to_string())
 }
 
-async fn get_response_with_headers(
-    uri: &str,
-) -> (StatusCode, axum::http::HeaderMap, String) {
+async fn get_response_with_headers(uri: &str) -> (StatusCode, axum::http::HeaderMap, String) {
     let response = app()
         .oneshot(Request::get(uri).body(Body::empty()).unwrap())
         .await
@@ -249,9 +254,7 @@ async fn extremely_long_parameter_name_list() {
         .map(|i| format!("param{i}"))
         .collect::<Vec<_>>()
         .join(",");
-    let uri = format!(
-        "/collections/weather/locations/helsinki?parameter-name={params}"
-    );
+    let uri = format!("/collections/weather/locations/helsinki?parameter-name={params}");
     let (status, _body) = get_response(&uri).await;
     // Should succeed (engine just filters) or return a valid response, not crash
     assert!(
@@ -276,11 +279,11 @@ async fn null_bytes_in_collection_id() {
 #[tokio::test]
 async fn unicode_in_collection_id() {
     let payloads = [
-        "caf\u{00e9}",          // Latin accent
-        "\u{0437}\u{0434}",     // Cyrillic
-        "\u{1F4A9}",            // Emoji
-        "\u{202e}rehtaew",      // RTL override + reversed "weather"
-        "\u{0000}",             // Null
+        "caf\u{00e9}",      // Latin accent
+        "\u{0437}\u{0434}", // Cyrillic
+        "\u{1F4A9}",        // Emoji
+        "\u{202e}rehtaew",  // RTL override + reversed "weather"
+        "\u{0000}",         // Null
     ];
     for payload in &payloads {
         let uri = format!("/collections/{payload}");
@@ -320,10 +323,7 @@ async fn sql_injection_in_collection_id() {
 
 #[tokio::test]
 async fn sql_injection_in_location_id() {
-    let payloads = [
-        "helsinki' OR '1'='1",
-        "'; DROP TABLE locations;--",
-    ];
+    let payloads = ["helsinki' OR '1'='1", "'; DROP TABLE locations;--"];
     for payload in &payloads {
         let uri = format!("/collections/weather/locations/{payload}");
         let (status, _body) = get_response(&uri).await;
@@ -346,11 +346,7 @@ async fn xss_payloads_in_collection_id() {
     for payload in &payloads {
         let uri = format!("/collections/{payload}");
         let (status, body) = get_response(&uri).await;
-        assert_ne!(
-            status,
-            StatusCode::OK,
-            "XSS payload should not succeed"
-        );
+        assert_ne!(status, StatusCode::OK, "XSS payload should not succeed");
         // If we got a JSON error response, verify the payload is JSON-encoded
         // (angle brackets should appear as part of a JSON string, not raw HTML)
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
@@ -377,7 +373,11 @@ async fn xss_payloads_in_location_id() {
 
     // URI with angle brackets is rejected at HTTP layer or by handler
     assert_ne!(status, StatusCode::OK, "XSS payload should not succeed");
-    assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR, "XSS payload should not cause 500");
+    assert_ne!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "XSS payload should not cause 500"
+    );
 
     // If we got a body, it must be valid JSON (not raw HTML)
     if !body.is_empty() {
@@ -392,13 +392,19 @@ async fn xss_payloads_in_location_id() {
 #[tokio::test]
 async fn xss_payloads_in_datetime_param() {
     let payload = "<script>alert(1)</script>";
-    let uri = format!(
-        "/collections/weather/locations/helsinki?datetime={payload}"
-    );
+    let uri = format!("/collections/weather/locations/helsinki?datetime={payload}");
     let (status, body) = get_response(&uri).await;
     // The URI may be rejected at the HTTP layer (invalid chars) or by our handler
-    assert_ne!(status, StatusCode::OK, "XSS payload in datetime should not succeed");
-    assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR, "XSS payload should not cause 500");
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "XSS payload in datetime should not succeed"
+    );
+    assert_ne!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "XSS payload should not cause 500"
+    );
     // If we got a body, it must be valid JSON
     if !body.is_empty() {
         assert!(
@@ -413,25 +419,23 @@ async fn xss_payloads_in_datetime_param() {
 #[tokio::test]
 async fn adversarial_datetime_inputs() {
     let payloads = [
-        "",                                          // empty string
-        "/",                                         // just separator
-        "//",                                        // double separator
-        "../..",                                     // open both ends
-        "not-a-date",                                // garbage
-        "2024-13-01T00:00:00Z",                      // invalid month
-        "2024-01-32T00:00:00Z",                      // invalid day
-        "2024-01-01T25:00:00Z",                      // invalid hour
-        "9999-99-99T99:99:99Z",                      // all invalid
+        "",                                                               // empty string
+        "/",                                                              // just separator
+        "//",                                                             // double separator
+        "../..",                                                          // open both ends
+        "not-a-date",                                                     // garbage
+        "2024-13-01T00:00:00Z",                                           // invalid month
+        "2024-01-32T00:00:00Z",                                           // invalid day
+        "2024-01-01T25:00:00Z",                                           // invalid hour
+        "9999-99-99T99:99:99Z",                                           // all invalid
         "2024-01-01T00:00:00Z/2024-01-01T00:00:00Z/2024-01-01T00:00:00Z", // triple
-        &"2024-01-01T00:00:00Z".repeat(100),         // repeated valid datetime
-        "2024-01-01T00:00:00+99:99",                 // invalid timezone offset
-        "\0",                                        // null byte
-        "2024-01-01T00:00:00Z/\0",                   // null byte in interval end
+        &"2024-01-01T00:00:00Z".repeat(100),                              // repeated valid datetime
+        "2024-01-01T00:00:00+99:99",                                      // invalid timezone offset
+        "\0",                                                             // null byte
+        "2024-01-01T00:00:00Z/\0", // null byte in interval end
     ];
     for payload in &payloads {
-        let uri = format!(
-            "/collections/weather/locations/helsinki?datetime={payload}"
-        );
+        let uri = format!("/collections/weather/locations/helsinki?datetime={payload}");
         let (status, body) = get_response(&uri).await;
         assert_ne!(
             status,
@@ -459,7 +463,10 @@ async fn error_404_does_not_expose_internal_paths() {
     let desc = json["description"].as_str().unwrap();
 
     // Should not contain file system paths or stack traces
-    assert!(!desc.contains('/'), "Error description should not contain file paths: {desc}");
+    assert!(
+        !desc.contains('/'),
+        "Error description should not contain file paths: {desc}"
+    );
     assert!(
         !desc.to_lowercase().contains("stack"),
         "Error description should not contain stack traces: {desc}"
@@ -472,8 +479,7 @@ async fn error_404_does_not_expose_internal_paths() {
 
 #[tokio::test]
 async fn error_404_location_does_not_expose_internals() {
-    let (status, body) =
-        get_response("/collections/weather/locations/does_not_exist").await;
+    let (status, body) = get_response("/collections/weather/locations/does_not_exist").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_valid_error_response(&body);
 
@@ -493,10 +499,8 @@ async fn error_404_location_does_not_expose_internals() {
 
 #[tokio::test]
 async fn error_400_datetime_does_not_expose_internals() {
-    let (status, body) = get_response(
-        "/collections/weather/locations/helsinki?datetime=garbage",
-    )
-    .await;
+    let (status, body) =
+        get_response("/collections/weather/locations/helsinki?datetime=garbage").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_valid_error_response(&body);
 
@@ -552,7 +556,10 @@ async fn content_type_is_set_for_success_responses() {
         ("/collections", "application/json"),
         ("/collections/weather", "application/json"),
         ("/collections/weather/locations", "application/geo+json"),
-        ("/collections/weather/locations/helsinki", "application/prs.coverage+json"),
+        (
+            "/collections/weather/locations/helsinki",
+            "application/prs.coverage+json",
+        ),
     ];
     for (uri, expected_ct) in &uris_and_types {
         let (status, headers, _body) = get_response_with_headers(uri).await;
@@ -586,8 +593,7 @@ async fn no_server_version_header_leaked() {
 
 #[tokio::test]
 async fn no_sensitive_headers_in_error_responses() {
-    let (_, headers, _) =
-        get_response_with_headers("/collections/nonexistent").await;
+    let (_, headers, _) = get_response_with_headers("/collections/nonexistent").await;
 
     assert!(
         headers.get("server").is_none(),
@@ -602,11 +608,8 @@ async fn no_sensitive_headers_in_error_responses() {
         headers.get("x-debug").is_none(),
         "Should not have debug headers"
     );
-    assert!(
-        headers.get("x-request-id").is_none()
-            || true, // request IDs are fine, just check no stack traces
-        "Request ID headers are acceptable"
-    );
+    // request IDs are fine, just check no stack traces
+    // (x-request-id presence is acceptable)
 }
 
 // Note: CORS headers are added at the server level (CorsLayer in main.rs),

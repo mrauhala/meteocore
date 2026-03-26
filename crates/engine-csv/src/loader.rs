@@ -74,9 +74,7 @@ impl CsvDataStore {
 
             let mut values = HashMap::new();
             for (i, param_name) in parameter_names.iter().enumerate() {
-                let val = record[param_start + i]
-                    .parse::<f64>()
-                    .ok();
+                let val = record[param_start + i].parse::<f64>().ok();
                 values.insert(param_name.clone(), val);
             }
 
