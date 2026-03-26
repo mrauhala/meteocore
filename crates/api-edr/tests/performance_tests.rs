@@ -41,6 +41,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::{DateTime, Utc};
@@ -149,7 +150,7 @@ impl Engine for ScalableEngine {
     }
 }
 
-fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<EdrState> {
+fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<ArcSwap<EdrState>> {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     engines.insert("weather".to_string(), engine);
@@ -165,11 +166,11 @@ fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<EdrState> {
             geotiff: None,
         },
     );
-    Arc::new(EdrState {
+    Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
         collections,
         base_url: String::new(),
-    })
+    }))
 }
 
 fn build_app(engine: ScalableEngine) -> axum::Router {

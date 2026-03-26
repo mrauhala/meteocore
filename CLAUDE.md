@@ -46,6 +46,10 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 /features/collections/{id}                     Features collection detail
 /features/collections/{id}/items               Feature items (paginated GeoJSON)
 /features/collections/{id}/items/{feature_id}  Single feature (GeoJSON)
+
+/admin/collections/reload                      POST: reload config and swap engines
+/health                                        Per-collection health status
+/metrics                                       Prometheus metrics (text format)
 ```
 
 ## Adding a New Engine
@@ -423,6 +427,45 @@ Currently implemented: `PointSeries`, `Grid`.
 - NdArray `axisNames` must have `uniqueItems: true`
 - Forgetting `referencing` on an inline domain object (required when domain is an object, not a URL string)
 - Using non-BCP47 keys in i18n objects (use `"en"`, not `"english"`)
+
+## Admin, Health & Metrics
+
+### Dynamic collection reload
+
+`POST /admin/collections/reload` re-reads `config.toml` (or `CONFIG_PATH`), creates new engines, and atomically swaps them into the running server. Old GeoTIFF poll loops are shut down and new ones spawned. If the reload produces zero working collections, the old state is preserved.
+
+Response: `{"status": "ok", "loaded": N, "configured": M, "collections": [...]}`.
+
+### Health endpoint
+
+`GET /health` returns per-collection health status. Each collection reports one of:
+
+| Status | Meaning |
+|--------|---------|
+| `ready` | Engine loaded and has data |
+| `degraded` | Engine loaded but no data yet (e.g., GeoTIFF waiting for first poll) |
+| `failed` | Engine failed to load (error message included) |
+
+Overall status: `healthy` (all ready), `degraded` (some degraded, none failed), `unhealthy` (any failed). Returns HTTP 503 when unhealthy.
+
+### Prometheus metrics
+
+`GET /metrics` returns Prometheus text format. Exposed metrics:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `http_requests_total` | counter | method, path, status | Total HTTP requests |
+| `http_request_duration_seconds` | histogram | method, path | Request latency |
+| `collections_total` | gauge | — | Total configured collections |
+| `collections_healthy` | gauge | — | Collections in ready state |
+| `collections_degraded` | gauge | — | Collections in degraded state |
+| `collections_failed` | gauge | — | Collections in failed state |
+
+Path labels use axum's `MatchedPath` (route patterns, not raw URLs) to avoid unbounded cardinality.
+
+### State architecture
+
+API state (`EdrState`, `FeaturesState`) is wrapped in `ArcSwap` for lock-free reads and atomic swaps on reload. The `ServerState` in `server/src/admin.rs` holds the `ArcSwap` pointers, health registry, and GeoTIFF engine list. Engine loading logic is in `admin::load_collections()`, shared by startup and reload.
 
 ## Known Limitations
 

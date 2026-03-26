@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
@@ -26,7 +27,7 @@ pub struct EdrState {
     pub base_url: String,
 }
 
-pub type AppState = Arc<EdrState>;
+pub type AppState = Arc<ArcSwap<EdrState>>;
 
 #[allow(clippy::type_complexity)]
 fn lookup_collection<'a>(
@@ -44,6 +45,7 @@ fn lookup_collection<'a>(
 }
 
 pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
+    let state = state.load_full();
     let base = &state.base_url;
     Json(json!({
         "title": "Metocean Data Server - EDR",
@@ -87,6 +89,7 @@ pub async fn conformance() -> impl IntoResponse {
 }
 
 pub async fn collections(State(state): State<AppState>) -> impl IntoResponse {
+    let state = state.load_full();
     let base = &state.base_url;
     let collections: Vec<serde_json::Value> = state
         .collections
@@ -116,6 +119,7 @@ pub async fn collection(
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
     Ok(Json(build_collection_metadata(
         engine.as_ref(),
@@ -128,6 +132,7 @@ pub async fn locations(
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
 
     let locs = engine.get_locations().map_err(|_| {
@@ -155,6 +160,7 @@ pub async fn location_query(
     Query(params): Query<LocationQueryParams>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
 
     let datetime = params
@@ -206,6 +212,7 @@ pub async fn position_query(
     Query(params): Query<PositionQueryParams>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
 
     let datetime = params
@@ -261,6 +268,7 @@ pub async fn area_query(
     Query(params): Query<AreaQueryParams>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
 
     let datetime = params

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
@@ -143,11 +144,11 @@ fn build_router() -> axum::Router {
         },
     );
 
-    let state = Arc::new(FeaturesState {
+    let state = Arc::new(ArcSwap::from_pointee(FeaturesState {
         engines,
         collections,
         base_url: String::new(),
-    });
+    }));
     api_features::router(state)
 }
 

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
@@ -24,7 +25,7 @@ pub struct FeaturesState {
     pub base_url: String,
 }
 
-pub type AppState = Arc<FeaturesState>;
+pub type AppState = Arc<ArcSwap<FeaturesState>>;
 
 /// Custom response type for GeoJSON with correct Content-Type.
 pub struct GeoJsonResponse(pub serde_json::Value);
@@ -62,6 +63,7 @@ fn lookup_collection<'a>(
 }
 
 pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
+    let state = state.load_full();
     let base = &state.base_url;
     Json(json!({
         "title": "Metocean Data Server - Features",
@@ -106,6 +108,7 @@ pub async fn conformance() -> impl IntoResponse {
 }
 
 pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
+    let state = state.load_full();
     let mut collection_paths = json!({});
     for config in state.collections.values() {
         let id = &config.id;
@@ -299,6 +302,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
 }
 
 pub async fn collections(State(state): State<AppState>) -> impl IntoResponse {
+    let state = state.load_full();
     let base = &state.base_url;
     let mut collections: Vec<serde_json::Value> = state
         .collections
@@ -333,6 +337,7 @@ pub async fn collection(
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
     Ok(Json(build_collection_metadata(
         engine.as_ref(),
@@ -346,6 +351,7 @@ pub async fn items(
     Query(params): Query<ItemsQueryParams>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
 
     let bbox = params
@@ -404,6 +410,7 @@ pub async fn item(
     Path((id, feature_id)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
 
     let feature = engine.get_feature(&feature_id).map_err(|e| match &e {

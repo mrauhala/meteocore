@@ -2,14 +2,12 @@ pub mod handlers;
 pub mod params;
 pub mod response;
 
-use std::sync::Arc;
-
 use axum::routing::get;
 use axum::Router;
 
-use handlers::EdrState;
+use handlers::AppState;
 
-pub fn router(state: Arc<EdrState>) -> Router {
+pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(handlers::landing_page))
         .route("/conformance", get(handlers::conformance))
