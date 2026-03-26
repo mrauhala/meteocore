@@ -1,4 +1,4 @@
-name: Docker
+name: CI
 
 on:
   schedule:
@@ -11,12 +11,51 @@ on:
     branches: [ "main" ]
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  check:
+    name: Check, Lint & Test
+    # Skip on scheduled runs — only Docker needs to rebuild weekly
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
 
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy, rustfmt
+
+    - name: Cache cargo registry & build
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    - name: Check formatting
+      run: cargo fmt -- --check
+
+    - name: Clippy
+      run: cargo clippy --all-targets -- -D warnings
+
+    - name: Build
+      run: cargo build --verbose
+
+    - name: Run tests
+      run: cargo test --verbose
+
+  docker:
+    name: Docker
+    needs: check
+    # Run after check passes, or unconditionally on schedule (check is skipped)
+    if: always() && (needs.check.result == 'success' || github.event_name == 'schedule')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -34,11 +73,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log into registry ${{ env.REGISTRY }}
+      - name: Log into registry
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -46,7 +85,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ghcr.io/${{ github.repository }}
 
       - name: Build and push Docker image
         id: build-and-push
