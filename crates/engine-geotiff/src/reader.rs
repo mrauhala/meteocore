@@ -771,9 +771,16 @@ pub fn read_pixel(
     Ok(values[local_idx])
 }
 
+/// Maximum number of concurrent tile fetches for remote sources.
+const MAX_TILE_CONCURRENCY: usize = 5;
+
 /// Read pixel values within a bounding box from a GeoTIFF data source.
 /// Returns a row-major grid of values [row_start..row_end, col_start..col_end].
 /// `band_index` selects which band (0-based) for multi-band files.
+///
+/// For remote sources, tiles are fetched in parallel (up to `MAX_TILE_CONCURRENCY`
+/// concurrent fetches) using a dedicated rayon thread pool. If a single tile fetch
+/// fails, the corresponding pixels are filled with `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn read_bbox(
     source: &DataSource,
@@ -797,70 +804,195 @@ pub fn read_bbox(
         )));
     }
 
-    // Open decoder once for non-remote sources
-    let mut decoder = match source {
-        DataSource::Remote { .. } => None,
-        _ => Some(source.open_decoder()?),
-    };
-
-    let mut result = vec![None; total_pixels];
-
     let tile_col_start = col_start / metadata.tile_width;
     let tile_col_end = (col_end - 1) / metadata.tile_width + 1;
     let tile_row_start = row_start / metadata.tile_height;
     let tile_row_end = (row_end - 1) / metadata.tile_height + 1;
 
+    // For remote sources, fetch tiles in parallel
+    if let DataSource::Remote {
+        store,
+        path,
+        tile_info,
+    } = source
+    {
+        return read_bbox_parallel(
+            store,
+            path,
+            tile_info,
+            metadata,
+            col_start,
+            row_start,
+            col_end,
+            row_end,
+            tile_col_start,
+            tile_col_end,
+            tile_row_start,
+            tile_row_end,
+            cache,
+            file_path,
+            band_index,
+            nx,
+            total_pixels,
+        );
+    }
+
+    // Non-remote: sequential path (decoder is not thread-safe)
+    let mut decoder = source.open_decoder()?;
+    let mut result = vec![None; total_pixels];
+
     for tile_row in tile_row_start..tile_row_end {
         for tile_col in tile_col_start..tile_col_end {
             let chunk_index = tile_row * metadata.tiles_across + tile_col;
-            let tile_data = match source {
-                DataSource::Remote {
+            let tile_data =
+                decode_chunk_f64(&mut decoder, chunk_index, metadata, band_index)?;
+
+            copy_tile_to_result(
+                &tile_data,
+                &mut result,
+                tile_col,
+                tile_row,
+                metadata,
+                col_start,
+                row_start,
+                col_end,
+                row_end,
+                nx,
+            );
+        }
+    }
+
+    Ok(result)
+}
+
+/// Parallel tile fetching for remote data sources.
+/// Uses a rayon thread pool capped at `MAX_TILE_CONCURRENCY` threads.
+#[allow(clippy::too_many_arguments)]
+fn read_bbox_parallel(
+    store: &ds_storage::DataStore,
+    obj_path: &ds_storage::object_store::path::Path,
+    tile_info: &RemoteTileInfo,
+    metadata: &TiffMetadata,
+    col_start: u32,
+    row_start: u32,
+    col_end: u32,
+    row_end: u32,
+    tile_col_start: u32,
+    tile_col_end: u32,
+    tile_row_start: u32,
+    tile_row_end: u32,
+    cache: Option<&crate::cache::TileCache>,
+    file_path: &Path,
+    band_index: usize,
+    nx: usize,
+    total_pixels: usize,
+) -> Result<Vec<Option<f64>>, DataServerError> {
+    use rayon::prelude::*;
+
+    // Collect all tile coordinates we need to fetch
+    let tile_coords: Vec<(u32, u32)> = (tile_row_start..tile_row_end)
+        .flat_map(|tr| (tile_col_start..tile_col_end).map(move |tc| (tr, tc)))
+        .collect();
+
+    // Build a thread pool with limited concurrency
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(MAX_TILE_CONCURRENCY)
+        .build()
+        .map_err(|e| {
+            DataServerError::GeoTiff(format!("Failed to create tile fetch thread pool: {e}"))
+        })?;
+
+    // Fetch all tiles in parallel; failed tiles return None-filled data
+    let tile_pixel_count = (metadata.tile_width * metadata.tile_height) as usize;
+    let tile_results: Vec<(u32, u32, Vec<Option<f64>>)> = pool.install(|| {
+        tile_coords
+            .par_iter()
+            .map(|&(tile_row, tile_col)| {
+                let chunk_index = tile_row * metadata.tiles_across + tile_col;
+                let tile_data = match read_remote_chunk_f64(
                     store,
-                    path,
-                    tile_info,
-                } => read_remote_chunk_f64(
-                    store,
-                    path,
+                    obj_path,
                     tile_info,
                     metadata,
                     chunk_index,
                     cache,
                     file_path,
                     band_index,
-                )?,
-                _ => {
-                    decode_chunk_f64(decoder.as_mut().unwrap(), chunk_index, metadata, band_index)?
-                }
-            };
-
-            let tile_pixel_col_start = tile_col * metadata.tile_width;
-            let tile_pixel_row_start = tile_row * metadata.tile_height;
-
-            let overlap_col_start = col_start.max(tile_pixel_col_start);
-            let overlap_col_end = col_end.min(tile_pixel_col_start + metadata.tile_width);
-            let overlap_row_start = row_start.max(tile_pixel_row_start);
-            let overlap_row_end = row_end.min(tile_pixel_row_start + metadata.tile_height);
-
-            for row in overlap_row_start..overlap_row_end {
-                for col in overlap_col_start..overlap_col_end {
-                    let local_col = col - tile_pixel_col_start;
-                    let local_row = row - tile_pixel_row_start;
-                    let tile_idx = (local_row * metadata.tile_width + local_col) as usize;
-
-                    if tile_idx >= tile_data.len() {
-                        continue;
+                ) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to fetch tile ({}, {}), chunk {}: {e}",
+                            tile_row,
+                            tile_col,
+                            chunk_index
+                        );
+                        vec![None; tile_pixel_count]
                     }
+                };
+                (tile_row, tile_col, tile_data)
+            })
+            .collect()
+    });
 
-                    let out_col = (col - col_start) as usize;
-                    let out_row = (row - row_start) as usize;
-                    let out_idx = out_row * nx + out_col;
-                    result[out_idx] = tile_data[tile_idx];
-                }
-            }
-        }
+    // Assemble the result grid
+    let mut result = vec![None; total_pixels];
+    for (tile_row, tile_col, tile_data) in &tile_results {
+        copy_tile_to_result(
+            tile_data,
+            &mut result,
+            *tile_col,
+            *tile_row,
+            metadata,
+            col_start,
+            row_start,
+            col_end,
+            row_end,
+            nx,
+        );
     }
 
     Ok(result)
+}
+
+/// Copy pixels from a decoded tile into the output result grid.
+#[allow(clippy::too_many_arguments)]
+fn copy_tile_to_result(
+    tile_data: &[Option<f64>],
+    result: &mut [Option<f64>],
+    tile_col: u32,
+    tile_row: u32,
+    metadata: &TiffMetadata,
+    col_start: u32,
+    row_start: u32,
+    col_end: u32,
+    row_end: u32,
+    nx: usize,
+) {
+    let tile_pixel_col_start = tile_col * metadata.tile_width;
+    let tile_pixel_row_start = tile_row * metadata.tile_height;
+
+    let overlap_col_start = col_start.max(tile_pixel_col_start);
+    let overlap_col_end = col_end.min(tile_pixel_col_start + metadata.tile_width);
+    let overlap_row_start = row_start.max(tile_pixel_row_start);
+    let overlap_row_end = row_end.min(tile_pixel_row_start + metadata.tile_height);
+
+    for row in overlap_row_start..overlap_row_end {
+        for col in overlap_col_start..overlap_col_end {
+            let local_col = col - tile_pixel_col_start;
+            let local_row = row - tile_pixel_row_start;
+            let tile_idx = (local_row * metadata.tile_width + local_col) as usize;
+
+            if tile_idx >= tile_data.len() {
+                continue;
+            }
+
+            let out_col = (col - col_start) as usize;
+            let out_row = (row - row_start) as usize;
+            let out_idx = out_row * nx + out_col;
+            result[out_idx] = tile_data[tile_idx];
+        }
+    }
 }
 
 // ============================================================================
@@ -1334,5 +1466,81 @@ mod tests {
         let (hits, misses) = cache.stats();
         assert_eq!(hits, 1);
         assert_eq!(misses, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parallel_read_bbox_matches_sequential() {
+        let dir = find_test_radar_dir();
+        let tif_path = find_first_tif(&dir);
+
+        // Sequential: read via local file (uses decode_chunk_f64 path)
+        let full_meta = TiffMetadata::from_file(&tif_path).unwrap();
+        let full_source = DataSource::from_path(&tif_path);
+
+        // Pick a bbox that spans multiple tiles but stays under MAX_AREA_PIXELS
+        let col_start = 0;
+        let row_start = 0;
+        let max_side = ((MAX_AREA_PIXELS as f64).sqrt() as u32).min(full_meta.tile_width * 2);
+        let col_end = max_side.min(full_meta.width);
+        let row_end = max_side.min(full_meta.height);
+
+        let sequential_result =
+            read_bbox(&full_source, &full_meta, col_start, row_start, col_end, row_end, None, &tif_path, 0)
+                .unwrap();
+
+        // Parallel: read via remote source (uses read_bbox_parallel path)
+        let (store, _prefix) = ds_storage::build_store(dir.to_str().unwrap()).unwrap();
+        let filename = tif_path.file_name().unwrap().to_str().unwrap();
+        let obj_path = ds_storage::object_store::path::Path::from(filename);
+        let file_size = std::fs::metadata(&tif_path).unwrap().len();
+
+        let (header_meta, tile_info) =
+            TiffMetadata::from_header_read(&store, &obj_path, file_size).unwrap();
+
+        let remote_source = DataSource::Remote {
+            store: store.clone(),
+            path: obj_path,
+            tile_info,
+        };
+
+        let cache = crate::cache::TileCache::new(64 * 1024 * 1024);
+        let pseudo_path = PathBuf::from(filename);
+
+        let parallel_result = read_bbox(
+            &remote_source,
+            &header_meta,
+            col_start,
+            row_start,
+            col_end,
+            row_end,
+            Some(&cache),
+            &pseudo_path,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sequential_result.len(),
+            parallel_result.len(),
+            "Result lengths differ: sequential={} vs parallel={}",
+            sequential_result.len(),
+            parallel_result.len()
+        );
+
+        let mut mismatches = 0;
+        for (i, (s, p)) in sequential_result.iter().zip(parallel_result.iter()).enumerate() {
+            if s != p {
+                if mismatches < 5 {
+                    eprintln!("Mismatch at index {}: sequential={:?}, parallel={:?}", i, s, p);
+                }
+                mismatches += 1;
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "{} pixel mismatches out of {} total pixels",
+            mismatches,
+            sequential_result.len()
+        );
     }
 }
