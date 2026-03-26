@@ -22,10 +22,12 @@ impl TimeWindow {
             (false, s)
         };
 
-        let rest = rest.strip_prefix('P')
-            .ok_or_else(|| DataServerError::Config(format!(
-                "Invalid time_window '{}': must start with 'P' or '-P'", s
-            )))?;
+        let rest = rest.strip_prefix('P').ok_or_else(|| {
+            DataServerError::Config(format!(
+                "Invalid time_window '{}': must start with 'P' or '-P'",
+                s
+            ))
+        })?;
 
         let (date_part, time_part) = if let Some(t_pos) = rest.find('T') {
             (&rest[..t_pos], &rest[t_pos + 1..])
@@ -67,7 +69,8 @@ impl TimeWindow {
 
         if total_seconds == 0 {
             return Err(DataServerError::Config(format!(
-                "Invalid time_window '{}': zero duration", s
+                "Invalid time_window '{}': zero duration",
+                s
             )));
         }
 
@@ -75,7 +78,9 @@ impl TimeWindow {
             total_seconds = -total_seconds;
         }
 
-        Ok(TimeWindow { seconds: total_seconds })
+        Ok(TimeWindow {
+            seconds: total_seconds,
+        })
     }
 
     /// Compute the (start, end) time range relative to now.
@@ -118,7 +123,10 @@ impl TimeWindow {
 
 fn parse_component(s: &str, suffix: char, original: &str) -> Result<i64, DataServerError> {
     let stripped = s.strip_suffix(suffix).ok_or_else(|| {
-        DataServerError::Config(format!("Invalid date component in time_window '{}'", original))
+        DataServerError::Config(format!(
+            "Invalid date component in time_window '{}'",
+            original
+        ))
     })?;
     stripped.parse().map_err(|_| {
         DataServerError::Config(format!("Invalid number in time_window '{}'", original))
@@ -208,8 +216,11 @@ mod tests {
         use chrono::NaiveDate;
         let tw = TimeWindow::parse("-PT2H").unwrap();
         // 15:00 UTC - 2h = 13:00 UTC, same day
-        let now = NaiveDate::from_ymd_opt(2026, 3, 25).unwrap()
-            .and_hms_opt(15, 0, 0).unwrap().and_utc();
+        let now = NaiveDate::from_ymd_opt(2026, 3, 25)
+            .unwrap()
+            .and_hms_opt(15, 0, 0)
+            .unwrap()
+            .and_utc();
         let dates = tw.scan_dates(now);
         assert_eq!(dates.len(), 1, "At 15:00, -PT2H should only scan today");
         assert_eq!(dates[0], NaiveDate::from_ymd_opt(2026, 3, 25).unwrap());
@@ -220,10 +231,17 @@ mod tests {
         use chrono::NaiveDate;
         let tw = TimeWindow::parse("-PT2H").unwrap();
         // 01:00 UTC - 2h = 23:00 yesterday
-        let now = NaiveDate::from_ymd_opt(2026, 3, 25).unwrap()
-            .and_hms_opt(1, 0, 0).unwrap().and_utc();
+        let now = NaiveDate::from_ymd_opt(2026, 3, 25)
+            .unwrap()
+            .and_hms_opt(1, 0, 0)
+            .unwrap()
+            .and_utc();
         let dates = tw.scan_dates(now);
-        assert_eq!(dates.len(), 2, "At 01:00, -PT2H should scan yesterday+today");
+        assert_eq!(
+            dates.len(),
+            2,
+            "At 01:00, -PT2H should scan yesterday+today"
+        );
         assert_eq!(dates[0], NaiveDate::from_ymd_opt(2026, 3, 24).unwrap());
         assert_eq!(dates[1], NaiveDate::from_ymd_opt(2026, 3, 25).unwrap());
     }
@@ -233,8 +251,11 @@ mod tests {
         use chrono::NaiveDate;
         let tw = TimeWindow::parse("-PT2H").unwrap();
         // 00:00 UTC - 2h = 22:00 yesterday
-        let now = NaiveDate::from_ymd_opt(2026, 3, 25).unwrap()
-            .and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let now = NaiveDate::from_ymd_opt(2026, 3, 25)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
         let dates = tw.scan_dates(now);
         assert_eq!(dates.len(), 2);
     }

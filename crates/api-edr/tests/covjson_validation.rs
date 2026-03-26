@@ -8,9 +8,11 @@ use api_edr::response::{area_query_result_to_json, query_result_to_coverage_json
 use ds_core::model::*;
 
 fn load_schema() -> Value {
-    let schema_str =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../schemas/coveragejson.json"))
-            .expect("Failed to read CoverageJSON schema");
+    let schema_str = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../schemas/coveragejson.json"
+    ))
+    .expect("Failed to read CoverageJSON schema");
     serde_json::from_str(&schema_str).expect("Failed to parse schema JSON")
 }
 
@@ -31,9 +33,7 @@ fn validate(json: &Value, schema: &Value) {
 }
 
 fn make_time(hour: u32) -> DateTime<Utc> {
-    format!("2024-01-01T{hour:02}:00:00Z")
-        .parse()
-        .unwrap()
+    format!("2024-01-01T{hour:02}:00:00Z").parse().unwrap()
 }
 
 fn make_query_result(
@@ -80,9 +80,45 @@ fn coverage_with_multiple_params_validates() {
     let result = make_query_result(
         times,
         vec![
-            ("temperature", "°C", vec![Some(-2.5), Some(-2.8), Some(-3.1), Some(-3.0), Some(-2.9), Some(-2.7), Some(-2.5)]),
-            ("humidity", "%", vec![Some(85.0), Some(86.0), Some(87.0), Some(86.5), Some(85.5), Some(84.0), Some(83.0)]),
-            ("wind_speed", "m/s", vec![Some(3.2), Some(3.5), Some(3.8), Some(4.1), Some(4.5), Some(4.2), Some(3.9)]),
+            (
+                "temperature",
+                "°C",
+                vec![
+                    Some(-2.5),
+                    Some(-2.8),
+                    Some(-3.1),
+                    Some(-3.0),
+                    Some(-2.9),
+                    Some(-2.7),
+                    Some(-2.5),
+                ],
+            ),
+            (
+                "humidity",
+                "%",
+                vec![
+                    Some(85.0),
+                    Some(86.0),
+                    Some(87.0),
+                    Some(86.5),
+                    Some(85.5),
+                    Some(84.0),
+                    Some(83.0),
+                ],
+            ),
+            (
+                "wind_speed",
+                "m/s",
+                vec![
+                    Some(3.2),
+                    Some(3.5),
+                    Some(3.8),
+                    Some(4.1),
+                    Some(4.5),
+                    Some(4.2),
+                    Some(3.9),
+                ],
+            ),
         ],
     );
     let json = query_result_to_coverage_json(&result);
@@ -95,7 +131,11 @@ fn coverage_with_single_param_validates() {
     let times = vec![make_time(0), make_time(1), make_time(2)];
     let result = make_query_result(
         times,
-        vec![("temperature", "°C", vec![Some(-2.5), Some(-2.8), Some(-3.1)])],
+        vec![(
+            "temperature",
+            "°C",
+            vec![Some(-2.5), Some(-2.8), Some(-3.1)],
+        )],
     );
     let json = query_result_to_coverage_json(&result);
     validate(&json, &schema);
@@ -117,10 +157,7 @@ fn coverage_with_null_values_validates() {
 fn coverage_with_single_timestep_validates() {
     let schema = load_schema();
     let times = vec![make_time(0)];
-    let result = make_query_result(
-        times,
-        vec![("pressure", "hPa", vec![Some(1013.25)])],
-    );
+    let result = make_query_result(times, vec![("pressure", "hPa", vec![Some(1013.25)])]);
     let json = query_result_to_coverage_json(&result);
     validate(&json, &schema);
 }
@@ -129,10 +166,7 @@ fn coverage_with_single_timestep_validates() {
 fn coverage_with_all_nulls_validates() {
     let schema = load_schema();
     let times = vec![make_time(0), make_time(1)];
-    let result = make_query_result(
-        times,
-        vec![("temperature", "°C", vec![None, None])],
-    );
+    let result = make_query_result(times, vec![("temperature", "°C", vec![None, None])]);
     let json = query_result_to_coverage_json(&result);
     validate(&json, &schema);
 }
@@ -141,10 +175,7 @@ fn coverage_with_all_nulls_validates() {
 fn coverage_required_fields_present() {
     let schema = load_schema();
     let times = vec![make_time(0)];
-    let result = make_query_result(
-        times,
-        vec![("temperature", "°C", vec![Some(20.0)])],
-    );
+    let result = make_query_result(times, vec![("temperature", "°C", vec![Some(20.0)])]);
     let json = query_result_to_coverage_json(&result);
 
     // Verify top-level required fields
@@ -165,8 +196,16 @@ fn coverage_required_fields_present() {
     assert!(axes["x"]["values"].is_array());
     assert!(axes["y"]["values"].is_array());
     assert!(axes["t"]["values"].is_array());
-    assert_eq!(axes["x"]["values"].as_array().unwrap().len(), 1, "x must be single-value for PointSeries");
-    assert_eq!(axes["y"]["values"].as_array().unwrap().len(), 1, "y must be single-value for PointSeries");
+    assert_eq!(
+        axes["x"]["values"].as_array().unwrap().len(),
+        1,
+        "x must be single-value for PointSeries"
+    );
+    assert_eq!(
+        axes["y"]["values"].as_array().unwrap().len(),
+        1,
+        "y must be single-value for PointSeries"
+    );
 
     // Verify referencing systems
     let refs = domain["referencing"].as_array().unwrap();
@@ -196,7 +235,11 @@ fn coverage_ndarray_shape_matches_values() {
     let times = vec![make_time(0), make_time(1), make_time(2), make_time(3)];
     let result = make_query_result(
         times,
-        vec![("temperature", "°C", vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0)])],
+        vec![(
+            "temperature",
+            "°C",
+            vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0)],
+        )],
     );
     let json = query_result_to_coverage_json(&result);
 
@@ -209,7 +252,10 @@ fn coverage_ndarray_shape_matches_values() {
         .collect();
     let values_len = range["values"].as_array().unwrap().len();
     let expected_len: usize = shape.iter().product();
-    assert_eq!(values_len, expected_len, "values length must equal product of shape dimensions");
+    assert_eq!(
+        values_len, expected_len,
+        "values length must equal product of shape dimensions"
+    );
 }
 
 #[test]
@@ -286,13 +332,14 @@ fn grid_coverage_without_time_validates() {
     let y = vec![60.0, 60.5];
     // 2 rows * 3 cols = 6 values
     let values: Vec<Option<f64>> = vec![
-        Some(1.0), Some(2.0), Some(3.0),
-        Some(4.0), Some(5.0), Some(6.0),
+        Some(1.0),
+        Some(2.0),
+        Some(3.0),
+        Some(4.0),
+        Some(5.0),
+        Some(6.0),
     ];
-    let result = make_grid_query_result(
-        x, y, None,
-        vec![("temperature", "K", values)],
-    );
+    let result = make_grid_query_result(x, y, None, vec![("temperature", "K", values)]);
     let json = query_result_to_coverage_json(&result);
     validate(&json, &schema);
 }
@@ -305,13 +352,16 @@ fn grid_coverage_with_time_validates() {
     let t = vec![make_time(0), make_time(1)];
     // 2 times * 2 rows * 2 cols = 8 values
     let values: Vec<Option<f64>> = vec![
-        Some(1.0), Some(2.0), Some(3.0), Some(4.0),
-        Some(5.0), Some(6.0), Some(7.0), Some(8.0),
+        Some(1.0),
+        Some(2.0),
+        Some(3.0),
+        Some(4.0),
+        Some(5.0),
+        Some(6.0),
+        Some(7.0),
+        Some(8.0),
     ];
-    let result = make_grid_query_result(
-        x, y, Some(t),
-        vec![("reflectivity", "dBZ", values)],
-    );
+    let result = make_grid_query_result(x, y, Some(t), vec![("reflectivity", "dBZ", values)]);
     let json = query_result_to_coverage_json(&result);
     validate(&json, &schema);
 }
@@ -321,14 +371,8 @@ fn grid_coverage_with_nulls_validates() {
     let schema = load_schema();
     let x = vec![10.0, 10.5, 11.0];
     let y = vec![60.0, 60.5];
-    let values: Vec<Option<f64>> = vec![
-        Some(1.0), None, Some(3.0),
-        None, Some(5.0), None,
-    ];
-    let result = make_grid_query_result(
-        x, y, None,
-        vec![("temperature", "K", values)],
-    );
+    let values: Vec<Option<f64>> = vec![Some(1.0), None, Some(3.0), None, Some(5.0), None];
+    let result = make_grid_query_result(x, y, None, vec![("temperature", "K", values)]);
     let json = query_result_to_coverage_json(&result);
     validate(&json, &schema);
 }
@@ -340,10 +384,7 @@ fn grid_ndarray_shape_matches_values() {
     let t = vec![make_time(0), make_time(1), make_time(2)];
     // 3 times * 2 rows * 3 cols = 18 values
     let values: Vec<Option<f64>> = (0..18).map(|i| Some(i as f64)).collect();
-    let result = make_grid_query_result(
-        x, y, Some(t),
-        vec![("temperature", "K", values)],
-    );
+    let result = make_grid_query_result(x, y, Some(t), vec![("temperature", "K", values)]);
     let json = query_result_to_coverage_json(&result);
 
     let range = &json["ranges"]["temperature"];
@@ -363,8 +404,14 @@ fn grid_domain_structure() {
     let x = vec![10.0, 10.5];
     let y = vec![60.0, 60.5];
     let result = make_grid_query_result(
-        x.clone(), y.clone(), None,
-        vec![("temperature", "K", vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0)])],
+        x.clone(),
+        y.clone(),
+        None,
+        vec![(
+            "temperature",
+            "K",
+            vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0)],
+        )],
     );
     let json = query_result_to_coverage_json(&result);
 
@@ -373,10 +420,18 @@ fn grid_domain_structure() {
     assert_eq!(domain["domainType"], "Grid");
 
     let axes = &domain["axes"];
-    let x_vals: Vec<f64> = axes["x"]["values"].as_array().unwrap()
-        .iter().map(|v| v.as_f64().unwrap()).collect();
-    let y_vals: Vec<f64> = axes["y"]["values"].as_array().unwrap()
-        .iter().map(|v| v.as_f64().unwrap()).collect();
+    let x_vals: Vec<f64> = axes["x"]["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
+    let y_vals: Vec<f64> = axes["y"]["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
     assert_eq!(x_vals, x);
     assert_eq!(y_vals, y);
     assert!(axes.get("t").is_none() || axes["t"].is_null());
@@ -397,7 +452,11 @@ fn coverage_collection_validates() {
     let coverages = vec![
         make_query_result(
             times.clone(),
-            vec![("temperature", "°C", vec![Some(-2.5), Some(-2.8), Some(-3.1)])],
+            vec![(
+                "temperature",
+                "°C",
+                vec![Some(-2.5), Some(-2.8), Some(-3.1)],
+            )],
         ),
         make_query_result(
             times.clone(),
@@ -456,10 +515,8 @@ fn area_query_single_result_validates() {
     let schema = load_schema();
     let x = vec![10.0, 10.5, 11.0];
     let y = vec![60.0, 60.5];
-    let values: Vec<Option<f64>> = vec![
-        Some(1.0), Some(2.0), Some(3.0),
-        Some(4.0), None, Some(6.0),
-    ];
+    let values: Vec<Option<f64>> =
+        vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0), None, Some(6.0)];
     let qr = make_grid_query_result(x, y, None, vec![("reflectivity", "dBZ", values)]);
     let result = AreaQueryResult::Single(qr);
     let json = area_query_result_to_json(&result);

@@ -98,8 +98,9 @@ pub fn scan_directory(
     pending: &mut BTreeMap<PathBuf, PendingFile>,
     existing: &HashMap<&Path, &FileEntry>,
 ) -> Result<Catalog, DataServerError> {
-    let read_dir = std::fs::read_dir(dir)
-        .map_err(|e| DataServerError::GeoTiff(format!("Cannot read directory {}: {e}", dir.display())))?;
+    let read_dir = std::fs::read_dir(dir).map_err(|e| {
+        DataServerError::GeoTiff(format!("Cannot read directory {}: {e}", dir.display()))
+    })?;
 
     let mut entries = BTreeMap::new();
 
@@ -148,7 +149,11 @@ pub fn scan_directory(
         let datetime = match NaiveDateTime::parse_from_str(&timestamp_str, timestamp_format) {
             Ok(dt) => dt.and_utc(),
             Err(_) => {
-                tracing::warn!("Cannot parse timestamp '{}' from file '{}'", timestamp_str, file_name);
+                tracing::warn!(
+                    "Cannot parse timestamp '{}' from file '{}'",
+                    timestamp_str,
+                    file_name
+                );
                 continue;
             }
         };
@@ -213,12 +218,22 @@ pub fn scan_directory(
             }
             tracing::warn!(
                 "Duplicate timestamp {}: using {}, replacing {}",
-                datetime, path.display(), existing_entry.path.display()
+                datetime,
+                path.display(),
+                existing_entry.path.display()
             );
         }
 
         let source = DataSource::from_path(&path);
-        entries.insert(datetime, FileEntry { path, source, metadata, file_size });
+        entries.insert(
+            datetime,
+            FileEntry {
+                path,
+                source,
+                metadata,
+                file_size,
+            },
+        );
     }
 
     // Clean pending files that no longer exist in the directory
@@ -270,6 +285,7 @@ const MAX_REMOTE_FILE_SIZE: usize = 50 * 1024 * 1024;
 ///
 /// `existing` provides a path-based index of entries already in the catalog.
 /// Files with unchanged size reuse their cached entry (no re-download).
+#[allow(clippy::too_many_arguments)]
 pub fn scan_remote_with_limit(
     store: &ds_storage::DataStore,
     prefix: &ds_storage::object_store::path::Path,
@@ -283,7 +299,12 @@ pub fn scan_remote_with_limit(
     let entries_list = store.list(prefix)?;
 
     // First pass: match filenames and parse timestamps without downloading
-    let mut candidates: Vec<(DateTime<Utc>, String, u64, ds_storage::object_store::path::Path)> = Vec::new();
+    let mut candidates: Vec<(
+        DateTime<Utc>,
+        String,
+        u64,
+        ds_storage::object_store::path::Path,
+    )> = Vec::new();
 
     for obj in &entries_list {
         let key = obj.location.to_string();
@@ -335,12 +356,18 @@ pub fn scan_remote_with_limit(
     if time_filter.is_some() {
         tracing::info!(
             "[{}] Prefix '{}': {} listed, {} within time window",
-            collection_id, prefix, listed, kept
+            collection_id,
+            prefix,
+            listed,
+            kept
         );
     } else {
         tracing::info!(
             "[{}] Prefix '{}': {} listed, {} matching",
-            collection_id, prefix, listed, kept
+            collection_id,
+            prefix,
+            listed,
+            kept
         );
     }
 
@@ -359,24 +386,34 @@ pub fn scan_remote_with_limit(
         }
 
         // Try COG range read first (header only)
-        if let Some((metadata, tile_info)) = TiffMetadata::from_header_read(store, location, *file_size) {
+        if let Some((metadata, tile_info)) =
+            TiffMetadata::from_header_read(store, location, *file_size)
+        {
             tracing::debug!("[{}] {} — range read OK", collection_id, key);
             let source = DataSource::Remote {
                 store: store.clone(),
                 path: location.clone(),
                 tile_info,
             };
-            entries.insert(*datetime, FileEntry {
-                path: pseudo_path,
-                source,
-                metadata,
-                file_size: *file_size,
-            });
+            entries.insert(
+                *datetime,
+                FileEntry {
+                    path: pseudo_path,
+                    source,
+                    metadata,
+                    file_size: *file_size,
+                },
+            );
             continue;
         }
 
         // Fallback: download full file
-        tracing::info!("[{}] {} — range read failed, downloading full file ({})", collection_id, key, super::format_bytes(*file_size));
+        tracing::info!(
+            "[{}] {} — range read failed, downloading full file ({})",
+            collection_id,
+            key,
+            super::format_bytes(*file_size)
+        );
         let data = match store.get(location) {
             Ok(d) => d,
             Err(e) => {
@@ -394,12 +431,15 @@ pub fn scan_remote_with_limit(
             }
         };
 
-        entries.insert(*datetime, FileEntry {
-            path: pseudo_path,
-            source,
-            metadata,
-            file_size: *file_size,
-        });
+        entries.insert(
+            *datetime,
+            FileEntry {
+                path: pseudo_path,
+                source,
+                metadata,
+                file_size: *file_size,
+            },
+        );
     }
 
     let temporal_extent = match (entries.keys().next(), entries.keys().next_back()) {
@@ -425,6 +465,9 @@ mod tests {
         assert!(is_excluded("data.tmp", &["*.tmp".into()]));
         assert!(is_excluded("data.part", &["*.part".into()]));
         assert!(is_excluded(".hidden", &[".*".into()]));
-        assert!(!is_excluded("radar_20240101T0000Z.tif", &["*.tmp".into(), "*.part".into()]));
+        assert!(!is_excluded(
+            "radar_20240101T0000Z.tif",
+            &["*.tmp".into(), "*.part".into()]
+        ));
     }
 }

@@ -151,10 +151,7 @@ fn build_router() -> axum::Router {
 
 async fn get(uri: &str) -> (StatusCode, Value) {
     let app = build_router();
-    let req = Request::builder()
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
+    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
     let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -164,10 +161,7 @@ async fn get(uri: &str) -> (StatusCode, Value) {
 
 async fn get_with_headers(uri: &str) -> (StatusCode, axum::http::HeaderMap, Value) {
     let app = build_router();
-    let req = Request::builder()
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
+    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
     let headers = resp.headers().clone();
@@ -221,10 +215,7 @@ mod landing_page {
         let links = json["links"].as_array().unwrap();
         let desc = links.iter().find(|l| l["rel"] == "service-desc").unwrap();
         assert!(
-            desc["type"]
-                .as_str()
-                .unwrap()
-                .contains("openapi"),
+            desc["type"].as_str().unwrap().contains("openapi"),
             "service-desc link should have OpenAPI type"
         );
     }
@@ -507,8 +498,7 @@ mod items {
     #[tokio::test]
     async fn bbox_filter() {
         // Bbox covering only Helsinki area
-        let (_, json) =
-            get("/collections/cities/items?bbox=24.5,60.0,25.5,60.5").await;
+        let (_, json) = get("/collections/cities/items?bbox=24.5,60.0,25.5,60.5").await;
         assert_eq!(json["numberMatched"], 1);
         let features = json["features"].as_array().unwrap();
         assert_eq!(features[0]["id"], "helsinki");
@@ -516,15 +506,13 @@ mod items {
 
     #[tokio::test]
     async fn bbox_no_match() {
-        let (_, json) =
-            get("/collections/cities/items?bbox=0.0,0.0,1.0,1.0").await;
+        let (_, json) = get("/collections/cities/items?bbox=0.0,0.0,1.0,1.0").await;
         assert_eq!(json["numberMatched"], 0);
     }
 
     #[tokio::test]
     async fn invalid_bbox_returns_400() {
-        let (status, _) =
-            get("/collections/cities/items?bbox=not,valid,bbox,here").await;
+        let (status, _) = get("/collections/cities/items?bbox=not,valid,bbox,here").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
@@ -565,8 +553,7 @@ mod single_item {
 
     #[tokio::test]
     async fn returns_geojson_content_type() {
-        let (_, headers, _) =
-            get_with_headers("/collections/cities/items/helsinki").await;
+        let (_, headers, _) = get_with_headers("/collections/cities/items/helsinki").await;
         let ct = headers.get("content-type").unwrap().to_str().unwrap();
         assert!(ct.contains("application/geo+json"));
     }
@@ -606,8 +593,7 @@ mod single_item {
 
     #[tokio::test]
     async fn null_geometry_feature() {
-        let (status, json) =
-            get("/collections/cities/items/no-location").await;
+        let (status, json) = get("/collections/cities/items/no-location").await;
         assert_eq!(status, StatusCode::OK);
         assert!(json["geometry"].is_null());
     }
@@ -629,16 +615,14 @@ mod errors {
 
     #[tokio::test]
     async fn bad_bbox_returns_400_with_error_body() {
-        let (status, json) =
-            get("/collections/cities/items?bbox=invalid").await;
+        let (status, json) = get("/collections/cities/items?bbox=invalid").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(json["code"].is_string());
     }
 
     #[tokio::test]
     async fn invalid_datetime_returns_400() {
-        let (status, json) =
-            get("/collections/cities/items?datetime=not-a-date").await;
+        let (status, json) = get("/collections/cities/items?datetime=not-a-date").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(json["code"].is_string());
     }

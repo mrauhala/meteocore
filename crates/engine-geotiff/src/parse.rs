@@ -17,7 +17,7 @@ pub fn parse_coords(coords: &str) -> Result<(f64, f64), DataServerError> {
         .or_else(|| trimmed.strip_prefix("POINT ("))
         .and_then(|s| s.strip_suffix(')'))
     {
-        let parts: Vec<&str> = inner.trim().split_whitespace().collect();
+        let parts: Vec<&str> = inner.split_whitespace().collect();
         if parts.len() != 2 {
             return Err(DataServerError::InvalidParameter(
                 "Expected POINT(lon lat) format".into(),
@@ -57,4 +57,3 @@ fn validate_coords(lat: f64, lon: f64) -> Result<(f64, f64), DataServerError> {
     }
     Ok((lat, lon))
 }
-

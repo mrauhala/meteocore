@@ -139,8 +139,7 @@ mod tests {
 
     #[test]
     fn parse_datetime_interval() {
-        let dt =
-            parse_datetime("2024-01-01T00:00:00Z/2024-01-02T00:00:00Z").unwrap();
+        let dt = parse_datetime("2024-01-01T00:00:00Z/2024-01-02T00:00:00Z").unwrap();
         assert!(dt.start.is_some());
         assert!(dt.end.is_some());
         assert!(dt.start.unwrap() < dt.end.unwrap());

@@ -3,7 +3,9 @@ use std::collections::HashMap;
 
 use ds_core::engine::Engine;
 use ds_core::error::DataServerError;
-use ds_core::feature::{parse_area_coords, Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue};
+use ds_core::feature::{
+    parse_area_coords, Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue,
+};
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::model::*;
 
@@ -290,14 +292,8 @@ impl FeatureEngine for CsvEngine {
                 "name".to_string(),
                 PropertyValue::String(row.location.clone()),
             );
-            properties.insert(
-                "latitude".to_string(),
-                PropertyValue::Float(row.latitude),
-            );
-            properties.insert(
-                "longitude".to_string(),
-                PropertyValue::Float(row.longitude),
-            );
+            properties.insert("latitude".to_string(), PropertyValue::Float(row.latitude));
+            properties.insert("longitude".to_string(), PropertyValue::Float(row.longitude));
 
             all_features.push(Feature {
                 id: row.location.clone(),
@@ -343,14 +339,8 @@ impl FeatureEngine for CsvEngine {
             "name".to_string(),
             PropertyValue::String(row.location.clone()),
         );
-        properties.insert(
-            "latitude".to_string(),
-            PropertyValue::Float(row.latitude),
-        );
-        properties.insert(
-            "longitude".to_string(),
-            PropertyValue::Float(row.longitude),
-        );
+        properties.insert("latitude".to_string(), PropertyValue::Float(row.latitude));
+        properties.insert("longitude".to_string(), PropertyValue::Float(row.longitude));
 
         Ok(Feature {
             id: row.location.clone(),
@@ -459,7 +449,12 @@ mod tests {
     fn get_feature_by_id() {
         let engine = CsvEngine::new(test_store());
         // Get any feature from the listing and fetch it by ID
-        let all = engine.get_features(&FeatureQuery { limit: 1, ..Default::default() }).unwrap();
+        let all = engine
+            .get_features(&FeatureQuery {
+                limit: 1,
+                ..Default::default()
+            })
+            .unwrap();
         let first_id = &all.features[0].id;
 
         let feature = engine.get_feature(first_id).unwrap();

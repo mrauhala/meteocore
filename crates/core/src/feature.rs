@@ -19,6 +19,7 @@ pub enum Geometry {
     },
     MultiPolygon {
         /// Each polygon is (exterior ring, holes).
+        #[allow(clippy::type_complexity)]
         polygons: Vec<(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>)>,
     },
     /// Null geometry for features without spatial location (RFC 7946 §3.2).
@@ -198,7 +199,7 @@ fn parse_wkt_ring(ring_str: &str) -> Result<Vec<[f64; 2]>, DataServerError> {
     }
     let mut coords = Vec::with_capacity(points.len());
     for point in &points {
-        let parts: Vec<&str> = point.trim().split_whitespace().collect();
+        let parts: Vec<&str> = point.split_whitespace().collect();
         if parts.len() != 2 {
             return Err(DataServerError::InvalidParameter(format!(
                 "Invalid coordinate pair: '{}'",
@@ -267,9 +268,7 @@ pub fn parse_area_coords(coords: &str) -> Result<QueryPolygon, DataServerError> 
         }
 
         let bb = ring_bbox(&exterior);
-        let bbox = Bbox::new(bb[0], bb[1], bb[2], bb[3]).map_err(|e| {
-            DataServerError::InvalidBbox(e)
-        })?;
+        let bbox = Bbox::new(bb[0], bb[1], bb[2], bb[3]).map_err(DataServerError::InvalidBbox)?;
 
         return Ok(QueryPolygon {
             exterior,
@@ -293,8 +292,7 @@ pub fn parse_area_coords(coords: &str) -> Result<QueryPolygon, DataServerError> 
         let north: f64 = parts[3].trim().parse().map_err(|_| {
             DataServerError::InvalidParameter(format!("Invalid north: {}", parts[3]))
         })?;
-        let bbox =
-            Bbox::new(west, south, east, north).map_err(|e| DataServerError::InvalidBbox(e))?;
+        let bbox = Bbox::new(west, south, east, north).map_err(DataServerError::InvalidBbox)?;
         let exterior = vec![
             [west, south],
             [east, south],
@@ -358,7 +356,7 @@ impl Bbox {
                 return Err("bbox coordinates must be finite numbers".into());
             }
         }
-        if west < -180.0 || west > 180.0 || east < -180.0 || east > 180.0 {
+        if !(-180.0..=180.0).contains(&west) || !(-180.0..=180.0).contains(&east) {
             return Err("bbox longitude out of range (-180..180)".into());
         }
         if south < -90.0 || north > 90.0 {

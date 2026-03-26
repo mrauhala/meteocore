@@ -12,27 +12,27 @@ pub enum Crs {
     Wgs84,
     /// Transverse Mercator (e.g., EPSG:3067 TM35FIN).
     TransverseMercator {
-        lat0: f64,     // latitude of natural origin (radians)
-        lon0: f64,     // central meridian (radians)
-        k0: f64,       // scale factor at natural origin
-        false_e: f64,  // false easting (meters)
-        false_n: f64,  // false northing (meters)
+        lat0: f64,    // latitude of natural origin (radians)
+        lon0: f64,    // central meridian (radians)
+        k0: f64,      // scale factor at natural origin
+        false_e: f64, // false easting (meters)
+        false_n: f64, // false northing (meters)
     },
     /// Lambert Azimuthal Equal Area (e.g., EPSG:3035).
     LambertAzimuthalEqualArea {
-        lat0: f64,     // latitude of natural origin (radians)
-        lon0: f64,     // longitude of natural origin (radians)
-        false_e: f64,  // false easting (meters)
-        false_n: f64,  // false northing (meters)
+        lat0: f64,    // latitude of natural origin (radians)
+        lon0: f64,    // longitude of natural origin (radians)
+        false_e: f64, // false easting (meters)
+        false_n: f64, // false northing (meters)
     },
     /// Lambert Conformal Conic with 2 standard parallels.
     LambertConformalConic {
-        lat1: f64,     // first standard parallel (radians)
-        lat2: f64,     // second standard parallel (radians)
-        lat0: f64,     // latitude of false origin (radians)
-        lon0: f64,     // longitude of false origin (radians)
-        false_e: f64,  // false easting (meters)
-        false_n: f64,  // false northing (meters)
+        lat1: f64,    // first standard parallel (radians)
+        lat2: f64,    // second standard parallel (radians)
+        lat0: f64,    // latitude of false origin (radians)
+        lon0: f64,    // longitude of false origin (radians)
+        false_e: f64, // false easting (meters)
+        false_n: f64, // false northing (meters)
     },
 }
 
@@ -42,15 +42,51 @@ impl Crs {
     pub fn forward(&self, lon_deg: f64, lat_deg: f64) -> (f64, f64) {
         match self {
             Crs::Wgs84 => (lon_deg, lat_deg),
-            Crs::TransverseMercator { lat0, lon0, k0, false_e, false_n } => {
-                tm_forward(lat_deg.to_radians(), lon_deg.to_radians(), *lat0, *lon0, *k0, *false_e, *false_n)
-            }
-            Crs::LambertAzimuthalEqualArea { lat0, lon0, false_e, false_n } => {
-                laea_forward(lat_deg.to_radians(), lon_deg.to_radians(), *lat0, *lon0, *false_e, *false_n)
-            }
-            Crs::LambertConformalConic { lat1, lat2, lat0, lon0, false_e, false_n } => {
-                lcc_forward(lat_deg.to_radians(), lon_deg.to_radians(), *lat1, *lat2, *lat0, *lon0, *false_e, *false_n)
-            }
+            Crs::TransverseMercator {
+                lat0,
+                lon0,
+                k0,
+                false_e,
+                false_n,
+            } => tm_forward(
+                lat_deg.to_radians(),
+                lon_deg.to_radians(),
+                *lat0,
+                *lon0,
+                *k0,
+                *false_e,
+                *false_n,
+            ),
+            Crs::LambertAzimuthalEqualArea {
+                lat0,
+                lon0,
+                false_e,
+                false_n,
+            } => laea_forward(
+                lat_deg.to_radians(),
+                lon_deg.to_radians(),
+                *lat0,
+                *lon0,
+                *false_e,
+                *false_n,
+            ),
+            Crs::LambertConformalConic {
+                lat1,
+                lat2,
+                lat0,
+                lon0,
+                false_e,
+                false_n,
+            } => lcc_forward(
+                lat_deg.to_radians(),
+                lon_deg.to_radians(),
+                *lat1,
+                *lat2,
+                *lat0,
+                *lon0,
+                *false_e,
+                *false_n,
+            ),
         }
     }
 
@@ -59,15 +95,33 @@ impl Crs {
     pub fn inverse(&self, x: f64, y: f64) -> (f64, f64) {
         match self {
             Crs::Wgs84 => (x, y),
-            Crs::TransverseMercator { lat0, lon0, k0, false_e, false_n } => {
+            Crs::TransverseMercator {
+                lat0,
+                lon0,
+                k0,
+                false_e,
+                false_n,
+            } => {
                 let (lat, lon) = tm_inverse(x, y, *lat0, *lon0, *k0, *false_e, *false_n);
                 (lon.to_degrees(), lat.to_degrees())
             }
-            Crs::LambertAzimuthalEqualArea { lat0, lon0, false_e, false_n } => {
+            Crs::LambertAzimuthalEqualArea {
+                lat0,
+                lon0,
+                false_e,
+                false_n,
+            } => {
                 let (lat, lon) = laea_inverse(x, y, *lat0, *lon0, *false_e, *false_n);
                 (lon.to_degrees(), lat.to_degrees())
             }
-            Crs::LambertConformalConic { lat1, lat2, lat0, lon0, false_e, false_n } => {
+            Crs::LambertConformalConic {
+                lat1,
+                lat2,
+                lat0,
+                lon0,
+                false_e,
+                false_n,
+            } => {
                 let (lat, lon) = lcc_inverse(x, y, *lat1, *lat2, *lat0, *lon0, *false_e, *false_n);
                 (lon.to_degrees(), lat.to_degrees())
             }
@@ -157,7 +211,13 @@ impl GeoTransform {
     /// Convert a WGS84 bbox [west, south, east, north] to pixel range.
     /// Transforms all four corners to the source CRS, takes the envelope, then maps to pixels.
     /// Returns (col_start, row_start, col_end, row_end) clamped to raster bounds. Exclusive end.
-    pub fn bbox_to_pixels(&self, west: f64, south: f64, east: f64, north: f64) -> Option<(u32, u32, u32, u32)> {
+    pub fn bbox_to_pixels(
+        &self,
+        west: f64,
+        south: f64,
+        east: f64,
+        north: f64,
+    ) -> Option<(u32, u32, u32, u32)> {
         // Transform bbox corners to source CRS
         let corners = [
             self.crs.forward(west, south),
@@ -178,10 +238,18 @@ impl GeoTransform {
             max_y = max_y.max(*y);
         }
 
-        let col_start = ((min_x - self.origin_x) / self.pixel_width).floor().max(0.0) as u32;
-        let col_end = ((max_x - self.origin_x) / self.pixel_width).ceil().min(self.width as f64) as u32;
-        let row_start = ((self.origin_y - max_y) / self.pixel_height).floor().max(0.0) as u32;
-        let row_end = ((self.origin_y - min_y) / self.pixel_height).ceil().min(self.height as f64) as u32;
+        let col_start = ((min_x - self.origin_x) / self.pixel_width)
+            .floor()
+            .max(0.0) as u32;
+        let col_end = ((max_x - self.origin_x) / self.pixel_width)
+            .ceil()
+            .min(self.width as f64) as u32;
+        let row_start = ((self.origin_y - max_y) / self.pixel_height)
+            .floor()
+            .max(0.0) as u32;
+        let row_end = ((self.origin_y - min_y) / self.pixel_height)
+            .ceil()
+            .min(self.height as f64) as u32;
 
         if col_start >= col_end || row_start >= row_end {
             return None;
@@ -196,7 +264,15 @@ impl GeoTransform {
 // Reference: Snyder, USGS PP 1395, equations 8-9 through 8-15
 // ============================================================================
 
-fn tm_forward(lat: f64, lon: f64, lat0: f64, lon0: f64, k0: f64, false_e: f64, false_n: f64) -> (f64, f64) {
+fn tm_forward(
+    lat: f64,
+    lon: f64,
+    lat0: f64,
+    lon0: f64,
+    k0: f64,
+    false_e: f64,
+    false_n: f64,
+) -> (f64, f64) {
     let e2 = WGS84_E2;
     let ep2 = e2 / (1.0 - e2); // e'^2
 
@@ -215,19 +291,33 @@ fn tm_forward(lat: f64, lon: f64, lat0: f64, lon0: f64, k0: f64, false_e: f64, f
     let m = meridian_arc(lat);
     let m0 = meridian_arc(lat0);
 
-    let x = k0 * n_val * (a_coeff
-        + (1.0 - t2 + c) * a2 * a_coeff / 6.0
-        + (5.0 - 18.0 * t2 + t2 * t2 + 72.0 * c - 58.0 * ep2) * a2 * a2 * a_coeff / 120.0);
+    let x = k0
+        * n_val
+        * (a_coeff
+            + (1.0 - t2 + c) * a2 * a_coeff / 6.0
+            + (5.0 - 18.0 * t2 + t2 * t2 + 72.0 * c - 58.0 * ep2) * a2 * a2 * a_coeff / 120.0);
 
-    let y = k0 * (m - m0
-        + n_val * tan_lat * (a2 / 2.0
-            + (5.0 - t2 + 9.0 * c + 4.0 * c * c) * a2 * a2 / 24.0
-            + (61.0 - 58.0 * t2 + t2 * t2 + 600.0 * c - 330.0 * ep2) * a2 * a2 * a2 / 720.0));
+    let y = k0
+        * (m - m0
+            + n_val
+                * tan_lat
+                * (a2 / 2.0
+                    + (5.0 - t2 + 9.0 * c + 4.0 * c * c) * a2 * a2 / 24.0
+                    + (61.0 - 58.0 * t2 + t2 * t2 + 600.0 * c - 330.0 * ep2) * a2 * a2 * a2
+                        / 720.0));
 
     (false_e + x, false_n + y)
 }
 
-fn tm_inverse(x: f64, y: f64, lat0: f64, lon0: f64, k0: f64, false_e: f64, false_n: f64) -> (f64, f64) {
+fn tm_inverse(
+    x: f64,
+    y: f64,
+    lat0: f64,
+    lon0: f64,
+    k0: f64,
+    false_e: f64,
+    false_n: f64,
+) -> (f64, f64) {
     // Newton iteration approach — works at any distance from central meridian.
     // Start with the footpoint latitude, then iterate to find (lat, lon).
     let e2 = WGS84_E2;
@@ -258,14 +348,25 @@ fn tm_inverse(x: f64, y: f64, lat0: f64, lon0: f64, k0: f64, false_e: f64, false
 
     // Series initial guess
     let mut lat = lat1
-        - (n1 * tan_lat1 / r1) * (d2 / 2.0
-            - (5.0 + 3.0 * t12 + 10.0 * c1 - 4.0 * c1 * c1 - 9.0 * ep2) * d2 * d2 / 24.0
-            + (61.0 + 90.0 * t12 + 298.0 * c1 + 45.0 * t12 * t12 - 252.0 * ep2 - 3.0 * c1 * c1) * d2 * d2 * d2 / 720.0);
+        - (n1 * tan_lat1 / r1)
+            * (d2 / 2.0
+                - (5.0 + 3.0 * t12 + 10.0 * c1 - 4.0 * c1 * c1 - 9.0 * ep2) * d2 * d2 / 24.0
+                + (61.0 + 90.0 * t12 + 298.0 * c1 + 45.0 * t12 * t12
+                    - 252.0 * ep2
+                    - 3.0 * c1 * c1)
+                    * d2
+                    * d2
+                    * d2
+                    / 720.0);
 
     let mut lon = lon0
         + (d - (1.0 + 2.0 * t12 + c1) * d2 * d / 6.0
-            + (5.0 - 2.0 * c1 + 28.0 * t12 - 3.0 * c1 * c1 + 8.0 * ep2 + 24.0 * t12 * t12) * d2 * d2 * d / 120.0)
-        / cos_lat1;
+            + (5.0 - 2.0 * c1 + 28.0 * t12 - 3.0 * c1 * c1 + 8.0 * ep2 + 24.0 * t12 * t12)
+                * d2
+                * d2
+                * d
+                / 120.0)
+            / cos_lat1;
 
     // Newton refinement: iterate forward(lat,lon) towards target (x,y)
     for _ in 0..20 {
@@ -303,10 +404,11 @@ fn meridian_arc(lat: f64) -> f64 {
     let e2 = WGS84_E2;
     let e4 = e2 * e2;
     let e6 = e4 * e2;
-    WGS84_A * ((1.0 - e2 / 4.0 - 3.0 * e4 / 64.0 - 5.0 * e6 / 256.0) * lat
-        - (3.0 * e2 / 8.0 + 3.0 * e4 / 32.0 + 45.0 * e6 / 1024.0) * (2.0 * lat).sin()
-        + (15.0 * e4 / 256.0 + 45.0 * e6 / 1024.0) * (4.0 * lat).sin()
-        - (35.0 * e6 / 3072.0) * (6.0 * lat).sin())
+    WGS84_A
+        * ((1.0 - e2 / 4.0 - 3.0 * e4 / 64.0 - 5.0 * e6 / 256.0) * lat
+            - (3.0 * e2 / 8.0 + 3.0 * e4 / 32.0 + 45.0 * e6 / 1024.0) * (2.0 * lat).sin()
+            + (15.0 * e4 / 256.0 + 45.0 * e6 / 1024.0) * (4.0 * lat).sin()
+            - (35.0 * e6 / 3072.0) * (6.0 * lat).sin())
 }
 
 // ============================================================================
@@ -314,7 +416,14 @@ fn meridian_arc(lat: f64) -> f64 {
 // Reference: Snyder, "Map Projections: A Working Manual", USGS PP 1395, p.187
 // ============================================================================
 
-fn laea_forward(lat: f64, lon: f64, lat0: f64, lon0: f64, false_e: f64, false_n: f64) -> (f64, f64) {
+fn laea_forward(
+    lat: f64,
+    lon: f64,
+    lat0: f64,
+    lon0: f64,
+    false_e: f64,
+    false_n: f64,
+) -> (f64, f64) {
     let e2 = WGS84_E2;
     let e = e2.sqrt();
 
@@ -332,7 +441,10 @@ fn laea_forward(lat: f64, lon: f64, lat0: f64, lon0: f64, false_e: f64, false_n:
     let dl = lon - lon0;
 
     // Snyder eq. 24-2, 24-3 (oblique)
-    let b = rq * (2.0 / (1.0 + beta0.sin() * beta.sin() + beta0.cos() * beta.cos() * dl.cos())).max(0.0).sqrt();
+    let b = rq
+        * (2.0 / (1.0 + beta0.sin() * beta.sin() + beta0.cos() * beta.cos() * dl.cos()))
+            .max(0.0)
+            .sqrt();
 
     let x = false_e + b * dd * beta.cos() * dl.sin();
     let y = false_n + (b / dd) * (beta0.cos() * beta.sin() - beta0.sin() * beta.cos() * dl.cos());
@@ -373,7 +485,9 @@ fn laea_inverse(x: f64, y: f64, lat0: f64, lon0: f64, false_e: f64, false_n: f64
 fn q_authalic(lat: f64, e: f64) -> f64 {
     let sin_lat = lat.sin();
     let e_sin = e * sin_lat;
-    (1.0 - e * e) * (sin_lat / (1.0 - e_sin * e_sin) - (1.0 / (2.0 * e)) * ((1.0 - e_sin) / (1.0 + e_sin)).ln())
+    (1.0 - e * e)
+        * (sin_lat / (1.0 - e_sin * e_sin)
+            - (1.0 / (2.0 * e)) * ((1.0 - e_sin) / (1.0 + e_sin)).ln())
 }
 
 #[allow(dead_code)]
@@ -413,7 +527,17 @@ fn authalic_inverse(q: f64, e: f64) -> f64 {
 // Reference: Snyder, USGS PP 1395, p.107
 // ============================================================================
 
-fn lcc_forward(lat: f64, lon: f64, lat1: f64, lat2: f64, lat0: f64, lon0: f64, false_e: f64, false_n: f64) -> (f64, f64) {
+#[allow(clippy::too_many_arguments)]
+fn lcc_forward(
+    lat: f64,
+    lon: f64,
+    lat1: f64,
+    lat2: f64,
+    lat0: f64,
+    lon0: f64,
+    false_e: f64,
+    false_n: f64,
+) -> (f64, f64) {
     let e2 = WGS84_E2;
     let e = e2.sqrt();
 
@@ -436,7 +560,17 @@ fn lcc_forward(lat: f64, lon: f64, lat1: f64, lat2: f64, lat0: f64, lon0: f64, f
     (x, y)
 }
 
-fn lcc_inverse(x: f64, y: f64, lat1: f64, lat2: f64, lat0: f64, lon0: f64, false_e: f64, false_n: f64) -> (f64, f64) {
+#[allow(clippy::too_many_arguments)]
+fn lcc_inverse(
+    x: f64,
+    y: f64,
+    lat1: f64,
+    lat2: f64,
+    lat0: f64,
+    lon0: f64,
+    false_e: f64,
+    false_n: f64,
+) -> (f64, f64) {
     let e2 = WGS84_E2;
     let e = e2.sqrt();
 
@@ -619,7 +753,10 @@ mod tests {
         };
         // UL: (-1000, 1000) should be ~(-39.57, 67.02)
         let (lon, lat) = crs.inverse(-1000.0, 1000.0);
-        assert!((lon - (-39.57)).abs() < 1.0, "UL lon={lon}, expected ~-39.57");
+        assert!(
+            (lon - (-39.57)).abs() < 1.0,
+            "UL lon={lon}, expected ~-39.57"
+        );
         assert!((lat - 67.02).abs() < 1.0, "UL lat={lat}, expected ~67.02");
 
         // LR: (3799000, -4399000) should be ~(29.41, 31.99)
@@ -650,6 +787,9 @@ mod tests {
         // Center of projection (10, 55) should map to approximately (1950000, -2100000)
         // in projected coords, which in pixel coords is ((1950000+1000)/2000, (1000+2100000)/2000)
         let pixel = gt.world_to_pixel(10.0, 55.0);
-        assert!(pixel.is_some(), "Center of projection should be inside raster");
+        assert!(
+            pixel.is_some(),
+            "Center of projection should be inside raster"
+        );
     }
 }

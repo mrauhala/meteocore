@@ -12,7 +12,10 @@ use ds_core::datetime::parse_datetime_interval;
 use ds_core::engine::Engine;
 
 use crate::params::{AreaQueryParams, LocationQueryParams, PositionQueryParams};
-use crate::response::{area_query_result_to_json, locations_to_geojson, query_result_to_coverage_json, LocationsContext};
+use crate::response::{
+    area_query_result_to_json, locations_to_geojson, query_result_to_coverage_json,
+    LocationsContext,
+};
 
 /// Shared state for the EDR API: a registry of collection engines + metadata.
 #[derive(Clone)]
@@ -25,6 +28,7 @@ pub struct EdrState {
 
 pub type AppState = Arc<EdrState>;
 
+#[allow(clippy::type_complexity)]
 fn lookup_collection<'a>(
     state: &'a EdrState,
     id: &str,
@@ -87,7 +91,13 @@ pub async fn collections(State(state): State<AppState>) -> impl IntoResponse {
     let collections: Vec<serde_json::Value> = state
         .collections
         .values()
-        .map(|config| build_collection_metadata(state.engines.get(&config.id).unwrap().as_ref(), config, base))
+        .map(|config| {
+            build_collection_metadata(
+                state.engines.get(&config.id).unwrap().as_ref(),
+                config,
+                base,
+            )
+        })
         .collect();
 
     Json(json!({
@@ -300,7 +310,11 @@ pub async fn area_query(
     ))
 }
 
-fn build_collection_metadata(engine: &dyn Engine, config: &CollectionConfig, base_url: &str) -> serde_json::Value {
+fn build_collection_metadata(
+    engine: &dyn Engine,
+    config: &CollectionConfig,
+    base_url: &str,
+) -> serde_json::Value {
     let param_descs = engine.get_parameter_descriptions();
     let temporal = engine.get_temporal_extent();
     let spatial = engine.get_spatial_extent();

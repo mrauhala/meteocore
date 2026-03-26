@@ -143,9 +143,11 @@ fn default_apis() -> Vec<String> {
 
 impl ServerConfig {
     pub fn from_file(path: &str) -> Result<Self, crate::error::DataServerError> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| crate::error::DataServerError::Config(format!("Failed to read {path}: {e}")))?;
-        toml::from_str(&content)
-            .map_err(|e| crate::error::DataServerError::Config(format!("Failed to parse config: {e}")))
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            crate::error::DataServerError::Config(format!("Failed to read {path}: {e}"))
+        })?;
+        toml::from_str(&content).map_err(|e| {
+            crate::error::DataServerError::Config(format!("Failed to parse config: {e}"))
+        })
     }
 }
