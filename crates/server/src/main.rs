@@ -5,6 +5,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
+use tokio::signal;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
@@ -33,6 +34,8 @@ async fn main() {
         HashMap::new();
     let mut feature_collections: HashMap<String, ds_core::config::CollectionConfig> =
         HashMap::new();
+    let mut geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>> = Vec::new();
+    let mut loaded_count: usize = 0;
 
     for collection in &config.collections {
         let data_path_display = collection
@@ -92,6 +95,7 @@ async fn main() {
                     );
                     feature_collections.insert(collection.id.clone(), collection.clone());
                 }
+                loaded_count += 1;
             }
             "geojson" => {
                 let data_path = match collection.data_path.as_deref() {
@@ -137,6 +141,7 @@ async fn main() {
                         collection.id
                     );
                 }
+                loaded_count += 1;
             }
             "geotiff" => {
                 let geotiff_config = match collection.geotiff.as_ref() {
@@ -181,6 +186,8 @@ async fn main() {
                     poller.poll_loop().await;
                 });
 
+                geotiff_engines.push(engine.clone());
+
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
                         collection.id.clone(),
@@ -195,6 +202,7 @@ async fn main() {
                         collection.id
                     );
                 }
+                loaded_count += 1;
             }
             other => {
                 tracing::error!(
@@ -206,6 +214,19 @@ async fn main() {
             }
         }
     }
+
+    if loaded_count == 0 {
+        tracing::error!(
+            "No collections loaded successfully ({} configured). Refusing to start an empty server.",
+            config.collections.len()
+        );
+        std::process::exit(1);
+    }
+    info!(
+        "Loaded {}/{} collections successfully",
+        loaded_count,
+        config.collections.len()
+    );
 
     let edr_state = Arc::new(EdrState {
         engines: edr_engines,
@@ -249,7 +270,40 @@ async fn main() {
         .await
         .expect("Failed to bind");
 
-    axum::serve(listener, app).await.expect("Server error");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("Server error");
+
+    // Signal all GeoTIFF polling loops to stop
+    for engine in &geotiff_engines {
+        engine.shutdown();
+    }
+    info!("Server shut down gracefully");
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("Received Ctrl+C, shutting down..."),
+        _ = terminate => info!("Received SIGTERM, shutting down..."),
+    }
 }
 
 async fn root_landing_page(base_url: Arc<String>) -> impl IntoResponse {

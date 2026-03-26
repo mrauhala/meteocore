@@ -36,6 +36,13 @@ impl CsvDataStore {
         // Fixed columns: location, latitude, longitude, time
         // Everything else is a parameter
         let param_start = 4;
+        if headers.len() < param_start {
+            return Err(DataServerError::Csv(format!(
+                "CSV must have at least {} columns (location, latitude, longitude, time), found {}",
+                param_start,
+                headers.len()
+            )));
+        }
         let parameter_names: Vec<String> = headers[param_start..].to_vec();
 
         let parameter_units: HashMap<String, String> = parameter_names

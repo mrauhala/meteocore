@@ -7,6 +7,7 @@ mod time_window;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -65,6 +66,8 @@ pub struct GeoTiffEngine {
     override_offset: Option<f64>,
     /// Shutdown signal for the polling loop.
     shutdown_tx: watch::Sender<()>,
+    /// Consecutive poll failures/empty results (for escalating warnings).
+    consecutive_poll_failures: AtomicU32,
 }
 
 impl GeoTiffEngine {
@@ -177,6 +180,7 @@ impl GeoTiffEngine {
             override_scale: config.scale,
             override_offset: config.offset,
             shutdown_tx,
+            consecutive_poll_failures: AtomicU32::new(0),
         };
 
         // Initial scan
@@ -358,15 +362,28 @@ impl GeoTiffEngine {
                 let total_bytes: u64 = new_catalog.entries.values().map(|e| e.file_size).sum();
 
                 if count == 0 && old_count > 0 {
-                    tracing::warn!(
-                        "[{}] Poll returned 0 files (was {}); keeping old catalog. \
-                         Check data source connectivity and filename pattern.",
-                        self.collection_id,
-                        old_count
-                    );
+                    let failures = self.consecutive_poll_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                    if failures >= 10 {
+                        tracing::error!(
+                            "[{}] Poll returned 0 files for {} consecutive cycles (was {}). \
+                             Data source may be permanently unavailable. Serving stale data.",
+                            self.collection_id,
+                            failures,
+                            old_count
+                        );
+                    } else {
+                        tracing::warn!(
+                            "[{}] Poll returned 0 files (was {}, {} consecutive). \
+                             Keeping old catalog. Check data source connectivity and filename pattern.",
+                            self.collection_id,
+                            old_count,
+                            failures
+                        );
+                    }
                     return;
                 }
 
+                self.consecutive_poll_failures.store(0, Ordering::Relaxed);
                 self.catalog.store(Arc::new(new_catalog));
                 let (hits, misses) = self.tile_cache.stats();
                 tracing::debug!(
@@ -379,10 +396,20 @@ impl GeoTiffEngine {
                 );
             }
             Err(e) => {
-                tracing::warn!(
-                    "[{}] Scan failed, keeping old catalog: {e}",
-                    self.collection_id
-                );
+                let failures = self.consecutive_poll_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if failures >= 10 {
+                    tracing::error!(
+                        "[{}] Scan failed for {} consecutive cycles: {e}. Serving stale data.",
+                        self.collection_id,
+                        failures
+                    );
+                } else {
+                    tracing::warn!(
+                        "[{}] Scan failed (attempt {}), keeping old catalog: {e}",
+                        self.collection_id,
+                        failures
+                    );
+                }
             }
         }
     }
@@ -678,11 +705,18 @@ impl Engine for GeoTiffEngine {
             let nt = t.as_ref().map_or(1, |tv| tv.len());
             let ny = y.len();
             let nx = x.len();
+            let expected_len = nt * ny * nx;
             for (_name, ndarray) in result.ranges.iter_mut() {
+                if ndarray.values.len() != expected_len {
+                    tracing::error!(
+                        "NdArray length mismatch: expected {} ({}*{}*{}), got {}",
+                        expected_len, nt, ny, nx, ndarray.values.len()
+                    );
+                    continue;
+                }
                 for (iy, y_val) in y.iter().enumerate() {
                     for (ix, x_val) in x.iter().enumerate() {
                         if !polygon.contains(*x_val, *y_val) {
-                            // Null out all timesteps for this pixel
                             for it in 0..nt {
                                 let idx = it * ny * nx + iy * nx + ix;
                                 ndarray.values[idx] = None;

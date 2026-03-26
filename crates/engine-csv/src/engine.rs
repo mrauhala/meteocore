@@ -119,15 +119,19 @@ impl Engine for CsvEngine {
             );
         }
 
+        // Build time→row_index map for O(1) lookups
+        let time_to_row: HashMap<DateTime<Utc>, usize> = row_indices
+            .iter()
+            .map(|&i| (self.store.rows[i].time, i))
+            .collect();
+
         // Build ranges — values ordered by time
         let mut ranges = HashMap::new();
         for name in &param_names {
             let mut values: Vec<Option<f64>> = Vec::with_capacity(times.len());
             for t in &times {
-                // Find the row for this time
-                let val = row_indices
-                    .iter()
-                    .find(|&&i| self.store.rows[i].time == *t)
+                let val = time_to_row
+                    .get(t)
                     .and_then(|&i| self.store.rows[i].values.get(name).copied())
                     .unwrap_or(None);
                 values.push(val);
