@@ -77,10 +77,7 @@ async fn main() {
     let root_state = server_state.clone();
 
     let app = Router::new()
-        .route(
-            "/",
-            get(move || root_landing_page(root_state)),
-        )
+        .route("/", get(move || root_landing_page(root_state)))
         .nest("/edr", api_edr::router(edr_swap.clone()))
         .nest("/features", api_features::router(features_swap.clone()))
         // Trailing-slash variants so /edr/ and /features/ also work

@@ -844,8 +844,7 @@ pub fn read_bbox(
     for tile_row in tile_row_start..tile_row_end {
         for tile_col in tile_col_start..tile_col_end {
             let chunk_index = tile_row * metadata.tiles_across + tile_col;
-            let tile_data =
-                decode_chunk_f64(&mut decoder, chunk_index, metadata, band_index)?;
+            let tile_data = decode_chunk_f64(&mut decoder, chunk_index, metadata, band_index)?;
 
             copy_tile_to_result(
                 &tile_data,
@@ -1484,9 +1483,18 @@ mod tests {
         let col_end = max_side.min(full_meta.width);
         let row_end = max_side.min(full_meta.height);
 
-        let sequential_result =
-            read_bbox(&full_source, &full_meta, col_start, row_start, col_end, row_end, None, &tif_path, 0)
-                .unwrap();
+        let sequential_result = read_bbox(
+            &full_source,
+            &full_meta,
+            col_start,
+            row_start,
+            col_end,
+            row_end,
+            None,
+            &tif_path,
+            0,
+        )
+        .unwrap();
 
         // Parallel: read via remote source (uses read_bbox_parallel path)
         let (store, _prefix) = ds_storage::build_store(dir.to_str().unwrap()).unwrap();
@@ -1528,16 +1536,24 @@ mod tests {
         );
 
         let mut mismatches = 0;
-        for (i, (s, p)) in sequential_result.iter().zip(parallel_result.iter()).enumerate() {
+        for (i, (s, p)) in sequential_result
+            .iter()
+            .zip(parallel_result.iter())
+            .enumerate()
+        {
             if s != p {
                 if mismatches < 5 {
-                    eprintln!("Mismatch at index {}: sequential={:?}, parallel={:?}", i, s, p);
+                    eprintln!(
+                        "Mismatch at index {}: sequential={:?}, parallel={:?}",
+                        i, s, p
+                    );
                 }
                 mismatches += 1;
             }
         }
         assert_eq!(
-            mismatches, 0,
+            mismatches,
+            0,
             "{} pixel mismatches out of {} total pixels",
             mismatches,
             sequential_result.len()

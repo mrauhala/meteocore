@@ -362,7 +362,10 @@ impl GeoTiffEngine {
                 let total_bytes: u64 = new_catalog.entries.values().map(|e| e.file_size).sum();
 
                 if count == 0 && old_count > 0 {
-                    let failures = self.consecutive_poll_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                    let failures = self
+                        .consecutive_poll_failures
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
                     if failures >= 10 {
                         tracing::error!(
                             "[{}] Poll returned 0 files for {} consecutive cycles (was {}). \
@@ -396,7 +399,10 @@ impl GeoTiffEngine {
                 );
             }
             Err(e) => {
-                let failures = self.consecutive_poll_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                let failures = self
+                    .consecutive_poll_failures
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
                 if failures >= 10 {
                     tracing::error!(
                         "[{}] Scan failed for {} consecutive cycles: {e}. Serving stale data.",
@@ -710,7 +716,11 @@ impl Engine for GeoTiffEngine {
                 if ndarray.values.len() != expected_len {
                     tracing::error!(
                         "NdArray length mismatch: expected {} ({}*{}*{}), got {}",
-                        expected_len, nt, ny, nx, ndarray.values.len()
+                        expected_len,
+                        nt,
+                        ny,
+                        nx,
+                        ndarray.values.len()
                     );
                     continue;
                 }

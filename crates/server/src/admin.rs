@@ -40,7 +40,9 @@ static HTTP_REQUEST_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
             "http_request_duration_seconds",
             "HTTP request duration in seconds",
         )
-        .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0]),
+        .buckets(vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0,
+        ]),
         &["method", "path"],
     )
     .unwrap();
@@ -61,8 +63,7 @@ static COLLECTIONS_HEALTHY: LazyLock<IntGauge> = LazyLock::new(|| {
 });
 
 static COLLECTIONS_DEGRADED: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge =
-        IntGauge::new("collections_degraded", "Collections in degraded state").unwrap();
+    let gauge = IntGauge::new("collections_degraded", "Collections in degraded state").unwrap();
     REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
 });
@@ -119,10 +120,7 @@ pub struct LoadResult {
     pub geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>>,
 }
 
-pub fn load_collections(
-    collections: &[CollectionConfig],
-    base_url: &str,
-) -> LoadResult {
+pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> LoadResult {
     let mut edr_engines: HashMap<String, Arc<dyn ds_core::engine::Engine>> = HashMap::new();
     let mut edr_collections: HashMap<String, CollectionConfig> = HashMap::new();
     let mut feature_engines: HashMap<String, Arc<dyn ds_core::feature_engine::FeatureEngine>> =
@@ -419,7 +417,10 @@ pub fn update_health_gauges(health: &[CollectionHealth]) {
 pub async fn reload_handler(
     State(state): State<AdminState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    info!("Reload requested, re-reading config from {}", state.config_path);
+    info!(
+        "Reload requested, re-reading config from {}",
+        state.config_path
+    );
 
     let config = ds_core::config::ServerConfig::from_file(&state.config_path).map_err(|e| {
         tracing::error!("Reload failed: {e}");
@@ -441,7 +442,11 @@ pub async fn reload_handler(
 
     let result = load_collections(&config.collections, &base_url);
 
-    let loaded = result.health.iter().filter(|h| h.status != CollectionStatus::Failed).count();
+    let loaded = result
+        .health
+        .iter()
+        .filter(|h| h.status != CollectionStatus::Failed)
+        .count();
 
     if loaded == 0 && !config.collections.is_empty() {
         // Restore old GeoTIFF engines (they were shut down)
@@ -494,9 +499,7 @@ pub async fn reload_handler(
 }
 
 /// GET /health — per-collection health status.
-pub async fn health_handler(
-    State(state): State<AdminState>,
-) -> impl IntoResponse {
+pub async fn health_handler(State(state): State<AdminState>) -> impl IntoResponse {
     let health = state.health.read().unwrap().clone();
 
     let overall = if health.iter().all(|h| h.status == CollectionStatus::Ready) {
