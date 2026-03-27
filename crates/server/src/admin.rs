@@ -105,6 +105,8 @@ pub struct ServerState {
     pub config_path: String,
     pub health: RwLock<Vec<CollectionHealth>>,
     pub geotiff_engines: RwLock<Vec<Arc<engine_geotiff::GeoTiffEngine>>>,
+    /// Serializes reload requests to prevent concurrent reloads from racing.
+    pub reload_lock: tokio::sync::Mutex<()>,
 }
 
 pub type AdminState = Arc<ServerState>;
@@ -417,6 +419,14 @@ pub fn update_health_gauges(health: &[CollectionHealth]) {
 pub async fn reload_handler(
     State(state): State<AdminState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // Serialize reload requests — prevent concurrent reloads from racing
+    let _reload_guard = state.reload_lock.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "A reload is already in progress" })),
+        )
+    })?;
+
     info!(
         "Reload requested, re-reading config from {}",
         state.config_path

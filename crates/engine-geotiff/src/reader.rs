@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use bytes::Bytes;
 use ds_core::error::DataServerError;
@@ -774,6 +775,16 @@ pub fn read_pixel(
 /// Maximum number of concurrent tile fetches for remote sources.
 const MAX_TILE_CONCURRENCY: usize = 5;
 
+/// Shared rayon thread pool for parallel tile fetching.
+/// Avoids the overhead of creating a new pool per request (~10-50us each).
+static TILE_FETCH_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(MAX_TILE_CONCURRENCY)
+        .thread_name(|i| format!("tile-fetch-{i}"))
+        .build()
+        .expect("failed to create tile fetch thread pool")
+});
+
 /// Read pixel values within a bounding box from a GeoTIFF data source.
 /// Returns a row-major grid of values [row_start..row_end, col_start..col_end].
 /// `band_index` selects which band (0-based) for multi-band files.
@@ -893,17 +904,9 @@ fn read_bbox_parallel(
         .flat_map(|tr| (tile_col_start..tile_col_end).map(move |tc| (tr, tc)))
         .collect();
 
-    // Build a thread pool with limited concurrency
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(MAX_TILE_CONCURRENCY)
-        .build()
-        .map_err(|e| {
-            DataServerError::GeoTiff(format!("Failed to create tile fetch thread pool: {e}"))
-        })?;
-
-    // Fetch all tiles in parallel; failed tiles return None-filled data
+    // Fetch all tiles in parallel using the shared thread pool
     let tile_pixel_count = (metadata.tile_width * metadata.tile_height) as usize;
-    let tile_results: Vec<(u32, u32, Vec<Option<f64>>)> = pool.install(|| {
+    let tile_results: Vec<(u32, u32, Vec<Option<f64>>)> = TILE_FETCH_POOL.install(|| {
         tile_coords
             .par_iter()
             .map(|&(tile_row, tile_col)| {

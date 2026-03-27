@@ -72,6 +72,7 @@ async fn main() {
         config_path,
         health: RwLock::new(result.health),
         geotiff_engines: RwLock::new(result.geotiff_engines),
+        reload_lock: tokio::sync::Mutex::new(()),
     });
 
     let root_state = server_state.clone();
