@@ -13,6 +13,18 @@ cargo run -p server          # Start server (reads config.toml)
 cargo check -p <crate>       # Type-check a single crate
 ```
 
+### Fuzz testing
+
+Fuzz targets live in `fuzz/` (separate from workspace, uses `cargo-fuzz` + `libfuzzer`). Requires nightly.
+
+```bash
+cargo install cargo-fuzz                                          # One-time setup
+cargo +nightly fuzz run fuzz_tiff_metadata -- -max_total_time=60  # Fuzz TIFF parser
+cargo +nightly fuzz run fuzz_geo_transform -- -max_total_time=60  # Fuzz CRS transforms
+```
+
+Seed corpus in `fuzz/corpus/fuzz_tiff_metadata/` — add real GeoTIFF files for better coverage.
+
 ## Architecture Rules
 
 - **Two core traits: `Engine` (EDR) and `FeatureEngine` (Features).** They are separate traits — not all engines need to support both APIs. Engines return domain types, never JSON. Serialization belongs in the API crates.

@@ -10,3 +10,4 @@ members = [
     "crates/api-features",
     "crates/server",
 ]
+exclude = ["fuzz"]

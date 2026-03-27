@@ -1,0 +1,26 @@
+[package]
+name = "dataserver-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+engine-geotiff = { path = "../crates/engine-geotiff", features = ["fuzz"] }
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_tiff_metadata"
+path = "fuzz_targets/fuzz_tiff_metadata.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_geo_transform"
+path = "fuzz_targets/fuzz_geo_transform.rs"
+doc = false

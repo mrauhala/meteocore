@@ -83,8 +83,8 @@ impl DataSource {
         DataSource::LocalFile(path.to_path_buf())
     }
 
-    pub fn from_bytes(data: Bytes) -> Self {
-        DataSource::InMemory(data)
+    pub fn from_bytes(data: impl Into<Bytes>) -> Self {
+        DataSource::InMemory(data.into())
     }
 
     /// Open a decoder for this data source (LocalFile and InMemory only).
@@ -302,9 +302,22 @@ impl TiffMetadata {
     }
 
     /// Check if a raw value is nodata (before scale/offset).
+    ///
+    /// Uses bitwise comparison for integer-representable nodata values (exact match)
+    /// and ULP-aware comparison for float nodata to handle f32→f64 promotion.
     fn is_nodata_raw(&self, raw: f64) -> bool {
         if let Some(nd) = self.nodata {
-            (raw - nd).abs() < 1e-10
+            // If nodata is an exact integer (common: 255, 0, 65535, -9999, etc.),
+            // use exact comparison — integer-to-f64 conversion is lossless for
+            // all integers up to 2^53.
+            if nd == nd.trunc() && nd.is_finite() {
+                return raw == nd;
+            }
+            // For non-integer nodata (e.g., -3.4028235e+38 from GDAL float32 max),
+            // compare via f32 roundtrip to handle f32→f64 promotion mismatch.
+            // The GDAL_NODATA tag is stored as ASCII text and parsed to f64,
+            // but the actual pixel values may have been f32 promoted to f64.
+            (raw as f32) == (nd as f32)
         } else {
             false
         }
@@ -1021,40 +1034,55 @@ fn parse_geo_transform(
     width: u32,
     height: u32,
 ) -> Result<GeoTransform, DataServerError> {
-    let tiepoint = decoder.get_tag(Tag::Unknown(33922)).map_err(|_| {
-        DataServerError::GeoTiff("Missing ModelTiepointTag — not a GeoTIFF?".into())
-    })?;
-    let pixelscale = decoder.get_tag(Tag::Unknown(33550)).map_err(|_| {
-        DataServerError::GeoTiff("Missing ModelPixelScaleTag — not a GeoTIFF?".into())
-    })?;
-
-    let tp = extract_doubles(&tiepoint)
-        .ok_or_else(|| DataServerError::GeoTiff("Cannot parse ModelTiepointTag".into()))?;
-    let ps = extract_doubles(&pixelscale)
-        .ok_or_else(|| DataServerError::GeoTiff("Cannot parse ModelPixelScaleTag".into()))?;
-
-    if tp.len() < 6 || ps.len() < 2 {
-        return Err(DataServerError::GeoTiff(
-            "ModelTiepointTag or ModelPixelScaleTag has too few values".into(),
-        ));
-    }
-
-    let origin_x = tp[3] - tp[0] * ps[0];
-    let origin_y = tp[4] + tp[1] * ps[1];
-
-    // Parse CRS from GeoKeys
+    // Parse CRS first — needed for both paths
     let crs = parse_crs(decoder)?;
     tracing::debug!("Parsed CRS: {:?}", crs);
 
-    Ok(GeoTransform {
-        origin_x,
-        origin_y,
-        pixel_width: ps[0],
-        pixel_height: ps[1],
-        width,
-        height,
-        crs,
-    })
+    // Try ModelTiepointTag (33922) + ModelPixelScaleTag (33550) first — the common case
+    let tiepoint_result = decoder.get_tag(Tag::Unknown(33922));
+    let pixelscale_result = decoder.get_tag(Tag::Unknown(33550));
+
+    if let (Ok(tiepoint), Ok(pixelscale)) = (tiepoint_result, pixelscale_result) {
+        let tp = extract_doubles(&tiepoint)
+            .ok_or_else(|| DataServerError::GeoTiff("Cannot parse ModelTiepointTag".into()))?;
+        let ps = extract_doubles(&pixelscale)
+            .ok_or_else(|| DataServerError::GeoTiff("Cannot parse ModelPixelScaleTag".into()))?;
+
+        if tp.len() < 6 || ps.len() < 2 {
+            return Err(DataServerError::GeoTiff(
+                "ModelTiepointTag or ModelPixelScaleTag has too few values".into(),
+            ));
+        }
+
+        let origin_x = tp[3] - tp[0] * ps[0];
+        let origin_y = tp[4] + tp[1] * ps[1];
+
+        return Ok(GeoTransform {
+            origin_x,
+            origin_y,
+            pixel_width: ps[0],
+            pixel_height: ps[1],
+            width,
+            height,
+            crs,
+        });
+    }
+
+    // Fallback: try ModelTransformationTag (34264) — a 4x4 affine matrix
+    if let Ok(transform_tag) = decoder.get_tag(Tag::Unknown(34264)) {
+        let matrix = extract_doubles(&transform_tag).ok_or_else(|| {
+            DataServerError::GeoTiff("Cannot parse ModelTransformationTag".into())
+        })?;
+
+        return GeoTransform::from_transformation_matrix(&matrix, width, height, crs)
+            .map_err(|e| DataServerError::GeoTiff(e));
+    }
+
+    Err(DataServerError::GeoTiff(
+        "Missing geolocation tags — need either ModelTiepointTag (33922) + \
+         ModelPixelScaleTag (33550), or ModelTransformationTag (34264)"
+            .into(),
+    ))
 }
 
 /// Parse the CRS from GeoTIFF GeoKey Directory.
@@ -1561,5 +1589,86 @@ mod tests {
             mismatches,
             sequential_result.len()
         );
+    }
+
+    // --- Nodata comparison tests ---
+
+    fn meta_with_nodata(nodata: f64) -> TiffMetadata {
+        TiffMetadata {
+            width: 1,
+            height: 1,
+            tile_width: 1,
+            tile_height: 1,
+            tiles_across: 1,
+            tiles_down: 1,
+            samples_per_pixel: 1,
+            geo_transform: crate::geo::GeoTransform {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                pixel_width: 1.0,
+                pixel_height: 1.0,
+                width: 1,
+                height: 1,
+                crs: crate::geo::Crs::Wgs84,
+            },
+            nodata: Some(nodata),
+            scale: None,
+            offset: None,
+        }
+    }
+
+    #[test]
+    fn nodata_integer_exact_match() {
+        let meta = meta_with_nodata(255.0);
+        assert!(meta.is_nodata_raw(255.0));
+        assert!(!meta.is_nodata_raw(254.0));
+        assert!(!meta.is_nodata_raw(255.5));
+    }
+
+    #[test]
+    fn nodata_negative_integer() {
+        let meta = meta_with_nodata(-9999.0);
+        assert!(meta.is_nodata_raw(-9999.0));
+        assert!(!meta.is_nodata_raw(-9998.0));
+    }
+
+    #[test]
+    fn nodata_f32_promotion() {
+        // A nodata value that differs between f32 and f64 representation.
+        // f32 can only represent ~7 decimal digits of precision.
+        // When a nodata is specified as a precise f64 value but pixels are f32,
+        // the pixel value (f32→f64 promoted) may differ from the tag value.
+        let nodata_tag = 1.0000001_f64; // more precision than f32 can hold
+        let pixel_f32 = nodata_tag as f32; // rounds to nearest f32
+        let pixel_promoted = pixel_f32 as f64; // promoted back — differs from original
+
+        // These should differ at f64 precision
+        assert_ne!(
+            nodata_tag, pixel_promoted,
+            "f32 roundtrip should lose precision"
+        );
+
+        // But our comparison should still detect the match via f32 roundtrip
+        let meta = meta_with_nodata(nodata_tag);
+        assert!(
+            meta.is_nodata_raw(pixel_promoted),
+            "f32-promoted nodata should match tag value"
+        );
+    }
+
+    #[test]
+    fn nodata_zero() {
+        let meta = meta_with_nodata(0.0);
+        assert!(meta.is_nodata_raw(0.0));
+        assert!(!meta.is_nodata_raw(1.0));
+        // -0.0 == 0.0 in IEEE 754, so this should also match
+        assert!(meta.is_nodata_raw(-0.0));
+    }
+
+    #[test]
+    fn nodata_u16_max() {
+        let meta = meta_with_nodata(65535.0);
+        assert!(meta.is_nodata_raw(65535.0));
+        assert!(!meta.is_nodata_raw(65534.0));
     }
 }

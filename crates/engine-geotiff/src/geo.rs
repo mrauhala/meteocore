@@ -136,6 +136,10 @@ impl Crs {
 }
 
 /// Affine transform mapping pixel coordinates to projected (or geographic) coordinates.
+///
+/// Supports both axis-aligned rasters (from ModelPixelScaleTag + ModelTiepointTag)
+/// and general affine transforms (from ModelTransformationTag, tag 34264).
+/// Rotated or skewed rasters are detected and rejected at parse time.
 #[derive(Debug, Clone)]
 pub struct GeoTransform {
     /// Origin X in source CRS (easting or longitude).
@@ -148,6 +152,59 @@ pub struct GeoTransform {
     pub height: u32,
     /// Coordinate reference system of the raster.
     pub crs: Crs,
+}
+
+impl GeoTransform {
+    /// Create from a 4x4 ModelTransformationTag matrix (row-major, 16 doubles).
+    /// Rejects rotated/skewed rasters (non-zero off-diagonal terms).
+    pub fn from_transformation_matrix(
+        matrix: &[f64],
+        width: u32,
+        height: u32,
+        crs: Crs,
+    ) -> Result<Self, String> {
+        if matrix.len() < 16 {
+            return Err(format!(
+                "ModelTransformationTag has {} values, expected 16",
+                matrix.len()
+            ));
+        }
+
+        // 4x4 row-major: [a b c d / e f g h / i j k l / m n o p]
+        // For 2D raster→model: x' = a*col + b*row + d, y' = e*col + f*row + h
+        // Axis-aligned means b ≈ 0 and e ≈ 0 (no rotation/skew)
+        let a = matrix[0]; // pixel_width (x scale)
+        let b = matrix[1]; // rotation term (should be ~0)
+        let d = matrix[3]; // origin_x
+        let e = matrix[4]; // rotation term (should be ~0)
+        let f = matrix[5]; // -pixel_height (y scale, typically negative)
+        let h = matrix[7]; // origin_y
+
+        let rotation_threshold = 1e-10;
+        if b.abs() > rotation_threshold || e.abs() > rotation_threshold {
+            return Err(format!(
+                "Rotated/skewed raster detected (off-diagonal terms: b={b:.6e}, e={e:.6e}). \
+                 This server requires axis-aligned pixels. Use gdalwarp to remove rotation: \
+                 gdalwarp -r bilinear input.tif output.tif"
+            ));
+        }
+
+        if a.abs() < 1e-15 || f.abs() < 1e-15 {
+            return Err(format!(
+                "Degenerate affine transform: pixel_width={a}, pixel_height={f}"
+            ));
+        }
+
+        Ok(GeoTransform {
+            origin_x: d,
+            origin_y: h,
+            pixel_width: a,
+            pixel_height: -f, // pixel_height stored as positive; f is typically negative
+            width,
+            height,
+            crs,
+        })
+    }
 }
 
 impl GeoTransform {
@@ -800,5 +857,48 @@ mod tests {
             pixel.is_some(),
             "Center of projection should be inside raster"
         );
+    }
+
+    // ModelTransformationTag (tag 34264) — axis-aligned matrix
+    #[test]
+    fn from_transformation_matrix_axis_aligned() {
+        // Identity-like: pixel_width=2000, pixel_height=2000 (f is -2000)
+        // origin_x=-1000, origin_y=1000
+        #[rustfmt::skip]
+        let matrix = [
+            2000.0, 0.0, 0.0, -1000.0,
+            0.0, -2000.0, 0.0, 1000.0,
+            0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        let gt = GeoTransform::from_transformation_matrix(&matrix, 100, 100, Crs::Wgs84).unwrap();
+        assert!((gt.origin_x - (-1000.0)).abs() < 1e-10);
+        assert!((gt.origin_y - 1000.0).abs() < 1e-10);
+        assert!((gt.pixel_width - 2000.0).abs() < 1e-10);
+        assert!((gt.pixel_height - 2000.0).abs() < 1e-10);
+    }
+
+    // Rotated raster must be rejected
+    #[test]
+    fn from_transformation_matrix_rotated_rejected() {
+        #[rustfmt::skip]
+        let matrix = [
+            1000.0, 500.0, 0.0, 0.0,   // b=500 → rotation
+            -500.0, 1000.0, 0.0, 0.0,   // e=-500 → rotation
+            0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        let result = GeoTransform::from_transformation_matrix(&matrix, 100, 100, Crs::Wgs84);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("Rotated/skewed"), "got: {err}");
+    }
+
+    // Too few values
+    #[test]
+    fn from_transformation_matrix_too_short() {
+        let matrix = [1.0, 0.0, 0.0];
+        let result = GeoTransform::from_transformation_matrix(&matrix, 100, 100, Crs::Wgs84);
+        assert!(result.is_err());
     }
 }

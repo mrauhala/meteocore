@@ -5,6 +5,14 @@ mod parse;
 mod reader;
 mod time_window;
 
+/// Re-exports for fuzz testing. Not part of the public API.
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+pub mod fuzz_exports {
+    pub use crate::geo::{Crs, GeoTransform};
+    pub use crate::reader::{DataSource, TiffMetadata};
+}
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
