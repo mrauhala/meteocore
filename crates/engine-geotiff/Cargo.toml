@@ -21,7 +21,13 @@ rayon = "1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs"] }
 
 [[bench]]
 name = "geotiff_engine"
+harness = false
+
+[[bench]]
+name = "geotiff_remote"
 harness = false

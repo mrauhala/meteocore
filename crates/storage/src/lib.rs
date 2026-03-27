@@ -280,8 +280,11 @@ fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServ
     let url = url::Url::parse(data_path)
         .map_err(|e| DataServerError::Storage(format!("Invalid URL {data_path}: {e}")))?;
 
-    // Use the URL without the path as the base
-    let base_url = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""));
+    // Use the URL without the path as the base (preserve port if present)
+    let base_url = match url.port() {
+        Some(port) => format!("{}://{}:{}", url.scheme(), url.host_str().unwrap_or(""), port),
+        None => format!("{}://{}", url.scheme(), url.host_str().unwrap_or("")),
+    };
 
     let store = object_store::http::HttpBuilder::new()
         .with_url(&base_url)
