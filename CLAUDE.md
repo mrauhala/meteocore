@@ -2,7 +2,7 @@
 
 ## What This Is
 
-Rust workspace implementing OGC API - EDR and OGC API - Features servers. Eight crates: `ds-core` (traits + types), `ds-storage` (S3/HTTP/local object store), `engine-csv` (CSV data engine), `engine-geojson` (GeoJSON data engine), `engine-geotiff` (GeoTIFF/COG data engine), `api-edr` (EDR HTTP layer), `api-features` (Features HTTP layer), `server` (binary).
+Rust workspace implementing OGC API - EDR, OGC API - Features, and OGC WMS 1.3.0 servers. Ten crates: `ds-core` (traits + types), `ds-storage` (S3/HTTP/local object store), `ds-render` (raster colorization + PNG encoding), `engine-csv` (CSV data engine), `engine-geojson` (GeoJSON data engine), `engine-geotiff` (GeoTIFF/COG data engine), `api-edr` (EDR HTTP layer), `api-features` (Features HTTP layer), `api-wms` (WMS 1.3.0 HTTP layer), `server` (binary).
 
 ## Build & Run
 
@@ -27,14 +27,16 @@ Seed corpus in `fuzz/corpus/fuzz_tiff_metadata/` — add real GeoTIFF files for 
 
 ## Architecture Rules
 
-- **Two core traits: `Engine` (EDR) and `FeatureEngine` (Features).** They are separate traits — not all engines need to support both APIs. Engines return domain types, never JSON. Serialization belongs in the API crates.
+- **Three core traits: `Engine` (EDR), `FeatureEngine` (Features), and `MapEngine` (WMS).** They are separate traits — not all engines need to support all APIs. Engines return domain types, never JSON/XML. Serialization belongs in the API crates.
 - **ds-core has no framework dependencies.** Only chrono, serde, thiserror, toml. Keep it that way. Use `PropertyValue` enum instead of `serde_json::Value` for feature properties.
-- **API crates depend only on ds-core**, not on any engine crate. API state is a registry of engines keyed by collection ID (`EdrState` / `FeaturesState`), not a single engine.
-- **EDR and Features are separate services** with separate base routes (`/edr/...` and `/features/...`). They share data sources but have independent landing pages, conformance endpoints, and collection listings.
+- **ds-render has no framework dependencies.** Only ds-core and `png`. Pure rendering library for colorization and image encoding.
+- **API crates depend only on ds-core** (and ds-render for api-wms), not on any engine crate. API state is a registry of engines keyed by collection ID (`EdrState` / `FeaturesState` / `WmsState`), not a single engine.
+- **EDR, Features, and WMS are separate services** with separate base routes (`/edr/...`, `/features/...`, `/wms/...`). They share data sources but have independent endpoints.
+- **WMS uses XML, not JSON.** All XML output in api-wms uses `quick-xml::Writer` for proper escaping. Never build XML with `format!()` or string concatenation (XML injection risk).
 - **CORS is applied at the server level**, not in individual API crates. The `CorsLayer` lives in `server/src/main.rs`.
-- **New engines** implement `Engine` and/or `FeatureEngine` traits in their own crate, get wired up in `server/src/main.rs`.
-- **Collection routing is dynamic.** Handlers look up engines from a `HashMap<String, Arc<dyn Engine/FeatureEngine>>` by collection ID from the URL path. No collection IDs are hardcoded.
-- **The `apis` config field is enforced.** Only collections listing a given API in their `apis` array are wired to that API's router. A GeoJSON collection with `apis = ["features"]` will not appear in EDR.
+- **New engines** implement `Engine`, `FeatureEngine`, and/or `MapEngine` traits in their own crate, get wired up in `server/src/main.rs`.
+- **Collection routing is dynamic.** Handlers look up engines from a `HashMap<String, Arc<dyn Engine/FeatureEngine/MapEngine>>` by collection ID from the URL path. No collection IDs are hardcoded.
+- **The `apis` config field is enforced.** Only collections listing a given API in their `apis` array are wired to that API's router. A GeoJSON collection with `apis = ["features"]` will not appear in EDR or WMS.
 
 ## Crate Name
 
@@ -43,7 +45,7 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 ## Route Structure
 
 ```
-/                                              Root landing page (links to both services)
+/                                              Root landing page (links to all services)
 /edr/                                          EDR landing page
 /edr/conformance                               EDR conformance classes
 /edr/collections                               EDR collection listing
@@ -59,6 +61,9 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 /features/collections/{id}/items               Feature items (paginated GeoJSON)
 /features/collections/{id}/items/{feature_id}  Single feature (GeoJSON)
 
+/wms/?SERVICE=WMS&REQUEST=GetCapabilities      WMS 1.3.0 GetCapabilities (XML)
+/wms/?SERVICE=WMS&REQUEST=GetMap&...           WMS 1.3.0 GetMap (PNG image)
+
 /admin/collections/reload                      POST: reload config and swap engines
 /health                                        Per-collection health status
 /metrics                                       Prometheus metrics (text format)
@@ -67,11 +72,11 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 ## Adding a New Engine
 
 1. Create `crates/engine-<name>/` with `Cargo.toml` depending on `ds-core`
-2. Implement `Engine` and/or `FeatureEngine` traits from `ds_core::engine` / `ds_core::feature_engine`
+2. Implement `Engine`, `FeatureEngine`, and/or `MapEngine` traits from `ds_core::engine` / `ds_core::feature_engine` / `ds_core::map_engine`
 3. Add the crate to workspace members in root `Cargo.toml`
 4. Add the crate as a dependency of `crates/server/Cargo.toml`
 5. Add a match arm for the new `engine_type` in `server/src/main.rs`
-6. Wire it into the appropriate registries (`edr_engines` / `feature_engines`) based on the collection's `apis` config
+6. Wire it into the appropriate registries (`edr_engines` / `feature_engines` / `map_engines`) based on the collection's `apis` config
 
 ## Adding a New EDR Endpoint
 
@@ -104,6 +109,131 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 - **Collection metadata**: Includes `extent.spatial.bbox`, `crs`, `storageCrs`
 - **OpenAPI**: Served at `/features/api` (linked from landing page via `rel: service-desc`)
 - **Conformance**: Declares `core`, `oas30`, `geojson`
+
+## WMS 1.3.0
+
+The server implements OGC WMS 1.3.0 for serving raster data as map images. Only GeoTIFF collections can be exposed via WMS (they implement `MapEngine`).
+
+### Endpoints
+
+Single `/wms/` route dispatches on the `REQUEST` query parameter:
+
+- **GetCapabilities**: `?SERVICE=WMS&REQUEST=GetCapabilities` — returns XML capabilities with layers, CRS, extents, time dimension
+- **GetMap**: `?SERVICE=WMS&REQUEST=GetMap&LAYERS=...&CRS=...&BBOX=...&WIDTH=...&HEIGHT=...&FORMAT=image/png` — returns PNG image
+
+### GetMap Parameters
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `SERVICE` | yes | Must be `WMS` |
+| `VERSION` | yes | Must be `1.3.0` |
+| `REQUEST` | yes | `GetMap` |
+| `LAYERS` | yes | Single layer name (= collection ID). Multi-layer not yet supported. |
+| `CRS` | yes | `CRS:84`, `EPSG:4326`, `EPSG:3857`, `EPSG:3067`, or `EPSG:3035` |
+| `BBOX` | yes | Bounding box — axis order depends on CRS (see below) |
+| `WIDTH` | yes | Image width in pixels (max 4096) |
+| `HEIGHT` | yes | Image height in pixels (max 4096) |
+| `FORMAT` | yes | Must be `image/png` |
+| `TRANSPARENT` | no | Default `TRUE` |
+| `TIME` | no | ISO 8601 timestamp; defaults to latest available |
+
+### WMS 1.3.0 Axis Order
+
+**Critical:** WMS 1.3.0 BBOX axis order depends on the CRS:
+
+- **CRS:84**: `BBOX=west,south,east,north` (lon/lat — same as internal)
+- **EPSG:4326**: `BBOX=south,west,north,east` (lat/lon — swapped!)
+- **EPSG:3857, EPSG:3067, EPSG:3035**: `BBOX=minx,miny,maxx,maxy` (easting/northing)
+
+The handler normalizes all bbox values to `[west, south, east, north]` internally. Test with both CRS:84 and EPSG:4326 to catch axis order bugs.
+
+### WMS Error Handling
+
+Errors are returned as XML `ServiceExceptionReport` documents with WMS-specific error codes: `LayerNotDefined`, `CRSNotDefined`, `InvalidDimensionValue`, `MissingParameterValue`, `InvalidFormat`, etc.
+
+### Security Limits
+
+| Limit | Value | Location |
+|-------|-------|----------|
+| MAX_MAP_PIXELS | 8,000,000 (8M) | `api-wms/src/params.rs` |
+| MAX_MAP_DIMENSION | 4,096 px | `api-wms/src/params.rs` |
+| Render semaphore | 8 concurrent | `WmsState` |
+| CRS whitelist | CRS:84, EPSG:4326/3857/3067/3035 | `api-wms/src/params.rs` |
+| No external SLD | SLD parameter rejected | Not implemented |
+| Max LAYERS | 1 | `api-wms/src/params.rs` |
+| FORMAT whitelist | `image/png` only | `api-wms/src/params.rs` |
+
+### Rendering Pipeline
+
+1. Parse WMS parameters, validate, normalize bbox axis order
+2. Look up `MapEngine` by layer name (= collection ID)
+3. Check rendered image cache (LRU, keyed by quantized bbox + layer + time)
+4. If miss: acquire render semaphore, call `MapEngine::get_raster_tile()` on a blocking thread
+5. Engine reads source tiles, reprojects bbox to source CRS, resamples to output dimensions (nearest-neighbor)
+6. Apply colormap (LUT for integer data, linear interpolation for continuous data) → RGBA buffer
+7. Encode RGBA → PNG using pure Rust `png` crate (compression level Fast)
+8. Cache rendered PNG, return with `Content-Type: image/png`
+
+### Colormaps
+
+Colormaps are configured per collection in `[collections.wms]`:
+
+| Built-in Name | Description | Default Range |
+|---------------|-------------|---------------|
+| `radar_dbz` | Standard radar reflectivity (blue→green→yellow→red) | 0–70 dBZ |
+| `grayscale` | Linear black→white | 0–1 |
+| `viridis` | Perceptually uniform (good default for continuous data) | 0–1 |
+
+Custom color stops override built-in colormaps:
+
+```toml
+[collections.wms]
+[[collections.wms.color_stops]]
+value = 0.0
+color = "#00000000"
+[[collections.wms.color_stops]]
+value = 50.0
+color = "#FF0000"
+```
+
+### Rendered Image Cache (Tier 2)
+
+Separate from the GeoTIFF source tile cache (Tier 1). Caches final PNG bytes.
+
+- Default size: 128 MB (configurable via `rendered_cache_mb`)
+- Cache key: quantized bbox (6 decimal places) + layer + width + height + CRS + time
+- Lock-free concurrent LRU (uses `quick_cache`)
+- Invalidated on collection reload (`POST /admin/collections/reload`)
+- Cache hit skips entire pipeline: no tile reads, no colorization, no PNG encoding
+
+### WMS Config Fields
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `colormap` | no | `"viridis"` | Built-in colormap name: `"radar_dbz"`, `"viridis"`, `"grayscale"` |
+| `color_stops` | no | — | Array of `{value, color}` entries. Overrides built-in colormap. |
+| `rendered_cache_mb` | no | `128` | Rendered image cache size in MB. Set to 0 to disable. |
+
+### Adding WMS to a Collection
+
+Add `"wms"` to the `apis` array and configure `[collections.wms]`:
+
+```toml
+[[collections]]
+id = "radar"
+engine_type = "geotiff"
+apis = ["edr", "wms"]
+
+[collections.geotiff]
+filename_template = "radar_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+
+[collections.wms]
+colormap = "radar_dbz"
+```
+
+Only `engine_type = "geotiff"` collections support WMS. CSV and GeoJSON engines do not implement `MapEngine`.
 
 ## Geometry Types
 
@@ -171,7 +301,7 @@ lon, lat = transformer.transform(easting, northing)
 
 ## GeoTIFF Data Format
 
-Cloud-Optimized GeoTIFF (COG) files with tiled layout. The engine implements `Engine` (EDR) only — it exposes position and area queries returning CoverageJSON.
+Cloud-Optimized GeoTIFF (COG) files with tiled layout. The engine implements `Engine` (EDR) for position/area queries returning CoverageJSON, and `MapEngine` (WMS) for raster tile rendering returning PNG images.
 
 ### Requirements
 
@@ -313,7 +443,7 @@ id = "radar"
 title = "FMI Radar Composite"
 description = "Finnish Meteorological Institute radar reflectivity"
 engine_type = "geotiff"
-apis = ["edr"]
+apis = ["edr", "wms"]
 
 [collections.geotiff]
 filename_template = "radar_%Y%m%dT%H%MZ.tif"
@@ -328,6 +458,10 @@ bucket = "radar-data"
 prefix_pattern = "%Y/%m/%d/"
 time_window = "-PT2H"           # keep last 2 hours
 max_files = 24
+
+[collections.wms]
+colormap = "radar_dbz"          # built-in colormap (or use color_stops for custom)
+# rendered_cache_mb = 128       # optional, default 128 MB
 ```
 
 ### Config fields
@@ -338,8 +472,9 @@ max_files = 24
 | `title` | yes | — | Human-readable collection title |
 | `description` | yes | — | Collection description |
 | `data_path` | yes | — | Path to data file (CSV or GeoJSON) |
-| `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, or both |
+| `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, `"wms"` |
 | `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, or `"geotiff"` |
+| `wms` | no | — | WMS rendering config (see WMS Config Fields). Required when `apis` contains `"wms"`. |
 
 Server-level fields:
 
@@ -351,7 +486,7 @@ Server-level fields:
 
 ## API State Architecture
 
-Both API crates use registry-based state instead of a single engine:
+All API crates use registry-based state instead of a single engine:
 
 ```rust
 // api-edr
@@ -365,9 +500,18 @@ pub struct FeaturesState {
     pub engines: HashMap<String, Arc<dyn FeatureEngine>>,
     pub collections: HashMap<String, CollectionConfig>,
 }
+
+// api-wms
+pub struct WmsState {
+    pub engines: HashMap<String, Arc<dyn MapEngine>>,
+    pub collections: HashMap<String, CollectionConfig>,
+    pub colormaps: HashMap<String, Arc<dyn ColorMap>>,
+    pub render_semaphore: Arc<Semaphore>,
+    pub rendered_cache: Arc<RenderedCache>,
+}
 ```
 
-Handlers look up the engine by collection ID from the URL path parameter. Unknown collection IDs return 404. Collection metadata (title, description, links) is built from `CollectionConfig`, not hardcoded.
+Handlers look up the engine by collection ID from the URL path parameter (or WMS LAYERS parameter). Unknown collection IDs return 404 (or WMS `LayerNotDefined` XML error). Collection metadata (title, description, links) is built from `CollectionConfig`, not hardcoded.
 
 ## CoverageJSON Schema Compliance
 
@@ -477,7 +621,7 @@ Path labels use axum's `MatchedPath` (route patterns, not raw URLs) to avoid unb
 
 ### State architecture
 
-API state (`EdrState`, `FeaturesState`) is wrapped in `ArcSwap` for lock-free reads and atomic swaps on reload. The `ServerState` in `server/src/admin.rs` holds the `ArcSwap` pointers, health registry, and GeoTIFF engine list. Engine loading logic is in `admin::load_collections()`, shared by startup and reload.
+API state (`EdrState`, `FeaturesState`, `WmsState`) is wrapped in `ArcSwap` for lock-free reads and atomic swaps on reload. The `ServerState` in `server/src/admin.rs` holds the `ArcSwap` pointers, health registry, and GeoTIFF engine list. Engine loading logic is in `admin::load_collections()`, shared by startup and reload. On reload, the WMS rendered image cache is replaced (old cache is dropped).
 
 ## Known Limitations
 
@@ -485,13 +629,16 @@ API state (`EdrState`, `FeaturesState`) is wrapped in `ArcSwap` for lock-free re
 - CSV/GeoJSON data loaded into memory at startup; GeoTIFF reads tiles on demand
 - CSV engine supports only the `locations` query type (no position, area, radius, trajectory, corridor)
 - GeoTIFF engine supports `position` and `area` queries (no locations, radius, trajectory, corridor)
-- GeoJSON engine implements `FeatureEngine` only (not `Engine`/EDR) — polygon boundary data has no time-series parameters
-- GeoTIFF engine implements `Engine` only (not `FeatureEngine`/Features)
+- GeoJSON engine implements `FeatureEngine` only (not `Engine`/EDR, not `MapEngine`/WMS) — polygon boundary data has no time-series parameters
+- GeoTIFF engine implements `Engine` (EDR) and `MapEngine` (WMS) only (not `FeatureEngine`/Features)
 - GeoTIFF CRS: WGS84, Transverse Mercator, LAEA, and LCC supported; other projections fall back to WGS84
 - GeoTIFF area queries extract the bounding box from POLYGON WKT — they do not clip to the actual polygon shape
 - Strip-based (non-tiled) GeoTIFFs are not supported — convert to COG first
 - No per-file timeout on remote reads — a hung S3 endpoint blocks the poll cycle
 - GeoTIFF multi-band: one band per collection; multiple bands as separate parameters not yet supported
+- WMS: single LAYERS only (no multi-layer composition), PNG only (no JPEG/WebP), no SLD/SE styling, no GetFeatureInfo
+- WMS: nearest-neighbor resampling only (no bilinear interpolation)
+- WMS: colormap value ranges for built-in colormaps are hardcoded (radar_dbz: 0–70, others: 0–1); use custom color_stops for different ranges
 
 ## Code Style
 

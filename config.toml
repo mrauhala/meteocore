@@ -1,5 +1,5 @@
 [server]
-host = "0.0.0.0"
+host = "127.0.0.1"
 port = 8000
 
 [[collections]]
@@ -31,7 +31,7 @@ title = "Weather Radar Reflectivity"
 description = "Radar composite from MET Norway (preprocessed to WGS84)"
 data_path = "testdata/radar"
 engine_type = "geotiff"
-apis = ["edr"]
+apis = ["edr", "wms"]
 
 [collections.geotiff]
 filename_template = "radar_%Y%m%dT%H%MZ.tif"
@@ -39,13 +39,16 @@ parameter = "reflectivity"
 unit = "dBZ"
 poll_interval_secs = 30
 
+[collections.wms]
+colormap = "radar_dbz"
+
 [[collections]]
 id = "radar-norway"
 title = "MET Norway Radar (native LCC projection)"
 description = "Radar composite in Lambert Conformal Conic, served without reprojection"
 data_path = "testdata/radar-native"
 engine_type = "geotiff"
-apis = ["edr"]
+apis = ["edr", "wms"]
 
 [collections.geotiff]
 filename_template = "norway_%Y%m%dT%H%MZ.tiff"
@@ -53,12 +56,15 @@ parameter = "reflectivity"
 unit = "dBZ"
 poll_interval_secs = 60
 
+[collections.wms]
+colormap = "radar_dbz"
+
 [[collections]]
 id = "fmi-radar"
 title = "FMI Radar (S3, EPSG:3067)"
 description = "Finnish radar composite from FMI S3 bucket, Transverse Mercator projection"
 engine_type = "geotiff"
-apis = ["edr"]
+apis = ["edr", "wms"]
 
 [collections.geotiff]
 endpoint = "https://s3-eu-west-1.amazonaws.com"
@@ -70,12 +76,15 @@ parameter = "reflectivity"
 unit = "dBZ"
 poll_interval_secs = 300
 
+[collections.wms]
+colormap = "radar_dbz"
+
 [[collections]]
 id = "opera-precipitation"
 title = "OPERA European Radar Composite"
 description = "1h accumulated precipitation from EUMETNET OPERA, LAEA projection (CloudFerro S3)"
 engine_type = "geotiff"
-apis = ["edr"]
+apis = ["edr", "wms"]
 
 [collections.geotiff]
 endpoint = "https://s3.waw3-1.cloudferro.com"
@@ -87,12 +96,15 @@ parameter = "precipitation"
 unit = "mm"
 poll_interval_secs = 300
 
+[collections.wms]
+colormap = "viridis"
+
 [[collections]]
 id = "opera-reflectivity"
 title = "OPERA European Radar Reflectivity"
 description = "Radar reflectivity composite (DBZH) from EUMETNET OPERA, LAEA projection (CloudFerro S3)"
 engine_type = "geotiff"
-apis = ["edr"]
+apis = ["edr", "wms"]
 
 [collections.geotiff]
 endpoint = "https://s3.waw3-1.cloudferro.com"
@@ -103,6 +115,9 @@ filename_template = "OPERA@%Y%m%dT%H%M@0@DBZH.tiff"
 parameter = "reflectivity"
 unit = "dBZ"
 poll_interval_secs = 300
+
+[collections.wms]
+colormap = "radar_dbz"
 
 # MET Norway radar cannot be listed via S3 (AccessDenied on list).
 # Individual files are accessible but discovery requires STAC API (Phase 4).

@@ -45,6 +45,37 @@ pub struct CollectionConfig {
     pub engine_type: String,
     /// GeoTIFF-specific configuration. Required when engine_type = "geotiff".
     pub geotiff: Option<GeoTiffConfig>,
+    /// WMS map rendering configuration. Required when apis contains "wms".
+    pub wms: Option<WmsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WmsConfig {
+    /// Built-in colormap name (e.g., "radar_dbz", "viridis", "grayscale").
+    /// Ignored if color_stops are provided.
+    #[serde(default = "default_colormap")]
+    pub colormap: String,
+    /// Inline color stops. Overrides the built-in colormap.
+    #[serde(default)]
+    pub color_stops: Vec<ColorStop>,
+    /// Rendered image cache size in MB. Default: 128.
+    #[serde(default = "default_rendered_cache_mb")]
+    pub rendered_cache_mb: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ColorStop {
+    pub value: f64,
+    /// Color in "#RRGGBB" or "#RRGGBBAA" hex format.
+    pub color: String,
+}
+
+fn default_colormap() -> String {
+    "viridis".to_string()
+}
+
+fn default_rendered_cache_mb() -> u64 {
+    128
 }
 
 #[derive(Debug, Clone, Deserialize)]

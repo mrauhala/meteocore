@@ -157,6 +157,7 @@ fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<ArcSwap<EdrState>> {
             apis: vec!["edr".to_string()],
             engine_type: "csv".to_string(),
             geotiff: None,
+            wms: None,
         },
     );
     Arc::new(ArcSwap::from_pointee(EdrState {

@@ -141,6 +141,7 @@ fn build_router() -> axum::Router {
             apis: vec!["features".to_string()],
             engine_type: "mock".to_string(),
             geotiff: None,
+            wms: None,
         },
     );
 

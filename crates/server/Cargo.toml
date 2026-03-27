@@ -10,6 +10,8 @@ engine-geojson = { path = "../engine-geojson" }
 engine-geotiff = { path = "../engine-geotiff" }
 api-edr = { path = "../api-edr" }
 api-features = { path = "../api-features" }
+api-wms = { path = "../api-wms" }
+ds-render = { path = "../render" }
 arc-swap = "1"
 axum = "0.8"
 prometheus = "0.13"

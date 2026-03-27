@@ -1,0 +1,259 @@
+/// Trait for mapping raster values to RGBA colors.
+pub trait ColorMap: Send + Sync {
+    /// Map a value to an RGBA color. None = nodata → transparent.
+    fn color(&self, value: Option<f64>) -> [u8; 4];
+}
+
+/// A color stop for defining gradient colormaps.
+pub struct ColorStop {
+    pub value: f64,
+    pub color: [u8; 4],
+}
+
+/// Built-in colormap names.
+pub enum BuiltinColormap {
+    /// Standard radar reflectivity (blue → green → yellow → red).
+    RadarDbz,
+    /// Linear grayscale (black → white).
+    Grayscale,
+    /// Perceptually uniform (dark purple → blue → green → yellow).
+    Viridis,
+}
+
+/// Lookup-table colormap. O(1) per pixel.
+/// Best for integer-like data (radar U8, classification).
+pub struct LutColorMap {
+    lut: Vec<[u8; 4]>,
+    min: f64,
+    max: f64,
+    nodata_color: [u8; 4],
+}
+
+impl LutColorMap {
+    /// Create a LUT colormap from a built-in palette.
+    ///
+    /// The min/max define the value range mapped to the LUT.
+    /// Values in the stops define which colors appear at which physical values.
+    /// The LUT samples the stops across the min..max range.
+    pub fn from_builtin(builtin: BuiltinColormap, min: f64, max: f64) -> Self {
+        let stops = builtin_stops(&builtin);
+        Self::from_stops(&stops, min, max)
+    }
+
+    /// Create a LUT colormap from color stops.
+    ///
+    /// The `min`/`max` define the data value range. The color stops define
+    /// which colors appear at which values within (or beyond) that range.
+    /// The LUT has 4096 entries for better precision with wide value ranges.
+    pub fn from_stops(stops: &[ColorStop], min: f64, max: f64) -> Self {
+        let lut_size = 4096;
+        let mut lut = Vec::with_capacity(lut_size);
+
+        for i in 0..lut_size {
+            let t = i as f64 / (lut_size - 1) as f64;
+            let value = min + t * (max - min);
+            lut.push(interpolate_stops(stops, value));
+        }
+
+        Self {
+            lut,
+            min,
+            max,
+            nodata_color: [0, 0, 0, 0],
+        }
+    }
+}
+
+impl ColorMap for LutColorMap {
+    fn color(&self, value: Option<f64>) -> [u8; 4] {
+        match value {
+            None => self.nodata_color,
+            Some(v) => {
+                if self.max <= self.min {
+                    return self.lut[0];
+                }
+                let t = (v - self.min) / (self.max - self.min);
+                let idx = (t * (self.lut.len() - 1) as f64)
+                    .round()
+                    .clamp(0.0, (self.lut.len() - 1) as f64) as usize;
+                self.lut[idx]
+            }
+        }
+    }
+}
+
+/// Linear interpolation colormap for continuous data.
+pub struct LinearColorMap {
+    stops: Vec<ColorStop>,
+    nodata_color: [u8; 4],
+}
+
+impl LinearColorMap {
+    pub fn new(stops: Vec<ColorStop>) -> Self {
+        Self {
+            stops,
+            nodata_color: [0, 0, 0, 0],
+        }
+    }
+}
+
+impl ColorMap for LinearColorMap {
+    fn color(&self, value: Option<f64>) -> [u8; 4] {
+        match value {
+            None => self.nodata_color,
+            Some(v) => interpolate_stops(&self.stops, v),
+        }
+    }
+}
+
+/// Interpolate between color stops to find the color for a given value.
+fn interpolate_stops(stops: &[ColorStop], value: f64) -> [u8; 4] {
+    if stops.is_empty() {
+        return [0, 0, 0, 255];
+    }
+    if stops.len() == 1 || value <= stops[0].value {
+        return stops[0].color;
+    }
+    if value >= stops[stops.len() - 1].value {
+        return stops[stops.len() - 1].color;
+    }
+
+    // Find the two surrounding stops
+    for i in 0..stops.len() - 1 {
+        let lo = &stops[i];
+        let hi = &stops[i + 1];
+        if value >= lo.value && value <= hi.value {
+            let range = hi.value - lo.value;
+            if range == 0.0 {
+                return lo.color;
+            }
+            let t = (value - lo.value) / range;
+            return [
+                lerp_u8(lo.color[0], hi.color[0], t),
+                lerp_u8(lo.color[1], hi.color[1], t),
+                lerp_u8(lo.color[2], hi.color[2], t),
+                lerp_u8(lo.color[3], hi.color[3], t),
+            ];
+        }
+    }
+
+    stops[stops.len() - 1].color
+}
+
+fn lerp_u8(a: u8, b: u8, t: f64) -> u8 {
+    (a as f64 + (b as f64 - a as f64) * t).round() as u8
+}
+
+/// Parse a hex color string like "#RRGGBB" or "#RRGGBBAA".
+pub fn parse_hex_color(s: &str) -> Result<[u8; 4], String> {
+    let s = s.strip_prefix('#').unwrap_or(s);
+    match s.len() {
+        6 => {
+            let r = u8::from_str_radix(&s[0..2], 16).map_err(|e| e.to_string())?;
+            let g = u8::from_str_radix(&s[2..4], 16).map_err(|e| e.to_string())?;
+            let b = u8::from_str_radix(&s[4..6], 16).map_err(|e| e.to_string())?;
+            Ok([r, g, b, 255])
+        }
+        8 => {
+            let r = u8::from_str_radix(&s[0..2], 16).map_err(|e| e.to_string())?;
+            let g = u8::from_str_radix(&s[2..4], 16).map_err(|e| e.to_string())?;
+            let b = u8::from_str_radix(&s[4..6], 16).map_err(|e| e.to_string())?;
+            let a = u8::from_str_radix(&s[6..8], 16).map_err(|e| e.to_string())?;
+            Ok([r, g, b, a])
+        }
+        _ => Err(format!("invalid hex color: '{s}' (expected 6 or 8 hex digits)")),
+    }
+}
+
+/// Get built-in color stops for a named colormap.
+pub fn builtin_stops(builtin: &BuiltinColormap) -> Vec<ColorStop> {
+    match builtin {
+        BuiltinColormap::Grayscale => vec![
+            ColorStop { value: 0.0, color: [0, 0, 0, 255] },
+            ColorStop { value: 1.0, color: [255, 255, 255, 255] },
+        ],
+        BuiltinColormap::RadarDbz => vec![
+            ColorStop { value: 0.0,  color: [0, 0, 0, 0] },         // transparent (no echo)
+            ColorStop { value: 5.0,  color: [0, 0, 0, 0] },         // transparent (below threshold)
+            ColorStop { value: 5.1,  color: [0, 128, 255, 255] },    // light blue
+            ColorStop { value: 15.0, color: [0, 200, 255, 255] },    // cyan
+            ColorStop { value: 25.0, color: [0, 200, 0, 255] },      // green
+            ColorStop { value: 30.0, color: [0, 255, 0, 255] },      // bright green
+            ColorStop { value: 35.0, color: [255, 255, 0, 255] },    // yellow
+            ColorStop { value: 40.0, color: [255, 200, 0, 255] },    // orange-yellow
+            ColorStop { value: 45.0, color: [255, 128, 0, 255] },    // orange
+            ColorStop { value: 50.0, color: [255, 0, 0, 255] },      // red
+            ColorStop { value: 55.0, color: [200, 0, 0, 255] },      // dark red
+            ColorStop { value: 60.0, color: [180, 0, 180, 255] },    // magenta
+            ColorStop { value: 70.0, color: [255, 255, 255, 255] },  // white (extreme)
+        ],
+        BuiltinColormap::Viridis => vec![
+            ColorStop { value: 0.0,   color: [68, 1, 84, 255] },
+            ColorStop { value: 0.125, color: [72, 36, 117, 255] },
+            ColorStop { value: 0.25,  color: [56, 88, 140, 255] },
+            ColorStop { value: 0.375, color: [38, 130, 142, 255] },
+            ColorStop { value: 0.5,   color: [31, 158, 137, 255] },
+            ColorStop { value: 0.625, color: [78, 178, 101, 255] },
+            ColorStop { value: 0.75,  color: [148, 197, 56, 255] },
+            ColorStop { value: 0.875, color: [220, 215, 30, 255] },
+            ColorStop { value: 1.0,   color: [253, 231, 37, 255] },
+        ],
+    }
+}
+
+/// Resolve a built-in colormap name to its enum variant.
+pub fn resolve_builtin(name: &str) -> Option<BuiltinColormap> {
+    match name {
+        "radar_dbz" => Some(BuiltinColormap::RadarDbz),
+        "grayscale" => Some(BuiltinColormap::Grayscale),
+        "viridis" => Some(BuiltinColormap::Viridis),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lut_colormap_boundaries() {
+        let cmap = LutColorMap::from_builtin(BuiltinColormap::Grayscale, 0.0, 100.0);
+        let black = cmap.color(Some(0.0));
+        let white = cmap.color(Some(100.0));
+        assert_eq!(black, [0, 0, 0, 255]);
+        assert_eq!(white, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn test_lut_colormap_nodata() {
+        let cmap = LutColorMap::from_builtin(BuiltinColormap::Grayscale, 0.0, 100.0);
+        assert_eq!(cmap.color(None), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_lut_colormap_clamp() {
+        let cmap = LutColorMap::from_builtin(BuiltinColormap::Grayscale, 0.0, 100.0);
+        // Below min should clamp to first color
+        assert_eq!(cmap.color(Some(-10.0)), [0, 0, 0, 255]);
+        // Above max should clamp to last color
+        assert_eq!(cmap.color(Some(200.0)), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn test_parse_hex_color() {
+        assert_eq!(parse_hex_color("#FF0000"), Ok([255, 0, 0, 255]));
+        assert_eq!(parse_hex_color("#00FF0080"), Ok([0, 255, 0, 128]));
+        assert_eq!(parse_hex_color("AABBCC"), Ok([170, 187, 204, 255]));
+        assert!(parse_hex_color("#FFF").is_err());
+    }
+
+    #[test]
+    fn test_linear_colormap() {
+        let cmap = LinearColorMap::new(vec![
+            ColorStop { value: 0.0, color: [0, 0, 0, 255] },
+            ColorStop { value: 100.0, color: [255, 255, 255, 255] },
+        ]);
+        let mid = cmap.color(Some(50.0));
+        assert_eq!(mid, [128, 128, 128, 255]);
+    }
+}

@@ -6,8 +6,10 @@ members = [
     "crates/engine-geojson",
     "crates/engine-geotiff",
     "crates/storage",
+    "crates/render",
     "crates/api-edr",
     "crates/api-features",
+    "crates/api-wms",
     "crates/server",
 ]
 exclude = ["fuzz"]

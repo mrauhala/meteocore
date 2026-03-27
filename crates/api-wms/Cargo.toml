@@ -1,0 +1,16 @@
+[package]
+name = "api-wms"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ds-core = { path = "../core" }
+ds-render = { path = "../render" }
+arc-swap = "1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+quick-xml = "0.37"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+quick_cache = "0.6"

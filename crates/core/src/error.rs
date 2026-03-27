@@ -35,6 +35,9 @@ pub enum DataServerError {
     #[error("Storage error: {0}")]
     Storage(String),
 
+    #[error("Render error: {0}")]
+    Render(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }

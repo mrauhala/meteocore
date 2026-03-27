@@ -665,6 +665,184 @@ fn filter_by_datetime(
     }
 }
 
+impl ds_core::map_engine::MapEngine for GeoTiffEngine {
+    fn get_raster_tile(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<DateTime<Utc>>,
+        output_crs: &ds_core::map_engine::OutputCrs,
+    ) -> Result<ds_core::map_engine::RasterTile, DataServerError> {
+        let catalog = self.catalog.load();
+
+        // Find the entry closest to the requested time, or the latest
+        let entry = if let Some(t) = time {
+            // Find exact match or nearest
+            catalog
+                .entries
+                .range(..=t)
+                .next_back()
+                .or_else(|| catalog.entries.iter().next())
+        } else {
+            // Latest entry
+            catalog.entries.iter().next_back()
+        };
+
+        let (_timestamp, entry) = entry.ok_or_else(|| {
+            DataServerError::GeoTiff("No data available for the requested time".into())
+        })?;
+
+        let [west, south, east, north] = bbox;
+        let total_pixels = (width as usize) * (height as usize);
+        let mut values = Vec::with_capacity(total_pixels);
+
+        // Select the best overview level for the output resolution.
+        // This avoids reading millions of full-resolution pixels for zoomed-out views.
+        // If no overview matches but full res is too large, force the smallest overview.
+        let overview = entry.metadata.select_overview(west, south, east, north, width, height)
+            .or_else(|| {
+                // Check if full resolution would exceed the map pixel limit
+                if let Some((c0, r0, c1, r1)) = entry.metadata.geo_transform.bbox_to_pixels(west, south, east, north) {
+                    let full_pixels = ((c1 - c0) as usize) * ((r1 - r0) as usize);
+                    if full_pixels > 16_000_000 {
+                        // Force smallest overview to avoid exceeding limits
+                        entry.metadata.overviews.last()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            });
+        let gt = if let Some(ov) = overview {
+            tracing::debug!(
+                "Using overview {}x{} (IFD {}) for {}x{} output",
+                ov.width, ov.height, ov.ifd_index, width, height
+            );
+            entry.metadata.overview_geo_transform(ov)
+        } else {
+            entry.metadata.geo_transform.clone()
+        };
+
+        // Compute the source pixel range in the selected level
+        let source_range = gt.bbox_to_pixels(west, south, east, north);
+
+        if source_range.is_none() {
+            // Bbox doesn't intersect raster at all — all nodata
+            values.resize(total_pixels, None);
+        } else {
+            let (col_start, row_start, col_end, row_end) = source_range.unwrap();
+            let src_nx = (col_end - col_start) as usize;
+
+            tracing::debug!(
+                "Reading source pixels: cols {}..{} ({}), rows {}..{} ({}), total {} px",
+                col_start, col_end, col_end - col_start,
+                row_start, row_end, row_end - row_start,
+                src_nx * ((row_end - row_start) as usize)
+            );
+
+            // Read from overview or full resolution
+            let pixels = if let Some(ov) = overview {
+                reader::read_bbox_overview(
+                    &entry.source,
+                    &entry.metadata,
+                    ov,
+                    col_start,
+                    row_start,
+                    col_end,
+                    row_end,
+                    Some(&self.tile_cache),
+                    &entry.path,
+                    self.band_index,
+                )
+            } else {
+                reader::read_bbox_map(
+                    &entry.source,
+                    &entry.metadata,
+                    col_start,
+                    row_start,
+                    col_end,
+                    row_end,
+                    Some(&self.tile_cache),
+                    &entry.path,
+                    self.band_index,
+                )
+            }?;
+
+            // Pre-compute Mercator Y bounds if needed
+            let (merc_y_north, merc_y_south) = if *output_crs == ds_core::map_engine::OutputCrs::WebMercator {
+                (lat_to_merc_y(north), lat_to_merc_y(south))
+            } else {
+                (0.0, 0.0) // unused
+            };
+
+            // Resample source grid to output dimensions using nearest-neighbor
+            for oy in 0..height {
+                for ox in 0..width {
+                    let frac_x = (ox as f64 + 0.5) / width as f64;
+                    let frac_y = (oy as f64 + 0.5) / height as f64;
+                    let lon = west + frac_x * (east - west);
+                    let lat = if *output_crs == ds_core::map_engine::OutputCrs::WebMercator {
+                        // In Mercator, pixels have equal spacing in Y meters.
+                        // Interpolate in Mercator Y, then convert back to lat.
+                        let merc_y = merc_y_north - frac_y * (merc_y_north - merc_y_south);
+                        merc_y_to_lat(merc_y)
+                    } else {
+                        // Linear interpolation in latitude
+                        north - frac_y * (north - south)
+                    };
+
+                    match gt.world_to_pixel(lon, lat) {
+                        Some((col, row))
+                            if col >= col_start
+                                && col < col_end
+                                && row >= row_start
+                                && row < row_end =>
+                        {
+                            let sc = (col - col_start) as usize;
+                            let sr = (row - row_start) as usize;
+                            let idx = sr * src_nx + sc;
+                            values.push(pixels.get(idx).copied().unwrap_or(None));
+                        }
+                        _ => values.push(None),
+                    }
+                }
+            }
+        }
+
+        Ok(ds_core::map_engine::RasterTile {
+            width,
+            height,
+            values,
+        })
+    }
+
+    fn raster_info(&self) -> ds_core::map_engine::RasterInfo {
+        let catalog = self.catalog.load();
+        let crs_name = if let Some(entry) = catalog.entries.values().next() {
+            match &entry.metadata.geo_transform.crs {
+                geo::Crs::Wgs84 => "EPSG:4326".to_string(),
+                geo::Crs::TransverseMercator { .. } => "EPSG:3067".to_string(),
+                geo::Crs::LambertAzimuthalEqualArea { .. } => "EPSG:3035".to_string(),
+                geo::Crs::LambertConformalConic { .. } => "projected".to_string(),
+            }
+        } else {
+            "EPSG:4326".to_string()
+        };
+
+        let times: Vec<DateTime<Utc>> = catalog.entries.keys().rev().cloned().collect();
+
+        ds_core::map_engine::RasterInfo {
+            native_crs: crs_name,
+            spatial_extent: catalog.spatial_extent,
+            times,
+            parameter: self.parameter.clone(),
+            unit: self.unit.clone(),
+        }
+    }
+}
+
 impl Engine for GeoTiffEngine {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
         Ok(vec![])
@@ -780,6 +958,19 @@ impl Engine for GeoTiffEngine {
 
 /// Validate GeoTIFF config for common mistakes that would otherwise cause
 /// confusing runtime behavior.
+/// Convert latitude (degrees) to Web Mercator Y (meters).
+fn lat_to_merc_y(lat_deg: f64) -> f64 {
+    const R: f64 = 6_378_137.0;
+    let lat_rad = lat_deg.to_radians();
+    R * ((std::f64::consts::FRAC_PI_4 + lat_rad / 2.0).tan()).ln()
+}
+
+/// Convert Web Mercator Y (meters) to latitude (degrees).
+fn merc_y_to_lat(y: f64) -> f64 {
+    const R: f64 = 6_378_137.0;
+    (std::f64::consts::FRAC_PI_2 - 2.0 * (-y / R).exp().atan()).to_degrees()
+}
+
 fn validate_config(
     collection_id: &str,
     data_path: Option<&str>,

@@ -17,9 +17,11 @@ const MAX_DECODED_TILE_BYTES: usize = 64 * 1024 * 1024; // 64 MB
 /// Maximum number of pixels in an area query result.
 const MAX_AREA_PIXELS: usize = 1_000_000;
 
-/// Size of the initial header read for COG range reads (64 KB).
-/// This is enough for the IFD and all tag values in typical COGs.
-pub(crate) const HEADER_READ_SIZE: usize = 64 * 1024;
+/// Size of the initial header read for COG range reads (512 KB).
+/// Must be large enough to contain ALL IFDs (full-res + overviews) and their
+/// tile offset/byte count arrays. 64 KB was insufficient for files with
+/// multiple overview levels, causing overview tile offsets to be truncated.
+pub(crate) const HEADER_READ_SIZE: usize = 512 * 1024;
 
 /// TIFF compression methods we support for manual decompression.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -164,6 +166,35 @@ impl DecoderWrapper {
             Self::Memory(d) => d.read_chunk(idx),
         }
     }
+
+    fn seek_to_image(&mut self, index: usize) -> Result<(), tiff::TiffError> {
+        match self {
+            Self::File(d) => d.seek_to_image(index),
+            Self::Memory(d) => d.seek_to_image(index),
+        }
+    }
+
+    fn more_images(&self) -> bool {
+        match self {
+            Self::File(d) => d.more_images(),
+            Self::Memory(d) => d.more_images(),
+        }
+    }
+}
+
+/// Metadata for a single overview level in a COG.
+#[derive(Debug, Clone)]
+pub struct OverviewLevel {
+    /// IFD index in the TIFF file (0 = full resolution, 1+ = overviews).
+    pub ifd_index: usize,
+    pub width: u32,
+    pub height: u32,
+    pub tile_width: u32,
+    pub tile_height: u32,
+    pub tiles_across: u32,
+    pub tiles_down: u32,
+    /// Tile info for remote byte-range reads (None for local sources).
+    pub tile_info: Option<RemoteTileInfo>,
 }
 
 /// Parsed metadata from a GeoTIFF file's IFD headers.
@@ -181,6 +212,9 @@ pub struct TiffMetadata {
     pub nodata: Option<f64>,
     pub scale: Option<f64>,
     pub offset: Option<f64>,
+    /// COG overview levels, sorted by decreasing resolution (largest first).
+    /// Empty if the file has no overviews.
+    pub overviews: Vec<OverviewLevel>,
 }
 
 impl TiffMetadata {
@@ -251,6 +285,51 @@ impl TiffMetadata {
         let nodata = parse_nodata(decoder);
         let (scale, offset) = parse_scale_offset(decoder);
 
+        // Discover COG overview levels by traversing the IFD chain
+        let mut overviews = Vec::new();
+        let mut ifd_index = 1;
+        while decoder.more_images() {
+            if decoder.seek_to_image(ifd_index).is_err() {
+                break;
+            }
+            if let Ok((ov_width, ov_height)) = decoder.dimensions() {
+                // Overview must be smaller than full resolution
+                if ov_width < width && ov_height < height {
+                    if let (Some(ov_tw), Some(ov_th)) = (
+                        read_tag_u32(decoder, Tag::TileWidth),
+                        read_tag_u32(decoder, Tag::TileLength),
+                    ) {
+                        let ov_tile_info = extract_tile_info_at_level(decoder, ov_tw, ov_th);
+                        overviews.push(OverviewLevel {
+                            ifd_index,
+                            width: ov_width,
+                            height: ov_height,
+                            tile_width: ov_tw,
+                            tile_height: ov_th,
+                            tiles_across: ov_width.div_ceil(ov_tw),
+                            tiles_down: ov_height.div_ceil(ov_th),
+                            tile_info: ov_tile_info,
+                        });
+                    }
+                }
+            }
+            ifd_index += 1;
+        }
+        // Sort overviews by decreasing resolution (largest first)
+        overviews.sort_by(|a, b| (b.width as u64 * b.height as u64)
+            .cmp(&(a.width as u64 * a.height as u64)));
+
+        if !overviews.is_empty() {
+            tracing::debug!(
+                "{source_name}: found {} overview levels: {}",
+                overviews.len(),
+                overviews.iter().map(|o| format!("{}x{}", o.width, o.height)).collect::<Vec<_>>().join(", ")
+            );
+        }
+
+        // Seek back to IFD 0 for subsequent reads
+        let _ = decoder.seek_to_image(0);
+
         Ok(TiffMetadata {
             width,
             height,
@@ -263,6 +342,7 @@ impl TiffMetadata {
             nodata,
             scale,
             offset,
+            overviews,
         })
     }
 
@@ -320,6 +400,80 @@ impl TiffMetadata {
             (raw as f32) == (nd as f32)
         } else {
             false
+        }
+    }
+
+    /// Select the best overview level for the given output dimensions.
+    ///
+    /// Returns the overview whose resolution is closest to (but not less than)
+    /// the output resolution. Returns `None` if full resolution should be used.
+    /// Select the best overview level for the given bbox and output dimensions.
+    ///
+    /// Compares how many source pixels the bbox covers at each level against
+    /// the output dimensions. Picks the smallest level where the source pixel
+    /// coverage still exceeds the output (no upscaling).
+    pub fn select_overview(
+        &self,
+        bbox_west: f64,
+        bbox_south: f64,
+        bbox_east: f64,
+        bbox_north: f64,
+        output_width: u32,
+        output_height: u32,
+    ) -> Option<&OverviewLevel> {
+        if self.overviews.is_empty() {
+            return None;
+        }
+
+        // Check how many full-res pixels the bbox covers
+        let full_range = self.geo_transform.bbox_to_pixels(bbox_west, bbox_south, bbox_east, bbox_north);
+        let (full_cols, full_rows) = match full_range {
+            Some((c0, r0, c1, r1)) => ((c1 - c0), (r1 - r0)),
+            None => return None, // bbox doesn't intersect
+        };
+
+        // If full resolution already fits the output, no need for overviews
+        if full_cols <= output_width && full_rows <= output_height {
+            return None;
+        }
+
+        // Find the smallest overview where the bbox still covers enough
+        // source pixels to fill the output without upscaling.
+        // Overviews are sorted by decreasing resolution (largest first).
+        let mut best: Option<&OverviewLevel> = None;
+        for ov in &self.overviews {
+            let ov_gt = self.overview_geo_transform(ov);
+            if let Some((c0, r0, c1, r1)) = ov_gt.bbox_to_pixels(bbox_west, bbox_south, bbox_east, bbox_north) {
+                let ov_cols = c1 - c0;
+                let ov_rows = r1 - r0;
+                if ov_cols >= output_width && ov_rows >= output_height {
+                    // This overview has enough pixels — it's a candidate
+                    best = Some(ov);
+                } else {
+                    // Too small — stop, use previous candidate
+                    break;
+                }
+            }
+        }
+
+        best
+    }
+
+    /// Build a GeoTransform for an overview level.
+    ///
+    /// The overview covers the same geographic extent as the full resolution,
+    /// but with larger pixels.
+    pub fn overview_geo_transform(&self, overview: &OverviewLevel) -> GeoTransform {
+        let x_scale = self.width as f64 / overview.width as f64;
+        let y_scale = self.height as f64 / overview.height as f64;
+        GeoTransform {
+            origin_x: self.geo_transform.origin_x,
+            origin_y: self.geo_transform.origin_y,
+            pixel_width: self.geo_transform.pixel_width * x_scale,
+            pixel_height: self.geo_transform.pixel_height * y_scale,
+            width: overview.width,
+            height: overview.height,
+            crs: self.geo_transform.crs.clone(),
         }
     }
 
@@ -470,6 +624,55 @@ fn extract_tile_info(
         predictor,
         tile_width: metadata.tile_width,
         tile_height: metadata.tile_height,
+    })
+}
+
+/// Extract tile info from the currently-selected IFD (for overview levels).
+fn extract_tile_info_at_level(
+    decoder: &mut DecoderWrapper,
+    tile_width: u32,
+    tile_height: u32,
+) -> Option<RemoteTileInfo> {
+    let tile_offsets = extract_u64_list(&decoder.get_tag(Tag::TileOffsets).ok()?)?;
+    let tile_byte_counts = extract_u64_list(&decoder.get_tag(Tag::TileByteCounts).ok()?)?;
+
+    if tile_offsets.is_empty() || tile_offsets.len() != tile_byte_counts.len() {
+        return None;
+    }
+
+    let compression_code = read_tag_u32(decoder, Tag::Compression).unwrap_or(1);
+    let compression = match compression_code {
+        1 => TiffCompression::None,
+        5 => TiffCompression::Lzw,
+        8 | 32946 => TiffCompression::Deflate,
+        _ => return None,
+    };
+
+    let bits_per_sample = read_tag_u32(decoder, Tag::BitsPerSample).unwrap_or(8) as u16;
+    let sample_format = read_tag_u32(decoder, Tag::SampleFormat).unwrap_or(1);
+
+    let sample_type = match (bits_per_sample, sample_format) {
+        (8, 1) => SampleType::U8,
+        (16, 1) => SampleType::U16,
+        (16, 2) => SampleType::I16,
+        (32, 3) => SampleType::F32,
+        (64, 3) => SampleType::F64,
+        _ => return None,
+    };
+
+    let predictor = read_tag_u32(decoder, Tag::Predictor).unwrap_or(1) as u16;
+    if predictor > 2 {
+        return None;
+    }
+
+    Some(RemoteTileInfo {
+        tile_offsets,
+        tile_byte_counts,
+        compression,
+        sample_type,
+        predictor,
+        tile_width,
+        tile_height,
     })
 }
 
@@ -680,6 +883,7 @@ fn read_remote_chunk_f64(
     cache: Option<&crate::cache::TileCache>,
     file_path: &Path,
     band_index: usize,
+    ifd_index: u16,
 ) -> Result<Vec<Option<f64>>, DataServerError> {
     let idx = chunk_index as usize;
     if idx >= tile_info.tile_offsets.len() {
@@ -694,9 +898,23 @@ fn read_remote_chunk_f64(
     let byte_count = tile_info.tile_byte_counts[idx] as usize;
 
     if byte_count == 0 {
-        // Empty tile — return all nodata
+        // Empty tile — return all nodata.
+        // This is normal for COG tiles outside the data extent, but could also
+        // indicate truncated tile offset arrays from an undersized header read.
+        tracing::trace!(
+            "Tile {} has byte_count=0 (offset={}), returning nodata",
+            idx, offset
+        );
         let pixel_count = (tile_info.tile_width * tile_info.tile_height) as usize;
         return Ok(vec![None; pixel_count]);
+    }
+
+    // Sanity check: offset 0 for a non-first tile is suspicious (likely truncated header)
+    if offset == 0 && idx > 0 {
+        tracing::warn!(
+            "Tile {} has offset=0 (suspicious for non-first tile, possible truncated header)",
+            idx
+        );
     }
 
     // Validate range doesn't overflow
@@ -707,21 +925,35 @@ fn read_remote_chunk_f64(
         ))
     })?;
 
-    // Check cache for compressed bytes
+    // Check cache for compressed bytes (keyed by file + chunk + IFD level)
     let compressed = if let Some(c) = cache {
-        if let Some(cached) = c.get(file_path, chunk_index) {
+        if let Some(cached) = c.get(file_path, chunk_index, ifd_index) {
             cached
         } else {
             let fetched = store
                 .get_range(obj_path, offset..end)
                 .map_err(|e| DataServerError::GeoTiff(format!("Failed to read tile range: {e}")))?;
-            c.insert(file_path, chunk_index, fetched.clone());
+            // Validate response length matches request
+            if fetched.len() != byte_count {
+                return Err(DataServerError::GeoTiff(format!(
+                    "Tile {} truncated: requested {} bytes, got {}",
+                    idx, byte_count, fetched.len()
+                )));
+            }
+            c.insert(file_path, chunk_index, ifd_index, fetched.clone());
             fetched
         }
     } else {
-        store
+        let fetched = store
             .get_range(obj_path, offset..end)
-            .map_err(|e| DataServerError::GeoTiff(format!("Failed to read tile range: {e}")))?
+            .map_err(|e| DataServerError::GeoTiff(format!("Failed to read tile range: {e}")))?;
+        if fetched.len() != byte_count {
+            return Err(DataServerError::GeoTiff(format!(
+                "Tile {} truncated: requested {} bytes, got {}",
+                idx, byte_count, fetched.len()
+            )));
+        }
+        fetched
     };
 
     let mut raw = decompress_tile(&compressed, tile_info.compression)?;
@@ -772,6 +1004,7 @@ pub fn read_pixel(
             cache,
             file_path,
             band_index,
+            0, // full resolution IFD
         )?,
         _ => {
             let mut decoder = source.open_decoder()?;
@@ -806,6 +1039,144 @@ static TILE_FETCH_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
 /// concurrent fetches) using a dedicated rayon thread pool. If a single tile fetch
 /// fails, the corresponding pixels are filled with `None`.
 #[allow(clippy::too_many_arguments)]
+/// Read a bbox from a specific overview level for map rendering.
+///
+/// Uses the overview's tile layout and geometry. Falls back to full resolution
+/// if the overview doesn't have tile info for remote sources.
+#[allow(clippy::too_many_arguments)]
+pub fn read_bbox_overview(
+    source: &DataSource,
+    metadata: &TiffMetadata,
+    overview: &OverviewLevel,
+    col_start: u32,
+    row_start: u32,
+    col_end: u32,
+    row_end: u32,
+    cache: Option<&crate::cache::TileCache>,
+    file_path: &Path,
+    band_index: usize,
+) -> Result<Vec<Option<f64>>, DataServerError> {
+    let nx = (col_end - col_start) as usize;
+    let ny = (row_end - row_start) as usize;
+    let total_pixels = nx * ny;
+
+    // Build a temporary metadata for this overview level
+    let ov_metadata = TiffMetadata {
+        width: overview.width,
+        height: overview.height,
+        tile_width: overview.tile_width,
+        tile_height: overview.tile_height,
+        tiles_across: overview.tiles_across,
+        tiles_down: overview.tiles_down,
+        samples_per_pixel: metadata.samples_per_pixel,
+        geo_transform: metadata.overview_geo_transform(overview),
+        nodata: metadata.nodata,
+        scale: metadata.scale,
+        offset: metadata.offset,
+        overviews: Vec::new(),
+    };
+
+    let tile_col_start = col_start / overview.tile_width;
+    let tile_col_end = (col_end - 1) / overview.tile_width + 1;
+    let tile_row_start = row_start / overview.tile_height;
+    let tile_row_end = (row_end - 1) / overview.tile_height + 1;
+
+    match source {
+        DataSource::Remote { store, path, .. } => {
+            let ov_tile_info = overview.tile_info.as_ref().ok_or_else(|| {
+                DataServerError::GeoTiff(format!(
+                    "Overview IFD {} has no tile info for remote source (header too small?)",
+                    overview.ifd_index
+                ))
+            })?;
+            return read_bbox_parallel(
+                store,
+                path,
+                ov_tile_info,
+                &ov_metadata,
+                col_start,
+                row_start,
+                col_end,
+                row_end,
+                tile_col_start,
+                tile_col_end,
+                tile_row_start,
+                tile_row_end,
+                cache,
+                file_path,
+                band_index,
+                nx,
+                total_pixels,
+                overview.ifd_index as u16,
+            );
+        }
+        _ => {}
+    }
+
+    // For local files, seek to the overview IFD and read tiles
+    let mut decoder = source.open_decoder()?;
+    decoder.seek_to_image(overview.ifd_index).map_err(|e| {
+        DataServerError::GeoTiff(format!("Failed to seek to overview IFD {}: {e}", overview.ifd_index))
+    })?;
+
+    let mut result = vec![None; total_pixels];
+
+    for tile_row in tile_row_start..tile_row_end {
+        for tile_col in tile_col_start..tile_col_end {
+            let chunk_index = tile_row * overview.tiles_across + tile_col;
+            let tile_data = decode_chunk_f64(&mut decoder, chunk_index, &ov_metadata, band_index)?;
+
+            copy_tile_to_result(
+                &tile_data,
+                &mut result,
+                tile_col,
+                tile_row,
+                &ov_metadata,
+                col_start,
+                row_start,
+                col_end,
+                row_end,
+                nx,
+            );
+        }
+    }
+
+    Ok(result)
+}
+
+/// Maximum pixels for map rendering (higher than EDR area queries since output
+/// is already bounded by MAX_MAP_PIXELS and data is resampled to output resolution).
+const MAX_MAP_PIXELS: usize = 16_000_000;
+
+/// Read a bbox for map rendering with a higher pixel limit.
+/// Used by MapEngine::get_raster_tile where output size is already bounded.
+#[allow(clippy::too_many_arguments)]
+pub fn read_bbox_map(
+    source: &DataSource,
+    metadata: &TiffMetadata,
+    col_start: u32,
+    row_start: u32,
+    col_end: u32,
+    row_end: u32,
+    cache: Option<&crate::cache::TileCache>,
+    file_path: &Path,
+    band_index: usize,
+) -> Result<Vec<Option<f64>>, DataServerError> {
+    let nx = (col_end - col_start) as usize;
+    let ny = (row_end - row_start) as usize;
+    let total_pixels = nx * ny;
+
+    if total_pixels > MAX_MAP_PIXELS {
+        return Err(DataServerError::InvalidParameter(format!(
+            "Map render source area {} pixels exceeds maximum {}.",
+            total_pixels, MAX_MAP_PIXELS
+        )));
+    }
+
+    read_bbox_inner(source, metadata, col_start, row_start, col_end, row_end, cache, file_path, band_index, nx, total_pixels)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn read_bbox(
     source: &DataSource,
     metadata: &TiffMetadata,
@@ -827,6 +1198,24 @@ pub fn read_bbox(
             total_pixels, MAX_AREA_PIXELS
         )));
     }
+
+    read_bbox_inner(source, metadata, col_start, row_start, col_end, row_end, cache, file_path, band_index, nx, total_pixels)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_bbox_inner(
+    source: &DataSource,
+    metadata: &TiffMetadata,
+    col_start: u32,
+    row_start: u32,
+    col_end: u32,
+    row_end: u32,
+    cache: Option<&crate::cache::TileCache>,
+    file_path: &Path,
+    band_index: usize,
+    nx: usize,
+    total_pixels: usize,
+) -> Result<Vec<Option<f64>>, DataServerError> {
 
     let tile_col_start = col_start / metadata.tile_width;
     let tile_col_end = (col_end - 1) / metadata.tile_width + 1;
@@ -858,6 +1247,7 @@ pub fn read_bbox(
             band_index,
             nx,
             total_pixels,
+            0, // full resolution IFD
         );
     }
 
@@ -909,6 +1299,7 @@ fn read_bbox_parallel(
     band_index: usize,
     nx: usize,
     total_pixels: usize,
+    ifd_index: u16,
 ) -> Result<Vec<Option<f64>>, DataServerError> {
     use rayon::prelude::*;
 
@@ -933,16 +1324,44 @@ fn read_bbox_parallel(
                     cache,
                     file_path,
                     band_index,
+                    ifd_index,
                 ) {
                     Ok(data) => data,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to fetch tile ({}, {}), chunk {}: {e}",
-                            tile_row,
-                            tile_col,
-                            chunk_index
-                        );
-                        vec![None; tile_pixel_count]
+                    Err(first_err) => {
+                        // Retry up to 2 times for transient S3 errors (truncation, throttling)
+                        let mut last_err = first_err;
+                        let mut succeeded = false;
+                        let mut result_data = vec![None; tile_pixel_count];
+                        for attempt in 1..=2 {
+                            tracing::debug!(
+                                "Tile ({}, {}), chunk {} failed (attempt {}), retrying: {last_err}",
+                                tile_row, tile_col, chunk_index, attempt
+                            );
+                            // Brief backoff before retry
+                            std::thread::sleep(std::time::Duration::from_millis(50 * attempt));
+                            match read_remote_chunk_f64(
+                                store, obj_path, tile_info, metadata, chunk_index,
+                                cache, file_path, band_index, ifd_index,
+                            ) {
+                                Ok(data) => {
+                                    tracing::debug!(
+                                        "Tile ({}, {}), chunk {} succeeded on retry {}",
+                                        tile_row, tile_col, chunk_index, attempt
+                                    );
+                                    result_data = data;
+                                    succeeded = true;
+                                    break;
+                                }
+                                Err(e) => last_err = e,
+                            }
+                        }
+                        if !succeeded {
+                            tracing::warn!(
+                                "Tile ({}, {}), chunk {} failed after 2 retries: {last_err}",
+                                tile_row, tile_col, chunk_index
+                            );
+                        }
+                        result_data
                     }
                 };
                 (tile_row, tile_col, tile_data)
@@ -1614,6 +2033,7 @@ mod tests {
             nodata: Some(nodata),
             scale: None,
             offset: None,
+            overviews: Vec::new(),
         }
     }
 

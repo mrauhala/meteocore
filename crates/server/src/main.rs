@@ -65,10 +65,12 @@ async fn main() {
     // Build swappable state
     let edr_swap = Arc::new(ArcSwap::from_pointee(result.edr_state));
     let features_swap = Arc::new(ArcSwap::from_pointee(result.features_state));
+    let wms_swap = Arc::new(ArcSwap::from_pointee(result.wms_state));
 
     let server_state: AdminState = Arc::new(ServerState {
         edr: edr_swap.clone(),
         features: features_swap.clone(),
+        wms: wms_swap.clone(),
         config_path,
         health: RwLock::new(result.health),
         geotiff_engines: RwLock::new(result.geotiff_engines),
@@ -81,6 +83,7 @@ async fn main() {
         .route("/", get(move || root_landing_page(root_state)))
         .nest("/edr", api_edr::router(edr_swap.clone()))
         .nest("/features", api_features::router(features_swap.clone()))
+        .nest("/wms", api_wms::router(wms_swap.clone()))
         // Trailing-slash variants so /edr/ and /features/ also work
         .route(
             "/edr/",
@@ -172,6 +175,12 @@ async fn root_landing_page(state: AdminState) -> impl IntoResponse {
                 "rel": "service-desc",
                 "type": "application/json",
                 "title": "Features API"
+            },
+            {
+                "href": format!("{base}/wms/?SERVICE=WMS&REQUEST=GetCapabilities"),
+                "rel": "service-desc",
+                "type": "text/xml",
+                "title": "WMS 1.3.0"
             },
             {
                 "href": format!("{base}/health"),

@@ -11,12 +11,15 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-/// Cache key: uniquely identifies a compressed tile across all files.
+/// Cache key: uniquely identifies a compressed tile across all files and IFD levels.
 /// Uses Arc<str> instead of PathBuf to avoid allocation on every lookup.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TileCacheKey {
     file_path: Arc<str>,
     chunk_index: u32,
+    /// IFD index (0 = full resolution, 1+ = overview levels).
+    /// Prevents cache collisions between full-res and overview tiles.
+    ifd_index: u16,
 }
 
 /// Weight function: count the compressed byte size of each entry.
@@ -59,10 +62,12 @@ impl TileCache {
     }
 
     /// Look up a cached compressed tile.
-    pub fn get(&self, file_path: &Path, chunk_index: u32) -> Option<Bytes> {
+    /// `ifd_index` distinguishes full-resolution (0) from overview tiles (1+).
+    pub fn get(&self, file_path: &Path, chunk_index: u32, ifd_index: u16) -> Option<Bytes> {
         let key = TileCacheKey {
             file_path: Arc::from(file_path.to_string_lossy().as_ref()),
             chunk_index,
+            ifd_index,
         };
         let result = self.inner.get(&key);
         if result.is_some() {
@@ -74,10 +79,12 @@ impl TileCache {
     }
 
     /// Insert compressed tile bytes into the cache.
-    pub fn insert(&self, file_path: &Path, chunk_index: u32, data: Bytes) {
+    /// `ifd_index` distinguishes full-resolution (0) from overview tiles (1+).
+    pub fn insert(&self, file_path: &Path, chunk_index: u32, ifd_index: u16, data: Bytes) {
         let key = TileCacheKey {
             file_path: Arc::from(file_path.to_string_lossy().as_ref()),
             chunk_index,
+            ifd_index,
         };
         self.inner.insert(key, data);
     }
@@ -101,13 +108,28 @@ mod tests {
         let path = Path::new("test/file.tif");
         let data = Bytes::from(vec![1u8; 100]);
 
-        assert!(cache.get(path, 0).is_none());
-        cache.insert(path, 0, data.clone());
-        assert_eq!(cache.get(path, 0).unwrap(), data);
+        assert!(cache.get(path, 0, 0).is_none());
+        cache.insert(path, 0, 0, data.clone());
+        assert_eq!(cache.get(path, 0, 0).unwrap(), data);
 
         let (hits, misses) = cache.stats();
         assert_eq!(hits, 1);
         assert_eq!(misses, 1);
+    }
+
+    #[test]
+    fn cache_separates_ifd_levels() {
+        let cache = TileCache::new(1024 * 1024);
+        let path = Path::new("test/file.tif");
+        let full_res = Bytes::from(vec![1u8; 100]);
+        let overview = Bytes::from(vec![2u8; 50]);
+
+        cache.insert(path, 0, 0, full_res.clone());
+        cache.insert(path, 0, 1, overview.clone());
+
+        // Same chunk_index, different IFD — must return different data
+        assert_eq!(cache.get(path, 0, 0).unwrap(), full_res);
+        assert_eq!(cache.get(path, 0, 1).unwrap(), overview);
     }
 
     #[test]
@@ -117,13 +139,13 @@ mod tests {
         let path = Path::new("test/file.tif");
 
         for i in 0..20 {
-            cache.insert(path, i, Bytes::from(vec![0u8; 100]));
+            cache.insert(path, i, 0, Bytes::from(vec![0u8; 100]));
         }
 
         // Some earlier entries should have been evicted
         let mut found = 0;
         for i in 0..20 {
-            if cache.get(path, i).is_some() {
+            if cache.get(path, i, 0).is_some() {
                 found += 1;
             }
         }
@@ -139,7 +161,7 @@ mod tests {
     fn zero_capacity_cache_stores_nothing() {
         let cache = TileCache::new(0);
         let path = Path::new("test/file.tif");
-        cache.insert(path, 0, Bytes::from(vec![1u8; 100]));
-        assert!(cache.get(path, 0).is_none());
+        cache.insert(path, 0, 0, Bytes::from(vec![1u8; 100]));
+        assert!(cache.get(path, 0, 0).is_none());
     }
 }
