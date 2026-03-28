@@ -89,6 +89,7 @@ filename_template = "%Y%m%d%H%M_composite_cappi_600_dbzh_finrad_qc.tif"
 parameter = "reflectivity"
 unit = "dBZ"
 poll_interval_secs = 300
+nodata = 255
 
 [collections.wms]
 colormap = "radar_dbz"
@@ -113,6 +114,20 @@ poll_interval_secs = 300
 [collections.wms]
 colormap = "viridis"
 
+[[collections.wms.styles]]
+name = "grayscale"
+title = "Grayscale"
+colormap = "grayscale"
+min = 0.0
+max = 70.0
+
+[[collections.wms.styles]]
+name = "viridis"
+title = "Viridis"
+colormap = "viridis"
+min = 0.0
+max = 70.0
+
 [[collections]]
 id = "opera-reflectivity"
 title = "OPERA European Radar Reflectivity"
@@ -124,7 +139,7 @@ apis = ["edr", "wms"]
 endpoint = "https://s3.waw3-1.cloudferro.com"
 bucket = "openradar-24h"
 prefix_pattern = "%Y/%m/%d/OPERA/COMP/"
-time_window = "-PT2H"
+time_window = "-PT12H"
 filename_template = "OPERA@%Y%m%dT%H%M@0@DBZH.tiff"
 parameter = "reflectivity"
 unit = "dBZ"
