@@ -75,6 +75,27 @@ pub fn encode_jpeg(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Data
     Ok(buf)
 }
 
+/// Encode an RGBA buffer to WebP bytes.
+///
+/// Uses lossy encoding with quality 80 for a good size/quality tradeoff.
+/// WebP supports alpha channel natively, so no transparency compositing needed.
+pub fn encode_webp(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, DataServerError> {
+    let expected_len = (width * height * 4) as usize;
+    if rgba.len() != expected_len {
+        return Err(DataServerError::Render(format!(
+            "RGBA buffer length {} does not match {}x{}x4 = {}",
+            rgba.len(),
+            width,
+            height,
+            expected_len,
+        )));
+    }
+
+    let encoder = webp::Encoder::from_rgba(rgba, width, height);
+    let memory = encoder.encode(80.0);
+    Ok(memory.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +123,17 @@ mod tests {
         assert!(result.is_ok());
         let bytes = result.unwrap();
         assert!(bytes[0] == 0xFF && bytes[1] == 0xD8); // JPEG SOI marker
+    }
+
+    #[test]
+    fn test_encode_webp_valid() {
+        let rgba = vec![255u8; 4 * 4 * 4]; // 4x4 white
+        let result = encode_webp(&rgba, 4, 4);
+        assert!(result.is_ok());
+        let bytes = result.unwrap();
+        // WebP files start with RIFF header
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WEBP");
     }
 
     #[test]

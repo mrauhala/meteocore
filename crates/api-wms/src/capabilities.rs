@@ -90,6 +90,7 @@ fn write_request(writer: &mut Writer<Vec<u8>>, base_url: &str) {
     let _ = writer.write_event(Event::Start(BytesStart::new("GetMap")));
     write_format(writer, "image/png");
     write_format(writer, "image/jpeg");
+    write_format(writer, "image/webp");
     write_dcp_type(writer, base_url);
     let _ = writer.write_event(Event::End(BytesEnd::new("GetMap")));
 
@@ -97,6 +98,7 @@ fn write_request(writer: &mut Writer<Vec<u8>>, base_url: &str) {
     let _ = writer.write_event(Event::Start(BytesStart::new("GetLegendGraphic")));
     write_format(writer, "image/png");
     write_format(writer, "image/jpeg");
+    write_format(writer, "image/webp");
     write_dcp_type(writer, base_url);
     let _ = writer.write_event(Event::End(BytesEnd::new("GetLegendGraphic")));
 

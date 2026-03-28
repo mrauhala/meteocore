@@ -14,7 +14,7 @@ pub const MAX_MAP_DIMENSION: u32 = 4096;
 const SUPPORTED_CRS: &[&str] = &["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:3067", "EPSG:3035"];
 
 /// Supported output formats.
-const SUPPORTED_FORMATS: &[&str] = &["image/png", "image/jpeg"];
+const SUPPORTED_FORMATS: &[&str] = &["image/png", "image/jpeg", "image/webp"];
 
 /// Raw WMS query parameters (case-insensitive keys handled by axum).
 #[derive(Debug, Deserialize)]
@@ -193,6 +193,7 @@ impl WmsQuery {
 
         let image_format = match format {
             "image/jpeg" => ds_render::ImageFormat::Jpeg,
+            "image/webp" => ds_render::ImageFormat::Webp,
             _ => ds_render::ImageFormat::Png,
         };
 

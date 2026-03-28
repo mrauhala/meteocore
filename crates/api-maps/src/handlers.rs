@@ -396,6 +396,7 @@ async fn render_map(
         format: match validated.format {
             ds_render::ImageFormat::Png => 0,
             ds_render::ImageFormat::Jpeg => 1,
+            ds_render::ImageFormat::Webp => 2,
         },
         crs: validated.crs.clone(),
         bbox: ds_render::quantize_bbox(&validated.bbox),

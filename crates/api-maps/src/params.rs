@@ -13,7 +13,7 @@ pub const MAX_MAP_DIMENSION: u32 = 4096;
 const SUPPORTED_CRS: &[&str] = &["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:3067", "EPSG:3035"];
 
 /// Supported output formats.
-const SUPPORTED_FORMATS: &[&str] = &["image/png", "image/jpeg"];
+const SUPPORTED_FORMATS: &[&str] = &["image/png", "image/jpeg", "image/webp"];
 
 /// Query parameters for OGC API Maps get_map / get_styled_map endpoints.
 #[derive(Debug, Deserialize)]
@@ -107,6 +107,7 @@ impl MapQueryParams {
         }
         let format = match format_str {
             "image/jpeg" => ds_render::ImageFormat::Jpeg,
+            "image/webp" => ds_render::ImageFormat::Webp,
             _ => ds_render::ImageFormat::Png,
         };
 

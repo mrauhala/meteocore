@@ -111,6 +111,7 @@ pub async fn wms_handler(
                 format: match params.format {
                     ds_render::ImageFormat::Png => 0,
                     ds_render::ImageFormat::Jpeg => 1,
+                    ds_render::ImageFormat::Webp => 2,
                 },
                 crs: params.crs.clone(),
                 bbox: ds_render::quantize_bbox(&params.bbox),

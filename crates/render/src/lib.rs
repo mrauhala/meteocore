@@ -4,7 +4,7 @@ mod encode;
 pub use colormap::{
     parse_hex_color, BuiltinColormap, ColorMap, ColorStop, LinearColorMap, LutColorMap,
 };
-pub use encode::{encode_jpeg, encode_png};
+pub use encode::{encode_jpeg, encode_png, encode_webp};
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -20,6 +20,7 @@ use ds_core::map_engine::RasterTile;
 pub enum ImageFormat {
     Png,
     Jpeg,
+    Webp,
 }
 
 impl ImageFormat {
@@ -27,6 +28,7 @@ impl ImageFormat {
         match self {
             ImageFormat::Png => "image/png",
             ImageFormat::Jpeg => "image/jpeg",
+            ImageFormat::Webp => "image/webp",
         }
     }
 }
@@ -51,7 +53,7 @@ pub struct StyleInfo {
 pub struct CacheKey {
     pub layer: String,
     pub style: String,
-    pub format: u8, // 0=png, 1=jpeg
+    pub format: u8, // 0=png, 1=jpeg, 2=webp
     pub crs: String,
     pub bbox: [i64; 4], // bbox quantized to microdegrees (6 decimal places)
     pub width: u32,
@@ -119,6 +121,7 @@ pub fn render_tile(
     match format {
         ImageFormat::Png => encode::encode_png(&rgba, tile.width, tile.height),
         ImageFormat::Jpeg => encode::encode_jpeg(&rgba, tile.width, tile.height),
+        ImageFormat::Webp => encode::encode_webp(&rgba, tile.width, tile.height),
     }
 }
 
@@ -163,6 +166,7 @@ pub fn render_legend(
     match format {
         ImageFormat::Png => encode::encode_png(&rgba, width, height),
         ImageFormat::Jpeg => encode::encode_jpeg(&rgba, width, height),
+        ImageFormat::Webp => encode::encode_webp(&rgba, width, height),
     }
 }
 
