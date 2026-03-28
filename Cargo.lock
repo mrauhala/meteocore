@@ -85,6 +85,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "api-maps"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "axum",
+ "chrono",
+ "ds-core",
+ "ds-render",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "api-wms"
 version = "0.1.0"
 dependencies = [
@@ -94,7 +111,6 @@ dependencies = [
  "ds-core",
  "ds-render",
  "quick-xml",
- "quick_cache",
  "serde",
  "tokio",
  "tracing",
@@ -508,9 +524,11 @@ dependencies = [
 name = "ds-render"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "ds-core",
  "jpeg-encoder",
  "png",
+ "quick_cache",
 ]
 
 [[package]]
@@ -2119,6 +2137,7 @@ version = "0.1.0"
 dependencies = [
  "api-edr",
  "api-features",
+ "api-maps",
  "api-wms",
  "arc-swap",
  "axum",

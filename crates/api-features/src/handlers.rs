@@ -66,8 +66,8 @@ pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
     let state = state.load_full();
     let base = &state.base_url;
     Json(json!({
-        "title": "Metocean Data Server - Features",
-        "description": "OGC API - Features",
+        "title": "MeteoCore - Features",
+        "description": "Metocean Data Server — OGC API Features",
         "links": [
             {
                 "href": format!("{base}/features/"),
@@ -211,7 +211,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
     let openapi = json!({
         "openapi": "3.0.3",
         "info": {
-            "title": "Metocean Data Server - OGC API Features",
+            "title": "MeteoCore - OGC API Features",
             "version": "1.0.0",
             "description": "OGC API - Features implementation"
         },

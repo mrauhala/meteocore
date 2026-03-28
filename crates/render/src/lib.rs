@@ -6,6 +6,12 @@ pub use colormap::{
 };
 pub use encode::{encode_jpeg, encode_png};
 
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
+use chrono::{DateTime, Utc};
+use quick_cache::sync::Cache;
+
 use ds_core::error::DataServerError;
 use ds_core::map_engine::RasterTile;
 
@@ -22,6 +28,84 @@ impl ImageFormat {
             ImageFormat::Png => "image/png",
             ImageFormat::Jpeg => "image/jpeg",
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared types for rendered image caching (used by api-wms and api-maps)
+// ---------------------------------------------------------------------------
+
+/// A named style with its colormap and value range.
+#[derive(Clone)]
+pub struct StyleInfo {
+    pub name: String,
+    pub title: String,
+    pub colormap: Arc<dyn ColorMap>,
+    pub min: f64,
+    pub max: f64,
+}
+
+/// Cache key for rendered map images.
+/// Bbox values are quantized to microdegrees (6 decimal places) for stable hashing.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CacheKey {
+    pub layer: String,
+    pub style: String,
+    pub format: u8, // 0=png, 1=jpeg
+    pub crs: String,
+    pub bbox: [i64; 4], // bbox quantized to microdegrees (6 decimal places)
+    pub width: u32,
+    pub height: u32,
+    pub time: Option<DateTime<Utc>>,
+}
+
+impl CacheKey {
+    /// Compute an ETag from the cache key for HTTP caching.
+    pub fn etag(&self) -> String {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut hasher);
+        let hash = hasher.finish();
+        format!("\"{hash:016x}\"")
+    }
+}
+
+/// Quantize a floating-point bbox to integer microdegrees for cache key stability.
+pub fn quantize_bbox(bbox: &[f64; 4]) -> [i64; 4] {
+    [
+        (bbox[0] * 1_000_000.0).round() as i64,
+        (bbox[1] * 1_000_000.0).round() as i64,
+        (bbox[2] * 1_000_000.0).round() as i64,
+        (bbox[3] * 1_000_000.0).round() as i64,
+    ]
+}
+
+/// Cache for rendered map images (Tier 2).
+/// Keys are quantized to improve hit rates for tiled clients.
+/// No TTL — radar measurements are immutable once produced.
+/// Cache is invalidated on collection reload.
+pub struct RenderedCache {
+    cache: Cache<CacheKey, Arc<Vec<u8>>>,
+}
+
+impl RenderedCache {
+    pub fn new(capacity_mb: u64) -> Self {
+        let estimated_tile_size = 60 * 1024;
+        let capacity = if capacity_mb == 0 {
+            0
+        } else {
+            ((capacity_mb * 1024 * 1024) / estimated_tile_size).max(1) as usize
+        };
+        Self {
+            cache: Cache::new(capacity),
+        }
+    }
+
+    pub fn get(&self, key: &CacheKey) -> Option<Arc<Vec<u8>>> {
+        self.cache.get(key)
+    }
+
+    pub fn insert(&self, key: CacheKey, value: Arc<Vec<u8>>) {
+        self.cache.insert(key, value);
     }
 }
 
