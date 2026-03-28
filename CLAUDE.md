@@ -118,8 +118,9 @@ The server implements OGC WMS 1.3.0 for serving raster data as map images. Only 
 
 Single `/wms/` route dispatches on the `REQUEST` query parameter:
 
-- **GetCapabilities**: `?SERVICE=WMS&REQUEST=GetCapabilities` — returns XML capabilities with layers, CRS, extents, time dimension
-- **GetMap**: `?SERVICE=WMS&REQUEST=GetMap&LAYERS=...&CRS=...&BBOX=...&WIDTH=...&HEIGHT=...&FORMAT=image/png` — returns PNG image
+- **GetCapabilities**: `?SERVICE=WMS&REQUEST=GetCapabilities` — returns XML capabilities with layers, CRS, extents, time dimension, styles
+- **GetMap**: `?SERVICE=WMS&REQUEST=GetMap&LAYERS=...&CRS=...&BBOX=...&WIDTH=...&HEIGHT=...&FORMAT=image/png` — returns map image (PNG or JPEG)
+- **GetLegendGraphic**: `?SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER=...&STYLE=...` — returns legend image showing colormap scale
 
 ### GetMap Parameters
 
@@ -133,8 +134,9 @@ Single `/wms/` route dispatches on the `REQUEST` query parameter:
 | `BBOX` | yes | Bounding box — axis order depends on CRS (see below) |
 | `WIDTH` | yes | Image width in pixels (max 4096) |
 | `HEIGHT` | yes | Image height in pixels (max 4096) |
-| `FORMAT` | yes | Must be `image/png` |
+| `FORMAT` | yes | `image/png` or `image/jpeg` |
 | `TRANSPARENT` | no | Default `TRUE` |
+| `STYLES` | no | Style name (default: `default`). Empty string = default. |
 | `TIME` | no | ISO 8601 timestamp; defaults to latest available |
 
 ### WMS 1.3.0 Axis Order
@@ -161,7 +163,7 @@ Errors are returned as XML `ServiceExceptionReport` documents with WMS-specific 
 | CRS whitelist | CRS:84, EPSG:4326/3857/3067/3035 | `api-wms/src/params.rs` |
 | No external SLD | SLD parameter rejected | Not implemented |
 | Max LAYERS | 1 | `api-wms/src/params.rs` |
-| FORMAT whitelist | `image/png` only | `api-wms/src/params.rs` |
+| FORMAT whitelist | `image/png`, `image/jpeg` | `api-wms/src/params.rs` |
 
 ### Rendering Pipeline
 
@@ -183,6 +185,9 @@ Colormaps are configured per collection in `[collections.wms]`:
 | `radar_dbz` | Standard radar reflectivity (blue→green→yellow→red) | 0–70 dBZ |
 | `grayscale` | Linear black→white | 0–1 |
 | `viridis` | Perceptually uniform (good default for continuous data) | 0–1 |
+| `temperature` | Temperature palette (purple→blue→cyan→green→yellow→red) | -40–50 °C |
+| `precipitation` | Precipitation accumulation (transparent→blue→purple→white) | 0–50 mm |
+| `wind_speed` | Wind speed (green→yellow→orange→red→purple) | 0–50 m/s |
 
 Custom color stops override built-in colormaps:
 
@@ -198,21 +203,51 @@ color = "#FF0000"
 
 ### Rendered Image Cache (Tier 2)
 
-Separate from the GeoTIFF source tile cache (Tier 1). Caches final PNG bytes.
+Separate from the GeoTIFF source tile cache (Tier 1). Caches final PNG/JPEG bytes.
 
-- Default size: 128 MB (configurable via `rendered_cache_mb`)
-- Cache key: quantized bbox (6 decimal places) + layer + width + height + CRS + time
+- Default size: 512 MB (configurable via `rendered_cache_mb`)
+- Cache key: quantized bbox (6 decimal places) + layer + style + format + width + height + CRS + time
 - Lock-free concurrent LRU (uses `quick_cache`)
-- Invalidated on collection reload (`POST /admin/collections/reload`)
-- Cache hit skips entire pipeline: no tile reads, no colorization, no PNG encoding
+- No TTL — radar data is immutable once produced. Cache invalidated on collection reload.
+- Cache hit skips entire pipeline: no tile reads, no colorization, no image encoding
+- Error tiles (render failures) are NOT cached — re-attempted on next request
+
+### HTTP Cache Headers
+
+WMS responses include cache headers for client-side and CDN caching:
+
+| Scenario | Cache-Control | ETag |
+|----------|---------------|------|
+| GetMap with explicit `TIME=` | `public, max-age=86400, immutable` | Yes |
+| GetMap without `TIME` (latest) | `public, max-age=60, must-revalidate` | Yes |
+| GetLegendGraphic | `public, max-age=86400, immutable` | No |
+| GetCapabilities | No cache headers | No |
+
+Requests with explicit timestamps are immutable (data won't change), so clients and CDNs can cache for 24 hours. Requests for "latest" data get 60-second cache to pick up new measurements.
 
 ### WMS Config Fields
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `colormap` | no | `"viridis"` | Built-in colormap name: `"radar_dbz"`, `"viridis"`, `"grayscale"` |
+| `colormap` | no | `"viridis"` | Built-in colormap name for the default style |
 | `color_stops` | no | — | Array of `{value, color}` entries. Overrides built-in colormap. |
-| `rendered_cache_mb` | no | `128` | Rendered image cache size in MB. Set to 0 to disable. |
+| `min` | no | from colormap | Minimum value for the colormap range |
+| `max` | no | from colormap | Maximum value for the colormap range |
+| `styles` | no | — | Array of named styles (see below) |
+| `rendered_cache_mb` | no | `512` | Rendered image cache size in MB. Set to 0 to disable. |
+
+### Named Styles
+
+Additional styles beyond the default are defined in `[[collections.wms.styles]]`:
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `name` | yes | — | Style name (used in `STYLES=` parameter) |
+| `title` | no | same as name | Human-readable title for GetCapabilities |
+| `colormap` | no | `"viridis"` | Built-in colormap name |
+| `color_stops` | no | — | Custom color stops (overrides colormap) |
+| `min` | no | from colormap | Minimum value for this style's range |
+| `max` | no | from colormap | Maximum value for this style's range |
 
 ### Adding WMS to a Collection
 
@@ -231,6 +266,21 @@ unit = "dBZ"
 
 [collections.wms]
 colormap = "radar_dbz"
+
+# Additional named styles (optional)
+[[collections.wms.styles]]
+name = "grayscale"
+title = "Grayscale"
+colormap = "grayscale"
+min = 0.0
+max = 70.0
+
+[[collections.wms.styles]]
+name = "viridis"
+title = "Viridis"
+colormap = "viridis"
+min = 0.0
+max = 70.0
 ```
 
 Only `engine_type = "geotiff"` collections support WMS. CSV and GeoJSON engines do not implement `MapEngine`.
@@ -362,7 +412,7 @@ The engine polls for new files at a configurable interval (`poll_interval_secs`,
 
 ### Tile caching
 
-The engine caches **compressed** tile bytes (not decoded pixels) in a lock-free LRU cache. This gives ~58× better memory efficiency than caching decoded tiles. Default cache size is 64 MB (`tile_cache_mb`). Set to 0 to disable.
+The engine caches **compressed** tile bytes (not decoded pixels) in a lock-free LRU cache. This gives ~58× better memory efficiency than caching decoded tiles. Default cache size is 256 MB (`tile_cache_mb`). Set to 0 to disable. Cache keys include the IFD index to prevent collisions between full-resolution and overview tiles.
 
 ### Security limits (hardcoded)
 
@@ -384,7 +434,7 @@ The engine caches **compressed** tile bytes (not decoded pixels) in a lock-free 
 | `parameter` | yes | — | Parameter name, e.g., `"reflectivity"` |
 | `unit` | yes | — | Unit of measurement, e.g., `"dBZ"` |
 | `poll_interval_secs` | no | `30` | Directory poll interval in seconds. Must be > 0. |
-| `tile_cache_mb` | no | `64` | Tile cache size in MB. Set to 0 to disable. |
+| `tile_cache_mb` | no | `256` | Tile cache size in MB for compressed COG tiles. Set to 0 to disable. |
 | `band` | no | `1` | Band number to read (1-based). |
 | `max_files` | no | none | Keep only the N most recent files by timestamp. |
 | `nodata` | no | from file | Override nodata value. Use when files lack a GDAL_NODATA tag. |
@@ -636,9 +686,9 @@ API state (`EdrState`, `FeaturesState`, `WmsState`) is wrapped in `ArcSwap` for 
 - Strip-based (non-tiled) GeoTIFFs are not supported — convert to COG first
 - No per-file timeout on remote reads — a hung S3 endpoint blocks the poll cycle
 - GeoTIFF multi-band: one band per collection; multiple bands as separate parameters not yet supported
-- WMS: single LAYERS only (no multi-layer composition), PNG only (no JPEG/WebP), no SLD/SE styling, no GetFeatureInfo
+- WMS: single LAYERS only (no multi-layer composition), no SLD/SE styling, no GetFeatureInfo
 - WMS: nearest-neighbor resampling only (no bilinear interpolation)
-- WMS: colormap value ranges for built-in colormaps are hardcoded (radar_dbz: 0–70, others: 0–1); use custom color_stops for different ranges
+- WMS: JPEG output composites transparency onto white background (no alpha channel support)
 
 ## Code Style
 

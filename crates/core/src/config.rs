@@ -98,7 +98,7 @@ fn default_colormap() -> String {
 }
 
 fn default_rendered_cache_mb() -> u64 {
-    128
+    512
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -172,7 +172,7 @@ pub struct GeoTiffConfig {
 }
 
 fn default_tile_cache_mb() -> u64 {
-    64
+    256
 }
 
 fn default_band() -> u32 {

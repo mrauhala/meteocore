@@ -80,8 +80,9 @@ new ol.layer.Tile({
 
 | Operation | Description |
 |-----------|-------------|
-| `GetCapabilities` | Returns XML document listing available layers, CRS, extents, and time dimension |
-| `GetMap` | Returns a rendered PNG map image |
+| `GetCapabilities` | Returns XML document listing available layers, CRS, extents, time dimension, and styles |
+| `GetMap` | Returns a rendered map image (PNG or JPEG) |
+| `GetLegendGraphic` | Returns a legend image showing the colormap scale |
 
 GetFeatureInfo is not supported.
 
@@ -132,6 +133,18 @@ colormap = "radar_dbz"    # Standard radar reflectivity colors
 | `radar_dbz` | 0–70 | Blue, cyan, green, yellow, orange, red, magenta, white |
 | `viridis` | 0–1 | Dark purple through blue, green, yellow |
 | `grayscale` | 0–1 | Black to white |
+| `temperature` | -40–50 | Purple, blue, cyan, green, yellow, orange, red |
+| `precipitation` | 0–50 | Transparent, light blue, blue, purple, magenta, white |
+| `wind_speed` | 0–50 | Green, yellow, orange, red, crimson, purple, violet |
+
+Use `min` and `max` to override the default value range:
+
+```toml
+[collections.wms]
+colormap = "temperature"
+min = -20.0    # only show -20 to 40 range
+max = 40.0
+```
 
 ### Custom Color Stops
 
@@ -160,15 +173,59 @@ color = "#FF0000"      # red
 
 Colors are specified in `#RRGGBB` (6 hex digits, fully opaque) or `#RRGGBBAA` (8 hex digits, with alpha). Values between stops are linearly interpolated.
 
+### Named Styles
+
+Define multiple styles per layer. Clients select via `STYLES=` parameter.
+
+```toml
+[collections.wms]
+colormap = "radar_dbz"    # default style
+
+[[collections.wms.styles]]
+name = "grayscale"
+title = "Grayscale Reflectivity"
+colormap = "grayscale"
+min = 0.0
+max = 70.0
+
+[[collections.wms.styles]]
+name = "viridis"
+title = "Viridis Reflectivity"
+colormap = "viridis"
+min = 0.0
+max = 70.0
+```
+
+Styles are listed in GetCapabilities and include LegendURL links.
+
 ### Cache Configuration
 
 ```toml
 [collections.wms]
 colormap = "radar_dbz"
-rendered_cache_mb = 128    # Default: 128 MB. Set to 0 to disable.
+rendered_cache_mb = 512    # Default: 512 MB. Set to 0 to disable.
 ```
 
-The rendered image cache stores final PNG bytes keyed by bbox, dimensions, CRS, and timestamp. Cache hits bypass the entire rendering pipeline. The cache is invalidated when collections are reloaded via `POST /admin/collections/reload`.
+The rendered image cache stores final PNG/JPEG bytes keyed by bbox, style, format, dimensions, CRS, and timestamp. No TTL — radar data is immutable once produced. Cache is invalidated on collection reload (`POST /admin/collections/reload`).
+
+Also configure the source tile cache for remote GeoTIFFs:
+
+```toml
+[collections.geotiff]
+tile_cache_mb = 256    # Default: 256 MB. Caches compressed COG tile bytes from S3.
+```
+
+### HTTP Caching
+
+WMS responses include headers for client and CDN caching:
+
+| Scenario | Cache-Control |
+|----------|---------------|
+| GetMap with `TIME=` | `public, max-age=86400, immutable` (24h) |
+| GetMap without `TIME` | `public, max-age=60, must-revalidate` (1min) |
+| GetLegendGraphic | `public, max-age=86400, immutable` (24h) |
+
+All GetMap responses include an `ETag` header derived from the request parameters.
 
 ## Security Limits
 
@@ -178,7 +235,7 @@ The rendered image cache stores final PNG bytes keyed by bbox, dimensions, CRS, 
 | Max dimension | 4,096 px | Limits width and height individually |
 | Concurrent renders | 8 | Semaphore prevents CPU/memory exhaustion |
 | CRS whitelist | 5 CRS | Only supported projections accepted |
-| Format whitelist | PNG only | No unexpected format handling |
+| Format whitelist | PNG, JPEG | No unexpected format handling |
 | No external SLD | — | Eliminates SSRF risk from style references |
 | XML output | quick-xml Writer | Prevents XML injection in GetCapabilities/errors |
 
@@ -230,9 +287,8 @@ Client
 ## Current Limitations
 
 - Single layer per request (no multi-layer composition)
-- PNG only (no JPEG, WebP, or GeoTIFF output)
 - No SLD/SE styling (no external style documents)
 - No GetFeatureInfo (use EDR position query instead)
 - Nearest-neighbor resampling only (no bilinear interpolation)
 - Only GeoTIFF collections can be exposed via WMS
-- Built-in colormap value ranges are fixed; use custom color_stops for different ranges
+- JPEG output composites transparency onto white background (no alpha channel)
