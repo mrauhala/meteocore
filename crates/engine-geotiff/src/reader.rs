@@ -316,14 +316,19 @@ impl TiffMetadata {
             ifd_index += 1;
         }
         // Sort overviews by decreasing resolution (largest first)
-        overviews.sort_by(|a, b| (b.width as u64 * b.height as u64)
-            .cmp(&(a.width as u64 * a.height as u64)));
+        overviews.sort_by(|a, b| {
+            (b.width as u64 * b.height as u64).cmp(&(a.width as u64 * a.height as u64))
+        });
 
         if !overviews.is_empty() {
             tracing::debug!(
                 "{source_name}: found {} overview levels: {}",
                 overviews.len(),
-                overviews.iter().map(|o| format!("{}x{}", o.width, o.height)).collect::<Vec<_>>().join(", ")
+                overviews
+                    .iter()
+                    .map(|o| format!("{}x{}", o.width, o.height))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
 
@@ -426,7 +431,9 @@ impl TiffMetadata {
         }
 
         // Check how many full-res pixels the bbox covers
-        let full_range = self.geo_transform.bbox_to_pixels(bbox_west, bbox_south, bbox_east, bbox_north);
+        let full_range = self
+            .geo_transform
+            .bbox_to_pixels(bbox_west, bbox_south, bbox_east, bbox_north);
         let (full_cols, full_rows) = match full_range {
             Some((c0, r0, c1, r1)) => ((c1 - c0), (r1 - r0)),
             None => return None, // bbox doesn't intersect
@@ -443,7 +450,9 @@ impl TiffMetadata {
         let mut best: Option<&OverviewLevel> = None;
         for ov in &self.overviews {
             let ov_gt = self.overview_geo_transform(ov);
-            if let Some((c0, r0, c1, r1)) = ov_gt.bbox_to_pixels(bbox_west, bbox_south, bbox_east, bbox_north) {
+            if let Some((c0, r0, c1, r1)) =
+                ov_gt.bbox_to_pixels(bbox_west, bbox_south, bbox_east, bbox_north)
+            {
                 let ov_cols = c1 - c0;
                 let ov_rows = r1 - r0;
                 if ov_cols >= output_width && ov_rows >= output_height {
@@ -903,7 +912,8 @@ fn read_remote_chunk_f64(
         // indicate truncated tile offset arrays from an undersized header read.
         tracing::trace!(
             "Tile {} has byte_count=0 (offset={}), returning nodata",
-            idx, offset
+            idx,
+            offset
         );
         let pixel_count = (tile_info.tile_width * tile_info.tile_height) as usize;
         return Ok(vec![None; pixel_count]);
@@ -937,7 +947,9 @@ fn read_remote_chunk_f64(
             if fetched.len() != byte_count {
                 return Err(DataServerError::GeoTiff(format!(
                     "Tile {} truncated: requested {} bytes, got {}",
-                    idx, byte_count, fetched.len()
+                    idx,
+                    byte_count,
+                    fetched.len()
                 )));
             }
             c.insert(file_path, chunk_index, ifd_index, fetched.clone());
@@ -950,7 +962,9 @@ fn read_remote_chunk_f64(
         if fetched.len() != byte_count {
             return Err(DataServerError::GeoTiff(format!(
                 "Tile {} truncated: requested {} bytes, got {}",
-                idx, byte_count, fetched.len()
+                idx,
+                byte_count,
+                fetched.len()
             )));
         }
         fetched
@@ -1116,7 +1130,10 @@ pub fn read_bbox_overview(
     // For local files, seek to the overview IFD and read tiles
     let mut decoder = source.open_decoder()?;
     decoder.seek_to_image(overview.ifd_index).map_err(|e| {
-        DataServerError::GeoTiff(format!("Failed to seek to overview IFD {}: {e}", overview.ifd_index))
+        DataServerError::GeoTiff(format!(
+            "Failed to seek to overview IFD {}: {e}",
+            overview.ifd_index
+        ))
     })?;
 
     let mut result = vec![None; total_pixels];
@@ -1173,7 +1190,19 @@ pub fn read_bbox_map(
         )));
     }
 
-    read_bbox_inner(source, metadata, col_start, row_start, col_end, row_end, cache, file_path, band_index, nx, total_pixels)
+    read_bbox_inner(
+        source,
+        metadata,
+        col_start,
+        row_start,
+        col_end,
+        row_end,
+        cache,
+        file_path,
+        band_index,
+        nx,
+        total_pixels,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1199,7 +1228,19 @@ pub fn read_bbox(
         )));
     }
 
-    read_bbox_inner(source, metadata, col_start, row_start, col_end, row_end, cache, file_path, band_index, nx, total_pixels)
+    read_bbox_inner(
+        source,
+        metadata,
+        col_start,
+        row_start,
+        col_end,
+        row_end,
+        cache,
+        file_path,
+        band_index,
+        nx,
+        total_pixels,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1216,7 +1257,6 @@ fn read_bbox_inner(
     nx: usize,
     total_pixels: usize,
 ) -> Result<Vec<Option<f64>>, DataServerError> {
-
     let tile_col_start = col_start / metadata.tile_width;
     let tile_col_end = (col_end - 1) / metadata.tile_width + 1;
     let tile_row_start = row_start / metadata.tile_height;
@@ -1315,55 +1355,68 @@ fn read_bbox_parallel(
             .par_iter()
             .map(|&(tile_row, tile_col)| {
                 let chunk_index = tile_row * metadata.tiles_across + tile_col;
-                let tile_data = match read_remote_chunk_f64(
-                    store,
-                    obj_path,
-                    tile_info,
-                    metadata,
-                    chunk_index,
-                    cache,
-                    file_path,
-                    band_index,
-                    ifd_index,
-                ) {
-                    Ok(data) => data,
-                    Err(first_err) => {
-                        // Retry up to 2 times for transient S3 errors (truncation, throttling)
-                        let mut last_err = first_err;
-                        let mut succeeded = false;
-                        let mut result_data = vec![None; tile_pixel_count];
-                        for attempt in 1..=2 {
-                            tracing::debug!(
+                let tile_data =
+                    match read_remote_chunk_f64(
+                        store,
+                        obj_path,
+                        tile_info,
+                        metadata,
+                        chunk_index,
+                        cache,
+                        file_path,
+                        band_index,
+                        ifd_index,
+                    ) {
+                        Ok(data) => data,
+                        Err(first_err) => {
+                            // Retry up to 2 times for transient S3 errors (truncation, throttling)
+                            let mut last_err = first_err;
+                            let mut succeeded = false;
+                            let mut result_data = vec![None; tile_pixel_count];
+                            for attempt in 1..=2 {
+                                tracing::debug!(
                                 "Tile ({}, {}), chunk {} failed (attempt {}), retrying: {last_err}",
                                 tile_row, tile_col, chunk_index, attempt
                             );
-                            // Brief backoff before retry
-                            std::thread::sleep(std::time::Duration::from_millis(50 * attempt));
-                            match read_remote_chunk_f64(
-                                store, obj_path, tile_info, metadata, chunk_index,
-                                cache, file_path, band_index, ifd_index,
-                            ) {
-                                Ok(data) => {
-                                    tracing::debug!(
-                                        "Tile ({}, {}), chunk {} succeeded on retry {}",
-                                        tile_row, tile_col, chunk_index, attempt
-                                    );
-                                    result_data = data;
-                                    succeeded = true;
-                                    break;
+                                // Brief backoff before retry
+                                std::thread::sleep(std::time::Duration::from_millis(50 * attempt));
+                                match read_remote_chunk_f64(
+                                    store,
+                                    obj_path,
+                                    tile_info,
+                                    metadata,
+                                    chunk_index,
+                                    cache,
+                                    file_path,
+                                    band_index,
+                                    ifd_index,
+                                ) {
+                                    Ok(data) => {
+                                        tracing::debug!(
+                                            "Tile ({}, {}), chunk {} succeeded on retry {}",
+                                            tile_row,
+                                            tile_col,
+                                            chunk_index,
+                                            attempt
+                                        );
+                                        result_data = data;
+                                        succeeded = true;
+                                        break;
+                                    }
+                                    Err(e) => last_err = e,
                                 }
-                                Err(e) => last_err = e,
                             }
+                            if !succeeded {
+                                tracing::warn!(
+                                    "Tile ({}, {}), chunk {} failed after 2 retries: {last_err}",
+                                    tile_row,
+                                    tile_col,
+                                    chunk_index
+                                );
+                            }
+                            result_data
                         }
-                        if !succeeded {
-                            tracing::warn!(
-                                "Tile ({}, {}), chunk {} failed after 2 retries: {last_err}",
-                                tile_row, tile_col, chunk_index
-                            );
-                        }
-                        result_data
-                    }
-                };
+                    };
                 (tile_row, tile_col, tile_data)
             })
             .collect()

@@ -45,7 +45,11 @@ fn bench_query_position(c: &mut Criterion) {
 
     c.bench_function("geotiff_query_position", |b| {
         b.iter(|| {
-            black_box(engine.query_position(black_box(coords), None, None).unwrap())
+            black_box(
+                engine
+                    .query_position(black_box(coords), None, None)
+                    .unwrap(),
+            )
         })
     });
 }
@@ -59,7 +63,11 @@ fn bench_query_position_cached(c: &mut Criterion) {
 
     c.bench_function("geotiff_query_position_cached", |b| {
         b.iter(|| {
-            black_box(engine.query_position(black_box(coords), None, None).unwrap())
+            black_box(
+                engine
+                    .query_position(black_box(coords), None, None)
+                    .unwrap(),
+            )
         })
     });
 }
@@ -73,9 +81,7 @@ fn bench_query_area_small(c: &mut Criterion) {
     let _ = engine.query_area(coords, None, None);
 
     c.bench_function("geotiff_query_area_small", |b| {
-        b.iter(|| {
-            black_box(engine.query_area(black_box(coords), None, None).unwrap())
-        })
+        b.iter(|| black_box(engine.query_area(black_box(coords), None, None).unwrap()))
     });
 }
 
@@ -88,9 +94,7 @@ fn bench_query_area_large(c: &mut Criterion) {
     let _ = engine.query_area(coords, None, None);
 
     c.bench_function("geotiff_query_area_large", |b| {
-        b.iter(|| {
-            black_box(engine.query_area(black_box(coords), None, None).unwrap())
-        })
+        b.iter(|| black_box(engine.query_area(black_box(coords), None, None).unwrap()))
     });
 }
 

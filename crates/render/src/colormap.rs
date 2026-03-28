@@ -161,7 +161,9 @@ pub fn parse_hex_color(s: &str) -> Result<[u8; 4], String> {
             let a = u8::from_str_radix(&s[6..8], 16).map_err(|e| e.to_string())?;
             Ok([r, g, b, a])
         }
-        _ => Err(format!("invalid hex color: '{s}' (expected 6 or 8 hex digits)")),
+        _ => Err(format!(
+            "invalid hex color: '{s}' (expected 6 or 8 hex digits)"
+        )),
     }
 }
 
@@ -169,34 +171,106 @@ pub fn parse_hex_color(s: &str) -> Result<[u8; 4], String> {
 pub fn builtin_stops(builtin: &BuiltinColormap) -> Vec<ColorStop> {
     match builtin {
         BuiltinColormap::Grayscale => vec![
-            ColorStop { value: 0.0, color: [0, 0, 0, 255] },
-            ColorStop { value: 1.0, color: [255, 255, 255, 255] },
+            ColorStop {
+                value: 0.0,
+                color: [0, 0, 0, 255],
+            },
+            ColorStop {
+                value: 1.0,
+                color: [255, 255, 255, 255],
+            },
         ],
         BuiltinColormap::RadarDbz => vec![
-            ColorStop { value: 0.0,  color: [0, 0, 0, 0] },         // transparent (no echo)
-            ColorStop { value: 5.0,  color: [0, 0, 0, 0] },         // transparent (below threshold)
-            ColorStop { value: 5.1,  color: [0, 128, 255, 255] },    // light blue
-            ColorStop { value: 15.0, color: [0, 200, 255, 255] },    // cyan
-            ColorStop { value: 25.0, color: [0, 200, 0, 255] },      // green
-            ColorStop { value: 30.0, color: [0, 255, 0, 255] },      // bright green
-            ColorStop { value: 35.0, color: [255, 255, 0, 255] },    // yellow
-            ColorStop { value: 40.0, color: [255, 200, 0, 255] },    // orange-yellow
-            ColorStop { value: 45.0, color: [255, 128, 0, 255] },    // orange
-            ColorStop { value: 50.0, color: [255, 0, 0, 255] },      // red
-            ColorStop { value: 55.0, color: [200, 0, 0, 255] },      // dark red
-            ColorStop { value: 60.0, color: [180, 0, 180, 255] },    // magenta
-            ColorStop { value: 70.0, color: [255, 255, 255, 255] },  // white (extreme)
+            ColorStop {
+                value: 0.0,
+                color: [0, 0, 0, 0],
+            }, // transparent (no echo)
+            ColorStop {
+                value: 5.0,
+                color: [0, 0, 0, 0],
+            }, // transparent (below threshold)
+            ColorStop {
+                value: 5.1,
+                color: [0, 128, 255, 255],
+            }, // light blue
+            ColorStop {
+                value: 15.0,
+                color: [0, 200, 255, 255],
+            }, // cyan
+            ColorStop {
+                value: 25.0,
+                color: [0, 200, 0, 255],
+            }, // green
+            ColorStop {
+                value: 30.0,
+                color: [0, 255, 0, 255],
+            }, // bright green
+            ColorStop {
+                value: 35.0,
+                color: [255, 255, 0, 255],
+            }, // yellow
+            ColorStop {
+                value: 40.0,
+                color: [255, 200, 0, 255],
+            }, // orange-yellow
+            ColorStop {
+                value: 45.0,
+                color: [255, 128, 0, 255],
+            }, // orange
+            ColorStop {
+                value: 50.0,
+                color: [255, 0, 0, 255],
+            }, // red
+            ColorStop {
+                value: 55.0,
+                color: [200, 0, 0, 255],
+            }, // dark red
+            ColorStop {
+                value: 60.0,
+                color: [180, 0, 180, 255],
+            }, // magenta
+            ColorStop {
+                value: 70.0,
+                color: [255, 255, 255, 255],
+            }, // white (extreme)
         ],
         BuiltinColormap::Viridis => vec![
-            ColorStop { value: 0.0,   color: [68, 1, 84, 255] },
-            ColorStop { value: 0.125, color: [72, 36, 117, 255] },
-            ColorStop { value: 0.25,  color: [56, 88, 140, 255] },
-            ColorStop { value: 0.375, color: [38, 130, 142, 255] },
-            ColorStop { value: 0.5,   color: [31, 158, 137, 255] },
-            ColorStop { value: 0.625, color: [78, 178, 101, 255] },
-            ColorStop { value: 0.75,  color: [148, 197, 56, 255] },
-            ColorStop { value: 0.875, color: [220, 215, 30, 255] },
-            ColorStop { value: 1.0,   color: [253, 231, 37, 255] },
+            ColorStop {
+                value: 0.0,
+                color: [68, 1, 84, 255],
+            },
+            ColorStop {
+                value: 0.125,
+                color: [72, 36, 117, 255],
+            },
+            ColorStop {
+                value: 0.25,
+                color: [56, 88, 140, 255],
+            },
+            ColorStop {
+                value: 0.375,
+                color: [38, 130, 142, 255],
+            },
+            ColorStop {
+                value: 0.5,
+                color: [31, 158, 137, 255],
+            },
+            ColorStop {
+                value: 0.625,
+                color: [78, 178, 101, 255],
+            },
+            ColorStop {
+                value: 0.75,
+                color: [148, 197, 56, 255],
+            },
+            ColorStop {
+                value: 0.875,
+                color: [220, 215, 30, 255],
+            },
+            ColorStop {
+                value: 1.0,
+                color: [253, 231, 37, 255],
+            },
         ],
     }
 }
@@ -250,8 +324,14 @@ mod tests {
     #[test]
     fn test_linear_colormap() {
         let cmap = LinearColorMap::new(vec![
-            ColorStop { value: 0.0, color: [0, 0, 0, 255] },
-            ColorStop { value: 100.0, color: [255, 255, 255, 255] },
+            ColorStop {
+                value: 0.0,
+                color: [0, 0, 0, 255],
+            },
+            ColorStop {
+                value: 100.0,
+                color: [255, 255, 255, 255],
+            },
         ]);
         let mid = cmap.color(Some(50.0));
         assert_eq!(mid, [128, 128, 128, 255]);

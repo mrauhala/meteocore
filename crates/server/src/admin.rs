@@ -353,10 +353,7 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                     let colormap = build_colormap(collection);
                     map_colormaps.insert(collection.id.clone(), colormap);
 
-                    info!(
-                        "Collection '{}': wired to WMS API",
-                        collection.id
-                    );
+                    info!("Collection '{}': wired to WMS API", collection.id);
                 }
 
                 // GeoTIFF starts degraded (no data yet until first poll), unless

@@ -700,10 +700,16 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         // Select the best overview level for the output resolution.
         // This avoids reading millions of full-resolution pixels for zoomed-out views.
         // If no overview matches but full res is too large, force the smallest overview.
-        let overview = entry.metadata.select_overview(west, south, east, north, width, height)
+        let overview = entry
+            .metadata
+            .select_overview(west, south, east, north, width, height)
             .or_else(|| {
                 // Check if full resolution would exceed the map pixel limit
-                if let Some((c0, r0, c1, r1)) = entry.metadata.geo_transform.bbox_to_pixels(west, south, east, north) {
+                if let Some((c0, r0, c1, r1)) = entry
+                    .metadata
+                    .geo_transform
+                    .bbox_to_pixels(west, south, east, north)
+                {
                     let full_pixels = ((c1 - c0) as usize) * ((r1 - r0) as usize);
                     if full_pixels > 16_000_000 {
                         // Force smallest overview to avoid exceeding limits
@@ -718,7 +724,11 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         let gt = if let Some(ov) = overview {
             tracing::debug!(
                 "Using overview {}x{} (IFD {}) for {}x{} output",
-                ov.width, ov.height, ov.ifd_index, width, height
+                ov.width,
+                ov.height,
+                ov.ifd_index,
+                width,
+                height
             );
             entry.metadata.overview_geo_transform(ov)
         } else {
@@ -737,8 +747,12 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
 
             tracing::debug!(
                 "Reading source pixels: cols {}..{} ({}), rows {}..{} ({}), total {} px",
-                col_start, col_end, col_end - col_start,
-                row_start, row_end, row_end - row_start,
+                col_start,
+                col_end,
+                col_end - col_start,
+                row_start,
+                row_end,
+                row_end - row_start,
                 src_nx * ((row_end - row_start) as usize)
             );
 
@@ -771,11 +785,12 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             }?;
 
             // Pre-compute Mercator Y bounds if needed
-            let (merc_y_north, merc_y_south) = if *output_crs == ds_core::map_engine::OutputCrs::WebMercator {
-                (lat_to_merc_y(north), lat_to_merc_y(south))
-            } else {
-                (0.0, 0.0) // unused
-            };
+            let (merc_y_north, merc_y_south) =
+                if *output_crs == ds_core::map_engine::OutputCrs::WebMercator {
+                    (lat_to_merc_y(north), lat_to_merc_y(south))
+                } else {
+                    (0.0, 0.0) // unused
+                };
 
             // Resample source grid to output dimensions using nearest-neighbor
             for oy in 0..height {

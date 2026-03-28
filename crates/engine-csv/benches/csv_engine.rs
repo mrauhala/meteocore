@@ -3,8 +3,8 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ds_core::engine::Engine;
 use ds_core::feature::{Bbox, FeatureQuery};
 use ds_core::feature_engine::FeatureEngine;
-use engine_csv::loader::CsvDataStore;
 use engine_csv::engine::CsvEngine;
+use engine_csv::loader::CsvDataStore;
 
 fn load_engine() -> CsvEngine {
     CsvEngine::new(CsvDataStore::load("../../testdata/weather.csv").unwrap())
@@ -24,7 +24,11 @@ fn bench_query_location(c: &mut Criterion) {
 
     c.bench_function("csv_query_location_all_params", |b| {
         b.iter(|| {
-            black_box(engine.query_location(black_box(loc_id), None, None).unwrap())
+            black_box(
+                engine
+                    .query_location(black_box(loc_id), None, None)
+                    .unwrap(),
+            )
         })
     });
 
@@ -62,9 +66,7 @@ fn bench_query_area(c: &mut Criterion) {
     let coords = "POLYGON((24.0 60.0, 26.0 60.0, 26.0 61.0, 24.0 61.0, 24.0 60.0))";
 
     c.bench_function("csv_query_area", |b| {
-        b.iter(|| {
-            black_box(engine.query_area(black_box(coords), None, None).unwrap())
-        })
+        b.iter(|| black_box(engine.query_area(black_box(coords), None, None).unwrap()))
     });
 }
 

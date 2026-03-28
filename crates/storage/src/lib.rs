@@ -282,7 +282,12 @@ fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServ
 
     // Use the URL without the path as the base (preserve port if present)
     let base_url = match url.port() {
-        Some(port) => format!("{}://{}:{}", url.scheme(), url.host_str().unwrap_or(""), port),
+        Some(port) => format!(
+            "{}://{}:{}",
+            url.scheme(),
+            url.host_str().unwrap_or(""),
+            port
+        ),
         None => format!("{}://{}", url.scheme(), url.host_str().unwrap_or("")),
     };
 

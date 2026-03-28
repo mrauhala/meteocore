@@ -198,10 +198,7 @@ pub async fn wms_handler(
                             header::HeaderName::from_static("x-content-type-options"),
                             "nosniff",
                         ),
-                        (
-                            header::HeaderName::from_static("x-cache"),
-                            "HIT",
-                        ),
+                        (header::HeaderName::from_static("x-cache"), "HIT"),
                     ],
                     cached.as_ref().clone(),
                 )
@@ -210,9 +207,7 @@ pub async fn wms_handler(
 
             // Acquire render semaphore
             let _permit = state.render_semaphore.try_acquire().map_err(|_| {
-                WmsError::Internal(
-                    "Server busy: too many concurrent render requests".to_string(),
-                )
+                WmsError::Internal("Server busy: too many concurrent render requests".to_string())
             })?;
 
             // Render on a blocking thread
@@ -253,10 +248,7 @@ pub async fn wms_handler(
                         header::HeaderName::from_static("x-content-type-options"),
                         "nosniff",
                     ),
-                    (
-                        header::HeaderName::from_static("x-cache"),
-                        "MISS",
-                    ),
+                    (header::HeaderName::from_static("x-cache"), "MISS"),
                 ],
                 png_arc.as_ref().clone(),
             )

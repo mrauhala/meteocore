@@ -11,13 +11,7 @@ pub const MAX_MAP_PIXELS: u64 = 8_000_000;
 pub const MAX_MAP_DIMENSION: u32 = 4096;
 
 /// Supported CRS identifiers.
-const SUPPORTED_CRS: &[&str] = &[
-    "CRS:84",
-    "EPSG:4326",
-    "EPSG:3857",
-    "EPSG:3067",
-    "EPSG:3035",
-];
+const SUPPORTED_CRS: &[&str] = &["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:3067", "EPSG:3035"];
 
 /// Supported output formats.
 const SUPPORTED_FORMATS: &[&str] = &["image/png"];
@@ -170,11 +164,7 @@ impl WmsQuery {
             .unwrap_or(true);
 
         // TIME
-        let time = self
-            .time
-            .as_deref()
-            .map(parse_time)
-            .transpose()?;
+        let time = self.time.as_deref().map(parse_time).transpose()?;
 
         let output_crs = match crs.as_str() {
             "EPSG:3857" => OutputCrs::WebMercator,
@@ -274,9 +264,7 @@ fn parse_bbox(bbox_str: &str, crs: &str) -> Result<[f64; 4], WmsError> {
 fn epsg3857_to_wgs84(x: f64, y: f64) -> (f64, f64) {
     const EARTH_RADIUS: f64 = 6_378_137.0; // WGS84 semi-major axis
     let lon = x * 180.0 / (std::f64::consts::PI * EARTH_RADIUS);
-    let lat = (std::f64::consts::PI * 0.5
-        - 2.0 * (-y / EARTH_RADIUS).exp().atan())
-        .to_degrees();
+    let lat = (std::f64::consts::PI * 0.5 - 2.0 * (-y / EARTH_RADIUS).exp().atan()).to_degrees();
     (lon, lat)
 }
 
@@ -334,7 +322,7 @@ mod tests {
         // Web Mercator bbox covering roughly lon 1.5-14.3, lat 53.0-63.0
         let bbox = parse_bbox("171318.93,6897641.62,2528475.00,9153471.98", "EPSG:3857").unwrap();
         // Should be reprojected to WGS84 degrees
-        assert!((bbox[0] - 1.539).abs() < 0.01);  // west ≈ 1.54°
+        assert!((bbox[0] - 1.539).abs() < 0.01); // west ≈ 1.54°
         assert!((bbox[1] - 52.536).abs() < 0.01); // south ≈ 52.54°
         assert!((bbox[2] - 22.714).abs() < 0.01); // east ≈ 22.71°
         assert!((bbox[3] - 63.216).abs() < 0.01); // north ≈ 63.22°

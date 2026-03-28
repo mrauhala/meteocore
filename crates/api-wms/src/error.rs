@@ -40,7 +40,9 @@ impl WmsError {
     }
 
     pub fn invalid_format(format: &str) -> Self {
-        WmsError::InvalidFormat(format!("Format '{format}' is not supported. Use image/png."))
+        WmsError::InvalidFormat(format!(
+            "Format '{format}' is not supported. Use image/png."
+        ))
     }
 
     pub fn layer_not_found(layer: &str) -> Self {
@@ -94,10 +96,7 @@ impl WmsError {
 
         let mut root = BytesStart::new("ServiceExceptionReport");
         root.push_attribute(("version", "1.3.0"));
-        root.push_attribute((
-            "xmlns",
-            "http://www.opengis.net/ogc",
-        ));
+        root.push_attribute(("xmlns", "http://www.opengis.net/ogc"));
         let _ = writer.write_event(Event::Start(root));
 
         let mut exception = BytesStart::new("ServiceException");

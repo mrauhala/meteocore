@@ -46,7 +46,12 @@ fn make_config(cache_mb: u64) -> GeoTiffConfig {
 }
 
 fn load_engine(cache_mb: u64) -> GeoTiffEngine {
-    GeoTiffEngine::new("radar", Some("../../testdata/radar"), &make_config(cache_mb)).unwrap()
+    GeoTiffEngine::new(
+        "radar",
+        Some("../../testdata/radar"),
+        &make_config(cache_mb),
+    )
+    .unwrap()
 }
 
 /// Benchmark position queries with varying cache states.
@@ -63,7 +68,11 @@ fn bench_position_cache_comparison(c: &mut Criterion) {
     let engine_nocache = load_engine(0);
     group.bench_function("no_cache", |b| {
         b.iter(|| {
-            black_box(engine_nocache.query_position(black_box(coords), None, None).unwrap())
+            black_box(
+                engine_nocache
+                    .query_position(black_box(coords), None, None)
+                    .unwrap(),
+            )
         })
     });
 
@@ -73,7 +82,11 @@ fn bench_position_cache_comparison(c: &mut Criterion) {
         b.iter(|| {
             // New engine each iteration to avoid warm cache
             let engine = load_engine(64);
-            black_box(engine.query_position(black_box(coords), None, None).unwrap())
+            black_box(
+                engine
+                    .query_position(black_box(coords), None, None)
+                    .unwrap(),
+            )
         })
     });
 
@@ -81,7 +94,11 @@ fn bench_position_cache_comparison(c: &mut Criterion) {
     let _ = engine_cached.query_position(coords, None, None);
     group.bench_function("cache_warm", |b| {
         b.iter(|| {
-            black_box(engine_cached.query_position(black_box(coords), None, None).unwrap())
+            black_box(
+                engine_cached
+                    .query_position(black_box(coords), None, None)
+                    .unwrap(),
+            )
         })
     });
 
@@ -96,18 +113,31 @@ fn bench_area_scaling(c: &mut Criterion) {
     let engine = load_engine(0); // no cache — measure raw read cost
 
     let areas = [
-        ("0.1x0.1_deg", "POLYGON((25.0 60.0, 25.1 60.0, 25.1 60.1, 25.0 60.1, 25.0 60.0))"),
-        ("0.5x0.5_deg", "POLYGON((24.5 60.0, 25.0 60.0, 25.0 60.5, 24.5 60.5, 24.5 60.0))"),
-        ("1x1_deg", "POLYGON((24.0 60.0, 25.0 60.0, 25.0 61.0, 24.0 61.0, 24.0 60.0))"),
-        ("2x2_deg", "POLYGON((24.0 59.0, 26.0 59.0, 26.0 61.0, 24.0 61.0, 24.0 59.0))"),
-        ("4x3_deg", "POLYGON((22.0 59.0, 26.0 59.0, 26.0 62.0, 22.0 62.0, 22.0 59.0))"),
+        (
+            "0.1x0.1_deg",
+            "POLYGON((25.0 60.0, 25.1 60.0, 25.1 60.1, 25.0 60.1, 25.0 60.0))",
+        ),
+        (
+            "0.5x0.5_deg",
+            "POLYGON((24.5 60.0, 25.0 60.0, 25.0 60.5, 24.5 60.5, 24.5 60.0))",
+        ),
+        (
+            "1x1_deg",
+            "POLYGON((24.0 60.0, 25.0 60.0, 25.0 61.0, 24.0 61.0, 24.0 60.0))",
+        ),
+        (
+            "2x2_deg",
+            "POLYGON((24.0 59.0, 26.0 59.0, 26.0 61.0, 24.0 61.0, 24.0 59.0))",
+        ),
+        (
+            "4x3_deg",
+            "POLYGON((22.0 59.0, 26.0 59.0, 26.0 62.0, 22.0 62.0, 22.0 59.0))",
+        ),
     ];
 
     for (label, coords) in &areas {
         group.bench_with_input(BenchmarkId::new("no_cache", label), coords, |b, coords| {
-            b.iter(|| {
-                black_box(engine.query_area(black_box(coords), None, None).unwrap())
-            })
+            b.iter(|| black_box(engine.query_area(black_box(coords), None, None).unwrap()))
         });
     }
 
@@ -139,12 +169,8 @@ fn bench_concurrent_position(c: &mut Criterion) {
                             let eng = engine.clone();
                             std::thread::spawn(move || {
                                 black_box(
-                                    eng.query_position(
-                                        black_box("POINT(25.0 60.5)"),
-                                        None,
-                                        None,
-                                    )
-                                    .unwrap(),
+                                    eng.query_position(black_box("POINT(25.0 60.5)"), None, None)
+                                        .unwrap(),
                                 )
                             })
                         })
