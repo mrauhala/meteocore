@@ -16,6 +16,7 @@ use tracing::info;
 
 use api_edr::handlers::EdrState;
 use api_features::handlers::FeaturesState;
+use api_maps::MapsState;
 use api_wms::WmsState;
 use ds_core::config::CollectionConfig;
 
@@ -104,6 +105,7 @@ pub struct ServerState {
     pub edr: Arc<ArcSwap<EdrState>>,
     pub features: Arc<ArcSwap<FeaturesState>>,
     pub wms: Arc<ArcSwap<WmsState>>,
+    pub maps: Arc<ArcSwap<MapsState>>,
     pub config_path: String,
     pub health: RwLock<Vec<CollectionHealth>>,
     pub geotiff_engines: RwLock<Vec<Arc<engine_geotiff::GeoTiffEngine>>>,
@@ -121,6 +123,7 @@ pub struct LoadResult {
     pub edr_state: EdrState,
     pub features_state: FeaturesState,
     pub wms_state: WmsState,
+    pub maps_state: MapsState,
     pub health: Vec<CollectionHealth>,
     pub geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>>,
 }
@@ -133,8 +136,10 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
     let mut feature_collections: HashMap<String, CollectionConfig> = HashMap::new();
     let mut map_engines: HashMap<String, Arc<dyn ds_core::map_engine::MapEngine>> = HashMap::new();
     let mut map_collections: HashMap<String, CollectionConfig> = HashMap::new();
-    let mut map_styles: HashMap<String, HashMap<String, api_wms::handlers::StyleInfo>> =
-        HashMap::new();
+    let mut map_styles: HashMap<String, HashMap<String, ds_render::StyleInfo>> = HashMap::new();
+    let mut maps_engines: HashMap<String, Arc<dyn ds_core::map_engine::MapEngine>> = HashMap::new();
+    let mut maps_collections: HashMap<String, CollectionConfig> = HashMap::new();
+    let mut maps_styles: HashMap<String, HashMap<String, ds_render::StyleInfo>> = HashMap::new();
     let mut geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>> = Vec::new();
     let mut health: Vec<CollectionHealth> = Vec::new();
 
@@ -356,6 +361,18 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
 
                     info!("Collection '{}': wired to WMS API", collection.id);
                 }
+                if collection.apis.contains(&"maps".to_string()) {
+                    maps_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    maps_collections.insert(collection.id.clone(), collection.clone());
+
+                    let styles = build_styles(collection);
+                    maps_styles.insert(collection.id.clone(), styles);
+
+                    info!("Collection '{}': wired to Maps API", collection.id);
+                }
 
                 // GeoTIFF starts degraded (no data yet until first poll), unless
                 // the initial scan already found files.
@@ -396,10 +413,15 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
     // Determine rendered cache size from first WMS collection config, or default
     let rendered_cache_mb = map_collections
         .values()
+        .chain(maps_collections.values())
         .filter_map(|c| c.wms.as_ref())
         .map(|w| w.rendered_cache_mb)
         .next()
         .unwrap_or(128);
+
+    // Shared render semaphore and cache between WMS and Maps APIs
+    let render_semaphore = Arc::new(tokio::sync::Semaphore::new(8));
+    let rendered_cache = Arc::new(ds_render::RenderedCache::new(rendered_cache_mb));
 
     LoadResult {
         edr_state: EdrState {
@@ -416,8 +438,16 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
             engines: map_engines,
             collections: map_collections,
             styles: map_styles,
-            render_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
-            rendered_cache: Arc::new(api_wms::handlers::RenderedCache::new(rendered_cache_mb)),
+            render_semaphore: render_semaphore.clone(),
+            rendered_cache: rendered_cache.clone(),
+            base_url: base_url.to_string(),
+        },
+        maps_state: MapsState {
+            engines: maps_engines,
+            collections: maps_collections,
+            styles: maps_styles,
+            render_semaphore,
+            rendered_cache,
             base_url: base_url.to_string(),
         },
         health,
@@ -426,7 +456,7 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
 }
 
 /// Build all styles for a WMS-enabled collection from its config.
-fn build_styles(collection: &CollectionConfig) -> HashMap<String, api_wms::handlers::StyleInfo> {
+fn build_styles(collection: &CollectionConfig) -> HashMap<String, ds_render::StyleInfo> {
     let mut styles = HashMap::new();
 
     // Build default style from top-level wms config
@@ -442,7 +472,7 @@ fn build_styles(collection: &CollectionConfig) -> HashMap<String, api_wms::handl
     );
     styles.insert(
         "default".to_string(),
-        api_wms::handlers::StyleInfo {
+        ds_render::StyleInfo {
             name: "default".to_string(),
             title: "Default".to_string(),
             colormap: default_colormap,
@@ -462,7 +492,7 @@ fn build_styles(collection: &CollectionConfig) -> HashMap<String, api_wms::handl
             );
             styles.insert(
                 style_config.name.clone(),
-                api_wms::handlers::StyleInfo {
+                ds_render::StyleInfo {
                     name: style_config.name.clone(),
                     title: style_config
                         .title
@@ -631,6 +661,7 @@ pub async fn reload_handler(
     state.edr.store(Arc::new(result.edr_state));
     state.features.store(Arc::new(result.features_state));
     state.wms.store(Arc::new(result.wms_state));
+    state.maps.store(Arc::new(result.maps_state));
 
     // Update health
     update_health_gauges(&result.health);

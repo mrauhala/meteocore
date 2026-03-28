@@ -66,11 +66,13 @@ async fn main() {
     let edr_swap = Arc::new(ArcSwap::from_pointee(result.edr_state));
     let features_swap = Arc::new(ArcSwap::from_pointee(result.features_state));
     let wms_swap = Arc::new(ArcSwap::from_pointee(result.wms_state));
+    let maps_swap = Arc::new(ArcSwap::from_pointee(result.maps_state));
 
     let server_state: AdminState = Arc::new(ServerState {
         edr: edr_swap.clone(),
         features: features_swap.clone(),
         wms: wms_swap.clone(),
+        maps: maps_swap.clone(),
         config_path,
         health: RwLock::new(result.health),
         geotiff_engines: RwLock::new(result.geotiff_engines),
@@ -84,7 +86,8 @@ async fn main() {
         .nest("/edr", api_edr::router(edr_swap.clone()))
         .nest("/features", api_features::router(features_swap.clone()))
         .nest("/wms", api_wms::router(wms_swap.clone()))
-        // Trailing-slash variants so /edr/ and /features/ also work
+        .nest("/maps", api_maps::router(maps_swap.clone()))
+        // Trailing-slash variants so /edr/, /features/, and /maps/ also work
         .route(
             "/edr/",
             get(api_edr::handlers::landing_page).with_state(edr_swap),
@@ -92,6 +95,10 @@ async fn main() {
         .route(
             "/features/",
             get(api_features::handlers::landing_page).with_state(features_swap),
+        )
+        .route(
+            "/maps/",
+            get(api_maps::handlers::landing_page).with_state(maps_swap),
         )
         // Admin endpoints
         .route(
@@ -155,8 +162,8 @@ async fn root_landing_page(state: AdminState) -> impl IntoResponse {
     let edr_state = state.edr.load_full();
     let base = &edr_state.base_url;
     Json(json!({
-        "title": "Metocean Data Server",
-        "description": "OGC API server providing EDR and Features access to metocean data",
+        "title": "MeteoCore",
+        "description": "Metocean Data Server implementing OGC API - EDR, OGC API - Features, OGC API - Maps, and OGC WMS 1.3.0",
         "links": [
             {
                 "href": format!("{base}/"),
@@ -181,6 +188,12 @@ async fn root_landing_page(state: AdminState) -> impl IntoResponse {
                 "rel": "service-desc",
                 "type": "text/xml",
                 "title": "WMS 1.3.0"
+            },
+            {
+                "href": format!("{base}/maps/"),
+                "rel": "service-desc",
+                "type": "application/json",
+                "title": "Maps API"
             },
             {
                 "href": format!("{base}/health"),

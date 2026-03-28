@@ -48,8 +48,8 @@ pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
     let state = state.load_full();
     let base = &state.base_url;
     Json(json!({
-        "title": "Metocean Data Server - EDR",
-        "description": "OGC API - Environmental Data Retrieval",
+        "title": "MeteoCore - EDR",
+        "description": "Metocean Data Server — OGC API EDR",
         "links": [
             {
                 "href": format!("{base}/edr/"),

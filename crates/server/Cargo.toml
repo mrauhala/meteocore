@@ -11,6 +11,7 @@ engine-geotiff = { path = "../engine-geotiff" }
 api-edr = { path = "../api-edr" }
 api-features = { path = "../api-features" }
 api-wms = { path = "../api-wms" }
+api-maps = { path = "../api-maps" }
 ds-render = { path = "../render" }
 arc-swap = "1"
 axum = "0.8"

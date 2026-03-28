@@ -6,8 +6,8 @@ use ds_core::map_engine::{MapEngine, RasterInfo};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
-use crate::handlers::StyleInfo;
 use crate::params;
+use ds_render::StyleInfo;
 
 /// Generate WMS 1.3.0 GetCapabilities XML.
 ///
@@ -40,7 +40,7 @@ pub fn get_capabilities_xml(
 
     // Root Layer (container for all layers)
     let _ = writer.write_event(Event::Start(BytesStart::new("Layer")));
-    write_text_element(&mut writer, "Title", "Metocean Data Server - WMS");
+    write_text_element(&mut writer, "Title", "MeteoCore - WMS");
 
     // Supported CRS
     for crs in params::supported_crs_list() {
@@ -72,11 +72,11 @@ pub fn get_capabilities_xml(
 fn write_service(writer: &mut Writer<Vec<u8>>) {
     let _ = writer.write_event(Event::Start(BytesStart::new("Service")));
     write_text_element(writer, "Name", "WMS");
-    write_text_element(writer, "Title", "Metocean Data Server - WMS");
+    write_text_element(writer, "Title", "MeteoCore - WMS");
     write_text_element(
         writer,
         "Abstract",
-        "OGC WMS 1.3.0 service providing map images of metocean data",
+        "Metocean Data Server — OGC WMS 1.3.0",
     );
     let _ = writer.write_event(Event::End(BytesEnd::new("Service")));
 }

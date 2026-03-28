@@ -1,30 +1,17 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use axum::extract::{Query, State};
 use axum::http::header;
 use axum::response::IntoResponse;
-use chrono::{DateTime, Utc};
-use quick_cache::sync::Cache;
 
 use ds_core::config::CollectionConfig;
 use ds_core::map_engine::MapEngine;
-use ds_render::ColorMap;
+use ds_render::{CacheKey, RenderedCache, StyleInfo};
 
 use crate::error::WmsError;
 use crate::params::{WmsQuery, WmsRequestType};
-
-/// A named style with its colormap and value range.
-#[derive(Clone)]
-pub struct StyleInfo {
-    pub name: String,
-    pub title: String,
-    pub colormap: Arc<dyn ColorMap>,
-    pub min: f64,
-    pub max: f64,
-}
 
 #[derive(Clone)]
 pub struct WmsState {
@@ -39,58 +26,6 @@ pub struct WmsState {
 
 pub type AppState = Arc<ArcSwap<WmsState>>;
 
-/// Cache for rendered map images (Tier 2).
-/// Keys are quantized to improve hit rates for tiled clients.
-/// No TTL — radar measurements are immutable once produced.
-/// Cache is invalidated on collection reload.
-pub struct RenderedCache {
-    cache: Cache<CacheKey, Arc<Vec<u8>>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct CacheKey {
-    layer: String,
-    style: String,
-    format: u8, // 0=png, 1=jpeg
-    crs: String,
-    bbox: [i64; 4], // bbox quantized to microdegrees (6 decimal places)
-    width: u32,
-    height: u32,
-    time: Option<DateTime<Utc>>,
-}
-
-impl CacheKey {
-    /// Compute an ETag from the cache key for HTTP caching.
-    fn etag(&self) -> String {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.hash(&mut hasher);
-        let hash = hasher.finish();
-        format!("\"{hash:016x}\"")
-    }
-}
-
-impl RenderedCache {
-    pub fn new(capacity_mb: u64) -> Self {
-        let estimated_tile_size = 60 * 1024;
-        let capacity = if capacity_mb == 0 {
-            0
-        } else {
-            ((capacity_mb * 1024 * 1024) / estimated_tile_size).max(1) as usize
-        };
-        Self {
-            cache: Cache::new(capacity),
-        }
-    }
-
-    fn get(&self, key: &CacheKey) -> Option<Arc<Vec<u8>>> {
-        self.cache.get(key)
-    }
-
-    fn insert(&self, key: CacheKey, value: Arc<Vec<u8>>) {
-        self.cache.insert(key, value);
-    }
-}
-
 /// Render a semi-transparent red error tile to make failed areas visible.
 fn render_error_tile(width: u32, height: u32) -> Result<Vec<u8>, WmsError> {
     let pixel_count = (width * height) as usize;
@@ -100,15 +35,6 @@ fn render_error_tile(width: u32, height: u32) -> Result<Vec<u8>, WmsError> {
     }
     ds_render::encode_png(&rgba, width, height)
         .map_err(|e| WmsError::Internal(format!("Failed to encode error tile: {e}")))
-}
-
-fn quantize_bbox(bbox: &[f64; 4]) -> [i64; 4] {
-    [
-        (bbox[0] * 1_000_000.0).round() as i64,
-        (bbox[1] * 1_000_000.0).round() as i64,
-        (bbox[2] * 1_000_000.0).round() as i64,
-        (bbox[3] * 1_000_000.0).round() as i64,
-    ]
 }
 
 /// Cache-Control header value for a WMS response.
@@ -187,7 +113,7 @@ pub async fn wms_handler(
                     ds_render::ImageFormat::Jpeg => 1,
                 },
                 crs: params.crs.clone(),
-                bbox: quantize_bbox(&params.bbox),
+                bbox: ds_render::quantize_bbox(&params.bbox),
                 width: params.width,
                 height: params.height,
                 time: params.time,

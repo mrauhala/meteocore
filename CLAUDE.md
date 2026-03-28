@@ -1,4 +1,4 @@
-# Metocean Data Server — Claude Instructions
+# MeteoCore — Claude Instructions
 
 ## What This Is
 
