@@ -845,7 +845,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             "EPSG:4326".to_string()
         };
 
-        let times: Vec<DateTime<Utc>> = catalog.entries.keys().rev().cloned().collect();
+        let times: Vec<DateTime<Utc>> = catalog.entries.keys().cloned().collect();
 
         ds_core::map_engine::RasterInfo {
             native_crs: crs_name,

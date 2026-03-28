@@ -174,7 +174,7 @@ fn write_layer(
         let mut dim = BytesStart::new("Dimension");
         dim.push_attribute(("name", "time"));
         dim.push_attribute(("units", "ISO8601"));
-        if let Some(latest) = info.times.first() {
+        if let Some(latest) = info.times.last() {
             dim.push_attribute(("default", latest.to_rfc3339().as_str()));
         }
         dim.push_attribute(("nearestValue", "1"));
