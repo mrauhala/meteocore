@@ -1,7 +1,6 @@
 use std::collections::HashMap;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use axum::extract::{Query, State};
@@ -16,9 +15,6 @@ use ds_render::ColorMap;
 
 use crate::error::WmsError;
 use crate::params::{WmsQuery, WmsRequestType};
-
-/// How long rendered tiles stay valid in the cache.
-const CACHE_TTL_SECS: u64 = 300; // 5 minutes
 
 /// A named style with its colormap and value range.
 #[derive(Clone)]
@@ -45,15 +41,10 @@ pub type AppState = Arc<ArcSwap<WmsState>>;
 
 /// Cache for rendered map images (Tier 2).
 /// Keys are quantized to improve hit rates for tiled clients.
-/// Entries expire after `CACHE_TTL_SECS` to allow recovery from transient S3 failures.
+/// No TTL — radar measurements are immutable once produced.
+/// Cache is invalidated on collection reload.
 pub struct RenderedCache {
-    cache: Cache<CacheKey, CacheEntry>,
-}
-
-#[derive(Clone)]
-struct CacheEntry {
-    data: Arc<Vec<u8>>,
-    created: Instant,
+    cache: Cache<CacheKey, Arc<Vec<u8>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -68,9 +59,18 @@ struct CacheKey {
     time: Option<DateTime<Utc>>,
 }
 
+impl CacheKey {
+    /// Compute an ETag from the cache key for HTTP caching.
+    fn etag(&self) -> String {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut hasher);
+        let hash = hasher.finish();
+        format!("\"{hash:016x}\"")
+    }
+}
+
 impl RenderedCache {
     pub fn new(capacity_mb: u64) -> Self {
-        // Estimate ~60KB per tile, capacity in items
         let estimated_tile_size = 60 * 1024;
         let capacity = if capacity_mb == 0 {
             0
@@ -83,21 +83,11 @@ impl RenderedCache {
     }
 
     fn get(&self, key: &CacheKey) -> Option<Arc<Vec<u8>>> {
-        let entry = self.cache.get(key)?;
-        if entry.created.elapsed().as_secs() > CACHE_TTL_SECS {
-            return None; // expired
-        }
-        Some(entry.data)
+        self.cache.get(key)
     }
 
     fn insert(&self, key: CacheKey, value: Arc<Vec<u8>>) {
-        self.cache.insert(
-            key,
-            CacheEntry {
-                data: value,
-                created: Instant::now(),
-            },
-        );
+        self.cache.insert(key, value);
     }
 }
 
@@ -105,7 +95,6 @@ impl RenderedCache {
 fn render_error_tile(width: u32, height: u32) -> Result<Vec<u8>, WmsError> {
     let pixel_count = (width * height) as usize;
     let mut rgba = Vec::with_capacity(pixel_count * 4);
-    // Semi-transparent red: RGBA(255, 0, 0, 100)
     for _ in 0..pixel_count {
         rgba.extend_from_slice(&[255, 0, 0, 100]);
     }
@@ -120,6 +109,18 @@ fn quantize_bbox(bbox: &[f64; 4]) -> [i64; 4] {
         (bbox[2] * 1_000_000.0).round() as i64,
         (bbox[3] * 1_000_000.0).round() as i64,
     ]
+}
+
+/// Cache-Control header value for a WMS response.
+///
+/// - Requests with explicit TIME: immutable data, cache for 24 hours
+/// - Requests without TIME (latest): short cache (60s) since "latest" changes
+fn cache_control_value(has_explicit_time: bool) -> &'static str {
+    if has_explicit_time {
+        "public, max-age=86400, immutable"
+    } else {
+        "public, max-age=60, must-revalidate"
+    }
 }
 
 /// Main WMS handler — dispatches on REQUEST parameter.
@@ -175,8 +176,9 @@ pub async fn wms_handler(
 
             let colormap = style_info.colormap.clone();
             let content_type = params.format.content_type();
+            let has_explicit_time = params.time.is_some();
 
-            // Check rendered cache
+            // Build cache key
             let cache_key = CacheKey {
                 layer: params.layer.clone(),
                 style: params.style.clone(),
@@ -191,18 +193,22 @@ pub async fn wms_handler(
                 time: params.time,
             };
 
+            let etag = cache_key.etag();
+            let cache_control = cache_control_value(has_explicit_time);
+
+            // Check rendered cache
             if let Some(cached) = state.rendered_cache.get(&cache_key) {
-                return Ok((
-                    [
-                        (header::CONTENT_TYPE, content_type),
-                        (
-                            header::HeaderName::from_static("x-content-type-options"),
-                            "nosniff",
-                        ),
-                        (header::HeaderName::from_static("x-cache"), "HIT"),
-                    ],
-                    cached.as_ref().clone(),
-                )
+                return Ok(axum::response::Response::builder()
+                    .header(header::CONTENT_TYPE, content_type)
+                    .header(header::ETAG, &etag)
+                    .header(header::CACHE_CONTROL, cache_control)
+                    .header(
+                        header::HeaderName::from_static("x-content-type-options"),
+                        "nosniff",
+                    )
+                    .header(header::HeaderName::from_static("x-cache"), "HIT")
+                    .body(axum::body::Body::from(cached.as_ref().clone()))
+                    .unwrap()
                     .into_response());
             }
 
@@ -241,17 +247,20 @@ pub async fn wms_handler(
                 rendered_cache.insert(cache_key, image_arc.clone());
             }
 
-            Ok((
-                [
-                    (header::CONTENT_TYPE, content_type),
-                    (
-                        header::HeaderName::from_static("x-content-type-options"),
-                        "nosniff",
-                    ),
-                    (header::HeaderName::from_static("x-cache"), "MISS"),
-                ],
-                image_arc.as_ref().clone(),
-            )
+            Ok(axum::response::Response::builder()
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::ETAG, &etag)
+                .header(header::CACHE_CONTROL, cache_control)
+                .header(
+                    header::HeaderName::from_static("x-content-type-options"),
+                    "nosniff",
+                )
+                .header(
+                    header::HeaderName::from_static("x-cache"),
+                    if cacheable { "MISS" } else { "ERROR" },
+                )
+                .body(axum::body::Body::from(image_arc.as_ref().clone()))
+                .unwrap()
                 .into_response())
         }
         WmsRequestType::GetLegendGraphic => {
@@ -315,7 +324,8 @@ pub async fn wms_handler(
                         header::HeaderName::from_static("x-content-type-options"),
                         "nosniff",
                     ),
-                    (header::HeaderName::from_static("x-cache"), "MISS"),
+                    // Legends are static — cache for 24h
+                    (header::CACHE_CONTROL, "public, max-age=86400, immutable"),
                 ],
                 legend_bytes,
             )
