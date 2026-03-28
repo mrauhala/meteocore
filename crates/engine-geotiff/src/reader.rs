@@ -1050,9 +1050,6 @@ static TILE_FETCH_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
 /// `band_index` selects which band (0-based) for multi-band files.
 ///
 /// For remote sources, tiles are fetched in parallel (up to `MAX_TILE_CONCURRENCY`
-/// concurrent fetches) using a dedicated rayon thread pool. If a single tile fetch
-/// fails, the corresponding pixels are filled with `None`.
-#[allow(clippy::too_many_arguments)]
 /// Read a bbox from a specific overview level for map rendering.
 ///
 /// Uses the overview's tile layout and geometry. Falls back to full resolution
@@ -1095,36 +1092,33 @@ pub fn read_bbox_overview(
     let tile_row_start = row_start / overview.tile_height;
     let tile_row_end = (row_end - 1) / overview.tile_height + 1;
 
-    match source {
-        DataSource::Remote { store, path, .. } => {
-            let ov_tile_info = overview.tile_info.as_ref().ok_or_else(|| {
-                DataServerError::GeoTiff(format!(
-                    "Overview IFD {} has no tile info for remote source (header too small?)",
-                    overview.ifd_index
-                ))
-            })?;
-            return read_bbox_parallel(
-                store,
-                path,
-                ov_tile_info,
-                &ov_metadata,
-                col_start,
-                row_start,
-                col_end,
-                row_end,
-                tile_col_start,
-                tile_col_end,
-                tile_row_start,
-                tile_row_end,
-                cache,
-                file_path,
-                band_index,
-                nx,
-                total_pixels,
-                overview.ifd_index as u16,
-            );
-        }
-        _ => {}
+    if let DataSource::Remote { store, path, .. } = source {
+        let ov_tile_info = overview.tile_info.as_ref().ok_or_else(|| {
+            DataServerError::GeoTiff(format!(
+                "Overview IFD {} has no tile info for remote source (header too small?)",
+                overview.ifd_index
+            ))
+        })?;
+        return read_bbox_parallel(
+            store,
+            path,
+            ov_tile_info,
+            &ov_metadata,
+            col_start,
+            row_start,
+            col_end,
+            row_end,
+            tile_col_start,
+            tile_col_end,
+            tile_row_start,
+            tile_row_end,
+            cache,
+            file_path,
+            band_index,
+            nx,
+            total_pixels,
+            overview.ifd_index as u16,
+        );
     }
 
     // For local files, seek to the overview IFD and read tiles
@@ -1547,7 +1541,7 @@ fn parse_geo_transform(
         })?;
 
         return GeoTransform::from_transformation_matrix(&matrix, width, height, crs)
-            .map_err(|e| DataServerError::GeoTiff(e));
+            .map_err(DataServerError::GeoTiff);
     }
 
     Err(DataServerError::GeoTiff(

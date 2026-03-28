@@ -25,7 +25,7 @@ fn bench_get_features(c: &mut Criterion) {
     let bbox = Bbox::new(24.0, 60.0, 26.0, 61.0).unwrap();
     c.bench_function("geojson_get_features_bbox", |b| {
         let query = FeatureQuery {
-            bbox: Some(bbox.clone()),
+            bbox: Some(bbox),
             limit: 1000,
             ..Default::default()
         };
@@ -36,7 +36,7 @@ fn bench_get_features(c: &mut Criterion) {
     let small_bbox = Bbox::new(24.9, 60.15, 25.0, 60.2).unwrap();
     c.bench_function("geojson_get_features_small_bbox", |b| {
         let query = FeatureQuery {
-            bbox: Some(small_bbox.clone()),
+            bbox: Some(small_bbox),
             limit: 1000,
             ..Default::default()
         };

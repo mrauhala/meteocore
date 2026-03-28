@@ -738,11 +738,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         // Compute the source pixel range in the selected level
         let source_range = gt.bbox_to_pixels(west, south, east, north);
 
-        if source_range.is_none() {
-            // Bbox doesn't intersect raster at all — all nodata
-            values.resize(total_pixels, None);
-        } else {
-            let (col_start, row_start, col_end, row_end) = source_range.unwrap();
+        if let Some((col_start, row_start, col_end, row_end)) = source_range {
             let src_nx = (col_end - col_start) as usize;
 
             tracing::debug!(
@@ -824,6 +820,9 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                     }
                 }
             }
+        } else {
+            // Bbox doesn't intersect raster at all — all nodata
+            values.resize(total_pixels, None);
         }
 
         Ok(ds_core::map_engine::RasterTile {
