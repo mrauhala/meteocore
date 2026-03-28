@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 ds-core = { path = "../core" }
 png = "0.17"
+jpeg-encoder = "0.6"

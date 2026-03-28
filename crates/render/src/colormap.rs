@@ -18,6 +18,12 @@ pub enum BuiltinColormap {
     Grayscale,
     /// Perceptually uniform (dark purple → blue → green → yellow).
     Viridis,
+    /// Temperature palette (blue → cyan → green → yellow → red).
+    Temperature,
+    /// Precipitation palette (light blue → blue → purple → magenta).
+    Precipitation,
+    /// Wind speed palette (calm green → yellow → orange → red → purple).
+    WindSpeed,
 }
 
 /// Lookup-table colormap. O(1) per pixel.
@@ -272,6 +278,124 @@ pub fn builtin_stops(builtin: &BuiltinColormap) -> Vec<ColorStop> {
                 color: [253, 231, 37, 255],
             },
         ],
+        BuiltinColormap::Temperature => vec![
+            ColorStop {
+                value: -40.0,
+                color: [40, 0, 120, 255],
+            }, // deep purple (extreme cold)
+            ColorStop {
+                value: -30.0,
+                color: [0, 0, 180, 255],
+            }, // dark blue
+            ColorStop {
+                value: -20.0,
+                color: [0, 60, 255, 255],
+            }, // blue
+            ColorStop {
+                value: -10.0,
+                color: [0, 160, 255, 255],
+            }, // light blue
+            ColorStop {
+                value: 0.0,
+                color: [0, 220, 220, 255],
+            }, // cyan
+            ColorStop {
+                value: 10.0,
+                color: [0, 200, 0, 255],
+            }, // green
+            ColorStop {
+                value: 20.0,
+                color: [200, 200, 0, 255],
+            }, // yellow
+            ColorStop {
+                value: 30.0,
+                color: [255, 128, 0, 255],
+            }, // orange
+            ColorStop {
+                value: 40.0,
+                color: [255, 0, 0, 255],
+            }, // red
+            ColorStop {
+                value: 50.0,
+                color: [180, 0, 0, 255],
+            }, // dark red
+        ],
+        BuiltinColormap::Precipitation => vec![
+            ColorStop {
+                value: 0.0,
+                color: [0, 0, 0, 0],
+            }, // transparent (no precip)
+            ColorStop {
+                value: 0.1,
+                color: [170, 220, 255, 255],
+            }, // very light blue
+            ColorStop {
+                value: 0.5,
+                color: [100, 180, 255, 255],
+            }, // light blue
+            ColorStop {
+                value: 1.0,
+                color: [50, 130, 255, 255],
+            }, // blue
+            ColorStop {
+                value: 2.0,
+                color: [0, 80, 255, 255],
+            }, // medium blue
+            ColorStop {
+                value: 5.0,
+                color: [0, 40, 200, 255],
+            }, // dark blue
+            ColorStop {
+                value: 10.0,
+                color: [120, 0, 200, 255],
+            }, // purple
+            ColorStop {
+                value: 20.0,
+                color: [200, 0, 150, 255],
+            }, // magenta
+            ColorStop {
+                value: 50.0,
+                color: [255, 255, 255, 255],
+            }, // white (extreme)
+        ],
+        BuiltinColormap::WindSpeed => vec![
+            ColorStop {
+                value: 0.0,
+                color: [0, 160, 0, 255],
+            }, // calm green
+            ColorStop {
+                value: 5.0,
+                color: [100, 200, 0, 255],
+            }, // yellow-green
+            ColorStop {
+                value: 10.0,
+                color: [200, 200, 0, 255],
+            }, // yellow
+            ColorStop {
+                value: 15.0,
+                color: [255, 180, 0, 255],
+            }, // orange-yellow
+            ColorStop {
+                value: 20.0,
+                color: [255, 100, 0, 255],
+            }, // orange
+            ColorStop {
+                value: 25.0,
+                color: [255, 0, 0, 255],
+            }, // red
+            ColorStop {
+                value: 30.0,
+                color: [200, 0, 80, 255],
+            }, // crimson
+            ColorStop {
+                value: 40.0,
+                color: [150, 0, 150, 255],
+            }, // purple
+            ColorStop {
+                value: 50.0,
+                color: [100, 0, 200, 255],
+            }, // violet
+        ],
     }
 }
 
@@ -281,8 +405,23 @@ pub fn resolve_builtin(name: &str) -> Option<BuiltinColormap> {
         "radar_dbz" => Some(BuiltinColormap::RadarDbz),
         "grayscale" => Some(BuiltinColormap::Grayscale),
         "viridis" => Some(BuiltinColormap::Viridis),
+        "temperature" => Some(BuiltinColormap::Temperature),
+        "precipitation" => Some(BuiltinColormap::Precipitation),
+        "wind_speed" => Some(BuiltinColormap::WindSpeed),
         _ => None,
     }
+}
+
+/// List all available built-in colormap names.
+pub fn builtin_names() -> &'static [&'static str] {
+    &[
+        "radar_dbz",
+        "grayscale",
+        "viridis",
+        "temperature",
+        "precipitation",
+        "wind_speed",
+    ]
 }
 
 #[cfg(test)]

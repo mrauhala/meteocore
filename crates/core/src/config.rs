@@ -51,16 +51,39 @@ pub struct CollectionConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WmsConfig {
-    /// Built-in colormap name (e.g., "radar_dbz", "viridis", "grayscale").
+    /// Built-in colormap name for the default style (e.g., "radar_dbz", "viridis").
     /// Ignored if color_stops are provided.
     #[serde(default = "default_colormap")]
     pub colormap: String,
-    /// Inline color stops. Overrides the built-in colormap.
+    /// Inline color stops for the default style. Overrides the built-in colormap.
     #[serde(default)]
     pub color_stops: Vec<ColorStop>,
+    /// Minimum value for the colormap range. Overrides the colormap's built-in range.
+    pub min: Option<f64>,
+    /// Maximum value for the colormap range. Overrides the colormap's built-in range.
+    pub max: Option<f64>,
+    /// Named styles in addition to the default. Each style has its own colormap.
+    #[serde(default)]
+    pub styles: Vec<WmsStyle>,
     /// Rendered image cache size in MB. Default: 128.
     #[serde(default = "default_rendered_cache_mb")]
     pub rendered_cache_mb: u64,
+}
+
+/// A named WMS style with its own colormap configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WmsStyle {
+    pub name: String,
+    pub title: Option<String>,
+    /// Built-in colormap name.
+    pub colormap: Option<String>,
+    /// Custom color stops (overrides colormap).
+    #[serde(default)]
+    pub color_stops: Vec<ColorStop>,
+    /// Minimum value for the colormap range.
+    pub min: Option<f64>,
+    /// Maximum value for the colormap range.
+    pub max: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

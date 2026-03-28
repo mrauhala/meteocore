@@ -14,7 +14,7 @@ pub const MAX_MAP_DIMENSION: u32 = 4096;
 const SUPPORTED_CRS: &[&str] = &["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:3067", "EPSG:3035"];
 
 /// Supported output formats.
-const SUPPORTED_FORMATS: &[&str] = &["image/png"];
+const SUPPORTED_FORMATS: &[&str] = &["image/png", "image/jpeg"];
 
 /// Raw WMS query parameters (case-insensitive keys handled by axum).
 #[derive(Debug, Deserialize)]
@@ -27,8 +27,12 @@ pub struct WmsQuery {
     pub version: Option<String>,
     #[serde(alias = "LAYERS", alias = "Layers")]
     pub layers: Option<String>,
+    #[serde(alias = "LAYER", alias = "Layer")]
+    pub layer: Option<String>,
     #[serde(alias = "STYLES", alias = "Styles")]
     pub styles: Option<String>,
+    #[serde(alias = "STYLE", alias = "Style")]
+    pub style: Option<String>,
     #[serde(alias = "CRS", alias = "Crs")]
     pub crs: Option<String>,
     #[serde(alias = "BBOX", alias = "Bbox")]
@@ -50,6 +54,7 @@ pub struct WmsQuery {
 /// Validated GetMap parameters.
 pub struct GetMapParams {
     pub layer: String,
+    pub style: String,
     pub crs: String,
     /// Bbox in WGS84 [west, south, east, north], normalized from CRS axis order.
     pub bbox: [f64; 4],
@@ -59,6 +64,8 @@ pub struct GetMapParams {
     pub time: Option<DateTime<Utc>>,
     /// Output CRS for pixel-to-coordinate mapping.
     pub output_crs: OutputCrs,
+    /// Output image format.
+    pub format: ds_render::ImageFormat,
 }
 
 impl WmsQuery {
@@ -72,6 +79,7 @@ impl WmsQuery {
         match request {
             "GetCapabilities" => Ok(WmsRequestType::GetCapabilities),
             "GetMap" => Ok(WmsRequestType::GetMap),
+            "GetLegendGraphic" => Ok(WmsRequestType::GetLegendGraphic),
             other => Err(WmsError::operation_not_supported(other)),
         }
     }
@@ -171,8 +179,26 @@ impl WmsQuery {
             _ => OutputCrs::Wgs84,
         };
 
+        // STYLES — empty string or missing = "default"
+        let style = self
+            .styles
+            .as_deref()
+            .or(self.style.as_deref())
+            .unwrap_or("");
+        let style = if style.is_empty() {
+            "default".to_string()
+        } else {
+            style.to_string()
+        };
+
+        let image_format = match format {
+            "image/jpeg" => ds_render::ImageFormat::Jpeg,
+            _ => ds_render::ImageFormat::Png,
+        };
+
         Ok(GetMapParams {
             layer,
+            style,
             crs,
             bbox,
             width,
@@ -180,6 +206,7 @@ impl WmsQuery {
             transparent,
             time,
             output_crs,
+            format: image_format,
         })
     }
 }
@@ -187,6 +214,7 @@ impl WmsQuery {
 pub enum WmsRequestType {
     GetCapabilities,
     GetMap,
+    GetLegendGraphic,
 }
 
 /// Parse BBOX string, handling WMS 1.3.0 axis order.

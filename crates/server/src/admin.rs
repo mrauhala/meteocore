@@ -133,7 +133,8 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
     let mut feature_collections: HashMap<String, CollectionConfig> = HashMap::new();
     let mut map_engines: HashMap<String, Arc<dyn ds_core::map_engine::MapEngine>> = HashMap::new();
     let mut map_collections: HashMap<String, CollectionConfig> = HashMap::new();
-    let mut map_colormaps: HashMap<String, Arc<dyn ds_render::ColorMap>> = HashMap::new();
+    let mut map_styles: HashMap<String, HashMap<String, api_wms::handlers::StyleInfo>> =
+        HashMap::new();
     let mut geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>> = Vec::new();
     let mut health: Vec<CollectionHealth> = Vec::new();
 
@@ -349,9 +350,9 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
 
-                    // Build colormap from config
-                    let colormap = build_colormap(collection);
-                    map_colormaps.insert(collection.id.clone(), colormap);
+                    // Build styles from config
+                    let styles = build_styles(collection);
+                    map_styles.insert(collection.id.clone(), styles);
 
                     info!("Collection '{}': wired to WMS API", collection.id);
                 }
@@ -414,7 +415,7 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
         wms_state: WmsState {
             engines: map_engines,
             collections: map_collections,
-            colormaps: map_colormaps,
+            styles: map_styles,
             render_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             rendered_cache: Arc::new(api_wms::handlers::RenderedCache::new(rendered_cache_mb)),
             base_url: base_url.to_string(),
@@ -424,42 +425,112 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
     }
 }
 
-/// Build a colormap for a WMS-enabled collection from its config.
-fn build_colormap(collection: &CollectionConfig) -> Arc<dyn ds_render::ColorMap> {
+/// Build all styles for a WMS-enabled collection from its config.
+fn build_styles(collection: &CollectionConfig) -> HashMap<String, api_wms::handlers::StyleInfo> {
+    let mut styles = HashMap::new();
+
+    // Build default style from top-level wms config
+    let (default_colormap, default_min, default_max) = build_colormap_from_wms_config(
+        collection.wms.as_ref().map(|w| w.colormap.as_str()),
+        collection
+            .wms
+            .as_ref()
+            .map(|w| &w.color_stops[..])
+            .unwrap_or(&[]),
+        collection.wms.as_ref().and_then(|w| w.min),
+        collection.wms.as_ref().and_then(|w| w.max),
+    );
+    styles.insert(
+        "default".to_string(),
+        api_wms::handlers::StyleInfo {
+            name: "default".to_string(),
+            title: "Default".to_string(),
+            colormap: default_colormap,
+            min: default_min,
+            max: default_max,
+        },
+    );
+
+    // Build additional named styles
     if let Some(wms_config) = &collection.wms {
-        // Custom color stops take priority
-        if !wms_config.color_stops.is_empty() {
-            let stops: Vec<ds_render::ColorStop> = wms_config
-                .color_stops
-                .iter()
-                .filter_map(|s| {
-                    ds_render::parse_hex_color(&s.color)
-                        .ok()
-                        .map(|c| ds_render::ColorStop {
-                            value: s.value,
-                            color: c,
-                        })
-                })
-                .collect();
-            if !stops.is_empty() {
-                return Arc::new(ds_render::LinearColorMap::new(stops));
-            }
-        }
-        // Fall back to built-in colormap name
-        if let Some(builtin) = ds_render::colormap::resolve_builtin(&wms_config.colormap) {
-            // Use the value range from the colormap's own stops
-            let stops = ds_render::colormap::builtin_stops(&builtin);
-            let min = stops.first().map(|s| s.value).unwrap_or(0.0);
-            let max = stops.last().map(|s| s.value).unwrap_or(1.0);
-            return Arc::new(ds_render::LutColorMap::from_builtin(builtin, min, max));
+        for style_config in &wms_config.styles {
+            let (colormap, min, max) = build_colormap_from_wms_config(
+                style_config.colormap.as_deref(),
+                &style_config.color_stops,
+                style_config.min,
+                style_config.max,
+            );
+            styles.insert(
+                style_config.name.clone(),
+                api_wms::handlers::StyleInfo {
+                    name: style_config.name.clone(),
+                    title: style_config
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| style_config.name.clone()),
+                    colormap,
+                    min,
+                    max,
+                },
+            );
         }
     }
+
+    styles
+}
+
+/// Build a colormap and value range from WMS config fields.
+fn build_colormap_from_wms_config(
+    colormap_name: Option<&str>,
+    color_stops: &[ds_core::config::ColorStop],
+    min_override: Option<f64>,
+    max_override: Option<f64>,
+) -> (Arc<dyn ds_render::ColorMap>, f64, f64) {
+    // Custom color stops take priority
+    if !color_stops.is_empty() {
+        let stops: Vec<ds_render::ColorStop> = color_stops
+            .iter()
+            .filter_map(|s| {
+                ds_render::parse_hex_color(&s.color)
+                    .ok()
+                    .map(|c| ds_render::ColorStop {
+                        value: s.value,
+                        color: c,
+                    })
+            })
+            .collect();
+        if !stops.is_empty() {
+            let min = min_override.unwrap_or_else(|| stops.first().map(|s| s.value).unwrap_or(0.0));
+            let max = max_override.unwrap_or_else(|| stops.last().map(|s| s.value).unwrap_or(1.0));
+            return (Arc::new(ds_render::LinearColorMap::new(stops)), min, max);
+        }
+    }
+
+    // Fall back to built-in colormap name
+    let name = colormap_name.unwrap_or("viridis");
+    if let Some(builtin) = ds_render::colormap::resolve_builtin(name) {
+        let stops = ds_render::colormap::builtin_stops(&builtin);
+        let min = min_override.unwrap_or_else(|| stops.first().map(|s| s.value).unwrap_or(0.0));
+        let max = max_override.unwrap_or_else(|| stops.last().map(|s| s.value).unwrap_or(1.0));
+        return (
+            Arc::new(ds_render::LutColorMap::from_builtin(builtin, min, max)),
+            min,
+            max,
+        );
+    }
+
     // Default: viridis 0..1
-    Arc::new(ds_render::LutColorMap::from_builtin(
-        ds_render::BuiltinColormap::Viridis,
-        0.0,
-        1.0,
-    ))
+    let min = min_override.unwrap_or(0.0);
+    let max = max_override.unwrap_or(1.0);
+    (
+        Arc::new(ds_render::LutColorMap::from_builtin(
+            ds_render::BuiltinColormap::Viridis,
+            min,
+            max,
+        )),
+        min,
+        max,
+    )
 }
 
 /// Update the health gauges from the current health vector.

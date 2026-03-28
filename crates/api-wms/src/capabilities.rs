@@ -1,9 +1,12 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use ds_core::config::CollectionConfig;
 use ds_core::map_engine::{MapEngine, RasterInfo};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
-use std::sync::Arc;
 
+use crate::handlers::StyleInfo;
 use crate::params;
 
 /// Generate WMS 1.3.0 GetCapabilities XML.
@@ -11,8 +14,9 @@ use crate::params;
 /// Uses quick-xml Writer to ensure all text content is properly escaped.
 /// Never builds XML via format!() or string concatenation (XML injection risk).
 pub fn get_capabilities_xml(
-    engines: &std::collections::HashMap<String, Arc<dyn MapEngine>>,
-    collections: &std::collections::HashMap<String, CollectionConfig>,
+    engines: &HashMap<String, Arc<dyn MapEngine>>,
+    collections: &HashMap<String, CollectionConfig>,
+    styles: &HashMap<String, HashMap<String, StyleInfo>>,
     base_url: &str,
 ) -> Vec<u8> {
     let mut writer = Writer::new(Vec::new());
@@ -46,7 +50,15 @@ pub fn get_capabilities_xml(
     // Individual layers (one per collection)
     for (id, config) in collections {
         if let Some(engine) = engines.get(id) {
-            write_layer(&mut writer, id, config, engine.raster_info());
+            let layer_styles = styles.get(id.as_str());
+            write_layer(
+                &mut writer,
+                id,
+                config,
+                engine.raster_info(),
+                layer_styles,
+                base_url,
+            );
         }
     }
 
@@ -81,8 +93,16 @@ fn write_request(writer: &mut Writer<Vec<u8>>, base_url: &str) {
     // GetMap
     let _ = writer.write_event(Event::Start(BytesStart::new("GetMap")));
     write_format(writer, "image/png");
+    write_format(writer, "image/jpeg");
     write_dcp_type(writer, base_url);
     let _ = writer.write_event(Event::End(BytesEnd::new("GetMap")));
+
+    // GetLegendGraphic
+    let _ = writer.write_event(Event::Start(BytesStart::new("GetLegendGraphic")));
+    write_format(writer, "image/png");
+    write_format(writer, "image/jpeg");
+    write_dcp_type(writer, base_url);
+    let _ = writer.write_event(Event::End(BytesEnd::new("GetLegendGraphic")));
 
     let _ = writer.write_event(Event::End(BytesEnd::new("Request")));
 }
@@ -113,6 +133,8 @@ fn write_layer(
     id: &str,
     config: &CollectionConfig,
     info: RasterInfo,
+    layer_styles: Option<&HashMap<String, StyleInfo>>,
+    base_url: &str,
 ) {
     let mut layer = BytesStart::new("Layer");
     layer.push_attribute(("queryable", "0"));
@@ -164,11 +186,48 @@ fn write_layer(
         let _ = writer.write_event(Event::End(BytesEnd::new("Dimension")));
     }
 
-    // Default style
-    let _ = writer.write_event(Event::Start(BytesStart::new("Style")));
-    write_text_element(writer, "Name", "default");
-    write_text_element(writer, "Title", "Default");
-    let _ = writer.write_event(Event::End(BytesEnd::new("Style")));
+    // Styles
+    if let Some(styles) = layer_styles {
+        // Sort to ensure "default" comes first
+        let mut style_names: Vec<&String> = styles.keys().collect();
+        style_names.sort_by(|a, b| {
+            if a.as_str() == "default" {
+                std::cmp::Ordering::Less
+            } else if b.as_str() == "default" {
+                std::cmp::Ordering::Greater
+            } else {
+                a.cmp(b)
+            }
+        });
+        for name in style_names {
+            if let Some(style) = styles.get(name) {
+                let _ = writer.write_event(Event::Start(BytesStart::new("Style")));
+                write_text_element(writer, "Name", &style.name);
+                write_text_element(writer, "Title", &style.title);
+
+                // LegendURL
+                let _ = writer.write_event(Event::Start(BytesStart::new("LegendURL")));
+                let legend_url = format!(
+                    "{base_url}/wms?SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER={id}&STYLE={}&FORMAT=image/png",
+                    style.name
+                );
+                let mut or = BytesStart::new("OnlineResource");
+                or.push_attribute(("xmlns:xlink", "http://www.w3.org/1999/xlink"));
+                or.push_attribute(("xlink:type", "simple"));
+                or.push_attribute(("xlink:href", legend_url.as_str()));
+                let _ = writer.write_event(Event::Empty(or));
+                let _ = writer.write_event(Event::End(BytesEnd::new("LegendURL")));
+
+                let _ = writer.write_event(Event::End(BytesEnd::new("Style")));
+            }
+        }
+    } else {
+        // Fallback if no styles configured
+        let _ = writer.write_event(Event::Start(BytesStart::new("Style")));
+        write_text_element(writer, "Name", "default");
+        write_text_element(writer, "Title", "Default");
+        let _ = writer.write_event(Event::End(BytesEnd::new("Style")));
+    }
 
     let _ = writer.write_event(Event::End(BytesEnd::new("Layer")));
 }

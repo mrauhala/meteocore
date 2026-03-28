@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -20,11 +20,22 @@ use crate::params::{WmsQuery, WmsRequestType};
 /// How long rendered tiles stay valid in the cache.
 const CACHE_TTL_SECS: u64 = 300; // 5 minutes
 
+/// A named style with its colormap and value range.
+#[derive(Clone)]
+pub struct StyleInfo {
+    pub name: String,
+    pub title: String,
+    pub colormap: Arc<dyn ColorMap>,
+    pub min: f64,
+    pub max: f64,
+}
+
 #[derive(Clone)]
 pub struct WmsState {
     pub engines: HashMap<String, Arc<dyn MapEngine>>,
     pub collections: HashMap<String, CollectionConfig>,
-    pub colormaps: HashMap<String, Arc<dyn ColorMap>>,
+    /// Map of layer → style name → StyleInfo. Every layer has at least "default".
+    pub styles: HashMap<String, HashMap<String, StyleInfo>>,
     pub render_semaphore: Arc<tokio::sync::Semaphore>,
     pub rendered_cache: Arc<RenderedCache>,
     pub base_url: String,
@@ -45,38 +56,16 @@ struct CacheEntry {
     created: Instant,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CacheKey {
     layer: String,
+    style: String,
+    format: u8, // 0=png, 1=jpeg
     crs: String,
     bbox: [i64; 4], // bbox quantized to microdegrees (6 decimal places)
     width: u32,
     height: u32,
     time: Option<DateTime<Utc>>,
-}
-
-impl PartialEq for CacheKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.layer == other.layer
-            && self.crs == other.crs
-            && self.bbox == other.bbox
-            && self.width == other.width
-            && self.height == other.height
-            && self.time == other.time
-    }
-}
-
-impl Eq for CacheKey {}
-
-impl Hash for CacheKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.layer.hash(state);
-        self.crs.hash(state);
-        self.bbox.hash(state);
-        self.width.hash(state);
-        self.height.hash(state);
-        self.time.hash(state);
-    }
 }
 
 impl RenderedCache {
@@ -145,6 +134,7 @@ pub async fn wms_handler(
             let xml = crate::capabilities::get_capabilities_xml(
                 &state.engines,
                 &state.collections,
+                &state.styles,
                 &state.base_url,
             );
             Ok((
@@ -168,21 +158,32 @@ pub async fn wms_handler(
                 .get(&params.layer)
                 .ok_or_else(|| WmsError::layer_not_found(&params.layer))?;
 
-            // Look up colormap
-            let colormap = state
-                .colormaps
+            // Look up style
+            let layer_styles = state
+                .styles
                 .get(&params.layer)
-                .ok_or_else(|| {
-                    WmsError::Internal(format!(
-                        "No colormap configured for layer '{}'",
-                        params.layer
-                    ))
-                })?
-                .clone();
+                .ok_or_else(|| WmsError::layer_not_found(&params.layer))?;
+
+            let style_info = layer_styles.get(&params.style).ok_or_else(|| {
+                WmsError::StyleNotDefined(format!(
+                    "Style '{}' not defined for layer '{}'. Available: {}",
+                    params.style,
+                    params.layer,
+                    layer_styles.keys().cloned().collect::<Vec<_>>().join(", ")
+                ))
+            })?;
+
+            let colormap = style_info.colormap.clone();
+            let content_type = params.format.content_type();
 
             // Check rendered cache
             let cache_key = CacheKey {
                 layer: params.layer.clone(),
+                style: params.style.clone(),
+                format: match params.format {
+                    ds_render::ImageFormat::Png => 0,
+                    ds_render::ImageFormat::Jpeg => 1,
+                },
                 crs: params.crs.clone(),
                 bbox: quantize_bbox(&params.bbox),
                 width: params.width,
@@ -193,7 +194,7 @@ pub async fn wms_handler(
             if let Some(cached) = state.rendered_cache.get(&cache_key) {
                 return Ok((
                     [
-                        (header::CONTENT_TYPE, "image/png"),
+                        (header::CONTENT_TYPE, content_type),
                         (
                             header::HeaderName::from_static("x-content-type-options"),
                             "nosniff",
@@ -217,40 +218,106 @@ pub async fn wms_handler(
             let height = params.height;
             let time = params.time;
             let output_crs = params.output_crs;
+            let format = params.format;
             let rendered_cache = state.rendered_cache.clone();
 
             let render_result = tokio::task::spawn_blocking(move || {
                 let tile = engine.get_raster_tile(bbox, width, height, time, &output_crs)?;
-                ds_render::render_tile_png(&tile, colormap.as_ref())
+                ds_render::render_tile(&tile, colormap.as_ref(), format)
             })
             .await
             .map_err(|e| WmsError::Internal(format!("Render task failed: {e}")))?;
 
-            let (png_bytes, cacheable) = match render_result {
+            let (image_bytes, cacheable) = match render_result {
                 Ok(bytes) => (bytes, true),
                 Err(e) => {
                     tracing::warn!("WMS render error for layer '{}': {e}", params.layer);
-                    // Return a semi-transparent red error tile so the client
-                    // can see which areas failed instead of silent white gaps.
                     (render_error_tile(params.width, params.height)?, false)
                 }
             };
 
-            let png_arc = Arc::new(png_bytes);
+            let image_arc = Arc::new(image_bytes);
             if cacheable {
-                rendered_cache.insert(cache_key, png_arc.clone());
+                rendered_cache.insert(cache_key, image_arc.clone());
             }
 
             Ok((
                 [
-                    (header::CONTENT_TYPE, "image/png"),
+                    (header::CONTENT_TYPE, content_type),
                     (
                         header::HeaderName::from_static("x-content-type-options"),
                         "nosniff",
                     ),
                     (header::HeaderName::from_static("x-cache"), "MISS"),
                 ],
-                png_arc.as_ref().clone(),
+                image_arc.as_ref().clone(),
+            )
+                .into_response())
+        }
+        WmsRequestType::GetLegendGraphic => {
+            let layer_name = query
+                .layers
+                .as_deref()
+                .or(query.layer.as_deref())
+                .ok_or(WmsError::missing_parameter("LAYER"))?;
+
+            let style_name = query.styles.as_deref().unwrap_or("default");
+            let style_name = if style_name.is_empty() {
+                "default"
+            } else {
+                style_name
+            };
+
+            let layer_styles = state
+                .styles
+                .get(layer_name)
+                .ok_or_else(|| WmsError::layer_not_found(layer_name))?;
+
+            let style_info = layer_styles.get(style_name).ok_or_else(|| {
+                WmsError::StyleNotDefined(format!(
+                    "Style '{style_name}' not defined for layer '{layer_name}'"
+                ))
+            })?;
+
+            let width: u32 = query
+                .width
+                .as_deref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(40);
+            let height: u32 = query
+                .height
+                .as_deref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(200);
+            let width = width.min(256);
+            let height = height.min(1024);
+
+            let format = match query.format.as_deref() {
+                Some("image/jpeg") => ds_render::ImageFormat::Jpeg,
+                _ => ds_render::ImageFormat::Png,
+            };
+
+            let colormap = style_info.colormap.clone();
+            let min = style_info.min;
+            let max = style_info.max;
+
+            let legend_bytes = tokio::task::spawn_blocking(move || {
+                ds_render::render_legend(colormap.as_ref(), min, max, width, height, format)
+            })
+            .await
+            .map_err(|e| WmsError::Internal(format!("Legend render failed: {e}")))?
+            .map_err(|e| WmsError::Internal(format!("Legend render error: {e}")))?;
+
+            Ok((
+                [
+                    (header::CONTENT_TYPE, format.content_type()),
+                    (
+                        header::HeaderName::from_static("x-content-type-options"),
+                        "nosniff",
+                    ),
+                    (header::HeaderName::from_static("x-cache"), "MISS"),
+                ],
+                legend_bytes,
             )
                 .into_response())
         }

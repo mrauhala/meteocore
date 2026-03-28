@@ -42,6 +42,20 @@ poll_interval_secs = 30
 [collections.wms]
 colormap = "radar_dbz"
 
+[[collections.wms.styles]]
+name = "grayscale"
+title = "Grayscale"
+colormap = "grayscale"
+min = 0.0
+max = 70.0
+
+[[collections.wms.styles]]
+name = "viridis"
+title = "Viridis"
+colormap = "viridis"
+min = 0.0
+max = 70.0
+
 [[collections]]
 id = "radar-norway"
 title = "MET Norway Radar (native LCC projection)"
