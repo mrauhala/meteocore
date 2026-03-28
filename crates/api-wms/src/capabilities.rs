@@ -73,11 +73,7 @@ fn write_service(writer: &mut Writer<Vec<u8>>) {
     let _ = writer.write_event(Event::Start(BytesStart::new("Service")));
     write_text_element(writer, "Name", "WMS");
     write_text_element(writer, "Title", "MeteoCore - WMS");
-    write_text_element(
-        writer,
-        "Abstract",
-        "Metocean Data Server — OGC WMS 1.3.0",
-    );
+    write_text_element(writer, "Abstract", "Metocean Data Server — OGC WMS 1.3.0");
     let _ = writer.write_event(Event::End(BytesEnd::new("Service")));
 }
 
