@@ -10,13 +10,55 @@ use crate::reader::{DataSource, TiffMetadata};
 /// Maximum filename length to prevent abuse.
 const MAX_FILENAME_LENGTH: usize = 255;
 
+/// Lightweight stub for STAC entries that haven't had their GeoTIFF metadata loaded yet.
+#[derive(Debug, Clone)]
+pub struct StacStub {
+    pub bbox: Option<[f64; 4]>,
+    pub asset_url: String,
+}
+
 /// An entry in the file catalog: one GeoTIFF file with a parsed timestamp.
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub path: PathBuf,
-    pub source: DataSource,
-    pub metadata: TiffMetadata,
+    pub source: Option<DataSource>,
+    pub metadata: Option<TiffMetadata>,
     pub file_size: u64,
+    pub stac_stub: Option<StacStub>,
+}
+
+impl FileEntry {
+    /// Create a fully loaded entry (local or remote scan).
+    pub fn loaded(
+        path: PathBuf,
+        source: DataSource,
+        metadata: TiffMetadata,
+        file_size: u64,
+    ) -> Self {
+        Self {
+            path,
+            source: Some(source),
+            metadata: Some(metadata),
+            file_size,
+            stac_stub: None,
+        }
+    }
+
+    /// Create a stub entry from STAC metadata (no GeoTIFF data loaded yet).
+    pub fn stac_stub(path: PathBuf, file_size: u64, stub: StacStub) -> Self {
+        Self {
+            path,
+            source: None,
+            metadata: None,
+            file_size,
+            stac_stub: Some(stub),
+        }
+    }
+
+    /// Whether this entry has full GeoTIFF metadata loaded.
+    pub fn is_loaded(&self) -> bool {
+        self.metadata.is_some()
+    }
 }
 
 /// Immutable snapshot of discovered GeoTIFF files, sorted by timestamp.
@@ -63,7 +105,17 @@ impl Catalog {
 fn compute_spatial_union<'a>(entries: impl Iterator<Item = &'a FileEntry>) -> Option<[f64; 4]> {
     let mut result: Option<[f64; 4]> = None;
     for entry in entries {
-        let bbox = entry.metadata.geo_transform.bbox();
+        let bbox = if let Some(meta) = &entry.metadata {
+            meta.geo_transform.bbox()
+        } else if let Some(stub) = &entry.stac_stub {
+            if let Some(b) = stub.bbox {
+                b
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        };
         result = Some(match result {
             None => bbox,
             Some([w, s, e, n]) => [
@@ -204,7 +256,16 @@ pub fn scan_directory(
         // Reuse cached metadata if file size unchanged
         let metadata = if let Some(entry) = existing_entry {
             if entry.file_size == file_size {
-                entry.metadata.clone()
+                match entry.metadata.clone() {
+                    Some(m) => m,
+                    None => match TiffMetadata::from_file(&path) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::warn!("Skipping {}: {e}", path.display());
+                            continue;
+                        }
+                    },
+                }
             } else {
                 match TiffMetadata::from_file(&path) {
                     Ok(m) => m,
@@ -241,12 +302,7 @@ pub fn scan_directory(
         let source = DataSource::from_path(&path);
         entries.insert(
             datetime,
-            FileEntry {
-                path,
-                source,
-                metadata,
-                file_size,
-            },
+            FileEntry::loaded(path, source, metadata, file_size),
         );
     }
 
@@ -289,7 +345,7 @@ fn is_excluded(filename: &str, patterns: &[String]) -> bool {
 }
 
 /// Maximum file size for remote downloads (50 MB).
-const MAX_REMOTE_FILE_SIZE: usize = 50 * 1024 * 1024;
+pub(crate) const MAX_REMOTE_FILE_SIZE: usize = 50 * 1024 * 1024;
 
 /// Scan a remote object store for GeoTIFF files matching a filename pattern.
 ///
@@ -411,12 +467,7 @@ pub fn scan_remote_with_limit(
             };
             entries.insert(
                 *datetime,
-                FileEntry {
-                    path: pseudo_path,
-                    source,
-                    metadata,
-                    file_size: *file_size,
-                },
+                FileEntry::loaded(pseudo_path, source, metadata, *file_size),
             );
             continue;
         }
@@ -447,12 +498,7 @@ pub fn scan_remote_with_limit(
 
         entries.insert(
             *datetime,
-            FileEntry {
-                path: pseudo_path,
-                source,
-                metadata,
-                file_size: *file_size,
-            },
+            FileEntry::loaded(pseudo_path, source, metadata, *file_size),
         );
     }
 
@@ -470,9 +516,158 @@ pub fn scan_remote_with_limit(
     })
 }
 
+/// Create a catalog seeded from STAC collection extent — no items fetched.
+///
+/// This is called at engine startup. The catalog has no entries but carries
+/// the spatial and temporal extent from the STAC collection metadata.
+/// Items are fetched on-demand when queries arrive.
+pub fn init_stac_from_extent(extent: &crate::stac::StacExtent) -> Catalog {
+    let temporal_extent = extent.temporal_start.map(|start| {
+        let end = extent.temporal_end.unwrap_or_else(Utc::now);
+        (start, end)
+    });
+
+    Catalog {
+        entries: BTreeMap::new(),
+        temporal_extent,
+        spatial_extent: extent.spatial_bbox,
+    }
+}
+
+/// Fetch STAC items for a specific datetime range and merge into the catalog.
+///
+/// Called on-demand from query path when entries are needed for a time range.
+/// Creates lightweight stub entries — no GeoTIFF downloads.
+/// Existing entries (both stubs and loaded) are preserved.
+pub fn fetch_stac_range(
+    client: &crate::stac::StacClient,
+    existing_catalog: &Catalog,
+    time_range: (chrono::DateTime<Utc>, chrono::DateTime<Utc>),
+    collection_id: &str,
+) -> Result<Catalog, DataServerError> {
+    let items = client.fetch_items(Some(time_range), None)?;
+
+    tracing::info!(
+        "[{}] STAC: fetched {} items for range {}/{}",
+        collection_id,
+        items.len(),
+        time_range.0.format("%Y-%m-%dT%H:%MZ"),
+        time_range.1.format("%Y-%m-%dT%H:%MZ"),
+    );
+
+    // Start with existing entries
+    let mut entries = existing_catalog.entries.clone();
+
+    for item in &items {
+        // Skip if we already have this timestamp
+        if entries.contains_key(&item.datetime) {
+            continue;
+        }
+
+        let pseudo_path = PathBuf::from(&item.asset_url);
+        let file_size = item.file_size.unwrap_or(0);
+
+        entries.insert(
+            item.datetime,
+            FileEntry::stac_stub(
+                pseudo_path,
+                file_size,
+                StacStub {
+                    bbox: item.bbox,
+                    asset_url: item.asset_url.clone(),
+                },
+            ),
+        );
+    }
+
+    let temporal_extent = existing_catalog.temporal_extent;
+    let spatial_extent = existing_catalog.spatial_extent;
+
+    Ok(Catalog {
+        entries,
+        temporal_extent,
+        spatial_extent,
+    })
+}
+
+/// Poll STAC for new items since the latest catalog entry.
+///
+/// Used by the poll loop to pick up newly published data.
+/// Only fetches items newer than the most recent existing entry.
+pub fn poll_stac_latest(
+    client: &crate::stac::StacClient,
+    existing_catalog: &Catalog,
+    collection_id: &str,
+) -> Result<Catalog, DataServerError> {
+    // Refresh extent (temporal end may have advanced)
+    let extent = client.fetch_extent().unwrap_or_else(|e| {
+        tracing::warn!("[{}] STAC extent refresh failed: {}", collection_id, e);
+        crate::stac::StacExtent {
+            spatial_bbox: existing_catalog.spatial_extent,
+            temporal_start: existing_catalog.temporal_extent.map(|(s, _)| s),
+            temporal_end: None,
+        }
+    });
+
+    // Fetch items newer than our latest entry
+    let since = existing_catalog
+        .entries
+        .keys()
+        .next_back()
+        .map(|latest| *latest + chrono::Duration::seconds(1))
+        .unwrap_or_else(|| Utc::now() - chrono::Duration::hours(1));
+
+    let items = client.fetch_items(Some((since, Utc::now())), None)?;
+
+    let new_count = items.len();
+    if new_count > 0 {
+        tracing::info!(
+            "[{}] STAC poll: {} new items (total: {})",
+            collection_id,
+            new_count,
+            existing_catalog.entries.len() + new_count
+        );
+    }
+
+    let mut entries = existing_catalog.entries.clone();
+
+    for item in &items {
+        if entries.contains_key(&item.datetime) {
+            continue;
+        }
+        let pseudo_path = PathBuf::from(&item.asset_url);
+        let file_size = item.file_size.unwrap_or(0);
+        entries.insert(
+            item.datetime,
+            FileEntry::stac_stub(
+                pseudo_path,
+                file_size,
+                StacStub {
+                    bbox: item.bbox,
+                    asset_url: item.asset_url.clone(),
+                },
+            ),
+        );
+    }
+
+    // Update temporal extent from collection metadata
+    let temporal_extent = extent.temporal_start.map(|start| {
+        let end = extent.temporal_end.unwrap_or_else(Utc::now);
+        (start, end)
+    });
+
+    Ok(Catalog {
+        entries,
+        temporal_extent,
+        spatial_extent: extent.spatial_bbox.or(existing_catalog.spatial_extent),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geo::{Crs, GeoTransform};
+    use crate::reader::{DataSource, TiffMetadata};
 
     #[test]
     fn exclude_patterns() {
@@ -483,5 +678,82 @@ mod tests {
             "radar_20240101T0000Z.tif",
             &["*.tmp".into(), "*.part".into()]
         ));
+    }
+
+    fn dummy_metadata() -> TiffMetadata {
+        TiffMetadata {
+            width: 100,
+            height: 100,
+            tile_width: 256,
+            tile_height: 256,
+            tiles_across: 1,
+            tiles_down: 1,
+            samples_per_pixel: 1,
+            geo_transform: GeoTransform {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                pixel_width: 0.01,
+                pixel_height: -0.01,
+                width: 100,
+                height: 100,
+                crs: Crs::Wgs84,
+            },
+            nodata: None,
+            scale: None,
+            offset: None,
+            overviews: vec![],
+        }
+    }
+
+    #[test]
+    fn file_entry_loaded_constructor() {
+        let path = PathBuf::from("/tmp/test.tif");
+        let source = DataSource::from_path(&path);
+        let metadata = dummy_metadata();
+        let entry = FileEntry::loaded(path.clone(), source, metadata, 1024);
+
+        assert!(entry.metadata.is_some());
+        assert!(entry.source.is_some());
+        assert!(entry.stac_stub.is_none());
+        assert_eq!(entry.file_size, 1024);
+        assert_eq!(entry.path, path);
+    }
+
+    #[test]
+    fn file_entry_stac_stub_constructor() {
+        let path = PathBuf::from("https://example.com/radar/file.tif");
+        let stub = StacStub {
+            bbox: Some([10.0, 55.0, 30.0, 72.0]),
+            asset_url: "https://example.com/radar/file.tif".to_string(),
+        };
+        let entry = FileEntry::stac_stub(path.clone(), 2048, stub);
+
+        assert!(entry.metadata.is_none());
+        assert!(entry.source.is_none());
+        assert!(entry.stac_stub.is_some());
+        assert_eq!(entry.file_size, 2048);
+        assert_eq!(entry.path, path);
+        let stub = entry.stac_stub.unwrap();
+        assert_eq!(stub.bbox, Some([10.0, 55.0, 30.0, 72.0]));
+        assert_eq!(stub.asset_url, "https://example.com/radar/file.tif");
+    }
+
+    #[test]
+    fn file_entry_is_loaded() {
+        // A loaded entry should return true
+        let path = PathBuf::from("/tmp/test.tif");
+        let source = DataSource::from_path(&path);
+        let metadata = dummy_metadata();
+        let loaded = FileEntry::loaded(path, source, metadata, 1024);
+        assert!(loaded.is_loaded());
+
+        // A stub entry should return false
+        let stub_path = PathBuf::from("https://example.com/file.tif");
+        let stub = StacStub {
+            bbox: None,
+            asset_url: "https://example.com/file.tif".to_string(),
+        };
+        let unloaded = FileEntry::stac_stub(stub_path, 0, stub);
+        assert!(!unloaded.is_loaded());
     }
 }

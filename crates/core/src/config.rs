@@ -151,6 +151,16 @@ pub struct GeoTiffConfig {
     /// Override offset. Takes precedence over the file's GDAL_METADATA OFFSET.
     pub offset: Option<f64>,
 
+    /// STAC API items endpoint URL. Mutually exclusive with `data_path` and
+    /// `endpoint+bucket`. E.g. `"https://api.example.com/collections/radar/items"`
+    pub stac_url: Option<String>,
+    /// Asset key to extract from STAC items. Default: "data".
+    #[serde(default = "default_stac_asset_key")]
+    pub stac_asset_key: String,
+    /// Required SSRF protection: list of allowed URL prefixes for asset URLs.
+    /// E.g. `["https://thredds.met.no/"]`. Required when `stac_url` is set.
+    pub stac_asset_allowlist: Option<Vec<String>>,
+
     /// S3-compatible endpoint URL. When set with `bucket`, replaces `data_path`
     /// for remote access. E.g. `"https://s3.waw3-1.cloudferro.com"`
     pub endpoint: Option<String>,
@@ -169,6 +179,10 @@ pub struct GeoTiffConfig {
     /// Number of days to scan when prefix_pattern contains date templates.
     /// Default: auto-derived from time_window. Override if needed.
     pub scan_days: Option<u32>,
+}
+
+fn default_stac_asset_key() -> String {
+    "data".to_string()
 }
 
 fn default_tile_cache_mb() -> u64 {
