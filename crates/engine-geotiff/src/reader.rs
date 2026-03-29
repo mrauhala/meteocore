@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
 use ds_core::error::DataServerError;
@@ -9,6 +9,21 @@ use tiff::decoder::{Decoder, DecodingResult};
 use tiff::tags::Tag;
 
 use crate::geo::{Crs, GeoTransform};
+
+/// Bridge async to sync for standalone functions.
+/// Uses `block_in_place` when inside a tokio runtime, or creates a temporary runtime otherwise.
+fn block_on_async<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+        Err(_) => {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(future)
+        }
+    }
+}
 
 /// Security limits
 const MAX_RASTER_DIMENSION: u32 = 100_000;
@@ -78,6 +93,13 @@ pub enum DataSource {
         path: ds_storage::object_store::path::Path,
         tile_info: RemoteTileInfo,
     },
+    /// Remote file accessed via raw HTTP range reads (reqwest).
+    /// Used for STAC assets where object_store URL-encodes path components.
+    HttpDirect {
+        url: String,
+        http: Arc<reqwest::Client>,
+        tile_info: RemoteTileInfo,
+    },
 }
 
 impl DataSource {
@@ -108,9 +130,11 @@ impl DataSource {
                     |e| DataServerError::GeoTiff(format!("Invalid TIFF (in-memory): {e}")),
                 )?))
             }
-            DataSource::Remote { .. } => Err(DataServerError::GeoTiff(
-                "Cannot open decoder for Remote source; use range reads".into(),
-            )),
+            DataSource::Remote { .. } | DataSource::HttpDirect { .. } => {
+                Err(DataServerError::GeoTiff(
+                    "Cannot open decoder for remote source; use range reads".into(),
+                ))
+            }
         }
     }
 
@@ -119,6 +143,7 @@ impl DataSource {
             DataSource::LocalFile(p) => p.display().to_string(),
             DataSource::InMemory(_) => "<in-memory>".to_string(),
             DataSource::Remote { path, .. } => format!("<remote:{}>", path),
+            DataSource::HttpDirect { url, .. } => format!("<http:{}>", url),
         }
     }
 }
@@ -373,6 +398,43 @@ impl TiffMetadata {
 
         let tile_info = extract_tile_info(&mut decoder, &metadata)?;
 
+        Some((metadata, tile_info))
+    }
+
+    /// Parse metadata from a partial HTTP header read (COG range read via reqwest).
+    ///
+    /// Similar to `from_header_read` but uses a raw reqwest HTTP client instead
+    /// of object_store. Used for STAC assets where object_store URL-encodes path
+    /// components, breaking servers like Ceph RGW.
+    ///
+    /// Returns `None` if parsing fails (caller should fall back to full download).
+    pub fn from_http_header_read(
+        http: &reqwest::Client,
+        url: &str,
+        file_size: u64,
+    ) -> Option<(Self, RemoteTileInfo)> {
+        let read_size = HEADER_READ_SIZE.min(file_size as usize);
+        if read_size == 0 {
+            return None;
+        }
+        let range_header = format!("bytes=0-{}", read_size - 1);
+        let url_owned = url.to_string();
+        let header_bytes = block_on_async(async {
+            let resp = http
+                .get(&url_owned)
+                .header(reqwest::header::RANGE, &range_header)
+                .send()
+                .await
+                .ok()?;
+            if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                return None;
+            }
+            resp.bytes().await.ok()
+        })?;
+        let cursor = Cursor::new(header_bytes.to_vec());
+        let mut decoder = DecoderWrapper::Memory(Decoder::new(cursor).ok()?);
+        let metadata = Self::from_decoder_wrapper(&mut decoder, format!("<http:{}>", url)).ok()?;
+        let tile_info = extract_tile_info(&mut decoder, &metadata)?;
         Some((metadata, tile_info))
     }
 
@@ -983,6 +1045,125 @@ fn read_remote_chunk_f64(
     decode_raw_tile_f64(&raw, tile_info, metadata, band_index)
 }
 
+/// Fetch a byte range from an HTTP URL using reqwest.
+fn read_http_range(
+    http: &reqwest::Client,
+    url: &str,
+    range: std::ops::Range<usize>,
+) -> Result<Bytes, DataServerError> {
+    let range_header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
+    let url_owned = url.to_string();
+    block_on_async(async {
+        let resp = http
+            .get(&url_owned)
+            .header(reqwest::header::RANGE, &range_header)
+            .send()
+            .await
+            .map_err(|e| DataServerError::GeoTiff(format!("HTTP range read failed: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(DataServerError::GeoTiff(format!(
+                "HTTP range read returned {}",
+                resp.status()
+            )));
+        }
+        resp.bytes()
+            .await
+            .map_err(|e| DataServerError::GeoTiff(format!("Failed to read body: {e}")))
+    })
+}
+
+/// Read and decode a tile from an HTTP source via byte-range read (reqwest).
+/// Mirrors `read_remote_chunk_f64` but uses `read_http_range` instead of object_store.
+#[allow(clippy::too_many_arguments)]
+fn read_http_chunk_f64(
+    http: &reqwest::Client,
+    url: &str,
+    tile_info: &RemoteTileInfo,
+    metadata: &TiffMetadata,
+    chunk_index: u32,
+    cache: Option<&crate::cache::TileCache>,
+    file_path: &Path,
+    band_index: usize,
+    ifd_index: u16,
+) -> Result<Vec<Option<f64>>, DataServerError> {
+    let idx = chunk_index as usize;
+    if idx >= tile_info.tile_offsets.len() {
+        return Err(DataServerError::GeoTiff(format!(
+            "Tile index {} out of range ({})",
+            idx,
+            tile_info.tile_offsets.len()
+        )));
+    }
+
+    let offset = tile_info.tile_offsets[idx] as usize;
+    let byte_count = tile_info.tile_byte_counts[idx] as usize;
+
+    if byte_count == 0 {
+        tracing::trace!(
+            "Tile {} has byte_count=0 (offset={}), returning nodata",
+            idx,
+            offset
+        );
+        let pixel_count = (tile_info.tile_width * tile_info.tile_height) as usize;
+        return Ok(vec![None; pixel_count]);
+    }
+
+    if offset == 0 && idx > 0 {
+        tracing::warn!(
+            "Tile {} has offset=0 (suspicious for non-first tile, possible truncated header)",
+            idx
+        );
+    }
+
+    let end = offset.checked_add(byte_count).ok_or_else(|| {
+        DataServerError::GeoTiff(format!(
+            "Tile {} byte range overflow: offset={} + count={}",
+            idx, offset, byte_count
+        ))
+    })?;
+
+    let compressed = if let Some(c) = cache {
+        if let Some(cached) = c.get(file_path, chunk_index, ifd_index) {
+            cached
+        } else {
+            let fetched = read_http_range(http, url, offset..end)?;
+            if fetched.len() != byte_count {
+                return Err(DataServerError::GeoTiff(format!(
+                    "Tile {} truncated: requested {} bytes, got {}",
+                    idx,
+                    byte_count,
+                    fetched.len()
+                )));
+            }
+            c.insert(file_path, chunk_index, ifd_index, fetched.clone());
+            fetched
+        }
+    } else {
+        let fetched = read_http_range(http, url, offset..end)?;
+        if fetched.len() != byte_count {
+            return Err(DataServerError::GeoTiff(format!(
+                "Tile {} truncated: requested {} bytes, got {}",
+                idx,
+                byte_count,
+                fetched.len()
+            )));
+        }
+        fetched
+    };
+
+    let mut raw = decompress_tile(&compressed, tile_info.compression)?;
+
+    if tile_info.predictor == 2 {
+        undo_horizontal_predictor(
+            &mut raw,
+            tile_info.tile_width,
+            tile_info.sample_type.bytes_per_sample(),
+        );
+    }
+
+    decode_raw_tile_f64(&raw, tile_info, metadata, band_index)
+}
+
 /// Read a single pixel value from a GeoTIFF at a given pixel coordinate.
 /// For remote sources, `cache` enables compressed tile caching and `file_path`
 /// identifies the file in the cache.
@@ -1012,6 +1193,21 @@ pub fn read_pixel(
         } => read_remote_chunk_f64(
             store,
             path,
+            tile_info,
+            metadata,
+            chunk_index,
+            cache,
+            file_path,
+            band_index,
+            0, // full resolution IFD
+        )?,
+        DataSource::HttpDirect {
+            url,
+            http,
+            tile_info,
+        } => read_http_chunk_f64(
+            http,
+            url,
             tile_info,
             metadata,
             chunk_index,
@@ -1102,6 +1298,40 @@ pub fn read_bbox_overview(
         return read_bbox_parallel(
             store,
             path,
+            ov_tile_info,
+            &ov_metadata,
+            col_start,
+            row_start,
+            col_end,
+            row_end,
+            tile_col_start,
+            tile_col_end,
+            tile_row_start,
+            tile_row_end,
+            cache,
+            file_path,
+            band_index,
+            nx,
+            total_pixels,
+            overview.ifd_index as u16,
+        );
+    }
+
+    if let DataSource::HttpDirect {
+        url,
+        http,
+        tile_info: _,
+    } = source
+    {
+        let ov_tile_info = overview.tile_info.as_ref().ok_or_else(|| {
+            DataServerError::GeoTiff(format!(
+                "Overview IFD {} has no tile info for remote source (header too small?)",
+                overview.ifd_index
+            ))
+        })?;
+        return read_bbox_parallel_http(
+            http,
+            url,
             ov_tile_info,
             &ov_metadata,
             col_start,
@@ -1285,6 +1515,34 @@ fn read_bbox_inner(
         );
     }
 
+    if let DataSource::HttpDirect {
+        url,
+        http,
+        tile_info,
+    } = source
+    {
+        return read_bbox_parallel_http(
+            http,
+            url,
+            tile_info,
+            metadata,
+            col_start,
+            row_start,
+            col_end,
+            row_end,
+            tile_col_start,
+            tile_col_end,
+            tile_row_start,
+            tile_row_end,
+            cache,
+            file_path,
+            band_index,
+            nx,
+            total_pixels,
+            0, // full resolution IFD
+        );
+    }
+
     // Non-remote: sequential path (decoder is not thread-safe)
     let mut decoder = source.open_decoder()?;
     let mut result = vec![None; total_pixels];
@@ -1417,6 +1675,130 @@ fn read_bbox_parallel(
     });
 
     // Assemble the result grid
+    let mut result = vec![None; total_pixels];
+    for (tile_row, tile_col, tile_data) in &tile_results {
+        copy_tile_to_result(
+            tile_data,
+            &mut result,
+            *tile_col,
+            *tile_row,
+            metadata,
+            col_start,
+            row_start,
+            col_end,
+            row_end,
+            nx,
+        );
+    }
+
+    Ok(result)
+}
+
+/// Parallel tile fetching for HTTP direct data sources (reqwest).
+/// Mirrors `read_bbox_parallel` but uses `read_http_chunk_f64` instead of `read_remote_chunk_f64`.
+#[allow(clippy::too_many_arguments)]
+fn read_bbox_parallel_http(
+    http: &Arc<reqwest::Client>,
+    url: &str,
+    tile_info: &RemoteTileInfo,
+    metadata: &TiffMetadata,
+    col_start: u32,
+    row_start: u32,
+    col_end: u32,
+    row_end: u32,
+    tile_col_start: u32,
+    tile_col_end: u32,
+    tile_row_start: u32,
+    tile_row_end: u32,
+    cache: Option<&crate::cache::TileCache>,
+    file_path: &Path,
+    band_index: usize,
+    nx: usize,
+    total_pixels: usize,
+    ifd_index: u16,
+) -> Result<Vec<Option<f64>>, DataServerError> {
+    use rayon::prelude::*;
+
+    let tile_coords: Vec<(u32, u32)> = (tile_row_start..tile_row_end)
+        .flat_map(|tr| (tile_col_start..tile_col_end).map(move |tc| (tr, tc)))
+        .collect();
+
+    let tile_pixel_count = (metadata.tile_width * metadata.tile_height) as usize;
+    let http_clone = http.clone();
+    let url_owned = url.to_string();
+
+    let tile_results: Vec<(u32, u32, Vec<Option<f64>>)> = TILE_FETCH_POOL.install(|| {
+        tile_coords
+            .par_iter()
+            .map(|&(tile_row, tile_col)| {
+                let chunk_index = tile_row * metadata.tiles_across + tile_col;
+                let tile_data = match read_http_chunk_f64(
+                    &http_clone,
+                    &url_owned,
+                    tile_info,
+                    metadata,
+                    chunk_index,
+                    cache,
+                    file_path,
+                    band_index,
+                    ifd_index,
+                ) {
+                    Ok(data) => data,
+                    Err(first_err) => {
+                        let mut last_err = first_err;
+                        let mut succeeded = false;
+                        let mut result_data = vec![None; tile_pixel_count];
+                        for attempt in 1..=2 {
+                            tracing::debug!(
+                                "Tile ({}, {}), chunk {} failed (attempt {}), retrying: {last_err}",
+                                tile_row,
+                                tile_col,
+                                chunk_index,
+                                attempt
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(50 * attempt));
+                            match read_http_chunk_f64(
+                                &http_clone,
+                                &url_owned,
+                                tile_info,
+                                metadata,
+                                chunk_index,
+                                cache,
+                                file_path,
+                                band_index,
+                                ifd_index,
+                            ) {
+                                Ok(data) => {
+                                    tracing::debug!(
+                                        "Tile ({}, {}), chunk {} succeeded on retry {}",
+                                        tile_row,
+                                        tile_col,
+                                        chunk_index,
+                                        attempt
+                                    );
+                                    result_data = data;
+                                    succeeded = true;
+                                    break;
+                                }
+                                Err(e) => last_err = e,
+                            }
+                        }
+                        if !succeeded {
+                            tracing::warn!(
+                                "Tile ({}, {}), chunk {} failed after 2 retries: {last_err}",
+                                tile_row,
+                                tile_col,
+                                chunk_index
+                            );
+                        }
+                        result_data
+                    }
+                };
+                (tile_row, tile_col, tile_data)
+            })
+            .collect()
+    });
+
     let mut result = vec![None; total_pixels];
     for (tile_row, tile_col, tile_data) in &tile_results {
         copy_tile_to_result(

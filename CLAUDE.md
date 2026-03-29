@@ -399,6 +399,7 @@ Values are converted to `f64` internally. Physical values are computed as: `phys
 | Local directory | `data_path = "path/to/dir"` | Scans a local directory |
 | Fixed remote prefix | `data_path = "s3://bucket/prefix/"` | Scans a single S3/HTTP prefix |
 | Dynamic remote prefix | `endpoint` + `bucket` + `prefix_pattern` | Expands date-based prefixes on each poll cycle |
+| STAC catalog | `stac_url` + `stac_asset_allowlist` | Discovers files via STAC API items endpoint |
 
 ### Polling and file discovery
 
@@ -409,6 +410,49 @@ The engine polls for new files at a configurable interval (`poll_interval_secs`,
 - **Metadata caching:** Files with unchanged size reuse their cached metadata across poll cycles — no re-download.
 - **Failure handling:** If a poll cycle fails, the old catalog is preserved. If a poll returns 0 files but the old catalog had files, it is treated as a transient failure and the old catalog is kept.
 - **Duplicate timestamps:** When two files have the same timestamp, the lexicographically last filename is kept.
+- **STAC mode:** Queries the STAC API items endpoint for file discovery. Timestamps come from `properties.datetime` (with `start_datetime` fallback). Asset URLs are validated against `stac_asset_allowlist` (SSRF protection). Pagination follows `rel=next` links (same-origin only, max 20 pages, 120s total timeout). HTTP redirects are disabled.
+
+### STAC catalog integration
+
+The engine can discover GeoTIFF files via a STAC API instead of directory listing. This is useful when the data provider exposes a STAC catalog but denies S3 LIST operations (e.g., MET Norway radar).
+
+**How it works:**
+1. On startup, fetches collection extent from the STAC collection endpoint (bbox + temporal interval) — no items
+2. When a query arrives for a datetime range, fetches STAC items for that range on-demand
+3. Creates lightweight stubs from STAC metadata (datetime, bbox, asset URL) — no GeoTIFF downloads
+4. GeoTIFF headers are loaded lazily via COG byte-range reads when pixel data is first needed
+5. Loaded metadata is cached — subsequent queries for the same timestamp skip all HTTP
+6. Poll loop only fetches newly published items (incremental, since latest known timestamp)
+
+**Fully on-demand architecture:** The STAC catalog mirrors the full temporal extent of the origin server without downloading anything. Items are discovered and GeoTIFF metadata is loaded only when queries request specific time ranges. This enables serving years of archived data with near-zero startup cost. A cap of 50 GeoTIFF loads per query prevents timeout on very large time ranges.
+
+**Security:**
+- **Asset URL allowlist** (`stac_asset_allowlist`): mandatory, no default. Every asset URL must match at least one prefix (validated by scheme + host + port + path prefix, not string matching).
+- **HTTP redirects disabled**: prevents redirect-based SSRF attacks.
+- **Pagination origin check**: `next` links must be same-origin as the items URL.
+- **Scheme validation**: only `http://` and `https://` asset URLs are accepted.
+
+**Config example:**
+```toml
+[[collections]]
+id = "met-norway-radar"
+title = "MET Norway Radar Mosaic"
+engine_type = "geotiff"
+apis = ["edr", "wms"]
+
+[collections.geotiff]
+stac_url = "https://radar-stacapi.met.no/v1/collections/Mosaic-Norway-v1/items"
+stac_asset_key = "data"
+stac_asset_allowlist = ["https://rgw.met.no/"]
+parameter = "reflectivity"
+unit = "dBZ"
+nodata = 255
+max_files = 24
+poll_interval_secs = 60
+
+[collections.wms]
+colormap = "radar_dbz"
+```
 
 ### Tile caching
 
@@ -446,9 +490,13 @@ The engine caches **compressed** tile bytes (not decoded pixels) in a lock-free 
 | `prefix_pattern` | no | `""` | Object prefix, optionally with strftime templates, e.g., `"%Y/%m/%d/data/"` |
 | `time_window` | no | none | ISO 8601 duration for file selection, e.g., `"-PT2H"` (past 2 hours) |
 | `scan_days` | no | auto | Number of days to scan for date-based prefixes. Auto-derived from `time_window`. |
+| `stac_url` | no‡ | — | STAC API items endpoint URL. Replaces `data_path`/`endpoint+bucket` for file discovery. |
+| `stac_asset_key` | no | `"data"` | Which STAC asset key to extract the GeoTIFF URL from. |
+| `stac_asset_allowlist` | no‡ | — | Required SSRF protection: list of allowed URL prefixes for asset downloads. |
 
-\* Either `filename_template` **or** both `filename_pattern` + `timestamp_format` must be set.
+\* Either `filename_template` **or** both `filename_pattern` + `timestamp_format` must be set (not required in STAC mode).
 † `endpoint` and `bucket` must both be set or both absent.
+‡ `stac_url` is mutually exclusive with `data_path` and `endpoint+bucket`. `stac_asset_allowlist` is required when `stac_url` is set.
 
 ### Troubleshooting
 
@@ -458,7 +506,9 @@ The engine caches **compressed** tile bytes (not decoded pixels) in a lock-free 
 | "Raster dimensions exceed maximum" | File is larger than 100,000 × 100,000 px | Downsample or use overviews |
 | "Decompressed tile exceeds maximum size" | Tile dimensions × bands × bytes/sample > 64 MB | Use smaller tiles (256×256 or 512×512) |
 | "No matching GeoTIFF files found" | No files match the filename pattern | Check `filename_template` against actual filenames in the directory |
-| "Either data_path or endpoint+bucket must be configured" | Missing data source | Set `data_path` for local/HTTP, or `endpoint` + `bucket` for S3 |
+| "Either data_path, endpoint+bucket, or stac_url must be configured" | Missing data source | Set `data_path` for local/HTTP, `endpoint` + `bucket` for S3, or `stac_url` for STAC |
+| "'stac_url' and 'data_path' are mutually exclusive" | Both STAC and local config set | Use only one data source mode |
+| "'stac_asset_allowlist' is required when 'stac_url' is set" | Missing SSRF protection | Add `stac_asset_allowlist` with allowed URL prefixes |
 | "'endpoint' is set but 'bucket' is missing" | Incomplete S3 config | Set both `endpoint` and `bucket` |
 | "poll_interval_secs must be > 0" | Zero poll interval | Set to at least 1 (typically 30-60) |
 | Empty results / all-None values | Wrong `band` number, or missing `nodata` override | Check band count with `gdalinfo`; set `nodata` if file lacks the tag |
@@ -689,6 +739,11 @@ API state (`EdrState`, `FeaturesState`, `WmsState`) is wrapped in `ArcSwap` for 
 - WMS: single LAYERS only (no multi-layer composition), no SLD/SE styling, no GetFeatureInfo
 - WMS: nearest-neighbor resampling only (no bilinear interpolation)
 - WMS: JPEG output composites transparency onto white background (no alpha channel support)
+- STAC: no retry logic on transient API failures (relies on poll loop to retry next cycle)
+- STAC: no HTTP caching (ETag/Last-Modified) — re-fetches item list every poll cycle
+- STAC: items with neither `datetime` nor `start_datetime` are silently skipped
+- STAC: first query to a datetime range fetches STAC items + GeoTIFF headers on-demand (~100-500ms per file)
+- STAC: GeoTIFF metadata loads are capped at 50 per query to prevent timeout on large ranges
 
 ## Code Style
 

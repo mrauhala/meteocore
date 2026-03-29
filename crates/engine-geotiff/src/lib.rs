@@ -3,6 +3,7 @@ mod catalog;
 mod geo;
 mod parse;
 mod reader;
+pub mod stac;
 mod time_window;
 
 /// Re-exports for fuzz testing. Not part of the public API.
@@ -52,6 +53,8 @@ enum StoreMode {
         scan_days: u32,
         time_window: Option<time_window::TimeWindow>,
     },
+    /// STAC API catalog: items discovered on-demand via STAC, assets fetched as remote COGs.
+    RemoteStac { client: stac::StacClient },
 }
 
 pub struct GeoTiffEngine {
@@ -76,6 +79,8 @@ pub struct GeoTiffEngine {
     shutdown_tx: watch::Sender<()>,
     /// Consecutive poll failures/empty results (for escalating warnings).
     consecutive_poll_failures: AtomicU32,
+    /// Tracks STAC entries currently being loaded to prevent concurrent loads.
+    loading_in_flight: Mutex<std::collections::HashSet<PathBuf>>,
 }
 
 impl GeoTiffEngine {
@@ -108,9 +113,12 @@ impl GeoTiffEngine {
             .map(time_window::TimeWindow::parse)
             .transpose()?;
 
-        let (store_mode, display) = if let (Some(endpoint), Some(bucket)) =
-            (&config.endpoint, &config.bucket)
-        {
+        let (store_mode, display) = if let Some(stac_url) = &config.stac_url {
+            let allowlist = config.stac_asset_allowlist.clone().unwrap_or_default();
+            let client = stac::StacClient::new(stac_url, &config.stac_asset_key, allowlist)?;
+            let display = format!("stac:{}", stac_url);
+            (StoreMode::RemoteStac { client }, display)
+        } else if let (Some(endpoint), Some(bucket)) = (&config.endpoint, &config.bucket) {
             let store = ds_storage::build_s3_store_from_parts(endpoint, bucket)?;
             let prefix_pattern = config.prefix_pattern.clone().unwrap_or_default();
             let display = format!("s3://{}/{}", bucket, prefix_pattern);
@@ -159,7 +167,7 @@ impl GeoTiffEngine {
             }
         } else {
             return Err(DataServerError::GeoTiff(
-                "Either data_path or endpoint+bucket must be configured".into(),
+                "Either data_path, endpoint+bucket, or stac_url must be configured".into(),
             ));
         };
 
@@ -189,29 +197,62 @@ impl GeoTiffEngine {
             override_offset: config.offset,
             shutdown_tx,
             consecutive_poll_failures: AtomicU32::new(0),
+            loading_in_flight: Mutex::new(std::collections::HashSet::new()),
         };
 
-        // Initial scan
-        let empty = Catalog::empty();
-        let initial_catalog = engine.do_scan(&empty)?;
-        let file_count = initial_catalog.entries.len();
-        let total_bytes: u64 = initial_catalog.entries.values().map(|e| e.file_size).sum();
-        engine.catalog.store(Arc::new(initial_catalog));
-
-        if file_count == 0 {
-            tracing::warn!(
-                "[{}] No matching GeoTIFF files found in {}",
-                collection_id,
-                engine.data_path_display
-            );
+        // Initial scan — STAC mode fetches collection extent only (no items)
+        let is_stac = matches!(engine.store_mode, StoreMode::RemoteStac { .. });
+        if is_stac {
+            if let StoreMode::RemoteStac { ref client, .. } = engine.store_mode {
+                match client.fetch_extent() {
+                    Ok(extent) => {
+                        let initial = catalog::init_stac_from_extent(&extent);
+                        tracing::info!(
+                            "[{}] STAC catalog ready — extent: {:?}, temporal: {:?}",
+                            collection_id,
+                            extent.spatial_bbox,
+                            extent.temporal_start.map(|s| format!(
+                                "{} → {}",
+                                s.format("%Y-%m-%d"),
+                                extent.temporal_end.map_or("now".to_string(), |e| e
+                                    .format("%Y-%m-%d")
+                                    .to_string())
+                            )),
+                        );
+                        engine.catalog.store(Arc::new(initial));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[{}] STAC extent fetch failed (will retry on poll): {}",
+                            collection_id,
+                            e
+                        );
+                        engine.catalog.store(Arc::new(Catalog::empty()));
+                    }
+                }
+            }
         } else {
-            tracing::info!(
-                "[{}] Loaded {} files from {} (metadata: {})",
-                collection_id,
-                file_count,
-                engine.data_path_display,
-                format_bytes(total_bytes)
-            );
+            let empty = Catalog::empty();
+            let initial_catalog = engine.do_scan(&empty)?;
+            let file_count = initial_catalog.entries.len();
+            let total_bytes: u64 = initial_catalog.entries.values().map(|e| e.file_size).sum();
+            engine.catalog.store(Arc::new(initial_catalog));
+
+            if file_count == 0 {
+                tracing::warn!(
+                    "[{}] No matching GeoTIFF files found in {}",
+                    collection_id,
+                    engine.data_path_display
+                );
+            } else {
+                tracing::info!(
+                    "[{}] Loaded {} files from {} (metadata: {})",
+                    collection_id,
+                    file_count,
+                    engine.data_path_display,
+                    format_bytes(total_bytes)
+                );
+            }
         }
 
         Ok(engine)
@@ -313,6 +354,10 @@ impl GeoTiffEngine {
                 merged.recompute_extents();
                 merged
             }
+            StoreMode::RemoteStac { client } => {
+                let current_catalog = self.catalog.load();
+                catalog::poll_stac_latest(client, &current_catalog, &self.collection_id)?
+            }
         };
 
         // Apply config overrides for nodata/scale/offset
@@ -321,11 +366,13 @@ impl GeoTiffEngine {
             || self.override_offset.is_some()
         {
             for entry in catalog.entries.values_mut() {
-                entry.metadata.apply_overrides(
-                    self.override_nodata,
-                    self.override_scale,
-                    self.override_offset,
-                );
+                if let Some(ref mut metadata) = entry.metadata {
+                    metadata.apply_overrides(
+                        self.override_nodata,
+                        self.override_scale,
+                        self.override_offset,
+                    );
+                }
             }
         }
 
@@ -334,6 +381,251 @@ impl GeoTiffEngine {
         }
 
         Ok(catalog)
+    }
+
+    /// Load GeoTIFF metadata for a STAC stub entry.
+    ///
+    /// For STAC mode, uses the StacClient's reqwest-based HTTP methods directly
+    /// (bypassing object_store which URL-encodes path components and breaks
+    /// servers like Ceph RGW that use colons in paths).
+    ///
+    /// Tries COG range read first (64KB header), falls back to full download.
+    fn load_stac_entry_metadata(
+        &self,
+        stub: &catalog::StacStub,
+        file_size: u64,
+    ) -> Result<(reader::TiffMetadata, reader::DataSource), DataServerError> {
+        let stac_client = match &self.store_mode {
+            StoreMode::RemoteStac { client } => client,
+            _ => {
+                return Err(DataServerError::GeoTiff(
+                    "load_stac_entry_metadata called on non-STAC engine".into(),
+                ))
+            }
+        };
+
+        // Get actual file size if not known from STAC
+        let actual_size = if file_size == 0 {
+            stac_client.head_asset(&stub.asset_url).unwrap_or(0)
+        } else {
+            file_size
+        };
+
+        if actual_size > catalog::MAX_REMOTE_FILE_SIZE as u64 {
+            return Err(DataServerError::GeoTiff(format!(
+                "File too large ({} > {} max)",
+                format_bytes(actual_size),
+                format_bytes(catalog::MAX_REMOTE_FILE_SIZE as u64)
+            )));
+        }
+
+        // Try COG range read first (only 512KB header) — creates HttpDirect source
+        // that fetches tiles on demand via byte-range reads.
+        let http = stac_client.http_client();
+        if actual_size > 0 {
+            if let Some((metadata, tile_info)) =
+                reader::TiffMetadata::from_http_header_read(&http, &stub.asset_url, actual_size)
+            {
+                tracing::debug!(
+                    "[{}] STAC COG range read '{}' (header only, {} tiles)",
+                    self.collection_id,
+                    stub.asset_url,
+                    tile_info.tile_offsets.len()
+                );
+                let source = reader::DataSource::HttpDirect {
+                    url: stub.asset_url.clone(),
+                    http,
+                    tile_info,
+                };
+                return Ok((metadata, source));
+            }
+        }
+
+        // Fallback: download the full file into memory (non-COG or range read failed)
+        tracing::debug!(
+            "[{}] STAC downloading '{}' ({})",
+            self.collection_id,
+            stub.asset_url,
+            format_bytes(actual_size)
+        );
+
+        let data = stac_client.get_asset(&stub.asset_url)?;
+        let source = reader::DataSource::from_bytes(data);
+        let metadata = reader::TiffMetadata::from_source(&source)?;
+
+        Ok((metadata, source))
+    }
+
+    /// Ensure a single entry's metadata is loaded. No-op if already loaded.
+    /// Uses `loading_in_flight` to prevent concurrent loads for the same entry.
+    fn ensure_metadata(&self, timestamp: &DateTime<Utc>) -> Result<(), DataServerError> {
+        // Fast path: check if already loaded
+        {
+            let catalog = self.catalog.load();
+            if let Some(entry) = catalog.entries.get(timestamp) {
+                if entry.is_loaded() {
+                    return Ok(());
+                }
+            } else {
+                return Ok(()); // Entry doesn't exist
+            }
+        }
+
+        // Get the stub info we need before acquiring the in-flight lock
+        let (path, asset_url, file_size) = {
+            let catalog = self.catalog.load();
+            let entry = match catalog.entries.get(timestamp) {
+                Some(e) => e,
+                None => return Ok(()),
+            };
+            let stub = match &entry.stac_stub {
+                Some(s) => s,
+                None => return Ok(()), // Not a stub, but metadata is None — shouldn't happen
+            };
+            (entry.path.clone(), stub.asset_url.clone(), entry.file_size)
+        };
+
+        // Check/acquire in-flight lock
+        {
+            let in_flight = self
+                .loading_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if in_flight.contains(&path) {
+                drop(in_flight);
+                // Wait for the other thread to finish loading (up to ~10 seconds)
+                let mut loaded_by_other = false;
+                for attempt in 0u64..20 {
+                    std::thread::sleep(Duration::from_millis(100 * (attempt + 1).min(5)));
+                    let catalog = self.catalog.load();
+                    if let Some(entry) = catalog.entries.get(timestamp) {
+                        if entry.is_loaded() {
+                            loaded_by_other = true;
+                            break;
+                        }
+                    }
+                    // Check if still in-flight (other thread may have errored out)
+                    let in_flight_check = self
+                        .loading_in_flight
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if !in_flight_check.contains(&path) {
+                        // Other thread finished (possibly with error), try loading ourselves
+                        break;
+                    }
+                }
+                if loaded_by_other {
+                    return Ok(());
+                }
+                // Fall through to try loading ourselves
+            }
+            // Re-acquire lock to insert (may have been dropped above)
+        }
+        {
+            let mut in_flight = self
+                .loading_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            in_flight.insert(path.clone());
+        }
+
+        // Load the metadata (outside the in-flight lock)
+        let stub = catalog::StacStub {
+            bbox: None, // Not needed for loading
+            asset_url,
+        };
+        let result = self.load_stac_entry_metadata(&stub, file_size);
+
+        // Always remove from in-flight set
+        {
+            let mut in_flight = self
+                .loading_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            in_flight.remove(&path);
+        }
+
+        let (mut metadata, source) = result?;
+
+        // Apply config overrides
+        metadata.apply_overrides(
+            self.override_nodata,
+            self.override_scale,
+            self.override_offset,
+        );
+
+        // Clone the catalog, update the entry, and swap
+        let current = self.catalog.load();
+        let mut new_catalog = (**current).clone();
+        if let Some(entry) = new_catalog.entries.get_mut(timestamp) {
+            entry.metadata = Some(metadata);
+            entry.source = Some(source);
+        }
+        new_catalog.recompute_extents();
+        self.catalog.store(Arc::new(new_catalog));
+
+        Ok(())
+    }
+
+    /// Ensure entries exist and have metadata loaded for the requested datetime range.
+    ///
+    /// For STAC mode: if the catalog has no entries for the requested range,
+    /// fetches items from the STAC API first (on-demand discovery), then
+    /// lazy-loads GeoTIFF metadata for the matching entries.
+    fn ensure_entries_loaded(
+        &self,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    ) -> Result<(), DataServerError> {
+        // For STAC mode: fetch items on-demand if we don't have entries for this range
+        if let StoreMode::RemoteStac { ref client, .. } = self.store_mode {
+            if let Some(range) = datetime {
+                let catalog = self.catalog.load();
+                let existing = filter_by_datetime(&catalog.entries, Some(range));
+                if existing.is_empty() {
+                    // No entries for this range — fetch from STAC API
+                    drop(catalog);
+                    let current = self.catalog.load();
+                    let updated =
+                        catalog::fetch_stac_range(client, &current, range, &self.collection_id)?;
+                    self.catalog.store(Arc::new(updated));
+                }
+            } else {
+                // No datetime filter (e.g., "latest") — fetch recent items if catalog is empty
+                let catalog = self.catalog.load();
+                if catalog.entries.is_empty() {
+                    drop(catalog);
+                    let now = Utc::now();
+                    let since = now - chrono::Duration::hours(1);
+                    let current = self.catalog.load();
+                    let updated = catalog::fetch_stac_range(
+                        client,
+                        &current,
+                        (since, now),
+                        &self.collection_id,
+                    )?;
+                    self.catalog.store(Arc::new(updated));
+                }
+            }
+        }
+
+        let catalog = self.catalog.load();
+        let entries = filter_by_datetime(&catalog.entries, datetime);
+
+        // Collect timestamps of unloaded entries (most recent first)
+        let unloaded: Vec<DateTime<Utc>> = entries
+            .iter()
+            .rev()
+            .filter(|(_, entry)| !entry.is_loaded())
+            .map(|(ts, _)| **ts)
+            .collect();
+
+        drop(catalog);
+
+        for ts in &unloaded {
+            self.ensure_metadata(ts)?;
+        }
+
+        Ok(())
     }
 
     /// Run the polling loop. Call this from a tokio::spawn task.
@@ -364,8 +656,23 @@ impl GeoTiffEngine {
         let result = self.do_scan(&current);
 
         match result {
-            Ok(new_catalog) => {
+            Ok(mut new_catalog) => {
                 let old_count = current.entries.len();
+
+                // Merge loaded metadata from current catalog into new catalog.
+                // Prevents race where lazy loads completed between scan-start
+                // and catalog-swap are overwritten by stubs.
+                for (timestamp, current_entry) in &current.entries {
+                    if current_entry.is_loaded() {
+                        if let Some(new_entry) = new_catalog.entries.get_mut(timestamp) {
+                            if !new_entry.is_loaded() {
+                                new_entry.metadata = current_entry.metadata.clone();
+                                new_entry.source = current_entry.source.clone();
+                            }
+                        }
+                    }
+                }
+
                 let count = new_catalog.entries.len();
                 let total_bytes: u64 = new_catalog.entries.values().map(|e| e.file_size).sum();
 
@@ -447,6 +754,9 @@ impl GeoTiffEngine {
             }
         }
 
+        // Lazily load STAC stubs for the requested time range
+        self.ensure_entries_loaded(datetime)?;
+
         let catalog = self.catalog.load();
         let entries = filter_by_datetime(&catalog.entries, datetime);
 
@@ -462,12 +772,20 @@ impl GeoTiffEngine {
         for (timestamp, entry) in &entries {
             times.push(**timestamp);
 
-            let pixel = entry.metadata.geo_transform.world_to_pixel(lon, lat);
+            let (metadata, source) = match (entry.metadata.as_ref(), entry.source.as_ref()) {
+                (Some(m), Some(s)) => (m, s),
+                _ => {
+                    values.push(None);
+                    continue;
+                }
+            };
+
+            let pixel = metadata.geo_transform.world_to_pixel(lon, lat);
             let value = match pixel {
                 Some((col, row)) => {
                     match reader::read_pixel(
-                        &entry.source,
-                        &entry.metadata,
+                        source,
+                        metadata,
                         col,
                         row,
                         Some(&self.tile_cache),
@@ -541,6 +859,9 @@ impl GeoTiffEngine {
             }
         }
 
+        // Lazily load STAC stubs for the requested time range
+        self.ensure_entries_loaded(datetime)?;
+
         let catalog = self.catalog.load();
         let entries = filter_by_datetime(&catalog.entries, datetime);
 
@@ -552,8 +873,11 @@ impl GeoTiffEngine {
 
         // Use first entry's geo_transform to compute pixel range and axis values
         let first_entry = entries[0].1;
-        let (col_start, row_start, col_end, row_end) = first_entry
+        let first_metadata = first_entry
             .metadata
+            .as_ref()
+            .ok_or_else(|| DataServerError::GeoTiff("First entry has no metadata loaded".into()))?;
+        let (col_start, row_start, col_end, row_end) = first_metadata
             .geo_transform
             .bbox_to_pixels(west, south, east, north)
             .ok_or_else(|| {
@@ -567,10 +891,10 @@ impl GeoTiffEngine {
 
         // Build x and y axis values (pixel centers)
         let x_values: Vec<f64> = (col_start..col_end)
-            .map(|c| first_entry.metadata.geo_transform.pixel_to_world(c, 0).0)
+            .map(|c| first_metadata.geo_transform.pixel_to_world(c, 0).0)
             .collect();
         let y_values: Vec<f64> = (row_start..row_end)
-            .map(|r| first_entry.metadata.geo_transform.pixel_to_world(0, r).1)
+            .map(|r| first_metadata.geo_transform.pixel_to_world(0, r).1)
             .collect();
 
         let has_time = entries.len() > 1;
@@ -580,9 +904,17 @@ impl GeoTiffEngine {
         for (timestamp, entry) in &entries {
             times.push(**timestamp);
 
+            let (metadata, source) = match (entry.metadata.as_ref(), entry.source.as_ref()) {
+                (Some(m), Some(s)) => (m, s),
+                _ => {
+                    all_values.extend(std::iter::repeat_n(None, nx * ny));
+                    continue;
+                }
+            };
+
             match reader::read_bbox(
-                &entry.source,
-                &entry.metadata,
+                source,
+                metadata,
                 col_start,
                 row_start,
                 col_end,
@@ -674,24 +1006,65 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         time: Option<DateTime<Utc>>,
         output_crs: &ds_core::map_engine::OutputCrs,
     ) -> Result<ds_core::map_engine::RasterTile, DataServerError> {
-        let catalog = self.catalog.load();
+        // For STAC: ensure we have items around the requested time
+        if let StoreMode::RemoteStac { ref client, .. } = self.store_mode {
+            let catalog = self.catalog.load();
+            let need_fetch = if let Some(t) = time {
+                // Check if we have any entry near this time
+                catalog.entries.range(..=t).next_back().is_none()
+                    && catalog.entries.iter().next().is_none()
+            } else {
+                catalog.entries.is_empty()
+            };
+            if need_fetch {
+                drop(catalog);
+                let now = time.unwrap_or_else(Utc::now);
+                let range = (
+                    now - chrono::Duration::hours(1),
+                    now + chrono::Duration::minutes(5),
+                );
+                let current = self.catalog.load();
+                let updated =
+                    catalog::fetch_stac_range(client, &current, range, &self.collection_id)?;
+                self.catalog.store(Arc::new(updated));
+            }
+        }
 
-        // Find the entry closest to the requested time, or the latest
-        let entry = if let Some(t) = time {
-            // Find exact match or nearest
-            catalog
-                .entries
-                .range(..=t)
-                .next_back()
-                .or_else(|| catalog.entries.iter().next())
-        } else {
-            // Latest entry
-            catalog.entries.iter().next_back()
+        // Find the target timestamp first, then ensure it's loaded
+        let target_timestamp = {
+            let catalog = self.catalog.load();
+            let entry = if let Some(t) = time {
+                catalog
+                    .entries
+                    .range(..=t)
+                    .next_back()
+                    .or_else(|| catalog.entries.iter().next())
+            } else {
+                catalog.entries.iter().next_back()
+            };
+            let (ts, _) = entry.ok_or_else(|| {
+                DataServerError::GeoTiff("No data available for the requested time".into())
+            })?;
+            *ts
         };
 
-        let (_timestamp, entry) = entry.ok_or_else(|| {
-            DataServerError::GeoTiff("No data available for the requested time".into())
-        })?;
+        // Lazily load STAC stub if needed
+        self.ensure_metadata(&target_timestamp)?;
+
+        let catalog = self.catalog.load();
+        let (_timestamp, entry) = catalog
+            .entries
+            .get_key_value(&target_timestamp)
+            .ok_or_else(|| DataServerError::GeoTiff("Entry disappeared after loading".into()))?;
+
+        let metadata = entry
+            .metadata
+            .as_ref()
+            .ok_or_else(|| DataServerError::GeoTiff("Entry metadata not loaded".into()))?;
+        let source = entry
+            .source
+            .as_ref()
+            .ok_or_else(|| DataServerError::GeoTiff("Entry source not loaded".into()))?;
 
         let [west, south, east, north] = bbox;
         let total_pixels = (width as usize) * (height as usize);
@@ -700,20 +1073,18 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         // Select the best overview level for the output resolution.
         // This avoids reading millions of full-resolution pixels for zoomed-out views.
         // If no overview matches but full res is too large, force the smallest overview.
-        let overview = entry
-            .metadata
+        let overview = metadata
             .select_overview(west, south, east, north, width, height)
             .or_else(|| {
                 // Check if full resolution would exceed the map pixel limit
-                if let Some((c0, r0, c1, r1)) = entry
-                    .metadata
+                if let Some((c0, r0, c1, r1)) = metadata
                     .geo_transform
                     .bbox_to_pixels(west, south, east, north)
                 {
                     let full_pixels = ((c1 - c0) as usize) * ((r1 - r0) as usize);
                     if full_pixels > 16_000_000 {
                         // Force smallest overview to avoid exceeding limits
-                        entry.metadata.overviews.last()
+                        metadata.overviews.last()
                     } else {
                         None
                     }
@@ -730,9 +1101,9 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                 width,
                 height
             );
-            entry.metadata.overview_geo_transform(ov)
+            metadata.overview_geo_transform(ov)
         } else {
-            entry.metadata.geo_transform.clone()
+            metadata.geo_transform.clone()
         };
 
         // Compute the source pixel range in the selected level
@@ -755,8 +1126,8 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             // Read from overview or full resolution
             let pixels = if let Some(ov) = overview {
                 reader::read_bbox_overview(
-                    &entry.source,
-                    &entry.metadata,
+                    source,
+                    metadata,
                     ov,
                     col_start,
                     row_start,
@@ -768,8 +1139,8 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                 )
             } else {
                 reader::read_bbox_map(
-                    &entry.source,
-                    &entry.metadata,
+                    source,
+                    metadata,
                     col_start,
                     row_start,
                     col_end,
@@ -833,17 +1204,42 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
     }
 
     fn raster_info(&self) -> ds_core::map_engine::RasterInfo {
-        let catalog = self.catalog.load();
-        let crs_name = if let Some(entry) = catalog.entries.values().next() {
-            match &entry.metadata.geo_transform.crs {
-                geo::Crs::Wgs84 => "EPSG:4326".to_string(),
-                geo::Crs::TransverseMercator { .. } => "EPSG:3067".to_string(),
-                geo::Crs::LambertAzimuthalEqualArea { .. } => "EPSG:3035".to_string(),
-                geo::Crs::LambertConformalConic { .. } => "projected".to_string(),
+        // Try to load at least one entry's metadata for CRS detection
+        {
+            let catalog = self.catalog.load();
+            let has_loaded = catalog.entries.values().any(|e| e.is_loaded());
+            if !has_loaded {
+                // No loaded entries — try each until one succeeds
+                let timestamps: Vec<DateTime<Utc>> = catalog.entries.keys().copied().collect();
+                drop(catalog);
+                for ts in &timestamps {
+                    match self.ensure_metadata(ts) {
+                        Ok(()) => break,
+                        Err(e) => {
+                            tracing::warn!(
+                                "[{}] Failed to load metadata for CRS detection: {}",
+                                self.collection_id,
+                                e
+                            );
+                        }
+                    }
+                }
             }
-        } else {
-            "EPSG:4326".to_string()
-        };
+        }
+
+        let catalog = self.catalog.load();
+        let crs_name = catalog
+            .entries
+            .values()
+            .find_map(|entry| {
+                entry.metadata.as_ref().map(|m| match &m.geo_transform.crs {
+                    geo::Crs::Wgs84 => "EPSG:4326".to_string(),
+                    geo::Crs::TransverseMercator { .. } => "EPSG:3067".to_string(),
+                    geo::Crs::LambertAzimuthalEqualArea { .. } => "EPSG:3035".to_string(),
+                    geo::Crs::LambertConformalConic { .. } => "projected".to_string(),
+                })
+            })
+            .unwrap_or_else(|| "EPSG:4326".to_string());
 
         let times: Vec<DateTime<Utc>> = catalog.entries.keys().cloned().collect();
 
@@ -1005,6 +1401,34 @@ fn validate_config(
         _ => {}
     }
 
+    // stac_url is mutually exclusive with data_path and endpoint+bucket
+    if config.stac_url.is_some() {
+        if data_path.is_some() {
+            return Err(DataServerError::GeoTiff(format!(
+                "[{collection_id}] 'stac_url' and 'data_path' are mutually exclusive"
+            )));
+        }
+        if config.endpoint.is_some() {
+            return Err(DataServerError::GeoTiff(format!(
+                "[{collection_id}] 'stac_url' and 'endpoint+bucket' are mutually exclusive"
+            )));
+        }
+        // stac_asset_allowlist is required for SSRF protection
+        match &config.stac_asset_allowlist {
+            None => {
+                return Err(DataServerError::GeoTiff(format!(
+                    "[{collection_id}] 'stac_asset_allowlist' is required when 'stac_url' is set (SSRF protection)"
+                )));
+            }
+            Some(list) if list.is_empty() => {
+                return Err(DataServerError::GeoTiff(format!(
+                    "[{collection_id}] 'stac_asset_allowlist' must not be empty"
+                )));
+            }
+            _ => {}
+        }
+    }
+
     // Warn if both endpoint+bucket and data_path are set (data_path is silently ignored)
     if config.endpoint.is_some() && data_path.is_some() {
         tracing::warn!(
@@ -1030,7 +1454,15 @@ fn validate_config(
 
 /// Resolve filename_template or filename_pattern + timestamp_format from config.
 /// Returns (regex_pattern, timestamp_format).
+///
+/// In STAC mode, filename patterns are not used (timestamps come from STAC properties),
+/// so dummy values are returned.
 fn resolve_filename_config(config: &GeoTiffConfig) -> Result<(String, String), DataServerError> {
+    // STAC mode: timestamps come from STAC item properties, not filenames
+    if config.stac_url.is_some() {
+        return Ok(("unused".to_string(), "unused".to_string()));
+    }
+
     if let Some(template) = &config.filename_template {
         let (regex, format) = expand_filename_template(template)?;
         tracing::debug!(

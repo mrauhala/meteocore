@@ -148,6 +148,20 @@ poll_interval_secs = 300
 [collections.wms]
 colormap = "radar_dbz"
 
-# MET Norway radar cannot be listed via S3 (AccessDenied on list).
-# Individual files are accessible but discovery requires STAC API (Phase 4).
-# Use local files or the STAC catalog URL once implemented.
+[[collections]]
+id = "met-norway-radar"
+title = "MET Norway Radar Mosaic"
+description = "Radar reflectivity mosaic from MET Norway via STAC catalog, Lambert Conformal Conic"
+engine_type = "geotiff"
+apis = ["edr", "wms", "maps"]
+
+[collections.geotiff]
+stac_url = "https://radar-stacapi.met.no/v1/collections/Mosaic-Norway-v1/items"
+stac_asset_key = "data"
+stac_asset_allowlist = ["https://rgw.met.no/"]
+parameter = "reflectivity"
+unit = "dBZ"
+poll_interval_secs = 300
+
+[collections.wms]
+colormap = "radar_dbz"
