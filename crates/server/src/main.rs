@@ -3,13 +3,16 @@ mod admin;
 use std::sync::{Arc, RwLock};
 
 use arc_swap::ArcSwap;
+use axum::body::Body;
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Json, Router, ServiceExt};
 use serde_json::json;
 use tokio::signal;
+use tower::Layer;
 use tower_http::cors::CorsLayer;
+use tower_http::normalize_path::NormalizePathLayer;
 use tracing::info;
 
 use admin::{AdminState, ServerState};
@@ -114,6 +117,9 @@ async fn main() {
         .layer(middleware::from_fn(admin::metrics_middleware))
         .layer(CorsLayer::permissive());
 
+    // Normalize trailing slashes (e.g., /wms/ → /wms) before routing
+    let app = NormalizePathLayer::trim_trailing_slash().layer(app);
+
     let addr = format!("{}:{}", config.server.host, config.server.port);
     info!("Starting server on {addr}");
 
@@ -121,7 +127,7 @@ async fn main() {
         .await
         .expect("Failed to bind");
 
-    axum::serve(listener, app)
+    axum::serve(listener, ServiceExt::<axum::http::Request<Body>>::into_make_service(app))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("Server error");
@@ -184,7 +190,7 @@ async fn root_landing_page(state: AdminState) -> impl IntoResponse {
                 "title": "Features API"
             },
             {
-                "href": format!("{base}/wms/?SERVICE=WMS&REQUEST=GetCapabilities"),
+                "href": format!("{base}/wms?SERVICE=WMS&REQUEST=GetCapabilities"),
                 "rel": "service-desc",
                 "type": "text/xml",
                 "title": "WMS 1.3.0"
