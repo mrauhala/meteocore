@@ -24,6 +24,9 @@ fn make_config() -> GeoTiffConfig {
         prefix_pattern: None,
         time_window: None,
         scan_days: None,
+        stac_url: None,
+        stac_asset_key: "data".to_string(),
+        stac_asset_allowlist: None,
     }
 }
 
