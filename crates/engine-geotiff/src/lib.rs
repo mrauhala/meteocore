@@ -33,6 +33,27 @@ use ds_core::model::*;
 
 use crate::catalog::{scan_directory, scan_remote_with_limit, Catalog, PendingFile};
 
+/// RAII guard that removes a path from the `loading_in_flight` set on drop.
+/// Prevents paths from getting stuck if a thread panics during metadata loading.
+struct InFlightGuard<'a> {
+    set: &'a Mutex<std::collections::HashSet<PathBuf>>,
+    path: PathBuf,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn new(set: &'a Mutex<std::collections::HashSet<PathBuf>>, path: PathBuf) -> Self {
+        Self { set, path }
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.set.lock() {
+            guard.remove(&self.path);
+        }
+    }
+}
+
 /// Whether the data source is local or remote.
 #[derive(Debug)]
 enum StoreMode {
@@ -81,9 +102,89 @@ pub struct GeoTiffEngine {
     consecutive_poll_failures: AtomicU32,
     /// Tracks STAC entries currently being loaded to prevent concurrent loads.
     loading_in_flight: Mutex<std::collections::HashSet<PathBuf>>,
+    /// Circuit breaker: consecutive STAC API failures.
+    stac_consecutive_failures: AtomicU32,
+    /// Circuit breaker: last STAC API attempt time.
+    stac_last_attempt: Mutex<Option<std::time::Instant>>,
+    /// Tracks when the catalog was last successfully updated.
+    catalog_updated_at: Mutex<Option<DateTime<Utc>>>,
 }
 
+/// Circuit breaker threshold: number of consecutive failures before opening.
+const STAC_CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
+/// How long the circuit breaker stays open before allowing a retry.
+const STAC_CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
+
 impl GeoTiffEngine {
+    /// Check whether the STAC circuit breaker allows a request.
+    /// Returns Ok(()) if the request should proceed, Err if the circuit is open.
+    fn check_stac_circuit_breaker(&self) -> Result<(), DataServerError> {
+        let failures = self.stac_consecutive_failures.load(Ordering::Relaxed);
+        if failures >= STAC_CIRCUIT_BREAKER_THRESHOLD {
+            let last_attempt = self
+                .stac_last_attempt
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(last) = *last_attempt {
+                if last.elapsed() < STAC_CIRCUIT_BREAKER_COOLDOWN {
+                    return Err(DataServerError::GeoTiff(format!(
+                        "STAC API temporarily unavailable, circuit breaker open \
+                         ({} consecutive failures, retry in {}s)",
+                        failures,
+                        (STAC_CIRCUIT_BREAKER_COOLDOWN - last.elapsed()).as_secs()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a successful STAC API call — resets the circuit breaker.
+    fn record_stac_success(&self) {
+        let prev = self.stac_consecutive_failures.swap(0, Ordering::Relaxed);
+        if prev >= STAC_CIRCUIT_BREAKER_THRESHOLD {
+            tracing::warn!(
+                "[{}] STAC circuit breaker closed (recovered after {} failures)",
+                self.collection_id,
+                prev
+            );
+        }
+        *self
+            .stac_last_attempt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    }
+
+    /// Record a failed STAC API call — increments the circuit breaker counter.
+    fn record_stac_failure(&self) {
+        let prev = self
+            .stac_consecutive_failures
+            .fetch_add(1, Ordering::Relaxed);
+        *self
+            .stac_last_attempt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+        if prev + 1 == STAC_CIRCUIT_BREAKER_THRESHOLD {
+            tracing::warn!(
+                "[{}] STAC circuit breaker open after {} consecutive failures — \
+                 pausing STAC requests for {}s",
+                self.collection_id,
+                prev + 1,
+                STAC_CIRCUIT_BREAKER_COOLDOWN.as_secs()
+            );
+        }
+    }
+
+    /// How long ago the catalog was last successfully updated.
+    /// Returns `None` if the catalog has never been updated after initial load.
+    pub fn catalog_age(&self) -> Option<chrono::Duration> {
+        let updated_at = self
+            .catalog_updated_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        updated_at.map(|t| Utc::now() - t)
+    }
+
     /// Create a new GeoTIFF engine, performing an initial scan.
     ///
     /// Data source is determined by config:
@@ -198,6 +299,9 @@ impl GeoTiffEngine {
             shutdown_tx,
             consecutive_poll_failures: AtomicU32::new(0),
             loading_in_flight: Mutex::new(std::collections::HashSet::new()),
+            stac_consecutive_failures: AtomicU32::new(0),
+            stac_last_attempt: Mutex::new(None),
+            catalog_updated_at: Mutex::new(None),
         };
 
         // Initial scan — STAC mode fetches collection extent only (no items)
@@ -367,7 +471,7 @@ impl GeoTiffEngine {
         {
             for entry in catalog.entries.values_mut() {
                 if let Some(ref mut metadata) = entry.metadata {
-                    metadata.apply_overrides(
+                    Arc::make_mut(metadata).apply_overrides(
                         self.override_nodata,
                         self.override_scale,
                         self.override_offset,
@@ -529,21 +633,15 @@ impl GeoTiffEngine {
             in_flight.insert(path.clone());
         }
 
+        // RAII guard ensures path is removed from in-flight set even on panic
+        let _guard = InFlightGuard::new(&self.loading_in_flight, path.clone());
+
         // Load the metadata (outside the in-flight lock)
         let stub = catalog::StacStub {
             bbox: None, // Not needed for loading
             asset_url,
         };
         let result = self.load_stac_entry_metadata(&stub, file_size);
-
-        // Always remove from in-flight set
-        {
-            let mut in_flight = self
-                .loading_in_flight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            in_flight.remove(&path);
-        }
 
         let (mut metadata, source) = result?;
 
@@ -558,8 +656,8 @@ impl GeoTiffEngine {
         let current = self.catalog.load();
         let mut new_catalog = (**current).clone();
         if let Some(entry) = new_catalog.entries.get_mut(timestamp) {
-            entry.metadata = Some(metadata);
-            entry.source = Some(source);
+            entry.metadata = Some(Arc::new(metadata));
+            entry.source = Some(Arc::new(source));
         }
         new_catalog.recompute_extents();
         self.catalog.store(Arc::new(new_catalog));
@@ -578,6 +676,8 @@ impl GeoTiffEngine {
     ) -> Result<(), DataServerError> {
         // For STAC mode: fetch items on-demand if we don't have entries for this range
         if let StoreMode::RemoteStac { ref client, .. } = self.store_mode {
+            self.check_stac_circuit_breaker()?;
+
             if let Some(range) = datetime {
                 let catalog = self.catalog.load();
                 let existing = filter_by_datetime(&catalog.entries, Some(range));
@@ -585,9 +685,16 @@ impl GeoTiffEngine {
                     // No entries for this range — fetch from STAC API
                     drop(catalog);
                     let current = self.catalog.load();
-                    let updated =
-                        catalog::fetch_stac_range(client, &current, range, &self.collection_id)?;
-                    self.catalog.store(Arc::new(updated));
+                    match catalog::fetch_stac_range(client, &current, range, &self.collection_id) {
+                        Ok(updated) => {
+                            self.record_stac_success();
+                            self.catalog.store(Arc::new(updated));
+                        }
+                        Err(e) => {
+                            self.record_stac_failure();
+                            return Err(e);
+                        }
+                    }
                 }
             } else {
                 // No datetime filter (e.g., "latest") — fetch recent items if catalog is empty
@@ -597,13 +704,21 @@ impl GeoTiffEngine {
                     let now = Utc::now();
                     let since = now - chrono::Duration::hours(1);
                     let current = self.catalog.load();
-                    let updated = catalog::fetch_stac_range(
+                    match catalog::fetch_stac_range(
                         client,
                         &current,
                         (since, now),
                         &self.collection_id,
-                    )?;
-                    self.catalog.store(Arc::new(updated));
+                    ) {
+                        Ok(updated) => {
+                            self.record_stac_success();
+                            self.catalog.store(Arc::new(updated));
+                        }
+                        Err(e) => {
+                            self.record_stac_failure();
+                            return Err(e);
+                        }
+                    }
                 }
             }
         }
@@ -662,6 +777,7 @@ impl GeoTiffEngine {
                 // Merge loaded metadata from current catalog into new catalog.
                 // Prevents race where lazy loads completed between scan-start
                 // and catalog-swap are overwritten by stubs.
+                // This is correct: Arc-cloning metadata/source is cheap (pointer bump).
                 for (timestamp, current_entry) in &current.entries {
                     if current_entry.is_loaded() {
                         if let Some(new_entry) = new_catalog.entries.get_mut(timestamp) {
@@ -703,6 +819,11 @@ impl GeoTiffEngine {
 
                 self.consecutive_poll_failures.store(0, Ordering::Relaxed);
                 self.catalog.store(Arc::new(new_catalog));
+                // Track successful catalog update time
+                *self
+                    .catalog_updated_at
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
                 let (hits, misses) = self.tile_cache.stats();
                 tracing::debug!(
                     "[{}] Poll: {} files ({}), tile cache: {} hits / {} misses",
@@ -899,7 +1020,7 @@ impl GeoTiffEngine {
 
         let has_time = entries.len() > 1;
         let mut times = Vec::with_capacity(entries.len());
-        let mut all_values = Vec::new();
+        let mut all_values = Vec::with_capacity(entries.len() * ny * nx);
 
         for (timestamp, entry) in &entries {
             times.push(**timestamp);
@@ -1008,6 +1129,8 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
     ) -> Result<ds_core::map_engine::RasterTile, DataServerError> {
         // For STAC: ensure we have items around the requested time
         if let StoreMode::RemoteStac { ref client, .. } = self.store_mode {
+            self.check_stac_circuit_breaker()?;
+
             let catalog = self.catalog.load();
             let need_fetch = if let Some(t) = time {
                 // Check if we have any entry near this time
@@ -1024,9 +1147,16 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                     now + chrono::Duration::minutes(5),
                 );
                 let current = self.catalog.load();
-                let updated =
-                    catalog::fetch_stac_range(client, &current, range, &self.collection_id)?;
-                self.catalog.store(Arc::new(updated));
+                match catalog::fetch_stac_range(client, &current, range, &self.collection_id) {
+                    Ok(updated) => {
+                        self.record_stac_success();
+                        self.catalog.store(Arc::new(updated));
+                    }
+                    Err(e) => {
+                        self.record_stac_failure();
+                        return Err(e);
+                    }
+                }
             }
         }
 

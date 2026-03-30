@@ -174,20 +174,27 @@ fn stac_url_with_empty_allowlist_is_error() {
 #[test]
 fn valid_stac_config_no_filename_template() {
     // Valid STAC config should not require filename_template.
-    // It will fail on the actual STAC fetch (network error), not on config validation.
+    // Engine creation may succeed (empty catalog) or fail with a network error,
+    // but should NOT fail with a config validation error.
     let mut config = base_config();
     config.stac_url = Some("https://api.example.com/collections/radar/items".to_string());
     config.stac_asset_allowlist = Some(vec!["https://example.com/".to_string()]);
 
-    let err = expect_err(GeoTiffEngine::new("test", None, &config));
-    // Should NOT be a config validation error — should be a network/fetch error
-    assert!(
-        !err.contains("mutually exclusive")
-            && !err.contains("stac_asset_allowlist")
-            && !err.contains("filename_template"),
-        "config validation should pass; got config error: {}",
-        err
-    );
+    let result = GeoTiffEngine::new("test", None, &config);
+    match result {
+        Ok(_) => {} // Config validation passed, engine created with empty catalog — fine
+        Err(e) => {
+            let err = e.to_string();
+            // Should NOT be a config validation error — should be a network/fetch error
+            assert!(
+                !err.contains("mutually exclusive")
+                    && !err.contains("stac_asset_allowlist")
+                    && !err.contains("filename_template"),
+                "config validation should pass; got config error: {}",
+                err
+            );
+        }
+    }
 }
 
 // =========================================================================
@@ -236,8 +243,8 @@ fn stac_client_fetch_from_nonexistent_endpoint() {
     );
     let err = result.unwrap_err().to_string();
     assert!(
-        err.contains("STAC request failed"),
-        "error should mention request failure, got: {}",
+        err.contains("STAC") && err.contains("failed"),
+        "error should mention STAC request failure, got: {}",
         err
     );
 }

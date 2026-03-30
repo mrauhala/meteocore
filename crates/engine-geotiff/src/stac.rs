@@ -153,18 +153,24 @@ impl StacClient {
         let http = self.http.clone();
         let body: serde_json::Value = self.block_on(async {
             let response = http.get(&url).send().await.map_err(|e| {
-                DataServerError::GeoTiff(format!("STAC collection request failed: {}", e))
+                tracing::warn!("STAC collection request to {} failed: {}", url, e);
+                DataServerError::GeoTiff("STAC collection request failed".into())
             })?;
 
             if !response.status().is_success() {
-                return Err(DataServerError::GeoTiff(format!(
-                    "STAC collection returned HTTP {}",
+                tracing::warn!(
+                    "STAC collection {} returned HTTP {}",
+                    url,
                     response.status()
-                )));
+                );
+                return Err(DataServerError::GeoTiff(
+                    "STAC collection request failed".into(),
+                ));
             }
 
             response.json().await.map_err(|e| {
-                DataServerError::GeoTiff(format!("STAC collection response invalid JSON: {}", e))
+                tracing::warn!("STAC collection response from {} invalid JSON: {}", url, e);
+                DataServerError::GeoTiff("STAC collection response invalid".into())
             })
         })?;
 
@@ -247,21 +253,75 @@ impl StacClient {
             let url_str = url.as_str().to_string();
             let http = self.http.clone();
             let body: serde_json::Value = self.block_on(async {
-                let response =
-                    http.get(&url_str).send().await.map_err(|e| {
-                        DataServerError::GeoTiff(format!("STAC request failed: {}", e))
-                    })?;
+                let retry_delays = [
+                    Duration::from_millis(100),
+                    Duration::from_millis(200),
+                    Duration::from_millis(400),
+                ];
+                let max_attempts = retry_delays.len() + 1; // 1 initial + 3 retries
 
-                if !response.status().is_success() {
-                    return Err(DataServerError::GeoTiff(format!(
-                        "STAC API returned HTTP {}",
-                        response.status()
-                    )));
+                let mut last_err = None;
+                for attempt in 0..max_attempts {
+                    let result = http.get(&url_str).send().await;
+                    match result {
+                        Ok(response) => {
+                            let status = response.status();
+                            if status.is_success() {
+                                return response.json().await.map_err(|e| {
+                                    tracing::warn!(
+                                        "STAC response from {} is not valid JSON: {}",
+                                        url_str,
+                                        e
+                                    );
+                                    DataServerError::GeoTiff("STAC response invalid".into())
+                                });
+                            }
+                            // 4xx: do not retry (client error)
+                            if status.is_client_error() {
+                                tracing::warn!(
+                                    "STAC API {} returned HTTP {} (not retrying)",
+                                    url_str,
+                                    status
+                                );
+                                return Err(DataServerError::GeoTiff(
+                                    "STAC metadata request failed".into(),
+                                ));
+                            }
+                            // 5xx: retry
+                            tracing::warn!(
+                                "STAC API {} returned HTTP {} (attempt {}/{})",
+                                url_str,
+                                status,
+                                attempt + 1,
+                                max_attempts
+                            );
+                            last_err = Some(DataServerError::GeoTiff(
+                                "STAC metadata request failed".into(),
+                            ));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "STAC request to {} failed: {} (attempt {}/{})",
+                                url_str,
+                                e,
+                                attempt + 1,
+                                max_attempts
+                            );
+                            last_err = Some(DataServerError::GeoTiff(
+                                "STAC metadata request failed".into(),
+                            ));
+                        }
+                    }
+
+                    // Sleep before retry (not after last attempt)
+                    if attempt < retry_delays.len() {
+                        tokio::time::sleep(retry_delays[attempt]).await;
+                    }
                 }
 
-                response.json().await.map_err(|e| {
-                    DataServerError::GeoTiff(format!("STAC response is not valid JSON: {}", e))
-                })
+                Err(last_err.unwrap_or_else(|| {
+                    DataServerError::GeoTiff("STAC metadata request failed".into())
+                }))
             })?;
 
             // Parse features array
@@ -340,7 +400,14 @@ impl StacClient {
         // Extract datetime from properties (fall back to start_datetime per STAC spec)
         let datetime_str = feature["properties"]["datetime"]
             .as_str()
-            .or_else(|| feature["properties"]["start_datetime"].as_str())?;
+            .or_else(|| feature["properties"]["start_datetime"].as_str());
+        let datetime_str = match datetime_str {
+            Some(s) => s,
+            None => {
+                tracing::warn!("STAC item '{}' has no datetime, skipping", item_id);
+                return None;
+            }
+        };
         let datetime = DateTime::parse_from_rfc3339(datetime_str)
             .ok()
             .or_else(|| {
@@ -358,9 +425,8 @@ impl StacClient {
         // Validate asset URL scheme (reject file://, data:, gopher://, etc.)
         if !asset_url.starts_with("http://") && !asset_url.starts_with("https://") {
             tracing::warn!(
-                "STAC item '{}': asset URL '{}' has invalid scheme, skipping",
+                "STAC item '{}': asset URL has invalid scheme, skipping",
                 item_id,
-                asset_url
             );
             return None;
         }
@@ -368,9 +434,8 @@ impl StacClient {
         // SSRF protection: validate asset URL against allowlist
         if !self.is_url_allowed(asset_url) {
             tracing::warn!(
-                "STAC item '{}': asset URL '{}' not in allowlist, skipping",
+                "STAC item '{}': asset URL not in allowlist, skipping",
                 item_id,
-                asset_url
             );
             return None;
         }
@@ -431,6 +496,11 @@ impl StacClient {
     /// Compares scheme, host, and port exactly, then checks that the asset path
     /// starts with the allowlist entry's path. This prevents hostname confusion
     /// (e.g., allowlist "example.com" matching "example.comevil").
+    ///
+    /// Path handling: if the allowlist entry has an empty path (e.g., "https://host.com"),
+    /// it is normalized to "/" so that it matches all paths on that host (since all valid
+    /// URLs have paths starting with "/"). To restrict to a specific prefix, include it
+    /// in the allowlist entry (e.g., "https://host.com/data/").
     fn is_url_allowed(&self, url: &str) -> bool {
         let parsed = match Url::parse(url) {
             Ok(u) => u,
@@ -438,10 +508,15 @@ impl StacClient {
         };
 
         self.asset_allowlist.iter().any(|allowed| {
+            let allowed_path = if allowed.path().is_empty() {
+                "/"
+            } else {
+                allowed.path()
+            };
             parsed.scheme() == allowed.scheme()
                 && parsed.host() == allowed.host()
                 && parsed.port() == allowed.port()
-                && parsed.path().starts_with(allowed.path())
+                && parsed.path().starts_with(allowed_path)
         })
     }
 
@@ -462,14 +537,14 @@ impl StacClient {
         let http = self.http.clone();
         self.block_on(async {
             let resp = http.head(&url_owned).send().await.map_err(|e| {
-                DataServerError::GeoTiff(format!("HEAD failed for '{}': {}", url_owned, e))
+                tracing::warn!("HEAD failed for '{}': {}", url_owned, e);
+                DataServerError::GeoTiff("Failed to fetch remote file metadata".into())
             })?;
             if !resp.status().is_success() {
-                return Err(DataServerError::GeoTiff(format!(
-                    "HEAD returned {} for '{}'",
-                    resp.status(),
-                    url_owned
-                )));
+                tracing::warn!("HEAD returned {} for '{}'", resp.status(), url_owned);
+                return Err(DataServerError::GeoTiff(
+                    "Failed to fetch remote file metadata".into(),
+                ));
             }
             let size = resp
                 .headers()
@@ -498,20 +573,18 @@ impl StacClient {
                 .send()
                 .await
                 .map_err(|e| {
-                    DataServerError::GeoTiff(format!(
-                        "Range read failed for '{}': {}",
-                        url_owned, e
-                    ))
+                    tracing::warn!("Range read failed for '{}': {}", url_owned, e);
+                    DataServerError::GeoTiff("Failed to read remote file".into())
                 })?;
             if !resp.status().is_success() {
-                return Err(DataServerError::GeoTiff(format!(
-                    "Range read returned {} for '{}'",
-                    resp.status(),
-                    url_owned
-                )));
+                tracing::warn!("Range read returned {} for '{}'", resp.status(), url_owned);
+                return Err(DataServerError::GeoTiff(
+                    "Failed to read remote file".into(),
+                ));
             }
             let data = resp.bytes().await.map_err(|e| {
-                DataServerError::GeoTiff(format!("Failed to read body from '{}': {}", url_owned, e))
+                tracing::warn!("Failed to read body from '{}': {}", url_owned, e);
+                DataServerError::GeoTiff("Failed to read remote file".into())
             })?;
             Ok(data)
         })
@@ -523,17 +596,18 @@ impl StacClient {
         let http = self.http.clone();
         self.block_on(async {
             let resp = http.get(&url_owned).send().await.map_err(|e| {
-                DataServerError::GeoTiff(format!("Download failed for '{}': {:?}", url_owned, e))
+                tracing::warn!("Download failed for '{}': {:?}", url_owned, e);
+                DataServerError::GeoTiff("Failed to download remote file".into())
             })?;
             if !resp.status().is_success() {
-                return Err(DataServerError::GeoTiff(format!(
-                    "Download returned {} for '{}'",
-                    resp.status(),
-                    url_owned
-                )));
+                tracing::warn!("Download returned {} for '{}'", resp.status(), url_owned);
+                return Err(DataServerError::GeoTiff(
+                    "Failed to download remote file".into(),
+                ));
             }
             let data = resp.bytes().await.map_err(|e| {
-                DataServerError::GeoTiff(format!("Failed to read body from '{}': {}", url_owned, e))
+                tracing::warn!("Failed to read download body from '{}': {}", url_owned, e);
+                DataServerError::GeoTiff("Failed to download remote file".into())
             })?;
             Ok(data)
         })
