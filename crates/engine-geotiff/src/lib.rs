@@ -470,7 +470,7 @@ impl GeoTiffEngine {
             || self.override_offset.is_some()
         {
             for entry in catalog.entries.values_mut() {
-                if let Some(ref mut metadata) = entry.metadata {
+                if let Some(metadata) = entry.metadata_mut() {
                     Arc::make_mut(metadata).apply_overrides(
                         self.override_nodata,
                         self.override_scale,
@@ -560,19 +560,82 @@ impl GeoTiffEngine {
         Ok((metadata, source))
     }
 
+    /// Check if a catalog entry's metadata is already loaded.
+    /// Returns `true` if loaded or entry doesn't exist (nothing to do).
+    fn is_metadata_loaded(&self, timestamp: &DateTime<Utc>) -> bool {
+        let catalog = self.catalog.load();
+        match catalog.entries.get(timestamp) {
+            Some(entry) => entry.is_loaded(),
+            None => true, // Entry doesn't exist — nothing to load
+        }
+    }
+
+    /// Wait for another thread to finish loading metadata for the given path.
+    /// Returns `true` if another thread successfully loaded it.
+    fn wait_for_concurrent_load(&self, timestamp: &DateTime<Utc>, path: &Path) -> bool {
+        for attempt in 0u64..20 {
+            std::thread::sleep(Duration::from_millis(100 * (attempt + 1).min(5)));
+            let catalog = self.catalog.load();
+            if let Some(entry) = catalog.entries.get(timestamp) {
+                if entry.is_loaded() {
+                    return true;
+                }
+            }
+            // Check if still in-flight (other thread may have errored out)
+            let in_flight = self
+                .loading_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !in_flight.contains(path) {
+                // Other thread finished (possibly with error), try loading ourselves
+                return false;
+            }
+        }
+        false
+    }
+
+    /// Load metadata for a stub entry and update the catalog.
+    fn do_load_metadata(
+        &self,
+        timestamp: &DateTime<Utc>,
+        asset_url: &str,
+        file_size: u64,
+        path: &Path,
+    ) -> Result<(), DataServerError> {
+        // RAII guard ensures path is removed from in-flight set even on panic
+        let _guard = InFlightGuard::new(&self.loading_in_flight, path.to_path_buf());
+
+        let stub = catalog::StacStub {
+            bbox: None, // Not needed for loading
+            asset_url: asset_url.to_string(),
+        };
+        let (mut metadata, source) = self.load_stac_entry_metadata(&stub, file_size)?;
+
+        // Apply config overrides
+        metadata.apply_overrides(
+            self.override_nodata,
+            self.override_scale,
+            self.override_offset,
+        );
+
+        // Clone the catalog, update the entry, and swap
+        let current = self.catalog.load();
+        let mut new_catalog = (**current).clone();
+        if let Some(entry) = new_catalog.entries.get_mut(timestamp) {
+            entry.set_loaded(Arc::new(metadata), Arc::new(source));
+        }
+        new_catalog.recompute_extents();
+        self.catalog.store(Arc::new(new_catalog));
+
+        Ok(())
+    }
+
     /// Ensure a single entry's metadata is loaded. No-op if already loaded.
     /// Uses `loading_in_flight` to prevent concurrent loads for the same entry.
     fn ensure_metadata(&self, timestamp: &DateTime<Utc>) -> Result<(), DataServerError> {
         // Fast path: check if already loaded
-        {
-            let catalog = self.catalog.load();
-            if let Some(entry) = catalog.entries.get(timestamp) {
-                if entry.is_loaded() {
-                    return Ok(());
-                }
-            } else {
-                return Ok(()); // Entry doesn't exist
-            }
+        if self.is_metadata_loaded(timestamp) {
+            return Ok(());
         }
 
         // Get the stub info we need before acquiring the in-flight lock
@@ -582,7 +645,7 @@ impl GeoTiffEngine {
                 Some(e) => e,
                 None => return Ok(()),
             };
-            let stub = match &entry.stac_stub {
+            let stub = match entry.stac_stub_info() {
                 Some(s) => s,
                 None => return Ok(()), // Not a stub, but metadata is None — shouldn't happen
             };
@@ -597,33 +660,11 @@ impl GeoTiffEngine {
                 .unwrap_or_else(|e| e.into_inner());
             if in_flight.contains(&path) {
                 drop(in_flight);
-                // Wait for the other thread to finish loading (up to ~10 seconds)
-                let mut loaded_by_other = false;
-                for attempt in 0u64..20 {
-                    std::thread::sleep(Duration::from_millis(100 * (attempt + 1).min(5)));
-                    let catalog = self.catalog.load();
-                    if let Some(entry) = catalog.entries.get(timestamp) {
-                        if entry.is_loaded() {
-                            loaded_by_other = true;
-                            break;
-                        }
-                    }
-                    // Check if still in-flight (other thread may have errored out)
-                    let in_flight_check = self
-                        .loading_in_flight
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if !in_flight_check.contains(&path) {
-                        // Other thread finished (possibly with error), try loading ourselves
-                        break;
-                    }
-                }
-                if loaded_by_other {
+                if self.wait_for_concurrent_load(timestamp, &path) {
                     return Ok(());
                 }
                 // Fall through to try loading ourselves
             }
-            // Re-acquire lock to insert (may have been dropped above)
         }
         {
             let mut in_flight = self
@@ -633,36 +674,7 @@ impl GeoTiffEngine {
             in_flight.insert(path.clone());
         }
 
-        // RAII guard ensures path is removed from in-flight set even on panic
-        let _guard = InFlightGuard::new(&self.loading_in_flight, path.clone());
-
-        // Load the metadata (outside the in-flight lock)
-        let stub = catalog::StacStub {
-            bbox: None, // Not needed for loading
-            asset_url,
-        };
-        let result = self.load_stac_entry_metadata(&stub, file_size);
-
-        let (mut metadata, source) = result?;
-
-        // Apply config overrides
-        metadata.apply_overrides(
-            self.override_nodata,
-            self.override_scale,
-            self.override_offset,
-        );
-
-        // Clone the catalog, update the entry, and swap
-        let current = self.catalog.load();
-        let mut new_catalog = (**current).clone();
-        if let Some(entry) = new_catalog.entries.get_mut(timestamp) {
-            entry.metadata = Some(Arc::new(metadata));
-            entry.source = Some(Arc::new(source));
-        }
-        new_catalog.recompute_extents();
-        self.catalog.store(Arc::new(new_catalog));
-
-        Ok(())
+        self.do_load_metadata(timestamp, &asset_url, file_size, &path)
     }
 
     /// Ensure entries exist and have metadata loaded for the requested datetime range.
@@ -777,13 +789,12 @@ impl GeoTiffEngine {
                 // Merge loaded metadata from current catalog into new catalog.
                 // Prevents race where lazy loads completed between scan-start
                 // and catalog-swap are overwritten by stubs.
-                // This is correct: Arc-cloning metadata/source is cheap (pointer bump).
+                // This is correct: Arc-cloning state is cheap (pointer bump).
                 for (timestamp, current_entry) in &current.entries {
                     if current_entry.is_loaded() {
                         if let Some(new_entry) = new_catalog.entries.get_mut(timestamp) {
                             if !new_entry.is_loaded() {
-                                new_entry.metadata = current_entry.metadata.clone();
-                                new_entry.source = current_entry.source.clone();
+                                new_entry.state = current_entry.state.clone();
                             }
                         }
                     }
@@ -893,7 +904,7 @@ impl GeoTiffEngine {
         for (timestamp, entry) in &entries {
             times.push(**timestamp);
 
-            let (metadata, source) = match (entry.metadata.as_ref(), entry.source.as_ref()) {
+            let (metadata, source) = match (entry.metadata(), entry.source()) {
                 (Some(m), Some(s)) => (m, s),
                 _ => {
                     values.push(None);
@@ -995,8 +1006,7 @@ impl GeoTiffEngine {
         // Use first entry's geo_transform to compute pixel range and axis values
         let first_entry = entries[0].1;
         let first_metadata = first_entry
-            .metadata
-            .as_ref()
+            .metadata()
             .ok_or_else(|| DataServerError::GeoTiff("First entry has no metadata loaded".into()))?;
         let (col_start, row_start, col_end, row_end) = first_metadata
             .geo_transform
@@ -1025,7 +1035,7 @@ impl GeoTiffEngine {
         for (timestamp, entry) in &entries {
             times.push(**timestamp);
 
-            let (metadata, source) = match (entry.metadata.as_ref(), entry.source.as_ref()) {
+            let (metadata, source) = match (entry.metadata(), entry.source()) {
                 (Some(m), Some(s)) => (m, s),
                 _ => {
                     all_values.extend(std::iter::repeat_n(None, nx * ny));
@@ -1188,12 +1198,10 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             .ok_or_else(|| DataServerError::GeoTiff("Entry disappeared after loading".into()))?;
 
         let metadata = entry
-            .metadata
-            .as_ref()
+            .metadata()
             .ok_or_else(|| DataServerError::GeoTiff("Entry metadata not loaded".into()))?;
         let source = entry
-            .source
-            .as_ref()
+            .source()
             .ok_or_else(|| DataServerError::GeoTiff("Entry source not loaded".into()))?;
 
         let [west, south, east, north] = bbox;
@@ -1362,7 +1370,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             .entries
             .values()
             .find_map(|entry| {
-                entry.metadata.as_ref().map(|m| match &m.geo_transform.crs {
+                entry.metadata().map(|m| match &m.geo_transform.crs {
                     geo::Crs::Wgs84 => "EPSG:4326".to_string(),
                     geo::Crs::TransverseMercator { .. } => "EPSG:3067".to_string(),
                     geo::Crs::LambertAzimuthalEqualArea { .. } => "EPSG:3035".to_string(),
