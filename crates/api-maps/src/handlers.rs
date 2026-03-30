@@ -199,6 +199,18 @@ pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
                 "title": "This document"
             },
             {
+                "href": format!("{base}/maps/api"),
+                "rel": "service-desc",
+                "type": "application/vnd.oai.openapi+json;version=3.0",
+                "title": "API definition"
+            },
+            {
+                "href": format!("{base}/maps/api/docs"),
+                "rel": "service-doc",
+                "type": "text/html",
+                "title": "API documentation"
+            },
+            {
                 "href": format!("{base}/maps/conformance"),
                 "rel": "conformance",
                 "type": "application/json",
@@ -212,6 +224,304 @@ pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
             }
         ]
     }))
+}
+
+/// GET /maps/api — OpenAPI 3.0.3 definition
+pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
+    let state = state.load_full();
+    let mut collection_paths = json!({});
+    for config in state.collections.values() {
+        let id = &config.id;
+
+        // GET /maps/collections/{id}
+        let detail_path = format!("/maps/collections/{id}");
+        collection_paths[&detail_path] = json!({
+            "get": {
+                "summary": format!("Get {} collection metadata", config.title),
+                "operationId": format!("getCollection_{id}"),
+                "tags": [id],
+                "responses": {
+                    "200": {"description": "Collection metadata"},
+                    "404": {"description": "Collection not found"}
+                }
+            }
+        });
+
+        // GET /maps/collections/{id}/map
+        let map_path = format!("/maps/collections/{id}/map");
+        collection_paths[&map_path] = json!({
+            "get": {
+                "summary": format!("Get map for {}", config.title),
+                "operationId": format!("getMap_{id}"),
+                "tags": [id],
+                "parameters": [
+                    {"$ref": "#/components/parameters/bbox"},
+                    {"$ref": "#/components/parameters/width"},
+                    {"$ref": "#/components/parameters/height"},
+                    {"$ref": "#/components/parameters/crs"},
+                    {"$ref": "#/components/parameters/datetime"},
+                    {"$ref": "#/components/parameters/transparent"},
+                    {"$ref": "#/components/parameters/f"},
+                    {"$ref": "#/components/parameters/bbox-crs"}
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Map image",
+                        "content": {
+                            "image/png": {
+                                "schema": {"type": "string", "format": "binary"}
+                            },
+                            "image/jpeg": {
+                                "schema": {"type": "string", "format": "binary"}
+                            },
+                            "image/webp": {
+                                "schema": {"type": "string", "format": "binary"}
+                            }
+                        }
+                    },
+                    "400": {"description": "Bad request"},
+                    "404": {"description": "Collection not found"},
+                    "500": {"description": "Server error"}
+                }
+            }
+        });
+
+        // GET /maps/collections/{id}/styles
+        let styles_path = format!("/maps/collections/{id}/styles");
+        collection_paths[&styles_path] = json!({
+            "get": {
+                "summary": format!("List styles for {}", config.title),
+                "operationId": format!("getStyles_{id}"),
+                "tags": [id],
+                "responses": {
+                    "200": {
+                        "description": "List of styles",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/styleList"}
+                            }
+                        }
+                    },
+                    "404": {"description": "Collection not found"},
+                    "500": {"description": "Server error"}
+                }
+            }
+        });
+
+        // GET /maps/collections/{id}/styles/{styleId}/map
+        let styled_map_path = format!("/maps/collections/{id}/styles/{{styleId}}/map");
+        collection_paths[&styled_map_path] = json!({
+            "get": {
+                "summary": format!("Get styled map for {}", config.title),
+                "operationId": format!("getStyledMap_{id}"),
+                "tags": [id],
+                "parameters": [
+                    {
+                        "name": "styleId",
+                        "in": "path",
+                        "required": true,
+                        "schema": {"type": "string"},
+                        "description": "Style identifier"
+                    },
+                    {"$ref": "#/components/parameters/bbox"},
+                    {"$ref": "#/components/parameters/width"},
+                    {"$ref": "#/components/parameters/height"},
+                    {"$ref": "#/components/parameters/crs"},
+                    {"$ref": "#/components/parameters/datetime"},
+                    {"$ref": "#/components/parameters/transparent"},
+                    {"$ref": "#/components/parameters/f"},
+                    {"$ref": "#/components/parameters/bbox-crs"}
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Map image",
+                        "content": {
+                            "image/png": {
+                                "schema": {"type": "string", "format": "binary"}
+                            },
+                            "image/jpeg": {
+                                "schema": {"type": "string", "format": "binary"}
+                            },
+                            "image/webp": {
+                                "schema": {"type": "string", "format": "binary"}
+                            }
+                        }
+                    },
+                    "400": {"description": "Bad request"},
+                    "404": {"description": "Collection or style not found"},
+                    "500": {"description": "Server error"}
+                }
+            }
+        });
+    }
+
+    let mut paths = json!({
+        "/maps/": {
+            "get": {
+                "summary": "Landing page",
+                "operationId": "getLandingPage",
+                "responses": {
+                    "200": {"description": "Landing page"}
+                }
+            }
+        },
+        "/maps/conformance": {
+            "get": {
+                "summary": "Conformance classes",
+                "operationId": "getConformance",
+                "responses": {
+                    "200": {"description": "Conformance classes"}
+                }
+            }
+        },
+        "/maps/collections": {
+            "get": {
+                "summary": "List collections",
+                "operationId": "getCollections",
+                "responses": {
+                    "200": {"description": "List of collections"}
+                }
+            }
+        }
+    });
+
+    // Merge collection paths into main paths
+    if let (Some(main_obj), Some(coll_obj)) = (paths.as_object_mut(), collection_paths.as_object())
+    {
+        for (k, v) in coll_obj {
+            main_obj.insert(k.clone(), v.clone());
+        }
+    }
+
+    let openapi = json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": "MeteoCore - OGC API Maps",
+            "version": "1.0.0",
+            "description": "OGC API - Maps implementation"
+        },
+        "paths": paths,
+        "components": {
+            "parameters": {
+                "bbox": {
+                    "name": "bbox",
+                    "in": "query",
+                    "required": true,
+                    "schema": {"type": "string"},
+                    "description": "Bounding box: west,south,east,north"
+                },
+                "width": {
+                    "name": "width",
+                    "in": "query",
+                    "required": false,
+                    "schema": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 4096,
+                        "default": 256
+                    },
+                    "description": "Image width in pixels"
+                },
+                "height": {
+                    "name": "height",
+                    "in": "query",
+                    "required": false,
+                    "schema": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 4096,
+                        "default": 256
+                    },
+                    "description": "Image height in pixels"
+                },
+                "crs": {
+                    "name": "crs",
+                    "in": "query",
+                    "required": false,
+                    "schema": {
+                        "type": "string",
+                        "default": "CRS:84",
+                        "enum": ["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:3067", "EPSG:3035"]
+                    },
+                    "description": "Coordinate reference system"
+                },
+                "datetime": {
+                    "name": "datetime",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "description": "ISO 8601 timestamp"
+                },
+                "transparent": {
+                    "name": "transparent",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "description": "Transparency support"
+                },
+                "f": {
+                    "name": "f",
+                    "in": "query",
+                    "required": false,
+                    "schema": {
+                        "type": "string",
+                        "default": "image/png",
+                        "enum": ["image/png", "image/jpeg", "image/webp"]
+                    },
+                    "description": "Output format"
+                },
+                "bbox-crs": {
+                    "name": "bbox-crs",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "description": "CRS for bbox coordinates. Only CRS:84 supported."
+                }
+            },
+            "schemas": {
+                "styleList": {
+                    "type": "object",
+                    "properties": {
+                        "styles": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/style"}
+                        },
+                        "links": {"type": "array", "items": {"$ref": "#/components/schemas/link"}}
+                    }
+                },
+                "style": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "links": {"type": "array", "items": {"$ref": "#/components/schemas/link"}}
+                    }
+                },
+                "link": {
+                    "type": "object",
+                    "required": ["href"],
+                    "properties": {
+                        "href": {"type": "string"},
+                        "rel": {"type": "string"},
+                        "type": {"type": "string"},
+                        "title": {"type": "string"}
+                    }
+                }
+            }
+        }
+    });
+
+    Json(openapi)
+}
+
+/// GET /maps/api/docs — Swagger UI
+pub async fn api_docs(State(state): State<AppState>) -> impl IntoResponse {
+    let state = state.load_full();
+    let spec_url = format!("{}/maps/api", state.base_url);
+    axum::response::Html(ds_core::openapi::swagger_ui_html(
+        "MeteoCore - Maps API",
+        &spec_url,
+    ))
 }
 
 /// GET /maps/conformance

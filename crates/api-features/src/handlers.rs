@@ -82,6 +82,12 @@ pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
                 "title": "API definition"
             },
             {
+                "href": format!("{base}/features/api/docs"),
+                "rel": "service-doc",
+                "type": "text/html",
+                "title": "API documentation"
+            },
+            {
                 "href": format!("{base}/features/conformance"),
                 "rel": "conformance",
                 "type": "application/json",
@@ -299,6 +305,15 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
     });
 
     Json(openapi)
+}
+
+pub async fn api_docs(State(state): State<AppState>) -> impl IntoResponse {
+    let state = state.load_full();
+    let spec_url = format!("{}/features/api", state.base_url);
+    axum::response::Html(ds_core::openapi::swagger_ui_html(
+        "MeteoCore - Features API",
+        &spec_url,
+    ))
 }
 
 pub async fn collections(State(state): State<AppState>) -> impl IntoResponse {

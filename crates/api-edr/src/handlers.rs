@@ -58,6 +58,18 @@ pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
                 "title": "This document"
             },
             {
+                "href": format!("{base}/edr/api"),
+                "rel": "service-desc",
+                "type": "application/vnd.oai.openapi+json;version=3.0",
+                "title": "API definition"
+            },
+            {
+                "href": format!("{base}/edr/api/docs"),
+                "rel": "service-doc",
+                "type": "text/html",
+                "title": "API documentation"
+            },
+            {
                 "href": format!("{base}/edr/conformance"),
                 "rel": "conformance",
                 "type": "application/json",
@@ -71,6 +83,242 @@ pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
             }
         ]
     }))
+}
+
+pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
+    let state = state.load_full();
+    let mut collection_paths = json!({});
+    for config in state.collections.values() {
+        let id = &config.id;
+
+        // Collection detail
+        let detail_path = format!("/edr/collections/{id}");
+        collection_paths[&detail_path] = json!({
+            "get": {
+                "summary": format!("Get {} collection metadata", config.title),
+                "operationId": format!("getCollection_{id}"),
+                "tags": [id],
+                "responses": {
+                    "200": {"description": "Collection metadata"},
+                    "404": {"description": "Collection not found"}
+                }
+            }
+        });
+
+        // Locations list
+        let locations_path = format!("/edr/collections/{id}/locations");
+        collection_paths[&locations_path] = json!({
+            "get": {
+                "summary": format!("Get locations for {}", config.title),
+                "operationId": format!("getLocations_{id}"),
+                "tags": [id],
+                "responses": {
+                    "200": {
+                        "description": "Locations in GeoJSON format",
+                        "content": {
+                            "application/geo+json": {
+                                "schema": {"type": "object"}
+                            }
+                        }
+                    },
+                    "404": {"description": "Collection not found"}
+                }
+            }
+        });
+
+        // Location data query
+        let location_path = format!("/edr/collections/{id}/locations/{{locationId}}");
+        collection_paths[&location_path] = json!({
+            "get": {
+                "summary": format!("Get data for a location in {}", config.title),
+                "operationId": format!("getLocationData_{id}"),
+                "tags": [id],
+                "parameters": [
+                    {
+                        "name": "locationId",
+                        "in": "path",
+                        "required": true,
+                        "schema": {"type": "string"}
+                    },
+                    {"$ref": "#/components/parameters/datetime"},
+                    {"$ref": "#/components/parameters/parameter-name"}
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Coverage data",
+                        "content": {
+                            "application/prs.coverage+json": {
+                                "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                            }
+                        }
+                    },
+                    "400": {"description": "Bad request"},
+                    "404": {"description": "Location not found"},
+                    "500": {"description": "Server error"}
+                }
+            }
+        });
+
+        // Position query
+        let position_path = format!("/edr/collections/{id}/position");
+        collection_paths[&position_path] = json!({
+            "get": {
+                "summary": format!("Position query for {}", config.title),
+                "operationId": format!("getPosition_{id}"),
+                "tags": [id],
+                "parameters": [
+                    {"$ref": "#/components/parameters/coords-point"},
+                    {"$ref": "#/components/parameters/datetime"},
+                    {"$ref": "#/components/parameters/parameter-name"}
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Coverage data",
+                        "content": {
+                            "application/prs.coverage+json": {
+                                "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                            }
+                        }
+                    },
+                    "400": {"description": "Bad request"},
+                    "404": {"description": "Not found"},
+                    "500": {"description": "Server error"}
+                }
+            }
+        });
+
+        // Area query
+        let area_path = format!("/edr/collections/{id}/area");
+        collection_paths[&area_path] = json!({
+            "get": {
+                "summary": format!("Area query for {}", config.title),
+                "operationId": format!("getArea_{id}"),
+                "tags": [id],
+                "parameters": [
+                    {"$ref": "#/components/parameters/coords-polygon"},
+                    {"$ref": "#/components/parameters/datetime"},
+                    {"$ref": "#/components/parameters/parameter-name"}
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Coverage data",
+                        "content": {
+                            "application/prs.coverage+json": {
+                                "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                            }
+                        }
+                    },
+                    "400": {"description": "Bad request"},
+                    "404": {"description": "Not found"},
+                    "500": {"description": "Server error"}
+                }
+            }
+        });
+    }
+
+    let mut paths = json!({
+        "/edr/": {
+            "get": {
+                "summary": "Landing page",
+                "operationId": "getLandingPage",
+                "responses": {
+                    "200": {"description": "Landing page"}
+                }
+            }
+        },
+        "/edr/conformance": {
+            "get": {
+                "summary": "Conformance classes",
+                "operationId": "getConformance",
+                "responses": {
+                    "200": {"description": "Conformance classes"}
+                }
+            }
+        },
+        "/edr/collections": {
+            "get": {
+                "summary": "List collections",
+                "operationId": "getCollections",
+                "responses": {
+                    "200": {"description": "List of EDR collections"}
+                }
+            }
+        }
+    });
+
+    // Merge collection paths into main paths
+    if let (Some(main_obj), Some(coll_obj)) = (paths.as_object_mut(), collection_paths.as_object())
+    {
+        for (k, v) in coll_obj {
+            main_obj.insert(k.clone(), v.clone());
+        }
+    }
+
+    let openapi = json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": "MeteoCore - OGC API EDR",
+            "version": "1.0.0",
+            "description": "OGC API - Environmental Data Retrieval implementation"
+        },
+        "paths": paths,
+        "components": {
+            "parameters": {
+                "datetime": {
+                    "name": "datetime",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "description": "RFC 3339 datetime or interval (start/end, ../end, start/..)"
+                },
+                "parameter-name": {
+                    "name": "parameter-name",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "description": "Comma-separated list of parameter names to include"
+                },
+                "coords-point": {
+                    "name": "coords",
+                    "in": "query",
+                    "required": true,
+                    "schema": {"type": "string"},
+                    "description": "WKT POINT geometry, e.g. POINT(24.94 60.17)"
+                },
+                "coords-polygon": {
+                    "name": "coords",
+                    "in": "query",
+                    "required": true,
+                    "schema": {"type": "string"},
+                    "description": "WKT POLYGON geometry, e.g. POLYGON((24 60, 26 60, 26 61, 24 61, 24 60))"
+                }
+            },
+            "schemas": {
+                "coverageJSON": {
+                    "type": "object",
+                    "description": "OGC CoverageJSON 1.0 Coverage object",
+                    "required": ["type", "domain", "parameters", "ranges"],
+                    "properties": {
+                        "type": {"type": "string", "enum": ["Coverage"]},
+                        "domain": {"type": "object"},
+                        "parameters": {"type": "object"},
+                        "ranges": {"type": "object"}
+                    }
+                }
+            }
+        }
+    });
+
+    Json(openapi)
+}
+
+pub async fn api_docs(State(state): State<AppState>) -> impl IntoResponse {
+    let state = state.load_full();
+    let spec_url = format!("{}/edr/api", state.base_url);
+    axum::response::Html(ds_core::openapi::swagger_ui_html(
+        "MeteoCore - EDR API",
+        &spec_url,
+    ))
 }
 
 pub async fn conformance() -> impl IntoResponse {

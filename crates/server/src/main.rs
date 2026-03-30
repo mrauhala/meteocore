@@ -182,27 +182,63 @@ async fn root_landing_page(state: AdminState) -> impl IntoResponse {
             },
             {
                 "href": format!("{base}/edr/"),
-                "rel": "service-desc",
+                "rel": "child",
                 "type": "application/json",
                 "title": "EDR API"
             },
             {
-                "href": format!("{base}/features/"),
+                "href": format!("{base}/edr/api"),
                 "rel": "service-desc",
+                "type": "application/vnd.oai.openapi+json;version=3.0",
+                "title": "EDR API definition"
+            },
+            {
+                "href": format!("{base}/edr/api/docs"),
+                "rel": "service-doc",
+                "type": "text/html",
+                "title": "EDR API documentation"
+            },
+            {
+                "href": format!("{base}/features/"),
+                "rel": "child",
                 "type": "application/json",
                 "title": "Features API"
+            },
+            {
+                "href": format!("{base}/features/api"),
+                "rel": "service-desc",
+                "type": "application/vnd.oai.openapi+json;version=3.0",
+                "title": "Features API definition"
+            },
+            {
+                "href": format!("{base}/features/api/docs"),
+                "rel": "service-doc",
+                "type": "text/html",
+                "title": "Features API documentation"
             },
             {
                 "href": format!("{base}/wms?SERVICE=WMS&REQUEST=GetCapabilities"),
                 "rel": "service-desc",
                 "type": "text/xml",
-                "title": "WMS 1.3.0"
+                "title": "WMS 1.3.0 Capabilities"
             },
             {
                 "href": format!("{base}/maps/"),
-                "rel": "service-desc",
+                "rel": "child",
                 "type": "application/json",
                 "title": "Maps API"
+            },
+            {
+                "href": format!("{base}/maps/api"),
+                "rel": "service-desc",
+                "type": "application/vnd.oai.openapi+json;version=3.0",
+                "title": "Maps API definition"
+            },
+            {
+                "href": format!("{base}/maps/api/docs"),
+                "rel": "service-doc",
+                "type": "text/html",
+                "title": "Maps API documentation"
             },
             {
                 "href": format!("{base}/health"),

@@ -226,26 +226,30 @@ async fn finding_03_landing_page_links_are_relative() {
 }
 
 // ===========================================================================
-// FINDING 4: Landing page missing required "api" link
+// FINDING 4: Landing page has required "api" link
 // ===========================================================================
 // Spec: EDR 1.1 landing page SHOULD include a link with rel="service-desc"
 //   pointing to the API definition (e.g., OpenAPI document).
-// Implementation: No rel="service-desc" or rel="service-doc" link present.
-// Impact: Clients cannot discover the API description document.
-// Fix: Add link { "href": "/edr/api", "rel": "service-desc",
-//        "type": "application/vnd.oai.openapi+json;version=3.0" }
 
 #[tokio::test]
-async fn finding_04_landing_page_missing_service_desc_link() {
+async fn finding_04_landing_page_has_service_desc_link() {
     let (_status, json) = get_json("/").await;
     let links = json["links"].as_array().unwrap();
-    let has_service_desc = links
+    let service_desc = links
         .iter()
-        .any(|l| l["rel"].as_str() == Some("service-desc"));
-    // SPEC GAP: No service-desc link
+        .find(|l| l["rel"].as_str() == Some("service-desc"));
     assert!(
-        !has_service_desc,
-        "Documenting: no service-desc link exists (should be added)"
+        service_desc.is_some(),
+        "Landing page should have a service-desc link"
+    );
+    let link = service_desc.unwrap();
+    assert!(
+        link["href"].as_str().unwrap().contains("/edr/api"),
+        "service-desc link should point to /edr/api"
+    );
+    assert_eq!(
+        link["type"].as_str().unwrap(),
+        "application/vnd.oai.openapi+json;version=3.0"
     );
 }
 

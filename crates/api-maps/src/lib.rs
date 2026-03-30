@@ -10,6 +10,8 @@ pub use handlers::{AppState, MapsState};
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(handlers::landing_page))
+        .route("/api", get(handlers::api_definition))
+        .route("/api/docs", get(handlers::api_docs))
         .route("/conformance", get(handlers::conformance))
         .route("/collections", get(handlers::collections))
         .route("/collections/{id}", get(handlers::collection))
