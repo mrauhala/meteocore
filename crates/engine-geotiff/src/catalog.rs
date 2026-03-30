@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use ds_core::error::DataServerError;
@@ -18,11 +19,15 @@ pub struct StacStub {
 }
 
 /// An entry in the file catalog: one GeoTIFF file with a parsed timestamp.
+///
+/// `metadata` and `source` are wrapped in `Arc` so that cloning the catalog's
+/// `BTreeMap` (required for COW semantics with `ArcSwap`) is cheap — just
+/// pointer bumps instead of deep-cloning potentially large `DataSource` buffers.
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub path: PathBuf,
-    pub source: Option<DataSource>,
-    pub metadata: Option<TiffMetadata>,
+    pub source: Option<Arc<DataSource>>,
+    pub metadata: Option<Arc<TiffMetadata>>,
     pub file_size: u64,
     pub stac_stub: Option<StacStub>,
 }
@@ -37,8 +42,8 @@ impl FileEntry {
     ) -> Self {
         Self {
             path,
-            source: Some(source),
-            metadata: Some(metadata),
+            source: Some(Arc::new(source)),
+            metadata: Some(Arc::new(metadata)),
             file_size,
             stac_stub: None,
         }
@@ -256,7 +261,7 @@ pub fn scan_directory(
         // Reuse cached metadata if file size unchanged
         let metadata = if let Some(entry) = existing_entry {
             if entry.file_size == file_size {
-                match entry.metadata.clone() {
+                match entry.metadata.as_deref().cloned() {
                     Some(m) => m,
                     None => match TiffMetadata::from_file(&path) {
                         Ok(m) => m,

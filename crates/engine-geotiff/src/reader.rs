@@ -28,9 +28,26 @@ where
 /// Security limits
 const MAX_RASTER_DIMENSION: u32 = 100_000;
 const MAX_DECODED_TILE_BYTES: usize = 64 * 1024 * 1024; // 64 MB
+const MAX_IFD_LEVELS: usize = 256;
 
 /// Maximum number of pixels in an area query result.
 const MAX_AREA_PIXELS: usize = 1_000_000;
+
+/// Compute tile index with overflow protection.
+fn safe_tile_index(
+    tile_row: u32,
+    tiles_across: u32,
+    tile_col: u32,
+) -> Result<u32, DataServerError> {
+    let index = (tile_row as u64)
+        .checked_mul(tiles_across as u64)
+        .and_then(|v| v.checked_add(tile_col as u64))
+        .ok_or_else(|| DataServerError::GeoTiff("Tile index overflow".into()))?;
+    if index > u32::MAX as u64 {
+        return Err(DataServerError::GeoTiff("Tile index overflow".into()));
+    }
+    Ok(index as u32)
+}
 
 /// Size of the initial header read for COG range reads (512 KB).
 /// Must be large enough to contain ALL IFDs (full-res + overviews) and their
@@ -285,6 +302,13 @@ impl TiffMetadata {
                  Convert to tiled COG with: gdal_translate -co TILED=YES -co COMPRESS=DEFLATE input.tif output.tif"
             )))?;
 
+        if tile_width == 0 || tile_height == 0 {
+            return Err(DataServerError::GeoTiff(format!(
+                "{source_name}: Invalid tile dimensions {}x{} (must be > 0)",
+                tile_width, tile_height
+            )));
+        }
+
         let tiles_across = width.div_ceil(tile_width);
         let tiles_down = height.div_ceil(tile_height);
         let samples_per_pixel = read_tag_u32(decoder, Tag::SamplesPerPixel).unwrap_or(1);
@@ -294,10 +318,16 @@ impl TiffMetadata {
         // the real value rather than assuming worst-case 8 bytes/sample.
         let bps = Self::bits_per_sample_from_decoder(decoder);
         let bytes_per_sample = (bps as usize).div_ceil(8);
-        let decoded_tile_bytes = tile_width as usize
-            * tile_height as usize
-            * bytes_per_sample
-            * samples_per_pixel as usize;
+        let decoded_tile_bytes = (tile_width as usize)
+            .checked_mul(tile_height as usize)
+            .and_then(|v| v.checked_mul(bytes_per_sample))
+            .and_then(|v| v.checked_mul(samples_per_pixel as usize))
+            .ok_or_else(|| {
+                DataServerError::GeoTiff(format!(
+                    "Decoded tile size overflow ({}x{} px, {} bands, {} bytes/sample)",
+                    tile_width, tile_height, samples_per_pixel, bytes_per_sample
+                ))
+            })?;
         if decoded_tile_bytes > MAX_DECODED_TILE_BYTES {
             return Err(DataServerError::GeoTiff(format!(
                 "Decoded tile size {} bytes ({}x{} px, {} bands, {} bytes/sample) exceeds maximum {}",
@@ -314,6 +344,12 @@ impl TiffMetadata {
         let mut overviews = Vec::new();
         let mut ifd_index = 1;
         while decoder.more_images() {
+            if ifd_index > MAX_IFD_LEVELS {
+                tracing::warn!(
+                    "{source_name}: IFD chain exceeds {MAX_IFD_LEVELS} levels, stopping traversal"
+                );
+                break;
+            }
             if decoder.seek_to_image(ifd_index).is_err() {
                 break;
             }
@@ -1179,7 +1215,7 @@ pub fn read_pixel(
 ) -> Result<Option<f64>, DataServerError> {
     let tile_col = col / metadata.tile_width;
     let tile_row = row / metadata.tile_height;
-    let chunk_index = tile_row * metadata.tiles_across + tile_col;
+    let chunk_index = safe_tile_index(tile_row, metadata.tiles_across, tile_col)?;
 
     let local_col = col % metadata.tile_width;
     let local_row = row % metadata.tile_height;
@@ -1364,7 +1400,7 @@ pub fn read_bbox_overview(
 
     for tile_row in tile_row_start..tile_row_end {
         for tile_col in tile_col_start..tile_col_end {
-            let chunk_index = tile_row * overview.tiles_across + tile_col;
+            let chunk_index = safe_tile_index(tile_row, overview.tiles_across, tile_col)?;
             let tile_data = decode_chunk_f64(&mut decoder, chunk_index, &ov_metadata, band_index)?;
 
             copy_tile_to_result(
@@ -1549,7 +1585,7 @@ fn read_bbox_inner(
 
     for tile_row in tile_row_start..tile_row_end {
         for tile_col in tile_col_start..tile_col_end {
-            let chunk_index = tile_row * metadata.tiles_across + tile_col;
+            let chunk_index = safe_tile_index(tile_row, metadata.tiles_across, tile_col)?;
             let tile_data = decode_chunk_f64(&mut decoder, chunk_index, metadata, band_index)?;
 
             copy_tile_to_result(
@@ -1606,7 +1642,13 @@ fn read_bbox_parallel(
         tile_coords
             .par_iter()
             .map(|&(tile_row, tile_col)| {
-                let chunk_index = tile_row * metadata.tiles_across + tile_col;
+                let chunk_index = match safe_tile_index(tile_row, metadata.tiles_across, tile_col) {
+                    Ok(idx) => idx,
+                    Err(e) => {
+                        tracing::warn!("Tile index overflow at ({}, {}): {e}", tile_row, tile_col);
+                        return (tile_row, tile_col, vec![None; tile_pixel_count]);
+                    }
+                };
                 let tile_data =
                     match read_remote_chunk_f64(
                         store,
@@ -1731,7 +1773,13 @@ fn read_bbox_parallel_http(
         tile_coords
             .par_iter()
             .map(|&(tile_row, tile_col)| {
-                let chunk_index = tile_row * metadata.tiles_across + tile_col;
+                let chunk_index = match safe_tile_index(tile_row, metadata.tiles_across, tile_col) {
+                    Ok(idx) => idx,
+                    Err(e) => {
+                        tracing::warn!("Tile index overflow at ({}, {}): {e}", tile_row, tile_col);
+                        return (tile_row, tile_col, vec![None; tile_pixel_count]);
+                    }
+                };
                 let tile_data = match read_http_chunk_f64(
                     &http_clone,
                     &url_owned,
