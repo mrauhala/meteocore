@@ -2,7 +2,7 @@
 
 ## What This Is
 
-Rust workspace implementing OGC API - EDR, OGC API - Features, and OGC WMS 1.3.0 servers. Ten crates: `ds-core` (traits + types), `ds-storage` (S3/HTTP/local object store), `ds-render` (raster colorization + PNG encoding), `engine-csv` (CSV data engine), `engine-geojson` (GeoJSON data engine), `engine-geotiff` (GeoTIFF/COG data engine), `api-edr` (EDR HTTP layer), `api-features` (Features HTTP layer), `api-wms` (WMS 1.3.0 HTTP layer), `server` (binary).
+Rust workspace implementing OGC API - EDR, OGC API - Features, OGC API - Maps, and OGC WMS 1.3.0 servers. Twelve crates: `ds-core` (traits + types + shared utilities), `ds-storage` (S3/HTTP/local object store), `ds-render` (raster colorization + PNG encoding), `engine-csv` (CSV data engine), `engine-geojson` (GeoJSON data engine), `engine-geotiff` (GeoTIFF/COG data engine), `api-edr` (EDR HTTP layer), `api-features` (Features HTTP layer), `api-maps` (OGC API Maps HTTP layer), `api-wms` (WMS 1.3.0 HTTP layer), `server` (binary).
 
 ## Build & Run
 
@@ -27,11 +27,11 @@ Seed corpus in `fuzz/corpus/fuzz_tiff_metadata/` — add real GeoTIFF files for 
 
 ## Architecture Rules
 
-- **Three core traits: `Engine` (EDR), `FeatureEngine` (Features), and `MapEngine` (WMS).** They are separate traits — not all engines need to support all APIs. Engines return domain types, never JSON/XML. Serialization belongs in the API crates.
+- **Three core traits: `Engine` (EDR), `FeatureEngine` (Features), and `MapEngine` (Maps/WMS).** They are separate traits — not all engines need to support all APIs. Engines return domain types, never JSON/XML. Serialization belongs in the API crates.
 - **ds-core has no framework dependencies.** Only chrono, serde, thiserror, toml. Keep it that way. Use `PropertyValue` enum instead of `serde_json::Value` for feature properties.
 - **ds-render has no framework dependencies.** Only ds-core and `png`. Pure rendering library for colorization and image encoding.
-- **API crates depend only on ds-core** (and ds-render for api-wms), not on any engine crate. API state is a registry of engines keyed by collection ID (`EdrState` / `FeaturesState` / `WmsState`), not a single engine.
-- **EDR, Features, and WMS are separate services** with separate base routes (`/edr/...`, `/features/...`, `/wms/...`). They share data sources but have independent endpoints.
+- **API crates depend only on ds-core** (and ds-render for api-wms/api-maps), not on any engine crate. API state is a registry of engines keyed by collection ID (`EdrState` / `FeaturesState` / `MapsState` / `WmsState`), not a single engine.
+- **EDR, Features, Maps, and WMS are separate services** with separate base routes (`/edr/...`, `/features/...`, `/maps/...`, `/wms/...`). They share data sources but have independent endpoints.
 - **WMS uses XML, not JSON.** All XML output in api-wms uses `quick-xml::Writer` for proper escaping. Never build XML with `format!()` or string concatenation (XML injection risk).
 - **CORS is applied at the server level**, not in individual API crates. The `CorsLayer` lives in `server/src/main.rs`.
 - **New engines** implement `Engine`, `FeatureEngine`, and/or `MapEngine` traits in their own crate, get wired up in `server/src/main.rs`.
@@ -47,22 +47,38 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 ```
 /                                              Root landing page (links to all services)
 /edr/                                          EDR landing page
+/edr/api                                       EDR OpenAPI definition (JSON)
+/edr/api/docs                                  EDR Swagger UI
 /edr/conformance                               EDR conformance classes
 /edr/collections                               EDR collection listing
 /edr/collections/{id}                          EDR collection detail
 /edr/collections/{id}/locations                EDR locations query
 /edr/collections/{id}/locations/{loc_id}       EDR location data query (CoverageJSON)
+/edr/collections/{id}/position                 EDR position query (CoverageJSON)
+/edr/collections/{id}/area                     EDR area query (CoverageJSON)
 
 /features/                                     Features landing page
-/features/api                                  Features OpenAPI definition
+/features/api                                  Features OpenAPI definition (JSON)
+/features/api/docs                             Features Swagger UI
 /features/conformance                          Features conformance classes
 /features/collections                          Features collection listing
 /features/collections/{id}                     Features collection detail
 /features/collections/{id}/items               Feature items (paginated GeoJSON)
 /features/collections/{id}/items/{feature_id}  Single feature (GeoJSON)
 
+/maps/                                         Maps landing page
+/maps/api                                      Maps OpenAPI definition (JSON)
+/maps/api/docs                                 Maps Swagger UI
+/maps/conformance                              Maps conformance classes
+/maps/collections                              Maps collection listing
+/maps/collections/{id}                         Maps collection detail
+/maps/collections/{id}/map                     Get map (default style, PNG/JPEG/WebP)
+/maps/collections/{id}/styles                  List available styles
+/maps/collections/{id}/styles/{styleId}/map    Get styled map (PNG/JPEG/WebP)
+
 /wms/?SERVICE=WMS&REQUEST=GetCapabilities      WMS 1.3.0 GetCapabilities (XML)
 /wms/?SERVICE=WMS&REQUEST=GetMap&...           WMS 1.3.0 GetMap (PNG image)
+/wms/?SERVICE=WMS&REQUEST=GetLegendGraphic&... WMS 1.3.0 GetLegendGraphic
 
 /admin/collections/reload                      POST: reload config and swap engines
 /health                                        Per-collection health status
@@ -84,6 +100,7 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 2. Add the route in `crates/api-edr/src/lib.rs`
 3. If new query params are needed, add them in `params.rs`
 4. If new response formats are needed, add serializers in `response.rs`
+5. Update `api_definition()` in `handlers.rs` to include the new path in the OpenAPI spec
 
 ## Adding a New Features Endpoint
 
@@ -91,6 +108,14 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 2. Add the route in `crates/api-features/src/lib.rs`
 3. If new query params are needed, add them in `params.rs`
 4. If new response formats are needed, add serializers in `response.rs`
+5. Update `api_definition()` in `handlers.rs` to include the new path in the OpenAPI spec
+
+## Adding a New Maps Endpoint
+
+1. Add the handler function in `crates/api-maps/src/handlers.rs`
+2. Add the route in `crates/api-maps/src/lib.rs`
+3. If new query params are needed, add them in `params.rs`
+4. Update `api_definition()` in `handlers.rs` to include the new path in the OpenAPI spec
 
 ## Features API Query Parameters
 
@@ -107,7 +132,7 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 - **`timeStamp`**: FeatureCollection responses include `timeStamp` (RFC 3339)
 - **`numberMatched`/`numberReturned`**: Always present in FeatureCollection responses
 - **Collection metadata**: Includes `extent.spatial.bbox`, `crs`, `storageCrs`
-- **OpenAPI**: Served at `/features/api` (linked from landing page via `rel: service-desc`)
+- **OpenAPI**: Served at `/features/api` (linked from landing page via `rel: service-desc`). Swagger UI at `/features/api/docs` (`rel: service-doc`).
 - **Conformance**: Declares `core`, `oas30`, `geojson`
 
 ## WMS 1.3.0
@@ -514,6 +539,51 @@ The engine caches **compressed** tile bytes (not decoded pixels) in a lock-free 
 | Empty results / all-None values | Wrong `band` number, or missing `nodata` override | Check band count with `gdalinfo`; set `nodata` if file lacks the tag |
 | Slow poll cycles | Many remote files, or non-COG layout causing full downloads | Set `max_files` and/or `time_window` to limit scan scope; convert to COG |
 
+## OGC API Maps
+
+The server implements OGC API Maps for serving raster data as map images via a RESTful JSON API. Only GeoTIFF collections can be exposed via Maps (they implement `MapEngine`). Maps and WMS share the same `MapEngine` trait but have separate HTTP layers and state.
+
+### Maps Query Parameters
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `bbox` | yes | — | Bounding box: `west,south,east,north` (always lon/lat order) |
+| `width` | no | `256` | Image width in pixels (max 4096) |
+| `height` | no | `256` | Image height in pixels (max 4096) |
+| `crs` | no | `CRS:84` | Output CRS: `CRS:84`, `EPSG:4326`, `EPSG:3857`, `EPSG:3067`, `EPSG:3035` |
+| `datetime` | no | latest | ISO 8601 timestamp |
+| `f` | no | `image/png` | Output format: `image/png`, `image/jpeg`, `image/webp` |
+| `transparent` | no | — | Transparency support |
+| `bbox-crs` | no | — | CRS for bbox coordinates (only `CRS:84` supported) |
+
+### Key Differences from WMS
+
+- **Maps uses REST paths** (`/maps/collections/{id}/map`), WMS uses query parameters (`?REQUEST=GetMap&LAYERS=...`)
+- **Maps bbox is always lon/lat order** (no axis-order swapping like WMS 1.3.0 EPSG:4326)
+- **Maps supports WebP** output format in addition to PNG and JPEG
+- **Maps has named styles** via `/collections/{id}/styles/{styleId}/map`
+- **Maps has its own state** (`MapsState`) with styles, render semaphore, and rendered cache
+
+## OpenAPI and Swagger UI
+
+Each OGC API (EDR, Features, Maps) serves a dynamic OpenAPI 3.0.3 specification and a Swagger UI page:
+
+| API | OpenAPI spec (service-desc) | Swagger UI (service-doc) |
+|-----|---------------------------|-------------------------|
+| EDR | `/edr/api` | `/edr/api/docs` |
+| Features | `/features/api` | `/features/api/docs` |
+| Maps | `/maps/api` | `/maps/api/docs` |
+
+OpenAPI specs are **generated dynamically** from configured collections — new collections appear automatically after config reload. The Swagger UI is a static HTML page loading `swagger-ui-dist@5` from unpkg CDN. The shared HTML template lives in `ds_core::openapi::swagger_ui_html()`.
+
+Landing pages link to both:
+- `rel="service-desc"` → OpenAPI JSON (`application/vnd.oai.openapi+json;version=3.0`)
+- `rel="service-doc"` → Swagger UI HTML (`text/html`)
+
+WMS uses XML `GetCapabilities` for service description (no OpenAPI).
+
+When adding new endpoints to any API, update the `api_definition()` handler in that crate's `handlers.rs` to include the new paths in the spec.
+
 ## Config Format
 
 ```toml
@@ -572,7 +642,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `title` | yes | — | Human-readable collection title |
 | `description` | yes | — | Collection description |
 | `data_path` | yes | — | Path to data file (CSV or GeoJSON) |
-| `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, `"wms"` |
+| `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, `"maps"`, `"wms"` |
 | `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, or `"geotiff"` |
 | `wms` | no | — | WMS rendering config (see WMS Config Fields). Required when `apis` contains `"wms"`. |
 
@@ -599,6 +669,15 @@ pub struct EdrState {
 pub struct FeaturesState {
     pub engines: HashMap<String, Arc<dyn FeatureEngine>>,
     pub collections: HashMap<String, CollectionConfig>,
+}
+
+// api-maps
+pub struct MapsState {
+    pub engines: HashMap<String, Arc<dyn MapEngine>>,
+    pub collections: HashMap<String, CollectionConfig>,
+    pub styles: HashMap<String, Vec<StyleInfo>>,
+    pub render_semaphore: Arc<Semaphore>,
+    pub rendered_cache: Arc<RenderedCache>,
 }
 
 // api-wms
@@ -721,7 +800,7 @@ Path labels use axum's `MatchedPath` (route patterns, not raw URLs) to avoid unb
 
 ### State architecture
 
-API state (`EdrState`, `FeaturesState`, `WmsState`) is wrapped in `ArcSwap` for lock-free reads and atomic swaps on reload. The `ServerState` in `server/src/admin.rs` holds the `ArcSwap` pointers, health registry, and GeoTIFF engine list. Engine loading logic is in `admin::load_collections()`, shared by startup and reload. On reload, the WMS rendered image cache is replaced (old cache is dropped).
+API state (`EdrState`, `FeaturesState`, `MapsState`, `WmsState`) is wrapped in `ArcSwap` for lock-free reads and atomic swaps on reload. The `ServerState` in `server/src/admin.rs` holds the `ArcSwap` pointers, health registry, and GeoTIFF engine list. Engine loading logic is in `admin::load_collections()`, shared by startup and reload. On reload, the WMS rendered image cache is replaced (old cache is dropped).
 
 ## Known Limitations
 
@@ -730,7 +809,7 @@ API state (`EdrState`, `FeaturesState`, `WmsState`) is wrapped in `ArcSwap` for 
 - CSV engine supports only the `locations` query type (no position, area, radius, trajectory, corridor)
 - GeoTIFF engine supports `position` and `area` queries (no locations, radius, trajectory, corridor)
 - GeoJSON engine implements `FeatureEngine` only (not `Engine`/EDR, not `MapEngine`/WMS) — polygon boundary data has no time-series parameters
-- GeoTIFF engine implements `Engine` (EDR) and `MapEngine` (WMS) only (not `FeatureEngine`/Features)
+- GeoTIFF engine implements `Engine` (EDR) and `MapEngine` (Maps/WMS) only (not `FeatureEngine`/Features)
 - GeoTIFF CRS: WGS84, Transverse Mercator, LAEA, and LCC supported; other projections fall back to WGS84
 - GeoTIFF area queries extract the bounding box from POLYGON WKT — they do not clip to the actual polygon shape
 - Strip-based (non-tiled) GeoTIFFs are not supported — convert to COG first
