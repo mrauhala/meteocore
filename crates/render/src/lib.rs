@@ -2,7 +2,8 @@ pub mod colormap;
 mod encode;
 
 pub use colormap::{
-    parse_hex_color, BuiltinColormap, ColorMap, ColorStop, LinearColorMap, LutColorMap,
+    parse_hex_color, BuiltinColormap, ColorMap, ColorStop, IntegerLutColorMap, LinearColorMap,
+    LutColorMap,
 };
 pub use encode::{encode_jpeg, encode_png, encode_webp};
 

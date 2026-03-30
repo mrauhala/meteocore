@@ -18,6 +18,22 @@ pub struct StacStub {
     pub asset_url: String,
 }
 
+/// The loading state of a file entry.
+///
+/// Non-STAC entries (local/remote) are always `Loaded` since metadata is parsed
+/// during the scan. STAC entries start as `Stub` and transition to `Loaded` when
+/// GeoTIFF metadata is fetched on demand.
+#[derive(Debug, Clone)]
+pub enum FileState {
+    /// STAC stub: only STAC metadata available, GeoTIFF not yet loaded.
+    Stub { stub: StacStub },
+    /// Fully loaded with GeoTIFF metadata and data source.
+    Loaded {
+        metadata: Arc<TiffMetadata>,
+        source: Arc<DataSource>,
+    },
+}
+
 /// An entry in the file catalog: one GeoTIFF file with a parsed timestamp.
 ///
 /// `metadata` and `source` are wrapped in `Arc` so that cloning the catalog's
@@ -26,10 +42,8 @@ pub struct StacStub {
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub path: PathBuf,
-    pub source: Option<Arc<DataSource>>,
-    pub metadata: Option<Arc<TiffMetadata>>,
     pub file_size: u64,
-    pub stac_stub: Option<StacStub>,
+    pub state: FileState,
 }
 
 impl FileEntry {
@@ -42,10 +56,11 @@ impl FileEntry {
     ) -> Self {
         Self {
             path,
-            source: Some(Arc::new(source)),
-            metadata: Some(Arc::new(metadata)),
             file_size,
-            stac_stub: None,
+            state: FileState::Loaded {
+                metadata: Arc::new(metadata),
+                source: Arc::new(source),
+            },
         }
     }
 
@@ -53,16 +68,51 @@ impl FileEntry {
     pub fn stac_stub(path: PathBuf, file_size: u64, stub: StacStub) -> Self {
         Self {
             path,
-            source: None,
-            metadata: None,
             file_size,
-            stac_stub: Some(stub),
+            state: FileState::Stub { stub },
         }
     }
 
     /// Whether this entry has full GeoTIFF metadata loaded.
     pub fn is_loaded(&self) -> bool {
-        self.metadata.is_some()
+        matches!(self.state, FileState::Loaded { .. })
+    }
+
+    /// Get metadata if loaded, None if stub.
+    pub fn metadata(&self) -> Option<&Arc<TiffMetadata>> {
+        match &self.state {
+            FileState::Loaded { metadata, .. } => Some(metadata),
+            FileState::Stub { .. } => None,
+        }
+    }
+
+    /// Get source if loaded, None if stub.
+    pub fn source(&self) -> Option<&Arc<DataSource>> {
+        match &self.state {
+            FileState::Loaded { source, .. } => Some(source),
+            FileState::Stub { .. } => None,
+        }
+    }
+
+    /// Get the STAC stub if this is a stub entry.
+    pub fn stac_stub_info(&self) -> Option<&StacStub> {
+        match &self.state {
+            FileState::Stub { stub } => Some(stub),
+            FileState::Loaded { .. } => None,
+        }
+    }
+
+    /// Promote a stub to loaded state with metadata and source.
+    pub fn set_loaded(&mut self, metadata: Arc<TiffMetadata>, source: Arc<DataSource>) {
+        self.state = FileState::Loaded { metadata, source };
+    }
+
+    /// Get mutable access to metadata (for applying overrides). Returns None if stub.
+    pub fn metadata_mut(&mut self) -> Option<&mut Arc<TiffMetadata>> {
+        match &mut self.state {
+            FileState::Loaded { metadata, .. } => Some(metadata),
+            FileState::Stub { .. } => None,
+        }
     }
 }
 
@@ -110,16 +160,12 @@ impl Catalog {
 fn compute_spatial_union<'a>(entries: impl Iterator<Item = &'a FileEntry>) -> Option<[f64; 4]> {
     let mut result: Option<[f64; 4]> = None;
     for entry in entries {
-        let bbox = if let Some(meta) = &entry.metadata {
-            meta.geo_transform.bbox()
-        } else if let Some(stub) = &entry.stac_stub {
-            if let Some(b) = stub.bbox {
-                b
-            } else {
-                continue;
-            }
-        } else {
-            continue;
+        let bbox = match &entry.state {
+            FileState::Loaded { metadata, .. } => metadata.geo_transform.bbox(),
+            FileState::Stub { stub } => match stub.bbox {
+                Some(b) => b,
+                None => continue,
+            },
         };
         result = Some(match result {
             None => bbox,
@@ -132,6 +178,67 @@ fn compute_spatial_union<'a>(entries: impl Iterator<Item = &'a FileEntry>) -> Op
         });
     }
     result
+}
+
+/// Parse candidate files from an iterator of (filename, file_size) pairs.
+///
+/// Matches filenames against the regex pattern, extracts timestamps, and
+/// returns a vec of (datetime, filename, file_size) tuples.
+pub fn parse_candidates_from_names<'a>(
+    names: impl Iterator<Item = (&'a str, u64)>,
+    pattern: &Regex,
+    ts_format: &str,
+) -> Vec<(DateTime<Utc>, String, u64)> {
+    let mut candidates = Vec::new();
+    for (filename, file_size) in names {
+        if filename.len() > MAX_FILENAME_LENGTH {
+            continue;
+        }
+        let caps = match pattern.captures(filename) {
+            Some(c) => c,
+            None => continue,
+        };
+        let timestamp_str = match caps.name("timestamp") {
+            Some(m) => m.as_str(),
+            None => continue,
+        };
+        let datetime = match NaiveDateTime::parse_from_str(timestamp_str, ts_format) {
+            Ok(dt) => dt.and_utc(),
+            Err(_) => {
+                tracing::warn!(
+                    "Cannot parse timestamp '{}' from file '{}'",
+                    timestamp_str,
+                    filename
+                );
+                continue;
+            }
+        };
+        candidates.push((datetime, filename.to_string(), file_size));
+    }
+    candidates
+}
+
+/// Apply time window filter and max_files limit to a list of candidates.
+///
+/// Filters by time window (if set), sorts by timestamp descending, truncates
+/// to max_files, then re-sorts ascending for BTreeMap insertion order.
+pub fn apply_scan_filters(
+    candidates: &mut Vec<(DateTime<Utc>, String, u64)>,
+    time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    max_files: Option<usize>,
+) {
+    // Filter by time window
+    if let Some((start, end)) = time_filter {
+        candidates.retain(|(dt, _, _)| *dt >= start && *dt <= end);
+    }
+
+    // Sort by timestamp descending and take only max_files most recent
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    if let Some(max) = max_files {
+        candidates.truncate(max);
+    }
+    // Re-sort ascending for BTreeMap insertion order
+    candidates.sort_by_key(|c| c.0);
 }
 
 /// Tracks files seen but not yet confirmed as fully written.
@@ -261,7 +368,7 @@ pub fn scan_directory(
         // Reuse cached metadata if file size unchanged
         let metadata = if let Some(entry) = existing_entry {
             if entry.file_size == file_size {
-                match entry.metadata.as_deref().cloned() {
+                match entry.metadata().map(|m| (**m).clone()) {
                     Some(m) => m,
                     None => match TiffMetadata::from_file(&path) {
                         Ok(m) => m,
@@ -373,58 +480,39 @@ pub fn scan_remote_with_limit(
 ) -> Result<Catalog, DataServerError> {
     let entries_list = store.list(prefix)?;
 
-    // First pass: match filenames and parse timestamps without downloading
-    let mut candidates: Vec<(
-        DateTime<Utc>,
-        String,
-        u64,
-        ds_storage::object_store::path::Path,
-    )> = Vec::new();
+    // Build location index and extract basenames for pattern matching.
+    // parse_candidates_from_names works with basenames; we keep the full key
+    // in a parallel vec so we can look up the object_store path afterward.
+    let remote_entries: Vec<(String, String, u64, ds_storage::object_store::path::Path)> =
+        entries_list
+            .iter()
+            .filter_map(|obj| {
+                if obj.size > MAX_REMOTE_FILE_SIZE {
+                    return None;
+                }
+                let key = obj.location.to_string();
+                let filename = key.rsplit('/').next().unwrap_or(&key).to_string();
+                Some((key, filename, obj.size as u64, obj.location.clone()))
+            })
+            .collect();
 
-    for obj in &entries_list {
-        let key = obj.location.to_string();
-        let filename = key.rsplit('/').next().unwrap_or(&key);
+    let mut candidates = parse_candidates_from_names(
+        remote_entries
+            .iter()
+            .map(|(_, filename, size, _)| (filename.as_str(), *size)),
+        pattern,
+        timestamp_format,
+    );
 
-        if filename.len() > MAX_FILENAME_LENGTH {
-            continue;
-        }
+    apply_scan_filters(&mut candidates, time_filter, max_files);
 
-        let caps = match pattern.captures(filename) {
-            Some(c) => c,
-            None => continue,
-        };
-
-        let timestamp_str = match caps.name("timestamp") {
-            Some(m) => m.as_str().to_string(),
-            None => continue,
-        };
-
-        let datetime = match NaiveDateTime::parse_from_str(&timestamp_str, timestamp_format) {
-            Ok(dt) => dt.and_utc(),
-            Err(_) => continue,
-        };
-
-        // Filter by time window before downloading anything
-        if let Some((start, end)) = time_filter {
-            if datetime < start || datetime > end {
-                continue;
-            }
-        }
-
-        if obj.size > MAX_REMOTE_FILE_SIZE {
-            continue;
-        }
-
-        candidates.push((datetime, key, obj.size as u64, obj.location.clone()));
-    }
-
-    // Sort by timestamp descending and take only max_files most recent
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
-    if let Some(max) = max_files {
-        candidates.truncate(max);
-    }
-    // Re-sort ascending for the BTreeMap
-    candidates.sort_by_key(|c| c.0);
+    // Build a filename→(key, location) lookup for resolving full paths.
+    // (candidates contain basenames from parse_candidates_from_names)
+    let filename_to_remote: HashMap<&str, (&str, &ds_storage::object_store::path::Path)> =
+        remote_entries
+            .iter()
+            .map(|(key, filename, _, location)| (filename.as_str(), (key.as_str(), location)))
+            .collect();
 
     let listed = entries_list.len();
     let kept = candidates.len();
@@ -449,7 +537,11 @@ pub fn scan_remote_with_limit(
     // Second pass: parse metadata (range read, falling back to full download)
     let mut entries = BTreeMap::new();
 
-    for (datetime, key, file_size, location) in &candidates {
+    for (datetime, filename, file_size) in &candidates {
+        let &(key, location) = match filename_to_remote.get(filename.as_str()) {
+            Some(kl) => kl,
+            None => continue, // shouldn't happen
+        };
         let pseudo_path = PathBuf::from(key);
 
         // Reuse cached entry if file size unchanged
@@ -717,9 +809,9 @@ mod tests {
         let metadata = dummy_metadata();
         let entry = FileEntry::loaded(path.clone(), source, metadata, 1024);
 
-        assert!(entry.metadata.is_some());
-        assert!(entry.source.is_some());
-        assert!(entry.stac_stub.is_none());
+        assert!(entry.metadata().is_some());
+        assert!(entry.source().is_some());
+        assert!(entry.stac_stub_info().is_none());
         assert_eq!(entry.file_size, 1024);
         assert_eq!(entry.path, path);
     }
@@ -733,12 +825,12 @@ mod tests {
         };
         let entry = FileEntry::stac_stub(path.clone(), 2048, stub);
 
-        assert!(entry.metadata.is_none());
-        assert!(entry.source.is_none());
-        assert!(entry.stac_stub.is_some());
+        assert!(entry.metadata().is_none());
+        assert!(entry.source().is_none());
+        assert!(entry.stac_stub_info().is_some());
         assert_eq!(entry.file_size, 2048);
         assert_eq!(entry.path, path);
-        let stub = entry.stac_stub.unwrap();
+        let stub = entry.stac_stub_info().unwrap();
         assert_eq!(stub.bbox, Some([10.0, 55.0, 30.0, 72.0]));
         assert_eq!(stub.asset_url, "https://example.com/radar/file.tif");
     }

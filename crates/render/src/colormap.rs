@@ -46,6 +46,13 @@ impl LutColorMap {
         Self::from_stops(&stops, min, max)
     }
 
+    /// Pre-compute an integer LUT from this colormap over `[min_val, max_val]`.
+    ///
+    /// Returns `None` if the range exceeds 65,536 entries.
+    pub fn to_integer_lut(&self, min_val: i64, max_val: i64) -> Option<IntegerLutColorMap> {
+        IntegerLutColorMap::from_colormap(self, min_val, max_val)
+    }
+
     /// Create a LUT colormap from color stops.
     ///
     /// The `min`/`max` define the data value range. The color stops define
@@ -88,6 +95,71 @@ impl ColorMap for LutColorMap {
     }
 }
 
+/// Pre-computed integer LUT colormap. O(1) per pixel with direct indexing.
+///
+/// For integer data types (UInt8, UInt16, Int16), all possible output colors
+/// are pre-computed into a flat array. Lookup is a single index operation
+/// with no floating-point math — significantly faster than even the
+/// normalized LUT approach for integer raster data.
+///
+/// Maximum supported range: 65,536 entries (~256 KB for UInt16/Int16).
+pub struct IntegerLutColorMap {
+    lut: Vec<[u8; 4]>,
+    offset: i64,
+    nodata_color: [u8; 4],
+}
+
+/// Maximum number of entries in an integer LUT (covers full UInt16 / Int16 range).
+const MAX_INTEGER_LUT_SIZE: usize = 65_536;
+
+impl IntegerLutColorMap {
+    /// Pre-compute a LUT for integer data in the range `[min_val, max_val]` (inclusive).
+    ///
+    /// Each integer value in the range gets its color computed once from the
+    /// source colormap. At render time, lookup is `O(1)` per pixel.
+    ///
+    /// Returns `None` if the range exceeds 65,536 entries.
+    pub fn from_colormap(source: &dyn ColorMap, min_val: i64, max_val: i64) -> Option<Self> {
+        if max_val < min_val {
+            return Some(Self {
+                lut: Vec::new(),
+                offset: 0,
+                nodata_color: [0, 0, 0, 0],
+            });
+        }
+        let range = (max_val - min_val + 1) as usize;
+        if range > MAX_INTEGER_LUT_SIZE {
+            return None;
+        }
+        let mut lut = Vec::with_capacity(range);
+        for i in 0..range {
+            let value = (i as i64 + min_val) as f64;
+            lut.push(source.color(Some(value)));
+        }
+        Some(Self {
+            lut,
+            offset: min_val,
+            nodata_color: [0, 0, 0, 0],
+        })
+    }
+}
+
+impl ColorMap for IntegerLutColorMap {
+    fn color(&self, value: Option<f64>) -> [u8; 4] {
+        match value {
+            None => self.nodata_color,
+            Some(v) => {
+                let index = (v as i64 - self.offset) as usize;
+                if index < self.lut.len() {
+                    self.lut[index]
+                } else {
+                    [0, 0, 0, 0] // transparent for out-of-range
+                }
+            }
+        }
+    }
+}
+
 /// Linear interpolation colormap for continuous data.
 pub struct LinearColorMap {
     stops: Vec<ColorStop>,
@@ -100,6 +172,13 @@ impl LinearColorMap {
             stops,
             nodata_color: [0, 0, 0, 0],
         }
+    }
+
+    /// Pre-compute an integer LUT for this colormap over `[min_val, max_val]`.
+    ///
+    /// Returns `None` if the range exceeds 65,536 entries.
+    pub fn to_integer_lut(&self, min_val: i64, max_val: i64) -> Option<IntegerLutColorMap> {
+        IntegerLutColorMap::from_colormap(self, min_val, max_val)
     }
 }
 
@@ -474,5 +553,197 @@ mod tests {
         ]);
         let mid = cmap.color(Some(50.0));
         assert_eq!(mid, [128, 128, 128, 255]);
+    }
+
+    // --- IntegerLutColorMap tests ---
+
+    #[test]
+    fn test_integer_lut_matches_linear_colormap() {
+        let linear = LinearColorMap::new(vec![
+            ColorStop {
+                value: 0.0,
+                color: [0, 0, 0, 255],
+            },
+            ColorStop {
+                value: 255.0,
+                color: [255, 255, 255, 255],
+            },
+        ]);
+        let lut = linear.to_integer_lut(0, 255).unwrap();
+
+        // Every integer value should produce the same color
+        for i in 0..=255 {
+            assert_eq!(
+                lut.color(Some(i as f64)),
+                linear.color(Some(i as f64)),
+                "mismatch at value {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_integer_lut_signed_offset() {
+        let linear = LinearColorMap::new(vec![
+            ColorStop {
+                value: -128.0,
+                color: [0, 0, 0, 255],
+            },
+            ColorStop {
+                value: 127.0,
+                color: [255, 255, 255, 255],
+            },
+        ]);
+        let lut = IntegerLutColorMap::from_colormap(&linear, -128, 127).unwrap();
+
+        // Check boundaries
+        assert_eq!(lut.color(Some(-128.0)), linear.color(Some(-128.0)));
+        assert_eq!(lut.color(Some(0.0)), linear.color(Some(0.0)));
+        assert_eq!(lut.color(Some(127.0)), linear.color(Some(127.0)));
+
+        // Check all values match
+        for i in -128..=127_i64 {
+            assert_eq!(
+                lut.color(Some(i as f64)),
+                linear.color(Some(i as f64)),
+                "mismatch at value {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_integer_lut_out_of_range_transparent() {
+        let linear = LinearColorMap::new(vec![
+            ColorStop {
+                value: 0.0,
+                color: [100, 100, 100, 255],
+            },
+            ColorStop {
+                value: 10.0,
+                color: [200, 200, 200, 255],
+            },
+        ]);
+        let lut = IntegerLutColorMap::from_colormap(&linear, 0, 10).unwrap();
+
+        // Out of range below
+        assert_eq!(lut.color(Some(-1.0)), [0, 0, 0, 0]);
+        // Out of range above
+        assert_eq!(lut.color(Some(11.0)), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_integer_lut_nodata() {
+        let linear = LinearColorMap::new(vec![
+            ColorStop {
+                value: 0.0,
+                color: [255, 0, 0, 255],
+            },
+            ColorStop {
+                value: 10.0,
+                color: [0, 255, 0, 255],
+            },
+        ]);
+        let lut = IntegerLutColorMap::from_colormap(&linear, 0, 10).unwrap();
+        assert_eq!(lut.color(None), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_integer_lut_single_value_range() {
+        let linear = LinearColorMap::new(vec![
+            ColorStop {
+                value: 0.0,
+                color: [0, 0, 0, 255],
+            },
+            ColorStop {
+                value: 100.0,
+                color: [255, 255, 255, 255],
+            },
+        ]);
+        let lut = IntegerLutColorMap::from_colormap(&linear, 50, 50).unwrap();
+        assert_eq!(lut.color(Some(50.0)), linear.color(Some(50.0)));
+        // Out of range
+        assert_eq!(lut.color(Some(49.0)), [0, 0, 0, 0]);
+        assert_eq!(lut.color(Some(51.0)), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_integer_lut_full_uint16_range() {
+        let linear = LinearColorMap::new(vec![
+            ColorStop {
+                value: 0.0,
+                color: [0, 0, 0, 255],
+            },
+            ColorStop {
+                value: 65535.0,
+                color: [255, 255, 255, 255],
+            },
+        ]);
+        let lut = IntegerLutColorMap::from_colormap(&linear, 0, 65535).unwrap();
+
+        // Check boundaries
+        assert_eq!(lut.color(Some(0.0)), [0, 0, 0, 255]);
+        assert_eq!(lut.color(Some(65535.0)), [255, 255, 255, 255]);
+        // Check midpoint
+        assert_eq!(lut.color(Some(32768.0)), linear.color(Some(32768.0)));
+    }
+
+    #[test]
+    fn test_integer_lut_full_int16_range() {
+        let linear = LinearColorMap::new(vec![
+            ColorStop {
+                value: -32768.0,
+                color: [0, 0, 0, 255],
+            },
+            ColorStop {
+                value: 32767.0,
+                color: [255, 255, 255, 255],
+            },
+        ]);
+        let lut = IntegerLutColorMap::from_colormap(&linear, -32768, 32767).unwrap();
+
+        assert_eq!(lut.color(Some(-32768.0)), [0, 0, 0, 255]);
+        assert_eq!(lut.color(Some(32767.0)), [255, 255, 255, 255]);
+        assert_eq!(lut.color(Some(0.0)), linear.color(Some(0.0)));
+    }
+
+    #[test]
+    fn test_integer_lut_rejects_too_large_range() {
+        let linear = LinearColorMap::new(vec![
+            ColorStop {
+                value: 0.0,
+                color: [0, 0, 0, 255],
+            },
+            ColorStop {
+                value: 1.0,
+                color: [255, 255, 255, 255],
+            },
+        ]);
+        // 65537 entries — one too many
+        assert!(IntegerLutColorMap::from_colormap(&linear, 0, 65536).is_none());
+    }
+
+    #[test]
+    fn test_integer_lut_empty_range() {
+        let linear = LinearColorMap::new(vec![ColorStop {
+            value: 0.0,
+            color: [255, 0, 0, 255],
+        }]);
+        // min > max → empty
+        let lut = IntegerLutColorMap::from_colormap(&linear, 10, 5).unwrap();
+        assert_eq!(lut.color(Some(7.0)), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_integer_lut_from_builtin_lut() {
+        let builtin = LutColorMap::from_builtin(BuiltinColormap::RadarDbz, 0.0, 70.0);
+        let int_lut = builtin.to_integer_lut(0, 70).unwrap();
+
+        // Verify key values match
+        for v in [0, 5, 10, 25, 35, 50, 70] {
+            assert_eq!(
+                int_lut.color(Some(v as f64)),
+                builtin.color(Some(v as f64)),
+                "mismatch at dBZ {v}"
+            );
+        }
     }
 }

@@ -3,6 +3,8 @@
 //! Provides a synchronous `DataStore` over the `object_store` crate,
 //! supporting local filesystem, S3, and HTTP backends.
 
+mod error;
+
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -12,6 +14,7 @@ use object_store::path::Path as ObjectPath;
 use object_store::{ObjectMeta, ObjectStore};
 
 pub use bytes;
+pub use error::StorageError;
 pub use object_store;
 
 /// Synchronous wrapper around an `ObjectStore`.
@@ -85,14 +88,16 @@ impl DataStore {
             }
         };
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(timed))
-                .map_err(|e| DataServerError::Storage(format!("{e}"))),
+            Ok(handle) => {
+                let result = tokio::task::block_in_place(|| handle.block_on(timed));
+                result.map_err(|e| DataServerError::from(StorageError::from(e)))
+            }
             Err(_) => {
                 // No runtime — create a temporary one (e.g., in tests or CLI tools)
                 let rt = tokio::runtime::Runtime::new()
                     .map_err(|e| DataServerError::Storage(format!("Cannot create runtime: {e}")))?;
-                rt.block_on(timed)
-                    .map_err(|e| DataServerError::Storage(format!("{e}")))
+                let result = rt.block_on(timed);
+                result.map_err(|e| DataServerError::from(StorageError::from(e)))
             }
         }
     }
