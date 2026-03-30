@@ -127,10 +127,13 @@ async fn main() {
         .await
         .expect("Failed to bind");
 
-    axum::serve(listener, ServiceExt::<axum::http::Request<Body>>::into_make_service(app))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .expect("Server error");
+    axum::serve(
+        listener,
+        ServiceExt::<axum::http::Request<Body>>::into_make_service(app),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .expect("Server error");
 
     // Signal all GeoTIFF polling loops to stop
     let engines = server_state.geotiff_engines.read().unwrap();
