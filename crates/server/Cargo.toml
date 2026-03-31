@@ -12,6 +12,7 @@ api-edr = { path = "../api-edr" }
 api-features = { path = "../api-features" }
 api-wms = { path = "../api-wms" }
 api-maps = { path = "../api-maps" }
+api-tiles = { path = "../api-tiles" }
 ds-render = { path = "../render" }
 arc-swap = "1"
 axum = "0.8"

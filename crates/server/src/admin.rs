@@ -17,6 +17,7 @@ use tracing::info;
 use api_edr::handlers::EdrState;
 use api_features::handlers::FeaturesState;
 use api_maps::MapsState;
+use api_tiles::TilesState;
 use api_wms::WmsState;
 use ds_core::config::CollectionConfig;
 
@@ -106,6 +107,7 @@ pub struct ServerState {
     pub features: Arc<ArcSwap<FeaturesState>>,
     pub wms: Arc<ArcSwap<WmsState>>,
     pub maps: Arc<ArcSwap<MapsState>>,
+    pub tiles: Arc<ArcSwap<TilesState>>,
     pub config_path: String,
     pub health: RwLock<Vec<CollectionHealth>>,
     pub geotiff_engines: RwLock<Vec<Arc<engine_geotiff::GeoTiffEngine>>>,
@@ -124,6 +126,7 @@ pub struct LoadResult {
     pub features_state: FeaturesState,
     pub wms_state: WmsState,
     pub maps_state: MapsState,
+    pub tiles_state: TilesState,
     pub health: Vec<CollectionHealth>,
     pub geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>>,
 }
@@ -140,6 +143,10 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
     let mut maps_engines: HashMap<String, Arc<dyn ds_core::map_engine::MapEngine>> = HashMap::new();
     let mut maps_collections: HashMap<String, CollectionConfig> = HashMap::new();
     let mut maps_styles: HashMap<String, HashMap<String, ds_render::StyleInfo>> = HashMap::new();
+    let mut tiles_engines: HashMap<String, Arc<dyn ds_core::map_engine::MapEngine>> =
+        HashMap::new();
+    let mut tiles_collections: HashMap<String, CollectionConfig> = HashMap::new();
+    let mut tiles_styles: HashMap<String, HashMap<String, ds_render::StyleInfo>> = HashMap::new();
     let mut geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>> = Vec::new();
     let mut health: Vec<CollectionHealth> = Vec::new();
 
@@ -373,6 +380,18 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
 
                     info!("Collection '{}': wired to Maps API", collection.id);
                 }
+                if collection.apis.contains(&"tiles".to_string()) {
+                    tiles_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    tiles_collections.insert(collection.id.clone(), collection.clone());
+
+                    let styles = build_styles(collection);
+                    tiles_styles.insert(collection.id.clone(), styles);
+
+                    info!("Collection '{}': wired to Tiles API", collection.id);
+                }
 
                 // GeoTIFF starts degraded (no data yet until first poll), unless
                 // the initial scan already found files.
@@ -419,7 +438,7 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
         .next()
         .unwrap_or(128);
 
-    // Shared render semaphore and cache between WMS and Maps APIs
+    // Shared render semaphore and cache between WMS, Maps, and Tiles APIs
     let render_semaphore = Arc::new(tokio::sync::Semaphore::new(8));
     let rendered_cache = Arc::new(ds_render::RenderedCache::new(rendered_cache_mb));
 
@@ -446,6 +465,14 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
             engines: maps_engines,
             collections: maps_collections,
             styles: maps_styles,
+            render_semaphore: render_semaphore.clone(),
+            rendered_cache: rendered_cache.clone(),
+            base_url: base_url.to_string(),
+        },
+        tiles_state: TilesState {
+            map_engines: tiles_engines,
+            collections: tiles_collections,
+            styles: tiles_styles,
             render_semaphore,
             rendered_cache,
             base_url: base_url.to_string(),
@@ -662,6 +689,7 @@ pub async fn reload_handler(
     state.features.store(Arc::new(result.features_state));
     state.wms.store(Arc::new(result.wms_state));
     state.maps.store(Arc::new(result.maps_state));
+    state.tiles.store(Arc::new(result.tiles_state));
 
     // Update health
     update_health_gauges(&result.health);
