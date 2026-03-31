@@ -1690,31 +1690,36 @@ fn read_bbox_parallel(
 
     // Fetch all tiles in parallel using the shared thread pool.
     // Each tile returns Ok(data) or Err(error) — errors are NOT silently swallowed.
-    let tile_results: Vec<TileFetchResult> =
-        TILE_FETCH_POOL.install(|| {
-            tile_coords
-                .par_iter()
-                .map(|&(tile_row, tile_col)| {
-                    let chunk_index =
-                        match safe_tile_index(tile_row, metadata.tiles_across, tile_col) {
-                            Ok(idx) => idx,
-                            Err(e) => return (tile_row, tile_col, Err(e)),
-                        };
-                    let result = read_remote_chunk_with_retry(
-                        || {
-                            read_remote_chunk_f64(
-                                store, obj_path, tile_info, metadata, chunk_index, cache,
-                                file_path, band_index, ifd_index,
-                            )
-                        },
-                        tile_row,
-                        tile_col,
-                        chunk_index,
-                    );
-                    (tile_row, tile_col, result)
-                })
-                .collect()
-        });
+    let tile_results: Vec<TileFetchResult> = TILE_FETCH_POOL.install(|| {
+        tile_coords
+            .par_iter()
+            .map(|&(tile_row, tile_col)| {
+                let chunk_index = match safe_tile_index(tile_row, metadata.tiles_across, tile_col) {
+                    Ok(idx) => idx,
+                    Err(e) => return (tile_row, tile_col, Err(e)),
+                };
+                let result = read_remote_chunk_with_retry(
+                    || {
+                        read_remote_chunk_f64(
+                            store,
+                            obj_path,
+                            tile_info,
+                            metadata,
+                            chunk_index,
+                            cache,
+                            file_path,
+                            band_index,
+                            ifd_index,
+                        )
+                    },
+                    tile_row,
+                    tile_col,
+                    chunk_index,
+                );
+                (tile_row, tile_col, result)
+            })
+            .collect()
+    });
 
     // Assemble the result grid, propagating any tile read errors
     let mut result = vec![None; total_pixels];
@@ -1774,31 +1779,36 @@ fn read_bbox_parallel_http(
     let http_clone = http.clone();
     let url_owned = url.to_string();
 
-    let tile_results: Vec<TileFetchResult> =
-        TILE_FETCH_POOL.install(|| {
-            tile_coords
-                .par_iter()
-                .map(|&(tile_row, tile_col)| {
-                    let chunk_index =
-                        match safe_tile_index(tile_row, metadata.tiles_across, tile_col) {
-                            Ok(idx) => idx,
-                            Err(e) => return (tile_row, tile_col, Err(e)),
-                        };
-                    let result = read_remote_chunk_with_retry(
-                        || {
-                            read_http_chunk_f64(
-                                &http_clone, &url_owned, tile_info, metadata, chunk_index, cache,
-                                file_path, band_index, ifd_index,
-                            )
-                        },
-                        tile_row,
-                        tile_col,
-                        chunk_index,
-                    );
-                    (tile_row, tile_col, result)
-                })
-                .collect()
-        });
+    let tile_results: Vec<TileFetchResult> = TILE_FETCH_POOL.install(|| {
+        tile_coords
+            .par_iter()
+            .map(|&(tile_row, tile_col)| {
+                let chunk_index = match safe_tile_index(tile_row, metadata.tiles_across, tile_col) {
+                    Ok(idx) => idx,
+                    Err(e) => return (tile_row, tile_col, Err(e)),
+                };
+                let result = read_remote_chunk_with_retry(
+                    || {
+                        read_http_chunk_f64(
+                            &http_clone,
+                            &url_owned,
+                            tile_info,
+                            metadata,
+                            chunk_index,
+                            cache,
+                            file_path,
+                            band_index,
+                            ifd_index,
+                        )
+                    },
+                    tile_row,
+                    tile_col,
+                    chunk_index,
+                );
+                (tile_row, tile_col, result)
+            })
+            .collect()
+    });
 
     let mut result = vec![None; total_pixels];
     for (tile_row, tile_col, tile_data) in &tile_results {

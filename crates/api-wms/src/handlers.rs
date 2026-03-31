@@ -174,8 +174,10 @@ pub async fn wms_handler(
                 Ok(None) => {
                     // Empty tile: return transparent PNG without caching
                     let rgba = vec![0u8; (params.width * params.height * 4) as usize];
-                    let png = ds_render::encode_png(&rgba, params.width, params.height)
-                        .map_err(|e| WmsError::Internal(format!("Failed to encode empty tile: {e}")))?;
+                    let png =
+                        ds_render::encode_png(&rgba, params.width, params.height).map_err(|e| {
+                            WmsError::Internal(format!("Failed to encode empty tile: {e}"))
+                        })?;
                     (png, "EMPTY")
                 }
                 Err(e) => {
