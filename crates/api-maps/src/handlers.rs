@@ -751,18 +751,33 @@ async fn render_map(
 
     let render_result = tokio::task::spawn_blocking(move || {
         let tile = engine.get_raster_tile(bbox, width, height, time, &output_crs)?;
-        ds_render::render_tile(&tile, colormap.as_ref(), format)
+        // If every pixel is nodata, skip colorization + encoding entirely.
+        if tile.is_empty() {
+            return Ok(None);
+        }
+        ds_render::render_tile(&tile, colormap.as_ref(), format).map(Some)
     })
     .await
     .map_err(|e| MapsError::Internal(format!("Render task failed: {e}")))?;
 
-    let image_bytes = render_result.map_err(|e| {
-        tracing::warn!("Maps render error for collection '{}': {e}", collection_id);
-        MapsError::Internal(format!("Render failed: {e}"))
-    })?;
-
-    let image_arc = Arc::new(image_bytes);
-    rendered_cache.insert(cache_key, image_arc.clone());
+    let (image_bytes, x_cache) = match render_result {
+        Ok(Some(bytes)) => {
+            let image_arc = Arc::new(bytes);
+            rendered_cache.insert(cache_key, image_arc.clone());
+            (image_arc.as_ref().clone(), "MISS")
+        }
+        Ok(None) => {
+            // Empty tile: return transparent PNG without caching
+            let rgba = vec![0u8; (width * height * 4) as usize];
+            let png = ds_render::encode_png(&rgba, width, height)
+                .map_err(|e| MapsError::Internal(format!("Failed to encode empty tile: {e}")))?;
+            (png, "EMPTY")
+        }
+        Err(e) => {
+            tracing::warn!("Maps render error for collection '{}': {e}", collection_id);
+            return Err(MapsError::Internal(format!("Render failed: {e}")));
+        }
+    };
 
     Ok(axum::response::Response::builder()
         .header(header::CONTENT_TYPE, content_type)
@@ -773,8 +788,8 @@ async fn render_map(
             header::HeaderName::from_static("x-content-type-options"),
             "nosniff",
         )
-        .header(header::HeaderName::from_static("x-cache"), "MISS")
-        .body(axum::body::Body::from(image_arc.as_ref().clone()))
+        .header(header::HeaderName::from_static("x-cache"), x_cache)
+        .body(axum::body::Body::from(image_bytes))
         .unwrap()
         .into_response())
 }

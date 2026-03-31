@@ -1606,6 +1606,58 @@ fn read_bbox_inner(
     Ok(result)
 }
 
+/// Result of a parallel tile fetch: (row, col, pixel data or error).
+type TileFetchResult = (u32, u32, Result<Vec<Option<f64>>, DataServerError>);
+
+/// Retry a remote tile read up to 2 times with brief backoff.
+/// Returns the final error if all attempts fail (instead of silently returning nodata).
+fn read_remote_chunk_with_retry<F>(
+    read_fn: F,
+    tile_row: u32,
+    tile_col: u32,
+    chunk_index: u32,
+) -> Result<Vec<Option<f64>>, DataServerError>
+where
+    F: Fn() -> Result<Vec<Option<f64>>, DataServerError>,
+{
+    match read_fn() {
+        Ok(data) => Ok(data),
+        Err(first_err) => {
+            let mut last_err = first_err;
+            for attempt in 1..=2 {
+                tracing::debug!(
+                    "Tile ({}, {}), chunk {} failed (attempt {}), retrying: {last_err}",
+                    tile_row,
+                    tile_col,
+                    chunk_index,
+                    attempt
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50 * attempt));
+                match read_fn() {
+                    Ok(data) => {
+                        tracing::debug!(
+                            "Tile ({}, {}), chunk {} succeeded on retry {}",
+                            tile_row,
+                            tile_col,
+                            chunk_index,
+                            attempt
+                        );
+                        return Ok(data);
+                    }
+                    Err(e) => last_err = e,
+                }
+            }
+            tracing::warn!(
+                "Tile ({}, {}), chunk {} failed after 2 retries: {last_err}",
+                tile_row,
+                tile_col,
+                chunk_index
+            );
+            Err(last_err)
+        }
+    }
+}
+
 /// Parallel tile fetching for remote data sources.
 /// Uses a rayon thread pool capped at `MAX_TILE_CONCURRENCY` threads.
 #[allow(clippy::too_many_arguments)]
@@ -1636,91 +1688,45 @@ fn read_bbox_parallel(
         .flat_map(|tr| (tile_col_start..tile_col_end).map(move |tc| (tr, tc)))
         .collect();
 
-    // Fetch all tiles in parallel using the shared thread pool
-    let tile_pixel_count = (metadata.tile_width * metadata.tile_height) as usize;
-    let tile_results: Vec<(u32, u32, Vec<Option<f64>>)> = TILE_FETCH_POOL.install(|| {
-        tile_coords
-            .par_iter()
-            .map(|&(tile_row, tile_col)| {
-                let chunk_index = match safe_tile_index(tile_row, metadata.tiles_across, tile_col) {
-                    Ok(idx) => idx,
-                    Err(e) => {
-                        tracing::warn!("Tile index overflow at ({}, {}): {e}", tile_row, tile_col);
-                        return (tile_row, tile_col, vec![None; tile_pixel_count]);
-                    }
-                };
-                let tile_data =
-                    match read_remote_chunk_f64(
-                        store,
-                        obj_path,
-                        tile_info,
-                        metadata,
+    // Fetch all tiles in parallel using the shared thread pool.
+    // Each tile returns Ok(data) or Err(error) — errors are NOT silently swallowed.
+    let tile_results: Vec<TileFetchResult> =
+        TILE_FETCH_POOL.install(|| {
+            tile_coords
+                .par_iter()
+                .map(|&(tile_row, tile_col)| {
+                    let chunk_index =
+                        match safe_tile_index(tile_row, metadata.tiles_across, tile_col) {
+                            Ok(idx) => idx,
+                            Err(e) => return (tile_row, tile_col, Err(e)),
+                        };
+                    let result = read_remote_chunk_with_retry(
+                        || {
+                            read_remote_chunk_f64(
+                                store, obj_path, tile_info, metadata, chunk_index, cache,
+                                file_path, band_index, ifd_index,
+                            )
+                        },
+                        tile_row,
+                        tile_col,
                         chunk_index,
-                        cache,
-                        file_path,
-                        band_index,
-                        ifd_index,
-                    ) {
-                        Ok(data) => data,
-                        Err(first_err) => {
-                            // Retry up to 2 times for transient S3 errors (truncation, throttling)
-                            let mut last_err = first_err;
-                            let mut succeeded = false;
-                            let mut result_data = vec![None; tile_pixel_count];
-                            for attempt in 1..=2 {
-                                tracing::debug!(
-                                "Tile ({}, {}), chunk {} failed (attempt {}), retrying: {last_err}",
-                                tile_row, tile_col, chunk_index, attempt
-                            );
-                                // Brief backoff before retry
-                                std::thread::sleep(std::time::Duration::from_millis(50 * attempt));
-                                match read_remote_chunk_f64(
-                                    store,
-                                    obj_path,
-                                    tile_info,
-                                    metadata,
-                                    chunk_index,
-                                    cache,
-                                    file_path,
-                                    band_index,
-                                    ifd_index,
-                                ) {
-                                    Ok(data) => {
-                                        tracing::debug!(
-                                            "Tile ({}, {}), chunk {} succeeded on retry {}",
-                                            tile_row,
-                                            tile_col,
-                                            chunk_index,
-                                            attempt
-                                        );
-                                        result_data = data;
-                                        succeeded = true;
-                                        break;
-                                    }
-                                    Err(e) => last_err = e,
-                                }
-                            }
-                            if !succeeded {
-                                tracing::warn!(
-                                    "Tile ({}, {}), chunk {} failed after 2 retries: {last_err}",
-                                    tile_row,
-                                    tile_col,
-                                    chunk_index
-                                );
-                            }
-                            result_data
-                        }
-                    };
-                (tile_row, tile_col, tile_data)
-            })
-            .collect()
-    });
+                    );
+                    (tile_row, tile_col, result)
+                })
+                .collect()
+        });
 
-    // Assemble the result grid
+    // Assemble the result grid, propagating any tile read errors
     let mut result = vec![None; total_pixels];
     for (tile_row, tile_col, tile_data) in &tile_results {
+        let data = tile_data.as_ref().map_err(|e| {
+            DataServerError::GeoTiff(format!(
+                "Failed to read tile ({}, {}): {e}",
+                tile_row, tile_col
+            ))
+        })?;
         copy_tile_to_result(
-            tile_data,
+            data,
             &mut result,
             *tile_col,
             *tile_row,
@@ -1765,92 +1771,45 @@ fn read_bbox_parallel_http(
         .flat_map(|tr| (tile_col_start..tile_col_end).map(move |tc| (tr, tc)))
         .collect();
 
-    let tile_pixel_count = (metadata.tile_width * metadata.tile_height) as usize;
     let http_clone = http.clone();
     let url_owned = url.to_string();
 
-    let tile_results: Vec<(u32, u32, Vec<Option<f64>>)> = TILE_FETCH_POOL.install(|| {
-        tile_coords
-            .par_iter()
-            .map(|&(tile_row, tile_col)| {
-                let chunk_index = match safe_tile_index(tile_row, metadata.tiles_across, tile_col) {
-                    Ok(idx) => idx,
-                    Err(e) => {
-                        tracing::warn!("Tile index overflow at ({}, {}): {e}", tile_row, tile_col);
-                        return (tile_row, tile_col, vec![None; tile_pixel_count]);
-                    }
-                };
-                let tile_data = match read_http_chunk_f64(
-                    &http_clone,
-                    &url_owned,
-                    tile_info,
-                    metadata,
-                    chunk_index,
-                    cache,
-                    file_path,
-                    band_index,
-                    ifd_index,
-                ) {
-                    Ok(data) => data,
-                    Err(first_err) => {
-                        let mut last_err = first_err;
-                        let mut succeeded = false;
-                        let mut result_data = vec![None; tile_pixel_count];
-                        for attempt in 1..=2 {
-                            tracing::debug!(
-                                "Tile ({}, {}), chunk {} failed (attempt {}), retrying: {last_err}",
-                                tile_row,
-                                tile_col,
-                                chunk_index,
-                                attempt
-                            );
-                            std::thread::sleep(std::time::Duration::from_millis(50 * attempt));
-                            match read_http_chunk_f64(
-                                &http_clone,
-                                &url_owned,
-                                tile_info,
-                                metadata,
-                                chunk_index,
-                                cache,
-                                file_path,
-                                band_index,
-                                ifd_index,
-                            ) {
-                                Ok(data) => {
-                                    tracing::debug!(
-                                        "Tile ({}, {}), chunk {} succeeded on retry {}",
-                                        tile_row,
-                                        tile_col,
-                                        chunk_index,
-                                        attempt
-                                    );
-                                    result_data = data;
-                                    succeeded = true;
-                                    break;
-                                }
-                                Err(e) => last_err = e,
-                            }
-                        }
-                        if !succeeded {
-                            tracing::warn!(
-                                "Tile ({}, {}), chunk {} failed after 2 retries: {last_err}",
-                                tile_row,
-                                tile_col,
-                                chunk_index
-                            );
-                        }
-                        result_data
-                    }
-                };
-                (tile_row, tile_col, tile_data)
-            })
-            .collect()
-    });
+    let tile_results: Vec<TileFetchResult> =
+        TILE_FETCH_POOL.install(|| {
+            tile_coords
+                .par_iter()
+                .map(|&(tile_row, tile_col)| {
+                    let chunk_index =
+                        match safe_tile_index(tile_row, metadata.tiles_across, tile_col) {
+                            Ok(idx) => idx,
+                            Err(e) => return (tile_row, tile_col, Err(e)),
+                        };
+                    let result = read_remote_chunk_with_retry(
+                        || {
+                            read_http_chunk_f64(
+                                &http_clone, &url_owned, tile_info, metadata, chunk_index, cache,
+                                file_path, band_index, ifd_index,
+                            )
+                        },
+                        tile_row,
+                        tile_col,
+                        chunk_index,
+                    );
+                    (tile_row, tile_col, result)
+                })
+                .collect()
+        });
 
     let mut result = vec![None; total_pixels];
     for (tile_row, tile_col, tile_data) in &tile_results {
+        let data = tile_data.as_ref().map_err(|e| {
+            DataServerError::GeoTiff(format!(
+                "Failed to read tile ({}, {}): {e}",
+                tile_row, tile_col
+            ))
+        })?;
         copy_tile_to_result(
-            tile_data,
+            data,
             &mut result,
             *tile_col,
             *tile_row,
