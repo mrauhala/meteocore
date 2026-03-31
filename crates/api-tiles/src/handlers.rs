@@ -752,7 +752,7 @@ async fn render_tile(
         let tile = engine.get_raster_tile(bbox, tile_size, tile_size, time, &output_crs)?;
 
         // If every pixel is nodata, skip colorization + encoding entirely.
-        if tile.values.iter().all(Option::is_none) {
+        if tile.is_empty() {
             return Ok(None);
         }
 
