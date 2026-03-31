@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arc_swap::ArcSwap;
 use axum::extract::{Path, Query, State};
@@ -15,6 +15,14 @@ use ds_render::{CacheKey, RenderedCache, StyleInfo};
 use crate::error::TilesError;
 use crate::params::{self, TileQueryParams};
 use crate::tilematrixset::{self, SUPPORTED_TILE_MATRIX_SETS};
+
+/// Pre-generated 256x256 fully transparent PNG for empty (all-nodata) tiles.
+/// Avoids running the colorization + encoding pipeline when a tile has no data.
+static EMPTY_TILE_PNG: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    let size = params::TILE_SIZE;
+    let rgba = vec![0u8; (size * size * 4) as usize];
+    ds_render::encode_png(&rgba, size, size).expect("encoding empty tile PNG must not fail")
+});
 
 /// Shared state for the OGC API Tiles service.
 #[derive(Clone)]
@@ -738,20 +746,35 @@ async fn render_tile(
     let format = validated.format;
     let rendered_cache = state.rendered_cache.clone();
 
+    // The blocking closure returns Ok(None) for empty (all-nodata) tiles,
+    // or Ok(Some(bytes)) for tiles with data.
     let render_result = tokio::task::spawn_blocking(move || {
         let tile = engine.get_raster_tile(bbox, tile_size, tile_size, time, &output_crs)?;
-        ds_render::render_tile(&tile, colormap.as_ref(), format)
+
+        // If every pixel is nodata, skip colorization + encoding entirely.
+        if tile.values.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+
+        ds_render::render_tile(&tile, colormap.as_ref(), format).map(Some)
     })
     .await
     .map_err(|e| TilesError::Internal(format!("Render task failed: {e}")))?;
 
-    let image_bytes = render_result.map_err(|e| {
+    let maybe_bytes = render_result.map_err(|e| {
         tracing::warn!("Tiles render error for collection '{}': {e}", collection_id);
         TilesError::Internal(format!("Render failed: {e}"))
     })?;
 
-    let image_arc = Arc::new(image_bytes);
-    rendered_cache.insert(cache_key, image_arc.clone());
+    // Empty tiles: return the pre-generated transparent PNG without caching.
+    let (image_bytes, x_cache) = match maybe_bytes {
+        None => (EMPTY_TILE_PNG.clone(), "EMPTY"),
+        Some(bytes) => {
+            let image_arc = Arc::new(bytes);
+            rendered_cache.insert(cache_key, image_arc.clone());
+            (image_arc.as_ref().clone(), "MISS")
+        }
+    };
 
     Ok(axum::response::Response::builder()
         .header(header::CONTENT_TYPE, content_type)
@@ -762,8 +785,8 @@ async fn render_tile(
             header::HeaderName::from_static("x-content-type-options"),
             "nosniff",
         )
-        .header(header::HeaderName::from_static("x-cache"), "MISS")
-        .body(axum::body::Body::from(image_arc.as_ref().clone()))
+        .header(header::HeaderName::from_static("x-cache"), x_cache)
+        .body(axum::body::Body::from(image_bytes))
         .unwrap()
         .into_response())
 }

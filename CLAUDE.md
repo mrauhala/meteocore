@@ -2,7 +2,7 @@
 
 ## What This Is
 
-Rust workspace implementing OGC API - EDR, OGC API - Features, OGC API - Maps, and OGC WMS 1.3.0 servers. Twelve crates: `ds-core` (traits + types + shared utilities), `ds-storage` (S3/HTTP/local object store), `ds-render` (raster colorization + PNG encoding), `engine-csv` (CSV data engine), `engine-geojson` (GeoJSON data engine), `engine-geotiff` (GeoTIFF/COG data engine), `api-edr` (EDR HTTP layer), `api-features` (Features HTTP layer), `api-maps` (OGC API Maps HTTP layer), `api-wms` (WMS 1.3.0 HTTP layer), `server` (binary).
+Rust workspace implementing OGC API - EDR, OGC API - Features, OGC API - Maps, OGC API - Tiles, and OGC WMS 1.3.0 servers. Thirteen crates: `ds-core` (traits + types + shared utilities), `ds-storage` (S3/HTTP/local object store), `ds-render` (raster colorization + PNG encoding), `engine-csv` (CSV data engine), `engine-geojson` (GeoJSON data engine), `engine-geotiff` (GeoTIFF/COG data engine), `api-edr` (EDR HTTP layer), `api-features` (Features HTTP layer), `api-maps` (OGC API Maps HTTP layer), `api-tiles` (OGC API Tiles HTTP layer), `api-wms` (WMS 1.3.0 HTTP layer), `server` (binary).
 
 ## Build & Run
 
@@ -27,16 +27,17 @@ Seed corpus in `fuzz/corpus/fuzz_tiff_metadata/` — add real GeoTIFF files for 
 
 ## Architecture Rules
 
-- **Three core traits: `Engine` (EDR), `FeatureEngine` (Features), and `MapEngine` (Maps/WMS).** They are separate traits — not all engines need to support all APIs. Engines return domain types, never JSON/XML. Serialization belongs in the API crates.
+- **Three core traits: `Engine` (EDR), `FeatureEngine` (Features), and `MapEngine` (Maps/WMS/Tiles).** They are separate traits — not all engines need to support all APIs. Engines return domain types, never JSON/XML. Serialization belongs in the API crates.
 - **ds-core has no framework dependencies.** Only chrono, serde, thiserror, toml. Keep it that way. Use `PropertyValue` enum instead of `serde_json::Value` for feature properties.
 - **ds-render has no framework dependencies.** Only ds-core and `png`. Pure rendering library for colorization and image encoding.
 - **API crates depend only on ds-core** (and ds-render for api-wms/api-maps), not on any engine crate. API state is a registry of engines keyed by collection ID (`EdrState` / `FeaturesState` / `MapsState` / `WmsState`), not a single engine.
-- **EDR, Features, Maps, and WMS are separate services** with separate base routes (`/edr/...`, `/features/...`, `/maps/...`, `/wms/...`). They share data sources but have independent endpoints.
+- **EDR, Features, Maps, Tiles, and WMS are separate services** with separate base routes (`/edr/...`, `/features/...`, `/maps/...`, `/tiles/...`, `/wms/...`). They share data sources but have independent endpoints.
 - **WMS uses XML, not JSON.** All XML output in api-wms uses `quick-xml::Writer` for proper escaping. Never build XML with `format!()` or string concatenation (XML injection risk).
 - **CORS is applied at the server level**, not in individual API crates. The `CorsLayer` lives in `server/src/main.rs`.
 - **New engines** implement `Engine`, `FeatureEngine`, and/or `MapEngine` traits in their own crate, get wired up in `server/src/main.rs`.
 - **Collection routing is dynamic.** Handlers look up engines from a `HashMap<String, Arc<dyn Engine/FeatureEngine/MapEngine>>` by collection ID from the URL path. No collection IDs are hardcoded.
-- **The `apis` config field is enforced.** Only collections listing a given API in their `apis` array are wired to that API's router. A GeoJSON collection with `apis = ["features"]` will not appear in EDR or WMS.
+- **The `apis` config field is enforced.** Only collections listing a given API in their `apis` array are wired to that API's router. A GeoJSON collection with `apis = ["features"]` will not appear in EDR, WMS, or Tiles.
+- **Tiles reuses MapEngine.** Tile z/x/y coordinates are converted to a bbox via TileMatrixSet math, then passed to `MapEngine::get_raster_tile()`. No separate tile engine trait is needed. TilesState has `map_engines` (raster tiles) with space for future `vector_engines` (vector tiles from FeatureEngine).
 
 ## Crate Name
 
@@ -75,6 +76,18 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 /maps/collections/{id}/map                     Get map (default style, PNG/JPEG/WebP)
 /maps/collections/{id}/styles                  List available styles
 /maps/collections/{id}/styles/{styleId}/map    Get styled map (PNG/JPEG/WebP)
+
+/tiles/                                        Tiles landing page
+/tiles/api                                     Tiles OpenAPI definition (JSON)
+/tiles/api/docs                                Tiles Swagger UI
+/tiles/conformance                             Tiles conformance classes
+/tiles/tileMatrixSets                          List supported tiling schemes
+/tiles/tileMatrixSets/{tileMatrixSetId}        Get tiling scheme definition
+/tiles/collections                             Tiles collection listing
+/tiles/collections/{id}                        Tiles collection detail
+/tiles/collections/{id}/tiles                  List tilesets for collection
+/tiles/collections/{id}/tiles/{tms}/{z}/{row}/{col}              Get tile (PNG/JPEG/WebP)
+/tiles/collections/{id}/styles/{styleId}/tiles/{tms}/{z}/{row}/{col}  Get styled tile
 
 /wms/?SERVICE=WMS&REQUEST=GetCapabilities      WMS 1.3.0 GetCapabilities (XML)
 /wms/?SERVICE=WMS&REQUEST=GetMap&...           WMS 1.3.0 GetMap (PNG image)
@@ -116,6 +129,14 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 2. Add the route in `crates/api-maps/src/lib.rs`
 3. If new query params are needed, add them in `params.rs`
 4. Update `api_definition()` in `handlers.rs` to include the new path in the OpenAPI spec
+
+## Adding a New Tiles Endpoint
+
+1. Add the handler function in `crates/api-tiles/src/handlers.rs`
+2. Add the route in `crates/api-tiles/src/lib.rs`
+3. If new query params are needed, add them in `params.rs`
+4. If new TileMatrixSet support is needed, add it in `tilematrixset.rs`
+5. Update `api_definition()` in `handlers.rs` to include the new path in the OpenAPI spec
 
 ## Features API Query Parameters
 
@@ -564,15 +585,92 @@ The server implements OGC API Maps for serving raster data as map images via a R
 - **Maps has named styles** via `/collections/{id}/styles/{styleId}/map`
 - **Maps has its own state** (`MapsState`) with styles, render semaphore, and rendered cache
 
+## OGC API Tiles
+
+The server implements OGC API - Tiles Part 1 for serving raster data as tiled map images. Only GeoTIFF collections can be exposed via Tiles (they implement `MapEngine`). Tiles reuses the same rendering pipeline as Maps/WMS — tile z/x/y coordinates are converted to a bbox via TileMatrixSet math, then rendered through `MapEngine::get_raster_tile()`.
+
+### Tile Addressing
+
+Tiles are addressed by `{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}` where:
+- **tileMatrixSetId**: Tiling scheme (e.g., `WebMercatorQuad`, `WorldCRS84Quad`)
+- **tileMatrix**: Zoom level (0-24)
+- **tileRow**: Row index (0 = top/north)
+- **tileCol**: Column index (0 = left/west)
+
+All tiles are fixed 256x256 pixels (not user-configurable).
+
+### Supported TileMatrixSets
+
+| ID | CRS | Description |
+|----|-----|-------------|
+| `WebMercatorQuad` | EPSG:3857 | Standard web map tiles (Google/OSM scheme) |
+| `WorldCRS84Quad` | CRS:84 | Geographic tiles in lon/lat |
+
+TileMatrixSet definitions and bbox computation math live in `api-tiles/src/tilematrixset.rs`.
+
+### Tiles Query Parameters
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `datetime` | no | latest | ISO 8601 timestamp |
+| `f` | no | `image/png` | Output format: `image/png`, `image/jpeg`, `image/webp` |
+
+Tile coordinates (z, row, col) and TileMatrixSet ID come from URL path parameters.
+
+### Security Limits
+
+| Limit | Value | Location |
+|-------|-------|----------|
+| MAX_ZOOM_LEVEL | 24 | `api-tiles/src/params.rs` |
+| DEFAULT_MAX_ZOOM | 18 | `api-tiles/src/params.rs` |
+| TILE_SIZE | 256 px (fixed) | `api-tiles/src/params.rs` |
+| Render semaphore | Shared with Maps/WMS | `TilesState` |
+| TileMatrixSet whitelist | WebMercatorQuad, WorldCRS84Quad | `api-tiles/src/tilematrixset.rs` |
+| Format whitelist | `image/png`, `image/jpeg`, `image/webp` | `api-tiles/src/params.rs` |
+
+### Tile Cache
+
+Tiles share the `RenderedCache` with Maps and WMS. Cache keys use quantized bbox computed from tile coordinates, so a Maps request for the same area at 256x256 can share cached results with tile requests. Empty tiles (all nodata) return a pre-generated transparent PNG without cache insertion.
+
+### HTTP Cache Headers
+
+| Scenario | Cache-Control | ETag |
+|----------|---------------|------|
+| Tile with explicit `datetime=` | `public, max-age=86400, immutable` | Yes |
+| Tile without `datetime` (latest) | `public, max-age=60, must-revalidate` | Yes |
+| TileMatrixSet metadata | No cache headers | No |
+
+### Adding Tiles to a Collection
+
+Add `"tiles"` to the `apis` array. Tiles reuses the same `[collections.wms]` config for colormap/styles:
+
+```toml
+[[collections]]
+id = "radar"
+engine_type = "geotiff"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[collections.geotiff]
+filename_template = "radar_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+
+[collections.wms]
+colormap = "radar_dbz"
+```
+
+Only `engine_type = "geotiff"` collections support Tiles. CSV and GeoJSON engines do not implement `MapEngine`.
+
 ## OpenAPI and Swagger UI
 
-Each OGC API (EDR, Features, Maps) serves a dynamic OpenAPI 3.0.3 specification and a Swagger UI page:
+Each OGC API (EDR, Features, Maps, Tiles) serves a dynamic OpenAPI 3.0.3 specification and a Swagger UI page:
 
 | API | OpenAPI spec (service-desc) | Swagger UI (service-doc) |
 |-----|---------------------------|-------------------------|
 | EDR | `/edr/api` | `/edr/api/docs` |
 | Features | `/features/api` | `/features/api/docs` |
 | Maps | `/maps/api` | `/maps/api/docs` |
+| Tiles | `/tiles/api` | `/tiles/api/docs` |
 
 OpenAPI specs are **generated dynamically** from configured collections — new collections appear automatically after config reload. The Swagger UI is a static HTML page loading `swagger-ui-dist@5` from unpkg CDN. The shared HTML template lives in `ds_core::openapi::swagger_ui_html()`.
 
@@ -642,7 +740,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `title` | yes | — | Human-readable collection title |
 | `description` | yes | — | Collection description |
 | `data_path` | yes | — | Path to data file (CSV or GeoJSON) |
-| `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, `"maps"`, `"wms"` |
+| `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, `"maps"`, `"tiles"`, `"wms"` |
 | `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, or `"geotiff"` |
 | `wms` | no | — | WMS rendering config (see WMS Config Fields). Required when `apis` contains `"wms"`. |
 
@@ -676,6 +774,15 @@ pub struct MapsState {
     pub engines: HashMap<String, Arc<dyn MapEngine>>,
     pub collections: HashMap<String, CollectionConfig>,
     pub styles: HashMap<String, Vec<StyleInfo>>,
+    pub render_semaphore: Arc<Semaphore>,
+    pub rendered_cache: Arc<RenderedCache>,
+}
+
+// api-tiles
+pub struct TilesState {
+    pub map_engines: HashMap<String, Arc<dyn MapEngine>>,
+    pub collections: HashMap<String, CollectionConfig>,
+    pub styles: HashMap<String, HashMap<String, StyleInfo>>,
     pub render_semaphore: Arc<Semaphore>,
     pub rendered_cache: Arc<RenderedCache>,
 }
@@ -800,7 +907,7 @@ Path labels use axum's `MatchedPath` (route patterns, not raw URLs) to avoid unb
 
 ### State architecture
 
-API state (`EdrState`, `FeaturesState`, `MapsState`, `WmsState`) is wrapped in `ArcSwap` for lock-free reads and atomic swaps on reload. The `ServerState` in `server/src/admin.rs` holds the `ArcSwap` pointers, health registry, and GeoTIFF engine list. Engine loading logic is in `admin::load_collections()`, shared by startup and reload. On reload, the WMS rendered image cache is replaced (old cache is dropped).
+API state (`EdrState`, `FeaturesState`, `MapsState`, `TilesState`, `WmsState`) is wrapped in `ArcSwap` for lock-free reads and atomic swaps on reload. The `ServerState` in `server/src/admin.rs` holds the `ArcSwap` pointers, health registry, and GeoTIFF engine list. Engine loading logic is in `admin::load_collections()`, shared by startup and reload. On reload, the WMS/Maps/Tiles rendered image cache is replaced (old cache is dropped). The render semaphore and rendered cache are shared across Maps, Tiles, and WMS APIs.
 
 ## Known Limitations
 
@@ -809,7 +916,7 @@ API state (`EdrState`, `FeaturesState`, `MapsState`, `WmsState`) is wrapped in `
 - CSV engine supports only the `locations` query type (no position, area, radius, trajectory, corridor)
 - GeoTIFF engine supports `position` and `area` queries (no locations, radius, trajectory, corridor)
 - GeoJSON engine implements `FeatureEngine` only (not `Engine`/EDR, not `MapEngine`/WMS) — polygon boundary data has no time-series parameters
-- GeoTIFF engine implements `Engine` (EDR) and `MapEngine` (Maps/WMS) only (not `FeatureEngine`/Features)
+- GeoTIFF engine implements `Engine` (EDR) and `MapEngine` (Maps/WMS/Tiles) only (not `FeatureEngine`/Features)
 - GeoTIFF CRS: WGS84, Transverse Mercator, LAEA, and LCC supported; other projections fall back to WGS84
 - GeoTIFF area queries extract the bounding box from POLYGON WKT — they do not clip to the actual polygon shape
 - Strip-based (non-tiled) GeoTIFFs are not supported — convert to COG first
@@ -823,6 +930,11 @@ API state (`EdrState`, `FeaturesState`, `MapsState`, `WmsState`) is wrapped in `
 - STAC: items with neither `datetime` nor `start_datetime` are silently skipped
 - STAC: first query to a datetime range fetches STAC items + GeoTIFF headers on-demand (~100-500ms per file)
 - STAC: GeoTIFF metadata loads are capped at 50 per query to prevent timeout on large ranges
+- Tiles: only raster map tiles (no vector tiles yet — planned via FeatureEngine)
+- Tiles: only WebMercatorQuad and WorldCRS84Quad TileMatrixSets supported
+- Tiles: fixed 256x256 tile size (no 512x512 HiDPI support yet)
+- Tiles: no request coalescing for concurrent identical tile renders
+- Tiles: no per-collection max zoom configuration (hardcoded DEFAULT_MAX_ZOOM = 18, absolute MAX = 24)
 
 ## Code Style
 
