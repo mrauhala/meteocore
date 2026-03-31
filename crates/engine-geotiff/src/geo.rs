@@ -284,24 +284,37 @@ impl GeoTransform {
         east: f64,
         north: f64,
     ) -> Option<(u32, u32, u32, u32)> {
-        // Transform bbox corners to source CRS
-        let corners = [
-            self.crs.forward(west, south),
-            self.crs.forward(east, south),
-            self.crs.forward(west, north),
-            self.crs.forward(east, north),
-        ];
-
+        // Transform bbox to source CRS by sampling points along all 4 edges.
+        // For non-linear projections (TM, LAEA, LCC), bbox edges project as
+        // curves — edge midpoints can extend beyond the 4-corner envelope.
+        // Using only corners causes missing source tiles (transparent areas).
         let mut min_x = f64::MAX;
         let mut max_x = f64::MIN;
         let mut min_y = f64::MAX;
         let mut max_y = f64::MIN;
 
-        for (x, y) in &corners {
-            min_x = min_x.min(*x);
-            max_x = max_x.max(*x);
-            min_y = min_y.min(*y);
-            max_y = max_y.max(*y);
+        let n = 8; // samples per edge (corners + 7 interior points)
+        for i in 0..=n {
+            let frac = i as f64 / n as f64;
+            let lon = west + frac * (east - west);
+            let lat = south + frac * (north - south);
+
+            // South and north edges
+            for &edge_lat in &[south, north] {
+                let (x, y) = self.crs.forward(lon, edge_lat);
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+            // West and east edges
+            for &edge_lon in &[west, east] {
+                let (x, y) = self.crs.forward(edge_lon, lat);
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
         }
 
         let col_start = ((min_x - self.origin_x) / self.pixel_width)

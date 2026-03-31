@@ -156,23 +156,33 @@ pub async fn wms_handler(
 
             let render_result = tokio::task::spawn_blocking(move || {
                 let tile = engine.get_raster_tile(bbox, width, height, time, &output_crs)?;
-                ds_render::render_tile(&tile, colormap.as_ref(), format)
+                // If every pixel is nodata, skip colorization + encoding entirely.
+                if tile.is_empty() {
+                    return Ok(None);
+                }
+                ds_render::render_tile(&tile, colormap.as_ref(), format).map(Some)
             })
             .await
             .map_err(|e| WmsError::Internal(format!("Render task failed: {e}")))?;
 
-            let (image_bytes, cacheable) = match render_result {
-                Ok(bytes) => (bytes, true),
+            let (image_bytes, x_cache) = match render_result {
+                Ok(Some(bytes)) => {
+                    let image_arc = Arc::new(bytes);
+                    rendered_cache.insert(cache_key, image_arc.clone());
+                    (image_arc.as_ref().clone(), "MISS")
+                }
+                Ok(None) => {
+                    // Empty tile: return transparent PNG without caching
+                    let rgba = vec![0u8; (params.width * params.height * 4) as usize];
+                    let png = ds_render::encode_png(&rgba, params.width, params.height)
+                        .map_err(|e| WmsError::Internal(format!("Failed to encode empty tile: {e}")))?;
+                    (png, "EMPTY")
+                }
                 Err(e) => {
                     tracing::warn!("WMS render error for layer '{}': {e}", params.layer);
-                    (render_error_tile(params.width, params.height)?, false)
+                    (render_error_tile(params.width, params.height)?, "ERROR")
                 }
             };
-
-            let image_arc = Arc::new(image_bytes);
-            if cacheable {
-                rendered_cache.insert(cache_key, image_arc.clone());
-            }
 
             Ok(axum::response::Response::builder()
                 .header(header::CONTENT_TYPE, content_type)
@@ -182,11 +192,8 @@ pub async fn wms_handler(
                     header::HeaderName::from_static("x-content-type-options"),
                     "nosniff",
                 )
-                .header(
-                    header::HeaderName::from_static("x-cache"),
-                    if cacheable { "MISS" } else { "ERROR" },
-                )
-                .body(axum::body::Body::from(image_arc.as_ref().clone()))
+                .header(header::HeaderName::from_static("x-cache"), x_cache)
+                .body(axum::body::Body::from(image_bytes))
                 .unwrap()
                 .into_response())
         }
