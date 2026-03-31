@@ -113,12 +113,21 @@ impl RenderedCache {
 }
 
 /// Render a raster tile to image bytes using the given colormap and format.
+///
+/// If the tile is entirely nodata (all values are `None`), skips colorization
+/// and produces a fully transparent image directly. This is significantly faster
+/// for large tiles since it avoids iterating every pixel through the colormap.
 pub fn render_tile(
     tile: &RasterTile,
     colormap: &dyn ColorMap,
     format: ImageFormat,
 ) -> Result<Vec<u8>, DataServerError> {
-    let rgba = colorize(tile, colormap);
+    // Short-circuit for empty tiles: skip colorization, produce transparent RGBA directly.
+    let rgba = if tile.is_empty() {
+        vec![0u8; (tile.width * tile.height * 4) as usize]
+    } else {
+        colorize(tile, colormap)
+    };
     match format {
         ImageFormat::Png => encode::encode_png(&rgba, tile.width, tile.height),
         ImageFormat::Jpeg => encode::encode_jpeg(&rgba, tile.width, tile.height),
@@ -220,6 +229,30 @@ mod tests {
         let cmap = LutColorMap::from_builtin(BuiltinColormap::Grayscale, 0.0, 1.0);
         let rgba = colorize(&tile, &cmap);
         assert_eq!(rgba, vec![0, 0, 0, 0]); // fully transparent
+    }
+
+    #[test]
+    fn test_empty_tile_skips_colorize() {
+        let tile = RasterTile {
+            width: 4,
+            height: 4,
+            values: vec![None; 16],
+        };
+        assert!(tile.is_empty());
+        let cmap = LutColorMap::from_builtin(BuiltinColormap::Grayscale, 0.0, 1.0);
+        let png_bytes = render_tile(&tile, &cmap, ImageFormat::Png).unwrap();
+        // Should produce a valid PNG (the short-circuit path still encodes)
+        assert!(png_bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+    }
+
+    #[test]
+    fn test_non_empty_tile_is_not_empty() {
+        let tile = RasterTile {
+            width: 2,
+            height: 2,
+            values: vec![None, Some(1.0), None, None],
+        };
+        assert!(!tile.is_empty());
     }
 
     #[test]

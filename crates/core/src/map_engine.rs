@@ -20,6 +20,13 @@ pub struct RasterTile {
     pub values: Vec<Option<f64>>,
 }
 
+impl RasterTile {
+    /// Returns true if all pixel values are nodata (None).
+    pub fn is_empty(&self) -> bool {
+        self.values.iter().all(Option::is_none)
+    }
+}
+
 /// Metadata about a map-capable raster collection.
 pub struct RasterInfo {
     /// Native CRS identifier (e.g., "EPSG:3067").
