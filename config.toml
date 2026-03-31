@@ -31,7 +31,7 @@ title = "Weather Radar Reflectivity"
 description = "Radar composite from MET Norway (preprocessed to WGS84)"
 data_path = "testdata/radar"
 engine_type = "geotiff"
-apis = ["edr", "wms", "maps"]
+apis = ["edr", "wms", "maps", "tiles"]
 
 [collections.geotiff]
 filename_template = "radar_%Y%m%dT%H%MZ.tif"
@@ -62,7 +62,7 @@ title = "MET Norway Radar (native LCC projection)"
 description = "Radar composite in Lambert Conformal Conic, served without reprojection"
 data_path = "testdata/radar-native"
 engine_type = "geotiff"
-apis = ["edr", "wms", "maps"]
+apis = ["edr", "wms", "maps", "tiles"]
 
 [collections.geotiff]
 filename_template = "norway_%Y%m%dT%H%MZ.tiff"
@@ -78,7 +78,7 @@ id = "fmi-radar"
 title = "FMI Radar (S3, EPSG:3067)"
 description = "Finnish radar composite from FMI S3 bucket, Transverse Mercator projection"
 engine_type = "geotiff"
-apis = ["edr", "wms", "maps"]
+apis = ["edr", "wms", "maps", "tiles"]
 
 [collections.geotiff]
 endpoint = "https://s3-eu-west-1.amazonaws.com"
@@ -99,7 +99,7 @@ id = "opera-precipitation"
 title = "OPERA European Radar Composite"
 description = "1h accumulated precipitation from EUMETNET OPERA, LAEA projection (CloudFerro S3)"
 engine_type = "geotiff"
-apis = ["edr", "wms", "maps"]
+apis = ["edr", "wms", "maps", "tiles"]
 
 [collections.geotiff]
 endpoint = "https://s3.waw3-1.cloudferro.com"
@@ -133,7 +133,7 @@ id = "opera-reflectivity"
 title = "OPERA European Radar Reflectivity"
 description = "Radar reflectivity composite (DBZH) from EUMETNET OPERA, LAEA projection (CloudFerro S3)"
 engine_type = "geotiff"
-apis = ["edr", "wms", "maps"]
+apis = ["edr", "wms", "maps", "tiles"]
 
 [collections.geotiff]
 endpoint = "https://s3.waw3-1.cloudferro.com"
@@ -153,7 +153,7 @@ id = "met-norway-radar"
 title = "MET Norway Radar Mosaic"
 description = "Radar reflectivity mosaic from MET Norway via STAC catalog, Lambert Conformal Conic"
 engine_type = "geotiff"
-apis = ["edr", "wms", "maps"]
+apis = ["edr", "wms", "maps", "tiles"]
 
 [collections.geotiff]
 stac_url = "https://radar-stacapi.met.no/v1/collections/Mosaic-Norway-v1/items"
