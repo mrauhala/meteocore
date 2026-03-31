@@ -405,6 +405,76 @@ Cloud-Optimized GeoTIFF (COG) files with tiled layout. The engine implements `En
 - **One parameter per collection.** Each collection reads a single band from the GeoTIFF files. Multi-band files are supported — select the band with the `band` config field (1-based).
 - **Files are discovered by filename pattern.** Each file must contain a parseable timestamp in its filename (e.g., `radar_20260325T1200Z.tif`).
 
+### Preparing COG files
+
+Optimal settings for serving via MeteoCore (applies to both local and remote files):
+
+**Quick recipe (GDAL 3.1+):**
+
+```bash
+gdal_translate -of COG \
+  -co COMPRESS=DEFLATE \
+  -co PREDICTOR=YES \
+  -co BLOCKSIZE=256 \
+  -co OVERVIEW_RESAMPLING=AVERAGE \
+  -co OVERVIEWS=AUTO \
+  input.tif output_cog.tif
+```
+
+For radar/classification data, use nearest-neighbor resampling to preserve discrete values:
+
+```bash
+gdal_translate -of COG \
+  -co COMPRESS=DEFLATE \
+  -co PREDICTOR=YES \
+  -co BLOCKSIZE=256 \
+  -co OVERVIEW_RESAMPLING=NEAREST \
+  -co OVERVIEWS=AUTO \
+  -a_nodata 255 \
+  radar_input.tif radar_cog.tif
+```
+
+**Manual recipe (older GDAL):**
+
+```bash
+# 1. Create tiled GeoTIFF
+gdal_translate -of GTiff \
+  -co TILED=YES -co BLOCKXSIZE=256 -co BLOCKYSIZE=256 \
+  -co COMPRESS=DEFLATE -co PREDICTOR=2 \
+  input.tif temp.tif
+
+# 2. Add overviews (powers of 2 to align with tile zoom levels)
+gdaladdo -r average \
+  --config COMPRESS_OVERVIEW DEFLATE \
+  --config PREDICTOR_OVERVIEW 2 \
+  temp.tif 2 4 8 16 32 64
+
+# 3. Re-create as COG (overviews before data for efficient range reads)
+gdal_translate -of COG \
+  -co COMPRESS=DEFLATE -co PREDICTOR=YES -co BLOCKSIZE=256 \
+  temp.tif output_cog.tif && rm temp.tif
+```
+
+**Recommended settings:**
+
+| Setting | Value | Rationale |
+|---------|-------|-----------|
+| Tile size | 256x256 | Matches Tiles API tile size (one source tile = one output tile at native resolution). Smaller tiles = more granular caching, less wasted data on partial reads. |
+| Compression | Deflate | Best ratio with predictor. The tile cache stores compressed bytes, so better compression = more tiles in cache. |
+| Predictor | 2 (integer) or 3 (float) | Horizontal differencing (2) for UInt8/UInt16/Int16. Floating point predictor (3) for Float32/Float64. Use `PREDICTOR=YES` with COG driver for automatic selection. |
+| Overviews | Powers of 2, auto | Align with TileMatrixSet zoom levels. Without overviews, every low-zoom tile reads full-resolution data. |
+| Overview resampling | NEAREST for discrete data, AVERAGE for continuous | Radar dBZ/classification: NEAREST preserves categories. Temperature/wind: AVERAGE avoids aliasing. |
+
+**Settings to avoid:**
+
+| Setting | Problem |
+|---------|---------|
+| Strip layout (no tiling) | Server rejects with "Not a tiled TIFF" error |
+| Tile size > 512x512 | Wastes bandwidth/memory on partial reads |
+| JPEG compression | Not supported by the server's TIFF reader |
+| No overviews | Every low-zoom request reads full resolution — very slow for large files |
+| LZW without predictor | Worse compression than Deflate with predictor |
+
 ### Supported coordinate reference systems
 
 Queries are always in WGS84 (lon/lat). The engine reprojects internally when the source files use a projected CRS. Supported projections:
