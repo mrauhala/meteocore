@@ -102,6 +102,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "api-tiles"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "axum",
+ "chrono",
+ "ds-core",
+ "ds-render",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "api-wms"
 version = "0.1.0"
 dependencies = [
@@ -2173,6 +2190,7 @@ dependencies = [
  "api-edr",
  "api-features",
  "api-maps",
+ "api-tiles",
  "api-wms",
  "arc-swap",
  "axum",

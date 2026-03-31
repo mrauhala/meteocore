@@ -70,12 +70,14 @@ async fn main() {
     let features_swap = Arc::new(ArcSwap::from_pointee(result.features_state));
     let wms_swap = Arc::new(ArcSwap::from_pointee(result.wms_state));
     let maps_swap = Arc::new(ArcSwap::from_pointee(result.maps_state));
+    let tiles_swap = Arc::new(ArcSwap::from_pointee(result.tiles_state));
 
     let server_state: AdminState = Arc::new(ServerState {
         edr: edr_swap.clone(),
         features: features_swap.clone(),
         wms: wms_swap.clone(),
         maps: maps_swap.clone(),
+        tiles: tiles_swap.clone(),
         config_path,
         health: RwLock::new(result.health),
         geotiff_engines: RwLock::new(result.geotiff_engines),
@@ -90,7 +92,8 @@ async fn main() {
         .nest("/features", api_features::router(features_swap.clone()))
         .nest("/wms", api_wms::router(wms_swap.clone()))
         .nest("/maps", api_maps::router(maps_swap.clone()))
-        // Trailing-slash variants so /edr/, /features/, and /maps/ also work
+        .nest("/tiles", api_tiles::router(tiles_swap.clone()))
+        // Trailing-slash variants so /edr/, /features/, /maps/, and /tiles/ also work
         .route(
             "/edr/",
             get(api_edr::handlers::landing_page).with_state(edr_swap),
@@ -102,6 +105,10 @@ async fn main() {
         .route(
             "/maps/",
             get(api_maps::handlers::landing_page).with_state(maps_swap),
+        )
+        .route(
+            "/tiles/",
+            get(api_tiles::handlers::landing_page).with_state(tiles_swap),
         )
         // Admin endpoints
         .route(
@@ -172,7 +179,7 @@ async fn root_landing_page(state: AdminState) -> impl IntoResponse {
     let base = &edr_state.base_url;
     Json(json!({
         "title": "MeteoCore",
-        "description": "Metocean Data Server implementing OGC API - EDR, OGC API - Features, OGC API - Maps, and OGC WMS 1.3.0",
+        "description": "Metocean Data Server implementing OGC API - EDR, OGC API - Features, OGC API - Maps, OGC API - Tiles, and OGC WMS 1.3.0",
         "links": [
             {
                 "href": format!("{base}/"),
@@ -239,6 +246,24 @@ async fn root_landing_page(state: AdminState) -> impl IntoResponse {
                 "rel": "service-doc",
                 "type": "text/html",
                 "title": "Maps API documentation"
+            },
+            {
+                "href": format!("{base}/tiles/"),
+                "rel": "child",
+                "type": "application/json",
+                "title": "Tiles API"
+            },
+            {
+                "href": format!("{base}/tiles/api"),
+                "rel": "service-desc",
+                "type": "application/vnd.oai.openapi+json;version=3.0",
+                "title": "Tiles API definition"
+            },
+            {
+                "href": format!("{base}/tiles/api/docs"),
+                "rel": "service-doc",
+                "type": "text/html",
+                "title": "Tiles API documentation"
             },
             {
                 "href": format!("{base}/health"),
