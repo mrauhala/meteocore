@@ -736,9 +736,11 @@ async fn render_map(
     }
 
     // Acquire render semaphore
-    let _permit = state.render_semaphore.try_acquire().map_err(|_| {
-        MapsError::Internal("Server busy: too many concurrent render requests".to_string())
-    })?;
+    let _permit = state
+        .render_semaphore
+        .acquire()
+        .await
+        .map_err(|_| MapsError::Internal("Render semaphore closed".to_string()))?;
 
     // Render on a blocking thread
     let engine = engine.clone();
