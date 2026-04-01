@@ -140,9 +140,11 @@ pub async fn wms_handler(
             }
 
             // Acquire render semaphore
-            let _permit = state.render_semaphore.try_acquire().map_err(|_| {
-                WmsError::Internal("Server busy: too many concurrent render requests".to_string())
-            })?;
+            let _permit = state
+                .render_semaphore
+                .acquire()
+                .await
+                .map_err(|_| WmsError::Internal("Render semaphore closed".to_string()))?;
 
             // Render on a blocking thread
             let engine = engine.clone();

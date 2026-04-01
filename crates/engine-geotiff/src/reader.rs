@@ -1610,22 +1610,27 @@ fn read_bbox_inner(
     Ok(result)
 }
 
-/// Result of a parallel tile fetch: (row, col, pixel data or error).
-type TileFetchResult = (u32, u32, Result<Vec<Option<f64>>, DataServerError>);
+/// Result of a parallel tile fetch: (row, col, pixel data).
+/// Failed tile reads are logged at error level and replaced with all-nodata
+/// to allow partial rendering — a map with gaps is better than a 500 error.
+type TileFetchResult = (u32, u32, Vec<Option<f64>>);
 
 /// Retry a remote tile read up to 2 times with brief backoff.
-/// Returns the final error if all attempts fail (instead of silently returning nodata).
+/// On final failure, logs at error level and returns all-nodata pixels.
+/// Map rendering tolerates partial failures (gaps) — a 500 error is worse
+/// than a tile with transparent holes that will be retried on next request.
 fn read_remote_chunk_with_retry<F>(
     read_fn: F,
     tile_row: u32,
     tile_col: u32,
     chunk_index: u32,
-) -> Result<Vec<Option<f64>>, DataServerError>
+    nodata_pixel_count: usize,
+) -> Vec<Option<f64>>
 where
     F: Fn() -> Result<Vec<Option<f64>>, DataServerError>,
 {
     match read_fn() {
-        Ok(data) => Ok(data),
+        Ok(data) => data,
         Err(first_err) => {
             let mut last_err = first_err;
             for attempt in 1..=2 {
@@ -1646,18 +1651,19 @@ where
                             chunk_index,
                             attempt
                         );
-                        return Ok(data);
+                        return data;
                     }
                     Err(e) => last_err = e,
                 }
             }
-            tracing::warn!(
-                "Tile ({}, {}), chunk {} failed after 2 retries: {last_err}",
+            tracing::error!(
+                "Tile ({}, {}), chunk {} failed after 3 attempts: {last_err}. \
+                 Rendering with transparent gap.",
                 tile_row,
                 tile_col,
                 chunk_index
             );
-            Err(last_err)
+            vec![None; nodata_pixel_count]
         }
     }
 }
@@ -1693,16 +1699,20 @@ fn read_bbox_parallel(
         .collect();
 
     // Fetch all tiles in parallel using the shared thread pool.
-    // Each tile returns Ok(data) or Err(error) — errors are NOT silently swallowed.
+    // Failed tiles are logged at error level and replaced with nodata.
+    let tile_pixel_count = (metadata.tile_width * metadata.tile_height) as usize;
     let tile_results: Vec<TileFetchResult> = TILE_FETCH_POOL.install(|| {
         tile_coords
             .par_iter()
             .map(|&(tile_row, tile_col)| {
                 let chunk_index = match safe_tile_index(tile_row, metadata.tiles_across, tile_col) {
                     Ok(idx) => idx,
-                    Err(e) => return (tile_row, tile_col, Err(e)),
+                    Err(e) => {
+                        tracing::error!("Tile index overflow at ({tile_row}, {tile_col}): {e}");
+                        return (tile_row, tile_col, vec![None; tile_pixel_count]);
+                    }
                 };
-                let result = read_remote_chunk_with_retry(
+                let data = read_remote_chunk_with_retry(
                     || {
                         read_remote_chunk_f64(
                             store,
@@ -1719,23 +1729,18 @@ fn read_bbox_parallel(
                     tile_row,
                     tile_col,
                     chunk_index,
+                    tile_pixel_count,
                 );
-                (tile_row, tile_col, result)
+                (tile_row, tile_col, data)
             })
             .collect()
     });
 
-    // Assemble the result grid, propagating any tile read errors
+    // Assemble the result grid
     let mut result = vec![None; total_pixels];
     for (tile_row, tile_col, tile_data) in &tile_results {
-        let data = tile_data.as_ref().map_err(|e| {
-            DataServerError::GeoTiff(format!(
-                "Failed to read tile ({}, {}): {e}",
-                tile_row, tile_col
-            ))
-        })?;
         copy_tile_to_result(
-            data,
+            tile_data,
             &mut result,
             *tile_col,
             *tile_row,
@@ -1783,15 +1788,19 @@ fn read_bbox_parallel_http(
     let http_clone = http.clone();
     let url_owned = url.to_string();
 
+    let tile_pixel_count = (metadata.tile_width * metadata.tile_height) as usize;
     let tile_results: Vec<TileFetchResult> = TILE_FETCH_POOL.install(|| {
         tile_coords
             .par_iter()
             .map(|&(tile_row, tile_col)| {
                 let chunk_index = match safe_tile_index(tile_row, metadata.tiles_across, tile_col) {
                     Ok(idx) => idx,
-                    Err(e) => return (tile_row, tile_col, Err(e)),
+                    Err(e) => {
+                        tracing::error!("Tile index overflow at ({tile_row}, {tile_col}): {e}");
+                        return (tile_row, tile_col, vec![None; tile_pixel_count]);
+                    }
                 };
-                let result = read_remote_chunk_with_retry(
+                let data = read_remote_chunk_with_retry(
                     || {
                         read_http_chunk_f64(
                             &http_clone,
@@ -1808,22 +1817,17 @@ fn read_bbox_parallel_http(
                     tile_row,
                     tile_col,
                     chunk_index,
+                    tile_pixel_count,
                 );
-                (tile_row, tile_col, result)
+                (tile_row, tile_col, data)
             })
             .collect()
     });
 
     let mut result = vec![None; total_pixels];
     for (tile_row, tile_col, tile_data) in &tile_results {
-        let data = tile_data.as_ref().map_err(|e| {
-            DataServerError::GeoTiff(format!(
-                "Failed to read tile ({}, {}): {e}",
-                tile_row, tile_col
-            ))
-        })?;
         copy_tile_to_result(
-            data,
+            tile_data,
             &mut result,
             *tile_col,
             *tile_row,
