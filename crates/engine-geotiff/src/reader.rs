@@ -560,6 +560,10 @@ impl TiffMetadata {
                     // Too small — stop, use previous candidate
                     break;
                 }
+            } else {
+                // bbox_to_pixels returned None — this overview's pixels are too
+                // coarse to detect the intersection. Stop and use previous candidate.
+                break;
             }
         }
 

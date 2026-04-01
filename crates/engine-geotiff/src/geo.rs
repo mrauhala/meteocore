@@ -213,11 +213,13 @@ impl GeoTransform {
     /// Returns None if the coordinate is outside the raster bounds.
     pub fn world_to_pixel(&self, lon: f64, lat: f64) -> Option<(u32, u32)> {
         let (x, y) = self.crs.forward(lon, lat);
-        let col = ((x - self.origin_x) / self.pixel_width) as i64;
-        let row = ((self.origin_y - y) / self.pixel_height) as i64;
+        // Use floor() to match bbox_to_pixels() rounding — `as i64` truncates
+        // toward zero which maps slightly-negative values to 0 (wrong pixel).
+        let col_f = ((x - self.origin_x) / self.pixel_width).floor();
+        let row_f = ((self.origin_y - y) / self.pixel_height).floor();
 
-        if col >= 0 && col < self.width as i64 && row >= 0 && row < self.height as i64 {
-            Some((col as u32, row as u32))
+        if col_f >= 0.0 && col_f < self.width as f64 && row_f >= 0.0 && row_f < self.height as f64 {
+            Some((col_f as u32, row_f as u32))
         } else {
             None
         }
@@ -284,16 +286,16 @@ impl GeoTransform {
         east: f64,
         north: f64,
     ) -> Option<(u32, u32, u32, u32)> {
-        // Transform bbox to source CRS by sampling points along all 4 edges.
-        // For non-linear projections (TM, LAEA, LCC), bbox edges project as
-        // curves — edge midpoints can extend beyond the 4-corner envelope.
-        // Using only corners causes missing source tiles (transparent areas).
+        // Transform bbox to source CRS by sampling points along all 4 edges
+        // AND interior grid. For non-linear projections (TM, LAEA, LCC), bbox
+        // edges project as curves — edge midpoints can extend beyond the
+        // corner envelope. TM35FIN at high latitudes needs dense sampling.
         let mut min_x = f64::MAX;
         let mut max_x = f64::MIN;
         let mut min_y = f64::MAX;
         let mut max_y = f64::MIN;
 
-        let n = 8; // samples per edge (corners + 7 interior points)
+        let n = 20; // samples per edge (matching bbox() inverse sampling)
         for i in 0..=n {
             let frac = i as f64 / n as f64;
             let lon = west + frac * (east - west);
