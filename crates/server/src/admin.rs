@@ -438,8 +438,15 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
         .next()
         .unwrap_or(128);
 
-    // Shared render semaphore and cache between WMS, Maps, and Tiles APIs
-    let render_semaphore = Arc::new(tokio::sync::Semaphore::new(8));
+    // Shared render semaphore and cache between WMS, Maps, and Tiles APIs.
+    // Size to available CPU cores — render tasks are CPU-bound (colorization + PNG encoding).
+    // Minimum 4 to avoid starving on small machines; excess requests queue via acquire().await.
+    let render_concurrency = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+        .max(4);
+    tracing::info!("Render concurrency: {render_concurrency} (from available CPUs)");
+    let render_semaphore = Arc::new(tokio::sync::Semaphore::new(render_concurrency));
     let rendered_cache = Arc::new(ds_render::RenderedCache::new(rendered_cache_mb));
 
     LoadResult {
