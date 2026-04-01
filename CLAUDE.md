@@ -205,7 +205,7 @@ Errors are returned as XML `ServiceExceptionReport` documents with WMS-specific 
 |-------|-------|----------|
 | MAX_MAP_PIXELS | 8,000,000 (8M) | `api-wms/src/params.rs` |
 | MAX_MAP_DIMENSION | 4,096 px | `api-wms/src/params.rs` |
-| Render semaphore | 8 concurrent | `WmsState` |
+| Render semaphore | CPU core count (min 4) | `server/src/admin.rs` |
 | CRS whitelist | CRS:84, EPSG:4326/3857/3067/3035 | `api-wms/src/params.rs` |
 | No external SLD | SLD parameter rejected | Not implemented |
 | Max LAYERS | 1 | `api-wms/src/params.rs` |
@@ -216,11 +216,12 @@ Errors are returned as XML `ServiceExceptionReport` documents with WMS-specific 
 1. Parse WMS parameters, validate, normalize bbox axis order
 2. Look up `MapEngine` by layer name (= collection ID)
 3. Check rendered image cache (LRU, keyed by quantized bbox + layer + time)
-4. If miss: acquire render semaphore, call `MapEngine::get_raster_tile()` on a blocking thread
-5. Engine reads source tiles, reprojects bbox to source CRS, resamples to output dimensions (nearest-neighbor)
-6. Apply colormap (LUT for integer data, linear interpolation for continuous data) → RGBA buffer
-7. Encode RGBA → PNG using pure Rust `png` crate (compression level Fast)
-8. Cache rendered PNG, return with `Content-Type: image/png`
+4. If miss: await render semaphore (queues if all slots busy), call `MapEngine::get_raster_tile()` on a blocking thread
+5. Engine projects bbox to source CRS (sampling 20 points per edge to capture projection curvature), selects best overview level, reads source tiles, resamples to output dimensions (nearest-neighbor)
+6. If tile is all nodata: return transparent PNG without caching (allows retry on next request)
+7. Apply colormap (LUT for integer data, linear interpolation for continuous data) → RGBA buffer
+8. Encode RGBA → PNG using pure Rust `png` crate (compression level Fast)
+9. Cache rendered PNG, return with `Content-Type: image/png`
 
 ### Colormaps
 
@@ -257,6 +258,7 @@ Separate from the GeoTIFF source tile cache (Tier 1). Caches final PNG/JPEG byte
 - No TTL — radar data is immutable once produced. Cache invalidated on collection reload.
 - Cache hit skips entire pipeline: no tile reads, no colorization, no image encoding
 - Error tiles (render failures) are NOT cached — re-attempted on next request
+- Empty tiles (all nodata) are NOT cached — allows recovery from transient failures
 
 ### HTTP Cache Headers
 
@@ -488,6 +490,8 @@ Queries are always in WGS84 (lon/lat). The engine reprojects internally when the
 
 CRS parameters are read from GeoTIFF GeoKeys (tag 34735). Files without GeoKeys are assumed WGS84. **Rotated or skewed rasters are not supported** (the engine assumes axis-aligned pixels).
 
+When reprojecting, `bbox_to_pixels()` samples 20 points along each bbox edge (not just 4 corners) to capture projection curvature — critical for TM at high latitudes where bbox edges project as curves. `world_to_pixel()` uses `floor()` for consistent rounding with `bbox_to_pixels()`. Overview selection breaks early when an overview's coarse pixel grid can't detect bbox intersection, falling back to the previous (larger) candidate.
+
 ### Supported compression
 
 | Method | Notes |
@@ -694,13 +698,13 @@ Tile coordinates (z, row, col) and TileMatrixSet ID come from URL path parameter
 | MAX_ZOOM_LEVEL | 24 | `api-tiles/src/params.rs` |
 | DEFAULT_MAX_ZOOM | 18 | `api-tiles/src/params.rs` |
 | TILE_SIZE | 256 px (fixed) | `api-tiles/src/params.rs` |
-| Render semaphore | Shared with Maps/WMS | `TilesState` |
+| Render semaphore | CPU core count (min 4), shared with Maps/WMS | `server/src/admin.rs` |
 | TileMatrixSet whitelist | WebMercatorQuad, WorldCRS84Quad | `api-tiles/src/tilematrixset.rs` |
 | Format whitelist | `image/png`, `image/jpeg`, `image/webp` | `api-tiles/src/params.rs` |
 
 ### Tile Cache
 
-Tiles share the `RenderedCache` with Maps and WMS. Cache keys use quantized bbox computed from tile coordinates, so a Maps request for the same area at 256x256 can share cached results with tile requests. Empty tiles (all nodata) return a pre-generated transparent PNG without cache insertion.
+Tiles share the `RenderedCache` with Maps and WMS. Cache keys use quantized bbox computed from tile coordinates, so a Maps request for the same area at 256x256 can share cached results with tile requests. Empty tiles (all nodata) return a pre-generated transparent PNG without cache insertion. This applies to all three APIs (WMS, Maps, Tiles) — empty tiles are never cached to allow recovery from transient failures.
 
 ### HTTP Cache Headers
 
@@ -977,7 +981,7 @@ Path labels use axum's `MatchedPath` (route patterns, not raw URLs) to avoid unb
 
 ### State architecture
 
-API state (`EdrState`, `FeaturesState`, `MapsState`, `TilesState`, `WmsState`) is wrapped in `ArcSwap` for lock-free reads and atomic swaps on reload. The `ServerState` in `server/src/admin.rs` holds the `ArcSwap` pointers, health registry, and GeoTIFF engine list. Engine loading logic is in `admin::load_collections()`, shared by startup and reload. On reload, the WMS/Maps/Tiles rendered image cache is replaced (old cache is dropped). The render semaphore and rendered cache are shared across Maps, Tiles, and WMS APIs.
+API state (`EdrState`, `FeaturesState`, `MapsState`, `TilesState`, `WmsState`) is wrapped in `ArcSwap` for lock-free reads and atomic swaps on reload. The `ServerState` in `server/src/admin.rs` holds the `ArcSwap` pointers, health registry, and GeoTIFF engine list. Engine loading logic is in `admin::load_collections()`, shared by startup and reload. On reload, the WMS/Maps/Tiles rendered image cache is replaced (old cache is dropped). The render semaphore (sized to available CPU cores, minimum 4) and rendered cache are shared across Maps, Tiles, and WMS APIs. The semaphore uses `acquire().await` so excess requests queue instead of failing — important for animation clients that prefetch many timesteps concurrently.
 
 ## Known Limitations
 
@@ -1003,7 +1007,7 @@ API state (`EdrState`, `FeaturesState`, `MapsState`, `TilesState`, `WmsState`) i
 - Tiles: only raster map tiles (no vector tiles yet — planned via FeatureEngine)
 - Tiles: only WebMercatorQuad and WorldCRS84Quad TileMatrixSets supported
 - Tiles: fixed 256x256 tile size (no 512x512 HiDPI support yet)
-- Tiles: no request coalescing for concurrent identical tile renders
+- Tiles/WMS/Maps: no request coalescing for concurrent identical renders (duplicate work if same tile requested simultaneously)
 - Tiles: no per-collection max zoom configuration (hardcoded DEFAULT_MAX_ZOOM = 18, absolute MAX = 24)
 
 ## Code Style
