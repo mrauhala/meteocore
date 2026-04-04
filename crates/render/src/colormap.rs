@@ -16,6 +16,8 @@ pub enum BuiltinColormap {
     RadarDbz,
     /// SMHI radar reflectivity with gray below-threshold, per-dBZ colors, -29 to 70 dBZ.
     RadarSmhi,
+    /// FMI summer radar reflectivity (cyan → green → yellow → orange → red → magenta → pink).
+    RadarFmi,
     /// Linear grayscale (black → white).
     Grayscale,
     /// Perceptually uniform (dark purple → blue → green → yellow).
@@ -365,6 +367,30 @@ pub fn builtin_stops(builtin: &BuiltinColormap) -> Vec<ColorStop> {
                 })
                 .collect()
         }
+        BuiltinColormap::RadarFmi => {
+            // FMI summer radar reflectivity. Converted from SLD raw values
+            // to dBZ via: dBZ = raw * 0.5 - 32. Below 5 dBZ is transparent.
+            let data: &[(f64, [u8; 4])] = &[
+                (-32.0, [0, 0, 0, 0]),       // below range: transparent
+                (5.0, [0, 0, 0, 0]),         // raw 74: below threshold
+                (8.0, [108, 235, 243, 255]), // raw 80: light cyan
+                (12.0, [88, 199, 151, 255]), // raw 88: green
+                (18.0, [64, 152, 87, 255]),  // raw 100: dark green
+                (24.0, [241, 243, 90, 255]), // raw 112: yellow
+                (30.0, [223, 196, 10, 255]), // raw 124: gold
+                (34.0, [235, 149, 26, 255]), // raw 132: orange
+                (40.0, [232, 86, 22, 255]),  // raw 144: red-orange
+                (46.0, [206, 2, 2, 255]),    // raw 156: red
+                (52.0, [131, 10, 70, 255]),  // raw 168: dark magenta
+                (58.0, [250, 81, 165, 255]), // raw 180: pink
+            ];
+            data.iter()
+                .map(|(v, c)| ColorStop {
+                    value: *v,
+                    color: *c,
+                })
+                .collect()
+        }
         BuiltinColormap::Viridis => vec![
             ColorStop {
                 value: 0.0,
@@ -529,6 +555,7 @@ pub fn resolve_builtin(name: &str) -> Option<BuiltinColormap> {
     match name {
         "radar_dbz" => Some(BuiltinColormap::RadarDbz),
         "radar_smhi" => Some(BuiltinColormap::RadarSmhi),
+        "radar_fmi" => Some(BuiltinColormap::RadarFmi),
         "grayscale" => Some(BuiltinColormap::Grayscale),
         "viridis" => Some(BuiltinColormap::Viridis),
         "temperature" => Some(BuiltinColormap::Temperature),
@@ -543,6 +570,7 @@ pub fn builtin_names() -> &'static [&'static str] {
     &[
         "radar_dbz",
         "radar_smhi",
+        "radar_fmi",
         "grayscale",
         "viridis",
         "temperature",
