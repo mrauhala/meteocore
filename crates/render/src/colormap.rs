@@ -18,6 +18,8 @@ pub enum BuiltinColormap {
     RadarSmhi,
     /// FMI summer radar reflectivity (cyan → green → yellow → orange → red → magenta → pink).
     RadarFmi,
+    /// Bookbinder 8-bit Z curve (Evan Bookbinder, WFO SGF). Full dBZ range to 95.
+    RadarBookbinder,
     /// Linear grayscale (black → white).
     Grayscale,
     /// Perceptually uniform (dark purple → blue → green → yellow).
@@ -391,6 +393,39 @@ pub fn builtin_stops(builtin: &BuiltinColormap) -> Vec<ColorStop> {
                 })
                 .collect()
         }
+        BuiltinColormap::RadarBookbinder => {
+            // Bookbinder 8-bit Z curve (Evan Bookbinder, WFO SGF).
+            // Converted from SLD raw values to dBZ via: dBZ = raw * 0.5 - 32.
+            let data: &[(f64, [u8; 4])] = &[
+                (-32.0, [0, 0, 0, 0]),        // raw 0: transparent
+                (-31.5, [96, 96, 96, 77]),    // raw 1: faint gray
+                (4.5, [96, 96, 96, 77]),      // raw 73: gray
+                (5.0, [32, 96, 128, 179]),    // raw 74: dark cyan
+                (19.5, [48, 208, 255, 255]),  // raw 103: bright cyan
+                (20.0, [0, 255, 0, 255]),     // raw 104: bright green
+                (39.5, [0, 76, 0, 255]),      // raw 143: dark green
+                (40.0, [255, 230, 0, 255]),   // raw 144: yellow
+                (49.5, [255, 128, 0, 255]),   // raw 163: orange
+                (50.0, [255, 0, 0, 255]),     // raw 164: red
+                (59.5, [96, 0, 0, 255]),      // raw 183: dark red
+                (60.0, [255, 255, 255, 255]), // raw 184: white
+                (64.5, [255, 255, 255, 255]), // raw 193: white
+                (65.0, [144, 48, 208, 255]),  // raw 194: purple
+                (69.5, [144, 48, 208, 255]),  // raw 203: purple
+                (70.0, [255, 32, 255, 255]),  // raw 204: magenta
+                (74.5, [255, 32, 255, 255]),  // raw 213: magenta
+                (75.0, [255, 0, 128, 255]),   // raw 214: hot pink
+                (79.5, [255, 0, 128, 255]),   // raw 223: hot pink
+                (80.0, [255, 0, 150, 255]),   // raw 224: deep pink
+                (94.5, [255, 0, 150, 255]),   // raw 253: deep pink
+            ];
+            data.iter()
+                .map(|(v, c)| ColorStop {
+                    value: *v,
+                    color: *c,
+                })
+                .collect()
+        }
         BuiltinColormap::Viridis => vec![
             ColorStop {
                 value: 0.0,
@@ -556,6 +591,7 @@ pub fn resolve_builtin(name: &str) -> Option<BuiltinColormap> {
         "radar_dbz" => Some(BuiltinColormap::RadarDbz),
         "radar_smhi" => Some(BuiltinColormap::RadarSmhi),
         "radar_fmi" => Some(BuiltinColormap::RadarFmi),
+        "radar_bookbinder" => Some(BuiltinColormap::RadarBookbinder),
         "grayscale" => Some(BuiltinColormap::Grayscale),
         "viridis" => Some(BuiltinColormap::Viridis),
         "temperature" => Some(BuiltinColormap::Temperature),
@@ -571,6 +607,7 @@ pub fn builtin_names() -> &'static [&'static str] {
         "radar_dbz",
         "radar_smhi",
         "radar_fmi",
+        "radar_bookbinder",
         "grayscale",
         "viridis",
         "temperature",
