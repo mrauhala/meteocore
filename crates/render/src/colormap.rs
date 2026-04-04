@@ -14,6 +14,8 @@ pub struct ColorStop {
 pub enum BuiltinColormap {
     /// Standard radar reflectivity (blue → green → yellow → red).
     RadarDbz,
+    /// SMHI radar reflectivity with gray below-threshold, per-dBZ colors, -29 to 70 dBZ.
+    RadarSmhi,
     /// Linear grayscale (black → white).
     Grayscale,
     /// Perceptually uniform (dark purple → blue → green → yellow).
@@ -319,6 +321,50 @@ pub fn builtin_stops(builtin: &BuiltinColormap) -> Vec<ColorStop> {
                 color: [255, 255, 255, 255],
             }, // white (extreme)
         ],
+        BuiltinColormap::RadarSmhi => {
+            // SMHI radar reflectivity colormap with per-dBZ colors.
+            // Gray tones below 5 dBZ, then blue → green → yellow → orange → red → magenta → cyan.
+            let data: &[(f64, [u8; 4])] = &[
+                (-30.0, [0, 0, 0, 0]), // below range: transparent
+                (-29.1, [0, 0, 0, 0]),
+                (-29.0, [54, 54, 54, 255]), // gray ramp starts
+                (-20.0, [63, 63, 63, 255]),
+                (-10.0, [73, 73, 73, 255]),
+                (-6.0, [87, 87, 87, 255]),
+                (-1.0, [139, 139, 139, 255]),
+                (0.0, [150, 150, 150, 255]),
+                (4.0, [192, 192, 192, 255]),
+                (5.0, [0, 50, 255, 255]), // blue ramp
+                (8.0, [0, 110, 255, 255]),
+                (11.0, [0, 170, 255, 255]),
+                (12.0, [0, 128, 0, 255]), // green ramp
+                (15.0, [0, 163, 0, 255]),
+                (19.0, [0, 178, 0, 255]),
+                (20.0, [10, 208, 10, 255]), // bright green
+                (24.0, [10, 248, 10, 255]),
+                (25.0, [255, 255, 15, 255]), // yellow ramp
+                (29.0, [255, 220, 15, 255]),
+                (30.0, [255, 200, 0, 255]), // orange ramp
+                (34.0, [255, 120, 0, 255]),
+                (35.0, [255, 35, 35, 255]), // red ramp
+                (37.0, [255, 0, 0, 255]),
+                (40.0, [195, 0, 0, 255]),
+                (44.0, [115, 0, 0, 255]),
+                (45.0, [175, 0, 175, 255]), // magenta ramp
+                (50.0, [219, 0, 219, 255]),
+                (54.0, [255, 0, 255, 255]),
+                (55.0, [0, 255, 255, 255]), // cyan ramp
+                (60.0, [64, 255, 255, 255]),
+                (65.0, [128, 255, 255, 255]),
+                (70.0, [192, 255, 255, 255]),
+            ];
+            data.iter()
+                .map(|(v, c)| ColorStop {
+                    value: *v,
+                    color: *c,
+                })
+                .collect()
+        }
         BuiltinColormap::Viridis => vec![
             ColorStop {
                 value: 0.0,
@@ -482,6 +528,7 @@ pub fn builtin_stops(builtin: &BuiltinColormap) -> Vec<ColorStop> {
 pub fn resolve_builtin(name: &str) -> Option<BuiltinColormap> {
     match name {
         "radar_dbz" => Some(BuiltinColormap::RadarDbz),
+        "radar_smhi" => Some(BuiltinColormap::RadarSmhi),
         "grayscale" => Some(BuiltinColormap::Grayscale),
         "viridis" => Some(BuiltinColormap::Viridis),
         "temperature" => Some(BuiltinColormap::Temperature),
@@ -495,6 +542,7 @@ pub fn resolve_builtin(name: &str) -> Option<BuiltinColormap> {
 pub fn builtin_names() -> &'static [&'static str] {
     &[
         "radar_dbz",
+        "radar_smhi",
         "grayscale",
         "viridis",
         "temperature",
