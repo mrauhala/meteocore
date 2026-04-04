@@ -1,6 +1,5 @@
 mod cache;
 mod catalog;
-mod geo;
 mod parse;
 mod reader;
 pub mod stac;
@@ -10,8 +9,8 @@ mod time_window;
 #[cfg(feature = "fuzz")]
 #[doc(hidden)]
 pub mod fuzz_exports {
-    pub use crate::geo::{Crs, GeoTransform};
     pub use crate::reader::{DataSource, TiffMetadata};
+    pub use ds_core::geo::{Crs, GeoTransform};
 }
 
 use std::collections::{BTreeMap, HashMap};
@@ -1371,10 +1370,12 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             .values()
             .find_map(|entry| {
                 entry.metadata().map(|m| match &m.geo_transform.crs {
-                    geo::Crs::Wgs84 => "EPSG:4326".to_string(),
-                    geo::Crs::TransverseMercator { .. } => "EPSG:3067".to_string(),
-                    geo::Crs::LambertAzimuthalEqualArea { .. } => "EPSG:3035".to_string(),
-                    geo::Crs::LambertConformalConic { .. } => "projected".to_string(),
+                    ds_core::geo::Crs::Wgs84 => "EPSG:4326".to_string(),
+                    ds_core::geo::Crs::TransverseMercator { .. } => "EPSG:3067".to_string(),
+                    ds_core::geo::Crs::LambertAzimuthalEqualArea { .. } => "EPSG:3035".to_string(),
+                    ds_core::geo::Crs::LambertConformalConic { .. } => "projected".to_string(),
+                    ds_core::geo::Crs::Stereographic { .. } => "projected".to_string(),
+                    ds_core::geo::Crs::RotatedLatLon { .. } => "EPSG:4326".to_string(),
                 })
             })
             .unwrap_or_else(|| "EPSG:4326".to_string());

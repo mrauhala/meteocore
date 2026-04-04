@@ -4,6 +4,7 @@ pub mod engine;
 pub mod error;
 pub mod feature;
 pub mod feature_engine;
+pub mod geo;
 pub mod map_engine;
 pub mod model;
 pub mod openapi;
