@@ -8,7 +8,7 @@ use ds_core::error::DataServerError;
 use tiff::decoder::{Decoder, DecodingResult};
 use tiff::tags::Tag;
 
-use crate::geo::{Crs, GeoTransform};
+use ds_core::geo::{Crs, GeoTransform};
 
 /// Bridge async to sync for standalone functions.
 /// Uses `block_in_place` when inside a tokio runtime, or creates a temporary runtime otherwise.
@@ -2475,14 +2475,14 @@ mod tests {
             tiles_across: 1,
             tiles_down: 1,
             samples_per_pixel: 1,
-            geo_transform: crate::geo::GeoTransform {
+            geo_transform: ds_core::geo::GeoTransform {
                 origin_x: 0.0,
                 origin_y: 0.0,
                 pixel_width: 1.0,
                 pixel_height: 1.0,
                 width: 1,
                 height: 1,
-                crs: crate::geo::Crs::Wgs84,
+                crs: ds_core::geo::Crs::Wgs84,
             },
             nodata: Some(nodata),
             scale: None,

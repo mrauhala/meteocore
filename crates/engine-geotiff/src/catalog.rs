@@ -763,8 +763,8 @@ pub fn poll_stac_latest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geo::{Crs, GeoTransform};
     use crate::reader::{DataSource, TiffMetadata};
+    use ds_core::geo::{Crs, GeoTransform};
 
     #[test]
     fn exclude_patterns() {

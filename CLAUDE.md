@@ -29,6 +29,7 @@ Seed corpus in `fuzz/corpus/fuzz_tiff_metadata/` — add real GeoTIFF files for 
 
 - **Three core traits: `Engine` (EDR), `FeatureEngine` (Features), and `MapEngine` (Maps/WMS/Tiles).** They are separate traits — not all engines need to support all APIs. Engines return domain types, never JSON/XML. Serialization belongs in the API crates.
 - **ds-core has no framework dependencies.** Only chrono, serde, thiserror, toml. Keep it that way. Use `PropertyValue` enum instead of `serde_json::Value` for feature properties.
+- **CRS and GeoTransform live in ds-core** (`ds_core::geo`), shared by all engines. Projection math (forward/inverse transforms) for WGS84, TM, LAEA, LCC, Stereographic, and Rotated Lat-Lon.
 - **ds-render has no framework dependencies.** Only ds-core and `png`. Pure rendering library for colorization and image encoding.
 - **API crates depend only on ds-core** (and ds-render for api-wms/api-maps), not on any engine crate. API state is a registry of engines keyed by collection ID (`EdrState` / `FeaturesState` / `MapsState` / `WmsState`), not a single engine.
 - **EDR, Features, Maps, Tiles, and WMS are separate services** with separate base routes (`/edr/...`, `/features/...`, `/maps/...`, `/tiles/...`, `/wms/...`). They share data sources but have independent endpoints.
@@ -487,6 +488,9 @@ Queries are always in WGS84 (lon/lat). The engine reprojects internally when the
 | Transverse Mercator | ProjCoordTrans = 1 | EPSG:3067 (TM35FIN) |
 | Lambert Azimuthal Equal Area | ProjCoordTrans = 10 | EPSG:3035 (ETRS89-LAEA) |
 | Lambert Conformal Conic (2SP) | ProjCoordTrans = 8 | Various national grids |
+| Stereographic | ProjCoordTrans = 14 | FMI/DMI ODIM radar composites |
+
+CRS types and math live in `ds-core/src/geo.rs` (shared across all engines). Additional projections available in ds-core but not yet wired to GeoTIFF GeoKey parsing: Rotated Latitude-Longitude (for HIRLAM/HARMONIE NWP grids).
 
 CRS parameters are read from GeoTIFF GeoKeys (tag 34735). Files without GeoKeys are assumed WGS84. **Rotated or skewed rasters are not supported** (the engine assumes axis-aligned pixels).
 

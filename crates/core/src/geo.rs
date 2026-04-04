@@ -5,7 +5,10 @@ const WGS84_A: f64 = 6_378_137.0; // semi-major axis (meters)
 const WGS84_F: f64 = 1.0 / 298.257223563; // flattening
 const WGS84_E2: f64 = 2.0 * WGS84_F - WGS84_F * WGS84_F; // eccentricity squared
 
-/// Coordinate reference system parsed from GeoTIFF GeoKeys.
+/// Coordinate reference system.
+///
+/// Stores projection parameters and provides forward/inverse transforms
+/// between WGS84 geographic coordinates and projected coordinates.
 #[derive(Debug, Clone)]
 pub enum Crs {
     /// WGS84 geographic (EPSG:4326 / CRS84). Coordinates are (lon, lat) in degrees.
@@ -34,11 +37,32 @@ pub enum Crs {
         false_e: f64, // false easting (meters)
         false_n: f64, // false northing (meters)
     },
+    /// Polar Stereographic (e.g., FMI ODIM radar composites).
+    ///
+    /// Oblique stereographic on WGS84 ellipsoid using the conformal sphere
+    /// approach (Gauss conformal latitude). Parameters match PROJ +proj=stere.
+    Stereographic {
+        lat0: f64,    // latitude of natural origin (radians)
+        lon0: f64,    // central meridian (radians)
+        k0: f64,      // scale factor at natural origin
+        false_e: f64, // false easting (meters)
+        false_n: f64, // false northing (meters)
+    },
+    /// Rotated latitude-longitude grid (e.g., HIRLAM NWP models).
+    ///
+    /// Grid coordinates are in a rotated coordinate system where the south pole
+    /// is moved to (south_pole_lon, south_pole_lat). Used by FMI's querydata format
+    /// for regional NWP grids.
+    RotatedLatLon {
+        south_pole_lat: f64, // latitude of the rotated south pole (radians)
+        south_pole_lon: f64, // longitude of the rotated south pole (radians)
+    },
 }
 
 impl Crs {
     /// Forward-transform WGS84 (lon_deg, lat_deg) to projected (easting, northing).
     /// For Wgs84, returns (lon, lat) unchanged.
+    /// For RotatedLatLon, returns rotated (lon, lat) in degrees.
     pub fn forward(&self, lon_deg: f64, lat_deg: f64) -> (f64, f64) {
         match self {
             Crs::Wgs84 => (lon_deg, lat_deg),
@@ -87,11 +111,36 @@ impl Crs {
                 *false_e,
                 *false_n,
             ),
+            Crs::Stereographic {
+                lat0,
+                lon0,
+                k0,
+                false_e,
+                false_n,
+            } => stere_forward(
+                lat_deg.to_radians(),
+                lon_deg.to_radians(),
+                *lat0,
+                *lon0,
+                *k0,
+                *false_e,
+                *false_n,
+            ),
+            Crs::RotatedLatLon {
+                south_pole_lat,
+                south_pole_lon,
+            } => rotlatlon_forward(
+                lat_deg.to_radians(),
+                lon_deg.to_radians(),
+                *south_pole_lat,
+                *south_pole_lon,
+            ),
         }
     }
 
     /// Inverse-transform projected (easting, northing) to WGS84 (lon_deg, lat_deg).
     /// For Wgs84, returns (x, y) unchanged.
+    /// For RotatedLatLon, input is rotated (lon, lat) in degrees.
     /// Returns `None` if the projection math produces NaN/Inf (e.g., near poles).
     pub fn inverse(&self, x: f64, y: f64) -> Option<(f64, f64)> {
         let result = match self {
@@ -126,6 +175,25 @@ impl Crs {
                 let (lat, lon) = lcc_inverse(x, y, *lat1, *lat2, *lat0, *lon0, *false_e, *false_n);
                 (lon.to_degrees(), lat.to_degrees())
             }
+            Crs::Stereographic {
+                lat0,
+                lon0,
+                k0,
+                false_e,
+                false_n,
+            } => {
+                let (lat, lon) = stere_inverse(x, y, *lat0, *lon0, *k0, *false_e, *false_n);
+                (lon.to_degrees(), lat.to_degrees())
+            }
+            Crs::RotatedLatLon {
+                south_pole_lat,
+                south_pole_lon,
+            } => rotlatlon_inverse(
+                x.to_radians(),
+                y.to_radians(),
+                *south_pole_lat,
+                *south_pole_lon,
+            ),
         };
         if result.0.is_finite() && result.1.is_finite() {
             Some(result)
@@ -697,6 +765,156 @@ fn lcc_t(lat: f64, e: f64) -> f64 {
     (PI / 4.0 - lat / 2.0).tan() / ((1.0 - e_sin) / (1.0 + e_sin)).powf(e / 2.0)
 }
 
+// ============================================================================
+// Oblique Stereographic — used by FMI/DMI ODIM radar composites
+// Reference: EPSG guidance note 7-2, method 9809 (Oblique Stereographic)
+// Uses conformal sphere approach (Gauss conformal latitude)
+// ============================================================================
+
+fn stere_forward(
+    lat: f64,
+    lon: f64,
+    lat0: f64,
+    lon0: f64,
+    k0: f64,
+    false_e: f64,
+    false_n: f64,
+) -> (f64, f64) {
+    let e2 = WGS84_E2;
+    let e = e2.sqrt();
+
+    // Conformal sphere radius
+    let sin_lat0 = lat0.sin();
+    let rn = WGS84_A / (1.0 - e2 * sin_lat0 * sin_lat0).sqrt();
+    let rm = WGS84_A * (1.0 - e2) / (1.0 - e2 * sin_lat0 * sin_lat0).powf(1.5);
+    let r_sphere = (rn * rm).sqrt();
+
+    // Conformal latitude at origin
+    let n = (1.0 + (e2 * lat0.cos().powi(4)) / (1.0 - e2)).sqrt();
+    let s1 = (1.0 + sin_lat0) / (1.0 - sin_lat0);
+    let s2 = (1.0 - e * sin_lat0) / (1.0 + e * sin_lat0);
+    let w1 = (s1 * s2.powf(e)).powf(n / 2.0);
+    let sin_chi0 = (w1 - 1.0) / (w1 + 1.0);
+    let chi0 = sin_chi0.asin();
+
+    // Conformal latitude of point
+    let sin_lat = lat.sin();
+    let sa = (1.0 + sin_lat) / (1.0 - sin_lat);
+    let sb = (1.0 - e * sin_lat) / (1.0 + e * sin_lat);
+    let w = (sa * sb.powf(e)).powf(n / 2.0);
+    let sin_chi = (w - 1.0) / (w + 1.0);
+    let cos_chi = (1.0 - sin_chi * sin_chi).sqrt();
+
+    // Conformal longitude difference
+    let dl = n * (lon - lon0);
+
+    // Stereographic projection on conformal sphere
+    let cos_chi0 = chi0.cos();
+    let sin_chi0_v = chi0.sin();
+
+    let b_denom = 1.0 + sin_chi0_v * sin_chi + cos_chi0 * cos_chi * dl.cos();
+    let b = 2.0 * r_sphere * k0 / b_denom;
+
+    let x = false_e + b * cos_chi * dl.sin();
+    let y = false_n + b * (cos_chi0 * sin_chi - sin_chi0_v * cos_chi * dl.cos());
+
+    (x, y)
+}
+
+fn stere_inverse(
+    x: f64,
+    y: f64,
+    lat0: f64,
+    lon0: f64,
+    k0: f64,
+    false_e: f64,
+    false_n: f64,
+) -> (f64, f64) {
+    // Newton iteration: robust at any distance from center
+    let mut lat = lat0;
+    let mut lon = lon0;
+
+    for _ in 0..20 {
+        let (fx, fy) = stere_forward(lat, lon, lat0, lon0, k0, false_e, false_n);
+        let ex = x - fx;
+        let ey = y - fy;
+        if ex.abs() < 0.01 && ey.abs() < 0.01 {
+            break;
+        }
+        let h = 1e-8;
+        let (fx_dlat, fy_dlat) = stere_forward(lat + h, lon, lat0, lon0, k0, false_e, false_n);
+        let (fx_dlon, fy_dlon) = stere_forward(lat, lon + h, lat0, lon0, k0, false_e, false_n);
+        let de_dlat = (fx_dlat - fx) / h;
+        let de_dlon = (fx_dlon - fx) / h;
+        let dn_dlat = (fy_dlat - fy) / h;
+        let dn_dlon = (fy_dlon - fy) / h;
+        let det = de_dlat * dn_dlon - de_dlon * dn_dlat;
+        if det.abs() < 1e-30 {
+            break;
+        }
+        lat += (dn_dlon * ex - de_dlon * ey) / det;
+        lon += (-dn_dlat * ex + de_dlat * ey) / det;
+    }
+
+    (lat, lon)
+}
+
+// ============================================================================
+// Rotated Latitude-Longitude — used by HIRLAM and other NWP models
+// The south pole is moved to a new position, rotating the coordinate system.
+// Input/output: geographic degrees. Projected coords: rotated degrees.
+// ============================================================================
+
+/// Forward: WGS84 (lat, lon) in radians → rotated (lon, lat) in degrees.
+///
+/// The rotation moves the south pole from (-90°, 0°) to (south_pole_lat, south_pole_lon).
+/// Derived from two sequential rotations:
+/// 1. Rotate by -sp_lon around Z axis (align south pole to prime meridian)
+/// 2. Rotate by (90° + sp_lat) around Y axis (tilt south pole to correct latitude)
+fn rotlatlon_forward(lat: f64, lon: f64, south_pole_lat: f64, south_pole_lon: f64) -> (f64, f64) {
+    let sin_sp = south_pole_lat.sin();
+    let cos_sp = south_pole_lat.cos();
+    let dl = lon - south_pole_lon;
+
+    // Rotated latitude
+    let sin_lat_r = -sin_sp * lat.sin() - cos_sp * lat.cos() * dl.cos();
+    let lat_r = sin_lat_r.clamp(-1.0, 1.0).asin();
+
+    // Rotated longitude
+    let x_r = -sin_sp * lat.cos() * dl.cos() + cos_sp * lat.sin();
+    let y_r = lat.cos() * dl.sin();
+    let lon_r = y_r.atan2(x_r);
+
+    (lon_r.to_degrees(), lat_r.to_degrees())
+}
+
+/// Inverse: rotated (lon, lat) in radians → WGS84 (lon_deg, lat_deg).
+fn rotlatlon_inverse(
+    lon_r: f64,
+    lat_r: f64,
+    south_pole_lat: f64,
+    south_pole_lon: f64,
+) -> (f64, f64) {
+    let sin_sp = south_pole_lat.sin();
+    let cos_sp = south_pole_lat.cos();
+
+    // Geographic latitude from rotated coordinates
+    let sin_lat = cos_sp * lat_r.cos() * lon_r.cos() - sin_sp * lat_r.sin();
+    let lat = sin_lat.clamp(-1.0, 1.0).asin();
+
+    // Geographic longitude from rotated coordinates
+    let x = -sin_sp * lat_r.cos() * lon_r.cos() - cos_sp * lat_r.sin();
+    let y = lat_r.cos() * lon_r.sin();
+    let dl = y.atan2(x);
+    let lon = south_pole_lon + dl;
+
+    // Normalize longitude to [-180, 180]
+    let lon_deg = lon.to_degrees();
+    let lon_norm = ((lon_deg + 180.0) % 360.0 + 360.0) % 360.0 - 180.0;
+
+    (lon_norm, lat.to_degrees())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,5 +1133,129 @@ mod tests {
         let matrix = [1.0, 0.0, 0.0];
         let result = GeoTransform::from_transformation_matrix(&matrix, 100, 100, Crs::Wgs84);
         assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // Stereographic projection tests
+    // ========================================================================
+
+    // FMI radar composite: oblique stereographic centered on Finland
+    // PROJ: +proj=stere +lat_0=60 +lon_0=25 +k=1 +x_0=0 +y_0=0 +datum=WGS84
+    #[test]
+    fn stereographic_roundtrip_center() {
+        let crs = Crs::Stereographic {
+            lat0: 60.0_f64.to_radians(),
+            lon0: 25.0_f64.to_radians(),
+            k0: 1.0,
+            false_e: 0.0,
+            false_n: 0.0,
+        };
+        // Center of projection should map to (0, 0)
+        let (e, n) = crs.forward(25.0, 60.0);
+        assert!(e.abs() < 1.0, "easting at center={e}, expected ~0");
+        assert!(n.abs() < 1.0, "northing at center={n}, expected ~0");
+    }
+
+    #[test]
+    fn stereographic_roundtrip_helsinki() {
+        let crs = Crs::Stereographic {
+            lat0: 60.0_f64.to_radians(),
+            lon0: 25.0_f64.to_radians(),
+            k0: 1.0,
+            false_e: 0.0,
+            false_n: 0.0,
+        };
+        // Helsinki roundtrip
+        let (e, n) = crs.forward(24.9384, 60.1699);
+        let (lon, lat) = crs.inverse(e, n).unwrap();
+        assert!((lon - 24.9384).abs() < 0.001, "lon={lon}");
+        assert!((lat - 60.1699).abs() < 0.001, "lat={lat}");
+    }
+
+    // DMI radar: +proj=stere +lat_0=56 +lon_0=10.5667 +k=1.0
+    #[test]
+    fn stereographic_roundtrip_dmi() {
+        let crs = Crs::Stereographic {
+            lat0: 56.0_f64.to_radians(),
+            lon0: 10.5667_f64.to_radians(),
+            k0: 1.0,
+            false_e: 0.0,
+            false_n: 0.0,
+        };
+        // Copenhagen roundtrip
+        let (e, n) = crs.forward(12.5683, 55.6761);
+        let (lon, lat) = crs.inverse(e, n).unwrap();
+        assert!((lon - 12.5683).abs() < 0.001, "lon={lon}");
+        assert!((lat - 55.6761).abs() < 0.001, "lat={lat}");
+    }
+
+    // Test at ~1000km from center (edge of typical radar composite)
+    #[test]
+    fn stereographic_far_from_center() {
+        let crs = Crs::Stereographic {
+            lat0: 60.0_f64.to_radians(),
+            lon0: 25.0_f64.to_radians(),
+            k0: 1.0,
+            false_e: 0.0,
+            false_n: 0.0,
+        };
+        // Tromsø, ~1200km from center
+        let (e, n) = crs.forward(19.0, 69.65);
+        let (lon, lat) = crs.inverse(e, n).unwrap();
+        assert!((lon - 19.0).abs() < 0.01, "lon={lon}");
+        assert!((lat - 69.65).abs() < 0.01, "lat={lat}");
+    }
+
+    // ========================================================================
+    // Rotated lat-lon tests
+    // ========================================================================
+
+    // HIRLAM-like: south pole at (-30, -170)
+    #[test]
+    fn rotlatlon_roundtrip_center() {
+        let sp_lat = (-30.0_f64).to_radians();
+        let sp_lon = (-170.0_f64).to_radians();
+        let crs = Crs::RotatedLatLon {
+            south_pole_lat: sp_lat,
+            south_pole_lon: sp_lon,
+        };
+
+        // The rotated equator should pass through the geographic north pole
+        // of the rotated system (antipode of south pole = 30N, 10E)
+        // At the rotated origin (0, 0) → should map to the rotated north pole
+        let (rlon, rlat) = crs.forward(10.0, 30.0);
+        // Should be near rotated (0, 0) since this is the rotated north pole's position
+        // Actually the rotated north pole is at rotated (0, 90) — let's just test roundtrip
+        let (lon, lat) = crs.inverse(rlon, rlat).unwrap();
+        assert!((lon - 10.0).abs() < 0.01, "lon={lon}");
+        assert!((lat - 30.0).abs() < 0.01, "lat={lat}");
+    }
+
+    #[test]
+    fn rotlatlon_roundtrip_helsinki() {
+        let sp_lat = (-30.0_f64).to_radians();
+        let sp_lon = (-170.0_f64).to_radians();
+        let crs = Crs::RotatedLatLon {
+            south_pole_lat: sp_lat,
+            south_pole_lon: sp_lon,
+        };
+
+        let (rlon, rlat) = crs.forward(24.9384, 60.1699);
+        let (lon, lat) = crs.inverse(rlon, rlat).unwrap();
+        assert!((lon - 24.9384).abs() < 0.01, "lon={lon}");
+        assert!((lat - 60.1699).abs() < 0.01, "lat={lat}");
+    }
+
+    // Identity rotation: south pole at (-90, 0) should be a no-op
+    #[test]
+    fn rotlatlon_identity() {
+        let crs = Crs::RotatedLatLon {
+            south_pole_lat: (-90.0_f64).to_radians(),
+            south_pole_lon: 0.0_f64.to_radians(),
+        };
+
+        let (rlon, rlat) = crs.forward(24.0, 60.0);
+        assert!((rlon - 24.0).abs() < 0.01, "rlon={rlon}");
+        assert!((rlat - 60.0).abs() < 0.01, "rlat={rlat}");
     }
 }
