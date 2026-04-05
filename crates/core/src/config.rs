@@ -45,6 +45,8 @@ pub struct CollectionConfig {
     pub engine_type: String,
     /// GeoTIFF-specific configuration. Required when engine_type = "geotiff".
     pub geotiff: Option<GeoTiffConfig>,
+    /// QueryData-specific configuration. Required when engine_type = "querydata".
+    pub querydata: Option<QueryDataConfig>,
     /// WMS map rendering configuration. Required when apis contains "wms".
     pub wms: Option<WmsConfig>,
 }
@@ -207,6 +209,13 @@ fn default_engine_type() -> String {
 
 fn default_apis() -> Vec<String> {
     vec!["edr".to_string()]
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueryDataConfig {
+    /// Parameter to expose for WMS/Maps rendering. Must match a parameter name
+    /// in the querydata file. If not set, the first parameter is used.
+    pub wms_parameter: Option<String>,
 }
 
 impl ServerConfig {
