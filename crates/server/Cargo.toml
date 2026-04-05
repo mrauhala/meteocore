@@ -8,6 +8,7 @@ ds-core = { path = "../core" }
 engine-csv = { path = "../engine-csv" }
 engine-geojson = { path = "../engine-geojson" }
 engine-geotiff = { path = "../engine-geotiff" }
+engine-querydata = { path = "../engine-querydata" }
 api-edr = { path = "../api-edr" }
 api-features = { path = "../api-features" }
 api-wms = { path = "../api-wms" }

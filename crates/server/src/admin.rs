@@ -111,6 +111,7 @@ pub struct ServerState {
     pub config_path: String,
     pub health: RwLock<Vec<CollectionHealth>>,
     pub geotiff_engines: RwLock<Vec<Arc<engine_geotiff::GeoTiffEngine>>>,
+    pub querydata_engines: RwLock<Vec<Arc<engine_querydata::QueryDataEngine>>>,
     /// Serializes reload requests to prevent concurrent reloads from racing.
     pub reload_lock: tokio::sync::Mutex<()>,
 }
@@ -129,6 +130,7 @@ pub struct LoadResult {
     pub tiles_state: TilesState,
     pub health: Vec<CollectionHealth>,
     pub geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>>,
+    pub querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>>,
 }
 
 pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> LoadResult {
@@ -148,6 +150,7 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
     let mut tiles_collections: HashMap<String, CollectionConfig> = HashMap::new();
     let mut tiles_styles: HashMap<String, HashMap<String, ds_render::StyleInfo>> = HashMap::new();
     let mut geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>> = Vec::new();
+    let mut querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>> = Vec::new();
     let mut health: Vec<CollectionHealth> = Vec::new();
 
     for collection in collections {
@@ -412,6 +415,107 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                     },
                 });
             }
+            "querydata" => {
+                let data_path = match collection.data_path.as_deref() {
+                    Some(p) => p,
+                    None => {
+                        tracing::error!(
+                            "Collection '{}': engine_type 'querydata' requires data_path, skipping",
+                            collection.id
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "querydata".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some("missing data_path".into()),
+                        });
+                        continue;
+                    }
+                };
+
+                let qd_config = collection.querydata.as_ref();
+                let wms_param = qd_config.and_then(|c| c.wms_parameter.as_deref());
+                let poll_secs = qd_config.map_or(30, |c| c.poll_interval_secs);
+
+                let engine = match engine_querydata::QueryDataEngine::new(
+                    std::path::Path::new(data_path),
+                    &collection.id,
+                    wms_param,
+                    poll_secs,
+                ) {
+                    Ok(e) => Arc::new(e),
+                    Err(e) => {
+                        tracing::error!(
+                            "Collection '{}': failed to initialize QueryData engine: {}",
+                            collection.id,
+                            e
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "querydata".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some(format!("{e}")),
+                        });
+                        continue;
+                    }
+                };
+
+                querydata_engines.push(engine.clone());
+
+                if collection.apis.contains(&"edr".to_string()) {
+                    edr_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::engine::Engine>,
+                    );
+                    edr_collections.insert(collection.id.clone(), collection.clone());
+                }
+                if collection.apis.contains(&"wms".to_string()) {
+                    map_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    map_collections.insert(collection.id.clone(), collection.clone());
+                    let styles = build_styles(collection);
+                    map_styles.insert(collection.id.clone(), styles);
+                    info!("Collection '{}': wired to WMS API", collection.id);
+                }
+                if collection.apis.contains(&"maps".to_string()) {
+                    maps_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    maps_collections.insert(collection.id.clone(), collection.clone());
+                    let styles = build_styles(collection);
+                    maps_styles.insert(collection.id.clone(), styles);
+                    info!("Collection '{}': wired to Maps API", collection.id);
+                }
+                if collection.apis.contains(&"tiles".to_string()) {
+                    tiles_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    tiles_collections.insert(collection.id.clone(), collection.clone());
+                    let styles = build_styles(collection);
+                    tiles_styles.insert(collection.id.clone(), styles);
+                    info!("Collection '{}': wired to Tiles API", collection.id);
+                }
+
+                let has_data = engine.has_data();
+                health.push(CollectionHealth {
+                    id: collection.id.clone(),
+                    engine_type: "querydata".into(),
+                    status: if has_data {
+                        CollectionStatus::Ready
+                    } else {
+                        CollectionStatus::Degraded
+                    },
+                    error: if has_data {
+                        None
+                    } else {
+                        Some("no .sqd files found yet (waiting for poll)".into())
+                    },
+                });
+            }
             other => {
                 tracing::error!(
                     "Collection '{}': unknown engine type '{}', skipping",
@@ -486,6 +590,7 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
         },
         health,
         geotiff_engines,
+        querydata_engines,
     }
 }
 
@@ -650,10 +755,14 @@ pub async fn reload_handler(
 
     let base_url = config.server.base_url();
 
-    // Shut down old GeoTIFF poll loops
+    // Shut down old poll loops
     {
-        let old_engines = state.geotiff_engines.read().unwrap();
-        for engine in old_engines.iter() {
+        let old_geotiff = state.geotiff_engines.read().unwrap();
+        for engine in old_geotiff.iter() {
+            engine.shutdown();
+        }
+        let old_querydata = state.querydata_engines.read().unwrap();
+        for engine in old_querydata.iter() {
             engine.shutdown();
         }
     }
@@ -683,8 +792,14 @@ pub async fn reload_handler(
         ));
     }
 
-    // Spawn poll loops for new GeoTIFF engines
+    // Spawn poll loops for new engines
     for engine in &result.geotiff_engines {
+        let poller = engine.clone();
+        tokio::spawn(async move {
+            poller.poll_loop().await;
+        });
+    }
+    for engine in &result.querydata_engines {
         let poller = engine.clone();
         tokio::spawn(async move {
             poller.poll_loop().await;
@@ -702,8 +817,9 @@ pub async fn reload_handler(
     update_health_gauges(&result.health);
     *state.health.write().unwrap() = result.health.clone();
 
-    // Update GeoTIFF engine list
+    // Update engine lists
     *state.geotiff_engines.write().unwrap() = result.geotiff_engines;
+    *state.querydata_engines.write().unwrap() = result.querydata_engines;
 
     info!(
         "Reload complete: {}/{} collections loaded",

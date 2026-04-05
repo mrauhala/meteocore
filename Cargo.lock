@@ -2221,6 +2221,7 @@ dependencies = [
  "engine-csv",
  "engine-geojson",
  "engine-geotiff",
+ "engine-querydata",
  "prometheus",
  "serde",
  "serde_json",

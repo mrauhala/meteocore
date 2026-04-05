@@ -54,8 +54,14 @@ async fn main() {
         config.collections.len()
     );
 
-    // Spawn GeoTIFF poll loops
+    // Spawn poll loops
     for engine in &result.geotiff_engines {
+        let poller = engine.clone();
+        tokio::spawn(async move {
+            poller.poll_loop().await;
+        });
+    }
+    for engine in &result.querydata_engines {
         let poller = engine.clone();
         tokio::spawn(async move {
             poller.poll_loop().await;
@@ -81,6 +87,7 @@ async fn main() {
         config_path,
         health: RwLock::new(result.health),
         geotiff_engines: RwLock::new(result.geotiff_engines),
+        querydata_engines: RwLock::new(result.querydata_engines),
         reload_lock: tokio::sync::Mutex::new(()),
     });
 
@@ -142,9 +149,13 @@ async fn main() {
     .await
     .expect("Server error");
 
-    // Signal all GeoTIFF polling loops to stop
-    let engines = server_state.geotiff_engines.read().unwrap();
-    for engine in engines.iter() {
+    // Signal all polling loops to stop
+    let geotiff = server_state.geotiff_engines.read().unwrap();
+    for engine in geotiff.iter() {
+        engine.shutdown();
+    }
+    let querydata = server_state.querydata_engines.read().unwrap();
+    for engine in querydata.iter() {
         engine.shutdown();
     }
     info!("Server shut down gracefully");
