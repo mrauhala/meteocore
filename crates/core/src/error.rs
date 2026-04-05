@@ -32,6 +32,9 @@ pub enum DataServerError {
     #[error("GeoTIFF error: {0}")]
     GeoTiff(String),
 
+    #[error("QueryData error: {0}")]
+    QueryData(String),
+
     #[error("Storage error: {0}")]
     Storage(String),
 

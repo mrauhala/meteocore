@@ -149,6 +149,21 @@ poll_interval_secs = 300
 colormap = "radar_dbz"
 
 [[collections]]
+id = "ecmwf-kenya"
+title = "ECMWF Kenya Surface"
+description = "ECMWF surface forecast for Kenya region (temperature, pressure, wind, precipitation)"
+data_path = "testdata/ecmwf-kenya"
+engine_type = "querydata"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[collections.querydata]
+wms_parameter = "2 Metre Temperature (2t)"
+poll_interval_secs = 60
+
+[collections.wms]
+colormap = "temperature"
+
+[[collections]]
 id = "met-norway-radar"
 title = "MET Norway Radar Mosaic"
 description = "Radar reflectivity mosaic from MET Norway via STAC catalog, Lambert Conformal Conic"

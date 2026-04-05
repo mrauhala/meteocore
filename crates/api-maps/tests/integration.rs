@@ -89,6 +89,7 @@ fn build_router() -> axum::Router {
             apis: vec!["maps".to_string()],
             engine_type: "geotiff".to_string(),
             geotiff: None,
+            querydata: None,
             wms: None,
         },
     );
