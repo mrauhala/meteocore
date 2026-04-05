@@ -313,7 +313,7 @@ impl GeoTiffEngine {
             loading_in_flight: Mutex::new(std::collections::HashSet::new()),
             stac_consecutive_failures: AtomicU32::new(0),
             stac_last_attempt: Mutex::new(None),
-            catalog_updated_at: Mutex::new(None),
+            catalog_updated_at: Mutex::new(Some(Utc::now())),
         };
 
         // Initial scan — STAC mode fetches collection extent only (no items)
