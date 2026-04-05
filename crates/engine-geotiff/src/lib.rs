@@ -174,6 +174,14 @@ impl GeoTiffEngine {
         }
     }
 
+    /// Store a STAC catalog update, applying max_files eviction if configured.
+    fn store_stac_catalog(&self, mut catalog: Catalog) {
+        if let Some(max) = self.max_files {
+            catalog.trim_to_latest(max);
+        }
+        self.catalog.store(Arc::new(catalog));
+    }
+
     /// How long ago the catalog was last successfully updated.
     /// Returns `None` if the catalog has never been updated after initial load.
     pub fn catalog_age(&self) -> Option<chrono::Duration> {
@@ -699,7 +707,7 @@ impl GeoTiffEngine {
                     match catalog::fetch_stac_range(client, &current, range, &self.collection_id) {
                         Ok(updated) => {
                             self.record_stac_success();
-                            self.catalog.store(Arc::new(updated));
+                            self.store_stac_catalog(updated);
                         }
                         Err(e) => {
                             self.record_stac_failure();
@@ -723,7 +731,7 @@ impl GeoTiffEngine {
                     ) {
                         Ok(updated) => {
                             self.record_stac_success();
-                            self.catalog.store(Arc::new(updated));
+                            self.store_stac_catalog(updated);
                         }
                         Err(e) => {
                             self.record_stac_failure();
@@ -1159,7 +1167,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                 match catalog::fetch_stac_range(client, &current, range, &self.collection_id) {
                     Ok(updated) => {
                         self.record_stac_success();
-                        self.catalog.store(Arc::new(updated));
+                        self.store_stac_catalog(updated);
                     }
                     Err(e) => {
                         self.record_stac_failure();
