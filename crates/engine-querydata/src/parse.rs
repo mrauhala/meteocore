@@ -649,6 +649,7 @@ fn read_grid_area(r: &mut TextReader) -> Result<GridArea, QueryDataError> {
         10 => read_latlon_area(r),
         11 => read_rotated_latlon_area(r),
         13 => read_stereographic_area(r),
+        84 => read_lcc_area(r),
         _ => Err(QueryDataError::UnsupportedArea(class_id)),
     }
 }
@@ -751,6 +752,53 @@ fn read_stereographic_area(r: &mut TextReader) -> Result<GridArea, QueryDataErro
             lat0: central_lat.to_radians(),
             lon0: central_lon.to_radians(),
             k0: 1.0,
+            false_e: 0.0,
+            false_n: 0.0,
+        },
+    })
+}
+
+/// Read NFmiLambertConformalConicArea (classId=84, extends NFmiArea directly).
+fn read_lcc_area(r: &mut TextReader) -> Result<GridArea, QueryDataError> {
+    // NFmiArea base: NFmiRect (XY rect)
+    let _xy_p1 = r.read_line()?;
+    let _xy_p2 = r.read_line()?;
+
+    // Bottom-left (lon, lat)
+    let bl_line = r.read_line()?;
+    let bl = parse_point(&bl_line)?;
+
+    // Top-right (lon, lat)
+    let tr_line = r.read_line()?;
+    let tr = parse_point(&tr_line)?;
+
+    // "centralLon centralLat" on one line
+    let central_line = r.read_line()?;
+    let central = parse_point(&central_line)?;
+    let central_lon = central.0;
+    let central_lat = central.1;
+
+    // "trueLat1 trueLat2" on one line
+    let true_lats_line = r.read_line()?;
+    let true_lats = parse_point(&true_lats_line)?;
+    let true_lat1 = true_lats.0;
+    let true_lat2 = true_lats.1;
+
+    // radius (Earth radius, e.g. 6371220)
+    let _radius = r.read_line()?;
+
+    // World rect (4 doubles as 2 points, precision 15)
+    let _wr_p1 = r.read_line()?;
+    let _wr_p2 = r.read_line()?;
+
+    Ok(GridArea {
+        bottom_left: bl,
+        top_right: tr,
+        crs: Crs::LambertConformalConic {
+            lat1: true_lat1.to_radians(),
+            lat2: true_lat2.to_radians(),
+            lat0: central_lat.to_radians(),
+            lon0: central_lon.to_radians(),
             false_e: 0.0,
             false_n: 0.0,
         },
