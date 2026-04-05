@@ -46,6 +46,9 @@ pub struct StyleInfo {
     pub colormap: Arc<dyn ColorMap>,
     pub min: f64,
     pub max: f64,
+    /// Data parameter to render. For multi-parameter engines, selects which
+    /// parameter's data is returned by `get_raster_tile()`. None = engine default.
+    pub parameter: Option<String>,
 }
 
 /// Cache key for rendered map images.

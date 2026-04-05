@@ -750,8 +750,17 @@ async fn render_tile(
 
     // The blocking closure returns Ok(None) for empty (all-nodata) tiles,
     // or Ok(Some(bytes)) for tiles with data.
+    let style_parameter = style_info.parameter.as_deref().map(String::from);
+
     let render_result = tokio::task::spawn_blocking(move || {
-        let tile = engine.get_raster_tile(bbox, tile_size, tile_size, time, &output_crs)?;
+        let tile = engine.get_raster_tile(
+            bbox,
+            tile_size,
+            tile_size,
+            time,
+            &output_crs,
+            style_parameter.as_deref(),
+        )?;
 
         // If every pixel is nodata, skip colorization + encoding entirely.
         if tile.is_empty() {

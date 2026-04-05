@@ -90,6 +90,10 @@ pub struct WmsStyle {
     pub min: Option<f64>,
     /// Maximum value for the colormap range.
     pub max: Option<f64>,
+    /// Data parameter to render for this style. For multi-parameter engines
+    /// (e.g., querydata), selects which parameter's data is returned.
+    /// If not set, the engine's default parameter is used.
+    pub parameter: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

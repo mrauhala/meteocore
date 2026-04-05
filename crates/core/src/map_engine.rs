@@ -54,6 +54,11 @@ pub trait MapEngine: Send + Sync {
     /// - `WebMercator`: pixels have equal spacing in Mercator Y (meters),
     ///   which is non-linear in latitude
     ///
+    /// The optional `parameter` selects which data parameter to render when the
+    /// engine supports multiple parameters (e.g., querydata with 10+ NWP fields).
+    /// Engines that serve a single parameter (e.g., GeoTIFF) ignore this.
+    /// The value comes from the style's `parameter` config field.
+    ///
     /// The engine handles CRS reprojection to source data internally.
     fn get_raster_tile(
         &self,
@@ -62,6 +67,7 @@ pub trait MapEngine: Send + Sync {
         height: u32,
         time: Option<DateTime<Utc>>,
         output_crs: &OutputCrs,
+        parameter: Option<&str>,
     ) -> Result<RasterTile, DataServerError>;
 
     /// Return metadata for capabilities documents.

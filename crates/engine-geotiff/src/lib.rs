@@ -1159,8 +1159,10 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         height: u32,
         time: Option<DateTime<Utc>>,
         output_crs: &ds_core::map_engine::OutputCrs,
+        parameter: Option<&str>,
     ) -> Result<ds_core::map_engine::RasterTile, DataServerError> {
-        // For STAC: ensure we have items around the requested time
+        let _ = parameter; // GeoTIFF engine serves a single band per collection
+                           // For STAC: ensure we have items around the requested time
         if let StoreMode::RemoteStac { ref client, .. } = self.store_mode {
             self.check_stac_circuit_breaker()?;
 

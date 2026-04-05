@@ -620,6 +620,7 @@ fn build_styles(collection: &CollectionConfig) -> HashMap<String, ds_render::Sty
             colormap: default_colormap,
             min: default_min,
             max: default_max,
+            parameter: None,
         },
     );
 
@@ -643,6 +644,7 @@ fn build_styles(collection: &CollectionConfig) -> HashMap<String, ds_render::Sty
                     colormap,
                     min,
                     max,
+                    parameter: style_config.parameter.clone(),
                 },
             );
         }
