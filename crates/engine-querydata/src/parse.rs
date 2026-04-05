@@ -759,6 +759,11 @@ fn read_stereographic_area(r: &mut TextReader) -> Result<GridArea, QueryDataErro
 }
 
 /// Read NFmiLambertConformalConicArea (classId=84, extends NFmiArea directly).
+///
+/// Format (9 lines + possible empty lines between sections):
+///   XY rect place, XY rect size, BL lon/lat, TR lon/lat,
+///   [empty], central lon+lat, true lat1+lat2, radius,
+///   world rect place, world rect size, [empty]
 fn read_lcc_area(r: &mut TextReader) -> Result<GridArea, QueryDataError> {
     // NFmiArea base: NFmiRect (XY rect)
     let _xy_p1 = r.read_line()?;
@@ -772,8 +777,13 @@ fn read_lcc_area(r: &mut TextReader) -> Result<GridArea, QueryDataError> {
     let tr_line = r.read_line()?;
     let tr = parse_point(&tr_line)?;
 
+    // Skip empty lines between sections
+    let mut central_line = r.read_line()?;
+    while central_line.trim().is_empty() {
+        central_line = r.read_line()?;
+    }
+
     // "centralLon centralLat" on one line
-    let central_line = r.read_line()?;
     let central = parse_point(&central_line)?;
     let central_lon = central.0;
     let central_lat = central.1;
@@ -790,6 +800,11 @@ fn read_lcc_area(r: &mut TextReader) -> Result<GridArea, QueryDataError> {
     // World rect (4 doubles as 2 points, precision 15)
     let _wr_p1 = r.read_line()?;
     let _wr_p2 = r.read_line()?;
+
+    // Skip trailing empty line if present
+    if r.pos < r.data.len() && r.data[r.pos] == b'\n' {
+        r.pos += 1;
+    }
 
     Ok(GridArea {
         bottom_left: bl,
@@ -1089,5 +1104,48 @@ mod tests {
 
         // No match
         assert!(qd.param_index_by_name("nonexistent").is_none());
+    }
+
+    #[test]
+    fn parse_meps_lcc() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/meps");
+        let files: Vec<_> = std::fs::read_dir(&path)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "sqd"))
+            .collect();
+        if files.is_empty() {
+            eprintln!("No MEPS test files found, skipping");
+            return;
+        }
+
+        let qd = QueryData::open(&files[0].path()).unwrap();
+
+        println!(
+            "MEPS: {} params, {}x{} grid, {} levels, {} times",
+            qd.params.len(),
+            qd.grid.nx,
+            qd.grid.ny,
+            qd.levels.len(),
+            qd.times.len()
+        );
+        for (i, p) in qd.params.iter().enumerate() {
+            println!("  param[{i}]: id={}, name={}", p.id, p.name);
+        }
+        println!("  CRS: {:?}", qd.grid.area.crs);
+        println!(
+            "  BL: {:?}, TR: {:?}",
+            qd.grid.area.bottom_left, qd.grid.area.top_right
+        );
+
+        assert!(matches!(
+            qd.grid.area.crs,
+            Crs::LambertConformalConic { .. }
+        ));
+        assert!(qd.grid.nx > 0);
+        assert!(qd.grid.ny > 0);
+        assert!(!qd.params.is_empty());
+        assert!(!qd.times.is_empty());
     }
 }
