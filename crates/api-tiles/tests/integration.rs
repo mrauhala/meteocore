@@ -39,6 +39,7 @@ impl MockMapEngine {
             ],
             parameter: "reflectivity".to_string(),
             unit: "dBZ".to_string(),
+            parameters: vec![],
         }
     }
 }
@@ -51,6 +52,7 @@ impl MapEngine for MockMapEngine {
         height: u32,
         _time: Option<chrono::DateTime<chrono::Utc>>,
         _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
     ) -> Result<RasterTile, DataServerError> {
         let pixel_count = (width * height) as usize;
         let values: Vec<Option<f64>> = (0..pixel_count)
@@ -108,6 +110,7 @@ fn build_router() -> axum::Router {
             colormap: cmap.clone(),
             min: 0.0,
             max: 1.0,
+            parameter: None,
         },
     );
     layer_styles.insert(
@@ -122,6 +125,7 @@ fn build_router() -> axum::Router {
             )),
             min: 0.0,
             max: 1.0,
+            parameter: None,
         },
     );
     styles_map.insert("radar".to_string(), layer_styles);

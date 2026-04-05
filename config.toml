@@ -157,11 +157,33 @@ engine_type = "querydata"
 apis = ["edr", "wms", "maps", "tiles"]
 
 [collections.querydata]
-wms_parameter = "2 Metre Temperature (2t)"
+wms_parameter = "2t"
 poll_interval_secs = 60
 
 [collections.wms]
+colormap = "viridis"
+
+[[collections.wms.parameters]]
+name = "2t"
 colormap = "temperature"
+
+[[collections.wms.parameters]]
+name = "2d"
+colormap = "temperature"
+
+[[collections.wms.parameters]]
+name = "msl"
+colormap = "viridis"
+min = 980.0
+max = 1040.0
+
+[[collections.wms.parameters]]
+name = "rr1h"
+colormap = "precipitation_rate"
+
+[[collections.wms.parameters]]
+name = "tp"
+colormap = "precipitation"
 
 [[collections]]
 id = "met-norway-radar"

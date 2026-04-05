@@ -305,9 +305,15 @@ impl MapEngine for QueryDataEngine {
         height: u32,
         time: Option<DateTime<Utc>>,
         output_crs: &OutputCrs,
+        parameter: Option<&str>,
     ) -> Result<RasterTile, DataServerError> {
         let data = self.load_data();
-        let param_idx = self.resolve_map_param_idx(&data);
+        let param_idx = if let Some(param_name) = parameter {
+            data.param_index_by_name(param_name)
+                .unwrap_or_else(|| self.resolve_map_param_idx(&data))
+        } else {
+            self.resolve_map_param_idx(&data)
+        };
 
         let time_idx = find_time_idx(&data, time).ok_or_else(|| {
             DataServerError::QueryData("No data available for the requested time".into())
@@ -360,12 +366,29 @@ impl MapEngine for QueryDataEngine {
             _ => "projected".to_string(),
         };
 
+        // Build parameter list: (short_name, full_title) for each parameter
+        let parameters: Vec<(String, String)> = data
+            .params
+            .iter()
+            .map(|p| {
+                // Extract short name from parentheses, e.g., "2 Metre Temperature (2t)" → "2t"
+                let short = p
+                    .name
+                    .rfind('(')
+                    .and_then(|start| p.name[start + 1..].strip_suffix(')'))
+                    .unwrap_or(&p.name)
+                    .to_string();
+                (short, p.name.clone())
+            })
+            .collect();
+
         RasterInfo {
             native_crs,
             spatial_extent: Some(bbox),
             times: data.times.clone(),
             parameter: param_name,
             unit: String::new(),
+            parameters,
         }
     }
 }
@@ -658,7 +681,14 @@ mod tests {
                 .unwrap();
 
         let tile = engine
-            .get_raster_tile([33.0, -5.0, 42.0, 5.0], 16, 16, None, &OutputCrs::Wgs84)
+            .get_raster_tile(
+                [33.0, -5.0, 42.0, 5.0],
+                16,
+                16,
+                None,
+                &OutputCrs::Wgs84,
+                None,
+            )
             .unwrap();
 
         assert_eq!(tile.width, 16);

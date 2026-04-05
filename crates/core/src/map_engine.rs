@@ -35,10 +35,13 @@ pub struct RasterInfo {
     pub spatial_extent: Option<[f64; 4]>,
     /// Available timestamps, most recent first.
     pub times: Vec<DateTime<Utc>>,
-    /// Parameter name (e.g., "reflectivity").
+    /// Default parameter name (e.g., "reflectivity").
     pub parameter: String,
     /// Unit of measurement (e.g., "dBZ").
     pub unit: String,
+    /// All available parameters. Empty means single-parameter engine (use `parameter`).
+    /// For multi-parameter engines (e.g., querydata), each entry is a (short_name, title) pair.
+    pub parameters: Vec<(String, String)>,
 }
 
 /// Engine trait for serving raster data as map images.
@@ -54,6 +57,11 @@ pub trait MapEngine: Send + Sync {
     /// - `WebMercator`: pixels have equal spacing in Mercator Y (meters),
     ///   which is non-linear in latitude
     ///
+    /// The optional `parameter` selects which data parameter to render when the
+    /// engine supports multiple parameters (e.g., querydata with 10+ NWP fields).
+    /// Engines that serve a single parameter (e.g., GeoTIFF) ignore this.
+    /// The value comes from the style's `parameter` config field.
+    ///
     /// The engine handles CRS reprojection to source data internally.
     fn get_raster_tile(
         &self,
@@ -62,6 +70,7 @@ pub trait MapEngine: Send + Sync {
         height: u32,
         time: Option<DateTime<Utc>>,
         output_crs: &OutputCrs,
+        parameter: Option<&str>,
     ) -> Result<RasterTile, DataServerError>;
 
     /// Return metadata for capabilities documents.

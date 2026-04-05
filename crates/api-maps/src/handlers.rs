@@ -751,8 +751,17 @@ async fn render_map(
     let format = validated.format;
     let rendered_cache = state.rendered_cache.clone();
 
+    let style_parameter = style_info.parameter.as_deref().map(String::from);
+
     let render_result = tokio::task::spawn_blocking(move || {
-        let tile = engine.get_raster_tile(bbox, width, height, time, &output_crs)?;
+        let tile = engine.get_raster_tile(
+            bbox,
+            width,
+            height,
+            time,
+            &output_crs,
+            style_parameter.as_deref(),
+        )?;
         // If every pixel is nodata, skip colorization + encoding entirely.
         if tile.is_empty() {
             return Ok(None);

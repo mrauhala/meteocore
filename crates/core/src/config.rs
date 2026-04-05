@@ -71,9 +71,30 @@ pub struct WmsConfig {
     /// Named styles in addition to the default. Each style has its own colormap.
     #[serde(default)]
     pub styles: Vec<WmsStyle>,
+    /// Per-parameter default colormap overrides. For multi-parameter engines,
+    /// each parameter layer can have its own default colormap and range.
+    /// Parameters not listed here use the top-level `colormap`/`min`/`max`.
+    #[serde(default)]
+    pub parameters: Vec<WmsParameterConfig>,
     /// Rendered image cache size in MB. Default: 128.
     #[serde(default = "default_rendered_cache_mb")]
     pub rendered_cache_mb: u64,
+}
+
+/// Per-parameter default colormap configuration for WMS.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WmsParameterConfig {
+    /// Parameter short name (e.g., "2t", "msl"). Matched via param_index_by_name().
+    pub name: String,
+    /// Built-in colormap name for this parameter's default style.
+    pub colormap: Option<String>,
+    /// Custom color stops (overrides colormap).
+    #[serde(default)]
+    pub color_stops: Vec<ColorStop>,
+    /// Minimum value for this parameter's colormap range.
+    pub min: Option<f64>,
+    /// Maximum value for this parameter's colormap range.
+    pub max: Option<f64>,
 }
 
 /// A named WMS style with its own colormap configuration.
@@ -90,6 +111,10 @@ pub struct WmsStyle {
     pub min: Option<f64>,
     /// Maximum value for the colormap range.
     pub max: Option<f64>,
+    /// Data parameter to render for this style. For multi-parameter engines
+    /// (e.g., querydata), selects which parameter's data is returned.
+    /// If not set, the engine's default parameter is used.
+    pub parameter: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

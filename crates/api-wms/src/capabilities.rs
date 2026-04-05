@@ -51,14 +51,16 @@ pub fn get_capabilities_xml(
     for (id, config) in collections {
         if let Some(engine) = engines.get(id) {
             let layer_styles = styles.get(id.as_str());
-            write_layer(
-                &mut writer,
-                id,
-                config,
-                engine.raster_info(),
-                layer_styles,
-                base_url,
-            );
+            let info = engine.raster_info();
+
+            if info.parameters.len() > 1 {
+                // Multi-parameter engine: parent layer (not requestable) with
+                // nested child layers per parameter
+                write_parent_layer(&mut writer, id, config, &info, layer_styles, base_url);
+            } else {
+                // Single-parameter engine: one requestable layer
+                write_layer(&mut writer, id, config, &info, layer_styles, base_url, None);
+            }
         }
     }
 
@@ -126,23 +128,82 @@ fn write_dcp_type(writer: &mut Writer<Vec<u8>>, base_url: &str) {
     let _ = writer.write_event(Event::End(BytesEnd::new("DCPType")));
 }
 
-fn write_layer(
+/// Write a parent layer for a multi-parameter collection.
+/// The parent is not directly requestable — child layers per parameter are.
+fn write_parent_layer(
     writer: &mut Writer<Vec<u8>>,
     id: &str,
     config: &CollectionConfig,
-    info: RasterInfo,
+    info: &RasterInfo,
     layer_styles: Option<&HashMap<String, StyleInfo>>,
     base_url: &str,
+) {
+    let _ = writer.write_event(Event::Start(BytesStart::new("Layer")));
+
+    // Parent has no Name element — makes it non-requestable per WMS spec
+    write_text_element(writer, "Title", &config.title);
+    write_text_element(writer, "Abstract", &config.description);
+
+    // CRS, bbox, time on parent — inherited by children
+    write_layer_metadata(writer, info);
+
+    // Child layers — one per parameter
+    for (short_name, title) in &info.parameters {
+        let child_layer_name = format!("{id}/{short_name}");
+        write_layer(
+            writer,
+            &child_layer_name,
+            config,
+            info,
+            layer_styles,
+            base_url,
+            Some(title),
+        );
+    }
+
+    let _ = writer.write_event(Event::End(BytesEnd::new("Layer")));
+}
+
+/// Write a single requestable layer.
+/// If `param_title` is Some, this is a child of a multi-param parent and we
+/// skip inherited metadata (CRS, bbox, time) since the parent already has it.
+fn write_layer(
+    writer: &mut Writer<Vec<u8>>,
+    layer_name: &str,
+    config: &CollectionConfig,
+    info: &RasterInfo,
+    layer_styles: Option<&HashMap<String, StyleInfo>>,
+    base_url: &str,
+    param_title: Option<&str>,
 ) {
     let mut layer = BytesStart::new("Layer");
     layer.push_attribute(("queryable", "0"));
     layer.push_attribute(("opaque", "1"));
     let _ = writer.write_event(Event::Start(layer));
 
-    write_text_element(writer, "Name", id);
-    write_text_element(writer, "Title", &config.title);
-    write_text_element(writer, "Abstract", &config.description);
+    write_text_element(writer, "Name", layer_name);
 
+    if let Some(title) = param_title {
+        write_text_element(writer, "Title", title);
+    } else {
+        write_text_element(writer, "Title", &config.title);
+        write_text_element(writer, "Abstract", &config.description);
+    }
+
+    // For top-level (non-nested) layers, write full metadata.
+    // For nested child layers, parent already has CRS/bbox/time.
+    if param_title.is_none() {
+        write_layer_metadata(writer, info);
+    }
+
+    // Styles
+    write_layer_styles(writer, layer_name, layer_styles, base_url);
+
+    let _ = writer.write_event(Event::End(BytesEnd::new("Layer")));
+}
+
+/// Write CRS, bbox, and time dimension for a layer.
+fn write_layer_metadata(writer: &mut Writer<Vec<u8>>, info: &RasterInfo) {
     // CRS
     for crs in params::supported_crs_list() {
         write_text_element(writer, "CRS", crs);
@@ -157,7 +218,6 @@ fn write_layer(
         write_text_element(writer, "northBoundLatitude", &format!("{north:.6}"));
         let _ = writer.write_event(Event::End(BytesEnd::new("EX_GeographicBoundingBox")));
 
-        // BoundingBox for CRS:84
         let mut bb = BytesStart::new("BoundingBox");
         bb.push_attribute(("CRS", "CRS:84"));
         bb.push_attribute(("minx", format!("{west:.6}").as_str()));
@@ -183,10 +243,16 @@ fn write_layer(
 
         let _ = writer.write_event(Event::End(BytesEnd::new("Dimension")));
     }
+}
 
-    // Styles
+/// Write style elements for a layer.
+fn write_layer_styles(
+    writer: &mut Writer<Vec<u8>>,
+    layer_name: &str,
+    layer_styles: Option<&HashMap<String, StyleInfo>>,
+    base_url: &str,
+) {
     if let Some(styles) = layer_styles {
-        // Sort to ensure "default" comes first
         let mut style_names: Vec<&String> = styles.keys().collect();
         style_names.sort_by(|a, b| {
             if a.as_str() == "default" {
@@ -203,10 +269,11 @@ fn write_layer(
                 write_text_element(writer, "Name", &style.name);
                 write_text_element(writer, "Title", &style.title);
 
-                // LegendURL
+                // LegendURL — use the collection ID (before /) for the LAYER param
+                let legend_layer = layer_name.split('/').next().unwrap_or(layer_name);
                 let _ = writer.write_event(Event::Start(BytesStart::new("LegendURL")));
                 let legend_url = format!(
-                    "{base_url}/wms?SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER={id}&STYLE={}&FORMAT=image/png",
+                    "{base_url}/wms?SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER={legend_layer}&STYLE={}&FORMAT=image/png",
                     style.name
                 );
                 let mut or = BytesStart::new("OnlineResource");
@@ -220,14 +287,11 @@ fn write_layer(
             }
         }
     } else {
-        // Fallback if no styles configured
         let _ = writer.write_event(Event::Start(BytesStart::new("Style")));
         write_text_element(writer, "Name", "default");
         write_text_element(writer, "Title", "Default");
         let _ = writer.write_event(Event::End(BytesEnd::new("Style")));
     }
-
-    let _ = writer.write_event(Event::End(BytesEnd::new("Layer")));
 }
 
 /// Write a simple text element using quick-xml (auto-escapes content).
