@@ -216,6 +216,9 @@ pub struct QueryDataConfig {
     /// Parameter to expose for WMS/Maps rendering. Must match a parameter name
     /// in the querydata file. If not set, the first parameter is used.
     pub wms_parameter: Option<String>,
+    /// Directory poll interval in seconds. Default: 30.
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_secs: u64,
 }
 
 impl ServerConfig {

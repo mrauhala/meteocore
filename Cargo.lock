@@ -631,10 +631,12 @@ dependencies = [
 name = "engine-querydata"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "chrono",
  "ds-core",
  "memmap2",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
