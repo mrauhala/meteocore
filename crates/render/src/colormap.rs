@@ -26,9 +26,11 @@ pub enum BuiltinColormap {
     Viridis,
     /// Temperature palette (blue → cyan → green → yellow → red).
     Temperature,
-    /// Precipitation palette (light blue → blue → purple → magenta).
+    /// Precipitation accumulation palette (light blue → blue → purple → magenta). 0–50 mm.
     Precipitation,
-    /// Wind speed palette (calm green → yellow → orange → red → purple).
+    /// Precipitation rate palette (transparent → cyan → blue → green → yellow → red). 0–30 mm/h.
+    PrecipitationRate,
+    /// Wind speed palette (calm green → yellow → orange → red ��� purple).
     WindSpeed,
 }
 
@@ -544,6 +546,44 @@ pub fn builtin_stops(builtin: &BuiltinColormap) -> Vec<ColorStop> {
                 color: [255, 255, 255, 255],
             }, // white (extreme)
         ],
+        BuiltinColormap::PrecipitationRate => vec![
+            ColorStop {
+                value: 0.0,
+                color: [0, 0, 0, 0],
+            }, // transparent (no rain)
+            ColorStop {
+                value: 0.1,
+                color: [200, 240, 255, 200],
+            }, // very light cyan (drizzle)
+            ColorStop {
+                value: 0.5,
+                color: [100, 210, 255, 255],
+            }, // light cyan
+            ColorStop {
+                value: 1.0,
+                color: [30, 170, 255, 255],
+            }, // cyan-blue
+            ColorStop {
+                value: 2.0,
+                color: [0, 120, 200, 255],
+            }, // blue
+            ColorStop {
+                value: 4.0,
+                color: [0, 180, 80, 255],
+            }, // green
+            ColorStop {
+                value: 8.0,
+                color: [200, 220, 0, 255],
+            }, // yellow
+            ColorStop {
+                value: 15.0,
+                color: [255, 140, 0, 255],
+            }, // orange
+            ColorStop {
+                value: 30.0,
+                color: [220, 0, 0, 255],
+            }, // red (heavy)
+        ],
         BuiltinColormap::WindSpeed => vec![
             ColorStop {
                 value: 0.0,
@@ -596,6 +636,7 @@ pub fn resolve_builtin(name: &str) -> Option<BuiltinColormap> {
         "viridis" => Some(BuiltinColormap::Viridis),
         "temperature" => Some(BuiltinColormap::Temperature),
         "precipitation" => Some(BuiltinColormap::Precipitation),
+        "precipitation_rate" => Some(BuiltinColormap::PrecipitationRate),
         "wind_speed" => Some(BuiltinColormap::WindSpeed),
         _ => None,
     }
@@ -612,6 +653,7 @@ pub fn builtin_names() -> &'static [&'static str] {
         "viridis",
         "temperature",
         "precipitation",
+        "precipitation_rate",
         "wind_speed",
     ]
 }

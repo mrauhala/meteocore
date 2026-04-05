@@ -472,6 +472,10 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
                 }
+                // Get parameter list for per-parameter-layer styles
+                let raster_params =
+                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+
                 if collection.apis.contains(&"wms".to_string()) {
                     map_engines.insert(
                         collection.id.clone(),
@@ -480,6 +484,13 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                     map_collections.insert(collection.id.clone(), collection.clone());
                     let styles = build_styles(collection);
                     map_styles.insert(collection.id.clone(), styles);
+                    if !raster_params.is_empty() {
+                        register_parameter_layer_styles(
+                            collection,
+                            &raster_params,
+                            &mut map_styles,
+                        );
+                    }
                     info!("Collection '{}': wired to WMS API", collection.id);
                 }
                 if collection.apis.contains(&"maps".to_string()) {
@@ -490,6 +501,13 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                     maps_collections.insert(collection.id.clone(), collection.clone());
                     let styles = build_styles(collection);
                     maps_styles.insert(collection.id.clone(), styles);
+                    if !raster_params.is_empty() {
+                        register_parameter_layer_styles(
+                            collection,
+                            &raster_params,
+                            &mut maps_styles,
+                        );
+                    }
                     info!("Collection '{}': wired to Maps API", collection.id);
                 }
                 if collection.apis.contains(&"tiles".to_string()) {
@@ -500,6 +518,13 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                     tiles_collections.insert(collection.id.clone(), collection.clone());
                     let styles = build_styles(collection);
                     tiles_styles.insert(collection.id.clone(), styles);
+                    if !raster_params.is_empty() {
+                        register_parameter_layer_styles(
+                            collection,
+                            &raster_params,
+                            &mut tiles_styles,
+                        );
+                    }
                     info!("Collection '{}': wired to Tiles API", collection.id);
                 }
 
@@ -602,16 +627,8 @@ fn build_styles(collection: &CollectionConfig) -> HashMap<String, ds_render::Sty
     let mut styles = HashMap::new();
 
     // Build default style from top-level wms config
-    let (default_colormap, default_min, default_max) = build_colormap_from_wms_config(
-        collection.wms.as_ref().map(|w| w.colormap.as_str()),
-        collection
-            .wms
-            .as_ref()
-            .map(|w| &w.color_stops[..])
-            .unwrap_or(&[]),
-        collection.wms.as_ref().and_then(|w| w.min),
-        collection.wms.as_ref().and_then(|w| w.max),
-    );
+    let (default_colormap, default_min, default_max) =
+        build_collection_default_colormap(collection);
     styles.insert(
         "default".to_string(),
         ds_render::StyleInfo {
@@ -651,6 +668,87 @@ fn build_styles(collection: &CollectionConfig) -> HashMap<String, ds_render::Sty
     }
 
     styles
+}
+
+/// Build the collection-level default colormap (from top-level [collections.wms]).
+fn build_collection_default_colormap(
+    collection: &CollectionConfig,
+) -> (Arc<dyn ds_render::ColorMap>, f64, f64) {
+    build_colormap_from_wms_config(
+        collection.wms.as_ref().map(|w| w.colormap.as_str()),
+        collection
+            .wms
+            .as_ref()
+            .map(|w| &w.color_stops[..])
+            .unwrap_or(&[]),
+        collection.wms.as_ref().and_then(|w| w.min),
+        collection.wms.as_ref().and_then(|w| w.max),
+    )
+}
+
+/// Register per-parameter-layer styles for multi-parameter engines.
+///
+/// For each parameter in `param_names`, creates a style set under the layer
+/// name `"collection-id/param-short-name"`. The default style uses the
+/// per-parameter colormap from `[[collections.wms.parameters]]` if configured,
+/// or falls back to the collection-level default. Named styles are shared
+/// across all parameter layers.
+fn register_parameter_layer_styles(
+    collection: &CollectionConfig,
+    param_names: &[(String, String)],
+    style_map: &mut HashMap<String, HashMap<String, ds_render::StyleInfo>>,
+) {
+    let wms_config = match &collection.wms {
+        Some(c) => c,
+        None => return,
+    };
+
+    // Build named styles (shared across all param layers)
+    let shared_named_styles = build_styles(collection);
+
+    // Index per-parameter configs by name
+    let param_configs: HashMap<&str, &ds_core::config::WmsParameterConfig> = wms_config
+        .parameters
+        .iter()
+        .map(|p| (p.name.as_str(), p))
+        .collect();
+
+    // Collection-level default colormap (fallback)
+    let (fallback_colormap, fallback_min, fallback_max) =
+        build_collection_default_colormap(collection);
+
+    for (short_name, _title) in param_names {
+        let layer_key = format!("{}/{}", collection.id, short_name);
+        let mut layer_styles = HashMap::new();
+
+        // Build this parameter's default style
+        let (colormap, min, max) = if let Some(pc) = param_configs.get(short_name.as_str()) {
+            build_colormap_from_wms_config(pc.colormap.as_deref(), &pc.color_stops, pc.min, pc.max)
+        } else {
+            (fallback_colormap.clone(), fallback_min, fallback_max)
+        };
+
+        layer_styles.insert(
+            "default".to_string(),
+            ds_render::StyleInfo {
+                name: "default".to_string(),
+                title: "Default".to_string(),
+                colormap,
+                min,
+                max,
+                parameter: Some(short_name.clone()),
+            },
+        );
+
+        // Add shared named styles (excluding "default" which we just built)
+        for (name, style) in &shared_named_styles {
+            if name != "default" {
+                layer_styles.insert(name.clone(), style.clone());
+            }
+        }
+
+        style_map.insert(layer_key, layer_styles);
+    }
 }
 
 /// Build a colormap and value range from WMS config fields.
