@@ -93,10 +93,12 @@ pub async fn wms_handler(
                 .get(&collection_id)
                 .ok_or_else(|| WmsError::layer_not_found(&params.layer))?;
 
-            // Look up style by collection ID
+            // Look up style: try full layer name first (e.g., "ecmwf-kenya/2t" for
+            // per-parameter defaults), then fall back to collection ID
             let layer_styles = state
                 .styles
-                .get(&collection_id)
+                .get(&params.layer)
+                .or_else(|| state.styles.get(&collection_id))
                 .ok_or_else(|| WmsError::layer_not_found(&params.layer))?;
 
             let style_info = layer_styles.get(&params.style).ok_or_else(|| {
