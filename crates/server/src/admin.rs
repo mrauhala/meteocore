@@ -886,8 +886,8 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
         .unwrap_or_else(|e| e.into_inner())
         .clone();
 
-    // Build catalog age map from geotiff engines
-    let mut catalog_ages: HashMap<String, i64> = HashMap::new();
+    // Build data age map from polling engines
+    let mut data_ages: HashMap<String, i64> = HashMap::new();
     {
         let engines = state
             .geotiff_engines
@@ -895,7 +895,18 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             .unwrap_or_else(|e| e.into_inner());
         for engine in engines.iter() {
             if let Some(age) = engine.catalog_age() {
-                catalog_ages.insert(engine.collection_id().to_string(), age.num_seconds());
+                data_ages.insert(engine.collection_id().to_string(), age.num_seconds());
+            }
+        }
+    }
+    {
+        let engines = state
+            .querydata_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        for engine in engines.iter() {
+            if let Some(age) = engine.data_age() {
+                data_ages.insert(engine.collection_id().to_string(), age.num_seconds());
             }
         }
     }
@@ -905,7 +916,7 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
         .iter()
         .map(|h| {
             let mut entry = serde_json::to_value(h).unwrap_or_default();
-            if let Some(age_secs) = catalog_ages.get(&h.id) {
+            if let Some(age_secs) = data_ages.get(&h.id) {
                 entry["data_age_secs"] = json!(*age_secs);
             }
             entry
