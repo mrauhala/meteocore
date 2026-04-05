@@ -569,9 +569,12 @@ pub fn scan_remote_with_limit(
             continue;
         }
 
-        // Fallback: download full file
-        tracing::info!(
-            "[{}] {} — range read failed, downloading full file ({})",
+        // Fallback: download full file — this means the file is not a valid COG
+        // (missing tiled layout or non-standard IFD). Full downloads are much slower
+        // and cost more on S3. Convert to COG: gdal_translate -of COG input.tif output.tif
+        tracing::warn!(
+            "[{}] {} — COG range read failed, falling back to full download ({}). \
+             Convert to COG for faster serving.",
             collection_id,
             key,
             super::format_bytes(*file_size)

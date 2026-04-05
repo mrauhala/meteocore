@@ -183,6 +183,11 @@ impl GeoTiffEngine {
     }
 
     /// How long ago the catalog was last successfully updated.
+    /// The collection ID this engine serves.
+    pub fn collection_id(&self) -> &str {
+        &self.collection_id
+    }
+
     /// Returns `None` if the catalog has never been updated after initial load.
     pub fn catalog_age(&self) -> Option<chrono::Duration> {
         let updated_at = self
@@ -764,14 +769,25 @@ impl GeoTiffEngine {
 
     /// Run the polling loop. Call this from a tokio::spawn task.
     /// The loop exits gracefully when `shutdown()` is called.
+    ///
+    /// On consecutive failures, the poll interval backs off exponentially
+    /// (2×, 4×, 8×, up to 16× the base interval) to avoid hammering a
+    /// failing remote. Resets to base interval on first success.
     pub async fn poll_loop(&self) {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
-        let mut interval = tokio::time::interval(self.poll_interval);
-        interval.tick().await;
+        let base = self.poll_interval;
 
         loop {
+            let failures = self.consecutive_poll_failures.load(Ordering::Relaxed);
+            let backoff_multiplier = if failures == 0 {
+                1
+            } else {
+                (1u32 << failures.min(4)).min(16) // 2, 4, 8, 16 cap
+            };
+            let sleep_duration = base * backoff_multiplier;
+
             tokio::select! {
-                _ = interval.tick() => self.poll_once(),
+                _ = tokio::time::sleep(sleep_duration) => self.poll_once(),
                 _ = shutdown_rx.changed() => {
                     tracing::info!("[{}] Poll loop shutting down", self.collection_id);
                     break;
