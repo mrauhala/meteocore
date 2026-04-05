@@ -163,6 +163,18 @@ poll_interval_secs = 60
 [collections.wms]
 colormap = "temperature"
 
+[[collections.wms.styles]]
+name = "temperature-2m"
+title = "2m Temperature"
+colormap = "temperature"
+parameter = "2 Metre Temperature (2t)"
+
+[[collections.wms.styles]]
+name = "dewpoint-2m"
+title = "2m Dewpoint"
+colormap = "temperature"
+parameter = "2 Metre Dewpoint Temperature (2d)"
+
 [[collections]]
 id = "met-norway-radar"
 title = "MET Norway Radar Mosaic"
