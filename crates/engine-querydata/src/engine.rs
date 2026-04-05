@@ -545,13 +545,11 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/ecmwf-kenya")
     }
 
     fn test_file_exists() -> bool {
-        test_dir()
-            .join("202604042019_202604040600_ecmwf_kenya_surface.sqd")
-            .exists()
+        test_dir().exists() && find_latest_sqd(&test_dir()).is_some()
     }
 
     #[test]

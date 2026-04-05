@@ -902,7 +902,7 @@ mod tests {
 
     fn test_file() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../testdata/202604042019_202604040600_ecmwf_kenya_surface.sqd")
+            .join("../../testdata/ecmwf-kenya/202604042019_202604040600_ecmwf_kenya_surface.sqd")
     }
 
     #[test]
