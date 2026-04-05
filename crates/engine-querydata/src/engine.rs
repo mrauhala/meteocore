@@ -102,6 +102,12 @@ impl QueryDataEngine {
             None => return, // no files — keep current data
         };
 
+        // Successful directory read — update staleness tracker
+        *self
+            .data_updated_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
+
         // Check if file changed
         let current = self.current_file.load();
         if current.as_deref() == Some(&latest) {
@@ -113,10 +119,6 @@ impl QueryDataEngine {
                 log_loaded(&self.collection_id, &latest, &new_data);
                 self.data.store(Arc::new(new_data));
                 self.current_file.store(Arc::new(Some(latest)));
-                *self
-                    .data_updated_at
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
             }
             Err(e) => {
                 tracing::error!(
