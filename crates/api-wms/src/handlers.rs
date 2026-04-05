@@ -79,16 +79,24 @@ pub async fn wms_handler(
         WmsRequestType::GetMap => {
             let params = query.validate_get_map()?;
 
-            // Look up engine
+            // Parse layer name: "collection-id" or "collection-id/parameter"
+            let (collection_id, layer_parameter) =
+                if let Some((cid, param)) = params.layer.split_once('/') {
+                    (cid.to_string(), Some(param.to_string()))
+                } else {
+                    (params.layer.clone(), None)
+                };
+
+            // Look up engine by collection ID
             let engine = state
                 .engines
-                .get(&params.layer)
+                .get(&collection_id)
                 .ok_or_else(|| WmsError::layer_not_found(&params.layer))?;
 
-            // Look up style
+            // Look up style by collection ID
             let layer_styles = state
                 .styles
-                .get(&params.layer)
+                .get(&collection_id)
                 .ok_or_else(|| WmsError::layer_not_found(&params.layer))?;
 
             let style_info = layer_styles.get(&params.style).ok_or_else(|| {
@@ -156,7 +164,9 @@ pub async fn wms_handler(
             let format = params.format;
             let rendered_cache = state.rendered_cache.clone();
 
-            let style_parameter = style_info.parameter.as_deref().map(String::from);
+            // Layer parameter (from "collection/param") takes priority over style parameter
+            let style_parameter =
+                layer_parameter.or_else(|| style_info.parameter.as_deref().map(String::from));
 
             let render_result = tokio::task::spawn_blocking(move || {
                 let tile = engine.get_raster_tile(
@@ -224,9 +234,11 @@ pub async fn wms_handler(
                 style_name
             };
 
+            // Support "collection/parameter" layer names for legend
+            let legend_collection_id = layer_name.split('/').next().unwrap_or(layer_name);
             let layer_styles = state
                 .styles
-                .get(layer_name)
+                .get(legend_collection_id)
                 .ok_or_else(|| WmsError::layer_not_found(layer_name))?;
 
             let style_info = layer_styles.get(style_name).ok_or_else(|| {

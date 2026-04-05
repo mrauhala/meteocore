@@ -1414,6 +1414,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             times,
             parameter: self.parameter.clone(),
             unit: self.unit.clone(),
+            parameters: vec![], // single-parameter engine
         }
     }
 }

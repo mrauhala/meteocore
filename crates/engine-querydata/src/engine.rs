@@ -366,12 +366,29 @@ impl MapEngine for QueryDataEngine {
             _ => "projected".to_string(),
         };
 
+        // Build parameter list: (short_name, full_title) for each parameter
+        let parameters: Vec<(String, String)> = data
+            .params
+            .iter()
+            .map(|p| {
+                // Extract short name from parentheses, e.g., "2 Metre Temperature (2t)" → "2t"
+                let short = p
+                    .name
+                    .rfind('(')
+                    .and_then(|start| p.name[start + 1..].strip_suffix(')'))
+                    .unwrap_or(&p.name)
+                    .to_string();
+                (short, p.name.clone())
+            })
+            .collect();
+
         RasterInfo {
             native_crs,
             spatial_extent: Some(bbox),
             times: data.times.clone(),
             parameter: param_name,
             unit: String::new(),
+            parameters,
         }
     }
 }

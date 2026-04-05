@@ -39,6 +39,7 @@ impl MockMapEngine {
             ],
             parameter: "reflectivity".to_string(),
             unit: "dBZ".to_string(),
+            parameters: vec![],
         }
     }
 }

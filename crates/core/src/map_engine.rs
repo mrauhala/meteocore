@@ -35,10 +35,13 @@ pub struct RasterInfo {
     pub spatial_extent: Option<[f64; 4]>,
     /// Available timestamps, most recent first.
     pub times: Vec<DateTime<Utc>>,
-    /// Parameter name (e.g., "reflectivity").
+    /// Default parameter name (e.g., "reflectivity").
     pub parameter: String,
     /// Unit of measurement (e.g., "dBZ").
     pub unit: String,
+    /// All available parameters. Empty means single-parameter engine (use `parameter`).
+    /// For multi-parameter engines (e.g., querydata), each entry is a (short_name, title) pair.
+    pub parameters: Vec<(String, String)>,
 }
 
 /// Engine trait for serving raster data as map images.
