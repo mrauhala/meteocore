@@ -13,6 +13,10 @@ pub struct ServerSettings {
     /// External base URL for generating absolute links (e.g. "https://api.example.com").
     /// If not set, defaults to "http://{host}:{port}".
     pub base_url: Option<String>,
+    /// Bearer token for admin endpoints (e.g. /admin/collections/reload).
+    /// Can also be set via `ADMIN_TOKEN` env var (takes priority).
+    /// If neither is set, admin endpoints are disabled (return 403).
+    pub admin_token: Option<String>,
 }
 
 impl ServerSettings {
@@ -214,8 +218,41 @@ impl ServerConfig {
         let content = std::fs::read_to_string(path).map_err(|e| {
             crate::error::DataServerError::Config(format!("Failed to read {path}: {e}"))
         })?;
-        toml::from_str(&content).map_err(|e| {
+        let config: Self = toml::from_str(&content).map_err(|e| {
             crate::error::DataServerError::Config(format!("Failed to parse config: {e}"))
-        })
+        })?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate configuration for common errors before starting the server.
+    pub fn validate(&self) -> Result<(), crate::error::DataServerError> {
+        for collection in &self.collections {
+            let id = &collection.id;
+
+            if id.is_empty() {
+                return Err(crate::error::DataServerError::Config(
+                    "Collection has an empty 'id' field".to_string(),
+                ));
+            }
+
+            // GeoTIFF engine requires geotiff config section
+            if collection.engine_type == "geotiff" && collection.geotiff.is_none() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': engine_type 'geotiff' requires a [collections.geotiff] config section"
+                )));
+            }
+
+            // GeoTIFF poll_interval_secs must be > 0
+            if let Some(geotiff) = &collection.geotiff {
+                if geotiff.poll_interval_secs == 0 {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': poll_interval_secs must be > 0"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
