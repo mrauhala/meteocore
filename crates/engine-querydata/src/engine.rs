@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -34,6 +34,8 @@ pub struct QueryDataEngine {
     poll_interval: Duration,
     /// Shutdown signal.
     shutdown_tx: watch::Sender<()>,
+    /// Tracks when data was last successfully loaded/updated.
+    data_updated_at: Mutex<Option<DateTime<Utc>>>,
 }
 
 impl QueryDataEngine {
@@ -68,6 +70,7 @@ impl QueryDataEngine {
             collection_id: collection_id.to_string(),
             poll_interval: Duration::from_secs(poll_interval_secs.max(1)),
             shutdown_tx,
+            data_updated_at: Mutex::new(Some(Utc::now())),
         })
     }
 
@@ -98,6 +101,12 @@ impl QueryDataEngine {
             Some(p) => p,
             None => return, // no files — keep current data
         };
+
+        // Successful directory read — update staleness tracker
+        *self
+            .data_updated_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
 
         // Check if file changed
         let current = self.current_file.load();
@@ -139,6 +148,20 @@ impl QueryDataEngine {
     /// Check if this engine has data loaded.
     pub fn has_data(&self) -> bool {
         !self.data.load().times.is_empty()
+    }
+
+    /// The collection ID this engine serves.
+    pub fn collection_id(&self) -> &str {
+        &self.collection_id
+    }
+
+    /// How long ago the data was last successfully loaded/updated.
+    pub fn data_age(&self) -> Option<chrono::Duration> {
+        let updated_at = self
+            .data_updated_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        updated_at.map(|t| Utc::now() - t)
     }
 }
 

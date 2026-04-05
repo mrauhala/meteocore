@@ -788,11 +788,17 @@ pub async fn reload_handler(
 
     // Shut down old poll loops
     {
-        let old_geotiff = state.geotiff_engines.read().unwrap();
+        let old_geotiff = state
+            .geotiff_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         for engine in old_geotiff.iter() {
             engine.shutdown();
         }
-        let old_querydata = state.querydata_engines.read().unwrap();
+        let old_querydata = state
+            .querydata_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         for engine in old_querydata.iter() {
             engine.shutdown();
         }
@@ -846,11 +852,17 @@ pub async fn reload_handler(
 
     // Update health
     update_health_gauges(&result.health);
-    *state.health.write().unwrap() = result.health.clone();
+    *state.health.write().unwrap_or_else(|e| e.into_inner()) = result.health.clone();
 
     // Update engine lists
-    *state.geotiff_engines.write().unwrap() = result.geotiff_engines;
-    *state.querydata_engines.write().unwrap() = result.querydata_engines;
+    *state
+        .geotiff_engines
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = result.geotiff_engines;
+    *state
+        .querydata_engines
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = result.querydata_engines;
 
     info!(
         "Reload complete: {}/{} collections loaded",
@@ -866,9 +878,67 @@ pub async fn reload_handler(
     })))
 }
 
-/// GET /health — per-collection health status.
+/// GET /health — per-collection health status with data staleness info.
 pub async fn health_handler(State(state): State<AdminState>) -> impl IntoResponse {
-    let health = state.health.read().unwrap().clone();
+    let health = state
+        .health
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+
+    // Build per-collection metadata from concrete engine types
+    let mut data_ages: HashMap<String, i64> = HashMap::new();
+    let mut temporal_extents: HashMap<String, (String, String)> = HashMap::new();
+    {
+        let engines = state
+            .geotiff_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        for engine in engines.iter() {
+            let id = engine.collection_id().to_string();
+            if let Some(age) = engine.catalog_age() {
+                data_ages.insert(id.clone(), age.num_seconds());
+            }
+            if let Some((start, end)) =
+                ds_core::engine::Engine::get_temporal_extent(engine.as_ref())
+            {
+                temporal_extents.insert(id, (start.to_rfc3339(), end.to_rfc3339()));
+            }
+        }
+    }
+    {
+        let engines = state
+            .querydata_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        for engine in engines.iter() {
+            let id = engine.collection_id().to_string();
+            if let Some(age) = engine.data_age() {
+                data_ages.insert(id.clone(), age.num_seconds());
+            }
+            if let Some((start, end)) =
+                ds_core::engine::Engine::get_temporal_extent(engine.as_ref())
+            {
+                temporal_extents.insert(id, (start.to_rfc3339(), end.to_rfc3339()));
+            }
+        }
+    }
+
+    // Enrich health entries with staleness and temporal extent
+    let collections: Vec<serde_json::Value> = health
+        .iter()
+        .map(|h| {
+            let mut entry = serde_json::to_value(h).unwrap_or_default();
+            if let Some(age_secs) = data_ages.get(&h.id) {
+                entry["data_age_secs"] = json!(*age_secs);
+            }
+            if let Some((start, end)) = temporal_extents.get(&h.id) {
+                entry["temporal_start"] = json!(start);
+                entry["temporal_end"] = json!(end);
+            }
+            entry
+        })
+        .collect();
 
     let overall = if health.iter().all(|h| h.status == CollectionStatus::Ready) {
         "healthy"
@@ -888,7 +958,7 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
         status_code,
         Json(json!({
             "status": overall,
-            "collections": health
+            "collections": collections
         })),
     )
 }

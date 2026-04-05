@@ -165,11 +165,17 @@ async fn main() {
     .expect("Server error");
 
     // Signal all polling loops to stop
-    let geotiff = server_state.geotiff_engines.read().unwrap();
+    let geotiff = server_state
+        .geotiff_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     for engine in geotiff.iter() {
         engine.shutdown();
     }
-    let querydata = server_state.querydata_engines.read().unwrap();
+    let querydata = server_state
+        .querydata_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     for engine in querydata.iter() {
         engine.shutdown();
     }
