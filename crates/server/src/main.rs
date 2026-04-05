@@ -133,10 +133,9 @@ async fn main() {
             "/health",
             get(admin::health_handler).with_state(server_state.clone()),
         )
-        .route("/metrics", get(admin::metrics_handler))
-        .layer(CorsLayer::permissive());
+        .route("/metrics", get(admin::metrics_handler));
 
-    // Admin routes: no CORS layer (browser requests blocked by default)
+    // Admin routes (protected by bearer token auth, not CORS)
     let admin_routes = Router::new().route(
         "/admin/collections/reload",
         post(admin::reload_handler).with_state(server_state.clone()),
@@ -144,7 +143,8 @@ async fn main() {
 
     let app = public
         .merge(admin_routes)
-        .layer(middleware::from_fn(admin::metrics_middleware));
+        .layer(middleware::from_fn(admin::metrics_middleware))
+        .layer(CorsLayer::permissive());
 
     // Normalize trailing slashes (e.g., /wms/ → /wms) before routing
     let app = NormalizePathLayer::trim_trailing_slash().layer(app);
