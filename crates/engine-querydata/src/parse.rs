@@ -309,11 +309,39 @@ impl QueryData {
     }
 
     /// Find a parameter index by name (case-insensitive).
+    ///
+    /// Matches against (in order of priority):
+    /// 1. Full name: `"2 Metre Temperature (2t)"`
+    /// 2. Short name in parentheses: `"2t"`
+    /// 3. Numeric parameter ID: `"4"`
     pub fn param_index_by_name(&self, name: &str) -> Option<usize> {
         let lower = name.to_lowercase();
-        self.params
+
+        // Try exact full name match
+        if let Some(idx) = self
+            .params
             .iter()
             .position(|p| p.name.to_lowercase() == lower)
+        {
+            return Some(idx);
+        }
+
+        // Try short name: match content inside parentheses at the end, e.g., "(2t)"
+        if let Some(idx) = self.params.iter().position(|p| {
+            p.name
+                .rfind('(')
+                .and_then(|start| p.name[start + 1..].strip_suffix(')'))
+                .is_some_and(|short| short.to_lowercase() == lower)
+        }) {
+            return Some(idx);
+        }
+
+        // Try numeric ID
+        if let Ok(id) = name.parse::<u32>() {
+            return self.param_index(id);
+        }
+
+        None
     }
 }
 
@@ -991,8 +1019,27 @@ mod tests {
         }
 
         let qd = QueryData::open(&path).unwrap();
+        // By numeric ID
         assert!(qd.param_index(1).is_some()); // MSLP
-        assert!(qd.param_index_by_name("2 Metre Temperature (2t)").is_some());
         assert!(qd.param_index(99999).is_none());
+
+        // By full name
+        assert!(qd.param_index_by_name("2 Metre Temperature (2t)").is_some());
+
+        // By short name (content inside parentheses)
+        assert_eq!(
+            qd.param_index_by_name("2t"),
+            qd.param_index_by_name("2 Metre Temperature (2t)")
+        );
+        assert_eq!(
+            qd.param_index_by_name("msl"),
+            qd.param_index_by_name("Mean Sea Level Pressure (msl)")
+        );
+
+        // By numeric ID as string
+        assert_eq!(qd.param_index_by_name("1"), qd.param_index(1));
+
+        // No match
+        assert!(qd.param_index_by_name("nonexistent").is_none());
     }
 }

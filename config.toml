@@ -157,7 +157,7 @@ engine_type = "querydata"
 apis = ["edr", "wms", "maps", "tiles"]
 
 [collections.querydata]
-wms_parameter = "2 Metre Temperature (2t)"
+wms_parameter = "2t"
 poll_interval_secs = 60
 
 [collections.wms]
@@ -167,13 +167,13 @@ colormap = "temperature"
 name = "temperature-2m"
 title = "2m Temperature"
 colormap = "temperature"
-parameter = "2 Metre Temperature (2t)"
+parameter = "2t"
 
 [[collections.wms.styles]]
 name = "dewpoint-2m"
 title = "2m Dewpoint"
 colormap = "temperature"
-parameter = "2 Metre Dewpoint Temperature (2d)"
+parameter = "2d"
 
 [[collections]]
 id = "met-norway-radar"
