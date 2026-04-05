@@ -886,16 +886,23 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
         .unwrap_or_else(|e| e.into_inner())
         .clone();
 
-    // Build data age map from polling engines
+    // Build per-collection metadata from concrete engine types
     let mut data_ages: HashMap<String, i64> = HashMap::new();
+    let mut temporal_extents: HashMap<String, (String, String)> = HashMap::new();
     {
         let engines = state
             .geotiff_engines
             .read()
             .unwrap_or_else(|e| e.into_inner());
         for engine in engines.iter() {
+            let id = engine.collection_id().to_string();
             if let Some(age) = engine.catalog_age() {
-                data_ages.insert(engine.collection_id().to_string(), age.num_seconds());
+                data_ages.insert(id.clone(), age.num_seconds());
+            }
+            if let Some((start, end)) =
+                ds_core::engine::Engine::get_temporal_extent(engine.as_ref())
+            {
+                temporal_extents.insert(id, (start.to_rfc3339(), end.to_rfc3339()));
             }
         }
     }
@@ -905,19 +912,29 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             .read()
             .unwrap_or_else(|e| e.into_inner());
         for engine in engines.iter() {
+            let id = engine.collection_id().to_string();
             if let Some(age) = engine.data_age() {
-                data_ages.insert(engine.collection_id().to_string(), age.num_seconds());
+                data_ages.insert(id.clone(), age.num_seconds());
+            }
+            if let Some((start, end)) =
+                ds_core::engine::Engine::get_temporal_extent(engine.as_ref())
+            {
+                temporal_extents.insert(id, (start.to_rfc3339(), end.to_rfc3339()));
             }
         }
     }
 
-    // Enrich health entries with staleness
+    // Enrich health entries with staleness and temporal extent
     let collections: Vec<serde_json::Value> = health
         .iter()
         .map(|h| {
             let mut entry = serde_json::to_value(h).unwrap_or_default();
             if let Some(age_secs) = data_ages.get(&h.id) {
                 entry["data_age_secs"] = json!(*age_secs);
+            }
+            if let Some((start, end)) = temporal_extents.get(&h.id) {
+                entry["temporal_start"] = json!(start);
+                entry["temporal_end"] = json!(end);
             }
             entry
         })
