@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use axum::extract::{MatchedPath, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use prometheus::{
@@ -114,6 +114,9 @@ pub struct ServerState {
     pub querydata_engines: RwLock<Vec<Arc<engine_querydata::QueryDataEngine>>>,
     /// Serializes reload requests to prevent concurrent reloads from racing.
     pub reload_lock: tokio::sync::Mutex<()>,
+    /// Bearer token for admin endpoint authentication.
+    /// If None, admin endpoints are disabled (return 403).
+    pub admin_token: Option<String>,
 }
 
 pub type AdminState = Arc<ServerState>;
@@ -731,7 +734,35 @@ pub fn update_health_gauges(health: &[CollectionHealth]) {
 /// POST /admin/collections/reload — re-read config and swap engines atomically.
 pub async fn reload_handler(
     State(state): State<AdminState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // Check admin token authentication
+    match &state.admin_token {
+        None => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "Admin endpoint is disabled. Set ADMIN_TOKEN env var or admin_token in [server] config to enable."
+                })),
+            ));
+        }
+        Some(expected_token) => {
+            let provided = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+            match provided {
+                Some(token) if token == expected_token => {} // OK
+                _ => {
+                    return Err((
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "error": "Invalid or missing Bearer token" })),
+                    ));
+                }
+            }
+        }
+    }
+
     // Serialize reload requests — prevent concurrent reloads from racing
     let _reload_guard = state.reload_lock.try_lock().map_err(|_| {
         (
@@ -887,7 +918,7 @@ pub async fn metrics_middleware(
     let method = req.method().to_string();
     let path = matched_path
         .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| req.uri().path().to_string());
+        .unwrap_or_else(|| "unmatched".to_string());
 
     let response = next.run(req).await;
 

@@ -78,6 +78,16 @@ async fn main() {
     let maps_swap = Arc::new(ArcSwap::from_pointee(result.maps_state));
     let tiles_swap = Arc::new(ArcSwap::from_pointee(result.tiles_state));
 
+    // Resolve admin token: ADMIN_TOKEN env var takes priority over config
+    let admin_token = std::env::var("ADMIN_TOKEN")
+        .ok()
+        .or(config.server.admin_token.clone());
+    if admin_token.is_some() {
+        info!("Admin endpoint authentication enabled");
+    } else {
+        info!("Admin endpoint authentication disabled (no ADMIN_TOKEN set)");
+    }
+
     let server_state: AdminState = Arc::new(ServerState {
         edr: edr_swap.clone(),
         features: features_swap.clone(),
@@ -89,11 +99,13 @@ async fn main() {
         geotiff_engines: RwLock::new(result.geotiff_engines),
         querydata_engines: RwLock::new(result.querydata_engines),
         reload_lock: tokio::sync::Mutex::new(()),
+        admin_token,
     });
 
     let root_state = server_state.clone();
 
-    let app = Router::new()
+    // Public routes get permissive CORS (OGC APIs, health, metrics)
+    let public = Router::new()
         .route("/", get(move || root_landing_page(root_state)))
         .nest("/edr", api_edr::router(edr_swap.clone()))
         .nest("/features", api_features::router(features_swap.clone()))
@@ -117,19 +129,22 @@ async fn main() {
             "/tiles/",
             get(api_tiles::handlers::landing_page).with_state(tiles_swap),
         )
-        // Admin endpoints
-        .route(
-            "/admin/collections/reload",
-            post(admin::reload_handler).with_state(server_state.clone()),
-        )
         .route(
             "/health",
             get(admin::health_handler).with_state(server_state.clone()),
         )
         .route("/metrics", get(admin::metrics_handler))
-        // Middleware
-        .layer(middleware::from_fn(admin::metrics_middleware))
         .layer(CorsLayer::permissive());
+
+    // Admin routes: no CORS layer (browser requests blocked by default)
+    let admin_routes = Router::new().route(
+        "/admin/collections/reload",
+        post(admin::reload_handler).with_state(server_state.clone()),
+    );
+
+    let app = public
+        .merge(admin_routes)
+        .layer(middleware::from_fn(admin::metrics_middleware));
 
     // Normalize trailing slashes (e.g., /wms/ → /wms) before routing
     let app = NormalizePathLayer::trim_trailing_slash().layer(app);
