@@ -86,24 +86,35 @@ pub fn quantize_bbox(bbox: &[f64; 4]) -> [i64; 4] {
     ]
 }
 
-/// Cache for rendered map images (Tier 2).
+/// Weight function: count the byte size of each cached rendered image.
+#[derive(Clone)]
+struct RenderedWeighter;
+
+impl quick_cache::Weighter<CacheKey, Bytes> for RenderedWeighter {
+    fn weight(&self, _key: &CacheKey, val: &Bytes) -> u64 {
+        val.len() as u64 + 64 // data + overhead
+    }
+}
+
+/// Cache for rendered map images (Tier 2), weighted by byte size.
 /// Keys are quantized to improve hit rates for tiled clients.
 /// No TTL — radar measurements are immutable once produced.
 /// Cache is invalidated on collection reload.
 pub struct RenderedCache {
-    cache: Cache<CacheKey, Bytes>,
+    cache: Cache<CacheKey, Bytes, RenderedWeighter>,
 }
 
 impl RenderedCache {
     pub fn new(capacity_mb: u64) -> Self {
-        let estimated_tile_size = 60 * 1024;
-        let capacity = if capacity_mb == 0 {
+        let max_bytes = capacity_mb * 1024 * 1024;
+        // Estimate ~60 KB per tile for initial hash map sizing
+        let estimated_items = if capacity_mb == 0 {
             0
         } else {
-            ((capacity_mb * 1024 * 1024) / estimated_tile_size).max(1) as usize
+            ((capacity_mb * 1024 * 1024) / (60 * 1024)).max(1) as usize
         };
         Self {
-            cache: Cache::new(capacity),
+            cache: Cache::with_weighter(estimated_items, max_bytes, RenderedWeighter),
         }
     }
 

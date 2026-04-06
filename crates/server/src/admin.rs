@@ -178,26 +178,26 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
             "grib" => &["edr", "wms", "maps", "tiles"],
             _ => &[],
         };
-        let mut has_unsupported = false;
-        for api in &collection.apis {
-            if !supported_apis.contains(&api.as_str()) {
-                tracing::error!(
-                    "Collection '{}': engine '{}' does not support '{}' API, skipping collection",
-                    collection.id,
-                    collection.engine_type,
-                    api
-                );
-                has_unsupported = true;
-            }
-        }
-        if has_unsupported {
+        let unsupported: Vec<&str> = collection
+            .apis
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|api| !supported_apis.contains(api))
+            .collect();
+        if !unsupported.is_empty() {
+            tracing::error!(
+                "Collection '{}': engine '{}' does not support APIs {:?}, skipping collection",
+                collection.id,
+                collection.engine_type,
+                unsupported
+            );
             health.push(CollectionHealth {
                 id: collection.id.clone(),
                 engine_type: collection.engine_type.clone(),
                 status: CollectionStatus::Failed,
                 error: Some(format!(
-                    "engine '{}' does not support requested APIs: {:?}",
-                    collection.engine_type, collection.apis
+                    "engine '{}' does not support APIs: {:?}",
+                    collection.engine_type, unsupported
                 )),
             });
             continue;

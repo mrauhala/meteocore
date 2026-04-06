@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 /// Cache key: identifies a specific GRIB message.
-/// Uses `Arc<str>` instead of `String` to avoid allocation on every lookup.
+/// Uses `Arc<str>` instead of `String` for a smaller allocation (no capacity field).
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct GridKey {
     /// URL or path to the GRIB file.
