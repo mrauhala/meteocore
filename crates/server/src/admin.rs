@@ -1214,18 +1214,24 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
         })
         .collect();
 
+    let all_failed =
+        !health.is_empty() && health.iter().all(|h| h.status == CollectionStatus::Failed);
+
     let overall = if health.iter().all(|h| h.status == CollectionStatus::Ready) {
         "healthy"
-    } else if health.iter().any(|h| h.status == CollectionStatus::Failed) {
+    } else if all_failed {
+        // Every collection failed — nothing to serve
         "unhealthy"
     } else {
+        // Mix of ready/degraded/failed — server is functional but not fully healthy
         "degraded"
     };
 
-    let status_code = match overall {
-        "healthy" => StatusCode::OK,
-        "degraded" => StatusCode::OK,
-        _ => StatusCode::SERVICE_UNAVAILABLE,
+    // Only return 503 when the server can't serve anything at all
+    let status_code = if all_failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
     };
 
     (

@@ -1099,7 +1099,7 @@ Response: `{"status": "ok", "loaded": N, "configured": M, "collections": [...]}`
 | `degraded` | Engine loaded but no data yet (e.g., GeoTIFF waiting for first poll) |
 | `failed` | Engine failed to load (error message included) |
 
-Overall status: `healthy` (all ready), `degraded` (some degraded, none failed), `unhealthy` (any failed). Returns HTTP 503 when unhealthy.
+Overall status: `healthy` (all ready), `degraded` (some degraded or failed, but at least one working), `unhealthy` (all failed). Returns HTTP 503 only when all collections have failed (nothing to serve). A single failed collection does not take down the service.
 
 ### Prometheus metrics
 
