@@ -206,38 +206,34 @@ colormap = "temperature"
 [[collections.wms.parameters]]
 name = "2t"
 colormap = "temperature"
-min = 220.0
-max = 320.0
 
 [[collections.wms.parameters]]
 name = "2d"
 colormap = "temperature"
-min = 220.0
-max = 310.0
 
 [[collections.wms.parameters]]
 name = "msl"
 colormap = "viridis"
-min = 92000.0
-max = 108000.0
+min = 950.0
+max = 1050.0
 
 [[collections.wms.parameters]]
 name = "sp"
 colormap = "viridis"
-min = 50000.0
-max = 108000.0
+min = 500.0
+max = 1050.0
 
 [[collections.wms.parameters]]
 name = "tp"
 colormap = "precipitation"
 min = 0.0
-max = 0.05
+max = 50.0
 
 [[collections.wms.parameters]]
 name = "tcc"
 colormap = "grayscale"
 min = 0.0
-max = 1.0
+max = 100.0
 
 [[collections.wms.parameters]]
 name = "10u"
@@ -267,13 +263,13 @@ max = 3000.0
 name = "sf"
 colormap = "precipitation"
 min = 0.0
-max = 0.02
+max = 20.0
 
 [[collections.wms.parameters]]
 name = "sd"
 colormap = "viridis"
 min = 0.0
-max = 1.0
+max = 1000.0
 
 [[collections]]
 id = "met-norway-radar"

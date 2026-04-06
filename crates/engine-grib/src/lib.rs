@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod index;
 pub mod params;
 pub mod reader;
+mod time_window;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use ds_core::model::*;
 
 use crate::cache::GridCache;
 use crate::catalog::{Catalog, ForecastRun, StepFile};
+use crate::time_window::TimeWindow;
 
 /// Engine for serving GRIB2 NWP forecast data.
 ///
@@ -216,6 +218,21 @@ impl GribEngine {
             run.steps.insert(parsed.step, step_file);
         }
 
+        // Apply time_window filtering: remove steps whose valid times fall outside the window
+        if let Some(tw_str) = &self.config.time_window {
+            if let Ok(tw) = TimeWindow::parse(tw_str) {
+                let (tw_start, tw_end) = tw.to_range(now);
+                for run in new_catalog.runs.values_mut() {
+                    run.steps.retain(|&step, _| {
+                        let vt = run.reference_time + chrono::Duration::hours(i64::from(step));
+                        vt >= tw_start && vt <= tw_end
+                    });
+                }
+                // Remove runs that have no steps left
+                new_catalog.runs.retain(|_, run| !run.steps.is_empty());
+            }
+        }
+
         // Apply max_runs eviction
         if let Some(max_runs) = self.config.max_runs {
             new_catalog.evict(max_runs);
@@ -329,15 +346,15 @@ impl Engine for GribEngine {
     fn get_parameter_descriptions(
         &self,
     ) -> std::collections::HashMap<String, ParameterDescription> {
-        let params = self.catalog.load().all_params();
+        let all = self.catalog.load().all_params();
         let mut map = std::collections::HashMap::new();
-        for p in params {
-            let (label, unit) = params::ecmwf_param_info(&p);
+        for p in all {
+            let info = params::ecmwf_param_info(&p);
             map.insert(
                 p.clone(),
                 ParameterDescription {
-                    label: label.to_string(),
-                    unit: unit.to_string(),
+                    label: info.label.to_string(),
+                    unit: info.unit.to_string(),
                     observed_property: p,
                 },
             );
@@ -367,54 +384,114 @@ impl Engine for GribEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
     ) -> Result<QueryResult, DataServerError> {
-        // Parse "POINT(lon lat)" or "lon,lat"
         let (lon, lat) = parse_coords(coords)?;
-        let (_step, step_file) = self.resolve_time(datetime)?;
+        let catalog = self.catalog.load();
+
+        if catalog.runs.is_empty() {
+            return Err(DataServerError::Grib(
+                "No forecast data available".to_string(),
+            ));
+        }
+
+        // Find the best forecast run
+        let run = match datetime {
+            Some((start, _)) => {
+                // Find the run whose valid times include the requested time
+                catalog
+                    .runs
+                    .values()
+                    .rev()
+                    .find(|r| r.find_step_for_time(start).is_some())
+                    .ok_or_else(|| {
+                        DataServerError::InvalidParameter(format!(
+                            "No forecast run covers time {start}"
+                        ))
+                    })?
+            }
+            None => catalog.latest_run().unwrap(),
+        };
+
+        // Determine which forecast steps to include
+        let steps_to_query: Vec<(u32, &StepFile)> = match datetime {
+            Some((start, end)) => {
+                // If start == end (single instant), return just that step
+                // If interval, return all steps within the range
+                run.steps
+                    .iter()
+                    .filter(|(&step, _)| {
+                        let vt = run.reference_time + chrono::Duration::hours(i64::from(step));
+                        vt >= start && vt <= end
+                    })
+                    .map(|(&s, sf)| (s, sf))
+                    .collect()
+            }
+            None => {
+                // No datetime: return all steps in the latest run (full forecast time series)
+                run.steps.iter().map(|(&s, sf)| (s, sf)).collect()
+            }
+        };
+
+        if steps_to_query.is_empty() {
+            return Err(DataServerError::InvalidParameter(
+                "No forecast steps match the requested time range".to_string(),
+            ));
+        }
 
         // Determine which parameters to query
-        let _all_params = step_file.param_names();
-        let query_params: Vec<&str> = match parameters {
-            Some(p) => p.iter().map(|s| s.as_str()).collect(),
+        let first_step = &steps_to_query[0].1;
+        let query_params: Vec<String> = match parameters {
+            Some(p) => p.to_vec(),
             None => {
                 // Default to surface parameters only
-                step_file
+                let mut seen = std::collections::HashSet::new();
+                first_step
                     .messages
                     .iter()
                     .filter(|m| m.levtype == "sfc")
-                    .map(|m| m.param.as_str())
-                    .collect::<std::collections::HashSet<_>>()
-                    .into_iter()
+                    .filter(|m| seen.insert(m.param.clone()))
+                    .map(|m| m.param.clone())
                     .collect()
             }
         };
 
+        // Build valid times
+        let valid_times: Vec<DateTime<Utc>> = steps_to_query
+            .iter()
+            .map(|(step, _)| run.reference_time + chrono::Duration::hours(i64::from(*step)))
+            .collect();
+
         let mut param_descs = std::collections::HashMap::new();
         let mut ranges = std::collections::HashMap::new();
 
-        for &param_name in &query_params {
-            // Find the message (surface params have level=None)
-            let level = step_file
-                .messages
-                .iter()
-                .find(|m| m.param == param_name)
-                .and_then(|m| m.level);
+        for param_name in &query_params {
+            let info = params::ecmwf_param_info(param_name);
 
-            let grid = match self.fetch_grid(&step_file, param_name, level) {
-                Ok(g) => g,
-                Err(e) => {
-                    tracing::warn!("Failed to fetch grid for {param_name}: {e}");
-                    continue;
+            // Collect values across all forecast steps
+            let mut values: Vec<Option<f64>> = Vec::with_capacity(steps_to_query.len());
+            for (_step, step_file) in &steps_to_query {
+                let level = step_file
+                    .messages
+                    .iter()
+                    .find(|m| m.param == *param_name)
+                    .and_then(|m| m.level);
+
+                match self.fetch_grid(step_file, param_name, level) {
+                    Ok(grid) => {
+                        let raw = grid.nearest_value(lon, lat);
+                        values.push(raw.map(|v| info.convert(v)));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch {param_name} for step: {e}");
+                        values.push(None);
+                    }
                 }
-            };
+            }
 
-            let value = grid.nearest_value(lon, lat);
-
-            let (label, unit) = params::ecmwf_param_info(param_name);
             param_descs.insert(
                 param_name.to_string(),
                 ParameterDescription {
-                    label: label.to_string(),
-                    unit: unit.to_string(),
+                    label: info.label.to_string(),
+                    unit: info.unit.to_string(),
                     observed_property: param_name.to_string(),
                 },
             );
@@ -422,20 +499,18 @@ impl Engine for GribEngine {
             ranges.insert(
                 param_name.to_string(),
                 NdArray {
-                    shape: vec![1],
+                    shape: vec![valid_times.len()],
                     axis_names: vec!["t".to_string()],
-                    values: vec![value],
+                    values,
                 },
             );
         }
-
-        let valid_time = datetime.map_or_else(Utc::now, |(start, _)| start);
 
         Ok(QueryResult {
             domain: DomainDescription::PointSeries {
                 x: lon,
                 y: lat,
-                t: vec![valid_time],
+                t: valid_times,
             },
             parameters: param_descs,
             ranges,
@@ -498,6 +573,7 @@ impl Engine for GribEngine {
         let mut ranges = std::collections::HashMap::new();
 
         for &pname in &query_params {
+            let info = params::ecmwf_param_info(pname);
             let plevel = step_file
                 .messages
                 .iter()
@@ -511,12 +587,21 @@ impl Engine for GribEngine {
                 ))
             })?;
 
-            let (label, unit) = params::ecmwf_param_info(pname);
+            // Apply unit conversion
+            let values: Vec<Option<f64>> = if info.has_conversion() {
+                values
+                    .into_iter()
+                    .map(|v| v.map(|raw| info.convert(raw)))
+                    .collect()
+            } else {
+                values
+            };
+
             param_descs.insert(
                 pname.to_string(),
                 ParameterDescription {
-                    label: label.to_string(),
-                    unit: unit.to_string(),
+                    label: info.label.to_string(),
+                    unit: info.unit.to_string(),
                     observed_property: pname.to_string(),
                 },
             );
@@ -582,6 +667,17 @@ impl MapEngine for GribEngine {
         let web_mercator = matches!(output_crs, OutputCrs::WebMercator);
         let values = grid.resample(bbox, width, height, web_mercator);
 
+        // Apply unit conversion so colormap ranges use display units
+        let info = params::ecmwf_param_info(param_name);
+        let values = if info.has_conversion() {
+            values
+                .into_iter()
+                .map(|v| v.map(|raw| info.convert(raw)))
+                .collect()
+        } else {
+            values
+        };
+
         Ok(RasterTile {
             width,
             height,
@@ -598,8 +694,8 @@ impl MapEngine for GribEngine {
             .all_params()
             .into_iter()
             .map(|p| {
-                let (label, _unit) = params::ecmwf_param_info(&p);
-                (p, label.to_string())
+                let info = params::ecmwf_param_info(&p);
+                (p, info.label.to_string())
             })
             .collect();
 
@@ -609,8 +705,8 @@ impl MapEngine for GribEngine {
             .unwrap_or_else(|| "2t".to_string());
 
         let default_unit = {
-            let (_, unit) = params::ecmwf_param_info(&default_param);
-            unit.to_string()
+            let info = params::ecmwf_param_info(&default_param);
+            info.unit.to_string()
         };
 
         RasterInfo {
