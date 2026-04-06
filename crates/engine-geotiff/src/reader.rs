@@ -1432,6 +1432,11 @@ pub fn read_bbox_overview(
 /// extents even for moderate output sizes.
 const MAX_MAP_PIXELS: usize = 64_000_000;
 
+/// Public accessor for MAX_MAP_PIXELS (used by overview selection in lib.rs).
+pub fn max_map_pixels() -> usize {
+    MAX_MAP_PIXELS
+}
+
 /// Read a bbox for map rendering with a higher pixel limit.
 /// Used by MapEngine::get_raster_tile where output size is already bounded.
 #[allow(clippy::too_many_arguments)]
