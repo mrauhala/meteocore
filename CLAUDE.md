@@ -231,7 +231,7 @@ Errors are returned as XML `ServiceExceptionReport` documents with WMS-specific 
 
 | Limit | Value | Location |
 |-------|-------|----------|
-| MAX_MAP_PIXELS | 8,000,000 (8M) | `api-wms/src/params.rs` |
+| MAX_MAP_PIXELS | 16,777,216 (16M) | `api-wms/src/params.rs` |
 | MAX_MAP_DIMENSION | 4,096 px | `api-wms/src/params.rs` |
 | Render semaphore | CPU core count (min 4) | `server/src/admin.rs` |
 | CRS whitelist | CRS:84, EPSG:4326/3857/3067/3035 | `api-wms/src/params.rs` |

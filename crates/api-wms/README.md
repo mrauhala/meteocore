@@ -231,7 +231,7 @@ All GetMap responses include an `ETag` header derived from the request parameter
 
 | Limit | Value | Purpose |
 |-------|-------|---------|
-| Max image pixels | 8,000,000 | Prevents memory exhaustion from large renders |
+| Max image pixels | 16,777,216 | Prevents memory exhaustion from large renders |
 | Max dimension | 4,096 px | Limits width and height individually |
 | Concurrent renders | 8 | Semaphore prevents CPU/memory exhaustion |
 | CRS whitelist | 5 CRS | Only supported projections accepted |
