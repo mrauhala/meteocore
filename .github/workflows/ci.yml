@@ -54,8 +54,11 @@ jobs:
   docker:
     name: Docker
     needs: check
-    # Run after check passes, or unconditionally on schedule (check is skipped)
-    if: always() && (needs.check.result == 'success' || github.event_name == 'schedule')
+    # Only build Docker on push to main, tags, and scheduled runs — skip on PRs
+    if: >-
+      always() &&
+      (needs.check.result == 'success' || github.event_name == 'schedule') &&
+      github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
