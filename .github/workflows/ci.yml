@@ -23,6 +23,9 @@ jobs:
     steps:
     - uses: actions/checkout@v6
 
+    - name: Install system dependencies
+      run: sudo apt-get update && sudo apt-get install -y cmake clang
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
@@ -51,10 +54,30 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
+  docker-check:
+    name: Docker Build (PR)
+    needs: check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build Docker image (no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   docker:
     name: Docker
     needs: check
-    # Only build Docker on push to main, tags, and scheduled runs — skip on PRs
+    # Only push Docker on main, tags, and scheduled runs — skip on PRs
     if: >-
       always() &&
       (needs.check.result == 'success' || github.event_name == 'schedule') &&
