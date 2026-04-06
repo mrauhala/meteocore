@@ -4,9 +4,11 @@ FROM rust:1.87-slim AS builder
 WORKDIR /build
 
 # Install build dependencies
-# cmake + clang needed for libaec-sys (GRIB CCSDS compression)
+# pip cmake provides 3.26+ needed by libaec-sys (Bookworm ships 3.25)
+# clang needed for libaec-sys (GRIB CCSDS compression)
 RUN apt-get update && apt-get install -y \
-    pkg-config libssl-dev cmake clang \
+    pkg-config libssl-dev clang python3-pip \
+    && pip install --break-system-packages cmake \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy manifests first for dependency caching
