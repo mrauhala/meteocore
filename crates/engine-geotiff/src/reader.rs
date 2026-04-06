@@ -42,9 +42,9 @@ fn safe_tile_index(
     let index = (tile_row as u64)
         .checked_mul(tiles_across as u64)
         .and_then(|v| v.checked_add(tile_col as u64))
-        .ok_or_else(|| DataServerError::GeoTiff("Tile index overflow".into()))?;
+        .ok_or_else(|| DataServerError::Engine("Tile index overflow".into()))?;
     if index > u32::MAX as u64 {
-        return Err(DataServerError::GeoTiff("Tile index overflow".into()));
+        return Err(DataServerError::Engine("Tile index overflow".into()));
     }
     Ok(index as u32)
 }
@@ -133,22 +133,22 @@ impl DataSource {
         match self {
             DataSource::LocalFile(path) => {
                 let file = File::open(path).map_err(|e| {
-                    DataServerError::GeoTiff(format!("Cannot open {}: {e}", path.display()))
+                    DataServerError::Engine(format!("Cannot open {}: {e}", path.display()))
                 })?;
                 Ok(DecoderWrapper::File(
                     Decoder::new(BufReader::new(file)).map_err(|e| {
-                        DataServerError::GeoTiff(format!("Invalid TIFF {}: {e}", path.display()))
+                        DataServerError::Engine(format!("Invalid TIFF {}: {e}", path.display()))
                     })?,
                 ))
             }
             DataSource::InMemory(bytes) => {
                 let cursor = Cursor::new(bytes.to_vec());
                 Ok(DecoderWrapper::Memory(Decoder::new(cursor).map_err(
-                    |e| DataServerError::GeoTiff(format!("Invalid TIFF (in-memory): {e}")),
+                    |e| DataServerError::Engine(format!("Invalid TIFF (in-memory): {e}")),
                 )?))
             }
             DataSource::Remote { .. } | DataSource::HttpDirect { .. } => {
-                Err(DataServerError::GeoTiff(
+                Err(DataServerError::Engine(
                     "Cannot open decoder for remote source; use range reads".into(),
                 ))
             }
@@ -176,10 +176,10 @@ impl DecoderWrapper {
         match self {
             Self::File(d) => d
                 .dimensions()
-                .map_err(|e| DataServerError::GeoTiff(format!("{e}"))),
+                .map_err(|e| DataServerError::Engine(format!("{e}"))),
             Self::Memory(d) => d
                 .dimensions()
-                .map_err(|e| DataServerError::GeoTiff(format!("{e}"))),
+                .map_err(|e| DataServerError::Engine(format!("{e}"))),
         }
     }
 
@@ -188,10 +188,10 @@ impl DecoderWrapper {
         match self {
             Self::File(d) => d
                 .colortype()
-                .map_err(|e| DataServerError::GeoTiff(format!("{e}"))),
+                .map_err(|e| DataServerError::Engine(format!("{e}"))),
             Self::Memory(d) => d
                 .colortype()
-                .map_err(|e| DataServerError::GeoTiff(format!("{e}"))),
+                .map_err(|e| DataServerError::Engine(format!("{e}"))),
         }
     }
 
@@ -282,28 +282,28 @@ impl TiffMetadata {
     ) -> Result<Self, DataServerError> {
         let (width, height) = decoder
             .dimensions()
-            .map_err(|e| DataServerError::GeoTiff(format!("Cannot read dimensions: {e}")))?;
+            .map_err(|e| DataServerError::Engine(format!("Cannot read dimensions: {e}")))?;
 
         if width > MAX_RASTER_DIMENSION || height > MAX_RASTER_DIMENSION {
-            return Err(DataServerError::GeoTiff(format!(
+            return Err(DataServerError::Engine(format!(
                 "Raster dimensions {}x{} exceed maximum {}",
                 width, height, MAX_RASTER_DIMENSION
             )));
         }
 
         let tile_width = read_tag_u32(decoder, Tag::TileWidth)
-            .ok_or_else(|| DataServerError::GeoTiff(format!(
+            .ok_or_else(|| DataServerError::Engine(format!(
                 "{source_name}: Not a tiled TIFF (TileWidth missing). \
                  Convert to tiled COG with: gdal_translate -co TILED=YES -co COMPRESS=DEFLATE input.tif output.tif"
             )))?;
         let tile_height = read_tag_u32(decoder, Tag::TileLength)
-            .ok_or_else(|| DataServerError::GeoTiff(format!(
+            .ok_or_else(|| DataServerError::Engine(format!(
                 "{source_name}: Not a tiled TIFF (TileLength missing). \
                  Convert to tiled COG with: gdal_translate -co TILED=YES -co COMPRESS=DEFLATE input.tif output.tif"
             )))?;
 
         if tile_width == 0 || tile_height == 0 {
-            return Err(DataServerError::GeoTiff(format!(
+            return Err(DataServerError::Engine(format!(
                 "{source_name}: Invalid tile dimensions {}x{} (must be > 0)",
                 tile_width, tile_height
             )));
@@ -323,13 +323,13 @@ impl TiffMetadata {
             .and_then(|v| v.checked_mul(bytes_per_sample))
             .and_then(|v| v.checked_mul(samples_per_pixel as usize))
             .ok_or_else(|| {
-                DataServerError::GeoTiff(format!(
+                DataServerError::Engine(format!(
                     "Decoded tile size overflow ({}x{} px, {} bands, {} bytes/sample)",
                     tile_width, tile_height, samples_per_pixel, bytes_per_sample
                 ))
             })?;
         if decoded_tile_bytes > MAX_DECODED_TILE_BYTES {
-            return Err(DataServerError::GeoTiff(format!(
+            return Err(DataServerError::Engine(format!(
                 "Decoded tile size {} bytes ({}x{} px, {} bands, {} bytes/sample) exceeds maximum {}",
                 decoded_tile_bytes, tile_width, tile_height, samples_per_pixel, bytes_per_sample,
                 MAX_DECODED_TILE_BYTES
@@ -619,7 +619,7 @@ fn decode_chunk_f64(
 ) -> Result<Vec<Option<f64>>, DataServerError> {
     let result = decoder
         .read_chunk(chunk_index)
-        .map_err(|e| DataServerError::GeoTiff(format!("Failed to read tile: {e}")))?;
+        .map_err(|e| DataServerError::Engine(format!("Failed to read tile: {e}")))?;
 
     let spp = metadata.samples_per_pixel as usize;
 
@@ -684,7 +684,7 @@ fn decode_chunk_f64(
                 }
             })
             .collect(),
-        _ => return Err(DataServerError::GeoTiff("Unsupported data type".into())),
+        _ => return Err(DataServerError::Engine("Unsupported data type".into())),
     };
 
     Ok(values)
@@ -824,10 +824,10 @@ fn decompress_tile(
                 .take(MAX_DECODED_TILE_BYTES as u64)
                 .read_to_end(&mut decompressed)
                 .map_err(|e| {
-                    DataServerError::GeoTiff(format!("Deflate decompression failed: {e}"))
+                    DataServerError::Engine(format!("Deflate decompression failed: {e}"))
                 })?;
             if decompressed.len() >= MAX_DECODED_TILE_BYTES {
-                return Err(DataServerError::GeoTiff(format!(
+                return Err(DataServerError::Engine(format!(
                     "Decompressed tile exceeds maximum size ({} bytes)",
                     MAX_DECODED_TILE_BYTES
                 )));
@@ -841,9 +841,9 @@ fn decompress_tile(
                 weezl::decode::Decoder::with_tiff_size_switch(weezl::BitOrder::Msb, 8);
             let decompressed = decoder
                 .decode(compressed)
-                .map_err(|e| DataServerError::GeoTiff(format!("LZW decompression failed: {e}")))?;
+                .map_err(|e| DataServerError::Engine(format!("LZW decompression failed: {e}")))?;
             if decompressed.len() > MAX_DECODED_TILE_BYTES {
-                return Err(DataServerError::GeoTiff(format!(
+                return Err(DataServerError::Engine(format!(
                     "Decompressed tile exceeds maximum size ({} bytes)",
                     MAX_DECODED_TILE_BYTES
                 )));
@@ -887,7 +887,7 @@ fn decode_raw_tile_f64(
 
     // Validate buffer is large enough for at least one pixel
     if sample_stride == 0 {
-        return Err(DataServerError::GeoTiff(
+        return Err(DataServerError::Engine(
             "Invalid tile: zero sample stride".into(),
         ));
     }
@@ -897,7 +897,7 @@ fn decode_raw_tile_f64(
     if pixel_count > 0 {
         let last_offset = (pixel_count - 1) * sample_stride + band_byte_offset + bps;
         if last_offset > raw.len() {
-            return Err(DataServerError::GeoTiff(format!(
+            return Err(DataServerError::Engine(format!(
                 "Truncated tile data: need {} bytes for {} pixels but got {}",
                 last_offset,
                 pixel_count,
@@ -998,7 +998,7 @@ fn read_remote_chunk_f64(
 ) -> Result<Vec<Option<f64>>, DataServerError> {
     let idx = chunk_index as usize;
     if idx >= tile_info.tile_offsets.len() {
-        return Err(DataServerError::GeoTiff(format!(
+        return Err(DataServerError::Engine(format!(
             "Tile index {} out of range ({})",
             idx,
             tile_info.tile_offsets.len()
@@ -1031,7 +1031,7 @@ fn read_remote_chunk_f64(
 
     // Validate range doesn't overflow
     let end = offset.checked_add(byte_count).ok_or_else(|| {
-        DataServerError::GeoTiff(format!(
+        DataServerError::Engine(format!(
             "Tile {} byte range overflow: offset={} + count={}",
             idx, offset, byte_count
         ))
@@ -1044,10 +1044,10 @@ fn read_remote_chunk_f64(
         } else {
             let fetched = store
                 .get_range(obj_path, offset..end)
-                .map_err(|e| DataServerError::GeoTiff(format!("Failed to read tile range: {e}")))?;
+                .map_err(|e| DataServerError::Engine(format!("Failed to read tile range: {e}")))?;
             // Validate response length matches request
             if fetched.len() != byte_count {
-                return Err(DataServerError::GeoTiff(format!(
+                return Err(DataServerError::Engine(format!(
                     "Tile {} truncated: requested {} bytes, got {}",
                     idx,
                     byte_count,
@@ -1060,9 +1060,9 @@ fn read_remote_chunk_f64(
     } else {
         let fetched = store
             .get_range(obj_path, offset..end)
-            .map_err(|e| DataServerError::GeoTiff(format!("Failed to read tile range: {e}")))?;
+            .map_err(|e| DataServerError::Engine(format!("Failed to read tile range: {e}")))?;
         if fetched.len() != byte_count {
-            return Err(DataServerError::GeoTiff(format!(
+            return Err(DataServerError::Engine(format!(
                 "Tile {} truncated: requested {} bytes, got {}",
                 idx,
                 byte_count,
@@ -1099,16 +1099,16 @@ fn read_http_range(
             .header(reqwest::header::RANGE, &range_header)
             .send()
             .await
-            .map_err(|e| DataServerError::GeoTiff(format!("HTTP range read failed: {e}")))?;
+            .map_err(|e| DataServerError::Engine(format!("HTTP range read failed: {e}")))?;
         if !resp.status().is_success() {
-            return Err(DataServerError::GeoTiff(format!(
+            return Err(DataServerError::Engine(format!(
                 "HTTP range read returned {}",
                 resp.status()
             )));
         }
         resp.bytes()
             .await
-            .map_err(|e| DataServerError::GeoTiff(format!("Failed to read body: {e}")))
+            .map_err(|e| DataServerError::Engine(format!("Failed to read body: {e}")))
     })
 }
 
@@ -1128,7 +1128,7 @@ fn read_http_chunk_f64(
 ) -> Result<Vec<Option<f64>>, DataServerError> {
     let idx = chunk_index as usize;
     if idx >= tile_info.tile_offsets.len() {
-        return Err(DataServerError::GeoTiff(format!(
+        return Err(DataServerError::Engine(format!(
             "Tile index {} out of range ({})",
             idx,
             tile_info.tile_offsets.len()
@@ -1156,7 +1156,7 @@ fn read_http_chunk_f64(
     }
 
     let end = offset.checked_add(byte_count).ok_or_else(|| {
-        DataServerError::GeoTiff(format!(
+        DataServerError::Engine(format!(
             "Tile {} byte range overflow: offset={} + count={}",
             idx, offset, byte_count
         ))
@@ -1168,7 +1168,7 @@ fn read_http_chunk_f64(
         } else {
             let fetched = read_http_range(http, url, offset..end)?;
             if fetched.len() != byte_count {
-                return Err(DataServerError::GeoTiff(format!(
+                return Err(DataServerError::Engine(format!(
                     "Tile {} truncated: requested {} bytes, got {}",
                     idx,
                     byte_count,
@@ -1181,7 +1181,7 @@ fn read_http_chunk_f64(
     } else {
         let fetched = read_http_range(http, url, offset..end)?;
         if fetched.len() != byte_count {
-            return Err(DataServerError::GeoTiff(format!(
+            return Err(DataServerError::Engine(format!(
                 "Tile {} truncated: requested {} bytes, got {}",
                 idx,
                 byte_count,
@@ -1330,7 +1330,7 @@ pub fn read_bbox_overview(
 
     if let DataSource::Remote { store, path, .. } = source {
         let ov_tile_info = overview.tile_info.as_ref().ok_or_else(|| {
-            DataServerError::GeoTiff(format!(
+            DataServerError::Engine(format!(
                 "Overview IFD {} has no tile info for remote source (header too small?)",
                 overview.ifd_index
             ))
@@ -1364,7 +1364,7 @@ pub fn read_bbox_overview(
     } = source
     {
         let ov_tile_info = overview.tile_info.as_ref().ok_or_else(|| {
-            DataServerError::GeoTiff(format!(
+            DataServerError::Engine(format!(
                 "Overview IFD {} has no tile info for remote source (header too small?)",
                 overview.ifd_index
             ))
@@ -1394,7 +1394,7 @@ pub fn read_bbox_overview(
     // For local files, seek to the overview IFD and read tiles
     let mut decoder = source.open_decoder()?;
     decoder.seek_to_image(overview.ifd_index).map_err(|e| {
-        DataServerError::GeoTiff(format!(
+        DataServerError::Engine(format!(
             "Failed to seek to overview IFD {}: {e}",
             overview.ifd_index
         ))
@@ -1925,12 +1925,12 @@ fn parse_geo_transform(
 
     if let (Ok(tiepoint), Ok(pixelscale)) = (tiepoint_result, pixelscale_result) {
         let tp = extract_doubles(&tiepoint)
-            .ok_or_else(|| DataServerError::GeoTiff("Cannot parse ModelTiepointTag".into()))?;
+            .ok_or_else(|| DataServerError::Engine("Cannot parse ModelTiepointTag".into()))?;
         let ps = extract_doubles(&pixelscale)
-            .ok_or_else(|| DataServerError::GeoTiff("Cannot parse ModelPixelScaleTag".into()))?;
+            .ok_or_else(|| DataServerError::Engine("Cannot parse ModelPixelScaleTag".into()))?;
 
         if tp.len() < 6 || ps.len() < 2 {
-            return Err(DataServerError::GeoTiff(
+            return Err(DataServerError::Engine(
                 "ModelTiepointTag or ModelPixelScaleTag has too few values".into(),
             ));
         }
@@ -1951,15 +1951,14 @@ fn parse_geo_transform(
 
     // Fallback: try ModelTransformationTag (34264) — a 4x4 affine matrix
     if let Ok(transform_tag) = decoder.get_tag(Tag::Unknown(34264)) {
-        let matrix = extract_doubles(&transform_tag).ok_or_else(|| {
-            DataServerError::GeoTiff("Cannot parse ModelTransformationTag".into())
-        })?;
+        let matrix = extract_doubles(&transform_tag)
+            .ok_or_else(|| DataServerError::Engine("Cannot parse ModelTransformationTag".into()))?;
 
         return GeoTransform::from_transformation_matrix(&matrix, width, height, crs)
-            .map_err(DataServerError::GeoTiff);
+            .map_err(DataServerError::Engine);
     }
 
-    Err(DataServerError::GeoTiff(
+    Err(DataServerError::Engine(
         "Missing geolocation tags — need either ModelTiepointTag (33922) + \
          ModelPixelScaleTag (33550), or ModelTransformationTag (34264)"
             .into(),
@@ -2056,7 +2055,7 @@ fn parse_crs(decoder: &mut DecoderWrapper) -> Result<Crs, DataServerError> {
                 false_e: 4_321_000.0,
                 false_n: 3_210_000.0,
             }),
-            _ => Err(DataServerError::GeoTiff(format!(
+            _ => Err(DataServerError::Engine(format!(
                 "EPSG:{} is not supported and GeoKeys lack projection parameters. \
                  Convert with: gdalwarp -t_srs EPSG:4326 -of COG input.tif output.tif",
                 epsg
@@ -2138,7 +2137,7 @@ fn parse_crs(decoder: &mut DecoderWrapper) -> Result<Crs, DataServerError> {
                 false_n,
             })
         }
-        _ => Err(DataServerError::GeoTiff(format!(
+        _ => Err(DataServerError::Engine(format!(
             "Unsupported projection method {} (GeoKey 3075). \
                  Supported: Transverse Mercator (1), Lambert Conformal Conic 2SP (8), \
                  Lambert Azimuthal Equal Area (10). \

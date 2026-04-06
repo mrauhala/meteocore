@@ -38,24 +38,24 @@ impl GeoJsonEngine {
     pub fn load(path: &str) -> Result<Self, DataServerError> {
         // Check file size
         let metadata = std::fs::metadata(path)
-            .map_err(|e| DataServerError::GeoJson(format!("Failed to read file metadata: {e}")))?;
+            .map_err(|e| DataServerError::Engine(format!("Failed to read file metadata: {e}")))?;
         if metadata.len() > MAX_FILE_SIZE {
-            return Err(DataServerError::GeoJson(format!(
+            return Err(DataServerError::Engine(format!(
                 "File exceeds maximum size of {} MB",
                 MAX_FILE_SIZE / (1024 * 1024)
             )));
         }
 
         let file = std::fs::File::open(path)
-            .map_err(|e| DataServerError::GeoJson(format!("Failed to open file: {e}")))?;
+            .map_err(|e| DataServerError::Engine(format!("Failed to open file: {e}")))?;
         let reader = BufReader::new(file);
 
         let geojson: serde_json::Value = serde_json::from_reader(reader)
-            .map_err(|e| DataServerError::GeoJson(format!("Invalid JSON: {e}")))?;
+            .map_err(|e| DataServerError::Engine(format!("Invalid JSON: {e}")))?;
 
         let fc_type = geojson.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if fc_type != "FeatureCollection" {
-            return Err(DataServerError::GeoJson(
+            return Err(DataServerError::Engine(
                 "Expected a GeoJSON FeatureCollection".into(),
             ));
         }
@@ -63,10 +63,10 @@ impl GeoJsonEngine {
         let raw_features = geojson
             .get("features")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| DataServerError::GeoJson("Missing 'features' array".into()))?;
+            .ok_or_else(|| DataServerError::Engine("Missing 'features' array".into()))?;
 
         if raw_features.len() > MAX_FEATURES {
-            return Err(DataServerError::GeoJson(format!(
+            return Err(DataServerError::Engine(format!(
                 "File has {} features, exceeding limit of {}",
                 raw_features.len(),
                 MAX_FEATURES
@@ -244,7 +244,7 @@ fn extract_feature_id(feature: &serde_json::Value, fallback_idx: usize) -> Strin
 }
 
 fn parse_geometry(geom: Option<&serde_json::Value>) -> Result<Geometry, DataServerError> {
-    let geom = geom.ok_or_else(|| DataServerError::GeoJson("Feature missing geometry".into()))?;
+    let geom = geom.ok_or_else(|| DataServerError::Engine("Feature missing geometry".into()))?;
 
     if geom.is_null() {
         return Ok(Geometry::Null);
@@ -257,15 +257,15 @@ fn parse_geometry(geom: Option<&serde_json::Value>) -> Result<Geometry, DataServ
             let coords = geom
                 .get("coordinates")
                 .and_then(|v| v.as_array())
-                .ok_or_else(|| DataServerError::GeoJson("Point missing coordinates".into()))?;
+                .ok_or_else(|| DataServerError::Engine("Point missing coordinates".into()))?;
             let x = coords
                 .first()
                 .and_then(|v| v.as_f64())
-                .ok_or_else(|| DataServerError::GeoJson("Invalid Point x coordinate".into()))?;
+                .ok_or_else(|| DataServerError::Engine("Invalid Point x coordinate".into()))?;
             let y = coords
                 .get(1)
                 .and_then(|v| v.as_f64())
-                .ok_or_else(|| DataServerError::GeoJson("Invalid Point y coordinate".into()))?;
+                .ok_or_else(|| DataServerError::Engine("Invalid Point y coordinate".into()))?;
             validate_coord(x, y)?;
             Ok(Geometry::Point { x, y })
         }
@@ -273,7 +273,7 @@ fn parse_geometry(geom: Option<&serde_json::Value>) -> Result<Geometry, DataServ
             let rings = geom
                 .get("coordinates")
                 .and_then(|v| v.as_array())
-                .ok_or_else(|| DataServerError::GeoJson("Polygon missing coordinates".into()))?;
+                .ok_or_else(|| DataServerError::Engine("Polygon missing coordinates".into()))?;
             let (exterior, holes) = parse_polygon_rings(rings)?;
             Ok(Geometry::Polygon { exterior, holes })
         }
@@ -282,7 +282,7 @@ fn parse_geometry(geom: Option<&serde_json::Value>) -> Result<Geometry, DataServ
                 .get("coordinates")
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| {
-                    DataServerError::GeoJson("MultiPolygon missing coordinates".into())
+                    DataServerError::Engine("MultiPolygon missing coordinates".into())
                 })?;
 
             let mut polygons = Vec::with_capacity(polygons_raw.len());
@@ -290,7 +290,7 @@ fn parse_geometry(geom: Option<&serde_json::Value>) -> Result<Geometry, DataServ
 
             for poly_raw in polygons_raw {
                 let rings = poly_raw.as_array().ok_or_else(|| {
-                    DataServerError::GeoJson("Invalid MultiPolygon ring array".into())
+                    DataServerError::Engine("Invalid MultiPolygon ring array".into())
                 })?;
                 let (ext, holes) = parse_polygon_rings(rings)?;
                 total_coords += ext.len();
@@ -298,7 +298,7 @@ fn parse_geometry(geom: Option<&serde_json::Value>) -> Result<Geometry, DataServ
                     total_coords += h.len();
                 }
                 if total_coords > MAX_COORDS_PER_GEOMETRY {
-                    return Err(DataServerError::GeoJson(format!(
+                    return Err(DataServerError::Engine(format!(
                         "Geometry exceeds maximum coordinate count of {}",
                         MAX_COORDS_PER_GEOMETRY
                     )));
@@ -308,7 +308,7 @@ fn parse_geometry(geom: Option<&serde_json::Value>) -> Result<Geometry, DataServ
 
             Ok(Geometry::MultiPolygon { polygons })
         }
-        other => Err(DataServerError::GeoJson(format!(
+        other => Err(DataServerError::Engine(format!(
             "Unsupported geometry type: {other}"
         ))),
     }
@@ -319,7 +319,7 @@ fn parse_polygon_rings(
     rings: &[serde_json::Value],
 ) -> Result<(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>), DataServerError> {
     if rings.is_empty() {
-        return Err(DataServerError::GeoJson(
+        return Err(DataServerError::Engine(
             "Polygon must have at least one ring".into(),
         ));
     }
@@ -336,21 +336,21 @@ fn parse_polygon_rings(
 fn parse_ring(ring: &serde_json::Value) -> Result<Vec<[f64; 2]>, DataServerError> {
     let coords_raw = ring
         .as_array()
-        .ok_or_else(|| DataServerError::GeoJson("Ring is not an array".into()))?;
+        .ok_or_else(|| DataServerError::Engine("Ring is not an array".into()))?;
 
     let mut coords = Vec::with_capacity(coords_raw.len());
     for c in coords_raw {
         let pair = c
             .as_array()
-            .ok_or_else(|| DataServerError::GeoJson("Coordinate is not an array".into()))?;
+            .ok_or_else(|| DataServerError::Engine("Coordinate is not an array".into()))?;
         let x = pair
             .first()
             .and_then(|v| v.as_f64())
-            .ok_or_else(|| DataServerError::GeoJson("Invalid x coordinate".into()))?;
+            .ok_or_else(|| DataServerError::Engine("Invalid x coordinate".into()))?;
         let y = pair
             .get(1)
             .and_then(|v| v.as_f64())
-            .ok_or_else(|| DataServerError::GeoJson("Invalid y coordinate".into()))?;
+            .ok_or_else(|| DataServerError::Engine("Invalid y coordinate".into()))?;
         validate_coord(x, y)?;
         coords.push([x, y]);
     }
@@ -360,12 +360,12 @@ fn parse_ring(ring: &serde_json::Value) -> Result<Vec<[f64; 2]>, DataServerError
 
 fn validate_coord(x: f64, y: f64) -> Result<(), DataServerError> {
     if !x.is_finite() || !y.is_finite() {
-        return Err(DataServerError::GeoJson(
+        return Err(DataServerError::Engine(
             "Coordinates must be finite numbers".into(),
         ));
     }
     if !(-180.0..=180.0).contains(&x) || !(-90.0..=90.0).contains(&y) {
-        return Err(DataServerError::GeoJson(format!(
+        return Err(DataServerError::Engine(format!(
             "Coordinates ({x}, {y}) outside WGS84 range. \
              If your data uses a projected CRS, convert to WGS84 first."
         )));
@@ -376,7 +376,7 @@ fn validate_coord(x: f64, y: f64) -> Result<(), DataServerError> {
 fn validate_wgs84_bbox(bbox: &[f64; 4]) -> Result<(), DataServerError> {
     for &v in bbox {
         if !v.is_finite() {
-            return Err(DataServerError::GeoJson(
+            return Err(DataServerError::Engine(
                 "Geometry has non-finite coordinates".into(),
             ));
         }

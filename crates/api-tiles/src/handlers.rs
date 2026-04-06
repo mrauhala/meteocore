@@ -18,10 +18,12 @@ use crate::tilematrixset::{self, SUPPORTED_TILE_MATRIX_SETS};
 
 /// Pre-generated 256x256 fully transparent PNG for empty (all-nodata) tiles.
 /// Avoids running the colorization + encoding pipeline when a tile has no data.
-static EMPTY_TILE_PNG: LazyLock<Vec<u8>> = LazyLock::new(|| {
+static EMPTY_TILE_PNG: LazyLock<bytes::Bytes> = LazyLock::new(|| {
     let size = params::TILE_SIZE;
     let rgba = vec![0u8; (size * size * 4) as usize];
-    ds_render::encode_png(&rgba, size, size).expect("encoding empty tile PNG must not fail")
+    bytes::Bytes::from(
+        ds_render::encode_png(&rgba, size, size).expect("encoding empty tile PNG must not fail"),
+    )
 });
 
 /// Shared state for the OGC API Tiles service.
@@ -731,7 +733,7 @@ async fn render_tile(
                 "nosniff",
             )
             .header(header::HeaderName::from_static("x-cache"), "HIT")
-            .body(axum::body::Body::from(cached.as_ref().clone()))
+            .body(axum::body::Body::from(cached))
             .unwrap()
             .into_response());
     }
@@ -781,9 +783,9 @@ async fn render_tile(
     let (image_bytes, x_cache) = match maybe_bytes {
         None => (EMPTY_TILE_PNG.clone(), "EMPTY"),
         Some(bytes) => {
-            let image_arc = Arc::new(bytes);
-            rendered_cache.insert(cache_key, image_arc.clone());
-            (image_arc.as_ref().clone(), "MISS")
+            let image_bytes = bytes::Bytes::from(bytes);
+            rendered_cache.insert(cache_key, image_bytes.clone());
+            (image_bytes, "MISS")
         }
     };
 

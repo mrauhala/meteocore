@@ -366,7 +366,7 @@ impl GribEngine {
         let catalog = self.catalog.load();
 
         if catalog.runs.is_empty() {
-            return Err(DataServerError::Grib(
+            return Err(DataServerError::Engine(
                 "No forecast data available".to_string(),
             ));
         }
@@ -472,7 +472,7 @@ impl Engine for GribEngine {
         let catalog = self.catalog.load();
 
         if catalog.runs.is_empty() {
-            return Err(DataServerError::Grib(
+            return Err(DataServerError::Engine(
                 "No forecast data available".to_string(),
             ));
         }

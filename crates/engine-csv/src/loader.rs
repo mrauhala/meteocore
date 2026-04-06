@@ -24,11 +24,11 @@ pub struct CsvDataStore {
 impl CsvDataStore {
     pub fn load(path: &str) -> Result<Self, DataServerError> {
         let mut reader = csv::Reader::from_path(path)
-            .map_err(|e| DataServerError::Csv(format!("Failed to open {path}: {e}")))?;
+            .map_err(|e| DataServerError::Engine(format!("Failed to open {path}: {e}")))?;
 
         let headers: Vec<String> = reader
             .headers()
-            .map_err(|e| DataServerError::Csv(format!("Failed to read headers: {e}")))?
+            .map_err(|e| DataServerError::Engine(format!("Failed to read headers: {e}")))?
             .iter()
             .map(|h| h.to_string())
             .collect();
@@ -37,7 +37,7 @@ impl CsvDataStore {
         // Everything else is a parameter
         let param_start = 4;
         if headers.len() < param_start {
-            return Err(DataServerError::Csv(format!(
+            return Err(DataServerError::Engine(format!(
                 "CSV must have at least {} columns (location, latitude, longitude, time), found {}",
                 param_start,
                 headers.len()
@@ -66,18 +66,18 @@ impl CsvDataStore {
 
         for result in reader.records() {
             let record =
-                result.map_err(|e| DataServerError::Csv(format!("Failed to read row: {e}")))?;
+                result.map_err(|e| DataServerError::Engine(format!("Failed to read row: {e}")))?;
 
             let location = record[0].to_string();
             let latitude: f64 = record[1]
                 .parse()
-                .map_err(|e| DataServerError::Csv(format!("Invalid latitude: {e}")))?;
+                .map_err(|e| DataServerError::Engine(format!("Invalid latitude: {e}")))?;
             let longitude: f64 = record[2]
                 .parse()
-                .map_err(|e| DataServerError::Csv(format!("Invalid longitude: {e}")))?;
+                .map_err(|e| DataServerError::Engine(format!("Invalid longitude: {e}")))?;
             let time: DateTime<Utc> = record[3]
                 .parse()
-                .map_err(|e| DataServerError::Csv(format!("Invalid time: {e}")))?;
+                .map_err(|e| DataServerError::Engine(format!("Invalid time: {e}")))?;
 
             let mut values = HashMap::new();
             for (i, param_name) in parameter_names.iter().enumerate() {
