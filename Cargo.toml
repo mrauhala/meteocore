@@ -6,6 +6,7 @@ members = [
     "crates/engine-geojson",
     "crates/engine-geotiff",
     "crates/engine-querydata",
+    "crates/engine-grib",
     "crates/storage",
     "crates/render",
     "crates/api-edr",

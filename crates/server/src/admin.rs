@@ -112,6 +112,7 @@ pub struct ServerState {
     pub health: RwLock<Vec<CollectionHealth>>,
     pub geotiff_engines: RwLock<Vec<Arc<engine_geotiff::GeoTiffEngine>>>,
     pub querydata_engines: RwLock<Vec<Arc<engine_querydata::QueryDataEngine>>>,
+    pub grib_engines: RwLock<Vec<Arc<engine_grib::GribEngine>>>,
     /// Serializes reload requests to prevent concurrent reloads from racing.
     pub reload_lock: tokio::sync::Mutex<()>,
     /// Bearer token for admin endpoint authentication.
@@ -134,6 +135,7 @@ pub struct LoadResult {
     pub health: Vec<CollectionHealth>,
     pub geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>>,
     pub querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>>,
+    pub grib_engines: Vec<Arc<engine_grib::GribEngine>>,
 }
 
 pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> LoadResult {
@@ -154,6 +156,7 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
     let mut tiles_styles: HashMap<String, HashMap<String, ds_render::StyleInfo>> = HashMap::new();
     let mut geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>> = Vec::new();
     let mut querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>> = Vec::new();
+    let mut grib_engines: Vec<Arc<engine_grib::GribEngine>> = Vec::new();
     let mut health: Vec<CollectionHealth> = Vec::new();
 
     for collection in collections {
@@ -544,6 +547,141 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                     },
                 });
             }
+            "grib" => {
+                let grib_config = match collection.grib.as_ref() {
+                    Some(c) => c,
+                    None => {
+                        tracing::error!(
+                            "Collection '{}': engine_type 'grib' but missing [collections.grib] config, skipping",
+                            collection.id
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "grib".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some("missing [collections.grib] config".into()),
+                        });
+                        continue;
+                    }
+                };
+
+                let engine = match engine_grib::GribEngine::new(&collection.id, grib_config) {
+                    Ok(e) => Arc::new(e),
+                    Err(e) => {
+                        tracing::error!(
+                            "Collection '{}': failed to initialize GRIB engine: {}",
+                            collection.id,
+                            e
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "grib".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some(format!("{e}")),
+                        });
+                        continue;
+                    }
+                };
+
+                if let Some((start, end)) =
+                    ds_core::engine::Engine::get_temporal_extent(engine.as_ref())
+                {
+                    info!(
+                        "Collection '{}': temporal extent {} to {}",
+                        collection.id, start, end
+                    );
+                }
+
+                grib_engines.push(engine.clone());
+
+                if collection.apis.contains(&"edr".to_string()) {
+                    edr_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::engine::Engine>,
+                    );
+                    edr_collections.insert(collection.id.clone(), collection.clone());
+                }
+                if collection.apis.contains(&"features".to_string()) {
+                    info!(
+                        "Warning: GRIB engine does not support Features API, \
+                         skipping Features wiring for collection '{}'",
+                        collection.id
+                    );
+                }
+
+                // Get parameter list for per-parameter-layer styles
+                let raster_params =
+                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+
+                if collection.apis.contains(&"wms".to_string()) {
+                    map_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    map_collections.insert(collection.id.clone(), collection.clone());
+                    let styles = build_styles(collection);
+                    map_styles.insert(collection.id.clone(), styles);
+                    if !raster_params.is_empty() {
+                        register_parameter_layer_styles(
+                            collection,
+                            &raster_params,
+                            &mut map_styles,
+                        );
+                    }
+                    info!("Collection '{}': wired to WMS API", collection.id);
+                }
+                if collection.apis.contains(&"maps".to_string()) {
+                    maps_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    maps_collections.insert(collection.id.clone(), collection.clone());
+                    let styles = build_styles(collection);
+                    maps_styles.insert(collection.id.clone(), styles);
+                    if !raster_params.is_empty() {
+                        register_parameter_layer_styles(
+                            collection,
+                            &raster_params,
+                            &mut maps_styles,
+                        );
+                    }
+                    info!("Collection '{}': wired to Maps API", collection.id);
+                }
+                if collection.apis.contains(&"tiles".to_string()) {
+                    tiles_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    tiles_collections.insert(collection.id.clone(), collection.clone());
+                    let styles = build_styles(collection);
+                    tiles_styles.insert(collection.id.clone(), styles);
+                    if !raster_params.is_empty() {
+                        register_parameter_layer_styles(
+                            collection,
+                            &raster_params,
+                            &mut tiles_styles,
+                        );
+                    }
+                    info!("Collection '{}': wired to Tiles API", collection.id);
+                }
+
+                let has_data =
+                    ds_core::engine::Engine::get_temporal_extent(engine.as_ref()).is_some();
+                health.push(CollectionHealth {
+                    id: collection.id.clone(),
+                    engine_type: "grib".into(),
+                    status: if has_data {
+                        CollectionStatus::Ready
+                    } else {
+                        CollectionStatus::Degraded
+                    },
+                    error: if has_data {
+                        None
+                    } else {
+                        Some("no forecast data found yet (waiting for poll)".into())
+                    },
+                });
+            }
             other => {
                 tracing::error!(
                     "Collection '{}': unknown engine type '{}', skipping",
@@ -619,6 +757,7 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
         health,
         geotiff_engines,
         querydata_engines,
+        grib_engines,
     }
 }
 
@@ -902,6 +1041,10 @@ pub async fn reload_handler(
         for engine in old_querydata.iter() {
             engine.shutdown();
         }
+        let old_grib = state.grib_engines.read().unwrap_or_else(|e| e.into_inner());
+        for engine in old_grib.iter() {
+            engine.shutdown();
+        }
     }
 
     let result = load_collections(&config.collections, &base_url);
@@ -942,6 +1085,12 @@ pub async fn reload_handler(
             poller.poll_loop().await;
         });
     }
+    for engine in &result.grib_engines {
+        let poller = engine.clone();
+        tokio::spawn(async move {
+            poller.poll_loop().await;
+        });
+    }
 
     // Atomically swap state
     state.edr.store(Arc::new(result.edr_state));
@@ -963,6 +1112,10 @@ pub async fn reload_handler(
         .querydata_engines
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.querydata_engines;
+    *state
+        .grib_engines
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = result.grib_engines;
 
     info!(
         "Reload complete: {}/{} collections loaded",
