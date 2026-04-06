@@ -467,13 +467,6 @@ mod get_map {
         let (status, _) = get("/collections/radar/map?bbox=10,55,30,70&width=5000").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
-
-    #[tokio::test]
-    async fn pixel_count_too_large_returns_400() {
-        let (status, _) =
-            get("/collections/radar/map?bbox=10,55,30,70&width=4096&height=4096").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-    }
 }
 
 // ---------------------------------------------------------------------------

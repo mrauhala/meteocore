@@ -4,8 +4,8 @@ use serde::Deserialize;
 
 use crate::error::WmsError;
 
-/// Maximum map pixels (width * height). 8 million ≈ 2828x2828.
-pub const MAX_MAP_PIXELS: u64 = 8_000_000;
+/// Maximum map pixels (width * height). 16M = 4096x4096 (matches MAX_MAP_DIMENSION).
+pub const MAX_MAP_PIXELS: u64 = 16_777_216;
 
 /// Maximum single dimension (width or height).
 pub const MAX_MAP_DIMENSION: u32 = 4096;
