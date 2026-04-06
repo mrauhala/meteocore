@@ -52,9 +52,9 @@ impl GribEngine {
             ))
         })?;
 
-        // Build data store
-        let url = format!("{endpoint}/{bucket}/");
-        let (store, _prefix) = ds_storage::build_store(&url).map_err(|e| {
+        // Build data store. Construct URL from endpoint+bucket for S3 region detection.
+        let store_url = format!("{endpoint}/{bucket}/");
+        let (store, _prefix) = ds_storage::build_store(&store_url).map_err(|e| {
             DataServerError::Config(format!(
                 "Collection '{collection_id}': failed to build store: {e}"
             ))
