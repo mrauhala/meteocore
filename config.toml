@@ -195,9 +195,10 @@ apis = ["edr", "wms", "maps", "tiles"]
 [collections.grib]
 endpoint = "https://s3.eu-central-1.amazonaws.com"
 bucket = "ecmwf-forecasts"
-prefix_pattern = "%Y%m%d/00z/ifs/0p25/oper/"
+prefix_pattern = "%Y%m%d/{run}z/ifs/0p25/oper/"
 poll_interval_secs = 300
-max_runs = 2
+max_runs = 4
+run_hours = [0, 6, 12, 18]
 parameters = ["2t", "2d", "10u", "10v", "msl", "sp", "tp", "tcc", "tcwv", "cape", "sf", "sd"]
 
 [collections.wms]
