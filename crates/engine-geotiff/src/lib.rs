@@ -1239,14 +1239,30 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         let overview = metadata
             .select_overview(west, south, east, north, width, height)
             .or_else(|| {
-                // Check if full resolution would exceed the map pixel limit
+                // select_overview returned None — either no overviews exist,
+                // or all overviews have enough pixels. Check if full resolution
+                // exceeds the source pixel limit, and if so pick the finest
+                // overview that fits under the limit.
                 if let Some((c0, r0, c1, r1)) = metadata
                     .geo_transform
                     .bbox_to_pixels(west, south, east, north)
                 {
                     let full_pixels = ((c1 - c0) as usize) * ((r1 - r0) as usize);
-                    if full_pixels > 16_000_000 {
-                        // Force smallest overview to avoid exceeding limits
+                    if full_pixels > reader::max_map_pixels() {
+                        // Find the finest overview that fits under the limit
+                        // (overviews are sorted coarsest-last, iterate in reverse)
+                        for ov in metadata.overviews.iter().rev() {
+                            let ov_gt = metadata.overview_geo_transform(ov);
+                            if let Some((oc0, or0, oc1, or1)) =
+                                ov_gt.bbox_to_pixels(west, south, east, north)
+                            {
+                                let ov_pixels = ((oc1 - oc0) as usize) * ((or1 - or0) as usize);
+                                if ov_pixels <= reader::max_map_pixels() {
+                                    return Some(ov);
+                                }
+                            }
+                        }
+                        // All overviews still exceed limit — use coarsest
                         metadata.overviews.last()
                     } else {
                         None
