@@ -186,6 +186,96 @@ name = "tp"
 colormap = "precipitation"
 
 [[collections]]
+id = "ecmwf-ifs"
+title = "ECMWF IFS Global Forecast"
+description = "IFS deterministic forecast (0.25 deg) from ECMWF open data"
+engine_type = "grib"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[collections.grib]
+endpoint = "https://s3.eu-central-1.amazonaws.com"
+bucket = "ecmwf-forecasts"
+prefix_pattern = "%Y%m%d/00z/ifs/0p25/oper/"
+poll_interval_secs = 300
+max_runs = 2
+parameters = ["2t", "2d", "10u", "10v", "msl", "sp", "tp", "tcc", "tcwv", "cape", "sf", "sd"]
+
+[collections.wms]
+colormap = "temperature"
+
+[[collections.wms.parameters]]
+name = "2t"
+colormap = "temperature"
+min = 220.0
+max = 320.0
+
+[[collections.wms.parameters]]
+name = "2d"
+colormap = "temperature"
+min = 220.0
+max = 310.0
+
+[[collections.wms.parameters]]
+name = "msl"
+colormap = "viridis"
+min = 92000.0
+max = 108000.0
+
+[[collections.wms.parameters]]
+name = "sp"
+colormap = "viridis"
+min = 50000.0
+max = 108000.0
+
+[[collections.wms.parameters]]
+name = "tp"
+colormap = "precipitation"
+min = 0.0
+max = 0.05
+
+[[collections.wms.parameters]]
+name = "tcc"
+colormap = "grayscale"
+min = 0.0
+max = 1.0
+
+[[collections.wms.parameters]]
+name = "10u"
+colormap = "wind_speed"
+min = -30.0
+max = 30.0
+
+[[collections.wms.parameters]]
+name = "10v"
+colormap = "wind_speed"
+min = -30.0
+max = 30.0
+
+[[collections.wms.parameters]]
+name = "tcwv"
+colormap = "viridis"
+min = 0.0
+max = 70.0
+
+[[collections.wms.parameters]]
+name = "cape"
+colormap = "viridis"
+min = 0.0
+max = 3000.0
+
+[[collections.wms.parameters]]
+name = "sf"
+colormap = "precipitation"
+min = 0.0
+max = 0.02
+
+[[collections.wms.parameters]]
+name = "sd"
+colormap = "viridis"
+min = 0.0
+max = 1.0
+
+[[collections]]
 id = "met-norway-radar"
 title = "MET Norway Radar Mosaic"
 description = "Radar reflectivity mosaic from MET Norway via STAC catalog, Lambert Conformal Conic"
