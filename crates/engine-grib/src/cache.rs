@@ -44,12 +44,41 @@ impl DecodedGrid {
     /// Get the value at the grid point nearest to (lon, lat).
     /// Returns None if the point is outside the grid.
     pub fn nearest_value(&self, lon: f64, lat: f64) -> Option<f64> {
-        let (col, row) = self.lonlat_to_grid(lon, lat)?;
+        let (col, row, _, _) = self.lonlat_to_fractional(lon, lat)?;
         Some(self.values[row * self.ni + col])
     }
 
-    /// Convert (lon, lat) to (col, row) grid indices.
-    fn lonlat_to_grid(&self, lon: f64, lat: f64) -> Option<(usize, usize)> {
+    /// Bilinear interpolation at (lon, lat).
+    /// Interpolates between the 4 surrounding grid points.
+    /// Returns None if the point is outside the grid.
+    pub fn bilinear_value(&self, lon: f64, lat: f64) -> Option<f64> {
+        let (col, row, dx, dy) = self.lonlat_to_fractional(lon, lat)?;
+
+        // Right and bottom neighbors (clamp to grid edge)
+        let col1 = (col + 1).min(self.ni - 1);
+        let row1 = (row + 1).min(self.nj - 1);
+
+        let v00 = self.values[row * self.ni + col];
+        let v10 = self.values[row * self.ni + col1];
+        let v01 = self.values[row1 * self.ni + col];
+        let v11 = self.values[row1 * self.ni + col1];
+
+        // Skip interpolation if any neighbor is NaN
+        if v00.is_nan() || v10.is_nan() || v01.is_nan() || v11.is_nan() {
+            // Fall back to nearest non-NaN
+            return if !v00.is_nan() { Some(v00) } else { None };
+        }
+
+        let val = v00 * (1.0 - dx) * (1.0 - dy)
+            + v10 * dx * (1.0 - dy)
+            + v01 * (1.0 - dx) * dy
+            + v11 * dx * dy;
+        Some(val)
+    }
+
+    /// Convert (lon, lat) to (col, row) grid indices plus fractional offsets (dx, dy).
+    /// dx/dy are in [0, 1) representing the position within the grid cell.
+    fn lonlat_to_fractional(&self, lon: f64, lat: f64) -> Option<(usize, usize, f64, f64)> {
         // Normalize longitude to grid range
         let mut lon = lon;
         if lon < self.lon_first {
@@ -59,14 +88,20 @@ impl DecodedGrid {
             lon -= 360.0;
         }
 
-        let col = ((lon - self.lon_first) / self.lon_inc).round() as isize;
-        let row = ((lat - self.lat_first) / self.lat_inc).round() as isize;
+        let col_f = (lon - self.lon_first) / self.lon_inc;
+        let row_f = (lat - self.lat_first) / self.lat_inc;
+
+        let col = col_f.floor() as isize;
+        let row = row_f.floor() as isize;
 
         if col < 0 || col >= self.ni as isize || row < 0 || row >= self.nj as isize {
             return None;
         }
 
-        Some((col as usize, row as usize))
+        let dx = col_f - col as f64;
+        let dy = row_f - row as f64;
+
+        Some((col as usize, row as usize, dx, dy))
     }
 
     /// Extract a grid subset for the given bbox [west, south, east, north].

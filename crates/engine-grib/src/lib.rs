@@ -477,7 +477,7 @@ impl Engine for GribEngine {
 
                 match self.fetch_grid(step_file, param_name, level) {
                     Ok(grid) => {
-                        let raw = grid.nearest_value(lon, lat);
+                        let raw = grid.bilinear_value(lon, lat);
                         values.push(raw.map(|v| info.convert(v)));
                     }
                     Err(e) => {
