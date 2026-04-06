@@ -25,6 +25,33 @@ cargo +nightly fuzz run fuzz_geo_transform -- -max_total_time=60  # Fuzz CRS tra
 
 Seed corpus in `fuzz/corpus/fuzz_tiff_metadata/` — add real GeoTIFF files for better coverage.
 
+## Project Tracking
+
+Backlog is tracked in **GitHub Issues**: https://github.com/mrauhala/meteocore/issues
+
+### Labels
+- **Priority:** `priority: high`, `priority: medium`, `priority: low`
+- **Effort:** `effort: tiny` (<1h), `effort: small` (1-4h), `effort: medium` (½-1 day), `effort: large` (multi-day)
+- **Type:** `bug`, `enhancement`, `security`, `performance`, `reliability`, `architecture`, `operational`, `spec-compliance`
+- **Epic:** `epic` — parent issues with task lists tracking sub-issues
+
+### Milestones
+- **v0.2** — Radar engines + rendering fixes
+- **v0.3** — QueryData improvements + multi-band GeoTIFF
+- **v1.0** — Spec compliance + production hardening
+
+### Useful commands
+```bash
+gh issue list                              # All open issues
+gh issue list -l "priority: high"          # High priority only
+gh issue list -l "bug"                     # Bugs only
+gh issue list -l "effort: tiny"            # Quick wins
+gh issue list --milestone "v0.2"           # Issues in v0.2 milestone
+gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
+```
+
+When completing work, close the relevant issue: `gh issue close <number>`.
+
 ## Architecture Rules
 
 - **Three core traits: `Engine` (EDR), `FeatureEngine` (Features), and `MapEngine` (Maps/WMS/Tiles).** They are separate traits — not all engines need to support all APIs. Engines return domain types, never JSON/XML. Serialization belongs in the API crates.
