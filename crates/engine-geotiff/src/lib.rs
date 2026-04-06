@@ -1245,7 +1245,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                     .bbox_to_pixels(west, south, east, north)
                 {
                     let full_pixels = ((c1 - c0) as usize) * ((r1 - r0) as usize);
-                    if full_pixels > 16_000_000 {
+                    if full_pixels > 64_000_000 {
                         // Force smallest overview to avoid exceeding limits
                         metadata.overviews.last()
                     } else {

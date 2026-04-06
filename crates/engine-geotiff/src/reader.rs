@@ -1425,9 +1425,12 @@ pub fn read_bbox_overview(
     Ok(result)
 }
 
-/// Maximum pixels for map rendering (higher than EDR area queries since output
-/// is already bounded by MAX_MAP_PIXELS and data is resampled to output resolution).
-const MAX_MAP_PIXELS: usize = 16_000_000;
+/// Maximum source pixels for map rendering. Higher than EDR area queries since
+/// the output is already bounded by MAX_MAP_DIMENSION (4096) and the data is
+/// resampled to output resolution. Needs to be generous because projected CRS
+/// data (e.g., TM35FIN radar covering all of Scandinavia) can have large source
+/// extents even for moderate output sizes.
+const MAX_MAP_PIXELS: usize = 64_000_000;
 
 /// Read a bbox for map rendering with a higher pixel limit.
 /// Used by MapEngine::get_raster_tile where output size is already bounded.
