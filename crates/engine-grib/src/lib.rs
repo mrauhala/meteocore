@@ -366,6 +366,15 @@ impl Engine for GribEngine {
         self.catalog.load().temporal_extent()
     }
 
+    fn get_available_times(&self) -> Option<Vec<DateTime<Utc>>> {
+        let times = self.catalog.load().all_valid_times();
+        if times.is_empty() {
+            None
+        } else {
+            Some(times)
+        }
+    }
+
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
         // Global grid
         if self.catalog.load().runs.is_empty() {

@@ -35,6 +35,14 @@ pub trait Engine: Send + Sync {
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)>;
 
+    /// Returns the individual timesteps available for querying.
+    /// Used in EDR collection metadata to advertise available times to clients.
+    /// Default: None (only interval is shown). Override for engines with
+    /// non-uniform time steps (e.g., GRIB forecasts with 3h/6h steps).
+    fn get_available_times(&self) -> Option<Vec<DateTime<Utc>>> {
+        None
+    }
+
     fn get_spatial_extent(&self) -> Option<[f64; 4]>;
 
     /// Returns the EDR query types this engine supports.
