@@ -197,7 +197,7 @@ impl DecodedGrid {
 
             for col in 0..w {
                 let lon = west + (col as f64 + 0.5) * (east - west) / w as f64;
-                out.push(self.nearest_value(lon, lat));
+                out.push(self.bilinear_value(lon, lat));
             }
         }
 
