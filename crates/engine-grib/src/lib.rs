@@ -5,8 +5,8 @@ pub mod params;
 pub mod reader;
 mod time_window;
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
@@ -21,6 +21,12 @@ use ds_core::model::*;
 use crate::cache::GridCache;
 use crate::catalog::{Catalog, ForecastRun, StepFile};
 use crate::time_window::TimeWindow;
+
+/// Default model run hours for ECMWF IFS (4 runs per day).
+const DEFAULT_RUN_HOURS: &[u32] = &[0, 6, 12, 18];
+
+/// Number of days to scan back (today + yesterday handles overnight transitions).
+const SCAN_DAYS: u32 = 2;
 
 /// Engine for serving GRIB2 NWP forecast data.
 ///
@@ -37,9 +43,17 @@ pub struct GribEngine {
     shutdown_tx: watch::Sender<bool>,
     /// Allowed parameters (None = all).
     param_filter: Option<Vec<String>>,
+    /// Index files already downloaded and parsed (by S3 path). Avoids
+    /// re-downloading unchanged index files on every poll cycle.
+    known_indexes: Mutex<HashSet<String>>,
 }
 
 impl GribEngine {
+    /// Returns the collection ID.
+    pub fn collection_id(&self) -> &str {
+        &self.collection_id
+    }
+
     /// Create a new GRIB engine from config.
     pub fn new(collection_id: &str, config: &GribConfig) -> Result<Self, DataServerError> {
         // Validate config
@@ -75,6 +89,7 @@ impl GribEngine {
             grid_cache,
             shutdown_tx,
             param_filter: config.parameters.clone(),
+            known_indexes: Mutex::new(HashSet::new()),
         };
 
         // Do initial scan
@@ -120,53 +135,92 @@ impl GribEngine {
         let _ = self.shutdown_tx.send(true);
     }
 
-    /// Perform one scan cycle: list index files, parse, update catalog.
+    /// Perform one scan cycle: list index files across multiple dates and
+    /// run hours, parse new ones, merge into the catalog.
     fn scan_once(&self) -> Result<(), DataServerError> {
         let now = Utc::now();
-        let prefix = expand_prefix(&self.prefix_pattern, now);
-
         let index_suffix = self.config.index_suffix.as_deref().unwrap_or(".index");
         let data_suffix = self.config.data_suffix.as_deref().unwrap_or(".grib2");
+        let run_hours = self
+            .config
+            .run_hours
+            .as_deref()
+            .unwrap_or(DEFAULT_RUN_HOURS);
 
-        // List objects in prefix
-        let obj_prefix = ds_storage::object_store::path::Path::from(prefix.as_str());
-        let objects = self.store.list(&obj_prefix).map_err(|e| {
-            DataServerError::Storage(format!("Failed to list GRIB prefix '{prefix}': {e}"))
-        })?;
+        // Generate all prefixes to scan: SCAN_DAYS dates × run_hours
+        let prefixes = build_scan_prefixes(&self.prefix_pattern, now, run_hours);
 
-        // Filter for index files
-        let index_files: Vec<_> = objects
-            .iter()
-            .filter(|o| o.location.as_ref().ends_with(index_suffix))
-            .collect();
+        // Collect all index files across all prefixes
+        let mut all_index_paths: Vec<ds_storage::object_store::path::Path> = Vec::new();
+        for prefix in &prefixes {
+            let obj_prefix = ds_storage::object_store::path::Path::from(prefix.as_str());
+            match self.store.list(&obj_prefix) {
+                Ok(objects) => {
+                    for obj in objects {
+                        if obj.location.as_ref().ends_with(index_suffix) {
+                            all_index_paths.push(obj.location);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "Collection '{}': failed to list prefix '{}': {}",
+                        self.collection_id,
+                        prefix,
+                        e
+                    );
+                }
+            }
+        }
 
-        if index_files.is_empty() {
+        if all_index_paths.is_empty() {
             tracing::debug!(
-                "Collection '{}': no index files found in '{}'",
+                "Collection '{}': no index files found in {} prefixes",
                 self.collection_id,
-                prefix
+                prefixes.len()
+            );
+            return Ok(());
+        }
+
+        // Filter to only new index files (not seen before)
+        let new_paths: Vec<_> = {
+            let known = self.known_indexes.lock().unwrap();
+            all_index_paths
+                .iter()
+                .filter(|p| !known.contains(p.as_ref()))
+                .cloned()
+                .collect()
+        };
+
+        if new_paths.is_empty() {
+            tracing::debug!(
+                "Collection '{}': no new index files ({} already known)",
+                self.collection_id,
+                all_index_paths.len()
             );
             return Ok(());
         }
 
         tracing::info!(
-            "Collection '{}': found {} index files in '{}'",
+            "Collection '{}': found {} new index files ({} total across {} prefixes)",
             self.collection_id,
-            index_files.len(),
-            prefix
+            new_paths.len(),
+            all_index_paths.len(),
+            prefixes.len()
         );
 
-        let mut new_catalog = Catalog::new();
+        // Start from existing catalog for incremental merge
+        let mut new_catalog = (*self.catalog.load_full()).clone();
 
-        for obj in &index_files {
+        for path in &new_paths {
             // Read index file
-            let bytes = match self.store.get(&obj.location) {
+            let bytes = match self.store.get(path) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!(
                         "Collection '{}': failed to read index file {}: {}",
                         self.collection_id,
-                        obj.location,
+                        path,
                         e
                     );
                     continue;
@@ -186,13 +240,13 @@ impl GribEngine {
                 tracing::warn!(
                     "Collection '{}': cannot parse ref time from index {}",
                     self.collection_id,
-                    obj.location
+                    path
                 );
                 continue;
             };
 
             // Derive GRIB file URL from index file path
-            let grib_url = obj.location.as_ref().replace(index_suffix, data_suffix);
+            let grib_url = path.as_ref().replace(index_suffix, data_suffix);
 
             // Filter messages if param_filter is set
             let messages = if let Some(filter) = &self.param_filter {
@@ -216,6 +270,12 @@ impl GribEngine {
                 });
 
             run.steps.insert(parsed.step, step_file);
+
+            // Mark as known
+            self.known_indexes
+                .lock()
+                .unwrap()
+                .insert(path.as_ref().to_string());
         }
 
         // Apply time_window filtering: remove steps whose valid times fall outside the window
@@ -236,6 +296,21 @@ impl GribEngine {
         // Apply max_runs eviction
         if let Some(max_runs) = self.config.max_runs {
             new_catalog.evict(max_runs);
+        }
+
+        // Clean up known_indexes: remove entries for runs that were evicted
+        {
+            let mut known = self.known_indexes.lock().unwrap();
+            let valid_prefixes: HashSet<String> = new_catalog
+                .runs
+                .values()
+                .flat_map(|r| r.steps.values().map(|s| s.grib_url.clone()))
+                .collect();
+            known.retain(|path| {
+                // Keep if the corresponding grib URL is still in the catalog
+                let grib_path = path.replace(index_suffix, data_suffix);
+                valid_prefixes.contains(&grib_path)
+            });
         }
 
         let total_steps: usize = new_catalog.runs.values().map(|r| r.steps.len()).sum();
@@ -364,6 +439,15 @@ impl Engine for GribEngine {
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
         self.catalog.load().temporal_extent()
+    }
+
+    fn get_available_times(&self) -> Option<Vec<DateTime<Utc>>> {
+        let times = self.catalog.load().all_valid_times();
+        if times.is_empty() {
+            None
+        } else {
+            Some(times)
+        }
     }
 
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
@@ -811,9 +895,35 @@ fn parse_bbox_from_wkt(coords: &str) -> Result<[f64; 4], DataServerError> {
     )))
 }
 
-/// Expand a strftime prefix pattern to today's date.
-fn expand_prefix(pattern: &str, now: DateTime<Utc>) -> String {
-    now.format(pattern).to_string()
+/// Build all S3 prefixes to scan for the given pattern, dates, and run hours.
+///
+/// The pattern supports strftime placeholders for the date part, plus `{run}`
+/// which is expanded to each run hour (zero-padded, e.g., "00", "06", "12", "18").
+///
+/// If the pattern contains no `{run}` placeholder, it's expanded once per date
+/// using strftime only (backward compatible with the original behavior).
+fn build_scan_prefixes(pattern: &str, now: DateTime<Utc>, run_hours: &[u32]) -> Vec<String> {
+    use chrono::Duration;
+
+    let mut prefixes = Vec::new();
+
+    for days_back in 0..SCAN_DAYS {
+        let date = now - Duration::days(i64::from(days_back));
+
+        if pattern.contains("{run}") {
+            // Expand for each run hour
+            for &hour in run_hours {
+                let run_str = format!("{hour:02}");
+                let with_run = pattern.replace("{run}", &run_str);
+                prefixes.push(date.format(&with_run).to_string());
+            }
+        } else {
+            // No {run} placeholder — just expand strftime
+            prefixes.push(date.format(pattern).to_string());
+        }
+    }
+
+    prefixes
 }
 
 #[cfg(test)]
@@ -841,12 +951,27 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_prefix() {
+    fn test_build_scan_prefixes_with_run() {
         use chrono::TimeZone;
-        let dt = Utc.with_ymd_and_hms(2026, 4, 5, 0, 0, 0).unwrap();
-        assert_eq!(
-            expand_prefix("%Y%m%d/00z/ifs/0p25/oper/", dt),
-            "20260405/00z/ifs/0p25/oper/"
-        );
+        let dt = Utc.with_ymd_and_hms(2026, 4, 6, 15, 0, 0).unwrap();
+        let prefixes = build_scan_prefixes("%Y%m%d/{run}z/ifs/0p25/oper/", dt, &[0, 6, 12, 18]);
+
+        // 2 days × 4 run hours = 8 prefixes
+        assert_eq!(prefixes.len(), 8);
+        assert!(prefixes.contains(&"20260406/00z/ifs/0p25/oper/".to_string()));
+        assert!(prefixes.contains(&"20260406/12z/ifs/0p25/oper/".to_string()));
+        assert!(prefixes.contains(&"20260405/18z/ifs/0p25/oper/".to_string()));
+    }
+
+    #[test]
+    fn test_build_scan_prefixes_no_run_placeholder() {
+        use chrono::TimeZone;
+        let dt = Utc.with_ymd_and_hms(2026, 4, 6, 15, 0, 0).unwrap();
+        let prefixes = build_scan_prefixes("%Y%m%d/00z/ifs/0p25/oper/", dt, &[0, 6, 12, 18]);
+
+        // No {run} placeholder — 2 dates, 1 prefix each
+        assert_eq!(prefixes.len(), 2);
+        assert_eq!(prefixes[0], "20260406/00z/ifs/0p25/oper/");
+        assert_eq!(prefixes[1], "20260405/00z/ifs/0p25/oper/");
     }
 }

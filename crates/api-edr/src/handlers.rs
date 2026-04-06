@@ -583,10 +583,23 @@ fn build_collection_metadata(
         );
     }
     if let Some((start, end)) = temporal {
-        extent.insert(
-            "temporal".to_string(),
-            json!({ "interval": [[start.to_rfc3339(), end.to_rfc3339()]], "trs": "http://www.opengis.net/def/uom/ISO-8601/0/Gregorian" }),
+        let mut temporal_obj = serde_json::Map::new();
+        temporal_obj.insert(
+            "interval".to_string(),
+            json!([[start.to_rfc3339(), end.to_rfc3339()]]),
         );
+        temporal_obj.insert(
+            "trs".to_string(),
+            json!("http://www.opengis.net/def/uom/ISO-8601/0/Gregorian"),
+        );
+
+        // Include individual timesteps if the engine provides them
+        if let Some(times) = engine.get_available_times() {
+            let values: Vec<String> = times.iter().map(|t| t.to_rfc3339()).collect();
+            temporal_obj.insert("values".to_string(), json!(values));
+        }
+
+        extent.insert("temporal".to_string(), json!(temporal_obj));
     }
 
     let parameter_names: serde_json::Map<String, serde_json::Value> = param_descs
