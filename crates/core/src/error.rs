@@ -35,6 +35,9 @@ pub enum DataServerError {
     #[error("QueryData error: {0}")]
     QueryData(String),
 
+    #[error("GRIB error: {0}")]
+    Grib(String),
+
     #[error("Storage error: {0}")]
     Storage(String),
 

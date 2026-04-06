@@ -159,6 +159,7 @@ fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<ArcSwap<EdrState>> {
             geotiff: None,
             querydata: None,
             wms: None,
+            grib: None,
         },
     );
     Arc::new(ArcSwap::from_pointee(EdrState {

@@ -67,6 +67,12 @@ async fn main() {
             poller.poll_loop().await;
         });
     }
+    for engine in &result.grib_engines {
+        let poller = engine.clone();
+        tokio::spawn(async move {
+            poller.poll_loop().await;
+        });
+    }
 
     // Set initial health gauges
     admin::update_health_gauges(&result.health);
@@ -98,6 +104,7 @@ async fn main() {
         health: RwLock::new(result.health),
         geotiff_engines: RwLock::new(result.geotiff_engines),
         querydata_engines: RwLock::new(result.querydata_engines),
+        grib_engines: RwLock::new(result.grib_engines),
         reload_lock: tokio::sync::Mutex::new(()),
         admin_token,
     });
@@ -177,6 +184,13 @@ async fn main() {
         .read()
         .unwrap_or_else(|e| e.into_inner());
     for engine in querydata.iter() {
+        engine.shutdown();
+    }
+    let grib = server_state
+        .grib_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    for engine in grib.iter() {
         engine.shutdown();
     }
     info!("Server shut down gracefully");

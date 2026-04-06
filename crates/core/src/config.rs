@@ -51,6 +51,8 @@ pub struct CollectionConfig {
     pub geotiff: Option<GeoTiffConfig>,
     /// QueryData-specific configuration. Required when engine_type = "querydata".
     pub querydata: Option<QueryDataConfig>,
+    /// GRIB-specific configuration. Required when engine_type = "grib".
+    pub grib: Option<GribConfig>,
     /// WMS map rendering configuration. Required when apis contains "wms".
     pub wms: Option<WmsConfig>,
 }
@@ -250,6 +252,42 @@ pub struct QueryDataConfig {
     pub poll_interval_secs: u64,
 }
 
+fn default_grib_poll_interval() -> u64 {
+    300
+}
+
+fn default_grid_cache_mb() -> u64 {
+    256
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GribConfig {
+    /// S3-compatible endpoint URL, e.g. "https://s3.amazonaws.com"
+    pub endpoint: Option<String>,
+    /// S3 bucket name. Required when endpoint is set.
+    pub bucket: Option<String>,
+    /// Prefix pattern with strftime templates, e.g. "%Y%m%d/00z/ifs/0p25/oper/"
+    pub prefix_pattern: String,
+    /// Suffix for index files. Default: ".index"
+    pub index_suffix: Option<String>,
+    /// Suffix for GRIB data files. Default: ".grib2"
+    pub data_suffix: Option<String>,
+    /// Poll interval in seconds. Default: 300 (5 min)
+    #[serde(default = "default_grib_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// Maximum number of forecast runs to retain. Default: 4
+    pub max_runs: Option<usize>,
+    /// Time window for file selection (ISO 8601 duration)
+    pub time_window: Option<String>,
+    /// Optional parameter filter — only expose these params. Default: all.
+    pub parameters: Option<Vec<String>>,
+    /// Grid cache size in MB. Default: 256.
+    #[serde(default = "default_grid_cache_mb")]
+    pub grid_cache_mb: u64,
+    /// Model run hours to poll. Default: all (00, 06, 12, 18)
+    pub run_hours: Option<Vec<u32>>,
+}
+
 impl ServerConfig {
     pub fn from_file(path: &str) -> Result<Self, crate::error::DataServerError> {
         let content = std::fs::read_to_string(path).map_err(|e| {
@@ -285,6 +323,22 @@ impl ServerConfig {
                 if geotiff.poll_interval_secs == 0 {
                     return Err(crate::error::DataServerError::Config(format!(
                         "Collection '{id}': poll_interval_secs must be > 0"
+                    )));
+                }
+            }
+
+            // GRIB engine requires grib config section
+            if collection.engine_type == "grib" && collection.grib.is_none() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': engine_type 'grib' requires a [collections.grib] config section"
+                )));
+            }
+
+            // GRIB poll_interval_secs must be > 0
+            if let Some(grib) = &collection.grib {
+                if grib.poll_interval_secs == 0 {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': grib poll_interval_secs must be > 0"
                     )));
                 }
             }

@@ -2,7 +2,7 @@
 
 ## What This Is
 
-Rust workspace implementing OGC API - EDR, OGC API - Features, OGC API - Maps, OGC API - Tiles, and OGC WMS 1.3.0 servers. Thirteen crates: `ds-core` (traits + types + shared utilities), `ds-storage` (S3/HTTP/local object store), `ds-render` (raster colorization + PNG encoding), `engine-csv` (CSV data engine), `engine-geojson` (GeoJSON data engine), `engine-geotiff` (GeoTIFF/COG data engine), `api-edr` (EDR HTTP layer), `api-features` (Features HTTP layer), `api-maps` (OGC API Maps HTTP layer), `api-tiles` (OGC API Tiles HTTP layer), `api-wms` (WMS 1.3.0 HTTP layer), `server` (binary).
+Rust workspace implementing OGC API - EDR, OGC API - Features, OGC API - Maps, OGC API - Tiles, and OGC WMS 1.3.0 servers. Fourteen crates: `ds-core` (traits + types + shared utilities), `ds-storage` (S3/HTTP/local object store), `ds-render` (raster colorization + PNG encoding), `engine-csv` (CSV data engine), `engine-geojson` (GeoJSON data engine), `engine-geotiff` (GeoTIFF/COG data engine), `engine-grib` (GRIB2 NWP data engine), `api-edr` (EDR HTTP layer), `api-features` (Features HTTP layer), `api-maps` (OGC API Maps HTTP layer), `api-tiles` (OGC API Tiles HTTP layer), `api-wms` (WMS 1.3.0 HTTP layer), `server` (binary).
 
 ## Build & Run
 
@@ -665,6 +665,112 @@ The engine caches **compressed** tile bytes (not decoded pixels) in a lock-free 
 | Empty results / all-None values | Wrong `band` number, or missing `nodata` override | Check band count with `gdalinfo`; set `nodata` if file lacks the tag |
 | Slow poll cycles | Many remote files, or non-COG layout causing full downloads | Set `max_files` and/or `time_window` to limit scan scope; convert to COG |
 
+## GRIB2 Data Format
+
+GRIB2 files from NWP (Numerical Weather Prediction) models. The engine discovers data via JSON index sidecar files, fetches individual GRIB messages via byte-range reads, and serves them through EDR and Maps/WMS/Tiles APIs. Primary target: ECMWF IFS open data on S3.
+
+### Requirements
+
+- **Index sidecar files (`.index`)** — JSON-lines format with `_offset` and `_length` fields per GRIB message. ECMWF publishes these alongside `.grib2` files.
+- **Regular lat/lon grid** — Template 3.0 (equidistant cylindrical). Other grid types are not yet supported.
+- **S3/HTTP access** — The engine uses `ds_storage` for byte-range reads.
+
+### Data access pattern
+
+1. Poll S3 prefix for `.index` files (lightweight, ~35 KB each)
+2. Parse index → build catalog: `(reference_time, step) → (file_url, message_offsets)`
+3. On query: HTTP Range request for the specific GRIB message (~500 KB per surface field)
+4. Decode message via `grib` crate → regular lat/lon grid → serve via Engine/MapEngine
+
+### Multi-parameter collections
+
+Unlike GeoTIFF (one band per collection), a GRIB collection exposes all parameters from the data source. Each GRIB file contains ~160 messages (all parameters for one forecast step). EDR queries select parameters via the `parameter-name` query parameter. MapEngine uses per-parameter WMS layers (`LAYERS=collection-id/param-name`).
+
+### Automatic unit conversion
+
+The engine automatically converts common meteorological units to human-readable display units. Conversions are config-free and applied to all outputs (EDR, WMS, Maps, Tiles):
+
+| Source Unit | Display Unit | Conversion | Parameters |
+|-------------|-------------|------------|------------|
+| K | °C | −273.15 | 2t, 2d, skt, t, sot |
+| Pa | hPa | ×0.01 | msl, sp |
+| m | mm | ×1000 | tp, cp, sf, sd |
+| 0-1 | % | ×100 | tcc, lcc, mcc, hcc, lsm |
+| m²/s² | gpm | ÷9.80665 | z |
+
+Colormap ranges in `[collections.wms.parameters]` should use display units (°C, hPa, mm, %).
+
+### Forecast time model
+
+Each GRIB file represents one forecast step from one model run. The catalog is keyed by `(reference_time, step)`. EDR position queries return a time series across all available forecast steps (PointSeries domain with the time axis representing lead times). Valid time = `reference_time + step`.
+
+### GRIB config fields
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `endpoint` | yes | — | S3-compatible endpoint URL, e.g., `"https://s3.eu-central-1.amazonaws.com"` |
+| `bucket` | yes | — | S3 bucket name |
+| `prefix_pattern` | yes | — | Prefix with strftime templates, e.g., `"%Y%m%d/00z/ifs/0p25/oper/"` |
+| `index_suffix` | no | `".index"` | Suffix for index sidecar files |
+| `data_suffix` | no | `".grib2"` | Suffix for GRIB data files |
+| `poll_interval_secs` | no | `300` | Poll interval in seconds |
+| `max_runs` | no | none | Keep only the N most recent forecast runs |
+| `time_window` | no | none | ISO 8601 duration for valid time filtering, e.g., `"PT48H"` |
+| `parameters` | no | all | Optional parameter filter, e.g., `["2t", "msl", "tp"]` |
+| `grid_cache_mb` | no | `256` | LRU cache size for decoded grids |
+| `run_hours` | no | all | Model run hours to poll, e.g., `[0, 6, 12, 18]` |
+
+### Example config
+
+```toml
+[[collections]]
+id = "ecmwf-ifs"
+title = "ECMWF IFS Global Forecast"
+description = "IFS deterministic forecast (0.25 deg) from ECMWF open data"
+engine_type = "grib"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[collections.grib]
+endpoint = "https://s3.eu-central-1.amazonaws.com"
+bucket = "ecmwf-forecasts"
+prefix_pattern = "%Y%m%d/00z/ifs/0p25/oper/"
+poll_interval_secs = 300
+max_runs = 2
+parameters = ["2t", "msl", "tp", "tcc"]
+
+[collections.wms]
+colormap = "temperature"
+
+[[collections.wms.parameters]]
+name = "2t"
+colormap = "temperature"
+
+[[collections.wms.parameters]]
+name = "msl"
+colormap = "viridis"
+min = 950.0
+max = 1050.0
+```
+
+### Supported compression
+
+ECMWF open data uses CCSDS/AEC compression (GRIB2 template 5.42). This requires the `libaec` C library, built automatically via `libaec-sys`.
+
+| Method | Notes |
+|--------|-------|
+| Simple packing (5.0) | Pure Rust, no C deps |
+| Complex packing (5.2, 5.3) | Pure Rust, no C deps |
+| CCSDS/AEC (5.42) | Requires `libaec-sys` (C dep). Used by ECMWF. |
+
+### Known limitations
+
+- Only regular lat/lon grids (Template 3.0). Rotated, Lambert, Gaussian grids not supported.
+- No GRIB1 support (GRIB2 only).
+- No bilinear interpolation for position queries (nearest-neighbor only).
+- Index files (`.index`) are required — no raw GRIB scanning without sidecar files.
+- CCSDS compression requires `libaec` C library.
+- No per-file timeout on remote reads.
+
 ## OGC API Maps
 
 The server implements OGC API Maps for serving raster data as map images via a RESTful JSON API. Only GeoTIFF collections can be exposed via Maps (they implement `MapEngine`). Maps and WMS share the same `MapEngine` trait but have separate HTTP layers and state.
@@ -846,7 +952,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `description` | yes | — | Collection description |
 | `data_path` | yes | — | Path to data file (CSV or GeoJSON) |
 | `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, `"maps"`, `"tiles"`, `"wms"` |
-| `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, or `"geotiff"` |
+| `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, or `"querydata"` |
 | `wms` | no | — | WMS rendering config (see WMS Config Fields). Required when `apis` contains `"wms"`. |
 
 Server-level fields:
@@ -1040,6 +1146,11 @@ API state (`EdrState`, `FeaturesState`, `MapsState`, `TilesState`, `WmsState`) i
 - Tiles: fixed 256x256 tile size (no 512x512 HiDPI support yet)
 - Tiles/WMS/Maps: no request coalescing for concurrent identical renders (duplicate work if same tile requested simultaneously)
 - Tiles: no per-collection max zoom configuration (hardcoded DEFAULT_MAX_ZOOM = 18, absolute MAX = 24)
+- GRIB: only regular lat/lon grids (Template 3.0); rotated, Lambert, Gaussian grids not supported
+- GRIB: GRIB2 only (no GRIB1 support)
+- GRIB: requires index sidecar files — no raw GRIB scanning
+- GRIB: nearest-neighbor interpolation only for position queries (no bilinear)
+- GRIB: CCSDS compression requires libaec C library
 
 ## Code Style
 

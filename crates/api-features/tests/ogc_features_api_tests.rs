@@ -143,6 +143,7 @@ fn build_router() -> axum::Router {
             geotiff: None,
             querydata: None,
             wms: None,
+            grib: None,
         },
     );
 
