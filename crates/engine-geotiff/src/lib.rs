@@ -126,7 +126,7 @@ impl GeoTiffEngine {
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(last) = *last_attempt {
                 if last.elapsed() < STAC_CIRCUIT_BREAKER_COOLDOWN {
-                    return Err(DataServerError::GeoTiff(format!(
+                    return Err(DataServerError::Engine(format!(
                         "STAC API temporarily unavailable, circuit breaker open \
                          ({} consecutive failures, retry in {}s)",
                         failures,
@@ -215,7 +215,7 @@ impl GeoTiffEngine {
         let (pattern_str, timestamp_format) = resolve_filename_config(config)?;
 
         let filename_pattern = Regex::new(&pattern_str).map_err(|e| {
-            DataServerError::GeoTiff(format!("Invalid filename pattern '{}': {e}", pattern_str))
+            DataServerError::Engine(format!("Invalid filename pattern '{}': {e}", pattern_str))
         })?;
 
         // Determine store mode from config
@@ -263,12 +263,12 @@ impl GeoTiffEngine {
             } else {
                 let directory = PathBuf::from(data_path);
                 if !directory.is_dir() {
-                    return Err(DataServerError::GeoTiff(format!(
+                    return Err(DataServerError::Engine(format!(
                         "{data_path} is not a directory"
                     )));
                 }
                 let directory = directory.canonicalize().map_err(|e| {
-                    DataServerError::GeoTiff(format!("Cannot resolve directory {data_path}: {e}"))
+                    DataServerError::Engine(format!("Cannot resolve directory {data_path}: {e}"))
                 })?;
                 (
                     StoreMode::Local {
@@ -279,7 +279,7 @@ impl GeoTiffEngine {
                 )
             }
         } else {
-            return Err(DataServerError::GeoTiff(
+            return Err(DataServerError::Engine(
                 "Either data_path, endpoint+bucket, or stac_url must be configured".into(),
             ));
         };
@@ -514,7 +514,7 @@ impl GeoTiffEngine {
         let stac_client = match &self.store_mode {
             StoreMode::RemoteStac { client } => client,
             _ => {
-                return Err(DataServerError::GeoTiff(
+                return Err(DataServerError::Engine(
                     "load_stac_entry_metadata called on non-STAC engine".into(),
                 ))
             }
@@ -528,7 +528,7 @@ impl GeoTiffEngine {
         };
 
         if actual_size > catalog::MAX_REMOTE_FILE_SIZE as u64 {
-            return Err(DataServerError::GeoTiff(format!(
+            return Err(DataServerError::Engine(format!(
                 "File too large ({} > {} max)",
                 format_bytes(actual_size),
                 format_bytes(catalog::MAX_REMOTE_FILE_SIZE as u64)
@@ -1030,7 +1030,7 @@ impl GeoTiffEngine {
         let first_entry = entries[0].1;
         let first_metadata = first_entry
             .metadata()
-            .ok_or_else(|| DataServerError::GeoTiff("First entry has no metadata loaded".into()))?;
+            .ok_or_else(|| DataServerError::Engine("First entry has no metadata loaded".into()))?;
         let (col_start, row_start, col_end, row_end) = first_metadata
             .geo_transform
             .bbox_to_pixels(west, south, east, north)
@@ -1208,7 +1208,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                 catalog.entries.iter().next_back()
             };
             let (ts, _) = entry.ok_or_else(|| {
-                DataServerError::GeoTiff("No data available for the requested time".into())
+                DataServerError::Engine("No data available for the requested time".into())
             })?;
             *ts
         };
@@ -1220,14 +1220,14 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         let (_timestamp, entry) = catalog
             .entries
             .get_key_value(&target_timestamp)
-            .ok_or_else(|| DataServerError::GeoTiff("Entry disappeared after loading".into()))?;
+            .ok_or_else(|| DataServerError::Engine("Entry disappeared after loading".into()))?;
 
         let metadata = entry
             .metadata()
-            .ok_or_else(|| DataServerError::GeoTiff("Entry metadata not loaded".into()))?;
+            .ok_or_else(|| DataServerError::Engine("Entry metadata not loaded".into()))?;
         let source = entry
             .source()
-            .ok_or_else(|| DataServerError::GeoTiff("Entry source not loaded".into()))?;
+            .ok_or_else(|| DataServerError::Engine("Entry source not loaded".into()))?;
 
         let [west, south, east, north] = bbox;
         let total_pixels = (width as usize) * (height as usize);
@@ -1571,12 +1571,12 @@ fn validate_config(
     // endpoint and bucket must both be set or both absent
     match (&config.endpoint, &config.bucket) {
         (Some(_), None) => {
-            return Err(DataServerError::GeoTiff(format!(
+            return Err(DataServerError::Engine(format!(
                 "[{collection_id}] 'endpoint' is set but 'bucket' is missing — both are required for S3 access"
             )));
         }
         (None, Some(_)) => {
-            return Err(DataServerError::GeoTiff(format!(
+            return Err(DataServerError::Engine(format!(
                 "[{collection_id}] 'bucket' is set but 'endpoint' is missing — both are required for S3 access"
             )));
         }
@@ -1586,24 +1586,24 @@ fn validate_config(
     // stac_url is mutually exclusive with data_path and endpoint+bucket
     if config.stac_url.is_some() {
         if data_path.is_some() {
-            return Err(DataServerError::GeoTiff(format!(
+            return Err(DataServerError::Engine(format!(
                 "[{collection_id}] 'stac_url' and 'data_path' are mutually exclusive"
             )));
         }
         if config.endpoint.is_some() {
-            return Err(DataServerError::GeoTiff(format!(
+            return Err(DataServerError::Engine(format!(
                 "[{collection_id}] 'stac_url' and 'endpoint+bucket' are mutually exclusive"
             )));
         }
         // stac_asset_allowlist is required for SSRF protection
         match &config.stac_asset_allowlist {
             None => {
-                return Err(DataServerError::GeoTiff(format!(
+                return Err(DataServerError::Engine(format!(
                     "[{collection_id}] 'stac_asset_allowlist' is required when 'stac_url' is set (SSRF protection)"
                 )));
             }
             Some(list) if list.is_empty() => {
-                return Err(DataServerError::GeoTiff(format!(
+                return Err(DataServerError::Engine(format!(
                     "[{collection_id}] 'stac_asset_allowlist' must not be empty"
                 )));
             }
@@ -1620,13 +1620,13 @@ fn validate_config(
     }
 
     if config.poll_interval_secs == 0 {
-        return Err(DataServerError::GeoTiff(format!(
+        return Err(DataServerError::Engine(format!(
             "[{collection_id}] poll_interval_secs must be > 0"
         )));
     }
 
     if config.band == 0 {
-        return Err(DataServerError::GeoTiff(format!(
+        return Err(DataServerError::Engine(format!(
             "[{collection_id}] band must be >= 1 (1-based index)"
         )));
     }
@@ -1658,13 +1658,13 @@ fn resolve_filename_config(config: &GeoTiffConfig) -> Result<(String, String), D
         (&config.filename_pattern, &config.timestamp_format)
     {
         if !pattern.contains("(?P<timestamp>") {
-            return Err(DataServerError::GeoTiff(
+            return Err(DataServerError::Engine(
                 "filename_pattern must contain a named capture group (?P<timestamp>...)".into(),
             ));
         }
         Ok((pattern.clone(), format.clone()))
     } else {
-        Err(DataServerError::GeoTiff(
+        Err(DataServerError::Engine(
             "Either filename_template or both filename_pattern + timestamp_format must be set"
                 .into(),
         ))
@@ -1716,7 +1716,7 @@ fn expand_filename_template(template: &str) -> Result<(String, String), DataServ
                 }
             }
             if !matched {
-                return Err(DataServerError::GeoTiff(format!(
+                return Err(DataServerError::Engine(format!(
                     "Unknown strftime code '{}' in filename_template",
                     &template[i..i + 2]
                 )));
@@ -1768,7 +1768,7 @@ fn expand_filename_template(template: &str) -> Result<(String, String), DataServ
     }
 
     if !timestamp_started {
-        return Err(DataServerError::GeoTiff(format!(
+        return Err(DataServerError::Engine(format!(
             "filename_template '{}' contains no strftime codes (%%Y, %%m, etc.)",
             template
         )));

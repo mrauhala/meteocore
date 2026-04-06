@@ -730,7 +730,7 @@ async fn render_map(
                 "nosniff",
             )
             .header(header::HeaderName::from_static("x-cache"), "HIT")
-            .body(axum::body::Body::from(cached.as_ref().clone()))
+            .body(axum::body::Body::from(cached))
             .unwrap()
             .into_response());
     }
@@ -773,16 +773,16 @@ async fn render_map(
 
     let (image_bytes, x_cache) = match render_result {
         Ok(Some(bytes)) => {
-            let image_arc = Arc::new(bytes);
-            rendered_cache.insert(cache_key, image_arc.clone());
-            (image_arc.as_ref().clone(), "MISS")
+            let image_bytes = bytes::Bytes::from(bytes);
+            rendered_cache.insert(cache_key, image_bytes.clone());
+            (image_bytes, "MISS")
         }
         Ok(None) => {
             // Empty tile: return transparent PNG without caching
             let rgba = vec![0u8; (width * height * 4) as usize];
             let png = ds_render::encode_png(&rgba, width, height)
                 .map_err(|e| MapsError::Internal(format!("Failed to encode empty tile: {e}")))?;
-            (png, "EMPTY")
+            (bytes::Bytes::from(png), "EMPTY")
         }
         Err(e) => {
             tracing::warn!("Maps render error for collection '{}': {e}", collection_id);

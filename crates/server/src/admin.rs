@@ -169,6 +169,40 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
             collection.id, collection.engine_type, data_path_display
         );
 
+        // Validate engine+API compatibility
+        let supported_apis: &[&str] = match collection.engine_type.as_str() {
+            "csv" => &["edr", "features"],
+            "geojson" => &["features"],
+            "geotiff" => &["edr", "wms", "maps", "tiles"],
+            "querydata" => &["edr", "wms", "maps", "tiles"],
+            "grib" => &["edr", "wms", "maps", "tiles"],
+            _ => &[],
+        };
+        let mut has_unsupported = false;
+        for api in &collection.apis {
+            if !supported_apis.contains(&api.as_str()) {
+                tracing::error!(
+                    "Collection '{}': engine '{}' does not support '{}' API, skipping collection",
+                    collection.id,
+                    collection.engine_type,
+                    api
+                );
+                has_unsupported = true;
+            }
+        }
+        if has_unsupported {
+            health.push(CollectionHealth {
+                id: collection.id.clone(),
+                engine_type: collection.engine_type.clone(),
+                status: CollectionStatus::Failed,
+                error: Some(format!(
+                    "engine '{}' does not support requested APIs: {:?}",
+                    collection.engine_type, collection.apis
+                )),
+            });
+            continue;
+        }
+
         match collection.engine_type.as_str() {
             "csv" => {
                 let data_path = match collection.data_path.as_deref() {
@@ -285,13 +319,6 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                     );
                     feature_collections.insert(collection.id.clone(), collection.clone());
                 }
-                if collection.apis.contains(&"edr".to_string()) {
-                    info!(
-                        "Warning: GeoJSON engine does not support EDR API, \
-                         skipping EDR wiring for collection '{}'",
-                        collection.id
-                    );
-                }
                 health.push(CollectionHealth {
                     id: collection.id.clone(),
                     engine_type: "geojson".into(),
@@ -356,13 +383,6 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                         engine.clone() as Arc<dyn ds_core::engine::Engine>,
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
-                }
-                if collection.apis.contains(&"features".to_string()) {
-                    info!(
-                        "Warning: GeoTIFF engine does not support Features API, \
-                         skipping Features wiring for collection '{}'",
-                        collection.id
-                    );
                 }
                 if collection.apis.contains(&"wms".to_string()) {
                     map_engines.insert(
@@ -601,14 +621,6 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
                 }
-                if collection.apis.contains(&"features".to_string()) {
-                    info!(
-                        "Warning: GRIB engine does not support Features API, \
-                         skipping Features wiring for collection '{}'",
-                        collection.id
-                    );
-                }
-
                 // Get parameter list for per-parameter-layer styles
                 let raster_params =
                     ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;

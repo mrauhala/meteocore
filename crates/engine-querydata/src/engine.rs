@@ -50,7 +50,7 @@ impl QueryDataEngine {
         poll_interval_secs: u64,
     ) -> Result<Self, DataServerError> {
         let latest = find_latest_sqd(data_dir).ok_or_else(|| {
-            DataServerError::QueryData(format!(
+            DataServerError::Engine(format!(
                 "[{collection_id}] No .sqd files found in {}",
                 data_dir.display()
             ))
@@ -232,7 +232,7 @@ impl Engine for QueryDataEngine {
 
         let time_indices = find_time_range(&data, datetime);
         if time_indices.is_empty() {
-            return Err(DataServerError::QueryData(
+            return Err(DataServerError::Engine(
                 "No data available for the requested time range".into(),
             ));
         }
@@ -316,7 +316,7 @@ impl MapEngine for QueryDataEngine {
         };
 
         let time_idx = find_time_idx(&data, time).ok_or_else(|| {
-            DataServerError::QueryData("No data available for the requested time".into())
+            DataServerError::Engine("No data available for the requested time".into())
         })?;
 
         let [west, south, east, north] = bbox;
@@ -415,7 +415,7 @@ fn find_latest_sqd(dir: &Path) -> Option<PathBuf> {
 
 fn load_file(path: &Path, collection_id: &str) -> Result<QueryData, DataServerError> {
     QueryData::open(path).map_err(|e| {
-        DataServerError::QueryData(format!(
+        DataServerError::Engine(format!(
             "[{collection_id}] Failed to load {}: {e}",
             path.display()
         ))

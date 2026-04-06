@@ -90,6 +90,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "axum",
+ "bytes",
  "chrono",
  "ds-core",
  "ds-render",
@@ -107,6 +108,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "axum",
+ "bytes",
  "chrono",
  "ds-core",
  "ds-render",
@@ -124,6 +126,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "axum",
+ "bytes",
  "chrono",
  "ds-core",
  "ds-render",
@@ -592,6 +595,7 @@ dependencies = [
 name = "ds-render"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
  "ds-core",
  "jpeg-encoder",

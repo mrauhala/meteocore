@@ -34,12 +34,12 @@ pub fn read_message(
 /// Decode a GRIB2 message from raw bytes.
 pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServerError> {
     let grib2 = grib::from_reader(std::io::Cursor::new(bytes)).map_err(|e| {
-        DataServerError::Grib(format!("Failed to parse GRIB2 message for {param}: {e}"))
+        DataServerError::Engine(format!("Failed to parse GRIB2 message for {param}: {e}"))
     })?;
 
     // A single byte-range-fetched message should contain exactly one submessage
     let (_index, submessage) = grib2.iter().next().ok_or_else(|| {
-        DataServerError::Grib(format!("GRIB2 message for {param} contains no submessages"))
+        DataServerError::Engine(format!("GRIB2 message for {param} contains no submessages"))
     })?;
 
     // Extract grid definition
@@ -47,16 +47,17 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
 
     let (ni, nj, lon_first, lat_first, lon_inc, lat_inc) = extract_grid_params(grid_def)
         .ok_or_else(|| {
-            DataServerError::Grib(format!(
+            DataServerError::Engine(format!(
                 "Unsupported grid type in GRIB2 message for {param}"
             ))
         })?;
 
     // Decode values using Grib2SubmessageDecoder
-    let decoder = Grib2SubmessageDecoder::from(submessage)
-        .map_err(|e| DataServerError::Grib(format!("Failed to create decoder for {param}: {e}")))?;
+    let decoder = Grib2SubmessageDecoder::from(submessage).map_err(|e| {
+        DataServerError::Engine(format!("Failed to create decoder for {param}: {e}"))
+    })?;
     let decoded = decoder.dispatch().map_err(|e| {
-        DataServerError::Grib(format!("Failed to decode GRIB2 values for {param}: {e}"))
+        DataServerError::Engine(format!("Failed to decode GRIB2 values for {param}: {e}"))
     })?;
 
     // Convert f32 values to f64, NaN → value (not filtered)
@@ -64,7 +65,7 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
 
     let expected = ni * nj;
     if values.len() != expected {
-        return Err(DataServerError::Grib(format!(
+        return Err(DataServerError::Engine(format!(
             "GRIB2 grid size mismatch for {param}: expected {expected}, got {}",
             values.len()
         )));

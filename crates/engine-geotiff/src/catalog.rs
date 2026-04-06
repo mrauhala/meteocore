@@ -265,7 +265,7 @@ pub fn scan_directory(
     existing: &HashMap<&Path, &FileEntry>,
 ) -> Result<Catalog, DataServerError> {
     let read_dir = std::fs::read_dir(dir).map_err(|e| {
-        DataServerError::GeoTiff(format!("Cannot read directory {}: {e}", dir.display()))
+        DataServerError::Engine(format!("Cannot read directory {}: {e}", dir.display()))
     })?;
 
     let mut entries = BTreeMap::new();

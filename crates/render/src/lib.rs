@@ -10,6 +10,7 @@ pub use encode::{encode_jpeg, encode_png, encode_webp};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use quick_cache::sync::Cache;
 
@@ -90,7 +91,7 @@ pub fn quantize_bbox(bbox: &[f64; 4]) -> [i64; 4] {
 /// No TTL — radar measurements are immutable once produced.
 /// Cache is invalidated on collection reload.
 pub struct RenderedCache {
-    cache: Cache<CacheKey, Arc<Vec<u8>>>,
+    cache: Cache<CacheKey, Bytes>,
 }
 
 impl RenderedCache {
@@ -106,11 +107,11 @@ impl RenderedCache {
         }
     }
 
-    pub fn get(&self, key: &CacheKey) -> Option<Arc<Vec<u8>>> {
+    pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
         self.cache.get(key)
     }
 
-    pub fn insert(&self, key: CacheKey, value: Arc<Vec<u8>>) {
+    pub fn insert(&self, key: CacheKey, value: Bytes) {
         self.cache.insert(key, value);
     }
 }

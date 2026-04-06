@@ -11,8 +11,8 @@ pub enum DataServerError {
     #[error("Invalid datetime format: {0}")]
     InvalidDatetime(String),
 
-    #[error("CSV error: {0}")]
-    Csv(String),
+    #[error("Engine error: {0}")]
+    Engine(String),
 
     #[error("Config error: {0}")]
     Config(String),
@@ -25,18 +25,6 @@ pub enum DataServerError {
 
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
-
-    #[error("GeoJSON error: {0}")]
-    GeoJson(String),
-
-    #[error("GeoTIFF error: {0}")]
-    GeoTiff(String),
-
-    #[error("QueryData error: {0}")]
-    QueryData(String),
-
-    #[error("GRIB error: {0}")]
-    Grib(String),
 
     #[error("Storage error: {0}")]
     Storage(String),

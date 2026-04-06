@@ -5,15 +5,24 @@
 
 use std::sync::Arc;
 
-use quick_cache::sync::Cache;
-
 /// Cache key: identifies a specific GRIB message.
+/// Uses `Arc<str>` instead of `String` to avoid allocation on every lookup.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct GridKey {
     /// URL or path to the GRIB file.
-    url: String,
+    url: Arc<str>,
     /// Byte offset of the message within the file.
     offset: u64,
+}
+
+/// Weight function: count the byte size of each cached grid.
+#[derive(Clone)]
+struct GridWeighter;
+
+impl quick_cache::Weighter<GridKey, Arc<DecodedGrid>> for GridWeighter {
+    fn weight(&self, _key: &GridKey, val: &Arc<DecodedGrid>) -> u64 {
+        val.size_bytes() as u64
+    }
 }
 
 /// A decoded grid with its metadata.
@@ -205,9 +214,9 @@ impl DecodedGrid {
     }
 }
 
-/// LRU cache for decoded grids.
+/// LRU cache for decoded grids, weighted by byte size.
 pub struct GridCache {
-    cache: Cache<GridKey, Arc<DecodedGrid>>,
+    cache: quick_cache::sync::Cache<GridKey, Arc<DecodedGrid>, GridWeighter>,
 }
 
 impl GridCache {
@@ -217,19 +226,19 @@ impl GridCache {
         if size_mb == 0 {
             return None;
         }
+        let max_bytes = size_mb * 1024 * 1024;
         // Estimate: each grid is ~8 MB (1440*721*8 bytes).
-        // With 256 MB, that's ~32 grids.
         let estimated_items = (size_mb as usize * 1024 * 1024) / (8 * 1024 * 1024);
         let items = estimated_items.max(16);
         Some(Self {
-            cache: Cache::new(items),
+            cache: quick_cache::sync::Cache::with_weighter(items, max_bytes, GridWeighter),
         })
     }
 
     /// Get a cached grid, or None if not cached.
     pub fn get(&self, url: &str, offset: u64) -> Option<Arc<DecodedGrid>> {
         let key = GridKey {
-            url: url.to_string(),
+            url: Arc::from(url),
             offset,
         };
         self.cache.get(&key)
@@ -238,11 +247,9 @@ impl GridCache {
     /// Insert a decoded grid into the cache.
     pub fn insert(&self, url: &str, offset: u64, grid: Arc<DecodedGrid>) {
         let key = GridKey {
-            url: url.to_string(),
+            url: Arc::from(url),
             offset,
         };
-        let weight = grid.size_bytes() as u64;
-        let _ = weight; // quick_cache uses item count, not weight
         self.cache.insert(key, grid);
     }
 }
