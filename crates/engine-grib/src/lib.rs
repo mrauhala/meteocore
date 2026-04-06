@@ -40,6 +40,11 @@ pub struct GribEngine {
 }
 
 impl GribEngine {
+    /// Returns the collection ID.
+    pub fn collection_id(&self) -> &str {
+        &self.collection_id
+    }
+
     /// Create a new GRIB engine from config.
     pub fn new(collection_id: &str, config: &GribConfig) -> Result<Self, DataServerError> {
         // Validate config

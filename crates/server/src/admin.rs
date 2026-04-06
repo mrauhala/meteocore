@@ -1139,9 +1139,26 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
         .unwrap_or_else(|e| e.into_inner())
         .clone();
 
-    // Build per-collection metadata from concrete engine types
+    // Build per-collection metadata from concrete engine types.
+    // Uses EDR-style temporal extent format: { interval, values? }
     let mut data_ages: HashMap<String, i64> = HashMap::new();
-    let mut temporal_extents: HashMap<String, (String, String)> = HashMap::new();
+    let mut temporal_info: HashMap<String, serde_json::Value> = HashMap::new();
+
+    // Helper: build temporal extent from any Engine
+    fn build_temporal(engine: &dyn ds_core::engine::Engine) -> Option<serde_json::Value> {
+        let (start, end) = engine.get_temporal_extent()?;
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "interval".to_string(),
+            json!([[start.to_rfc3339(), end.to_rfc3339()]]),
+        );
+        if let Some(times) = engine.get_available_times() {
+            let values: Vec<String> = times.iter().map(|t| t.to_rfc3339()).collect();
+            obj.insert("values".to_string(), json!(values));
+        }
+        Some(json!(obj))
+    }
+
     {
         let engines = state
             .geotiff_engines
@@ -1152,10 +1169,8 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             if let Some(age) = engine.catalog_age() {
                 data_ages.insert(id.clone(), age.num_seconds());
             }
-            if let Some((start, end)) =
-                ds_core::engine::Engine::get_temporal_extent(engine.as_ref())
-            {
-                temporal_extents.insert(id, (start.to_rfc3339(), end.to_rfc3339()));
+            if let Some(temporal) = build_temporal(engine.as_ref()) {
+                temporal_info.insert(id, temporal);
             }
         }
     }
@@ -1169,10 +1184,17 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             if let Some(age) = engine.data_age() {
                 data_ages.insert(id.clone(), age.num_seconds());
             }
-            if let Some((start, end)) =
-                ds_core::engine::Engine::get_temporal_extent(engine.as_ref())
-            {
-                temporal_extents.insert(id, (start.to_rfc3339(), end.to_rfc3339()));
+            if let Some(temporal) = build_temporal(engine.as_ref()) {
+                temporal_info.insert(id, temporal);
+            }
+        }
+    }
+    {
+        let engines = state.grib_engines.read().unwrap_or_else(|e| e.into_inner());
+        for engine in engines.iter() {
+            let id = engine.collection_id().to_string();
+            if let Some(temporal) = build_temporal(engine.as_ref()) {
+                temporal_info.insert(id, temporal);
             }
         }
     }
@@ -1185,9 +1207,8 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             if let Some(age_secs) = data_ages.get(&h.id) {
                 entry["data_age_secs"] = json!(*age_secs);
             }
-            if let Some((start, end)) = temporal_extents.get(&h.id) {
-                entry["temporal_start"] = json!(start);
-                entry["temporal_end"] = json!(end);
+            if let Some(temporal) = temporal_info.get(&h.id) {
+                entry["extent"] = json!({ "temporal": temporal });
             }
             entry
         })
