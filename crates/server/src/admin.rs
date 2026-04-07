@@ -77,6 +77,109 @@ static COLLECTIONS_FAILED: LazyLock<IntGauge> = LazyLock::new(|| {
     gauge
 });
 
+static HTTP_RESPONSE_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "http_response_bytes_total",
+            "Total HTTP response body bytes sent",
+        ),
+        &["method", "path"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static TILE_CACHE_HITS: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "tile_cache_hits_total",
+        "GeoTIFF tile cache hits (cumulative)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static TILE_CACHE_MISSES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "tile_cache_misses_total",
+        "GeoTIFF tile cache misses (cumulative)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static RENDERED_CACHE_HITS: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "rendered_cache_hits_total",
+        "Rendered image cache hits (cumulative)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static RENDERED_CACHE_MISSES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "rendered_cache_misses_total",
+        "Rendered image cache misses (cumulative)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static GRID_CACHE_HITS: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge =
+        IntGauge::new("grid_cache_hits_total", "GRIB grid cache hits (cumulative)").unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static GRID_CACHE_MISSES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "grid_cache_misses_total",
+        "GRIB grid cache misses (cumulative)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static RENDER_SEMAPHORE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "render_semaphore_available",
+        "Available render semaphore permits",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static RENDER_SEMAPHORE_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "render_semaphore_total",
+        "Total render semaphore permits (CPU cores)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static STORAGE_BYTES_READ: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "storage_bytes_read_total",
+            "Total bytes read from storage by engine",
+        ),
+        &["collection", "engine_type"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
 // ---------------------------------------------------------------------------
 // Health types
 // ---------------------------------------------------------------------------
@@ -731,6 +834,9 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
     let render_semaphore = Arc::new(tokio::sync::Semaphore::new(render_concurrency));
     let rendered_cache = Arc::new(ds_render::RenderedCache::new(rendered_cache_mb));
 
+    // Set initial render semaphore total gauge
+    RENDER_SEMAPHORE_TOTAL.set(render_concurrency as i64);
+
     LoadResult {
         edr_state: EdrState {
             engines: edr_engines,
@@ -762,8 +868,8 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
             map_engines: tiles_engines,
             collections: tiles_collections,
             styles: tiles_styles,
-            render_semaphore,
-            rendered_cache,
+            render_semaphore: render_semaphore.clone(),
+            rendered_cache: rendered_cache.clone(),
             base_url: base_url.to_string(),
         },
         health,
@@ -1256,7 +1362,63 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
 }
 
 /// GET /metrics — Prometheus text format.
-pub async fn metrics_handler() -> impl IntoResponse {
+///
+/// Updates gauge-style metrics from engine/cache state before gathering,
+/// so Prometheus always gets a fresh snapshot.
+pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoResponse {
+    // Read from current WMS state (survives reloads via ArcSwap)
+    let wms = state.wms.load();
+    RENDER_SEMAPHORE_AVAILABLE.set(wms.render_semaphore.available_permits() as i64);
+
+    let (r_hits, r_misses) = wms.rendered_cache.stats();
+    RENDERED_CACHE_HITS.set(r_hits as i64);
+    RENDERED_CACHE_MISSES.set(r_misses as i64);
+
+    // Update tile cache gauges (sum across all GeoTIFF engines)
+    if let Ok(engines) = state.geotiff_engines.read() {
+        let (mut total_hits, mut total_misses) = (0u64, 0u64);
+        for engine in engines.iter() {
+            let (h, m) = engine.tile_cache_stats();
+            total_hits += h;
+            total_misses += m;
+
+            // Update per-collection storage bytes
+            let bytes = engine.storage_bytes_read();
+            if bytes > 0 {
+                STORAGE_BYTES_READ
+                    .with_label_values(&[engine.collection_id(), "geotiff"])
+                    .reset();
+                STORAGE_BYTES_READ
+                    .with_label_values(&[engine.collection_id(), "geotiff"])
+                    .inc_by(bytes);
+            }
+        }
+        TILE_CACHE_HITS.set(total_hits as i64);
+        TILE_CACHE_MISSES.set(total_misses as i64);
+    }
+
+    // Update GRIB grid cache and storage bytes
+    if let Ok(engines) = state.grib_engines.read() {
+        let (mut total_hits, mut total_misses) = (0u64, 0u64);
+        for engine in engines.iter() {
+            let (h, m) = engine.grid_cache_stats();
+            total_hits += h;
+            total_misses += m;
+
+            let bytes = engine.storage_bytes_read();
+            if bytes > 0 {
+                STORAGE_BYTES_READ
+                    .with_label_values(&[engine.collection_id(), "grib"])
+                    .reset();
+                STORAGE_BYTES_READ
+                    .with_label_values(&[engine.collection_id(), "grib"])
+                    .inc_by(bytes);
+            }
+        }
+        GRID_CACHE_HITS.set(total_hits as i64);
+        GRID_CACHE_MISSES.set(total_misses as i64);
+    }
+
     let encoder = TextEncoder::new();
     let metric_families = REGISTRY.gather();
     let mut buffer = Vec::new();
@@ -1286,6 +1448,15 @@ pub async fn metrics_middleware(
 
     let duration = start.elapsed().as_secs_f64();
     let status = response.status().as_u16().to_string();
+
+    // Track response body size from content-length header if present
+    if let Some(content_length) = response.headers().get(header::CONTENT_LENGTH) {
+        if let Ok(len) = content_length.to_str().unwrap_or("0").parse::<u64>() {
+            HTTP_RESPONSE_BYTES
+                .with_label_values(&[&method, &path])
+                .inc_by(len);
+        }
+    }
 
     HTTP_REQUESTS_TOTAL
         .with_label_values(&[&method, &path, &status])

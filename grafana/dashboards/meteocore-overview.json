@@ -1,0 +1,559 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "title": "HTTP Traffic",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "title": "Request Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "fillOpacity": 10, "lineWidth": 2 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total[5m]))",
+          "legendFormat": "Total"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{path=~\"/wms.*\"}[5m]))",
+          "legendFormat": "WMS"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{path=~\"/tiles.*\"}[5m]))",
+          "legendFormat": "Tiles"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{path=~\"/maps.*\"}[5m]))",
+          "legendFormat": "Maps"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{path=~\"/edr.*\"}[5m]))",
+          "legendFormat": "EDR"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{path=~\"/features.*\"}[5m]))",
+          "legendFormat": "Features"
+        }
+      ]
+    },
+    {
+      "title": "Error Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "fillOpacity": 10, "lineWidth": 2 },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "5xx" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "4xx" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{status=~\"5..\"}[5m]))",
+          "legendFormat": "5xx"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{status=~\"4..\"}[5m]))",
+          "legendFormat": "4xx"
+        }
+      ]
+    },
+    {
+      "title": "Request Latency (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "fillOpacity": 5, "lineWidth": 2 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "title": "Latency by API (p95)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "fillOpacity": 5, "lineWidth": 2 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{path=~\"/wms.*\"}[5m])) by (le))",
+          "legendFormat": "WMS p95"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{path=~\"/tiles.*\"}[5m])) by (le))",
+          "legendFormat": "Tiles p95"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{path=~\"/maps.*\"}[5m])) by (le))",
+          "legendFormat": "Maps p95"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{path=~\"/edr.*\"}[5m])) by (le))",
+          "legendFormat": "EDR p95"
+        }
+      ]
+    },
+    {
+      "title": "Data Transfer",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
+      "collapsed": false
+    },
+    {
+      "title": "Response Throughput",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": { "fillOpacity": 10, "lineWidth": 2 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(http_response_bytes_total[5m]))",
+          "legendFormat": "Total"
+        },
+        {
+          "expr": "sum(rate(http_response_bytes_total{path=~\"/wms.*\"}[5m]))",
+          "legendFormat": "WMS"
+        },
+        {
+          "expr": "sum(rate(http_response_bytes_total{path=~\"/tiles.*\"}[5m]))",
+          "legendFormat": "Tiles"
+        },
+        {
+          "expr": "sum(rate(http_response_bytes_total{path=~\"/maps.*\"}[5m]))",
+          "legendFormat": "Maps"
+        },
+        {
+          "expr": "sum(rate(http_response_bytes_total{path=~\"/edr.*\"}[5m]))",
+          "legendFormat": "EDR"
+        }
+      ]
+    },
+    {
+      "title": "Storage Bytes Read by Engine",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": { "fillOpacity": 10, "lineWidth": 2 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(storage_bytes_read_total[5m])) by (collection)",
+          "legendFormat": "{{collection}}"
+        }
+      ]
+    },
+    {
+      "title": "Response Bytes Transferred (24h)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 26 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": {
+            "steps": [{ "color": "blue", "value": null }]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(http_response_bytes_total[24h]))",
+          "legendFormat": "Sent"
+        }
+      ]
+    },
+    {
+      "title": "Storage Bytes Read (24h)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 26 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": {
+            "steps": [{ "color": "purple", "value": null }]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(storage_bytes_read_total[24h]))",
+          "legendFormat": "Read"
+        }
+      ]
+    },
+    {
+      "title": "Caches",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 30 },
+      "collapsed": false
+    },
+    {
+      "title": "Tile Cache Hit Rate",
+      "type": "gauge",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 31 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "green", "value": 0.8 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "tile_cache_hits_total / clamp_min(tile_cache_hits_total + tile_cache_misses_total, 1)",
+          "legendFormat": "Hit Rate"
+        }
+      ]
+    },
+    {
+      "title": "Rendered Cache Hit Rate",
+      "type": "gauge",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 31 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "green", "value": 0.8 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "rendered_cache_hits_total / clamp_min(rendered_cache_hits_total + rendered_cache_misses_total, 1)",
+          "legendFormat": "Hit Rate"
+        }
+      ]
+    },
+    {
+      "title": "GRIB Grid Cache Hit Rate",
+      "type": "gauge",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 31 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "green", "value": 0.8 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "grid_cache_hits_total / clamp_min(grid_cache_hits_total + grid_cache_misses_total, 1)",
+          "legendFormat": "Hit Rate"
+        }
+      ]
+    },
+    {
+      "title": "Render Semaphore",
+      "type": "gauge",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 31 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "green", "value": 2 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "render_semaphore_available",
+          "legendFormat": "Available"
+        }
+      ],
+      "options": {
+        "text": { "titleSize": 14 }
+      }
+    },
+    {
+      "title": "Cache Hits vs Misses",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 37 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "fillOpacity": 10, "lineWidth": 2 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*Hits" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*Misses" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "rate(tile_cache_hits_total[5m])",
+          "legendFormat": "Tile Hits"
+        },
+        {
+          "expr": "rate(tile_cache_misses_total[5m])",
+          "legendFormat": "Tile Misses"
+        },
+        {
+          "expr": "rate(rendered_cache_hits_total[5m])",
+          "legendFormat": "Rendered Hits"
+        },
+        {
+          "expr": "rate(rendered_cache_misses_total[5m])",
+          "legendFormat": "Rendered Misses"
+        }
+      ]
+    },
+    {
+      "title": "Render Semaphore Utilization",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 37 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "fillOpacity": 10, "lineWidth": 2 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "In Use" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Total" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "render_semaphore_total - render_semaphore_available",
+          "legendFormat": "In Use"
+        },
+        {
+          "expr": "render_semaphore_total",
+          "legendFormat": "Total"
+        }
+      ]
+    },
+    {
+      "title": "Collections & Endpoints",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 45 },
+      "collapsed": false
+    },
+    {
+      "title": "Collection Health",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 46 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          }
+        }
+      },
+      "targets": [
+        { "expr": "collections_total", "legendFormat": "Total" },
+        { "expr": "collections_healthy", "legendFormat": "Healthy" }
+      ]
+    },
+    {
+      "title": "Degraded",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 6, "y": 46 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        { "expr": "collections_degraded", "legendFormat": "Degraded" }
+      ]
+    },
+    {
+      "title": "Failed",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 3, "x": 9, "y": 46 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        { "expr": "collections_failed", "legendFormat": "Failed" }
+      ]
+    },
+    {
+      "title": "Requests by Status Code",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 46 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "sum(increase(http_requests_total[1h])) by (status)",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "title": "Top Endpoints by Request Count",
+      "type": "bargauge",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 46 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient"
+      },
+      "targets": [
+        {
+          "expr": "topk(10, sum(increase(http_requests_total[1h])) by (path))",
+          "legendFormat": "{{path}}"
+        }
+      ]
+    },
+    {
+      "title": "Request Rate by Endpoint",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "fillOpacity": 10, "lineWidth": 1, "stacking": { "mode": "normal" } }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total[5m])) by (path)",
+          "legendFormat": "{{path}}"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["meteocore"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "Prometheus" }
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "MeteoCore",
+  "uid": "meteocore-overview",
+  "version": 2
+}

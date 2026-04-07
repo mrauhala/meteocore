@@ -3,6 +3,7 @@
 //! Caches decoded f64 arrays keyed by (grib_url, offset) to avoid
 //! repeated byte-range fetches and GRIB decoding.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Cache key: identifies a specific GRIB message.
@@ -217,6 +218,8 @@ impl DecodedGrid {
 /// LRU cache for decoded grids, weighted by byte size.
 pub struct GridCache {
     cache: quick_cache::sync::Cache<GridKey, Arc<DecodedGrid>, GridWeighter>,
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 impl GridCache {
@@ -232,6 +235,8 @@ impl GridCache {
         let items = estimated_items.max(16);
         Some(Self {
             cache: quick_cache::sync::Cache::with_weighter(items, max_bytes, GridWeighter),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         })
     }
 
@@ -241,7 +246,13 @@ impl GridCache {
             url: Arc::from(url),
             offset,
         };
-        self.cache.get(&key)
+        let result = self.cache.get(&key);
+        if result.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     /// Insert a decoded grid into the cache.
@@ -251,5 +262,13 @@ impl GridCache {
             offset,
         };
         self.cache.insert(key, grid);
+    }
+
+    /// Return (hits, misses) counters.
+    pub fn stats(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+        )
     }
 }

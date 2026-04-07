@@ -6,6 +6,7 @@
 mod error;
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -26,20 +27,27 @@ pub use object_store;
 #[derive(Clone)]
 pub struct DataStore {
     inner: Arc<dyn ObjectStore>,
+    bytes_read: Arc<AtomicU64>,
 }
 
 impl DataStore {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { inner: store }
+        Self {
+            inner: store,
+            bytes_read: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     /// Get the entire contents of an object.
     #[allow(clippy::needless_question_mark)]
     pub fn get(&self, path: &ObjectPath) -> Result<Bytes, DataServerError> {
-        self.block_on(async {
+        let result = self.block_on(async {
             let result = self.inner.get(path).await?;
             Ok(result.bytes().await?)
-        })
+        })?;
+        self.bytes_read
+            .fetch_add(result.len() as u64, Ordering::Relaxed);
+        Ok(result)
     }
 
     /// Get a byte range from an object.
@@ -49,7 +57,15 @@ impl DataStore {
         path: &ObjectPath,
         range: Range<usize>,
     ) -> Result<Bytes, DataServerError> {
-        self.block_on(async { Ok(self.inner.get_range(path, range).await?) })
+        let result = self.block_on(async { Ok(self.inner.get_range(path, range).await?) })?;
+        self.bytes_read
+            .fetch_add(result.len() as u64, Ordering::Relaxed);
+        Ok(result)
+    }
+
+    /// Return total bytes read from this store since creation.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read.load(Ordering::Relaxed)
     }
 
     /// List objects under a prefix.
