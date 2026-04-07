@@ -8,6 +8,7 @@ pub use colormap::{
 pub use encode::{encode_jpeg, encode_png, encode_webp};
 
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -102,6 +103,8 @@ impl quick_cache::Weighter<CacheKey, Bytes> for RenderedWeighter {
 /// Cache is invalidated on collection reload.
 pub struct RenderedCache {
     cache: Cache<CacheKey, Bytes, RenderedWeighter>,
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 impl RenderedCache {
@@ -115,15 +118,31 @@ impl RenderedCache {
         };
         Self {
             cache: Cache::with_weighter(estimated_items, max_bytes, RenderedWeighter),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 
     pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
-        self.cache.get(key)
+        let result = self.cache.get(key);
+        if result.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     pub fn insert(&self, key: CacheKey, value: Bytes) {
         self.cache.insert(key, value);
+    }
+
+    /// Return (hits, misses) counters.
+    pub fn stats(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+        )
     }
 }
 

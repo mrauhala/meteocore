@@ -188,6 +188,21 @@ impl GeoTiffEngine {
         &self.collection_id
     }
 
+    /// Return (hits, misses) for the tile cache.
+    pub fn tile_cache_stats(&self) -> (u64, u64) {
+        self.tile_cache.stats()
+    }
+
+    /// Return total bytes read from remote storage (0 for local engines).
+    pub fn storage_bytes_read(&self) -> u64 {
+        match &self.store_mode {
+            StoreMode::Remote { store, .. } | StoreMode::RemoteDynamic { store, .. } => {
+                store.bytes_read()
+            }
+            _ => 0,
+        }
+    }
+
     /// Returns `None` if the catalog has never been updated after initial load.
     pub fn catalog_age(&self) -> Option<chrono::Duration> {
         let updated_at = self

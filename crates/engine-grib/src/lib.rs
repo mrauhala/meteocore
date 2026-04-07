@@ -54,6 +54,19 @@ impl GribEngine {
         &self.collection_id
     }
 
+    /// Return total bytes read from storage.
+    pub fn storage_bytes_read(&self) -> u64 {
+        self.store.bytes_read()
+    }
+
+    /// Return (hits, misses) for the grid cache, or (0, 0) if disabled.
+    pub fn grid_cache_stats(&self) -> (u64, u64) {
+        self.grid_cache
+            .as_ref()
+            .map(|c| c.stats())
+            .unwrap_or((0, 0))
+    }
+
     /// Create a new GRIB engine from config.
     pub fn new(collection_id: &str, config: &GribConfig) -> Result<Self, DataServerError> {
         // Validate config

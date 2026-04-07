@@ -140,7 +140,10 @@ async fn main() {
             "/health",
             get(admin::health_handler).with_state(server_state.clone()),
         )
-        .route("/metrics", get(admin::metrics_handler));
+        .route(
+            "/metrics",
+            get(admin::metrics_handler).with_state(server_state.clone()),
+        );
 
     // Admin routes (protected by bearer token auth, not CORS)
     let admin_routes = Router::new().route(
