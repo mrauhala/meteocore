@@ -18,6 +18,7 @@ api-tiles = { path = "../api-tiles" }
 ds-render = { path = "../render" }
 arc-swap = "1"
 axum = "0.8"
+http-body = "1"
 prometheus = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

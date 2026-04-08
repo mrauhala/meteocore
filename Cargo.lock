@@ -2488,6 +2488,7 @@ dependencies = [
  "engine-geotiff",
  "engine-grib",
  "engine-querydata",
+ "http-body",
  "prometheus",
  "serde",
  "serde_json",
