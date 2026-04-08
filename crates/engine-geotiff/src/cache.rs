@@ -36,6 +36,7 @@ impl quick_cache::Weighter<TileCacheKey, Bytes> for TileWeighter {
 /// Thread-safe tile cache backed by quick_cache (lock-free concurrent LRU).
 pub struct TileCache {
     inner: quick_cache::sync::Cache<TileCacheKey, Bytes, TileWeighter>,
+    capacity_bytes: u64,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -56,6 +57,7 @@ impl TileCache {
                 max_bytes,
                 TileWeighter,
             ),
+            capacity_bytes: max_bytes,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
@@ -95,6 +97,22 @@ impl TileCache {
             self.hits.load(Ordering::Relaxed),
             self.misses.load(Ordering::Relaxed),
         )
+    }
+
+    /// Current weight (bytes used) of the cache.
+    pub fn weight(&self) -> u64 {
+        self.inner.weight()
+    }
+
+    /// Maximum weight (bytes) the cache will hold.
+    pub fn capacity(&self) -> u64 {
+        self.capacity_bytes
+    }
+
+    /// Number of entries currently in the cache.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.inner.len()
     }
 }
 

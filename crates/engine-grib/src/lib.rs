@@ -67,6 +67,15 @@ impl GribEngine {
             .unwrap_or((0, 0))
     }
 
+    /// Return grid cache utilization as (bytes_used, capacity_bytes, entries).
+    /// Zeroes if the cache is disabled.
+    pub fn grid_cache_utilization(&self) -> (u64, u64, usize) {
+        self.grid_cache
+            .as_ref()
+            .map(|c| (c.weight(), c.capacity(), c.len()))
+            .unwrap_or((0, 0, 0))
+    }
+
     /// Create a new GRIB engine from config.
     pub fn new(collection_id: &str, config: &GribConfig) -> Result<Self, DataServerError> {
         // Validate config

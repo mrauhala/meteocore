@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
@@ -8,7 +8,8 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry, TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -90,62 +91,187 @@ static HTTP_RESPONSE_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     counter
 });
 
-static TILE_CACHE_HITS: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "tile_cache_hits_total",
-        "GeoTIFF tile cache hits (cumulative)",
+// Tile cache (per-collection).
+static TILE_CACHE_HITS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new("tile_cache_hits_total", "GeoTIFF tile cache hits"),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static TILE_CACHE_MISSES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new("tile_cache_misses_total", "GeoTIFF tile cache misses"),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static TILE_CACHE_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "tile_cache_bytes",
+            "Bytes currently held in the GeoTIFF tile cache",
+        ),
+        &["collection"],
     )
     .unwrap();
     REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
 });
 
-static TILE_CACHE_MISSES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "tile_cache_misses_total",
-        "GeoTIFF tile cache misses (cumulative)",
+static TILE_CACHE_CAPACITY_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "tile_cache_capacity_bytes",
+            "Configured GeoTIFF tile cache capacity in bytes",
+        ),
+        &["collection"],
     )
     .unwrap();
     REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
 });
 
-static RENDERED_CACHE_HITS: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "rendered_cache_hits_total",
-        "Rendered image cache hits (cumulative)",
+static TILE_CACHE_ENTRIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "tile_cache_entries",
+            "Number of entries currently in the GeoTIFF tile cache",
+        ),
+        &["collection"],
     )
     .unwrap();
     REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
 });
 
-static RENDERED_CACHE_MISSES: LazyLock<IntGauge> = LazyLock::new(|| {
+// Rendered image cache (global — shared across all collections that render).
+static RENDERED_CACHE_HITS: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter =
+        IntCounter::new("rendered_cache_hits_total", "Rendered image cache hits").unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static RENDERED_CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter =
+        IntCounter::new("rendered_cache_misses_total", "Rendered image cache misses").unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static RENDERED_CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
     let gauge = IntGauge::new(
-        "rendered_cache_misses_total",
-        "Rendered image cache misses (cumulative)",
+        "rendered_cache_bytes",
+        "Bytes currently held in the rendered image cache",
     )
     .unwrap();
     REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
 });
 
-static GRID_CACHE_HITS: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge =
-        IntGauge::new("grid_cache_hits_total", "GRIB grid cache hits (cumulative)").unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
-
-static GRID_CACHE_MISSES: LazyLock<IntGauge> = LazyLock::new(|| {
+static RENDERED_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
     let gauge = IntGauge::new(
-        "grid_cache_misses_total",
-        "GRIB grid cache misses (cumulative)",
+        "rendered_cache_capacity_bytes",
+        "Configured rendered image cache capacity in bytes",
     )
     .unwrap();
     REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
 });
+
+static RENDERED_CACHE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "rendered_cache_entries",
+        "Number of entries currently in the rendered image cache",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+// GRIB grid cache (per-collection).
+static GRID_CACHE_HITS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new("grid_cache_hits_total", "GRIB grid cache hits"),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static GRID_CACHE_MISSES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new("grid_cache_misses_total", "GRIB grid cache misses"),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static GRID_CACHE_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "grid_cache_bytes",
+            "Bytes currently held in the GRIB grid cache",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static GRID_CACHE_CAPACITY_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "grid_cache_capacity_bytes",
+            "Configured GRIB grid cache capacity in bytes",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static GRID_CACHE_ENTRIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "grid_cache_entries",
+            "Number of entries currently in the GRIB grid cache",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+/// Tracks the last observed (hits, misses) snapshot per (cache_kind, collection)
+/// so that the metrics handler can convert cumulative cache counters into
+/// monotonically-increasing Prometheus counters via delta tracking.
+///
+/// On collection reload the underlying cache is replaced with a fresh one
+/// (hits/misses reset to 0), which we detect as a decrease and treat as the
+/// new baseline.
+static CACHE_COUNTER_STATE: LazyLock<Mutex<CacheCounterState>> =
+    LazyLock::new(|| Mutex::new(CacheCounterState::default()));
+
+#[derive(Default)]
+struct CacheCounterState {
+    tile: HashMap<String, (u64, u64)>,
+    grid: HashMap<String, (u64, u64)>,
+    rendered: (u64, u64),
+}
 
 static RENDER_SEMAPHORE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
     let gauge = IntGauge::new(
@@ -1370,54 +1496,131 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     let wms = state.wms.load();
     RENDER_SEMAPHORE_AVAILABLE.set(wms.render_semaphore.available_permits() as i64);
 
-    let (r_hits, r_misses) = wms.rendered_cache.stats();
-    RENDERED_CACHE_HITS.set(r_hits as i64);
-    RENDERED_CACHE_MISSES.set(r_misses as i64);
+    // Delta-tracked cache counters: cache implementations expose cumulative
+    // (hits, misses) values but may be replaced on reload. Convert to
+    // monotonic Prometheus counters.
+    let mut counter_state = CACHE_COUNTER_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
-    // Update tile cache gauges (sum across all GeoTIFF engines)
+    // Rendered image cache: global (single cache shared across collections).
+    // Always call inc_by() (even with delta 0) to ensure the LazyLock counter
+    // is registered on the first scrape, so dashboards see the series even
+    // before any rendering has happened.
+    let (r_hits, r_misses) = wms.rendered_cache.stats();
+    let (last_h, last_m) = counter_state.rendered;
+    if r_hits < last_h || r_misses < last_m {
+        // Cache was replaced (reload) — rebaseline without emitting a spike.
+        counter_state.rendered = (r_hits, r_misses);
+        RENDERED_CACHE_HITS.inc_by(0);
+        RENDERED_CACHE_MISSES.inc_by(0);
+    } else {
+        RENDERED_CACHE_HITS.inc_by(r_hits - last_h);
+        RENDERED_CACHE_MISSES.inc_by(r_misses - last_m);
+        counter_state.rendered = (r_hits, r_misses);
+    }
+    RENDERED_CACHE_BYTES.set(wms.rendered_cache.weight() as i64);
+    RENDERED_CACHE_CAPACITY_BYTES.set(wms.rendered_cache.capacity() as i64);
+    RENDERED_CACHE_ENTRIES.set(wms.rendered_cache.len() as i64);
+
+    // Tile cache: per-collection
     if let Ok(engines) = state.geotiff_engines.read() {
-        let (mut total_hits, mut total_misses) = (0u64, 0u64);
         for engine in engines.iter() {
-            let (h, m) = engine.tile_cache_stats();
-            total_hits += h;
-            total_misses += m;
+            let collection = engine.collection_id();
+            let (hits, misses) = engine.tile_cache_stats();
+            let entry = counter_state
+                .tile
+                .entry(collection.to_string())
+                .or_insert((0, 0));
+            if hits < entry.0 || misses < entry.1 {
+                *entry = (hits, misses);
+            } else {
+                let dh = hits - entry.0;
+                let dm = misses - entry.1;
+                if dh > 0 {
+                    TILE_CACHE_HITS.with_label_values(&[collection]).inc_by(dh);
+                }
+                if dm > 0 {
+                    TILE_CACHE_MISSES
+                        .with_label_values(&[collection])
+                        .inc_by(dm);
+                }
+                *entry = (hits, misses);
+            }
+
+            let (bytes_used, capacity_bytes, entries) = engine.tile_cache_utilization();
+            TILE_CACHE_BYTES
+                .with_label_values(&[collection])
+                .set(bytes_used as i64);
+            TILE_CACHE_CAPACITY_BYTES
+                .with_label_values(&[collection])
+                .set(capacity_bytes as i64);
+            TILE_CACHE_ENTRIES
+                .with_label_values(&[collection])
+                .set(entries as i64);
 
             // Update per-collection storage bytes
             let bytes = engine.storage_bytes_read();
             if bytes > 0 {
                 STORAGE_BYTES_READ
-                    .with_label_values(&[engine.collection_id(), "geotiff"])
+                    .with_label_values(&[collection, "geotiff"])
                     .reset();
                 STORAGE_BYTES_READ
-                    .with_label_values(&[engine.collection_id(), "geotiff"])
+                    .with_label_values(&[collection, "geotiff"])
                     .inc_by(bytes);
             }
         }
-        TILE_CACHE_HITS.set(total_hits as i64);
-        TILE_CACHE_MISSES.set(total_misses as i64);
     }
 
-    // Update GRIB grid cache and storage bytes
+    // GRIB grid cache: per-collection
     if let Ok(engines) = state.grib_engines.read() {
-        let (mut total_hits, mut total_misses) = (0u64, 0u64);
         for engine in engines.iter() {
-            let (h, m) = engine.grid_cache_stats();
-            total_hits += h;
-            total_misses += m;
+            let collection = engine.collection_id();
+            let (hits, misses) = engine.grid_cache_stats();
+            let entry = counter_state
+                .grid
+                .entry(collection.to_string())
+                .or_insert((0, 0));
+            if hits < entry.0 || misses < entry.1 {
+                *entry = (hits, misses);
+            } else {
+                let dh = hits - entry.0;
+                let dm = misses - entry.1;
+                if dh > 0 {
+                    GRID_CACHE_HITS.with_label_values(&[collection]).inc_by(dh);
+                }
+                if dm > 0 {
+                    GRID_CACHE_MISSES
+                        .with_label_values(&[collection])
+                        .inc_by(dm);
+                }
+                *entry = (hits, misses);
+            }
+
+            let (bytes_used, capacity_bytes, entries) = engine.grid_cache_utilization();
+            GRID_CACHE_BYTES
+                .with_label_values(&[collection])
+                .set(bytes_used as i64);
+            GRID_CACHE_CAPACITY_BYTES
+                .with_label_values(&[collection])
+                .set(capacity_bytes as i64);
+            GRID_CACHE_ENTRIES
+                .with_label_values(&[collection])
+                .set(entries as i64);
 
             let bytes = engine.storage_bytes_read();
             if bytes > 0 {
                 STORAGE_BYTES_READ
-                    .with_label_values(&[engine.collection_id(), "grib"])
+                    .with_label_values(&[collection, "grib"])
                     .reset();
                 STORAGE_BYTES_READ
-                    .with_label_values(&[engine.collection_id(), "grib"])
+                    .with_label_values(&[collection, "grib"])
                     .inc_by(bytes);
             }
         }
-        GRID_CACHE_HITS.set(total_hits as i64);
-        GRID_CACHE_MISSES.set(total_misses as i64);
     }
+
+    drop(counter_state);
 
     let encoder = TextEncoder::new();
     let metric_families = REGISTRY.gather();

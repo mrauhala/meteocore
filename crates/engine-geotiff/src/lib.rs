@@ -193,6 +193,15 @@ impl GeoTiffEngine {
         self.tile_cache.stats()
     }
 
+    /// Return current tile cache utilization as (bytes_used, capacity_bytes, entries).
+    pub fn tile_cache_utilization(&self) -> (u64, u64, usize) {
+        (
+            self.tile_cache.weight(),
+            self.tile_cache.capacity(),
+            self.tile_cache.len(),
+        )
+    }
+
     /// Return total bytes read from remote storage (0 for local engines).
     pub fn storage_bytes_read(&self) -> u64 {
         match &self.store_mode {

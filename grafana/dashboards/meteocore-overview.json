@@ -263,7 +263,7 @@
       },
       "targets": [
         {
-          "expr": "tile_cache_hits_total / clamp_min(tile_cache_hits_total + tile_cache_misses_total, 1)",
+          "expr": "sum(rate(tile_cache_hits_total[5m])) / clamp_min(sum(rate(tile_cache_hits_total[5m])) + sum(rate(tile_cache_misses_total[5m])), 0.0001)",
           "legendFormat": "Hit Rate"
         }
       ]
@@ -289,7 +289,7 @@
       },
       "targets": [
         {
-          "expr": "rendered_cache_hits_total / clamp_min(rendered_cache_hits_total + rendered_cache_misses_total, 1)",
+          "expr": "rate(rendered_cache_hits_total[5m]) / clamp_min(rate(rendered_cache_hits_total[5m]) + rate(rendered_cache_misses_total[5m]), 0.0001)",
           "legendFormat": "Hit Rate"
         }
       ]
@@ -315,7 +315,7 @@
       },
       "targets": [
         {
-          "expr": "grid_cache_hits_total / clamp_min(grid_cache_hits_total + grid_cache_misses_total, 1)",
+          "expr": "sum(rate(grid_cache_hits_total[5m])) / clamp_min(sum(rate(grid_cache_hits_total[5m])) + sum(rate(grid_cache_misses_total[5m])), 0.0001)",
           "legendFormat": "Hit Rate"
         }
       ]
@@ -371,11 +371,11 @@
       },
       "targets": [
         {
-          "expr": "rate(tile_cache_hits_total[5m])",
+          "expr": "sum(rate(tile_cache_hits_total[5m]))",
           "legendFormat": "Tile Hits"
         },
         {
-          "expr": "rate(tile_cache_misses_total[5m])",
+          "expr": "sum(rate(tile_cache_misses_total[5m]))",
           "legendFormat": "Tile Misses"
         },
         {
@@ -385,6 +385,14 @@
         {
           "expr": "rate(rendered_cache_misses_total[5m])",
           "legendFormat": "Rendered Misses"
+        },
+        {
+          "expr": "sum(rate(grid_cache_hits_total[5m]))",
+          "legendFormat": "Grid Hits"
+        },
+        {
+          "expr": "sum(rate(grid_cache_misses_total[5m]))",
+          "legendFormat": "Grid Misses"
         }
       ]
     },
