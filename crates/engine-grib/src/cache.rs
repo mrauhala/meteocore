@@ -218,6 +218,7 @@ impl DecodedGrid {
 /// LRU cache for decoded grids, weighted by byte size.
 pub struct GridCache {
     cache: quick_cache::sync::Cache<GridKey, Arc<DecodedGrid>, GridWeighter>,
+    capacity_bytes: u64,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -235,6 +236,7 @@ impl GridCache {
         let items = estimated_items.max(16);
         Some(Self {
             cache: quick_cache::sync::Cache::with_weighter(items, max_bytes, GridWeighter),
+            capacity_bytes: max_bytes,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         })
@@ -270,5 +272,25 @@ impl GridCache {
             self.hits.load(Ordering::Relaxed),
             self.misses.load(Ordering::Relaxed),
         )
+    }
+
+    /// Current weight (bytes used) of the cache.
+    pub fn weight(&self) -> u64 {
+        self.cache.weight()
+    }
+
+    /// Maximum weight (bytes) the cache will hold.
+    pub fn capacity(&self) -> u64 {
+        self.capacity_bytes
+    }
+
+    /// Number of entries currently in the cache.
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Whether the cache is currently empty.
+    pub fn is_empty(&self) -> bool {
+        self.cache.len() == 0
     }
 }
