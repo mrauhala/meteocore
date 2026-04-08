@@ -544,6 +544,100 @@
           "legendFormat": "{{path}}"
         }
       ]
+    },
+    {
+      "title": "Logs",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 62 },
+      "collapsed": false
+    },
+    {
+      "title": "Request Rate by Query Type (from logs)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 63 },
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "fillOpacity": 10, "lineWidth": 1 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (api, query_type) (rate({job=\"meteocore\"} | json | __error__=\"\" [5m]))",
+          "legendFormat": "{{api}} / {{query_type}}"
+        }
+      ]
+    },
+    {
+      "title": "Error Rate by Status Class (from logs)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 63 },
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "fillOpacity": 20, "lineWidth": 1, "stacking": { "mode": "normal" } }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "4xx" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "5xx" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "sum by (status_class) (rate({job=\"meteocore\", status_class=~\"4xx|5xx\"} [5m]))",
+          "legendFormat": "{{status_class}}"
+        }
+      ]
+    },
+    {
+      "title": "Recent Requests",
+      "type": "logs",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 71 },
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        {
+          "expr": "{job=\"meteocore\"} | json | line_format \"{{.method}} {{.path}} → {{.status}} ({{.duration_ms}}ms) rid={{.request_id}} {{if .query}}?{{.query}}{{end}}\"",
+          "maxLines": 500
+        }
+      ]
+    },
+    {
+      "title": "Errors (4xx / 5xx)",
+      "type": "logs",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 83 },
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        {
+          "expr": "{job=\"meteocore\", status_class=~\"4xx|5xx\"} | json | line_format \"{{.method}} {{.path}} → {{.status}} rid={{.request_id}} {{if .query}}?{{.query}}{{end}}\"",
+          "maxLines": 200
+        }
+      ]
     }
   ],
   "schemaVersion": 39,
@@ -555,6 +649,12 @@
         "type": "datasource",
         "query": "prometheus",
         "current": { "text": "Prometheus", "value": "Prometheus" }
+      },
+      {
+        "name": "DS_LOKI",
+        "type": "datasource",
+        "query": "loki",
+        "current": { "text": "Loki", "value": "Loki" }
       }
     ]
   },

@@ -1,0 +1,52 @@
+# MeteoCore config used by the docker compose observability stack.
+#
+# This config mirrors the minimal subset of the dev `config.toml` that
+# only depends on test data tracked in git (CSV, GeoJSON, local GeoTIFF),
+# so `docker compose up -d` works out of the box with a clean checkout.
+#
+# The server binds to 0.0.0.0 so the meteocore container is reachable
+# from the other services and from the host via the published port.
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[[collections]]
+id = "weather"
+title = "Finnish Weather Observations"
+description = "Hourly weather observations from Finnish weather stations"
+data_path = "testdata/weather.csv"
+apis = ["edr", "features"]
+
+[[collections]]
+id = "municipalities"
+title = "Finnish Municipalities"
+description = "Municipality boundaries from Statistics Finland (1:1M scale)"
+data_path = "testdata/municipalities.geojson"
+engine_type = "geojson"
+apis = ["features"]
+
+[[collections]]
+id = "regions"
+title = "Finnish Regions"
+description = "Regional boundaries (maakunta) from Statistics Finland (1:1M scale)"
+data_path = "testdata/regions.geojson"
+engine_type = "geojson"
+apis = ["features"]
+
+[[collections]]
+id = "radar"
+title = "Weather Radar Reflectivity"
+description = "Radar composite (local GeoTIFF test fixtures)"
+data_path = "testdata/radar"
+engine_type = "geotiff"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[collections.geotiff]
+filename_template = "radar_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+poll_interval_secs = 30
+
+[collections.wms]
+colormap = "radar_dbz"
