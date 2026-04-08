@@ -154,6 +154,7 @@ async fn main() {
     let app = public
         .merge(admin_routes)
         .layer(middleware::from_fn(admin::metrics_middleware))
+        .layer(middleware::from_fn(admin::request_logging_middleware))
         .layer(CorsLayer::permissive());
 
     // Normalize trailing slashes (e.g., /wms/ → /wms) before routing

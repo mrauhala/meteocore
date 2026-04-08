@@ -1467,3 +1467,164 @@ pub async fn metrics_middleware(
 
     response
 }
+
+/// Derive (api, collection_id, query_type) from a real URI path and the
+/// matched route template.
+///
+/// Examples:
+///   `/edr/collections/weather/position`, `/edr/collections/{id}/position`
+///     -> ("edr", Some("weather"), "position")
+///   `/tiles/collections/radar/tiles/WebMercatorQuad/5/10/20`
+///     -> ("tiles", Some("radar"), "tiles")
+///   `/features/collections/roads/items/42`
+///     -> ("features", Some("roads"), "items")
+///   `/health` -> ("", None, "health")
+///   `/wms`    -> ("wms", None, "")
+fn classify_route<'a>(
+    uri_path: &'a str,
+    matched: Option<&'a str>,
+) -> (&'a str, Option<&'a str>, &'a str) {
+    let segs: Vec<&str> = uri_path.trim_matches('/').split('/').collect();
+    let api = match segs.first().copied() {
+        Some("edr") | Some("features") | Some("wms") | Some("maps") | Some("tiles") => segs[0],
+        _ => "",
+    };
+
+    let collection_id = if segs.get(1) == Some(&"collections") {
+        segs.get(2).copied().filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
+    // Derive the query/operation type from the matched route template,
+    // falling back to the real URI path when no template is available.
+    // For e.g. `/edr/collections/{id}/position` this yields "position".
+    let template = matched.unwrap_or(uri_path);
+    let query_type = template
+        .trim_matches('/')
+        .rsplit('/')
+        .find(|s| !s.is_empty() && !s.starts_with('{'))
+        .unwrap_or("");
+
+    (api, collection_id, query_type)
+}
+
+/// Middleware that emits one structured INFO log line per HTTP request.
+///
+/// Fields: method, path, route (template), api, collection, query_type,
+/// query (raw query string), status, duration_ms, result_size (bytes from
+/// Content-Length header if present).
+pub async fn request_logging_middleware(
+    matched_path: Option<MatchedPath>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let start = Instant::now();
+    let method = req.method().to_string();
+    let uri_path = req.uri().path().to_string();
+    let query = req.uri().query().map(|q| q.to_string());
+    let matched = matched_path.as_ref().map(|p| p.as_str().to_string());
+
+    let response = next.run(req).await;
+
+    let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let status = response.status().as_u16();
+    let result_size = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    let (api, collection_id, query_type) = classify_route(&uri_path, matched.as_deref());
+
+    tracing::info!(
+        method = %method,
+        path = %uri_path,
+        route = matched.as_deref().unwrap_or(""),
+        api = api,
+        collection = collection_id.unwrap_or(""),
+        query_type = query_type,
+        query = query.as_deref().unwrap_or(""),
+        status = status,
+        duration_ms = format!("{duration_ms:.3}"),
+        result_size = result_size,
+        "request"
+    );
+
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_route;
+
+    #[test]
+    fn classifies_edr_position_query() {
+        let (api, coll, qt) = classify_route(
+            "/edr/collections/weather/position",
+            Some("/edr/collections/{id}/position"),
+        );
+        assert_eq!(api, "edr");
+        assert_eq!(coll, Some("weather"));
+        assert_eq!(qt, "position");
+    }
+
+    #[test]
+    fn classifies_features_item() {
+        let (api, coll, qt) = classify_route(
+            "/features/collections/roads/items/42",
+            Some("/features/collections/{id}/items/{feature_id}"),
+        );
+        assert_eq!(api, "features");
+        assert_eq!(coll, Some("roads"));
+        assert_eq!(qt, "items");
+    }
+
+    #[test]
+    fn classifies_tiles_get_tile() {
+        let (api, coll, qt) = classify_route(
+            "/tiles/collections/radar/tiles/WebMercatorQuad/5/10/20",
+            Some(
+                "/tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",
+            ),
+        );
+        assert_eq!(api, "tiles");
+        assert_eq!(coll, Some("radar"));
+        assert_eq!(qt, "tiles");
+    }
+
+    #[test]
+    fn classifies_maps_get_map() {
+        let (api, coll, qt) = classify_route(
+            "/maps/collections/radar/map",
+            Some("/maps/collections/{id}/map"),
+        );
+        assert_eq!(api, "maps");
+        assert_eq!(coll, Some("radar"));
+        assert_eq!(qt, "map");
+    }
+
+    #[test]
+    fn classifies_wms_root() {
+        let (api, coll, qt) = classify_route("/wms", Some("/wms"));
+        assert_eq!(api, "wms");
+        assert_eq!(coll, None);
+        assert_eq!(qt, "wms");
+    }
+
+    #[test]
+    fn classifies_health() {
+        let (api, coll, qt) = classify_route("/health", Some("/health"));
+        assert_eq!(api, "");
+        assert_eq!(coll, None);
+        assert_eq!(qt, "health");
+    }
+
+    #[test]
+    fn classifies_unmatched_fallback() {
+        let (api, coll, qt) = classify_route("/edr/collections/weather/position", None);
+        assert_eq!(api, "edr");
+        assert_eq!(coll, Some("weather"));
+        assert_eq!(qt, "position");
+    }
+}
