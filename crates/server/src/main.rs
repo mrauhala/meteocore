@@ -14,12 +14,37 @@ use tower::Layer;
 use tower_http::cors::CorsLayer;
 use tower_http::normalize_path::NormalizePathLayer;
 use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 use admin::{AdminState, ServerState};
 
+/// Initialize tracing based on the `LOG_FORMAT` env var.
+///
+/// * `LOG_FORMAT=json` — newline-delimited JSON, one object per event.
+///   Use this in production so Alloy / Promtail / Loki can parse fields
+///   without regex stages.
+/// * anything else (or unset) — human-readable ANSI output for dev.
+///
+/// Filter is controlled by `RUST_LOG` (defaults to `info`).
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let format = std::env::var("LOG_FORMAT").unwrap_or_default();
+    if format.eq_ignore_ascii_case("json") {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .with_span_list(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    init_tracing();
 
     let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
     let config = match ds_core::config::ServerConfig::from_file(&config_path) {
@@ -155,6 +180,7 @@ async fn main() {
         .merge(admin_routes)
         .layer(middleware::from_fn(admin::metrics_middleware))
         .layer(middleware::from_fn(admin::request_logging_middleware))
+        .layer(middleware::from_fn(admin::correlation_id_middleware))
         .layer(CorsLayer::permissive());
 
     // Normalize trailing slashes (e.g., /wms/ → /wms) before routing

@@ -1509,11 +1509,67 @@ fn classify_route<'a>(
     (api, collection_id, query_type)
 }
 
+/// Request ID attached to an incoming request via extensions so that
+/// downstream middleware and handlers can correlate logs with the wire
+/// `X-Request-ID` header.
+#[derive(Clone, Debug)]
+pub struct RequestId(pub String);
+
+/// Maximum length of an incoming `X-Request-ID` header we will trust.
+/// Anything longer is replaced with a fresh UUID to bound log-line size.
+const MAX_REQUEST_ID_LEN: usize = 128;
+
+/// Returns true if the string is a plausible request ID — only printable
+/// ASCII, no control characters, bounded length. This keeps malicious
+/// clients from injecting newlines or other log-forgery payloads through
+/// the `X-Request-ID` header.
+fn is_safe_request_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_REQUEST_ID_LEN
+        && s.chars()
+            .all(|c| c.is_ascii_graphic() || c == ' ' || c == '-' || c == '_')
+}
+
+/// Middleware that assigns a correlation ID to every request.
+///
+/// - Reads `X-Request-ID` from the incoming headers if present and safe;
+///   otherwise generates a fresh UUIDv4.
+/// - Stores the ID in request extensions as [`RequestId`] so downstream
+///   middleware and handlers can attach it to logs.
+/// - Wraps the downstream future in a tracing span carrying the ID, so
+///   any log events emitted from inside the request inherit it.
+/// - Echoes the final ID back to the client as `X-Request-ID`.
+pub async fn correlation_id_middleware(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use tracing::Instrument;
+
+    let request_id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| is_safe_request_id(s))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    req.extensions_mut().insert(RequestId(request_id.clone()));
+
+    let span = tracing::info_span!("http_request", request_id = %request_id);
+    let mut response = next.run(req).instrument(span).await;
+
+    if let Ok(header_value) = request_id.parse() {
+        response.headers_mut().insert("x-request-id", header_value);
+    }
+
+    response
+}
+
 /// Middleware that emits one structured INFO log line per HTTP request.
 ///
-/// Fields: method, path, route (template), api, collection, query_type,
-/// query (raw query string), status, duration_ms, result_size (bytes from
-/// Content-Length header if present).
+/// Fields: request_id, method, path, route (template), api, collection,
+/// query_type, query (raw query string), status, duration_ms, result_size
+/// (bytes from Content-Length header if present).
 pub async fn request_logging_middleware(
     matched_path: Option<MatchedPath>,
     req: axum::extract::Request,
@@ -1524,6 +1580,11 @@ pub async fn request_logging_middleware(
     let uri_path = req.uri().path().to_string();
     let query = req.uri().query().map(|q| q.to_string());
     let matched = matched_path.as_ref().map(|p| p.as_str().to_string());
+    let request_id = req
+        .extensions()
+        .get::<RequestId>()
+        .map(|id| id.0.clone())
+        .unwrap_or_default();
 
     let response = next.run(req).await;
 
@@ -1538,6 +1599,7 @@ pub async fn request_logging_middleware(
     let (api, collection_id, query_type) = classify_route(&uri_path, matched.as_deref());
 
     tracing::info!(
+        request_id = %request_id,
         method = %method,
         path = %uri_path,
         route = matched.as_deref().unwrap_or(""),
@@ -1556,7 +1618,38 @@ pub async fn request_logging_middleware(
 
 #[cfg(test)]
 mod tests {
-    use super::classify_route;
+    use super::{classify_route, is_safe_request_id};
+
+    #[test]
+    fn accepts_typical_uuid() {
+        assert!(is_safe_request_id("550e8400-e29b-41d4-a716-446655440000"));
+    }
+
+    #[test]
+    fn accepts_alphanumeric_with_underscores() {
+        assert!(is_safe_request_id("trace_12345"));
+        assert!(is_safe_request_id("req-abc-xyz"));
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(!is_safe_request_id(""));
+    }
+
+    #[test]
+    fn rejects_newlines_and_control_chars() {
+        // Prevents log forgery via CRLF injection.
+        assert!(!is_safe_request_id("abc\ndef"));
+        assert!(!is_safe_request_id("abc\rdef"));
+        assert!(!is_safe_request_id("abc\tdef"));
+        assert!(!is_safe_request_id("abc\x00def"));
+    }
+
+    #[test]
+    fn rejects_oversized_ids() {
+        let huge = "a".repeat(256);
+        assert!(!is_safe_request_id(&huge));
+    }
 
     #[test]
     fn classifies_edr_position_query() {
