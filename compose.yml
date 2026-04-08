@@ -1,17 +1,25 @@
 name: meteocore
 
-# Full observability stack for local development and smoke testing:
+# Full observability stack for local development and smoke testing.
 #
-#   meteocore    — the server itself, configured to emit JSON logs
-#   prometheus   — scrapes /metrics every 15s
-#   loki         — stores structured log events
-#   alloy        — ships container stdout to Loki with labels
-#   grafana      — dashboards (anonymous admin for zero-friction local use)
+# All sidecar services use Docker Hardened Images (DHI) Community tier:
+# small, distroless, non-root, no shell, CVE-scanned. Free tier, non-FIPS.
 #
-# Usage:
+#   meteocore    — the server itself, built from the repo Dockerfile
+#   prometheus   — dhi.io/prometheus — scrapes /metrics every 15s
+#   loki         — dhi.io/loki       — stores structured log events
+#   alloy        — dhi.io/alloy      — ships container stdout to Loki
+#   grafana      — dhi.io/grafana    — dashboards (anonymous admin)
+#
+# First-time setup (DHI images require authentication to pull):
+#
+#   docker login dhi.io
+#
+# Then bring the stack up:
+#
 #   docker compose up -d
-#   open http://localhost:3000        # Grafana — MeteoCore dashboard
-#   open http://localhost:8000/health # server health
+#   open http://localhost:3000         # Grafana — MeteoCore dashboard
+#   open http://localhost:8000/health  # server health
 #
 # Tear down (including volumes):
 #   docker compose down -v
@@ -38,16 +46,19 @@ services:
       logging.job: meteocore
 
   prometheus:
-    image: prom/prometheus:v2.55.1
+    image: dhi.io/prometheus:3.11
     container_name: meteocore-prometheus
+    # DHI images have no shell entrypoint wrapper, so all flags must be
+    # passed explicitly. Note the data path: DHI uses /var/prometheus,
+    # NOT /prometheus like the upstream prom/prometheus image.
     command:
       - --config.file=/etc/prometheus/prometheus.yml
-      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.path=/var/prometheus
       - --storage.tsdb.retention.time=7d
       - --web.enable-lifecycle
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus-data:/prometheus
+      - prometheus-data:/var/prometheus
     ports:
       - "9090:9090"
     restart: unless-stopped
@@ -55,7 +66,7 @@ services:
       - meteocore
 
   loki:
-    image: grafana/loki:3.2.0
+    image: dhi.io/loki:3.6
     container_name: meteocore-loki
     command: -config.file=/etc/loki/config.yml
     volumes:
@@ -66,16 +77,27 @@ services:
     restart: unless-stopped
 
   alloy:
-    image: grafana/alloy:v1.4.2
+    image: dhi.io/alloy:1.15
     container_name: meteocore-alloy
+    # Alloy needs to read the Docker socket to discover containers and
+    # /var/lib/docker/containers/*/*.log to tail their stdout. On most
+    # Linux hosts the socket is root:docker 0660 and the log directory
+    # is root-only — DHI's non-root default user can't read either.
+    # Running this one service as root is the pragmatic tradeoff for
+    # keeping the Docker-socket log discovery pipeline simple. The other
+    # four services (meteocore, prometheus, loki, grafana) still run as
+    # non-root.
+    user: "0:0"
     command:
       - run
+      - --storage.path=/var/lib/alloy/data
       - --server.http.listen-addr=0.0.0.0:12345
       - /etc/alloy/config.alloy
     volumes:
       - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - alloy-data:/var/lib/alloy/data
     ports:
       - "12345:12345"
     restart: unless-stopped
@@ -83,14 +105,18 @@ services:
       - loki
 
   grafana:
-    image: grafana/grafana:11.3.0
+    image: dhi.io/grafana:12.3
     container_name: meteocore-grafana
     environment:
-      # Anonymous admin keeps local dev frictionless. Do NOT use this in prod.
+      # Anonymous admin keeps local dev frictionless. Do NOT use this in
+      # production. These GF_AUTH_* / GF_FEATURE_* env vars work on DHI
+      # because they're consumed by Grafana itself. The GF_PATHS_*,
+      # GF_INSTALL_PLUGINS, GF_*__FILE and GF_AWS_PROFILES families are
+      # NOT supported on DHI (no shell entrypoint) — see the DHI Grafana
+      # guide for workarounds if you need them.
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
-      GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
@@ -106,3 +132,4 @@ volumes:
   prometheus-data:
   loki-data:
   grafana-data:
+  alloy-data:
