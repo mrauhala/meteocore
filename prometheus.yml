@@ -1,0 +1,6 @@
+scrape_configs:
+  - job_name: meteocore
+    scrape_interval: 15s
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['meteocore:8000']

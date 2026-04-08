@@ -1,0 +1,108 @@
+name: meteocore
+
+# Full observability stack for local development and smoke testing:
+#
+#   meteocore    — the server itself, configured to emit JSON logs
+#   prometheus   — scrapes /metrics every 15s
+#   loki         — stores structured log events
+#   alloy        — ships container stdout to Loki with labels
+#   grafana      — dashboards (anonymous admin for zero-friction local use)
+#
+# Usage:
+#   docker compose up -d
+#   open http://localhost:3000        # Grafana — MeteoCore dashboard
+#   open http://localhost:8000/health # server health
+#
+# Tear down (including volumes):
+#   docker compose down -v
+
+services:
+  meteocore:
+    build: .
+    container_name: meteocore
+    environment:
+      LOG_FORMAT: json
+      RUST_LOG: info
+    ports:
+      - "8000:8000"
+    volumes:
+      # Docker-specific config: binds to 0.0.0.0, only references tracked
+      # test data so a fresh checkout works without copying anything else.
+      - ./docker/config.toml:/data/config.toml:ro
+      - ./testdata:/data/testdata:ro
+    restart: unless-stopped
+    # Alloy discovers this container via the Docker socket. The labels below
+    # are not strictly required (Alloy filters by container name) but make
+    # the Docker UI a bit friendlier.
+    labels:
+      logging.job: meteocore
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: meteocore-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    depends_on:
+      - meteocore
+
+  loki:
+    image: grafana/loki:3.2.0
+    container_name: meteocore-loki
+    command: -config.file=/etc/loki/config.yml
+    volumes:
+      - ./loki/config.yml:/etc/loki/config.yml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    restart: unless-stopped
+
+  alloy:
+    image: grafana/alloy:v1.4.2
+    container_name: meteocore-alloy
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    ports:
+      - "12345:12345"
+    restart: unless-stopped
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: meteocore-grafana
+    environment:
+      # Anonymous admin keeps local dev frictionless. Do NOT use this in prod.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+      - loki
+
+volumes:
+  prometheus-data:
+  loki-data:
+  grafana-data:

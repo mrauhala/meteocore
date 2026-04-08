@@ -1,0 +1,88 @@
+// Grafana Alloy configuration for shipping meteocore container logs to Loki.
+//
+// 1. Discovers running containers via the Docker socket.
+// 2. Filters to only the "meteocore" container (not Loki / Grafana / itself).
+// 3. Parses the JSON log line emitted by `LOG_FORMAT=json`.
+// 4. Promotes a small, bounded set of fields as Loki labels.
+// 5. Pushes to the local Loki instance.
+//
+// Labels are deliberately kept low-cardinality: `level`, `api`, `query_type`,
+// and a derived `status_class` (2xx / 4xx / 5xx). High-cardinality fields
+// like `collection`, `path`, `request_id`, and the raw `query` string stay
+// in the log line body — queryable via `| json` in LogQL without blowing up
+// Loki's index.
+
+discovery.docker "containers" {
+    host             = "unix:///var/run/docker.sock"
+    refresh_interval = "10s"
+}
+
+discovery.relabel "meteocore" {
+    targets = discovery.docker.containers.targets
+
+    // Keep only the meteocore container.
+    rule {
+        source_labels = ["__meta_docker_container_name"]
+        regex         = "/?meteocore"
+        action        = "keep"
+    }
+
+    // Expose the container name as a `container` label.
+    rule {
+        source_labels = ["__meta_docker_container_name"]
+        regex         = "/?(.*)"
+        target_label  = "container"
+    }
+
+    // Static job label so dashboards can pin to it.
+    rule {
+        target_label = "job"
+        replacement  = "meteocore"
+    }
+}
+
+loki.source.docker "meteocore" {
+    host             = "unix:///var/run/docker.sock"
+    targets          = discovery.relabel.meteocore.output
+    forward_to       = [loki.process.meteocore.receiver]
+    refresh_interval = "5s"
+}
+
+loki.process "meteocore" {
+    forward_to = [loki.write.default.receiver]
+
+    // Parse the JSON event emitted by the server. Fields we pull out here
+    // become available to later stages as template variables — they are
+    // NOT automatically indexed as labels until stage.labels promotes them.
+    stage.json {
+        expressions = {
+            level      = "level",
+            api        = "api",
+            query_type = "query_type",
+            status     = "status",
+        }
+    }
+
+    // Derive status_class (2xx / 4xx / 5xx / unknown) to keep the status
+    // label bounded to a handful of values rather than one per HTTP code.
+    stage.template {
+        source   = "status_class"
+        template = "{{ if .status }}{{ slice .status 0 1 }}xx{{ else }}unknown{{ end }}"
+    }
+
+    // Promote the parsed fields to indexed labels.
+    stage.labels {
+        values = {
+            level        = "",
+            api          = "",
+            query_type   = "",
+            status_class = "",
+        }
+    }
+}
+
+loki.write "default" {
+    endpoint {
+        url = "http://loki:3100/loki/api/v1/push"
+    }
+}
