@@ -1652,13 +1652,20 @@ pub async fn metrics_middleware(
     let duration = start.elapsed().as_secs_f64();
     let status = response.status().as_u16().to_string();
 
-    // Track response body size from content-length header if present
-    if let Some(content_length) = response.headers().get(header::CONTENT_LENGTH) {
-        if let Ok(len) = content_length.to_str().unwrap_or("0").parse::<u64>() {
-            HTTP_RESPONSE_BYTES
-                .with_label_values(&[&method, &path])
-                .inc_by(len);
-        }
+    // Track response body size. Axum handlers like `Json`, `Bytes`, and
+    // image responses return buffered bodies whose exact length is known
+    // at response-construction time and exposed via `Body::size_hint()`.
+    // The `Content-Length` HTTP header is NOT set on the response object
+    // at this point — hyper adds it later when serializing to the wire —
+    // so reading it here always returns `None`. `size_hint().exact()`
+    // works directly on the in-memory body and covers every buffered
+    // response (99% of the traffic this server serves). Streaming bodies
+    // return `None` from size_hint and are silently skipped, which is
+    // acceptable — no handler in this codebase streams.
+    if let Some(len) = http_body::Body::size_hint(response.body()).exact() {
+        HTTP_RESPONSE_BYTES
+            .with_label_values(&[&method, &path])
+            .inc_by(len);
     }
 
     HTTP_REQUESTS_TOTAL
