@@ -797,16 +797,127 @@ Returns HTTP 503 only when all collections have failed.
 
 ### Prometheus Metrics
 
-`GET /metrics` returns Prometheus text format:
+`GET /metrics` returns Prometheus text format. Path labels are the matched route template (e.g. `/edr/collections/{id}/position`), not the raw URL, so cardinality stays bounded.
+
+**HTTP:**
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `http_requests_total` | counter | method, path, status | Total HTTP requests |
-| `http_request_duration_seconds` | histogram | method, path | Request latency |
+| `http_request_duration_seconds` | histogram | method, path | Request latency histogram |
+| `http_response_bytes_total` | counter | method, path | Response body bytes sent |
+
+**Collections & health:**
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
 | `collections_total` | gauge | — | Total configured collections |
 | `collections_healthy` | gauge | — | Collections in ready state |
 | `collections_degraded` | gauge | — | Collections in degraded state |
 | `collections_failed` | gauge | — | Collections in failed state |
+
+**GeoTIFF tile cache** (per-collection, compressed byte cache for remote COGs):
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `tile_cache_hits_total` | counter | collection | Tile cache hits |
+| `tile_cache_misses_total` | counter | collection | Tile cache misses |
+| `tile_cache_bytes` | gauge | collection | Bytes currently held |
+| `tile_cache_capacity_bytes` | gauge | collection | Configured capacity |
+| `tile_cache_entries` | gauge | collection | Number of cached entries |
+
+**Rendered image cache** (global, shared across WMS/Maps/Tiles):
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `rendered_cache_hits_total` | counter | — | Rendered image cache hits |
+| `rendered_cache_misses_total` | counter | — | Rendered image cache misses |
+| `rendered_cache_bytes` | gauge | — | Bytes currently held |
+| `rendered_cache_capacity_bytes` | gauge | — | Configured capacity |
+| `rendered_cache_entries` | gauge | — | Number of cached entries |
+
+**GRIB grid cache** (per-collection, decoded grid cache):
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `grid_cache_hits_total` | counter | collection | Grid cache hits |
+| `grid_cache_misses_total` | counter | collection | Grid cache misses |
+| `grid_cache_bytes` | gauge | collection | Bytes currently held |
+| `grid_cache_capacity_bytes` | gauge | collection | Configured capacity |
+| `grid_cache_entries` | gauge | collection | Number of cached entries |
+
+**Render & storage:**
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `render_semaphore_available` | gauge | — | Available render permits |
+| `render_semaphore_total` | gauge | — | Total render permits (CPU cores) |
+| `storage_bytes_read_total` | counter | collection, engine_type | Bytes read from remote storage |
+
+#### Computing cache hit rates
+
+All cache hit/miss metrics are true counters, so you can use PromQL `rate()` directly:
+
+```promql
+sum(rate(tile_cache_hits_total[5m]))
+  / clamp_min(sum(rate(tile_cache_hits_total[5m])) + sum(rate(tile_cache_misses_total[5m])), 0.0001)
+```
+
+Replace `tile_` with `rendered_` or `grid_` for the other two caches. Drop the outer `sum(...)` and add a `by (collection)` clause to get per-collection hit rates for tuning.
+
+### Structured Logging
+
+The server emits one structured log line per HTTP request with the fields needed to diagnose slow queries and correlate them with client-side errors: `request_id`, `method`, `path`, `route`, `api`, `collection`, `query_type`, `query`, `status`, `duration_ms`, `result_size`.
+
+Two log formats are supported, selected via the `LOG_FORMAT` environment variable:
+
+| `LOG_FORMAT` | Output | When to use |
+|--------------|--------|-------------|
+| _unset_ or `pretty` | Human-readable ANSI | Local development |
+| `json` | Newline-delimited JSON, one object per event | Production — directly ingestable by Loki / Alloy / Promtail without regex parse stages |
+
+Log level is controlled via the standard `RUST_LOG` env var (default `info`), e.g. `RUST_LOG=server=debug,engine_geotiff=warn`.
+
+#### Correlation IDs
+
+Every request is assigned a correlation ID:
+
+- If the client sends an `X-Request-ID` header with a safe value (printable ASCII, ≤128 chars, no CRLF), it is reused.
+- Otherwise the server generates a fresh UUIDv4.
+- The ID is echoed back in the response `X-Request-ID` header so the client can log it.
+- The ID appears as `request_id` on every log event emitted during the request and inside a dedicated `http_request` tracing span.
+
+This lets you jump from a failed client request, to the exact server log line, to every downstream log written while that request was being handled.
+
+### Observability Stack
+
+The repo ships a batteries-included observability stack for local development and smoke testing at `compose.yml`. It uses **Docker Hardened Images** (free Community tier, non-FIPS) for every sidecar so the stack matches a realistic production profile: distroless, non-root, shell-less, CVE-scanned.
+
+Services:
+
+| Service | Image | Port | Purpose |
+|---------|-------|------|---------|
+| `meteocore` | built from `./Dockerfile` | 8000 | The server, `LOG_FORMAT=json` |
+| `prometheus` | `dhi.io/prometheus:3.11` | 9090 | Scrapes `/metrics` every 15s |
+| `loki` | `dhi.io/loki:3.6` | 3100 | Stores structured log events |
+| `alloy` | `dhi.io/alloy:1.15` | 12345 | Tails meteocore stdout, parses JSON, pushes to Loki |
+| `grafana` | `dhi.io/grafana:12.3` | 3000 | Auto-provisioned dashboard + both datasources |
+
+First-time setup (DHI Community images require authentication):
+
+```bash
+docker login dhi.io           # free Docker account
+docker compose up -d
+open http://localhost:3000    # Grafana (anonymous admin for local dev)
+```
+
+Tear down including volumes: `docker compose down -v`.
+
+Alloy promotes a bounded set of labels to Loki: `level`, `api`, `query_type`, `status_class` (`2xx` / `4xx` / `5xx`). High-cardinality fields like `collection`, `path`, `request_id`, and the raw query string stay in the log body and are queryable via `| json` in LogQL — this keeps Loki's index bounded as the number of collections grows.
+
+The bundled Grafana dashboard at `grafana/dashboards/meteocore-overview.json` has a **Logs** row with four Loki-backed panels: request rate by `(api, query_type)`, error rate by `status_class`, live request stream, and a dedicated 4xx/5xx stream. All panels work with the Prometheus and Loki datasources that are auto-provisioned from `grafana/provisioning/`.
+
+> Production note: the compose stack is intended for local dev. It uses anonymous admin Grafana, filesystem-backed Loki, no retention beyond 7 days, and runs Alloy as root so it can tail the Docker socket. Do not deploy it as-is.
 
 ## Testing
 
