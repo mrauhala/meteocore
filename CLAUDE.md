@@ -143,9 +143,14 @@ Currently implemented: `PointSeries`, `Grid`.
 
 ## GRIB Engine Notes
 
-- Discovers data via JSON index sidecar files (`.index`), fetches messages via byte-range reads.
-- Only regular lat/lon grids (Template 3.0). Multi-parameter collections (unlike GeoTIFF).
-- Auto-converts K→°C, Pa→hPa, m→mm, 0-1→%, m²/s²→gpm. Colormap ranges use display units.
+- Discovers data via index sidecar files on S3/HTTP, fetches messages via byte-range reads.
+- Supports two index formats via `index_format` config: `"ecmwf-json"` (default, JSON-lines as shipped by ECMWF open data) and `"wgrib2"` (colon-separated text as shipped by NOAA GFS).
+- Only regular lat/lon grids (Template 0). Multi-parameter collections (unlike GeoTIFF).
+- **Unit conversion is driven by the WMO `(discipline, category, parameter_number)` triple read out of every decoded message**, not by hardcoded short-name tables. Source units come from WMO Code Table 4.2 (see `crates/engine-grib/src/units.rs`) plus per-center overlays for local parameter numbers 192-254. Display conversions are mechanical: K→°C, Pa→hPa, kg m⁻²→mm, m² s⁻²→gpm, proportion→%. Colormap ranges use display units.
+- **Per-provider vocabularies are not needed.** Adding a new provider only requires new local-overlay entries if it uses local parameter numbers (192-254). The ECMWF-`tcc`-vs-GFS-`TCDC` cloud-cover asymmetry and the `z`-vs-`HGT` geopotential asymmetry are both handled by construction because they use different WMO triples.
+- Parameter metadata is populated lazily: `scan_once` runs a bounded eager-probe pass (≤32 messages per scan) against the newest run's first step file so `/collections` metadata is populated by the first poll cycle.
+- Wgrib2 index files carry only byte offsets — the last record's length is resolved via `DataStore::head()` on the corresponding data file. If HEAD fails or the file size suggests a partial upload, the index is skipped and retried on the next poll.
+- **v1 limitations for GFS support:** only regular lat/lon grids (gaussian-grid products like `gdas.*` fail loudly); accumulated (`acc fcst`) and averaged (`ave fcst`) aggregate fields are dropped, so **`APCP` is unavailable** — use `PRATE` for precipitation; `max fcst`/`min fcst` windowed aggregates are coerced to the end step (preserves `GUST`). Users are strongly advised to set a `parameters` filter when using `index_format = "wgrib2"` — a single GFS 0.25° file contains ~700 messages.
 - CCSDS/AEC compression requires `libaec` C library (via `libaec-sys`).
 
 ## QueryData Engine Notes

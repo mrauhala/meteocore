@@ -2,21 +2,71 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, Utc};
+
+#[cfg(test)]
+use chrono::{NaiveDate, NaiveTime};
 
 /// A single GRIB message location within a file.
 #[derive(Debug, Clone)]
 pub struct MessageEntry {
     /// Parameter short name (e.g., "2t", "msl").
     pub param: String,
-    /// Level type: "sfc", "pl", "sol".
+    /// Level type: "sfc" (surface), "hag" (height above ground),
+    /// "pl" (pressure level), "sol" (soil), "ml" (model level), "iso" (isentropic).
     pub levtype: String,
     /// Level value (e.g., 850 for pressure levels). None for surface.
     pub level: Option<u32>,
     /// Byte offset within the GRIB file.
     pub offset: u64,
     /// Byte length of this GRIB message.
-    pub length: u64,
+    ///
+    /// `None` means "last record in the file, length not yet known" — this
+    /// happens for wgrib2 index files, which only carry offsets. The engine
+    /// resolves the length via a HEAD request on the data file the first
+    /// time someone actually fetches this message, not during scan.
+    pub length: Option<u64>,
+}
+
+impl MessageEntry {
+    /// True if this message represents a near-surface field — either a surface
+    /// type (`sfc`, including MSL / PBL / tropopause / entire-atmosphere in the
+    /// wgrib2 canonical mapping) or a height-above-ground level at or below
+    /// 100 m (covering 2 m temperature, 10 m / 80 m / 100 m winds).
+    pub fn is_near_surface(&self) -> bool {
+        match self.levtype.as_str() {
+            "sfc" => true,
+            "hag" => self.level.is_some_and(|l| l <= 100),
+            _ => false,
+        }
+    }
+
+    /// Priority score for "how canonical is this surface for the parameter
+    /// it carries", used to pick which of several levels to probe for
+    /// metadata when a short name appears at multiple levels. **Lower is
+    /// more preferred.**
+    ///
+    /// Rationale:
+    /// - `hag` at ≤ 10 m captures the conventional 2 m temperature / 10 m
+    ///   wind defaults, so it outranks plain `sfc` (which for GFS often
+    ///   means skin temperature or planetary boundary layer values).
+    /// - `sfc` comes next (standard surface fields like surface pressure,
+    ///   precipitation rate, MSL pressure).
+    /// - Pressure / model / other levels come last because they represent
+    ///   deliberate upper-air measurements, not a default surface view.
+    pub fn surface_priority(&self) -> u8 {
+        match (self.levtype.as_str(), self.level) {
+            ("hag", Some(n)) if n <= 10 => 0,
+            ("hag", Some(n)) if n <= 100 => 1,
+            ("sfc", _) => 2,
+            ("hag", _) => 3,
+            ("pl", _) => 4,
+            ("ml", _) => 5,
+            ("iso", _) => 6,
+            ("sol", _) => 7,
+            _ => 8,
+        }
+    }
 }
 
 /// One forecast step file with its message index.
@@ -159,7 +209,7 @@ impl Catalog {
         let mut seen = std::collections::HashSet::new();
         let mut params = Vec::new();
         for m in &step.messages {
-            if m.levtype == "sfc" && seen.insert(m.param.clone()) {
+            if m.is_near_surface() && seen.insert(m.param.clone()) {
                 params.push(m.param.clone());
             }
         }
@@ -204,9 +254,8 @@ impl Catalog {
     }
 }
 
-/// Parse a reference time from ECMWF date+time strings.
-/// date: "20260405", time: "0000" → 2026-04-05T00:00:00Z
-pub fn parse_reference_time(date: &str, time: &str) -> Option<DateTime<Utc>> {
+#[cfg(test)]
+fn parse_reference_time(date: &str, time: &str) -> Option<DateTime<Utc>> {
     let nd = NaiveDate::parse_from_str(date, "%Y%m%d").ok()?;
     let nt = NaiveTime::parse_from_str(time, "%H%M").ok()?;
     Some(nd.and_time(nt).and_utc())
@@ -223,6 +272,53 @@ mod tests {
 
         let dt = parse_reference_time("20260405", "1200").unwrap();
         assert_eq!(dt.to_rfc3339(), "2026-04-05T12:00:00+00:00");
+    }
+
+    #[test]
+    fn is_near_surface_cases() {
+        let sfc = MessageEntry {
+            param: "msl".into(),
+            levtype: "sfc".into(),
+            level: None,
+            offset: 0,
+            length: Some(1),
+        };
+        assert!(sfc.is_near_surface());
+
+        let hag2 = MessageEntry {
+            levtype: "hag".into(),
+            level: Some(2),
+            ..sfc.clone()
+        };
+        assert!(hag2.is_near_surface());
+
+        let hag100 = MessageEntry {
+            levtype: "hag".into(),
+            level: Some(100),
+            ..sfc.clone()
+        };
+        assert!(hag100.is_near_surface());
+
+        let hag500 = MessageEntry {
+            levtype: "hag".into(),
+            level: Some(500),
+            ..sfc.clone()
+        };
+        assert!(!hag500.is_near_surface());
+
+        let pl850 = MessageEntry {
+            levtype: "pl".into(),
+            level: Some(850),
+            ..sfc.clone()
+        };
+        assert!(!pl850.is_near_surface());
+
+        let ml1 = MessageEntry {
+            levtype: "ml".into(),
+            level: Some(1),
+            ..sfc.clone()
+        };
+        assert!(!ml1.is_near_surface());
     }
 
     #[test]

@@ -197,7 +197,7 @@ endpoint = "https://s3.eu-central-1.amazonaws.com"
 bucket = "ecmwf-forecasts"
 prefix_pattern = "%Y%m%d/{run}z/ifs/0p25/oper/"
 poll_interval_secs = 300
-max_runs = 4
+max_runs = 1
 run_hours = [0, 6, 12, 18]
 parameters = ["2t", "2d", "10u", "10v", "msl", "sp", "tp", "tcc", "tcwv", "cape", "sf", "sd"]
 
@@ -263,6 +263,74 @@ name = "sd"
 colormap = "viridis"
 min = 0.0
 max = 1000.0
+
+[[collections]]
+id = "noaa-gfs"
+title = "NOAA GFS Global Forecast"
+description = "GFS deterministic forecast (0.25 deg) from NOAA Open Data on AWS"
+engine_type = "grib"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[collections.grib]
+endpoint = "https://s3.us-east-1.amazonaws.com"
+bucket = "noaa-gfs-bdp-pds"
+prefix_pattern = "gfs.%Y%m%d/{run}/atmos/"
+# GFS atmos directories contain several product variants that all end in
+# .idx (pgrb2.0p25, pgrb2.0p50, pgrb2.1p00, pgrb2b, goessimpgrb2, ...).
+# filename_contains narrows to just the 0.25-degree forecast files. The
+# "z.pgrb2.0p25.f" prefix prevents matching "goessimpgrb2.0p25.f" which
+# has a substring collision if you only match "pgrb2.0p25.f".
+filename_contains = "z.pgrb2.0p25.f"
+index_suffix = ".idx"
+data_suffix = ""
+index_format = "wgrib2"
+poll_interval_secs = 600
+max_runs = 1
+run_hours = [0, 6, 12, 18]
+# Most common near-surface fields. A single GFS 0.25 deg file contains ~700
+# messages; the parameters filter is strongly recommended for wgrib2 indexes.
+# Note: APCP (total precipitation) is unavailable in v1 because GFS only
+# ships it as an accumulated aggregate; use PRATE instead.
+parameters = ["TMP", "DPT", "PRMSL", "UGRD", "VGRD", "GUST", "TCDC", "PRATE"]
+
+[collections.wms]
+colormap = "temperature"
+
+[[collections.wms.parameters]]
+name = "TMP"
+colormap = "temperature"              # -40 to 50 C from stops (source is K -> C)
+
+[[collections.wms.parameters]]
+name = "DPT"
+colormap = "temperature"
+
+[[collections.wms.parameters]]
+name = "PRMSL"
+colormap = "viridis"                  # Pa -> hPa
+min = 950.0
+max = 1050.0
+
+[[collections.wms.parameters]]
+name = "UGRD"
+colormap = "wind_speed"               # m/s identity
+
+[[collections.wms.parameters]]
+name = "VGRD"
+colormap = "wind_speed"
+
+[[collections.wms.parameters]]
+name = "GUST"
+colormap = "wind_speed"
+
+[[collections.wms.parameters]]
+name = "TCDC"
+colormap = "grayscale"                # GFS TCDC is already in percent (0-100)
+min = 0.0
+max = 100.0
+
+[[collections.wms.parameters]]
+name = "PRATE"
+colormap = "precipitation_rate"
 
 [[collections]]
 id = "met-norway-radar"

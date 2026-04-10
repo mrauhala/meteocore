@@ -1,15 +1,16 @@
 pub mod cache;
 pub mod catalog;
 pub mod index;
-pub mod params;
 pub mod reader;
 mod time_window;
+pub mod units;
+pub mod wgrib2_index;
 
-use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
 
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use tokio::sync::watch;
 
 use ds_core::config::GribConfig;
@@ -18,9 +19,61 @@ use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::*;
 
-use crate::cache::GridCache;
+use crate::cache::{DecodedGrid, GridCache};
 use crate::catalog::{Catalog, ForecastRun, StepFile};
 use crate::time_window::TimeWindow;
+use crate::units::{DisplayConversion, SourceUnit};
+
+/// Resolved metadata for a parameter, populated after the first successful
+/// decode of a message carrying that short name. Derived from the WMO triple
+/// **and the Code Table 4.5 fixed surface type** read out of the GRIB2
+/// message itself — never from hardcoded name tables.
+#[derive(Debug, Clone)]
+struct ParamMetadata {
+    /// Base WMO label from Code Table 4.2, without any level qualifier.
+    /// E.g. "Temperature", "Pressure", "u-component of wind".
+    base_label: String,
+    /// Canonical source unit from the WMO table. Kept for diagnostics and
+    /// for potential config-driven display-unit overrides.
+    #[allow(dead_code)]
+    source_unit: SourceUnit,
+    display: DisplayConversion,
+    /// GRIB2 Code Table 4.5 first fixed surface type. `None` means no
+    /// message has been probed yet (placeholder state).
+    first_surface_type: Option<u8>,
+    /// Scaled value of the first fixed surface. Units depend on the type;
+    /// `None` for types where no numeric value applies (e.g. 1 surface,
+    /// 101 MSL, 200 entire atmosphere).
+    first_surface_value: Option<f64>,
+}
+
+impl ParamMetadata {
+    /// Placeholder used when metadata has not yet been populated (no message
+    /// for this parameter has been decoded yet). The label falls back to the
+    /// short name and the display conversion is identity.
+    fn placeholder(short_name: &str) -> Self {
+        Self {
+            base_label: short_name.to_string(),
+            source_unit: SourceUnit::Dimensionless,
+            display: DisplayConversion {
+                display_unit: "",
+                scale: 1.0,
+                offset: 0.0,
+            },
+            first_surface_type: None,
+            first_surface_value: None,
+        }
+    }
+
+    /// Render the full display label, composing the base WMO label with a
+    /// level qualifier derived from the Table 4.5 surface type.
+    fn label(&self) -> String {
+        let qualifier = self
+            .first_surface_type
+            .and_then(|t| units::format_level_qualifier(t, self.first_surface_value));
+        units::compose_label(&self.base_label, qualifier.as_deref())
+    }
+}
 
 /// Default model run hours for ECMWF IFS (4 runs per day).
 const DEFAULT_RUN_HOURS: &[u32] = &[0, 6, 12, 18];
@@ -46,6 +99,11 @@ pub struct GribEngine {
     /// Index files already downloaded and parsed (by S3 path). Avoids
     /// re-downloading unchanged index files on every poll cycle.
     known_indexes: Mutex<HashSet<String>>,
+    /// Which index file format this collection uses.
+    index_format: index::IndexFormat,
+    /// Parameter metadata cache keyed by short name. Populated lazily on
+    /// the first successful decode of each distinct short name.
+    param_meta: RwLock<HashMap<String, ParamMetadata>>,
 }
 
 impl GribEngine {
@@ -102,6 +160,13 @@ impl GribEngine {
 
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
 
+        let index_format = index::IndexFormat::from_config(config.index_format.as_deref())
+            .ok_or_else(|| {
+                DataServerError::Config(format!(
+                    "Collection '{collection_id}': invalid grib index_format"
+                ))
+            })?;
+
         let engine = Self {
             collection_id: collection_id.to_string(),
             config: config.clone(),
@@ -112,6 +177,8 @@ impl GribEngine {
             shutdown_tx,
             param_filter: config.parameters.clone(),
             known_indexes: Mutex::new(HashSet::new()),
+            index_format,
+            param_meta: RwLock::new(HashMap::new()),
         };
 
         // Do initial scan
@@ -169,19 +236,53 @@ impl GribEngine {
             .as_deref()
             .unwrap_or(DEFAULT_RUN_HOURS);
 
-        // Generate all prefixes to scan: SCAN_DAYS dates × run_hours
+        // Generate all prefixes to scan, newest-first (skipping future runs).
         let prefixes = build_scan_prefixes(&self.prefix_pattern, now, run_hours);
 
-        // Collect all index files across all prefixes
+        // Optional filename substring filter. Applied in addition to the
+        // index suffix match so that, for example, a GFS atmos directory
+        // containing pgrb2.0p25 / pgrb2.0p50 / pgrb2b / goessimpgrb2 can be
+        // narrowed to just the 0.25-degree product.
+        let filename_contains = self.config.filename_contains.as_deref();
+
+        // Cap how many runs we actually scan. `max_runs` is the number of
+        // runs we want to keep in the catalog; there is no point scanning
+        // older prefixes that would immediately be evicted. We iterate
+        // prefixes newest-first and stop after collecting hits from exactly
+        // that many runs.
+        //
+        // Without `max_runs` set, we fall back to listing every prefix.
+        let scan_budget = self.config.max_runs;
+
+        // Collect all index files across all prefixes, iterating newest-first
+        // and stopping once we have collected enough runs to satisfy
+        // `max_runs`.
         let mut all_index_paths: Vec<ds_storage::object_store::path::Path> = Vec::new();
-        for prefix in &prefixes {
+        let mut runs_with_hits = 0usize;
+        let mut listed_prefixes = 0usize;
+        for (_ref_time, prefix) in &prefixes {
+            if let Some(budget) = scan_budget {
+                if runs_with_hits >= budget {
+                    break;
+                }
+            }
+            listed_prefixes += 1;
             let obj_prefix = ds_storage::object_store::path::Path::from(prefix.as_str());
+            let mut hits_in_this_prefix = 0usize;
             match self.store.list(&obj_prefix) {
                 Ok(objects) => {
                     for obj in objects {
-                        if obj.location.as_ref().ends_with(index_suffix) {
-                            all_index_paths.push(obj.location);
+                        let loc = obj.location.as_ref();
+                        if !loc.ends_with(index_suffix) {
+                            continue;
                         }
+                        if let Some(needle) = filename_contains {
+                            if !loc.contains(needle) {
+                                continue;
+                            }
+                        }
+                        all_index_paths.push(obj.location);
+                        hits_in_this_prefix += 1;
                     }
                 }
                 Err(e) => {
@@ -193,7 +294,18 @@ impl GribEngine {
                     );
                 }
             }
+            if hits_in_this_prefix > 0 {
+                runs_with_hits += 1;
+            }
         }
+        tracing::debug!(
+            "Collection '{}': listed {}/{} prefixes, {} runs produced hits, {} candidate index files",
+            self.collection_id,
+            listed_prefixes,
+            prefixes.len(),
+            runs_with_hits,
+            all_index_paths.len()
+        );
 
         if all_index_paths.is_empty() {
             tracing::debug!(
@@ -224,10 +336,11 @@ impl GribEngine {
         }
 
         tracing::info!(
-            "Collection '{}': found {} new index files ({} total across {} prefixes)",
+            "Collection '{}': found {} new index files ({} total; listed {}/{} prefixes)",
             self.collection_id,
             new_paths.len(),
             all_index_paths.len(),
+            listed_prefixes,
             prefixes.len()
         );
 
@@ -254,21 +367,16 @@ impl GribEngine {
                 Err(_) => continue,
             };
 
-            let Some(parsed) = index::parse_index(content) else {
-                continue;
-            };
-
-            let Some(ref_time) = catalog::parse_reference_time(&parsed.date, &parsed.time) else {
-                tracing::warn!(
-                    "Collection '{}': cannot parse ref time from index {}",
-                    self.collection_id,
-                    path
-                );
-                continue;
-            };
-
             // Derive GRIB file URL from index file path
             let grib_url = path.as_ref().replace(index_suffix, data_suffix);
+
+            // Parse according to format. For wgrib2 this also resolves the
+            // last-record length via a HEAD request on the data file.
+            let Some(parsed) = self.parse_and_resolve(self.index_format, content, &grib_url) else {
+                continue;
+            };
+
+            let ref_time = parsed.reference_time;
 
             // Filter messages if param_filter is set
             let messages = if let Some(filter) = &self.param_filter {
@@ -344,7 +452,146 @@ impl GribEngine {
         );
 
         self.catalog.store(Arc::new(new_catalog));
+
+        // Probe one message per distinct short name in the newest run to
+        // populate the parameter metadata cache. Without this, the EDR
+        // /collections endpoint returns empty labels/units until the first
+        // actual query is served.
+        self.probe_new_parameters();
+
         Ok(())
+    }
+
+    /// For each distinct short name in the newest forecast run that has not
+    /// yet been seen, fetch one message via byte-range and decode it so the
+    /// WMO triple populates the parameter metadata cache.
+    ///
+    /// Any failures are logged and swallowed — the probe is best-effort and
+    /// the metadata cache will eventually fill in as real queries land on
+    /// the missing parameters anyway.
+    fn probe_new_parameters(&self) {
+        let catalog = self.catalog.load();
+        let Some(run) = catalog.latest_run() else {
+            return;
+        };
+        let Some(step_file) = run.steps.values().next() else {
+            return;
+        };
+
+        // For each distinct short name not yet in the metadata cache,
+        // pick the message at the most canonical surface level (see
+        // `MessageEntry::surface_priority`). This ensures that when a
+        // short name appears at multiple levels (e.g. GFS `TMP` at 1
+        // hybrid / 2 m AGL / 500 hPa / 2 hPa / ...), the probed metadata
+        // reflects the conventional default — 2 m temperature, 10 m wind,
+        // surface pressure — instead of whichever level happens to come
+        // first in the index file.
+        //
+        // We carry the index of the winning message so that the fetch can
+        // bypass `find_message`'s `(param, level)`-only lookup — which
+        // would otherwise collide between, e.g., `hag=2 m` and `pl=2 hPa`
+        // for GFS `TMP` (both have the numeric level 2).
+        let todo: Vec<usize> = {
+            let cache = self.param_meta.read().unwrap();
+            // short_name → (best_priority, index in step_file.messages)
+            let mut chosen: std::collections::HashMap<String, (u8, usize)> =
+                std::collections::HashMap::new();
+            for (i, m) in step_file.messages.iter().enumerate() {
+                if cache.contains_key(&m.param) {
+                    continue;
+                }
+                let prio = m.surface_priority();
+                chosen
+                    .entry(m.param.clone())
+                    .and_modify(|existing| {
+                        if prio < existing.0 {
+                            *existing = (prio, i);
+                        }
+                    })
+                    .or_insert((prio, i));
+            }
+            chosen.into_values().map(|(_, i)| i).collect()
+        };
+
+        if todo.is_empty() {
+            return;
+        }
+
+        tracing::debug!(
+            "Collection '{}': probing {} new parameters to populate metadata",
+            self.collection_id,
+            todo.len()
+        );
+
+        // Cap the probe budget to avoid a 700-request burst on an unfiltered
+        // wgrib2 catalog. Users are expected to set `parameters` when using
+        // wgrib2 — see the warning emitted elsewhere.
+        const MAX_PROBES_PER_SCAN: usize = 32;
+        for i in todo.into_iter().take(MAX_PROBES_PER_SCAN) {
+            let entry = &step_file.messages[i];
+            let name = entry.param.clone();
+            if let Err(e) = self.fetch_grid_by_entry(&step_file.grib_url, entry, &name) {
+                tracing::debug!(
+                    "Collection '{}': probe for parameter '{name}' failed: {e}",
+                    self.collection_id
+                );
+            }
+        }
+    }
+
+    /// Parse an index file's contents into the engine's catalog shape.
+    ///
+    /// For `EcmwfJson` this is a straight call into the JSON parser —
+    /// lengths are explicit and every message entry has `length = Some(_)`.
+    ///
+    /// For `Wgrib2` the parser derives lengths from next-record offsets and
+    /// leaves the final record with `length = None`. We deliberately do NOT
+    /// resolve the tail via a HEAD request here — that would cost one HEAD
+    /// per index file during scan (hundreds of serial round-trips) for a
+    /// record that users typically never query. Instead, the length is
+    /// resolved lazily on the first actual fetch of the tail message.
+    fn parse_and_resolve(
+        &self,
+        format: index::IndexFormat,
+        content: &str,
+        _grib_url: &str,
+    ) -> Option<index::IndexResult> {
+        match format {
+            index::IndexFormat::EcmwfJson => index::parse_ecmwf_json(content),
+            index::IndexFormat::Wgrib2 => {
+                let parsed = wgrib2_index::parse_wgrib2(content)?;
+
+                // wgrib2 indexes cover a single forecast step per file. We
+                // derive the nominal step from the first message (all
+                // messages in the same file share it after aggregate filter).
+                let nominal_step = parsed.messages.first()?.nominal_step;
+
+                // Convert ParsedMessage → MessageEntry directly. The tail
+                // record keeps `length = None` and is resolved lazily in
+                // `fetch_grid` when someone actually asks for it.
+                let messages: Vec<catalog::MessageEntry> = parsed
+                    .messages
+                    .into_iter()
+                    .map(|m| catalog::MessageEntry {
+                        param: m.short_name,
+                        levtype: m.levtype.to_string(),
+                        level: m.level,
+                        offset: m.offset,
+                        length: m.length,
+                    })
+                    .collect();
+
+                if messages.is_empty() {
+                    return None;
+                }
+
+                Some(index::IndexResult {
+                    reference_time: parsed.reference_time,
+                    step: nominal_step,
+                    messages,
+                })
+            }
+        }
     }
 
     /// Fetch and decode a grid for a specific parameter from a step file.
@@ -359,25 +606,94 @@ impl GribEngine {
                 "Parameter '{param}' not found in forecast step"
             ))
         })?;
+        self.fetch_grid_by_entry(&step_file.grib_url, entry, param)
+    }
 
-        // Check cache
+    /// Fetch and decode a specific `MessageEntry` from the given data file
+    /// URL. Use this when the caller has already resolved the exact entry
+    /// they want (e.g. via `surface_priority`) and does not want
+    /// `find_message`'s `(param, level)`-only matching to pick a different
+    /// message that happens to share the same numeric level.
+    fn fetch_grid_by_entry(
+        &self,
+        grib_url: &str,
+        entry: &catalog::MessageEntry,
+        param: &str,
+    ) -> Result<Arc<cache::DecodedGrid>, DataServerError> {
+        // Check cache (keyed by url + offset — unique per message)
         if let Some(cache) = &self.grid_cache {
-            if let Some(grid) = cache.get(&step_file.grib_url, entry.offset) {
+            if let Some(grid) = cache.get(grib_url, entry.offset) {
+                self.populate_metadata(param, &grid);
                 return Ok(grid);
             }
         }
 
         // Fetch via byte-range
-        let path = ds_storage::object_store::path::Path::from(step_file.grib_url.as_str());
+        let path = ds_storage::object_store::path::Path::from(grib_url);
         let grid = reader::read_message(&self.store, &path, entry)?;
         let grid = Arc::new(grid);
 
-        // Cache it
+        self.populate_metadata(param, &grid);
+
         if let Some(cache) = &self.grid_cache {
-            cache.insert(&step_file.grib_url, entry.offset, grid.clone());
+            cache.insert(grib_url, entry.offset, grid.clone());
         }
 
         Ok(grid)
+    }
+
+    /// Populate the parameter metadata cache from a decoded grid, using the
+    /// WMO triple *and* the Code Table 4.5 surface type carried by the
+    /// message itself (not a hardcoded short-name table). No-op if the
+    /// short name is already cached.
+    fn populate_metadata(&self, short_name: &str, grid: &DecodedGrid) {
+        {
+            let cache = self.param_meta.read().unwrap();
+            if cache.contains_key(short_name) {
+                return;
+            }
+        }
+
+        let (discipline, category, number) = grid.triple;
+        let centre = grid.centre;
+        let mut meta = match units::lookup(centre, discipline, category, number) {
+            Some(info) => ParamMetadata {
+                base_label: info.label.to_string(),
+                source_unit: info.source_unit,
+                display: units::default_display(info.source_unit),
+                first_surface_type: None,
+                first_surface_value: None,
+            },
+            None => {
+                tracing::debug!(
+                    "Unknown WMO triple ({centre}, {discipline}, {category}, {number}) \
+                     for short name '{short_name}'; falling back to identity conversion"
+                );
+                ParamMetadata::placeholder(short_name)
+            }
+        };
+
+        // Attach the surface type from the decoded message so that
+        // otherwise-identical parameters at different levels (e.g. msl vs
+        // sp, both under WMO triple (0, 3, 0) "Pressure") can be told apart
+        // in the rendered label.
+        meta.first_surface_type = Some(grid.first_surface_type);
+        meta.first_surface_value = grid.first_surface_value;
+
+        let mut cache = self.param_meta.write().unwrap();
+        cache.entry(short_name.to_string()).or_insert(meta);
+    }
+
+    /// Look up cached parameter metadata. Returns a placeholder (identity
+    /// conversion, empty unit string) if the short name has not yet been
+    /// populated — typically because no message for it has been decoded yet.
+    fn param_metadata(&self, short_name: &str) -> ParamMetadata {
+        self.param_meta
+            .read()
+            .unwrap()
+            .get(short_name)
+            .cloned()
+            .unwrap_or_else(|| ParamMetadata::placeholder(short_name))
     }
 
     /// Find the best step file for a datetime query.
@@ -446,12 +762,12 @@ impl Engine for GribEngine {
         let all = self.catalog.load().all_params();
         let mut map = std::collections::HashMap::new();
         for p in all {
-            let info = params::ecmwf_param_info(&p);
+            let meta = self.param_metadata(&p);
             map.insert(
                 p.clone(),
                 ParameterDescription {
-                    label: info.label.to_string(),
-                    unit: info.unit.to_string(),
+                    label: meta.label(),
+                    unit: meta.display.display_unit.to_string(),
                     observed_property: p,
                 },
             );
@@ -548,12 +864,12 @@ impl Engine for GribEngine {
         let query_params: Vec<String> = match parameters {
             Some(p) => p.to_vec(),
             None => {
-                // Default to surface parameters only
+                // Default to near-surface parameters only (surface + 2m/10m/etc.)
                 let mut seen = std::collections::HashSet::new();
                 first_step
                     .messages
                     .iter()
-                    .filter(|m| m.levtype == "sfc")
+                    .filter(|m| m.is_near_surface())
                     .filter(|m| seen.insert(m.param.clone()))
                     .map(|m| m.param.clone())
                     .collect()
@@ -570,8 +886,6 @@ impl Engine for GribEngine {
         let mut ranges = std::collections::HashMap::new();
 
         for param_name in &query_params {
-            let info = params::ecmwf_param_info(param_name);
-
             // Collect values across all forecast steps
             let mut values: Vec<Option<f64>> = Vec::with_capacity(steps_to_query.len());
             for (_step, step_file) in &steps_to_query {
@@ -584,7 +898,10 @@ impl Engine for GribEngine {
                 match self.fetch_grid(step_file, param_name, level) {
                     Ok(grid) => {
                         let raw = grid.bilinear_value(lon, lat);
-                        values.push(raw.map(|v| info.convert(v)));
+                        // Metadata must be resolved AFTER fetch_grid (which
+                        // populates the cache on first decode).
+                        let meta = self.param_metadata(param_name);
+                        values.push(raw.map(|v| meta.display.convert(v)));
                     }
                     Err(e) => {
                         tracing::warn!("Failed to fetch {param_name} for step: {e}");
@@ -593,11 +910,12 @@ impl Engine for GribEngine {
                 }
             }
 
+            let meta = self.param_metadata(param_name);
             param_descs.insert(
                 param_name.to_string(),
                 ParameterDescription {
-                    label: info.label.to_string(),
-                    unit: info.unit.to_string(),
+                    label: meta.label(),
+                    unit: meta.display.display_unit.to_string(),
                     observed_property: param_name.to_string(),
                 },
             );
@@ -632,14 +950,14 @@ impl Engine for GribEngine {
         let bbox = parse_bbox_from_wkt(coords)?;
         let (_step, step_file) = self.resolve_time(datetime)?;
 
-        // Default to first surface parameter
+        // Default to first near-surface parameter
         let query_params: Vec<&str> = match parameters {
             Some(p) => p.iter().map(|s| s.as_str()).collect(),
             None => {
                 let surface: Vec<_> = step_file
                     .messages
                     .iter()
-                    .filter(|m| m.levtype == "sfc")
+                    .filter(|m| m.is_near_surface())
                     .map(|m| m.param.as_str())
                     .take(1)
                     .collect();
@@ -679,7 +997,6 @@ impl Engine for GribEngine {
         let mut ranges = std::collections::HashMap::new();
 
         for &pname in &query_params {
-            let info = params::ecmwf_param_info(pname);
             let plevel = step_file
                 .messages
                 .iter()
@@ -693,11 +1010,14 @@ impl Engine for GribEngine {
                 ))
             })?;
 
+            // Metadata is populated by fetch_grid on first decode.
+            let meta = self.param_metadata(pname);
+
             // Apply unit conversion
-            let values: Vec<Option<f64>> = if info.has_conversion() {
+            let values: Vec<Option<f64>> = if meta.display.has_conversion() {
                 values
                     .into_iter()
-                    .map(|v| v.map(|raw| info.convert(raw)))
+                    .map(|v| v.map(|raw| meta.display.convert(raw)))
                     .collect()
             } else {
                 values
@@ -706,8 +1026,8 @@ impl Engine for GribEngine {
             param_descs.insert(
                 pname.to_string(),
                 ParameterDescription {
-                    label: info.label.to_string(),
-                    unit: info.unit.to_string(),
+                    label: meta.label(),
+                    unit: meta.display.display_unit.to_string(),
                     observed_property: pname.to_string(),
                 },
             );
@@ -753,11 +1073,11 @@ impl MapEngine for GribEngine {
 
         // Determine parameter to render
         let param_name = parameter.unwrap_or_else(|| {
-            // Default to first surface parameter
+            // Default to first near-surface parameter
             step_file
                 .messages
                 .iter()
-                .find(|m| m.levtype == "sfc")
+                .find(|m| m.is_near_surface())
                 .map(|m| m.param.as_str())
                 .unwrap_or("2t")
         });
@@ -773,12 +1093,14 @@ impl MapEngine for GribEngine {
         let web_mercator = matches!(output_crs, OutputCrs::WebMercator);
         let values = grid.resample(bbox, width, height, web_mercator);
 
-        // Apply unit conversion so colormap ranges use display units
-        let info = params::ecmwf_param_info(param_name);
-        let values = if info.has_conversion() {
+        // Apply unit conversion so colormap ranges use display units.
+        // fetch_grid populates the metadata cache from the decoded message's
+        // WMO triple on first decode, so this lookup is safe here.
+        let meta = self.param_metadata(param_name);
+        let values = if meta.display.has_conversion() {
             values
                 .into_iter()
-                .map(|v| v.map(|raw| info.convert(raw)))
+                .map(|v| v.map(|raw| meta.display.convert(raw)))
                 .collect()
         } else {
             values
@@ -795,13 +1117,15 @@ impl MapEngine for GribEngine {
         let catalog = self.catalog.load();
         let times = catalog.all_valid_times();
 
-        // Build parameter list from catalog
+        // Build parameter list from catalog using cached metadata (populated
+        // lazily as each parameter is first decoded).
         let params: Vec<(String, String)> = catalog
             .all_params()
             .into_iter()
             .map(|p| {
-                let info = params::ecmwf_param_info(&p);
-                (p, info.label.to_string())
+                let meta = self.param_metadata(&p);
+                let label = meta.label();
+                (p, label)
             })
             .collect();
 
@@ -810,10 +1134,11 @@ impl MapEngine for GribEngine {
             .map(|(name, _)| name.clone())
             .unwrap_or_else(|| "2t".to_string());
 
-        let default_unit = {
-            let info = params::ecmwf_param_info(&default_param);
-            info.unit.to_string()
-        };
+        let default_unit = self
+            .param_metadata(&default_param)
+            .display
+            .display_unit
+            .to_string();
 
         RasterInfo {
             native_crs: "EPSG:4326".to_string(),
@@ -917,35 +1242,72 @@ fn parse_bbox_from_wkt(coords: &str) -> Result<[f64; 4], DataServerError> {
     )))
 }
 
-/// Build all S3 prefixes to scan for the given pattern, dates, and run hours.
+/// Build `(reference_time, prefix)` pairs to scan for the given pattern,
+/// dates, and run hours.
 ///
 /// The pattern supports strftime placeholders for the date part, plus `{run}`
 /// which is expanded to each run hour (zero-padded, e.g., "00", "06", "12", "18").
 ///
-/// If the pattern contains no `{run}` placeholder, it's expanded once per date
-/// using strftime only (backward compatible with the original behavior).
-fn build_scan_prefixes(pattern: &str, now: DateTime<Utc>, run_hours: &[u32]) -> Vec<String> {
-    use chrono::Duration;
+/// Behaviour notes:
+/// - Returned pairs are sorted by `reference_time` **descending** (newest
+///   first), so callers can iterate and stop early once they have collected
+///   enough runs.
+/// - Future runs (reference time strictly after `now`) are skipped — a model
+///   run cannot exist before its reference time.
+/// - If the pattern contains no `{run}` placeholder, the reference time is
+///   taken to be the UTC start of the scan date and only one prefix is
+///   emitted per day (backward compatible with the date-only behaviour).
+fn build_scan_prefixes(
+    pattern: &str,
+    now: DateTime<Utc>,
+    run_hours: &[u32],
+) -> Vec<(DateTime<Utc>, String)> {
+    use chrono::{Duration, TimeZone};
 
-    let mut prefixes = Vec::new();
+    let mut out: Vec<(DateTime<Utc>, String)> = Vec::new();
 
     for days_back in 0..SCAN_DAYS {
         let date = now - Duration::days(i64::from(days_back));
 
         if pattern.contains("{run}") {
-            // Expand for each run hour
             for &hour in run_hours {
+                let ref_time = Utc
+                    .with_ymd_and_hms(
+                        date.year_ce().1 as i32,
+                        date.month(),
+                        date.day(),
+                        hour,
+                        0,
+                        0,
+                    )
+                    .single();
+                let Some(ref_time) = ref_time else {
+                    continue;
+                };
+                if ref_time > now {
+                    continue;
+                }
                 let run_str = format!("{hour:02}");
                 let with_run = pattern.replace("{run}", &run_str);
-                prefixes.push(date.format(&with_run).to_string());
+                let prefix = date.format(&with_run).to_string();
+                out.push((ref_time, prefix));
             }
         } else {
-            // No {run} placeholder — just expand strftime
-            prefixes.push(date.format(pattern).to_string());
+            let ref_time = Utc
+                .with_ymd_and_hms(date.year_ce().1 as i32, date.month(), date.day(), 0, 0, 0)
+                .single();
+            if let Some(ref_time) = ref_time {
+                if ref_time > now {
+                    continue;
+                }
+                out.push((ref_time, date.format(pattern).to_string()));
+            }
         }
     }
 
-    prefixes
+    // Sort newest-first so callers can break early once they have enough runs.
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out
 }
 
 #[cfg(test)]
@@ -975,14 +1337,39 @@ mod tests {
     #[test]
     fn test_build_scan_prefixes_with_run() {
         use chrono::TimeZone;
+        // 2026-04-06 15:00 UTC: today's 00/06/12 have published, 18z is future.
         let dt = Utc.with_ymd_and_hms(2026, 4, 6, 15, 0, 0).unwrap();
         let prefixes = build_scan_prefixes("%Y%m%d/{run}z/ifs/0p25/oper/", dt, &[0, 6, 12, 18]);
 
-        // 2 days × 4 run hours = 8 prefixes
-        assert_eq!(prefixes.len(), 8);
-        assert!(prefixes.contains(&"20260406/00z/ifs/0p25/oper/".to_string()));
-        assert!(prefixes.contains(&"20260406/12z/ifs/0p25/oper/".to_string()));
-        assert!(prefixes.contains(&"20260405/18z/ifs/0p25/oper/".to_string()));
+        // 2 days × 4 run hours minus 1 future run (today's 18z) = 7 prefixes.
+        assert_eq!(prefixes.len(), 7);
+
+        // Newest-first ordering.
+        assert_eq!(prefixes[0].1, "20260406/12z/ifs/0p25/oper/");
+        assert_eq!(prefixes[1].1, "20260406/06z/ifs/0p25/oper/");
+        assert_eq!(prefixes[2].1, "20260406/00z/ifs/0p25/oper/");
+        assert_eq!(prefixes[3].1, "20260405/18z/ifs/0p25/oper/");
+        assert_eq!(prefixes[6].1, "20260405/00z/ifs/0p25/oper/");
+
+        // Reference times are strictly descending.
+        for pair in prefixes.windows(2) {
+            assert!(pair[0].0 > pair[1].0);
+        }
+    }
+
+    #[test]
+    fn test_build_scan_prefixes_skips_future_runs() {
+        use chrono::TimeZone;
+        // 2026-04-06 02:00 UTC: yesterday 18z is the latest published run.
+        // Today's 00z technically has a reference time of 00:00 UTC which is
+        // <= now, so it should still be listed (even if still publishing).
+        let dt = Utc.with_ymd_and_hms(2026, 4, 6, 2, 0, 0).unwrap();
+        let prefixes = build_scan_prefixes("%Y%m%d/{run}z/ifs/0p25/oper/", dt, &[0, 6, 12, 18]);
+
+        // Today: 00z only. Yesterday: all 4. Total 5.
+        assert_eq!(prefixes.len(), 5);
+        assert_eq!(prefixes[0].1, "20260406/00z/ifs/0p25/oper/");
+        assert_eq!(prefixes[1].1, "20260405/18z/ifs/0p25/oper/");
     }
 
     #[test]
@@ -991,9 +1378,9 @@ mod tests {
         let dt = Utc.with_ymd_and_hms(2026, 4, 6, 15, 0, 0).unwrap();
         let prefixes = build_scan_prefixes("%Y%m%d/00z/ifs/0p25/oper/", dt, &[0, 6, 12, 18]);
 
-        // No {run} placeholder — 2 dates, 1 prefix each
+        // No {run} placeholder — 2 dates, 1 prefix each, newest-first.
         assert_eq!(prefixes.len(), 2);
-        assert_eq!(prefixes[0], "20260406/00z/ifs/0p25/oper/");
-        assert_eq!(prefixes[1], "20260405/00z/ifs/0p25/oper/");
+        assert_eq!(prefixes[0].1, "20260406/00z/ifs/0p25/oper/");
+        assert_eq!(prefixes[1].1, "20260405/00z/ifs/0p25/oper/");
     }
 }

@@ -13,12 +13,39 @@ use crate::cache::DecodedGrid;
 use crate::catalog::MessageEntry;
 
 /// Fetch and decode a single GRIB message from a data store.
+///
+/// If `entry.length` is `Some(_)`, a direct byte-range read is performed.
+/// If it is `None` (the last record in a wgrib2 index file whose tail length
+/// has not been resolved yet), this function issues a HEAD request on the
+/// data file, computes the length as `file_size - offset`, and then fetches
+/// the bytes.
 pub fn read_message(
     store: &DataStore,
     path: &ds_storage::object_store::path::Path,
     entry: &MessageEntry,
 ) -> Result<DecodedGrid, DataServerError> {
-    let range = entry.offset as usize..(entry.offset + entry.length) as usize;
+    let length = match entry.length {
+        Some(l) => l,
+        None => {
+            let meta = store.head(path).map_err(|e| {
+                DataServerError::Storage(format!(
+                    "Failed to HEAD {path} for tail-length resolution of {}: {e}",
+                    entry.param
+                ))
+            })?;
+            let file_size = meta.size as u64;
+            if file_size <= entry.offset {
+                return Err(DataServerError::Storage(format!(
+                    "File {path} size {file_size} <= tail offset {}; \
+                     data file may be truncated or mid-upload",
+                    entry.offset
+                )));
+            }
+            file_size - entry.offset
+        }
+    };
+
+    let range = entry.offset as usize..(entry.offset + length) as usize;
     let bytes = store.get_range(path, range).map_err(|e| {
         DataServerError::Storage(format!(
             "Failed to fetch GRIB message {}/{}: {}",
@@ -42,6 +69,11 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
         DataServerError::Engine(format!("GRIB2 message for {param} contains no submessages"))
     })?;
 
+    // Extract originating centre from Section 1 and discipline from Section 0.
+    // Both are per-submessage accessors in grib 0.15.
+    let centre = submessage.identification().centre_id();
+    let discipline = submessage.indicator().discipline;
+
     // Extract grid definition
     let grid_def = submessage.grid_def();
 
@@ -51,6 +83,32 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
                 "Unsupported grid type in GRIB2 message for {param}"
             ))
         })?;
+
+    // Extract the parameter triple from the Product Definition Section.
+    // `parameter_category`/`parameter_number` are `Option<u8>` (absent for
+    // some obscure templates); for anything we might render, both are set.
+    let prod_def = submessage.prod_def();
+    let category = prod_def.parameter_category().ok_or_else(|| {
+        DataServerError::Engine(format!(
+            "GRIB2 message for {param} missing parameter category"
+        ))
+    })?;
+    let number = prod_def.parameter_number().ok_or_else(|| {
+        DataServerError::Engine(format!(
+            "GRIB2 message for {param} missing parameter number"
+        ))
+    })?;
+
+    // First fixed surface (GRIB2 Code Table 4.5). Used to distinguish, e.g.,
+    // mean sea level pressure from surface pressure (both encode as WMO
+    // triple (0, 3, 0) "Pressure" but have different surface types).
+    let (first_surface_type, first_surface_value) = match prod_def.fixed_surfaces() {
+        Some((s1, _s2)) => {
+            let v = s1.value();
+            (s1.surface_type, if v.is_nan() { None } else { Some(v) })
+        }
+        None => (255, None),
+    };
 
     // Decode values using Grib2SubmessageDecoder
     let decoder = Grib2SubmessageDecoder::from(submessage).map_err(|e| {
@@ -79,6 +137,10 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
         lon_inc,
         lat_inc,
         values: Arc::new(values),
+        triple: (discipline, category, number),
+        centre,
+        first_surface_type,
+        first_surface_value,
     })
 }
 

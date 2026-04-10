@@ -1,0 +1,45 @@
+[server]
+host = "127.0.0.1"
+port = 8098
+
+[[collections]]
+id = "noaa-gfs"
+title = "NOAA GFS 0.25 Global Forecast"
+description = "GFS deterministic forecast from NOAA Open Data on AWS"
+engine_type = "grib"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[collections.grib]
+endpoint = "https://s3.amazonaws.com"
+bucket = "noaa-gfs-bdp-pds"
+prefix_pattern = "gfs.%Y%m%d/{run}/atmos/"
+index_suffix = ".idx"
+data_suffix = ""
+index_format = "wgrib2"
+poll_interval_secs = 600
+max_runs = 1
+run_hours = [0, 6, 12, 18]
+# A strong `parameters` filter is strongly recommended for wgrib2 indexes —
+# a single GFS 0.25° file contains ~700 messages, most of which are unused
+# for typical workflows.
+parameters = ["TMP", "PRMSL", "UGRD", "VGRD", "GUST"]
+
+[collections.wms]
+colormap = "temperature"
+
+# Display units after source-unit-driven conversion:
+#   TMP: Kelvin -> Celsius (WMO triple 0,0,0)
+#   PRMSL: Pascal -> hPa (WMO triple 0,3,1)
+#   UGRD/VGRD: m s-1 identity
+#   GUST: m s-1 identity (wind gust, aggregated)
+[[collections.wms.parameters]]
+name = "TMP"
+colormap = "temperature"
+min = -30.0
+max = 40.0
+
+[[collections.wms.parameters]]
+name = "PRMSL"
+colormap = "viridis"
+min = 950.0
+max = 1050.0
