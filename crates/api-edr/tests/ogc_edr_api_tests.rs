@@ -137,6 +137,36 @@ impl Engine for MockEngine {
         }
         Ok(AreaQueryResult::Collection(coverages))
     }
+
+    fn query_position(
+        &self,
+        coords: &str,
+        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
+    ) -> Result<QueryResult, DataServerError> {
+        // Accept any well-formed POINT(lon lat). Parsing is handled here to
+        // exercise the handler's MULTIPOINT fan-out (which normalizes each
+        // sub-point to POINT before calling the engine).
+        let inner = coords
+            .trim()
+            .strip_prefix("POINT(")
+            .or_else(|| coords.trim().strip_prefix("POINT ("))
+            .and_then(|s| s.strip_suffix(')'))
+            .ok_or_else(|| DataServerError::InvalidParameter(format!("bad point: {coords}")))?;
+        let parts: Vec<&str> = inner.split_whitespace().collect();
+        if parts.len() != 2 {
+            return Err(DataServerError::InvalidParameter(format!(
+                "bad point arity: {coords}"
+            )));
+        }
+        let _lon: f64 = parts[0].parse().map_err(|_| {
+            DataServerError::InvalidParameter(format!("bad longitude: {}", parts[0]))
+        })?;
+        let _lat: f64 = parts[1].parse().map_err(|_| {
+            DataServerError::InvalidParameter(format!("bad latitude: {}", parts[1]))
+        })?;
+        Ok(Self::sample_query_result())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -924,11 +954,55 @@ mod unimplemented_queries {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "position query not yet implemented"]
-    async fn position_query() {
-        // GET /collections/{id}/position?coords=POINT(24.9384 60.1699)
-        let (status, _) = get("/collections/weather/position?coords=POINT(24.9384 60.1699)").await;
+    async fn position_query_point_returns_single_coverage() {
+        // POINT(24.9384 60.1699)
+        let (status, json) =
+            get("/collections/weather/position?coords=POINT%2824.9384%2060.1699%29").await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["type"], "Coverage");
+        assert!(json["domain"].is_object());
+    }
+
+    #[tokio::test]
+    async fn position_query_multipoint_returns_coverage_collection() {
+        // MULTIPOINT((24.94 60.17),(23.76 61.5))
+        let (status, json) = get(
+            "/collections/weather/position?coords=MULTIPOINT%28%2824.94%2060.17%29%2C%2823.76%2061.5%29%29",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["type"], "CoverageCollection");
+        assert_eq!(json["domainType"], "PointSeries");
+        let coverages = json["coverages"].as_array().unwrap();
+        assert_eq!(coverages.len(), 2);
+        for cov in coverages {
+            assert_eq!(cov["type"], "Coverage");
+            assert!(cov["domain"].is_object());
+        }
+        // Parameters hoisted to collection level.
+        assert!(json["parameters"].is_object());
+    }
+
+    #[tokio::test]
+    async fn position_query_multipoint_flat_form() {
+        // MULTIPOINT(24.94 60.17, 23.76 61.5, 27.67 62.9)
+        let (status, json) = get(
+            "/collections/weather/position?coords=MULTIPOINT%2824.94%2060.17%2C%2023.76%2061.5%2C%2027.67%2062.9%29",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["type"], "CoverageCollection");
+        assert_eq!(json["coverages"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn position_query_rejects_polygon() {
+        let (status, json) = get(
+            "/collections/weather/position?coords=POLYGON%28%280%200%2C1%200%2C1%201%2C0%201%2C0%200%29%29",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["code"], "BadRequest");
     }
 
     #[tokio::test]
