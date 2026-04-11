@@ -286,6 +286,17 @@ pub struct GribConfig {
     pub grid_cache_mb: u64,
     /// Model run hours to poll. Default: all (00, 06, 12, 18)
     pub run_hours: Option<Vec<u32>>,
+    /// Index file format: "ecmwf-json" (default) or "wgrib2".
+    /// ECMWF open data ships JSON-lines index files; NOAA GFS ships
+    /// wgrib2 colon-separated text index files.
+    pub index_format: Option<String>,
+    /// Optional substring that every matching index filename must contain.
+    /// Used to narrow down S3 listings when the directory holds multiple
+    /// product variants sharing the index suffix. For example, GFS atmos
+    /// directories contain pgrb2.0p25, pgrb2.0p50, pgrb2b, goessimpgrb2,
+    /// etc. — all ending in `.idx`. Set `filename_contains = "pgrb2.0p25"`
+    /// to keep only the 0.25-degree forecast files.
+    pub filename_contains: Option<String>,
 }
 
 impl ServerConfig {
@@ -340,6 +351,16 @@ impl ServerConfig {
                     return Err(crate::error::DataServerError::Config(format!(
                         "Collection '{id}': grib poll_interval_secs must be > 0"
                     )));
+                }
+
+                // Validate index_format
+                if let Some(fmt) = grib.index_format.as_deref() {
+                    if fmt != "ecmwf-json" && fmt != "wgrib2" {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': invalid grib index_format '{fmt}', \
+                             expected 'ecmwf-json' or 'wgrib2'"
+                        )));
+                    }
                 }
             }
         }

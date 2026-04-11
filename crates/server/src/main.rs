@@ -42,18 +42,114 @@ fn init_tracing() {
     }
 }
 
+/// Parsed command-line flags.
+struct CliArgs {
+    /// Optional allowlist of collection IDs to load. When present, only
+    /// collections whose `id` matches one of these values are instantiated;
+    /// all others are silently skipped. Useful for smoke-testing a single
+    /// collection without editing `config.toml`.
+    collections: Option<Vec<String>>,
+}
+
+/// Very small hand-rolled argv parser — the server only has a couple of
+/// flags, so pulling in clap would be overkill.
+///
+/// Supported forms:
+///   --collections=id1,id2
+///   --collections id1,id2
+///   -h / --help
+fn parse_cli_args() -> CliArgs {
+    let mut collections: Option<Vec<String>> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                eprintln!(
+                    "Usage: server [OPTIONS]\n\
+                     \n\
+                     Options:\n  \
+                       --collections <id1,id2,...>   Only load collections with these IDs\n  \
+                       -h, --help                    Show this help\n\
+                     \n\
+                     Environment:\n  \
+                       CONFIG_PATH    Path to config.toml (default: ./config.toml)\n  \
+                       LOG_FORMAT     'json' for structured logs (default: human-readable)\n  \
+                       RUST_LOG       Log filter (default: info)\n  \
+                       ADMIN_TOKEN    Bearer token for admin endpoints"
+                );
+                std::process::exit(0);
+            }
+            "--collections" => {
+                let Some(list) = args.next() else {
+                    eprintln!("error: --collections requires a value");
+                    std::process::exit(2);
+                };
+                collections = Some(parse_collection_list(&list));
+            }
+            s if s.starts_with("--collections=") => {
+                let list = &s["--collections=".len()..];
+                collections = Some(parse_collection_list(list));
+            }
+            other => {
+                eprintln!("error: unknown argument '{other}' (try --help)");
+                std::process::exit(2);
+            }
+        }
+    }
+    CliArgs { collections }
+}
+
+fn parse_collection_list(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
 #[tokio::main]
 async fn main() {
     init_tracing();
 
+    let cli = parse_cli_args();
+
     let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
-    let config = match ds_core::config::ServerConfig::from_file(&config_path) {
+    let mut config = match ds_core::config::ServerConfig::from_file(&config_path) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to load {}: {}", config_path, e);
             std::process::exit(1);
         }
     };
+
+    // Apply --collections filter if provided. Unknown IDs are a hard error —
+    // typing `--collections noa-gfs` should not silently load nothing.
+    if let Some(allow) = &cli.collections {
+        let configured: std::collections::HashSet<&str> =
+            config.collections.iter().map(|c| c.id.as_str()).collect();
+        let unknown: Vec<&str> = allow
+            .iter()
+            .filter(|id| !configured.contains(id.as_str()))
+            .map(|s| s.as_str())
+            .collect();
+        if !unknown.is_empty() {
+            tracing::error!(
+                "--collections: unknown collection ID(s) {:?} (known: {:?})",
+                unknown,
+                configured
+            );
+            std::process::exit(2);
+        }
+        let before = config.collections.len();
+        config
+            .collections
+            .retain(|c| allow.iter().any(|id| id == &c.id));
+        info!(
+            "--collections filter: kept {}/{} collections ({:?})",
+            config.collections.len(),
+            before,
+            allow
+        );
+    }
 
     let base_url = config.server.base_url();
     info!("Base URL: {base_url}");

@@ -3,9 +3,31 @@
 //! Each line maps a single GRIB message to its byte range within the
 //! corresponding `.grib2` file, enabling efficient HTTP Range reads.
 
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use serde::Deserialize;
 
 use crate::catalog::MessageEntry;
+
+/// Index file format.
+///
+/// `EcmwfJson` is the original ECMWF JSON-lines format (one JSON object per
+/// line). `Wgrib2` is NOAA's wgrib2 colon-separated text format used by GFS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexFormat {
+    EcmwfJson,
+    Wgrib2,
+}
+
+impl IndexFormat {
+    /// Parse from config string. Returns `EcmwfJson` for `None` (the default).
+    pub fn from_config(s: Option<&str>) -> Option<Self> {
+        match s {
+            None | Some("ecmwf-json") => Some(Self::EcmwfJson),
+            Some("wgrib2") => Some(Self::Wgrib2),
+            _ => None,
+        }
+    }
+}
 
 /// Raw JSON structure of one line in an ECMWF `.index` file.
 #[derive(Debug, Deserialize)]
@@ -28,10 +50,8 @@ struct IndexLine {
 
 /// Parsed result from an index file.
 pub struct IndexResult {
-    /// Reference date string, e.g. "20260405".
-    pub date: String,
-    /// Reference time string, e.g. "0000".
-    pub time: String,
+    /// Model reference time (run time), parsed from the index file.
+    pub reference_time: DateTime<Utc>,
     /// Forecast step in hours.
     pub step: u32,
     /// Individual GRIB message entries.
@@ -41,7 +61,7 @@ pub struct IndexResult {
 /// Parse the contents of an ECMWF `.index` file.
 ///
 /// Returns `None` if the file is empty or unparseable.
-pub fn parse_index(content: &str) -> Option<IndexResult> {
+pub fn parse_ecmwf_json(content: &str) -> Option<IndexResult> {
     let mut date = String::new();
     let mut time = String::new();
     let mut step: u32 = 0;
@@ -76,7 +96,7 @@ pub fn parse_index(content: &str) -> Option<IndexResult> {
             levtype: entry.levtype,
             level,
             offset: entry.offset,
-            length: entry.length,
+            length: Some(entry.length),
         });
     }
 
@@ -84,12 +104,21 @@ pub fn parse_index(content: &str) -> Option<IndexResult> {
         return None;
     }
 
+    let reference_time = parse_ecmwf_ref_time(&date, &time)?;
+
     Some(IndexResult {
-        date,
-        time,
+        reference_time,
         step,
         messages,
     })
+}
+
+/// Parse an ECMWF-style reference time from separate `date` (YYYYMMDD) and
+/// `time` (HHMM) strings.
+fn parse_ecmwf_ref_time(date: &str, time: &str) -> Option<DateTime<Utc>> {
+    let nd = NaiveDate::parse_from_str(date, "%Y%m%d").ok()?;
+    let nt = NaiveTime::parse_from_str(time, "%H%M").ok()?;
+    Some(nd.and_time(nt).and_utc())
 }
 
 #[cfg(test)]
@@ -97,14 +126,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_ecmwf_index() {
+    fn parse_ecmwf_json_index() {
         let content = r#"{"domain": "g", "date": "20260405", "time": "0000", "expver": "0001", "class": "od", "type": "fc", "stream": "oper", "step": "0", "levelist": "150", "levtype": "pl", "param": "q", "_offset": 0, "_length": 572555}
 {"domain": "g", "date": "20260405", "time": "0000", "expver": "0001", "class": "od", "type": "fc", "stream": "oper", "step": "0", "levtype": "sfc", "param": "2d", "_offset": 572555, "_length": 688894}
 {"domain": "g", "date": "20260405", "time": "0000", "expver": "0001", "class": "od", "type": "fc", "stream": "oper", "levtype": "sfc", "step": "0", "param": "ssrd", "_offset": 2557842, "_length": 224}"#;
 
-        let result = parse_index(content).unwrap();
-        assert_eq!(result.date, "20260405");
-        assert_eq!(result.time, "0000");
+        let result = parse_ecmwf_json(content).unwrap();
+        assert_eq!(
+            result.reference_time.to_rfc3339(),
+            "2026-04-05T00:00:00+00:00"
+        );
         assert_eq!(result.step, 0);
         assert_eq!(result.messages.len(), 3);
 
@@ -113,7 +144,7 @@ mod tests {
         assert_eq!(result.messages[0].levtype, "pl");
         assert_eq!(result.messages[0].level, Some(150));
         assert_eq!(result.messages[0].offset, 0);
-        assert_eq!(result.messages[0].length, 572555);
+        assert_eq!(result.messages[0].length, Some(572555));
 
         // Surface message (no levelist)
         assert_eq!(result.messages[1].param, "2d");
@@ -123,7 +154,21 @@ mod tests {
 
     #[test]
     fn parse_empty_index() {
-        assert!(parse_index("").is_none());
-        assert!(parse_index("   \n   \n").is_none());
+        assert!(parse_ecmwf_json("").is_none());
+        assert!(parse_ecmwf_json("   \n   \n").is_none());
+    }
+
+    #[test]
+    fn index_format_from_config() {
+        assert_eq!(IndexFormat::from_config(None), Some(IndexFormat::EcmwfJson));
+        assert_eq!(
+            IndexFormat::from_config(Some("ecmwf-json")),
+            Some(IndexFormat::EcmwfJson)
+        );
+        assert_eq!(
+            IndexFormat::from_config(Some("wgrib2")),
+            Some(IndexFormat::Wgrib2)
+        );
+        assert_eq!(IndexFormat::from_config(Some("bogus")), None);
     }
 }

@@ -43,6 +43,22 @@ pub struct DecodedGrid {
     pub lat_inc: f64,
     /// Decoded values in row-major order (north to south, west to east).
     pub values: Arc<Vec<f64>>,
+    /// WMO GRIB2 parameter identification triple `(discipline, category, number)`
+    /// extracted from the decoded message. Used for unit resolution.
+    pub triple: (u8, u8, u8),
+    /// Originating centre ID from GRIB2 Section 1 (Common Code Table C-11).
+    /// Used to resolve local parameter extensions (numbers 192-254).
+    pub centre: u16,
+    /// Type of first fixed surface from GRIB2 Code Table 4.5, e.g.
+    /// 1 = ground or water surface, 100 = isobaric level,
+    /// 101 = mean sea level, 103 = specified height above ground.
+    /// 255 = missing / not set.
+    pub first_surface_type: u8,
+    /// Numeric value of the first fixed surface after scale_factor has been
+    /// applied. `None` if not set (scale_factor == -127 or equivalent).
+    /// Units depend on `first_surface_type` (see WMO Code Table 4.5):
+    /// 100 → Pa, 103 → m, 107 → K, etc.
+    pub first_surface_value: Option<f64>,
 }
 
 impl DecodedGrid {
