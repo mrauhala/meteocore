@@ -12,7 +12,11 @@ use ds_core::config::CollectionConfig;
 use ds_core::datetime::parse_datetime_interval;
 use ds_core::engine::Engine;
 
-use crate::params::{AreaQueryParams, LocationQueryParams, PositionQueryParams};
+use ds_core::model::AreaQueryResult;
+
+use crate::params::{
+    split_position_coords, AreaQueryParams, LocationQueryParams, PositionQueryParams,
+};
 use crate::response::{
     area_query_result_to_json, locations_to_geojson, query_result_to_coverage_json,
     LocationsContext,
@@ -283,7 +287,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "in": "query",
                     "required": true,
                     "schema": {"type": "string"},
-                    "description": "WKT POINT geometry, e.g. POINT(24.94 60.17)"
+                    "description": "WKT POINT or MULTIPOINT geometry. Examples: POINT(24.94 60.17), MULTIPOINT((24.94 60.17),(23.76 61.5))"
                 },
                 "coords-polygon": {
                     "name": "coords",
@@ -480,31 +484,61 @@ pub async fn position_query(
         .as_deref()
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
-    let result = engine
-        .query_position(&params.coords, datetime, param_names.as_deref())
-        .map_err(|e| match &e {
-            ds_core::error::DataServerError::InvalidParameter(_)
-            | ds_core::error::DataServerError::InvalidBbox(_)
-            | ds_core::error::DataServerError::InvalidDatetime(_) => (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-            ),
-            ds_core::error::DataServerError::LocationNotFound(_)
-            | ds_core::error::DataServerError::CollectionNotFound(_)
-            | ds_core::error::DataServerError::FeatureNotFound(_) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "code": "NotFound", "description": e.to_string() })),
-            ),
-            _ => {
-                tracing::error!("Position query error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "code": "ServerError", "description": "Internal server error" })),
-                )
-            }
-        })?;
+    // Split coords into one or more POINT(lon lat) strings. A single POINT is
+    // passed through to the engine as-is; MULTIPOINT is fanned out into one
+    // query per point and assembled into a CoverageCollection.
+    let points = split_position_coords(&params.coords).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+        )
+    })?;
 
-    let body = serde_json::to_string(&query_result_to_coverage_json(&result)).unwrap();
+    let map_engine_error = |e: &ds_core::error::DataServerError| match e {
+        ds_core::error::DataServerError::InvalidParameter(_)
+        | ds_core::error::DataServerError::InvalidBbox(_)
+        | ds_core::error::DataServerError::InvalidDatetime(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+        ),
+        ds_core::error::DataServerError::LocationNotFound(_)
+        | ds_core::error::DataServerError::CollectionNotFound(_)
+        | ds_core::error::DataServerError::FeatureNotFound(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "code": "NotFound", "description": e.to_string() })),
+        ),
+        _ => {
+            tracing::error!("Position query error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "code": "ServerError", "description": "Internal server error" })),
+            )
+        }
+    };
+
+    if points.len() == 1 {
+        let result = engine
+            .query_position(&points[0], datetime, param_names.as_deref())
+            .map_err(|e| map_engine_error(&e))?;
+        let body = serde_json::to_string(&query_result_to_coverage_json(&result)).unwrap();
+        return Ok((
+            [(header::CONTENT_TYPE, "application/prs.coverage+json")],
+            body,
+        ));
+    }
+
+    let mut coverages = Vec::with_capacity(points.len());
+    for point in &points {
+        let qr = engine
+            .query_position(point, datetime, param_names.as_deref())
+            .map_err(|e| map_engine_error(&e))?;
+        coverages.push(qr);
+    }
+
+    let body = serde_json::to_string(&area_query_result_to_json(&AreaQueryResult::Collection(
+        coverages,
+    )))
+    .unwrap();
     Ok((
         [(header::CONTENT_TYPE, "application/prs.coverage+json")],
         body,

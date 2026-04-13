@@ -1,3 +1,4 @@
+use ds_core::error::DataServerError;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -21,4 +22,151 @@ pub struct AreaQueryParams {
     pub datetime: Option<String>,
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
+}
+
+/// Split a position-query `coords` value into one or more `POINT(lon lat)` WKT
+/// strings. Accepts either a single `POINT(lon lat)` or a
+/// `MULTIPOINT((lon lat),(lon lat),...)` (nested form) /
+/// `MULTIPOINT(lon lat, lon lat, ...)` (flat form). The returned strings are
+/// always normalized to `POINT(lon lat)` so that existing engine
+/// `query_position` implementations can be reused unchanged.
+pub fn split_position_coords(coords: &str) -> Result<Vec<String>, DataServerError> {
+    let trimmed = coords.trim();
+
+    // POINT(lon lat) — single point, passed through unchanged.
+    if starts_with_ignore_ascii_case(trimmed, "POINT") {
+        return Ok(vec![trimmed.to_string()]);
+    }
+
+    // MULTIPOINT(...) — split into individual POINT strings.
+    if let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, "MULTIPOINT") {
+        let inner = rest
+            .trim_start()
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .ok_or_else(|| {
+                DataServerError::InvalidParameter(
+                    "MULTIPOINT geometry must be wrapped in parentheses".into(),
+                )
+            })?;
+
+        let points: Vec<String> = inner
+            .split(',')
+            .map(|part| {
+                let part = part.trim();
+                // Nested form "(lon lat)" — strip the inner parens.
+                let point_body = part
+                    .strip_prefix('(')
+                    .and_then(|s| s.strip_suffix(')'))
+                    .unwrap_or(part)
+                    .trim();
+                // Validate "lon lat" so we fail fast before reaching any engine.
+                let coords: Vec<&str> = point_body.split_whitespace().collect();
+                if coords.len() != 2 {
+                    return Err(DataServerError::InvalidParameter(format!(
+                        "MULTIPOINT element '{part}' is not 'lon lat'"
+                    )));
+                }
+                coords[0].parse::<f64>().map_err(|_| {
+                    DataServerError::InvalidParameter(format!(
+                        "MULTIPOINT element '{part}' has invalid longitude"
+                    ))
+                })?;
+                coords[1].parse::<f64>().map_err(|_| {
+                    DataServerError::InvalidParameter(format!(
+                        "MULTIPOINT element '{part}' has invalid latitude"
+                    ))
+                })?;
+                Ok(format!("POINT({} {})", coords[0], coords[1]))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if points.is_empty() {
+            return Err(DataServerError::InvalidParameter(
+                "MULTIPOINT geometry must contain at least one point".into(),
+            ));
+        }
+
+        return Ok(points);
+    }
+
+    Err(DataServerError::InvalidParameter(
+        "Expected WKT POINT or MULTIPOINT geometry".into(),
+    ))
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    strip_prefix_ignore_ascii_case(s, prefix).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_point_passthrough() {
+        let points = split_position_coords("POINT(24.94 60.17)").unwrap();
+        assert_eq!(points, vec!["POINT(24.94 60.17)".to_string()]);
+    }
+
+    #[test]
+    fn point_case_insensitive() {
+        let points = split_position_coords("point(24.94 60.17)").unwrap();
+        assert_eq!(points, vec!["point(24.94 60.17)".to_string()]);
+    }
+
+    #[test]
+    fn multipoint_nested_form() {
+        let points =
+            split_position_coords("MULTIPOINT((24.94 60.17),(23.76 61.5),(27.67 62.9))").unwrap();
+        assert_eq!(
+            points,
+            vec![
+                "POINT(24.94 60.17)".to_string(),
+                "POINT(23.76 61.5)".to_string(),
+                "POINT(27.67 62.9)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn multipoint_flat_form() {
+        let points = split_position_coords("MULTIPOINT(24.94 60.17, 23.76 61.5)").unwrap();
+        assert_eq!(
+            points,
+            vec![
+                "POINT(24.94 60.17)".to_string(),
+                "POINT(23.76 61.5)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn multipoint_case_insensitive() {
+        let points = split_position_coords("MultiPoint((1 2),(3 4))").unwrap();
+        assert_eq!(points.len(), 2);
+    }
+
+    #[test]
+    fn multipoint_rejects_non_numeric() {
+        assert!(split_position_coords("MULTIPOINT((a b),(1 2))").is_err());
+    }
+
+    #[test]
+    fn multipoint_rejects_wrong_arity() {
+        assert!(split_position_coords("MULTIPOINT((1 2 3),(4 5))").is_err());
+    }
+
+    #[test]
+    fn rejects_polygon() {
+        assert!(split_position_coords("POLYGON((0 0,1 0,1 1,0 1,0 0))").is_err());
+    }
 }
