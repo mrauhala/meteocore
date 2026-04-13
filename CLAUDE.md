@@ -170,6 +170,7 @@ Currently implemented: `PointSeries`, `Grid`.
 host = "0.0.0.0"
 port = 8000
 # base_url = "https://api.example.com"  # optional, for absolute links behind a proxy
+# collections_dir = "collections.d"     # optional, directory of per-collection .toml files
 
 [[collections]]
 id = "weather"
@@ -200,6 +201,42 @@ colormap = "radar_dbz"
 ```
 
 See config struct definitions in each engine crate and `ds-core/src/config.rs` for all fields.
+
+### Per-File Collection Configs (`collections_dir`)
+
+Collections can optionally be defined as individual `.toml` files in a directory instead of (or in addition to) inline `[[collections]]` in `config.toml`.
+
+```toml
+# config.toml
+[server]
+collections_dir = "collections.d"   # relative to config.toml's parent, or absolute
+```
+
+```toml
+# collections.d/radar-opera.toml — one collection per file, no [[collections]] wrapper
+id = "radar-opera"
+title = "OPERA Radar Composite"
+description = "European radar reflectivity composite"
+engine_type = "geotiff"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[geotiff]
+filename_template = "OPERA@%Y%m%dT%H%M@0@ACRR.tiff"
+parameter = "reflectivity"
+unit = "dBZ"
+
+[wms]
+colormap = "radar_dbz"
+```
+
+**Rules:**
+- Both inline `[[collections]]` and `collections_dir` can coexist — inline collections load first, then directory collections sorted alphabetically by filename. Duplicate IDs across sources are rejected.
+- Only `.toml` files are loaded; other files are ignored. Rename to `.toml.disabled` to disable a collection.
+- The `id` field is required inside each file (not derived from filename). A warning is logged if the filename stem differs from the `id`.
+- The directory must exist if `collections_dir` is set (missing directory = hard error). An empty directory is valid but logs a warning.
+- Non-recursive: only files directly in the directory, no subdirectory traversal.
+- Hot-reload (`POST /admin/collections/reload`) picks up added, removed, and changed files automatically.
+- A single invalid file rejects the entire config (no partial loads).
 
 ## Admin & Operations
 
