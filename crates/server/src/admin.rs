@@ -1259,13 +1259,17 @@ pub async fn reload_handler(
         state.config_path
     );
 
-    let config = ds_core::config::ServerConfig::from_file(&state.config_path).map_err(|e| {
-        tracing::error!("Reload failed: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("Failed to read config: {e}") })),
-        )
-    })?;
+    let (config, config_warnings) = ds_core::config::ServerConfig::from_file(&state.config_path)
+        .map_err(|e| {
+            tracing::error!("Reload failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to read config: {e}") })),
+            )
+        })?;
+    for warning in &config_warnings {
+        tracing::warn!("{warning}");
+    }
 
     let base_url = config.server.base_url();
 

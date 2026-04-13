@@ -3,6 +3,7 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
     pub server: ServerSettings,
+    #[serde(default)]
     pub collections: Vec<CollectionConfig>,
 }
 
@@ -17,6 +18,10 @@ pub struct ServerSettings {
     /// Can also be set via `ADMIN_TOKEN` env var (takes priority).
     /// If neither is set, admin endpoints are disabled (return 403).
     pub admin_token: Option<String>,
+    /// Directory containing per-collection `.toml` config files.
+    /// Resolved relative to the parent directory of the main config file.
+    /// Each file defines one collection using `CollectionConfig` fields directly.
+    pub collections_dir: Option<String>,
 }
 
 impl ServerSettings {
@@ -300,19 +305,119 @@ pub struct GribConfig {
 }
 
 impl ServerConfig {
-    pub fn from_file(path: &str) -> Result<Self, crate::error::DataServerError> {
-        let content = std::fs::read_to_string(path).map_err(|e| {
+    /// Load config from a TOML file. If `collections_dir` is set, also loads
+    /// per-file collection configs from that directory. Returns the config and
+    /// a list of warning messages for the caller to log.
+    pub fn from_file(path: &str) -> Result<(Self, Vec<String>), crate::error::DataServerError> {
+        let config_path = std::path::Path::new(path);
+        let content = std::fs::read_to_string(config_path).map_err(|e| {
             crate::error::DataServerError::Config(format!("Failed to read {path}: {e}"))
         })?;
-        let config: Self = toml::from_str(&content).map_err(|e| {
+        let mut config: Self = toml::from_str(&content).map_err(|e| {
             crate::error::DataServerError::Config(format!("Failed to parse config: {e}"))
         })?;
+
+        let mut warnings = Vec::new();
+
+        // Load per-file collection configs from collections_dir
+        if let Some(ref dir) = config.server.collections_dir {
+            let config_parent = config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let collections_dir = config_parent.join(dir);
+            let collections_dir = collections_dir.canonicalize().map_err(|e| {
+                crate::error::DataServerError::Config(format!(
+                    "collections_dir '{}': {e}",
+                    collections_dir.display()
+                ))
+            })?;
+
+            let (dir_collections, dir_warnings) = Self::load_collections_dir(&collections_dir)?;
+            warnings.extend(dir_warnings);
+            config.collections.extend(dir_collections);
+        }
+
         config.validate()?;
-        Ok(config)
+        Ok((config, warnings))
+    }
+
+    /// Load all `.toml` files from a directory, each containing one `CollectionConfig`.
+    /// Returns the collections and a list of warning messages for the caller to log.
+    pub fn load_collections_dir(
+        dir: &std::path::Path,
+    ) -> Result<(Vec<CollectionConfig>, Vec<String>), crate::error::DataServerError> {
+        let entries = std::fs::read_dir(dir).map_err(|e| {
+            crate::error::DataServerError::Config(format!(
+                "collections_dir '{}': {e}",
+                dir.display()
+            ))
+        })?;
+
+        let mut files: Vec<std::path::PathBuf> = entries
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("toml") && path.is_file() {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Deterministic byte-order sort by filename
+        files.sort_unstable();
+
+        let mut warnings = Vec::new();
+
+        if files.is_empty() {
+            warnings.push(format!(
+                "collections_dir '{}' contains no .toml files",
+                dir.display()
+            ));
+        }
+
+        let mut collections = Vec::new();
+        for file_path in &files {
+            let filename = file_path.file_name().unwrap_or_default().to_string_lossy();
+
+            let content = std::fs::read_to_string(file_path).map_err(|e| {
+                crate::error::DataServerError::Config(format!("Failed to read {filename}: {e}"))
+            })?;
+
+            let collection: CollectionConfig = toml::from_str(&content).map_err(|e| {
+                crate::error::DataServerError::Config(format!("Failed to parse {filename}: {e}"))
+            })?;
+
+            // Warn if filename stem differs from collection id
+            let stem = file_path.file_stem().unwrap_or_default().to_string_lossy();
+            if stem != collection.id {
+                warnings.push(format!(
+                    "{filename}: filename stem '{stem}' differs from collection id '{}'",
+                    collection.id
+                ));
+            }
+
+            collections.push(collection);
+        }
+
+        Ok((collections, warnings))
     }
 
     /// Validate configuration for common errors before starting the server.
     pub fn validate(&self) -> Result<(), crate::error::DataServerError> {
+        // Check for duplicate collection IDs
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (i, collection) in self.collections.iter().enumerate() {
+            if let Some(&prev) = seen.get(collection.id.as_str()) {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Duplicate collection ID '{}': defined at collection index {prev} and {i}",
+                    collection.id
+                )));
+            }
+            seen.insert(&collection.id, i);
+        }
+
         for collection in &self.collections {
             let id = &collection.id;
 
@@ -366,5 +471,333 @@ impl ServerConfig {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn minimal_collection_toml(id: &str) -> String {
+        format!(
+            r#"
+id = "{id}"
+title = "Test"
+description = "Test collection"
+"#
+        )
+    }
+
+    fn write_config(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn from_file_without_collections_dir() {
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "test"
+title = "Test"
+description = "A test"
+"#;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
+        let (config, warnings) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(config.collections.len(), 1);
+        assert_eq!(config.collections[0].id, "test");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn from_file_with_collections_dir() {
+        let tmp = TempDir::new().unwrap();
+        let collections_dir = tmp.path().join("collections.d");
+        fs::create_dir(&collections_dir).unwrap();
+
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+collections_dir = "collections.d"
+
+[[collections]]
+id = "inline"
+title = "Inline"
+description = "Inline collection"
+"#;
+        write_config(tmp.path(), "config.toml", config_toml);
+        write_config(
+            &collections_dir,
+            "alpha.toml",
+            &minimal_collection_toml("alpha"),
+        );
+        write_config(
+            &collections_dir,
+            "beta.toml",
+            &minimal_collection_toml("beta"),
+        );
+
+        let path = tmp.path().join("config.toml");
+        let (config, _warnings) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(config.collections.len(), 3);
+        assert_eq!(config.collections[0].id, "inline");
+        // Directory collections sorted alphabetically
+        assert_eq!(config.collections[1].id, "alpha");
+        assert_eq!(config.collections[2].id, "beta");
+    }
+
+    #[test]
+    fn collections_dir_only_no_inline() {
+        let tmp = TempDir::new().unwrap();
+        let collections_dir = tmp.path().join("collections.d");
+        fs::create_dir(&collections_dir).unwrap();
+
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+collections_dir = "collections.d"
+"#;
+        write_config(tmp.path(), "config.toml", config_toml);
+        write_config(
+            &collections_dir,
+            "radar.toml",
+            &minimal_collection_toml("radar"),
+        );
+
+        let path = tmp.path().join("config.toml");
+        let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(config.collections.len(), 1);
+        assert_eq!(config.collections[0].id, "radar");
+    }
+
+    #[test]
+    fn duplicate_id_across_inline_and_dir() {
+        let tmp = TempDir::new().unwrap();
+        let collections_dir = tmp.path().join("collections.d");
+        fs::create_dir(&collections_dir).unwrap();
+
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+collections_dir = "collections.d"
+
+[[collections]]
+id = "radar"
+title = "Inline Radar"
+description = "Inline"
+"#;
+        write_config(tmp.path(), "config.toml", config_toml);
+        write_config(
+            &collections_dir,
+            "radar.toml",
+            &minimal_collection_toml("radar"),
+        );
+
+        let path = tmp.path().join("config.toml");
+        let result = ServerConfig::from_file(path.to_str().unwrap());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Duplicate collection ID 'radar'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_id_across_dir_files() {
+        let tmp = TempDir::new().unwrap();
+        let collections_dir = tmp.path().join("collections.d");
+        fs::create_dir(&collections_dir).unwrap();
+
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+collections_dir = "collections.d"
+"#;
+        write_config(tmp.path(), "config.toml", config_toml);
+        write_config(
+            &collections_dir,
+            "a.toml",
+            &minimal_collection_toml("same-id"),
+        );
+        write_config(
+            &collections_dir,
+            "b.toml",
+            &minimal_collection_toml("same-id"),
+        );
+
+        let path = tmp.path().join("config.toml");
+        let result = ServerConfig::from_file(path.to_str().unwrap());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Duplicate collection ID 'same-id'"));
+    }
+
+    #[test]
+    fn non_toml_files_ignored() {
+        let tmp = TempDir::new().unwrap();
+        let collections_dir = tmp.path().join("collections.d");
+        fs::create_dir(&collections_dir).unwrap();
+
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+collections_dir = "collections.d"
+"#;
+        write_config(tmp.path(), "config.toml", config_toml);
+        write_config(
+            &collections_dir,
+            "radar.toml",
+            &minimal_collection_toml("radar"),
+        );
+        write_config(&collections_dir, "radar.toml.disabled", "invalid toml {{{}");
+        write_config(&collections_dir, "README.md", "# Collections");
+        write_config(&collections_dir, "backup.bak", "junk");
+
+        let path = tmp.path().join("config.toml");
+        let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(config.collections.len(), 1);
+        assert_eq!(config.collections[0].id, "radar");
+    }
+
+    #[test]
+    fn malformed_toml_in_dir() {
+        let tmp = TempDir::new().unwrap();
+        let collections_dir = tmp.path().join("collections.d");
+        fs::create_dir(&collections_dir).unwrap();
+
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+collections_dir = "collections.d"
+"#;
+        write_config(tmp.path(), "config.toml", config_toml);
+        write_config(&collections_dir, "bad.toml", "this is not valid {{ toml");
+
+        let path = tmp.path().join("config.toml");
+        let result = ServerConfig::from_file(path.to_str().unwrap());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("bad.toml"),
+            "error should name the file, got: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_collections_dir_is_error() {
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+collections_dir = "nonexistent"
+"#;
+        write_config(tmp.path(), "config.toml", config_toml);
+
+        let path = tmp.path().join("config.toml");
+        let result = ServerConfig::from_file(path.to_str().unwrap());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("nonexistent"));
+    }
+
+    #[test]
+    fn empty_dir_warns() {
+        let tmp = TempDir::new().unwrap();
+        let collections_dir = tmp.path().join("collections.d");
+        fs::create_dir(&collections_dir).unwrap();
+
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+collections_dir = "collections.d"
+"#;
+        write_config(tmp.path(), "config.toml", config_toml);
+
+        let path = tmp.path().join("config.toml");
+        let (config, warnings) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert!(config.collections.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("no .toml files")));
+    }
+
+    #[test]
+    fn filename_stem_mismatch_warns() {
+        let tmp = TempDir::new().unwrap();
+        let collections_dir = tmp.path().join("collections.d");
+        fs::create_dir(&collections_dir).unwrap();
+
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+collections_dir = "collections.d"
+"#;
+        write_config(tmp.path(), "config.toml", config_toml);
+        // File named "radar.toml" but id is "weather"
+        write_config(
+            &collections_dir,
+            "radar.toml",
+            &minimal_collection_toml("weather"),
+        );
+
+        let path = tmp.path().join("config.toml");
+        let (config, warnings) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(config.collections.len(), 1);
+        assert_eq!(config.collections[0].id, "weather");
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("differs from collection id")));
+    }
+
+    #[test]
+    fn alphabetical_ordering() {
+        let tmp = TempDir::new().unwrap();
+        let collections_dir = tmp.path().join("collections.d");
+        fs::create_dir(&collections_dir).unwrap();
+
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+collections_dir = "collections.d"
+"#;
+        write_config(tmp.path(), "config.toml", config_toml);
+        write_config(
+            &collections_dir,
+            "02-beta.toml",
+            &minimal_collection_toml("beta"),
+        );
+        write_config(
+            &collections_dir,
+            "01-alpha.toml",
+            &minimal_collection_toml("alpha"),
+        );
+        write_config(
+            &collections_dir,
+            "03-gamma.toml",
+            &minimal_collection_toml("gamma"),
+        );
+
+        let path = tmp.path().join("config.toml");
+        let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        let ids: Vec<&str> = config.collections.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["alpha", "beta", "gamma"]);
     }
 }
