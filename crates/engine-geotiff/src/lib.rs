@@ -1067,12 +1067,17 @@ impl GeoTiffEngine {
         let nx = (col_end - col_start) as usize;
         let ny = (row_end - row_start) as usize;
 
-        // Build x and y axis values (pixel centers)
+        // Build x and y axis values (pixel centers).
+        // For projected CRS (LCC, TM, etc.) WGS84 axes aren't truly separable —
+        // lon depends on both col and row. Use the center row/col of the range
+        // for the best approximation in a CoverageJSON Grid domain.
+        let mid_row = (row_start + row_end) / 2;
+        let mid_col = (col_start + col_end) / 2;
         let x_values: Vec<f64> = (col_start..col_end)
-            .map(|c| first_metadata.geo_transform.pixel_to_world(c, 0).0)
+            .map(|c| first_metadata.geo_transform.pixel_to_world(c, mid_row).0)
             .collect();
         let y_values: Vec<f64> = (row_start..row_end)
-            .map(|r| first_metadata.geo_transform.pixel_to_world(0, r).1)
+            .map(|r| first_metadata.geo_transform.pixel_to_world(mid_col, r).1)
             .collect();
 
         let has_time = entries.len() > 1;
@@ -1494,6 +1499,27 @@ impl Engine for GeoTiffEngine {
         parameters: Option<&[String]>,
     ) -> Result<AreaQueryResult, DataServerError> {
         let polygon = ds_core::feature::parse_area_coords(coords)?;
+
+        // Get pixel range and geo_transform for accurate per-pixel coordinates.
+        // For projected CRS (LCC, TM, etc.), the Grid x/y axes are approximations —
+        // each pixel's true WGS84 position depends on both its column and row.
+        // We must use pixel_to_world(col, row) for polygon containment tests.
+        self.ensure_entries_loaded(datetime)?;
+        let catalog = self.catalog.load();
+        let entries = filter_by_datetime(&catalog.entries, datetime);
+        let geo_transform = entries
+            .first()
+            .and_then(|(_, e)| e.metadata())
+            .map(|m| &m.geo_transform);
+        let pixel_range = geo_transform.and_then(|gt| {
+            gt.bbox_to_pixels(
+                polygon.bbox.west,
+                polygon.bbox.south,
+                polygon.bbox.east,
+                polygon.bbox.north,
+            )
+        });
+
         let mut result = self.query_bbox(
             polygon.bbox.west,
             polygon.bbox.south,
@@ -1503,7 +1529,7 @@ impl Engine for GeoTiffEngine {
             parameters,
         )?;
 
-        // Mask pixels outside the polygon
+        // Mask pixels outside the polygon using true per-pixel WGS84 coordinates
         if let DomainDescription::Grid {
             ref x,
             ref y,
@@ -1514,6 +1540,7 @@ impl Engine for GeoTiffEngine {
             let ny = y.len();
             let nx = x.len();
             let expected_len = nt * ny * nx;
+            let (col_start, row_start) = pixel_range.map_or((0, 0), |(c, r, _, _)| (c, r));
             for (_name, ndarray) in result.ranges.iter_mut() {
                 if ndarray.values.len() != expected_len {
                     tracing::error!(
@@ -1528,7 +1555,14 @@ impl Engine for GeoTiffEngine {
                 }
                 for (iy, y_val) in y.iter().enumerate() {
                     for (ix, x_val) in x.iter().enumerate() {
-                        if !polygon.contains(*x_val, *y_val) {
+                        // Compute actual WGS84 coords for this pixel via
+                        // pixel_to_world — correct for projected CRS where
+                        // lon/lat depend on both column and row.
+                        let (lon, lat) = geo_transform.map_or(
+                            (*x_val, *y_val),
+                            |gt| gt.pixel_to_world(col_start + ix as u32, row_start + iy as u32),
+                        );
+                        if !polygon.contains(lon, lat) {
                             for it in 0..nt {
                                 let idx = it * ny * nx + iy * nx + ix;
                                 ndarray.values[idx] = None;
