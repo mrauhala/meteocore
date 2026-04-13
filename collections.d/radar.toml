@@ -1,0 +1,29 @@
+id = "radar"
+title = "Weather Radar Reflectivity"
+description = "Radar composite from MET Norway (preprocessed to WGS84)"
+data_path = "testdata/radar"
+engine_type = "geotiff"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[geotiff]
+filename_template = "radar_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+poll_interval_secs = 30
+
+[wms]
+colormap = "radar_dbz"
+
+[[wms.styles]]
+name = "grayscale"
+title = "Grayscale"
+colormap = "grayscale"
+min = 0.0
+max = 70.0
+
+[[wms.styles]]
+name = "viridis"
+title = "Viridis"
+colormap = "viridis"
+min = 0.0
+max = 70.0

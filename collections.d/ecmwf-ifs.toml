@@ -1,0 +1,77 @@
+id = "ecmwf-ifs"
+title = "ECMWF IFS Global Forecast"
+description = "IFS deterministic forecast (0.25 deg) from ECMWF open data"
+engine_type = "grib"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[grib]
+endpoint = "https://s3.eu-central-1.amazonaws.com"
+bucket = "ecmwf-forecasts"
+prefix_pattern = "%Y%m%d/{run}z/ifs/0p25/oper/"
+poll_interval_secs = 300
+max_runs = 1
+run_hours = [0, 6, 12, 18]
+parameters = ["2t", "2d", "10u", "10v", "msl", "sp", "tp", "tcc", "tcwv", "cape", "sf", "sd"]
+
+[wms]
+colormap = "temperature"
+
+[[wms.parameters]]
+name = "2t"
+colormap = "temperature"
+
+[[wms.parameters]]
+name = "2d"
+colormap = "temperature"
+
+[[wms.parameters]]
+name = "msl"
+colormap = "viridis"
+min = 950.0
+max = 1050.0
+
+[[wms.parameters]]
+name = "sp"
+colormap = "viridis"
+min = 500.0
+max = 1050.0
+
+[[wms.parameters]]
+name = "tp"
+colormap = "precipitation"
+
+[[wms.parameters]]
+name = "tcc"
+colormap = "grayscale"
+min = 0.0
+max = 100.0
+
+[[wms.parameters]]
+name = "10u"
+colormap = "wind_speed"
+
+[[wms.parameters]]
+name = "10v"
+colormap = "wind_speed"
+
+[[wms.parameters]]
+name = "tcwv"
+colormap = "viridis"
+min = 0.0
+max = 70.0
+
+[[wms.parameters]]
+name = "cape"
+colormap = "viridis"
+min = 0.0
+max = 3000.0
+
+[[wms.parameters]]
+name = "sf"
+colormap = "precipitation"
+
+[[wms.parameters]]
+name = "sd"
+colormap = "viridis"
+min = 0.0
+max = 1000.0
