@@ -1558,10 +1558,9 @@ impl Engine for GeoTiffEngine {
                         // Compute actual WGS84 coords for this pixel via
                         // pixel_to_world — correct for projected CRS where
                         // lon/lat depend on both column and row.
-                        let (lon, lat) = geo_transform.map_or(
-                            (*x_val, *y_val),
-                            |gt| gt.pixel_to_world(col_start + ix as u32, row_start + iy as u32),
-                        );
+                        let (lon, lat) = geo_transform.map_or((*x_val, *y_val), |gt| {
+                            gt.pixel_to_world(col_start + ix as u32, row_start + iy as u32)
+                        });
                         if !polygon.contains(lon, lat) {
                             for it in 0..nt {
                                 let idx = it * ny * nx + iy * nx + ix;
