@@ -159,7 +159,7 @@ async fn main() {
     let base_url = config.server.base_url();
     info!("Base URL: {base_url}");
 
-    let result = admin::load_collections(&config.collections, &base_url);
+    let result = admin::load_collections(&config.collections, &config.style_bundles, &base_url);
 
     let loaded = result
         .health
