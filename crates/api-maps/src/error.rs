@@ -13,6 +13,8 @@ pub enum MapsError {
     BadRequest(String),
     /// Internal server error.
     Internal(String),
+    /// Server too busy (render semaphore exhausted).
+    ServiceUnavailable(String),
 }
 
 impl IntoResponse for MapsError {
@@ -25,6 +27,9 @@ impl IntoResponse for MapsError {
                 "ServerError",
                 "Internal server error",
             ),
+            MapsError::ServiceUnavailable(msg) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "ServerBusy", msg.as_str())
+            }
         };
 
         (

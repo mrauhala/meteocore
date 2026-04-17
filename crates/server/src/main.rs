@@ -11,6 +11,7 @@ use axum::{Json, Router, ServiceExt};
 use serde_json::json;
 use tokio::signal;
 use tower::Layer;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::normalize_path::NormalizePathLayer;
 use tracing::info;
@@ -281,7 +282,8 @@ async fn main() {
         .layer(middleware::from_fn(admin::metrics_middleware))
         .layer(middleware::from_fn(admin::request_logging_middleware))
         .layer(middleware::from_fn(admin::correlation_id_middleware))
-        .layer(CorsLayer::permissive());
+        .layer(CorsLayer::permissive())
+        .layer(CompressionLayer::new());
 
     // Normalize trailing slashes (e.g., /wms/ → /wms) before routing
     let app = NormalizePathLayer::trim_trailing_slash().layer(app);
