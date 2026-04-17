@@ -1101,7 +1101,20 @@ fn resolve_bundle<'a>(
     bundles: &'a HashMap<&str, &'a StyleBundle>,
 ) -> Option<&'a StyleBundle> {
     let bundle_ref = collection.wms.as_ref()?.style_bundle.as_deref()?;
-    bundles.get(bundle_ref).copied()
+    match bundles.get(bundle_ref).copied() {
+        Some(b) => Some(b),
+        None => {
+            // validate() rejects unresolved refs, so this is defensive: log
+            // so the inline-fallback path is observable if a caller somehow
+            // bypasses validation.
+            tracing::warn!(
+                "Collection '{}': style_bundle '{}' not found in index — falling back to inline config",
+                collection.id,
+                bundle_ref
+            );
+            None
+        }
+    }
 }
 
 /// Build the collection-level default colormap from the bundle or inline `[wms]` fields.

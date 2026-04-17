@@ -495,6 +495,12 @@ impl ServerConfig {
                         bundle.id, extra.name
                     )));
                 }
+                if extra.parameter.as_deref() == Some("") {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Style bundle '{}': extra '{}' has an empty 'parameter' field",
+                        bundle.id, extra.name
+                    )));
+                }
             }
         }
 
@@ -1171,6 +1177,36 @@ colormap = "radar_fmi"
             .to_string();
         assert!(
             err.contains("Style bundle 'radar_multi': extra has an empty 'name' field"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn extra_with_empty_parameter_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[style_bundles]]
+id = "radar_multi"
+[style_bundles.default]
+colormap = "radar_dbz"
+
+[[style_bundles.extras]]
+name = "radar_fmi"
+colormap = "radar_fmi"
+parameter = ""
+"#;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "Style bundle 'radar_multi': extra 'radar_fmi' has an empty 'parameter' field"
+            ),
             "got: {err}"
         );
     }
