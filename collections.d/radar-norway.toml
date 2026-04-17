@@ -1,0 +1,15 @@
+id = "radar-norway"
+title = "MET Norway Radar (native LCC projection)"
+description = "Radar composite in Lambert Conformal Conic, served without reprojection"
+data_path = "testdata/radar-native"
+engine_type = "geotiff"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[geotiff]
+filename_template = "norway_%Y%m%dT%H%MZ.tiff"
+parameter = "reflectivity"
+unit = "dBZ"
+poll_interval_secs = 60
+
+[wms]
+colormap = "radar_dbz"

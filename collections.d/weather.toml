@@ -1,0 +1,5 @@
+id = "weather"
+title = "Finnish Weather Observations"
+description = "Hourly weather observations from Finnish weather stations"
+data_path = "testdata/weather.csv"
+apis = ["edr", "features"]

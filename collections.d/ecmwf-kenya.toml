@@ -1,0 +1,35 @@
+id = "ecmwf-kenya"
+title = "ECMWF Kenya Surface"
+description = "ECMWF surface forecast for Kenya region (temperature, pressure, wind, precipitation)"
+data_path = "testdata/ecmwf-kenya"
+engine_type = "querydata"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[querydata]
+wms_parameter = "2t"
+poll_interval_secs = 60
+
+[wms]
+colormap = "viridis"
+
+[[wms.parameters]]
+name = "2t"
+colormap = "temperature"
+
+[[wms.parameters]]
+name = "2d"
+colormap = "temperature"
+
+[[wms.parameters]]
+name = "msl"
+colormap = "viridis"
+min = 980.0
+max = 1040.0
+
+[[wms.parameters]]
+name = "rr1h"
+colormap = "precipitation_rate"
+
+[[wms.parameters]]
+name = "tp"
+colormap = "precipitation"

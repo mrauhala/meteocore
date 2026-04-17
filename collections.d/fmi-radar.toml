@@ -1,0 +1,19 @@
+id = "fmi-radar"
+title = "FMI Radar (S3, EPSG:3067)"
+description = "Finnish radar composite from FMI S3 bucket, Transverse Mercator projection"
+engine_type = "geotiff"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[geotiff]
+endpoint = "https://s3-eu-west-1.amazonaws.com"
+bucket = "fmi-opendata-radar-geotiff"
+prefix_pattern = "%Y/%m/%d/finrad/"
+time_window = "-PT2H"
+filename_template = "%Y%m%d%H%M_composite_cappi_600_dbzh_finrad_qc.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+poll_interval_secs = 300
+nodata = 255
+
+[wms]
+colormap = "radar_dbz"

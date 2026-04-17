@@ -1,0 +1,18 @@
+id = "opera-reflectivity"
+title = "OPERA European Radar Reflectivity"
+description = "Radar reflectivity composite (DBZH) from EUMETNET OPERA, LAEA projection (CloudFerro S3)"
+engine_type = "geotiff"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[geotiff]
+endpoint = "https://s3.waw3-1.cloudferro.com"
+bucket = "openradar-24h"
+prefix_pattern = "%Y/%m/%d/OPERA/COMP/"
+time_window = "-PT12H"
+filename_template = "OPERA@%Y%m%dT%H%M@0@DBZH.tiff"
+parameter = "reflectivity"
+unit = "dBZ"
+poll_interval_secs = 300
+
+[wms]
+colormap = "radar_dbz"

@@ -1,0 +1,6 @@
+id = "regions"
+title = "Finnish Regions"
+description = "Regional boundaries (maakunta) from Statistics Finland (1:1M scale)"
+data_path = "testdata/regions.geojson"
+engine_type = "geojson"
+apis = ["features"]

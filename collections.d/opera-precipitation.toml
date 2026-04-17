@@ -1,0 +1,32 @@
+id = "opera-precipitation"
+title = "OPERA European Radar Composite"
+description = "1h accumulated precipitation from EUMETNET OPERA, LAEA projection (CloudFerro S3)"
+engine_type = "geotiff"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[geotiff]
+endpoint = "https://s3.waw3-1.cloudferro.com"
+bucket = "openradar-24h"
+prefix_pattern = "%Y/%m/%d/OPERA/COMP/"
+time_window = "-PT2H"
+filename_template = "OPERA@%Y%m%dT%H%M@0@ACRR.tiff"
+parameter = "precipitation"
+unit = "mm"
+poll_interval_secs = 300
+
+[wms]
+colormap = "viridis"
+
+[[wms.styles]]
+name = "grayscale"
+title = "Grayscale"
+colormap = "grayscale"
+min = 0.0
+max = 70.0
+
+[[wms.styles]]
+name = "viridis"
+title = "Viridis"
+colormap = "viridis"
+min = 0.0
+max = 70.0

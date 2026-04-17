@@ -150,6 +150,7 @@ Edit `config.toml` to configure the server and data collections:
 host = "0.0.0.0"
 port = 8000
 # base_url = "https://api.example.com"  # optional, for absolute links behind a proxy
+# collections_dir = "collections.d"     # optional, load per-collection .toml files from directory
 
 [[collections]]
 id = "weather"
@@ -200,6 +201,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `host` | yes | — | Bind address |
 | `port` | yes | — | Bind port |
 | `base_url` | no | `http://{host}:{port}` | External base URL for absolute links (set when behind a reverse proxy) |
+| `collections_dir` | no | — | Directory of per-collection `.toml` config files (see [Per-File Collection Configs](#per-file-collection-configs)) |
 
 ### Collection Config Fields
 
@@ -212,6 +214,54 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, `"maps"`, `"tiles"`, `"wms"` |
 | `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, `"querydata"` |
 | `wms` | no | — | WMS rendering config. Required when `apis` contains `"wms"`. |
+
+### Per-File Collection Configs
+
+Instead of defining all collections inline in `config.toml`, you can split them into individual `.toml` files in a directory:
+
+```
+/etc/meteocore/
+├── config.toml
+└── collections.d/
+    ├── 01-radar-opera.toml
+    ├── 02-radar-fmi.toml
+    ├── 10-gfs-global.toml
+    └── cities.toml.disabled     # not loaded (non-.toml extension)
+```
+
+Enable by setting `collections_dir` in `[server]`:
+
+```toml
+[server]
+collections_dir = "collections.d"   # relative to config.toml, or absolute
+```
+
+Each file contains one collection using the same fields as `[[collections]]`, but without the wrapper:
+
+```toml
+# collections.d/01-radar-opera.toml
+id = "radar-opera"
+title = "OPERA Radar Composite"
+description = "European radar reflectivity composite"
+engine_type = "geotiff"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[geotiff]
+filename_template = "OPERA@%Y%m%dT%H%M@0@ACRR.tiff"
+parameter = "reflectivity"
+unit = "dBZ"
+
+[wms]
+colormap = "radar_dbz"
+```
+
+**Key behaviors:**
+- **Coexists with inline collections.** Both `[[collections]]` in `config.toml` and files in `collections_dir` are loaded and merged. Inline collections load first, then directory files sorted alphabetically by filename.
+- **Duplicate IDs are rejected.** If the same `id` appears in both inline config and a directory file (or in two directory files), startup fails with an error naming both sources.
+- **Only `.toml` files are loaded.** Rename to `.toml.disabled` (or any non-`.toml` extension) to disable a collection without deleting the file.
+- **`id` is required in file content**, not derived from the filename. A warning is logged if the filename stem differs from the `id`.
+- **Missing directory is a hard error.** If `collections_dir` is set but the directory doesn't exist, the server refuses to start.
+- **Hot-reload picks up changes.** `POST /admin/collections/reload` re-reads the directory, loading new files, removing deleted ones, and applying edits.
 
 ## Data Engines
 
@@ -781,7 +831,7 @@ OpenAPI specs are generated dynamically from configured collections. WMS uses XM
 
 ### Dynamic Collection Reload
 
-`POST /admin/collections/reload` re-reads `config.toml`, creates new engines, and atomically swaps them into the running server. If the reload produces zero working collections, the old state is preserved.
+`POST /admin/collections/reload` re-reads `config.toml` (and `collections_dir` if configured), creates new engines, and atomically swaps them into the running server. If the reload produces zero working collections, the old state is preserved.
 
 ### Health Endpoint
 

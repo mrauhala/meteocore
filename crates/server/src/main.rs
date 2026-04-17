@@ -113,13 +113,17 @@ async fn main() {
     let cli = parse_cli_args();
 
     let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
-    let mut config = match ds_core::config::ServerConfig::from_file(&config_path) {
-        Ok(c) => c,
+    let (mut config, config_warnings) = match ds_core::config::ServerConfig::from_file(&config_path)
+    {
+        Ok(result) => result,
         Err(e) => {
             tracing::error!("Failed to load {}: {}", config_path, e);
             std::process::exit(1);
         }
     };
+    for warning in &config_warnings {
+        tracing::warn!("{warning}");
+    }
 
     // Apply --collections filter if provided. Unknown IDs are a hard error —
     // typing `--collections noa-gfs` should not silently load nothing.
