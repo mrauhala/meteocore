@@ -172,6 +172,18 @@ port = 8000
 # base_url = "https://api.example.com"  # optional, for absolute links behind a proxy
 # collections_dir = "collections.d"     # optional, directory of per-collection .toml files
 
+# Optional shared WMS style bundles. MUST live in top-level config.toml —
+# a [[style_bundles]] block inside a collections_dir file is silently
+# dropped by serde and any collection referencing it will fail validation.
+[[style_bundles]]
+id = "radar_multi"
+[style_bundles.default]
+colormap = "radar_dbz"
+[[style_bundles.extras]]
+name = "radar_fmi"
+title = "FMI Radar"
+colormap = "radar_fmi"
+
 [[collections]]
 id = "weather"
 title = "Finnish Weather Observations"
@@ -197,7 +209,10 @@ time_window = "-PT2H"
 max_files = 24
 
 [collections.wms]
-colormap = "radar_dbz"
+# Either attach a named style_bundle (defined above), or set colormap/styles
+# inline — mixing the two in one [wms] block is rejected at config load.
+style_bundle = "radar_multi"
+# colormap = "radar_dbz"
 ```
 
 See config struct definitions in each engine crate and `ds-core/src/config.rs` for all fields.
@@ -237,6 +252,7 @@ colormap = "radar_dbz"
 - Non-recursive: only files directly in the directory, no subdirectory traversal.
 - Hot-reload (`POST /admin/collections/reload`) picks up added, removed, and changed files automatically.
 - A single invalid file rejects the entire config (no partial loads).
+- `[[style_bundles]]` blocks are NOT allowed in per-collection files — only in `config.toml`. Referencing a bundle from a per-collection `[wms]` is fine; defining one here is silently dropped.
 
 ## Admin & Operations
 

@@ -1017,17 +1017,18 @@ pub fn load_collections(
     }
 }
 
-/// Build all styles for a WMS-enabled collection from its config.
-///
-/// If the collection's `[wms] style_bundle` is set, the bundle's default +
-/// extras are used verbatim and inline WMS style fields are ignored
-/// (validation rejects mixing at config load time). Otherwise the inline
-/// `colormap` / `[[wms.styles]]` behavior applies.
+/// Build all styles for a WMS-enabled collection (bundle if bound, inline otherwise).
 fn build_styles(
     collection: &CollectionConfig,
     bundles: &HashMap<&str, &StyleBundle>,
 ) -> HashMap<String, ds_render::StyleInfo> {
-    let bundle = resolve_bundle(collection, bundles);
+    build_styles_with_bundle(collection, resolve_bundle(collection, bundles))
+}
+
+fn build_styles_with_bundle(
+    collection: &CollectionConfig,
+    bundle: Option<&StyleBundle>,
+) -> HashMap<String, ds_render::StyleInfo> {
     let mut styles = HashMap::new();
 
     // Build default style (either from the bundle or from inline wms config)
@@ -1094,9 +1095,7 @@ fn build_styles(
     styles
 }
 
-/// Look up a collection's bound style bundle, if any. Returns None when the
-/// collection has no `[wms]` section, no `style_bundle` ref, or — defensively —
-/// the ref didn't resolve (validation should catch that earlier).
+/// Resolve a collection's bound bundle; None if unset (validation rejects unresolved refs).
 fn resolve_bundle<'a>(
     collection: &CollectionConfig,
     bundles: &'a HashMap<&str, &'a StyleBundle>,
@@ -1105,9 +1104,7 @@ fn resolve_bundle<'a>(
     bundles.get(bundle_ref).copied()
 }
 
-/// Build the collection-level default colormap (from a bound style bundle if
-/// any, otherwise from the inline `[wms]` fields). The caller passes the
-/// already-resolved bundle so the HashMap lookup happens once per collection.
+/// Build the collection-level default colormap from the bundle or inline `[wms]` fields.
 fn build_collection_default_colormap(
     collection: &CollectionConfig,
     bundle: Option<&StyleBundle>,
@@ -1150,20 +1147,16 @@ fn register_parameter_layer_styles(
         None => return,
     };
 
-    // Build named styles (shared across all param layers)
-    let shared_named_styles = build_styles(collection, bundles);
     let bundle = resolve_bundle(collection, bundles);
+    let shared_named_styles = build_styles_with_bundle(collection, bundle);
 
-    // Index per-parameter configs by name. When a bundle is bound, inline
-    // per-parameter overrides are disallowed by validation, so this map is
-    // effectively empty in that case.
+    // When a bundle is bound, inline per-parameter overrides are rejected by validation.
     let param_configs: HashMap<&str, &ds_core::config::WmsParameterConfig> = wms_config
         .parameters
         .iter()
         .map(|p| (p.name.as_str(), p))
         .collect();
 
-    // Collection-level default colormap (fallback)
     let (fallback_colormap, fallback_min, fallback_max) =
         build_collection_default_colormap(collection, bundle);
 

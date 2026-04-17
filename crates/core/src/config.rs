@@ -5,9 +5,7 @@ pub struct ServerConfig {
     pub server: ServerSettings,
     #[serde(default)]
     pub collections: Vec<CollectionConfig>,
-    /// Reusable named style bundles referenced from collection configs via
-    /// `[wms] style_bundle = "..."`. Each bundle defines one default style
-    /// plus zero or more named extras that apply to every collection referencing it.
+    /// Shared style bundles referenced by collections via `[wms] style_bundle`.
     #[serde(default)]
     pub style_bundles: Vec<StyleBundle>,
 }
@@ -69,10 +67,7 @@ pub struct CollectionConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WmsConfig {
-    /// Reference to a named bundle declared under top-level `[[style_bundles]]`.
-    /// When set, the bundle's default + extras provide all styles for this
-    /// collection and the other fields below (colormap/color_stops/styles/
-    /// parameters/min/max) must be absent — mixing is rejected at config load.
+    /// Named bundle; mixing with inline colormap/styles/etc. is a config error.
     pub style_bundle: Option<String>,
     /// Built-in colormap name for the default style (e.g., "radar_dbz", "viridis").
     /// Ignored if color_stops are provided. Falls back to "viridis" if not set.
@@ -144,11 +139,7 @@ fn default_rendered_cache_mb() -> u64 {
     512
 }
 
-/// A reusable named style bundle declared at top level of `config.toml` and
-/// referenced by collections via `[wms] style_bundle = "..."`. Replaces the
-/// per-collection `colormap` + `[[wms.styles]]` block when many collections
-/// share the same set of styles (e.g. radar collections that all offer the
-/// same four dBZ palettes).
+/// Shared WMS style set: one default + zero or more named extras.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StyleBundle {
     /// Unique identifier referenced from `WmsConfig::style_bundle`.
@@ -161,8 +152,7 @@ pub struct StyleBundle {
     pub extras: Vec<StyleBundleExtra>,
 }
 
-/// Default style inside a `StyleBundle`. Same fields as a `WmsConfig` default
-/// style, minus references and per-parameter bits.
+/// Default style inside a `StyleBundle`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StyleBundleDefault {
     pub colormap: Option<String>,
@@ -172,9 +162,7 @@ pub struct StyleBundleDefault {
     pub max: Option<f64>,
 }
 
-/// Named extra style inside a `StyleBundle`. Mirrors `WmsStyle` — the fields
-/// are intentionally identical so bundle expansion maps 1:1 to the existing
-/// `StyleInfo` builder path.
+/// Named extra style inside a `StyleBundle`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StyleBundleExtra {
     pub name: String,
