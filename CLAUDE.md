@@ -252,7 +252,8 @@ colormap = "radar_dbz"
 - Non-recursive: only files directly in the directory, no subdirectory traversal.
 - Hot-reload (`POST /admin/collections/reload`) picks up added, removed, and changed files automatically.
 - A single invalid file rejects the entire config (no partial loads).
-- `[[style_bundles]]` blocks are NOT allowed in per-collection files — only in `config.toml`. Referencing a bundle from a per-collection `[wms]` is fine; defining one here is silently dropped.
+- `[[style_bundles]]` blocks are NOT allowed in per-collection files — only in `config.toml`. Referencing a bundle from a per-collection `[wms]` is fine; defining one here is rejected with an explicit error.
+- A `style_bundle` cannot coexist with `[[wms.parameters]]` on the same collection. Bundle-backed multi-parameter collections (e.g. QueryData with several parameters) use the bundle's default colormap for every parameter layer — per-parameter overrides are not available while a bundle is attached.
 
 ## Admin & Operations
 

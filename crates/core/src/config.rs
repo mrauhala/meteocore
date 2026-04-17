@@ -421,6 +421,19 @@ impl ServerConfig {
                 crate::error::DataServerError::Config(format!("Failed to read {filename}: {e}"))
             })?;
 
+            // Reject style_bundles declared in per-collection files — serde
+            // drops them silently on CollectionConfig, which makes the later
+            // "style_bundle '...' is not defined" error confusing.
+            let raw: toml::Table = toml::from_str(&content).map_err(|e| {
+                crate::error::DataServerError::Config(format!("Failed to parse {filename}: {e}"))
+            })?;
+            if raw.contains_key("style_bundles") {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "{filename}: [[style_bundles]] is not allowed in per-collection files — \
+                     move the block to the top-level config.toml"
+                )));
+            }
+
             let collection: CollectionConfig = toml::from_str(&content).map_err(|e| {
                 crate::error::DataServerError::Config(format!("Failed to parse {filename}: {e}"))
             })?;
@@ -1220,6 +1233,47 @@ colormap = "radar_fmi"
             .to_string();
         assert!(
             err.contains("extra cannot be named 'default'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn style_bundles_in_per_collection_file_rejected() {
+        // [[style_bundles]] inside a collections_dir file is dropped silently
+        // by CollectionConfig (no field). Without this hard error the user
+        // would see a confusing "not defined" validation failure instead.
+        let tmp = TempDir::new().unwrap();
+        let collections_dir = tmp.path().join("collections.d");
+        fs::create_dir(&collections_dir).unwrap();
+
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+collections_dir = "collections.d"
+"#;
+        write_config(tmp.path(), "config.toml", config_toml);
+        write_config(
+            &collections_dir,
+            "radar.toml",
+            r#"
+id = "radar"
+title = "Radar"
+description = "Radar"
+
+[[style_bundles]]
+id = "radar_multi"
+[style_bundles.default]
+colormap = "radar_dbz"
+"#,
+        );
+
+        let path = tmp.path().join("config.toml");
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("radar.toml: [[style_bundles]] is not allowed in per-collection files"),
             "got: {err}"
         );
     }

@@ -1022,10 +1022,10 @@ fn build_styles(
     collection: &CollectionConfig,
     bundles: &HashMap<&str, &StyleBundle>,
 ) -> HashMap<String, ds_render::StyleInfo> {
-    build_styles_with_bundle(collection, resolve_bundle(collection, bundles))
+    build_styles_inner(collection, resolve_bundle(collection, bundles))
 }
 
-fn build_styles_with_bundle(
+fn build_styles_inner(
     collection: &CollectionConfig,
     bundle: Option<&StyleBundle>,
 ) -> HashMap<String, ds_render::StyleInfo> {
@@ -1148,7 +1148,7 @@ fn register_parameter_layer_styles(
     };
 
     let bundle = resolve_bundle(collection, bundles);
-    let shared_named_styles = build_styles_with_bundle(collection, bundle);
+    let shared_named_styles = build_styles_inner(collection, bundle);
 
     // When a bundle is bound, inline per-parameter overrides are rejected by validation.
     let param_configs: HashMap<&str, &ds_core::config::WmsParameterConfig> = wms_config
