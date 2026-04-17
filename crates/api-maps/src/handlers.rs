@@ -721,10 +721,10 @@ async fn render_map(
     let etag = cache_key.etag();
     let cache_control = cache_control_value(has_explicit_time);
 
-    // Check If-None-Match — return 304 before any cache lookup or rendering
+    // Check If-None-Match ��� return 304 before any cache lookup or rendering
     if let Some(inm) = headers.get(header::IF_NONE_MATCH) {
         if let Ok(inm_str) = inm.to_str() {
-            if inm_str == etag || inm_str.trim_matches('"') == etag.trim_matches('"') {
+            if ds_render::etag_matches(inm_str, &etag) {
                 return Ok(axum::response::Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
                     .header(header::ETAG, &etag)
@@ -754,13 +754,10 @@ async fn render_map(
     }
 
     // Acquire render semaphore (with timeout to shed load under pressure)
-    let _permit = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        state.render_semaphore.acquire(),
-    )
-    .await
-    .map_err(|_| MapsError::ServiceUnavailable("Server busy, try again later".to_string()))?
-    .map_err(|_| MapsError::Internal("Render semaphore closed".to_string()))?;
+    let _permit = tokio::time::timeout(ds_render::RENDER_TIMEOUT, state.render_semaphore.acquire())
+        .await
+        .map_err(|_| MapsError::ServiceUnavailable("Server busy, try again later".to_string()))?
+        .map_err(|_| MapsError::Internal("Render semaphore closed".to_string()))?;
 
     // Render on a blocking thread
     let engine = engine.clone();
