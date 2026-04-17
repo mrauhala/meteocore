@@ -468,9 +468,12 @@ impl ServerConfig {
                     bundle.id
                 )));
             }
-            // Extras must have non-empty, non-"default" names. "default" is
-            // reserved for the bundle's default style; an extra using that
-            // name would silently overwrite it in admin::build_styles.
+            // Extras must have non-empty, non-"default", unique names.
+            // "default" is reserved for the bundle's default style; an extra
+            // using that name would silently overwrite it in
+            // admin::build_styles. Duplicate names within the same bundle
+            // would silently overwrite each other in the same HashMap.
+            let mut extra_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
             for extra in &bundle.extras {
                 if extra.name.is_empty() {
                     return Err(crate::error::DataServerError::Config(format!(
@@ -483,6 +486,12 @@ impl ServerConfig {
                         "Style bundle '{}': extra cannot be named 'default' \
                          (reserved for the bundle's default style)",
                         bundle.id
+                    )));
+                }
+                if !extra_names.insert(extra.name.as_str()) {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Style bundle '{}': duplicate extra name '{}'",
+                        bundle.id, extra.name
                     )));
                 }
             }
@@ -1161,6 +1170,39 @@ colormap = "radar_fmi"
             .to_string();
         assert!(
             err.contains("Style bundle 'radar_multi': extra has an empty 'name' field"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_extra_name_within_bundle_rejected() {
+        // Two extras with the same name would silently overwrite each other
+        // in build_styles' HashMap; catch at config load instead.
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[style_bundles]]
+id = "radar_multi"
+[style_bundles.default]
+colormap = "radar_dbz"
+
+[[style_bundles.extras]]
+name = "radar_fmi"
+colormap = "radar_fmi"
+
+[[style_bundles.extras]]
+name = "radar_fmi"
+colormap = "radar_bookbinder"
+"#;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Style bundle 'radar_multi': duplicate extra name 'radar_fmi'"),
             "got: {err}"
         );
     }

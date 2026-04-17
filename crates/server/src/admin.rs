@@ -1027,11 +1027,12 @@ fn build_styles(
     collection: &CollectionConfig,
     bundles: &HashMap<&str, &StyleBundle>,
 ) -> HashMap<String, ds_render::StyleInfo> {
+    let bundle = resolve_bundle(collection, bundles);
     let mut styles = HashMap::new();
 
-    // Build default style (either from a bundle or from inline wms config)
+    // Build default style (either from the bundle or from inline wms config)
     let (default_colormap, default_min, default_max) =
-        build_collection_default_colormap(collection, bundles);
+        build_collection_default_colormap(collection, bundle);
     styles.insert(
         "default".to_string(),
         ds_render::StyleInfo {
@@ -1045,7 +1046,7 @@ fn build_styles(
     );
 
     // Build additional named styles — prefer bundle extras when bound
-    if let Some(bundle) = resolve_bundle(collection, bundles) {
+    if let Some(bundle) = bundle {
         for extra in &bundle.extras {
             let (colormap, min, max) = build_colormap_from_wms_config(
                 extra.colormap.as_deref(),
@@ -1105,12 +1106,13 @@ fn resolve_bundle<'a>(
 }
 
 /// Build the collection-level default colormap (from a bound style bundle if
-/// any, otherwise from the inline `[wms]` fields).
+/// any, otherwise from the inline `[wms]` fields). The caller passes the
+/// already-resolved bundle so the HashMap lookup happens once per collection.
 fn build_collection_default_colormap(
     collection: &CollectionConfig,
-    bundles: &HashMap<&str, &StyleBundle>,
+    bundle: Option<&StyleBundle>,
 ) -> (Arc<dyn ds_render::ColorMap>, f64, f64) {
-    if let Some(bundle) = resolve_bundle(collection, bundles) {
+    if let Some(bundle) = bundle {
         return build_colormap_from_wms_config(
             bundle.default.colormap.as_deref(),
             &bundle.default.color_stops,
@@ -1150,6 +1152,7 @@ fn register_parameter_layer_styles(
 
     // Build named styles (shared across all param layers)
     let shared_named_styles = build_styles(collection, bundles);
+    let bundle = resolve_bundle(collection, bundles);
 
     // Index per-parameter configs by name. When a bundle is bound, inline
     // per-parameter overrides are disallowed by validation, so this map is
@@ -1162,7 +1165,7 @@ fn register_parameter_layer_styles(
 
     // Collection-level default colormap (fallback)
     let (fallback_colormap, fallback_min, fallback_max) =
-        build_collection_default_colormap(collection, bundles);
+        build_collection_default_colormap(collection, bundle);
 
     for (short_name, _title) in param_names {
         let layer_key = format!("{}/{}", collection.id, short_name);
