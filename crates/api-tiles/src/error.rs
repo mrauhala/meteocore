@@ -13,6 +13,8 @@ pub enum TilesError {
     BadRequest(String),
     /// Internal server error.
     Internal(String),
+    /// Server too busy (render semaphore exhausted).
+    ServiceUnavailable(String),
 }
 
 impl IntoResponse for TilesError {
@@ -25,6 +27,9 @@ impl IntoResponse for TilesError {
                 "ServerError",
                 "Internal server error",
             ),
+            TilesError::ServiceUnavailable(msg) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "ServerBusy", msg.as_str())
+            }
         };
 
         (

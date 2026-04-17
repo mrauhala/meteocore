@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use axum::extract::{Path, Query, State};
-use axum::http::header;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::json;
@@ -644,20 +644,22 @@ pub async fn styles(
 
 /// GET /maps/collections/{id}/map — render map with default style
 pub async fn get_map(
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(params): Query<MapQueryParams>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, MapsError> {
-    render_map(&id, "default", params, state).await
+    render_map(&id, "default", params, headers, state).await
 }
 
 /// GET /maps/collections/{id}/styles/{styleId}/map — render map with named style
 pub async fn get_styled_map(
+    headers: HeaderMap,
     Path((id, style_id)): Path<(String, String)>,
     Query(params): Query<MapQueryParams>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, MapsError> {
-    render_map(&id, &style_id, params, state).await
+    render_map(&id, &style_id, params, headers, state).await
 }
 
 /// Shared rendering logic for get_map and get_styled_map.
@@ -665,6 +667,7 @@ async fn render_map(
     collection_id: &str,
     style_name: &str,
     params: MapQueryParams,
+    headers: HeaderMap,
     state: AppState,
 ) -> Result<impl IntoResponse, MapsError> {
     let state = state.load_full();
@@ -718,6 +721,21 @@ async fn render_map(
     let etag = cache_key.etag();
     let cache_control = cache_control_value(has_explicit_time);
 
+    // Check If-None-Match — return 304 before any cache lookup or rendering
+    if let Some(inm) = headers.get(header::IF_NONE_MATCH) {
+        if let Ok(inm_str) = inm.to_str() {
+            if ds_render::etag_matches(inm_str, &etag) {
+                return Ok(axum::response::Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header(header::ETAG, &etag)
+                    .header(header::CACHE_CONTROL, cache_control)
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+                    .into_response());
+            }
+        }
+    }
+
     // Check rendered cache
     if let Some(cached) = state.rendered_cache.get(&cache_key) {
         return Ok(axum::response::Response::builder()
@@ -735,11 +753,10 @@ async fn render_map(
             .into_response());
     }
 
-    // Acquire render semaphore
-    let _permit = state
-        .render_semaphore
-        .acquire()
+    // Acquire render semaphore (with timeout to shed load under pressure)
+    let _permit = tokio::time::timeout(ds_render::RENDER_TIMEOUT, state.render_semaphore.acquire())
         .await
+        .map_err(|_| MapsError::ServiceUnavailable("Server busy, try again later".to_string()))?
         .map_err(|_| MapsError::Internal("Render semaphore closed".to_string()))?;
 
     // Render on a blocking thread

@@ -24,6 +24,8 @@ pub enum WmsError {
     OperationNotSupported(String),
     /// Internal server error.
     Internal(String),
+    /// Server too busy (render semaphore exhausted).
+    ServiceUnavailable(String),
 }
 
 impl WmsError {
@@ -64,6 +66,7 @@ impl WmsError {
             WmsError::InvalidParameterValue(_) => "InvalidParameterValue",
             WmsError::OperationNotSupported(_) => "OperationNotSupported",
             WmsError::Internal(_) => "Internal",
+            WmsError::ServiceUnavailable(_) => "Internal",
         }
     }
 
@@ -77,13 +80,15 @@ impl WmsError {
             | WmsError::InvalidFormat(m)
             | WmsError::InvalidParameterValue(m)
             | WmsError::OperationNotSupported(m)
-            | WmsError::Internal(m) => m,
+            | WmsError::Internal(m)
+            | WmsError::ServiceUnavailable(m) => m,
         }
     }
 
     fn status_code(&self) -> StatusCode {
         match self {
             WmsError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            WmsError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::BAD_REQUEST,
         }
     }

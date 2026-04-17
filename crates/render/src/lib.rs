@@ -10,6 +10,10 @@ pub use encode::{encode_jpeg, encode_png, encode_webp};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Maximum time to wait for a render semaphore permit before returning 503.
+pub const RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -75,6 +79,27 @@ impl CacheKey {
         let hash = hasher.finish();
         format!("\"{hash:016x}\"")
     }
+}
+
+/// Check whether an `If-None-Match` header value matches a given ETag.
+///
+/// Handles comma-separated lists, the `*` wildcard, and the `W/` weak prefix
+/// per RFC 7232 §3.2 (weak comparison).
+pub fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+    let etag_bare = etag
+        .trim()
+        .strip_prefix("W/")
+        .unwrap_or(etag.trim())
+        .trim_matches('"');
+
+    if_none_match.split(',').any(|tag| {
+        let tag = tag.trim();
+        if tag == "*" {
+            return true;
+        }
+        let tag_bare = tag.strip_prefix("W/").unwrap_or(tag).trim_matches('"');
+        tag_bare == etag_bare
+    })
 }
 
 /// Quantize a floating-point bbox to integer microdegrees for cache key stability.
@@ -316,5 +341,42 @@ mod tests {
         let cmap = LutColorMap::from_builtin(BuiltinColormap::Viridis, 0.0, 1.0);
         let legend = render_legend(&cmap, 0.0, 1.0, 40, 200, ImageFormat::Png).unwrap();
         assert!(legend.starts_with(&[0x89, b'P', b'N', b'G']));
+    }
+
+    #[test]
+    fn test_etag_matches_exact() {
+        assert!(etag_matches("\"abc123\"", "\"abc123\""));
+    }
+
+    #[test]
+    fn test_etag_matches_no_match() {
+        assert!(!etag_matches("\"abc123\"", "\"def456\""));
+    }
+
+    #[test]
+    fn test_etag_matches_multiple() {
+        assert!(etag_matches("\"aaa\", \"bbb\", \"ccc\"", "\"bbb\""));
+    }
+
+    #[test]
+    fn test_etag_matches_multiple_no_match() {
+        assert!(!etag_matches("\"aaa\", \"bbb\"", "\"ccc\""));
+    }
+
+    #[test]
+    fn test_etag_matches_wildcard() {
+        assert!(etag_matches("*", "\"anything\""));
+    }
+
+    #[test]
+    fn test_etag_matches_weak_prefix() {
+        assert!(etag_matches("W/\"abc123\"", "\"abc123\""));
+        assert!(etag_matches("\"abc123\"", "W/\"abc123\""));
+        assert!(etag_matches("W/\"abc123\"", "W/\"abc123\""));
+    }
+
+    #[test]
+    fn test_etag_matches_weak_in_list() {
+        assert!(etag_matches("\"aaa\", W/\"bbb\"", "\"bbb\""));
     }
 }

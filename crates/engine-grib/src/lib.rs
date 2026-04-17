@@ -1306,7 +1306,7 @@ fn build_scan_prefixes(
     }
 
     // Sort newest-first so callers can break early once they have enough runs.
-    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     out
 }
 

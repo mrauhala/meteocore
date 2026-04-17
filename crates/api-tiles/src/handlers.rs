@@ -3,7 +3,7 @@ use std::sync::{Arc, LazyLock};
 
 use arc_swap::ArcSwap;
 use axum::extract::{Path, Query, State};
-use axum::http::header;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::json;
@@ -575,6 +575,7 @@ pub async fn collection_tilesets(
 
 /// GET /tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}
 pub async fn get_tile(
+    headers: HeaderMap,
     Path((id, tms_id, tile_matrix, tile_row, tile_col)): Path<(String, String, u32, u64, u64)>,
     Query(params): Query<TileQueryParams>,
     State(state): State<AppState>,
@@ -587,6 +588,7 @@ pub async fn get_tile(
         tile_row,
         tile_col,
         params,
+        headers,
         state,
     )
     .await
@@ -594,6 +596,7 @@ pub async fn get_tile(
 
 /// GET /tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}
 pub async fn get_styled_tile(
+    headers: HeaderMap,
     Path((id, style_id, tms_id, tile_matrix, tile_row, tile_col)): Path<(
         String,
         String,
@@ -613,6 +616,7 @@ pub async fn get_styled_tile(
         tile_row,
         tile_col,
         params,
+        headers,
         state,
     )
     .await
@@ -628,6 +632,7 @@ async fn render_tile(
     row: u64,
     col: u64,
     params: TileQueryParams,
+    headers: HeaderMap,
     state: AppState,
 ) -> Result<impl IntoResponse, TilesError> {
     let state = state.load_full();
@@ -721,6 +726,21 @@ async fn render_tile(
     let etag = cache_key.etag();
     let cache_control = cache_control_value(has_explicit_time);
 
+    // Check If-None-Match — return 304 before any cache lookup or rendering
+    if let Some(inm) = headers.get(header::IF_NONE_MATCH) {
+        if let Ok(inm_str) = inm.to_str() {
+            if ds_render::etag_matches(inm_str, &etag) {
+                return Ok(axum::response::Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header(header::ETAG, &etag)
+                    .header(header::CACHE_CONTROL, cache_control)
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+                    .into_response());
+            }
+        }
+    }
+
     // Check rendered cache
     if let Some(cached) = state.rendered_cache.get(&cache_key) {
         return Ok(axum::response::Response::builder()
@@ -738,11 +758,10 @@ async fn render_tile(
             .into_response());
     }
 
-    // Acquire render semaphore
-    let _permit = state
-        .render_semaphore
-        .acquire()
+    // Acquire render semaphore (with timeout to shed load under pressure)
+    let _permit = tokio::time::timeout(ds_render::RENDER_TIMEOUT, state.render_semaphore.acquire())
         .await
+        .map_err(|_| TilesError::ServiceUnavailable("Server busy, try again later".to_string()))?
         .map_err(|_| TilesError::Internal("Render semaphore closed".to_string()))?;
 
     // Render on a blocking thread
