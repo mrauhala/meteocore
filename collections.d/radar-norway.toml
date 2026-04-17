@@ -12,4 +12,4 @@ unit = "dBZ"
 poll_interval_secs = 60
 
 [wms]
-colormap = "radar_dbz"
+style_bundle = "radar_multi"
