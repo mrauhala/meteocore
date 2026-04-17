@@ -233,7 +233,7 @@ pub fn apply_scan_filters(
     }
 
     // Sort by timestamp descending and take only max_files most recent
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
     if let Some(max) = max_files {
         candidates.truncate(max);
     }
