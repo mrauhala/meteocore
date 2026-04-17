@@ -134,7 +134,7 @@ pub async fn wms_handler(
             let etag = cache_key.etag();
             let cache_control = cache_control_value(has_explicit_time);
 
-            // Check If-None-Match �� return 304 before any cache lookup or rendering
+            // Check If-None-Match — return 304 before any cache lookup or rendering
             if let Some(inm) = headers.get(header::IF_NONE_MATCH) {
                 if let Ok(inm_str) = inm.to_str() {
                     if ds_render::etag_matches(inm_str, &etag) {

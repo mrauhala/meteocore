@@ -8,12 +8,12 @@ pub use colormap::{
 pub use encode::{encode_jpeg, encode_png, encode_webp};
 
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Maximum time to wait for a render semaphore permit before returning 503.
 pub const RENDER_TIMEOUT: Duration = Duration::from_secs(30);
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
