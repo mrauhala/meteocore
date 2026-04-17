@@ -163,7 +163,7 @@ pub struct StyleBundle {
 
 /// Default style inside a `StyleBundle`. Same fields as a `WmsConfig` default
 /// style, minus references and per-parameter bits.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct StyleBundleDefault {
     pub colormap: Option<String>,
     #[serde(default)]
@@ -454,7 +454,7 @@ impl ServerConfig {
 
     /// Validate configuration for common errors before starting the server.
     pub fn validate(&self) -> Result<(), crate::error::DataServerError> {
-        // Check for duplicate style_bundle IDs
+        // Check for duplicate style_bundle IDs + validate each bundle's extras.
         let mut bundle_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for bundle in &self.style_bundles {
             if bundle.id.is_empty() {
@@ -467,6 +467,24 @@ impl ServerConfig {
                     "Duplicate style_bundle ID '{}'",
                     bundle.id
                 )));
+            }
+            // Extras must have non-empty, non-"default" names. "default" is
+            // reserved for the bundle's default style; an extra using that
+            // name would silently overwrite it in admin::build_styles.
+            for extra in &bundle.extras {
+                if extra.name.is_empty() {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Style bundle '{}': extra has an empty 'name' field",
+                        bundle.id
+                    )));
+                }
+                if extra.name == "default" {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Style bundle '{}': extra cannot be named 'default' \
+                         (reserved for the bundle's default style)",
+                        bundle.id
+                    )));
+                }
             }
         }
 
@@ -1116,6 +1134,62 @@ colormap = "viridis"
             .to_string();
         assert!(
             err.contains("Style bundle has an empty 'id' field"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn extra_with_empty_name_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[style_bundles]]
+id = "radar_multi"
+[style_bundles.default]
+colormap = "radar_dbz"
+
+[[style_bundles.extras]]
+name = ""
+colormap = "radar_fmi"
+"#;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Style bundle 'radar_multi': extra has an empty 'name' field"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn extra_named_default_rejected() {
+        // Without this check, an extra named "default" would silently clobber
+        // the bundle's default style when build_styles inserts the extras.
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[style_bundles]]
+id = "radar_multi"
+[style_bundles.default]
+colormap = "radar_dbz"
+
+[[style_bundles.extras]]
+name = "default"
+colormap = "radar_fmi"
+"#;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("extra cannot be named 'default'"),
             "got: {err}"
         );
     }
