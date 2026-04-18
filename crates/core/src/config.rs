@@ -421,20 +421,19 @@ impl ServerConfig {
                 crate::error::DataServerError::Config(format!("Failed to read {filename}: {e}"))
             })?;
 
-            // Reject style_bundles declared in per-collection files — serde
-            // drops them silently on CollectionConfig, which makes the later
-            // "style_bundle '...' is not defined" error confusing.
             let raw: toml::Table = toml::from_str(&content).map_err(|e| {
                 crate::error::DataServerError::Config(format!("Failed to parse {filename}: {e}"))
             })?;
+            // style_bundles must live in config.toml; serde silently drops
+            // them on CollectionConfig, which makes the later "not defined"
+            // error confusing.
             if raw.contains_key("style_bundles") {
                 return Err(crate::error::DataServerError::Config(format!(
                     "{filename}: [[style_bundles]] is not allowed in per-collection files — \
                      move the block to the top-level config.toml"
                 )));
             }
-
-            let collection: CollectionConfig = toml::from_str(&content).map_err(|e| {
+            let collection: CollectionConfig = raw.try_into().map_err(|e| {
                 crate::error::DataServerError::Config(format!("Failed to parse {filename}: {e}"))
             })?;
 

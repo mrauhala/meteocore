@@ -253,7 +253,8 @@ colormap = "radar_dbz"
 - Hot-reload (`POST /admin/collections/reload`) picks up added, removed, and changed files automatically.
 - A single invalid file rejects the entire config (no partial loads).
 - `[[style_bundles]]` blocks are NOT allowed in per-collection files — only in `config.toml`. Referencing a bundle from a per-collection `[wms]` is fine; defining one here is rejected with an explicit error.
-- A `style_bundle` cannot coexist with `[[wms.parameters]]` on the same collection. Bundle-backed multi-parameter collections (e.g. QueryData with several parameters) use the bundle's default colormap for every parameter layer — per-parameter overrides are not available while a bundle is attached.
+- A `style_bundle` cannot coexist with `[[wms.parameters]]` on the same collection — inline per-parameter *defaults* are rejected at config load when a bundle is attached.
+- Inside a bundle, each `[[style_bundles.extras]]` entry may carry an optional `parameter` field. Extras with a `parameter` are scoped to that layer only (e.g. `parameter = "wind_speed"` surfaces only under `collection/wind_speed`); untagged extras are shared across every parameter layer.
 
 ## Admin & Operations
 
