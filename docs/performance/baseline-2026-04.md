@@ -154,12 +154,36 @@ curl -s https://meteocore.app.meteo.fi/metrics > /tmp/metrics_after_t2.txt
 curl -s https://meteocore.app.meteo.fi/metrics > /tmp/metrics_after_t3.txt
 ```
 
+## Saturation test — actual ceiling
+
+The 10/50/100-user tests above are "realistic traffic" shaped by the locustfile's 1–3 s think time. To find the real server ceiling, a separate run used `wait_time = constant(0)` with a stepped ramp (`saturation_locustfile.py` in `baseline-2026-04-data/`). 50 → 100 → 200 → 400 users, one minute each.
+
+| Stage | Users | Throughput | p50 | p95 | p99 | Fails |
+|---|---|---|---|---|---|---|
+| 1 | 50  | 271 rps | 130 ms | 530 ms  | 1 100 ms | 0 |
+| 2 | 100 | 360 rps | 150 ms | 670 ms  | 1 500 ms | 0 |
+| 3 | 200 | **543 rps** | 170 ms | **920 ms** | 2 100 ms | 0 |
+| 4 | 400 | 596 rps | 200 ms | 1 400 ms | 3 700 ms | 0 |
+
+Peak instantaneous throughput: **620 rps**. Total: 107 566 requests, **0 failures**.
+
+**Conclusions from the saturation run:**
+
+1. **~540 rps is the practical ceiling** if you want p95 under 1 s (stage 3, 200 users).
+2. **~600 rps is the hard throughput ceiling.** Going from 200 → 400 users added only ~50 rps while p95 jumped from 920 ms to 1.4 s. The server is saturated at 400 users; extra concurrency queues behind the render semaphore instead of increasing throughput.
+3. **Degradation is graceful, not cliff-shaped.** Zero failures at any point, even at peak. The failure mode is "slower", not "broken".
+4. **Rendered-cache hit rate held at 71 % under saturation** — same as realistic traffic. So the ceiling is genuinely CPU-bound (12 render permits × render cost), not cache-bound at this traffic profile.
+5. **A diverse bbox mix would lower the ceiling.** The locustfile draws from 7 predefined bboxes; real traffic with a larger unique bbox set would reduce the cache hit rate and push more requests through the render pool, dropping the ceiling below 540 rps.
+
+Ratio sanity check: at 400 users, 12 permits × (1/0.019 s) × (1/0.29 miss rate) ≈ 2 170 rps theoretical — we hit 600. The 3–4× gap is probably a combination of slower-than-average render cost on WMS GetMap EPSG:3857 (which is the heaviest-weighted task) and client-side network limits, not server CPU.
+
 ## Conclusions
 
-1. **Current production configuration comfortably handles 100 concurrent users** with zero failures and sub-second p99 latency.
-2. **Server-side render cost is 4–19 ms average.** Client-visible latency is dominated by network, not the engine.
-3. **The rendered cache is the binding cache.** It's running at 96 % capacity and its hit rate (45 % → 71 %) explains the warmup curve. The tile cache is vastly oversized for current traffic.
-4. **No evidence of render-semaphore contention** at this load. Whether it becomes the bottleneck at higher user counts is untested.
-5. **Cold-start behaviour is still unmeasured.** The first-minute p95 under cold cache is the missing data point.
+1. **Current production configuration comfortably handles 100 concurrent realistic-traffic users** with zero failures and sub-second p99 latency.
+2. **Server-side render cost is 4–19 ms average.** Client-visible latency at realistic loads is dominated by network, not the engine.
+3. **Hard ceiling is ~540–600 rps** (see saturation section). Beyond ~200 concurrent zero-think-time clients, p95 crosses 1 s. Still no failures.
+4. **The rendered cache is the binding cache.** It's running at 96 % capacity and its hit rate (45 % → 71 %) explains the warmup curve. The tile cache is vastly oversized for current traffic.
+5. **No evidence of render-semaphore contention at realistic load**, but it's clearly the throughput bottleneck under saturation.
+6. **Cold-start behaviour is still unmeasured.** The first-minute p95 under cold cache is the missing data point.
 
-Future optimisation work should: (a) produce its own baseline run, not compare against this one across different deployments; (b) watch the rendered-cache hit rate as the primary indicator; (c) include a cold-start measurement.
+Future optimisation work should: (a) produce its own baseline run, not compare against this one across different deployments; (b) watch the rendered-cache hit rate as the primary indicator; (c) include a cold-start measurement; (d) reconsider tile-cache capacity (2.3 GiB allocated, <1 % used) — that memory is more valuable as rendered-cache headroom.
