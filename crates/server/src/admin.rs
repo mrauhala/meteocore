@@ -1196,11 +1196,20 @@ fn register_parameter_layer_styles(
             },
         );
 
-        // Add shared named styles (excluding "default" which we just built)
+        // Add shared named styles (excluding "default" which we just built).
+        // Styles tagged with a specific `parameter` are scoped to that layer only —
+        // otherwise a bundle extra with `parameter = "wind_speed"` would leak into
+        // every parameter layer's style map.
         for (name, style) in &shared_named_styles {
-            if name != "default" {
-                layer_styles.insert(name.clone(), style.clone());
+            if name == "default" {
+                continue;
             }
+            if let Some(p) = style.parameter.as_deref() {
+                if p != short_name {
+                    continue;
+                }
+            }
+            layer_styles.insert(name.clone(), style.clone());
         }
 
         style_map.insert(layer_key, layer_styles);
@@ -2098,5 +2107,87 @@ colormap = "grayscale"
         assert!(styles.contains_key("default"));
         assert!(styles.contains_key("alt"));
         assert_eq!(styles["alt"].title, "Alt");
+    }
+
+    #[test]
+    fn build_styles_falls_back_when_bundle_ref_unknown() {
+        // Exercises the defensive path in resolve_bundle: validate() normally
+        // rejects unresolved refs, but if a caller skips validation the
+        // collection must still load with the inline default (viridis) rather
+        // than panic.
+        let collection: CollectionConfig = toml::from_str(
+            r#"
+id = "radar-x"
+title = "X"
+description = "X"
+engine_type = "geotiff"
+
+[geotiff]
+filename_template = "radar_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+data_path = "/tmp"
+
+[wms]
+style_bundle = "does_not_exist"
+"#,
+        )
+        .unwrap();
+
+        let index: HashMap<&str, &StyleBundle> = HashMap::new();
+        let styles = build_styles(&collection, &index);
+
+        // Only the default; no extras; the bundle was silently skipped.
+        assert_eq!(styles.len(), 1);
+        assert!(styles.contains_key("default"));
+    }
+
+    #[test]
+    fn build_styles_parameter_tagged_extras_stay_in_map() {
+        // build_styles itself returns every extra — scoping by parameter
+        // happens downstream in register_parameter_layer_styles. This test
+        // locks the current behaviour so the bundle surface stays stable.
+        let collection: CollectionConfig = toml::from_str(
+            r#"
+id = "multi"
+title = "Multi"
+description = "Multi"
+engine_type = "querydata"
+
+[querydata]
+
+[wms]
+style_bundle = "mixed"
+"#,
+        )
+        .unwrap();
+
+        let bundle: StyleBundle = toml::from_str(
+            r#"
+id = "mixed"
+
+[default]
+colormap = "viridis"
+
+[[extras]]
+name = "wind_only"
+colormap = "wind_speed"
+parameter = "wind_speed"
+
+[[extras]]
+name = "global"
+colormap = "grayscale"
+"#,
+        )
+        .unwrap();
+
+        let bundles = [bundle];
+        let index: HashMap<&str, &StyleBundle> =
+            bundles.iter().map(|b| (b.id.as_str(), b)).collect();
+        let styles = build_styles(&collection, &index);
+
+        assert_eq!(styles.len(), 3);
+        assert_eq!(styles["wind_only"].parameter.as_deref(), Some("wind_speed"));
+        assert!(styles["global"].parameter.is_none());
     }
 }
