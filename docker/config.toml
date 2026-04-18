@@ -11,6 +11,36 @@
 host = "0.0.0.0"
 port = 8000
 
+# Shared WMS style bundles — see config.toml for the same definition used by
+# the dev environment. Declared here so the docker-compose radar collection
+# can attach it via `style_bundle = "radar_multi"`.
+
+[[style_bundles]]
+id = "radar_multi"
+
+[style_bundles.default]
+colormap = "radar_dbz"
+
+[[style_bundles.extras]]
+name = "radar_dbz"
+title = "MeteoCore Radar"
+colormap = "radar_dbz"
+
+[[style_bundles.extras]]
+name = "radar_fmi"
+title = "FMI Radar"
+colormap = "radar_fmi"
+
+[[style_bundles.extras]]
+name = "radar_bookbinder"
+title = "Bookbinder Radar"
+colormap = "radar_bookbinder"
+
+[[style_bundles.extras]]
+name = "radar_smhi"
+title = "SMHI Radar"
+colormap = "radar_smhi"
+
 [[collections]]
 id = "weather"
 title = "Finnish Weather Observations"
@@ -49,4 +79,4 @@ unit = "dBZ"
 poll_interval_secs = 30
 
 [collections.wms]
-colormap = "radar_dbz"
+style_bundle = "radar_multi"

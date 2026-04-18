@@ -20,7 +20,7 @@ use api_features::handlers::FeaturesState;
 use api_maps::MapsState;
 use api_tiles::TilesState;
 use api_wms::WmsState;
-use ds_core::config::CollectionConfig;
+use ds_core::config::{CollectionConfig, StyleBundle};
 
 // ---------------------------------------------------------------------------
 // Prometheus metrics (global)
@@ -367,7 +367,13 @@ pub struct LoadResult {
     pub grib_engines: Vec<Arc<engine_grib::GribEngine>>,
 }
 
-pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> LoadResult {
+pub fn load_collections(
+    collections: &[CollectionConfig],
+    style_bundles: &[StyleBundle],
+    base_url: &str,
+) -> LoadResult {
+    let bundle_index: HashMap<&str, &StyleBundle> =
+        style_bundles.iter().map(|b| (b.id.as_str(), b)).collect();
     let mut edr_engines: HashMap<String, Arc<dyn ds_core::engine::Engine>> = HashMap::new();
     let mut edr_collections: HashMap<String, CollectionConfig> = HashMap::new();
     let mut feature_engines: HashMap<String, Arc<dyn ds_core::feature_engine::FeatureEngine>> =
@@ -621,7 +627,7 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                     map_collections.insert(collection.id.clone(), collection.clone());
 
                     // Build styles from config
-                    let styles = build_styles(collection);
+                    let styles = build_styles(collection, &bundle_index);
                     map_styles.insert(collection.id.clone(), styles);
 
                     info!("Collection '{}': wired to WMS API", collection.id);
@@ -633,7 +639,7 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                     );
                     maps_collections.insert(collection.id.clone(), collection.clone());
 
-                    let styles = build_styles(collection);
+                    let styles = build_styles(collection, &bundle_index);
                     maps_styles.insert(collection.id.clone(), styles);
 
                     info!("Collection '{}': wired to Maps API", collection.id);
@@ -645,7 +651,7 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                     );
                     tiles_collections.insert(collection.id.clone(), collection.clone());
 
-                    let styles = build_styles(collection);
+                    let styles = build_styles(collection, &bundle_index);
                     tiles_styles.insert(collection.id.clone(), styles);
 
                     info!("Collection '{}': wired to Tiles API", collection.id);
@@ -734,13 +740,14 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection);
+                    let styles = build_styles(collection, &bundle_index);
                     map_styles.insert(collection.id.clone(), styles);
                     if !raster_params.is_empty() {
                         register_parameter_layer_styles(
                             collection,
                             &raster_params,
                             &mut map_styles,
+                            &bundle_index,
                         );
                     }
                     info!("Collection '{}': wired to WMS API", collection.id);
@@ -751,13 +758,14 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     maps_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection);
+                    let styles = build_styles(collection, &bundle_index);
                     maps_styles.insert(collection.id.clone(), styles);
                     if !raster_params.is_empty() {
                         register_parameter_layer_styles(
                             collection,
                             &raster_params,
                             &mut maps_styles,
+                            &bundle_index,
                         );
                     }
                     info!("Collection '{}': wired to Maps API", collection.id);
@@ -768,13 +776,14 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     tiles_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection);
+                    let styles = build_styles(collection, &bundle_index);
                     tiles_styles.insert(collection.id.clone(), styles);
                     if !raster_params.is_empty() {
                         register_parameter_layer_styles(
                             collection,
                             &raster_params,
                             &mut tiles_styles,
+                            &bundle_index,
                         );
                     }
                     info!("Collection '{}': wired to Tiles API", collection.id);
@@ -860,13 +869,14 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection);
+                    let styles = build_styles(collection, &bundle_index);
                     map_styles.insert(collection.id.clone(), styles);
                     if !raster_params.is_empty() {
                         register_parameter_layer_styles(
                             collection,
                             &raster_params,
                             &mut map_styles,
+                            &bundle_index,
                         );
                     }
                     info!("Collection '{}': wired to WMS API", collection.id);
@@ -877,13 +887,14 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     maps_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection);
+                    let styles = build_styles(collection, &bundle_index);
                     maps_styles.insert(collection.id.clone(), styles);
                     if !raster_params.is_empty() {
                         register_parameter_layer_styles(
                             collection,
                             &raster_params,
                             &mut maps_styles,
+                            &bundle_index,
                         );
                     }
                     info!("Collection '{}': wired to Maps API", collection.id);
@@ -894,13 +905,14 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     tiles_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection);
+                    let styles = build_styles(collection, &bundle_index);
                     tiles_styles.insert(collection.id.clone(), styles);
                     if !raster_params.is_empty() {
                         register_parameter_layer_styles(
                             collection,
                             &raster_params,
                             &mut tiles_styles,
+                            &bundle_index,
                         );
                     }
                     info!("Collection '{}': wired to Tiles API", collection.id);
@@ -1005,13 +1017,23 @@ pub fn load_collections(collections: &[CollectionConfig], base_url: &str) -> Loa
     }
 }
 
-/// Build all styles for a WMS-enabled collection from its config.
-fn build_styles(collection: &CollectionConfig) -> HashMap<String, ds_render::StyleInfo> {
+/// Build all styles for a WMS-enabled collection (bundle if bound, inline otherwise).
+fn build_styles(
+    collection: &CollectionConfig,
+    bundles: &HashMap<&str, &StyleBundle>,
+) -> HashMap<String, ds_render::StyleInfo> {
+    build_styles_inner(collection, resolve_bundle(collection, bundles))
+}
+
+fn build_styles_inner(
+    collection: &CollectionConfig,
+    bundle: Option<&StyleBundle>,
+) -> HashMap<String, ds_render::StyleInfo> {
     let mut styles = HashMap::new();
 
-    // Build default style from top-level wms config
+    // Build default style (either from the bundle or from inline wms config)
     let (default_colormap, default_min, default_max) =
-        build_collection_default_colormap(collection);
+        build_collection_default_colormap(collection, bundle);
     styles.insert(
         "default".to_string(),
         ds_render::StyleInfo {
@@ -1024,8 +1046,28 @@ fn build_styles(collection: &CollectionConfig) -> HashMap<String, ds_render::Sty
         },
     );
 
-    // Build additional named styles
-    if let Some(wms_config) = &collection.wms {
+    // Build additional named styles — prefer bundle extras when bound
+    if let Some(bundle) = bundle {
+        for extra in &bundle.extras {
+            let (colormap, min, max) = build_colormap_from_wms_config(
+                extra.colormap.as_deref(),
+                &extra.color_stops,
+                extra.min,
+                extra.max,
+            );
+            styles.insert(
+                extra.name.clone(),
+                ds_render::StyleInfo {
+                    name: extra.name.clone(),
+                    title: extra.title.clone().unwrap_or_else(|| extra.name.clone()),
+                    colormap,
+                    min,
+                    max,
+                    parameter: extra.parameter.clone(),
+                },
+            );
+        }
+    } else if let Some(wms_config) = &collection.wms {
         for style_config in &wms_config.styles {
             let (colormap, min, max) = build_colormap_from_wms_config(
                 style_config.colormap.as_deref(),
@@ -1053,12 +1095,43 @@ fn build_styles(collection: &CollectionConfig) -> HashMap<String, ds_render::Sty
     styles
 }
 
-/// Build the collection-level default colormap (from top-level [collections.wms]).
+/// Resolve a collection's bound bundle; None if unset (validation rejects unresolved refs).
+fn resolve_bundle<'a>(
+    collection: &CollectionConfig,
+    bundles: &'a HashMap<&str, &'a StyleBundle>,
+) -> Option<&'a StyleBundle> {
+    let bundle_ref = collection.wms.as_ref()?.style_bundle.as_deref()?;
+    match bundles.get(bundle_ref).copied() {
+        Some(b) => Some(b),
+        None => {
+            // validate() rejects unresolved refs, so this is defensive: log
+            // so the inline-fallback path is observable if a caller somehow
+            // bypasses validation.
+            tracing::warn!(
+                "Collection '{}': style_bundle '{}' not found in index — falling back to inline config",
+                collection.id,
+                bundle_ref
+            );
+            None
+        }
+    }
+}
+
+/// Build the collection-level default colormap from the bundle or inline `[wms]` fields.
 fn build_collection_default_colormap(
     collection: &CollectionConfig,
+    bundle: Option<&StyleBundle>,
 ) -> (Arc<dyn ds_render::ColorMap>, f64, f64) {
+    if let Some(bundle) = bundle {
+        return build_colormap_from_wms_config(
+            bundle.default.colormap.as_deref(),
+            &bundle.default.color_stops,
+            bundle.default.min,
+            bundle.default.max,
+        );
+    }
     build_colormap_from_wms_config(
-        collection.wms.as_ref().map(|w| w.colormap.as_str()),
+        collection.wms.as_ref().and_then(|w| w.colormap.as_deref()),
         collection
             .wms
             .as_ref()
@@ -1080,25 +1153,25 @@ fn register_parameter_layer_styles(
     collection: &CollectionConfig,
     param_names: &[(String, String)],
     style_map: &mut HashMap<String, HashMap<String, ds_render::StyleInfo>>,
+    bundles: &HashMap<&str, &StyleBundle>,
 ) {
     let wms_config = match &collection.wms {
         Some(c) => c,
         None => return,
     };
 
-    // Build named styles (shared across all param layers)
-    let shared_named_styles = build_styles(collection);
+    let bundle = resolve_bundle(collection, bundles);
+    let shared_named_styles = build_styles_inner(collection, bundle);
 
-    // Index per-parameter configs by name
+    // When a bundle is bound, inline per-parameter overrides are rejected by validation.
     let param_configs: HashMap<&str, &ds_core::config::WmsParameterConfig> = wms_config
         .parameters
         .iter()
         .map(|p| (p.name.as_str(), p))
         .collect();
 
-    // Collection-level default colormap (fallback)
     let (fallback_colormap, fallback_min, fallback_max) =
-        build_collection_default_colormap(collection);
+        build_collection_default_colormap(collection, bundle);
 
     for (short_name, _title) in param_names {
         let layer_key = format!("{}/{}", collection.id, short_name);
@@ -1123,11 +1196,20 @@ fn register_parameter_layer_styles(
             },
         );
 
-        // Add shared named styles (excluding "default" which we just built)
+        // Add shared named styles (excluding "default" which we just built).
+        // Styles tagged with a specific `parameter` are scoped to that layer only —
+        // otherwise a bundle extra with `parameter = "wind_speed"` would leak into
+        // every parameter layer's style map.
         for (name, style) in &shared_named_styles {
-            if name != "default" {
-                layer_styles.insert(name.clone(), style.clone());
+            if name == "default" {
+                continue;
             }
+            if let Some(p) = style.parameter.as_deref() {
+                if p != short_name {
+                    continue;
+                }
+            }
+            layer_styles.insert(name.clone(), style.clone());
         }
 
         style_map.insert(layer_key, layer_styles);
@@ -1295,7 +1377,7 @@ pub async fn reload_handler(
         }
     }
 
-    let result = load_collections(&config.collections, &base_url);
+    let result = load_collections(&config.collections, &config.style_bundles, &base_url);
 
     let loaded = result
         .health
@@ -1832,7 +1914,9 @@ pub async fn request_logging_middleware(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_route, is_safe_request_id};
+    use super::{build_styles, classify_route, is_safe_request_id};
+    use ds_core::config::{CollectionConfig, StyleBundle};
+    use std::collections::HashMap;
 
     #[test]
     fn accepts_typical_uuid() {
@@ -1933,5 +2017,177 @@ mod tests {
         assert_eq!(api, "edr");
         assert_eq!(coll, Some("weather"));
         assert_eq!(qt, "position");
+    }
+
+    #[test]
+    fn build_styles_expands_bundle_into_default_plus_extras() {
+        let collection: CollectionConfig = toml::from_str(
+            r#"
+id = "radar-dwd"
+title = "DWD"
+description = "DWD"
+engine_type = "geotiff"
+
+[geotiff]
+filename_template = "radar_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+data_path = "/tmp"
+
+[wms]
+style_bundle = "radar_multi"
+"#,
+        )
+        .unwrap();
+
+        let bundle: StyleBundle = toml::from_str(
+            r#"
+id = "radar_multi"
+
+[default]
+colormap = "radar_bookbinder"
+
+[[extras]]
+name = "radar_dbz"
+title = "MeteoCore Radar"
+colormap = "radar_dbz"
+
+[[extras]]
+name = "radar_fmi"
+title = "FMI Radar"
+colormap = "radar_fmi"
+"#,
+        )
+        .unwrap();
+
+        let bundles = [bundle];
+        let index: HashMap<&str, &StyleBundle> =
+            bundles.iter().map(|b| (b.id.as_str(), b)).collect();
+
+        let styles = build_styles(&collection, &index);
+        assert_eq!(styles.len(), 3, "default + 2 extras expected");
+        assert!(styles.contains_key("default"));
+        assert_eq!(styles["default"].name, "default");
+        assert!(styles.contains_key("radar_dbz"));
+        assert_eq!(styles["radar_dbz"].title, "MeteoCore Radar");
+        assert!(styles.contains_key("radar_fmi"));
+        assert_eq!(styles["radar_fmi"].title, "FMI Radar");
+    }
+
+    #[test]
+    fn build_styles_falls_back_to_inline_when_no_bundle_referenced() {
+        let collection: CollectionConfig = toml::from_str(
+            r#"
+id = "radar-fmi"
+title = "FMI"
+description = "FMI"
+engine_type = "geotiff"
+
+[geotiff]
+filename_template = "radar_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+data_path = "/tmp"
+
+[wms]
+colormap = "radar_dbz"
+
+[[wms.styles]]
+name = "alt"
+title = "Alt"
+colormap = "grayscale"
+"#,
+        )
+        .unwrap();
+
+        let index: HashMap<&str, &StyleBundle> = HashMap::new();
+
+        let styles = build_styles(&collection, &index);
+        assert_eq!(styles.len(), 2);
+        assert!(styles.contains_key("default"));
+        assert!(styles.contains_key("alt"));
+        assert_eq!(styles["alt"].title, "Alt");
+    }
+
+    #[test]
+    fn build_styles_falls_back_when_bundle_ref_unknown() {
+        // Exercises the defensive path in resolve_bundle: validate() normally
+        // rejects unresolved refs, but if a caller skips validation the
+        // collection must still load with the inline default (viridis) rather
+        // than panic.
+        let collection: CollectionConfig = toml::from_str(
+            r#"
+id = "radar-x"
+title = "X"
+description = "X"
+engine_type = "geotiff"
+
+[geotiff]
+filename_template = "radar_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+data_path = "/tmp"
+
+[wms]
+style_bundle = "does_not_exist"
+"#,
+        )
+        .unwrap();
+
+        let index: HashMap<&str, &StyleBundle> = HashMap::new();
+        let styles = build_styles(&collection, &index);
+
+        // Only the default; no extras; the bundle was silently skipped.
+        assert_eq!(styles.len(), 1);
+        assert!(styles.contains_key("default"));
+    }
+
+    #[test]
+    fn build_styles_parameter_tagged_extras_stay_in_map() {
+        // build_styles itself returns every extra — scoping by parameter
+        // happens downstream in register_parameter_layer_styles. This test
+        // locks the current behaviour so the bundle surface stays stable.
+        let collection: CollectionConfig = toml::from_str(
+            r#"
+id = "multi"
+title = "Multi"
+description = "Multi"
+engine_type = "querydata"
+
+[querydata]
+
+[wms]
+style_bundle = "mixed"
+"#,
+        )
+        .unwrap();
+
+        let bundle: StyleBundle = toml::from_str(
+            r#"
+id = "mixed"
+
+[default]
+colormap = "viridis"
+
+[[extras]]
+name = "wind_only"
+colormap = "wind_speed"
+parameter = "wind_speed"
+
+[[extras]]
+name = "global"
+colormap = "grayscale"
+"#,
+        )
+        .unwrap();
+
+        let bundles = [bundle];
+        let index: HashMap<&str, &StyleBundle> =
+            bundles.iter().map(|b| (b.id.as_str(), b)).collect();
+        let styles = build_styles(&collection, &index);
+
+        assert_eq!(styles.len(), 3);
+        assert_eq!(styles["wind_only"].parameter.as_deref(), Some("wind_speed"));
+        assert!(styles["global"].parameter.is_none());
     }
 }

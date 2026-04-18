@@ -5,6 +5,9 @@ pub struct ServerConfig {
     pub server: ServerSettings,
     #[serde(default)]
     pub collections: Vec<CollectionConfig>,
+    /// Shared style bundles referenced by collections via `[wms] style_bundle`.
+    #[serde(default)]
+    pub style_bundles: Vec<StyleBundle>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,10 +67,11 @@ pub struct CollectionConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WmsConfig {
+    /// Named bundle; mixing with inline colormap/styles/etc. is a config error.
+    pub style_bundle: Option<String>,
     /// Built-in colormap name for the default style (e.g., "radar_dbz", "viridis").
-    /// Ignored if color_stops are provided.
-    #[serde(default = "default_colormap")]
-    pub colormap: String,
+    /// Ignored if color_stops are provided. Falls back to "viridis" if not set.
+    pub colormap: Option<String>,
     /// Inline color stops for the default style. Overrides the built-in colormap.
     #[serde(default)]
     pub color_stops: Vec<ColorStop>,
@@ -131,12 +135,44 @@ pub struct ColorStop {
     pub color: String,
 }
 
-fn default_colormap() -> String {
-    "viridis".to_string()
-}
-
 fn default_rendered_cache_mb() -> u64 {
     512
+}
+
+/// Shared WMS style set: one default + zero or more named extras.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StyleBundle {
+    /// Unique identifier referenced from `WmsConfig::style_bundle`.
+    pub id: String,
+    /// The default style (served when no STYLES= is given, or STYLES=default).
+    pub default: StyleBundleDefault,
+    /// Named extras — each becomes an additional WMS style for every
+    /// collection that references this bundle.
+    #[serde(default)]
+    pub extras: Vec<StyleBundleExtra>,
+}
+
+/// Default style inside a `StyleBundle`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StyleBundleDefault {
+    pub colormap: Option<String>,
+    #[serde(default)]
+    pub color_stops: Vec<ColorStop>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
+/// Named extra style inside a `StyleBundle`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StyleBundleExtra {
+    pub name: String,
+    pub title: Option<String>,
+    pub colormap: Option<String>,
+    #[serde(default)]
+    pub color_stops: Vec<ColorStop>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub parameter: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -385,7 +421,19 @@ impl ServerConfig {
                 crate::error::DataServerError::Config(format!("Failed to read {filename}: {e}"))
             })?;
 
-            let collection: CollectionConfig = toml::from_str(&content).map_err(|e| {
+            let raw: toml::Table = toml::from_str(&content).map_err(|e| {
+                crate::error::DataServerError::Config(format!("Failed to parse {filename}: {e}"))
+            })?;
+            // style_bundles must live in config.toml; serde silently drops
+            // them on CollectionConfig, which makes the later "not defined"
+            // error confusing.
+            if raw.contains_key("style_bundles") {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "{filename}: [[style_bundles]] is not allowed in per-collection files — \
+                     move the block to the top-level config.toml"
+                )));
+            }
+            let collection: CollectionConfig = raw.try_into().map_err(|e| {
                 crate::error::DataServerError::Config(format!("Failed to parse {filename}: {e}"))
             })?;
 
@@ -406,6 +454,55 @@ impl ServerConfig {
 
     /// Validate configuration for common errors before starting the server.
     pub fn validate(&self) -> Result<(), crate::error::DataServerError> {
+        // Check for duplicate style_bundle IDs + validate each bundle's extras.
+        let mut bundle_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for bundle in &self.style_bundles {
+            if bundle.id.is_empty() {
+                return Err(crate::error::DataServerError::Config(
+                    "Style bundle has an empty 'id' field".to_string(),
+                ));
+            }
+            if !bundle_ids.insert(bundle.id.as_str()) {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Duplicate style_bundle ID '{}'",
+                    bundle.id
+                )));
+            }
+            // Extras must have non-empty, non-"default", unique names.
+            // "default" is reserved for the bundle's default style; an extra
+            // using that name would silently overwrite it in
+            // admin::build_styles. Duplicate names within the same bundle
+            // would silently overwrite each other in the same HashMap.
+            let mut extra_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for extra in &bundle.extras {
+                if extra.name.is_empty() {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Style bundle '{}': extra has an empty 'name' field",
+                        bundle.id
+                    )));
+                }
+                if extra.name == "default" {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Style bundle '{}': extra cannot be named 'default' \
+                         (reserved for the bundle's default style)",
+                        bundle.id
+                    )));
+                }
+                if !extra_names.insert(extra.name.as_str()) {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Style bundle '{}': duplicate extra name '{}'",
+                        bundle.id, extra.name
+                    )));
+                }
+                if extra.parameter.as_deref() == Some("") {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Style bundle '{}': extra '{}' has an empty 'parameter' field",
+                        bundle.id, extra.name
+                    )));
+                }
+            }
+        }
+
         // Check for duplicate collection IDs
         let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for (i, collection) in self.collections.iter().enumerate() {
@@ -464,6 +561,30 @@ impl ServerConfig {
                         return Err(crate::error::DataServerError::Config(format!(
                             "Collection '{id}': invalid grib index_format '{fmt}', \
                              expected 'ecmwf-json' or 'wgrib2'"
+                        )));
+                    }
+                }
+            }
+
+            // style_bundle: reference must resolve, must not mix with inline WMS style fields
+            if let Some(wms) = &collection.wms {
+                if let Some(bundle_ref) = &wms.style_bundle {
+                    if !bundle_ids.contains(bundle_ref.as_str()) {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': style_bundle '{bundle_ref}' is not defined \
+                             in [[style_bundles]]"
+                        )));
+                    }
+                    if wms.colormap.is_some()
+                        || !wms.color_stops.is_empty()
+                        || !wms.styles.is_empty()
+                        || !wms.parameters.is_empty()
+                        || wms.min.is_some()
+                        || wms.max.is_some()
+                    {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': style_bundle cannot be combined with inline \
+                             colormap/color_stops/min/max/styles/parameters in [wms]"
                         )));
                     }
                 }
@@ -799,5 +920,422 @@ collections_dir = "collections.d"
         let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
         let ids: Vec<&str> = config.collections.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["alpha", "beta", "gamma"]);
+    }
+
+    // ---- style_bundles ------------------------------------------------------
+
+    fn radar_bundle_toml() -> &'static str {
+        r#"
+[[style_bundles]]
+id = "radar_multi"
+
+[style_bundles.default]
+colormap = "radar_bookbinder"
+
+[[style_bundles.extras]]
+name = "radar_dbz"
+title = "MeteoCore Radar"
+colormap = "radar_dbz"
+
+[[style_bundles.extras]]
+name = "radar_fmi"
+title = "FMI Radar"
+colormap = "radar_fmi"
+"#
+    }
+
+    #[test]
+    fn style_bundle_parses_and_collection_reference_resolves() {
+        let tmp = TempDir::new().unwrap();
+        let config_toml = format!(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+{bundle}
+
+[[collections]]
+id = "radar-dwd"
+title = "DWD"
+description = "DWD"
+engine_type = "geotiff"
+
+[collections.geotiff]
+filename_template = "radar_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+data_path = "/tmp"
+
+[collections.wms]
+style_bundle = "radar_multi"
+"#,
+            bundle = radar_bundle_toml()
+        );
+        let path = write_config(tmp.path(), "config.toml", &config_toml);
+        let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(config.style_bundles.len(), 1);
+        assert_eq!(config.style_bundles[0].id, "radar_multi");
+        assert_eq!(config.style_bundles[0].extras.len(), 2);
+        assert_eq!(
+            config.collections[0]
+                .wms
+                .as_ref()
+                .unwrap()
+                .style_bundle
+                .as_deref(),
+            Some("radar_multi")
+        );
+    }
+
+    #[test]
+    fn duplicate_style_bundle_id_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[style_bundles]]
+id = "dup"
+[style_bundles.default]
+colormap = "viridis"
+
+[[style_bundles]]
+id = "dup"
+[style_bundles.default]
+colormap = "grayscale"
+"#;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Duplicate style_bundle ID 'dup'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_style_bundle_reference_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "radar-dwd"
+title = "DWD"
+description = "DWD"
+engine_type = "geotiff"
+
+[collections.geotiff]
+filename_template = "radar_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+data_path = "/tmp"
+
+[collections.wms]
+style_bundle = "missing"
+"#;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("style_bundle 'missing' is not defined"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn style_bundle_cannot_be_mixed_with_inline_wms_fields() {
+        let tmp = TempDir::new().unwrap();
+        let config_toml = format!(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+{bundle}
+
+[[collections]]
+id = "radar-dwd"
+title = "DWD"
+description = "DWD"
+engine_type = "geotiff"
+
+[collections.geotiff]
+filename_template = "radar_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+data_path = "/tmp"
+
+[collections.wms]
+style_bundle = "radar_multi"
+colormap = "viridis"
+"#,
+            bundle = radar_bundle_toml()
+        );
+        let path = write_config(tmp.path(), "config.toml", &config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("style_bundle cannot be combined with inline"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn style_bundle_cannot_be_mixed_with_inline_styles_array() {
+        let tmp = TempDir::new().unwrap();
+        let config_toml = format!(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+{bundle}
+
+[[collections]]
+id = "radar-dwd"
+title = "DWD"
+description = "DWD"
+engine_type = "geotiff"
+
+[collections.geotiff]
+filename_template = "radar_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+data_path = "/tmp"
+
+[collections.wms]
+style_bundle = "radar_multi"
+
+[[collections.wms.styles]]
+name = "extra"
+colormap = "viridis"
+"#,
+            bundle = radar_bundle_toml()
+        );
+        let path = write_config(tmp.path(), "config.toml", &config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("style_bundle cannot be combined with inline"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_style_bundle_id_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[style_bundles]]
+id = ""
+[style_bundles.default]
+colormap = "viridis"
+"#;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Style bundle has an empty 'id' field"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn extra_with_empty_name_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[style_bundles]]
+id = "radar_multi"
+[style_bundles.default]
+colormap = "radar_dbz"
+
+[[style_bundles.extras]]
+name = ""
+colormap = "radar_fmi"
+"#;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Style bundle 'radar_multi': extra has an empty 'name' field"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn extra_with_empty_parameter_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[style_bundles]]
+id = "radar_multi"
+[style_bundles.default]
+colormap = "radar_dbz"
+
+[[style_bundles.extras]]
+name = "radar_fmi"
+colormap = "radar_fmi"
+parameter = ""
+"#;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "Style bundle 'radar_multi': extra 'radar_fmi' has an empty 'parameter' field"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_extra_name_within_bundle_rejected() {
+        // Two extras with the same name would silently overwrite each other
+        // in build_styles' HashMap; catch at config load instead.
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[style_bundles]]
+id = "radar_multi"
+[style_bundles.default]
+colormap = "radar_dbz"
+
+[[style_bundles.extras]]
+name = "radar_fmi"
+colormap = "radar_fmi"
+
+[[style_bundles.extras]]
+name = "radar_fmi"
+colormap = "radar_bookbinder"
+"#;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Style bundle 'radar_multi': duplicate extra name 'radar_fmi'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn extra_named_default_rejected() {
+        // Without this check, an extra named "default" would silently clobber
+        // the bundle's default style when build_styles inserts the extras.
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[style_bundles]]
+id = "radar_multi"
+[style_bundles.default]
+colormap = "radar_dbz"
+
+[[style_bundles.extras]]
+name = "default"
+colormap = "radar_fmi"
+"#;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("extra cannot be named 'default'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn style_bundles_in_per_collection_file_rejected() {
+        // [[style_bundles]] inside a collections_dir file is dropped silently
+        // by CollectionConfig (no field). Without this hard error the user
+        // would see a confusing "not defined" validation failure instead.
+        let tmp = TempDir::new().unwrap();
+        let collections_dir = tmp.path().join("collections.d");
+        fs::create_dir(&collections_dir).unwrap();
+
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+collections_dir = "collections.d"
+"#;
+        write_config(tmp.path(), "config.toml", config_toml);
+        write_config(
+            &collections_dir,
+            "radar.toml",
+            r#"
+id = "radar"
+title = "Radar"
+description = "Radar"
+
+[[style_bundles]]
+id = "radar_multi"
+[style_bundles.default]
+colormap = "radar_dbz"
+"#,
+        );
+
+        let path = tmp.path().join("config.toml");
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("radar.toml: [[style_bundles]] is not allowed in per-collection files"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn wms_without_colormap_or_bundle_defaults_to_none() {
+        // Verifies the Option<String> migration: omitting `colormap` no longer
+        // forces a default at parse time — the default "viridis" is applied
+        // later by build_colormap_from_wms_config. Previously this field was a
+        // required String with a serde default.
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "x"
+title = "X"
+description = "X"
+
+[collections.wms]
+"#;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
+        let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        let wms = config.collections[0].wms.as_ref().unwrap();
+        assert_eq!(wms.colormap, None);
+        assert_eq!(wms.style_bundle, None);
     }
 }

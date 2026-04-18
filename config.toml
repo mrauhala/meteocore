@@ -2,3 +2,33 @@
 host = "127.0.0.1"
 port = 8000
 collections_dir = "collections.d"
+
+# Shared WMS style bundles. Collections reference these by id from their
+# [wms] style_bundle field to avoid duplicating the same default + extras
+# block across multiple radar configs.
+
+[[style_bundles]]
+id = "radar_multi"
+
+[style_bundles.default]
+colormap = "radar_dbz"
+
+[[style_bundles.extras]]
+name = "radar_dbz"
+title = "MeteoCore Radar"
+colormap = "radar_dbz"
+
+[[style_bundles.extras]]
+name = "radar_fmi"
+title = "FMI Radar"
+colormap = "radar_fmi"
+
+[[style_bundles.extras]]
+name = "radar_bookbinder"
+title = "Bookbinder Radar"
+colormap = "radar_bookbinder"
+
+[[style_bundles.extras]]
+name = "radar_smhi"
+title = "SMHI Radar"
+colormap = "radar_smhi"
