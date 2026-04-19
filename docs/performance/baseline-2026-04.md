@@ -40,6 +40,8 @@ All tests back-to-back with no pause; tests 2 and 3 inherit a pre-warmed cache f
 
 **Zero failures across 21 259 requests.** No load-shedding observed at 100 concurrent users.
 
+(The `/metrics` snapshots show 91 pre-existing `http_requests_total{path="/wms",status="400"}` — the same count in `metrics_before`, `_after_t1`, `_after_t2`, and `_after_t3`. Those 4xx are unrelated background traffic from before the run started; no locust-issued request failed.)
+
 Throughput scales roughly linearly from 10 → 50 → 100 users (7.2 → 35.6 → 70.3 req/s, a 10× increase over a 10× user increase), with p95 latency only rising from 420 ms → 480 ms. The server isn't close to saturation at 100 users.
 
 ## Server-side latency (from Prometheus histograms, full test window)
@@ -88,7 +90,7 @@ The **rendered cache is running at its capacity ceiling** (490 / 512 MiB). Once 
 
 ## Per-endpoint client-side percentiles (test 3, 100-user burst)
 
-Worst offenders only; full CSVs in `/tmp/baseline-2026-04/t3_burst_100u_stats.csv` on the maintainer's machine.
+Worst offenders only; full CSVs in `docs/performance/baseline-2026-04-data/t3_burst_100u_stats.csv` (and `t1_`, `t2_` siblings).
 
 | Endpoint | p50 | p95 | p99 | max |
 |---|---|---|---|---|

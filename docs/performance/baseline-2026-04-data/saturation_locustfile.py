@@ -2,13 +2,20 @@
 Saturation test: same task set as locustfile.py, but with no think time
 and a stepped ramp to find the p95 cliff.
 
-Usage:
-  /tmp/locust-env/bin/locust -f saturation_locustfile.py \
+Run from the repo root so `locustfile.py` is importable:
+  /tmp/locust-env/bin/locust \
+    -f docs/performance/baseline-2026-04-data/saturation_locustfile.py \
     --host https://meteocore.app.meteo.fi --headless
 """
 
 import sys
-sys.path.insert(0, "/Users/mrauhala/Code/dataserver")
+from pathlib import Path
+
+# Resolve the repo root relative to this file so the import works regardless
+# of the caller's cwd: this file lives at docs/performance/<dir>/<file>.py,
+# so the repo root is three parents up.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(_REPO_ROOT))
 
 from locust import constant, LoadTestShape
 import locustfile as _base
