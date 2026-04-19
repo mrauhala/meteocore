@@ -1,0 +1,243 @@
+# HELP collections_degraded Collections in degraded state
+# TYPE collections_degraded gauge
+collections_degraded 0
+# HELP collections_failed Collections in failed state
+# TYPE collections_failed gauge
+collections_failed 0
+# HELP collections_healthy Collections in ready state
+# TYPE collections_healthy gauge
+collections_healthy 13
+# HELP collections_total Total configured collections
+# TYPE collections_total gauge
+collections_total 13
+# HELP grid_cache_bytes Bytes currently held in the GRIB grid cache
+# TYPE grid_cache_bytes gauge
+grid_cache_bytes{collection="ecmwf-ifs"} 107977792
+grid_cache_bytes{collection="noaa-gfs"} 215955584
+# HELP grid_cache_capacity_bytes Configured GRIB grid cache capacity in bytes
+# TYPE grid_cache_capacity_bytes gauge
+grid_cache_capacity_bytes{collection="ecmwf-ifs"} 268435456
+grid_cache_capacity_bytes{collection="noaa-gfs"} 268435456
+# HELP grid_cache_entries Number of entries currently in the GRIB grid cache
+# TYPE grid_cache_entries gauge
+grid_cache_entries{collection="ecmwf-ifs"} 13
+grid_cache_entries{collection="noaa-gfs"} 26
+# HELP grid_cache_hits_total GRIB grid cache hits
+# TYPE grid_cache_hits_total counter
+grid_cache_hits_total{collection="noaa-gfs"} 40
+# HELP grid_cache_misses_total GRIB grid cache misses
+# TYPE grid_cache_misses_total counter
+grid_cache_misses_total{collection="ecmwf-ifs"} 15
+grid_cache_misses_total{collection="noaa-gfs"} 44
+# HELP http_request_duration_seconds HTTP request duration in seconds
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{method="GET",path="/",le="0.001"} 3
+http_request_duration_seconds_bucket{method="GET",path="/",le="0.005"} 3
+http_request_duration_seconds_bucket{method="GET",path="/",le="0.01"} 3
+http_request_duration_seconds_bucket{method="GET",path="/",le="0.025"} 3
+http_request_duration_seconds_bucket{method="GET",path="/",le="0.05"} 3
+http_request_duration_seconds_bucket{method="GET",path="/",le="0.1"} 3
+http_request_duration_seconds_bucket{method="GET",path="/",le="0.25"} 3
+http_request_duration_seconds_bucket{method="GET",path="/",le="0.5"} 3
+http_request_duration_seconds_bucket{method="GET",path="/",le="1"} 3
+http_request_duration_seconds_bucket{method="GET",path="/",le="5"} 3
+http_request_duration_seconds_bucket{method="GET",path="/",le="+Inf"} 3
+http_request_duration_seconds_sum{method="GET",path="/"} 0.00022595999999999998
+http_request_duration_seconds_count{method="GET",path="/"} 3
+http_request_duration_seconds_bucket{method="GET",path="/health",le="0.001"} 3288
+http_request_duration_seconds_bucket{method="GET",path="/health",le="0.005"} 3306
+http_request_duration_seconds_bucket{method="GET",path="/health",le="0.01"} 3306
+http_request_duration_seconds_bucket{method="GET",path="/health",le="0.025"} 3306
+http_request_duration_seconds_bucket{method="GET",path="/health",le="0.05"} 3306
+http_request_duration_seconds_bucket{method="GET",path="/health",le="0.1"} 3306
+http_request_duration_seconds_bucket{method="GET",path="/health",le="0.25"} 3306
+http_request_duration_seconds_bucket{method="GET",path="/health",le="0.5"} 3306
+http_request_duration_seconds_bucket{method="GET",path="/health",le="1"} 3306
+http_request_duration_seconds_bucket{method="GET",path="/health",le="5"} 3306
+http_request_duration_seconds_bucket{method="GET",path="/health",le="+Inf"} 3306
+http_request_duration_seconds_sum{method="GET",path="/health"} 0.9135967690000013
+http_request_duration_seconds_count{method="GET",path="/health"} 3306
+http_request_duration_seconds_bucket{method="GET",path="/maps/collections/{id}/map",le="0.001"} 321
+http_request_duration_seconds_bucket{method="GET",path="/maps/collections/{id}/map",le="0.005"} 334
+http_request_duration_seconds_bucket{method="GET",path="/maps/collections/{id}/map",le="0.01"} 334
+http_request_duration_seconds_bucket{method="GET",path="/maps/collections/{id}/map",le="0.025"} 353
+http_request_duration_seconds_bucket{method="GET",path="/maps/collections/{id}/map",le="0.05"} 367
+http_request_duration_seconds_bucket{method="GET",path="/maps/collections/{id}/map",le="0.1"} 386
+http_request_duration_seconds_bucket{method="GET",path="/maps/collections/{id}/map",le="0.25"} 390
+http_request_duration_seconds_bucket{method="GET",path="/maps/collections/{id}/map",le="0.5"} 390
+http_request_duration_seconds_bucket{method="GET",path="/maps/collections/{id}/map",le="1"} 390
+http_request_duration_seconds_bucket{method="GET",path="/maps/collections/{id}/map",le="5"} 390
+http_request_duration_seconds_bucket{method="GET",path="/maps/collections/{id}/map",le="+Inf"} 390
+http_request_duration_seconds_sum{method="GET",path="/maps/collections/{id}/map"} 2.731744109999997
+http_request_duration_seconds_count{method="GET",path="/maps/collections/{id}/map"} 390
+http_request_duration_seconds_bucket{method="GET",path="/metrics",le="0.001"} 12680
+http_request_duration_seconds_bucket{method="GET",path="/metrics",le="0.005"} 12746
+http_request_duration_seconds_bucket{method="GET",path="/metrics",le="0.01"} 12746
+http_request_duration_seconds_bucket{method="GET",path="/metrics",le="0.025"} 12746
+http_request_duration_seconds_bucket{method="GET",path="/metrics",le="0.05"} 12746
+http_request_duration_seconds_bucket{method="GET",path="/metrics",le="0.1"} 12746
+http_request_duration_seconds_bucket{method="GET",path="/metrics",le="0.25"} 12746
+http_request_duration_seconds_bucket{method="GET",path="/metrics",le="0.5"} 12746
+http_request_duration_seconds_bucket{method="GET",path="/metrics",le="1"} 12746
+http_request_duration_seconds_bucket{method="GET",path="/metrics",le="5"} 12746
+http_request_duration_seconds_bucket{method="GET",path="/metrics",le="+Inf"} 12746
+http_request_duration_seconds_sum{method="GET",path="/metrics"} 3.669494285000007
+http_request_duration_seconds_count{method="GET",path="/metrics"} 12746
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections",le="0.001"} 109
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections",le="0.005"} 139
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections",le="0.01"} 139
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections",le="0.025"} 139
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections",le="0.05"} 139
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections",le="0.1"} 139
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections",le="0.25"} 139
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections",le="0.5"} 139
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections",le="1"} 139
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections",le="5"} 139
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections",le="+Inf"} 139
+http_request_duration_seconds_sum{method="GET",path="/tiles/collections"} 0.087079359
+http_request_duration_seconds_count{method="GET",path="/tiles/collections"} 139
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="0.001"} 178
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="0.005"} 190
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="0.01"} 196
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="0.025"} 234
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="0.05"} 248
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="0.1"} 249
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="0.25"} 249
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="0.5"} 249
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="1"} 249
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="5"} 249
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="+Inf"} 249
+http_request_duration_seconds_sum{method="GET",path="/tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}"} 1.3608293410000014
+http_request_duration_seconds_count{method="GET",path="/tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}"} 249
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="0.001"} 754
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="0.005"} 774
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="0.01"} 805
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="0.025"} 975
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="0.05"} 1035
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="0.1"} 1053
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="0.25"} 1053
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="0.5"} 1053
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="1"} 1053
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="5"} 1053
+http_request_duration_seconds_bucket{method="GET",path="/tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",le="+Inf"} 1053
+http_request_duration_seconds_sum{method="GET",path="/tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}"} 6.525056503999997
+http_request_duration_seconds_count{method="GET",path="/tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}"} 1053
+http_request_duration_seconds_bucket{method="GET",path="/wms",le="0.001"} 109641
+http_request_duration_seconds_bucket{method="GET",path="/wms",le="0.005"} 179547
+http_request_duration_seconds_bucket{method="GET",path="/wms",le="0.01"} 183519
+http_request_duration_seconds_bucket{method="GET",path="/wms",le="0.025"} 183698
+http_request_duration_seconds_bucket{method="GET",path="/wms",le="0.05"} 183904
+http_request_duration_seconds_bucket{method="GET",path="/wms",le="0.1"} 185465
+http_request_duration_seconds_bucket{method="GET",path="/wms",le="0.25"} 188657
+http_request_duration_seconds_bucket{method="GET",path="/wms",le="0.5"} 190511
+http_request_duration_seconds_bucket{method="GET",path="/wms",le="1"} 191392
+http_request_duration_seconds_bucket{method="GET",path="/wms",le="5"} 191890
+http_request_duration_seconds_bucket{method="GET",path="/wms",le="+Inf"} 191894
+http_request_duration_seconds_sum{method="GET",path="/wms"} 2821.2658635369667
+http_request_duration_seconds_count{method="GET",path="/wms"} 191894
+http_request_duration_seconds_bucket{method="GET",path="unmatched",le="0.001"} 12
+http_request_duration_seconds_bucket{method="GET",path="unmatched",le="0.005"} 12
+http_request_duration_seconds_bucket{method="GET",path="unmatched",le="0.01"} 12
+http_request_duration_seconds_bucket{method="GET",path="unmatched",le="0.025"} 12
+http_request_duration_seconds_bucket{method="GET",path="unmatched",le="0.05"} 12
+http_request_duration_seconds_bucket{method="GET",path="unmatched",le="0.1"} 12
+http_request_duration_seconds_bucket{method="GET",path="unmatched",le="0.25"} 12
+http_request_duration_seconds_bucket{method="GET",path="unmatched",le="0.5"} 12
+http_request_duration_seconds_bucket{method="GET",path="unmatched",le="1"} 12
+http_request_duration_seconds_bucket{method="GET",path="unmatched",le="5"} 12
+http_request_duration_seconds_bucket{method="GET",path="unmatched",le="+Inf"} 12
+http_request_duration_seconds_sum{method="GET",path="unmatched"} 0.00007124799999999999
+http_request_duration_seconds_count{method="GET",path="unmatched"} 12
+# HELP http_requests_total Total HTTP requests
+# TYPE http_requests_total counter
+http_requests_total{method="GET",path="/",status="200"} 3
+http_requests_total{method="GET",path="/health",status="200"} 3306
+http_requests_total{method="GET",path="/maps/collections/{id}/map",status="200"} 390
+http_requests_total{method="GET",path="/metrics",status="200"} 12746
+http_requests_total{method="GET",path="/tiles/collections",status="200"} 139
+http_requests_total{method="GET",path="/tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",status="200"} 249
+http_requests_total{method="GET",path="/tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",status="200"} 1053
+http_requests_total{method="GET",path="/wms",status="200"} 191776
+http_requests_total{method="GET",path="/wms",status="304"} 27
+http_requests_total{method="GET",path="/wms",status="400"} 91
+http_requests_total{method="GET",path="unmatched",status="404"} 12
+# HELP http_response_bytes_total Total HTTP response body bytes sent
+# TYPE http_response_bytes_total counter
+http_response_bytes_total{method="GET",path="/"} 6732
+http_response_bytes_total{method="GET",path="/health"} 32665521
+http_response_bytes_total{method="GET",path="/maps/collections/{id}/map"} 21787319
+http_response_bytes_total{method="GET",path="/metrics"} 137010653
+http_response_bytes_total{method="GET",path="/tiles/collections"} 1449631
+http_response_bytes_total{method="GET",path="/tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}"} 916358
+http_response_bytes_total{method="GET",path="/tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}"} 3869378
+http_response_bytes_total{method="GET",path="/wms"} 31965423714
+http_response_bytes_total{method="GET",path="unmatched"} 0
+# HELP render_semaphore_available Available render semaphore permits
+# TYPE render_semaphore_available gauge
+render_semaphore_available 12
+# HELP render_semaphore_total Total render semaphore permits (CPU cores)
+# TYPE render_semaphore_total gauge
+render_semaphore_total 12
+# HELP rendered_cache_bytes Bytes currently held in the rendered image cache
+# TYPE rendered_cache_bytes gauge
+rendered_cache_bytes 517146556
+# HELP rendered_cache_capacity_bytes Configured rendered image cache capacity in bytes
+# TYPE rendered_cache_capacity_bytes gauge
+rendered_cache_capacity_bytes 536870912
+# HELP rendered_cache_entries Number of entries currently in the rendered image cache
+# TYPE rendered_cache_entries gauge
+rendered_cache_entries 3164
+# HELP rendered_cache_hits_total Rendered image cache hits
+# TYPE rendered_cache_hits_total counter
+rendered_cache_hits_total 42390
+# HELP rendered_cache_misses_total Rendered image cache misses
+# TYPE rendered_cache_misses_total counter
+rendered_cache_misses_total 9491
+# HELP storage_bytes_read_total Total bytes read from storage by engine
+# TYPE storage_bytes_read_total counter
+storage_bytes_read_total{collection="ecmwf-ifs",engine_type="grib"} 15942454
+storage_bytes_read_total{collection="fmi-radar",engine_type="geotiff"} 290881815
+storage_bytes_read_total{collection="noaa-gfs",engine_type="grib"} 210872112
+storage_bytes_read_total{collection="opera-precipitation",engine_type="geotiff"} 64054448
+storage_bytes_read_total{collection="opera-reflectivity",engine_type="geotiff"} 183505603
+# HELP tile_cache_bytes Bytes currently held in the GeoTIFF tile cache
+# TYPE tile_cache_bytes gauge
+tile_cache_bytes{collection="dmi-radar-composite-dbz"} 0
+tile_cache_bytes{collection="dwd-radar-composite-dbz"} 0
+tile_cache_bytes{collection="fmi-radar"} 0
+tile_cache_bytes{collection="fmi-radar-composite-dbz"} 0
+tile_cache_bytes{collection="met-norway-radar"} 0
+tile_cache_bytes{collection="met-radar-composite-dbz"} 0
+tile_cache_bytes{collection="opera-precipitation"} 4795690
+tile_cache_bytes{collection="opera-reflectivity"} 5576851
+tile_cache_bytes{collection="smhi-radar-composite-dbz"} 0
+# HELP tile_cache_capacity_bytes Configured GeoTIFF tile cache capacity in bytes
+# TYPE tile_cache_capacity_bytes gauge
+tile_cache_capacity_bytes{collection="dmi-radar-composite-dbz"} 268435456
+tile_cache_capacity_bytes{collection="dwd-radar-composite-dbz"} 268435456
+tile_cache_capacity_bytes{collection="fmi-radar"} 268435456
+tile_cache_capacity_bytes{collection="fmi-radar-composite-dbz"} 268435456
+tile_cache_capacity_bytes{collection="met-norway-radar"} 268435456
+tile_cache_capacity_bytes{collection="met-radar-composite-dbz"} 268435456
+tile_cache_capacity_bytes{collection="opera-precipitation"} 268435456
+tile_cache_capacity_bytes{collection="opera-reflectivity"} 268435456
+tile_cache_capacity_bytes{collection="smhi-radar-composite-dbz"} 268435456
+# HELP tile_cache_entries Number of entries currently in the GeoTIFF tile cache
+# TYPE tile_cache_entries gauge
+tile_cache_entries{collection="dmi-radar-composite-dbz"} 0
+tile_cache_entries{collection="dwd-radar-composite-dbz"} 0
+tile_cache_entries{collection="fmi-radar"} 0
+tile_cache_entries{collection="fmi-radar-composite-dbz"} 0
+tile_cache_entries{collection="met-norway-radar"} 0
+tile_cache_entries{collection="met-radar-composite-dbz"} 0
+tile_cache_entries{collection="opera-precipitation"} 50
+tile_cache_entries{collection="opera-reflectivity"} 168
+tile_cache_entries{collection="smhi-radar-composite-dbz"} 0
+# HELP tile_cache_hits_total GeoTIFF tile cache hits
+# TYPE tile_cache_hits_total counter
+tile_cache_hits_total{collection="opera-precipitation"} 715
+tile_cache_hits_total{collection="opera-reflectivity"} 1527
+# HELP tile_cache_misses_total GeoTIFF tile cache misses
+# TYPE tile_cache_misses_total counter
+tile_cache_misses_total{collection="opera-precipitation"} 51
+tile_cache_misses_total{collection="opera-reflectivity"} 173
