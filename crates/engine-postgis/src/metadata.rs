@@ -1,0 +1,325 @@
+//! Per-collection metadata cache.
+//!
+//! Holds the station list, advertised parameters, temporal extent, and
+//! spatial bbox behind an [`ArcSwap`]. Reads are lock-free via
+//! `load_full()` and never acquire a pool connection — EDR metadata
+//! endpoints (`/collections`, `/collections/{id}`) therefore scale
+//! independently of DB health.
+//!
+//! Bootstrap: [`MetadataCache::refresh`] runs one `stations` query +
+//! one temporal-extent query against the pool and atomically swaps the
+//! result in. Today it's called once at engine construction; #108's
+//! background refresh task (300 s cadence) is deferred to a follow-up.
+
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use chrono::{DateTime, Utc};
+use deadpool_postgres::Pool;
+use ds_core::model::{Location, ParameterDescription};
+use std::collections::HashMap;
+use thiserror::Error;
+
+use crate::config::{PostgisEngineConfig, ValidatedParameter};
+use crate::query::{build_locations, SqlParam};
+use crate::schema::ObservationSchema;
+
+#[derive(Debug, Error)]
+pub enum MetadataError {
+    #[error("pool error: {0}")]
+    Pool(String),
+    #[error("database error")]
+    Db,
+    #[error("row decode error: {0}")]
+    Decode(String),
+}
+
+/// Snapshot of everything EDR metadata endpoints need to answer without
+/// hitting the pool. Cheap to clone (Arcs inside).
+#[derive(Debug, Clone)]
+pub struct CollectionMeta {
+    pub locations: Arc<Vec<Location>>,
+    pub parameters: Arc<HashMap<String, ParameterDescription>>,
+    pub temporal_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    pub spatial_extent: Option<[f64; 4]>,
+    /// Monotonic version counter — bumped by each successful refresh.
+    pub version: u64,
+}
+
+impl CollectionMeta {
+    fn empty() -> Self {
+        Self {
+            locations: Arc::new(Vec::new()),
+            parameters: Arc::new(HashMap::new()),
+            temporal_extent: None,
+            spatial_extent: None,
+            version: 0,
+        }
+    }
+}
+
+/// Thread-safe, reload-safe metadata cache. Reads are lock-free.
+#[derive(Debug)]
+pub struct MetadataCache {
+    inner: ArcSwap<CollectionMeta>,
+}
+
+impl MetadataCache {
+    pub fn new_empty() -> Self {
+        Self {
+            inner: ArcSwap::from_pointee(CollectionMeta::empty()),
+        }
+    }
+
+    pub fn load(&self) -> Arc<CollectionMeta> {
+        self.inner.load_full()
+    }
+
+    /// Atomically replace the cache snapshot.
+    pub fn store(&self, meta: CollectionMeta) {
+        self.inner.store(Arc::new(meta));
+    }
+
+    /// Run one refresh against the pool. Replaces the cached snapshot
+    /// on success, leaves it untouched on error. Caller logs the result.
+    pub async fn refresh(
+        &self,
+        cfg: &PostgisEngineConfig,
+        pool: &Pool,
+    ) -> Result<(), MetadataError> {
+        let locations = fetch_locations(cfg, pool).await?;
+        let parameters = build_parameter_descriptions(&cfg.parameters);
+        let spatial = spatial_extent_from(&locations);
+        let temporal = fetch_temporal_extent(cfg, pool).await?;
+
+        let previous = self.inner.load();
+        let next = CollectionMeta {
+            locations: Arc::new(locations),
+            parameters: Arc::new(parameters),
+            temporal_extent: temporal,
+            spatial_extent: spatial,
+            version: previous.version.wrapping_add(1),
+        };
+        self.inner.store(Arc::new(next));
+        Ok(())
+    }
+}
+
+fn build_parameter_descriptions(
+    params: &[ValidatedParameter],
+) -> HashMap<String, ParameterDescription> {
+    params
+        .iter()
+        .map(|p| {
+            (
+                p.name.clone(),
+                ParameterDescription {
+                    label: if p.label.is_empty() {
+                        p.name.clone()
+                    } else {
+                        p.label.clone()
+                    },
+                    unit: p.unit.clone(),
+                    observed_property: p.observed_property.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn spatial_extent_from(locations: &[Location]) -> Option<[f64; 4]> {
+    if locations.is_empty() {
+        return None;
+    }
+    let mut min_lon = f64::INFINITY;
+    let mut min_lat = f64::INFINITY;
+    let mut max_lon = f64::NEG_INFINITY;
+    let mut max_lat = f64::NEG_INFINITY;
+    for l in locations {
+        min_lon = min_lon.min(l.longitude);
+        max_lon = max_lon.max(l.longitude);
+        min_lat = min_lat.min(l.latitude);
+        max_lat = max_lat.max(l.latitude);
+    }
+    if min_lon.is_finite() && min_lat.is_finite() {
+        Some([min_lon, min_lat, max_lon, max_lat])
+    } else {
+        None
+    }
+}
+
+async fn fetch_locations(
+    cfg: &PostgisEngineConfig,
+    pool: &Pool,
+) -> Result<Vec<Location>, MetadataError> {
+    let built = build_locations(cfg).map_err(|e| MetadataError::Decode(e.to_string()))?;
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| MetadataError::Pool(e.to_string()))?;
+    let stmt = client
+        .prepare_cached(&built.sql)
+        .await
+        .map_err(|_| MetadataError::Db)?;
+    let param_refs = crate::query::params_as_refs(&built.params);
+    let rows = client
+        .query(&stmt, &param_refs)
+        .await
+        .map_err(|_| MetadataError::Db)?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let id: String = row
+            .try_get("id")
+            .map_err(|e| MetadataError::Decode(e.to_string()))?;
+        let label: String = row
+            .try_get("label")
+            .map_err(|e| MetadataError::Decode(e.to_string()))?;
+        let lat: f64 = row
+            .try_get("lat")
+            .map_err(|e| MetadataError::Decode(e.to_string()))?;
+        let lon: f64 = row
+            .try_get("lon")
+            .map_err(|e| MetadataError::Decode(e.to_string()))?;
+        out.push(Location {
+            id,
+            label,
+            latitude: lat,
+            longitude: lon,
+        });
+    }
+    Ok(out)
+}
+
+async fn fetch_temporal_extent(
+    cfg: &PostgisEngineConfig,
+    pool: &Pool,
+) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>, MetadataError> {
+    // Pick the first observation table to probe. For per_parameter we use
+    // the first declared table; for long/wide it's the single table.
+    let (table, time_col, tz) = match &cfg.observations {
+        ObservationSchema::Long(l) => (&l.table, l.time_col.as_str(), l.time_col_tz.as_deref()),
+        ObservationSchema::Wide(w) => (&w.table, w.time_col.as_str(), w.time_col_tz.as_deref()),
+        ObservationSchema::PerParameter(pp) => {
+            let Some(first) = pp.tables.first() else {
+                return Ok(None);
+            };
+            (
+                &first.table,
+                first.time_col.as_str(),
+                first.time_col_tz.as_deref(),
+            )
+        }
+    };
+
+    let time_expr = match tz {
+        None => format!("\"{time_col}\""),
+        Some(tz) => format!("(\"{time_col}\" AT TIME ZONE '{}')", tz.replace('\'', "''")),
+    };
+    let fq_table = format!(
+        "\"{}\".\"{}\"",
+        table.schema.replace('"', "\"\""),
+        table.table.replace('"', "\"\"")
+    );
+    let sql = format!(
+        "SELECT MIN({time_expr})::timestamptz AS lo, MAX({time_expr})::timestamptz AS hi FROM {fq_table}"
+    );
+
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| MetadataError::Pool(e.to_string()))?;
+    let empty_params: Vec<SqlParam> = vec![];
+    let param_refs = crate::query::params_as_refs(&empty_params);
+    let row = client
+        .query_one(&sql, &param_refs)
+        .await
+        .map_err(|_| MetadataError::Db)?;
+
+    let lo: Option<DateTime<Utc>> = row
+        .try_get("lo")
+        .map_err(|e| MetadataError::Decode(e.to_string()))?;
+    let hi: Option<DateTime<Utc>> = row
+        .try_get("hi")
+        .map_err(|e| MetadataError::Decode(e.to_string()))?;
+    Ok(lo.and_then(|lo_v| hi.map(|hi_v| (lo_v, hi_v))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_loc(id: &str, lon: f64, lat: f64) -> Location {
+        Location {
+            id: id.into(),
+            label: id.into(),
+            latitude: lat,
+            longitude: lon,
+        }
+    }
+
+    #[test]
+    fn spatial_extent_empty_is_none() {
+        assert!(spatial_extent_from(&[]).is_none());
+    }
+
+    #[test]
+    fn spatial_extent_single_station_is_zero_box() {
+        let locs = vec![mk_loc("s", 24.5, 60.2)];
+        assert_eq!(spatial_extent_from(&locs), Some([24.5, 60.2, 24.5, 60.2]));
+    }
+
+    #[test]
+    fn spatial_extent_covers_all_stations() {
+        let locs = vec![
+            mk_loc("a", 10.0, 40.0),
+            mk_loc("b", 30.0, 45.0),
+            mk_loc("c", 20.0, 35.0),
+        ];
+        assert_eq!(spatial_extent_from(&locs), Some([10.0, 35.0, 30.0, 45.0]));
+    }
+
+    #[test]
+    fn cache_starts_empty_and_store_replaces() {
+        let cache = MetadataCache::new_empty();
+        let m0 = cache.load();
+        assert_eq!(m0.version, 0);
+        assert!(m0.locations.is_empty());
+
+        let next = CollectionMeta {
+            locations: Arc::new(vec![mk_loc("s", 1.0, 2.0)]),
+            parameters: Arc::new(HashMap::new()),
+            temporal_extent: None,
+            spatial_extent: Some([1.0, 2.0, 1.0, 2.0]),
+            version: 1,
+        };
+        cache.store(next);
+        let m1 = cache.load();
+        assert_eq!(m1.version, 1);
+        assert_eq!(m1.locations.len(), 1);
+    }
+
+    #[test]
+    fn parameter_descriptions_fill_label_default() {
+        let params = vec![
+            ValidatedParameter {
+                name: "t2m".into(),
+                label: "".into(), // empty ⇒ fall back to name
+                unit: "°C".into(),
+                observed_property: "air_temperature".into(),
+                source_key: "t2m".into(),
+            },
+            ValidatedParameter {
+                name: "ws".into(),
+                label: "Wind".into(),
+                unit: "m/s".into(),
+                observed_property: "wind_speed".into(),
+                source_key: "ws".into(),
+            },
+        ];
+        let descs = build_parameter_descriptions(&params);
+        assert_eq!(descs["t2m"].label, "t2m");
+        assert_eq!(descs["ws"].label, "Wind");
+        assert_eq!(descs["t2m"].unit, "°C");
+    }
+}

@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 ds-core = { path = "../core" }
 chrono = { version = "0.4", features = ["serde"] }
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 deadpool-postgres = "0.14"
 tokio-postgres-rustls = "0.13"

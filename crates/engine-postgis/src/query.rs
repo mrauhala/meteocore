@@ -64,6 +64,26 @@ pub enum SqlParam {
     TextArray(Vec<String>),
 }
 
+impl SqlParam {
+    /// View the parameter as a tokio-postgres `ToSql` reference.
+    /// Engine-layer callers collect these into a `Vec<&(dyn ToSql + Sync)>`
+    /// for `client.query(&sql, &params)`.
+    pub fn as_sql(&self) -> &(dyn tokio_postgres::types::ToSql + Sync) {
+        match self {
+            SqlParam::Text(s) => s,
+            SqlParam::Float(f) => f,
+            SqlParam::Timestamp(t) => t,
+            SqlParam::TextArray(v) => v,
+        }
+    }
+}
+
+/// Convenience for the engine layer: turn `Vec<SqlParam>` into a slice of
+/// `&(dyn ToSql + Sync)` refs suitable for `query(&sql, &params)`.
+pub fn params_as_refs(params: &[SqlParam]) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> {
+    params.iter().map(|p| p.as_sql()).collect()
+}
+
 /// A finished, bind-safe query.
 ///
 /// `parameter` is `Some` for per_parameter shape queries so the caller
