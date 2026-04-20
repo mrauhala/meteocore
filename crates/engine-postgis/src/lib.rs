@@ -1,5 +1,6 @@
 pub mod config;
 pub mod engine;
+pub mod feature;
 pub mod health;
 pub mod metadata;
 pub mod pool;

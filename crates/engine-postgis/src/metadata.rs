@@ -16,9 +16,12 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
+use ds_core::feature::PropertyValue;
 use ds_core::model::{Location, ParameterDescription};
 use std::collections::HashMap;
 use thiserror::Error;
+use tokio_postgres::types::Type;
+use tokio_postgres::Row;
 
 use crate::config::{PostgisEngineConfig, ValidatedParameter};
 use crate::query::{build_locations, SqlParam};
@@ -34,10 +37,36 @@ pub enum MetadataError {
     Decode(String),
 }
 
-/// Snapshot of everything EDR metadata endpoints need to answer without
-/// hitting the pool. Cheap to clone (Arcs inside).
+/// A station row enriched with its mapped `property_cols` values already
+/// coerced to [`PropertyValue`]. Drives the `FeatureEngine` impl so
+/// feature lookups never touch the pool.
+#[derive(Debug, Clone)]
+pub struct FeatureStation {
+    pub id: String,
+    pub label: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub properties: Arc<HashMap<String, PropertyValue>>,
+}
+
+impl FeatureStation {
+    pub fn to_location(&self) -> Location {
+        Location {
+            id: self.id.clone(),
+            label: self.label.clone(),
+            latitude: self.lat,
+            longitude: self.lon,
+        }
+    }
+}
+
+/// Snapshot of everything EDR + Features metadata endpoints need to
+/// answer without hitting the pool. Cheap to clone (Arcs inside).
 #[derive(Debug, Clone)]
 pub struct CollectionMeta {
+    /// Full station rows with property values. `locations` is derived
+    /// from this list.
+    pub feature_stations: Arc<Vec<FeatureStation>>,
     pub locations: Arc<Vec<Location>>,
     pub parameters: Arc<HashMap<String, ParameterDescription>>,
     pub temporal_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -49,6 +78,7 @@ pub struct CollectionMeta {
 impl CollectionMeta {
     fn empty() -> Self {
         Self {
+            feature_stations: Arc::new(Vec::new()),
             locations: Arc::new(Vec::new()),
             parameters: Arc::new(HashMap::new()),
             temporal_extent: None,
@@ -87,13 +117,18 @@ impl MetadataCache {
         cfg: &PostgisEngineConfig,
         pool: &Pool,
     ) -> Result<(), MetadataError> {
-        let locations = fetch_locations(cfg, pool).await?;
+        let feature_stations = fetch_feature_stations(cfg, pool).await?;
+        let locations: Vec<Location> = feature_stations
+            .iter()
+            .map(FeatureStation::to_location)
+            .collect();
         let parameters = build_parameter_descriptions(&cfg.parameters);
         let spatial = spatial_extent_from(&locations);
         let temporal = fetch_temporal_extent(cfg, pool).await?;
 
         let previous = self.inner.load();
         let next = CollectionMeta {
+            feature_stations: Arc::new(feature_stations),
             locations: Arc::new(locations),
             parameters: Arc::new(parameters),
             temporal_extent: temporal,
@@ -148,10 +183,10 @@ fn spatial_extent_from(locations: &[Location]) -> Option<[f64; 4]> {
     }
 }
 
-async fn fetch_locations(
+async fn fetch_feature_stations(
     cfg: &PostgisEngineConfig,
     pool: &Pool,
-) -> Result<Vec<Location>, MetadataError> {
+) -> Result<Vec<FeatureStation>, MetadataError> {
     let built = build_locations(cfg).map_err(|e| MetadataError::Decode(e.to_string()))?;
     let client = pool
         .get()
@@ -181,14 +216,86 @@ async fn fetch_locations(
         let lon: f64 = row
             .try_get("lon")
             .map_err(|e| MetadataError::Decode(e.to_string()))?;
-        out.push(Location {
+
+        let mut properties = HashMap::with_capacity(cfg.stations.property_cols.len());
+        for col_name in &cfg.stations.property_cols {
+            let value = decode_property_by_name(row, col_name)?;
+            properties.insert(col_name.clone(), value);
+        }
+
+        out.push(FeatureStation {
             id,
             label,
-            latitude: lat,
-            longitude: lon,
+            lat,
+            lon,
+            properties: Arc::new(properties),
         });
     }
     Ok(out)
+}
+
+/// Coerce a column value to [`PropertyValue`] based on the column's
+/// PostgreSQL type. Null values map to `PropertyValue::Null`. Unsupported
+/// types (arrays, json, enums, etc.) return an error at decode time —
+/// operators see the mismatch early rather than at HTTP-request time.
+pub fn decode_property_by_name(row: &Row, name: &str) -> Result<PropertyValue, MetadataError> {
+    let col_idx = row
+        .columns()
+        .iter()
+        .position(|c| c.name() == name)
+        .ok_or_else(|| MetadataError::Decode(format!("column '{name}' not in row")))?;
+    decode_property(row, col_idx)
+}
+
+fn decode_property(row: &Row, col_idx: usize) -> Result<PropertyValue, MetadataError> {
+    let col_type = row.columns()[col_idx].type_().clone();
+    let decode_err = |e: tokio_postgres::Error| MetadataError::Decode(e.to_string());
+
+    if col_type == Type::BOOL {
+        let v: Option<bool> = row.try_get(col_idx).map_err(decode_err)?;
+        return Ok(v.map(PropertyValue::Bool).unwrap_or(PropertyValue::Null));
+    }
+    if col_type == Type::INT2 {
+        let v: Option<i16> = row.try_get(col_idx).map_err(decode_err)?;
+        return Ok(v
+            .map(|x| PropertyValue::Integer(x as i64))
+            .unwrap_or(PropertyValue::Null));
+    }
+    if col_type == Type::INT4 {
+        let v: Option<i32> = row.try_get(col_idx).map_err(decode_err)?;
+        return Ok(v
+            .map(|x| PropertyValue::Integer(x as i64))
+            .unwrap_or(PropertyValue::Null));
+    }
+    if col_type == Type::INT8 {
+        let v: Option<i64> = row.try_get(col_idx).map_err(decode_err)?;
+        return Ok(v.map(PropertyValue::Integer).unwrap_or(PropertyValue::Null));
+    }
+    if col_type == Type::FLOAT4 {
+        let v: Option<f32> = row.try_get(col_idx).map_err(decode_err)?;
+        return Ok(v
+            .map(|x| PropertyValue::Float(x as f64))
+            .unwrap_or(PropertyValue::Null));
+    }
+    if col_type == Type::FLOAT8 {
+        let v: Option<f64> = row.try_get(col_idx).map_err(decode_err)?;
+        return Ok(v.map(PropertyValue::Float).unwrap_or(PropertyValue::Null));
+    }
+    if col_type == Type::TEXT
+        || col_type == Type::VARCHAR
+        || col_type == Type::BPCHAR
+        || col_type == Type::NAME
+    {
+        let v: Option<String> = row.try_get(col_idx).map_err(decode_err)?;
+        return Ok(v.map(PropertyValue::String).unwrap_or(PropertyValue::Null));
+    }
+    // NUMERIC has no direct f64 FromSql; users who need it should map it in
+    // a VIEW or use one of the int/float types instead. Explicit rejection
+    // is clearer than a confusing decode error.
+    Err(MetadataError::Decode(format!(
+        "unsupported column type '{}' for property coercion (supported: bool, int2/4/8, float4/8, text/varchar/bpchar/name)",
+        col_type.name()
+    )))
 }
 
 async fn fetch_temporal_extent(
@@ -287,6 +394,7 @@ mod tests {
         assert!(m0.locations.is_empty());
 
         let next = CollectionMeta {
+            feature_stations: Arc::new(vec![]),
             locations: Arc::new(vec![mk_loc("s", 1.0, 2.0)]),
             parameters: Arc::new(HashMap::new()),
             temporal_extent: None,
