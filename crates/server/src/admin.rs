@@ -342,6 +342,7 @@ pub struct ServerState {
     pub geotiff_engines: RwLock<Vec<Arc<engine_geotiff::GeoTiffEngine>>>,
     pub querydata_engines: RwLock<Vec<Arc<engine_querydata::QueryDataEngine>>>,
     pub grib_engines: RwLock<Vec<Arc<engine_grib::GribEngine>>>,
+    pub postgis_engines: RwLock<Vec<Arc<engine_postgis::PostgisEngine>>>,
     /// Serializes reload requests to prevent concurrent reloads from racing.
     pub reload_lock: tokio::sync::Mutex<()>,
     /// Bearer token for admin endpoint authentication.
@@ -365,6 +366,7 @@ pub struct LoadResult {
     pub geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>>,
     pub querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>>,
     pub grib_engines: Vec<Arc<engine_grib::GribEngine>>,
+    pub postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>>,
 }
 
 pub fn load_collections(
@@ -392,6 +394,11 @@ pub fn load_collections(
     let mut geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>> = Vec::new();
     let mut querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>> = Vec::new();
     let mut grib_engines: Vec<Arc<engine_grib::GribEngine>> = Vec::new();
+    let mut postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>> = Vec::new();
+    // Pool registry is local to this load: collections sharing a DSN share a
+    // pool via Arc<Pool>. Across reloads, pools are rebuilt — documented
+    // v1 trade-off; reuse-by-identity across reloads is a follow-up.
+    let mut pool_registry = engine_postgis::pool::PoolRegistry::new();
     let mut health: Vec<CollectionHealth> = Vec::new();
 
     for collection in collections {
@@ -411,6 +418,7 @@ pub fn load_collections(
             "geotiff" => &["edr", "wms", "maps", "tiles"],
             "querydata" => &["edr", "wms", "maps", "tiles"],
             "grib" => &["edr", "wms", "maps", "tiles"],
+            "postgis" => &["edr", "features"],
             _ => &[],
         };
         let unsupported: Vec<&str> = collection
@@ -935,6 +943,129 @@ pub fn load_collections(
                     },
                 });
             }
+            "postgis" => {
+                let postgis_cfg = match collection.postgis.as_ref() {
+                    Some(c) => c,
+                    None => {
+                        tracing::error!(
+                            "Collection '{}': engine_type 'postgis' but missing [collections.postgis] config, skipping",
+                            collection.id
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "postgis".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some("missing [collections.postgis] config".into()),
+                        });
+                        continue;
+                    }
+                };
+
+                let validated =
+                    match engine_postgis::config::PostgisEngineConfig::resolve(postgis_cfg) {
+                        Ok(v) => Arc::new(v),
+                        Err(e) => {
+                            tracing::error!(
+                                "Collection '{}': postgis config resolve failed: {}",
+                                collection.id,
+                                e
+                            );
+                            health.push(CollectionHealth {
+                                id: collection.id.clone(),
+                                engine_type: "postgis".into(),
+                                status: CollectionStatus::Failed,
+                                error: Some(format!("{e}")),
+                            });
+                            continue;
+                        }
+                    };
+
+                let pool_size = std::num::NonZeroU32::new(validated.pool_size)
+                    .unwrap_or_else(engine_postgis::pool::default_pool_size);
+                let pool = match pool_registry.get_or_create(&validated.dsn, pool_size) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!(
+                            "Collection '{}': pool acquire failed: {}",
+                            collection.id,
+                            e
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "postgis".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some(format!("{e}")),
+                        });
+                        continue;
+                    }
+                };
+
+                let engine = Arc::new(engine_postgis::PostgisEngine::new(
+                    collection.id.clone(),
+                    validated.clone(),
+                    pool,
+                ));
+
+                // Bootstrap metadata synchronously. Failure ⇒ degraded status;
+                // the engine still gets wired in so requests can retry once
+                // the DB is reachable.
+                let refresh_result = match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        let e = engine.clone();
+                        tokio::task::block_in_place(|| {
+                            handle.block_on(async move { e.refresh_metadata().await })
+                        })
+                    }
+                    Err(_) => tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build tokio runtime")
+                        .block_on(async { engine.refresh_metadata().await }),
+                };
+
+                let (status, status_err) = match &refresh_result {
+                    Ok(()) => {
+                        use ds_core::engine::Engine as _;
+                        info!(
+                            "Collection '{}': postgis engine ready ({} stations, {} parameters)",
+                            collection.id,
+                            engine.get_locations().map(|l| l.len()).unwrap_or(0),
+                            engine.get_parameters().len()
+                        );
+                        (CollectionStatus::Ready, None)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Collection '{}': initial metadata refresh failed: {} (serving degraded)",
+                            collection.id,
+                            e
+                        );
+                        (CollectionStatus::Degraded, Some(format!("{e}")))
+                    }
+                };
+
+                if collection.apis.contains(&"edr".to_string()) {
+                    edr_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::engine::Engine>,
+                    );
+                    edr_collections.insert(collection.id.clone(), collection.clone());
+                }
+                if collection.apis.contains(&"features".to_string()) {
+                    feature_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
+                    );
+                    feature_collections.insert(collection.id.clone(), collection.clone());
+                }
+                postgis_engines.push(engine);
+                health.push(CollectionHealth {
+                    id: collection.id.clone(),
+                    engine_type: "postgis".into(),
+                    status,
+                    error: status_err,
+                });
+            }
             other => {
                 tracing::error!(
                     "Collection '{}': unknown engine type '{}', skipping",
@@ -1014,6 +1145,7 @@ pub fn load_collections(
         geotiff_engines,
         querydata_engines,
         grib_engines,
+        postgis_engines,
     }
 }
 
@@ -1446,6 +1578,10 @@ pub async fn reload_handler(
         .grib_engines
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.grib_engines;
+    *state
+        .postgis_engines
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = result.postgis_engines;
 
     info!(
         "Reload complete: {}/{} collections loaded",

@@ -73,6 +73,7 @@ fn make_collection(id: &str) -> CollectionConfig {
         querydata: None,
         wms: None,
         grib: None,
+        postgis: None,
     }
 }
 
