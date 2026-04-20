@@ -22,8 +22,8 @@ use tokio_postgres::Row;
 use crate::config::PostgisEngineConfig;
 use crate::metadata::{CollectionMeta, MetadataCache};
 use crate::query::{
-    build_location, build_position, params_as_refs, BuiltQuery, DEFAULT_POSITION_RADIUS_M,
-    MAX_OBSERVATION_ROWS,
+    build_location, build_position, build_stations_in_polygon, params_as_refs, BuiltQuery,
+    DEFAULT_POSITION_RADIUS_M, MAX_OBSERVATION_ROWS, MAX_STATIONS_IN_POLYGON,
 };
 use crate::schema::ObservationSchema;
 
@@ -123,11 +123,11 @@ impl Engine for PostgisEngine {
     }
 
     fn supported_query_types(&self) -> Vec<String> {
-        // query_area (#106) and features (#107) land in follow-up PRs.
         vec![
             "locations".to_string(),
             "position".to_string(),
             "location".to_string(),
+            "area".to_string(),
         ]
     }
 
@@ -168,15 +168,41 @@ impl Engine for PostgisEngine {
 
     fn query_area(
         &self,
-        _coords: &str,
-        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
-        _parameters: Option<&[String]>,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
     ) -> Result<AreaQueryResult, DataServerError> {
-        // #106 ships area queries. Until then, surface a clear error
-        // rather than the generic "not supported" default.
-        Err(DataServerError::InvalidParameter(
-            "area query for postgis engine is not yet implemented (#106)".into(),
-        ))
+        let polygon_wkt = normalize_area_wkt(coords)?;
+        let source_keys = resolve_source_keys(&self.config, parameters)?;
+        let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
+
+        let stations = run_stations_in_polygon_sync(&self.pool, &self.config, &polygon_wkt)?;
+        if stations.is_empty() {
+            return Ok(AreaQueryResult::Collection(vec![]));
+        }
+        if stations.len() >= MAX_STATIONS_IN_POLYGON {
+            return Err(DataServerError::Engine(format!(
+                "area query hit the {} station cap — narrow the polygon or time range",
+                MAX_STATIONS_IN_POLYGON - 1
+            )));
+        }
+
+        let mut results = Vec::with_capacity(stations.len());
+        for station in &stations {
+            let queries = build_location(&self.config, &station.id, datetime, &key_refs)
+                .map_err(|e| DataServerError::Engine(format!("build_location: {e}")))?;
+            let rows_per_query = run_queries_sync(&self.pool, &queries)?;
+            let qr = assemble_query_result(
+                &self.config,
+                &station.id,
+                station.longitude,
+                station.latitude,
+                &queries,
+                rows_per_query,
+            )?;
+            results.push(qr);
+        }
+        Ok(AreaQueryResult::Collection(results))
     }
 }
 
@@ -250,6 +276,52 @@ fn run_queries_sync(pool: &Pool, queries: &[BuiltQuery]) -> Result<Vec<Vec<Row>>
                 )));
             }
             out.push(rows);
+        }
+        Ok(out)
+    })
+}
+
+fn run_stations_in_polygon_sync(
+    pool: &Pool,
+    cfg: &PostgisEngineConfig,
+    polygon_wkt: &str,
+) -> Result<Vec<Location>, DataServerError> {
+    let built = build_stations_in_polygon(cfg, polygon_wkt)
+        .map_err(|e| DataServerError::Engine(format!("build_stations_in_polygon: {e}")))?;
+    let pool = pool.clone();
+    let sql = built.sql;
+    let params = built.params;
+    block_on_async(async move {
+        let client = pool
+            .get()
+            .await
+            .map_err(|e| DataServerError::Engine(format!("pool acquire failed: {e}")))?;
+        let refs = params_as_refs(&params);
+        let rows = client
+            .query(&sql, &refs)
+            .await
+            .map_err(|e| DataServerError::Engine(format!("stations_in_polygon failed: {e}")))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id: String = row
+                .try_get("id")
+                .map_err(|e| DataServerError::Engine(format!("decode station id: {e}")))?;
+            let label: String = row
+                .try_get("label")
+                .map_err(|e| DataServerError::Engine(format!("decode station label: {e}")))?;
+            let lat: f64 = row
+                .try_get("lat")
+                .map_err(|e| DataServerError::Engine(format!("decode lat: {e}")))?;
+            let lon: f64 = row
+                .try_get("lon")
+                .map_err(|e| DataServerError::Engine(format!("decode lon: {e}")))?;
+            out.push(Location {
+                id,
+                label,
+                latitude: lat,
+                longitude: lon,
+            });
         }
         Ok(out)
     })
@@ -641,6 +713,35 @@ where
     }
 }
 
+// ─── area-query WKT normalization ──────────────────────────────────────────
+
+/// Accept either a WKT POLYGON directly (pass-through after light trim)
+/// or a `west,south,east,north` bbox string (converted to a closed
+/// POLYGON). Everything goes into `ST_GeomFromText` as a bind so no
+/// request data reaches SQL as text.
+fn normalize_area_wkt(coords: &str) -> Result<String, DataServerError> {
+    let s = coords.trim();
+    if s.starts_with("POLYGON") {
+        return Ok(s.to_string());
+    }
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() == 4 {
+        let vals: Result<Vec<f64>, _> = parts.iter().map(|p| p.trim().parse::<f64>()).collect();
+        if let Ok(v) = vals {
+            return Ok(format!(
+                "POLYGON(({w} {s_},{e} {s_},{e} {n},{w} {n},{w} {s_}))",
+                w = v[0],
+                s_ = v[1],
+                e = v[2],
+                n = v[3]
+            ));
+        }
+    }
+    Err(DataServerError::InvalidParameter(format!(
+        "cannot parse area coordinates: {s}"
+    )))
+}
+
 // ─── coord parsing (WKT POINT or "lon,lat") ────────────────────────────────
 
 fn parse_coords(coords: &str) -> Result<(f64, f64), DataServerError> {
@@ -696,6 +797,26 @@ mod tests {
     fn parse_coords_garbage_rejected() {
         assert!(parse_coords("garbage").is_err());
         assert!(parse_coords("POINT(24.9)").is_err());
+    }
+
+    #[test]
+    fn normalize_area_wkt_passes_polygon_through() {
+        let wkt = "POLYGON((0 0,10 0,10 10,0 10,0 0))";
+        assert_eq!(normalize_area_wkt(wkt).unwrap(), wkt);
+    }
+
+    #[test]
+    fn normalize_area_wkt_converts_bbox_to_closed_polygon() {
+        let out = normalize_area_wkt("0,0,10,10").unwrap();
+        assert!(out.starts_with("POLYGON(("));
+        // 5 points: 4 corners + closing repeat.
+        assert_eq!(out.matches(',').count(), 4);
+    }
+
+    #[test]
+    fn normalize_area_wkt_rejects_garbage() {
+        assert!(normalize_area_wkt("not-coords").is_err());
+        assert!(normalize_area_wkt("1,2,3").is_err()); // wrong arity
     }
 
     #[test]
