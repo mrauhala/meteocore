@@ -25,9 +25,12 @@ use crate::schema::{
 };
 use crate::security::{quote_ident, QuoteError};
 
-/// Maximum rows returned by a locations list query; 1001 so exactly 1000
-/// stations fit and the 1001st row signals the cap is breached.
-pub const MAX_LOCATIONS: usize = 1001;
+/// Maximum rows returned by a locations list query. 50_001 covers the
+/// real-world deployment range (FMI ~10k stations, MET Office ~5k, NOAA
+/// COOP ~30k). Operators with larger networks should narrow via
+/// `stations.where`. The 50_001th row signals the cap is breached so the
+/// engine can warn — see #110 metadata refresh status.
+pub const MAX_LOCATIONS: usize = 50_001;
 
 /// Maximum rows returned per observation query. Exceeded ⇒ engine returns
 /// a `Truncated` error that the HTTP layer maps to 413.
@@ -307,7 +310,7 @@ fn build_location_long(
     let param_col = quote_ident(&shape.param_col)?;
     let value_col = quote_ident(&shape.value_col)?;
     let time_select = time_select_expr(&time_col, shape.time_col_tz.as_deref());
-    let time_filter = time_filter_expr(&time_col, shape.time_col_tz.as_deref());
+    let tz = shape.time_col_tz.as_deref();
 
     let mut params: Vec<SqlParam> = vec![SqlParam::Text(station_id.to_string())];
     let mut sql = format!(
@@ -319,7 +322,11 @@ fn build_location_long(
     );
 
     if let Some((t0, t1)) = time_range {
-        sql.push_str(&format!(" AND {time_filter} >= $2 AND {time_filter} <= $3"));
+        let rhs_lo = time_filter_rhs("$2", tz);
+        let rhs_hi = time_filter_rhs("$3", tz);
+        sql.push_str(&format!(
+            " AND {time_col} >= {rhs_lo} AND {time_col} <= {rhs_hi}"
+        ));
         params.push(SqlParam::Timestamp(t0));
         params.push(SqlParam::Timestamp(t1));
     }
@@ -347,7 +354,7 @@ fn build_location_wide(
     let station_fk = quote_ident(&shape.station_fk_col)?;
     let time_col = quote_ident(&shape.time_col)?;
     let time_select = time_select_expr(&time_col, shape.time_col_tz.as_deref());
-    let time_filter = time_filter_expr(&time_col, shape.time_col_tz.as_deref());
+    let tz = shape.time_col_tz.as_deref();
 
     // Build the projection list from source_keys by looking up columns.
     let mut projection = format!("{time_select} AS time");
@@ -370,7 +377,11 @@ fn build_location_wide(
          WHERE {station_fk} = $1"
     );
     if let Some((t0, t1)) = time_range {
-        sql.push_str(&format!(" AND {time_filter} >= $2 AND {time_filter} <= $3"));
+        let rhs_lo = time_filter_rhs("$2", tz);
+        let rhs_hi = time_filter_rhs("$3", tz);
+        sql.push_str(&format!(
+            " AND {time_col} >= {rhs_lo} AND {time_col} <= {rhs_hi}"
+        ));
         params.push(SqlParam::Timestamp(t0));
         params.push(SqlParam::Timestamp(t1));
     }
@@ -402,7 +413,7 @@ fn build_location_per_parameter(
         let time_col = quote_ident(&table.time_col)?;
         let value_col = quote_ident(&table.value_col)?;
         let time_select = time_select_expr(&time_col, table.time_col_tz.as_deref());
-        let time_filter = time_filter_expr(&time_col, table.time_col_tz.as_deref());
+        let tz = table.time_col_tz.as_deref();
 
         let mut params: Vec<SqlParam> = vec![SqlParam::Text(station_id.to_string())];
         let mut sql = format!(
@@ -412,7 +423,11 @@ fn build_location_per_parameter(
              WHERE {station_fk} = $1"
         );
         if let Some((t0, t1)) = time_range {
-            sql.push_str(&format!(" AND {time_filter} >= $2 AND {time_filter} <= $3"));
+            let rhs_lo = time_filter_rhs("$2", tz);
+            let rhs_hi = time_filter_rhs("$3", tz);
+            sql.push_str(&format!(
+                " AND {time_col} >= {rhs_lo} AND {time_col} <= {rhs_hi}"
+            ));
             params.push(SqlParam::Timestamp(t0));
             params.push(SqlParam::Timestamp(t1));
         }
@@ -448,17 +463,19 @@ fn time_select_expr(time_col: &str, tz: Option<&str>) -> String {
     }
 }
 
-/// Expression used on the right-hand side of WHERE clauses so the bound
-/// timestamptz bind value is converted to `timestamp without time zone`
-/// when necessary — preserves index usability on the underlying column.
-fn time_filter_expr(time_col: &str, tz: Option<&str>) -> String {
+/// Wrap a bind placeholder for use against a `time_col` in a WHERE clause.
+///
+/// - `timestamptz` column (tz=None): returns the bind placeholder unchanged;
+///   `DateTime<Utc>` ⇄ timestamptz pairs up cleanly.
+/// - `timestamp without time zone` (tz=Some("UTC")): wraps as
+///   `($N AT TIME ZONE '<tz>')`. The bind stays `DateTime<Utc>` (timestamptz);
+///   Postgres converts it to `timestamp` at query time, so comparisons are
+///   `timestamp >= timestamp` and the underlying btree/BRIN index on the
+///   column is preserved (wrapping the column instead would disable it).
+fn time_filter_rhs(bind: &str, tz: Option<&str>) -> String {
     match tz {
-        // timestamptz column: direct comparison against bound timestamptz.
-        None => time_col.to_string(),
-        // naive column: bind ($N) is timestamptz; convert it to the same
-        // timestamp_wo_tz domain the column lives in, preserving btree/BRIN
-        // index use.
-        Some(_tz) => time_col.to_string(),
+        None => bind.to_string(),
+        Some(tz) => format!("({bind} AT TIME ZONE '{}')", escape_sql_literal(tz)),
     }
 }
 

@@ -381,6 +381,15 @@ fn assemble_query_result(
     queries: &[BuiltQuery],
     rows_per_query: Vec<Vec<Row>>,
 ) -> Result<QueryResult, DataServerError> {
+    let total_rows: usize = rows_per_query.iter().map(|r| r.len()).sum();
+    if total_rows == 0 {
+        // Match CsvEngine: station exists but has no data in the queried
+        // window ⇒ 404. Better than emitting an empty PointSeries (which
+        // fails CoverageJSON schema validation).
+        return Err(DataServerError::LocationNotFound(format!(
+            "{station_id} (no data in time range)"
+        )));
+    }
     match &cfg.observations {
         ObservationSchema::Long(_) => {
             let rows = rows_per_query.into_iter().next().unwrap_or_default();
@@ -486,10 +495,9 @@ fn assemble_wide(
     // named after that source_key — walk `cfg.parameters` in order for the
     // column list, but we only know which were requested via the row's own
     // column schema. Iterate row columns to discover the set.
-    let Some(first) = rows.first() else {
-        // No rows → empty PointSeries.
-        return Ok(empty_result(cfg, lon, lat));
-    };
+    // Empty rows are caught upstream by assemble_query_result and turned
+    // into LocationNotFound — by the time we get here, `rows` is non-empty.
+    let first = rows.first().expect("upstream guarantees non-empty rows");
 
     let time_col_idx = first
         .columns()
@@ -610,9 +618,8 @@ fn assemble_per_parameter(
     all_times.sort_unstable();
     all_times.dedup();
 
-    if all_times.is_empty() {
-        return Ok(empty_result(cfg, lon, lat));
-    }
+    // Same invariant as wide: empty rows turned into LocationNotFound upstream.
+    debug_assert!(!all_times.is_empty(), "upstream guarantees non-empty rows");
 
     let domain = DomainDescription::PointSeries {
         x: lon,
@@ -660,36 +667,6 @@ fn assemble_per_parameter(
         parameters: param_descs,
         ranges,
     })
-}
-
-fn empty_result(cfg: &PostgisEngineConfig, lon: f64, lat: f64) -> QueryResult {
-    let mut param_descs = HashMap::new();
-    let mut ranges = HashMap::new();
-    for p in &cfg.parameters {
-        let desc = ParameterDescription {
-            label: p.label.clone(),
-            unit: p.unit.clone(),
-            observed_property: p.observed_property.clone(),
-        };
-        param_descs.insert(p.name.clone(), desc);
-        ranges.insert(
-            p.name.clone(),
-            NdArray {
-                shape: vec![0],
-                axis_names: vec!["t".into()],
-                values: vec![],
-            },
-        );
-    }
-    QueryResult {
-        domain: DomainDescription::PointSeries {
-            x: lon,
-            y: lat,
-            t: vec![],
-        },
-        parameters: param_descs,
-        ranges,
-    }
 }
 
 // ─── sync ↔ async bridge ───────────────────────────────────────────────────
