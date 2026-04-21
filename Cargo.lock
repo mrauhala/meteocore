@@ -2896,6 +2896,7 @@ dependencies = [
  "engine-geojson",
  "engine-geotiff",
  "engine-grib",
+ "engine-postgis",
  "engine-querydata",
  "http-body",
  "http-body-util",
