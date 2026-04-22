@@ -45,6 +45,9 @@ jobs:
     - name: Check formatting
       run: cargo fmt -- --check
 
+    - name: SQL safety check (engine-postgis)
+      run: bash scripts/check_sql_safety.sh
+
     - name: Clippy
       run: cargo clippy --all-targets -- -D warnings
 

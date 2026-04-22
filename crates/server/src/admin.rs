@@ -961,24 +961,35 @@ pub fn load_collections(
                     }
                 };
 
-                let validated =
-                    match engine_postgis::config::PostgisEngineConfig::resolve(postgis_cfg) {
-                        Ok(v) => Arc::new(v),
-                        Err(e) => {
-                            tracing::error!(
-                                "Collection '{}': postgis config resolve failed: {}",
-                                collection.id,
-                                e
+                let validated = match engine_postgis::config::PostgisEngineConfig::resolve(
+                    postgis_cfg,
+                ) {
+                    Ok(v) => {
+                        if v.dsn_was_literal {
+                            tracing::warn!(
+                                collection = %collection.id,
+                                "postgis DSN is a literal URL in config (MC_ALLOW_INLINE_DB_URL=1); \
+                                 use an env var in production — literal URLs end up in config \
+                                 artifacts and git history."
                             );
-                            health.push(CollectionHealth {
-                                id: collection.id.clone(),
-                                engine_type: "postgis".into(),
-                                status: CollectionStatus::Failed,
-                                error: Some(format!("{e}")),
-                            });
-                            continue;
                         }
-                    };
+                        Arc::new(v)
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Collection '{}': postgis config resolve failed: {}",
+                            collection.id,
+                            e
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "postgis".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some(format!("{e}")),
+                        });
+                        continue;
+                    }
+                };
 
                 let pool_size = std::num::NonZeroU32::new(validated.pool_size)
                     .unwrap_or_else(engine_postgis::pool::default_pool_size);

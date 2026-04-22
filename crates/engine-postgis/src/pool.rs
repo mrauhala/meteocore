@@ -225,6 +225,10 @@ impl PoolRegistry {
                 "SET statement_timeout = '5s'; SET lock_timeout = '2s'".into(),
             ),
         };
+        // TODO(#110): wire rustls so sslmode=require is actually enforced.
+        // Until then ALL connections use NoTls regardless of the parsed
+        // sslmode — the WARN above is the only signal for non-loopback,
+        // non-require deployments.
         let manager = deadpool_postgres::Manager::from_config(pg_config, NoTls, mgr_config);
 
         let pool = Pool::builder(manager)

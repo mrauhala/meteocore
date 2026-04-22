@@ -657,18 +657,24 @@ fn validate_stations_where_clause(id: &str, w: &str) -> Result<(), crate::error:
             "Collection '{id}': stations.where_clause must not contain SQL comment markers"
         )));
     }
-    // Whole-word check for write/DDL verbs. Case-insensitive; word
-    // boundaries defined as non-alphanumeric + non-underscore.
+    // Whole-word check for write/DDL verbs. Case-insensitive; we collapse
+    // all whitespace to single spaces first so that tab/newline-separated
+    // verbs (`active\nunion\nselect 1`) are caught the same as space-
+    // separated ones. Postgres treats any whitespace as a token separator,
+    // so the check must match.
     let lower = w.to_ascii_lowercase();
-    let padded = format!(" {lower} ");
+    let normalized = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+    let padded = format!(" {normalized} ");
     for verb in [
         // DML / DDL
         "drop", "delete", "update", "insert", "truncate", "alter", "create", "grant", "revoke",
         "copy",
         // Data-exfil / dynamic-execution vectors flagged in PR review:
         // UNION SELECT is the common SQLi exfil pattern; EXECUTE runs
-        // dynamic SQL; CALL / PERFORM invoke stored functions.
-        "union", "execute", "call", "perform",
+        // dynamic SQL; CALL / PERFORM invoke stored functions; SELECT /
+        // FROM catch correlated subqueries like
+        // `territory = (SELECT x FROM y)`.
+        "union", "execute", "call", "perform", "select", "from",
     ] {
         let needle = format!(" {verb} ");
         if padded.contains(&needle) {
@@ -2566,6 +2572,11 @@ unit = "C"
             "1=1 EXECUTE 'DROP TABLE stations'",
             "1=1 call do_something()",
             "1=1 perform evil()",
+            // Correlated subquery — needs SELECT/FROM in the blocklist.
+            "territory = (SELECT territory FROM stations LIMIT 1)",
+            // Whitespace bypass — verbs separated by non-space whitespace.
+            "active\nunion\nselect 1",
+            "active\tdelete\tfrom stations",
         ] {
             assert!(
                 validate_stations_where_clause("c", bad).is_err(),
