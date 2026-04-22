@@ -32,10 +32,8 @@ TimescaleDB) through OGC API - EDR and OGC API - Features.
 - No non-PostgreSQL backends (no MySQL, DuckDB, ODBC).
 - No hot-reload of column renames or DSN changes — those require a restart.
 
-See issue [#99](https://github.com/mrauhala/meteocore/issues/99) (epic) and the
-engine plan doc
-`~/.claude/projects/-Users-mrauhala-Code-dataserver/memory/project_postgis_engine_plan.md`
-for the full design, including phased roadmap and devil's-advocate resolutions.
+See issue [#99](https://github.com/mrauhala/meteocore/issues/99) (epic) for the
+full design, phased roadmap, and devil's-advocate resolutions.
 
 ## Prerequisites
 
@@ -44,9 +42,18 @@ for the full design, including phased roadmap and devil's-advocate resolutions.
 - **TimescaleDB** — optional. Recommended for large observation tables, but the
   engine does not branch on it.
 
-The engine connects via `tokio-postgres` with `rustls` TLS. `sslmode=verify-full`
-is the default; plaintext connections are rejected unless the host is loopback
-or `MC_PG_ALLOW_PLAINTEXT=1` is set.
+### TLS — not implemented in v1
+
+The engine currently connects with `NoTls`. The `sslmode` field in the DSN is
+parsed and used as part of the pool key, but the connection itself is **never
+actually encrypted**. Real TLS wiring with `rustls` + `webpki-roots` is tracked
+in [#110](https://github.com/mrauhala/meteocore/issues/110).
+
+Until #110 lands, make sure the database is reachable **only** over a private
+network, VPN, loopback, or an SSH tunnel. A startup `WARN` is emitted for any
+non-loopback pool whose DSN does not have `sslmode=require` — treat it as a
+reminder that credentials are moving in plaintext, not as proof that they
+aren't.
 
 ## Role SQL
 

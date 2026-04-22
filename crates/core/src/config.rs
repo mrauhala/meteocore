@@ -662,8 +662,13 @@ fn validate_stations_where_clause(id: &str, w: &str) -> Result<(), crate::error:
     let lower = w.to_ascii_lowercase();
     let padded = format!(" {lower} ");
     for verb in [
+        // DML / DDL
         "drop", "delete", "update", "insert", "truncate", "alter", "create", "grant", "revoke",
         "copy",
+        // Data-exfil / dynamic-execution vectors flagged in PR review:
+        // UNION SELECT is the common SQLi exfil pattern; EXECUTE runs
+        // dynamic SQL; CALL / PERFORM invoke stored functions.
+        "union", "execute", "call", "perform",
     ] {
         let needle = format!(" {verb} ");
         if padded.contains(&needle) {
@@ -2556,6 +2561,11 @@ unit = "C"
             "TRUNCATE stations",
             "grant select to public",
             "1; copy stations to program 'evil'",
+            // Data-exfil / dynamic-execution — flagged in PR review.
+            "territory = 'x' UNION SELECT password FROM admin_users",
+            "1=1 EXECUTE 'DROP TABLE stations'",
+            "1=1 call do_something()",
+            "1=1 perform evil()",
         ] {
             assert!(
                 validate_stations_where_clause("c", bad).is_err(),
