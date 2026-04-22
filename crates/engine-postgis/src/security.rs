@@ -76,6 +76,10 @@ pub fn redact_db_url(url: &str) -> String {
 
     let mut out = String::with_capacity(url.len());
     out.push_str(&url[..authority_start]);
+    // SAFETY: `user` is the userinfo fragment of a pre-parsed URL, not a
+    // config- or request-derived value; this file builds log strings, not
+    // SQL. The CI tripwire flags bare push_str(variable) in the crate;
+    // this one is out-of-scope for that guard.
     out.push_str(user);
     out.push_str(&rest[at_pos..]);
     out

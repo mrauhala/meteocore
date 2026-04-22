@@ -580,6 +580,9 @@ fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::D
             )));
         }
     }
+    if let Some(w) = s.where_clause.as_deref() {
+        validate_stations_where_clause(id, w)?;
+    }
 
     // -- observations (shape-dependent) -----------------------------------
     let o = &cfg.observations;
@@ -625,6 +628,50 @@ fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::D
         _ => {} // long: source_key is a string literal, no cross-ref
     }
 
+    Ok(())
+}
+
+/// Reject obviously-dangerous `stations.where_clause` contents before the
+/// engine inlines the string into SQL. Not a cryptographic guarantee —
+/// an operator with config-file write access can always break things —
+/// but blocks the common footgun of a typo (semicolons, comments, DML
+/// verbs) turning into a destructive query. Anything richer than a
+/// simple `col = value AND col < value` filter should live in a SQL
+/// `VIEW`, which is the documented exit strategy.
+fn validate_stations_where_clause(id: &str, w: &str) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+
+    const MAX_LEN: usize = 512;
+    if w.len() > MAX_LEN {
+        return Err(Config(format!(
+            "Collection '{id}': stations.where_clause exceeds {MAX_LEN}-byte cap"
+        )));
+    }
+    if w.contains(';') {
+        return Err(Config(format!(
+            "Collection '{id}': stations.where_clause must not contain ';' (statement chaining)"
+        )));
+    }
+    if w.contains("--") || w.contains("/*") || w.contains("*/") {
+        return Err(Config(format!(
+            "Collection '{id}': stations.where_clause must not contain SQL comment markers"
+        )));
+    }
+    // Whole-word check for write/DDL verbs. Case-insensitive; word
+    // boundaries defined as non-alphanumeric + non-underscore.
+    let lower = w.to_ascii_lowercase();
+    let padded = format!(" {lower} ");
+    for verb in [
+        "drop", "delete", "update", "insert", "truncate", "alter", "create", "grant", "revoke",
+        "copy",
+    ] {
+        let needle = format!(" {verb} ");
+        if padded.contains(&needle) {
+            return Err(Config(format!(
+                "Collection '{id}': stations.where_clause must not contain '{verb}' — put filter logic in a SQL VIEW instead"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -2479,6 +2526,48 @@ unit = "C"
         assert!(!is_valid_sql_identifier("\"; DROP TABLE x;--"));
         assert!(!is_valid_sql_identifier("a b"));
         assert!(!is_valid_sql_identifier("a-b"));
+    }
+
+    #[test]
+    fn validate_stations_where_clause_accepts_simple_filters() {
+        for ok in [
+            "active = true",
+            "quality_code IN (1, 2, 3)",
+            "country_code = 'FI'",
+            "obs_count > 0 AND station_type != 'mobile'",
+        ] {
+            validate_stations_where_clause("c", ok)
+                .unwrap_or_else(|e| panic!("expected OK for '{ok}', got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn validate_stations_where_clause_rejects_injection() {
+        // Each of these should surface as a config error so a typo or
+        // compromised config file cannot chain a destructive statement.
+        for bad in [
+            "1=1; DROP TABLE stations;--",
+            "1=1; DELETE FROM stations",
+            "1=1 -- and more",
+            "1=1 /* comment */",
+            "status = 'ok' */",
+            "DROP TABLE stations",
+            "x = 1 OR DELETE x",
+            "TRUNCATE stations",
+            "grant select to public",
+            "1; copy stations to program 'evil'",
+        ] {
+            assert!(
+                validate_stations_where_clause("c", bad).is_err(),
+                "expected error for '{bad}'"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_stations_where_clause_rejects_oversize() {
+        let long = "a = ".to_string() + &"1".repeat(520);
+        assert!(validate_stations_where_clause("c", &long).is_err());
     }
 
     #[test]

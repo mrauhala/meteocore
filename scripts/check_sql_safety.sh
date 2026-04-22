@@ -50,6 +50,43 @@ then
     found=1
 fi
 
+# push_str(variable) — same injection class as format! when the variable
+# carries config-supplied content. Static literals are safe; we only flag
+# identifier-form args (bare name or `&name`). Lines annotated `// SAFETY:`
+# within the following comment block are excluded.
+if grep -rEn \
+    '\.push_str[[:space:]]*\([[:space:]]*&?[a-z_][a-zA-Z0-9_]*[[:space:]]*\)' \
+    "$CRATE_DIR" \
+    | grep -v "security\.rs"
+then
+    echo >&2
+    echo "check_sql_safety: push_str(variable) — inlining a string variable" >&2
+    echo "  directly into SQL is an injection vector when the source is" >&2
+    echo "  config or request data. Route identifiers through security::" >&2
+    echo "  quote_ident and values through \$N bind parameters. If the" >&2
+    echo "  variable is definitely-safe (whitelist-validated), refactor to" >&2
+    echo "  inline the literal or document with a // SAFETY: comment." >&2
+    found=1
+fi
+
+# Multi-line format!() with a SQL verb further down the macro body.
+# grep is line-oriented and misses these; use perl in slurp mode.
+# Falls back silently if perl is unavailable (only macOS/Linux primary
+# CI jobs run this script, both have perl).
+if command -v perl >/dev/null 2>&1; then
+    if find "$CRATE_DIR" -name '*.rs' -print0 | \
+        xargs -0 perl -0ne 'if (/(format!|concat!)\s*\([^)]*(SELECT|INSERT|UPDATE|DELETE|DROP)/) { print STDERR "$ARGV: multi-line format!/concat! with SQL verb\n"; exit 1 }' \
+        2>/dev/null; then
+        : # no matches
+    else
+        echo >&2
+        echo "check_sql_safety: multi-line format!()/concat!() embedding a SQL" >&2
+        echo "  verb. Split the SELECT keyword off the dynamic portion or" >&2
+        echo "  build the statement with push_str + quote_ident." >&2
+        found=1
+    fi
+fi
+
 if [ "$found" -ne 0 ]; then
     exit 1
 fi

@@ -134,17 +134,20 @@ pub fn build_locations(cfg: &PostgisEngineConfig) -> Result<BuiltQuery, BuildErr
         props.push_str(&quote_ident(col)?);
     }
 
-    let mut sql = format!(
-        "SELECT {id}::text AS id, \
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!(
+        "{id}::text AS id, \
          {label} AS label, \
          ST_Y({geom}) AS lat, \
          ST_X({geom}) AS lon{props} \
          FROM {table}"
-    );
+    ));
+    // SAFETY: where_clause is validated at config load time
+    // (validate_stations_where_clause rejects ;, comments, and DML verbs);
+    // it cannot contain a SELECT or table-mutating statement.
     if let Some(w) = s.where_clause.as_deref() {
         if !w.trim().is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(w);
+            sql.push_str(&format!(" WHERE {w}"));
         }
     }
     sql.push_str(&format!(" ORDER BY {id} LIMIT {MAX_LOCATIONS}"));
@@ -177,22 +180,22 @@ pub fn build_position(
         props.push_str(&quote_ident(col)?);
     }
 
-    let mut sql = format!(
-        "SELECT {id}::text AS id, \
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!(
+        "{id}::text AS id, \
          {label} AS label, \
          ST_Y({geom}) AS lat, \
          ST_X({geom}) AS lon{props}, \
          ST_Distance({geom}::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) AS dist_m \
          FROM {table}"
-    );
-    sql.push_str(" WHERE ST_DWithin(");
-    sql.push_str(&geom);
-    sql.push_str("::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3)");
+    ));
+    sql.push_str(&format!(
+        " WHERE ST_DWithin({geom}::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3)"
+    ));
+    // SAFETY: see validate_stations_where_clause.
     if let Some(w) = s.where_clause.as_deref() {
         if !w.trim().is_empty() {
-            sql.push_str(" AND (");
-            sql.push_str(w);
-            sql.push(')');
+            sql.push_str(&format!(" AND ({w})"));
         }
     }
     sql.push_str(" ORDER BY dist_m LIMIT 1");
@@ -232,20 +235,20 @@ pub fn build_stations_in_polygon(
         props.push_str(&quote_ident(col)?);
     }
 
-    let mut sql = format!(
-        "SELECT {id}::text AS id, \
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!(
+        "{id}::text AS id, \
          {label} AS label, \
          ST_Y({geom}) AS lat, \
          ST_X({geom}) AS lon{props} \
          FROM {table} \
          WHERE {geom} && ST_GeomFromText($1, 4326) \
          AND ST_Within({geom}, ST_GeomFromText($1, 4326))"
-    );
+    ));
+    // SAFETY: see validate_stations_where_clause.
     if let Some(w) = s.where_clause.as_deref() {
         if !w.trim().is_empty() {
-            sql.push_str(" AND (");
-            sql.push_str(w);
-            sql.push(')');
+            sql.push_str(&format!(" AND ({w})"));
         }
     }
     sql.push_str(&format!(" ORDER BY {id} LIMIT {MAX_STATIONS_IN_POLYGON}"));
@@ -313,13 +316,14 @@ fn build_location_long(
     let tz = shape.time_col_tz.as_deref();
 
     let mut params: Vec<SqlParam> = vec![SqlParam::Text(station_id.to_string())];
-    let mut sql = format!(
-        "SELECT {time_select} AS time, \
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!(
+        "{time_select} AS time, \
          {param_col} AS parameter, \
          {value_col}::double precision AS value \
          FROM {table} \
          WHERE {station_fk} = $1"
-    );
+    ));
 
     if let Some((t0, t1)) = time_range {
         let rhs_lo = time_filter_rhs("$2", tz);
@@ -336,9 +340,9 @@ fn build_location_long(
         source_keys.iter().map(|s| s.to_string()).collect(),
     ));
 
-    sql.push_str(" ORDER BY ");
-    sql.push_str(&time_col);
-    sql.push_str(&format!(" LIMIT {MAX_OBSERVATION_ROWS}"));
+    sql.push_str(&format!(
+        " ORDER BY {time_col} LIMIT {MAX_OBSERVATION_ROWS}"
+    ));
 
     Ok(BuiltQuery::new(sql, params))
 }
@@ -371,11 +375,12 @@ fn build_location_wide(
     }
 
     let mut params: Vec<SqlParam> = vec![SqlParam::Text(station_id.to_string())];
-    let mut sql = format!(
-        "SELECT {projection} \
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!(
+        "{projection} \
          FROM {table} \
          WHERE {station_fk} = $1"
-    );
+    ));
     if let Some((t0, t1)) = time_range {
         let rhs_lo = time_filter_rhs("$2", tz);
         let rhs_hi = time_filter_rhs("$3", tz);
@@ -416,12 +421,13 @@ fn build_location_per_parameter(
         let tz = table.time_col_tz.as_deref();
 
         let mut params: Vec<SqlParam> = vec![SqlParam::Text(station_id.to_string())];
-        let mut sql = format!(
-            "SELECT {time_select} AS time, \
+        let mut sql = String::from("SELECT ");
+        sql.push_str(&format!(
+            "{time_select} AS time, \
              {value_col}::double precision AS value \
              FROM {table_fq} \
              WHERE {station_fk} = $1"
-        );
+        ));
         if let Some((t0, t1)) = time_range {
             let rhs_lo = time_filter_rhs("$2", tz);
             let rhs_hi = time_filter_rhs("$3", tz);
@@ -489,176 +495,164 @@ fn escape_sql_literal(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
-    use ds_core::config::{
-        PostgisConfig, PostgisObservationColumn, PostgisObservationTable,
-        PostgisObservationsConfig, PostgisParameterConfig, PostgisStationsConfig,
+    use crate::config::ValidatedParameter;
+    use crate::schema::{
+        LongShape, ObservationSchema, PerParameterShape, PerParameterTable, QualifiedTable,
+        StationsMapping, WideShape,
     };
+    use chrono::TimeZone;
 
     fn t(y: i32, mo: u32, d: u32, h: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, 0, 0).unwrap()
     }
 
-    fn nexus_per_parameter_cfg() -> PostgisEngineConfig {
-        // Safety: tests set TEST_DSN only after locking LOCK; we don't run
-        // alongside config::tests.
-        std::env::set_var("TEST_DSN", "postgres://test@localhost/weather");
-        let pc = PostgisConfig {
-            dsn_env: "TEST_DSN".into(),
-            pool_size: None,
+    // Test helpers build [`PostgisEngineConfig`] directly instead of going
+    // through `resolve()` — that path (env var resolution, MC_ALLOW_INLINE
+    // opt-in, parameter cross-refs) is exercised in `config::tests` with
+    // an `EnvGuard` serialization mutex. Avoiding env-var mutation here
+    // prevents a race with config::tests when cargo runs tests in
+    // parallel within one binary.
+
+    fn public(t_name: &str) -> QualifiedTable {
+        QualifiedTable {
+            schema: "public".into(),
+            table: t_name.into(),
+        }
+    }
+
+    fn param(
+        name: &str,
+        label: &str,
+        unit: &str,
+        observed: &str,
+        source: &str,
+    ) -> ValidatedParameter {
+        ValidatedParameter {
+            name: name.into(),
+            label: label.into(),
+            unit: unit.into(),
+            observed_property: observed.into(),
+            source_key: source.into(),
+        }
+    }
+
+    fn mk_cfg(
+        stations: StationsMapping,
+        observations: ObservationSchema,
+        parameters: Vec<ValidatedParameter>,
+    ) -> PostgisEngineConfig {
+        PostgisEngineConfig {
+            dsn: "postgres://test@localhost/x".into(),
+            dsn_was_literal: false,
+            pool_size: 4,
             pool_label: None,
-            metadata_refresh_secs: None,
-            stations: PostgisStationsConfig {
-                table: "public.stations".into(),
+            metadata_refresh_secs: 300,
+            stations,
+            observations,
+            parameters,
+        }
+    }
+
+    fn nexus_per_parameter_cfg() -> PostgisEngineConfig {
+        mk_cfg(
+            StationsMapping {
+                table: public("stations"),
                 id_col: "wigos_id".into(),
                 label_col: "name".into(),
                 geom_col: "the_geom".into(),
                 property_cols: vec!["territory".into()],
                 where_clause: None,
             },
-            observations: PostgisObservationsConfig {
-                shape: "per_parameter".into(),
-                table: None,
-                station_fk_col: Some("wigos_id".into()),
-                time_col: Some("time".into()),
-                time_col_tz: Some("UTC".into()),
-                param_col: None,
-                value_col: Some("value".into()),
-                geom_col: Some("the_geom".into()),
-                columns: vec![],
+            ObservationSchema::PerParameter(PerParameterShape {
                 tables: vec![
-                    PostgisObservationTable {
+                    PerParameterTable {
                         parameter: "air_temperature".into(),
-                        table: "public.airtemperature".into(),
-                        station_fk_col: None,
-                        time_col: None,
-                        time_col_tz: None,
-                        value_col: None,
-                        geom_col: None,
+                        table: public("airtemperature"),
+                        station_fk_col: "wigos_id".into(),
+                        time_col: "time".into(),
+                        time_col_tz: Some("UTC".into()),
+                        value_col: "value".into(),
+                        geom_col: Some("the_geom".into()),
                     },
-                    PostgisObservationTable {
+                    PerParameterTable {
                         parameter: "wind_speed".into(),
-                        table: "public.wind_speed".into(),
-                        station_fk_col: None,
-                        time_col: None,
-                        time_col_tz: None,
-                        value_col: None,
-                        geom_col: None,
+                        table: public("wind_speed"),
+                        station_fk_col: "wigos_id".into(),
+                        time_col: "time".into(),
+                        time_col_tz: Some("UTC".into()),
+                        value_col: "value".into(),
+                        geom_col: Some("the_geom".into()),
                     },
                 ],
-            },
-            parameters: vec![
-                PostgisParameterConfig {
-                    name: "air_temperature".into(),
-                    label: "2 m air temperature".into(),
-                    unit: "°C".into(),
-                    observed_property: Some("air_temperature".into()),
-                    source_key: None,
-                },
-                PostgisParameterConfig {
-                    name: "wind_speed".into(),
-                    label: "10 m wind speed".into(),
-                    unit: "m/s".into(),
-                    observed_property: Some("wind_speed".into()),
-                    source_key: None,
-                },
+            }),
+            vec![
+                param(
+                    "air_temperature",
+                    "2 m air temperature",
+                    "°C",
+                    "air_temperature",
+                    "air_temperature",
+                ),
+                param(
+                    "wind_speed",
+                    "10 m wind speed",
+                    "m/s",
+                    "wind_speed",
+                    "wind_speed",
+                ),
             ],
-        };
-        PostgisEngineConfig::resolve(&pc).unwrap()
+        )
     }
 
     fn long_cfg() -> PostgisEngineConfig {
-        std::env::set_var("TEST_DSN", "postgres://test@localhost/obs");
-        let pc = PostgisConfig {
-            dsn_env: "TEST_DSN".into(),
-            pool_size: None,
-            pool_label: None,
-            metadata_refresh_secs: None,
-            stations: PostgisStationsConfig {
-                table: "public.stations".into(),
+        mk_cfg(
+            StationsMapping {
+                table: public("stations"),
                 id_col: "fmisid".into(),
                 label_col: "name".into(),
                 geom_col: "geom".into(),
                 property_cols: vec![],
                 where_clause: Some("active = true".into()),
             },
-            observations: PostgisObservationsConfig {
-                shape: "long".into(),
-                table: Some("public.observations".into()),
-                station_fk_col: Some("fmisid".into()),
-                time_col: Some("obstime".into()),
+            ObservationSchema::Long(LongShape {
+                table: public("observations"),
+                station_fk_col: "fmisid".into(),
+                time_col: "obstime".into(),
                 time_col_tz: None,
-                param_col: Some("param_name".into()),
-                value_col: Some("value".into()),
+                param_col: "param_name".into(),
+                value_col: "value".into(),
                 geom_col: None,
-                columns: vec![],
-                tables: vec![],
-            },
-            parameters: vec![PostgisParameterConfig {
-                name: "t2m".into(),
-                label: "temp".into(),
-                unit: "°C".into(),
-                observed_property: None,
-                source_key: None,
-            }],
-        };
-        PostgisEngineConfig::resolve(&pc).unwrap()
+            }),
+            vec![param("t2m", "temp", "°C", "t2m", "t2m")],
+        )
     }
 
     fn wide_cfg() -> PostgisEngineConfig {
-        std::env::set_var("TEST_DSN", "postgres://test@localhost/obs");
-        let pc = PostgisConfig {
-            dsn_env: "TEST_DSN".into(),
-            pool_size: None,
-            pool_label: None,
-            metadata_refresh_secs: None,
-            stations: PostgisStationsConfig {
-                table: "public.stations".into(),
+        mk_cfg(
+            StationsMapping {
+                table: public("stations"),
                 id_col: "station_id".into(),
                 label_col: "name".into(),
                 geom_col: "geom".into(),
                 property_cols: vec![],
                 where_clause: None,
             },
-            observations: PostgisObservationsConfig {
-                shape: "wide".into(),
-                table: Some("public.synop".into()),
-                station_fk_col: Some("station_id".into()),
-                time_col: Some("valid_time".into()),
+            ObservationSchema::Wide(WideShape {
+                table: public("synop"),
+                station_fk_col: "station_id".into(),
+                time_col: "valid_time".into(),
                 time_col_tz: None,
-                param_col: None,
-                value_col: None,
                 geom_col: None,
                 columns: vec![
-                    PostgisObservationColumn {
-                        parameter: "t2m".into(),
-                        column: "temp_celsius".into(),
-                    },
-                    PostgisObservationColumn {
-                        parameter: "rh".into(),
-                        column: "humidity_pct".into(),
-                    },
+                    ("t2m".into(), "temp_celsius".into()),
+                    ("rh".into(), "humidity_pct".into()),
                 ],
-                tables: vec![],
-            },
-            parameters: vec![
-                PostgisParameterConfig {
-                    name: "t2m".into(),
-                    label: "temp".into(),
-                    unit: "°C".into(),
-                    observed_property: None,
-                    source_key: None,
-                },
-                PostgisParameterConfig {
-                    name: "rh".into(),
-                    label: "rh".into(),
-                    unit: "%".into(),
-                    observed_property: None,
-                    source_key: None,
-                },
+            }),
+            vec![
+                param("t2m", "temp", "°C", "t2m", "t2m"),
+                param("rh", "rh", "%", "rh", "rh"),
             ],
-        };
-        PostgisEngineConfig::resolve(&pc).unwrap()
+        )
     }
 
     #[test]

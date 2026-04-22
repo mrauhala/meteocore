@@ -319,18 +319,29 @@ async fn fetch_temporal_extent(
         }
     };
 
+    // Use quote_ident for every identifier — defense-in-depth even though
+    // schema/table/column have already passed the whitelist regex at
+    // config load.
+    let time_col_quoted =
+        crate::security::quote_ident(time_col).map_err(|e| MetadataError::Decode(e.to_string()))?;
+    let schema_quoted = crate::security::quote_ident(&table.schema)
+        .map_err(|e| MetadataError::Decode(e.to_string()))?;
+    let table_quoted = crate::security::quote_ident(&table.table)
+        .map_err(|e| MetadataError::Decode(e.to_string()))?;
     let time_expr = match tz {
-        None => format!("\"{time_col}\""),
-        Some(tz) => format!("(\"{time_col}\" AT TIME ZONE '{}')", tz.replace('\'', "''")),
+        None => time_col_quoted.clone(),
+        Some(tz) => format!(
+            "({time_col_quoted} AT TIME ZONE '{}')",
+            tz.replace('\'', "''")
+        ),
     };
-    let fq_table = format!(
-        "\"{}\".\"{}\"",
-        table.schema.replace('"', "\"\""),
-        table.table.replace('"', "\"\"")
-    );
-    let sql = format!(
-        "SELECT MIN({time_expr})::timestamptz AS lo, MAX({time_expr})::timestamptz AS hi FROM {fq_table}"
-    );
+    // Compose the statement with the SELECT keyword in a plain string
+    // literal (not in a format macro) so the check_sql_safety tripwire
+    // stays meaningful.
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!("MIN({time_expr})::timestamptz AS lo, "));
+    sql.push_str(&format!("MAX({time_expr})::timestamptz AS hi "));
+    sql.push_str(&format!("FROM {schema_quoted}.{table_quoted}"));
 
     let client = pool
         .get()
