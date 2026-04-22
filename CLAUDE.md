@@ -2,7 +2,7 @@
 
 ## What This Is
 
-Rust workspace implementing OGC API - EDR, OGC API - Features, OGC API - Maps, OGC API - Tiles, and OGC WMS 1.3.0 servers. Fifteen crates: `ds-core` (traits + types + shared utilities), `ds-storage` (S3/HTTP/local object store), `ds-render` (raster colorization + PNG encoding), `engine-csv` (CSV data engine), `engine-geojson` (GeoJSON data engine), `engine-geotiff` (GeoTIFF/COG data engine), `engine-grib` (GRIB2 NWP data engine), `engine-querydata` (FMI QueryData data engine), `api-edr` (EDR HTTP layer), `api-features` (Features HTTP layer), `api-maps` (OGC API Maps HTTP layer), `api-tiles` (OGC API Tiles HTTP layer), `api-wms` (WMS 1.3.0 HTTP layer), `server` (binary).
+Rust workspace implementing OGC API - EDR, OGC API - Features, OGC API - Maps, OGC API - Tiles, and OGC WMS 1.3.0 servers. Sixteen crates: `ds-core` (traits + types + shared utilities), `ds-storage` (S3/HTTP/local object store), `ds-render` (raster colorization + PNG encoding), `engine-csv` (CSV data engine), `engine-geojson` (GeoJSON data engine), `engine-geotiff` (GeoTIFF/COG data engine), `engine-grib` (GRIB2 NWP data engine), `engine-querydata` (FMI QueryData data engine), `engine-postgis` (PostGIS/TimescaleDB observation data engine), `api-edr` (EDR HTTP layer), `api-features` (Features HTTP layer), `api-maps` (OGC API Maps HTTP layer), `api-tiles` (OGC API Tiles HTTP layer), `api-wms` (WMS 1.3.0 HTTP layer), `server` (binary).
 
 ## Build & Run
 
@@ -131,6 +131,7 @@ Currently implemented: `PointSeries`, `Grid`.
 | GeoTIFF | `Engine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | GRIB | `Engine` + `MapEngine` | EDR, WMS, Maps, Tiles |
 | QueryData | `Engine` + `MapEngine` | EDR (position only), WMS, Maps, Tiles |
+| PostGIS | `Engine` + `FeatureEngine` | EDR (position, locations, area), Features |
 
 ## GeoTIFF Engine Notes
 
@@ -162,6 +163,21 @@ Currently implemented: `PointSeries`, `Grid`.
 - EDR position queries use bilinear interpolation. Map rendering uses nearest-neighbor.
 - Missing value sentinel: 32700.0.
 - Config: `wms_parameter` (name/short name/ID), `poll_interval_secs` (default 30).
+
+## PostGIS Engine Notes
+
+- Prerequisites: PostgreSQL ≥ 13 + PostGIS ≥ 3.0. TimescaleDB is a supported *deployment* choice (hypertables plan well) but the engine never branches on it.
+- Three schema shapes selected by `observations.shape`: `long` (EAV), `wide` (column-per-parameter), `per_parameter` (table-per-parameter, one fan-out query per param).
+- **DSN via env var only.** `[postgis].dsn_env` names an env var; a literal `postgres://` URL in TOML is rejected at load unless `MC_ALLOW_INLINE_DB_URL=1`.
+- **TLS is deferred to #110.** v1 passes `NoTls`; `sslmode=` in the DSN is parsed but not applied. A startup WARN fires when a non-loopback DSN lacks `sslmode=require`. Until #110 lands, reach the DB over private network/VPN/loopback.
+- **Security layers:** every identifier goes through `ds_core::config::is_valid_sql_identifier` at load + `security::quote_ident` at emit; every value is a `$N` bind. `stations.where_clause` is config-time only (no HTTP input reaches it) and validated against a blocklist (DML/DDL verbs + `UNION`/`EXECUTE`/`CALL`/`PERFORM`, `;`, comments) — if you need richer filtering, create a SQL VIEW.
+- **Per-URL pool** shared across collections on the same `(host, port, db, user, sslmode)` tuple. First-caller-wins on size; `HARD_POOL_CAP = 32`. Per-load only (no reuse across reloads in v1).
+- **Metadata cache** (`ArcSwap<CollectionMeta>`) holds station list, parameter descriptors, temporal extent, spatial bbox. Synchronous bootstrap at construction; background 300 s refresh is deferred to a follow-up.
+- **Row caps** (non-configurable, protective invariants): locations query `LIMIT 50_001` (covers FMI ~10k / NOAA COOP ~30k), per-observation-query `LIMIT 10_001`, stations-in-polygon prefilter `LIMIT 501`, nearest-station `LIMIT 1`.
+- **Time-zone columns:** `time_col_tz` field required when the mapped `time_col` is `timestamp without time zone`. The WHERE clause wraps the bind (`$N AT TIME ZONE '<tz>'`) so the column btree/BRIN index remains usable; the SELECT list wraps the column to emit `timestamptz` so `DateTime<Utc>` decodes cleanly.
+- **No data in window** returns `LocationNotFound` → 404 (matches `CsvEngine`); emitting an empty PointSeries would fail CoverageJSON validation.
+- **Supported `pg_type`s** for `property_cols`: `bool`, `int2/4/8`, `float4/8`, `text`/`varchar`/`bpchar`/`name`, and `NULL`. Unsupported types (arrays, json, enums, numeric, timestamp-typed properties) are rejected at refresh time.
+- **CI tripwire:** `scripts/check_sql_safety.sh` flags single-line + multi-line `format!`/`concat!` containing SQL verbs, string concatenation onto SQL literals, and `push_str(variable)`. Keep `SELECT` keywords in plain `String` literals, not inside `format!`.
 
 ## Config Format
 

@@ -14,6 +14,7 @@ A high-performance modular meteorological data server built in Rust. Implements 
 | `engine-geotiff` | GeoTIFF/COG data engine |
 | `engine-grib` | GRIB2 NWP data engine |
 | `engine-querydata` | FMI QueryData (.sqd) data engine |
+| `engine-postgis` | PostGIS/TimescaleDB observation data engine |
 | `api-edr` | EDR HTTP layer |
 | `api-features` | Features HTTP layer |
 | `api-maps` | OGC API Maps HTTP layer |
@@ -212,7 +213,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `description` | yes | — | Collection description |
 | `data_path` | yes* | — | Path to data file (CSV, GeoJSON) or directory (GeoTIFF) |
 | `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, `"maps"`, `"tiles"`, `"wms"` |
-| `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, `"querydata"` |
+| `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, `"querydata"`, `"postgis"` |
 | `wms` | no | — | WMS rendering config. Required when `apis` contains `"wms"`. |
 
 ### Per-File Collection Configs
@@ -627,6 +628,48 @@ colormap = "viridis"
 name = "2t"
 colormap = "temperature"
 ```
+
+### PostGIS observation data
+
+```toml
+[[collections]]
+id = "fmi-obs"
+title = "FMI Weather Observations"
+description = "Per-parameter hypertables on TimescaleDB"
+engine_type = "postgis"
+apis = ["edr", "features"]
+
+[collections.postgis]
+dsn_env = "FMI_OBS_DSN"             # env-var name holding the postgres:// URL
+
+[collections.postgis.stations]
+table = "public.stations"
+id_col = "wigos_id"
+label_col = "name"
+geom_col = "the_geom"
+property_cols = ["territory"]
+
+[collections.postgis.observations]
+shape = "per_parameter"             # "long" | "wide" | "per_parameter"
+station_fk_col = "wigos_id"
+time_col = "time"
+time_col_tz = "UTC"                 # required when time_col is timestamp w/o tz
+value_col = "value"
+
+[[collections.postgis.observations.tables]]
+parameter = "air_temperature"
+table = "public.airtemperature"
+
+[[collections.postgis.parameters]]
+name = "air_temperature"
+label = "2 m air temperature"
+unit = "degC"
+observed_property = "air_temperature"
+```
+
+- Requires PostgreSQL ≥ 13, PostGIS ≥ 3.0; TimescaleDB optional but recommended.
+- TLS is deferred to [#110](https://github.com/mrauhala/meteocore/issues/110); v1 connects with `NoTls` — deploy the DB behind a private network or loopback.
+- Full reference lives in `crates/engine-postgis/README.md` (role SQL, index recipes, startup hard-error vs. WARN list).
 
 ## OGC API - Features
 

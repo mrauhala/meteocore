@@ -335,7 +335,5 @@ suspicious but workable (WARN — the collection still loads).
 
 - Epic: [#99](https://github.com/mrauhala/meteocore/issues/99)
 - This README: [#112](https://github.com/mrauhala/meteocore/issues/112)
-- Plan doc:
-  `~/.claude/projects/-Users-mrauhala-Code-dataserver/memory/project_postgis_engine_plan.md`
 - Workspace guide: `/CLAUDE.md` (architecture rules, config format, admin
   endpoints)
