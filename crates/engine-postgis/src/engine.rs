@@ -192,15 +192,22 @@ impl Engine for PostgisEngine {
             let queries = build_location(&self.config, &station.id, datetime, &key_refs)
                 .map_err(|e| DataServerError::Engine(format!("build_location: {e}")))?;
             let rows_per_query = run_queries_sync(&self.pool, &queries)?;
-            let qr = assemble_query_result(
+            // A single-station gap inside an area window is expected
+            // (sparse stations, retired sensors, missing parameter for
+            // that station). Skip it rather than 404'ing the whole
+            // request. Real errors still propagate.
+            match assemble_query_result(
                 &self.config,
                 &station.id,
                 station.longitude,
                 station.latitude,
                 &queries,
                 rows_per_query,
-            )?;
-            results.push(qr);
+            ) {
+                Ok(qr) => results.push(qr),
+                Err(DataServerError::LocationNotFound(_)) => continue,
+                Err(e) => return Err(e),
+            }
         }
         Ok(AreaQueryResult::Collection(results))
     }

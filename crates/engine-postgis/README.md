@@ -46,8 +46,8 @@ full design, phased roadmap, and devil's-advocate resolutions.
 
 The engine currently connects with `NoTls`. The `sslmode` field in the DSN is
 parsed and used as part of the pool key, but the connection itself is **never
-actually encrypted**. Real TLS wiring with `rustls` + `webpki-roots` is tracked
-in [#110](https://github.com/mrauhala/meteocore/issues/110).
+actually encrypted**. Real TLS wiring is tracked in
+[#110](https://github.com/mrauhala/meteocore/issues/110).
 
 Until #110 lands, make sure the database is reachable **only** over a private
 network, VPN, loopback, or an SSH tunnel. A startup `WARN` is emitted for any
@@ -296,8 +296,6 @@ suspicious but workable (WARN — the collection still loads).
 - A `property_cols` entry has an unsupported type (only `text`, `varchar`,
   integer types, `real`, `double precision`, and `bool` are accepted).
 - The initial `SELECT 1` ping fails past the 2 s deadline at boot.
-- Plaintext TLS requested on a non-loopback host without
-  `MC_PG_ALLOW_PLAINTEXT=1`.
 
 ### Warnings (collection loads, condition logged)
 
@@ -309,11 +307,10 @@ suspicious but workable (WARN — the collection still loads).
 - Compound `btree (station_fk_col, time_col DESC)` on an observation table is
   missing.
 - `MC_ALLOW_INLINE_DB_URL=1` is set (inline DSNs are a dev-only escape hatch).
-- `MC_PG_ALLOW_PLAINTEXT=1` is set, or a loopback plaintext DSN is used.
+- A non-loopback DSN has `sslmode` other than `require` — a reminder that
+  credentials are moving in plaintext (TLS enforcement tracked in #110).
 - Two collections on the same pool tuple specify different `pool_size` —
-  **max wins**, runner-up logged at INFO.
-- `rustls-native-certs` finds no system trust store; the engine falls back to
-  `webpki-roots` (distroless images trigger this).
+  **first-caller wins**, subsequent size mismatches logged at INFO.
 
 ## Operations
 

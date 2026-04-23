@@ -9,10 +9,10 @@ chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 deadpool-postgres = "0.14"
-tokio-postgres-rustls = "0.13"
-rustls = "0.23"
-rustls-native-certs = "0.8"
-webpki-roots = "1"
+# TLS deps (rustls / tokio-postgres-rustls / rustls-native-certs /
+# webpki-roots) are deliberately absent until #110 wires real TLS. The
+# engine currently passes NoTls. Adding those deps now implies TLS
+# support that does not exist.
 postgis = "0.9"
 arc-swap = "1"
 tracing = "0.1"

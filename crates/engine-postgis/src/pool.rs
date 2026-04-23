@@ -9,8 +9,10 @@
 //! db, user, sslmode)` two different passwords. This prevents a config
 //! typo from silently splitting a pool into two.
 //!
-//! TLS: v1 ships `NoTls`. Real TLS wiring (rustls + `webpki-roots` fallback
-//! for distroless) lands with #110 via a builder hook.
+//! TLS: v1 ships `NoTls`. Real TLS wiring lands with #110. The TLS-
+//! related crates (rustls, tokio-postgres-rustls, rustls-native-certs,
+//! webpki-roots) are deliberately NOT in Cargo.toml until then —
+//! carrying them would imply support that doesn't exist.
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -121,15 +123,13 @@ pub fn normalize_dsn(dsn: &str) -> Result<(PgConfig, PoolKey, Option<String>), R
 }
 
 fn sslmode_str(mode: SslMode) -> String {
-    // tokio-postgres' `SslMode` doesn't implement Display; match exhaustively
-    // so a new variant becomes a compile error instead of a silent label.
-    match mode {
-        SslMode::Disable => "disable",
-        SslMode::Prefer => "prefer",
-        SslMode::Require => "require",
-        _ => "unknown",
-    }
-    .to_string()
+    // `SslMode` is `#[non_exhaustive]` in tokio-postgres so a literal
+    // match forces a catch-all — that would silently collapse any future
+    // variant into a single string and let two collections with
+    // different TLS modes accidentally share a pool. Use the Debug
+    // representation instead: every variant produces a unique string,
+    // forward-compatible when new variants are added upstream.
+    format!("{mode:?}").to_ascii_lowercase()
 }
 
 struct PoolEntry {
@@ -220,10 +220,14 @@ impl PoolRegistry {
             }
         }
 
+        // Recycling is `Fast` — no SQL probe on checkout. Session
+        // limits (statement_timeout, lock_timeout) are enforced via
+        // `ALTER ROLE meteocore_ro SET ...` (see crate README). A
+        // `Custom(SET ...)` recycle query would only run *between*
+        // checkouts, not on the first use of a freshly-connected
+        // client, leaving a window where the timeouts aren't in effect.
         let mgr_config = ManagerConfig {
-            recycling_method: RecyclingMethod::Custom(
-                "SET statement_timeout = '5s'; SET lock_timeout = '2s'".into(),
-            ),
+            recycling_method: RecyclingMethod::Fast,
         };
         // TODO(#110): wire rustls so sslmode=require is actually enforced.
         // Until then ALL connections use NoTls regardless of the parsed

@@ -142,9 +142,20 @@ pub fn build_locations(cfg: &PostgisEngineConfig) -> Result<BuiltQuery, BuildErr
          ST_X({geom}) AS lon{props} \
          FROM {table}"
     ));
-    // SAFETY: where_clause is validated at config load time
-    // (validate_stations_where_clause rejects ;, comments, and DML verbs);
-    // it cannot contain a SELECT or table-mutating statement.
+    // SAFETY: `where_clause` is inlined verbatim — it CANNOT be
+    // parameterised with `$N` because its role is to contribute SQL
+    // fragments (identifiers, operators), not values. The string is
+    // validated at config load time by
+    // `ds_core::config::validate_stations_where_clause`, which rejects
+    // `;`, comments (`--`/`/*`/`*/`), and whole-word DML/DDL/exfil
+    // verbs (`drop`/`delete`/`update`/`insert`/`truncate`/`alter`/
+    // `create`/`grant`/`revoke`/`copy`/`union`/`execute`/`call`/
+    // `perform`/`select`/`from`). The CI tripwire
+    // `scripts/check_sql_safety.sh` does NOT see this call site
+    // (`push_str(&format!(...))` with no verb in the template). For any
+    // filter logic beyond simple `col OP value AND col OP value`,
+    // create a Postgres VIEW and point `stations.table` at it —
+    // that's the documented extension path.
     if let Some(w) = s.where_clause.as_deref() {
         if !w.trim().is_empty() {
             sql.push_str(&format!(" WHERE {w}"));
