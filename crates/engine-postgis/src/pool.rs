@@ -201,23 +201,22 @@ impl PoolRegistry {
             return Ok(entry.pool.clone());
         }
 
-        // Operational warning when the DSN does not require TLS. `disable`
-        // and `prefer` both allow silent plaintext fallback; `require` is
-        // the minimum we want for non-loopback hosts. Production TLS
-        // wiring (rustls + webpki-roots) lands with #110.
-        if !matches!(key.sslmode.as_str(), "require") {
-            let loopback = matches!(
-                key.host.as_str(),
-                "localhost" | "127.0.0.1" | "::1" | "[::1]"
+        // WARN unconditionally on non-loopback hosts until #110 wires
+        // real TLS. Previously the warning was suppressed when the
+        // operator set `sslmode=require` — which is exactly the case
+        // that deserves the loudest signal: they asked for TLS and are
+        // silently getting plaintext.
+        let loopback = matches!(
+            key.host.as_str(),
+            "localhost" | "127.0.0.1" | "::1" | "[::1]"
+        );
+        if !loopback {
+            tracing::warn!(
+                pool_key = %key,
+                sslmode = %key.sslmode,
+                "v1 hardcodes NoTls regardless of sslmode='{}'; credentials are sent in plaintext for this non-loopback host. TLS is tracked in #110; until then, reach the database over a private network, VPN, or SSH tunnel.",
+                key.sslmode
             );
-            if !loopback {
-                tracing::warn!(
-                    pool_key = %key,
-                    sslmode = %key.sslmode,
-                    "postgis pool has sslmode='{}' for a non-loopback host; credentials may be sent in plaintext. Set sslmode=require in the DSN.",
-                    key.sslmode
-                );
-            }
         }
 
         // Recycling is `Fast` — no SQL probe on checkout. Session

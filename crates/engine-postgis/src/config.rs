@@ -123,8 +123,7 @@ impl PostgisEngineConfig {
                 ObservationSchema::Long(_) => {}
             }
             parameters.push(ValidatedParameter {
-                name: check_identifier(&p.name, "parameters[].name")
-                    .unwrap_or_else(|_| p.name.clone()),
+                name: check_identifier(&p.name, "parameters[].name")?,
                 label: p.label.clone(),
                 unit: p.unit.clone(),
                 observed_property: p

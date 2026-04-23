@@ -81,9 +81,14 @@ GRANT SELECT ON <schema>.obs_wind_speed     TO meteocore_ro;
 GRANT SELECT ON <schema>.obs_wind_direction TO meteocore_ro;
 GRANT SELECT ON <schema>.obs_precipitation  TO meteocore_ro;
 
--- Defense in depth: enforce server-side resource limits on every session
--- that logs in as this role. The engine also sets statement_timeout via
--- SET LOCAL per transaction; these ALTER ROLE lines are the backstop.
+-- Enforce server-side resource limits on every session that logs in as
+-- this role. THESE ARE NOT OPTIONAL — the engine does NOT set
+-- statement_timeout / lock_timeout / default_transaction_read_only
+-- itself (session state on a fresh `deadpool-postgres` client with
+-- RecyclingMethod::Fast has none applied). A superuser DSN, or a role
+-- without these ALTER ROLE statements, will run queries with no cap
+-- and no read-only guard — runaway SQL can saturate the pool and
+-- Postgres backends.
 ALTER ROLE meteocore_ro SET statement_timeout = '5s';
 ALTER ROLE meteocore_ro SET default_transaction_read_only = on;
 ALTER ROLE meteocore_ro SET lock_timeout = '2s';

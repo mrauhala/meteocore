@@ -57,8 +57,19 @@ impl PostgisEngine {
         config: Arc<PostgisEngineConfig>,
         pool: Arc<Pool>,
     ) -> Self {
+        let collection_id = collection_id.into();
+        // /health reports the boot-time outcome and is never updated
+        // afterwards. The 30 s background ping described in the plan
+        // doc lives in #110; until then, a DB that goes down after
+        // startup will still show `ready`. Surface this loudly per
+        // collection so operators don't trust /health more than they
+        // should.
+        tracing::warn!(
+            collection = %collection_id,
+            "postgis engine: live health monitoring is not implemented (#110). /health reflects the boot-time status only; a DB failure after startup will NOT flip the collection to degraded."
+        );
         Self {
-            collection_id: collection_id.into(),
+            collection_id,
             config,
             pool,
             cache: Arc::new(MetadataCache::new_empty()),

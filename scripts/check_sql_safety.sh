@@ -52,12 +52,13 @@ fi
 
 # push_str(variable) — same injection class as format! when the variable
 # carries config-supplied content. Static literals are safe; we only flag
-# identifier-form args (bare name or `&name`). Lines annotated `// SAFETY:`
-# within the following comment block are excluded.
+# identifier-form args (bare name or `&name`). Individual call sites can
+# opt out with a `// nosqlcheck` trailing comment — use sparingly and
+# pair with a SAFETY block explaining why the variable is trusted.
 if grep -rEn \
     '\.push_str[[:space:]]*\([[:space:]]*&?[a-z_][a-zA-Z0-9_]*[[:space:]]*\)' \
     "$CRATE_DIR" \
-    | grep -v "security\.rs"
+    | grep -v '// nosqlcheck$'
 then
     echo >&2
     echo "check_sql_safety: push_str(variable) — inlining a string variable" >&2
