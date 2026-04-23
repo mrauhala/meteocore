@@ -65,9 +65,16 @@ impl FeatureStation {
 #[derive(Debug, Clone)]
 pub struct CollectionMeta {
     /// Full station rows with property values. `locations` is derived
-    /// from this list.
+    /// from this list and kept in the same order, so `station_idx`
+    /// is a valid index into both.
     pub feature_stations: Arc<Vec<FeatureStation>>,
     pub locations: Arc<Vec<Location>>,
+    /// `id → index into feature_stations/locations` lookup built once
+    /// per refresh. Constant-time station resolution for
+    /// `query_location`, `query_area` (per-station), and
+    /// `FeatureEngine::get_feature` — at 30 k stations the previous
+    /// `iter().find()` was 12 M string compares per area request.
+    pub station_idx: Arc<HashMap<String, usize>>,
     pub parameters: Arc<HashMap<String, ParameterDescription>>,
     pub temporal_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
     pub spatial_extent: Option<[f64; 4]>,
@@ -80,12 +87,25 @@ impl CollectionMeta {
         Self {
             feature_stations: Arc::new(Vec::new()),
             locations: Arc::new(Vec::new()),
+            station_idx: Arc::new(HashMap::new()),
             parameters: Arc::new(HashMap::new()),
             temporal_extent: None,
             spatial_extent: None,
             version: 0,
         }
     }
+}
+
+fn build_station_idx(stations: &[FeatureStation]) -> HashMap<String, usize> {
+    let mut idx = HashMap::with_capacity(stations.len());
+    for (i, s) in stations.iter().enumerate() {
+        // Last-write-wins on duplicate ids. The stations table has
+        // station id as primary key in every documented layout, so
+        // duplicates are schema-level impossible; the fallback just
+        // means a quirky deployment doesn't panic.
+        idx.insert(s.id.clone(), i);
+    }
+    idx
 }
 
 /// Thread-safe, reload-safe metadata cache. Reads are lock-free.
@@ -122,6 +142,7 @@ impl MetadataCache {
             .iter()
             .map(FeatureStation::to_location)
             .collect();
+        let station_idx = build_station_idx(&feature_stations);
         let parameters = build_parameter_descriptions(&cfg.parameters);
         let spatial = spatial_extent_from(&locations);
         let temporal = fetch_temporal_extent(cfg, pool).await?;
@@ -130,6 +151,7 @@ impl MetadataCache {
         let next = CollectionMeta {
             feature_stations: Arc::new(feature_stations),
             locations: Arc::new(locations),
+            station_idx: Arc::new(station_idx),
             parameters: Arc::new(parameters),
             temporal_extent: temporal,
             spatial_extent: spatial,
@@ -407,6 +429,7 @@ mod tests {
         let next = CollectionMeta {
             feature_stations: Arc::new(vec![]),
             locations: Arc::new(vec![mk_loc("s", 1.0, 2.0)]),
+            station_idx: Arc::new(HashMap::from([("s".to_string(), 0)])),
             parameters: Arc::new(HashMap::new()),
             temporal_extent: None,
             spatial_extent: Some([1.0, 2.0, 1.0, 2.0]),
@@ -416,6 +439,31 @@ mod tests {
         let m1 = cache.load();
         assert_eq!(m1.version, 1);
         assert_eq!(m1.locations.len(), 1);
+    }
+
+    #[test]
+    fn build_station_idx_maps_id_to_vec_index() {
+        fn mk(id: &str) -> FeatureStation {
+            FeatureStation {
+                id: id.into(),
+                label: id.into(),
+                lat: 0.0,
+                lon: 0.0,
+                properties: Arc::new(HashMap::new()),
+            }
+        }
+        let stations = vec![mk("a"), mk("b"), mk("c")];
+        let idx = build_station_idx(&stations);
+        assert_eq!(idx.get("a"), Some(&0));
+        assert_eq!(idx.get("b"), Some(&1));
+        assert_eq!(idx.get("c"), Some(&2));
+        assert_eq!(idx.get("missing"), None);
+    }
+
+    #[test]
+    fn build_station_idx_empty_returns_empty_map() {
+        let idx = build_station_idx(&[]);
+        assert!(idx.is_empty());
     }
 
     #[test]

@@ -61,11 +61,11 @@ impl FeatureEngine for PostgisEngine {
 
     fn get_feature(&self, feature_id: &str) -> Result<Feature, DataServerError> {
         let meta = self.cache().load();
-        meta.feature_stations
-            .iter()
-            .find(|s| s.id == feature_id)
-            .map(station_to_feature)
-            .ok_or_else(|| DataServerError::FeatureNotFound(feature_id.to_string()))
+        let i = *meta
+            .station_idx
+            .get(feature_id)
+            .ok_or_else(|| DataServerError::FeatureNotFound(feature_id.to_string()))?;
+        Ok(station_to_feature(&meta.feature_stations[i]))
     }
 
     fn feature_count(&self) -> usize {

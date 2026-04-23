@@ -265,11 +265,11 @@ fn lookup_station_coords(
     meta: &CollectionMeta,
     location_id: &str,
 ) -> Result<(f64, f64), DataServerError> {
-    let station = meta
-        .locations
-        .iter()
-        .find(|l| l.id == location_id)
+    let i = *meta
+        .station_idx
+        .get(location_id)
         .ok_or_else(|| DataServerError::LocationNotFound(location_id.to_string()))?;
+    let station = &meta.locations[i];
     Ok((station.longitude, station.latitude))
 }
 
