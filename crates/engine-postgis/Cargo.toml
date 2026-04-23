@@ -1,0 +1,20 @@
+[package]
+name = "engine-postgis"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ds-core = { path = "../core" }
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+deadpool-postgres = "0.14"
+# TLS deps (rustls / tokio-postgres-rustls / rustls-native-certs /
+# webpki-roots) are deliberately absent until #110 wires real TLS. The
+# engine currently passes NoTls. Adding those deps now implies TLS
+# support that does not exist.
+postgis = "0.9"
+arc-swap = "1"
+tracing = "0.1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }

@@ -144,6 +144,7 @@ fn build_router() -> axum::Router {
             querydata: None,
             wms: None,
             grib: None,
+            postgis: None,
         },
     );
 

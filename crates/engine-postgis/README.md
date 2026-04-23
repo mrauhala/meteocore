@@ -1,0 +1,341 @@
+# engine-postgis
+
+MeteoCore engine that serves observations from PostgreSQL / PostGIS (optionally
+TimescaleDB) through OGC API - EDR and OGC API - Features.
+
+## Scope (v1)
+
+**In:**
+
+- `Engine` trait — `get_locations`, `query_position`, `query_location`, `query_area`.
+- `FeatureEngine` trait — each station is one Feature; properties come from the
+  mapped `property_cols`.
+- Three observation-table shapes:
+  - `long` — EAV (`param_col` + `value_col`)
+  - `wide` — column-per-parameter
+  - `per_parameter` — one table per parameter (typical for hypertables)
+
+**Out (deferred):**
+
+- No `MapEngine` — no WMS, Maps, or Tiles from this engine in v1. Sparse-point
+  rendering needs interpolation and vector symbolization; that is a separate
+  design.
+- No observations-as-time-aware Features — a Feature is a station. The time
+  series is delivered via EDR coverages.
+- No `events` shape (geometry + time without a station FK, e.g. lightning
+  strikes). Deferred past v0.2.
+- No TimescaleDB code branching — no runtime extension detection, no CAGG
+  selection, no hypertable-aware SQL. TimescaleDB is supported as a deployment
+  choice; the emitted SQL plans well on both.
+- No user-supplied `WHERE` fragments from HTTP. The only filter extension is
+  the load-time constant `stations.where` string.
+- No non-PostgreSQL backends (no MySQL, DuckDB, ODBC).
+- No hot-reload of column renames or DSN changes — those require a restart.
+
+See issue [#99](https://github.com/mrauhala/meteocore/issues/99) (epic) for the
+full design, phased roadmap, and devil's-advocate resolutions.
+
+## Prerequisites
+
+- **PostgreSQL** ≥ 13
+- **PostGIS** ≥ 3.0
+- **TimescaleDB** — optional. Recommended for large observation tables, but the
+  engine does not branch on it.
+
+### TLS — not implemented in v1
+
+The engine currently connects with `NoTls`. The `sslmode` field in the DSN is
+parsed and used as part of the pool key, but the connection itself is **never
+actually encrypted**. Real TLS wiring is tracked in
+[#110](https://github.com/mrauhala/meteocore/issues/110).
+
+Until #110 lands, make sure the database is reachable **only** over a private
+network, VPN, loopback, or an SSH tunnel. A startup `WARN` is emitted for any
+non-loopback pool whose DSN does not have `sslmode=require` — treat it as a
+reminder that credentials are moving in plaintext, not as proof that they
+aren't.
+
+## Role SQL
+
+Create a dedicated read-only role and hand MeteoCore a DSN that logs in as this
+role. The engine runs a startup privilege self-check and **warns** (does not
+abort) if the role can `INSERT` on any mapped table, so a misconfigured
+superuser DSN will still start — the warning is your signal.
+
+```sql
+-- Replace <db>, <schema>, <password> and the mapped table list as needed.
+
+CREATE ROLE meteocore_ro LOGIN PASSWORD '<password>' NOINHERIT;
+
+GRANT CONNECT ON DATABASE <db> TO meteocore_ro;
+GRANT USAGE   ON SCHEMA  <schema> TO meteocore_ro;
+
+-- One GRANT SELECT per mapped table. Do NOT use
+-- `GRANT SELECT ON ALL TABLES IN SCHEMA ...` — it re-grants on future tables
+-- that you may not want the engine to see.
+GRANT SELECT ON <schema>.stations           TO meteocore_ro;
+GRANT SELECT ON <schema>.obs_t2m            TO meteocore_ro;
+GRANT SELECT ON <schema>.obs_rh2m           TO meteocore_ro;
+GRANT SELECT ON <schema>.obs_pressure       TO meteocore_ro;
+GRANT SELECT ON <schema>.obs_wind_speed     TO meteocore_ro;
+GRANT SELECT ON <schema>.obs_wind_direction TO meteocore_ro;
+GRANT SELECT ON <schema>.obs_precipitation  TO meteocore_ro;
+
+-- Enforce server-side resource limits on every session that logs in as
+-- this role. THESE ARE NOT OPTIONAL — the engine does NOT set
+-- statement_timeout / lock_timeout / default_transaction_read_only
+-- itself (session state on a fresh `deadpool-postgres` client with
+-- RecyclingMethod::Fast has none applied). A superuser DSN, or a role
+-- without these ALTER ROLE statements, will run queries with no cap
+-- and no read-only guard — runaway SQL can saturate the pool and
+-- Postgres backends.
+ALTER ROLE meteocore_ro SET statement_timeout = '5s';
+ALTER ROLE meteocore_ro SET default_transaction_read_only = on;
+ALTER ROLE meteocore_ro SET lock_timeout = '2s';
+```
+
+Hand the engine the DSN via an environment variable — never inline in
+`config.toml`:
+
+```bash
+export FMI_OBS_DSN='postgres://meteocore_ro:<password>@db.example.com:5432/weather?sslmode=verify-full'
+```
+
+Inline DSNs in TOML are rejected at config load unless `MC_ALLOW_INLINE_DB_URL=1`
+is set (dev ergonomics only, warns at startup).
+
+## Recommended indexes
+
+The engine runs a startup index self-check against `pg_index` and logs
+prescriptive `CREATE INDEX` statements if the required indexes are missing. It
+does not abort — you can start an empty database and add the indexes later.
+
+### Always (required for hot-path performance)
+
+```sql
+-- Spatial lookups (bbox, nearest-station, ST_Within).
+CREATE INDEX IF NOT EXISTS stations_geom_gix
+  ON stations USING GIST (geom);
+
+-- One-station time-slice scans. Compound, with time DESC for "latest N" queries.
+-- Create this on EVERY observation table (per_parameter shape = once per table).
+CREATE INDEX IF NOT EXISTS obs_t2m_station_time_idx
+  ON obs_t2m (station_id, time DESC);
+-- ... repeat for each obs_<param> table
+```
+
+### Vanilla PostgreSQL only
+
+Add a BRIN index on `time` when observation tables are large (≫ 10M rows) and
+area queries scan wide time windows. BRIN is ~1000× smaller than btree and is a
+good fit for append-only, time-ordered inserts:
+
+```sql
+-- Vanilla PG only — DO NOT add this on a TimescaleDB hypertable.
+CREATE INDEX IF NOT EXISTS obs_t2m_time_brin
+  ON obs_t2m USING BRIN (time) WITH (pages_per_range = 32);
+```
+
+### TimescaleDB
+
+**Skip BRIN — per-chunk btree is already optimal.**
+
+Why: TimescaleDB partitions a hypertable by time into chunks. Each chunk gets
+its own local btree on `time`, which is already tight because the chunk covers
+a narrow time interval. A BRIN index on the hypertable parent is ignored by the
+planner, and a per-chunk BRIN is strictly worse than the per-chunk btree. This
+is a known footgun — people who port vanilla-PG index recipes to Timescale
+sometimes add BRIN "for safety" and then wonder why their scans got slower.
+
+If you enable native compression on a hypertable, also consider:
+
+```sql
+-- Optional, only if you compress chunks. Lets the planner decompress on demand
+-- during index-only plans. The engine does not assert this setting.
+ALTER TABLE obs_t2m
+  SET (timescaledb.enable_transparent_decompression = on);
+```
+
+## Configuration
+
+The example below is the `per_parameter` shape verified against a real
+deployment (TimescaleDB 2.13.1 + PostGIS 3.4.1, six per-parameter weather
+hypertables). All observation tables in that deployment use
+`timestamp without time zone` columns storing UTC, so `time_col_tz = "UTC"` is
+mandatory.
+
+```toml
+[[collections]]
+id = "nexus-obs"
+title = "Nexus Weather Observations"
+description = "Finnish surface observations — temperature, humidity, pressure, wind, precipitation"
+engine_type = "postgis"
+apis = ["edr", "features"]
+
+[collections.postgis]
+# DSN resolved from this env var at startup. Inline URLs rejected.
+dsn_env = "NEXUS_DSN"
+# Optional; defaults to max(4, min(cpu_count * 2, 16)), hard-capped at 32.
+# pool_size = 8
+# metadata_refresh_secs = 300
+
+[collections.postgis.stations]
+table         = "public.stations"
+id_col        = "station_id"
+label_col     = "name"
+geom_col      = "geom"                   # geometry(Point, 4326); SRID asserted at startup
+property_cols = ["country", "elevation_m", "wmo_id"]
+where         = "active = true"          # config-time constant, not user input
+
+[collections.postgis.observations]
+shape            = "per_parameter"
+station_fk_col   = "station_id"
+time_col         = "time"
+# Mandatory because the obs tables use `timestamp without time zone`.
+# Forbidden if time_col is `timestamptz`. IANA TZ names also accepted.
+time_col_tz      = "UTC"
+
+# One row per parameter table. Each table must carry station_fk_col and time_col.
+[[collections.postgis.observations.tables]]
+parameter = "t2m"
+table     = "public.obs_t2m"
+value_col = "value"
+
+[[collections.postgis.observations.tables]]
+parameter = "rh2m"
+table     = "public.obs_rh2m"
+value_col = "value"
+
+[[collections.postgis.observations.tables]]
+parameter = "pressure"
+table     = "public.obs_pressure"
+value_col = "value"
+
+[[collections.postgis.observations.tables]]
+parameter = "wind_speed"
+table     = "public.obs_wind_speed"
+value_col = "value"
+
+[[collections.postgis.observations.tables]]
+parameter = "wind_direction"
+table     = "public.obs_wind_direction"
+value_col = "value"
+
+[[collections.postgis.observations.tables]]
+parameter = "precipitation"
+table     = "public.obs_precipitation"
+value_col = "value"
+
+# EDR parameter metadata — one entry per advertised parameter.
+# `name` here must match `parameter` in observations.tables above.
+[[collections.postgis.parameters]]
+name              = "t2m"
+label             = "2 m air temperature"
+unit              = "°C"
+observed_property = "air_temperature"
+
+[[collections.postgis.parameters]]
+name              = "rh2m"
+label             = "2 m relative humidity"
+unit              = "%"
+observed_property = "relative_humidity"
+
+[[collections.postgis.parameters]]
+name              = "pressure"
+label             = "Station pressure"
+unit              = "hPa"
+observed_property = "air_pressure"
+
+[[collections.postgis.parameters]]
+name              = "wind_speed"
+label             = "10 m wind speed"
+unit              = "m/s"
+observed_property = "wind_speed"
+
+[[collections.postgis.parameters]]
+name              = "wind_direction"
+label             = "10 m wind direction"
+unit              = "°"
+observed_property = "wind_from_direction"
+
+[[collections.postgis.parameters]]
+name              = "precipitation"
+label             = "Hourly precipitation"
+unit              = "mm"
+observed_property = "precipitation_amount"
+```
+
+The other two shapes swap the `[collections.postgis.observations]` block:
+
+- **long / EAV:** set `shape = "long"`, drop `[[observations.tables]]`, add
+  `param_col` + `value_col` on `[observations]`, and list each `source_key`
+  under `[[parameters]]`.
+- **wide:** set `shape = "wide"`, drop `[[observations.tables]]`, and add
+  `[[observations.columns]]` mapping `parameter → column`.
+
+If none of the three shapes fit your schema, expose a Postgres `VIEW` that does.
+The DSL deliberately does not support joins, computed expressions, or column
+transforms.
+
+## Startup behavior: error vs. warning
+
+The engine distinguishes between conditions that make the collection
+unusable (hard error — the whole config load fails) and conditions that are
+suspicious but workable (WARN — the collection still loads).
+
+### Hard errors (config load or collection init fails)
+
+- `engine_type = "postgis"` but no `[postgis]` block present.
+- `[postgis]` contains a literal `postgres://…` URL and `MC_ALLOW_INLINE_DB_URL`
+  is not `1`.
+- `dsn_env` names an env var that does not exist at startup or during reload.
+- Any schema, table, or column identifier fails the regex
+  `^[A-Za-z_][A-Za-z0-9_]{0,62}$`.
+- `pool_size > 32`.
+- Two collections share a pool tuple `(host, port, db, user, sslmode)` but
+  specify different passwords.
+- `stations.geom_col` is not `geometry(Point, 4326)` (SRID or geometry type
+  mismatch is checked against `geometry_columns`).
+- `time_col` is `timestamp without time zone` but `time_col_tz` is absent.
+- `time_col` is `timestamptz` but `time_col_tz` is set.
+- A `property_cols` entry has an unsupported type (only `text`, `varchar`,
+  integer types, `real`, `double precision`, and `bool` are accepted).
+- The initial `SELECT 1` ping fails past the 2 s deadline at boot.
+
+### Warnings (collection loads, condition logged)
+
+- Role has `INSERT`, `UPDATE`, or `DELETE` privilege on any mapped table
+  (startup `has_table_privilege` check).
+- Role can `SELECT` a column on a mapped table that is not in the mapping
+  (`has_column_privilege` check) — suggests the DSN is broader than needed.
+- `GIST(geom)` on `stations` is missing.
+- Compound `btree (station_fk_col, time_col DESC)` on an observation table is
+  missing.
+- `MC_ALLOW_INLINE_DB_URL=1` is set (inline DSNs are a dev-only escape hatch).
+- A non-loopback DSN has `sslmode` other than `require` — a reminder that
+  credentials are moving in plaintext (TLS enforcement tracked in #110).
+- Two collections on the same pool tuple specify different `pool_size` —
+  **first-caller wins**, subsequent size mismatches logged at INFO.
+
+## Operations
+
+- **Health:** `/health` reports per-collection `ready | degraded | failed`.
+  A 30 s background ping flips between `ready` and `degraded`. `failed` means
+  the collection never finished loading.
+- **Metrics:** Prometheus series under the `postgis_*` prefix — pool stats by
+  `pool_key`, query histograms by `collection` + `query_type`, error counters
+  by `collection` + `kind`. Labels are bounded to keep cardinality sane.
+- **Reload:** `POST /admin/collections/reload` re-reads the config and swaps
+  engines atomically via `ArcSwap`. Shared pools carry over by identity across
+  reloads; dropped URLs' pools close naturally.
+- **Row cap:** every emitted SELECT carries `LIMIT 10001` (per-query,
+  non-configurable). Location/station listings use `LIMIT 1001`. Hitting the
+  ceiling returns HTTP 413 with a message asking the caller to narrow `bbox`
+  or `datetime` — it is a protection invariant, not a policy knob.
+
+## References
+
+- Epic: [#99](https://github.com/mrauhala/meteocore/issues/99)
+- This README: [#112](https://github.com/mrauhala/meteocore/issues/112)
+- Workspace guide: `/CLAUDE.md` (architecture rules, config format, admin
+  endpoints)

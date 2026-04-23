@@ -5,6 +5,7 @@ members = [
     "crates/engine-csv",
     "crates/engine-geojson",
     "crates/engine-geotiff",
+    "crates/engine-postgis",
     "crates/engine-querydata",
     "crates/engine-grib",
     "crates/storage",

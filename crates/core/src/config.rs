@@ -63,6 +63,8 @@ pub struct CollectionConfig {
     pub grib: Option<GribConfig>,
     /// WMS map rendering configuration. Required when apis contains "wms".
     pub wms: Option<WmsConfig>,
+    /// PostGIS-specific configuration. Required when engine_type = "postgis".
+    pub postgis: Option<PostgisConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -340,6 +342,620 @@ pub struct GribConfig {
     pub filename_contains: Option<String>,
 }
 
+/// Observation table configuration for engine-postgis.
+///
+/// Three shapes are supported:
+/// - `long` — EAV layout, one row per observation, parameter name stored in
+///   `param_col`, value in `value_col`.
+/// - `wide` — one row per (station, time), each parameter mapped to its own
+///   column via `[[columns]]`.
+/// - `per_parameter` — one table per parameter, listed under `[[tables]]`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PostgisConfig {
+    /// Either the name of an env var holding the DSN, or — when
+    /// `MC_ALLOW_INLINE_DB_URL=1` is set at config-load — a literal
+    /// `postgres://` / `postgresql://` URL (dev ergonomics, WARN logged).
+    pub dsn_env: String,
+    /// Optional connection pool size. Hard-capped at 32 at validate time.
+    pub pool_size: Option<u32>,
+    /// Optional label used for the `pool_key` metrics tag when the host is
+    /// ephemeral. Defaults to `<user>@<host>:<port>/<db>`.
+    pub pool_label: Option<String>,
+    /// Metadata cache refresh cadence. Default 300 s.
+    pub metadata_refresh_secs: Option<u64>,
+    pub stations: PostgisStationsConfig,
+    pub observations: PostgisObservationsConfig,
+    #[serde(default)]
+    pub parameters: Vec<PostgisParameterConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PostgisStationsConfig {
+    /// Qualified table name (`schema.table` or bare `table`).
+    pub table: String,
+    pub id_col: String,
+    pub label_col: String,
+    pub geom_col: String,
+    #[serde(default)]
+    pub property_cols: Vec<String>,
+    /// Config-time-constant WHERE fragment. Not re-parsed from requests.
+    #[serde(default, rename = "where")]
+    pub where_clause: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PostgisObservationsConfig {
+    /// One of `"long"`, `"wide"`, `"per_parameter"`.
+    pub shape: String,
+    /// Qualified table name. Required for `long` and `wide`, forbidden for
+    /// `per_parameter` (per-parameter tables are listed under `[[tables]]`).
+    pub table: Option<String>,
+    /// Column joining observations to a row in `stations.table`.
+    /// Required for all shapes (may be overridden per-table in `per_parameter`).
+    pub station_fk_col: Option<String>,
+    /// Timestamp column. Required for all shapes (inheritable in `per_parameter`).
+    pub time_col: Option<String>,
+    /// Mandatory when the mapped `time_col` is `timestamp without time zone`.
+    /// IANA TZ name (e.g. `"UTC"`, `"Europe/Helsinki"`). Runtime type
+    /// assertion via `information_schema.columns` is a TODO — see #110.
+    pub time_col_tz: Option<String>,
+    /// EAV parameter-name column. Only valid for `shape = "long"`.
+    pub param_col: Option<String>,
+    /// EAV value column. Valid for `long`; inheritable for `per_parameter`.
+    pub value_col: Option<String>,
+    /// Optional geometry column on the observations side (used in
+    /// orphan-station handling — see plan doc amendment E).
+    pub geom_col: Option<String>,
+    /// `wide` shape: one entry per parameter → column mapping.
+    #[serde(default)]
+    pub columns: Vec<PostgisObservationColumn>,
+    /// `per_parameter` shape: one entry per parameter → table mapping.
+    #[serde(default)]
+    pub tables: Vec<PostgisObservationTable>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PostgisObservationColumn {
+    pub parameter: String,
+    pub column: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PostgisObservationTable {
+    pub parameter: String,
+    pub table: String,
+    pub station_fk_col: Option<String>,
+    pub time_col: Option<String>,
+    pub time_col_tz: Option<String>,
+    pub value_col: Option<String>,
+    pub geom_col: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PostgisParameterConfig {
+    pub name: String,
+    pub label: String,
+    pub unit: String,
+    pub observed_property: Option<String>,
+    /// For `long`: the string literal stored in `param_col`.
+    /// For `wide`/`per_parameter`: column/table key. Defaults to `name`.
+    pub source_key: Option<String>,
+}
+
+/// Byte-level check for `^[A-Za-z_][A-Za-z0-9_]{0,62}$` — no regex dep.
+/// Used by config validation and (re-exported) by engine-postgis identifier checks.
+pub fn is_valid_sql_identifier(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || bytes.len() > 63 {
+        return false;
+    }
+    let first = bytes[0];
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Validate a qualified table name (`schema.table` or bare `table`). Returns
+/// the (schema, table) pair with schema defaulted to `"public"`.
+pub fn validate_qualified_table(name: &str) -> Result<(&str, &str), String> {
+    let parts: Vec<&str> = name.split('.').collect();
+    let (schema, table) = match parts.len() {
+        1 => ("public", parts[0]),
+        2 => (parts[0], parts[1]),
+        _ => return Err(format!("invalid qualified table name '{name}'")),
+    };
+    if !is_valid_sql_identifier(schema) {
+        return Err(format!("invalid schema identifier '{schema}' in '{name}'"));
+    }
+    if !is_valid_sql_identifier(table) {
+        return Err(format!("invalid table identifier '{table}' in '{name}'"));
+    }
+    Ok((schema, table))
+}
+
+fn looks_like_db_url(s: &str) -> bool {
+    s.starts_with("postgres://") || s.starts_with("postgresql://")
+}
+
+fn validate_tz_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'/' || b == b'-' || b == b'+')
+}
+
+/// Hard-fail validation for a `PostgisConfig`. Runs at load time via
+/// `ServerConfig::validate()`; see issue #101 for the rule list.
+fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+
+    // -- DSN / inline-URL opt-in ------------------------------------------
+    if cfg.dsn_env.is_empty() {
+        return Err(Config(format!(
+            "Collection '{id}': [postgis].dsn_env must be set (env var name, or literal URL with MC_ALLOW_INLINE_DB_URL=1)"
+        )));
+    }
+    if looks_like_db_url(&cfg.dsn_env)
+        && std::env::var("MC_ALLOW_INLINE_DB_URL").ok().as_deref() != Some("1")
+    {
+        return Err(Config(format!(
+            "Collection '{id}': [postgis].dsn_env looks like a literal database URL — use an env var name, or set MC_ALLOW_INLINE_DB_URL=1 to opt in"
+        )));
+    }
+    if !looks_like_db_url(&cfg.dsn_env) && !is_valid_env_var_name(&cfg.dsn_env) {
+        return Err(Config(format!(
+            "Collection '{id}': [postgis].dsn_env '{}' is not a valid env var name",
+            cfg.dsn_env
+        )));
+    }
+
+    // -- pool_size cap ----------------------------------------------------
+    if let Some(n) = cfg.pool_size {
+        if n == 0 {
+            return Err(Config(format!(
+                "Collection '{id}': [postgis].pool_size must be > 0"
+            )));
+        }
+        if n > 32 {
+            return Err(Config(format!(
+                "Collection '{id}': [postgis].pool_size {n} exceeds hard cap 32"
+            )));
+        }
+    }
+
+    // -- parameters list --------------------------------------------------
+    if cfg.parameters.is_empty() {
+        return Err(Config(format!(
+            "Collection '{id}': [postgis] requires at least one [[parameters]] entry"
+        )));
+    }
+    let mut param_names = std::collections::HashSet::new();
+    for p in &cfg.parameters {
+        if p.name.is_empty() {
+            return Err(Config(format!(
+                "Collection '{id}': parameter has an empty 'name' field"
+            )));
+        }
+        if !param_names.insert(p.name.as_str()) {
+            return Err(Config(format!(
+                "Collection '{id}': duplicate parameter name '{}'",
+                p.name
+            )));
+        }
+        if p.label.is_empty() {
+            return Err(Config(format!(
+                "Collection '{id}': parameter '{}' has empty 'label'",
+                p.name
+            )));
+        }
+        if p.unit.is_empty() {
+            return Err(Config(format!(
+                "Collection '{id}': parameter '{}' has empty 'unit'",
+                p.name
+            )));
+        }
+    }
+
+    // -- stations ---------------------------------------------------------
+    let s = &cfg.stations;
+    validate_qualified_table(&s.table)
+        .map_err(|e| Config(format!("Collection '{id}': stations.table: {e}")))?;
+    for (field, value) in [
+        ("id_col", &s.id_col),
+        ("label_col", &s.label_col),
+        ("geom_col", &s.geom_col),
+    ] {
+        if !is_valid_sql_identifier(value) {
+            return Err(Config(format!(
+                "Collection '{id}': stations.{field} '{value}' is not a valid SQL identifier"
+            )));
+        }
+    }
+    for (i, col) in s.property_cols.iter().enumerate() {
+        if !is_valid_sql_identifier(col) {
+            return Err(Config(format!(
+                "Collection '{id}': stations.property_cols[{i}] '{col}' is not a valid SQL identifier"
+            )));
+        }
+    }
+    if let Some(w) = s.where_clause.as_deref() {
+        validate_stations_where_clause(id, w)?;
+    }
+
+    // -- observations (shape-dependent) -----------------------------------
+    let o = &cfg.observations;
+    match o.shape.as_str() {
+        "long" => validate_observations_long(id, o)?,
+        "wide" => validate_observations_wide(id, o)?,
+        "per_parameter" => validate_observations_per_parameter(id, o)?,
+        other => {
+            return Err(Config(format!(
+                "Collection '{id}': observations.shape '{other}' is not one of 'long', 'wide', 'per_parameter'"
+            )));
+        }
+    }
+
+    // -- parameters cross-ref --------------------------------------------
+    match o.shape.as_str() {
+        "wide" => {
+            let cols: std::collections::HashSet<&str> =
+                o.columns.iter().map(|c| c.parameter.as_str()).collect();
+            for p in &cfg.parameters {
+                let key = p.source_key.as_deref().unwrap_or(p.name.as_str());
+                if !cols.contains(key) {
+                    return Err(Config(format!(
+                        "Collection '{id}': parameter '{}' (source_key '{key}') is not mapped in observations.columns",
+                        p.name
+                    )));
+                }
+            }
+        }
+        "per_parameter" => {
+            let tables: std::collections::HashSet<&str> =
+                o.tables.iter().map(|t| t.parameter.as_str()).collect();
+            for p in &cfg.parameters {
+                let key = p.source_key.as_deref().unwrap_or(p.name.as_str());
+                if !tables.contains(key) {
+                    return Err(Config(format!(
+                        "Collection '{id}': parameter '{}' (source_key '{key}') is not mapped in observations.tables",
+                        p.name
+                    )));
+                }
+            }
+        }
+        _ => {} // long: source_key is a string literal, no cross-ref
+    }
+
+    Ok(())
+}
+
+/// Reject obviously-dangerous `stations.where_clause` contents before the
+/// engine inlines the string into SQL. Not a cryptographic guarantee —
+/// an operator with config-file write access can always break things —
+/// but blocks the common footgun of a typo (semicolons, comments, DML
+/// verbs) turning into a destructive query. Anything richer than a
+/// simple `col = value AND col < value` filter should live in a SQL
+/// `VIEW`, which is the documented exit strategy.
+fn validate_stations_where_clause(id: &str, w: &str) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+
+    const MAX_LEN: usize = 512;
+    if w.len() > MAX_LEN {
+        return Err(Config(format!(
+            "Collection '{id}': stations.where_clause exceeds {MAX_LEN}-byte cap"
+        )));
+    }
+    if w.contains(';') {
+        return Err(Config(format!(
+            "Collection '{id}': stations.where_clause must not contain ';' (statement chaining)"
+        )));
+    }
+    if w.contains("--") || w.contains("/*") || w.contains("*/") {
+        return Err(Config(format!(
+            "Collection '{id}': stations.where_clause must not contain SQL comment markers"
+        )));
+    }
+    // Whole-word check for write/DDL verbs. Case-insensitive; we collapse
+    // all whitespace to single spaces first so that tab/newline-separated
+    // verbs (`active\nunion\nselect 1`) are caught the same as space-
+    // separated ones. Postgres treats any whitespace as a token separator,
+    // so the check must match.
+    let lower = w.to_ascii_lowercase();
+    let normalized = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+    let padded = format!(" {normalized} ");
+    for verb in [
+        // DML / DDL
+        "drop", "delete", "update", "insert", "truncate", "alter", "create", "grant", "revoke",
+        "copy",
+        // Data-exfil / dynamic-execution vectors flagged in PR review:
+        // UNION SELECT is the common SQLi exfil pattern; EXECUTE runs
+        // dynamic SQL; CALL / PERFORM invoke stored functions; SELECT /
+        // FROM catch correlated subqueries like
+        // `territory = (SELECT x FROM y)`.
+        "union", "execute", "call", "perform", "select", "from",
+    ] {
+        let needle = format!(" {verb} ");
+        if padded.contains(&needle) {
+            return Err(Config(format!(
+                "Collection '{id}': stations.where_clause must not contain '{verb}' — put filter logic in a SQL VIEW instead"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_valid_env_var_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().enumerate().all(|(i, b)| match (i, b) {
+            (0, b'0'..=b'9') => false,
+            (_, b'A'..=b'Z') | (_, b'a'..=b'z') | (_, b'0'..=b'9') | (_, b'_') => true,
+            _ => false,
+        })
+}
+
+fn validate_observations_long(
+    id: &str,
+    o: &PostgisObservationsConfig,
+) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+
+    let table = o.table.as_deref().ok_or_else(|| {
+        Config(format!(
+            "Collection '{id}': observations.shape = 'long' requires observations.table"
+        ))
+    })?;
+    validate_qualified_table(table)
+        .map_err(|e| Config(format!("Collection '{id}': observations.table: {e}")))?;
+
+    let required = [
+        ("station_fk_col", &o.station_fk_col),
+        ("time_col", &o.time_col),
+        ("param_col", &o.param_col),
+        ("value_col", &o.value_col),
+    ];
+    for (field, value) in required {
+        let v = value.as_deref().ok_or_else(|| {
+            Config(format!(
+                "Collection '{id}': observations.shape = 'long' requires observations.{field}"
+            ))
+        })?;
+        if !is_valid_sql_identifier(v) {
+            return Err(Config(format!(
+                "Collection '{id}': observations.{field} '{v}' is not a valid SQL identifier"
+            )));
+        }
+    }
+
+    if !o.columns.is_empty() {
+        return Err(Config(format!(
+            "Collection '{id}': observations.shape = 'long' does not allow [[observations.columns]]"
+        )));
+    }
+    if !o.tables.is_empty() {
+        return Err(Config(format!(
+            "Collection '{id}': observations.shape = 'long' does not allow [[observations.tables]]"
+        )));
+    }
+
+    if let Some(tz) = &o.time_col_tz {
+        if !validate_tz_name(tz) {
+            return Err(Config(format!(
+                "Collection '{id}': observations.time_col_tz '{tz}' is not a valid IANA-like name"
+            )));
+        }
+    }
+    if let Some(g) = &o.geom_col {
+        if !is_valid_sql_identifier(g) {
+            return Err(Config(format!(
+                "Collection '{id}': observations.geom_col '{g}' is not a valid SQL identifier"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_observations_wide(
+    id: &str,
+    o: &PostgisObservationsConfig,
+) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+
+    let table = o.table.as_deref().ok_or_else(|| {
+        Config(format!(
+            "Collection '{id}': observations.shape = 'wide' requires observations.table"
+        ))
+    })?;
+    validate_qualified_table(table)
+        .map_err(|e| Config(format!("Collection '{id}': observations.table: {e}")))?;
+
+    for (field, value) in [
+        ("station_fk_col", &o.station_fk_col),
+        ("time_col", &o.time_col),
+    ] {
+        let v = value.as_deref().ok_or_else(|| {
+            Config(format!(
+                "Collection '{id}': observations.shape = 'wide' requires observations.{field}"
+            ))
+        })?;
+        if !is_valid_sql_identifier(v) {
+            return Err(Config(format!(
+                "Collection '{id}': observations.{field} '{v}' is not a valid SQL identifier"
+            )));
+        }
+    }
+
+    if o.param_col.is_some() {
+        return Err(Config(format!(
+            "Collection '{id}': observations.shape = 'wide' does not allow observations.param_col"
+        )));
+    }
+    if o.value_col.is_some() {
+        return Err(Config(format!(
+            "Collection '{id}': observations.shape = 'wide' does not allow observations.value_col (use [[observations.columns]])"
+        )));
+    }
+    if !o.tables.is_empty() {
+        return Err(Config(format!(
+            "Collection '{id}': observations.shape = 'wide' does not allow [[observations.tables]]"
+        )));
+    }
+    if o.columns.is_empty() {
+        return Err(Config(format!(
+            "Collection '{id}': observations.shape = 'wide' requires at least one [[observations.columns]] entry"
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (i, c) in o.columns.iter().enumerate() {
+        if c.parameter.is_empty() {
+            return Err(Config(format!(
+                "Collection '{id}': observations.columns[{i}] has empty 'parameter'"
+            )));
+        }
+        if !seen.insert(c.parameter.as_str()) {
+            return Err(Config(format!(
+                "Collection '{id}': observations.columns has duplicate parameter '{}'",
+                c.parameter
+            )));
+        }
+        if !is_valid_sql_identifier(&c.column) {
+            return Err(Config(format!(
+                "Collection '{id}': observations.columns[{i}].column '{}' is not a valid SQL identifier",
+                c.column
+            )));
+        }
+    }
+    if let Some(tz) = &o.time_col_tz {
+        if !validate_tz_name(tz) {
+            return Err(Config(format!(
+                "Collection '{id}': observations.time_col_tz '{tz}' is not a valid IANA-like name"
+            )));
+        }
+    }
+    if let Some(g) = &o.geom_col {
+        if !is_valid_sql_identifier(g) {
+            return Err(Config(format!(
+                "Collection '{id}': observations.geom_col '{g}' is not a valid SQL identifier"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_observations_per_parameter(
+    id: &str,
+    o: &PostgisObservationsConfig,
+) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+
+    if o.table.is_some() {
+        return Err(Config(format!(
+            "Collection '{id}': observations.shape = 'per_parameter' does not allow observations.table (tables go under [[observations.tables]])"
+        )));
+    }
+    if o.param_col.is_some() {
+        return Err(Config(format!(
+            "Collection '{id}': observations.shape = 'per_parameter' does not allow observations.param_col"
+        )));
+    }
+    if !o.columns.is_empty() {
+        return Err(Config(format!(
+            "Collection '{id}': observations.shape = 'per_parameter' does not allow [[observations.columns]]"
+        )));
+    }
+    if o.tables.is_empty() {
+        return Err(Config(format!(
+            "Collection '{id}': observations.shape = 'per_parameter' requires at least one [[observations.tables]] entry"
+        )));
+    }
+
+    // Observations-level defaults (optional, inheritable per-table).
+    for (field, value) in [
+        ("station_fk_col", &o.station_fk_col),
+        ("time_col", &o.time_col),
+        ("value_col", &o.value_col),
+        ("geom_col", &o.geom_col),
+    ] {
+        if let Some(v) = value.as_deref() {
+            if !is_valid_sql_identifier(v) {
+                return Err(Config(format!(
+                    "Collection '{id}': observations.{field} '{v}' is not a valid SQL identifier"
+                )));
+            }
+        }
+    }
+    if let Some(tz) = &o.time_col_tz {
+        if !validate_tz_name(tz) {
+            return Err(Config(format!(
+                "Collection '{id}': observations.time_col_tz '{tz}' is not a valid IANA-like name"
+            )));
+        }
+    }
+
+    let mut seen_params = std::collections::HashSet::new();
+    for (i, t) in o.tables.iter().enumerate() {
+        if t.parameter.is_empty() {
+            return Err(Config(format!(
+                "Collection '{id}': observations.tables[{i}] has empty 'parameter'"
+            )));
+        }
+        if !seen_params.insert(t.parameter.as_str()) {
+            return Err(Config(format!(
+                "Collection '{id}': observations.tables has duplicate parameter '{}'",
+                t.parameter
+            )));
+        }
+        validate_qualified_table(&t.table).map_err(|e| {
+            Config(format!(
+                "Collection '{id}': observations.tables[{i}].table: {e}"
+            ))
+        })?;
+
+        // Resolve each column: per-table override wins, otherwise inherit.
+        let resolved = [
+            (
+                "station_fk_col",
+                t.station_fk_col.as_deref().or(o.station_fk_col.as_deref()),
+            ),
+            ("time_col", t.time_col.as_deref().or(o.time_col.as_deref())),
+            (
+                "value_col",
+                t.value_col.as_deref().or(o.value_col.as_deref()),
+            ),
+        ];
+        for (field, value) in resolved {
+            let v = value.ok_or_else(|| {
+                Config(format!(
+                    "Collection '{id}': observations.tables[{i}] ('{}') missing '{field}' (no per-table override and no observations-level default)",
+                    t.parameter
+                ))
+            })?;
+            if !is_valid_sql_identifier(v) {
+                return Err(Config(format!(
+                    "Collection '{id}': observations.tables[{i}].{field} '{v}' is not a valid SQL identifier"
+                )));
+            }
+        }
+
+        if let Some(tz) = &t.time_col_tz {
+            if !validate_tz_name(tz) {
+                return Err(Config(format!(
+                    "Collection '{id}': observations.tables[{i}].time_col_tz '{tz}' is not a valid IANA-like name"
+                )));
+            }
+        }
+        if let Some(g) = &t.geom_col {
+            if !is_valid_sql_identifier(g) {
+                return Err(Config(format!(
+                    "Collection '{id}': observations.tables[{i}].geom_col '{g}' is not a valid SQL identifier"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl ServerConfig {
     /// Load config from a TOML file. If `collections_dir` is set, also loads
     /// per-file collection configs from that directory. Returns the config and
@@ -564,6 +1180,21 @@ impl ServerConfig {
                         )));
                     }
                 }
+            }
+
+            // PostGIS engine: requires [postgis] section + parameters + valid shape.
+            if collection.engine_type == "postgis" {
+                let postgis = collection.postgis.as_ref().ok_or_else(|| {
+                    crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': engine_type 'postgis' requires a [collections.postgis] config section"
+                    ))
+                })?;
+                validate_postgis(id, postgis)?;
+            } else if collection.postgis.is_some() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': [collections.postgis] is set but engine_type is '{}'",
+                    collection.engine_type
+                )));
             }
 
             // style_bundle: reference must resolve, must not mix with inline WMS style fields
@@ -1337,5 +1968,642 @@ description = "X"
         let wms = config.collections[0].wms.as_ref().unwrap();
         assert_eq!(wms.colormap, None);
         assert_eq!(wms.style_bundle, None);
+    }
+
+    // ---- postgis ------------------------------------------------------------
+
+    fn nexus_postgis_toml() -> &'static str {
+        r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "nexus-obs"
+title = "Nexus Observations"
+description = "FMI nexus weather observations"
+engine_type = "postgis"
+apis = ["edr", "features"]
+
+[collections.postgis]
+dsn_env = "NEXUS_DSN"
+
+[collections.postgis.stations]
+table = "weather.stations"
+id_col = "wigos_id"
+label_col = "name"
+geom_col = "the_geom"
+property_cols = ["territory"]
+
+[collections.postgis.observations]
+shape = "per_parameter"
+station_fk_col = "wigos_id"
+time_col = "time"
+time_col_tz = "UTC"
+value_col = "value"
+geom_col = "the_geom"
+
+[[collections.postgis.observations.tables]]
+parameter = "t2m"
+table = "weather.air_temperature"
+
+[[collections.postgis.observations.tables]]
+parameter = "ws_10m"
+table = "weather.wind_speed"
+
+[[collections.postgis.parameters]]
+name = "t2m"
+label = "2 m air temperature"
+unit = "°C"
+observed_property = "air_temperature"
+
+[[collections.postgis.parameters]]
+name = "ws_10m"
+label = "10 m wind speed"
+unit = "m/s"
+observed_property = "wind_speed"
+"#
+    }
+
+    #[test]
+    fn postgis_nexus_per_parameter_parses_clean() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(tmp.path(), "config.toml", nexus_postgis_toml());
+        let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        let c = &config.collections[0];
+        assert_eq!(c.engine_type, "postgis");
+        let pg = c.postgis.as_ref().unwrap();
+        assert_eq!(pg.dsn_env, "NEXUS_DSN");
+        assert_eq!(pg.observations.shape, "per_parameter");
+        assert_eq!(pg.observations.tables.len(), 2);
+        assert_eq!(pg.parameters.len(), 2);
+    }
+
+    #[test]
+    fn postgis_engine_requires_postgis_section() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "nexus-obs"
+title = "Nexus"
+description = "Nexus"
+engine_type = "postgis"
+"#;
+        let path = write_config(tmp.path(), "config.toml", toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("requires a [collections.postgis]"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn postgis_requires_at_least_one_parameter() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "obs"
+title = "Obs"
+description = "Obs"
+engine_type = "postgis"
+
+[collections.postgis]
+dsn_env = "OBS_DSN"
+
+[collections.postgis.stations]
+table = "public.stations"
+id_col = "id"
+label_col = "name"
+geom_col = "geom"
+
+[collections.postgis.observations]
+shape = "long"
+table = "public.obs"
+station_fk_col = "station_id"
+time_col = "time"
+param_col = "param"
+value_col = "value"
+"#;
+        let path = write_config(tmp.path(), "config.toml", toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at least one [[parameters]]"), "got: {err}");
+    }
+
+    /// Combines both MC_ALLOW_INLINE_DB_URL paths (reject without opt-in,
+    /// accept with it) into one test — cargo test runs tests in parallel and
+    /// the process-wide env var can't be split across two test fns safely.
+    #[test]
+    fn postgis_literal_dsn_opt_in_behavior() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "obs"
+title = "Obs"
+description = "Obs"
+engine_type = "postgis"
+
+[collections.postgis]
+dsn_env = "postgres://user:pass@localhost/obs"
+
+[collections.postgis.stations]
+table = "public.stations"
+id_col = "id"
+label_col = "name"
+geom_col = "geom"
+
+[collections.postgis.observations]
+shape = "long"
+table = "public.obs"
+station_fk_col = "station_id"
+time_col = "time"
+param_col = "param"
+value_col = "value"
+
+[[collections.postgis.parameters]]
+name = "t2m"
+label = "Temp"
+unit = "C"
+"#;
+        let path = write_config(tmp.path(), "config.toml", toml);
+
+        // SAFETY: mutating process-wide env is racy across threads, but we
+        // hold the guard across both calls before restoring.
+        let guard = inline_db_url_guard();
+        guard.set(None);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("literal database URL") || err.contains("MC_ALLOW_INLINE_DB_URL"),
+            "without opt-in, expected rejection: {err}"
+        );
+
+        guard.set(Some("1"));
+        let result = ServerConfig::from_file(path.to_str().unwrap());
+        assert!(
+            result.is_ok(),
+            "with opt-in, expected accept: {:?}",
+            result.err()
+        );
+    }
+
+    // Tiny hand-rolled guard that serializes MC_ALLOW_INLINE_DB_URL mutations
+    // without adding serial_test as a dep. Tests that touch this env var
+    // MUST go through this guard — the lock is held for the test's duration.
+    struct InlineDbUrlGuard<'a> {
+        // Held for the duration of the guard; releases the mutex on Drop.
+        #[allow(dead_code)]
+        lock: std::sync::MutexGuard<'a, ()>,
+    }
+    impl InlineDbUrlGuard<'_> {
+        fn set(&self, value: Option<&str>) {
+            // SAFETY: lock is held for the duration of this guard.
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var("MC_ALLOW_INLINE_DB_URL", v),
+                    None => std::env::remove_var("MC_ALLOW_INLINE_DB_URL"),
+                }
+            }
+        }
+    }
+    impl Drop for InlineDbUrlGuard<'_> {
+        fn drop(&mut self) {
+            // SAFETY: lock is held for the duration of this guard.
+            unsafe {
+                std::env::remove_var("MC_ALLOW_INLINE_DB_URL");
+            }
+        }
+    }
+    fn inline_db_url_guard() -> InlineDbUrlGuard<'static> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        InlineDbUrlGuard {
+            lock: LOCK.lock().unwrap_or_else(|p| p.into_inner()),
+        }
+    }
+
+    #[test]
+    fn postgis_rejects_malicious_identifier() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "obs"
+title = "Obs"
+description = "Obs"
+engine_type = "postgis"
+
+[collections.postgis]
+dsn_env = "OBS_DSN"
+
+[collections.postgis.stations]
+table = "public.stations"
+id_col = "\"; DROP TABLE x;--"
+label_col = "name"
+geom_col = "geom"
+
+[collections.postgis.observations]
+shape = "long"
+table = "public.obs"
+station_fk_col = "station_id"
+time_col = "time"
+param_col = "param"
+value_col = "value"
+
+[[collections.postgis.parameters]]
+name = "t2m"
+label = "Temp"
+unit = "C"
+"#;
+        let path = write_config(tmp.path(), "config.toml", toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not a valid SQL identifier"), "got: {err}");
+    }
+
+    #[test]
+    fn postgis_wide_with_param_col_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "obs"
+title = "Obs"
+description = "Obs"
+engine_type = "postgis"
+
+[collections.postgis]
+dsn_env = "OBS_DSN"
+
+[collections.postgis.stations]
+table = "public.stations"
+id_col = "id"
+label_col = "name"
+geom_col = "geom"
+
+[collections.postgis.observations]
+shape = "wide"
+table = "public.obs"
+station_fk_col = "station_id"
+time_col = "time"
+param_col = "param"
+
+[[collections.postgis.observations.columns]]
+parameter = "t2m"
+column = "temperature"
+
+[[collections.postgis.parameters]]
+name = "t2m"
+label = "Temp"
+unit = "C"
+"#;
+        let path = write_config(tmp.path(), "config.toml", toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'wide' does not allow observations.param_col"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn postgis_long_with_columns_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "obs"
+title = "Obs"
+description = "Obs"
+engine_type = "postgis"
+
+[collections.postgis]
+dsn_env = "OBS_DSN"
+
+[collections.postgis.stations]
+table = "public.stations"
+id_col = "id"
+label_col = "name"
+geom_col = "geom"
+
+[collections.postgis.observations]
+shape = "long"
+table = "public.obs"
+station_fk_col = "station_id"
+time_col = "time"
+param_col = "param"
+value_col = "value"
+
+[[collections.postgis.observations.columns]]
+parameter = "t2m"
+column = "temperature"
+
+[[collections.postgis.parameters]]
+name = "t2m"
+label = "Temp"
+unit = "C"
+"#;
+        let path = write_config(tmp.path(), "config.toml", toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'long' does not allow [[observations.columns]]"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn postgis_per_parameter_with_table_field_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "obs"
+title = "Obs"
+description = "Obs"
+engine_type = "postgis"
+
+[collections.postgis]
+dsn_env = "OBS_DSN"
+
+[collections.postgis.stations]
+table = "public.stations"
+id_col = "id"
+label_col = "name"
+geom_col = "geom"
+
+[collections.postgis.observations]
+shape = "per_parameter"
+table = "public.obs"
+station_fk_col = "station_id"
+time_col = "time"
+value_col = "value"
+
+[[collections.postgis.observations.tables]]
+parameter = "t2m"
+table = "public.temp"
+
+[[collections.postgis.parameters]]
+name = "t2m"
+label = "Temp"
+unit = "C"
+"#;
+        let path = write_config(tmp.path(), "config.toml", toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'per_parameter' does not allow observations.table"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn postgis_unknown_shape_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "obs"
+title = "Obs"
+description = "Obs"
+engine_type = "postgis"
+
+[collections.postgis]
+dsn_env = "OBS_DSN"
+
+[collections.postgis.stations]
+table = "public.stations"
+id_col = "id"
+label_col = "name"
+geom_col = "geom"
+
+[collections.postgis.observations]
+shape = "bogus"
+
+[[collections.postgis.parameters]]
+name = "t2m"
+label = "Temp"
+unit = "C"
+"#;
+        let path = write_config(tmp.path(), "config.toml", toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'bogus'"), "got: {err}");
+    }
+
+    #[test]
+    fn postgis_parameter_not_mapped_in_columns_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "obs"
+title = "Obs"
+description = "Obs"
+engine_type = "postgis"
+
+[collections.postgis]
+dsn_env = "OBS_DSN"
+
+[collections.postgis.stations]
+table = "public.stations"
+id_col = "id"
+label_col = "name"
+geom_col = "geom"
+
+[collections.postgis.observations]
+shape = "wide"
+table = "public.obs"
+station_fk_col = "station_id"
+time_col = "time"
+
+[[collections.postgis.observations.columns]]
+parameter = "t2m"
+column = "temperature"
+
+[[collections.postgis.parameters]]
+name = "ws_10m"
+label = "Wind"
+unit = "m/s"
+"#;
+        let path = write_config(tmp.path(), "config.toml", toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'ws_10m'") && err.contains("not mapped"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn postgis_section_without_postgis_engine_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "obs"
+title = "Obs"
+description = "Obs"
+
+[collections.postgis]
+dsn_env = "OBS_DSN"
+
+[collections.postgis.stations]
+table = "public.stations"
+id_col = "id"
+label_col = "name"
+geom_col = "geom"
+
+[collections.postgis.observations]
+shape = "long"
+table = "public.obs"
+station_fk_col = "station_id"
+time_col = "time"
+param_col = "param"
+value_col = "value"
+
+[[collections.postgis.parameters]]
+name = "t2m"
+label = "Temp"
+unit = "C"
+"#;
+        let path = write_config(tmp.path(), "config.toml", toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("[collections.postgis] is set but engine_type"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn is_valid_sql_identifier_cases() {
+        // accepts
+        assert!(is_valid_sql_identifier("_"));
+        assert!(is_valid_sql_identifier("a"));
+        assert!(is_valid_sql_identifier("a1"));
+        assert!(is_valid_sql_identifier("wigos_id"));
+        assert!(is_valid_sql_identifier(&"a".repeat(63)));
+
+        // rejects
+        assert!(!is_valid_sql_identifier(""));
+        assert!(!is_valid_sql_identifier(&"a".repeat(64)));
+        assert!(!is_valid_sql_identifier("1abc"));
+        assert!(!is_valid_sql_identifier("a\"b"));
+        assert!(!is_valid_sql_identifier("a\0b"));
+        assert!(!is_valid_sql_identifier("\"; DROP TABLE x;--"));
+        assert!(!is_valid_sql_identifier("a b"));
+        assert!(!is_valid_sql_identifier("a-b"));
+    }
+
+    #[test]
+    fn validate_stations_where_clause_accepts_simple_filters() {
+        for ok in [
+            "active = true",
+            "quality_code IN (1, 2, 3)",
+            "country_code = 'FI'",
+            "obs_count > 0 AND station_type != 'mobile'",
+        ] {
+            validate_stations_where_clause("c", ok)
+                .unwrap_or_else(|e| panic!("expected OK for '{ok}', got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn validate_stations_where_clause_rejects_injection() {
+        // Each of these should surface as a config error so a typo or
+        // compromised config file cannot chain a destructive statement.
+        for bad in [
+            "1=1; DROP TABLE stations;--",
+            "1=1; DELETE FROM stations",
+            "1=1 -- and more",
+            "1=1 /* comment */",
+            "status = 'ok' */",
+            "DROP TABLE stations",
+            "x = 1 OR DELETE x",
+            "TRUNCATE stations",
+            "grant select to public",
+            "1; copy stations to program 'evil'",
+            // Data-exfil / dynamic-execution — flagged in PR review.
+            "territory = 'x' UNION SELECT password FROM admin_users",
+            "1=1 EXECUTE 'DROP TABLE stations'",
+            "1=1 call do_something()",
+            "1=1 perform evil()",
+            // Correlated subquery — needs SELECT/FROM in the blocklist.
+            "territory = (SELECT territory FROM stations LIMIT 1)",
+            // Whitespace bypass — verbs separated by non-space whitespace.
+            "active\nunion\nselect 1",
+            "active\tdelete\tfrom stations",
+        ] {
+            assert!(
+                validate_stations_where_clause("c", bad).is_err(),
+                "expected error for '{bad}'"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_stations_where_clause_rejects_oversize() {
+        let long = "a = ".to_string() + &"1".repeat(520);
+        assert!(validate_stations_where_clause("c", &long).is_err());
+    }
+
+    #[test]
+    fn validate_qualified_table_cases() {
+        assert_eq!(
+            validate_qualified_table("stations"),
+            Ok(("public", "stations"))
+        );
+        assert_eq!(
+            validate_qualified_table("weather.stations"),
+            Ok(("weather", "stations"))
+        );
+        assert!(validate_qualified_table("a.b.c").is_err());
+        assert!(validate_qualified_table(".bare").is_err());
+        assert!(validate_qualified_table("bare.").is_err());
+        assert!(validate_qualified_table("1schema.tbl").is_err());
     }
 }

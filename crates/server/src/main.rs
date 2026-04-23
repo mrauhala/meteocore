@@ -231,6 +231,7 @@ async fn main() {
         geotiff_engines: RwLock::new(result.geotiff_engines),
         querydata_engines: RwLock::new(result.querydata_engines),
         grib_engines: RwLock::new(result.grib_engines),
+        postgis_engines: RwLock::new(result.postgis_engines),
         reload_lock: tokio::sync::Mutex::new(()),
         admin_token,
     });
