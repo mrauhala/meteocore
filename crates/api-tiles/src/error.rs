@@ -32,10 +32,13 @@ impl IntoResponse for TilesError {
             }
         };
 
-        (
+        let reason = ds_core::error::ErrorReason(format!("{code}: {description}"));
+        let mut response = (
             status,
             Json(json!({ "code": code, "description": description })),
         )
-            .into_response()
+            .into_response();
+        response.extensions_mut().insert(reason);
+        response
     }
 }

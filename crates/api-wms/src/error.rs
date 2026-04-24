@@ -119,8 +119,10 @@ impl WmsError {
 impl IntoResponse for WmsError {
     fn into_response(self) -> axum::response::Response {
         let status = self.status_code();
+        let reason =
+            ds_core::error::ErrorReason(format!("{}: {}", self.error_code(), self.message()));
         let xml = self.to_xml();
-        (
+        let mut response = (
             status,
             [
                 (header::CONTENT_TYPE, "application/vnd.ogc.se_xml"),
@@ -131,6 +133,8 @@ impl IntoResponse for WmsError {
             ],
             xml,
         )
-            .into_response()
+            .into_response();
+        response.extensions_mut().insert(reason);
+        response
     }
 }

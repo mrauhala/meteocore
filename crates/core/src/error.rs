@@ -35,3 +35,14 @@ pub enum DataServerError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
+
+/// Carries a human-readable error reason across the axum middleware stack via
+/// response extensions. Each API crate attaches one of these when mapping an
+/// internal error to a ≥400 HTTP response; the request-logging middleware in
+/// the server crate reads it back out so the reason ends up in Loki as an
+/// `error` field alongside the status code.
+///
+/// Lives in ds-core because it straddles multiple API crates — but has no
+/// framework dependency itself, which keeps ds-core framework-free.
+#[derive(Debug, Clone)]
+pub struct ErrorReason(pub String);

@@ -2041,6 +2041,15 @@ pub async fn request_logging_middleware(
 
     let (api, collection_id, query_type) = classify_route(&uri_path, matched.as_deref());
 
+    // For ≥400 responses, API error types attach a ds_core::error::ErrorReason
+    // to the response extensions so the reason survives past IntoResponse (which
+    // otherwise only leaves it in the response body). Logged as an `error` field
+    // for easy LogQL filtering.
+    let error_reason = response
+        .extensions()
+        .get::<ds_core::error::ErrorReason>()
+        .map(|r| r.0.clone());
+
     tracing::info!(
         request_id = %request_id,
         method = %method,
@@ -2053,6 +2062,7 @@ pub async fn request_logging_middleware(
         status = status,
         duration_ms = format!("{duration_ms:.3}"),
         result_size = result_size,
+        error = error_reason.as_deref().unwrap_or(""),
         "request"
     );
 
