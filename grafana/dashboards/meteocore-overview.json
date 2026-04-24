@@ -432,15 +432,43 @@
       ]
     },
     {
+      "title": "Cache Hit Rate Over Time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 45 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "fillOpacity": 5, "lineWidth": 2 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(tile_cache_hits_total[5m])) / clamp_min(sum(rate(tile_cache_hits_total[5m])) + sum(rate(tile_cache_misses_total[5m])), 0.0001)",
+          "legendFormat": "Tile Cache"
+        },
+        {
+          "expr": "rate(rendered_cache_hits_total[5m]) / clamp_min(rate(rendered_cache_hits_total[5m]) + rate(rendered_cache_misses_total[5m]), 0.0001)",
+          "legendFormat": "Rendered Cache"
+        },
+        {
+          "expr": "sum(rate(grid_cache_hits_total[5m])) / clamp_min(sum(rate(grid_cache_hits_total[5m])) + sum(rate(grid_cache_misses_total[5m])), 0.0001)",
+          "legendFormat": "GRIB Grid Cache"
+        }
+      ]
+    },
+    {
       "title": "Collections & Endpoints",
       "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 45 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 53 },
       "collapsed": false
     },
     {
       "title": "Collection Health",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 46 },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 54 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "fieldConfig": {
         "defaults": {
@@ -459,7 +487,7 @@
     {
       "title": "Degraded",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 3, "x": 6, "y": 46 },
+      "gridPos": { "h": 4, "w": 3, "x": 6, "y": 54 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "fieldConfig": {
         "defaults": {
@@ -478,7 +506,7 @@
     {
       "title": "Failed",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 3, "x": 9, "y": 46 },
+      "gridPos": { "h": 4, "w": 3, "x": 9, "y": 54 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "fieldConfig": {
         "defaults": {
@@ -497,7 +525,7 @@
     {
       "title": "Requests by Status Code",
       "type": "piechart",
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 46 },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 54 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "targets": [
         {
@@ -509,7 +537,7 @@
     {
       "title": "Top Endpoints by Request Count",
       "type": "bargauge",
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 46 },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 54 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "fieldConfig": {
         "defaults": {
@@ -530,7 +558,7 @@
     {
       "title": "Request Rate by Endpoint",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 54 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 62 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "fieldConfig": {
         "defaults": {
@@ -548,13 +576,13 @@
     {
       "title": "Logs",
       "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 62 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 70 },
       "collapsed": false
     },
     {
       "title": "Request Rate by Query Type (from logs)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 63 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 71 },
       "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
       "fieldConfig": {
         "defaults": {
@@ -572,7 +600,7 @@
     {
       "title": "Error Rate by Status Class (from logs)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 63 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 71 },
       "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
       "fieldConfig": {
         "defaults": {
@@ -600,7 +628,7 @@
     {
       "title": "Recent Requests",
       "type": "logs",
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 71 },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 79 },
       "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
       "options": {
         "showTime": true,
@@ -622,7 +650,7 @@
     {
       "title": "Errors (4xx / 5xx)",
       "type": "logs",
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 83 },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 91 },
       "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
       "options": {
         "showTime": true,
