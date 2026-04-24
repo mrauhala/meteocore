@@ -96,8 +96,8 @@ GetFeatureInfo is not supported.
 | `LAYERS` | yes | Layer name (= collection ID). Only one layer per request. |
 | `CRS` | yes | Coordinate reference system (see below) |
 | `BBOX` | yes | Bounding box (axis order depends on CRS) |
-| `WIDTH` | yes | Output image width in pixels (1–4096) |
-| `HEIGHT` | yes | Output image height in pixels (1–4096) |
+| `WIDTH` | yes | Output image width in pixels (1–8192) |
+| `HEIGHT` | yes | Output image height in pixels (1–8192) |
 | `FORMAT` | yes | Must be `image/png` |
 | `TRANSPARENT` | no | `TRUE` (default) or `FALSE` |
 | `TIME` | no | ISO 8601 timestamp. Defaults to latest available. |

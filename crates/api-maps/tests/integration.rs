@@ -465,7 +465,7 @@ mod get_map {
 
     #[tokio::test]
     async fn dimension_too_large_returns_400() {
-        let (status, _) = get("/collections/radar/map?bbox=10,55,30,70&width=5000").await;
+        let (status, _) = get("/collections/radar/map?bbox=10,55,30,70&width=9000").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

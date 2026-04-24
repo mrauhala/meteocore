@@ -1426,7 +1426,7 @@ pub fn read_bbox_overview(
 }
 
 /// Maximum source pixels for map rendering. Higher than EDR area queries since
-/// the output is already bounded by MAX_MAP_DIMENSION (4096) and the data is
+/// the output is already bounded by MAX_MAP_DIMENSION (8192) and the data is
 /// resampled to output resolution. Needs to be generous because projected CRS
 /// data (e.g., TM35FIN radar covering all of Scandinavia) can have large source
 /// extents even for moderate output sizes.
