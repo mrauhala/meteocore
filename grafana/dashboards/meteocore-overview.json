@@ -289,7 +289,7 @@
       },
       "targets": [
         {
-          "expr": "rate(rendered_cache_hits_total[5m]) / clamp_min(rate(rendered_cache_hits_total[5m]) + rate(rendered_cache_misses_total[5m]), 0.0001)",
+          "expr": "sum(rate(rendered_cache_hits_total[5m])) / clamp_min(sum(rate(rendered_cache_hits_total[5m])) + sum(rate(rendered_cache_misses_total[5m])), 0.0001)",
           "legendFormat": "Hit Rate"
         }
       ]
@@ -379,11 +379,11 @@
           "legendFormat": "Tile Misses"
         },
         {
-          "expr": "rate(rendered_cache_hits_total[5m])",
+          "expr": "sum(rate(rendered_cache_hits_total[5m]))",
           "legendFormat": "Rendered Hits"
         },
         {
-          "expr": "rate(rendered_cache_misses_total[5m])",
+          "expr": "sum(rate(rendered_cache_misses_total[5m]))",
           "legendFormat": "Rendered Misses"
         },
         {
@@ -450,7 +450,7 @@
           "legendFormat": "Tile Cache"
         },
         {
-          "expr": "rate(rendered_cache_hits_total[5m]) / clamp_min(rate(rendered_cache_hits_total[5m]) + rate(rendered_cache_misses_total[5m]), 0.0001)",
+          "expr": "sum(rate(rendered_cache_hits_total[5m])) / clamp_min(sum(rate(rendered_cache_hits_total[5m])) + sum(rate(rendered_cache_misses_total[5m])), 0.0001)",
           "legendFormat": "Rendered Cache"
         },
         {

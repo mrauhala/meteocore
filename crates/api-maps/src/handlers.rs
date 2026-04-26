@@ -417,7 +417,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "schema": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 8192,
+                        "maximum": 8000,
                         "default": 256
                     },
                     "description": "Image width in pixels"
@@ -429,7 +429,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "schema": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 8192,
+                        "maximum": 8000,
                         "default": 256
                     },
                     "description": "Image height in pixels"

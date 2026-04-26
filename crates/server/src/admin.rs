@@ -2043,28 +2043,50 @@ pub async fn request_logging_middleware(
 
     // For ≥400 responses, API error types attach a ds_core::error::ErrorReason
     // to the response extensions so the reason survives past IntoResponse (which
-    // otherwise only leaves it in the response body). Logged as an `error` field
-    // for easy LogQL filtering.
+    // otherwise only leaves it in the response body). The field is omitted on
+    // success so 2xx logs aren't padded with `error = ""` — keeps Loki ingest
+    // smaller and `| json | error != ""` filters readable.
     let error_reason = response
         .extensions()
         .get::<ds_core::error::ErrorReason>()
         .map(|r| r.0.clone());
+    let duration_str = format!("{duration_ms:.3}");
+    let route_str = matched.as_deref().unwrap_or("");
+    let collection_str = collection_id.unwrap_or("");
+    let query_str = query.as_deref().unwrap_or("");
 
-    tracing::info!(
-        request_id = %request_id,
-        method = %method,
-        path = %uri_path,
-        route = matched.as_deref().unwrap_or(""),
-        api = api,
-        collection = collection_id.unwrap_or(""),
-        query_type = query_type,
-        query = query.as_deref().unwrap_or(""),
-        status = status,
-        duration_ms = format!("{duration_ms:.3}"),
-        result_size = result_size,
-        error = error_reason.as_deref().unwrap_or(""),
-        "request"
-    );
+    if let Some(reason) = error_reason {
+        tracing::info!(
+            request_id = %request_id,
+            method = %method,
+            path = %uri_path,
+            route = route_str,
+            api = api,
+            collection = collection_str,
+            query_type = query_type,
+            query = query_str,
+            status = status,
+            duration_ms = duration_str,
+            result_size = result_size,
+            error = %reason,
+            "request"
+        );
+    } else {
+        tracing::info!(
+            request_id = %request_id,
+            method = %method,
+            path = %uri_path,
+            route = route_str,
+            api = api,
+            collection = collection_str,
+            query_type = query_type,
+            query = query_str,
+            status = status,
+            duration_ms = duration_str,
+            result_size = result_size,
+            "request"
+        );
+    }
 
     response
 }
