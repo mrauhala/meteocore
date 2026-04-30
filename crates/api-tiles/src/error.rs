@@ -27,9 +27,15 @@ impl IntoResponse for TilesError {
                 "ServerError",
                 "Internal server error",
             ),
-            TilesError::ServiceUnavailable(msg) => {
-                (StatusCode::SERVICE_UNAVAILABLE, "ServerBusy", msg.as_str())
-            }
+            // Like Internal, drop the inner string structurally — the only
+            // current call site is render_semaphore-exhausted with a fixed
+            // string, but ignoring the payload here means a future caller
+            // can't accidentally leak internal state via this variant.
+            TilesError::ServiceUnavailable(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ServerBusy",
+                "Server busy, try again later",
+            ),
         };
 
         let reason = ds_core::error::ErrorReason(format!("{code}: {description}"));
@@ -63,5 +69,44 @@ mod tests {
             .get::<ErrorReason>()
             .expect("ErrorReason must be attached so request_logging_middleware can pick it up");
         assert_eq!(reason.0, "BadRequest: z=22 out of range");
+    }
+
+    #[test]
+    fn into_response_redacts_internal_message() {
+        let err = TilesError::Internal("connection refused at 10.0.0.5:5432".to_string());
+        let response = err.into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let reason = response
+            .extensions()
+            .get::<ErrorReason>()
+            .expect("attached");
+        assert_eq!(reason.0, "ServerError: Internal server error");
+        assert!(
+            !reason.0.contains("10.0.0.5"),
+            "inner detail must not leak via ErrorReason, got {:?}",
+            reason.0
+        );
+    }
+
+    #[test]
+    fn into_response_redacts_service_unavailable_message() {
+        // The only current call site passes a safe fixed string, but the
+        // variant must structurally drop its payload — defence-in-depth
+        // against a future caller passing internal state.
+        let err = TilesError::ServiceUnavailable("semaphore poisoned: secret".to_string());
+        let response = err.into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let reason = response
+            .extensions()
+            .get::<ErrorReason>()
+            .expect("attached");
+        assert_eq!(reason.0, "ServerBusy: Server busy, try again later");
+        assert!(
+            !reason.0.contains("secret"),
+            "inner detail must not leak via ErrorReason, got {:?}",
+            reason.0
+        );
     }
 }

@@ -27,9 +27,15 @@ impl IntoResponse for MapsError {
                 "ServerError",
                 "Internal server error",
             ),
-            MapsError::ServiceUnavailable(msg) => {
-                (StatusCode::SERVICE_UNAVAILABLE, "ServerBusy", msg.as_str())
-            }
+            // Like Internal, drop the inner string structurally — the only
+            // current call site is render_semaphore-exhausted with a fixed
+            // string, but ignoring the payload here means a future caller
+            // can't accidentally leak internal state via this variant.
+            MapsError::ServiceUnavailable(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ServerBusy",
+                "Server busy, try again later",
+            ),
         };
 
         let reason = ds_core::error::ErrorReason(format!("{code}: {description}"));
@@ -80,5 +86,26 @@ mod tests {
             .get::<ErrorReason>()
             .expect("attached");
         assert_eq!(reason.0, "ServerError: Internal server error");
+    }
+
+    #[test]
+    fn into_response_redacts_service_unavailable_message() {
+        // The only current call site passes a safe fixed string, but the
+        // variant must structurally drop its payload — defence-in-depth
+        // against a future caller passing internal state.
+        let err = MapsError::ServiceUnavailable("semaphore poisoned: secret".to_string());
+        let response = err.into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let reason = response
+            .extensions()
+            .get::<ErrorReason>()
+            .expect("attached");
+        assert_eq!(reason.0, "ServerBusy: Server busy, try again later");
+        assert!(
+            !reason.0.contains("secret"),
+            "inner detail must not leak via ErrorReason, got {:?}",
+            reason.0
+        );
     }
 }
