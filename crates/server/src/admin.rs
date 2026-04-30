@@ -2055,37 +2055,35 @@ pub async fn request_logging_middleware(
     let collection_str = collection_id.unwrap_or("");
     let query_str = query.as_deref().unwrap_or("");
 
+    // Local macro keeps the field list in one place: future fields like
+    // `user_agent` or `cache_hit` get added once and apply to both arms.
+    // tracing's macro requires the field list at the call site, so we splice
+    // an optional `error = …,` token tree depending on whether a reason was
+    // attached.
+    macro_rules! log_request {
+        ($($error_field:tt)*) => {
+            tracing::info!(
+                request_id = %request_id,
+                method = %method,
+                path = %uri_path,
+                route = route_str,
+                api = api,
+                collection = collection_str,
+                query_type = query_type,
+                query = query_str,
+                status = status,
+                duration_ms = duration_str,
+                result_size = result_size,
+                $($error_field)*
+                "request"
+            );
+        };
+    }
+
     if let Some(reason) = error_reason {
-        tracing::info!(
-            request_id = %request_id,
-            method = %method,
-            path = %uri_path,
-            route = route_str,
-            api = api,
-            collection = collection_str,
-            query_type = query_type,
-            query = query_str,
-            status = status,
-            duration_ms = duration_str,
-            result_size = result_size,
-            error = %reason,
-            "request"
-        );
+        log_request!(error = %reason,);
     } else {
-        tracing::info!(
-            request_id = %request_id,
-            method = %method,
-            path = %uri_path,
-            route = route_str,
-            api = api,
-            collection = collection_str,
-            query_type = query_type,
-            query = query_str,
-            status = status,
-            duration_ms = duration_str,
-            result_size = result_size,
-            "request"
-        );
+        log_request!();
     }
 
     response

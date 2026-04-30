@@ -70,6 +70,15 @@ impl WmsError {
         }
     }
 
+    /// Client-visible message — written into the WMS XML response body.
+    ///
+    /// 5xx variants must NOT echo the inner string here, because the
+    /// `ServiceExceptionReport` is shipped to the requesting client. Per
+    /// CLAUDE.md ("Do not leak internal error details to clients — use
+    /// generic messages for 500 errors") and the `MapsError` precedent,
+    /// `Internal` and `ServiceUnavailable` get a fixed redacted message;
+    /// the original detail is captured at the handler via `tracing::warn!`
+    /// before the error is mapped, so operators don't lose it.
     fn message(&self) -> &str {
         match self {
             WmsError::LayerNotDefined(m)
@@ -79,9 +88,9 @@ impl WmsError {
             | WmsError::MissingParameterValue(m)
             | WmsError::InvalidFormat(m)
             | WmsError::InvalidParameterValue(m)
-            | WmsError::OperationNotSupported(m)
-            | WmsError::Internal(m)
-            | WmsError::ServiceUnavailable(m) => m,
+            | WmsError::OperationNotSupported(m) => m,
+            WmsError::Internal(_) => "Internal server error",
+            WmsError::ServiceUnavailable(_) => "Server busy, try again later",
         }
     }
 
@@ -172,14 +181,40 @@ mod tests {
     }
 
     #[test]
-    fn into_response_attaches_reason_for_internal_errors_too() {
-        let err = WmsError::Internal("render task panicked".to_string());
+    fn into_response_redacts_internal_message_in_body_and_reason() {
+        // The XML body and ErrorReason both carry a fixed generic message
+        // for 5xx — the inner panic detail must not leak to clients via
+        // the response body, and ErrorReason mirrors the body so log lines
+        // and user-visible errors stay consistent. Operators get the
+        // original detail via `tracing::warn!` at the handler before the
+        // error is mapped to WmsError::Internal.
+        let err = WmsError::Internal("render task panicked: secret detail".to_string());
         let response = err.into_response();
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let reason = response.extensions().get::<ErrorReason>().expect(
             "5xx must also attach ErrorReason — operators triage these from Loki, not response bodies",
         );
-        assert_eq!(reason.0, "Internal: render task panicked");
+        assert_eq!(reason.0, "Internal: Internal server error");
+        assert!(
+            !reason.0.contains("secret detail"),
+            "inner panic detail must not leak via ErrorReason, got {:?}",
+            reason.0
+        );
+    }
+
+    #[test]
+    fn xml_body_does_not_leak_internal_detail() {
+        let err = WmsError::Internal("connection refused at 10.0.0.5:5432".to_string());
+        let xml = err.to_xml();
+        let xml_str = std::str::from_utf8(&xml).expect("valid utf-8");
+        assert!(
+            xml_str.contains("Internal server error"),
+            "body must carry the redacted message, got {xml_str}"
+        );
+        assert!(
+            !xml_str.contains("10.0.0.5"),
+            "body must not echo internal connection detail, got {xml_str}"
+        );
     }
 }
