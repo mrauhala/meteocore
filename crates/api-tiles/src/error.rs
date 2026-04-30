@@ -42,3 +42,26 @@ impl IntoResponse for TilesError {
         response
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ds_core::error::ErrorReason;
+
+    /// Locks in the contract that the request-logging middleware depends on:
+    /// every TilesError → response must carry an `ErrorReason` extension. A
+    /// future refactor that drops the `extensions_mut().insert(...)` call
+    /// would silently re-empty the `error` field in production Loki logs.
+    #[test]
+    fn into_response_attaches_error_reason_extension() {
+        let err = TilesError::BadRequest("z=22 out of range".to_string());
+        let response = err.into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let reason = response
+            .extensions()
+            .get::<ErrorReason>()
+            .expect("ErrorReason must be attached so request_logging_middleware can pick it up");
+        assert_eq!(reason.0, "BadRequest: z=22 out of range");
+    }
+}

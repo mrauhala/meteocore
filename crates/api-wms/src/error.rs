@@ -138,3 +138,48 @@ impl IntoResponse for WmsError {
         response
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ds_core::error::ErrorReason;
+
+    /// Locks in the contract that the request-logging middleware depends on:
+    /// every WmsError → response must carry an `ErrorReason` extension. A
+    /// future refactor that drops the `extensions_mut().insert(...)` call
+    /// would silently re-empty the `error` field in production Loki logs;
+    /// catching it here means it can't.
+    #[test]
+    fn into_response_attaches_error_reason_extension() {
+        let err = WmsError::layer_not_found("some-bogus-layer");
+        let response = err.into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let reason = response
+            .extensions()
+            .get::<ErrorReason>()
+            .expect("ErrorReason must be attached so request_logging_middleware can pick it up");
+        assert!(
+            reason.0.starts_with("LayerNotDefined: "),
+            "reason should be `code: message` for grep-friendly logs, got {:?}",
+            reason.0
+        );
+        assert!(
+            reason.0.contains("some-bogus-layer"),
+            "reason should carry the offending value, got {:?}",
+            reason.0
+        );
+    }
+
+    #[test]
+    fn into_response_attaches_reason_for_internal_errors_too() {
+        let err = WmsError::Internal("render task panicked".to_string());
+        let response = err.into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let reason = response.extensions().get::<ErrorReason>().expect(
+            "5xx must also attach ErrorReason — operators triage these from Loki, not response bodies",
+        );
+        assert_eq!(reason.0, "Internal: render task panicked");
+    }
+}
