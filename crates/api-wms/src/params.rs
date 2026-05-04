@@ -4,11 +4,14 @@ use serde::Deserialize;
 
 use crate::error::WmsError;
 
-/// Maximum map pixels (width * height). 16M = 4096x4096 (matches MAX_MAP_DIMENSION).
-pub const MAX_MAP_PIXELS: u64 = 16_777_216;
+/// Maximum map pixels (width * height). 64M matches the engine-geotiff cap so
+/// requests that pass API validation never get rejected further down the stack.
+pub const MAX_MAP_PIXELS: u64 = 64_000_000;
 
-/// Maximum single dimension (width or height).
-pub const MAX_MAP_DIMENSION: u32 = 4096;
+/// Maximum single dimension (width or height). 8000 chosen so 8000 × 8000
+/// equals MAX_MAP_PIXELS — a square at the per-dim cap doesn't trip the
+/// pixel cap with a confusing second error.
+pub const MAX_MAP_DIMENSION: u32 = 8000;
 
 /// Supported CRS identifiers.
 const SUPPORTED_CRS: &[&str] = &["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:3067", "EPSG:3035"];

@@ -65,9 +65,15 @@ loki.process "meteocore" {
 
     // Derive status_class (2xx / 4xx / 5xx / unknown) to keep the status
     // label bounded to a handful of values rather than one per HTTP code.
+    //
+    // The server records `status` as a u16, which tracing-subscriber's JSON
+    // formatter emits as a JSON number. Alloy's stage.json keeps that as a
+    // float64 in the extracted map, so string-only helpers like `slice`
+    // fail silently and leave `status_class` unset. Using sprig's `int` +
+    // `div` is robust whether the upstream value is `200` or `"200"`.
     stage.template {
         source   = "status_class"
-        template = "{{ if .status }}{{ slice .status 0 1 }}xx{{ else }}unknown{{ end }}"
+        template = "{{ if .status }}{{ div (int .status) 100 }}xx{{ else }}unknown{{ end }}"
     }
 
     // Promote the parsed fields to indexed labels.
