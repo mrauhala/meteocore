@@ -1,14 +1,16 @@
 // MeteoCore preview SPA.
 //
-// Renders the manifest into MapLibre layers:
-//   * `tiles.raster` collections → raster source + raster layer, with a
-//     visibility toggle and a style picker (when more than one style is
-//     configured).
-//   * `tiles.vector` collections → vector source + circle/line/fill layers,
-//     with a visibility toggle and a click handler that opens a popup
-//     listing the feature's properties.
+// Renders the manifest into MapLibre layers and a sidebar of collection cards.
 //
-// Time slider lands in a later phase.
+// Per-collection model:
+//   * Layers start hidden — the user opts in by toggling each card. Showing
+//     every collection by default produces visual noise when a deployment has
+//     more than a handful (and is expensive for tile-heavy raster layers).
+//   * First enable zooms the map to that collection's spatial extent so the
+//     user doesn't have to hunt for the data.
+//   * Cards display title, description, API surface, spatial bbox, and (when
+//     present) a time slider scrubbing through the temporal extent's discrete
+//     timesteps.
 //
 // XSS hygiene: every dynamic value reaches the DOM through `textContent` or
 // as a typed `<option>` value. Never use innerHTML with manifest data.
@@ -25,7 +27,7 @@
                 {
                     id: 'background',
                     type: 'background',
-                    paint: { 'background-color': '#e2e8f0' }
+                    paint: { 'background-color': '#0f172a' }
                 }
             ]
         },
@@ -35,189 +37,333 @@
     });
 
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }));
+    map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-right');
 
     const statusEl = document.getElementById('status');
     const listEl = document.getElementById('collections');
 
-    // Shared across every vector collection so clicking a feature in one
-    // collection dismisses an open popup from another.
+    // Shared across every vector collection so a click in one collection
+    // dismisses an open popup from another.
     let activePopup = null;
 
-    // `map.on('load')` so MapLibre's style is ready before we add raster
-    // sources/layers. Adding sources before style-load throws.
-    //
-    // Absolute manifest path: relative `manifest.json` would only resolve
-    // correctly when the URL ends in `/`, but the route table accepts both
-    // `/preview` and `/preview/`. Full proxy-prefix support (relative paths
-    // + `<base>` + redirect to enforce trailing slash) is later-phase work.
-    map.on('load', function () {
-        fetch('/preview/manifest.json')
-            .then(function (r) {
-                if (!r.ok) throw new Error('HTTP ' + r.status);
-                return r.json();
-            })
-            .then(renderManifest)
-            .catch(function (err) {
-                statusEl.textContent = 'Failed to load manifest: ' + err.message;
-                console.error('manifest fetch failed', err);
-            });
-    });
+    // Fetch the manifest in parallel with map initialization. Sources can't
+    // be added until the style is parsed, so the card factory defers
+    // `addSource`/`addLayer` behind `mapReady`. We poll `isStyleLoaded()`
+    // instead of subscribing to `load` because the `load` event is gated on
+    // glyph/sprite resolution and a minimal style with only a background
+    // layer doesn't always fire it in MapLibre 5.
+
+    fetch('/preview/manifest.json')
+        .then(function (r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+        })
+        .then(renderManifest)
+        .catch(function (err) {
+            statusEl.textContent = 'Failed to load manifest: ' + err.message;
+            statusEl.classList.add('error');
+            console.error('manifest fetch failed', err);
+        });
 
     function renderManifest(manifest) {
         const collections = manifest.collections || [];
-        // We fetch a single page (default limit=100). The total can exceed
-        // that; advertise the shortfall so users don't think the list is
-        // complete. Defensive read on `pagination`: a future schema change
-        // or a partial parse shouldn't crash the SPA before the map
-        // renders. Fall back to the rendered count.
-        const rendered = collections.length;
-        const total =
-            manifest.pagination && typeof manifest.pagination.total === 'number'
-                ? manifest.pagination.total
-                : rendered;
-        const noun = total === 1 ? 'collection' : 'collections';
+        const total = manifest.pagination ? manifest.pagination.total : collections.length;
         statusEl.textContent =
             total === 0
                 ? 'No collections registered.'
-                : rendered < total
-                    ? rendered + ' of ' + total + ' ' + noun + ' (paginated)'
-                    : total + ' ' + noun;
+                : total + (total === 1 ? ' collection' : ' collections') + ' available';
 
-        fitMapToCollections(collections);
+        if (collections.length === 0) return;
 
-        // Stable iteration order matches the manifest, which sorts by id.
-        // `map.addLayer()` without `beforeId` appends to the top of the
-        // draw stack, so the *last* collection iterated (alphabetically
-        // latest id) renders on top — same convention as the comment at
-        // `attachRasterLayer` ("collections later in the manifest stack
-        // on top"). Operators wanting a different stack can re-order
-        // collections in config.
         collections.forEach(function (c) {
-            const li = document.createElement('li');
-            li.className = 'collection';
-
-            const header = document.createElement('div');
-            header.className = 'collection-header';
-
-            const title = document.createElement('span');
-            title.className = 'title';
-            title.textContent = c.title || c.id;
-            header.appendChild(title);
-
-            const apis = document.createElement('span');
-            apis.className = 'apis';
-            apis.textContent = (c.apis || []).join(' · ');
-            header.appendChild(apis);
-
-            li.appendChild(header);
-
-            // Per-collection error isolation: `map.addSource` and
-            // `map.addLayer` throw synchronously on duplicate IDs,
-            // missing style, and similar boundary conditions. An
-            // uncaught throw inside `forEach` aborts the whole loop, so
-            // one malformed collection would silently drop every
-            // collection after it from the sidebar. Catch + log; the
-            // sidebar entry without controls is still informative.
-            if (c.tiles && c.tiles.raster) {
-                try {
-                    attachRasterLayer(c, li);
-                } catch (err) {
-                    console.error('attachRasterLayer failed for', c.id, err);
-                }
-            }
-            if (c.tiles && c.tiles.vector) {
-                try {
-                    attachVectorLayer(c, li);
-                } catch (err) {
-                    console.error('attachVectorLayer failed for', c.id, err);
-                }
-            }
-
-            listEl.appendChild(li);
+            listEl.appendChild(buildCollectionCard(c));
         });
     }
 
-    function fitMapToCollections(collections) {
-        const bounds = collections.reduce(function (acc, c) {
-            if (!c.spatial_extent) return acc;
-            const e = c.spatial_extent;
-            // Clamp to valid Mercator latitudes — a bbox at the poles
-            // (e.g. ECMWF's [-180,-90,180,90]) projects to infinity in
-            // web Mercator. MapLibre then accepts the bounds but `fitBounds`
-            // resolves to a white-canvas max-zoom view because no finite
-            // pixel rectangle contains the bbox.
-            const south = Math.max(e[1], -85);
-            const north = Math.min(e[3], 85);
-            const sw = [e[0], south];
-            const ne = [e[2], north];
-            if (!acc) return new maplibregl.LngLatBounds(sw, ne);
-            acc.extend(sw);
-            acc.extend(ne);
-            return acc;
-        }, null);
-        if (bounds) map.fitBounds(bounds, { padding: 60, duration: 0 });
+    // Schedule `fn` to run once the map style is ready to accept
+    // `addSource`/`addLayer` calls. `map.isStyleLoaded()` is not reliable
+    // here — in some browser-throttled tabs it never returns true — so we
+    // probe by calling `addSource`'s own readiness check on a throwaway
+    // marker source. On failure we retry on the next `styledata`, `data`,
+    // or `idle` event; whichever fires first re-triggers the probe.
+    function whenStyleReady(map, fn) {
+        const MARKER = '__readiness_probe__';
+        let done = false;
+        function attempt() {
+            if (done) return;
+            try {
+                map.addSource(MARKER, { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+                map.removeSource(MARKER);
+                done = true;
+                fn();
+            } catch (e) {
+                // Subscribe to multiple events; throttled tabs may not get
+                // every one. `setTimeout` also reschedules in case all map
+                // events stay silent (Chrome throttles `setInterval` more
+                // aggressively than `setTimeout`).
+                map.once('styledata', attempt);
+                map.once('data', attempt);
+                map.once('idle', attempt);
+                setTimeout(attempt, 250);
+            }
+        }
+        attempt();
     }
 
-    // -----------------------------------------------------------------
-    // Raster layer wiring
-    // -----------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Card construction
+    // ------------------------------------------------------------------
 
-    function attachRasterLayer(collection, li) {
+    function buildCollectionCard(collection) {
+        const state = {
+            enabled: false,
+            hasZoomed: false,
+            timeIndex: null,
+            timeValues: temporalValues(collection)
+        };
+
+        const li = document.createElement('li');
+        li.className = 'collection';
+
+        const card = document.createElement('div');
+        card.className = 'card';
+        li.appendChild(card);
+
+        // -- Header row: enable switch + title --
+        const header = document.createElement('div');
+        header.className = 'card-header';
+        card.appendChild(header);
+
+        const toggle = document.createElement('label');
+        toggle.className = 'switch';
+        toggle.title = 'Toggle layer visibility';
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = false;
+        toggle.appendChild(checkbox);
+        const slider = document.createElement('span');
+        slider.className = 'switch-slider';
+        toggle.appendChild(slider);
+        header.appendChild(toggle);
+
+        const titleBlock = document.createElement('div');
+        titleBlock.className = 'card-title-block';
+        const title = document.createElement('div');
+        title.className = 'card-title';
+        title.textContent = collection.title || collection.id;
+        titleBlock.appendChild(title);
+        const subtitle = document.createElement('div');
+        subtitle.className = 'card-subtitle';
+        subtitle.textContent = collection.id;
+        titleBlock.appendChild(subtitle);
+        header.appendChild(titleBlock);
+
+        // -- API badges --
+        if (collection.apis && collection.apis.length > 0) {
+            const badges = document.createElement('div');
+            badges.className = 'badges';
+            collection.apis.forEach(function (api) {
+                const badge = document.createElement('span');
+                badge.className = 'badge badge-' + api;
+                badge.textContent = api;
+                badges.appendChild(badge);
+            });
+            card.appendChild(badges);
+        }
+
+        // -- Description --
+        if (collection.description) {
+            const desc = document.createElement('p');
+            desc.className = 'card-desc';
+            desc.textContent = collection.description;
+            card.appendChild(desc);
+        }
+
+        // -- Metadata: spatial extent, time, etc. --
+        const meta = document.createElement('dl');
+        meta.className = 'card-meta';
+        if (collection.spatial_extent) {
+            appendMeta(meta, 'Extent', formatExtent(collection.spatial_extent));
+        }
+        if (collection.temporal_extent) {
+            const t = collection.temporal_extent;
+            if (t.start && t.end) {
+                appendMeta(meta, 'Time', formatTimeRange(t.start, t.end));
+            }
+            if (t.total_values) {
+                let label = t.total_values + ' timesteps';
+                if (t.truncated) label += ' (sliced)';
+                appendMeta(meta, 'Steps', label);
+            }
+        }
+        if (collection.tiles) {
+            const repr = [];
+            if (collection.tiles.raster) repr.push('raster');
+            if (collection.tiles.vector) repr.push('vector');
+            if (repr.length > 0) appendMeta(meta, 'Tiles', repr.join(' + '));
+        }
+        if (meta.childNodes.length > 0) card.appendChild(meta);
+
+        // -- Layer controls (style picker, time slider, etc.) --
+        const controlsHost = document.createElement('div');
+        controlsHost.className = 'controls';
+        card.appendChild(controlsHost);
+
+        // -- Wire up sources and layers. `addSource` throws
+        // "Style is not done loading" if called before the style finishes
+        // parsing, so we attempt-then-retry until it succeeds. Listening on
+        // `load` alone is unreliable for our minimal background-only style
+        // (the event sometimes doesn't fire at all), but `styledata`
+        // continues to fire as the map updates so it eventually unblocks.
+        const layerHandles = [];
+        whenStyleReady(map, function () {
+            try {
+                if (collection.tiles && collection.tiles.raster) {
+                    layerHandles.push(attachRasterLayer(collection, controlsHost, state));
+                }
+                if (collection.tiles && collection.tiles.vector) {
+                    layerHandles.push(attachVectorLayer(collection, controlsHost, state));
+                }
+                if (state.enabled) {
+                    layerHandles.forEach(function (h) { h.setVisible(true); });
+                }
+            } catch (err) {
+                console.error(
+                    'Failed to attach layers for collection ' + collection.id + ':',
+                    err
+                );
+            }
+        });
+
+        // -- Time slider --
+        if (state.timeValues && state.timeValues.length > 1) {
+            attachTimeSlider(controlsHost, state, layerHandles);
+        }
+
+        // -- Footer: actions --
+        const footer = document.createElement('div');
+        footer.className = 'card-footer';
+        if (collection.spatial_extent) {
+            const zoomBtn = document.createElement('button');
+            zoomBtn.type = 'button';
+            zoomBtn.className = 'link';
+            zoomBtn.textContent = 'Zoom to extent';
+            zoomBtn.addEventListener('click', function () {
+                fitMapToExtent(collection.spatial_extent);
+            });
+            footer.appendChild(zoomBtn);
+        }
+        if (footer.childNodes.length > 0) card.appendChild(footer);
+
+        // -- Wire toggle to layer visibility --
+        checkbox.addEventListener('change', function () {
+            state.enabled = checkbox.checked;
+            card.classList.toggle('active', state.enabled);
+            layerHandles.forEach(function (h) {
+                h.setVisible(state.enabled);
+            });
+            if (state.enabled && !state.hasZoomed && collection.spatial_extent) {
+                fitMapToExtent(collection.spatial_extent);
+                state.hasZoomed = true;
+            }
+        });
+
+        return li;
+    }
+
+    function appendMeta(dl, label, value) {
+        const dt = document.createElement('dt');
+        dt.textContent = label;
+        const dd = document.createElement('dd');
+        dd.textContent = value;
+        dl.appendChild(dt);
+        dl.appendChild(dd);
+    }
+
+    function fitMapToExtent(extent) {
+        const south = Math.max(extent[1], -85);
+        const north = Math.min(extent[3], 85);
+        const bounds = new maplibregl.LngLatBounds([extent[0], south], [extent[2], north]);
+        map.fitBounds(bounds, { padding: 80, maxZoom: 10, duration: 600 });
+    }
+
+    function formatExtent(e) {
+        // Compact human-readable bbox: "W 19.3°, S 59.8° → E 31.6°, N 70.1°"
+        return (
+            'W ' + e[0].toFixed(2) + '°, S ' + e[1].toFixed(2) + '° → ' +
+            'E ' + e[2].toFixed(2) + '°, N ' + e[3].toFixed(2) + '°'
+        );
+    }
+
+    function formatTimeRange(startIso, endIso) {
+        const start = new Date(startIso);
+        const end = new Date(endIso);
+        if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+            return startIso + ' → ' + endIso;
+        }
+        const sameDay =
+            start.getUTCFullYear() === end.getUTCFullYear() &&
+            start.getUTCMonth() === end.getUTCMonth() &&
+            start.getUTCDate() === end.getUTCDate();
+        if (sameDay) {
+            return formatDate(start) + ' · ' + formatTimeOnly(start) + ' → ' + formatTimeOnly(end);
+        }
+        return formatDateTime(start) + ' → ' + formatDateTime(end);
+    }
+
+    function formatDate(d) {
+        return d.toISOString().slice(0, 10);
+    }
+    function formatTimeOnly(d) {
+        return d.toISOString().slice(11, 16) + 'Z';
+    }
+    function formatDateTime(d) {
+        return d.toISOString().slice(0, 16).replace('T', ' ') + 'Z';
+    }
+
+    function temporalValues(collection) {
+        const t = collection.temporal_extent;
+        if (!t) return null;
+        if (Array.isArray(t.values) && t.values.length > 0) return t.values;
+        return null;
+    }
+
+    // ------------------------------------------------------------------
+    // Raster layer
+    // ------------------------------------------------------------------
+
+    function attachRasterLayer(collection, controlsHost, state) {
         const styles = collection.styles || [];
         let currentStyle = styles.length > 0 ? styles[0].id : 'default';
 
         const sourceId = 'src-' + collection.id;
         const layerId = 'layer-' + collection.id;
-        const initialUrl = tileUrlFor(collection, currentStyle);
 
-        // No `attribution` field: MapLibre renders attribution via
-        // `innerHTML` inside its AttributionControl, so a server config
-        // entry like `title = "<img src=x onerror=alert(1)>"` would
-        // execute script in the preview page. The title already appears
-        // in the sidebar (escaped via `textContent`), so the on-map
-        // attribution is redundant anyway.
+        // No `attribution`: MapLibre renders it via innerHTML.
         map.addSource(sourceId, {
             type: 'raster',
-            tiles: [initialUrl],
+            tiles: [tileUrlFor(collection, currentStyle, currentTime(state))],
             tileSize: 256
         });
-        // Append to the top of the draw stack (no `beforeId` argument).
-        // Per the iterator comment above, collections later in the
-        // manifest render above earlier ones — that ordering is enforced
-        // here by the natural append-to-top behaviour.
         map.addLayer({
             id: layerId,
             type: 'raster',
             source: sourceId,
+            // Hidden until the operator opts in via the card toggle. Layout
+            // properties are honoured before paint, so this is enough — no
+            // need to also gate the source.
+            layout: { visibility: 'none' },
             paint: { 'raster-opacity': 1 }
         });
 
-        // -- Toggle --
-        const controls = document.createElement('div');
-        controls.className = 'controls';
-
-        const toggle = document.createElement('label');
-        toggle.className = 'toggle';
-        const checkbox = document.createElement('input');
-        checkbox.type = 'checkbox';
-        checkbox.checked = true;
-        checkbox.addEventListener('change', function () {
-            const visibility = checkbox.checked ? 'visible' : 'none';
-            map.setLayoutProperty(layerId, 'visibility', visibility);
-        });
-        toggle.appendChild(checkbox);
-        const toggleText = document.createElement('span');
-        toggleText.textContent = 'Show layer';
-        toggle.appendChild(toggleText);
-        controls.appendChild(toggle);
-
-        // -- Style picker (only when there's a real choice) --
+        // -- Style picker (only if there's a real choice) --
         if (styles.length > 1) {
             const styleLabel = document.createElement('label');
-            styleLabel.className = 'style-picker';
-            const styleLabelText = document.createElement('span');
-            styleLabelText.textContent = 'Style';
-            styleLabel.appendChild(styleLabelText);
+            styleLabel.className = 'control-row';
+            const styleText = document.createElement('span');
+            styleText.className = 'control-label';
+            styleText.textContent = 'Style';
+            styleLabel.appendChild(styleText);
 
             const select = document.createElement('select');
             styles.forEach(function (s) {
@@ -229,48 +375,36 @@
             });
             select.addEventListener('change', function () {
                 currentStyle = select.value;
-                const url = tileUrlFor(collection, currentStyle);
-                const source = map.getSource(sourceId);
-                if (source && typeof source.setTiles === 'function') {
-                    source.setTiles([url]);
-                } else {
-                    // Silent failure would leave the dropdown out of sync
-                    // with the rendered tiles. Vendored MapLibre 5.24.0 does
-                    // expose `setTiles`, so this only fires if the binary is
-                    // re-vendored against a build that dropped the API.
-                    console.warn(
-                        'MapLibre source.setTiles unavailable; style swap ' +
-                        'requested for ' + collection.id + ' did not apply.'
-                    );
-                }
+                refreshSource();
             });
             styleLabel.appendChild(select);
-            controls.appendChild(styleLabel);
+            controlsHost.appendChild(styleLabel);
         }
 
-        li.appendChild(controls);
+        function refreshSource() {
+            const src = map.getSource(sourceId);
+            if (src && typeof src.setTiles === 'function') {
+                src.setTiles([tileUrlFor(collection, currentStyle, currentTime(state))]);
+            }
+        }
+
+        return {
+            setVisible: function (visible) {
+                map.setLayoutProperty(layerId, 'visibility', visible ? 'visible' : 'none');
+            },
+            refreshForTime: refreshSource
+        };
     }
 
     // Convert an OGC API Tiles URL template
     //   /tiles/.../{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}
     // into the form MapLibre raster sources understand
     //   /tiles/.../WebMercatorQuad/{z}/{y}/{x}
-    // MapLibre substitutes {z}/{x}/{y}; the OGC `tileMatrix` is z, `tileRow`
-    // is y, and `tileCol` is x. The placeholder *names* in the manifest
-    // come from the axum route (`{tileMatrixSetId}` / `{tileMatrix}` —
-    // see preview.rs:552-554), not from the generic `{tms}` / `{z}` that
-    // the server would reject. Substituting `WebMercatorQuad` as a literal
-    // path segment fixes the TMS to web-Mercator — the only one the
-    // raster source supports today.
-    function tileUrlFor(collection, styleId) {
+    // Placeholder names come from the axum route (see preview.rs), not from
+    // the generic `{tms}`/`{z}` which the server would reject.
+    function tileUrlFor(collection, styleId, time) {
         const raster = collection.tiles.raster;
-        // The `default` style is rendered by the plain `/tiles/...` route,
-        // not by `/styles/default/tiles/...`. Both endpoints currently
-        // produce identical bytes, but the plain one bypasses the style
-        // lookup entirely and is the canonical URL — picking it here keeps
-        // network traces and HTTP-cache keys consistent across the default
-        // case whether a user has explicitly selected "default" or never
-        // touched the picker.
+        // 'default' style uses the plain /tiles/... route, not /styles/default/...
         const useStyled = styleId && styleId !== 'default' && raster.styled_url_template;
         let template = useStyled ? raster.styled_url_template : raster.url_template;
         template = template.replace('{tileMatrixSetId}', 'WebMercatorQuad');
@@ -280,28 +414,17 @@
         if (useStyled) {
             template = template.replace('{styleId}', encodeURIComponent(styleId));
         }
-        // Coerce to a same-origin path. The manifest emits absolute URLs
-        // built from `server.base_url` (e.g. `http://127.0.0.1:8000/…`),
-        // but the user may access the preview on a different origin
-        // (`http://localhost:8000/…`). CSP `connect-src 'self'` matches
-        // origins literally, so a 127.0.0.1↔localhost mismatch blocks
-        // every tile request. The preview SPA is always served by the
-        // same binary that serves the tiles, so dropping the origin and
-        // letting the browser resolve against the page's location is
-        // always safe — and survives the dev-mode host alias and any
-        // reverse-proxy host rewriting.
+        // Strip manifest's absolute origin so 127.0.0.1↔localhost mismatch in
+        // `server.base_url` doesn't trip CSP `connect-src 'self'`.
         template = template.replace(/^https?:\/\/[^/]+/i, '');
-        return template;
+        return appendTimeParam(template, time);
     }
 
-    // -----------------------------------------------------------------
-    // Vector layer wiring
-    // -----------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Vector layer
+    // ------------------------------------------------------------------
 
-    // Split by geometry-type so one collection can carry mixed geometries
-    // without per-feature paint overrides. `source-layer` mirrors the
-    // ds-mvt encoder convention server-side (== collection id).
-    function attachVectorLayer(collection, li) {
+    function attachVectorLayer(collection, controlsHost, state) {
         const sourceId = 'vsrc-' + collection.id;
         const fillLayerId = 'vfill-' + collection.id;
         const lineLayerId = 'vline-' + collection.id;
@@ -310,53 +433,53 @@
         // No `attribution`: MapLibre renders it via innerHTML.
         map.addSource(sourceId, {
             type: 'vector',
-            tiles: [vectorTileUrlFor(collection)]
+            tiles: [vectorTileUrlFor(collection, currentTime(state))]
         });
 
-        // `match` over `==` so the filter catches `MultiPolygon` too
-        // (68/308 municipalities in the test data would otherwise vanish).
+        const layerIds = [fillLayerId, lineLayerId, pointLayerId];
+
+        // `match` over `==` catches `MultiPolygon` too (68/308
+        // municipalities in the test data are MultiPolygon).
         map.addLayer({
             id: fillLayerId,
             type: 'fill',
             source: sourceId,
             'source-layer': collection.id,
             filter: ['match', ['geometry-type'], ['Polygon', 'MultiPolygon'], true, false],
+            layout: { visibility: 'none' },
             paint: {
-                'fill-color': '#4299e1',
-                'fill-opacity': 0.18
+                'fill-color': '#60a5fa',
+                'fill-opacity': 0.35
             }
         });
-
-        // Polygon outlines so MultiPolygon boundaries stay visible under overlapping fills.
         map.addLayer({
             id: lineLayerId,
             type: 'line',
             source: sourceId,
             'source-layer': collection.id,
             filter: ['match', ['geometry-type'], ['Polygon', 'MultiPolygon'], true, false],
+            layout: { visibility: 'none' },
             paint: {
-                'line-color': '#2b6cb0',
-                'line-width': 1
+                'line-color': '#2563eb',
+                'line-width': 1.5
             }
         });
-
         map.addLayer({
             id: pointLayerId,
             type: 'circle',
             source: sourceId,
             'source-layer': collection.id,
             filter: ['match', ['geometry-type'], ['Point', 'MultiPoint'], true, false],
+            layout: { visibility: 'none' },
             paint: {
                 'circle-radius': 5,
-                'circle-color': '#4299e1',
+                'circle-color': '#60a5fa',
                 'circle-stroke-color': '#ffffff',
                 'circle-stroke-width': 1.5
             }
         });
 
-        const interactiveLayers = [fillLayerId, lineLayerId, pointLayerId];
-
-        map.on('click', interactiveLayers, function (e) {
+        map.on('click', layerIds, function (e) {
             if (!e.features || e.features.length === 0) return;
             const feature = e.features[0];
             // MapLibre doesn't auto-dismiss; replace any existing popup.
@@ -370,8 +493,7 @@
             });
         });
 
-        // mouseenter/mouseleave dispatch per-layer, not per-collection.
-        interactiveLayers.forEach(function (id) {
+        layerIds.forEach(function (id) {
             map.on('mouseenter', id, function () {
                 map.getCanvas().style.cursor = 'pointer';
             });
@@ -380,45 +502,112 @@
             });
         });
 
-        // Sidebar control — single checkbox flips all three layers together.
-        const controls = document.createElement('div');
-        controls.className = 'controls';
-
-        const toggle = document.createElement('label');
-        toggle.className = 'toggle';
-        const checkbox = document.createElement('input');
-        checkbox.type = 'checkbox';
-        checkbox.checked = true;
-        checkbox.addEventListener('change', function () {
-            const visibility = checkbox.checked ? 'visible' : 'none';
-            interactiveLayers.forEach(function (id) {
-                map.setLayoutProperty(id, 'visibility', visibility);
-            });
-        });
-        toggle.appendChild(checkbox);
-        const toggleText = document.createElement('span');
-        toggleText.textContent = 'Vector layer';
-        toggle.appendChild(toggleText);
-        controls.appendChild(toggle);
-
-        li.appendChild(controls);
+        return {
+            setVisible: function (visible) {
+                const v = visible ? 'visible' : 'none';
+                layerIds.forEach(function (id) {
+                    map.setLayoutProperty(id, 'visibility', v);
+                });
+            },
+            refreshForTime: function () {
+                const src = map.getSource(sourceId);
+                if (src && typeof src.setTiles === 'function') {
+                    src.setTiles([vectorTileUrlFor(collection, currentTime(state))]);
+                }
+            }
+        };
     }
 
-    function vectorTileUrlFor(collection) {
-        // Same OGC placeholders as raster — `?f=mvt` is already in the manifest.
+    function vectorTileUrlFor(collection, time) {
         let template = collection.tiles.vector.url_template;
         template = template.replace('{tileMatrixSetId}', 'WebMercatorQuad');
         template = template.replace('{tileMatrix}', '{z}');
         template = template.replace('{tileRow}', '{y}');
         template = template.replace('{tileCol}', '{x}');
-        // MapLibre's vector-tile worker rejects relative URLs ("URL is not
-        // valid or contains user credentials"). Re-anchor to the page
-        // origin so 127.0.0.1↔localhost mismatch in `server.base_url`
-        // doesn't trip CSP `connect-src 'self'` either.
+        // MapLibre's vector-tile worker rejects relative URLs. Re-anchor to
+        // page origin so 127.0.0.1↔localhost mismatch in `server.base_url`
+        // doesn't trip CSP `connect-src 'self'`.
         template = template.replace(/^https?:\/\/[^/]+/i, '');
         template = window.location.origin + template;
-        return template;
+        return appendTimeParam(template, time);
     }
+
+    function appendTimeParam(template, time) {
+        if (!time) return template;
+        // Bypass MapLibre's per-source HTTP cache for time changes by including
+        // the timestamp in the query string. Tile handler already honours the
+        // `datetime` query param at crates/api-tiles/src/handlers.rs:577.
+        const sep = template.indexOf('?') === -1 ? '?' : '&';
+        return template + sep + 'datetime=' + encodeURIComponent(time);
+    }
+
+    // ------------------------------------------------------------------
+    // Time slider
+    // ------------------------------------------------------------------
+
+    function attachTimeSlider(controlsHost, state, layerHandles) {
+        const values = state.timeValues;
+        // Default to the latest timestep so an opt-in toggle shows current
+        // conditions, matching the server's default `&time=` resolution.
+        state.timeIndex = values.length - 1;
+
+        const row = document.createElement('div');
+        row.className = 'time-slider';
+
+        const label = document.createElement('div');
+        label.className = 'control-label';
+        label.textContent = 'Time';
+        row.appendChild(label);
+
+        const valueLabel = document.createElement('div');
+        valueLabel.className = 'time-value';
+        valueLabel.textContent = formatSliderTime(values[state.timeIndex]);
+        row.appendChild(valueLabel);
+
+        const input = document.createElement('input');
+        input.type = 'range';
+        input.min = '0';
+        input.max = String(values.length - 1);
+        input.step = '1';
+        input.value = String(state.timeIndex);
+        input.addEventListener('input', function () {
+            state.timeIndex = parseInt(input.value, 10);
+            valueLabel.textContent = formatSliderTime(values[state.timeIndex]);
+        });
+        input.addEventListener('change', function () {
+            layerHandles.forEach(function (h) {
+                if (h.refreshForTime) h.refreshForTime();
+            });
+        });
+        row.appendChild(input);
+
+        const ticks = document.createElement('div');
+        ticks.className = 'time-ticks';
+        const firstTick = document.createElement('span');
+        firstTick.textContent = formatSliderTime(values[0]);
+        const lastTick = document.createElement('span');
+        lastTick.textContent = formatSliderTime(values[values.length - 1]);
+        ticks.appendChild(firstTick);
+        ticks.appendChild(lastTick);
+        row.appendChild(ticks);
+
+        controlsHost.appendChild(row);
+    }
+
+    function currentTime(state) {
+        if (state.timeIndex === null || !state.timeValues) return null;
+        return state.timeValues[state.timeIndex];
+    }
+
+    function formatSliderTime(iso) {
+        const d = new Date(iso);
+        if (Number.isNaN(d.getTime())) return iso;
+        return formatDateTime(d);
+    }
+
+    // ------------------------------------------------------------------
+    // Popup
+    // ------------------------------------------------------------------
 
     function buildPopupBody(collection, feature) {
         const root = document.createElement('div');
@@ -466,10 +655,6 @@
     function formatPropertyValue(value) {
         if (value === null || value === undefined) return '—';
         if (typeof value === 'number' && !Number.isInteger(value)) {
-            // Trim noisy floating-point trails without losing precision the
-            // user actually asked for. 6 sig figs covers area / population /
-            // perimeter values for the radar+admin-boundaries preview without
-            // turning every popup into a wall of decimal noise.
             return value.toLocaleString(undefined, { maximumSignificantDigits: 6 });
         }
         return String(value);

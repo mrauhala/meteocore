@@ -488,29 +488,31 @@ fn resolve_temporal_extent(
     tiles: &api_tiles::handlers::TilesState,
     wms: &api_wms::handlers::WmsState,
 ) -> Option<Value> {
-    // EDR is the canonical temporal source — it carries both interval and
-    // explicit instants. Maps/Tiles/WMS `raster_info().times` is the
-    // fallback when a collection isn't EDR-enabled (e.g. radar collections
-    // exposed only via WMS).
-    if let Some(engine) = edr.engines.get(id) {
-        let interval = engine.get_temporal_extent();
-        let values = engine.get_available_times();
-        if interval.is_some() || values.is_some() {
-            return Some(serialize_temporal(interval, values.as_deref()));
-        }
-    }
+    // Build interval from EDR (canonical source), then fill in discrete
+    // values from EDR first, falling back to raster_info().times. The fallback
+    // covers geotiff-style engines that expose timestep instants only through
+    // their raster surface — without it, a radar collection with EDR enabled
+    // would surface a continuous interval but no slider stops.
+    let edr_interval = edr.engines.get(id).and_then(|e| e.get_temporal_extent());
+    let edr_values = edr.engines.get(id).and_then(|e| e.get_available_times());
 
-    let times_from_raster = maps
+    let raster_times = maps
         .engines
         .get(id)
         .map(|e| e.raster_info().times)
         .or_else(|| tiles.map_engines.get(id).map(|e| e.raster_info().times))
-        .or_else(|| wms.engines.get(id).map(|e| e.raster_info().times));
-    if let Some(times) = times_from_raster {
-        if !times.is_empty() {
-            let interval = times.first().zip(times.last()).map(|(a, b)| (*a, *b));
-            return Some(serialize_temporal(interval, Some(&times)));
-        }
+        .or_else(|| wms.engines.get(id).map(|e| e.raster_info().times))
+        .filter(|t| !t.is_empty());
+
+    let interval = edr_interval.or_else(|| {
+        raster_times
+            .as_ref()
+            .and_then(|t| t.first().zip(t.last()).map(|(a, b)| (*a, *b)))
+    });
+    let values = edr_values.or(raster_times);
+
+    if interval.is_some() || values.is_some() {
+        return Some(serialize_temporal(interval, values.as_deref()));
     }
     None
 }
