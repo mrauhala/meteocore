@@ -123,6 +123,7 @@ fn build_collection_metadata(
         "id": config.id,
         "title": config.title,
         "description": config.description,
+        "apis": config.apis,
         "dataType": "map",
         "crs": crs_uris,
         "styles": style_list,

@@ -328,6 +328,13 @@ mod collections {
     }
 
     #[tokio::test]
+    async fn collection_exposes_apis_array() {
+        let (_, json) = get("/collections/radar").await;
+        let apis = json["apis"].as_array().expect("apis must be present");
+        assert!(apis.iter().any(|a| a == "maps"));
+    }
+
+    #[tokio::test]
     async fn unknown_collection_returns_404() {
         let (status, _) = get("/collections/nonexistent").await;
         assert_eq!(status, StatusCode::NOT_FOUND);

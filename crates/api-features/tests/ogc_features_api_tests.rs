@@ -390,9 +390,94 @@ mod collections {
     }
 
     #[tokio::test]
+    async fn collection_detail_exposes_apis_array() {
+        let (_, json) = get("/collections/cities").await;
+        let apis = json["apis"].as_array().expect("apis must be present");
+        assert!(apis.iter().any(|a| a == "features"));
+    }
+
+    #[tokio::test]
     async fn unknown_collection_returns_404() {
         let (status, _) = get("/collections/nonexistent").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vector-tile discovery tests
+// ---------------------------------------------------------------------------
+
+mod vector_tile_discovery {
+    use super::*;
+
+    fn build_router_with_tiles() -> axum::Router {
+        // Router seeded with a collection that advertises both Features and
+        // Tiles, mirroring how server/admin.rs would wire a real geojson
+        // collection that the operator opted into vector tiles for.
+        let engine: Arc<dyn FeatureEngine> = Arc::new(MockFeatureEngine::new());
+        let mut engines = HashMap::new();
+        let mut collections = HashMap::new();
+        engines.insert("cities".to_string(), engine);
+        collections.insert(
+            "cities".to_string(),
+            CollectionConfig {
+                id: "cities".to_string(),
+                title: "Finnish Cities".to_string(),
+                description: "City points for testing".to_string(),
+                data_path: None,
+                apis: vec!["features".to_string(), "tiles".to_string()],
+                engine_type: "mock".to_string(),
+                geotiff: None,
+                querydata: None,
+                wms: None,
+                grib: None,
+                postgis: None,
+            },
+        );
+        let state = Arc::new(ArcSwap::from_pointee(FeaturesState {
+            engines,
+            collections,
+            base_url: String::new(),
+        }));
+        api_features::router(state)
+    }
+
+    async fn fetch(uri: &str) -> Value {
+        let app = build_router_with_tiles();
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn collection_with_tiles_api_advertises_apis_array() {
+        let json = fetch("/collections/cities").await;
+        let apis = json["apis"].as_array().expect("apis must be present");
+        assert!(apis.iter().any(|a| a == "features"));
+        assert!(apis.iter().any(|a| a == "tiles"));
+    }
+
+    #[tokio::test]
+    async fn collection_with_tiles_api_emits_tileset_link() {
+        let json = fetch("/collections/cities").await;
+        let links = json["links"].as_array().expect("links must be present");
+        let tileset_link = links
+            .iter()
+            .find(|l| {
+                l["rel"].as_str() == Some("http://www.opengis.net/def/rel/ogc/1.0/tilesets-vector")
+            })
+            .expect("collection with apis=[tiles] must advertise a vector tileset link");
+        assert_eq!(
+            tileset_link["type"].as_str().unwrap(),
+            "application/vnd.mapbox-vector-tile"
+        );
+        assert_eq!(tileset_link["templated"].as_bool(), Some(true));
+        let href = tileset_link["href"].as_str().unwrap();
+        // URL template points at the api-tiles MVT route, and the format
+        // override stays explicit so blind copy/paste into a tile client works.
+        assert!(href.contains("/tiles/collections/cities/tiles/WebMercatorQuad/"));
+        assert!(href.contains("f=mvt"));
     }
 }
 

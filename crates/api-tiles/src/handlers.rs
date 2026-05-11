@@ -127,6 +127,7 @@ fn build_collection_metadata(
         "id": config.id,
         "title": config.title,
         "description": config.description,
+        "apis": config.apis,
         "dataType": "map",
         "tileMatrixSetLinks": tms_links,
         "styles": style_list,
@@ -424,7 +425,8 @@ pub async fn conformance() -> impl IntoResponse {
             "http://www.opengis.net/spec/tms/2.0/conf/tilematrixset",
             "http://www.opengis.net/spec/tms/2.0/conf/json-tilematrixset",
             "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/png",
-            "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/jpeg"
+            "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/jpeg",
+            "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/mvt"
         ]
     }))
 }
