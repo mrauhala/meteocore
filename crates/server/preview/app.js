@@ -323,7 +323,7 @@
             filter: ['match', ['geometry-type'], ['Polygon', 'MultiPolygon'], true, false],
             paint: {
                 'fill-color': '#4299e1',
-                'fill-opacity': 0.18
+                'fill-opacity': 0.35
             }
         });
 
@@ -336,7 +336,7 @@
             filter: ['match', ['geometry-type'], ['Polygon', 'MultiPolygon'], true, false],
             paint: {
                 'line-color': '#2b6cb0',
-                'line-width': 1
+                'line-width': 1.5
             }
         });
 

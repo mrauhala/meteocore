@@ -36,38 +36,48 @@ pub struct VectorTileKey {
     pub data_version: u64,
 }
 
-impl VectorTileKey {
-    /// Stable ETag for HTTP caching — `"hex64"` string of an FNV-1a hash
-    /// over the key fields. Format matches `ds_render::CacheKey::etag()` so
-    /// the same `etag_matches` helper works for both raster and vector tile
-    /// responses.
-    pub fn etag(&self) -> String {
+/// Cached tile payload plus its content-derived ETag.
+///
+/// The ETag hashes the bytes themselves so two cache entries under the same
+/// `VectorTileKey` with different content (e.g. data refresh, encoder change)
+/// produce different ETags. A stable key-derived ETag would let stale browser
+/// caches survive a server-side fix indefinitely, since `If-None-Match` would
+/// keep returning 304 against fresh-but-empty content.
+#[derive(Debug, Clone)]
+pub struct CachedTile {
+    pub bytes: Bytes,
+    pub etag: String,
+}
+
+impl CachedTile {
+    /// Build a cache entry from encoded bytes, deriving the ETag from the
+    /// content via FNV-1a. Format matches `ds_render::CacheKey::etag()` so the
+    /// same `etag_matches` helper works for both raster and vector responses.
+    /// FNV-1a (not `DefaultHasher`) so the ETag is stable across rustc
+    /// versions — a binary rebuild against unchanged content keeps the same
+    /// ETag and browser caches survive the redeploy.
+    pub fn new(bytes: Bytes) -> Self {
         let mut h = FNV1A_OFFSET;
-        fnv1a_mix(&mut h, self.collection.as_bytes());
-        fnv1a_mix(&mut h, b"|");
-        fnv1a_mix(&mut h, self.tms.id().as_bytes());
-        fnv1a_mix(&mut h, &self.z.to_le_bytes());
-        fnv1a_mix(&mut h, &self.x.to_le_bytes());
-        fnv1a_mix(&mut h, &self.y.to_le_bytes());
-        fnv1a_mix(&mut h, &self.properties_hash.to_le_bytes());
-        fnv1a_mix(&mut h, &self.data_version.to_le_bytes());
-        format!("\"{h:016x}\"")
+        fnv1a_mix(&mut h, bytes.as_ref());
+        let etag = format!("\"{h:016x}\"");
+        Self { bytes, etag }
     }
 }
 
 #[derive(Clone)]
 struct TileWeighter;
 
-impl Weighter<VectorTileKey, Bytes> for TileWeighter {
-    fn weight(&self, key: &VectorTileKey, val: &Bytes) -> u64 {
-        // 64-byte fixed overhead per entry + key string length + payload size.
-        64u64 + key.collection.len() as u64 + val.len() as u64
+impl Weighter<VectorTileKey, CachedTile> for TileWeighter {
+    fn weight(&self, key: &VectorTileKey, val: &CachedTile) -> u64 {
+        // 64-byte fixed overhead per entry + key string length + payload size
+        // + 18 bytes for the quoted hex64 ETag string.
+        64u64 + key.collection.len() as u64 + val.bytes.len() as u64 + val.etag.len() as u64
     }
 }
 
 /// Thread-safe weighted LRU cache for MVT bytes.
 pub struct VectorTileCache {
-    cache: Cache<VectorTileKey, Bytes, TileWeighter>,
+    cache: Cache<VectorTileKey, CachedTile, TileWeighter>,
     capacity_bytes: u64,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -90,7 +100,7 @@ impl VectorTileCache {
         }
     }
 
-    pub fn get(&self, key: &VectorTileKey) -> Option<Bytes> {
+    pub fn get(&self, key: &VectorTileKey) -> Option<CachedTile> {
         if self.capacity_bytes == 0 {
             self.misses.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -107,7 +117,7 @@ impl VectorTileCache {
         }
     }
 
-    pub fn insert(&self, key: VectorTileKey, val: Bytes) {
+    pub fn insert(&self, key: VectorTileKey, val: CachedTile) {
         if self.capacity_bytes == 0 {
             return;
         }
@@ -148,9 +158,9 @@ mod tests {
         let cache = VectorTileCache::new(1);
         let k = key(0, 0, 0);
         assert!(cache.get(&k).is_none());
-        cache.insert(k.clone(), Bytes::from_static(b"abc"));
+        cache.insert(k.clone(), CachedTile::new(Bytes::from_static(b"abc")));
         let got = cache.get(&k).unwrap();
-        assert_eq!(&got[..], b"abc");
+        assert_eq!(&got.bytes[..], b"abc");
         assert_eq!(cache.hits(), 1);
         assert_eq!(cache.misses(), 1);
     }
@@ -159,7 +169,7 @@ mod tests {
     fn zero_capacity_disables_cache() {
         let cache = VectorTileCache::new(0);
         let k = key(1, 1, 1);
-        cache.insert(k.clone(), Bytes::from_static(b"xyz"));
+        cache.insert(k.clone(), CachedTile::new(Bytes::from_static(b"xyz")));
         assert!(cache.get(&k).is_none());
         assert_eq!(cache.hits(), 0);
         // The insert is silently dropped, and the single `get` is counted as a miss.
@@ -167,46 +177,28 @@ mod tests {
     }
 
     #[test]
-    fn etag_is_stable_for_same_key() {
-        let k = key(3, 4, 5);
-        assert_eq!(k.etag(), k.clone().etag());
+    fn etag_is_stable_for_same_bytes() {
+        let a = CachedTile::new(Bytes::from_static(b"hello"));
+        let b = CachedTile::new(Bytes::from_static(b"hello"));
+        assert_eq!(a.etag, b.etag);
+    }
+
+    #[test]
+    fn etag_differs_for_distinct_bytes() {
+        let a = CachedTile::new(Bytes::from_static(b"hello"));
+        let b = CachedTile::new(Bytes::from_static(b"world"));
+        assert_ne!(a.etag, b.etag);
     }
 
     #[test]
     fn etag_uses_stable_fnv1a_not_default_hasher() {
-        // Golden value pinned to the FNV-1a algorithm. If this assertion ever
-        // changes you've either rotated the hashing algorithm (in which case
-        // every outstanding client ETag is invalidated — coordinate with
-        // operators) or accidentally regressed to `DefaultHasher`, which
-        // mutates silently across rustc versions and is unsafe to serialise.
-        let k = VectorTileKey {
-            collection: "demo".into(),
-            tms: TmsKind::WebMercatorQuad,
-            z: 3,
-            x: 4,
-            y: 5,
-            properties_hash: 0,
-            data_version: 0,
-        };
-        assert_eq!(k.etag(), "\"fd819b215b674f8c\"");
-    }
-
-    #[test]
-    fn etag_differs_for_distinct_keys() {
-        assert_ne!(key(3, 4, 5).etag(), key(3, 4, 6).etag());
-    }
-
-    #[test]
-    fn etag_changes_when_data_version_bumps() {
-        let k1 = key(3, 4, 5);
-        let mut k2 = k1.clone();
-        k2.data_version = 1;
-        assert_ne!(
-            k1.etag(),
-            k2.etag(),
-            "ETag must rotate on data refresh so reloaded collections don't \
-             serve stale tiles via 304 Not Modified"
-        );
+        // Golden value pinned to the FNV-1a algorithm. If this changes you've
+        // either rotated the hashing algorithm (every outstanding client ETag
+        // is invalidated — coordinate with operators) or accidentally
+        // regressed to `DefaultHasher`, which mutates silently across rustc
+        // versions and would re-key every browser cache on a binary upgrade.
+        let t = CachedTile::new(Bytes::from_static(b"hello"));
+        assert_eq!(t.etag, "\"a430d84680aabd0b\"");
     }
 
     #[test]
@@ -216,9 +208,9 @@ mod tests {
         let mut k2 = k1.clone();
         k1.properties_hash = 1;
         k2.properties_hash = 2;
-        cache.insert(k1.clone(), Bytes::from_static(b"one"));
-        cache.insert(k2.clone(), Bytes::from_static(b"two"));
-        assert_eq!(&cache.get(&k1).unwrap()[..], b"one");
-        assert_eq!(&cache.get(&k2).unwrap()[..], b"two");
+        cache.insert(k1.clone(), CachedTile::new(Bytes::from_static(b"one")));
+        cache.insert(k2.clone(), CachedTile::new(Bytes::from_static(b"two")));
+        assert_eq!(&cache.get(&k1).unwrap().bytes[..], b"one");
+        assert_eq!(&cache.get(&k2).unwrap().bytes[..], b"two");
     }
 }
