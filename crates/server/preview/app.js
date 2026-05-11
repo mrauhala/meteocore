@@ -1,8 +1,9 @@
 // MeteoCore preview SPA.
 //
-// v1 scope (Phase 2): boot a MapLibre canvas, fetch /preview/manifest.json,
-// list every collection in the sidebar. Layer rendering (raster, vector tiles,
-// time slider) lands in Phase 3+.
+// Phase 3 scope: render every `tiles.raster` collection as a MapLibre raster
+// layer, with a sidebar checkbox to toggle visibility and (when more than one
+// style exists) a dropdown to swap styles live. Vector tiles + time slider
+// land in later phases.
 //
 // XSS hygiene: every dynamic value reaches the DOM through `textContent` only.
 // Never use innerHTML with manifest data.
@@ -33,69 +34,193 @@
     const statusEl = document.getElementById('status');
     const listEl = document.getElementById('collections');
 
-    // Absolute path matches the asset references in `index.html` (also
-    // `/preview/...`). A relative `manifest.json` would only resolve
-    // correctly when the page URL ends in `/`, and the route table accepts
-    // both `/preview` and `/preview/`. Full proxy-prefix support (relative
-    // paths + a `<base>` tag + a server redirect to enforce the trailing
-    // slash) is tracked for a later phase.
-    fetch('/preview/manifest.json')
-        .then(function (r) {
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            return r.json();
-        })
-        .then(function (manifest) {
-            // We fetch a single page (default limit=100) and render only
-            // those entries. The total can exceed that; advertise the
-            // shortfall so users don't think the list is complete. Full
-            // pagination — following `pagination.next` — is Phase 3+.
-            //
-            // Defensive read on `pagination`: a future schema change or a
-            // partial parse shouldn't crash the SPA before the map even
-            // renders. Fall back to the rendered count.
-            const rendered = manifest.collections.length;
-            const total =
-                manifest.pagination && typeof manifest.pagination.total === 'number'
-                    ? manifest.pagination.total
-                    : rendered;
-            const noun = total === 1 ? 'collection' : 'collections';
-            statusEl.textContent =
-                total === 0
-                    ? 'No collections registered.'
-                    : rendered < total
-                        ? rendered + ' of ' + total + ' ' + noun + ' (paginated)'
-                        : total + ' ' + noun;
-
-            // Fit the map to the union of collection extents so the user
-            // sees roughly the right region on first load.
-            const bounds = manifest.collections.reduce(function (acc, c) {
-                if (!c.spatial_extent) return acc;
-                const e = c.spatial_extent;
-                if (!acc) return new maplibregl.LngLatBounds([e[0], e[1]], [e[2], e[3]]);
-                acc.extend([e[0], e[1]]);
-                acc.extend([e[2], e[3]]);
-                return acc;
-            }, null);
-            if (bounds) map.fitBounds(bounds, { padding: 60, duration: 0 });
-
-            manifest.collections.forEach(function (c) {
-                const li = document.createElement('li');
-
-                const title = document.createElement('span');
-                title.className = 'title';
-                title.textContent = c.title || c.id;
-                li.appendChild(title);
-
-                const apis = document.createElement('span');
-                apis.className = 'apis';
-                apis.textContent = (c.apis || []).join(' · ');
-                li.appendChild(apis);
-
-                listEl.appendChild(li);
+    // `map.on('load')` so MapLibre's style is ready before we add raster
+    // sources/layers. Adding sources before style-load throws.
+    //
+    // Absolute manifest path: relative `manifest.json` would only resolve
+    // correctly when the URL ends in `/`, but the route table accepts both
+    // `/preview` and `/preview/`. Full proxy-prefix support (relative paths
+    // + `<base>` + redirect to enforce trailing slash) is later-phase work.
+    map.on('load', function () {
+        fetch('/preview/manifest.json')
+            .then(function (r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.json();
+            })
+            .then(renderManifest)
+            .catch(function (err) {
+                statusEl.textContent = 'Failed to load manifest: ' + err.message;
+                console.error('manifest fetch failed', err);
             });
-        })
-        .catch(function (err) {
-            statusEl.textContent = 'Failed to load manifest: ' + err.message;
-            console.error('manifest fetch failed', err);
+    });
+
+    function renderManifest(manifest) {
+        const collections = manifest.collections || [];
+        // We fetch a single page (default limit=100). The total can exceed
+        // that; advertise the shortfall so users don't think the list is
+        // complete. Defensive read on `pagination`: a future schema change
+        // or a partial parse shouldn't crash the SPA before the map
+        // renders. Fall back to the rendered count.
+        const rendered = collections.length;
+        const total =
+            manifest.pagination && typeof manifest.pagination.total === 'number'
+                ? manifest.pagination.total
+                : rendered;
+        const noun = total === 1 ? 'collection' : 'collections';
+        statusEl.textContent =
+            total === 0
+                ? 'No collections registered.'
+                : rendered < total
+                    ? rendered + ' of ' + total + ' ' + noun + ' (paginated)'
+                    : total + ' ' + noun;
+
+        fitMapToCollections(collections);
+
+        // Stable iteration order matches the manifest, which sorts by id.
+        // First raster layer added goes on top — for radar-over-NWP stacks
+        // this gives the operator the most-detailed product on top by
+        // convention. Operators wanting a different stack can re-order
+        // collections in config.
+        collections.forEach(function (c) {
+            const li = document.createElement('li');
+            li.className = 'collection';
+
+            const header = document.createElement('div');
+            header.className = 'collection-header';
+
+            const title = document.createElement('span');
+            title.className = 'title';
+            title.textContent = c.title || c.id;
+            header.appendChild(title);
+
+            const apis = document.createElement('span');
+            apis.className = 'apis';
+            apis.textContent = (c.apis || []).join(' · ');
+            header.appendChild(apis);
+
+            li.appendChild(header);
+
+            if (c.tiles && c.tiles.raster) {
+                attachRasterLayer(c, li);
+            }
+
+            listEl.appendChild(li);
         });
+    }
+
+    function fitMapToCollections(collections) {
+        const bounds = collections.reduce(function (acc, c) {
+            if (!c.spatial_extent) return acc;
+            const e = c.spatial_extent;
+            // Clamp to valid Mercator latitudes — a bbox at the poles
+            // (e.g. ECMWF's [-180,-90,180,90]) would otherwise refuse to
+            // fit at any zoom level.
+            const south = Math.max(e[1], -85);
+            const north = Math.min(e[3], 85);
+            const sw = [e[0], south];
+            const ne = [e[2], north];
+            if (!acc) return new maplibregl.LngLatBounds(sw, ne);
+            acc.extend(sw);
+            acc.extend(ne);
+            return acc;
+        }, null);
+        if (bounds) map.fitBounds(bounds, { padding: 60, duration: 0 });
+    }
+
+    // -----------------------------------------------------------------
+    // Raster layer wiring
+    // -----------------------------------------------------------------
+
+    function attachRasterLayer(collection, li) {
+        const styles = collection.styles || [];
+        let currentStyle = styles.length > 0 ? styles[0].id : 'default';
+
+        const sourceId = 'src-' + collection.id;
+        const layerId = 'layer-' + collection.id;
+        const initialUrl = tileUrlFor(collection, currentStyle);
+
+        map.addSource(sourceId, {
+            type: 'raster',
+            tiles: [initialUrl],
+            tileSize: 256,
+            attribution: collection.title || collection.id
+        });
+        // Insert above the background but below subsequent layers, so
+        // collections later in the manifest stack on top.
+        map.addLayer({
+            id: layerId,
+            type: 'raster',
+            source: sourceId,
+            paint: { 'raster-opacity': 1 }
+        });
+
+        // -- Toggle --
+        const controls = document.createElement('div');
+        controls.className = 'controls';
+
+        const toggle = document.createElement('label');
+        toggle.className = 'toggle';
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = true;
+        checkbox.addEventListener('change', function () {
+            const visibility = checkbox.checked ? 'visible' : 'none';
+            map.setLayoutProperty(layerId, 'visibility', visibility);
+        });
+        toggle.appendChild(checkbox);
+        const toggleText = document.createElement('span');
+        toggleText.textContent = 'Show layer';
+        toggle.appendChild(toggleText);
+        controls.appendChild(toggle);
+
+        // -- Style picker (only when there's a real choice) --
+        if (styles.length > 1) {
+            const styleLabel = document.createElement('label');
+            styleLabel.className = 'style-picker';
+            const styleLabelText = document.createElement('span');
+            styleLabelText.textContent = 'Style';
+            styleLabel.appendChild(styleLabelText);
+
+            const select = document.createElement('select');
+            styles.forEach(function (s) {
+                const opt = document.createElement('option');
+                opt.value = s.id;
+                opt.textContent = s.title || s.id;
+                if (s.id === currentStyle) opt.selected = true;
+                select.appendChild(opt);
+            });
+            select.addEventListener('change', function () {
+                currentStyle = select.value;
+                const url = tileUrlFor(collection, currentStyle);
+                const source = map.getSource(sourceId);
+                if (source && typeof source.setTiles === 'function') {
+                    source.setTiles([url]);
+                }
+            });
+            styleLabel.appendChild(select);
+            controls.appendChild(styleLabel);
+        }
+
+        li.appendChild(controls);
+    }
+
+    // Convert an OGC API Tiles URL template
+    //   /tiles/.../{tms}/{tileMatrix}/{tileRow}/{tileCol}
+    // into the form MapLibre raster sources understand
+    //   /tiles/.../WebMercatorQuad/{z}/{y}/{x}
+    // MapLibre substitutes {z}/{x}/{y}; the OGC `tileRow` is y and `tileCol`
+    // is x. The order on the path is preserved — only the placeholders are
+    // renamed so MapLibre's templating engine fills them correctly.
+    function tileUrlFor(collection, styleId) {
+        const raster = collection.tiles.raster;
+        const useStyled = styleId && styleId !== 'default' && raster.styled_url_template;
+        let template = useStyled ? raster.styled_url_template : raster.url_template;
+        template = template.replace('{tms}', 'WebMercatorQuad');
+        template = template.replace('{tileRow}', '{y}');
+        template = template.replace('{tileCol}', '{x}');
+        if (useStyled) {
+            template = template.replace('{styleId}', encodeURIComponent(styleId));
+        }
+        return template;
+    }
 })();
