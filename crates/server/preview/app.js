@@ -1,12 +1,17 @@
 // MeteoCore preview SPA.
 //
-// Phase 3 scope: render every `tiles.raster` collection as a MapLibre raster
-// layer, with a sidebar checkbox to toggle visibility and (when more than one
-// style exists) a dropdown to swap styles live. Vector tiles + time slider
-// land in later phases.
+// Renders the manifest into MapLibre layers:
+//   * `tiles.raster` collections → raster source + raster layer, with a
+//     visibility toggle and a style picker (when more than one style is
+//     configured).
+//   * `tiles.vector` collections → vector source + circle/line/fill layers,
+//     with a visibility toggle and a click handler that opens a popup
+//     listing the feature's properties.
 //
-// XSS hygiene: every dynamic value reaches the DOM through `textContent` only.
-// Never use innerHTML with manifest data.
+// Time slider lands in a later phase.
+//
+// XSS hygiene: every dynamic value reaches the DOM through `textContent` or
+// as a typed `<option>` value. Never use innerHTML with manifest data.
 
 (function () {
     'use strict';
@@ -115,6 +120,9 @@
                 } catch (err) {
                     console.error('attachRasterLayer failed for', c.id, err);
                 }
+            }
+            if (c.tiles && c.tiles.vector) {
+                attachVectorLayer(c, li);
             }
 
             listEl.appendChild(li);
@@ -276,5 +284,188 @@
         // reverse-proxy host rewriting.
         template = template.replace(/^https?:\/\/[^/]+/i, '');
         return template;
+    }
+
+    // -----------------------------------------------------------------
+    // Vector layer wiring
+    // -----------------------------------------------------------------
+
+    // Three style layers per source — split by geometry-type so the same
+    // collection can carry mixed geometries without per-feature paint
+    // overrides. The MVT layer name (`source-layer`) equals the collection
+    // id; the ds-mvt encoder uses the same convention server-side.
+    function attachVectorLayer(collection, li) {
+        const sourceId = 'vsrc-' + collection.id;
+        const fillLayerId = 'vfill-' + collection.id;
+        const lineLayerId = 'vline-' + collection.id;
+        const pointLayerId = 'vpoint-' + collection.id;
+
+        // No `attribution` field: MapLibre renders attribution via
+        // `innerHTML` inside its AttributionControl — a server config
+        // title like `<img src=x onerror=alert(1)>` would execute
+        // script in the preview page. Mirrors the raster source.
+        map.addSource(sourceId, {
+            type: 'vector',
+            tiles: [vectorTileUrlFor(collection)]
+        });
+
+        map.addLayer({
+            id: fillLayerId,
+            type: 'fill',
+            source: sourceId,
+            'source-layer': collection.id,
+            filter: ['==', ['geometry-type'], 'Polygon'],
+            paint: {
+                'fill-color': '#4299e1',
+                'fill-opacity': 0.18
+            }
+        });
+
+        // Lines double as polygon outlines so MultiPolygon boundaries stay
+        // visible even when fills overlap.
+        map.addLayer({
+            id: lineLayerId,
+            type: 'line',
+            source: sourceId,
+            'source-layer': collection.id,
+            filter: [
+                'any',
+                ['==', ['geometry-type'], 'Polygon'],
+                ['==', ['geometry-type'], 'LineString']
+            ],
+            paint: {
+                'line-color': '#2b6cb0',
+                'line-width': 1
+            }
+        });
+
+        map.addLayer({
+            id: pointLayerId,
+            type: 'circle',
+            source: sourceId,
+            'source-layer': collection.id,
+            filter: ['==', ['geometry-type'], 'Point'],
+            paint: {
+                'circle-radius': 5,
+                'circle-color': '#4299e1',
+                'circle-stroke-color': '#ffffff',
+                'circle-stroke-width': 1.5
+            }
+        });
+
+        const interactiveLayers = [fillLayerId, lineLayerId, pointLayerId];
+
+        map.on('click', interactiveLayers, function (e) {
+            if (!e.features || e.features.length === 0) return;
+            const feature = e.features[0];
+            new maplibregl.Popup({ closeButton: true, maxWidth: '320px' })
+                .setLngLat(e.lngLat)
+                .setDOMContent(buildPopupBody(collection, feature))
+                .addTo(map);
+        });
+
+        // Cursor feedback. Tracked separately per layer because MapLibre
+        // dispatches mouseenter/mouseleave per-layer, not per-collection.
+        interactiveLayers.forEach(function (id) {
+            map.on('mouseenter', id, function () {
+                map.getCanvas().style.cursor = 'pointer';
+            });
+            map.on('mouseleave', id, function () {
+                map.getCanvas().style.cursor = '';
+            });
+        });
+
+        // Sidebar control — single checkbox flips all three layers together.
+        const controls = document.createElement('div');
+        controls.className = 'controls';
+
+        const toggle = document.createElement('label');
+        toggle.className = 'toggle';
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = true;
+        checkbox.addEventListener('change', function () {
+            const visibility = checkbox.checked ? 'visible' : 'none';
+            interactiveLayers.forEach(function (id) {
+                map.setLayoutProperty(id, 'visibility', visibility);
+            });
+        });
+        toggle.appendChild(checkbox);
+        const toggleText = document.createElement('span');
+        toggleText.textContent = 'Vector layer';
+        toggle.appendChild(toggleText);
+        controls.appendChild(toggle);
+
+        li.appendChild(controls);
+    }
+
+    function vectorTileUrlFor(collection) {
+        // Same placeholder rewrite as `tileUrlFor()` for rasters — same
+        // four OGC placeholder names emitted by the manifest
+        // (`{tileMatrixSetId}` / `{tileMatrix}` / `{tileRow}` / `{tileCol}`,
+        // not the generic `{tms}` / `{z}`). Plus the URL already carries
+        // `?f=mvt` from the manifest, so MapLibre fetches MVT-encoded
+        // bytes. Finally, strip the absolute origin so a 127.0.0.1↔
+        // localhost mismatch doesn't trip CSP `connect-src 'self'`.
+        let template = collection.tiles.vector.url_template;
+        template = template.replace('{tileMatrixSetId}', 'WebMercatorQuad');
+        template = template.replace('{tileMatrix}', '{z}');
+        template = template.replace('{tileRow}', '{y}');
+        template = template.replace('{tileCol}', '{x}');
+        template = template.replace(/^https?:\/\/[^/]+/i, '');
+        return template;
+    }
+
+    function buildPopupBody(collection, feature) {
+        const root = document.createElement('div');
+        root.className = 'popup';
+
+        const heading = document.createElement('h3');
+        heading.textContent = collection.title || collection.id;
+        root.appendChild(heading);
+
+        const rows = [];
+        if (feature.id !== undefined && feature.id !== null && feature.id !== '') {
+            rows.push(['id', String(feature.id)]);
+        }
+        const props = feature.properties || {};
+        Object.keys(props)
+            .sort()
+            .forEach(function (key) {
+                rows.push([key, formatPropertyValue(props[key])]);
+            });
+
+        if (rows.length === 0) {
+            const empty = document.createElement('p');
+            empty.className = 'popup-empty';
+            empty.textContent = 'No properties.';
+            root.appendChild(empty);
+            return root;
+        }
+
+        rows.forEach(function (kv) {
+            const row = document.createElement('div');
+            row.className = 'popup-row';
+            const k = document.createElement('span');
+            k.className = 'k';
+            k.textContent = kv[0];
+            const v = document.createElement('span');
+            v.className = 'v';
+            v.textContent = kv[1];
+            row.appendChild(k);
+            row.appendChild(v);
+            root.appendChild(row);
+        });
+        return root;
+    }
+
+    function formatPropertyValue(value) {
+        if (value === null || value === undefined) return '—';
+        if (typeof value === 'number' && !Number.isInteger(value)) {
+            // Trim noisy floating-point trails without losing precision the
+            // user actually asked for; 4 sig figs covers most preview cases.
+            return value.toLocaleString(undefined, { maximumSignificantDigits: 6 });
+        }
+        return String(value);
     }
 })();
