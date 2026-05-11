@@ -654,7 +654,11 @@ async fn render_vector_tile(
     let props_hash = properties_hash(&allowlist);
     let cache_key = VectorTileKey {
         collection: id.to_string(),
+<<<<<<< HEAD
         tms: tms_kind,
+=======
+        tms: tms_kind.id(),
+>>>>>>> d2711ad (feat(api-tiles): MVT route via ?f=mvt content negotiation (#127 Phase 2))
         z: zoom,
         x: col,
         y: row,
