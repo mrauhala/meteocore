@@ -275,7 +275,10 @@ async fn main() {
         .route(
             "/preview/manifest.json",
             get(preview::manifest_handler).with_state(server_state.clone()),
-        );
+        )
+        .route("/preview", get(preview::index_handler))
+        .route("/preview/", get(preview::index_handler))
+        .route("/preview/{*path}", get(preview::asset_handler));
 
     // Admin routes (protected by bearer token auth, not CORS)
     let admin_routes = Router::new().route(

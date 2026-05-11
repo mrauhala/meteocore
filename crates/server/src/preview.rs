@@ -1,24 +1,80 @@
 //! Built-in preview UI surface.
 //!
-//! v1 exposes a single endpoint, `GET /preview/manifest.json`, that aggregates
-//! every collection's discovery metadata into one denormalized JSON shape. The
-//! preview SPA consumes it as its single source of truth so the browser
-//! doesn't have to probe five separate `/collections` endpoints (EDR, Features,
-//! Maps, Tiles, WMS) per page load and reconcile their drift.
+//! Two responsibilities:
 //!
-//! Asset embedding (`/preview` + `/preview/{*path}`) ships in Phase 2.
+//! * `GET /preview/manifest.json` — aggregated discovery JSON consumed by
+//!   the SPA. Replaces five separate `/{api}/collections` probes per page
+//!   load and reconciles per-API schema drift server-side.
+//! * `GET /preview` (and `/preview/{*path}`) — serve the SPA's static
+//!   assets (HTML, JS, CSS, vendored MapLibre) embedded at build time via
+//!   `rust-embed`. No external requests at runtime; the binary is a
+//!   self-contained demo.
 
 use std::collections::BTreeSet;
 
-use axum::extract::{Query, State};
+use axum::body::Body;
+use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
+use rust_embed::RustEmbed;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use ds_core::config::CollectionConfig;
 
 use crate::admin::AdminState;
+
+// ---------------------------------------------------------------------------
+// Static-asset embedding
+// ---------------------------------------------------------------------------
+
+/// Everything under `crates/server/preview/` gets baked into the binary at
+/// compile time. The `manifest.json` route is *not* served from here; it
+/// has its own handler that reads live `ServerState`.
+#[derive(RustEmbed)]
+#[folder = "preview/"]
+#[exclude = "*.map"]
+struct PreviewAssets;
+
+/// `GET /preview` — serve the SPA shell. Equivalent to `/preview/index.html`.
+pub async fn index_handler() -> Response {
+    serve_asset("index.html")
+}
+
+/// `GET /preview/{*path}` — serve any embedded asset by relative path.
+pub async fn asset_handler(Path(path): Path<String>) -> Response {
+    serve_asset(&path)
+}
+
+fn serve_asset(path: &str) -> Response {
+    let Some(content) = PreviewAssets::get(path) else {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Body::from(format!("preview asset not found: {path}")))
+            .unwrap();
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, mime_for(path))
+        // Versioned (by binary) and embedded — safe to cache aggressively.
+        .header(header::CACHE_CONTROL, "public, max-age=86400, immutable")
+        .body(Body::from(content.data.into_owned()))
+        .unwrap()
+}
+
+fn mime_for(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" => "application/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "ico" => "image/x-icon",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
 
 /// Maximum number of explicit timestamps emitted per collection.
 /// Datasets with more timesteps set `temporal_extent.truncated = true`.
@@ -772,5 +828,85 @@ mod tests {
             m["collections"][0]["apis"],
             serde_json::json!(["edr", "features"])
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Static-asset embedding tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn index_handler_returns_html() {
+        let resp = index_handler().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(body_str.contains("MeteoCore"));
+        assert!(body_str.contains("maplibre-gl.js"));
+    }
+
+    #[tokio::test]
+    async fn vendored_maplibre_js_is_served_with_js_mime() {
+        let resp = asset_handler(axum::extract::Path("vendor/maplibre-gl.js".into())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/javascript; charset=utf-8"
+        );
+        // Sanity: the MapLibre UMD bundle starts with a recognisable token —
+        // tells us we're serving the real vendored file, not an empty stub.
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            body.len() > 100_000,
+            "maplibre-gl.js should be hundreds of KB; got {} bytes",
+            body.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn vendored_license_is_served() {
+        let resp =
+            asset_handler(axum::extract::Path("vendor/LICENSE-maplibre-gl.txt".into())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("BSD"),
+            "vendored license must be BSD-3-Clause"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_asset_returns_404() {
+        let resp = asset_handler(axum::extract::Path("does-not-exist.txt".into())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn assets_have_immutable_cache_control() {
+        let resp = index_handler().await;
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=86400, immutable"
+        );
+    }
+
+    #[test]
+    fn mime_inference_covers_common_extensions() {
+        assert_eq!(mime_for("a/b/index.html"), "text/html; charset=utf-8");
+        assert_eq!(mime_for("app.js"), "application/javascript; charset=utf-8");
+        assert_eq!(mime_for("app.css"), "text/css; charset=utf-8");
+        assert_eq!(mime_for("data.json"), "application/json");
+        assert_eq!(mime_for("icon.svg"), "image/svg+xml");
+        assert_eq!(mime_for("README"), "application/octet-stream");
     }
 }
