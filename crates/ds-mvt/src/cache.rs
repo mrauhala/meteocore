@@ -4,6 +4,7 @@
 //! instead of (bbox, width, height, style). Sized by bytes — eviction is driven
 //! by total weight, not entry count.
 
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
@@ -28,6 +29,17 @@ pub struct VectorTileKey {
     pub x: u64,
     pub y: u64,
     pub properties_hash: u64,
+}
+
+impl VectorTileKey {
+    /// Stable ETag for HTTP caching — `"hex64"` string of the key's hash.
+    /// Format matches `ds_render::CacheKey::etag()` so the same `etag_matches`
+    /// helper works for both raster and vector tile responses.
+    pub fn etag(&self) -> String {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut hasher);
+        format!("\"{:016x}\"", hasher.finish())
+    }
 }
 
 #[derive(Clone)]
@@ -138,6 +150,17 @@ mod tests {
         assert_eq!(cache.hits(), 0);
         // The insert is silently dropped, and the single `get` is counted as a miss.
         assert_eq!(cache.misses(), 1);
+    }
+
+    #[test]
+    fn etag_is_stable_for_same_key() {
+        let k = key(3, 4, 5);
+        assert_eq!(k.etag(), k.clone().etag());
+    }
+
+    #[test]
+    fn etag_differs_for_distinct_keys() {
+        assert_ne!(key(3, 4, 5).etag(), key(3, 4, 6).etag());
     }
 
     #[test]

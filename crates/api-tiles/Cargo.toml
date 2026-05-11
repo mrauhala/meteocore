@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 ds-core = { path = "../core" }
 ds-render = { path = "../render" }
+ds-mvt = { path = "../ds-mvt" }
 arc-swap = "1"
 axum = "0.8"
 bytes = "1"

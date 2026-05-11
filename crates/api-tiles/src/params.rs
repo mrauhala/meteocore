@@ -12,8 +12,12 @@ pub const DEFAULT_MAX_ZOOM: u32 = 18;
 /// Standard tile size in pixels.
 pub const TILE_SIZE: u32 = 256;
 
-/// Supported output formats for map tiles.
+/// Supported raster output formats for map tiles.
 const SUPPORTED_FORMATS: &[&str] = &["image/png", "image/jpeg", "image/webp"];
+
+/// MVT format aliases. Either form works in `?f=` for clients that prefer
+/// a short token or the canonical MIME.
+pub const MVT_FORMAT_TOKENS: &[&str] = &["mvt", "application/vnd.mapbox-vector-tile"];
 
 /// Query parameters for tile requests.
 #[derive(Debug, Deserialize)]
@@ -21,6 +25,16 @@ pub struct TileQueryParams {
     pub datetime: Option<String>,
     #[serde(rename = "f")]
     pub format: Option<String>,
+}
+
+impl TileQueryParams {
+    /// Whether the client requested a Mapbox Vector Tile via `?f=mvt`.
+    pub fn is_mvt(&self) -> bool {
+        self.format
+            .as_deref()
+            .map(|f| MVT_FORMAT_TOKENS.contains(&f))
+            .unwrap_or(false)
+    }
 }
 
 /// Validated tile query parameters.

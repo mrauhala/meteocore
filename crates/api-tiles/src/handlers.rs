@@ -9,7 +9,13 @@ use axum::Json;
 use serde_json::json;
 
 use ds_core::config::CollectionConfig;
+use ds_core::feature::{Bbox, FeatureQuery};
+use ds_core::feature_engine::FeatureEngine;
 use ds_core::map_engine::MapEngine;
+use ds_mvt::{
+    encode_tile, properties_hash, PropertyAllowlist, TileEncodeOptions, TmsKind, VectorTileCache,
+    VectorTileKey,
+};
 use ds_render::{CacheKey, RenderedCache, StyleInfo};
 
 use crate::error::TilesError;
@@ -33,8 +39,13 @@ pub struct TilesState {
     pub map_engines: HashMap<String, Arc<dyn MapEngine>>,
     pub collections: HashMap<String, CollectionConfig>,
     pub styles: HashMap<String, HashMap<String, StyleInfo>>,
+    /// Collections that can produce vector tiles (MVT). Keyed independently of
+    /// `map_engines` — a collection may serve raster, vector, or both.
+    pub feature_engines: HashMap<String, Arc<dyn FeatureEngine>>,
+    pub feature_collections: HashMap<String, CollectionConfig>,
     pub render_semaphore: Arc<tokio::sync::Semaphore>,
     pub rendered_cache: Arc<RenderedCache>,
+    pub vector_tile_cache: Arc<VectorTileCache>,
     pub base_url: String,
 }
 
@@ -573,13 +584,187 @@ pub async fn collection_tilesets(
     })))
 }
 
+/// MVT MIME type registered with IANA.
+const MVT_CONTENT_TYPE: &str = "application/vnd.mapbox-vector-tile";
+
+/// Refuse to encode a tile that would carry more than this many features.
+/// At z=0 of a 100k-feature dataset the whole world lands in one tile —
+/// returning a multi-megabyte MVT would harm the cache and the client. The
+/// fix is to raise the collection's `minzoom`, not to silently encode.
+const MAX_FEATURES_PER_TILE: usize = 50_000;
+
+/// Encode an MVT from a `FeatureEngine` and return it as an HTTP response.
+///
+/// Reached through content negotiation on the standard tile path:
+/// `GET /collections/{id}/tiles/{tms}/{z}/{row}/{col}?f=mvt`.
+/// Validation order mirrors `render_tile` (TMS → zoom → coords → engine
+/// lookup) so error responses stay consistent across raster and vector
+/// tile routes.
+async fn render_vector_tile(
+    headers: HeaderMap,
+    id: &str,
+    tms_id: &str,
+    zoom: u32,
+    row: u64,
+    col: u64,
+    state: AppState,
+) -> Result<axum::response::Response, TilesError> {
+    let state = state.load_full();
+
+    let tms_kind = TmsKind::from_id(tms_id).ok_or_else(|| {
+        TilesError::BadRequest(format!(
+            "TileMatrixSet '{tms_id}' is not supported. Supported: {}",
+            SUPPORTED_TILE_MATRIX_SETS.join(", ")
+        ))
+    })?;
+    let tms = tilematrixset::get_tile_matrix_set(tms_id)
+        .ok_or_else(|| TilesError::Internal("TileMatrixSet lookup failed".into()))?;
+
+    if zoom > params::MAX_ZOOM_LEVEL {
+        return Err(TilesError::BadRequest(format!(
+            "Zoom level {zoom} exceeds maximum of {}",
+            params::MAX_ZOOM_LEVEL
+        )));
+    }
+    if !tms.validate_coords(zoom, row, col) {
+        return Err(TilesError::NotFound(format!(
+            "Tile {zoom}/{row}/{col} is outside the matrix bounds for {tms_id}"
+        )));
+    }
+
+    let engine = state
+        .feature_engines
+        .get(id)
+        .ok_or_else(|| {
+            TilesError::NotFound(format!("Collection '{id}' has no vector-tile source"))
+        })?
+        .clone();
+    let _config = state
+        .feature_collections
+        .get(id)
+        .ok_or_else(|| TilesError::Internal("Collection config missing".into()))?;
+
+    let bbox = tms
+        .tile_bbox(zoom, row, col)
+        .ok_or_else(|| TilesError::Internal("Failed to compute tile bbox".into()))?;
+
+    let allowlist = PropertyAllowlist::All;
+    let props_hash = properties_hash(&allowlist);
+    let cache_key = VectorTileKey {
+        collection: id.to_string(),
+        tms: tms_kind,
+        z: zoom,
+        x: col,
+        y: row,
+        properties_hash: props_hash,
+    };
+    let etag = cache_key.etag();
+    let cache_control = "public, max-age=300";
+
+    if let Some(inm) = headers.get(header::IF_NONE_MATCH) {
+        if let Ok(s) = inm.to_str() {
+            if ds_render::etag_matches(s, &etag) {
+                return Ok(axum::response::Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header(header::ETAG, &etag)
+                    .header(header::CACHE_CONTROL, cache_control)
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+                    .into_response());
+            }
+        }
+    }
+
+    if let Some(cached) = state.vector_tile_cache.get(&cache_key) {
+        return Ok(axum::response::Response::builder()
+            .header(header::CONTENT_TYPE, MVT_CONTENT_TYPE)
+            .header(header::ETAG, &etag)
+            .header(header::CACHE_CONTROL, cache_control)
+            .header(header::HeaderName::from_static("x-cache"), "HIT")
+            .body(axum::body::Body::from(cached))
+            .unwrap()
+            .into_response());
+    }
+
+    let query_bbox = Bbox::new(bbox[0], bbox[1], bbox[2], bbox[3])
+        .map_err(|e| TilesError::BadRequest(format!("Invalid tile bbox: {e}")))?;
+    let query = FeatureQuery {
+        bbox: Some(query_bbox),
+        limit: 0,
+        offset: 0,
+        datetime: None,
+    };
+
+    // Share the raster semaphore — encoding is also CPU-bound and a single
+    // budget for tile production keeps DoS surface area minimal.
+    let _permit = tokio::time::timeout(ds_render::RENDER_TIMEOUT, state.render_semaphore.acquire())
+        .await
+        .map_err(|_| TilesError::ServiceUnavailable("Server busy, try again later".to_string()))?
+        .map_err(|_| TilesError::Internal("Render semaphore closed".to_string()))?;
+
+    let page = engine
+        .get_features(&query)
+        .map_err(|e| TilesError::Internal(format!("Feature query failed: {e}")))?;
+
+    if page.features.len() > MAX_FEATURES_PER_TILE {
+        return Err(TilesError::BadRequest(format!(
+            "tile-too-dense: {} features exceed maximum of {} — raise minzoom or narrow bbox",
+            page.features.len(),
+            MAX_FEATURES_PER_TILE
+        )));
+    }
+
+    let features = page.features;
+    let layer_name = id.to_string();
+    let collection_label = id.to_string();
+    let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ds_mvt::EncodeError> {
+        let mut opts = TileEncodeOptions::new(layer_name, tms_kind);
+        opts.properties = allowlist;
+        encode_tile(&features, bbox, &opts)
+    })
+    .await
+    .map_err(|e| TilesError::Internal(format!("Encode task failed: {e}")))?
+    .map_err(|e| {
+        tracing::warn!("MVT encode error for collection '{collection_label}': {e}");
+        TilesError::Internal(format!("Encode failed: {e}"))
+    })?;
+
+    let bytes = bytes::Bytes::from(bytes);
+    state.vector_tile_cache.insert(cache_key, bytes.clone());
+
+    Ok(axum::response::Response::builder()
+        .header(header::CONTENT_TYPE, MVT_CONTENT_TYPE)
+        .header(header::ETAG, &etag)
+        .header(header::CACHE_CONTROL, cache_control)
+        .header(header::HeaderName::from_static("x-cache"), "MISS")
+        .body(axum::body::Body::from(bytes))
+        .unwrap()
+        .into_response())
+}
+
 /// GET /tiles/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}
+///
+/// Content-negotiated between raster (PNG/JPEG/WebP, default) and Mapbox
+/// Vector Tile (`?f=mvt`). The latter routes through the `FeatureEngine`
+/// registry; the former through `MapEngine` as before.
 pub async fn get_tile(
     headers: HeaderMap,
     Path((id, tms_id, tile_matrix, tile_row, tile_col)): Path<(String, String, u32, u64, u64)>,
     Query(params): Query<TileQueryParams>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, TilesError> {
+) -> Result<axum::response::Response, TilesError> {
+    if params.is_mvt() {
+        return render_vector_tile(
+            headers,
+            &id,
+            &tms_id,
+            tile_matrix,
+            tile_row,
+            tile_col,
+            state,
+        )
+        .await;
+    }
     render_tile(
         &id,
         "default",
@@ -592,6 +777,7 @@ pub async fn get_tile(
         state,
     )
     .await
+    .map(|r| r.into_response())
 }
 
 /// GET /tiles/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}
@@ -607,7 +793,12 @@ pub async fn get_styled_tile(
     )>,
     Query(params): Query<TileQueryParams>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, TilesError> {
+) -> Result<axum::response::Response, TilesError> {
+    if params.is_mvt() {
+        return Err(TilesError::BadRequest(
+            "Vector tiles (?f=mvt) are not styled — request via /collections/{id}/tiles/...".into(),
+        ));
+    }
     render_tile(
         &id,
         &style_id,
@@ -620,6 +811,7 @@ pub async fn get_styled_tile(
         state,
     )
     .await
+    .map(|r| r.into_response())
 }
 
 /// Shared tile rendering logic.

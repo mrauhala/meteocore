@@ -17,6 +17,7 @@ api-wms = { path = "../api-wms" }
 api-maps = { path = "../api-maps" }
 api-tiles = { path = "../api-tiles" }
 ds-render = { path = "../render" }
+ds-mvt = { path = "../ds-mvt" }
 arc-swap = "1"
 axum = "0.8"
 http-body = "1"

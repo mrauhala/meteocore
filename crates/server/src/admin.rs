@@ -391,6 +391,15 @@ pub fn load_collections(
         HashMap::new();
     let mut tiles_collections: HashMap<String, CollectionConfig> = HashMap::new();
     let mut tiles_styles: HashMap<String, HashMap<String, ds_render::StyleInfo>> = HashMap::new();
+    // Vector-tile sources: collections with `apis = [..., "tiles"]` whose
+    // engine implements `FeatureEngine` end up here, keyed by collection id.
+    // Independent of `tiles_engines` (raster), so a collection can serve one,
+    // the other, or both.
+    let mut tiles_feature_engines: HashMap<
+        String,
+        Arc<dyn ds_core::feature_engine::FeatureEngine>,
+    > = HashMap::new();
+    let mut tiles_feature_collections: HashMap<String, CollectionConfig> = HashMap::new();
     let mut geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>> = Vec::new();
     let mut querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>> = Vec::new();
     let mut grib_engines: Vec<Arc<engine_grib::GribEngine>> = Vec::new();
@@ -414,11 +423,11 @@ pub fn load_collections(
         // Validate engine+API compatibility
         let supported_apis: &[&str] = match collection.engine_type.as_str() {
             "csv" => &["edr", "features"],
-            "geojson" => &["features"],
+            "geojson" => &["features", "tiles"],
             "geotiff" => &["edr", "wms", "maps", "tiles"],
             "querydata" => &["edr", "wms", "maps", "tiles"],
             "grib" => &["edr", "wms", "maps", "tiles"],
-            "postgis" => &["edr", "features"],
+            "postgis" => &["edr", "features", "tiles"],
             _ => &[],
         };
         let unsupported: Vec<&str> = collection
@@ -561,6 +570,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
                     );
                     feature_collections.insert(collection.id.clone(), collection.clone());
+                }
+                if collection.apis.contains(&"tiles".to_string()) {
+                    tiles_feature_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
+                    );
+                    tiles_feature_collections.insert(collection.id.clone(), collection.clone());
                 }
                 health.push(CollectionHealth {
                     id: collection.id.clone(),
@@ -1069,6 +1085,13 @@ pub fn load_collections(
                     );
                     feature_collections.insert(collection.id.clone(), collection.clone());
                 }
+                if collection.apis.contains(&"tiles".to_string()) {
+                    tiles_feature_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
+                    );
+                    tiles_feature_collections.insert(collection.id.clone(), collection.clone());
+                }
                 postgis_engines.push(engine);
                 health.push(CollectionHealth {
                     id: collection.id.clone(),
@@ -1113,6 +1136,10 @@ pub fn load_collections(
     tracing::info!("Render concurrency: {render_concurrency} (from available CPUs)");
     let render_semaphore = Arc::new(tokio::sync::Semaphore::new(render_concurrency));
     let rendered_cache = Arc::new(ds_render::RenderedCache::new(rendered_cache_mb));
+    // Vector-tile (MVT) cache is independent of the raster cache because the
+    // workloads differ (1–50 KB vs 30–200 KB per tile). 128 MB matches the
+    // raster default; a config knob lands when an operator asks for it.
+    let vector_tile_cache = Arc::new(ds_mvt::VectorTileCache::new(128));
 
     // Set initial render semaphore total gauge
     RENDER_SEMAPHORE_TOTAL.set(render_concurrency as i64);
@@ -1148,8 +1175,11 @@ pub fn load_collections(
             map_engines: tiles_engines,
             collections: tiles_collections,
             styles: tiles_styles,
+            feature_engines: tiles_feature_engines,
+            feature_collections: tiles_feature_collections,
             render_semaphore: render_semaphore.clone(),
             rendered_cache: rendered_cache.clone(),
+            vector_tile_cache: vector_tile_cache.clone(),
             base_url: base_url.to_string(),
         },
         health,
