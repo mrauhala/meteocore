@@ -25,24 +25,23 @@ jobs:
     steps:
     - uses: actions/checkout@v6
 
-    - name: Install system dependencies
-      run: sudo apt-get update && sudo apt-get install -y cmake clang
+    # `cmake` and `clang` are pre-installed on `ubuntu-24.04`
+    # (the current `ubuntu-latest`), so no `apt-get` step is needed.
+    # The previous step spent ~3 min mostly on `apt-get update` against
+    # 30+ repo indexes for two packages that the runner image ships.
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy, rustfmt
 
-    - name: Cache cargo registry & build
-      uses: actions/cache@v5
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-
+    # `Swatinem/rust-cache` is the de-facto Rust cache action — faster
+    # restore than `actions/cache`, GC's stale fingerprints/incremental
+    # artifacts before save (keeps target/ small so we hit the cache
+    # more often before the repo-wide 10 GiB limit evicts entries),
+    # keys on Cargo.lock + rustc version + workspace members.
+    - name: Rust cache
+      uses: Swatinem/rust-cache@v2
 
     - name: Check formatting
       run: cargo fmt -- --check
@@ -53,11 +52,10 @@ jobs:
     - name: Clippy
       run: cargo clippy --all-targets -- -D warnings
 
-    - name: Build
-      run: cargo build --verbose
-
+    # `cargo test` builds everything `cargo build` does, plus test
+    # binaries — a separate build step would just duplicate work.
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test
 
   docker-check:
     name: Docker Build (PR)
