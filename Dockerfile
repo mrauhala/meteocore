@@ -21,26 +21,21 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 #
 # System dependencies:
-#  - `pkg-config`, `libssl-dev`, `clang` from bookworm main — needed by
-#    libaec-sys (GRIB CCSDS compression). `clang` provides libclang for
-#    bindgen.
-#  - `cmake` from `bookworm-backports` (3.31) — libaec-sys requires ≥3.26,
-#    and Bookworm's main repo ships 3.25. Replaces the previous
-#    `pip install --break-system-packages cmake` hack.
-#
-# `--no-install-recommends` is intentionally *omitted* from the backports
-# `cmake` line: apt's solver needs the Recommends headroom to resolve
-# transitive deps like `libjsoncpp25` correctly across the main/backports
-# boundary. With `--no-install-recommends` the solver hits "unmet
-# dependencies" on `libjsoncpp25` even though the package is available.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
-    echo 'deb http://deb.debian.org/debian bookworm-backports main' \
-        > /etc/apt/sources.list.d/backports.list && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev clang && \
-    apt-get install -y -t bookworm-backports cmake && \
+#  - `pkg-config`, `libssl-dev`, `clang` — needed by libaec-sys (GRIB
+#    CCSDS compression). `clang` provides libclang for bindgen.
+#  - `cmake` via pip — libaec-sys requires cmake ≥3.26, but Bookworm
+#    main ships 3.25. The bookworm-backports route (cmake 3.31) was
+#    tried and abandoned: apt's solver fails to resolve `libjsoncpp25`
+#    across the main/backports boundary on current `rust:1.94-slim` even
+#    though the package is in main. `pip install --break-system-packages
+#    cmake` ships a self-contained static binary that sidesteps the
+#    system-package solver entirely. PEP 668 makes Debian's Python
+#    "system-managed" — `--break-system-packages` is the documented way
+#    to opt out for build-stage tooling. Build-stage only; never lands
+#    in the runtime image.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config libssl-dev clang python3-pip ca-certificates && \
+    pip install --break-system-packages cmake && \
     rm -rf /var/lib/apt/lists/*
 
 # Cook the dep tree from the recipe. This is the layer that benefits most
