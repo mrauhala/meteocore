@@ -10,6 +10,14 @@ on:
   pull_request_review:
     types: [submitted]
 
+# Bot only needs to act on the latest @claude trigger for a given ref.
+# `github.event.pull_request.number || github.ref` makes the group
+# stable across the comment/review event types that don't set
+# `pull_request` directly.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   claude:
     if: |

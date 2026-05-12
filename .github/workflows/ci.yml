@@ -12,6 +12,15 @@ on:
   pull_request:
     branches: [ "main" ]
 
+# Cancel stale runs when a newer commit lands on the same ref. PR review
+# rounds force-push frequently; multiple merges to `main` queue up runs
+# of which only the latest commit's result matters. `release.yml`
+# deliberately does *not* set this — each tag is a distinct release
+# artifact that must complete on its own.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
