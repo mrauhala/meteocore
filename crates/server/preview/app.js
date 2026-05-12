@@ -33,6 +33,12 @@
     const statusEl = document.getElementById('status');
     const listEl = document.getElementById('collections');
 
+    // Absolute path matches the asset references in `index.html` (also
+    // `/preview/...`). A relative `manifest.json` would only resolve
+    // correctly when the page URL ends in `/`, and the route table accepts
+    // both `/preview` and `/preview/`. Full proxy-prefix support (relative
+    // paths + a `<base>` tag + a server redirect to enforce the trailing
+    // slash) is tracked for a later phase.
     fetch('/preview/manifest.json')
         .then(function (r) {
             if (!r.ok) throw new Error('HTTP ' + r.status);

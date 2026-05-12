@@ -468,16 +468,42 @@ mod vector_tile_discovery {
                 l["rel"].as_str() == Some("http://www.opengis.net/def/rel/ogc/1.0/tilesets-vector")
             })
             .expect("collection with apis=[tiles] must advertise a vector tileset link");
-        assert_eq!(
-            tileset_link["type"].as_str().unwrap(),
-            "application/vnd.mapbox-vector-tile"
+        // Per OGC API – Tiles 1.0 §7.1 the `tilesets-vector` rel targets the
+        // tilesets-list resource (returns JSON), not a tile URL template, so
+        // the type is `application/json` and there is no `templated` flag.
+        assert_eq!(tileset_link["type"].as_str().unwrap(), "application/json");
+        assert!(
+            tileset_link.get("templated").is_none(),
+            "tilesets-vector link must not carry the `templated` HAL-ism: \
+             it points at a concrete tilesets-list URL, not a template"
         );
-        assert_eq!(tileset_link["templated"].as_bool(), Some(true));
         let href = tileset_link["href"].as_str().unwrap();
-        // URL template points at the api-tiles MVT route, and the format
-        // override stays explicit so blind copy/paste into a tile client works.
-        assert!(href.contains("/tiles/collections/cities/tiles/WebMercatorQuad/"));
-        assert!(href.contains("f=mvt"));
+        // No WebMercatorQuad hardcode — the list enumerates every supported
+        // TileMatrixSet, so the discovery link stays correct if another TMS
+        // is added later.
+        assert!(
+            href.ends_with("/tiles/collections/cities/tiles"),
+            "tilesets-vector href must be the tilesets-list endpoint, got: {href}"
+        );
+        assert!(!href.contains("WebMercatorQuad"));
+        assert!(!href.contains("f=mvt"));
+    }
+
+    #[tokio::test]
+    async fn collection_without_tiles_api_does_not_emit_tileset_link() {
+        // Reuse the standard `build_router()` fixture (via `get`), which
+        // seeds `cities` with `apis: ["features"]` only — exactly the
+        // config this assertion needs. The conditional in
+        // `build_collection_metadata` must omit the `tilesets-vector`
+        // link when `tiles` is absent.
+        let (_, json) = get("/collections/cities").await;
+        let links = json["links"].as_array().expect("links must be present");
+        assert!(
+            !links.iter().any(|l| {
+                l["rel"].as_str() == Some("http://www.opengis.net/def/rel/ogc/1.0/tilesets-vector")
+            }),
+            "collection without `tiles` in apis must not emit a tilesets-vector link"
+        );
     }
 }
 

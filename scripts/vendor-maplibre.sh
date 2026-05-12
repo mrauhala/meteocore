@@ -32,7 +32,17 @@ URL="https://github.com/maplibre/maplibre-gl-js/releases/download/v${VERSION}/di
 echo "Fetching MapLibre GL JS v${VERSION}..."
 curl --fail --silent --show-error --location --output "$TMP/dist.zip" "$URL"
 
-ACTUAL=$(shasum -a 256 "$TMP/dist.zip" | awk '{print $1}')
+# Portable sha256: prefer GNU coreutils (`sha256sum`, ubiquitous on Linux);
+# fall back to `shasum -a 256` (macOS / BSD via Perl). One of the two is
+# guaranteed to exist on any developer or CI environment we target.
+if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL=$(sha256sum "$TMP/dist.zip" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+    ACTUAL=$(shasum -a 256 "$TMP/dist.zip" | awk '{print $1}')
+else
+    echo >&2 "neither sha256sum nor shasum is on PATH; install GNU coreutils or perl-Digest-SHA"
+    exit 1
+fi
 if [ -n "$SHA256_EXPECTED" ]; then
     if [ "$ACTUAL" != "$SHA256_EXPECTED" ]; then
         echo >&2 "sha256 mismatch for dist.zip"

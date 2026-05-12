@@ -36,6 +36,22 @@ use crate::admin::AdminState;
 #[exclude = "*.map"]
 struct PreviewAssets;
 
+/// Locked-down CSP for the SPA shell. All resources are same-origin; the
+/// only exceptions are MapLibre's WebGL worker (which uses `blob:` URLs
+/// internally) and `data:`/`blob:` image URIs MapLibre generates for raster
+/// tiles in some code paths. No inline scripts and no `unsafe-eval` — every
+/// dynamic value in `app.js` reaches the DOM via `.textContent`, which CSP
+/// doesn't restrict. Defence in depth for future phases.
+const PREVIEW_CSP: &str = "default-src 'self'; \
+                           style-src 'self'; \
+                           script-src 'self'; \
+                           img-src 'self' data: blob:; \
+                           worker-src blob:; \
+                           connect-src 'self'; \
+                           object-src 'none'; \
+                           base-uri 'self'; \
+                           frame-ancestors 'none'";
+
 /// `GET /preview` — serve the SPA shell. Equivalent to `/preview/index.html`.
 pub async fn index_handler() -> Response {
     serve_asset("index.html")
@@ -48,18 +64,52 @@ pub async fn asset_handler(Path(path): Path<String>) -> Response {
 
 fn serve_asset(path: &str) -> Response {
     let Some(content) = PreviewAssets::get(path) else {
+        // Generic body — `path` is user-controlled. Reflecting it isn't an
+        // XSS vector here (`text/plain`) but matches the project's
+        // "no internal detail in client errors" guideline.
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(Body::from(format!("preview asset not found: {path}")))
-            .unwrap();
+            .body(Body::from("Not Found"))
+            .expect("static 404 response headers are valid");
     };
-    Response::builder()
-        .header(header::CONTENT_TYPE, mime_for(path))
-        // Versioned (by binary) and embedded — safe to cache aggressively.
-        .header(header::CACHE_CONTROL, "public, max-age=86400, immutable")
+    let mime = mime_for(path);
+    let is_html = mime.starts_with("text/html");
+    // Cache strategy splits by asset class:
+    //
+    // * `index.html` — entry point with a stable URL. `no-cache` forces the
+    //   browser to revalidate on every load so a binary upgrade ships the
+    //   new shell immediately. `immutable` here would pin clients to a
+    //   stale shell for up to `max-age` (review feedback on Phase 2).
+    // * `vendor/*` — version-pinned in `scripts/vendor-maplibre.sh` and
+    //   sha256-verified; safe to cache aggressively and mark immutable.
+    // * Everything else (`app.js`, `app.css`, etc.) — non-fingerprinted
+    //   stable URLs that change with every binary; `max-age=300` +
+    //   `must-revalidate` gives browsers cheap reuse during a session
+    //   without pinning them across deploys.
+    let cache_control = if is_html {
+        "no-cache"
+    } else if path.starts_with("vendor/") {
+        "public, max-age=86400, immutable"
+    } else {
+        "public, max-age=300, must-revalidate"
+    };
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CACHE_CONTROL, cache_control)
+        .header(
+            header::HeaderName::from_static("x-content-type-options"),
+            "nosniff",
+        );
+    if is_html {
+        builder = builder.header(
+            header::HeaderName::from_static("content-security-policy"),
+            PREVIEW_CSP,
+        );
+    }
+    builder
         .body(Body::from(content.data.into_owned()))
-        .unwrap()
+        .expect("static preview response headers are valid")
 }
 
 fn mime_for(path: &str) -> &'static str {
@@ -120,7 +170,16 @@ pub async fn manifest_handler(
 
     // Size guard — log only, never reject; pagination defaults already prevent
     // pathological responses, and the soft warn lets operators see drift early.
-    let body = serde_json::to_vec(&manifest).unwrap_or_else(|_| b"{}".to_vec());
+    //
+    // `serde_json::to_vec` on a `serde_json::Value` essentially never fails
+    // (the input is already validated JSON), but if it does we log and fall
+    // back to `{}` rather than 500-ing the request — preview UIs can keep
+    // rendering whatever cached snapshot they hold while operators see the
+    // error in logs.
+    let body = serde_json::to_vec(&manifest).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "preview manifest JSON serialisation failed");
+        b"{}".to_vec()
+    });
     if body.len() > MANIFEST_WARN_BYTES {
         tracing::warn!(
             "preview manifest body is {} bytes ({} collections, offset={}, limit={}); \
@@ -142,14 +201,30 @@ pub async fn manifest_handler(
 /// Build a denormalized inventory across every per-API `*State`.
 ///
 /// Pure: takes `&AdminState`, returns JSON. Used by the handler and by tests.
-pub fn build_manifest(state: &AdminState, offset: usize, limit: usize) -> Value {
+///
+/// **Snapshot semantics.** The five `load_full()` calls below are *not*
+/// atomic — a concurrent `POST /admin/collections/reload` racing between
+/// them can produce a torn snapshot where a collection is in EDR's view
+/// but not Tiles' (or vice versa). The cost would be momentarily-wrong
+/// `apis[]`/extents on the next request after a reload; the LRU clears
+/// once all five `ArcSwap`s settle. This is an accepted trade-off of
+/// the per-API `ArcSwap` pattern — wrapping all five in a single outer
+/// `ArcSwap` would fix it but is out of scope for this PR.
+pub(crate) fn build_manifest(state: &AdminState, offset: usize, limit: usize) -> Value {
     let edr = state.edr.load_full();
     let features = state.features.load_full();
     let maps = state.maps.load_full();
     let tiles = state.tiles.load_full();
     let wms = state.wms.load_full();
 
-    let base_url = edr.base_url.clone();
+    // All five `*State.base_url` fields are initialised from the same
+    // `config.server.base_url()` at load time, so any of them is correct
+    // in practice. Sourcing from `tiles.base_url` makes the dependency
+    // explicit: this function builds tile URL templates, so it reads
+    // base_url from the state that owns those URLs. A tile-only
+    // deployment with no EDR collections would now stay correct if
+    // per-API base-URL overrides ever land.
+    let base_url = tiles.base_url.clone();
 
     // Build the canonical id ordering: union of all *State.collections keys,
     // sorted lexicographically. Stable across reloads when configs are stable.
@@ -216,13 +291,26 @@ fn build_entry(
         "apis": apis,
     });
 
-    if let Some(extent) = resolve_spatial_extent(id, edr, features, maps, tiles) {
+    if let Some(extent) = resolve_spatial_extent(id, edr, features, maps, tiles, wms) {
         entry["spatial_extent"] = json!(extent);
     }
 
-    if let Some(temporal) = resolve_temporal_extent(id, edr, maps, tiles) {
+    if let Some(temporal) = resolve_temporal_extent(id, edr, maps, tiles, wms) {
         entry["temporal_extent"] = temporal;
     }
+
+    // Style source precedence is shared between the top-level `styles[]`
+    // list and the `default_style` inside the raster tile descriptor —
+    // otherwise a `default_style` could reference a style absent from
+    // `styles[]`, and a UI client would build a 404-producing styled-tile
+    // URL. `maps` first (it owns the canonical Maps styles), `tiles`
+    // second (independent style set when only Tiles is wired), `wms`
+    // third (WMS-only collections still expose colormaps via `[wms]`).
+    let effective_styles = maps
+        .styles
+        .get(id)
+        .or_else(|| tiles.styles.get(id))
+        .or_else(|| wms.styles.get(id));
 
     // Tile representations — emit only what's actually wired up so the UI
     // doesn't render a layer toggle for a dead endpoint.
@@ -233,16 +321,14 @@ fn build_entry(
     if tiles.map_engines.contains_key(id) {
         tile_block.insert(
             "raster".into(),
-            raster_tile_descriptor(id, base_url, tiles.styles.get(id)),
+            raster_tile_descriptor(id, base_url, effective_styles),
         );
     }
     if !tile_block.is_empty() {
         entry["tiles"] = Value::Object(tile_block);
     }
 
-    if let Some(styles) = maps.styles.get(id) {
-        entry["styles"] = json!(style_list(styles));
-    } else if let Some(styles) = tiles.styles.get(id) {
+    if let Some(styles) = effective_styles {
         entry["styles"] = json!(style_list(styles));
     }
 
@@ -266,12 +352,21 @@ fn first_config<'a>(
         .or_else(|| wms.collections.get(id))
 }
 
+// TODO: `resolve_spatial_extent` and `resolve_temporal_extent` both call
+// `raster_info()` on every maps / tiles / wms engine, which clones the
+// engine's `times: Vec<DateTime<Utc>>`. At default `limit=100` with
+// archive-sized collections (hundreds of timesteps) this is ~2× the
+// necessary clone work. Out of scope for the initial Phase 1 PR; the fix
+// is to call `raster_info()` once per entry in `build_entry` and pass
+// references down to both resolvers.
+#[allow(clippy::too_many_arguments)]
 fn resolve_spatial_extent(
     id: &str,
     edr: &api_edr::handlers::EdrState,
     features: &api_features::handlers::FeaturesState,
     maps: &api_maps::handlers::MapsState,
     tiles: &api_tiles::handlers::TilesState,
+    wms: &api_wms::handlers::WmsState,
 ) -> Option<[f64; 4]> {
     if let Some(engine) = edr.engines.get(id) {
         if let Some(bbox) = engine.get_spatial_extent() {
@@ -298,6 +393,12 @@ fn resolve_spatial_extent(
             return Some(bbox);
         }
     }
+    // WMS-only collection — same `MapEngine` interface as Maps/Tiles.
+    if let Some(engine) = wms.engines.get(id) {
+        if let Some(bbox) = engine.raster_info().spatial_extent {
+            return Some(bbox);
+        }
+    }
     None
 }
 
@@ -306,11 +407,12 @@ fn resolve_temporal_extent(
     edr: &api_edr::handlers::EdrState,
     maps: &api_maps::handlers::MapsState,
     tiles: &api_tiles::handlers::TilesState,
+    wms: &api_wms::handlers::WmsState,
 ) -> Option<Value> {
     // EDR is the canonical temporal source — it carries both interval and
-    // explicit instants. Maps/Tiles raster_info().times is the fallback when
-    // a collection isn't EDR-enabled (e.g. radar collections without an EDR
-    // surface).
+    // explicit instants. Maps/Tiles/WMS `raster_info().times` is the
+    // fallback when a collection isn't EDR-enabled (e.g. radar collections
+    // exposed only via WMS).
     if let Some(engine) = edr.engines.get(id) {
         let interval = engine.get_temporal_extent();
         let values = engine.get_available_times();
@@ -323,7 +425,8 @@ fn resolve_temporal_extent(
         .engines
         .get(id)
         .map(|e| e.raster_info().times)
-        .or_else(|| tiles.map_engines.get(id).map(|e| e.raster_info().times));
+        .or_else(|| tiles.map_engines.get(id).map(|e| e.raster_info().times))
+        .or_else(|| wms.engines.get(id).map(|e| e.raster_info().times));
     if let Some(times) = times_from_raster {
         if !times.is_empty() {
             let interval = times.first().zip(times.last()).map(|(a, b)| (*a, *b));
@@ -342,26 +445,40 @@ fn serialize_temporal(
         obj.insert("start".into(), json!(start.to_rfc3339()));
         obj.insert("end".into(), json!(end.to_rfc3339()));
     }
-    if let Some(values) = values {
-        let total = values.len();
-        let (slice, truncated) = if total > MAX_TEMPORAL_VALUES {
-            (&values[..MAX_TEMPORAL_VALUES], true)
-        } else {
-            (values, false)
-        };
-        let serialized: Vec<String> = slice.iter().map(|t| t.to_rfc3339()).collect();
-        obj.insert("values".into(), json!(serialized));
-        obj.insert("truncated".into(), json!(truncated));
-        obj.insert("total_values".into(), json!(total));
-    }
+    // Always emit `values` / `truncated` / `total_values`, even when the
+    // engine doesn't override `get_available_times()`. This keeps the
+    // manifest shape stable so UI clients don't have to null-guard each
+    // field individually. The `Engine` trait's default impl returns
+    // `None` for several engines (CSV, PostGIS, QueryData) — without
+    // this fallback those collections would emit only `start`/`end`.
+    let (slice, truncated, total): (&[_], bool, usize) = match values {
+        Some(vs) => {
+            let total = vs.len();
+            if total > MAX_TEMPORAL_VALUES {
+                (&vs[..MAX_TEMPORAL_VALUES], true, total)
+            } else {
+                (vs, false, total)
+            }
+        }
+        None => (&[], false, 0),
+    };
+    let serialized: Vec<String> = slice.iter().map(|t| t.to_rfc3339()).collect();
+    obj.insert("values".into(), json!(serialized));
+    obj.insert("truncated".into(), json!(truncated));
+    obj.insert("total_values".into(), json!(total));
     Value::Object(obj)
 }
 
+// Template placeholders match the axum route variables registered by
+// api-tiles (`/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}`).
+// Using `{tms}` and `{z}` here would yield a path that the server rejects
+// with a 404 — even though the URL looks "tile-shaped" it doesn't match
+// the registered route names.
 fn vector_tile_descriptor(id: &str, base_url: &str) -> Value {
     json!({
         "tile_matrix_sets": ["WebMercatorQuad", "WorldCRS84Quad"],
         "url_template": format!(
-            "{base_url}/tiles/collections/{id}/tiles/{{tms}}/{{z}}/{{tileRow}}/{{tileCol}}?f=mvt"
+            "{base_url}/tiles/collections/{id}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}?f=mvt"
         ),
         "media_type": "application/vnd.mapbox-vector-tile"
     })
@@ -372,21 +489,34 @@ fn raster_tile_descriptor(
     base_url: &str,
     styles: Option<&std::collections::HashMap<String, ds_render::StyleInfo>>,
 ) -> Value {
-    let default_style = styles
-        .and_then(|s| s.get("default"))
-        .map(|s| s.name.as_str())
-        .unwrap_or("default");
-    json!({
+    let mut desc = json!({
         "tile_matrix_sets": ["WebMercatorQuad", "WorldCRS84Quad"],
         "url_template": format!(
-            "{base_url}/tiles/collections/{id}/tiles/{{tms}}/{{z}}/{{tileRow}}/{{tileCol}}"
+            "{base_url}/tiles/collections/{id}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
         ),
-        "styled_url_template": format!(
-            "{base_url}/tiles/collections/{id}/styles/{{styleId}}/tiles/{{tms}}/{{z}}/{{tileRow}}/{{tileCol}}"
-        ),
-        "default_style": default_style,
         "media_type": "image/png"
-    })
+    });
+
+    // Only advertise the styled-tile URL when the collection actually has
+    // styles registered — otherwise a SPA following `styled_url_template`
+    // with `default_style` would hit a 404. Default-style preference: a
+    // style literally named "default", else the first style by sorted name.
+    if let Some(styles) = styles {
+        if let Some(default_style) = styles.get("default").map(|s| s.name.as_str()).or_else(|| {
+            let mut names: Vec<&String> = styles.keys().collect();
+            names.sort();
+            names
+                .first()
+                .and_then(|n| styles.get(*n))
+                .map(|s| s.name.as_str())
+        }) {
+            desc["default_style"] = json!(default_style);
+            desc["styled_url_template"] = json!(format!(
+                "{base_url}/tiles/collections/{id}/styles/{{styleId}}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
+            ));
+        }
+    }
+    desc
 }
 
 fn style_list(styles: &std::collections::HashMap<String, ds_render::StyleInfo>) -> Vec<Value> {
@@ -706,6 +836,10 @@ mod tests {
     #[test]
     fn manifest_emits_vector_and_raster_tile_descriptors_when_wired() {
         let mut tiles = empty_tiles();
+        // Seed a realistic base_url so the assertions can verify the full
+        // `https://…` prefix. An empty base would silently absorb a future
+        // regression that drops the base from the URL template.
+        tiles.base_url = "https://api.example.com".into();
         let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
             spatial_extent: Some([-180.0, -85.0, 180.0, 85.0]),
             times: vec![],
@@ -744,11 +878,27 @@ mod tests {
             .collect();
 
         // Raster-only collection: tiles.raster present, tiles.vector absent.
+        // URL template must carry the absolute base + the *route's* literal
+        // path variable names — `{tileMatrixSetId}`/`{tileMatrix}`, not the
+        // generic `{tms}`/`{z}` that don't match the axum route.
         let radar = by_id["radar"];
-        assert!(radar["tiles"]["raster"]["url_template"]
-            .as_str()
-            .unwrap()
-            .contains("/tiles/collections/radar/tiles/"));
+        let raster_url = radar["tiles"]["raster"]["url_template"].as_str().unwrap();
+        assert!(
+            raster_url.starts_with("https://api.example.com/tiles/collections/radar/tiles/"),
+            "raster url_template must carry the absolute base, got: {raster_url}"
+        );
+        assert!(
+            raster_url.contains("{tileMatrixSetId}") && raster_url.contains("{tileMatrix}"),
+            "raster url_template must use the axum route's placeholder names, got: {raster_url}"
+        );
+        // `radar` has no styles registered in this fixture, so the
+        // styled-tile fields must be absent — otherwise we'd advertise a
+        // URL the server can't honour. Locks in the conditional emit in
+        // `raster_tile_descriptor`.
+        assert!(radar["tiles"]["raster"]
+            .get("styled_url_template")
+            .is_none());
+        assert!(radar["tiles"]["raster"].get("default_style").is_none());
         assert!(radar["tiles"].get("vector").is_none());
 
         // Vector-only collection: tiles.vector present with ?f=mvt; tiles.raster absent.
@@ -756,7 +906,14 @@ mod tests {
         let vector_url = stations["tiles"]["vector"]["url_template"]
             .as_str()
             .unwrap();
-        assert!(vector_url.contains("/tiles/collections/stations/tiles/"));
+        assert!(
+            vector_url.starts_with("https://api.example.com/tiles/collections/stations/tiles/"),
+            "vector url_template must carry the absolute base, got: {vector_url}"
+        );
+        assert!(
+            vector_url.contains("{tileMatrixSetId}") && vector_url.contains("{tileMatrix}"),
+            "vector url_template must use the axum route's placeholder names, got: {vector_url}"
+        );
         assert!(vector_url.contains("f=mvt"));
         assert!(stations["tiles"].get("raster").is_none());
     }
@@ -830,8 +987,140 @@ mod tests {
         );
     }
 
+    #[test]
+    fn temporal_extent_shape_is_stable_when_engine_omits_available_times() {
+        // Regression: engines that implement `get_temporal_extent()` but
+        // leave `get_available_times()` at its default `None` (CSV,
+        // PostGIS, QueryData) used to produce `{"start","end"}` only,
+        // breaking UI clients that read `.values`/`.truncated`/
+        // `.total_values` without a null-guard. Manifest now always emits
+        // those three fields with empty defaults.
+        struct IntervalOnlyMock {
+            interval: (DateTime<Utc>, DateTime<Utc>),
+        }
+        impl Engine for IntervalOnlyMock {
+            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+                Ok(Vec::new())
+            }
+            fn query_location(
+                &self,
+                _: &str,
+                _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                _: Option<&[String]>,
+            ) -> Result<QueryResult, DataServerError> {
+                unimplemented!()
+            }
+            fn get_parameters(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+                Some(self.interval)
+            }
+            fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+                None
+            }
+            // Note: no `get_available_times` override — falls back to default `None`.
+        }
+        let mut edr = empty_edr();
+        let engine: Arc<dyn Engine> = Arc::new(IntervalOnlyMock {
+            interval: (
+                "2024-01-01T00:00:00Z".parse().unwrap(),
+                "2024-01-02T00:00:00Z".parse().unwrap(),
+            ),
+        });
+        edr.engines.insert("obs".into(), engine);
+        edr.collections
+            .insert("obs".into(), config("obs", &["edr"]));
+        let state = make_state(
+            edr,
+            empty_features(),
+            empty_maps(),
+            empty_tiles(),
+            empty_wms(),
+        );
+        let m = build_manifest(&state, 0, 100);
+        let temporal = &m["collections"][0]["temporal_extent"];
+        assert_eq!(temporal["start"], "2024-01-01T00:00:00+00:00");
+        assert_eq!(temporal["end"], "2024-01-02T00:00:00+00:00");
+        assert_eq!(
+            temporal["values"],
+            serde_json::json!([]),
+            "values key must be present (as empty array) even when get_available_times() is None"
+        );
+        assert_eq!(temporal["truncated"], false);
+        assert_eq!(temporal["total_values"], 0);
+    }
+
+    #[test]
+    fn wms_only_collection_surfaces_extent_and_styles() {
+        // Regression guard for the discovery gap flagged in review: a
+        // collection with `apis = ["wms"]` only (no EDR/Maps/Tiles
+        // surface) must still get its extent + temporal + styles fields
+        // populated from the WMS state.
+        let mut wms = empty_wms();
+        let times = vec![
+            "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            "2024-01-01T01:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+        ];
+        let engine: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
+            times: times.clone(),
+            parameter: "reflectivity".into(),
+            unit: "dBZ".into(),
+        });
+        wms.engines.insert("radar-wms".into(), engine);
+        wms.collections
+            .insert("radar-wms".into(), config("radar-wms", &["wms"]));
+        let mut styles = HashMap::new();
+        styles.insert(
+            "default".to_string(),
+            ds_render::StyleInfo {
+                name: "default".to_string(),
+                title: "Default".to_string(),
+                colormap: Arc::new(ds_render::LutColorMap::from_builtin(
+                    ds_render::BuiltinColormap::Viridis,
+                    0.0,
+                    1.0,
+                )),
+                min: 0.0,
+                max: 1.0,
+                parameter: None,
+            },
+        );
+        wms.styles.insert("radar-wms".into(), styles);
+
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            empty_tiles(),
+            wms,
+        );
+        let m = build_manifest(&state, 0, 100);
+        let c = &m["collections"][0];
+        assert_eq!(c["id"], "radar-wms");
+        assert_eq!(c["apis"], serde_json::json!(["wms"]));
+        assert_eq!(
+            c["spatial_extent"],
+            serde_json::json!([10.0, 55.0, 30.0, 70.0])
+        );
+        let temporal = &c["temporal_extent"];
+        assert!(
+            temporal["start"].is_string(),
+            "WMS-only collection should expose temporal start, got: {temporal}"
+        );
+        assert_eq!(temporal["total_values"], 2);
+        let styles_array = c["styles"].as_array().expect("styles must be present");
+        assert_eq!(styles_array.len(), 1);
+        assert_eq!(styles_array[0]["id"], "default");
+        // WMS-only collections have no `tiles` block (no MVT or raster-tile
+        // route exists). Worth asserting because a future refactor might
+        // accidentally synthesise one.
+        assert!(c.get("tiles").is_none());
+    }
+
     // -----------------------------------------------------------------------
-    // Static-asset embedding tests
+    // Static-asset handler tests
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -851,52 +1140,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vendored_maplibre_js_is_served_with_js_mime() {
-        let resp = asset_handler(axum::extract::Path("vendor/maplibre-gl.js".into())).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers().get(header::CONTENT_TYPE).unwrap(),
-            "application/javascript; charset=utf-8"
-        );
-        // Sanity: the MapLibre UMD bundle starts with a recognisable token —
-        // tells us we're serving the real vendored file, not an empty stub.
-        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
-            .await
-            .unwrap();
-        assert!(
-            body.len() > 100_000,
-            "maplibre-gl.js should be hundreds of KB; got {} bytes",
-            body.len()
-        );
-    }
-
-    #[tokio::test]
-    async fn vendored_license_is_served() {
-        let resp =
-            asset_handler(axum::extract::Path("vendor/LICENSE-maplibre-gl.txt".into())).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let text = std::str::from_utf8(&body).unwrap();
-        assert!(
-            text.contains("BSD"),
-            "vendored license must be BSD-3-Clause"
-        );
-    }
-
-    #[tokio::test]
-    async fn unknown_asset_returns_404() {
-        let resp = asset_handler(axum::extract::Path("does-not-exist.txt".into())).await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn assets_have_immutable_cache_control() {
+    async fn index_html_uses_no_cache_and_carries_csp() {
+        // Stable URL → must revalidate every load so a binary upgrade ships
+        // the new shell immediately. CSP is the SPA's only browser-side
+        // safety net (defence in depth even though `app.js` only writes via
+        // `textContent`).
         let resp = index_handler().await;
         assert_eq!(
             resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+        let csp = resp
+            .headers()
+            .get("content-security-policy")
+            .expect("CSP must be set on index.html")
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'self'"));
+        assert!(
+            csp.contains("worker-src blob:"),
+            "MapLibre needs worker-src blob:"
+        );
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert_eq!(
+            resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+    }
+
+    #[tokio::test]
+    async fn vendored_maplibre_js_is_served_with_immutable_cache() {
+        let resp = asset_handler(axum::extract::Path("vendor/maplibre-gl.js".into())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (parts, body) = resp.into_parts();
+        assert_eq!(
+            parts.headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/javascript; charset=utf-8"
+        );
+        // Version-pinned bundle → safe to cache aggressively + mark immutable.
+        assert_eq!(
+            parts.headers.get(header::CACHE_CONTROL).unwrap(),
             "public, max-age=86400, immutable"
+        );
+        // CSP is NOT applied to non-HTML assets — that header only matters
+        // when the browser parses the response as a document.
+        assert!(parts.headers.get("content-security-policy").is_none());
+        // Sanity: the MapLibre UMD bundle is hundreds of KB; serving an
+        // empty stub would mean the vendor script didn't run.
+        let bytes = axum::body::to_bytes(body, 16 * 1024 * 1024).await.unwrap();
+        assert!(
+            bytes.len() > 100_000,
+            "maplibre-gl.js should be hundreds of KB; got {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn app_js_uses_short_must_revalidate_cache() {
+        // Non-fingerprinted JS bundled with the binary: short cache, must
+        // revalidate. `immutable` would pin clients across deploys.
+        let resp = asset_handler(axum::extract::Path("app.js".into())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=300, must-revalidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_asset_returns_generic_404_body() {
+        // User-supplied path must NOT be reflected (review feedback Phase 2).
+        let resp = asset_handler(axum::extract::Path("does-not-exist.txt".into())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert_eq!(body_str, "Not Found");
+        assert!(
+            !body_str.contains("does-not-exist"),
+            "404 body must not echo the requested path"
         );
     }
 

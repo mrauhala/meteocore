@@ -375,36 +375,31 @@ fn lat_to_merc_y(lat: f64) -> f64 {
     clamped.to_radians().tan().asinh() * EARTH_RADIUS_M
 }
 
-/// Hash of a property allowlist for use in in-process cache keys.
-/// Different allowlists produce different hashes so they don't share cache
-/// slots.
+/// Hash of a property allowlist for use as a component of vector-tile cache
+/// keys and ETags. Different allowlists produce different hashes so they
+/// don't share cache slots.
 ///
-/// **Toolchain-ephemeral.** The implementation uses
-/// `std::collections::hash_map::DefaultHasher`, which uses a fixed seed
-/// (unlike `RandomState`) but whose algorithm is explicitly unspecified
-/// across Rust releases. The same binary will produce the same hash for
-/// the same input on every run, but a toolchain upgrade — or a binary
-/// compiled with a different Rust version — can change the output without
-/// warning. Do not persist this value, transmit it over the wire, or
-/// compare it across process boundaries built with different compilers;
-/// switch to a fixed-algorithm hasher (e.g. FNV) if stability is required.
+/// Uses FNV-1a (fixed algorithm) rather than `DefaultHasher` because the
+/// value flows into `VectorTileKey::etag()`, which is transmitted as an
+/// HTTP `ETag` header. A toolchain bump must not silently rotate the bytes
+/// clients replay in `If-None-Match`.
 pub fn properties_hash(allowlist: &PropertyAllowlist) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
+    use crate::hash::{fnv1a_mix, FNV1A_OFFSET};
+    let mut h = FNV1A_OFFSET;
     match allowlist {
-        PropertyAllowlist::All => 0u8.hash(&mut hasher),
+        PropertyAllowlist::All => fnv1a_mix(&mut h, &[0u8]),
         PropertyAllowlist::Subset(set) => {
-            1u8.hash(&mut hasher);
+            fnv1a_mix(&mut h, &[1u8]);
             // Sort for deterministic hashing — HashSet iteration order is random.
             let mut keys: Vec<&String> = set.iter().collect();
             keys.sort();
             for k in keys {
-                k.hash(&mut hasher);
+                fnv1a_mix(&mut h, k.as_bytes());
+                fnv1a_mix(&mut h, b"|");
             }
         }
     }
-    hasher.finish()
+    h
 }
 
 // ---------------------------------------------------------------------------
@@ -625,6 +620,40 @@ mod tests {
         let opts = TileEncodeOptions::new("multi", TmsKind::WebMercatorQuad);
         let bytes = encode_tile(&[f], web_mercator_tile_z0(), &opts).unwrap();
         assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn encode_multipolygon_with_holes() {
+        // Two parts, both with a hole. The encoder must emit
+        // `complete_geom()` before each non-first exterior AND between an
+        // exterior and its hole(s), so the ring separators land in the
+        // right places. Without correct placement either the protobuf is
+        // malformed or the `mvt` crate returns an error.
+        let f = feature(
+            "donuts",
+            Geometry::MultiPolygon {
+                polygons: vec![
+                    (
+                        vec![[-50.0, -10.0], [-40.0, -10.0], [-40.0, 0.0], [-50.0, 0.0]],
+                        vec![vec![
+                            [-48.0, -8.0],
+                            [-42.0, -8.0],
+                            [-42.0, -2.0],
+                            [-48.0, -2.0],
+                        ]],
+                    ),
+                    (
+                        vec![[40.0, 0.0], [50.0, 0.0], [50.0, 10.0], [40.0, 10.0]],
+                        vec![vec![[42.0, 2.0], [48.0, 2.0], [48.0, 8.0], [42.0, 8.0]]],
+                    ),
+                ],
+            },
+            &[],
+        );
+        let opts = TileEncodeOptions::new("donuts", TmsKind::WebMercatorQuad);
+        let bytes = encode_tile(&[f], web_mercator_tile_z0(), &opts).unwrap();
+        assert!(!bytes.is_empty());
+        assert!(slice_contains(&bytes, b"donuts"));
     }
 
     #[test]
