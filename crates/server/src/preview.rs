@@ -493,8 +493,9 @@ fn resolve_temporal_extent(
     // covers geotiff-style engines that expose timestep instants only through
     // their raster surface — without it, a radar collection with EDR enabled
     // would surface a continuous interval but no slider stops.
-    let edr_interval = edr.engines.get(id).and_then(|e| e.get_temporal_extent());
-    let edr_values = edr.engines.get(id).and_then(|e| e.get_available_times());
+    let (edr_interval, edr_values) = edr.engines.get(id).map_or((None, None), |e| {
+        (e.get_temporal_extent(), e.get_available_times())
+    });
 
     let raster_times = maps
         .engines
@@ -1145,6 +1146,86 @@ mod tests {
         );
         assert_eq!(temporal["truncated"], false);
         assert_eq!(temporal["total_values"], 0);
+    }
+
+    #[test]
+    fn temporal_extent_values_fall_back_to_raster_times_when_edr_lacks_them() {
+        // Regression guard for the round-4 fix in `resolve_temporal_extent`.
+        // Some engines (notably geotiff/radar) expose discrete timestep
+        // instants only through their raster surface — `get_available_times`
+        // returns `None`, but `MapEngine::raster_info().times` has the list.
+        // The manifest must merge: take the EDR interval (canonical), and
+        // backfill `values` from raster_info() when EDR doesn't expose them.
+        // Without the fallback, the preview's time slider has no stops to
+        // snap to even though the data has discrete steps.
+        let times = vec![
+            "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            "2024-01-01T01:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            "2024-01-01T02:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+        ];
+
+        struct IntervalOnlyEdr {
+            interval: (DateTime<Utc>, DateTime<Utc>),
+        }
+        impl Engine for IntervalOnlyEdr {
+            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+                Ok(Vec::new())
+            }
+            fn query_location(
+                &self,
+                _: &str,
+                _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                _: Option<&[String]>,
+            ) -> Result<QueryResult, DataServerError> {
+                unimplemented!()
+            }
+            fn get_parameters(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+                Some(self.interval)
+            }
+            fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+                None
+            }
+            // No `get_available_times` override — defaults to `None`.
+        }
+
+        let mut edr = empty_edr();
+        let edr_engine: Arc<dyn Engine> = Arc::new(IntervalOnlyEdr {
+            interval: (times[0], *times.last().unwrap()),
+        });
+        edr.engines.insert("radar".into(), edr_engine);
+        edr.collections
+            .insert("radar".into(), config("radar", &["edr", "tiles"]));
+
+        let mut tiles = empty_tiles();
+        let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            spatial_extent: Some([0.0, 0.0, 10.0, 10.0]),
+            times: times.clone(),
+            parameter: "reflectivity".into(),
+            unit: "dBZ".into(),
+        });
+        tiles.map_engines.insert("radar".into(), raster);
+        tiles
+            .collections
+            .insert("radar".into(), config("radar", &["edr", "tiles"]));
+
+        let state = make_state(edr, empty_features(), empty_maps(), tiles, empty_wms());
+        let m = build_manifest(&state, 0, 100);
+        let temporal = &m["collections"][0]["temporal_extent"];
+
+        assert_eq!(temporal["start"], "2024-01-01T00:00:00+00:00");
+        assert_eq!(temporal["end"], "2024-01-01T02:00:00+00:00");
+        assert_eq!(
+            temporal["values"].as_array().map(|a| a.len()),
+            Some(3),
+            "values must be backfilled from RasterMock.times when EDR's \
+             get_available_times returns None — otherwise the preview slider \
+             has no stops to snap to"
+        );
+        assert_eq!(temporal["total_values"], 3);
+        assert_eq!(temporal["truncated"], false);
     }
 
     #[test]

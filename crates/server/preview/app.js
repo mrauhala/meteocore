@@ -67,11 +67,22 @@
 
     function renderManifest(manifest) {
         const collections = manifest.collections || [];
-        const total = manifest.pagination ? manifest.pagination.total : collections.length;
+        // Honest pagination message — `pagination.total` can exceed the
+        // returned page length (server caps at 100 by default). Showing only
+        // `total` would mislead operators with >100 collections into thinking
+        // every entry is in the sidebar.
+        const rendered = collections.length;
+        const total =
+            manifest.pagination && typeof manifest.pagination.total === 'number'
+                ? manifest.pagination.total
+                : rendered;
+        const noun = total === 1 ? 'collection' : 'collections';
         statusEl.textContent =
             total === 0
                 ? 'No collections registered.'
-                : total + (total === 1 ? ' collection' : ' collections') + ' available';
+                : rendered < total
+                    ? rendered + ' of ' + total + ' ' + noun + ' (paginated)'
+                    : total + ' ' + noun + ' available';
 
         if (collections.length === 0) return;
 
@@ -89,18 +100,25 @@
     function whenStyleReady(map, fn) {
         const MARKER = '__readiness_probe__';
         let done = false;
+        // Gate per-probe-cycle so a failed attempt only ever queues ONE set
+        // of listeners + setTimeout. Without this, every failed attempt
+        // re-registers another 3 `once` callbacks plus a setTimeout — in a
+        // long-throttled tab the subscription count grows without bound.
+        let subscribed = false;
         function attempt() {
             if (done) return;
+            subscribed = false;
             try {
                 map.addSource(MARKER, { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
                 map.removeSource(MARKER);
                 done = true;
                 fn();
             } catch (e) {
+                if (subscribed) return;
+                subscribed = true;
                 // Subscribe to multiple events; throttled tabs may not get
                 // every one. `setTimeout` also reschedules in case all map
-                // events stay silent (Chrome throttles `setInterval` more
-                // aggressively than `setTimeout`).
+                // events stay silent.
                 map.once('styledata', attempt);
                 map.once('data', attempt);
                 map.once('idle', attempt);
@@ -164,7 +182,12 @@
             badges.className = 'badges';
             collection.apis.forEach(function (api) {
                 const badge = document.createElement('span');
-                badge.className = 'badge badge-' + api;
+                // `classList.add` validates each token rather than letting a
+                // space in `api` silently inject an extra class. The known
+                // values never contain whitespace today, but matching the
+                // file-level "every dynamic value reaches the DOM safely"
+                // hygiene comment is cheap.
+                badge.classList.add('badge', 'badge-' + api);
                 badge.textContent = api;
                 badges.appendChild(badge);
             });
@@ -216,6 +239,16 @@
         // (the event sometimes doesn't fire at all), but `styledata`
         // continues to fire as the map updates so it eventually unblocks.
         const layerHandles = [];
+        // Slider has to land *after* the layer handles exist (else its
+        // refresh callback fires against an empty array) AND in the same
+        // microtask sequence as the picker/toggle children (else style-pick
+        // and slider can end up in opposite orders in throttled tabs where
+        // `whenStyleReady` resolves asynchronously). Doing the slider attach
+        // inside the callback addresses both. Guard with a tile-presence
+        // check: an EDR-only collection has a `temporal_extent` but no tile
+        // layer to drive — surfacing a slider there is just noise.
+        const hasTiles =
+            collection.tiles && (collection.tiles.raster || collection.tiles.vector);
         whenStyleReady(map, function () {
             try {
                 if (collection.tiles && collection.tiles.raster) {
@@ -227,6 +260,9 @@
                 if (state.enabled) {
                     layerHandles.forEach(function (h) { h.setVisible(true); });
                 }
+                if (hasTiles && state.timeValues && state.timeValues.length > 1) {
+                    attachTimeSlider(controlsHost, state, layerHandles);
+                }
             } catch (err) {
                 console.error(
                     'Failed to attach layers for collection ' + collection.id + ':',
@@ -234,11 +270,6 @@
                 );
             }
         });
-
-        // -- Time slider --
-        if (state.timeValues && state.timeValues.length > 1) {
-            attachTimeSlider(controlsHost, state, layerHandles);
-        }
 
         // -- Footer: actions --
         const footer = document.createElement('div');
@@ -288,11 +319,19 @@
     }
 
     function formatExtent(e) {
-        // Compact human-readable bbox: "W 19.3°, S 59.8° → E 31.6°, N 70.1°"
-        return (
-            'W ' + e[0].toFixed(2) + '°, S ' + e[1].toFixed(2) + '° → ' +
-            'E ' + e[2].toFixed(2) + '°, N ' + e[3].toFixed(2) + '°'
-        );
+        // Compact human-readable bbox: "19.3°E, 59.8°N → 31.6°E, 70.1°N".
+        // Derive the hemisphere letter from the sign so a western-hemisphere
+        // dataset doesn't render as "W -10.50°" (doubly-signed).
+        return formatLon(e[0]) + ', ' + formatLat(e[1]) + ' → ' +
+               formatLon(e[2]) + ', ' + formatLat(e[3]);
+    }
+
+    function formatLon(lon) {
+        return Math.abs(lon).toFixed(2) + '°' + (lon < 0 ? 'W' : 'E');
+    }
+
+    function formatLat(lat) {
+        return Math.abs(lat).toFixed(2) + '°' + (lat < 0 ? 'S' : 'N');
     }
 
     function formatTimeRange(startIso, endIso) {
