@@ -77,9 +77,11 @@
         fitMapToCollections(collections);
 
         // Stable iteration order matches the manifest, which sorts by id.
-        // First raster layer added goes on top — for radar-over-NWP stacks
-        // this gives the operator the most-detailed product on top by
-        // convention. Operators wanting a different stack can re-order
+        // `map.addLayer()` without `beforeId` appends to the top of the
+        // draw stack, so the *last* collection iterated (alphabetically
+        // latest id) renders on top — same convention as the comment at
+        // `attachRasterLayer` ("collections later in the manifest stack
+        // on top"). Operators wanting a different stack can re-order
         // collections in config.
         collections.forEach(function (c) {
             const li = document.createElement('li');
@@ -141,11 +143,16 @@
         const layerId = 'layer-' + collection.id;
         const initialUrl = tileUrlFor(collection, currentStyle);
 
+        // No `attribution` field: MapLibre renders attribution via
+        // `innerHTML` inside its AttributionControl, so a server config
+        // entry like `title = "<img src=x onerror=alert(1)>"` would
+        // execute script in the preview page. The title already appears
+        // in the sidebar (escaped via `textContent`), so the on-map
+        // attribution is redundant anyway.
         map.addSource(sourceId, {
             type: 'raster',
             tiles: [initialUrl],
-            tileSize: 256,
-            attribution: collection.title || collection.id
+            tileSize: 256
         });
         // Insert above the background but below subsequent layers, so
         // collections later in the manifest stack on top.

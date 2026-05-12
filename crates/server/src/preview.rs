@@ -1336,6 +1336,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_js_does_not_pass_collection_title_as_maplibre_attribution() {
+        // Regression guard for #134 review: MapLibre's AttributionControl
+        // injects the `attribution` field of raster sources via `innerHTML`.
+        // Passing a server-controlled title — e.g.
+        // `title = "<img src=x onerror=alert(1)>"` from a malicious
+        // collection config — would execute script in the preview page.
+        // The title already appears in the sidebar (escaped via
+        // `textContent`), so the source attribution is redundant.
+        let resp = asset_handler(
+            axum::extract::Path("app.js".into()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(
+            !body_str.contains("attribution:"),
+            "app.js sets a raster-source `attribution:` — MapLibre renders \
+             that via innerHTML and would execute script from a malicious \
+             collection title. Drop the field or HTML-escape the value."
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_asset_returns_generic_404_body() {
         // User-supplied path must NOT be reflected (review feedback Phase 2).
         let resp = asset_handler(
