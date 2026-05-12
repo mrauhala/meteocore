@@ -202,6 +202,25 @@ mod tests {
     }
 
     #[test]
+    fn etag_rotates_after_data_refresh() {
+        // Production failure mode the old key-derived ETag was vulnerable to:
+        // a data refresh re-encodes the same tile coordinates with new content,
+        // but the key didn't change → ETag didn't change → browsers with the
+        // previous ETag kept getting 304 Not Modified and rendered stale tiles
+        // until their entries aged out. With content-derived ETags the property
+        // holds by construction (different bytes ⇒ different hash), but pin it
+        // as a guard against any future refactor that resurrects key-derived
+        // semantics.
+        let before = CachedTile::new(Bytes::from_static(b"\x1a\x05before"));
+        let after = CachedTile::new(Bytes::from_static(b"\x1a\x04after"));
+        assert_ne!(
+            before.etag, after.etag,
+            "post-refresh ETag must differ from pre-refresh — otherwise If-None-Match \
+             returns 304 and the client never sees the refreshed tile"
+        );
+    }
+
+    #[test]
     fn distinct_property_hashes_dont_collide() {
         let cache = VectorTileCache::new(1);
         let mut k1 = key(2, 1, 1);

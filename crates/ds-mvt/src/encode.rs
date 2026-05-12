@@ -311,12 +311,16 @@ impl ClipRect {
     }
 }
 
+/// `MinY` / `MaxY` rather than `Top` / `Bottom`: tile coordinates are
+/// y-down (y=0 at the top of the screen), so screen-relative "top" maps
+/// to `MinY` — opposite of what most readers would assume. Labelling by
+/// the literal numeric bound removes the ambiguity.
 #[derive(Debug, Clone, Copy)]
 enum ClipEdge {
     Left(f64),
     Right(f64),
-    Bottom(f64),
-    Top(f64),
+    MinY(f64),
+    MaxY(f64),
 }
 
 impl ClipEdge {
@@ -324,8 +328,8 @@ impl ClipEdge {
         match *self {
             ClipEdge::Left(v) => p.0 >= v,
             ClipEdge::Right(v) => p.0 <= v,
-            ClipEdge::Bottom(v) => p.1 >= v,
-            ClipEdge::Top(v) => p.1 <= v,
+            ClipEdge::MinY(v) => p.1 >= v,
+            ClipEdge::MaxY(v) => p.1 <= v,
         }
     }
 
@@ -335,7 +339,7 @@ impl ClipEdge {
                 let t = (v - a.0) / (b.0 - a.0);
                 (v, a.1 + t * (b.1 - a.1))
             }
-            ClipEdge::Bottom(v) | ClipEdge::Top(v) => {
+            ClipEdge::MinY(v) | ClipEdge::MaxY(v) => {
                 let t = (v - a.1) / (b.1 - a.1);
                 (a.0 + t * (b.0 - a.0), v)
             }
@@ -352,8 +356,8 @@ fn sutherland_hodgman(ring: &[(f64, f64)], clip: &ClipRect) -> Vec<(f64, f64)> {
     let edges = [
         ClipEdge::Left(clip.min_x),
         ClipEdge::Right(clip.max_x),
-        ClipEdge::Bottom(clip.min_y),
-        ClipEdge::Top(clip.max_y),
+        ClipEdge::MinY(clip.min_y),
+        ClipEdge::MaxY(clip.max_y),
     ];
     let mut output = ring.to_vec();
     for edge in edges {
@@ -946,28 +950,34 @@ mod tests {
 
     #[test]
     fn polygon_crossing_tile_edge_stays_within_buffer() {
-        // Polygon spans far beyond the tile. After clipping, all coords must
-        // be inside the buffered extent — MapLibre rejects features whose
-        // coords exceed `[-buffer, extent+buffer]`.
-        let f = feature(
-            "huge",
-            Geometry::Polygon {
-                // Whole northern hemisphere — way larger than the tile.
-                exterior: vec![[-180.0, 0.0], [180.0, 0.0], [180.0, 80.0], [-180.0, 80.0]],
-                holes: vec![],
-            },
-            &[],
+        // End-to-end check: projection + clip_ring on a real-world ring
+        // must constrain every output coordinate to the buffered envelope.
+        // The mvt crate doesn't expose a decoder, so we exercise the same
+        // pipeline the encoder runs (`Projector::new` → `clip_ring`) and
+        // inspect the projected/clipped coordinates directly. A failure
+        // here would mean encode_tile emits coords outside the buffer —
+        // MapLibre would refuse to render the feature.
+        let extent: u32 = 4096;
+        let proj =
+            Projector::new(TmsKind::WebMercatorQuad, [10.0, 50.0, 11.0, 51.0], extent).unwrap();
+        let clip = ClipRect::for_extent(extent);
+        // Northern-hemisphere band — far wider than the small tile at (10,50)-(11,51).
+        let ring = [[-180.0, 0.0], [180.0, 0.0], [180.0, 80.0], [-180.0, 80.0]];
+        let clipped = clip_ring(&ring, &proj, &clip, RingRole::Exterior);
+        assert!(
+            !clipped.is_empty(),
+            "polygon fully encloses the tile — clipped ring should not be empty"
         );
-        let opts = TileEncodeOptions::new("clip", TmsKind::WebMercatorQuad);
-        // A small tile somewhere in the middle.
-        let bytes = encode_tile(&[f], [10.0, 50.0, 11.0, 51.0], &opts).unwrap();
-        assert!(slice_contains(&bytes, b"clip"));
-        // The tile fully contains the polygon's bbox, so the encoded ring's
-        // tile-local coords must fall within `[-CLIP_BUFFER, extent + CLIP_BUFFER]`.
-        // We verify indirectly: a brittle byte-level decode would tie this test
-        // to the mvt crate. Roundtripping via mvt::Tile would be cleaner, but
-        // the encoder's contract is "no coord outside the buffer"; the
-        // Sutherland-Hodgman unit tests below cover the actual clipping math.
+        for &(x, y) in &clipped {
+            assert!(
+                x >= -CLIP_BUFFER && x <= extent as f64 + CLIP_BUFFER,
+                "clipped x out of buffered range: {x}"
+            );
+            assert!(
+                y >= -CLIP_BUFFER && y <= extent as f64 + CLIP_BUFFER,
+                "clipped y out of buffered range: {y}"
+            );
+        }
     }
 
     #[test]
