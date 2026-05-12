@@ -64,7 +64,16 @@ pub async fn manifest_handler(
 
     // Size guard — log only, never reject; pagination defaults already prevent
     // pathological responses, and the soft warn lets operators see drift early.
-    let body = serde_json::to_vec(&manifest).unwrap_or_else(|_| b"{}".to_vec());
+    //
+    // `serde_json::to_vec` on a `serde_json::Value` essentially never fails
+    // (the input is already validated JSON), but if it does we log and fall
+    // back to `{}` rather than 500-ing the request — preview UIs can keep
+    // rendering whatever cached snapshot they hold while operators see the
+    // error in logs.
+    let body = serde_json::to_vec(&manifest).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "preview manifest JSON serialisation failed");
+        b"{}".to_vec()
+    });
     if body.len() > MANIFEST_WARN_BYTES {
         tracing::warn!(
             "preview manifest body is {} bytes ({} collections, offset={}, limit={}); \
@@ -86,14 +95,30 @@ pub async fn manifest_handler(
 /// Build a denormalized inventory across every per-API `*State`.
 ///
 /// Pure: takes `&AdminState`, returns JSON. Used by the handler and by tests.
-pub fn build_manifest(state: &AdminState, offset: usize, limit: usize) -> Value {
+///
+/// **Snapshot semantics.** The five `load_full()` calls below are *not*
+/// atomic — a concurrent `POST /admin/collections/reload` racing between
+/// them can produce a torn snapshot where a collection is in EDR's view
+/// but not Tiles' (or vice versa). The cost would be momentarily-wrong
+/// `apis[]`/extents on the next request after a reload; the LRU clears
+/// once all five `ArcSwap`s settle. This is an accepted trade-off of
+/// the per-API `ArcSwap` pattern — wrapping all five in a single outer
+/// `ArcSwap` would fix it but is out of scope for this PR.
+pub(crate) fn build_manifest(state: &AdminState, offset: usize, limit: usize) -> Value {
     let edr = state.edr.load_full();
     let features = state.features.load_full();
     let maps = state.maps.load_full();
     let tiles = state.tiles.load_full();
     let wms = state.wms.load_full();
 
-    let base_url = edr.base_url.clone();
+    // All five `*State.base_url` fields are initialised from the same
+    // `config.server.base_url()` at load time, so any of them is correct
+    // in practice. Sourcing from `tiles.base_url` makes the dependency
+    // explicit: this function builds tile URL templates, so it reads
+    // base_url from the state that owns those URLs. A tile-only
+    // deployment with no EDR collections would now stay correct if
+    // per-API base-URL overrides ever land.
+    let base_url = tiles.base_url.clone();
 
     // Build the canonical id ordering: union of all *State.collections keys,
     // sorted lexicographically. Stable across reloads when configs are stable.
@@ -160,13 +185,26 @@ fn build_entry(
         "apis": apis,
     });
 
-    if let Some(extent) = resolve_spatial_extent(id, edr, features, maps, tiles) {
+    if let Some(extent) = resolve_spatial_extent(id, edr, features, maps, tiles, wms) {
         entry["spatial_extent"] = json!(extent);
     }
 
-    if let Some(temporal) = resolve_temporal_extent(id, edr, maps, tiles) {
+    if let Some(temporal) = resolve_temporal_extent(id, edr, maps, tiles, wms) {
         entry["temporal_extent"] = temporal;
     }
+
+    // Style source precedence is shared between the top-level `styles[]`
+    // list and the `default_style` inside the raster tile descriptor —
+    // otherwise a `default_style` could reference a style absent from
+    // `styles[]`, and a UI client would build a 404-producing styled-tile
+    // URL. `maps` first (it owns the canonical Maps styles), `tiles`
+    // second (independent style set when only Tiles is wired), `wms`
+    // third (WMS-only collections still expose colormaps via `[wms]`).
+    let effective_styles = maps
+        .styles
+        .get(id)
+        .or_else(|| tiles.styles.get(id))
+        .or_else(|| wms.styles.get(id));
 
     // Tile representations — emit only what's actually wired up so the UI
     // doesn't render a layer toggle for a dead endpoint.
@@ -177,16 +215,14 @@ fn build_entry(
     if tiles.map_engines.contains_key(id) {
         tile_block.insert(
             "raster".into(),
-            raster_tile_descriptor(id, base_url, tiles.styles.get(id)),
+            raster_tile_descriptor(id, base_url, effective_styles),
         );
     }
     if !tile_block.is_empty() {
         entry["tiles"] = Value::Object(tile_block);
     }
 
-    if let Some(styles) = maps.styles.get(id) {
-        entry["styles"] = json!(style_list(styles));
-    } else if let Some(styles) = tiles.styles.get(id) {
+    if let Some(styles) = effective_styles {
         entry["styles"] = json!(style_list(styles));
     }
 
@@ -210,12 +246,14 @@ fn first_config<'a>(
         .or_else(|| wms.collections.get(id))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_spatial_extent(
     id: &str,
     edr: &api_edr::handlers::EdrState,
     features: &api_features::handlers::FeaturesState,
     maps: &api_maps::handlers::MapsState,
     tiles: &api_tiles::handlers::TilesState,
+    wms: &api_wms::handlers::WmsState,
 ) -> Option<[f64; 4]> {
     if let Some(engine) = edr.engines.get(id) {
         if let Some(bbox) = engine.get_spatial_extent() {
@@ -242,6 +280,12 @@ fn resolve_spatial_extent(
             return Some(bbox);
         }
     }
+    // WMS-only collection — same `MapEngine` interface as Maps/Tiles.
+    if let Some(engine) = wms.engines.get(id) {
+        if let Some(bbox) = engine.raster_info().spatial_extent {
+            return Some(bbox);
+        }
+    }
     None
 }
 
@@ -250,11 +294,12 @@ fn resolve_temporal_extent(
     edr: &api_edr::handlers::EdrState,
     maps: &api_maps::handlers::MapsState,
     tiles: &api_tiles::handlers::TilesState,
+    wms: &api_wms::handlers::WmsState,
 ) -> Option<Value> {
     // EDR is the canonical temporal source — it carries both interval and
-    // explicit instants. Maps/Tiles raster_info().times is the fallback when
-    // a collection isn't EDR-enabled (e.g. radar collections without an EDR
-    // surface).
+    // explicit instants. Maps/Tiles/WMS `raster_info().times` is the
+    // fallback when a collection isn't EDR-enabled (e.g. radar collections
+    // exposed only via WMS).
     if let Some(engine) = edr.engines.get(id) {
         let interval = engine.get_temporal_extent();
         let values = engine.get_available_times();
@@ -267,7 +312,8 @@ fn resolve_temporal_extent(
         .engines
         .get(id)
         .map(|e| e.raster_info().times)
-        .or_else(|| tiles.map_engines.get(id).map(|e| e.raster_info().times));
+        .or_else(|| tiles.map_engines.get(id).map(|e| e.raster_info().times))
+        .or_else(|| wms.engines.get(id).map(|e| e.raster_info().times));
     if let Some(times) = times_from_raster {
         if !times.is_empty() {
             let interval = times.first().zip(times.last()).map(|(a, b)| (*a, *b));
@@ -301,11 +347,16 @@ fn serialize_temporal(
     Value::Object(obj)
 }
 
+// Template placeholders match the axum route variables registered by
+// api-tiles (`/collections/{id}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}`).
+// Using `{tms}` and `{z}` here would yield a path that the server rejects
+// with a 404 — even though the URL looks "tile-shaped" it doesn't match
+// the registered route names.
 fn vector_tile_descriptor(id: &str, base_url: &str) -> Value {
     json!({
         "tile_matrix_sets": ["WebMercatorQuad", "WorldCRS84Quad"],
         "url_template": format!(
-            "{base_url}/tiles/collections/{id}/tiles/{{tms}}/{{z}}/{{tileRow}}/{{tileCol}}?f=mvt"
+            "{base_url}/tiles/collections/{id}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}?f=mvt"
         ),
         "media_type": "application/vnd.mapbox-vector-tile"
     })
@@ -323,10 +374,10 @@ fn raster_tile_descriptor(
     json!({
         "tile_matrix_sets": ["WebMercatorQuad", "WorldCRS84Quad"],
         "url_template": format!(
-            "{base_url}/tiles/collections/{id}/tiles/{{tms}}/{{z}}/{{tileRow}}/{{tileCol}}"
+            "{base_url}/tiles/collections/{id}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
         ),
         "styled_url_template": format!(
-            "{base_url}/tiles/collections/{id}/styles/{{styleId}}/tiles/{{tms}}/{{z}}/{{tileRow}}/{{tileCol}}"
+            "{base_url}/tiles/collections/{id}/styles/{{styleId}}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
         ),
         "default_style": default_style,
         "media_type": "image/png"
@@ -650,6 +701,10 @@ mod tests {
     #[test]
     fn manifest_emits_vector_and_raster_tile_descriptors_when_wired() {
         let mut tiles = empty_tiles();
+        // Seed a realistic base_url so the assertions can verify the full
+        // `https://…` prefix. An empty base would silently absorb a future
+        // regression that drops the base from the URL template.
+        tiles.base_url = "https://api.example.com".into();
         let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
             spatial_extent: Some([-180.0, -85.0, 180.0, 85.0]),
             times: vec![],
@@ -688,11 +743,19 @@ mod tests {
             .collect();
 
         // Raster-only collection: tiles.raster present, tiles.vector absent.
+        // URL template must carry the absolute base + the *route's* literal
+        // path variable names — `{tileMatrixSetId}`/`{tileMatrix}`, not the
+        // generic `{tms}`/`{z}` that don't match the axum route.
         let radar = by_id["radar"];
-        assert!(radar["tiles"]["raster"]["url_template"]
-            .as_str()
-            .unwrap()
-            .contains("/tiles/collections/radar/tiles/"));
+        let raster_url = radar["tiles"]["raster"]["url_template"].as_str().unwrap();
+        assert!(
+            raster_url.starts_with("https://api.example.com/tiles/collections/radar/tiles/"),
+            "raster url_template must carry the absolute base, got: {raster_url}"
+        );
+        assert!(
+            raster_url.contains("{tileMatrixSetId}") && raster_url.contains("{tileMatrix}"),
+            "raster url_template must use the axum route's placeholder names, got: {raster_url}"
+        );
         assert!(radar["tiles"].get("vector").is_none());
 
         // Vector-only collection: tiles.vector present with ?f=mvt; tiles.raster absent.
@@ -700,7 +763,14 @@ mod tests {
         let vector_url = stations["tiles"]["vector"]["url_template"]
             .as_str()
             .unwrap();
-        assert!(vector_url.contains("/tiles/collections/stations/tiles/"));
+        assert!(
+            vector_url.starts_with("https://api.example.com/tiles/collections/stations/tiles/"),
+            "vector url_template must carry the absolute base, got: {vector_url}"
+        );
+        assert!(
+            vector_url.contains("{tileMatrixSetId}") && vector_url.contains("{tileMatrix}"),
+            "vector url_template must use the axum route's placeholder names, got: {vector_url}"
+        );
         assert!(vector_url.contains("f=mvt"));
         assert!(stations["tiles"].get("raster").is_none());
     }
@@ -772,5 +842,73 @@ mod tests {
             m["collections"][0]["apis"],
             serde_json::json!(["edr", "features"])
         );
+    }
+
+    #[test]
+    fn wms_only_collection_surfaces_extent_and_styles() {
+        // Regression guard for the discovery gap flagged in review: a
+        // collection with `apis = ["wms"]` only (no EDR/Maps/Tiles
+        // surface) must still get its extent + temporal + styles fields
+        // populated from the WMS state.
+        let mut wms = empty_wms();
+        let times = vec![
+            "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            "2024-01-01T01:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+        ];
+        let engine: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
+            times: times.clone(),
+            parameter: "reflectivity".into(),
+            unit: "dBZ".into(),
+        });
+        wms.engines.insert("radar-wms".into(), engine);
+        wms.collections
+            .insert("radar-wms".into(), config("radar-wms", &["wms"]));
+        let mut styles = HashMap::new();
+        styles.insert(
+            "default".to_string(),
+            ds_render::StyleInfo {
+                name: "default".to_string(),
+                title: "Default".to_string(),
+                colormap: Arc::new(ds_render::LutColorMap::from_builtin(
+                    ds_render::BuiltinColormap::Viridis,
+                    0.0,
+                    1.0,
+                )),
+                min: 0.0,
+                max: 1.0,
+                parameter: None,
+            },
+        );
+        wms.styles.insert("radar-wms".into(), styles);
+
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            empty_tiles(),
+            wms,
+        );
+        let m = build_manifest(&state, 0, 100);
+        let c = &m["collections"][0];
+        assert_eq!(c["id"], "radar-wms");
+        assert_eq!(c["apis"], serde_json::json!(["wms"]));
+        assert_eq!(
+            c["spatial_extent"],
+            serde_json::json!([10.0, 55.0, 30.0, 70.0])
+        );
+        let temporal = &c["temporal_extent"];
+        assert!(
+            temporal["start"].is_string(),
+            "WMS-only collection should expose temporal start, got: {temporal}"
+        );
+        assert_eq!(temporal["total_values"], 2);
+        let styles_array = c["styles"].as_array().expect("styles must be present");
+        assert_eq!(styles_array.len(), 1);
+        assert_eq!(styles_array[0]["id"], "default");
+        // WMS-only collections have no `tiles` block (no MVT or raster-tile
+        // route exists). Worth asserting because a future refactor might
+        // accidentally synthesise one.
+        assert!(c.get("tiles").is_none());
     }
 }
