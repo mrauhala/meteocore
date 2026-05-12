@@ -235,6 +235,17 @@
         if (useStyled) {
             template = template.replace('{styleId}', encodeURIComponent(styleId));
         }
+        // Coerce to a same-origin path. The manifest emits absolute URLs
+        // built from `server.base_url` (e.g. `http://127.0.0.1:8000/…`),
+        // but the user may access the preview on a different origin
+        // (`http://localhost:8000/…`). CSP `connect-src 'self'` matches
+        // origins literally, so a 127.0.0.1↔localhost mismatch blocks
+        // every tile request. The preview SPA is always served by the
+        // same binary that serves the tiles, so dropping the origin and
+        // letting the browser resolve against the page's location is
+        // always safe — and survives the dev-mode host alias and any
+        // reverse-proxy host rewriting.
+        template = template.replace(/^https?:\/\/[^/]+/i, '');
         return template;
     }
 })();
