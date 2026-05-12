@@ -550,6 +550,14 @@
         // Default to the latest timestep so an opt-in toggle shows current
         // conditions, matching the server's default `&time=` resolution.
         state.timeIndex = values.length - 1;
+        // Track the index that's been pushed to the source so we can skip a
+        // no-op refresh when the user scrubs and returns to the same step
+        // (each setTiles call re-fetches the visible tiles even with the
+        // same URL).
+        let appliedIndex = state.timeIndex;
+        // Debounce handle: rapid release events on the slider collapse to
+        // one server-side render burst instead of N piled-up bursts.
+        let pendingRefresh = null;
 
         const row = document.createElement('div');
         row.className = 'time-slider';
@@ -575,9 +583,15 @@
             valueLabel.textContent = formatSliderTime(values[state.timeIndex]);
         });
         input.addEventListener('change', function () {
-            layerHandles.forEach(function (h) {
-                if (h.refreshForTime) h.refreshForTime();
-            });
+            if (pendingRefresh !== null) clearTimeout(pendingRefresh);
+            pendingRefresh = setTimeout(function () {
+                pendingRefresh = null;
+                if (state.timeIndex === appliedIndex) return;
+                appliedIndex = state.timeIndex;
+                layerHandles.forEach(function (h) {
+                    if (h.refreshForTime) h.refreshForTime();
+                });
+            }, 200);
         });
         row.appendChild(input);
 
