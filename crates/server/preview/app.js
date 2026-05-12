@@ -431,14 +431,24 @@
         // (`{tileMatrixSetId}` / `{tileMatrix}` / `{tileRow}` / `{tileCol}`,
         // not the generic `{tms}` / `{z}`). Plus the URL already carries
         // `?f=mvt` from the manifest, so MapLibre fetches MVT-encoded
-        // bytes. Finally, strip the absolute origin so a 127.0.0.1↔
-        // localhost mismatch doesn't trip CSP `connect-src 'self'`.
+        // bytes.
         let template = collection.tiles.vector.url_template;
         template = template.replace('{tileMatrixSetId}', 'WebMercatorQuad');
         template = template.replace('{tileMatrix}', '{z}');
         template = template.replace('{tileRow}', '{y}');
         template = template.replace('{tileCol}', '{x}');
+        // Vector tiles are loaded inside a MapLibre Web Worker, which
+        // has no `document` base to resolve relative URLs against and
+        // rejects them with "URL is not valid or contains user
+        // credentials". Re-anchor to `window.location.origin` so:
+        //   (a) the worker receives a fully-qualified URL it can parse,
+        //   (b) the host always matches the page's origin, sidestepping
+        //       any 127.0.0.1↔localhost mismatch from `server.base_url`,
+        //       which CSP `connect-src 'self'` would otherwise refuse.
+        // Strip whatever origin the manifest emitted, then prefix the
+        // page's. Idempotent on path-only manifests.
         template = template.replace(/^https?:\/\/[^/]+/i, '');
+        template = window.location.origin + template;
         return template;
     }
 
