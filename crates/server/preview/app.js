@@ -204,6 +204,15 @@
                 const source = map.getSource(sourceId);
                 if (source && typeof source.setTiles === 'function') {
                     source.setTiles([url]);
+                } else {
+                    // Silent failure would leave the dropdown out of sync
+                    // with the rendered tiles. Vendored MapLibre 5.24.0 does
+                    // expose `setTiles`, so this only fires if the binary is
+                    // re-vendored against a build that dropped the API.
+                    console.warn(
+                        'MapLibre source.setTiles unavailable; style swap ' +
+                        'requested for ' + collection.id + ' did not apply.'
+                    );
                 }
             });
             styleLabel.appendChild(select);
@@ -226,6 +235,13 @@
     // raster source supports today.
     function tileUrlFor(collection, styleId) {
         const raster = collection.tiles.raster;
+        // The `default` style is rendered by the plain `/tiles/...` route,
+        // not by `/styles/default/tiles/...`. Both endpoints currently
+        // produce identical bytes, but the plain one bypasses the style
+        // lookup entirely and is the canonical URL — picking it here keeps
+        // network traces and HTTP-cache keys consistent across the default
+        // case whether a user has explicitly selected "default" or never
+        // touched the picker.
         const useStyled = styleId && styleId !== 'default' && raster.styled_url_template;
         let template = useStyled ? raster.styled_url_template : raster.url_template;
         template = template.replace('{tileMatrixSetId}', 'WebMercatorQuad');

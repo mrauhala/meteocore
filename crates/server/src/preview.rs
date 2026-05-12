@@ -613,8 +613,15 @@ fn style_list(styles: &std::collections::HashMap<String, ds_render::StyleInfo>) 
         .into_iter()
         .filter_map(|name| {
             styles.get(name).map(|s| {
+                // `id` is the HashMap key (`name`), not `s.name`. The client
+                // round-trips this back as `{styleId}` and the API resolves
+                // it via `layer_styles.get(...)` — i.e. by key. These two
+                // strings happen to be identical in every config today, but
+                // using the iterated key here removes the implicit
+                // "name field must equal map key" invariant: a future
+                // refactor where they diverge would otherwise 404 silently.
                 json!({
-                    "id": s.name,
+                    "id": name,
                     "title": s.title,
                 })
             })
