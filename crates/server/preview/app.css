@@ -46,22 +46,65 @@ html, body {
     list-style: none;
 }
 
-#sidebar li {
-    padding: 8px 0;
+#sidebar li.collection {
+    padding: 10px 0;
     border-top: 1px solid #edf2f7;
-    font-size: 13px;
 }
 
-#sidebar li .title {
-    display: block;
+.collection-header {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.collection-header .title {
     font-weight: 500;
+    font-size: 13px;
     color: #2d3748;
 }
 
-#sidebar li .apis {
-    display: inline-block;
-    margin-top: 2px;
+.collection-header .apis {
     font-size: 11px;
     color: #718096;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.controls {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 8px;
+    font-size: 12px;
+}
+
+.controls label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: #4a5568;
+}
+
+.controls input[type="checkbox"] {
+    margin: 0;
+    cursor: pointer;
+}
+
+.controls .style-picker {
+    justify-content: space-between;
+}
+
+.controls select {
+    flex: 1;
+    margin-left: 8px;
+    padding: 2px 6px;
+    font-size: 12px;
+    border: 1px solid #cbd5e0;
+    border-radius: 4px;
+    background: white;
+    cursor: pointer;
+}
+
+.controls select:focus {
+    outline: 2px solid #4299e1;
+    outline-offset: -1px;
 }

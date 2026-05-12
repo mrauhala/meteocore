@@ -580,15 +580,23 @@ fn raster_tile_descriptor(
     // styles registered — otherwise a SPA following `styled_url_template`
     // with `default_style` would hit a 404. Default-style preference: a
     // style literally named "default", else the first style by sorted name.
+    //
+    // Source-of-truth: the API resolves `{styleId}` via
+    // `layer_styles.get(style_name)` — a HashMap lookup *by key*. So
+    // `default_style` must name a key, not a `StyleInfo.name`. The two
+    // strings match in every config today, but using the key here
+    // removes the implicit "name field equals map key" invariant —
+    // matches the same fix in `style_list`.
     if let Some(styles) = styles {
-        if let Some(default_style) = styles.get("default").map(|s| s.name.as_str()).or_else(|| {
-            let mut names: Vec<&String> = styles.keys().collect();
-            names.sort();
-            names
-                .first()
-                .and_then(|n| styles.get(*n))
-                .map(|s| s.name.as_str())
-        }) {
+        if let Some(default_style) = styles
+            .get_key_value("default")
+            .map(|(k, _)| k.as_str())
+            .or_else(|| {
+                let mut names: Vec<&String> = styles.keys().collect();
+                names.sort();
+                names.first().map(|n| n.as_str())
+            })
+        {
             desc["default_style"] = json!(default_style);
             desc["styled_url_template"] = json!(format!(
                 "{base_url}/tiles/collections/{id}/styles/{{styleId}}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
@@ -613,8 +621,15 @@ fn style_list(styles: &std::collections::HashMap<String, ds_render::StyleInfo>) 
         .into_iter()
         .filter_map(|name| {
             styles.get(name).map(|s| {
+                // `id` is the HashMap key (`name`), not `s.name`. The client
+                // round-trips this back as `{styleId}` and the API resolves
+                // it via `layer_styles.get(...)` — i.e. by key. These two
+                // strings happen to be identical in every config today, but
+                // using the iterated key here removes the implicit
+                // "name field must equal map key" invariant: a future
+                // refactor where they diverge would otherwise 404 silently.
                 json!({
-                    "id": s.name,
+                    "id": name,
                     "title": s.title,
                 })
             })
@@ -1294,6 +1309,140 @@ mod tests {
         assert_eq!(
             resp.headers().get(header::CACHE_CONTROL).unwrap(),
             "public, max-age=300, must-revalidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn raster_url_template_carries_all_four_ogc_placeholders() {
+        // Contract test for the server side of the manifest↔JS handshake:
+        // `tileUrlFor()` in `app.js` rewrites four OGC placeholder names
+        // into MapLibre's `{z}/{x}/{y}` form. If the server ever stops
+        // emitting any one of them, the consumer breaks silently with
+        // every tile 404'ing on a literal `{tileMatrix}` segment.
+        //
+        // This locks the four placeholder names at the contract layer —
+        // brittle JS-source assertions are no longer needed to catch the
+        // same regression.
+        let mut styles = HashMap::new();
+        styles.insert(
+            "rainbow".to_string(),
+            ds_render::StyleInfo {
+                name: "rainbow".to_string(),
+                title: "Rainbow".to_string(),
+                colormap: Arc::new(ds_render::LutColorMap::from_builtin(
+                    ds_render::BuiltinColormap::Viridis,
+                    0.0,
+                    1.0,
+                )),
+                min: 0.0,
+                max: 1.0,
+                parameter: None,
+            },
+        );
+        let desc = raster_tile_descriptor("radar", "http://localhost:8000", Some(&styles));
+
+        let raster_url = desc["url_template"].as_str().expect("url_template");
+        for needle in [
+            "{tileMatrixSetId}",
+            "{tileMatrix}",
+            "{tileRow}",
+            "{tileCol}",
+        ] {
+            assert!(
+                raster_url.contains(needle),
+                "manifest url_template missing OGC placeholder {needle}: {raster_url}"
+            );
+        }
+
+        let styled_url = desc["styled_url_template"]
+            .as_str()
+            .expect("styled_url_template");
+        for needle in [
+            "{styleId}",
+            "{tileMatrixSetId}",
+            "{tileMatrix}",
+            "{tileRow}",
+            "{tileCol}",
+        ] {
+            assert!(
+                styled_url.contains(needle),
+                "manifest styled_url_template missing placeholder {needle}: {styled_url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn app_js_rewrites_ogc_tile_placeholders_for_maplibre() {
+        // Companion to `raster_url_template_carries_all_four_ogc_placeholders`:
+        // that test pins the contract on the *server* side; this one
+        // verifies the *client* still rewrites the same four placeholder
+        // names into MapLibre's `{z}/{x}/{y}` form. Missing any one of
+        // the four turns every tile request into a 404 because the path
+        // is left with literal `{tile…}` segments that no route matches.
+        //
+        // **The assertions below match literal app.js source text.** This
+        // is intentional and the tradeoff is known: a whitespace change,
+        // quote-style flip, or refactor that hoists the substitutions
+        // into a table/helper will break this test without indicating a
+        // real regression. If you hit that, fix the test rather than the
+        // strings — the contract being verified is "all four placeholder
+        // names are mapped to their MapLibre equivalents," and the
+        // server-side contract test already guards the placeholder
+        // *names*. Do NOT "fix" a failure by deleting an expected
+        // substitution unless the manifest stopped emitting it.
+        let resp = asset_handler(
+            axum::extract::Path("app.js".into()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        for needle in [
+            "'{tileMatrixSetId}', 'WebMercatorQuad'",
+            "'{tileMatrix}', '{z}'",
+            "'{tileRow}', '{y}'",
+            "'{tileCol}', '{x}'",
+        ] {
+            assert!(
+                body_str.contains(needle),
+                "app.js missing tile placeholder substitution: {needle}"
+            );
+        }
+        // Negative guard: the legacy `{tms}` shortcut must NOT reappear
+        // in the substitution targets — the manifest no longer uses it,
+        // so any code referencing it is a stale-doc bug.
+        assert!(
+            !body_str.contains("'{tms}'"),
+            "app.js still references legacy `{{tms}}` placeholder (manifest emits `{{tileMatrixSetId}}`)"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_js_does_not_pass_collection_title_as_maplibre_attribution() {
+        // Regression guard for #134 review: MapLibre's AttributionControl
+        // injects the `attribution` field of raster sources via `innerHTML`.
+        // Passing a server-controlled title — e.g.
+        // `title = "<img src=x onerror=alert(1)>"` from a malicious
+        // collection config — would execute script in the preview page.
+        // The title already appears in the sidebar (escaped via
+        // `textContent`), so the source attribution is redundant.
+        let resp = asset_handler(
+            axum::extract::Path("app.js".into()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(
+            !body_str.contains("attribution:"),
+            "app.js sets a raster-source `attribution:` — MapLibre renders \
+             that via innerHTML and would execute script from a malicious \
+             collection title. Drop the field or HTML-escape the value."
         );
     }
 
