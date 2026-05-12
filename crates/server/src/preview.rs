@@ -260,11 +260,18 @@ pub async fn manifest_handler(
     // `POST /admin/collections/reload` any cached copy (browser, CDN,
     // intermediary) would mask the new state until its TTL expires.
     // Cheaper to re-fetch every load than to debug stale-cache reports.
+    // `nosniff` is paranoia for `application/json` (no browser MIME-sniffs
+    // JSON) but matching `serve_asset`'s 200/304/404 paths keeps the
+    // security-header surface uniform across the entire `/preview` route.
     (
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "application/json"),
             (header::CACHE_CONTROL, "no-store"),
+            (
+                header::HeaderName::from_static("x-content-type-options"),
+                "nosniff",
+            ),
         ],
         body,
     )
@@ -1365,6 +1372,11 @@ mod tests {
         assert_eq!(
             resp.headers().get(header::CACHE_CONTROL).unwrap(),
             "no-store"
+        );
+        assert_eq!(
+            resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff",
+            "manifest_handler must mirror nosniff applied by serve_asset"
         );
     }
 
