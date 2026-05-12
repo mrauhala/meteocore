@@ -165,6 +165,11 @@ fn encode_geometry(geom: &Geometry, proj: &Projector) -> Result<Option<mvt::Geom
             let mut enc = GeomEncoder::<f64>::new(GeomType::Polygon);
             push_ring(&mut enc, exterior, proj, RingRole::Exterior)?;
             for hole in holes {
+                // Same zero-point trap as the exterior: an empty hole would
+                // make `complete_geom`/`complete` close a ring with no points.
+                if hole.is_empty() {
+                    continue;
+                }
                 enc.complete_geom()?;
                 push_ring(&mut enc, hole, proj, RingRole::Hole)?;
             }
@@ -188,6 +193,9 @@ fn encode_geometry(geom: &Geometry, proj: &Projector) -> Result<Option<mvt::Geom
                 }
                 push_ring(&mut enc, exterior, proj, RingRole::Exterior)?;
                 for hole in holes {
+                    if hole.is_empty() {
+                        continue;
+                    }
                     enc.complete_geom()?;
                     push_ring(&mut enc, hole, proj, RingRole::Hole)?;
                 }
@@ -647,6 +655,39 @@ mod tests {
         let opts = TileEncodeOptions::new("polys", TmsKind::WebMercatorQuad);
         let bytes = encode_tile(&[f], web_mercator_tile_z0(), &opts).unwrap();
         assert!(!slice_contains(&bytes, b"all-empty"));
+    }
+
+    #[test]
+    fn empty_hole_rings_are_skipped() {
+        // A polygon with a valid exterior but an empty hole would otherwise
+        // close a zero-point ring inside `enc.complete_geom()`. Both the
+        // `Polygon` and `MultiPolygon` arms must guard against this.
+        let single = feature(
+            "polygon-empty-hole",
+            Geometry::Polygon {
+                exterior: vec![[-5.0, -5.0], [5.0, -5.0], [5.0, 5.0], [-5.0, 5.0]],
+                holes: vec![vec![]],
+            },
+            &[],
+        );
+        let multi = feature(
+            "multi-empty-hole",
+            Geometry::MultiPolygon {
+                polygons: vec![(
+                    vec![[-5.0, -5.0], [5.0, -5.0], [5.0, 5.0], [-5.0, 5.0]],
+                    vec![vec![]],
+                )],
+            },
+            &[],
+        );
+        let opts = TileEncodeOptions::new("polys", TmsKind::WebMercatorQuad);
+        let bytes_single = encode_tile(&[single], web_mercator_tile_z0(), &opts).unwrap();
+        let bytes_multi = encode_tile(&[multi], web_mercator_tile_z0(), &opts).unwrap();
+        // Both succeed (no encoder error) and the exterior is preserved —
+        // we look for the layer name as a proxy because feature ids are
+        // strings that don't parse to u64.
+        assert!(slice_contains(&bytes_single, b"polys"));
+        assert!(slice_contains(&bytes_multi, b"polys"));
     }
 
     #[test]
