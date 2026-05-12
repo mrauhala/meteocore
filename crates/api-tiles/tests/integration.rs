@@ -661,6 +661,87 @@ mod mvt {
         api_tiles::router(state)
     }
 
+    /// Mock engine that always returns at least one more feature than the
+    /// density cap permits, regardless of the requested bbox or limit.
+    /// Used to exercise the `tile-too-dense` 400 branch.
+    struct OverflowingFeatureEngine {
+        /// How many features to emit. The handler asks for
+        /// `MAX_FEATURES_PER_TILE + 1`; the density guard fires when
+        /// `features.len() > MAX_FEATURES_PER_TILE`, so any value ≥ that
+        /// threshold trips the branch.
+        emit: usize,
+    }
+
+    impl FeatureEngine for OverflowingFeatureEngine {
+        fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+            // Honour `limit` so the test still trips the guard cleanly: the
+            // handler asks for `MAX + 1`, and we cap at that — returning a
+            // gigantic vector here would just waste memory.
+            let take = query.limit.min(self.emit);
+            let f = Feature {
+                id: "pt".into(),
+                geometry: StdArc::new(Geometry::Point { x: 0.0, y: 0.0 }),
+                properties: StdArc::new(Default::default()),
+            };
+            let features: Vec<Feature> = std::iter::repeat_with(|| f.clone()).take(take).collect();
+            let len = features.len();
+            Ok(FeaturePage {
+                features,
+                number_matched: self.emit,
+                number_returned: len,
+                next_offset: None,
+            })
+        }
+
+        fn get_feature(&self, _id: &str) -> Result<Feature, DataServerError> {
+            Err(DataServerError::FeatureNotFound("unused".into()))
+        }
+
+        fn feature_count(&self) -> usize {
+            self.emit
+        }
+
+        fn spatial_extent(&self) -> Option<[f64; 4]> {
+            Some([-180.0, -85.0, 180.0, 85.0])
+        }
+    }
+
+    fn build_dense_router(emit: usize) -> axum::Router {
+        let engine: Arc<dyn FeatureEngine> = Arc::new(OverflowingFeatureEngine { emit });
+        let mut feature_engines = HashMap::new();
+        let mut feature_collections = HashMap::new();
+        feature_engines.insert("dense".to_string(), engine);
+        feature_collections.insert(
+            "dense".to_string(),
+            CollectionConfig {
+                id: "dense".to_string(),
+                title: "Dense".to_string(),
+                description: "Always-overflow mock".to_string(),
+                data_path: None,
+                apis: vec!["tiles".to_string()],
+                engine_type: "geojson".to_string(),
+                geotiff: None,
+                querydata: None,
+                wms: None,
+                grib: None,
+                postgis: None,
+            },
+        );
+
+        let state = Arc::new(ArcSwap::from_pointee(TilesState {
+            map_engines: HashMap::new(),
+            collections: HashMap::new(),
+            styles: HashMap::new(),
+            feature_engines,
+            feature_collections,
+            render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            rendered_cache: Arc::new(RenderedCache::new(16)),
+            vector_tile_cache: Arc::new(VectorTileCache::new(16)),
+            base_url: String::new(),
+        }));
+        api_tiles::router(state)
+    }
+
     async fn fetch(uri: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
         let app = build_mvt_router();
         let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
@@ -816,6 +897,41 @@ mod mvt {
             Some("vector"),
             "vector-only collection must be advertised as dataType=vector"
         );
+    }
+
+    #[tokio::test]
+    async fn pbf_tile_too_dense_returns_400() {
+        // Hit `MAX_FEATURES_PER_TILE + 1` so the density guard fires.
+        // `MAX_FEATURES_PER_TILE` is a private const; this magic number must
+        // stay in sync with the handler. If a future change relaxes the cap,
+        // this test will go green on a `200` response — bump `emit` to the
+        // new cap + 1 so the guard remains under test.
+        let app = build_dense_router(50_001);
+        let req = Request::builder()
+            .uri("/collections/dense/tiles/WebMercatorQuad/0/0/0?f=mvt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body_str = std::str::from_utf8(&body).unwrap_or("");
+        assert!(
+            body_str.contains("tile-too-dense"),
+            "400 body should mention the density guard, got: {body_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pbf_tile_at_density_cap_returns_200() {
+        // One feature under the cap → success path. Confirms the guard's
+        // boundary condition isn't off-by-one.
+        let app = build_dense_router(50_000);
+        let req = Request::builder()
+            .uri("/collections/dense/tiles/WebMercatorQuad/0/0/0?f=mvt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

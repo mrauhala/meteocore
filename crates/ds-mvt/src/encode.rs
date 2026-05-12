@@ -375,36 +375,42 @@ fn lat_to_merc_y(lat: f64) -> f64 {
     clamped.to_radians().tan().asinh() * EARTH_RADIUS_M
 }
 
-/// Hash of a property allowlist for use in in-process cache keys.
-/// Different allowlists produce different hashes so they don't share cache
-/// slots.
+/// Hash of a property allowlist for use as a component of vector-tile cache
+/// keys and ETags. Different allowlists produce different hashes so they
+/// don't share cache slots.
 ///
-/// **Toolchain-ephemeral.** The implementation uses
-/// `std::collections::hash_map::DefaultHasher`, which uses a fixed seed
-/// (unlike `RandomState`) but whose algorithm is explicitly unspecified
-/// across Rust releases. The same binary will produce the same hash for
-/// the same input on every run, but a toolchain upgrade — or a binary
-/// compiled with a different Rust version — can change the output without
-/// warning. Do not persist this value, transmit it over the wire, or
-/// compare it across process boundaries built with different compilers;
-/// switch to a fixed-algorithm hasher (e.g. FNV) if stability is required.
+/// Uses FNV-1a (fixed algorithm) rather than `DefaultHasher` because the
+/// value flows into `VectorTileKey::etag()`, which is transmitted as an
+/// HTTP `ETag` header. A toolchain bump must not silently rotate the bytes
+/// clients replay in `If-None-Match`.
 pub fn properties_hash(allowlist: &PropertyAllowlist) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
+    // FNV-1a 64-bit — duplicated from `cache.rs` so this helper has no
+    // dependency on `VectorTileKey`. Algorithm is canonical and tiny;
+    // keeping a private copy is clearer than exposing a `pub(crate)` API
+    // surface for ten lines of code.
+    const FNV1A_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV1A_PRIME: u64 = 0x100000001b3;
+    let mut h = FNV1A_OFFSET;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV1A_PRIME);
+        }
+    };
     match allowlist {
-        PropertyAllowlist::All => 0u8.hash(&mut hasher),
+        PropertyAllowlist::All => mix(&[0u8]),
         PropertyAllowlist::Subset(set) => {
-            1u8.hash(&mut hasher);
+            mix(&[1u8]);
             // Sort for deterministic hashing — HashSet iteration order is random.
             let mut keys: Vec<&String> = set.iter().collect();
             keys.sort();
             for k in keys {
-                k.hash(&mut hasher);
+                mix(k.as_bytes());
+                mix(b"|");
             }
         }
     }
-    hasher.finish()
+    h
 }
 
 // ---------------------------------------------------------------------------

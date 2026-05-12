@@ -4,7 +4,6 @@
 //! instead of (bbox, width, height, style). Sized by bytes — eviction is driven
 //! by total weight, not entry count.
 
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
@@ -12,6 +11,21 @@ use quick_cache::sync::Cache;
 use quick_cache::Weighter;
 
 use crate::encode::TmsKind;
+
+/// FNV-1a 64-bit mix. Fixed algorithm — safe to serialise into HTTP `ETag`
+/// headers because the output does not change with a rustc upgrade. The
+/// stdlib `DefaultHasher` is explicitly unspecified across releases (see
+/// the `properties_hash` doc below) and must not leave the process.
+const FNV1A_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV1A_PRIME: u64 = 0x100000001b3;
+
+#[inline]
+fn fnv1a_mix(state: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *state ^= b as u64;
+        *state = state.wrapping_mul(FNV1A_PRIME);
+    }
+}
 
 /// Cache key for an encoded vector tile.
 ///
@@ -37,13 +51,21 @@ pub struct VectorTileKey {
 }
 
 impl VectorTileKey {
-    /// Stable ETag for HTTP caching — `"hex64"` string of the key's hash.
-    /// Format matches `ds_render::CacheKey::etag()` so the same `etag_matches`
-    /// helper works for both raster and vector tile responses.
+    /// Stable ETag for HTTP caching — `"hex64"` string of an FNV-1a hash
+    /// over the key fields. Format matches `ds_render::CacheKey::etag()` so
+    /// the same `etag_matches` helper works for both raster and vector tile
+    /// responses.
     pub fn etag(&self) -> String {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.hash(&mut hasher);
-        format!("\"{:016x}\"", hasher.finish())
+        let mut h = FNV1A_OFFSET;
+        fnv1a_mix(&mut h, self.collection.as_bytes());
+        fnv1a_mix(&mut h, b"|");
+        fnv1a_mix(&mut h, self.tms.id().as_bytes());
+        fnv1a_mix(&mut h, &self.z.to_le_bytes());
+        fnv1a_mix(&mut h, &self.x.to_le_bytes());
+        fnv1a_mix(&mut h, &self.y.to_le_bytes());
+        fnv1a_mix(&mut h, &self.properties_hash.to_le_bytes());
+        fnv1a_mix(&mut h, &self.data_version.to_le_bytes());
+        format!("\"{h:016x}\"")
     }
 }
 
@@ -162,6 +184,25 @@ mod tests {
     fn etag_is_stable_for_same_key() {
         let k = key(3, 4, 5);
         assert_eq!(k.etag(), k.clone().etag());
+    }
+
+    #[test]
+    fn etag_uses_stable_fnv1a_not_default_hasher() {
+        // Golden value pinned to the FNV-1a algorithm. If this assertion ever
+        // changes you've either rotated the hashing algorithm (in which case
+        // every outstanding client ETag is invalidated — coordinate with
+        // operators) or accidentally regressed to `DefaultHasher`, which
+        // mutates silently across rustc versions and is unsafe to serialise.
+        let k = VectorTileKey {
+            collection: "demo".into(),
+            tms: TmsKind::WebMercatorQuad,
+            z: 3,
+            x: 4,
+            y: 5,
+            properties_hash: 0,
+            data_version: 0,
+        };
+        assert_eq!(k.etag(), "\"fd819b215b674f8c\"");
     }
 
     #[test]
