@@ -19,3 +19,12 @@ members = [
     "crates/server",
 ]
 exclude = ["fuzz"]
+
+# Shared package metadata. Every member crate inherits `version` and
+# `edition` via `version.workspace = true` / `edition.workspace = true`,
+# so release-please can bump the whole workspace by editing this one
+# block. Adding repository/license/etc. here later only requires
+# adding one matching `<field>.workspace = true` line per crate.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"

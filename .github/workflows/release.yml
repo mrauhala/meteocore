@@ -1,0 +1,191 @@
+# Release pipeline driven by release-please (https://github.com/googleapis/release-please).
+#
+# Use Conventional Commit subject lines on PR merges into main:
+#   feat: new …
+#   fix: stop crashing on …
+#   chore: bump dependencies
+#   feat!: breaking …            # or include `BREAKING CHANGE:` in the body
+#
+# release-please watches commits to main and opens a PR titled
+# "chore(main): release X.Y.Z" with the bumped [workspace.package]
+# version + CHANGELOG. Merging that PR creates the git tag and GitHub
+# Release, which gates the build + publish jobs below.
+#
+# Single workflow on purpose: a tag pushed by GITHUB_TOKEN does NOT
+# trigger other workflows, so a separate `on: push tags` workflow would
+# be silently dormant. Doing the whole pipeline here avoids needing a
+# personal-access-token workaround.
+
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build-binary:
+    name: binary ${{ matrix.target }}
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Install system dependencies
+        # cmake/clang are needed by `libaec-sys` (GRIB CCSDS support).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.target }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p server
+
+      - name: Package tarball
+        run: |
+          version="${{ needs.release-please.outputs.tag_name }}"
+          base="meteocore-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${base}"
+          # Match the Docker image's binary name so the tarball and the
+          # container ship the same `dataserver` symbol.
+          cp "target/${{ matrix.target }}/release/server" "dist/${base}/dataserver"
+          cp LICENSE* README.md "dist/${base}/" 2>/dev/null || true
+          tar -czf "dist/${base}.tar.gz" -C dist "${base}"
+          (cd dist && sha256sum "${base}.tar.gz" > "${base}.tar.gz.sha256")
+          rm -rf "dist/${base}"
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: meteocore-${{ matrix.target }}
+          path: dist/*
+          retention-days: 7
+
+  build-container:
+    name: container image
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build-and-push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - uses: sigstore/cosign-installer@v4.1.1
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log into ${{ env.REGISTRY }}
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Strip the `v` prefix from the version tag so the image label
+          # is `:1.2.3` not `:v1.2.3` (de-facto convention on most
+          # registries). `:latest` flips to this release on every cut.
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.release-please.outputs.tag_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-please.outputs.tag_name }}
+            type=raw,value=latest
+
+      - name: Build and push (linux/amd64, linux/arm64)
+        id: build-and-push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Sign image with cosign
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+
+  upload:
+    name: attach binaries to release
+    # No dependency on build-container: image publish is a peer operation
+    # against ghcr.io. If the container build fails, the binaries on the
+    # GitHub Release are still useful and should ship.
+    needs: [release-please, build-binary]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate checksums
+        run: |
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          rm -f *.sha256
+          ls -la
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.release-please.outputs.tag_name }}
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
