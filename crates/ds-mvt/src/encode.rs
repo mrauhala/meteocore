@@ -15,7 +15,7 @@ use mvt::{Error as MvtError, GeomEncoder, GeomType, Tile};
 ///
 /// The variant drives how feature lon/lat is mapped to the tile's local
 /// `0..extent` coordinate space.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum TmsKind {
     /// Spherical Mercator (EPSG:3857). The dominant choice for slippy maps.
     WebMercatorQuad,
@@ -156,6 +156,12 @@ fn encode_geometry(geom: &Geometry, proj: &Projector) -> Result<Option<mvt::Geom
             Ok(Some(geom))
         }
         Geometry::Polygon { exterior, holes } => {
+            // Empty exterior would let `enc.complete()` run on a zero-point
+            // encoder, which the `mvt` crate either errors on or emits as
+            // degenerate protobuf. Skip the feature instead.
+            if exterior.is_empty() {
+                return Ok(None);
+            }
             let mut enc = GeomEncoder::<f64>::new(GeomType::Polygon);
             push_ring(&mut enc, exterior, proj, RingRole::Exterior)?;
             for hole in holes {
@@ -165,9 +171,18 @@ fn encode_geometry(geom: &Geometry, proj: &Projector) -> Result<Option<mvt::Geom
             Ok(Some(enc.complete()?.encode()?))
         }
         Geometry::MultiPolygon { polygons } => {
+            // A `MultiPolygon` with zero parts hits the same encoder-with-no-
+            // points trap as an empty `Polygon`. Treat it as "no geometry"
+            // rather than letting the failure propagate and kill the tile.
+            if polygons.is_empty() {
+                return Ok(None);
+            }
             let mut enc = GeomEncoder::<f64>::new(GeomType::Polygon);
             let mut first = true;
             for (exterior, holes) in polygons {
+                if exterior.is_empty() {
+                    continue;
+                }
                 if !first {
                     enc.complete_geom()?;
                 }
@@ -177,6 +192,10 @@ fn encode_geometry(geom: &Geometry, proj: &Projector) -> Result<Option<mvt::Geom
                     push_ring(&mut enc, hole, proj, RingRole::Hole)?;
                 }
                 first = false;
+            }
+            // All parts had empty exteriors → no points emitted.
+            if first {
+                return Ok(None);
             }
             Ok(Some(enc.complete()?.encode()?))
         }
@@ -336,14 +355,15 @@ fn lat_to_merc_y(lat: f64) -> f64 {
 /// Different allowlists produce different hashes so they don't share cache
 /// slots.
 ///
-/// **Single-process-ephemeral only.** The implementation uses
-/// `std::collections::hash_map::DefaultHasher`, whose algorithm is
-/// explicitly unspecified across Rust releases. Two processes — even on
-/// the same machine — may compute different values for the same input,
-/// and a toolchain upgrade can change the hash without warning. Do not
-/// persist this value, transmit it over the wire, or compare it across
-/// process boundaries; switch to a fixed-algorithm hasher (e.g. FNV) if
-/// stability is required.
+/// **Toolchain-ephemeral.** The implementation uses
+/// `std::collections::hash_map::DefaultHasher`, which uses a fixed seed
+/// (unlike `RandomState`) but whose algorithm is explicitly unspecified
+/// across Rust releases. The same binary will produce the same hash for
+/// the same input on every run, but a toolchain upgrade — or a binary
+/// compiled with a different Rust version — can change the output without
+/// warning. Do not persist this value, transmit it over the wire, or
+/// compare it across process boundaries built with different compilers;
+/// switch to a fixed-algorithm hasher (e.g. FNV) if stability is required.
 pub fn properties_hash(allowlist: &PropertyAllowlist) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -583,6 +603,50 @@ mod tests {
         let bytes = encode_tile(&[f], web_mercator_tile_z0(), &opts).unwrap();
         // The layer header is still emitted even when every feature is null.
         assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn empty_polygon_is_skipped() {
+        // A `Polygon` with an empty exterior would let `enc.complete()` run on
+        // a zero-point encoder — the `mvt` crate errors there and the whole
+        // tile would fail. Verify the encoder bails early instead.
+        let f = feature(
+            "empty",
+            Geometry::Polygon {
+                exterior: vec![],
+                holes: vec![],
+            },
+            &[],
+        );
+        let opts = TileEncodeOptions::new("polys", TmsKind::WebMercatorQuad);
+        let bytes = encode_tile(&[f], web_mercator_tile_z0(), &opts).unwrap();
+        // No feature bytes were written — the dropped id won't appear in tags.
+        assert!(!slice_contains(&bytes, b"empty"));
+    }
+
+    #[test]
+    fn empty_multipolygon_is_skipped() {
+        let f = feature("no-parts", Geometry::MultiPolygon { polygons: vec![] }, &[]);
+        let opts = TileEncodeOptions::new("polys", TmsKind::WebMercatorQuad);
+        let bytes = encode_tile(&[f], web_mercator_tile_z0(), &opts).unwrap();
+        assert!(!slice_contains(&bytes, b"no-parts"));
+    }
+
+    #[test]
+    fn multipolygon_with_only_empty_parts_is_skipped() {
+        // Mix of empty exterior + non-empty hole — every part is degenerate,
+        // so the whole feature must be dropped without invoking
+        // `enc.complete()`.
+        let f = feature(
+            "all-empty",
+            Geometry::MultiPolygon {
+                polygons: vec![(vec![], vec![]), (vec![], vec![vec![[0.0, 0.0]]])],
+            },
+            &[],
+        );
+        let opts = TileEncodeOptions::new("polys", TmsKind::WebMercatorQuad);
+        let bytes = encode_tile(&[f], web_mercator_tile_z0(), &opts).unwrap();
+        assert!(!slice_contains(&bytes, b"all-empty"));
     }
 
     #[test]

@@ -10,15 +10,20 @@ use bytes::Bytes;
 use quick_cache::sync::Cache;
 use quick_cache::Weighter;
 
+use crate::encode::TmsKind;
+
 /// Cache key for an encoded vector tile.
 ///
-/// `properties_hash` lets two callers with different property allowlists share
-/// the cache safely: a different allowlist hashes differently and lands in a
-/// distinct slot.
+/// `tms` is the strongly-typed `TmsKind` rather than a string so callers
+/// can't silently miss the cache by passing a different stringification
+/// (e.g. `"WebMercator"` vs `"WebMercatorQuad"`); the compiler enforces a
+/// 1:1 match between encode-time and lookup-time. `properties_hash` lets
+/// two callers with different property allowlists share the cache safely:
+/// a different allowlist hashes differently and lands in a distinct slot.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct VectorTileKey {
     pub collection: String,
-    pub tms: &'static str,
+    pub tms: TmsKind,
     pub z: u32,
     pub x: u64,
     pub y: u64,
@@ -104,7 +109,7 @@ mod tests {
     fn key(z: u32, x: u64, y: u64) -> VectorTileKey {
         VectorTileKey {
             collection: "demo".into(),
-            tms: "WebMercatorQuad",
+            tms: TmsKind::WebMercatorQuad,
             z,
             x,
             y,
