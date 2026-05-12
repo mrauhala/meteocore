@@ -79,7 +79,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake clang pkg-config libssl-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      # SHA-pinned for consistency with the other third-party actions
+      # in this file. Same risk model — even though this job is
+      # `contents: read` only, a hijacked `@stable` tag could still
+      # inject backdoored Rust into the release tarball.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           targets: ${{ matrix.target }}
 
@@ -110,6 +114,11 @@ jobs:
           rm -rf "dist/${base}"
           ls -la dist/
 
+      # Upload v7 + download v8 (in the `upload` job below) is the
+      # intended pairing: both use the post-v4 artifact API; v8 is the
+      # Node 24 successor of v7's download counterpart with no data-format
+      # change. Same combination is in use upstream (fmidev/kubetin's
+      # release.yml) and is the per-action floor in our CLAUDE.md.
       - uses: actions/upload-artifact@v7
         with:
           name: meteocore-${{ matrix.target }}
@@ -169,10 +178,12 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Sign image with cosign
+        # Sigstore signatures are attached to a manifest digest, not a tag
+        # name — so one call per digest is enough. Signing per-tag would
+        # just create three identical Rekor entries for the same digest.
         env:
-          TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build-and-push.outputs.digest }}
-        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+        run: cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
 
   upload:
     name: attach binaries to release
