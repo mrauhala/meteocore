@@ -1,6 +1,6 @@
-id = "fmi-radar"
-title = "FMI Radar (S3, EPSG:3067)"
-description = "Finnish radar composite from FMI S3 bucket, Transverse Mercator projection"
+id = "fmi-radar-composite-dbz-aws-s3"
+title = "FMI Radar Composite dBZ (AWS S3, EPSG:3067)"
+description = "Finnish radar reflectivity composite from FMI AWS S3 bucket COG, Transverse Mercator projection"
 engine_type = "geotiff"
 apis = ["edr", "wms", "maps", "tiles"]
 
