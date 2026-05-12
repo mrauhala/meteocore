@@ -8,8 +8,7 @@
   "packages": {
     "crates/server": {
       "package-name": "meteocore",
-      "component": "meteocore",
-      "changelog-path": "../../CHANGELOG.md"
+      "component": "meteocore"
     }
   }
 }
