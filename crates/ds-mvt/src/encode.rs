@@ -319,6 +319,12 @@ struct Projector {
 
 impl Projector {
     fn new(tms: TmsKind, tile_bbox: [f64; 4], extent: u32) -> Result<Self, EncodeError> {
+        if extent == 0 {
+            // `TileEncodeOptions.extent` is a public mutable field. Zero
+            // would collapse the projection to `(0, 0)` for every feature
+            // — fail loudly instead of silently producing wrong output.
+            return Err(EncodeError::InvalidBbox("extent must be > 0"));
+        }
         let [west, south, east, north] = tile_bbox;
         if !(west.is_finite() && south.is_finite() && east.is_finite() && north.is_finite()) {
             return Err(EncodeError::InvalidBbox("non-finite bbox coordinate"));
@@ -468,6 +474,13 @@ mod tests {
         assert!(Projector::new(TmsKind::WorldCRS84Quad, [0.0, 0.0, 0.0, 1.0], 4096).is_err());
         assert!(Projector::new(TmsKind::WorldCRS84Quad, [0.0, 0.0, 1.0, 0.0], 4096).is_err());
         assert!(Projector::new(TmsKind::WorldCRS84Quad, [0.0, f64::NAN, 1.0, 1.0], 4096).is_err());
+    }
+
+    #[test]
+    fn projector_rejects_zero_extent() {
+        // `extent = 0` would collapse the projection to (0,0) — fail loudly
+        // since `TileEncodeOptions.extent` is a public mutable field.
+        assert!(Projector::new(TmsKind::WorldCRS84Quad, [0.0, 0.0, 1.0, 1.0], 0).is_err());
     }
 
     #[test]
