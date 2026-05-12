@@ -20,11 +20,11 @@ members = [
 ]
 exclude = ["fuzz"]
 
-# Shared package metadata. Every member crate inherits `version` and
-# `edition` via `version.workspace = true` / `edition.workspace = true`,
-# so release-please can bump the whole workspace by editing this one
-# block. Adding repository/license/etc. here later only requires
-# adding one matching `<field>.workspace = true` line per crate.
-[workspace.package]
-version = "0.1.0"
-edition = "2021"
+# Per-crate `version` + `edition` are declared inline in each member's
+# `[package]` block on purpose. We tried hoisting them to
+# `[workspace.package]` (Rust's canonical inheritance shape) but
+# `release-please-action`'s Rust updater can't parse
+# `package.version.workspace = true` — it expects a literal string and
+# fails the release-PR with `value at path package.version is not tagged`.
+# Until that's fixed upstream, leaving versions inline lets release-please
+# walk the workspace members and bump each one to the same value.
