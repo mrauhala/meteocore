@@ -1,45 +1,47 @@
+# syntax=docker/dockerfile:1.7
 # Stage 1: Build
 FROM rust:1.94-slim AS builder
 
 WORKDIR /build
 
-# Install build dependencies
-# pip cmake provides 3.26+ needed by libaec-sys (Bookworm ships 3.25)
-# clang needed for libaec-sys (GRIB CCSDS compression)
-RUN apt-get update && apt-get install -y \
-    pkg-config libssl-dev clang python3-pip \
-    && pip install --break-system-packages cmake \
-    && rm -rf /var/lib/apt/lists/*
+# Build dependencies:
+#  - `pkg-config`, `libssl-dev`, `clang` — needed by libaec-sys (GRIB CCSDS
+#    compression). `clang` provides libclang for bindgen.
+#  - `cmake` from `bookworm-backports` (3.31) — libaec-sys requires ≥3.26,
+#    and Bookworm's main repo ships 3.25. Pulling from backports avoids the
+#    previous `pip install --break-system-packages cmake` hack.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    echo 'deb http://deb.debian.org/debian bookworm-backports main' \
+        > /etc/apt/sources.list.d/backports.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        pkg-config libssl-dev clang && \
+    apt-get install -y --no-install-recommends -t bookworm-backports cmake && \
+    rm -rf /var/lib/apt/lists/*
 
-# Copy manifests first for dependency caching
+# Copy the full workspace in one shot. The dep-cache layer split that used
+# to live here (manifest-only COPYs + stub lib.rs files + a throwaway build)
+# was always brittle — adding a new crate required updating the Dockerfile
+# in lock-step with `Cargo.toml`, and the cache only helped when Cargo.lock
+# was unchanged. The BuildKit cache mounts below get the same benefit
+# without enumerating workspace members, and they GC stale incremental
+# artifacts automatically.
 COPY Cargo.toml Cargo.lock ./
-COPY crates/core/Cargo.toml crates/core/Cargo.toml
-COPY crates/engine-csv/Cargo.toml crates/engine-csv/Cargo.toml
-COPY crates/engine-geojson/Cargo.toml crates/engine-geojson/Cargo.toml
-COPY crates/engine-geotiff/Cargo.toml crates/engine-geotiff/Cargo.toml
-COPY crates/engine-querydata/Cargo.toml crates/engine-querydata/Cargo.toml
-COPY crates/engine-grib/Cargo.toml crates/engine-grib/Cargo.toml
-COPY crates/storage/Cargo.toml crates/storage/Cargo.toml
-COPY crates/render/Cargo.toml crates/render/Cargo.toml
-COPY crates/api-edr/Cargo.toml crates/api-edr/Cargo.toml
-COPY crates/api-features/Cargo.toml crates/api-features/Cargo.toml
-COPY crates/api-wms/Cargo.toml crates/api-wms/Cargo.toml
-COPY crates/api-maps/Cargo.toml crates/api-maps/Cargo.toml
-COPY crates/api-tiles/Cargo.toml crates/api-tiles/Cargo.toml
-COPY crates/server/Cargo.toml crates/server/Cargo.toml
-
-# Create stub lib.rs files so cargo can resolve the workspace and cache deps
-RUN for dir in core engine-csv engine-geojson engine-geotiff engine-querydata engine-grib storage render api-edr api-features api-wms api-maps api-tiles; do \
-      mkdir -p crates/$dir/src && echo "" > crates/$dir/src/lib.rs; \
-    done && \
-    mkdir -p crates/server/src && echo "fn main() {}" > crates/server/src/main.rs
-
-RUN cargo build --release -p server 2>/dev/null || true
-
-# Copy actual source and build
 COPY crates/ crates/
 COPY schemas/ schemas/
-RUN cargo build --release -p server
+
+# `--mount=type=cache` keeps `target/` and the Cargo registry on the
+# BuildKit daemon between image builds. A typical source-only change
+# now compiles just the changed workspace member instead of re-doing all
+# 13 dependency crates from scratch. The final `cp` is required because
+# the cache mount is wiped from the produced image (build-time only), so
+# we copy the binary out to a stable path before the cache is detached.
+RUN --mount=type=cache,target=/build/target,id=meteocore-target \
+    --mount=type=cache,target=/usr/local/cargo/registry,id=meteocore-cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=meteocore-cargo-git \
+    cargo build --release -p server && \
+    cp target/release/server /usr/local/bin/server-build
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
@@ -48,7 +50,7 @@ RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib
 
 RUN groupadd -r dataserver && useradd -r -g dataserver dataserver
 
-COPY --from=builder /build/target/release/server /usr/local/bin/dataserver
+COPY --from=builder /usr/local/bin/server-build /usr/local/bin/dataserver
 
 WORKDIR /data
 COPY config.toml ./
