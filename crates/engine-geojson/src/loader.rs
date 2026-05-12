@@ -30,6 +30,10 @@ pub struct GeoJsonEngine {
     id_index: HashMap<String, usize>,
     spatial_index: SpatialIndex,
     spatial_extent: Option<[f64; 4]>,
+    /// Source-file mtime captured at load (seconds since UNIX epoch), used
+    /// as the data-version component in vector-tile ETags. Zero if the
+    /// platform doesn't provide mtime.
+    data_version: u64,
 }
 
 impl GeoJsonEngine {
@@ -45,6 +49,12 @@ impl GeoJsonEngine {
                 MAX_FILE_SIZE / (1024 * 1024)
             )));
         }
+        let data_version = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         let file = std::fs::File::open(path)
             .map_err(|e| DataServerError::Engine(format!("Failed to open file: {e}")))?;
@@ -133,6 +143,7 @@ impl GeoJsonEngine {
             id_index,
             spatial_index,
             spatial_extent,
+            data_version,
         })
     }
 
@@ -223,6 +234,10 @@ impl FeatureEngine for GeoJsonEngine {
 
     fn spatial_extent(&self) -> Option<[f64; 4]> {
         self.spatial_extent
+    }
+
+    fn data_version(&self) -> u64 {
+        self.data_version
     }
 }
 

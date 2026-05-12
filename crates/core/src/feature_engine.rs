@@ -22,4 +22,15 @@ pub trait FeatureEngine: Send + Sync {
     fn spatial_extent(&self) -> Option<[f64; 4]> {
         None
     }
+
+    /// Opaque token that changes when the underlying feature data changes.
+    ///
+    /// Used as a data-version component in vector-tile ETags so that an
+    /// `/admin/collections/reload` (or any in-process refresh) invalidates
+    /// previously-issued tile ETags instead of serving `304 Not Modified`
+    /// indefinitely. Engines that load once and never change can leave the
+    /// default `0`; consumers should treat the value as opaque.
+    fn data_version(&self) -> u64 {
+        0
+    }
 }

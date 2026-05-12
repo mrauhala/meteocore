@@ -11,6 +11,7 @@ use quick_cache::sync::Cache;
 use quick_cache::Weighter;
 
 use crate::encode::TmsKind;
+use crate::hash::{fnv1a_mix, FNV1A_OFFSET};
 
 /// Cache key for an encoded vector tile.
 ///
@@ -20,6 +21,10 @@ use crate::encode::TmsKind;
 /// 1:1 match between encode-time and lookup-time. `properties_hash` lets
 /// two callers with different property allowlists share the cache safely:
 /// a different allowlist hashes differently and lands in a distinct slot.
+/// `data_version` is an opaque token (file mtime, refresh counter, …)
+/// supplied by the source engine: bumping it after a reload invalidates
+/// previously-issued ETags so clients re-fetch instead of stalling on
+/// `304 Not Modified`.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct VectorTileKey {
     pub collection: String,
@@ -28,6 +33,26 @@ pub struct VectorTileKey {
     pub x: u64,
     pub y: u64,
     pub properties_hash: u64,
+    pub data_version: u64,
+}
+
+impl VectorTileKey {
+    /// Stable ETag for HTTP caching — `"hex64"` string of an FNV-1a hash
+    /// over the key fields. Format matches `ds_render::CacheKey::etag()` so
+    /// the same `etag_matches` helper works for both raster and vector tile
+    /// responses.
+    pub fn etag(&self) -> String {
+        let mut h = FNV1A_OFFSET;
+        fnv1a_mix(&mut h, self.collection.as_bytes());
+        fnv1a_mix(&mut h, b"|");
+        fnv1a_mix(&mut h, self.tms.id().as_bytes());
+        fnv1a_mix(&mut h, &self.z.to_le_bytes());
+        fnv1a_mix(&mut h, &self.x.to_le_bytes());
+        fnv1a_mix(&mut h, &self.y.to_le_bytes());
+        fnv1a_mix(&mut h, &self.properties_hash.to_le_bytes());
+        fnv1a_mix(&mut h, &self.data_version.to_le_bytes());
+        format!("\"{h:016x}\"")
+    }
 }
 
 #[derive(Clone)]
@@ -114,6 +139,7 @@ mod tests {
             x,
             y,
             properties_hash: 0,
+            data_version: 0,
         }
     }
 
@@ -138,6 +164,49 @@ mod tests {
         assert_eq!(cache.hits(), 0);
         // The insert is silently dropped, and the single `get` is counted as a miss.
         assert_eq!(cache.misses(), 1);
+    }
+
+    #[test]
+    fn etag_is_stable_for_same_key() {
+        let k = key(3, 4, 5);
+        assert_eq!(k.etag(), k.clone().etag());
+    }
+
+    #[test]
+    fn etag_uses_stable_fnv1a_not_default_hasher() {
+        // Golden value pinned to the FNV-1a algorithm. If this assertion ever
+        // changes you've either rotated the hashing algorithm (in which case
+        // every outstanding client ETag is invalidated — coordinate with
+        // operators) or accidentally regressed to `DefaultHasher`, which
+        // mutates silently across rustc versions and is unsafe to serialise.
+        let k = VectorTileKey {
+            collection: "demo".into(),
+            tms: TmsKind::WebMercatorQuad,
+            z: 3,
+            x: 4,
+            y: 5,
+            properties_hash: 0,
+            data_version: 0,
+        };
+        assert_eq!(k.etag(), "\"fd819b215b674f8c\"");
+    }
+
+    #[test]
+    fn etag_differs_for_distinct_keys() {
+        assert_ne!(key(3, 4, 5).etag(), key(3, 4, 6).etag());
+    }
+
+    #[test]
+    fn etag_changes_when_data_version_bumps() {
+        let k1 = key(3, 4, 5);
+        let mut k2 = k1.clone();
+        k2.data_version = 1;
+        assert_ne!(
+            k1.etag(),
+            k2.etag(),
+            "ETag must rotate on data refresh so reloaded collections don't \
+             serve stale tiles via 304 Not Modified"
+        );
     }
 
     #[test]
