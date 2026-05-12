@@ -505,12 +505,23 @@ fn resolve_temporal_extent(
         .or_else(|| wms.engines.get(id).map(|e| e.raster_info().times))
         .filter(|t| !t.is_empty());
 
-    let interval = edr_interval.or_else(|| {
-        raster_times
-            .as_ref()
-            .and_then(|t| t.first().zip(t.last()).map(|(a, b)| (*a, *b)))
-    });
-    let values = edr_values.or(raster_times);
+    // Pick the source that backs `values`, then derive `interval` from the
+    // same source so the preview card's "Time" row matches the slider's
+    // reachable range. EDR's interval can otherwise span a wider horizon
+    // (e.g. T-24h forecast bound) than the discrete raster timesteps cover,
+    // leaving the user looking at a span the slider can't reach.
+    let (interval, values) = match (edr_values, raster_times) {
+        (Some(v), _) => {
+            let int = edr_interval
+                .or_else(|| v.first().zip(v.last()).map(|(a, b)| (*a, *b)));
+            (int, Some(v))
+        }
+        (None, Some(t)) => {
+            let int = t.first().zip(t.last()).map(|(a, b)| (*a, *b));
+            (int, Some(t))
+        }
+        (None, None) => (edr_interval, None),
+    };
 
     if interval.is_some() || values.is_some() {
         return Some(serialize_temporal(interval, values.as_deref()));
@@ -1191,9 +1202,18 @@ mod tests {
             // No `get_available_times` override — defaults to `None`.
         }
 
+        // Use a deliberately wider EDR interval than the raster's discrete
+        // timesteps so the test catches the "interval/values divergence"
+        // bug: a slider with three 1-hour stops should not report a 24-hour
+        // span in the card header.
+        let wide_edr_interval = (
+            "2023-12-31T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            "2024-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+        );
+
         let mut edr = empty_edr();
         let edr_engine: Arc<dyn Engine> = Arc::new(IntervalOnlyEdr {
-            interval: (times[0], *times.last().unwrap()),
+            interval: wide_edr_interval,
         });
         edr.engines.insert("radar".into(), edr_engine);
         edr.collections
@@ -1215,6 +1235,9 @@ mod tests {
         let m = build_manifest(&state, 0, 100);
         let temporal = &m["collections"][0]["temporal_extent"];
 
+        // Interval must come from the *values* source (raster), not from EDR's
+        // wider span. Without this anchoring, the card's Time row would show
+        // 2023-12-31→2024-01-02 while the slider only has 00/01/02 stops.
         assert_eq!(temporal["start"], "2024-01-01T00:00:00+00:00");
         assert_eq!(temporal["end"], "2024-01-01T02:00:00+00:00");
         assert_eq!(

@@ -100,29 +100,31 @@
     function whenStyleReady(map, fn) {
         const MARKER = '__readiness_probe__';
         let done = false;
-        // Gate per-probe-cycle so a failed attempt only ever queues ONE set
-        // of listeners + setTimeout. Without this, every failed attempt
-        // re-registers another 3 `once` callbacks plus a setTimeout — in a
-        // long-throttled tab the subscription count grows without bound.
-        let subscribed = false;
+        let timer = null;
+        // Every entry into `attempt()` first detaches whatever the previous
+        // attempt registered. Combined with `data` *not* being a trigger
+        // (it fires on every tile load/error/unload — way too noisy),
+        // this guarantees at most one queued listener-per-event + one
+        // pending timer regardless of how many times `attempt` re-enters.
         function attempt() {
             if (done) return;
-            subscribed = false;
+            map.off('styledata', attempt);
+            map.off('idle', attempt);
+            if (timer !== null) {
+                clearTimeout(timer);
+                timer = null;
+            }
             try {
                 map.addSource(MARKER, { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
                 map.removeSource(MARKER);
                 done = true;
                 fn();
             } catch (e) {
-                if (subscribed) return;
-                subscribed = true;
-                // Subscribe to multiple events; throttled tabs may not get
-                // every one. `setTimeout` also reschedules in case all map
-                // events stay silent.
                 map.once('styledata', attempt);
-                map.once('data', attempt);
                 map.once('idle', attempt);
-                setTimeout(attempt, 250);
+                // setTimeout covers the throttled-tab case where neither
+                // map event fires.
+                timer = setTimeout(attempt, 250);
             }
         }
         attempt();
