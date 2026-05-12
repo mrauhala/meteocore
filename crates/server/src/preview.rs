@@ -94,10 +94,16 @@ fn serve_asset(path: &str, request_headers: &axum::http::HeaderMap) -> Response 
     let Some(content) = PreviewAssets::get(path) else {
         // Generic body — `path` is user-controlled. Reflecting it isn't an
         // XSS vector here (`text/plain`) but matches the project's
-        // "no internal detail in client errors" guideline.
+        // "no internal detail in client errors" guideline. `nosniff` on
+        // the 404 matches the 200 path so a browser can't sniff this
+        // `text/plain` response as something else under any edge case.
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(
+                header::HeaderName::from_static("x-content-type-options"),
+                "nosniff",
+            )
             .body(Body::from("Not Found"))
             .expect("static 404 response headers are valid");
     };
@@ -110,8 +116,12 @@ fn serve_asset(path: &str, request_headers: &axum::http::HeaderMap) -> Response 
     //   new shell immediately. The ETag below lets that revalidation come
     //   back as `304 Not Modified` (~0 bytes on the wire) when nothing
     //   changed; without it every reload re-fetches the body.
-    // * `vendor/*` — version-pinned in `scripts/vendor-maplibre.sh` and
-    //   sha256-verified; safe to cache aggressively and mark immutable.
+    // * `vendor/*` — version-pinned via `scripts/vendor-maplibre.sh` but
+    //   the URL itself is **not** content-addressed (path doesn't carry
+    //   the version), so `immutable` is wrong: after a vendor bump
+    //   clients would keep the old bundle until the entry expired. Keep
+    //   the long `max-age` for cheap reuse and rely on the ETag to
+    //   short-circuit revalidation when nothing changed.
     // * Everything else (`app.js`, `app.css`, etc.) — non-fingerprinted
     //   stable URLs that change with every binary; `max-age=300` +
     //   `must-revalidate` gives browsers cheap reuse during a session
@@ -119,7 +129,7 @@ fn serve_asset(path: &str, request_headers: &axum::http::HeaderMap) -> Response 
     let cache_control = if is_html {
         "no-cache"
     } else if path.starts_with("vendor/") {
-        "public, max-age=86400, immutable"
+        "public, max-age=86400"
     } else {
         "public, max-age=300, must-revalidate"
     };
@@ -1222,7 +1232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vendored_maplibre_js_is_served_with_immutable_cache() {
+    async fn vendored_maplibre_js_is_cacheable_but_not_immutable() {
         let resp = asset_handler(
             axum::extract::Path("vendor/maplibre-gl.js".into()),
             axum::http::HeaderMap::new(),
@@ -1234,10 +1244,13 @@ mod tests {
             parts.headers.get(header::CONTENT_TYPE).unwrap(),
             "application/javascript; charset=utf-8"
         );
-        // Version-pinned bundle → safe to cache aggressively + mark immutable.
+        // Long `max-age` for cheap reuse, but **not** `immutable` —
+        // `/preview/vendor/maplibre-gl.js` is a stable URL (no version
+        // segment), so `immutable` would pin clients to the old bundle
+        // after a vendor bump.
         assert_eq!(
             parts.headers.get(header::CACHE_CONTROL).unwrap(),
-            "public, max-age=86400, immutable"
+            "public, max-age=86400"
         );
         // CSP is NOT applied to non-HTML assets — that header only matters
         // when the browser parses the response as a document.

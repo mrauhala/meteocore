@@ -49,8 +49,15 @@
             // those entries. The total can exceed that; advertise the
             // shortfall so users don't think the list is complete. Full
             // pagination — following `pagination.next` — is Phase 3+.
-            const total = manifest.pagination.total;
+            //
+            // Defensive read on `pagination`: a future schema change or a
+            // partial parse shouldn't crash the SPA before the map even
+            // renders. Fall back to the rendered count.
             const rendered = manifest.collections.length;
+            const total =
+                manifest.pagination && typeof manifest.pagination.total === 'number'
+                    ? manifest.pagination.total
+                    : rendered;
             const noun = total === 1 ? 'collection' : 'collections';
             statusEl.textContent =
                 total === 0
