@@ -246,6 +246,13 @@ fn first_config<'a>(
         .or_else(|| wms.collections.get(id))
 }
 
+// TODO: `resolve_spatial_extent` and `resolve_temporal_extent` both call
+// `raster_info()` on every maps / tiles / wms engine, which clones the
+// engine's `times: Vec<DateTime<Utc>>`. At default `limit=100` with
+// archive-sized collections (hundreds of timesteps) this is ~2× the
+// necessary clone work. Out of scope for the initial Phase 1 PR; the fix
+// is to call `raster_info()` once per entry in `build_entry` and pass
+// references down to both resolvers.
 #[allow(clippy::too_many_arguments)]
 fn resolve_spatial_extent(
     id: &str,
@@ -332,18 +339,27 @@ fn serialize_temporal(
         obj.insert("start".into(), json!(start.to_rfc3339()));
         obj.insert("end".into(), json!(end.to_rfc3339()));
     }
-    if let Some(values) = values {
-        let total = values.len();
-        let (slice, truncated) = if total > MAX_TEMPORAL_VALUES {
-            (&values[..MAX_TEMPORAL_VALUES], true)
-        } else {
-            (values, false)
-        };
-        let serialized: Vec<String> = slice.iter().map(|t| t.to_rfc3339()).collect();
-        obj.insert("values".into(), json!(serialized));
-        obj.insert("truncated".into(), json!(truncated));
-        obj.insert("total_values".into(), json!(total));
-    }
+    // Always emit `values` / `truncated` / `total_values`, even when the
+    // engine doesn't override `get_available_times()`. This keeps the
+    // manifest shape stable so UI clients don't have to null-guard each
+    // field individually. The `Engine` trait's default impl returns
+    // `None` for several engines (CSV, PostGIS, QueryData) — without
+    // this fallback those collections would emit only `start`/`end`.
+    let (slice, truncated, total): (&[_], bool, usize) = match values {
+        Some(vs) => {
+            let total = vs.len();
+            if total > MAX_TEMPORAL_VALUES {
+                (&vs[..MAX_TEMPORAL_VALUES], true, total)
+            } else {
+                (vs, false, total)
+            }
+        }
+        None => (&[], false, 0),
+    };
+    let serialized: Vec<String> = slice.iter().map(|t| t.to_rfc3339()).collect();
+    obj.insert("values".into(), json!(serialized));
+    obj.insert("truncated".into(), json!(truncated));
+    obj.insert("total_values".into(), json!(total));
     Value::Object(obj)
 }
 
@@ -367,21 +383,34 @@ fn raster_tile_descriptor(
     base_url: &str,
     styles: Option<&std::collections::HashMap<String, ds_render::StyleInfo>>,
 ) -> Value {
-    let default_style = styles
-        .and_then(|s| s.get("default"))
-        .map(|s| s.name.as_str())
-        .unwrap_or("default");
-    json!({
+    let mut desc = json!({
         "tile_matrix_sets": ["WebMercatorQuad", "WorldCRS84Quad"],
         "url_template": format!(
             "{base_url}/tiles/collections/{id}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
         ),
-        "styled_url_template": format!(
-            "{base_url}/tiles/collections/{id}/styles/{{styleId}}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
-        ),
-        "default_style": default_style,
         "media_type": "image/png"
-    })
+    });
+
+    // Only advertise the styled-tile URL when the collection actually has
+    // styles registered — otherwise a SPA following `styled_url_template`
+    // with `default_style` would hit a 404. Default-style preference: a
+    // style literally named "default", else the first style by sorted name.
+    if let Some(styles) = styles {
+        if let Some(default_style) = styles.get("default").map(|s| s.name.as_str()).or_else(|| {
+            let mut names: Vec<&String> = styles.keys().collect();
+            names.sort();
+            names
+                .first()
+                .and_then(|n| styles.get(*n))
+                .map(|s| s.name.as_str())
+        }) {
+            desc["default_style"] = json!(default_style);
+            desc["styled_url_template"] = json!(format!(
+                "{base_url}/tiles/collections/{id}/styles/{{styleId}}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"
+            ));
+        }
+    }
+    desc
 }
 
 fn style_list(styles: &std::collections::HashMap<String, ds_render::StyleInfo>) -> Vec<Value> {
@@ -842,6 +871,70 @@ mod tests {
             m["collections"][0]["apis"],
             serde_json::json!(["edr", "features"])
         );
+    }
+
+    #[test]
+    fn temporal_extent_shape_is_stable_when_engine_omits_available_times() {
+        // Regression: engines that implement `get_temporal_extent()` but
+        // leave `get_available_times()` at its default `None` (CSV,
+        // PostGIS, QueryData) used to produce `{"start","end"}` only,
+        // breaking UI clients that read `.values`/`.truncated`/
+        // `.total_values` without a null-guard. Manifest now always emits
+        // those three fields with empty defaults.
+        struct IntervalOnlyMock {
+            interval: (DateTime<Utc>, DateTime<Utc>),
+        }
+        impl Engine for IntervalOnlyMock {
+            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+                Ok(Vec::new())
+            }
+            fn query_location(
+                &self,
+                _: &str,
+                _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                _: Option<&[String]>,
+            ) -> Result<QueryResult, DataServerError> {
+                unimplemented!()
+            }
+            fn get_parameters(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+                Some(self.interval)
+            }
+            fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+                None
+            }
+            // Note: no `get_available_times` override — falls back to default `None`.
+        }
+        let mut edr = empty_edr();
+        let engine: Arc<dyn Engine> = Arc::new(IntervalOnlyMock {
+            interval: (
+                "2024-01-01T00:00:00Z".parse().unwrap(),
+                "2024-01-02T00:00:00Z".parse().unwrap(),
+            ),
+        });
+        edr.engines.insert("obs".into(), engine);
+        edr.collections
+            .insert("obs".into(), config("obs", &["edr"]));
+        let state = make_state(
+            edr,
+            empty_features(),
+            empty_maps(),
+            empty_tiles(),
+            empty_wms(),
+        );
+        let m = build_manifest(&state, 0, 100);
+        let temporal = &m["collections"][0]["temporal_extent"];
+        assert_eq!(temporal["start"], "2024-01-01T00:00:00+00:00");
+        assert_eq!(temporal["end"], "2024-01-02T00:00:00+00:00");
+        assert_eq!(
+            temporal["values"],
+            serde_json::json!([]),
+            "values key must be present (as empty array) even when get_available_times() is None"
+        );
+        assert_eq!(temporal["truncated"], false);
+        assert_eq!(temporal["total_values"], 0);
     }
 
     #[test]
