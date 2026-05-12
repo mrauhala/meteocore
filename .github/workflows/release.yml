@@ -15,18 +15,21 @@
 # trigger other workflows, so a separate `on: push tags` workflow would
 # be silently dormant. Doing the whole pipeline here avoids needing a
 # personal-access-token workaround.
+#
+# Security:
+#   - No workflow-level `permissions:` — each job grants itself the
+#     minimum it needs. A compromised action in `build-binary` cannot
+#     request an OIDC token or push to ghcr.io.
+#   - Every third-party action holding any write permission is pinned
+#     to a commit SHA so a hijacked `vN` tag can't redirect us.
+#     `actions/*` (first-party GitHub) and `dtolnay/rust-toolchain`
+#     (no write perms in its job) stay on floating tags.
 
 name: release
 
 on:
   push:
     branches: [main]
-
-permissions:
-  contents: write
-  pull-requests: write
-  packages: write
-  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,12 +39,15 @@ env:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
     steps:
-      - uses: googleapis/release-please-action@v5
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7  # v5
         id: release
         with:
           config-file: release-please-config.json
@@ -51,6 +57,8 @@ jobs:
     name: binary ${{ matrix.target }}
     needs: release-please
     if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -112,6 +120,10 @@ jobs:
     name: container image
     needs: release-please
     if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     runs-on: ubuntu-latest
     outputs:
       digest: ${{ steps.build-and-push.outputs.digest }}
@@ -120,12 +132,12 @@ jobs:
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
 
-      - uses: sigstore/cosign-installer@v4.1.1
+      - uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003  # v4.1.1
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4
 
       - name: Log into ${{ env.REGISTRY }}
-        uses: docker/login-action@v4
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -133,7 +145,7 @@ jobs:
 
       - name: Compute image tags
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf  # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           # Strip the `v` prefix from the version tag so the image label
@@ -146,7 +158,7 @@ jobs:
 
       - name: Build and push (linux/amd64, linux/arm64)
         id: build-and-push
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -169,6 +181,8 @@ jobs:
     # GitHub Release are still useful and should ship.
     needs: [release-please, build-binary]
     if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
@@ -183,7 +197,7 @@ jobs:
           rm -f *.sha256
           ls -la
 
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3
         with:
           tag_name: ${{ needs.release-please.outputs.tag_name }}
           files: |
