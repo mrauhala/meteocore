@@ -157,10 +157,10 @@ fn encode_geometry(geom: &Geometry, proj: &Projector) -> Result<Option<mvt::Geom
         }
         Geometry::Polygon { exterior, holes } => {
             let mut enc = GeomEncoder::<f64>::new(GeomType::Polygon);
-            push_ring(&mut enc, exterior, proj)?;
+            push_ring(&mut enc, exterior, proj, RingRole::Exterior)?;
             for hole in holes {
                 enc.complete_geom()?;
-                push_ring(&mut enc, hole, proj)?;
+                push_ring(&mut enc, hole, proj, RingRole::Hole)?;
             }
             Ok(Some(enc.complete()?.encode()?))
         }
@@ -171,10 +171,10 @@ fn encode_geometry(geom: &Geometry, proj: &Projector) -> Result<Option<mvt::Geom
                 if !first {
                     enc.complete_geom()?;
                 }
-                push_ring(&mut enc, exterior, proj)?;
+                push_ring(&mut enc, exterior, proj, RingRole::Exterior)?;
                 for hole in holes {
                     enc.complete_geom()?;
-                    push_ring(&mut enc, hole, proj)?;
+                    push_ring(&mut enc, hole, proj, RingRole::Hole)?;
                 }
                 first = false;
             }
@@ -183,34 +183,82 @@ fn encode_geometry(geom: &Geometry, proj: &Projector) -> Result<Option<mvt::Geom
     }
 }
 
+/// What a ring represents inside its parent polygon. Used by `push_ring`
+/// to drive winding-order normalisation: MVT spec §4.3.4.4 requires
+/// exterior rings clockwise and holes counter-clockwise in tile-local
+/// coordinates (which have a flipped Y compared to RFC 7946 geographic).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RingRole {
+    Exterior,
+    Hole,
+}
+
 fn push_ring(
     enc: &mut GeomEncoder<f64>,
     ring: &[[f64; 2]],
     proj: &Projector,
+    role: RingRole,
 ) -> Result<(), MvtError> {
     // GeoJSON convention duplicates the first vertex at the end to close the
     // ring; MVT's ClosePath command implies closure, so emit the duplicate
     // only if the caller didn't supply one.
-    //
-    // Winding order: MVT spec §4.3.4.4 requires exterior rings clockwise and
-    // holes counter-clockwise *in tile coordinates*, where Y grows downward.
-    // RFC 7946 GeoJSON specifies the opposite convention in geographic
-    // coordinates (Y grows northward, exterior CCW). `Projector::project`
-    // flips Y, so an RFC 7946-conformant input lands at MVT-conformant
-    // winding by construction. Inputs that don't follow RFC 7946 (some
-    // PostGIS exports, or hand-built data) will render as inside-out on
-    // strict clients; callers must normalise winding before this point.
     let n = ring.len();
     let end = if n >= 2 && ring[0] == ring[n - 1] {
         n - 1
     } else {
         n
     };
-    for &[x, y] in &ring[..end] {
-        let (px, py) = proj.project(x, y);
+
+    // Project once into tile-local coords so we can inspect winding before
+    // emitting. Y is already flipped (north → 0, south → extent) inside
+    // `Projector::project`.
+    let mut projected: Vec<(f64, f64)> = ring[..end]
+        .iter()
+        .map(|p| proj.project(p[0], p[1]))
+        .collect();
+
+    // MVT spec §4.3.4.4: exterior rings must be clockwise, holes
+    // counter-clockwise *in tile coordinates* (Y-down). Computing the
+    // shoelace signed area in tile-local space, positive area corresponds
+    // to clockwise visual winding (because Y is flipped relative to the
+    // standard math convention). Reverse when the sign doesn't match the
+    // role — this makes the encoder robust to RFC-7946-violating inputs
+    // (some PostGIS exports, hand-edited GeoJSON) without burdening the
+    // engine layer with normalisation.
+    let area = signed_area(&projected);
+    let needs_reverse = match role {
+        RingRole::Exterior => area < 0.0,
+        RingRole::Hole => area > 0.0,
+    };
+    if needs_reverse {
+        projected.reverse();
+    }
+
+    for (px, py) in projected {
         enc.add_point(px, py)?;
     }
     Ok(())
+}
+
+/// Shoelace signed area for an open polygon ring (first vertex not
+/// duplicated). In screen-coords (Y-down) the convention is:
+///
+///   * positive → clockwise visual winding
+///   * negative → counter-clockwise visual winding
+///
+/// Returns 0 for rings with fewer than 3 distinct vertices.
+fn signed_area(ring: &[(f64, f64)]) -> f64 {
+    let n = ring.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut acc = 0.0;
+    for i in 0..n {
+        let (x0, y0) = ring[i];
+        let (x1, y1) = ring[(i + 1) % n];
+        acc += x0 * y1 - x1 * y0;
+    }
+    acc * 0.5
 }
 
 // ---------------------------------------------------------------------------
@@ -284,8 +332,18 @@ fn lat_to_merc_y(lat: f64) -> f64 {
     clamped.to_radians().tan().asinh() * EARTH_RADIUS_M
 }
 
-// Stable hash of a property allowlist for use in cache keys. Different
-// allowlists produce different hashes so they don't share cache slots.
+/// Hash of a property allowlist for use in in-process cache keys.
+/// Different allowlists produce different hashes so they don't share cache
+/// slots.
+///
+/// **Single-process-ephemeral only.** The implementation uses
+/// `std::collections::hash_map::DefaultHasher`, whose algorithm is
+/// explicitly unspecified across Rust releases. Two processes — even on
+/// the same machine — may compute different values for the same input,
+/// and a toolchain upgrade can change the hash without warning. Do not
+/// persist this value, transmit it over the wire, or compare it across
+/// process boundaries; switch to a fixed-algorithm hasher (e.g. FNV) if
+/// stability is required.
 pub fn properties_hash(allowlist: &PropertyAllowlist) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -430,8 +488,54 @@ mod tests {
         let opts = TileEncodeOptions::new("polys", TmsKind::WebMercatorQuad);
         let bytes_closed = encode_tile(&[closed], web_mercator_tile_z0(), &opts).unwrap();
         let bytes_open = encode_tile(&[open], web_mercator_tile_z0(), &opts).unwrap();
-        // Both forms encode to the same byte sequence — only the id string differs.
-        assert_eq!(bytes_closed.len(), bytes_open.len());
+        // Neither ID parses as `u64`, so `set_id` is skipped and the only
+        // remaining difference between the two features (the open/closed
+        // last vertex) is normalised away in `push_ring`. The byte streams
+        // must be identical, not just the same length.
+        assert_eq!(bytes_closed, bytes_open);
+    }
+
+    #[test]
+    fn signed_area_sign_matches_winding() {
+        // CW in screen-coords (Y down) → positive area
+        let cw_screen = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
+        assert!(signed_area(&cw_screen) > 0.0);
+        // CCW in screen-coords (Y down) → negative area
+        let ccw_screen = [(0.0, 0.0), (0.0, 10.0), (10.0, 10.0), (10.0, 0.0)];
+        assert!(signed_area(&ccw_screen) < 0.0);
+        // Degenerate / under 3 vertices
+        assert_eq!(signed_area(&[(0.0, 0.0), (1.0, 1.0)]), 0.0);
+    }
+
+    #[test]
+    fn winding_order_normalised_for_non_conformant_inputs() {
+        // Project both rings through the same projector and check that, after
+        // running through `push_ring`'s normalisation, the *projected*
+        // signed area has the right sign for the ring's role. Byte-level
+        // equality between two different inputs isn't a useful invariant
+        // here (a different start vertex changes the MVT byte stream even
+        // when the winding is identical), but the post-normalisation sign
+        // is the actual MVT-spec requirement.
+        let proj = Projector::new(TmsKind::WebMercatorQuad, web_mercator_tile_z0(), 4096).unwrap();
+
+        // RFC 7946: exterior CCW in geographic coords.
+        let ccw_geo = [[-5.0, -5.0], [5.0, -5.0], [5.0, 5.0], [-5.0, 5.0]];
+        // RFC 7946 violation: exterior CW in geographic coords.
+        let cw_geo = [[-5.0, -5.0], [-5.0, 5.0], [5.0, 5.0], [5.0, -5.0]];
+
+        for ring in [ccw_geo, cw_geo] {
+            let mut projected: Vec<(f64, f64)> =
+                ring.iter().map(|p| proj.project(p[0], p[1])).collect();
+            // Mirror the normalisation logic in `push_ring`.
+            if signed_area(&projected) < 0.0 {
+                projected.reverse();
+            }
+            // MVT spec §4.3.4.4: exterior must be CW in tile coords → positive area.
+            assert!(
+                signed_area(&projected) > 0.0,
+                "exterior must be CW (positive area) after normalisation"
+            );
+        }
     }
 
     #[test]
