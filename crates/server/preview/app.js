@@ -1,12 +1,17 @@
 // MeteoCore preview SPA.
 //
-// Phase 3 scope: render every `tiles.raster` collection as a MapLibre raster
-// layer, with a sidebar checkbox to toggle visibility and (when more than one
-// style exists) a dropdown to swap styles live. Vector tiles + time slider
-// land in later phases.
+// Renders the manifest into MapLibre layers:
+//   * `tiles.raster` collections → raster source + raster layer, with a
+//     visibility toggle and a style picker (when more than one style is
+//     configured).
+//   * `tiles.vector` collections → vector source + circle/line/fill layers,
+//     with a visibility toggle and a click handler that opens a popup
+//     listing the feature's properties.
 //
-// XSS hygiene: every dynamic value reaches the DOM through `textContent` only.
-// Never use innerHTML with manifest data.
+// Time slider lands in a later phase.
+//
+// XSS hygiene: every dynamic value reaches the DOM through `textContent` or
+// as a typed `<option>` value. Never use innerHTML with manifest data.
 
 (function () {
     'use strict';
@@ -33,6 +38,10 @@
 
     const statusEl = document.getElementById('status');
     const listEl = document.getElementById('collections');
+
+    // Shared across every vector collection so clicking a feature in one
+    // collection dismisses an open popup from another.
+    let activePopup = null;
 
     // `map.on('load')` so MapLibre's style is ready before we add raster
     // sources/layers. Adding sources before style-load throws.
@@ -114,6 +123,13 @@
                     attachRasterLayer(c, li);
                 } catch (err) {
                     console.error('attachRasterLayer failed for', c.id, err);
+                }
+            }
+            if (c.tiles && c.tiles.vector) {
+                try {
+                    attachVectorLayer(c, li);
+                } catch (err) {
+                    console.error('attachVectorLayer failed for', c.id, err);
                 }
             }
 
@@ -276,5 +292,186 @@
         // reverse-proxy host rewriting.
         template = template.replace(/^https?:\/\/[^/]+/i, '');
         return template;
+    }
+
+    // -----------------------------------------------------------------
+    // Vector layer wiring
+    // -----------------------------------------------------------------
+
+    // Split by geometry-type so one collection can carry mixed geometries
+    // without per-feature paint overrides. `source-layer` mirrors the
+    // ds-mvt encoder convention server-side (== collection id).
+    function attachVectorLayer(collection, li) {
+        const sourceId = 'vsrc-' + collection.id;
+        const fillLayerId = 'vfill-' + collection.id;
+        const lineLayerId = 'vline-' + collection.id;
+        const pointLayerId = 'vpoint-' + collection.id;
+
+        // No `attribution`: MapLibre renders it via innerHTML.
+        map.addSource(sourceId, {
+            type: 'vector',
+            tiles: [vectorTileUrlFor(collection)]
+        });
+
+        // `match` over `==` so the filter catches `MultiPolygon` too
+        // (68/308 municipalities in the test data would otherwise vanish).
+        map.addLayer({
+            id: fillLayerId,
+            type: 'fill',
+            source: sourceId,
+            'source-layer': collection.id,
+            filter: ['match', ['geometry-type'], ['Polygon', 'MultiPolygon'], true, false],
+            paint: {
+                'fill-color': '#4299e1',
+                'fill-opacity': 0.18
+            }
+        });
+
+        // Polygon outlines so MultiPolygon boundaries stay visible under overlapping fills.
+        map.addLayer({
+            id: lineLayerId,
+            type: 'line',
+            source: sourceId,
+            'source-layer': collection.id,
+            filter: ['match', ['geometry-type'], ['Polygon', 'MultiPolygon'], true, false],
+            paint: {
+                'line-color': '#2b6cb0',
+                'line-width': 1
+            }
+        });
+
+        map.addLayer({
+            id: pointLayerId,
+            type: 'circle',
+            source: sourceId,
+            'source-layer': collection.id,
+            filter: ['match', ['geometry-type'], ['Point', 'MultiPoint'], true, false],
+            paint: {
+                'circle-radius': 5,
+                'circle-color': '#4299e1',
+                'circle-stroke-color': '#ffffff',
+                'circle-stroke-width': 1.5
+            }
+        });
+
+        const interactiveLayers = [fillLayerId, lineLayerId, pointLayerId];
+
+        map.on('click', interactiveLayers, function (e) {
+            if (!e.features || e.features.length === 0) return;
+            const feature = e.features[0];
+            // MapLibre doesn't auto-dismiss; replace any existing popup.
+            if (activePopup) activePopup.remove();
+            activePopup = new maplibregl.Popup({ closeButton: true, maxWidth: '320px' })
+                .setLngLat(e.lngLat)
+                .setDOMContent(buildPopupBody(collection, feature))
+                .addTo(map);
+            activePopup.on('close', function () {
+                activePopup = null;
+            });
+        });
+
+        // mouseenter/mouseleave dispatch per-layer, not per-collection.
+        interactiveLayers.forEach(function (id) {
+            map.on('mouseenter', id, function () {
+                map.getCanvas().style.cursor = 'pointer';
+            });
+            map.on('mouseleave', id, function () {
+                map.getCanvas().style.cursor = '';
+            });
+        });
+
+        // Sidebar control — single checkbox flips all three layers together.
+        const controls = document.createElement('div');
+        controls.className = 'controls';
+
+        const toggle = document.createElement('label');
+        toggle.className = 'toggle';
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = true;
+        checkbox.addEventListener('change', function () {
+            const visibility = checkbox.checked ? 'visible' : 'none';
+            interactiveLayers.forEach(function (id) {
+                map.setLayoutProperty(id, 'visibility', visibility);
+            });
+        });
+        toggle.appendChild(checkbox);
+        const toggleText = document.createElement('span');
+        toggleText.textContent = 'Vector layer';
+        toggle.appendChild(toggleText);
+        controls.appendChild(toggle);
+
+        li.appendChild(controls);
+    }
+
+    function vectorTileUrlFor(collection) {
+        // Same OGC placeholders as raster — `?f=mvt` is already in the manifest.
+        let template = collection.tiles.vector.url_template;
+        template = template.replace('{tileMatrixSetId}', 'WebMercatorQuad');
+        template = template.replace('{tileMatrix}', '{z}');
+        template = template.replace('{tileRow}', '{y}');
+        template = template.replace('{tileCol}', '{x}');
+        // MapLibre's vector-tile worker rejects relative URLs ("URL is not
+        // valid or contains user credentials"). Re-anchor to the page
+        // origin so 127.0.0.1↔localhost mismatch in `server.base_url`
+        // doesn't trip CSP `connect-src 'self'` either.
+        template = template.replace(/^https?:\/\/[^/]+/i, '');
+        template = window.location.origin + template;
+        return template;
+    }
+
+    function buildPopupBody(collection, feature) {
+        const root = document.createElement('div');
+        root.className = 'popup';
+
+        const heading = document.createElement('h3');
+        heading.textContent = collection.title || collection.id;
+        root.appendChild(heading);
+
+        const rows = [];
+        if (feature.id !== undefined && feature.id !== null && feature.id !== '') {
+            rows.push(['id', String(feature.id)]);
+        }
+        const props = feature.properties || {};
+        Object.keys(props)
+            .sort()
+            .forEach(function (key) {
+                rows.push([key, formatPropertyValue(props[key])]);
+            });
+
+        if (rows.length === 0) {
+            const empty = document.createElement('p');
+            empty.className = 'popup-empty';
+            empty.textContent = 'No properties.';
+            root.appendChild(empty);
+            return root;
+        }
+
+        rows.forEach(function (kv) {
+            const row = document.createElement('div');
+            row.className = 'popup-row';
+            const k = document.createElement('span');
+            k.className = 'k';
+            k.textContent = kv[0];
+            const v = document.createElement('span');
+            v.className = 'v';
+            v.textContent = kv[1];
+            row.appendChild(k);
+            row.appendChild(v);
+            root.appendChild(row);
+        });
+        return root;
+    }
+
+    function formatPropertyValue(value) {
+        if (value === null || value === undefined) return '—';
+        if (typeof value === 'number' && !Number.isInteger(value)) {
+            // Trim noisy floating-point trails without losing precision the
+            // user actually asked for. 6 sig figs covers area / population /
+            // perimeter values for the radar+admin-boundaries preview without
+            // turning every popup into a wall of decimal noise.
+            return value.toLocaleString(undefined, { maximumSignificantDigits: 6 });
+        }
+        return String(value);
     }
 })();

@@ -3,4 +3,4 @@ title = "Finnish Municipalities"
 description = "Municipality boundaries from Statistics Finland (1:1M scale)"
 data_path = "testdata/municipalities.geojson"
 engine_type = "geojson"
-apis = ["features"]
+apis = ["features", "tiles"]
