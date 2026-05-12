@@ -468,19 +468,20 @@ fn build_collection_metadata(
         }),
     ];
 
-    // If this collection is also exposed through OGC API Tiles as MVT, advertise
-    // the tileset so clients can discover the vector-tile source without probing.
-    // URL template uses `?f=mvt` per the api-tiles content-negotiation route.
+    // If this collection is also exposed through OGC API Tiles, advertise the
+    // tilesets list so clients can discover the vector-tile representation
+    // without probing. Per OGC API – Tiles 1.0 §7.1, the `tilesets-vector`
+    // relation targets the tilesets list resource (`application/json`), not a
+    // tile URL template — the per-tile URL template lives one level deeper
+    // inside the tilesets-list response as `rel: item`. Linking to the list
+    // also avoids hardcoding `WebMercatorQuad`; the list enumerates every
+    // supported TileMatrixSet.
     if config.apis.iter().any(|a| a == "tiles") {
         links.push(json!({
-            "href": format!(
-                "{base_url}/tiles/collections/{}/tiles/WebMercatorQuad/{{tileMatrix}}/{{tileRow}}/{{tileCol}}?f=mvt",
-                config.id
-            ),
+            "href": format!("{base_url}/tiles/collections/{}/tiles", config.id),
             "rel": "http://www.opengis.net/def/rel/ogc/1.0/tilesets-vector",
-            "type": "application/vnd.mapbox-vector-tile",
-            "templated": true,
-            "title": "Vector tiles (MVT)"
+            "type": "application/json",
+            "title": "Vector tilesets"
         }));
     }
 

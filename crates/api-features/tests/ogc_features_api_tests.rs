@@ -468,16 +468,72 @@ mod vector_tile_discovery {
                 l["rel"].as_str() == Some("http://www.opengis.net/def/rel/ogc/1.0/tilesets-vector")
             })
             .expect("collection with apis=[tiles] must advertise a vector tileset link");
-        assert_eq!(
-            tileset_link["type"].as_str().unwrap(),
-            "application/vnd.mapbox-vector-tile"
+        // Per OGC API – Tiles 1.0 §7.1 the `tilesets-vector` rel targets the
+        // tilesets-list resource (returns JSON), not a tile URL template, so
+        // the type is `application/json` and there is no `templated` flag.
+        assert_eq!(tileset_link["type"].as_str().unwrap(), "application/json");
+        assert!(
+            tileset_link.get("templated").is_none(),
+            "tilesets-vector link must not carry the `templated` HAL-ism: \
+             it points at a concrete tilesets-list URL, not a template"
         );
-        assert_eq!(tileset_link["templated"].as_bool(), Some(true));
         let href = tileset_link["href"].as_str().unwrap();
-        // URL template points at the api-tiles MVT route, and the format
-        // override stays explicit so blind copy/paste into a tile client works.
-        assert!(href.contains("/tiles/collections/cities/tiles/WebMercatorQuad/"));
-        assert!(href.contains("f=mvt"));
+        // No WebMercatorQuad hardcode — the list enumerates every supported
+        // TileMatrixSet, so the discovery link stays correct if another TMS
+        // is added later.
+        assert!(
+            href.ends_with("/tiles/collections/cities/tiles"),
+            "tilesets-vector href must be the tilesets-list endpoint, got: {href}"
+        );
+        assert!(!href.contains("WebMercatorQuad"));
+        assert!(!href.contains("f=mvt"));
+    }
+
+    #[tokio::test]
+    async fn collection_without_tiles_api_does_not_emit_tileset_link() {
+        // Use a fresh router whose only collection declares `apis=["features"]`
+        // — i.e. no `"tiles"`. The conditional in `build_collection_metadata`
+        // must omit the `tilesets-vector` link entirely.
+        let engine: Arc<dyn FeatureEngine> = Arc::new(MockFeatureEngine::new());
+        let mut engines = HashMap::new();
+        let mut collections = HashMap::new();
+        engines.insert("cities".to_string(), engine);
+        collections.insert(
+            "cities".to_string(),
+            CollectionConfig {
+                id: "cities".to_string(),
+                title: "Finnish Cities".to_string(),
+                description: "City points for testing".to_string(),
+                data_path: None,
+                apis: vec!["features".to_string()],
+                engine_type: "mock".to_string(),
+                geotiff: None,
+                querydata: None,
+                wms: None,
+                grib: None,
+                postgis: None,
+            },
+        );
+        let state = Arc::new(ArcSwap::from_pointee(FeaturesState {
+            engines,
+            collections,
+            base_url: String::new(),
+        }));
+        let app = api_features::router(state);
+        let req = Request::builder()
+            .uri("/collections/cities")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let links = json["links"].as_array().expect("links must be present");
+        assert!(
+            !links.iter().any(|l| {
+                l["rel"].as_str() == Some("http://www.opengis.net/def/rel/ogc/1.0/tilesets-vector")
+            }),
+            "collection without `tiles` in apis must not emit a tilesets-vector link"
+        );
     }
 }
 
