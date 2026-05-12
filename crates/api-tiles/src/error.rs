@@ -11,6 +11,11 @@ pub enum TilesError {
     NotFound(String),
     /// Invalid request parameters.
     BadRequest(String),
+    /// Request is well-formed but the server can't satisfy it as-is — e.g.
+    /// a tile whose feature count exceeds the density cap. Maps to HTTP 422
+    /// (Unprocessable Content), the closest match in lieu of an OGC-specific
+    /// status.
+    Unprocessable(String),
     /// Internal server error.
     Internal(String),
     /// Server too busy (render semaphore exhausted).
@@ -22,6 +27,11 @@ impl IntoResponse for TilesError {
         let (status, code, description) = match &self {
             TilesError::NotFound(msg) => (StatusCode::NOT_FOUND, "NotFound", msg.as_str()),
             TilesError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "BadRequest", msg.as_str()),
+            TilesError::Unprocessable(msg) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Unprocessable",
+                msg.as_str(),
+            ),
             TilesError::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "ServerError",
