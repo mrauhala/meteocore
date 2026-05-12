@@ -18,7 +18,7 @@ mod encode;
 mod hash;
 mod simplify;
 
-pub use cache::{VectorTileCache, VectorTileKey};
+pub use cache::{CachedTile, VectorTileCache, VectorTileKey};
 pub use encode::{
     encode_tile, properties_hash, EncodeError, PropertyAllowlist, TileEncodeOptions, TmsKind,
 };

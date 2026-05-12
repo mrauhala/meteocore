@@ -13,8 +13,8 @@ use ds_core::feature::{Bbox, FeatureQuery};
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::map_engine::MapEngine;
 use ds_mvt::{
-    encode_tile, properties_hash, PropertyAllowlist, TileEncodeOptions, TmsKind, VectorTileCache,
-    VectorTileKey,
+    encode_tile, properties_hash, CachedTile, PropertyAllowlist, TileEncodeOptions, TmsKind,
+    VectorTileCache, VectorTileKey,
 };
 use ds_render::{CacheKey, RenderedCache, StyleInfo};
 
@@ -774,34 +774,37 @@ async fn render_vector_tile(
         // the ETag forces a fresh fetch instead of an infinite `304` loop.
         data_version: engine.data_version(),
     };
-    let etag = cache_key.etag();
     let cache_control = "public, max-age=300";
+    let if_none_match = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
 
-    if let Some(inm) = headers.get(header::IF_NONE_MATCH) {
-        if let Ok(s) = inm.to_str() {
-            if ds_render::etag_matches(s, &etag) {
+    // ETag is content-derived, so we must look at the cached bytes (or freshly
+    // encoded bytes) before we can answer `If-None-Match`. A key-derived ETag
+    // would let stale browser caches survive a server fix indefinitely.
+    if let Some(cached) = state.vector_tile_cache.get(&cache_key) {
+        if let Some(ref inm) = if_none_match {
+            if ds_render::etag_matches(inm, cached.etag()) {
                 return Ok(axum::response::Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
-                    .header(header::ETAG, &etag)
+                    .header(header::ETAG, cached.etag())
                     .header(header::CACHE_CONTROL, cache_control)
                     .body(axum::body::Body::empty())
                     .unwrap()
                     .into_response());
             }
         }
-    }
-
-    if let Some(cached) = state.vector_tile_cache.get(&cache_key) {
         return Ok(axum::response::Response::builder()
             .header(header::CONTENT_TYPE, MVT_CONTENT_TYPE)
-            .header(header::ETAG, &etag)
+            .header(header::ETAG, cached.etag())
             .header(header::CACHE_CONTROL, cache_control)
             .header(
                 header::HeaderName::from_static("x-content-type-options"),
                 "nosniff",
             )
             .header(header::HeaderName::from_static("x-cache"), "HIT")
-            .body(axum::body::Body::from(cached))
+            .body(axum::body::Body::from(cached.bytes))
             .unwrap()
             .into_response());
     }
@@ -862,19 +865,31 @@ async fn render_vector_tile(
         TilesError::Internal(format!("Encode failed: {e}"))
     })?;
 
-    let bytes = bytes::Bytes::from(bytes);
-    state.vector_tile_cache.insert(cache_key, bytes.clone());
+    let cached = CachedTile::new(bytes::Bytes::from(bytes));
+    state.vector_tile_cache.insert(cache_key, cached.clone());
+
+    if let Some(ref inm) = if_none_match {
+        if ds_render::etag_matches(inm, cached.etag()) {
+            return Ok(axum::response::Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header(header::ETAG, cached.etag())
+                .header(header::CACHE_CONTROL, cache_control)
+                .body(axum::body::Body::empty())
+                .unwrap()
+                .into_response());
+        }
+    }
 
     Ok(axum::response::Response::builder()
         .header(header::CONTENT_TYPE, MVT_CONTENT_TYPE)
-        .header(header::ETAG, &etag)
+        .header(header::ETAG, cached.etag())
         .header(header::CACHE_CONTROL, cache_control)
         .header(
             header::HeaderName::from_static("x-content-type-options"),
             "nosniff",
         )
         .header(header::HeaderName::from_static("x-cache"), "MISS")
-        .body(axum::body::Body::from(bytes))
+        .body(axum::body::Body::from(cached.bytes))
         .unwrap()
         .into_response())
 }
