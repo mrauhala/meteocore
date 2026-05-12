@@ -1,44 +1,59 @@
-# Stage 1: Build
-FROM rust:1.94-slim AS builder
-
+# Stage 1a: cargo-chef shared base
+#
+# `cargo-chef` produces a stable "recipe" (Cargo.toml/lock-derived) so the
+# dep-cache layer only invalidates when *dependencies* change, not when
+# workspace source changes. Replaces the previous hand-enumerated stub-lib
+# trick (which silently omitted `engine-postgis` when the workspace grew)
+# with a self-maintaining mechanism that picks up new crates automatically.
+FROM rust:1.94-slim AS chef
 WORKDIR /build
+RUN cargo install cargo-chef --locked --version 0.1.71
 
-# Install build dependencies
-# pip cmake provides 3.26+ needed by libaec-sys (Bookworm ships 3.25)
-# clang needed for libaec-sys (GRIB CCSDS compression)
-RUN apt-get update && apt-get install -y \
-    pkg-config libssl-dev clang python3-pip \
-    && pip install --break-system-packages cmake \
-    && rm -rf /var/lib/apt/lists/*
+# Stage 1b: derive recipe.json from the full workspace
+#
+# `cargo chef prepare` only reads Cargo.toml + Cargo.lock, so recipe.json is
+# stable across source-only changes — the next stage's cache hits.
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Copy manifests first for dependency caching
-COPY Cargo.toml Cargo.lock ./
-COPY crates/core/Cargo.toml crates/core/Cargo.toml
-COPY crates/engine-csv/Cargo.toml crates/engine-csv/Cargo.toml
-COPY crates/engine-geojson/Cargo.toml crates/engine-geojson/Cargo.toml
-COPY crates/engine-geotiff/Cargo.toml crates/engine-geotiff/Cargo.toml
-COPY crates/engine-querydata/Cargo.toml crates/engine-querydata/Cargo.toml
-COPY crates/engine-grib/Cargo.toml crates/engine-grib/Cargo.toml
-COPY crates/storage/Cargo.toml crates/storage/Cargo.toml
-COPY crates/render/Cargo.toml crates/render/Cargo.toml
-COPY crates/api-edr/Cargo.toml crates/api-edr/Cargo.toml
-COPY crates/api-features/Cargo.toml crates/api-features/Cargo.toml
-COPY crates/api-wms/Cargo.toml crates/api-wms/Cargo.toml
-COPY crates/api-maps/Cargo.toml crates/api-maps/Cargo.toml
-COPY crates/api-tiles/Cargo.toml crates/api-tiles/Cargo.toml
-COPY crates/server/Cargo.toml crates/server/Cargo.toml
+# Stage 1c: builder
+FROM chef AS builder
+#
+# System dependencies:
+#  - `pkg-config`, `libssl-dev`, `clang` — needed by libaec-sys (GRIB
+#    CCSDS compression). `clang` provides libclang for bindgen.
+#  - `make` — pip-installed `cmake` ships a static binary but still
+#    drives `make` for its Unix Makefiles generator. Without an explicit
+#    `make` install, libaec-sys's build script fails with "CMake was
+#    unable to find a build program corresponding to 'Unix Makefiles'".
+#    `clang` Recommends `make` but `--no-install-recommends` blocks that.
+#  - `cmake` via pip — libaec-sys requires cmake ≥3.26, but Bookworm
+#    main ships 3.25. The bookworm-backports route (cmake 3.31) was
+#    tried and abandoned: apt's solver fails to resolve `libjsoncpp25`
+#    across the main/backports boundary on current `rust:1.94-slim` even
+#    though the package is in main. `pip install --break-system-packages
+#    cmake` ships a self-contained static binary that sidesteps the
+#    system-package solver entirely. PEP 668 makes Debian's Python
+#    "system-managed" — `--break-system-packages` is the documented way
+#    to opt out for build-stage tooling. Build-stage only; never lands
+#    in the runtime image.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config libssl-dev clang make python3-pip ca-certificates && \
+    pip install --break-system-packages cmake && \
+    rm -rf /var/lib/apt/lists/*
 
-# Create stub lib.rs files so cargo can resolve the workspace and cache deps
-RUN for dir in core engine-csv engine-geojson engine-geotiff engine-querydata engine-grib storage render api-edr api-features api-wms api-maps api-tiles; do \
-      mkdir -p crates/$dir/src && echo "" > crates/$dir/src/lib.rs; \
-    done && \
-    mkdir -p crates/server/src && echo "fn main() {}" > crates/server/src/main.rs
+# Cook the dep tree from the recipe. This is the layer that benefits most
+# from cross-build caching — input is just `recipe.json` (manifests only),
+# so it stays cache-valid until any Cargo.toml or Cargo.lock changes.
+# Source changes do *not* invalidate it. `type=gha,mode=max` on the
+# workflow's `cache-to` exports this layer.
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json -p server
 
-RUN cargo build --release -p server 2>/dev/null || true
-
-# Copy actual source and build
-COPY crates/ crates/
-COPY schemas/ schemas/
+# Now copy the actual workspace source and build. Only the changed
+# workspace member's crate needs to recompile; deps are already linked.
+COPY . .
 RUN cargo build --release -p server
 
 # Stage 2: Runtime

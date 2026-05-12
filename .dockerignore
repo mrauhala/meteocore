@@ -1,7 +1,23 @@
+# Build artifacts and VCS — large, source of truth lives elsewhere.
 target/
-spike-geotiff/
-server.log
-*.excalidraw
-fetch_fmi_data.py
 .git/
-REVIEW-geotiff-engine.md
+
+# Tooling / docs / scratch — not needed in the image.
+.github/
+*.excalidraw
+*.md
+README*
+REVIEW-*.md
+fetch_fmi_data.py
+server.log
+
+# Test fixtures and one-off experiments — large, build doesn't read them.
+testdata/
+spike-geotiff/
+varnish/
+fuzz/
+
+# cargo-chef artefact — generated inside the builder image, never copied
+# from a developer's tree. Excluding it keeps `cargo chef prepare`'s
+# output deterministic regardless of whether the dev ran chef locally.
+recipe.json
