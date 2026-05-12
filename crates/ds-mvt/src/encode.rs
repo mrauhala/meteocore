@@ -156,18 +156,18 @@ fn encode_geometry(geom: &Geometry, proj: &Projector) -> Result<Option<mvt::Geom
             Ok(Some(geom))
         }
         Geometry::Polygon { exterior, holes } => {
-            // Empty exterior would let `enc.complete()` run on a zero-point
-            // encoder, which the `mvt` crate either errors on or emits as
-            // degenerate protobuf. Skip the feature instead.
-            if exterior.is_empty() {
+            // A ring with fewer than three unique vertices can't form a
+            // valid polygon (MVT §4.3.4.4 requires ≥3). Letting it through
+            // would emit a zero/one/two-point ring inside `enc.complete()`,
+            // which the `mvt` crate either errors on or stores as
+            // degenerate protobuf. Skip the feature.
+            if ring_unique_count(exterior) < 3 {
                 return Ok(None);
             }
             let mut enc = GeomEncoder::<f64>::new(GeomType::Polygon);
             push_ring(&mut enc, exterior, proj, RingRole::Exterior)?;
             for hole in holes {
-                // Same zero-point trap as the exterior: an empty hole would
-                // make `complete_geom`/`complete` close a ring with no points.
-                if hole.is_empty() {
+                if ring_unique_count(hole) < 3 {
                     continue;
                 }
                 enc.complete_geom()?;
@@ -176,16 +176,14 @@ fn encode_geometry(geom: &Geometry, proj: &Projector) -> Result<Option<mvt::Geom
             Ok(Some(enc.complete()?.encode()?))
         }
         Geometry::MultiPolygon { polygons } => {
-            // A `MultiPolygon` with zero parts hits the same encoder-with-no-
-            // points trap as an empty `Polygon`. Treat it as "no geometry"
-            // rather than letting the failure propagate and kill the tile.
+            // A `MultiPolygon` with zero valid parts hits the same trap.
             if polygons.is_empty() {
                 return Ok(None);
             }
             let mut enc = GeomEncoder::<f64>::new(GeomType::Polygon);
             let mut first = true;
             for (exterior, holes) in polygons {
-                if exterior.is_empty() {
+                if ring_unique_count(exterior) < 3 {
                     continue;
                 }
                 if !first {
@@ -193,7 +191,7 @@ fn encode_geometry(geom: &Geometry, proj: &Projector) -> Result<Option<mvt::Geom
                 }
                 push_ring(&mut enc, exterior, proj, RingRole::Exterior)?;
                 for hole in holes {
-                    if hole.is_empty() {
+                    if ring_unique_count(hole) < 3 {
                         continue;
                     }
                     enc.complete_geom()?;
@@ -201,12 +199,24 @@ fn encode_geometry(geom: &Geometry, proj: &Projector) -> Result<Option<mvt::Geom
                 }
                 first = false;
             }
-            // All parts had empty exteriors → no points emitted.
+            // All parts had degenerate exteriors → no points emitted.
             if first {
                 return Ok(None);
             }
             Ok(Some(enc.complete()?.encode()?))
         }
+    }
+}
+
+/// How many distinct vertices a ring contributes, ignoring the GeoJSON
+/// convention of repeating the first vertex at the end. A ring with fewer
+/// than 3 distinct vertices can't form a valid polygon.
+fn ring_unique_count(ring: &[[f64; 2]]) -> usize {
+    let n = ring.len();
+    if n >= 2 && ring[0] == ring[n - 1] {
+        n - 1
+    } else {
+        n
     }
 }
 
@@ -688,6 +698,54 @@ mod tests {
         // strings that don't parse to u64.
         assert!(slice_contains(&bytes_single, b"polys"));
         assert!(slice_contains(&bytes_multi, b"polys"));
+    }
+
+    #[test]
+    fn ring_with_fewer_than_three_unique_vertices_is_skipped() {
+        // `[[0,0],[1,1],[0,0]]` is closed (last == first), so stripping the
+        // duplicate leaves 2 unique vertices — too few for a polygon. The
+        // encoder must reject this before calling `enc.complete()`.
+        let degenerate = feature(
+            "two-vertex",
+            Geometry::Polygon {
+                exterior: vec![[0.0, 0.0], [1.0, 1.0], [0.0, 0.0]],
+                holes: vec![],
+            },
+            &[],
+        );
+        // 1-vertex (open) ring — also degenerate.
+        let single = feature(
+            "one-vertex",
+            Geometry::Polygon {
+                exterior: vec![[0.0, 0.0]],
+                holes: vec![],
+            },
+            &[],
+        );
+        let opts = TileEncodeOptions::new("polys", TmsKind::WebMercatorQuad);
+        // Both must encode successfully (no error from mvt::complete)
+        // and produce no feature bytes for the dropped polygons.
+        let bytes_a = encode_tile(&[degenerate], web_mercator_tile_z0(), &opts).unwrap();
+        let bytes_b = encode_tile(&[single], web_mercator_tile_z0(), &opts).unwrap();
+        assert!(!bytes_a.is_empty());
+        assert!(!bytes_b.is_empty());
+    }
+
+    #[test]
+    fn ring_unique_count_strips_closing_duplicate() {
+        // GeoJSON convention closes a ring by repeating the first vertex.
+        assert_eq!(
+            ring_unique_count(&[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]),
+            3
+        );
+        // Open ring — no duplicate to strip.
+        assert_eq!(ring_unique_count(&[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]), 3);
+        // 1-vertex ring is degenerate.
+        assert_eq!(ring_unique_count(&[[0.0, 0.0]]), 1);
+        // 2-vertex "closed" ring → 1 unique vertex after stripping.
+        assert_eq!(ring_unique_count(&[[0.0, 0.0], [0.0, 0.0]]), 1);
+        // Empty.
+        assert_eq!(ring_unique_count(&[]), 0);
     }
 
     #[test]
