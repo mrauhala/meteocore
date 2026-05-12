@@ -491,42 +491,12 @@ mod vector_tile_discovery {
 
     #[tokio::test]
     async fn collection_without_tiles_api_does_not_emit_tileset_link() {
-        // Use a fresh router whose only collection declares `apis=["features"]`
-        // — i.e. no `"tiles"`. The conditional in `build_collection_metadata`
-        // must omit the `tilesets-vector` link entirely.
-        let engine: Arc<dyn FeatureEngine> = Arc::new(MockFeatureEngine::new());
-        let mut engines = HashMap::new();
-        let mut collections = HashMap::new();
-        engines.insert("cities".to_string(), engine);
-        collections.insert(
-            "cities".to_string(),
-            CollectionConfig {
-                id: "cities".to_string(),
-                title: "Finnish Cities".to_string(),
-                description: "City points for testing".to_string(),
-                data_path: None,
-                apis: vec!["features".to_string()],
-                engine_type: "mock".to_string(),
-                geotiff: None,
-                querydata: None,
-                wms: None,
-                grib: None,
-                postgis: None,
-            },
-        );
-        let state = Arc::new(ArcSwap::from_pointee(FeaturesState {
-            engines,
-            collections,
-            base_url: String::new(),
-        }));
-        let app = api_features::router(state);
-        let req = Request::builder()
-            .uri("/collections/cities")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let json: Value = serde_json::from_slice(&body).unwrap();
+        // Reuse the standard `build_router()` fixture (via `get`), which
+        // seeds `cities` with `apis: ["features"]` only — exactly the
+        // config this assertion needs. The conditional in
+        // `build_collection_metadata` must omit the `tilesets-vector`
+        // link when `tiles` is absent.
+        let (_, json) = get("/collections/cities").await;
         let links = json["links"].as_array().expect("links must be present");
         assert!(
             !links.iter().any(|l| {
