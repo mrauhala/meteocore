@@ -20,6 +20,7 @@ ds-render = { path = "../render" }
 ds-mvt = { path = "../ds-mvt" }
 arc-swap = "1"
 axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
 http-body = "1"
 prometheus = "0.13"
 serde = { version = "1", features = ["derive"] }
@@ -32,7 +33,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-chrono = "0.4"
 http-body-util = "0.1"
 toml = "0.8"
 tower = { version = "0.5", features = ["util"] }

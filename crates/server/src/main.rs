@@ -1,4 +1,5 @@
 mod admin;
+mod preview;
 
 use std::sync::{Arc, RwLock};
 
@@ -270,6 +271,10 @@ async fn main() {
         .route(
             "/metrics",
             get(admin::metrics_handler).with_state(server_state.clone()),
+        )
+        .route(
+            "/preview/manifest.json",
+            get(preview::manifest_handler).with_state(server_state.clone()),
         );
 
     // Admin routes (protected by bearer token auth, not CORS)
