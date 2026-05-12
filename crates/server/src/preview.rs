@@ -63,11 +63,18 @@ const PREVIEW_CSP: &str = "default-src 'self'; \
 /// into a quoted hex ETag (`"hexhexhex..."`, 64 hex chars + quotes).
 /// Stable across binary rebuilds for the same asset bytes; changes the
 /// moment the embedded content does.
+///
+/// `write!` straight onto the `String` avoids the 32 temporary
+/// `format!(...)` heap allocations the obvious push-loop would do.
 fn sha256_etag(hash: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(2 + 64);
     out.push('"');
     for b in hash {
-        out.push_str(&format!("{b:02x}"));
+        // `write!` into a String never fails — `Write` impl for String is
+        // infallible — so unwrapping is safe and the compiler optimises
+        // the panic away.
+        write!(&mut out, "{b:02x}").expect("writing to String cannot fail");
     }
     out.push('"');
     out
