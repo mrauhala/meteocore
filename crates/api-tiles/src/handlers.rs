@@ -89,7 +89,8 @@ fn crs_to_uri(crs: &str) -> &'static str {
 
 fn build_collection_metadata(
     config: &CollectionConfig,
-    info: &ds_core::map_engine::RasterInfo,
+    raster_info: Option<&ds_core::map_engine::RasterInfo>,
+    feature_extent: Option<[f64; 4]>,
     styles: Option<&HashMap<String, StyleInfo>>,
     base_url: &str,
 ) -> serde_json::Value {
@@ -123,12 +124,22 @@ fn build_collection_metadata(
         }
     }
 
+    // OGC API Tiles §7 constrains `dataType` to "map" (raster) or "vector".
+    // A collection that supports both is advertised as "map" so existing raster
+    // clients aren't surprised; MVT availability is discoverable via the tile
+    // path's content negotiation (`?f=mvt`).
+    let data_type = if raster_info.is_some() {
+        "map"
+    } else {
+        "vector"
+    };
+
     let mut metadata = json!({
         "id": config.id,
         "title": config.title,
         "description": config.description,
         "apis": config.apis,
-        "dataType": "map",
+        "dataType": data_type,
         "tileMatrixSetLinks": tms_links,
         "styles": style_list,
         "links": [
@@ -147,7 +158,10 @@ fn build_collection_metadata(
         ]
     });
 
-    if let Some(bbox) = info.spatial_extent {
+    let spatial_extent = raster_info
+        .and_then(|i| i.spatial_extent)
+        .or(feature_extent);
+    if let Some(bbox) = spatial_extent {
         metadata["extent"] = json!({
             "spatial": {
                 "bbox": [bbox],
@@ -156,22 +170,24 @@ fn build_collection_metadata(
         });
     }
 
-    if !info.times.is_empty() {
-        let first = info.times.first().map(|t| t.to_rfc3339());
-        let last = info.times.last().map(|t| t.to_rfc3339());
-        if let (Some(start), Some(end)) = (first, last) {
-            if let Some(extent) = metadata.get_mut("extent") {
-                extent["temporal"] = json!({
-                    "interval": [[start, end]],
-                    "trs": "http://www.opengis.net/def/uom/ISO-8601/0/Gregorian"
-                });
-            } else {
-                metadata["extent"] = json!({
-                    "temporal": {
+    if let Some(info) = raster_info {
+        if !info.times.is_empty() {
+            let first = info.times.first().map(|t| t.to_rfc3339());
+            let last = info.times.last().map(|t| t.to_rfc3339());
+            if let (Some(start), Some(end)) = (first, last) {
+                if let Some(extent) = metadata.get_mut("extent") {
+                    extent["temporal"] = json!({
                         "interval": [[start, end]],
                         "trs": "http://www.opengis.net/def/uom/ISO-8601/0/Gregorian"
-                    }
-                });
+                    });
+                } else {
+                    metadata["extent"] = json!({
+                        "temporal": {
+                            "interval": [[start, end]],
+                            "trs": "http://www.opengis.net/def/uom/ISO-8601/0/Gregorian"
+                        }
+                    });
+                }
             }
         }
     }
@@ -235,8 +251,24 @@ pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
     let state = state.load_full();
     let mut collection_paths = json!({});
-    for config in state.collections.values() {
-        let id = &config.id;
+    // A collection may be raster-only, vector-only, or both. Iterate the
+    // union of `collections` (raster) and `feature_collections` (vector),
+    // then advertise the formats each one actually supports.
+    let mut ids: Vec<&String> = state
+        .collections
+        .keys()
+        .chain(state.feature_collections.keys())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    for id in ids {
+        let config = state
+            .collections
+            .get(id)
+            .or_else(|| state.feature_collections.get(id));
+        let Some(config) = config else { continue };
+        let has_raster = state.map_engines.contains_key(id);
+        let has_vector = state.feature_engines.contains_key(id);
 
         collection_paths[format!("/tiles/collections/{id}")] = json!({
             "get": {
@@ -260,6 +292,28 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 }
             }
         });
+
+        let mut content = serde_json::Map::new();
+        if has_raster {
+            content.insert(
+                "image/png".into(),
+                json!({"schema": {"type": "string", "format": "binary"}}),
+            );
+            content.insert(
+                "image/jpeg".into(),
+                json!({"schema": {"type": "string", "format": "binary"}}),
+            );
+            content.insert(
+                "image/webp".into(),
+                json!({"schema": {"type": "string", "format": "binary"}}),
+            );
+        }
+        if has_vector {
+            content.insert(
+                MVT_CONTENT_TYPE.into(),
+                json!({"schema": {"type": "string", "format": "binary"}}),
+            );
+        }
 
         collection_paths[format!("/tiles/collections/{id}/tiles/{{tileMatrixSetId}}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}")] = json!({
             "get": {
@@ -300,15 +354,12 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 ],
                 "responses": {
                     "200": {
-                        "description": "Tile image",
-                        "content": {
-                            "image/png": {"schema": {"type": "string", "format": "binary"}},
-                            "image/jpeg": {"schema": {"type": "string", "format": "binary"}},
-                            "image/webp": {"schema": {"type": "string", "format": "binary"}}
-                        }
+                        "description": "Tile image or vector tile",
+                        "content": content
                     },
                     "400": {"description": "Bad request"},
                     "404": {"description": "Tile not found"},
+                    "422": {"description": "Tile too dense (feature count exceeds per-tile cap)"},
                     "500": {"description": "Server error"}
                 }
             }
@@ -394,9 +445,15 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "schema": {
                         "type": "string",
                         "default": "image/png",
-                        "enum": ["image/png", "image/jpeg", "image/webp"]
+                        "enum": [
+                            "image/png",
+                            "image/jpeg",
+                            "image/webp",
+                            "mvt",
+                            "application/vnd.mapbox-vector-tile"
+                        ]
                     },
-                    "description": "Output format"
+                    "description": "Output format. `mvt` selects Mapbox Vector Tile (only on collections with a FeatureEngine)."
                 }
             }
         }
@@ -479,16 +536,33 @@ pub async fn tile_matrix_set(Path(tms_id): Path<String>) -> Result<impl IntoResp
 pub async fn collections(State(state): State<AppState>) -> impl IntoResponse {
     let state = state.load_full();
     let base = &state.base_url;
-    let mut colls: Vec<serde_json::Value> = state
+    // Surface every tile-enabled collection, regardless of which engine
+    // backs it — a vector-only collection that lives in `feature_collections`
+    // would otherwise be invisible at the discovery endpoint.
+    let mut seen = std::collections::HashSet::new();
+    let mut colls: Vec<serde_json::Value> = Vec::new();
+    for config in state
         .collections
         .values()
-        .filter_map(|config| {
-            let engine = state.map_engines.get(&config.id)?;
-            let info = engine.raster_info();
-            let styles = state.styles.get(&config.id);
-            Some(build_collection_metadata(config, &info, styles, base))
-        })
-        .collect();
+        .chain(state.feature_collections.values())
+    {
+        if !seen.insert(config.id.clone()) {
+            continue;
+        }
+        let raster_info = state.map_engines.get(&config.id).map(|e| e.raster_info());
+        let feature_extent = state
+            .feature_engines
+            .get(&config.id)
+            .and_then(|e| e.spatial_extent());
+        let styles = state.styles.get(&config.id);
+        colls.push(build_collection_metadata(
+            config,
+            raster_info.as_ref(),
+            feature_extent,
+            styles,
+            base,
+        ));
+    }
 
     colls.sort_by(|a, b| {
         a["id"]
@@ -513,12 +587,26 @@ pub async fn collection(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, TilesError> {
     let state = state.load_full();
-    let (engine, config) = lookup_engine(&state, &id)?;
-    let info = engine.raster_info();
+    let raster_info = state.map_engines.get(&id).map(|e| e.raster_info());
+    let feature_extent = state
+        .feature_engines
+        .get(&id)
+        .and_then(|e| e.spatial_extent());
+    let config = state
+        .collections
+        .get(&id)
+        .or_else(|| state.feature_collections.get(&id))
+        .ok_or_else(|| TilesError::NotFound(format!("Collection '{id}' not found")))?;
+    if raster_info.is_none() && !state.feature_engines.contains_key(&id) {
+        return Err(TilesError::NotFound(format!(
+            "Collection '{id}' has no tile source"
+        )));
+    }
     let styles = state.styles.get(&id);
     Ok(Json(build_collection_metadata(
         config,
-        &info,
+        raster_info.as_ref(),
+        feature_extent,
         styles,
         &state.base_url,
     )))
@@ -530,11 +618,30 @@ pub async fn collection_tilesets(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, TilesError> {
     let state = state.load_full();
-    let (engine, config) = lookup_engine(&state, &id)?;
-    let info = engine.raster_info();
+    let raster_info = state.map_engines.get(&id).map(|e| e.raster_info());
+    let feature_extent = state
+        .feature_engines
+        .get(&id)
+        .and_then(|e| e.spatial_extent());
+    let config = state
+        .collections
+        .get(&id)
+        .or_else(|| state.feature_collections.get(&id))
+        .ok_or_else(|| TilesError::NotFound(format!("Collection '{id}' not found")))?;
+    let has_raster = raster_info.is_some();
+    let has_vector = state.feature_engines.contains_key(&id);
+    if !has_raster && !has_vector {
+        return Err(TilesError::NotFound(format!(
+            "Collection '{id}' has no tile source"
+        )));
+    }
     let base = &state.base_url;
 
     let max_zoom = params::DEFAULT_MAX_ZOOM;
+    let spatial_extent = raster_info
+        .as_ref()
+        .and_then(|i| i.spatial_extent)
+        .or(feature_extent);
 
     let mut tilesets = Vec::new();
     for tms_id in SUPPORTED_TILE_MATRIX_SETS {
@@ -543,30 +650,44 @@ pub async fn collection_tilesets(
             None => continue,
         };
 
-        let limits = info
-            .spatial_extent
-            .map(|bbox| tms.limits_for_extent(bbox, max_zoom));
+        let limits = spatial_extent.map(|bbox| tms.limits_for_extent(bbox, max_zoom));
+
+        let mut item_links = Vec::new();
+        if has_raster {
+            item_links.push(json!({
+                "href": format!(
+                    "{base}/tiles/collections/{}/tiles/{tms_id}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}",
+                    config.id
+                ),
+                "rel": "item",
+                "type": "image/png",
+                "templated": true
+            }));
+        }
+        if has_vector {
+            item_links.push(json!({
+                "href": format!(
+                    "{base}/tiles/collections/{}/tiles/{tms_id}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}?f=mvt",
+                    config.id
+                ),
+                "rel": "item",
+                "type": MVT_CONTENT_TYPE,
+                "templated": true
+            }));
+        }
+
+        let mut links = vec![json!({
+            "href": format!("{base}/tiles/tileMatrixSets/{tms_id}"),
+            "rel": "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme",
+            "type": "application/json"
+        })];
+        links.extend(item_links);
 
         let mut tileset = json!({
-            "dataType": "map",
+            "dataType": if has_raster { "map" } else { "vector" },
             "crs": tms.crs,
             "tileMatrixSetURI": format!("http://www.opengis.net/def/tilematrixset/OGC/1.0/{tms_id}"),
-            "links": [
-                {
-                    "href": format!("{base}/tiles/tileMatrixSets/{tms_id}"),
-                    "rel": "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme",
-                    "type": "application/json"
-                },
-                {
-                    "href": format!(
-                        "{base}/tiles/collections/{}/tiles/{tms_id}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}",
-                        config.id
-                    ),
-                    "rel": "item",
-                    "type": "image/png",
-                    "templated": true
-                }
-            ]
+            "links": links,
         });
 
         if let Some(limits) = limits {
@@ -588,12 +709,6 @@ pub async fn collection_tilesets(
 
 /// MVT MIME type registered with IANA.
 const MVT_CONTENT_TYPE: &str = "application/vnd.mapbox-vector-tile";
-
-/// Refuse to encode a tile that would carry more than this many features.
-/// At z=0 of a 100k-feature dataset the whole world lands in one tile —
-/// returning a multi-megabyte MVT would harm the cache and the client. The
-/// fix is to raise the collection's `minzoom`, not to silently encode.
-const MAX_FEATURES_PER_TILE: usize = 50_000;
 
 /// Encode an MVT from a `FeatureEngine` and return it as an HTTP response.
 ///
@@ -641,10 +756,6 @@ async fn render_vector_tile(
             TilesError::NotFound(format!("Collection '{id}' has no vector-tile source"))
         })?
         .clone();
-    let _config = state
-        .feature_collections
-        .get(id)
-        .ok_or_else(|| TilesError::Internal("Collection config missing".into()))?;
 
     let bbox = tms
         .tile_bbox(zoom, row, col)
@@ -659,6 +770,9 @@ async fn render_vector_tile(
         x: col,
         y: row,
         properties_hash: props_hash,
+        // Engines bump their data version on reload/refresh; folding it into
+        // the ETag forces a fresh fetch instead of an infinite `304` loop.
+        data_version: engine.data_version(),
     };
     let etag = cache_key.etag();
     let cache_control = "public, max-age=300";
@@ -682,6 +796,10 @@ async fn render_vector_tile(
             .header(header::CONTENT_TYPE, MVT_CONTENT_TYPE)
             .header(header::ETAG, &etag)
             .header(header::CACHE_CONTROL, cache_control)
+            .header(
+                header::HeaderName::from_static("x-content-type-options"),
+                "nosniff",
+            )
             .header(header::HeaderName::from_static("x-cache"), "HIT")
             .body(axum::body::Body::from(cached))
             .unwrap()
@@ -690,35 +808,48 @@ async fn render_vector_tile(
 
     let query_bbox = Bbox::new(bbox[0], bbox[1], bbox[2], bbox[3])
         .map_err(|e| TilesError::BadRequest(format!("Invalid tile bbox: {e}")))?;
+    // `limit` semantics differ across engines: `GeoJsonEngine` honours zero
+    // literally (returns nothing), `PostgisEngine` treats zero as "no limit".
+    // Asking for `MAX_FEATURES_PER_TILE + 1` is unambiguous: every engine
+    // returns at most that many features, engines with native SQL limits can
+    // stop early, and the density guard below fires cleanly when we hit the
+    // cap.
     let query = FeatureQuery {
         bbox: Some(query_bbox),
-        limit: 0,
+        limit: params::MAX_FEATURES_PER_TILE + 1,
         offset: 0,
         datetime: None,
     };
-
-    // Share the raster semaphore — encoding is also CPU-bound and a single
-    // budget for tile production keeps DoS surface area minimal.
-    let _permit = tokio::time::timeout(ds_render::RENDER_TIMEOUT, state.render_semaphore.acquire())
-        .await
-        .map_err(|_| TilesError::ServiceUnavailable("Server busy, try again later".to_string()))?
-        .map_err(|_| TilesError::Internal("Render semaphore closed".to_string()))?;
 
     let page = engine
         .get_features(&query)
         .map_err(|e| TilesError::Internal(format!("Feature query failed: {e}")))?;
 
-    if page.features.len() > MAX_FEATURES_PER_TILE {
-        return Err(TilesError::BadRequest(format!(
+    if page.features.len() > params::MAX_FEATURES_PER_TILE {
+        // 422 (Unprocessable Content), not 400: the request itself is
+        // well-formed — valid TMS, valid coords, registered collection —
+        // and only the data exceeds the per-tile budget.
+        return Err(TilesError::Unprocessable(format!(
             "tile-too-dense: {} features exceed maximum of {} — raise minzoom or narrow bbox",
             page.features.len(),
-            MAX_FEATURES_PER_TILE
+            params::MAX_FEATURES_PER_TILE
         )));
     }
 
     let features = page.features;
     let layer_name = id.to_string();
     let collection_label = id.to_string();
+
+    // Share the raster semaphore — encoding is CPU-bound and a single budget
+    // for tile production keeps DoS surface area minimal. Acquire here (just
+    // before `spawn_blocking`) rather than around `get_features` so an engine
+    // that does I/O during the feature query doesn't hold a render slot while
+    // it waits.
+    let _permit = tokio::time::timeout(ds_render::RENDER_TIMEOUT, state.render_semaphore.acquire())
+        .await
+        .map_err(|_| TilesError::ServiceUnavailable("Server busy, try again later".to_string()))?
+        .map_err(|_| TilesError::Internal("Render semaphore closed".to_string()))?;
+
     let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ds_mvt::EncodeError> {
         let mut opts = TileEncodeOptions::new(layer_name, tms_kind);
         opts.properties = allowlist;
@@ -738,6 +869,10 @@ async fn render_vector_tile(
         .header(header::CONTENT_TYPE, MVT_CONTENT_TYPE)
         .header(header::ETAG, &etag)
         .header(header::CACHE_CONTROL, cache_control)
+        .header(
+            header::HeaderName::from_static("x-content-type-options"),
+            "nosniff",
+        )
         .header(header::HeaderName::from_static("x-cache"), "MISS")
         .body(axum::body::Body::from(bytes))
         .unwrap()

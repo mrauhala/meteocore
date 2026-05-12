@@ -556,6 +556,13 @@ mod collections {
             "locations link should have 'href'"
         );
     }
+
+    #[tokio::test]
+    async fn collection_exposes_apis_array() {
+        let (_, json) = get("/collections/weather").await;
+        let apis = json["apis"].as_array().expect("apis must be present");
+        assert!(apis.iter().any(|a| a == "edr"));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,12 +1112,5 @@ mod unimplemented_queries {
         );
         let crs = json["crs"].as_array().unwrap();
         assert!(!crs.is_empty());
-    }
-
-    #[tokio::test]
-    async fn collection_exposes_apis_array() {
-        let (_, json) = get("/collections/weather").await;
-        let apis = json["apis"].as_array().expect("apis must be present");
-        assert!(apis.iter().any(|a| a == "edr"));
     }
 }

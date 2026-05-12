@@ -7,7 +7,6 @@ pub use colormap::{
 };
 pub use encode::{encode_jpeg, encode_png, encode_webp};
 
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,13 +70,52 @@ pub struct CacheKey {
     pub time: Option<DateTime<Utc>>,
 }
 
+/// FNV-1a 64-bit mix. Fixed algorithm — safe to serialise into HTTP `ETag`
+/// headers because the output does not change with a rustc upgrade. The
+/// stdlib `DefaultHasher` is explicitly unspecified across releases and
+/// must not leave the process.
+const FNV1A_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV1A_PRIME: u64 = 0x100000001b3;
+
+#[inline]
+fn fnv1a_mix(state: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *state ^= b as u64;
+        *state = state.wrapping_mul(FNV1A_PRIME);
+    }
+}
+
 impl CacheKey {
     /// Compute an ETag from the cache key for HTTP caching.
     pub fn etag(&self) -> String {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.hash(&mut hasher);
-        let hash = hasher.finish();
-        format!("\"{hash:016x}\"")
+        let mut h = FNV1A_OFFSET;
+        fnv1a_mix(&mut h, self.layer.as_bytes());
+        fnv1a_mix(&mut h, b"|");
+        fnv1a_mix(&mut h, self.style.as_bytes());
+        fnv1a_mix(&mut h, b"|");
+        fnv1a_mix(&mut h, &[self.format]);
+        fnv1a_mix(&mut h, self.crs.as_bytes());
+        fnv1a_mix(&mut h, b"|");
+        for v in &self.bbox {
+            fnv1a_mix(&mut h, &v.to_le_bytes());
+        }
+        fnv1a_mix(&mut h, &self.width.to_le_bytes());
+        fnv1a_mix(&mut h, &self.height.to_le_bytes());
+        match self.time {
+            Some(t) => {
+                fnv1a_mix(&mut h, &[1u8]);
+                // `timestamp_nanos_opt` returns None for dates outside [1677-2262];
+                // for radar data we never come anywhere near those bounds, but the
+                // fallback to `timestamp_millis()` keeps the ETag deterministic
+                // even for pathological values rather than panicking.
+                let ts = t
+                    .timestamp_nanos_opt()
+                    .unwrap_or_else(|| t.timestamp_millis().saturating_mul(1_000_000));
+                fnv1a_mix(&mut h, &ts.to_le_bytes());
+            }
+            None => fnv1a_mix(&mut h, &[0u8]),
+        }
+        format!("\"{h:016x}\"")
     }
 }
 
@@ -378,5 +416,49 @@ mod tests {
     #[test]
     fn test_etag_matches_weak_in_list() {
         assert!(etag_matches("\"aaa\", W/\"bbb\"", "\"bbb\""));
+    }
+
+    #[test]
+    fn cache_key_etag_changes_when_time_bumps() {
+        let base = CacheKey {
+            layer: "radar".into(),
+            style: "default".into(),
+            format: 0,
+            crs: "EPSG:3857".into(),
+            bbox: [0, 0, 1, 1],
+            width: 256,
+            height: 256,
+            time: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+        };
+        let mut later = base.clone();
+        later.time = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:01Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        assert_ne!(base.etag(), later.etag());
+    }
+
+    #[test]
+    fn cache_key_etag_uses_stable_fnv1a_not_default_hasher() {
+        // Pinned golden value — see the matching `VectorTileKey` test for
+        // the rationale. If this changes you've either intentionally rotated
+        // the ETag algorithm (cache-bust event) or accidentally regressed to
+        // `DefaultHasher`, which mutates across rustc versions.
+        let key = CacheKey {
+            layer: "radar".into(),
+            style: "default".into(),
+            format: 0,
+            crs: "EPSG:3857".into(),
+            bbox: [0, 0, 0, 0],
+            width: 256,
+            height: 256,
+            time: None,
+        };
+        assert_eq!(key.etag(), "\"c4df9fcd1a7f44aa\"");
     }
 }

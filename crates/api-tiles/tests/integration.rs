@@ -613,12 +613,16 @@ mod mvt {
                 })
                 .collect();
             let n = matched.len();
-            let limit = if query.limit == 0 { n } else { query.limit };
-            let features: Vec<Feature> = matched.into_iter().take(limit).cloned().collect();
+            // Honour `limit` literally to match `GeoJsonEngine`'s real
+            // semantics (a previous version of the mock special-cased zero
+            // as "no limit", which hid the empty-tile bug fixed alongside
+            // this test).
+            let take = query.limit.min(n);
+            let features: Vec<Feature> = matched.into_iter().take(take).cloned().collect();
             Ok(FeaturePage {
                 features,
                 number_matched: n,
-                number_returned: n.min(limit),
+                number_returned: take,
                 next_offset: None,
             })
         }
@@ -651,6 +655,87 @@ mod mvt {
                 id: "places".to_string(),
                 title: "Places".to_string(),
                 description: "Test points".to_string(),
+                data_path: None,
+                apis: vec!["tiles".to_string()],
+                engine_type: "geojson".to_string(),
+                geotiff: None,
+                querydata: None,
+                wms: None,
+                grib: None,
+                postgis: None,
+            },
+        );
+
+        let state = Arc::new(ArcSwap::from_pointee(TilesState {
+            map_engines: HashMap::new(),
+            collections: HashMap::new(),
+            styles: HashMap::new(),
+            feature_engines,
+            feature_collections,
+            render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            rendered_cache: Arc::new(RenderedCache::new(16)),
+            vector_tile_cache: Arc::new(VectorTileCache::new(16)),
+            base_url: String::new(),
+        }));
+        api_tiles::router(state)
+    }
+
+    /// Mock engine that always returns at least one more feature than the
+    /// density cap permits, regardless of the requested bbox or limit.
+    /// Used to exercise the `tile-too-dense` 400 branch.
+    struct OverflowingFeatureEngine {
+        /// How many features to emit. The handler asks for
+        /// `MAX_FEATURES_PER_TILE + 1`; the density guard fires when
+        /// `features.len() > MAX_FEATURES_PER_TILE`, so any value ≥ that
+        /// threshold trips the branch.
+        emit: usize,
+    }
+
+    impl FeatureEngine for OverflowingFeatureEngine {
+        fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+            // Honour `limit` so the test still trips the guard cleanly: the
+            // handler asks for `MAX + 1`, and we cap at that — returning a
+            // gigantic vector here would just waste memory.
+            let take = query.limit.min(self.emit);
+            let f = Feature {
+                id: "pt".into(),
+                geometry: StdArc::new(Geometry::Point { x: 0.0, y: 0.0 }),
+                properties: StdArc::new(Default::default()),
+            };
+            let features: Vec<Feature> = std::iter::repeat_with(|| f.clone()).take(take).collect();
+            let len = features.len();
+            Ok(FeaturePage {
+                features,
+                number_matched: self.emit,
+                number_returned: len,
+                next_offset: None,
+            })
+        }
+
+        fn get_feature(&self, _id: &str) -> Result<Feature, DataServerError> {
+            Err(DataServerError::FeatureNotFound("unused".into()))
+        }
+
+        fn feature_count(&self) -> usize {
+            self.emit
+        }
+
+        fn spatial_extent(&self) -> Option<[f64; 4]> {
+            Some([-180.0, -85.0, 180.0, 85.0])
+        }
+    }
+
+    fn build_dense_router(emit: usize) -> axum::Router {
+        let engine: Arc<dyn FeatureEngine> = Arc::new(OverflowingFeatureEngine { emit });
+        let mut feature_engines = HashMap::new();
+        let mut feature_collections = HashMap::new();
+        feature_engines.insert("dense".to_string(), engine);
+        feature_collections.insert(
+            "dense".to_string(),
+            CollectionConfig {
+                id: "dense".to_string(),
+                title: "Dense".to_string(),
+                description: "Always-overflow mock".to_string(),
                 data_path: None,
                 apis: vec!["tiles".to_string()],
                 engine_type: "geojson".to_string(),
@@ -723,6 +808,11 @@ mod mvt {
             .unwrap();
         assert!(etag.starts_with('"') && etag.ends_with('"'));
         assert_eq!(headers.get("cache-control").unwrap(), "public, max-age=300");
+        assert_eq!(
+            headers.get("x-content-type-options").unwrap(),
+            "nosniff",
+            "MVT responses must set nosniff to match the raster tile path"
+        );
     }
 
     #[tokio::test]
@@ -792,5 +882,95 @@ mod mvt {
             "application/vnd.mapbox-vector-tile"
         );
         assert!(!body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn vector_only_collection_listed_in_collections() {
+        let app = build_mvt_router();
+        let req = Request::builder()
+            .uri("/collections")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = json["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"places"),
+            "vector-only collection 'places' must appear in /collections, got {ids:?}"
+        );
+        let places = json["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"].as_str() == Some("places"))
+            .unwrap();
+        assert_eq!(
+            places["dataType"].as_str(),
+            Some("vector"),
+            "vector-only collection must be advertised as dataType=vector"
+        );
+    }
+
+    #[tokio::test]
+    async fn pbf_tile_too_dense_returns_422() {
+        // One past the cap → density guard fires.
+        let app = build_dense_router(api_tiles::params::MAX_FEATURES_PER_TILE + 1);
+        let req = Request::builder()
+            .uri("/collections/dense/tiles/WebMercatorQuad/0/0/0?f=mvt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // 422 Unprocessable Content: the request is well-formed; only the
+        // data exceeds the per-tile feature budget.
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body_str = std::str::from_utf8(&body).unwrap_or("");
+        assert!(
+            body_str.contains("tile-too-dense"),
+            "422 body should mention the density guard, got: {body_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pbf_tile_at_density_cap_returns_200() {
+        // Exactly at the cap → success path. Confirms the guard's boundary
+        // condition isn't off-by-one (guard fires only on `>`, not `>=`).
+        let app = build_dense_router(api_tiles::params::MAX_FEATURES_PER_TILE);
+        let req = Request::builder()
+            .uri("/collections/dense/tiles/WebMercatorQuad/0/0/0?f=mvt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn vector_only_tilesets_advertises_mvt_item_link() {
+        let app = build_mvt_router();
+        let req = Request::builder()
+            .uri("/collections/places/tiles")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let any_mvt_link = json["tilesets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|t| t["links"].as_array().unwrap())
+            .any(|l| l["type"].as_str() == Some("application/vnd.mapbox-vector-tile"));
+        assert!(
+            any_mvt_link,
+            "vector-only collection tilesets must include at least one MVT item link"
+        );
     }
 }

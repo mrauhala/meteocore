@@ -75,6 +75,13 @@ impl FeatureEngine for PostgisEngine {
     fn spatial_extent(&self) -> Option<[f64; 4]> {
         self.cache().load().spatial_extent
     }
+
+    fn data_version(&self) -> u64 {
+        // The metadata cache bumps `version` on every successful refresh, so
+        // station-set changes (and PR #110's planned background refresh) will
+        // automatically invalidate vector-tile ETags.
+        self.cache().load().version
+    }
 }
 
 fn station_to_feature(s: &FeatureStation) -> Feature {
