@@ -981,6 +981,80 @@ mod tests {
     }
 
     #[test]
+    fn multipolygon_with_one_part_outside_tile_keeps_inside_part() {
+        // Exercises `encode_polygon_parts`' `wrote_any` / `complete_geom`
+        // sequencing when one part is dropped during clipping. The "all-out"
+        // exterior is skipped (clipped_ext.len() < 3), so subsequent parts
+        // must not be mistakenly read as holes of the missing exterior, and
+        // the surviving part must still be emitted as a valid polygon.
+        let extent: u32 = 4096;
+        let proj =
+            Projector::new(TmsKind::WebMercatorQuad, [10.0, 50.0, 11.0, 51.0], extent).unwrap();
+        // Part A: square fully inside the tile (10.2–10.8 lon, 50.2–50.8 lat).
+        let inside = (
+            vec![
+                [10.2, 50.2],
+                [10.8, 50.2],
+                [10.8, 50.8],
+                [10.2, 50.8],
+                [10.2, 50.2],
+            ],
+            vec![],
+        );
+        // Part B: square far away (-150..-140 lon, -10..0 lat) — entirely
+        // outside the tile and outside the buffer.
+        let outside = (
+            vec![
+                [-150.0, -10.0],
+                [-140.0, -10.0],
+                [-140.0, 0.0],
+                [-150.0, 0.0],
+                [-150.0, -10.0],
+            ],
+            vec![],
+        );
+        // Outside-then-inside ordering forces `wrote_any` to stay false on
+        // the first part — exercises the `if wrote_any { complete_geom() }`
+        // guard on the first surviving write.
+        let geom = Geometry::MultiPolygon {
+            polygons: vec![outside.clone(), inside.clone()],
+        };
+        let encoded = encode_geometry(&geom, &proj, extent)
+            .unwrap()
+            .expect("inside part must survive clipping");
+        assert!(
+            !encoded.is_empty(),
+            "encoded geometry must carry the inside part's commands"
+        );
+
+        // Reverse ordering: inside-then-outside. `wrote_any` is true after the
+        // first part; the second part's exterior is skipped without flipping
+        // any state, and the final `complete()` still succeeds.
+        let geom_rev = Geometry::MultiPolygon {
+            polygons: vec![inside, outside],
+        };
+        assert!(encode_geometry(&geom_rev, &proj, extent).unwrap().is_some());
+
+        // All-outside MultiPolygon — must produce `None`, not an empty-ring
+        // polygon that downstream readers might trip over.
+        let outside_only = Geometry::MultiPolygon {
+            polygons: vec![(
+                vec![
+                    [-150.0, -10.0],
+                    [-140.0, -10.0],
+                    [-140.0, 0.0],
+                    [-150.0, 0.0],
+                    [-150.0, -10.0],
+                ],
+                vec![],
+            )],
+        };
+        assert!(encode_geometry(&outside_only, &proj, extent)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn sutherland_hodgman_keeps_fully_inside_polygon() {
         let clip = ClipRect::for_extent(4096);
         let ring = vec![
