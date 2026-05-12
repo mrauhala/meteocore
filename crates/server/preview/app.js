@@ -45,11 +45,19 @@
             return r.json();
         })
         .then(function (manifest) {
+            // We fetch a single page (default limit=100) and render only
+            // those entries. The total can exceed that; advertise the
+            // shortfall so users don't think the list is complete. Full
+            // pagination — following `pagination.next` — is Phase 3+.
             const total = manifest.pagination.total;
+            const rendered = manifest.collections.length;
+            const noun = total === 1 ? 'collection' : 'collections';
             statusEl.textContent =
                 total === 0
                     ? 'No collections registered.'
-                    : total + (total === 1 ? ' collection' : ' collections');
+                    : rendered < total
+                        ? rendered + ' of ' + total + ' ' + noun + ' (paginated)'
+                        : total + ' ' + noun;
 
             // Fit the map to the union of collection extents so the user
             // sees roughly the right region on first load.

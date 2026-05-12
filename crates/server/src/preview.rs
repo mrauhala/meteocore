@@ -237,9 +237,16 @@ pub async fn manifest_handler(
         );
     }
 
+    // `no-store`: the manifest mirrors live `ArcSwap` state. After a
+    // `POST /admin/collections/reload` any cached copy (browser, CDN,
+    // intermediary) would mask the new state until its TTL expires.
+    // Cheaper to re-fetch every load than to debug stale-cache reports.
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
         body,
     )
 }
@@ -1309,6 +1316,27 @@ mod tests {
             body.is_empty(),
             "304 must have an empty body, got {} bytes",
             body.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_handler_emits_no_store_cache_control() {
+        use axum::extract::{Query, State};
+        // `manifest_handler` returns live `ArcSwap` state; caches must not
+        // hold it across an `/admin/collections/reload`.
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            empty_tiles(),
+            empty_wms(),
+        );
+        let resp = manifest_handler(State(state), Query(ManifestParams::default()))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
         );
     }
 
