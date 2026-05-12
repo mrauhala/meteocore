@@ -23,6 +23,11 @@ FROM chef AS builder
 # System dependencies:
 #  - `pkg-config`, `libssl-dev`, `clang` — needed by libaec-sys (GRIB
 #    CCSDS compression). `clang` provides libclang for bindgen.
+#  - `make` — pip-installed `cmake` ships a static binary but still
+#    drives `make` for its Unix Makefiles generator. Without an explicit
+#    `make` install, libaec-sys's build script fails with "CMake was
+#    unable to find a build program corresponding to 'Unix Makefiles'".
+#    `clang` Recommends `make` but `--no-install-recommends` blocks that.
 #  - `cmake` via pip — libaec-sys requires cmake ≥3.26, but Bookworm
 #    main ships 3.25. The bookworm-backports route (cmake 3.31) was
 #    tried and abandoned: apt's solver fails to resolve `libjsoncpp25`
@@ -34,7 +39,7 @@ FROM chef AS builder
 #    to opt out for build-stage tooling. Build-stage only; never lands
 #    in the runtime image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev clang python3-pip ca-certificates && \
+        pkg-config libssl-dev clang make python3-pip ca-certificates && \
     pip install --break-system-packages cmake && \
     rm -rf /var/lib/apt/lists/*
 

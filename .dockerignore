@@ -16,3 +16,8 @@ testdata/
 spike-geotiff/
 varnish/
 fuzz/
+
+# cargo-chef artefact — generated inside the builder image, never copied
+# from a developer's tree. Excluding it keeps `cargo chef prepare`'s
+# output deterministic regardless of whether the dev ran chef locally.
+recipe.json
