@@ -144,7 +144,13 @@ jobs:
             ${{ matrix.target }}-cargo-
 
       - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }} -p server
+        # `--locked` deliberately omitted: release-please updates
+        # Cargo.toml's version but not Cargo.lock, so a tag built with
+        # `--locked` would fail on the resulting drift. Once the
+        # release-please cargo-lockfile plugin is configured to keep both
+        # in sync (or we add a dedicated `cargo update -p server --precise`
+        # step in the release PR), we can put `--locked` back.
+        run: cargo build --release --target ${{ matrix.target }} -p server
 
       - name: Package tarball
         run: |
