@@ -102,8 +102,19 @@
 
             li.appendChild(header);
 
+            // Per-collection error isolation: `map.addSource` and
+            // `map.addLayer` throw synchronously on duplicate IDs,
+            // missing style, and similar boundary conditions. An
+            // uncaught throw inside `forEach` aborts the whole loop, so
+            // one malformed collection would silently drop every
+            // collection after it from the sidebar. Catch + log; the
+            // sidebar entry without controls is still informative.
             if (c.tiles && c.tiles.raster) {
-                attachRasterLayer(c, li);
+                try {
+                    attachRasterLayer(c, li);
+                } catch (err) {
+                    console.error('attachRasterLayer failed for', c.id, err);
+                }
             }
 
             listEl.appendChild(li);
