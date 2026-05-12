@@ -146,11 +146,12 @@ fn parse_numeric_id(id: &str) -> Option<u64> {
 }
 
 /// How far outside the tile extent (in tile-local units) clipped geometry may
-/// reach. MapLibre rejects features whose coords exceed `[-buffer, extent+buffer]`
-/// at parse time with "Geometry exceeds allowed extent". 256 matches the
-/// MapLibre source-layer default buffer plenty, and keeps polygon edges flush
-/// across tile boundaries.
-const CLIP_BUFFER: f64 = 256.0;
+/// reach, as a fraction of `extent`. MapLibre rejects features whose coords
+/// exceed `[-buffer, extent+buffer]` at parse time. `1/16` (= 6.25%) is
+/// MapLibre's default tile-buffer ratio — at the standard `extent = 4096`
+/// it resolves to 256, which matches MapLibre's source-layer default buffer
+/// and keeps polygon edges flush across tile boundaries.
+const CLIP_BUFFER_RATIO: f64 = 1.0 / 16.0;
 
 fn encode_geometry(
     geom: &Geometry,
@@ -285,7 +286,7 @@ fn clip_ring(
     clipped
 }
 
-/// Axis-aligned clip rectangle in tile-local space, expanded by [`CLIP_BUFFER`]
+/// Axis-aligned clip rectangle in tile-local space, expanded by `extent * CLIP_BUFFER_RATIO`
 /// so geometry on tile boundaries renders without seams.
 #[derive(Debug, Clone, Copy)]
 struct ClipRect {
@@ -298,11 +299,12 @@ struct ClipRect {
 impl ClipRect {
     fn for_extent(extent: u32) -> Self {
         let e = extent as f64;
+        let buffer = e * CLIP_BUFFER_RATIO;
         Self {
-            min_x: -CLIP_BUFFER,
-            min_y: -CLIP_BUFFER,
-            max_x: e + CLIP_BUFFER,
-            max_y: e + CLIP_BUFFER,
+            min_x: -buffer,
+            min_y: -buffer,
+            max_x: e + buffer,
+            max_y: e + buffer,
         }
     }
 
@@ -968,16 +970,31 @@ mod tests {
             !clipped.is_empty(),
             "polygon fully encloses the tile — clipped ring should not be empty"
         );
+        let buffer = extent as f64 * CLIP_BUFFER_RATIO;
         for &(x, y) in &clipped {
             assert!(
-                x >= -CLIP_BUFFER && x <= extent as f64 + CLIP_BUFFER,
+                x >= -buffer && x <= extent as f64 + buffer,
                 "clipped x out of buffered range: {x}"
             );
             assert!(
-                y >= -CLIP_BUFFER && y <= extent as f64 + CLIP_BUFFER,
+                y >= -buffer && y <= extent as f64 + buffer,
                 "clipped y out of buffered range: {y}"
             );
         }
+    }
+
+    #[test]
+    fn clip_buffer_scales_with_extent() {
+        // Non-standard extent must produce a proportional buffer — otherwise
+        // a 512-extent tile would have buffer=256 (50% of extent), which
+        // MapLibre would refuse to parse.
+        let standard = ClipRect::for_extent(4096);
+        assert_eq!(standard.min_x, -256.0);
+        assert_eq!(standard.max_x, 4096.0 + 256.0);
+
+        let small = ClipRect::for_extent(512);
+        assert_eq!(small.min_x, -32.0);
+        assert_eq!(small.max_x, 512.0 + 32.0);
     }
 
     #[test]
