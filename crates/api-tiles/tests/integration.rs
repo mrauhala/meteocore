@@ -252,6 +252,18 @@ mod conformance {
     }
 
     #[tokio::test]
+    async fn declares_mvt() {
+        let (_, json) = get("/conformance").await;
+        let classes = json["conformsTo"].as_array().unwrap();
+        assert!(
+            classes
+                .iter()
+                .any(|c| c.as_str().unwrap().ends_with("conf/mvt")),
+            "conformance must include the OGC API Tiles MVT class once ?f=mvt is wired"
+        );
+    }
+
+    #[tokio::test]
     async fn declares_tilematrixset() {
         let (_, json) = get("/conformance").await;
         let classes = json["conformsTo"].as_array().unwrap();
@@ -349,6 +361,13 @@ mod collections {
         let c = &json["collections"][0];
         assert!(c["tileMatrixSetLinks"].is_array());
         assert!(!c["tileMatrixSetLinks"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn collection_exposes_apis_array() {
+        let (_, json) = get("/collections/radar").await;
+        let apis = json["apis"].as_array().expect("apis must be present");
+        assert!(apis.iter().any(|a| a == "tiles"));
     }
 
     #[tokio::test]

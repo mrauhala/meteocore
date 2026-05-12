@@ -453,29 +453,49 @@ fn build_collection_metadata(
 ) -> serde_json::Value {
     let total = engine.feature_count();
 
+    let mut links = vec![
+        json!({
+            "href": format!("{base_url}/features/collections/{}", config.id),
+            "rel": "self",
+            "type": "application/json",
+            "title": config.title
+        }),
+        json!({
+            "href": format!("{base_url}/features/collections/{}/items", config.id),
+            "rel": "items",
+            "type": "application/geo+json",
+            "title": "Items"
+        }),
+    ];
+
+    // If this collection is also exposed through OGC API Tiles, advertise the
+    // tilesets list so clients can discover the vector-tile representation
+    // without probing. Per OGC API – Tiles 1.0 §7.1, the `tilesets-vector`
+    // relation targets the tilesets list resource (`application/json`), not a
+    // tile URL template — the per-tile URL template lives one level deeper
+    // inside the tilesets-list response as `rel: item`. Linking to the list
+    // also avoids hardcoding `WebMercatorQuad`; the list enumerates every
+    // supported TileMatrixSet.
+    if config.apis.iter().any(|a| a == "tiles") {
+        links.push(json!({
+            "href": format!("{base_url}/tiles/collections/{}/tiles", config.id),
+            "rel": "http://www.opengis.net/def/rel/ogc/1.0/tilesets-vector",
+            "type": "application/json",
+            "title": "Vector tilesets"
+        }));
+    }
+
     let mut metadata = json!({
         "id": config.id,
         "title": config.title,
         "description": config.description,
+        "apis": config.apis,
         "itemType": "feature",
         "crs": [
             "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
         ],
         "storageCrs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
-        "links": [
-            {
-                "href": format!("{base_url}/features/collections/{}", config.id),
-                "rel": "self",
-                "type": "application/json",
-                "title": config.title
-            },
-            {
-                "href": format!("{base_url}/features/collections/{}/items", config.id),
-                "rel": "items",
-                "type": "application/geo+json",
-                "title": "Items"
-            }
-        ],
+        "links": links,
         "numberItems": total
     });
 
