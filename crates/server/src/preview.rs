@@ -512,8 +512,7 @@ fn resolve_temporal_extent(
     // leaving the user looking at a span the slider can't reach.
     let (interval, values) = match (edr_values, raster_times) {
         (Some(v), _) => {
-            let int = edr_interval
-                .or_else(|| v.first().zip(v.last()).map(|(a, b)| (*a, *b)));
+            let int = edr_interval.or_else(|| v.first().zip(v.last()).map(|(a, b)| (*a, *b)));
             (int, Some(v))
         }
         (None, Some(t)) => {
