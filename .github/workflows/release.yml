@@ -16,6 +16,12 @@
 # be silently dormant. Doing the whole pipeline here avoids needing a
 # personal-access-token workaround.
 #
+# Manual re-fire: the `workflow_dispatch` trigger lets an operator
+# (re-)build artifacts for an existing tag — useful when the release
+# went through but build jobs were skipped due to a workflow bug. The
+# resolve-target job picks the tag from the dispatch input or from
+# release-please's output as appropriate.
+#
 # Security:
 #   - No workflow-level `permissions:` — each job grants itself the
 #     minimum it needs. A compromised action in `build-binary` cannot
@@ -30,6 +36,12 @@ name: release
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re-)build artifacts for (e.g. v0.2.0). Skips release-please.'
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,14 +50,25 @@ env:
 
 jobs:
   release-please:
+    # Skip on workflow_dispatch — that path explicitly targets an
+    # existing tag and bypasses release-please.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
     outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-      version: ${{ steps.release.outputs.version }}
+      # release-please-action v5 with a `packages` config (monorepo
+      # mode) emits flat-keyed outputs prefixed by the package path.
+      # The bare `release_created` / `tag_name` / `version` we
+      # previously read were empty in this mode, which silently
+      # skipped every downstream build job for the v0.2.0 release.
+      # `releases_created` (note the plural) is the cross-package
+      # "any release was made" flag and is the safe gate for the
+      # downstream jobs; per-package values are read by path key.
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      tag_name: ${{ steps.release.outputs['crates/server--tag_name'] }}
+      version: ${{ steps.release.outputs['crates/server--version'] }}
     steps:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7  # v5
         id: release
@@ -53,10 +76,33 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+  # Resolve the tag for the build matrix from whichever entry path
+  # fired this run. Centralising the resolution here means the build
+  # jobs don't need to branch on `github.event_name`.
+  resolve-target:
+    needs: release-please
+    if: |
+      always() &&
+      (github.event_name == 'workflow_dispatch' ||
+        needs.release-please.outputs.releases_created == 'true')
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+    steps:
+      - id: r
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${DISPATCH_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
   build-binary:
     name: binary ${{ matrix.target }}
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    needs: resolve-target
     permissions:
       contents: read
     strategy:
@@ -71,7 +117,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ needs.resolve-target.outputs.tag }}
 
       - name: Install system dependencies
         # cmake/clang are needed by `libaec-sys` (GRIB CCSDS support).
@@ -102,7 +148,7 @@ jobs:
 
       - name: Package tarball
         run: |
-          version="${{ needs.release-please.outputs.tag_name }}"
+          version="${{ needs.resolve-target.outputs.tag }}"
           base="meteocore-${version}-${{ matrix.target }}"
           mkdir -p "dist/${base}"
           # Match the Docker image's binary name so the tarball and the
@@ -127,8 +173,7 @@ jobs:
 
   build-container:
     name: container image
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    needs: resolve-target
     permissions:
       contents: read
       packages: write
@@ -139,7 +184,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ needs.resolve-target.outputs.tag }}
 
       - uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003  # v4.1.1
 
@@ -161,8 +206,8 @@ jobs:
           # is `:1.2.3` not `:v1.2.3` (de-facto convention on most
           # registries). `:latest` flips to this release on every cut.
           tags: |
-            type=semver,pattern={{version}},value=${{ needs.release-please.outputs.tag_name }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-please.outputs.tag_name }}
+            type=semver,pattern={{version}},value=${{ needs.resolve-target.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.resolve-target.outputs.tag }}
             type=raw,value=latest
 
       - name: Build and push (linux/amd64, linux/arm64)
@@ -190,8 +235,7 @@ jobs:
     # No dependency on build-container: image publish is a peer operation
     # against ghcr.io. If the container build fails, the binaries on the
     # GitHub Release are still useful and should ship.
-    needs: [release-please, build-binary]
-    if: needs.release-please.outputs.release_created == 'true'
+    needs: [resolve-target, build-binary]
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -210,7 +254,7 @@ jobs:
 
       - uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3
         with:
-          tag_name: ${{ needs.release-please.outputs.tag_name }}
+          tag_name: ${{ needs.resolve-target.outputs.tag }}
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS
