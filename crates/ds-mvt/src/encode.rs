@@ -628,6 +628,40 @@ mod tests {
     }
 
     #[test]
+    fn encode_multipolygon_with_holes() {
+        // Two parts, both with a hole. The encoder must emit
+        // `complete_geom()` before each non-first exterior AND between an
+        // exterior and its hole(s), so the ring separators land in the
+        // right places. Without correct placement either the protobuf is
+        // malformed or the `mvt` crate returns an error.
+        let f = feature(
+            "donuts",
+            Geometry::MultiPolygon {
+                polygons: vec![
+                    (
+                        vec![[-50.0, -10.0], [-40.0, -10.0], [-40.0, 0.0], [-50.0, 0.0]],
+                        vec![vec![
+                            [-48.0, -8.0],
+                            [-42.0, -8.0],
+                            [-42.0, -2.0],
+                            [-48.0, -2.0],
+                        ]],
+                    ),
+                    (
+                        vec![[40.0, 0.0], [50.0, 0.0], [50.0, 10.0], [40.0, 10.0]],
+                        vec![vec![[42.0, 2.0], [48.0, 2.0], [48.0, 8.0], [42.0, 8.0]]],
+                    ),
+                ],
+            },
+            &[],
+        );
+        let opts = TileEncodeOptions::new("donuts", TmsKind::WebMercatorQuad);
+        let bytes = encode_tile(&[f], web_mercator_tile_z0(), &opts).unwrap();
+        assert!(!bytes.is_empty());
+        assert!(slice_contains(&bytes, b"donuts"));
+    }
+
+    #[test]
     fn null_geometry_is_skipped() {
         let f = feature("null", Geometry::Null, &[]);
         let opts = TileEncodeOptions::new("nulls", TmsKind::WebMercatorQuad);

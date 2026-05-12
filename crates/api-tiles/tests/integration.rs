@@ -594,12 +594,16 @@ mod mvt {
                 })
                 .collect();
             let n = matched.len();
-            let limit = if query.limit == 0 { n } else { query.limit };
-            let features: Vec<Feature> = matched.into_iter().take(limit).cloned().collect();
+            // Honour `limit` literally to match `GeoJsonEngine`'s real
+            // semantics (a previous version of the mock special-cased zero
+            // as "no limit", which hid the empty-tile bug fixed alongside
+            // this test).
+            let take = query.limit.min(n);
+            let features: Vec<Feature> = matched.into_iter().take(take).cloned().collect();
             Ok(FeaturePage {
                 features,
                 number_matched: n,
-                number_returned: n.min(limit),
+                number_returned: take,
                 next_offset: None,
             })
         }
@@ -704,6 +708,11 @@ mod mvt {
             .unwrap();
         assert!(etag.starts_with('"') && etag.ends_with('"'));
         assert_eq!(headers.get("cache-control").unwrap(), "public, max-age=300");
+        assert_eq!(
+            headers.get("x-content-type-options").unwrap(),
+            "nosniff",
+            "MVT responses must set nosniff to match the raster tile path"
+        );
     }
 
     #[tokio::test]
@@ -773,5 +782,62 @@ mod mvt {
             "application/vnd.mapbox-vector-tile"
         );
         assert!(!body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn vector_only_collection_listed_in_collections() {
+        let app = build_mvt_router();
+        let req = Request::builder()
+            .uri("/collections")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = json["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&"places"),
+            "vector-only collection 'places' must appear in /collections, got {ids:?}"
+        );
+        let places = json["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"].as_str() == Some("places"))
+            .unwrap();
+        assert_eq!(
+            places["dataType"].as_str(),
+            Some("vector"),
+            "vector-only collection must be advertised as dataType=vector"
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_only_tilesets_advertises_mvt_item_link() {
+        let app = build_mvt_router();
+        let req = Request::builder()
+            .uri("/collections/places/tiles")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let any_mvt_link = json["tilesets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|t| t["links"].as_array().unwrap())
+            .any(|l| l["type"].as_str() == Some("application/vnd.mapbox-vector-tile"));
+        assert!(
+            any_mvt_link,
+            "vector-only collection tilesets must include at least one MVT item link"
+        );
     }
 }

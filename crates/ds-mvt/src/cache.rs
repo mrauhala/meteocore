@@ -21,6 +21,10 @@ use crate::encode::TmsKind;
 /// 1:1 match between encode-time and lookup-time. `properties_hash` lets
 /// two callers with different property allowlists share the cache safely:
 /// a different allowlist hashes differently and lands in a distinct slot.
+/// `data_version` is an opaque token (file mtime, refresh counter, …)
+/// supplied by the source engine: bumping it after a reload invalidates
+/// previously-issued ETags so clients re-fetch instead of stalling on
+/// `304 Not Modified`.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct VectorTileKey {
     pub collection: String,
@@ -29,6 +33,7 @@ pub struct VectorTileKey {
     pub x: u64,
     pub y: u64,
     pub properties_hash: u64,
+    pub data_version: u64,
 }
 
 impl VectorTileKey {
@@ -126,6 +131,7 @@ mod tests {
             x,
             y,
             properties_hash: 0,
+            data_version: 0,
         }
     }
 
@@ -161,6 +167,19 @@ mod tests {
     #[test]
     fn etag_differs_for_distinct_keys() {
         assert_ne!(key(3, 4, 5).etag(), key(3, 4, 6).etag());
+    }
+
+    #[test]
+    fn etag_changes_when_data_version_bumps() {
+        let k1 = key(3, 4, 5);
+        let mut k2 = k1.clone();
+        k2.data_version = 1;
+        assert_ne!(
+            k1.etag(),
+            k2.etag(),
+            "ETag must rotate on data refresh so reloaded collections don't \
+             serve stale tiles via 304 Not Modified"
+        );
     }
 
     #[test]
