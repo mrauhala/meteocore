@@ -628,11 +628,12 @@ mod tests {
     }
 
     #[test]
-    fn antimeridian_tile_bbox_accepted_for_crs84() {
-        // CRS84 tile spanning the antimeridian: west=170, east=190 (or equiv -170+360).
-        // Plate-carrée linear interp still works because we treat coords as
-        // pre-normalized display units; we don't accept west>east at this layer.
-        // Caller must normalize the antimeridian split before calling encode_tile.
+    fn antimeridian_bbox_west_gt_east_is_rejected_for_crs84() {
+        // CRS84 tile spanning the antimeridian: west=170, east=-170. Plate-carrée
+        // linear interp would still work if we normalised the split (e.g.
+        // west=170, east=190), but `Projector::new` is the wrong layer for
+        // that — its job is to map a single contiguous bbox to tile-local
+        // coords. Callers must split antimeridian-crossing tiles themselves.
         assert!(
             Projector::new(TmsKind::WorldCRS84Quad, [170.0, -10.0, -170.0, 10.0], 4096).is_err()
         );
