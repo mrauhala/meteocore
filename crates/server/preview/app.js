@@ -113,8 +113,10 @@
             if (!c.spatial_extent) return acc;
             const e = c.spatial_extent;
             // Clamp to valid Mercator latitudes — a bbox at the poles
-            // (e.g. ECMWF's [-180,-90,180,90]) would otherwise refuse to
-            // fit at any zoom level.
+            // (e.g. ECMWF's [-180,-90,180,90]) projects to infinity in
+            // web Mercator. MapLibre then accepts the bounds but `fitBounds`
+            // resolves to a white-canvas max-zoom view because no finite
+            // pixel rectangle contains the bbox.
             const south = Math.max(e[1], -85);
             const north = Math.min(e[3], 85);
             const sw = [e[0], south];
@@ -205,17 +207,22 @@
     }
 
     // Convert an OGC API Tiles URL template
-    //   /tiles/.../{tms}/{tileMatrix}/{tileRow}/{tileCol}
+    //   /tiles/.../{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}
     // into the form MapLibre raster sources understand
     //   /tiles/.../WebMercatorQuad/{z}/{y}/{x}
-    // MapLibre substitutes {z}/{x}/{y}; the OGC `tileRow` is y and `tileCol`
-    // is x. The order on the path is preserved — only the placeholders are
-    // renamed so MapLibre's templating engine fills them correctly.
+    // MapLibre substitutes {z}/{x}/{y}; the OGC `tileMatrix` is z, `tileRow`
+    // is y, and `tileCol` is x. The placeholder *names* in the manifest
+    // come from the axum route (`{tileMatrixSetId}` / `{tileMatrix}` —
+    // see preview.rs:552-554), not from the generic `{tms}` / `{z}` that
+    // the server would reject. Substituting `WebMercatorQuad` as a literal
+    // path segment fixes the TMS to web-Mercator — the only one the
+    // raster source supports today.
     function tileUrlFor(collection, styleId) {
         const raster = collection.tiles.raster;
         const useStyled = styleId && styleId !== 'default' && raster.styled_url_template;
         let template = useStyled ? raster.styled_url_template : raster.url_template;
-        template = template.replace('{tms}', 'WebMercatorQuad');
+        template = template.replace('{tileMatrixSetId}', 'WebMercatorQuad');
+        template = template.replace('{tileMatrix}', '{z}');
         template = template.replace('{tileRow}', '{y}');
         template = template.replace('{tileCol}', '{x}');
         if (useStyled) {

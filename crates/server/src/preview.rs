@@ -1298,6 +1298,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_js_rewrites_ogc_tile_placeholders_for_maplibre() {
+        // Regression guard for #134 review: `tileUrlFor()` must rewrite
+        // *every* OGC API Tiles placeholder name emitted by the manifest
+        // (see `tile_descriptors`) into the `{z}/{x}/{y}` form MapLibre
+        // raster sources substitute. Missing any one of the four turns
+        // every tile request into a 404 because the path is left with
+        // literal `{tile…}` segments that no route matches.
+        let resp = asset_handler(
+            axum::extract::Path("app.js".into()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        for needle in [
+            "'{tileMatrixSetId}', 'WebMercatorQuad'",
+            "'{tileMatrix}', '{z}'",
+            "'{tileRow}', '{y}'",
+            "'{tileCol}', '{x}'",
+        ] {
+            assert!(
+                body_str.contains(needle),
+                "app.js missing tile placeholder substitution: {needle}"
+            );
+        }
+        // Negative guard: the legacy `{tms}` and `{z}` shortcuts must NOT
+        // reappear in the substitution targets — the manifest no longer
+        // uses them, so any code referencing them is a stale-doc bug.
+        assert!(
+            !body_str.contains("'{tms}'"),
+            "app.js still references legacy `{{tms}}` placeholder (manifest emits `{{tileMatrixSetId}}`)"
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_asset_returns_generic_404_body() {
         // User-supplied path must NOT be reflected (review feedback Phase 2).
         let resp = asset_handler(
