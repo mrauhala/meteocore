@@ -140,10 +140,19 @@ fn serve_asset(path: &str, request_headers: &axum::http::HeaderMap) -> Response 
     if let Some(inm) = request_headers.get(header::IF_NONE_MATCH) {
         if let Ok(inm_str) = inm.to_str() {
             if ds_render::etag_matches(inm_str, &etag) {
+                // `nosniff` here is mostly cosmetic — browsers fold a 304's
+                // headers into the cached 200, which already carried this
+                // value — but keeping the two paths symmetric removes a
+                // class of "did we cover that header in every branch?"
+                // bookkeeping when the response shape evolves.
                 return Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
                     .header(header::ETAG, &etag)
                     .header(header::CACHE_CONTROL, cache_control)
+                    .header(
+                        header::HeaderName::from_static("x-content-type-options"),
+                        "nosniff",
+                    )
                     .body(Body::empty())
                     .expect("static 304 response headers are valid");
             }
@@ -1317,10 +1326,16 @@ mod tests {
         assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(second.headers().get(header::ETAG).unwrap(), &etag);
         // 304 must still carry Cache-Control so the browser refreshes its
-        // freshness clock.
+        // freshness clock, and nosniff for parity with the 200 path so a
+        // future refactor can't accidentally drop the header from one
+        // branch only.
         assert_eq!(
             second.headers().get(header::CACHE_CONTROL).unwrap(),
             "no-cache"
+        );
+        assert_eq!(
+            second.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
         );
         let body = axum::body::to_bytes(second.into_body(), 1024)
             .await
