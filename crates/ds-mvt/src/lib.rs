@@ -15,6 +15,7 @@
 
 mod cache;
 mod encode;
+mod hash;
 mod simplify;
 
 pub use cache::{VectorTileCache, VectorTileKey};

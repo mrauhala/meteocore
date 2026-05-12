@@ -900,32 +900,30 @@ mod mvt {
     }
 
     #[tokio::test]
-    async fn pbf_tile_too_dense_returns_400() {
-        // Hit `MAX_FEATURES_PER_TILE + 1` so the density guard fires.
-        // `MAX_FEATURES_PER_TILE` is a private const; this magic number must
-        // stay in sync with the handler. If a future change relaxes the cap,
-        // this test will go green on a `200` response — bump `emit` to the
-        // new cap + 1 so the guard remains under test.
-        let app = build_dense_router(50_001);
+    async fn pbf_tile_too_dense_returns_422() {
+        // One past the cap → density guard fires.
+        let app = build_dense_router(api_tiles::params::MAX_FEATURES_PER_TILE + 1);
         let req = Request::builder()
             .uri("/collections/dense/tiles/WebMercatorQuad/0/0/0?f=mvt")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // 422 Unprocessable Content: the request is well-formed; only the
+        // data exceeds the per-tile feature budget.
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let body_str = std::str::from_utf8(&body).unwrap_or("");
         assert!(
             body_str.contains("tile-too-dense"),
-            "400 body should mention the density guard, got: {body_str}"
+            "422 body should mention the density guard, got: {body_str}"
         );
     }
 
     #[tokio::test]
     async fn pbf_tile_at_density_cap_returns_200() {
-        // One feature under the cap → success path. Confirms the guard's
-        // boundary condition isn't off-by-one.
-        let app = build_dense_router(50_000);
+        // Exactly at the cap → success path. Confirms the guard's boundary
+        // condition isn't off-by-one (guard fires only on `>`, not `>=`).
+        let app = build_dense_router(api_tiles::params::MAX_FEATURES_PER_TILE);
         let req = Request::builder()
             .uri("/collections/dense/tiles/WebMercatorQuad/0/0/0?f=mvt")
             .body(Body::empty())

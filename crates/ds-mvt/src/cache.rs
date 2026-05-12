@@ -11,21 +11,7 @@ use quick_cache::sync::Cache;
 use quick_cache::Weighter;
 
 use crate::encode::TmsKind;
-
-/// FNV-1a 64-bit mix. Fixed algorithm — safe to serialise into HTTP `ETag`
-/// headers because the output does not change with a rustc upgrade. The
-/// stdlib `DefaultHasher` is explicitly unspecified across releases (see
-/// the `properties_hash` doc below) and must not leave the process.
-const FNV1A_OFFSET: u64 = 0xcbf29ce484222325;
-const FNV1A_PRIME: u64 = 0x100000001b3;
-
-#[inline]
-fn fnv1a_mix(state: &mut u64, bytes: &[u8]) {
-    for &b in bytes {
-        *state ^= b as u64;
-        *state = state.wrapping_mul(FNV1A_PRIME);
-    }
-}
+use crate::hash::{fnv1a_mix, FNV1A_OFFSET};
 
 /// Cache key for an encoded vector tile.
 ///

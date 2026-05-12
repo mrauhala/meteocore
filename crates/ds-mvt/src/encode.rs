@@ -384,29 +384,18 @@ fn lat_to_merc_y(lat: f64) -> f64 {
 /// HTTP `ETag` header. A toolchain bump must not silently rotate the bytes
 /// clients replay in `If-None-Match`.
 pub fn properties_hash(allowlist: &PropertyAllowlist) -> u64 {
-    // FNV-1a 64-bit — duplicated from `cache.rs` so this helper has no
-    // dependency on `VectorTileKey`. Algorithm is canonical and tiny;
-    // keeping a private copy is clearer than exposing a `pub(crate)` API
-    // surface for ten lines of code.
-    const FNV1A_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV1A_PRIME: u64 = 0x100000001b3;
+    use crate::hash::{fnv1a_mix, FNV1A_OFFSET};
     let mut h = FNV1A_OFFSET;
-    let mut mix = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(FNV1A_PRIME);
-        }
-    };
     match allowlist {
-        PropertyAllowlist::All => mix(&[0u8]),
+        PropertyAllowlist::All => fnv1a_mix(&mut h, &[0u8]),
         PropertyAllowlist::Subset(set) => {
-            mix(&[1u8]);
+            fnv1a_mix(&mut h, &[1u8]);
             // Sort for deterministic hashing — HashSet iteration order is random.
             let mut keys: Vec<&String> = set.iter().collect();
             keys.sort();
             for k in keys {
-                mix(k.as_bytes());
-                mix(b"|");
+                fnv1a_mix(&mut h, k.as_bytes());
+                fnv1a_mix(&mut h, b"|");
             }
         }
     }

@@ -12,6 +12,14 @@ pub const DEFAULT_MAX_ZOOM: u32 = 18;
 /// Standard tile size in pixels.
 pub const TILE_SIZE: u32 = 256;
 
+/// Maximum number of features a single MVT tile is allowed to carry. At
+/// z=0 of a 100k-feature dataset the whole world lands in one tile —
+/// returning a multi-megabyte MVT would harm the cache and the client.
+/// Exceeding this cap surfaces as HTTP 422 (Unprocessable Content): the
+/// request is well-formed, but the data can't be served at that scale.
+/// The fix is to raise the collection's `minzoom`, not to silently encode.
+pub const MAX_FEATURES_PER_TILE: usize = 50_000;
+
 /// Supported raster output formats for map tiles.
 const SUPPORTED_FORMATS: &[&str] = &["image/png", "image/jpeg", "image/webp"];
 

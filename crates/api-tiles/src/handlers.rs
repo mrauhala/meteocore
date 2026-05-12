@@ -358,6 +358,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     },
                     "400": {"description": "Bad request"},
                     "404": {"description": "Tile not found"},
+                    "422": {"description": "Tile too dense (feature count exceeds per-tile cap)"},
                     "500": {"description": "Server error"}
                 }
             }
@@ -707,12 +708,6 @@ pub async fn collection_tilesets(
 /// MVT MIME type registered with IANA.
 const MVT_CONTENT_TYPE: &str = "application/vnd.mapbox-vector-tile";
 
-/// Refuse to encode a tile that would carry more than this many features.
-/// At z=0 of a 100k-feature dataset the whole world lands in one tile —
-/// returning a multi-megabyte MVT would harm the cache and the client. The
-/// fix is to raise the collection's `minzoom`, not to silently encode.
-const MAX_FEATURES_PER_TILE: usize = 50_000;
-
 /// Encode an MVT from a `FeatureEngine` and return it as an HTTP response.
 ///
 /// Reached through content negotiation on the standard tile path:
@@ -819,7 +814,7 @@ async fn render_vector_tile(
     // cap.
     let query = FeatureQuery {
         bbox: Some(query_bbox),
-        limit: MAX_FEATURES_PER_TILE + 1,
+        limit: params::MAX_FEATURES_PER_TILE + 1,
         offset: 0,
         datetime: None,
     };
@@ -828,11 +823,14 @@ async fn render_vector_tile(
         .get_features(&query)
         .map_err(|e| TilesError::Internal(format!("Feature query failed: {e}")))?;
 
-    if page.features.len() > MAX_FEATURES_PER_TILE {
-        return Err(TilesError::BadRequest(format!(
+    if page.features.len() > params::MAX_FEATURES_PER_TILE {
+        // 422 (Unprocessable Content), not 400: the request itself is
+        // well-formed — valid TMS, valid coords, registered collection —
+        // and only the data exceeds the per-tile budget.
+        return Err(TilesError::Unprocessable(format!(
             "tile-too-dense: {} features exceed maximum of {} — raise minzoom or narrow bbox",
             page.features.len(),
-            MAX_FEATURES_PER_TILE
+            params::MAX_FEATURES_PER_TILE
         )));
     }
 
