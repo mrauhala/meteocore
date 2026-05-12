@@ -286,7 +286,7 @@ static RENDER_SEMAPHORE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
 static RENDER_SEMAPHORE_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
     let gauge = IntGauge::new(
         "render_semaphore_total",
-        "Total render semaphore permits (CPU cores)",
+        "Total render semaphore permits (2× CPU cores, min 8)",
     )
     .unwrap();
     REGISTRY.register(Box::new(gauge.clone())).unwrap();
@@ -1127,13 +1127,31 @@ pub fn load_collections(
         .unwrap_or(128);
 
     // Shared render semaphore and cache between WMS, Maps, and Tiles APIs.
-    // Size to available CPU cores — render tasks are CPU-bound (colorization + PNG encoding).
-    // Minimum 4 to avoid starving on small machines; excess requests queue via acquire().await.
+    //
+    // Sized to **2× available CPU cores** (min 8). Render tasks aren't pure
+    // CPU even though the semaphore wraps only the `spawn_blocking` body:
+    // for GeoTIFF/GRIB radar workloads the post-fetch path interleaves
+    // image decode (libpng, libdeflate) and PNG encode bursts with short
+    // bilinear-sample passes, leaving CPU idle a non-trivial fraction of
+    // the slot's wall time. The slot's "ownership" of a real CPU is
+    // therefore loose, and a 2× oversubscription typically improves
+    // throughput on radar-style workloads (preview SPA scrubbing the
+    // time slider over a radar stack) without raising load average on
+    // CPU-bound colourisation passes — those just queue at the OS
+    // scheduler instead of at the semaphore. Excess requests still queue
+    // via `acquire().await`.
+    //
+    // If this turns out to over-subscribe on a specific deployment (CPU
+    // load average climbs past `cores`), an operator can drop it via a
+    // future `[server] render_concurrency` config knob (#147).
     let render_concurrency = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(8)
-        .max(4);
-    tracing::info!("Render concurrency: {render_concurrency} (from available CPUs)");
+        .unwrap_or(4)
+        .saturating_mul(2)
+        .max(8);
+    tracing::info!(
+        "Render concurrency: {render_concurrency} (2× available CPUs, min 8)"
+    );
     let render_semaphore = Arc::new(tokio::sync::Semaphore::new(render_concurrency));
     let rendered_cache = Arc::new(ds_render::RenderedCache::new(rendered_cache_mb));
     // Vector-tile (MVT) cache is independent of the raster cache because the
