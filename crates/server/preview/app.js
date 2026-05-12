@@ -39,6 +39,10 @@
     const statusEl = document.getElementById('status');
     const listEl = document.getElementById('collections');
 
+    // Shared across every vector collection so clicking a feature in one
+    // collection dismisses an open popup from another.
+    let activePopup = null;
+
     // `map.on('load')` so MapLibre's style is ready before we add raster
     // sources/layers. Adding sources before style-load throws.
     //
@@ -294,33 +298,23 @@
     // Vector layer wiring
     // -----------------------------------------------------------------
 
-    // Three style layers per source — split by geometry-type so the same
-    // collection can carry mixed geometries without per-feature paint
-    // overrides. The MVT layer name (`source-layer`) equals the collection
-    // id; the ds-mvt encoder uses the same convention server-side.
+    // Split by geometry-type so one collection can carry mixed geometries
+    // without per-feature paint overrides. `source-layer` mirrors the
+    // ds-mvt encoder convention server-side (== collection id).
     function attachVectorLayer(collection, li) {
         const sourceId = 'vsrc-' + collection.id;
         const fillLayerId = 'vfill-' + collection.id;
         const lineLayerId = 'vline-' + collection.id;
         const pointLayerId = 'vpoint-' + collection.id;
 
-        // No `attribution` field: MapLibre renders attribution via
-        // `innerHTML` inside its AttributionControl — a server config
-        // title like `<img src=x onerror=alert(1)>` would execute
-        // script in the preview page. Mirrors the raster source.
+        // No `attribution`: MapLibre renders it via innerHTML.
         map.addSource(sourceId, {
             type: 'vector',
             tiles: [vectorTileUrlFor(collection)]
         });
 
-        // `match` (not `==`) so the filter catches Multi-variants too.
-        // The MVT decoder bundled in MapLibre reconstructs a
-        // `Geometry::MultiPolygon` as GeoJSON `MultiPolygon`, so the
-        // expression `['geometry-type']` returns `'MultiPolygon'` —
-        // an `== 'Polygon'` filter silently drops every multi-feature.
-        // In the test data being opted in here, 68/308 municipalities
-        // and 9/19 regions are MultiPolygon, so the bug would render
-        // a third of the dataset invisible.
+        // `match` over `==` so the filter catches `MultiPolygon` too
+        // (68/308 municipalities in the test data would otherwise vanish).
         map.addLayer({
             id: fillLayerId,
             type: 'fill',
@@ -333,22 +327,13 @@
             }
         });
 
-        // Lines double as polygon outlines so MultiPolygon boundaries stay
-        // visible even when fills overlap. `LineString`/`MultiLineString`
-        // arms are dead today (ds-core's `Geometry` enum has no LineString
-        // variant), but harmless future-proofing.
+        // Polygon outlines so MultiPolygon boundaries stay visible under overlapping fills.
         map.addLayer({
             id: lineLayerId,
             type: 'line',
             source: sourceId,
             'source-layer': collection.id,
-            filter: [
-                'match',
-                ['geometry-type'],
-                ['Polygon', 'MultiPolygon', 'LineString', 'MultiLineString'],
-                true,
-                false
-            ],
+            filter: ['match', ['geometry-type'], ['Polygon', 'MultiPolygon'], true, false],
             paint: {
                 'line-color': '#2b6cb0',
                 'line-width': 1
@@ -371,15 +356,10 @@
 
         const interactiveLayers = [fillLayerId, lineLayerId, pointLayerId];
 
-        // Track the currently-open popup so successive clicks replace
-        // rather than stack. MapLibre does not auto-dismiss existing
-        // popups when a new one is added, so without this, clicking
-        // municipality A then municipality B would leave both panels
-        // open. `null` after `.remove()` keeps the check simple.
-        let activePopup = null;
         map.on('click', interactiveLayers, function (e) {
             if (!e.features || e.features.length === 0) return;
             const feature = e.features[0];
+            // MapLibre doesn't auto-dismiss; replace any existing popup.
             if (activePopup) activePopup.remove();
             activePopup = new maplibregl.Popup({ closeButton: true, maxWidth: '320px' })
                 .setLngLat(e.lngLat)
@@ -390,8 +370,7 @@
             });
         });
 
-        // Cursor feedback. Tracked separately per layer because MapLibre
-        // dispatches mouseenter/mouseleave per-layer, not per-collection.
+        // mouseenter/mouseleave dispatch per-layer, not per-collection.
         interactiveLayers.forEach(function (id) {
             map.on('mouseenter', id, function () {
                 map.getCanvas().style.cursor = 'pointer';
@@ -426,27 +405,16 @@
     }
 
     function vectorTileUrlFor(collection) {
-        // Same placeholder rewrite as `tileUrlFor()` for rasters — same
-        // four OGC placeholder names emitted by the manifest
-        // (`{tileMatrixSetId}` / `{tileMatrix}` / `{tileRow}` / `{tileCol}`,
-        // not the generic `{tms}` / `{z}`). Plus the URL already carries
-        // `?f=mvt` from the manifest, so MapLibre fetches MVT-encoded
-        // bytes.
+        // Same OGC placeholders as raster — `?f=mvt` is already in the manifest.
         let template = collection.tiles.vector.url_template;
         template = template.replace('{tileMatrixSetId}', 'WebMercatorQuad');
         template = template.replace('{tileMatrix}', '{z}');
         template = template.replace('{tileRow}', '{y}');
         template = template.replace('{tileCol}', '{x}');
-        // Vector tiles are loaded inside a MapLibre Web Worker, which
-        // has no `document` base to resolve relative URLs against and
-        // rejects them with "URL is not valid or contains user
-        // credentials". Re-anchor to `window.location.origin` so:
-        //   (a) the worker receives a fully-qualified URL it can parse,
-        //   (b) the host always matches the page's origin, sidestepping
-        //       any 127.0.0.1↔localhost mismatch from `server.base_url`,
-        //       which CSP `connect-src 'self'` would otherwise refuse.
-        // Strip whatever origin the manifest emitted, then prefix the
-        // page's. Idempotent on path-only manifests.
+        // MapLibre's vector-tile worker rejects relative URLs ("URL is not
+        // valid or contains user credentials"). Re-anchor to the page
+        // origin so 127.0.0.1↔localhost mismatch in `server.base_url`
+        // doesn't trip CSP `connect-src 'self'` either.
         template = template.replace(/^https?:\/\/[^/]+/i, '');
         template = window.location.origin + template;
         return template;
