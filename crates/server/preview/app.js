@@ -122,7 +122,11 @@
                 }
             }
             if (c.tiles && c.tiles.vector) {
-                attachVectorLayer(c, li);
+                try {
+                    attachVectorLayer(c, li);
+                } catch (err) {
+                    console.error('attachVectorLayer failed for', c.id, err);
+                }
             }
 
             listEl.appendChild(li);
@@ -309,12 +313,20 @@
             tiles: [vectorTileUrlFor(collection)]
         });
 
+        // `match` (not `==`) so the filter catches Multi-variants too.
+        // The MVT decoder bundled in MapLibre reconstructs a
+        // `Geometry::MultiPolygon` as GeoJSON `MultiPolygon`, so the
+        // expression `['geometry-type']` returns `'MultiPolygon'` —
+        // an `== 'Polygon'` filter silently drops every multi-feature.
+        // In the test data being opted in here, 68/308 municipalities
+        // and 9/19 regions are MultiPolygon, so the bug would render
+        // a third of the dataset invisible.
         map.addLayer({
             id: fillLayerId,
             type: 'fill',
             source: sourceId,
             'source-layer': collection.id,
-            filter: ['==', ['geometry-type'], 'Polygon'],
+            filter: ['match', ['geometry-type'], ['Polygon', 'MultiPolygon'], true, false],
             paint: {
                 'fill-color': '#4299e1',
                 'fill-opacity': 0.18
@@ -322,16 +334,20 @@
         });
 
         // Lines double as polygon outlines so MultiPolygon boundaries stay
-        // visible even when fills overlap.
+        // visible even when fills overlap. `LineString`/`MultiLineString`
+        // arms are dead today (ds-core's `Geometry` enum has no LineString
+        // variant), but harmless future-proofing.
         map.addLayer({
             id: lineLayerId,
             type: 'line',
             source: sourceId,
             'source-layer': collection.id,
             filter: [
-                'any',
-                ['==', ['geometry-type'], 'Polygon'],
-                ['==', ['geometry-type'], 'LineString']
+                'match',
+                ['geometry-type'],
+                ['Polygon', 'MultiPolygon', 'LineString', 'MultiLineString'],
+                true,
+                false
             ],
             paint: {
                 'line-color': '#2b6cb0',
@@ -344,7 +360,7 @@
             type: 'circle',
             source: sourceId,
             'source-layer': collection.id,
-            filter: ['==', ['geometry-type'], 'Point'],
+            filter: ['match', ['geometry-type'], ['Point', 'MultiPoint'], true, false],
             paint: {
                 'circle-radius': 5,
                 'circle-color': '#4299e1',
@@ -463,7 +479,9 @@
         if (value === null || value === undefined) return '—';
         if (typeof value === 'number' && !Number.isInteger(value)) {
             // Trim noisy floating-point trails without losing precision the
-            // user actually asked for; 4 sig figs covers most preview cases.
+            // user actually asked for. 6 sig figs covers area / population /
+            // perimeter values for the radar+admin-boundaries preview without
+            // turning every popup into a wall of decimal noise.
             return value.toLocaleString(undefined, { maximumSignificantDigits: 6 });
         }
         return String(value);
