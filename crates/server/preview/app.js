@@ -371,13 +371,23 @@
 
         const interactiveLayers = [fillLayerId, lineLayerId, pointLayerId];
 
+        // Track the currently-open popup so successive clicks replace
+        // rather than stack. MapLibre does not auto-dismiss existing
+        // popups when a new one is added, so without this, clicking
+        // municipality A then municipality B would leave both panels
+        // open. `null` after `.remove()` keeps the check simple.
+        let activePopup = null;
         map.on('click', interactiveLayers, function (e) {
             if (!e.features || e.features.length === 0) return;
             const feature = e.features[0];
-            new maplibregl.Popup({ closeButton: true, maxWidth: '320px' })
+            if (activePopup) activePopup.remove();
+            activePopup = new maplibregl.Popup({ closeButton: true, maxWidth: '320px' })
                 .setLngLat(e.lngLat)
                 .setDOMContent(buildPopupBody(collection, feature))
                 .addTo(map);
+            activePopup.on('close', function () {
+                activePopup = null;
+            });
         });
 
         // Cursor feedback. Tracked separately per layer because MapLibre
