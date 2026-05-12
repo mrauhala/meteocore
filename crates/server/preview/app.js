@@ -154,8 +154,10 @@
             tiles: [initialUrl],
             tileSize: 256
         });
-        // Insert above the background but below subsequent layers, so
-        // collections later in the manifest stack on top.
+        // Append to the top of the draw stack (no `beforeId` argument).
+        // Per the iterator comment above, collections later in the
+        // manifest render above earlier ones — that ordering is enforced
+        // here by the natural append-to-top behaviour.
         map.addLayer({
             id: layerId,
             type: 'raster',
