@@ -6,7 +6,9 @@ on:
     - cron: '17 12 * * 0'
   push:
     branches: [ "main" ]
-    tags: [ 'v*.*.*' ]
+    # NB: no `tags:` here — release-please owns versioned releases via
+    # `.github/workflows/release.yml`, and a tag it pushes with
+    # `GITHUB_TOKEN` does not fan-out to other workflows anyway.
   pull_request:
     branches: [ "main" ]
 
@@ -115,6 +117,12 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
+          # `:latest` is owned by release.yml (it points at the most recent
+          # release-please tag). CI on main only publishes `:main` and
+          # `:sha-…` development tags so consumers can pin to a specific
+          # commit without colliding with the stable channel.
+          flavor: |
+            latest=false
 
       - name: Build and push Docker image
         id: build-and-push
