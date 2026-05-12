@@ -284,11 +284,7 @@ static RENDER_SEMAPHORE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
 });
 
 static RENDER_SEMAPHORE_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "render_semaphore_total",
-        "Total render semaphore permits (CPU cores)",
-    )
-    .unwrap();
+    let gauge = IntGauge::new("render_semaphore_total", "Total render semaphore permits").unwrap();
     REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
 });
@@ -1126,14 +1122,15 @@ pub fn load_collections(
         .next()
         .unwrap_or(128);
 
-    // Shared render semaphore and cache between WMS, Maps, and Tiles APIs.
-    // Size to available CPU cores — render tasks are CPU-bound (colorization + PNG encoding).
-    // Minimum 4 to avoid starving on small machines; excess requests queue via acquire().await.
+    // 2× cores (min 8) — the render slot's "ownership" of a CPU is loose
+    // because decode/encode interleaves with bilinear passes; configurable
+    // knob tracked in #147.
     let render_concurrency = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(8)
-        .max(4);
-    tracing::info!("Render concurrency: {render_concurrency} (from available CPUs)");
+        .unwrap_or(4)
+        .saturating_mul(2)
+        .max(8);
+    tracing::info!("Render concurrency: {render_concurrency} (2× available CPUs, min 8)");
     let render_semaphore = Arc::new(tokio::sync::Semaphore::new(render_concurrency));
     let rendered_cache = Arc::new(ds_render::RenderedCache::new(rendered_cache_mb));
     // Vector-tile (MVT) cache is independent of the raster cache because the
