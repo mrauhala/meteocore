@@ -488,29 +488,42 @@ fn resolve_temporal_extent(
     tiles: &api_tiles::handlers::TilesState,
     wms: &api_wms::handlers::WmsState,
 ) -> Option<Value> {
-    // EDR is the canonical temporal source — it carries both interval and
-    // explicit instants. Maps/Tiles/WMS `raster_info().times` is the
-    // fallback when a collection isn't EDR-enabled (e.g. radar collections
-    // exposed only via WMS).
-    if let Some(engine) = edr.engines.get(id) {
-        let interval = engine.get_temporal_extent();
-        let values = engine.get_available_times();
-        if interval.is_some() || values.is_some() {
-            return Some(serialize_temporal(interval, values.as_deref()));
-        }
-    }
+    // Build interval from EDR (canonical source), then fill in discrete
+    // values from EDR first, falling back to raster_info().times. The fallback
+    // covers geotiff-style engines that expose timestep instants only through
+    // their raster surface — without it, a radar collection with EDR enabled
+    // would surface a continuous interval but no slider stops.
+    let (edr_interval, edr_values) = edr.engines.get(id).map_or((None, None), |e| {
+        (e.get_temporal_extent(), e.get_available_times())
+    });
 
-    let times_from_raster = maps
+    let raster_times = maps
         .engines
         .get(id)
         .map(|e| e.raster_info().times)
         .or_else(|| tiles.map_engines.get(id).map(|e| e.raster_info().times))
-        .or_else(|| wms.engines.get(id).map(|e| e.raster_info().times));
-    if let Some(times) = times_from_raster {
-        if !times.is_empty() {
-            let interval = times.first().zip(times.last()).map(|(a, b)| (*a, *b));
-            return Some(serialize_temporal(interval, Some(&times)));
+        .or_else(|| wms.engines.get(id).map(|e| e.raster_info().times))
+        .filter(|t| !t.is_empty());
+
+    // Pick the source that backs `values`, then derive `interval` from the
+    // same source so the preview card's "Time" row matches the slider's
+    // reachable range. EDR's interval can otherwise span a wider horizon
+    // (e.g. T-24h forecast bound) than the discrete raster timesteps cover,
+    // leaving the user looking at a span the slider can't reach.
+    let (interval, values) = match (edr_values, raster_times) {
+        (Some(v), _) => {
+            let int = edr_interval.or_else(|| v.first().zip(v.last()).map(|(a, b)| (*a, *b)));
+            (int, Some(v))
         }
+        (None, Some(t)) => {
+            let int = t.first().zip(t.last()).map(|(a, b)| (*a, *b));
+            (int, Some(t))
+        }
+        (None, None) => (edr_interval, None),
+    };
+
+    if interval.is_some() || values.is_some() {
+        return Some(serialize_temporal(interval, values.as_deref()));
     }
     None
 }
@@ -1143,6 +1156,98 @@ mod tests {
         );
         assert_eq!(temporal["truncated"], false);
         assert_eq!(temporal["total_values"], 0);
+    }
+
+    #[test]
+    fn temporal_extent_values_fall_back_to_raster_times_when_edr_lacks_them() {
+        // Regression guard for the round-4 fix in `resolve_temporal_extent`.
+        // Some engines (notably geotiff/radar) expose discrete timestep
+        // instants only through their raster surface — `get_available_times`
+        // returns `None`, but `MapEngine::raster_info().times` has the list.
+        // The manifest must merge: take the EDR interval (canonical), and
+        // backfill `values` from raster_info() when EDR doesn't expose them.
+        // Without the fallback, the preview's time slider has no stops to
+        // snap to even though the data has discrete steps.
+        let times = vec![
+            "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            "2024-01-01T01:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            "2024-01-01T02:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+        ];
+
+        struct IntervalOnlyEdr {
+            interval: (DateTime<Utc>, DateTime<Utc>),
+        }
+        impl Engine for IntervalOnlyEdr {
+            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+                Ok(Vec::new())
+            }
+            fn query_location(
+                &self,
+                _: &str,
+                _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                _: Option<&[String]>,
+            ) -> Result<QueryResult, DataServerError> {
+                unimplemented!()
+            }
+            fn get_parameters(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+                Some(self.interval)
+            }
+            fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+                None
+            }
+            // No `get_available_times` override — defaults to `None`.
+        }
+
+        // Use a deliberately wider EDR interval than the raster's discrete
+        // timesteps so the test catches the "interval/values divergence"
+        // bug: a slider with three 1-hour stops should not report a 24-hour
+        // span in the card header.
+        let wide_edr_interval = (
+            "2023-12-31T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            "2024-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+        );
+
+        let mut edr = empty_edr();
+        let edr_engine: Arc<dyn Engine> = Arc::new(IntervalOnlyEdr {
+            interval: wide_edr_interval,
+        });
+        edr.engines.insert("radar".into(), edr_engine);
+        edr.collections
+            .insert("radar".into(), config("radar", &["edr", "tiles"]));
+
+        let mut tiles = empty_tiles();
+        let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            spatial_extent: Some([0.0, 0.0, 10.0, 10.0]),
+            times: times.clone(),
+            parameter: "reflectivity".into(),
+            unit: "dBZ".into(),
+        });
+        tiles.map_engines.insert("radar".into(), raster);
+        tiles
+            .collections
+            .insert("radar".into(), config("radar", &["edr", "tiles"]));
+
+        let state = make_state(edr, empty_features(), empty_maps(), tiles, empty_wms());
+        let m = build_manifest(&state, 0, 100);
+        let temporal = &m["collections"][0]["temporal_extent"];
+
+        // Interval must come from the *values* source (raster), not from EDR's
+        // wider span. Without this anchoring, the card's Time row would show
+        // 2023-12-31→2024-01-02 while the slider only has 00/01/02 stops.
+        assert_eq!(temporal["start"], "2024-01-01T00:00:00+00:00");
+        assert_eq!(temporal["end"], "2024-01-01T02:00:00+00:00");
+        assert_eq!(
+            temporal["values"].as_array().map(|a| a.len()),
+            Some(3),
+            "values must be backfilled from RasterMock.times when EDR's \
+             get_available_times returns None — otherwise the preview slider \
+             has no stops to snap to"
+        );
+        assert_eq!(temporal["total_values"], 3);
+        assert_eq!(temporal["truncated"], false);
     }
 
     #[test]
