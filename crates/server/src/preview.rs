@@ -785,6 +785,14 @@ mod tests {
             raster_url.contains("{tileMatrixSetId}") && raster_url.contains("{tileMatrix}"),
             "raster url_template must use the axum route's placeholder names, got: {raster_url}"
         );
+        // `radar` has no styles registered in this fixture, so the
+        // styled-tile fields must be absent — otherwise we'd advertise a
+        // URL the server can't honour. Locks in the conditional emit in
+        // `raster_tile_descriptor`.
+        assert!(radar["tiles"]["raster"]
+            .get("styled_url_template")
+            .is_none());
+        assert!(radar["tiles"]["raster"].get("default_style").is_none());
         assert!(radar["tiles"].get("vector").is_none());
 
         // Vector-only collection: tiles.vector present with ?f=mvt; tiles.raster absent.
