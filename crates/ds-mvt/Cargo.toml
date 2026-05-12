@@ -1,0 +1,11 @@
+[package]
+name = "ds-mvt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ds-core = { path = "../core" }
+mvt = "0.13"
+quick_cache = "0.6"
+bytes = "1"
+thiserror = "2"
