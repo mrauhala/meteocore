@@ -785,10 +785,10 @@ async fn render_vector_tile(
     // would let stale browser caches survive a server fix indefinitely.
     if let Some(cached) = state.vector_tile_cache.get(&cache_key) {
         if let Some(ref inm) = if_none_match {
-            if ds_render::etag_matches(inm, &cached.etag) {
+            if ds_render::etag_matches(inm, cached.etag()) {
                 return Ok(axum::response::Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
-                    .header(header::ETAG, &cached.etag)
+                    .header(header::ETAG, cached.etag())
                     .header(header::CACHE_CONTROL, cache_control)
                     .body(axum::body::Body::empty())
                     .unwrap()
@@ -797,7 +797,7 @@ async fn render_vector_tile(
         }
         return Ok(axum::response::Response::builder()
             .header(header::CONTENT_TYPE, MVT_CONTENT_TYPE)
-            .header(header::ETAG, &cached.etag)
+            .header(header::ETAG, cached.etag())
             .header(header::CACHE_CONTROL, cache_control)
             .header(
                 header::HeaderName::from_static("x-content-type-options"),
@@ -869,10 +869,10 @@ async fn render_vector_tile(
     state.vector_tile_cache.insert(cache_key, cached.clone());
 
     if let Some(ref inm) = if_none_match {
-        if ds_render::etag_matches(inm, &cached.etag) {
+        if ds_render::etag_matches(inm, cached.etag()) {
             return Ok(axum::response::Response::builder()
                 .status(StatusCode::NOT_MODIFIED)
-                .header(header::ETAG, &cached.etag)
+                .header(header::ETAG, cached.etag())
                 .header(header::CACHE_CONTROL, cache_control)
                 .body(axum::body::Body::empty())
                 .unwrap()
@@ -882,7 +882,7 @@ async fn render_vector_tile(
 
     Ok(axum::response::Response::builder()
         .header(header::CONTENT_TYPE, MVT_CONTENT_TYPE)
-        .header(header::ETAG, &cached.etag)
+        .header(header::ETAG, cached.etag())
         .header(header::CACHE_CONTROL, cache_control)
         .header(
             header::HeaderName::from_static("x-content-type-options"),

@@ -46,7 +46,13 @@ pub struct VectorTileKey {
 #[derive(Debug, Clone)]
 pub struct CachedTile {
     pub bytes: Bytes,
-    pub etag: String,
+    /// Private so the only path that sets it is `CachedTile::new`, which seals
+    /// the invariant `etag == FNV-1a(bytes)`. Without this seal, a workspace
+    /// crate could construct `CachedTile { bytes, etag: "wrong".into() }` and
+    /// silently break `If-None-Match` for that entry (a browser holding the
+    /// real ETag would get a full 200 response instead of 304, or vice
+    /// versa).
+    etag: String,
 }
 
 impl CachedTile {
@@ -61,6 +67,11 @@ impl CachedTile {
         fnv1a_mix(&mut h, bytes.as_ref());
         let etag = format!("\"{h:016x}\"");
         Self { bytes, etag }
+    }
+
+    /// Quoted hex16 ETag string suitable for the `ETag` response header.
+    pub fn etag(&self) -> &str {
+        &self.etag
     }
 }
 
