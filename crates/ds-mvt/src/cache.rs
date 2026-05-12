@@ -131,7 +131,7 @@ mod tests {
         cache.insert(k.clone(), Bytes::from_static(b"xyz"));
         assert!(cache.get(&k).is_none());
         assert_eq!(cache.hits(), 0);
-        // Two misses: the insert is silently dropped, both gets recorded as misses.
+        // The insert is silently dropped, and the single `get` is counted as a miss.
         assert_eq!(cache.misses(), 1);
     }
 

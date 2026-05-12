@@ -105,7 +105,7 @@ pub fn encode_tile(
     let mut layer = tile.create_layer(&opts.layer_name);
 
     for feature in features {
-        let Some(geom_data) = encode_geometry(&feature.geometry, &projector, opts.extent)? else {
+        let Some(geom_data) = encode_geometry(&feature.geometry, &projector)? else {
             continue;
         };
 
@@ -145,11 +145,7 @@ fn parse_numeric_id(id: &str) -> Option<u64> {
     id.parse::<u64>().ok()
 }
 
-fn encode_geometry(
-    geom: &Geometry,
-    proj: &Projector,
-    _extent: u32,
-) -> Result<Option<mvt::GeomData>, MvtError> {
+fn encode_geometry(geom: &Geometry, proj: &Projector) -> Result<Option<mvt::GeomData>, MvtError> {
     match geom {
         Geometry::Null => Ok(None),
         Geometry::Point { x, y } => {
@@ -195,6 +191,15 @@ fn push_ring(
     // GeoJSON convention duplicates the first vertex at the end to close the
     // ring; MVT's ClosePath command implies closure, so emit the duplicate
     // only if the caller didn't supply one.
+    //
+    // Winding order: MVT spec §4.3.4.4 requires exterior rings clockwise and
+    // holes counter-clockwise *in tile coordinates*, where Y grows downward.
+    // RFC 7946 GeoJSON specifies the opposite convention in geographic
+    // coordinates (Y grows northward, exterior CCW). `Projector::project`
+    // flips Y, so an RFC 7946-conformant input lands at MVT-conformant
+    // winding by construction. Inputs that don't follow RFC 7946 (some
+    // PostGIS exports, or hand-built data) will render as inside-out on
+    // strict clients; callers must normalise winding before this point.
     let n = ring.len();
     let end = if n >= 2 && ring[0] == ring[n - 1] {
         n - 1
