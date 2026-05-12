@@ -275,7 +275,13 @@ async fn main() {
         .route(
             "/preview/manifest.json",
             get(preview::manifest_handler).with_state(server_state.clone()),
-        );
+        )
+        // `NormalizePathLayer::trim_trailing_slash()` is wrapped around
+        // the whole app a few lines below — it rewrites `/preview/` to
+        // `/preview` before the router runs, so a single literal route
+        // handles both forms.
+        .route("/preview", get(preview::index_handler))
+        .route("/preview/{*path}", get(preview::asset_handler));
 
     // Admin routes (protected by bearer token auth, not CORS)
     let admin_routes = Router::new().route(

@@ -1,24 +1,195 @@
 //! Built-in preview UI surface.
 //!
-//! v1 exposes a single endpoint, `GET /preview/manifest.json`, that aggregates
-//! every collection's discovery metadata into one denormalized JSON shape. The
-//! preview SPA consumes it as its single source of truth so the browser
-//! doesn't have to probe five separate `/collections` endpoints (EDR, Features,
-//! Maps, Tiles, WMS) per page load and reconcile their drift.
+//! Two responsibilities:
 //!
-//! Asset embedding (`/preview` + `/preview/{*path}`) ships in Phase 2.
+//! * `GET /preview/manifest.json` — aggregated discovery JSON consumed by
+//!   the SPA. Replaces five separate `/{api}/collections` probes per page
+//!   load and reconciles per-API schema drift server-side.
+//! * `GET /preview` (and `/preview/{*path}`) — serve the SPA's static
+//!   assets (HTML, JS, CSS, vendored MapLibre) embedded at build time via
+//!   `rust-embed`. No external requests at runtime; the binary is a
+//!   self-contained demo.
 
 use std::collections::BTreeSet;
 
-use axum::extract::{Query, State};
+use axum::body::Body;
+use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
+use rust_embed::RustEmbed;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use ds_core::config::CollectionConfig;
 
 use crate::admin::AdminState;
+
+// ---------------------------------------------------------------------------
+// Static-asset embedding
+// ---------------------------------------------------------------------------
+
+/// Everything under `crates/server/preview/` gets baked into the binary at
+/// compile time. The `manifest.json` route is *not* served from here; it
+/// has its own handler that reads live `ServerState`.
+#[derive(RustEmbed)]
+#[folder = "preview/"]
+#[exclude = "*.map"]
+struct PreviewAssets;
+
+/// Locked-down CSP for the SPA shell. All resources are same-origin; the
+/// only exceptions are MapLibre's WebGL worker (which uses `blob:` URLs
+/// internally) and `data:`/`blob:` image URIs MapLibre generates for raster
+/// tiles in some code paths. No inline scripts and no `unsafe-eval` — every
+/// dynamic value in `app.js` reaches the DOM via `.textContent`, which CSP
+/// doesn't restrict. Defence in depth for future phases.
+///
+/// **Phase 3 caveat:** when external basemap tile providers land,
+/// `connect-src 'self'` will silently block the basemap fetch. Either
+/// relax it to a specific allowlist (e.g. `connect-src 'self'
+/// https://basemaps.example.com`) or expose basemap tiles through this
+/// server's own routes. Same caveat applies to `img-src` if tiles are
+/// rendered as `<img>` rather than fetched.
+const PREVIEW_CSP: &str = "default-src 'self'; \
+                           style-src 'self'; \
+                           script-src 'self'; \
+                           img-src 'self' data: blob:; \
+                           worker-src blob:; \
+                           connect-src 'self'; \
+                           object-src 'none'; \
+                           base-uri 'self'; \
+                           frame-ancestors 'none'";
+
+/// Format the `[u8; 32]` SHA-256 hash that `rust-embed` exposes per asset
+/// into a quoted hex ETag (`"hexhexhex..."`, 64 hex chars + quotes).
+/// Stable across binary rebuilds for the same asset bytes; changes the
+/// moment the embedded content does.
+///
+/// `write!` straight onto the `String` avoids the 32 temporary
+/// `format!(...)` heap allocations the obvious push-loop would do.
+fn sha256_etag(hash: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(2 + 64);
+    out.push('"');
+    for b in hash {
+        // `write!` into a String never fails — `Write` impl for String is
+        // infallible — so unwrapping is safe and the compiler optimises
+        // the panic away.
+        write!(&mut out, "{b:02x}").expect("writing to String cannot fail");
+    }
+    out.push('"');
+    out
+}
+
+/// `GET /preview` — serve the SPA shell. Equivalent to `/preview/index.html`.
+pub async fn index_handler(headers: axum::http::HeaderMap) -> Response {
+    serve_asset("index.html", &headers)
+}
+
+/// `GET /preview/{*path}` — serve any embedded asset by relative path.
+pub async fn asset_handler(Path(path): Path<String>, headers: axum::http::HeaderMap) -> Response {
+    serve_asset(&path, &headers)
+}
+
+fn serve_asset(path: &str, request_headers: &axum::http::HeaderMap) -> Response {
+    let Some(content) = PreviewAssets::get(path) else {
+        // Generic body — `path` is user-controlled. Reflecting it isn't an
+        // XSS vector here (`text/plain`) but matches the project's
+        // "no internal detail in client errors" guideline. `nosniff` on
+        // the 404 matches the 200 path so a browser can't sniff this
+        // `text/plain` response as something else under any edge case.
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(
+                header::HeaderName::from_static("x-content-type-options"),
+                "nosniff",
+            )
+            .body(Body::from("Not Found"))
+            .expect("static 404 response headers are valid");
+    };
+    let mime = mime_for(path);
+    let is_html = mime.starts_with("text/html");
+    // Cache strategy splits by asset class:
+    //
+    // * `index.html` — entry point with a stable URL. `no-cache` forces the
+    //   browser to revalidate on every load so a binary upgrade ships the
+    //   new shell immediately. The ETag below lets that revalidation come
+    //   back as `304 Not Modified` (~0 bytes on the wire) when nothing
+    //   changed; without it every reload re-fetches the body.
+    // * `vendor/*` — version-pinned via `scripts/vendor-maplibre.sh` but
+    //   the URL itself is **not** content-addressed (path doesn't carry
+    //   the version), so `immutable` is wrong: after a vendor bump
+    //   clients would keep the old bundle until the entry expired. Keep
+    //   the long `max-age` for cheap reuse and rely on the ETag to
+    //   short-circuit revalidation when nothing changed.
+    // * Everything else (`app.js`, `app.css`, etc.) — non-fingerprinted
+    //   stable URLs that change with every binary; `max-age=300` +
+    //   `must-revalidate` gives browsers cheap reuse during a session
+    //   without pinning them across deploys.
+    let cache_control = if is_html {
+        "no-cache"
+    } else if path.starts_with("vendor/") {
+        "public, max-age=86400"
+    } else {
+        "public, max-age=300, must-revalidate"
+    };
+    let etag = sha256_etag(&content.metadata.sha256_hash());
+    // Conditional GET: short-circuit to `304 Not Modified` when the client
+    // already has the same body. Saves the full payload on every reload of
+    // a `no-cache`-marked asset.
+    if let Some(inm) = request_headers.get(header::IF_NONE_MATCH) {
+        if let Ok(inm_str) = inm.to_str() {
+            if ds_render::etag_matches(inm_str, &etag) {
+                // `nosniff` here is mostly cosmetic — browsers fold a 304's
+                // headers into the cached 200, which already carried this
+                // value — but keeping the two paths symmetric removes a
+                // class of "did we cover that header in every branch?"
+                // bookkeeping when the response shape evolves.
+                return Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header(header::ETAG, &etag)
+                    .header(header::CACHE_CONTROL, cache_control)
+                    .header(
+                        header::HeaderName::from_static("x-content-type-options"),
+                        "nosniff",
+                    )
+                    .body(Body::empty())
+                    .expect("static 304 response headers are valid");
+            }
+        }
+    }
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CACHE_CONTROL, cache_control)
+        .header(header::ETAG, &etag)
+        .header(
+            header::HeaderName::from_static("x-content-type-options"),
+            "nosniff",
+        );
+    if is_html {
+        builder = builder.header(
+            header::HeaderName::from_static("content-security-policy"),
+            PREVIEW_CSP,
+        );
+    }
+    builder
+        .body(Body::from(content.data.into_owned()))
+        .expect("static preview response headers are valid")
+}
+
+fn mime_for(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" => "application/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "ico" => "image/x-icon",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
 
 /// Maximum number of explicit timestamps emitted per collection.
 /// Datasets with more timesteps set `temporal_extent.truncated = true`.
@@ -85,9 +256,23 @@ pub async fn manifest_handler(
         );
     }
 
+    // `no-store`: the manifest mirrors live `ArcSwap` state. After a
+    // `POST /admin/collections/reload` any cached copy (browser, CDN,
+    // intermediary) would mask the new state until its TTL expires.
+    // Cheaper to re-fetch every load than to debug stale-cache reports.
+    // `nosniff` is paranoia for `application/json` (no browser MIME-sniffs
+    // JSON) but matching `serve_asset`'s 200/304/404 paths keeps the
+    // security-header surface uniform across the entire `/preview` route.
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                header::HeaderName::from_static("x-content-type-options"),
+                "nosniff",
+            ),
+        ],
         body,
     )
 }
@@ -1011,5 +1196,218 @@ mod tests {
         // route exists). Worth asserting because a future refactor might
         // accidentally synthesise one.
         assert!(c.get("tiles").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Static-asset handler tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn index_handler_returns_html() {
+        let resp = index_handler(axum::http::HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(body_str.contains("MeteoCore"));
+        assert!(body_str.contains("maplibre-gl.js"));
+    }
+
+    #[tokio::test]
+    async fn index_html_uses_no_cache_and_carries_csp() {
+        // Stable URL → must revalidate every load so a binary upgrade ships
+        // the new shell immediately. CSP is the SPA's only browser-side
+        // safety net (defence in depth even though `app.js` only writes via
+        // `textContent`).
+        let resp = index_handler(axum::http::HeaderMap::new()).await;
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+        let csp = resp
+            .headers()
+            .get("content-security-policy")
+            .expect("CSP must be set on index.html")
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'self'"));
+        assert!(
+            csp.contains("worker-src blob:"),
+            "MapLibre needs worker-src blob:"
+        );
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert_eq!(
+            resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+    }
+
+    #[tokio::test]
+    async fn vendored_maplibre_js_is_cacheable_but_not_immutable() {
+        let resp = asset_handler(
+            axum::extract::Path("vendor/maplibre-gl.js".into()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (parts, body) = resp.into_parts();
+        assert_eq!(
+            parts.headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/javascript; charset=utf-8"
+        );
+        // Long `max-age` for cheap reuse, but **not** `immutable` —
+        // `/preview/vendor/maplibre-gl.js` is a stable URL (no version
+        // segment), so `immutable` would pin clients to the old bundle
+        // after a vendor bump.
+        assert_eq!(
+            parts.headers.get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=86400"
+        );
+        // CSP is NOT applied to non-HTML assets — that header only matters
+        // when the browser parses the response as a document.
+        assert!(parts.headers.get("content-security-policy").is_none());
+        // Sanity: the MapLibre UMD bundle is hundreds of KB; serving an
+        // empty stub would mean the vendor script didn't run.
+        let bytes = axum::body::to_bytes(body, 16 * 1024 * 1024).await.unwrap();
+        assert!(
+            bytes.len() > 100_000,
+            "maplibre-gl.js should be hundreds of KB; got {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn app_js_uses_short_must_revalidate_cache() {
+        // Non-fingerprinted JS bundled with the binary: short cache, must
+        // revalidate. `immutable` would pin clients across deploys.
+        let resp = asset_handler(
+            axum::extract::Path("app.js".into()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=300, must-revalidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_asset_returns_generic_404_body() {
+        // User-supplied path must NOT be reflected (review feedback Phase 2).
+        let resp = asset_handler(
+            axum::extract::Path("does-not-exist.txt".into()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert_eq!(body_str, "Not Found");
+        assert!(
+            !body_str.contains("does-not-exist"),
+            "404 body must not echo the requested path"
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_if_none_match_yields_304_with_empty_body() {
+        // First request — learn the ETag.
+        let first = index_handler(axum::http::HeaderMap::new()).await;
+        let etag = first
+            .headers()
+            .get(header::ETAG)
+            .expect("ETag must be set on 200 responses")
+            .clone();
+        // Replay with `If-None-Match`. The handler must short-circuit to
+        // 304 and return no body — saves the full HTML payload on every
+        // reload of the `no-cache` shell.
+        let mut req_headers = axum::http::HeaderMap::new();
+        req_headers.insert(header::IF_NONE_MATCH, etag.clone());
+        let second = index_handler(req_headers).await;
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(second.headers().get(header::ETAG).unwrap(), &etag);
+        // 304 must still carry Cache-Control so the browser refreshes its
+        // freshness clock, and nosniff for parity with the 200 path so a
+        // future refactor can't accidentally drop the header from one
+        // branch only.
+        assert_eq!(
+            second.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+        assert_eq!(
+            second.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        let body = axum::body::to_bytes(second.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(
+            body.is_empty(),
+            "304 must have an empty body, got {} bytes",
+            body.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_handler_emits_no_store_cache_control() {
+        use axum::extract::{Query, State};
+        // `manifest_handler` returns live `ArcSwap` state; caches must not
+        // hold it across an `/admin/collections/reload`.
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            empty_tiles(),
+            empty_wms(),
+        );
+        let resp = manifest_handler(State(state), Query(ManifestParams::default()))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff",
+            "manifest_handler must mirror nosniff applied by serve_asset"
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_if_none_match_returns_full_body() {
+        // If the client's cached ETag doesn't match, the server must serve
+        // the full body — otherwise a client with a stale ETag would be
+        // stuck with stale content.
+        let mut req_headers = axum::http::HeaderMap::new();
+        req_headers.insert(
+            header::IF_NONE_MATCH,
+            axum::http::HeaderValue::from_static("\"deadbeef\""),
+        );
+        let resp = index_handler(req_headers).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            !body.is_empty(),
+            "stale-ETag client must get full body back"
+        );
+    }
+
+    #[test]
+    fn mime_inference_covers_common_extensions() {
+        assert_eq!(mime_for("a/b/index.html"), "text/html; charset=utf-8");
+        assert_eq!(mime_for("app.js"), "application/javascript; charset=utf-8");
+        assert_eq!(mime_for("app.css"), "text/css; charset=utf-8");
+        assert_eq!(mime_for("data.json"), "application/json");
+        assert_eq!(mime_for("icon.svg"), "image/svg+xml");
+        assert_eq!(mime_for("README"), "application/octet-stream");
     }
 }

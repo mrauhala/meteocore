@@ -1,0 +1,4 @@
+maplibre-gl-js v5.24.0
+sha256: edcc812e8334825d91cd97b54c3953e361cfbf6c8f37f0b01312181a855522e6
+source: https://github.com/maplibre/maplibre-gl-js/releases/download/v5.24.0/dist.zip
+license: BSD-3-Clause (see LICENSE-maplibre-gl.txt)
