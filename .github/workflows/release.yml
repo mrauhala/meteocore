@@ -103,6 +103,11 @@ jobs:
   build-binary:
     name: binary ${{ matrix.target }}
     needs: resolve-target
+    # Skip cleanly if `resolve-target` was skipped (push that didn't
+    # produce a release); fail-skip cleanly if it errored. Without an
+    # explicit guard, a `resolve-target` failure cascades into job
+    # failures here instead of skips.
+    if: needs.resolve-target.result == 'success'
     permissions:
       contents: read
     strategy:
@@ -144,22 +149,30 @@ jobs:
             ${{ matrix.target }}-cargo-
 
       - name: Build release binary
-        # `--locked` deliberately omitted: release-please updates
-        # Cargo.toml's version but not Cargo.lock, so a tag built with
-        # `--locked` would fail on the resulting drift. Once the
-        # release-please cargo-lockfile plugin is configured to keep both
-        # in sync (or we add a dedicated `cargo update -p server --precise`
-        # step in the release PR), we can put `--locked` back.
-        run: cargo build --release --target ${{ matrix.target }} -p server
+        # `--locked` deliberately omitted while release-please's
+        # `cargo-workspace` plugin is not yet configured to bump
+        # `Cargo.lock` alongside `Cargo.toml`. Without the plugin a
+        # tag built with `--locked` fails on the version drift. Restore
+        # `--locked` once #153 lands; the obligation lives there, not here.
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --target "${TARGET}" -p server
 
       - name: Package tarball
+        # All inputs flow through `env:` so the shell never sees an
+        # untrusted GitHub expression. `tag` comes from
+        # `workflow_dispatch` input on the manual-backfill path, which
+        # a write-access collaborator could otherwise abuse to run
+        # arbitrary commands on the runner.
+        env:
+          VERSION: ${{ needs.resolve-target.outputs.tag }}
+          TARGET: ${{ matrix.target }}
         run: |
-          version="${{ needs.resolve-target.outputs.tag }}"
-          base="meteocore-${version}-${{ matrix.target }}"
+          base="meteocore-${VERSION}-${TARGET}"
           mkdir -p "dist/${base}"
           # Match the Docker image's binary name so the tarball and the
           # container ship the same `dataserver` symbol.
-          cp "target/${{ matrix.target }}/release/server" "dist/${base}/dataserver"
+          cp "target/${TARGET}/release/server" "dist/${base}/dataserver"
           cp LICENSE* README.md "dist/${base}/" 2>/dev/null || true
           tar -czf "dist/${base}.tar.gz" -C dist "${base}"
           (cd dist && sha256sum "${base}.tar.gz" > "${base}.tar.gz.sha256")
@@ -180,6 +193,7 @@ jobs:
   build-container:
     name: container image
     needs: resolve-target
+    if: needs.resolve-target.result == 'success'
     permissions:
       contents: read
       packages: write
@@ -242,6 +256,7 @@ jobs:
     # against ghcr.io. If the container build fails, the binaries on the
     # GitHub Release are still useful and should ship.
     needs: [resolve-target, build-binary]
+    if: needs.resolve-target.result == 'success'
     permissions:
       contents: write
     runs-on: ubuntu-latest
