@@ -91,10 +91,11 @@ jobs:
     steps:
       - id: r
         env:
+          EVENT_NAME: ${{ github.event_name }}
           DISPATCH_TAG: ${{ inputs.tag }}
           RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
             echo "tag=${DISPATCH_TAG}" >> "$GITHUB_OUTPUT"
           else
             echo "tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
