@@ -30,10 +30,10 @@ Each engine implements one or more of the core traits.
 
 | Crate | Plugin | Conformance |
 |-------|--------|-------------|
-| `api-edr` | [OGC API - EDR 1.1](https://docs.ogc.org/is/19-086r6/19-086r6.html) | core, collections, json, edr-geojson, covjson |
+| `api-edr` | [OGC API - EDR 1.1](https://docs.ogc.org/is/19-086r6/19-086r6.html) | ogcapi-common-1: core, landing-page, oas30; ogcapi-edr-1: core, collections, json, edr-geojson, covjson |
 | `api-features` | [OGC API - Features 1.0](https://docs.ogc.org/is/17-069r4/17-069r4.html) | core, oas30, geojson |
 | `api-maps` | [OGC API - Maps 1.0](https://docs.ogc.org/is/20-058/20-058.html) | core, collection-map, styled-map, spatial-subsetting, scaling, datetime, crs, png, jpeg |
-| `api-tiles` | [OGC API - Tiles 1.0](https://docs.ogc.org/is/20-057/20-057.html) | core (raster + MVT via `?f=mvt` content negotiation) |
+| `api-tiles` | [OGC API - Tiles 1.0](https://docs.ogc.org/is/20-057/20-057.html) | ogcapi-tiles-1: core, tileset, tilesets-list, png, jpeg, mvt; tms 2.0: tilematrixset, json-tilematrixset |
 | `api-wms` | [OGC WMS 1.3.0](https://portal.ogc.org/files/?artifact_id=14416) | GetCapabilities, GetMap, GetLegendGraphic |
 
 ### Binary

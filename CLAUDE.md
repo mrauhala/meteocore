@@ -126,7 +126,7 @@ Currently implemented: `PointSeries`, `Grid`.
 
 | Engine | Traits | APIs |
 |--------|--------|------|
-| CSV | `Engine` | EDR (locations only) |
+| CSV | `Engine` + `FeatureEngine` | EDR (locations only), Features |
 | GeoJSON | `FeatureEngine` | Features |
 | GeoTIFF | `Engine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | GRIB | `Engine` + `MapEngine` | EDR, WMS, Maps, Tiles |
@@ -279,7 +279,7 @@ colormap = "radar_dbz"
 - **Reload**: `POST /admin/collections/reload` — re-reads config, atomically swaps engines.
 - **Health**: `GET /health` — per-collection status (ready/degraded/failed). HTTP 503 only when all failed.
 - **Metrics**: `GET /metrics` — Prometheus format. Path labels use route patterns (not raw URLs) to avoid cardinality explosion.
-- **State**: API state wrapped in `ArcSwap` for lock-free reads. Render semaphore (CPU cores, min 4) shared across Maps/Tiles/WMS. Engine loading in `server/src/admin.rs`.
+- **State**: API state wrapped in `ArcSwap` for lock-free reads. Render semaphore (2× CPU cores, min 8) shared across Maps/Tiles/WMS. Engine loading in `server/src/admin.rs`.
 
 ## Code Style
 
