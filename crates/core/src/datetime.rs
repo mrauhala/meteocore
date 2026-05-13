@@ -21,13 +21,34 @@ pub fn parse_iso8601_duration(s: &str) -> Result<Duration, DataServerError> {
     let mut total_seconds: i64 = 0;
 
     if !date_part.is_empty() {
-        let stripped = date_part.strip_suffix('D').ok_or_else(|| {
-            DataServerError::Config(format!("Invalid date component in ISO 8601 duration '{s}'"))
-        })?;
-        let days: i64 = stripped.parse().map_err(|_| {
-            DataServerError::Config(format!("Invalid days in ISO 8601 duration '{s}'"))
-        })?;
-        total_seconds += days * 86_400;
+        // Weeks (`P1W`) — natural unit for meteorological archives; reject the
+        // ambiguous combination `P1W2D` which mixes weeks with other date units.
+        if let Some(stripped) = date_part.strip_suffix('W') {
+            let weeks: i64 = stripped.parse().map_err(|_| {
+                DataServerError::Config(format!("Invalid weeks in ISO 8601 duration '{s}'"))
+            })?;
+            total_seconds += weeks * 7 * 86_400;
+        } else {
+            let stripped = date_part.strip_suffix('D').ok_or_else(|| {
+                DataServerError::Config(format!(
+                    "Invalid date component in ISO 8601 duration '{s}': supported units are 'D' \
+                     (days) and 'W' (weeks)"
+                ))
+            })?;
+            let days: i64 = stripped.parse().map_err(|_| {
+                DataServerError::Config(format!("Invalid days in ISO 8601 duration '{s}'"))
+            })?;
+            total_seconds += days * 86_400;
+        }
+    }
+
+    // `PnDT` with no time components is not valid ISO 8601 — the `T` separator
+    // must be followed by at least one of H/M/S. Reject explicitly so config
+    // typos surface at load rather than silently parsing as `PnD`.
+    if rest.contains('T') && time_part.is_empty() {
+        return Err(DataServerError::Config(format!(
+            "Invalid ISO 8601 duration '{s}': 'T' separator present but no time components follow"
+        )));
     }
 
     if !time_part.is_empty() {
@@ -148,5 +169,22 @@ mod tests {
         assert!(parse_iso8601_duration("PT0H").is_err());
         assert!(parse_iso8601_duration("P0D").is_err());
         assert!(parse_iso8601_duration("-PT2H").is_err());
+        // Empty T segment is technically invalid; surface the typo.
+        assert!(parse_iso8601_duration("P1DT").is_err());
+        assert!(parse_iso8601_duration("PT").is_err());
+    }
+
+    #[test]
+    fn iso8601_duration_supports_weeks() {
+        assert_eq!(
+            parse_iso8601_duration("P1W").unwrap(),
+            Duration::seconds(7 * 86_400)
+        );
+        assert_eq!(
+            parse_iso8601_duration("P2W").unwrap(),
+            Duration::seconds(14 * 86_400)
+        );
+        // `P1W2D` mixes weeks with other date units — not supported.
+        assert!(parse_iso8601_duration("P1W2D").is_err());
     }
 }

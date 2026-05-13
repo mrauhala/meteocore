@@ -428,11 +428,22 @@ fn build_entry(
 /// Parameter list emitted as `parameters: [{name, title, unit}]` in the
 /// per-collection manifest entry. Sorted by name for stable ordering.
 ///
-/// Source precedence:
-/// 1. `EdrEngine::get_parameter_descriptions()` — richest (per-param unit + label).
-/// 2. `MapEngine::raster_info().parameters` — fallback for raster-only multi-
-///    parameter collections that aren't wired into EDR. No per-param unit
-///    metadata is available at this layer, so `unit` is left empty.
+/// Selection rules — the manifest must only advertise parameters the Tiles /
+/// Maps handlers will actually accept, so that the SPA dropdown can't pick a
+/// value that immediately 400s at render time:
+///
+/// 1. If a `MapEngine` is registered AND its `raster_info().parameters` is
+///    non-empty, that list is the source of truth (it's what the raster route
+///    validates against). Names absent from EDR fall back to the raster-side
+///    `(short_name, title)` with an empty unit.
+/// 2. When the matching `EdrEngine` is also present, its richer
+///    `get_parameter_descriptions()` (per-param `unit` + `label`) is preferred
+///    for each name that survived (1).
+/// 3. Pure-EDR fallback: no raster engine OR `raster_info().parameters` empty
+///    (single-band collections like single-parameter GeoTIFF) — surface EDR's
+///    full list. The dropdown still renders, but the tile handler's
+///    "single-param engine ignores `parameter-name`" branch keeps everything
+///    consistent.
 fn collection_parameters(
     id: &str,
     edr: &api_edr::handlers::EdrState,
@@ -440,48 +451,47 @@ fn collection_parameters(
     tiles: &api_tiles::handlers::TilesState,
     wms: &api_wms::handlers::WmsState,
 ) -> Option<Vec<Value>> {
-    if let Some(engine) = edr.engines.get(id) {
-        let descs = engine.get_parameter_descriptions();
-        if !descs.is_empty() {
-            let mut out: Vec<Value> = descs
-                .into_iter()
-                .map(|(name, desc)| {
-                    json!({
-                        "name": name,
-                        "title": desc.label,
-                        "unit": desc.unit,
-                    })
-                })
-                .collect();
-            out.sort_by(|a, b| {
-                a.get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .cmp(b.get("name").and_then(Value::as_str).unwrap_or(""))
-            });
-            return Some(out);
-        }
-    }
-    let map_engine = maps
+    let edr_descs = edr
+        .engines
+        .get(id)
+        .map(|engine| engine.get_parameter_descriptions());
+
+    let raster_params: Option<Vec<(String, String)>> = maps
         .engines
         .get(id)
         .or_else(|| tiles.map_engines.get(id))
-        .or_else(|| wms.engines.get(id))?;
-    let info = map_engine.raster_info();
-    if info.parameters.is_empty() {
-        return None;
-    }
-    let mut out: Vec<Value> = info
-        .parameters
-        .into_iter()
-        .map(|(name, title)| {
-            json!({
-                "name": name,
-                "title": title,
-                "unit": "",
+        .or_else(|| wms.engines.get(id))
+        .map(|engine| engine.raster_info().parameters);
+
+    let mut out: Vec<Value> = match (raster_params, edr_descs) {
+        (Some(raster), edr_opt) if !raster.is_empty() => {
+            // Raster-side is the renderable set; intersect EDR descriptions on
+            // top so the dropdown shows units when the EDR engine has them.
+            let edr = edr_opt.unwrap_or_default();
+            raster
+                .into_iter()
+                .map(|(name, title)| {
+                    let (label, unit) = edr
+                        .get(&name)
+                        .map(|d| (d.label.clone(), d.unit.clone()))
+                        .unwrap_or((title, String::new()));
+                    json!({ "name": name, "title": label, "unit": unit })
+                })
+                .collect()
+        }
+        (_, Some(edr)) if !edr.is_empty() => edr
+            .into_iter()
+            .map(|(name, desc)| {
+                json!({
+                    "name": name,
+                    "title": desc.label,
+                    "unit": desc.unit,
+                })
             })
-        })
-        .collect();
+            .collect(),
+        _ => return None,
+    };
+
     out.sort_by(|a, b| {
         a.get("name")
             .and_then(Value::as_str)
@@ -1675,6 +1685,124 @@ mod tests {
         );
         let m = build_manifest(&state, 0, 100);
         assert!(m["collections"][0].get("parameters").is_none());
+    }
+
+    #[test]
+    fn manifest_parameters_intersect_with_raster_renderable_set() {
+        // Reviewer scenario: EDR advertises a param the raster engine can't
+        // render (a derived/queryable-only field). The dropdown must be the
+        // intersection so a user can never select a value that 400s at the
+        // tile route.
+        use ds_core::model::ParameterDescription;
+
+        struct WideEdr;
+        impl EdrEngine for WideEdr {
+            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+                Ok(Vec::new())
+            }
+            fn query_location(
+                &self,
+                _: &str,
+                _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                _: Option<&[String]>,
+            ) -> Result<QueryResult, DataServerError> {
+                unimplemented!()
+            }
+            fn get_parameters(&self) -> Vec<String> {
+                vec!["2t".into(), "msl".into(), "derived_index".into()]
+            }
+            fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
+                let mut m = HashMap::new();
+                m.insert(
+                    "2t".into(),
+                    ParameterDescription {
+                        label: "Temperature".into(),
+                        unit: "K".into(),
+                        observed_property: "2t".into(),
+                    },
+                );
+                m.insert(
+                    "msl".into(),
+                    ParameterDescription {
+                        label: "Mean SLP".into(),
+                        unit: "Pa".into(),
+                        observed_property: "msl".into(),
+                    },
+                );
+                m.insert(
+                    "derived_index".into(),
+                    ParameterDescription {
+                        label: "Derived index".into(),
+                        unit: "1".into(),
+                        observed_property: "derived_index".into(),
+                    },
+                );
+                m
+            }
+            fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+                None
+            }
+            fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+                None
+            }
+        }
+
+        /// MapEngine that only exposes 2 of the EDR's 3 parameters.
+        struct PartialRaster;
+        impl MapEngine for PartialRaster {
+            fn get_raster_tile(
+                &self,
+                _: [f64; 4],
+                _: u32,
+                _: u32,
+                _: Option<DateTime<Utc>>,
+                _: &OutputCrs,
+                _: Option<&str>,
+            ) -> Result<RasterTile, DataServerError> {
+                unimplemented!()
+            }
+            fn raster_info(&self) -> RasterInfo {
+                RasterInfo {
+                    native_crs: "EPSG:4326".into(),
+                    spatial_extent: None,
+                    times: vec![],
+                    parameter: "2t".into(),
+                    unit: "K".into(),
+                    // Note: "derived_index" is intentionally absent.
+                    parameters: vec![
+                        ("2t".into(), "Temperature".into()),
+                        ("msl".into(), "Mean SLP".into()),
+                    ],
+                }
+            }
+        }
+
+        let mut edr = empty_edr();
+        let e: Arc<dyn EdrEngine> = Arc::new(WideEdr);
+        edr.engines.insert("ecmwf-fc".into(), e);
+        edr.collections
+            .insert("ecmwf-fc".into(), config("ecmwf-fc", &["edr", "tiles"]));
+
+        let mut tiles = empty_tiles();
+        let r: Arc<dyn MapEngine> = Arc::new(PartialRaster);
+        tiles.map_engines.insert("ecmwf-fc".into(), r);
+        tiles
+            .collections
+            .insert("ecmwf-fc".into(), config("ecmwf-fc", &["edr", "tiles"]));
+
+        let state = make_state(edr, empty_features(), empty_maps(), tiles, empty_wms());
+        let m = build_manifest(&state, 0, 100);
+        let params = m["collections"][0]["parameters"]
+            .as_array()
+            .expect("parameters array");
+        // Only the renderable subset. EDR's rich "Temperature" label + "K"
+        // unit should still propagate for the surviving "2t" entry.
+        assert_eq!(params.len(), 2);
+        let names: Vec<&str> = params.iter().map(|p| p["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["2t", "msl"]);
+        assert!(!names.contains(&"derived_index"));
+        assert_eq!(params[0]["unit"], "K");
+        assert_eq!(params[0]["title"], "Temperature");
     }
 
     // -----------------------------------------------------------------------
