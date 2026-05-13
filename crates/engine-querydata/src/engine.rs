@@ -7,7 +7,7 @@ use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use tokio::sync::watch;
 
-use ds_core::engine::Engine;
+use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{DomainDescription, Location, NdArray, ParameterDescription, QueryResult};
@@ -165,7 +165,7 @@ impl QueryDataEngine {
     }
 }
 
-impl Engine for QueryDataEngine {
+impl EdrEngine for QueryDataEngine {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
         Ok(vec![])
     }

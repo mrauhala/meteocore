@@ -32,8 +32,8 @@
 //    The spec allows 202 for long-running queries. All queries currently
 //    block the handler until completion.
 //
-// 5. Arc<dyn Engine> CONCURRENCY.
-//    The Engine trait requires Send + Sync, and state is shared via Arc.
+// 5. Arc<dyn EdrEngine> CONCURRENCY.
+//    The EdrEngine trait requires Send + Sync, and state is shared via Arc.
 //    This is correct for concurrent access but should be validated under load.
 //
 // =============================================================================
@@ -49,7 +49,7 @@ use tower::ServiceExt;
 
 use api_edr::handlers::EdrState;
 use ds_core::config::CollectionConfig;
-use ds_core::engine::Engine;
+use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::model::*;
 
@@ -63,7 +63,7 @@ struct ScalableEngine {
     parameter_count: usize,
 }
 
-impl Engine for ScalableEngine {
+impl EdrEngine for ScalableEngine {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
         let locations = (0..self.location_count)
             .map(|i| Location {
@@ -150,7 +150,7 @@ impl Engine for ScalableEngine {
     }
 }
 
-fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<ArcSwap<EdrState>> {
+fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     engines.insert("weather".to_string(), engine);
@@ -178,7 +178,7 @@ fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<ArcSwap<EdrState>> {
 }
 
 fn build_app(engine: ScalableEngine) -> axum::Router {
-    let engine: Arc<dyn Engine> = Arc::new(engine);
+    let engine: Arc<dyn EdrEngine> = Arc::new(engine);
     api_edr::router(make_edr_state(engine))
 }
 
@@ -453,7 +453,7 @@ async fn error_response_has_json_content_type() {
 // 4. Filtering Efficiency Tests
 // ===========================================================================
 //
-// NOTE: The current Engine trait signature accepts datetime and parameter-name
+// NOTE: The current EdrEngine trait signature accepts datetime and parameter-name
 // filters, but the ScalableEngine mock above ignores them. In a real
 // implementation, these filters reduce the data returned by the engine. These
 // tests verify that the handler correctly passes filter parameters through to
@@ -574,11 +574,11 @@ async fn invalid_datetime_filter_returns_400() {
 // ===========================================================================
 
 /// Verify that multiple concurrent requests to the same endpoint all succeed.
-/// This validates that the Arc<dyn Engine> sharing pattern works correctly
+/// This validates that the Arc<dyn EdrEngine> sharing pattern works correctly
 /// and that no internal state causes data races or deadlocks.
 #[tokio::test]
 async fn concurrent_location_queries_all_succeed() {
-    let engine: Arc<dyn Engine> = Arc::new(ScalableEngine {
+    let engine: Arc<dyn EdrEngine> = Arc::new(ScalableEngine {
         location_count: 10,
         timestep_count: 24,
         parameter_count: 3,
@@ -618,7 +618,7 @@ async fn concurrent_location_queries_all_succeed() {
 /// Mixes locations listing, location queries, and collection metadata.
 #[tokio::test]
 async fn concurrent_mixed_endpoint_requests_all_succeed() {
-    let engine: Arc<dyn Engine> = Arc::new(ScalableEngine {
+    let engine: Arc<dyn EdrEngine> = Arc::new(ScalableEngine {
         location_count: 5,
         timestep_count: 24,
         parameter_count: 2,

@@ -8,7 +8,7 @@ A high-performance modular meteorological data server built in Rust. Implements 
 
 | Crate | Description |
 |-------|-------------|
-| `ds-core` | Domain traits (`Engine`, `FeatureEngine`, `MapEngine`), shared types (CRS, GeoTransform, PropertyValue), config parsing. No framework deps. |
+| `ds-core` | Domain traits (`EdrEngine`, `FeatureEngine`, `MapEngine`), shared types (CRS, GeoTransform, PropertyValue), config parsing. No framework deps. |
 | `ds-storage` | Unified S3 / HTTP / local-filesystem object store, used by every engine that fetches remote data. |
 | `ds-render` | Raster colorization (LUT + linear gradient) and PNG encoding. No framework deps. |
 | `ds-mvt` | Mapbox Vector Tile encoder + weighted LRU cache. Used by `api-tiles` to serve `?f=mvt` from `FeatureEngine` collections. |
@@ -19,12 +19,12 @@ Each engine implements one or more of the core traits.
 
 | Crate | Traits | Source |
 |-------|--------|--------|
-| `engine-csv` | `Engine` + `FeatureEngine` | CSV files with fixed `location, latitude, longitude, time, …` columns |
+| `engine-csv` | `EdrEngine` + `FeatureEngine` | CSV files with fixed `location, latitude, longitude, time, …` columns |
 | `engine-geojson` | `FeatureEngine` | GeoJSON FeatureCollection files (WGS84 only) |
-| `engine-geotiff` | `Engine` + `MapEngine` | Cloud-Optimized GeoTIFF (local dir, S3, or STAC catalog) |
-| `engine-grib` | `Engine` + `MapEngine` | GRIB2 NWP data via JSON/wgrib2 index sidecars (ECMWF IFS, NOAA GFS) |
-| `engine-querydata` | `Engine` + `MapEngine` | FMI QueryData (`.sqd`) binary files, memory-mapped |
-| `engine-postgis` | `Engine` + `FeatureEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible) |
+| `engine-geotiff` | `EdrEngine` + `MapEngine` | Cloud-Optimized GeoTIFF (local dir, S3, or STAC catalog) |
+| `engine-grib` | `EdrEngine` + `MapEngine` | GRIB2 NWP data via JSON/wgrib2 index sidecars (ECMWF IFS, NOAA GFS) |
+| `engine-querydata` | `EdrEngine` + `MapEngine` | FMI QueryData (`.sqd`) binary files, memory-mapped |
+| `engine-postgis` | `EdrEngine` + `FeatureEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible) |
 
 ### OGC API Plugins
 
@@ -40,7 +40,7 @@ Each engine implements one or more of the core traits.
 
 | Crate | Description |
 |-------|-------------|
-| `server` | The deployable binary. Composes the plugins above into a single axum router, wires CORS/auth/metrics, embeds the `/preview` MapLibre SPA, and owns config + hot-reload. |
+| `server` | The deployable binary. Composes the plugins above into a single axum router, wires CORS, admin bearer-token auth (`/admin/*` only), and metrics, embeds the `/preview` MapLibre SPA, and owns config + hot-reload. |
 
 ## Quick Start
 
@@ -80,7 +80,7 @@ Three core traits, each corresponding to one or more APIs:
 
 | Trait | APIs | Description |
 |-------|------|-------------|
-| `Engine` | OGC API - EDR 1.1 | Time-series queries (position, area, locations) returning CoverageJSON |
+| `EdrEngine` | OGC API - EDR 1.1 | Time-series queries (position, area, locations) returning CoverageJSON |
 | `FeatureEngine` | OGC API - Features 1.0, OGC API - Tiles 1.0 (MVT) | Paginated spatial feature queries returning GeoJSON; vector tiles are encoded from the same query via `ds-mvt` |
 | `MapEngine` | OGC API - Maps 1.0, OGC WMS 1.3.0, OGC API - Tiles 1.0 (raster) | Raster tile rendering returning PNG/JPEG/WebP |
 
@@ -97,7 +97,7 @@ Traits are separate — not all engines need to support all APIs. Engines return
 ### Collection Routing
 
 - API state is a registry of engines keyed by collection ID (`EdrState` / `FeaturesState` / `MapsState` / `WmsState`).
-- Handlers look up engines from a `HashMap<String, Arc<dyn Engine/FeatureEngine/MapEngine>>` by collection ID from the URL path.
+- Handlers look up engines from a `HashMap<String, Arc<dyn EdrEngine/FeatureEngine/MapEngine>>` by collection ID from the URL path.
 - The `apis` config field is enforced — only collections listing a given API in their `apis` array are wired to that API's router.
 - Tiles reuses MapEngine — tile z/x/y coordinates are converted to a bbox via TileMatrixSet math, then passed to `MapEngine::get_raster_tile()`.
 
@@ -326,7 +326,7 @@ ogr2ogr -f GeoJSON -t_srs EPSG:4326 output.geojson input.geojson
 
 ### GeoTIFF
 
-Cloud-Optimized GeoTIFF (COG) files with tiled layout. Implements `Engine` (EDR) for position/area queries returning CoverageJSON, and `MapEngine` (WMS/Maps/Tiles) for raster tile rendering.
+Cloud-Optimized GeoTIFF (COG) files with tiled layout. Implements `EdrEngine` (EDR) for position/area queries returning CoverageJSON, and `MapEngine` (WMS/Maps/Tiles) for raster tile rendering.
 
 **Requirements:**
 - **Must be tiled.** Strip-based TIFFs are not supported. Convert with: `gdal_translate -co TILED=YES -co COMPRESS=DEFLATE input.tif output.tif`
@@ -538,7 +538,7 @@ GRIB2 files from NWP models. The engine discovers data via JSON index sidecar fi
 1. Poll S3 prefix for `.index` files (lightweight, ~35 KB each)
 2. Parse index -> build catalog: `(reference_time, step) -> (file_url, message_offsets)`
 3. On query: HTTP Range request for the specific GRIB message (~500 KB per surface field)
-4. Decode message -> regular lat/lon grid -> serve via Engine/MapEngine
+4. Decode message -> regular lat/lon grid -> serve via EdrEngine/MapEngine
 
 **Multi-parameter collections:** Unlike GeoTIFF (one band per collection), a GRIB collection exposes all parameters from the data source. EDR queries select parameters via `parameter-name`. MapEngine uses per-parameter WMS layers.
 
@@ -610,7 +610,7 @@ max = 1050.0
 
 ### QueryData
 
-FMI QueryData (.sqd) binary format for NWP gridded data. Implements `Engine` (EDR position queries) and `MapEngine` (WMS/Maps/Tiles rendering).
+FMI QueryData (.sqd) binary format for NWP gridded data. Implements `EdrEngine` (EDR position queries) and `MapEngine` (WMS/Maps/Tiles rendering).
 
 **Key characteristics:**
 - **Binary format** with text header. Magic bytes: `@$°£Q`. Version 6.0+ only, little-endian.
@@ -1062,7 +1062,7 @@ CoverageJSON output is validated against the official [OGC CoverageJSON 1.0 sche
 - CSV/GeoJSON data loaded into memory at startup; GeoTIFF reads tiles on demand
 - CSV engine supports only the `locations` query type
 - GeoJSON engine implements `FeatureEngine` only (not EDR or WMS)
-- GeoTIFF engine implements `Engine` + `MapEngine` only (not Features)
+- GeoTIFF engine implements `EdrEngine` + `MapEngine` only (not Features)
 - GeoTIFF: one band per collection; strip-based TIFFs not supported
 - WMS: single LAYERS only, no SLD/SE styling, no GetFeatureInfo
 - WMS/Maps/Tiles: nearest-neighbor resampling only

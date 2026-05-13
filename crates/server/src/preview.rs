@@ -540,7 +540,7 @@ fn serialize_temporal(
     // Always emit `values` / `truncated` / `total_values`, even when the
     // engine doesn't override `get_available_times()`. This keeps the
     // manifest shape stable so UI clients don't have to null-guard each
-    // field individually. The `Engine` trait's default impl returns
+    // field individually. The `EdrEngine` trait's default impl returns
     // `None` for several engines (CSV, PostGIS, QueryData) — without
     // this fallback those collections would emit only `start`/`end`.
     let (slice, truncated, total): (&[_], bool, usize) = match values {
@@ -663,7 +663,7 @@ mod tests {
 
     use arc_swap::ArcSwap;
     use chrono::{DateTime, Utc};
-    use ds_core::engine::Engine;
+    use ds_core::edr_engine::EdrEngine;
     use ds_core::error::DataServerError;
     use ds_core::feature::{Feature, FeaturePage, FeatureQuery};
     use ds_core::feature_engine::FeatureEngine;
@@ -679,7 +679,7 @@ mod tests {
         times: Vec<DateTime<Utc>>,
     }
 
-    impl Engine for EdrMock {
+    impl EdrEngine for EdrMock {
         fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
             Ok(Vec::new())
         }
@@ -874,7 +874,7 @@ mod tests {
     #[test]
     fn manifest_aggregates_edr_collection_with_temporal_extent() {
         let mut edr = empty_edr();
-        let engine: Arc<dyn Engine> = Arc::new(EdrMock {
+        let engine: Arc<dyn EdrEngine> = Arc::new(EdrMock {
             extent: Some([10.0, 55.0, 30.0, 70.0]),
             times: vec![t("2024-01-01T00:00:00Z"), t("2024-01-02T00:00:00Z")],
         });
@@ -914,7 +914,7 @@ mod tests {
         let times: Vec<DateTime<Utc>> = (0..MAX_TEMPORAL_VALUES + 50)
             .map(|i| DateTime::<Utc>::from_timestamp(1_700_000_000 + i as i64 * 60, 0).unwrap())
             .collect();
-        let engine: Arc<dyn Engine> = Arc::new(EdrMock {
+        let engine: Arc<dyn EdrEngine> = Arc::new(EdrMock {
             extent: None,
             times: times.clone(),
         });
@@ -1105,7 +1105,7 @@ mod tests {
         struct IntervalOnlyMock {
             interval: (DateTime<Utc>, DateTime<Utc>),
         }
-        impl Engine for IntervalOnlyMock {
+        impl EdrEngine for IntervalOnlyMock {
             fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
                 Ok(Vec::new())
             }
@@ -1129,7 +1129,7 @@ mod tests {
             // Note: no `get_available_times` override — falls back to default `None`.
         }
         let mut edr = empty_edr();
-        let engine: Arc<dyn Engine> = Arc::new(IntervalOnlyMock {
+        let engine: Arc<dyn EdrEngine> = Arc::new(IntervalOnlyMock {
             interval: (
                 "2024-01-01T00:00:00Z".parse().unwrap(),
                 "2024-01-02T00:00:00Z".parse().unwrap(),
@@ -1177,7 +1177,7 @@ mod tests {
         struct IntervalOnlyEdr {
             interval: (DateTime<Utc>, DateTime<Utc>),
         }
-        impl Engine for IntervalOnlyEdr {
+        impl EdrEngine for IntervalOnlyEdr {
             fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
                 Ok(Vec::new())
             }
@@ -1211,7 +1211,7 @@ mod tests {
         );
 
         let mut edr = empty_edr();
-        let edr_engine: Arc<dyn Engine> = Arc::new(IntervalOnlyEdr {
+        let edr_engine: Arc<dyn EdrEngine> = Arc::new(IntervalOnlyEdr {
             interval: wide_edr_interval,
         });
         edr.engines.insert("radar".into(), edr_engine);

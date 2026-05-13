@@ -10,7 +10,7 @@ use serde_json::json;
 
 use ds_core::config::CollectionConfig;
 use ds_core::datetime::parse_datetime_interval;
-use ds_core::engine::Engine;
+use ds_core::edr_engine::EdrEngine;
 
 use ds_core::model::AreaQueryResult;
 
@@ -25,7 +25,7 @@ use crate::response::{
 /// Shared state for the EDR API: a registry of collection engines + metadata.
 #[derive(Clone)]
 pub struct EdrState {
-    pub engines: HashMap<String, Arc<dyn Engine>>,
+    pub engines: HashMap<String, Arc<dyn EdrEngine>>,
     pub collections: HashMap<String, CollectionConfig>,
     /// Base URL for generating absolute links (e.g. "https://api.example.com").
     pub base_url: String,
@@ -37,7 +37,7 @@ pub type AppState = Arc<ArcSwap<EdrState>>;
 fn lookup_collection<'a>(
     state: &'a EdrState,
     id: &str,
-) -> Result<(&'a Arc<dyn Engine>, &'a CollectionConfig), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(&'a Arc<dyn EdrEngine>, &'a CollectionConfig), (StatusCode, Json<serde_json::Value>)> {
     let engine = state.engines.get(id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -601,7 +601,7 @@ pub async fn area_query(
 }
 
 fn build_collection_metadata(
-    engine: &dyn Engine,
+    engine: &dyn EdrEngine,
     config: &CollectionConfig,
     base_url: &str,
 ) -> serde_json::Value {

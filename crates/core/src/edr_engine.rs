@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use crate::error::DataServerError;
 use crate::model::{AreaQueryResult, Location, ParameterDescription, QueryResult};
 
-pub trait Engine: Send + Sync {
+pub trait EdrEngine: Send + Sync {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError>;
 
     fn query_location(

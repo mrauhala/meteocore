@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
-use ds_core::engine::Engine;
+use ds_core::edr_engine::EdrEngine;
 use ds_core::feature::{Bbox, FeatureQuery};
 use ds_core::feature_engine::FeatureEngine;
 use engine_csv::engine::CsvEngine;

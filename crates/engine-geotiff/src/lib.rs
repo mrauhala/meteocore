@@ -26,7 +26,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use ds_core::config::GeoTiffConfig;
-use ds_core::engine::Engine;
+use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::model::*;
 
@@ -1464,7 +1464,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
     }
 }
 
-impl Engine for GeoTiffEngine {
+impl EdrEngine for GeoTiffEngine {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
         Ok(vec![])
     }

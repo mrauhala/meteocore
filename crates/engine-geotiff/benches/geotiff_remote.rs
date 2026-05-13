@@ -19,7 +19,7 @@ use std::time::Duration;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use ds_core::config::GeoTiffConfig;
-use ds_core::engine::Engine;
+use ds_core::edr_engine::EdrEngine;
 use engine_geotiff::GeoTiffEngine;
 
 fn make_config(cache_mb: u64) -> GeoTiffConfig {

@@ -1,4 +1,4 @@
-//! `PostgisEngine` — implements the `ds_core::engine::Engine` trait on top
+//! `PostgisEngine` — implements the `ds_core::edr_engine::EdrEngine` trait on top
 //! of a [`deadpool_postgres`] pool and a [`MetadataCache`].
 //!
 //! DB work is async; the trait is sync. The bridge is
@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
-use ds_core::engine::Engine;
+use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::model::{
     AreaQueryResult, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
@@ -33,7 +33,7 @@ use crate::schema::ObservationSchema;
 type ParamSeries = Vec<(DateTime<Utc>, Option<f64>)>;
 
 /// Collection-scoped engine. Cheap to clone (Arcs inside); axum handlers
-/// hold it behind `Arc<dyn Engine>` as is done for every engine.
+/// hold it behind `Arc<dyn EdrEngine>` as is done for every engine.
 pub struct PostgisEngine {
     collection_id: String,
     config: Arc<PostgisEngineConfig>,
@@ -108,7 +108,7 @@ impl PostgisEngine {
 
 // ─── Engine trait ────────────────────────────────────────────────────────────
 
-impl Engine for PostgisEngine {
+impl EdrEngine for PostgisEngine {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
         Ok((*self.load_meta().locations).clone())
     }
