@@ -104,11 +104,13 @@ jobs:
   build-binary:
     name: binary ${{ matrix.target }}
     needs: resolve-target
-    # Skip cleanly if `resolve-target` was skipped (push that didn't
-    # produce a release); fail-skip cleanly if it errored. Without an
-    # explicit guard, a `resolve-target` failure cascades into job
-    # failures here instead of skips.
-    if: needs.resolve-target.result == 'success'
+    # `always() &&` is mandatory, not stylistic: on the
+    # `workflow_dispatch` backfill path `release-please` is skipped,
+    # and GitHub Actions propagates that skip *transitively* through
+    # the dependency chain. Without `always()`, this job inherits the
+    # original release-please skip even though its direct dep
+    # (`resolve-target`) succeeded — and every build job sits out.
+    if: always() && needs.resolve-target.result == 'success'
     permissions:
       contents: read
     strategy:
@@ -194,7 +196,9 @@ jobs:
   build-container:
     name: container image
     needs: resolve-target
-    if: needs.resolve-target.result == 'success'
+    # See build-binary above — `always()` defeats transitive skip
+    # propagation from the dispatch-path-skipped `release-please` job.
+    if: always() && needs.resolve-target.result == 'success'
     permissions:
       contents: read
       packages: write
@@ -257,7 +261,9 @@ jobs:
     # against ghcr.io. If the container build fails, the binaries on the
     # GitHub Release are still useful and should ship.
     needs: [resolve-target, build-binary]
-    if: needs.resolve-target.result == 'success'
+    # See build-binary above — `always()` defeats transitive skip
+    # propagation from the dispatch-path-skipped `release-please` job.
+    if: always() && needs.resolve-target.result == 'success' && needs.build-binary.result == 'success'
     permissions:
       contents: write
     runs-on: ubuntu-latest
