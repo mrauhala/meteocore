@@ -14,7 +14,7 @@ use chrono::{DateTime, Datelike, Utc};
 use tokio::sync::watch;
 
 use ds_core::config::GribConfig;
-use ds_core::engine::Engine;
+use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::*;
@@ -734,7 +734,7 @@ impl GribEngine {
 // Engine trait (EDR)
 // ---------------------------------------------------------------------------
 
-impl Engine for GribEngine {
+impl EdrEngine for GribEngine {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
         // Gridded data has no discrete locations
         Ok(Vec::new())

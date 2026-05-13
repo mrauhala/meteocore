@@ -11,7 +11,7 @@ use tower::ServiceExt;
 
 use api_edr::handlers::EdrState;
 use ds_core::config::CollectionConfig;
-use ds_core::engine::Engine;
+use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::model::*;
 
@@ -80,7 +80,7 @@ impl MockEngine {
     }
 }
 
-impl Engine for MockEngine {
+impl EdrEngine for MockEngine {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
         Ok(Self::sample_locations())
     }
@@ -173,7 +173,7 @@ impl Engine for MockEngine {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<ArcSwap<EdrState>> {
+fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     engines.insert("weather".to_string(), engine);
@@ -201,7 +201,7 @@ fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<ArcSwap<EdrState>> {
 }
 
 fn build_router() -> axum::Router {
-    let engine: Arc<dyn Engine> = Arc::new(MockEngine);
+    let engine: Arc<dyn EdrEngine> = Arc::new(MockEngine);
     api_edr::router(make_edr_state(engine))
 }
 

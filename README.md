@@ -60,7 +60,7 @@ Three core traits, each corresponding to one or more APIs:
 
 | Trait | APIs | Description |
 |-------|------|-------------|
-| `Engine` | EDR | Time-series queries (position, area, locations) returning CoverageJSON |
+| `EdrEngine` | EDR | Time-series queries (position, area, locations) returning CoverageJSON |
 | `FeatureEngine` | Features | Paginated spatial feature queries returning GeoJSON |
 | `MapEngine` | Maps, WMS, Tiles | Raster tile rendering returning PNG/JPEG/WebP images |
 
@@ -77,7 +77,7 @@ Traits are separate — not all engines need to support all APIs. Engines return
 ### Collection Routing
 
 - API state is a registry of engines keyed by collection ID (`EdrState` / `FeaturesState` / `MapsState` / `WmsState`).
-- Handlers look up engines from a `HashMap<String, Arc<dyn Engine/FeatureEngine/MapEngine>>` by collection ID from the URL path.
+- Handlers look up engines from a `HashMap<String, Arc<dyn EdrEngine/FeatureEngine/MapEngine>>` by collection ID from the URL path.
 - The `apis` config field is enforced — only collections listing a given API in their `apis` array are wired to that API's router.
 - Tiles reuses MapEngine — tile z/x/y coordinates are converted to a bbox via TileMatrixSet math, then passed to `MapEngine::get_raster_tile()`.
 
@@ -302,7 +302,7 @@ ogr2ogr -f GeoJSON -t_srs EPSG:4326 output.geojson input.geojson
 
 ### GeoTIFF
 
-Cloud-Optimized GeoTIFF (COG) files with tiled layout. Implements `Engine` (EDR) for position/area queries returning CoverageJSON, and `MapEngine` (WMS/Maps/Tiles) for raster tile rendering.
+Cloud-Optimized GeoTIFF (COG) files with tiled layout. Implements `EdrEngine` (EDR) for position/area queries returning CoverageJSON, and `MapEngine` (WMS/Maps/Tiles) for raster tile rendering.
 
 **Requirements:**
 - **Must be tiled.** Strip-based TIFFs are not supported. Convert with: `gdal_translate -co TILED=YES -co COMPRESS=DEFLATE input.tif output.tif`
@@ -514,7 +514,7 @@ GRIB2 files from NWP models. The engine discovers data via JSON index sidecar fi
 1. Poll S3 prefix for `.index` files (lightweight, ~35 KB each)
 2. Parse index -> build catalog: `(reference_time, step) -> (file_url, message_offsets)`
 3. On query: HTTP Range request for the specific GRIB message (~500 KB per surface field)
-4. Decode message -> regular lat/lon grid -> serve via Engine/MapEngine
+4. Decode message -> regular lat/lon grid -> serve via EdrEngine/MapEngine
 
 **Multi-parameter collections:** Unlike GeoTIFF (one band per collection), a GRIB collection exposes all parameters from the data source. EDR queries select parameters via `parameter-name`. MapEngine uses per-parameter WMS layers.
 
@@ -586,7 +586,7 @@ max = 1050.0
 
 ### QueryData
 
-FMI QueryData (.sqd) binary format for NWP gridded data. Implements `Engine` (EDR position queries) and `MapEngine` (WMS/Maps/Tiles rendering).
+FMI QueryData (.sqd) binary format for NWP gridded data. Implements `EdrEngine` (EDR position queries) and `MapEngine` (WMS/Maps/Tiles rendering).
 
 **Key characteristics:**
 - **Binary format** with text header. Magic bytes: `@$°£Q`. Version 6.0+ only, little-endian.
@@ -1032,7 +1032,7 @@ CoverageJSON output is validated against the official [OGC CoverageJSON 1.0 sche
 - CSV/GeoJSON data loaded into memory at startup; GeoTIFF reads tiles on demand
 - CSV engine supports only the `locations` query type
 - GeoJSON engine implements `FeatureEngine` only (not EDR or WMS)
-- GeoTIFF engine implements `Engine` + `MapEngine` only (not Features)
+- GeoTIFF engine implements `EdrEngine` + `MapEngine` only (not Features)
 - GeoTIFF: one band per collection; strip-based TIFFs not supported
 - WMS: single LAYERS only, no SLD/SE styling, no GetFeatureInfo
 - WMS/Maps/Tiles: nearest-neighbor resampling only

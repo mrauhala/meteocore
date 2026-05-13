@@ -372,7 +372,7 @@ pub fn load_collections(
 ) -> LoadResult {
     let bundle_index: HashMap<&str, &StyleBundle> =
         style_bundles.iter().map(|b| (b.id.as_str(), b)).collect();
-    let mut edr_engines: HashMap<String, Arc<dyn ds_core::engine::Engine>> = HashMap::new();
+    let mut edr_engines: HashMap<String, Arc<dyn ds_core::edr_engine::EdrEngine>> = HashMap::new();
     let mut edr_collections: HashMap<String, CollectionConfig> = HashMap::new();
     let mut feature_engines: HashMap<String, Arc<dyn ds_core::feature_engine::FeatureEngine>> =
         HashMap::new();
@@ -500,7 +500,7 @@ pub fn load_collections(
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
                         collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::engine::Engine>,
+                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
                 }
@@ -622,7 +622,7 @@ pub fn load_collections(
                 };
 
                 if let Some((start, end)) =
-                    ds_core::engine::Engine::get_temporal_extent(engine.as_ref())
+                    ds_core::edr_engine::EdrEngine::get_temporal_extent(engine.as_ref())
                 {
                     info!(
                         "Collection '{}': temporal extent {} to {}",
@@ -635,7 +635,7 @@ pub fn load_collections(
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
                         collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::engine::Engine>,
+                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
                 }
@@ -680,7 +680,7 @@ pub fn load_collections(
                 // GeoTIFF starts degraded (no data yet until first poll), unless
                 // the initial scan already found files.
                 let has_data =
-                    ds_core::engine::Engine::get_temporal_extent(engine.as_ref()).is_some();
+                    ds_core::edr_engine::EdrEngine::get_temporal_extent(engine.as_ref()).is_some();
                 health.push(CollectionHealth {
                     id: collection.id.clone(),
                     engine_type: "geotiff".into(),
@@ -746,7 +746,7 @@ pub fn load_collections(
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
                         collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::engine::Engine>,
+                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
                 }
@@ -862,7 +862,7 @@ pub fn load_collections(
                 };
 
                 if let Some((start, end)) =
-                    ds_core::engine::Engine::get_temporal_extent(engine.as_ref())
+                    ds_core::edr_engine::EdrEngine::get_temporal_extent(engine.as_ref())
                 {
                     info!(
                         "Collection '{}': temporal extent {} to {}",
@@ -875,7 +875,7 @@ pub fn load_collections(
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
                         collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::engine::Engine>,
+                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
                 }
@@ -939,7 +939,7 @@ pub fn load_collections(
                 }
 
                 let has_data =
-                    ds_core::engine::Engine::get_temporal_extent(engine.as_ref()).is_some();
+                    ds_core::edr_engine::EdrEngine::get_temporal_extent(engine.as_ref()).is_some();
                 health.push(CollectionHealth {
                     id: collection.id.clone(),
                     engine_type: "grib".into(),
@@ -1048,7 +1048,7 @@ pub fn load_collections(
 
                 let (status, status_err) = match &refresh_result {
                     Ok(()) => {
-                        use ds_core::engine::Engine as _;
+                        use ds_core::edr_engine::EdrEngine as _;
                         info!(
                             "Collection '{}': postgis engine ready ({} stations, {} parameters)",
                             collection.id,
@@ -1070,7 +1070,7 @@ pub fn load_collections(
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
                         collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::engine::Engine>,
+                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
                 }
@@ -1648,8 +1648,8 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
     let mut data_ages: HashMap<String, i64> = HashMap::new();
     let mut temporal_info: HashMap<String, serde_json::Value> = HashMap::new();
 
-    // Helper: build temporal extent from any Engine
-    fn build_temporal(engine: &dyn ds_core::engine::Engine) -> Option<serde_json::Value> {
+    // Helper: build temporal extent from any EdrEngine
+    fn build_temporal(engine: &dyn ds_core::edr_engine::EdrEngine) -> Option<serde_json::Value> {
         let (start, end) = engine.get_temporal_extent()?;
         let mut obj = serde_json::Map::new();
         obj.insert(

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
-use ds_core::engine::Engine;
+use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use std::sync::Arc;
 
@@ -23,7 +23,7 @@ impl CsvEngine {
     }
 }
 
-impl Engine for CsvEngine {
+impl EdrEngine for CsvEngine {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
         let mut locations = Vec::new();
         let mut seen = HashMap::new();

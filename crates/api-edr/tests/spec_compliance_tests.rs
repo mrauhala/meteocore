@@ -21,7 +21,7 @@ use tower::util::ServiceExt;
 
 use api_edr::handlers::EdrState;
 use ds_core::config::CollectionConfig;
-use ds_core::engine::Engine;
+use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::model::*;
 
@@ -30,7 +30,7 @@ use ds_core::model::*;
 // ---------------------------------------------------------------------------
 struct MockEngine;
 
-impl Engine for MockEngine {
+impl EdrEngine for MockEngine {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
         Ok(vec![
             Location {
@@ -105,7 +105,7 @@ impl Engine for MockEngine {
     }
 }
 
-fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<ArcSwap<EdrState>> {
+fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     engines.insert("weather".to_string(), engine);
@@ -133,7 +133,7 @@ fn make_edr_state(engine: Arc<dyn Engine>) -> Arc<ArcSwap<EdrState>> {
 }
 
 fn app() -> axum::Router {
-    let engine: Arc<dyn Engine> = Arc::new(MockEngine);
+    let engine: Arc<dyn EdrEngine> = Arc::new(MockEngine);
     api_edr::router(make_edr_state(engine))
 }
 
@@ -549,7 +549,7 @@ async fn finding_13_error_response_format() {
 // Implementation: build_collection_metadata() only includes "type" and
 //   "observedProperty" -- no "unit" field.
 // Impact: Clients cannot discover parameter units from collection metadata.
-// Fix: Engine trait needs to expose parameter descriptions (not just names)
+// Fix: EdrEngine trait needs to expose parameter descriptions (not just names)
 //   for collection-level metadata.
 
 #[tokio::test]
@@ -757,7 +757,7 @@ async fn finding_24_items_not_implemented() {
 // Spec: bbox should be an array of arrays, where each inner array is
 //   [west, south, east, north] (2D) or [west, south, min-z, east, north, max-z].
 // Implementation: Correctly wraps bbox in an outer array: "bbox": [bbox].
-//   But the Engine returns [f64; 4] and we wrap it as [bbox], which produces
+//   But the EdrEngine returns [f64; 4] and we wrap it as [bbox], which produces
 //   [[19.0, 59.0, 32.0, 71.0]]. This is correct.
 
 #[tokio::test]

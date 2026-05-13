@@ -44,9 +44,9 @@ pub struct RasterInfo {
     pub parameters: Vec<(String, String)>,
 }
 
-/// Engine trait for serving raster data as map images.
+/// Trait for serving raster data as map images.
 ///
-/// Separate from `Engine` (EDR) and `FeatureEngine` (Features).
+/// Separate from `EdrEngine` (EDR) and `FeatureEngine` (Features).
 /// Only raster engines (GeoTIFF, future NetCDF/GRIB) implement this.
 pub trait MapEngine: Send + Sync {
     /// Extract a raster tile for the given bbox and output dimensions.

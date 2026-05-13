@@ -50,7 +50,7 @@ When completing work, close the relevant issue: `gh issue close <number>`.
 
 ## Architecture Rules
 
-- **Three core traits: `Engine` (EDR), `FeatureEngine` (Features), and `MapEngine` (Maps/WMS/Tiles).** They are separate traits — not all engines need to support all APIs. Engines return domain types, never JSON/XML. Serialization belongs in the API crates.
+- **Three core traits: `EdrEngine` (EDR), `FeatureEngine` (Features), and `MapEngine` (Maps/WMS/Tiles).** They are separate traits — not all engines need to support all APIs. Engines return domain types, never JSON/XML. Serialization belongs in the API crates.
 - **ds-core has no framework dependencies.** Only chrono, serde, thiserror, toml. Keep it that way. Use `PropertyValue` enum instead of `serde_json::Value` for feature properties.
 - **CRS and GeoTransform live in ds-core** (`ds_core::geo`), shared by all engines.
 - **ds-render has no framework dependencies.** Only ds-core and `png`.
@@ -58,8 +58,8 @@ When completing work, close the relevant issue: `gh issue close <number>`.
 - **EDR, Features, Maps, Tiles, and WMS are separate services** with separate base routes (`/edr/...`, `/features/...`, `/maps/...`, `/tiles/...`, `/wms/...`).
 - **WMS uses XML, not JSON.** All XML output in api-wms uses `quick-xml::Writer` for proper escaping. Never build XML with `format!()` or string concatenation (XML injection risk).
 - **CORS is applied at the server level**, not in individual API crates. The `CorsLayer` lives in `server/src/main.rs`.
-- **New engines** implement `Engine`, `FeatureEngine`, and/or `MapEngine` traits in their own crate, get wired up in `server/src/main.rs`.
-- **Collection routing is dynamic.** Handlers look up engines from a `HashMap<String, Arc<dyn Engine/FeatureEngine/MapEngine>>` by collection ID from the URL path. No collection IDs are hardcoded.
+- **New engines** implement `EdrEngine`, `FeatureEngine`, and/or `MapEngine` traits in their own crate, get wired up in `server/src/main.rs`.
+- **Collection routing is dynamic.** Handlers look up engines from a `HashMap<String, Arc<dyn EdrEngine/FeatureEngine/MapEngine>>` by collection ID from the URL path. No collection IDs are hardcoded.
 - **The `apis` config field is enforced.** Only collections listing a given API in their `apis` array are wired to that API's router.
 - **Tiles reuses MapEngine.** Tile z/x/y coordinates are converted to a bbox via TileMatrixSet math, then passed to `MapEngine::get_raster_tile()`. No separate tile engine trait is needed.
 
@@ -70,7 +70,7 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 ## Adding a New Engine
 
 1. Create `crates/engine-<name>/` with `Cargo.toml` depending on `ds-core`
-2. Implement `Engine`, `FeatureEngine`, and/or `MapEngine` traits
+2. Implement `EdrEngine`, `FeatureEngine`, and/or `MapEngine` traits
 3. Add the crate to workspace members in root `Cargo.toml`
 4. Add the crate as a dependency of `crates/server/Cargo.toml`
 5. Add a match arm for the new `engine_type` in `server/src/main.rs`
@@ -126,12 +126,12 @@ Currently implemented: `PointSeries`, `Grid`.
 
 | Engine | Traits | APIs |
 |--------|--------|------|
-| CSV | `Engine` | EDR (locations only) |
+| CSV | `EdrEngine` + `FeatureEngine` | EDR (locations only), Features |
 | GeoJSON | `FeatureEngine` | Features |
-| GeoTIFF | `Engine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
-| GRIB | `Engine` + `MapEngine` | EDR, WMS, Maps, Tiles |
-| QueryData | `Engine` + `MapEngine` | EDR (position only), WMS, Maps, Tiles |
-| PostGIS | `Engine` + `FeatureEngine` | EDR (position, locations, area), Features |
+| GeoTIFF | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
+| GRIB | `EdrEngine` + `MapEngine` | EDR, WMS, Maps, Tiles |
+| QueryData | `EdrEngine` + `MapEngine` | EDR (position only), WMS, Maps, Tiles |
+| PostGIS | `EdrEngine` + `FeatureEngine` | EDR (position, locations, area), Features |
 
 ## GeoTIFF Engine Notes
 
