@@ -8,7 +8,7 @@ A high-performance modular meteorological data server built in Rust. Implements 
 
 | Crate | Description |
 |-------|-------------|
-| `ds-core` | Domain traits (`Engine`, `FeatureEngine`, `MapEngine`), shared types (CRS, GeoTransform, PropertyValue), config parsing. No framework deps. |
+| `ds-core` | Domain traits (`EdrEngine`, `FeatureEngine`, `MapEngine`), shared types (CRS, GeoTransform, PropertyValue), config parsing. No framework deps. |
 | `ds-storage` | Unified S3 / HTTP / local-filesystem object store, used by every engine that fetches remote data. |
 | `ds-render` | Raster colorization (LUT + linear gradient) and PNG encoding. No framework deps. |
 | `ds-mvt` | Mapbox Vector Tile encoder + weighted LRU cache. Used by `api-tiles` to serve `?f=mvt` from `FeatureEngine` collections. |
@@ -19,12 +19,12 @@ Each engine implements one or more of the core traits.
 
 | Crate | Traits | Source |
 |-------|--------|--------|
-| `engine-csv` | `Engine` + `FeatureEngine` | CSV files with fixed `location, latitude, longitude, time, …` columns |
+| `engine-csv` | `EdrEngine` + `FeatureEngine` | CSV files with fixed `location, latitude, longitude, time, …` columns |
 | `engine-geojson` | `FeatureEngine` | GeoJSON FeatureCollection files (WGS84 only) |
-| `engine-geotiff` | `Engine` + `MapEngine` | Cloud-Optimized GeoTIFF (local dir, S3, or STAC catalog) |
-| `engine-grib` | `Engine` + `MapEngine` | GRIB2 NWP data via JSON/wgrib2 index sidecars (ECMWF IFS, NOAA GFS) |
-| `engine-querydata` | `Engine` + `MapEngine` | FMI QueryData (`.sqd`) binary files, memory-mapped |
-| `engine-postgis` | `Engine` + `FeatureEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible) |
+| `engine-geotiff` | `EdrEngine` + `MapEngine` | Cloud-Optimized GeoTIFF (local dir, S3, or STAC catalog) |
+| `engine-grib` | `EdrEngine` + `MapEngine` | GRIB2 NWP data via JSON/wgrib2 index sidecars (ECMWF IFS, NOAA GFS) |
+| `engine-querydata` | `EdrEngine` + `MapEngine` | FMI QueryData (`.sqd`) binary files, memory-mapped |
+| `engine-postgis` | `EdrEngine` + `FeatureEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible) |
 
 ### OGC API Plugins
 
