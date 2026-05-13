@@ -1,26 +1,46 @@
 # MeteoCore
 
-A high-performance modular meteorological data server built in Rust. Implements [OGC API - EDR](https://ogcapi.ogc.org/edr/), [OGC API - Features](https://ogcapi.ogc.org/features/), [OGC API - Maps](https://ogcapi.ogc.org/maps/), [OGC API - Tiles](https://ogcapi.ogc.org/tiles/), and [OGC WMS 1.3.0](https://www.ogc.org/standard/wms/) as separate services sharing the same data sources.
+A high-performance modular meteorological data server built in Rust. Implements [OGC API - EDR 1.1](https://ogcapi.ogc.org/edr/), [OGC API - Features 1.0](https://ogcapi.ogc.org/features/), [OGC API - Maps 1.0](https://ogcapi.ogc.org/maps/), [OGC API - Tiles 1.0](https://ogcapi.ogc.org/tiles/), and [OGC WMS 1.3.0](https://www.ogc.org/standard/wms/) as separate services sharing the same data sources. A built-in `/preview` SPA renders every configured collection on a MapLibre canvas for quick visual smoke-testing.
 
 ## Workspace Crates
 
+### Foundation
+
 | Crate | Description |
 |-------|-------------|
-| `ds-core` | Traits, types, shared utilities |
-| `ds-storage` | S3/HTTP/local object store |
-| `ds-render` | Raster colorization + PNG encoding |
-| `engine-csv` | CSV data engine |
-| `engine-geojson` | GeoJSON data engine |
-| `engine-geotiff` | GeoTIFF/COG data engine |
-| `engine-grib` | GRIB2 NWP data engine |
-| `engine-querydata` | FMI QueryData (.sqd) data engine |
-| `engine-postgis` | PostGIS/TimescaleDB observation data engine |
-| `api-edr` | EDR HTTP layer |
-| `api-features` | Features HTTP layer |
-| `api-maps` | OGC API Maps HTTP layer |
-| `api-tiles` | OGC API Tiles HTTP layer |
-| `api-wms` | WMS 1.3.0 HTTP layer |
-| `server` | Binary |
+| `ds-core` | Domain traits (`Engine`, `FeatureEngine`, `MapEngine`), shared types (CRS, GeoTransform, PropertyValue), config parsing. No framework deps. |
+| `ds-storage` | Unified S3 / HTTP / local-filesystem object store, used by every engine that fetches remote data. |
+| `ds-render` | Raster colorization (LUT + linear gradient) and PNG encoding. No framework deps. |
+| `ds-mvt` | Mapbox Vector Tile encoder + weighted LRU cache. Used by `api-tiles` to serve `?f=mvt` from `FeatureEngine` collections. |
+
+### Data Engines
+
+Each engine implements one or more of the core traits.
+
+| Crate | Traits | Source |
+|-------|--------|--------|
+| `engine-csv` | `Engine` | CSV files with fixed `location, latitude, longitude, time, …` columns |
+| `engine-geojson` | `FeatureEngine` | GeoJSON FeatureCollection files (WGS84 only) |
+| `engine-geotiff` | `Engine` + `MapEngine` | Cloud-Optimized GeoTIFF (local dir, S3, or STAC catalog) |
+| `engine-grib` | `Engine` + `MapEngine` | GRIB2 NWP data via JSON/wgrib2 index sidecars (ECMWF IFS, NOAA GFS) |
+| `engine-querydata` | `Engine` + `MapEngine` | FMI QueryData (`.sqd`) binary files, memory-mapped |
+| `engine-postgis` | `Engine` + `FeatureEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible) |
+
+### OGC API Plugins
+
+| Crate | Plugin | Conformance |
+|-------|--------|-------------|
+| `api-edr` | [OGC API - EDR 1.1](https://docs.ogc.org/is/19-086r6/19-086r6.html) | core, collections, json, edr-geojson, covjson |
+| `api-features` | [OGC API - Features 1.0](https://docs.ogc.org/is/17-069r4/17-069r4.html) | core, oas30, geojson |
+| `api-maps` | [OGC API - Maps 1.0](https://docs.ogc.org/is/20-058/20-058.html) | core, collection-map, styled-map, spatial-subsetting, scaling, datetime, crs, png, jpeg |
+| `api-tiles` | [OGC API - Tiles 1.0](https://docs.ogc.org/is/20-057/20-057.html) | core (raster + MVT via `?f=mvt` content negotiation) |
+| `api-wms` | [OGC WMS 1.3.0](https://portal.ogc.org/files/?artifact_id=14416) | GetCapabilities, GetMap, GetLegendGraphic |
+
+### Binary
+
+| Crate | Description |
+|-------|-------------|
+| `server` | The deployable binary. Composes the plugins above into a single axum router, wires CORS/auth/metrics, embeds the `/preview` MapLibre SPA, and owns config + hot-reload. |
 
 ## Quick Start
 
@@ -60,9 +80,9 @@ Three core traits, each corresponding to one or more APIs:
 
 | Trait | APIs | Description |
 |-------|------|-------------|
-| `Engine` | EDR | Time-series queries (position, area, locations) returning CoverageJSON |
-| `FeatureEngine` | Features | Paginated spatial feature queries returning GeoJSON |
-| `MapEngine` | Maps, WMS, Tiles | Raster tile rendering returning PNG/JPEG/WebP images |
+| `Engine` | OGC API - EDR 1.1 | Time-series queries (position, area, locations) returning CoverageJSON |
+| `FeatureEngine` | OGC API - Features 1.0, OGC API - Tiles 1.0 (MVT) | Paginated spatial feature queries returning GeoJSON; vector tiles are encoded from the same query via `ds-mvt` |
+| `MapEngine` | OGC API - Maps 1.0, OGC WMS 1.3.0, OGC API - Tiles 1.0 (raster) | Raster tile rendering returning PNG/JPEG/WebP |
 
 Traits are separate — not all engines need to support all APIs. Engines return domain types, never JSON/XML. Serialization belongs in the API crates.
 
@@ -85,7 +105,7 @@ Traits are separate — not all engines need to support all APIs. Engines return
 
 API state (`EdrState`, `FeaturesState`, `MapsState`, `TilesState`, `WmsState`) is wrapped in `ArcSwap` for lock-free reads and atomic swaps on reload. The `ServerState` in `server/src/admin.rs` holds the `ArcSwap` pointers, health registry, and GeoTIFF engine list. Engine loading logic is in `admin::load_collections()`, shared by startup and reload.
 
-The render semaphore (sized to available CPU cores, minimum 4) and rendered cache are shared across Maps, Tiles, and WMS APIs. The semaphore uses `acquire().await` so excess requests queue instead of failing.
+The render semaphore (sized to 2× available CPU cores, minimum 8) and rendered cache are shared across Maps, Tiles, and WMS APIs. The semaphore uses `acquire().await` so excess requests queue instead of failing. The 2× oversubscription reflects that a slot's "ownership" of a CPU is loose — image decode (libpng, libdeflate) and PNG encode bursts interleave with bilinear-sample passes, leaving CPU idle a non-trivial fraction of the slot's wall time.
 
 ## Route Structure
 
@@ -130,12 +150,16 @@ The render semaphore (sized to available CPU cores, minimum 4) and rendered cach
 /tiles/collections                             Tiles collection listing
 /tiles/collections/{id}                        Tiles collection detail
 /tiles/collections/{id}/tiles                  List tilesets for collection
-/tiles/collections/{id}/tiles/{tms}/{z}/{row}/{col}              Get tile (PNG/JPEG/WebP)
+/tiles/collections/{id}/tiles/{tms}/{z}/{row}/{col}              Get tile (PNG/JPEG/WebP, or MVT via ?f=mvt)
 /tiles/collections/{id}/styles/{styleId}/tiles/{tms}/{z}/{row}/{col}  Get styled tile
 
 /wms/?SERVICE=WMS&REQUEST=GetCapabilities      WMS 1.3.0 GetCapabilities (XML)
 /wms/?SERVICE=WMS&REQUEST=GetMap&...           WMS 1.3.0 GetMap (PNG image)
 /wms/?SERVICE=WMS&REQUEST=GetLegendGraphic&... WMS 1.3.0 GetLegendGraphic
+
+/preview                                       Built-in MapLibre SPA (cards + map for every collection)
+/preview/manifest.json                         Aggregated discovery JSON consumed by the SPA
+/preview/{*path}                               Embedded SPA assets (HTML, JS, CSS, vendored MapLibre)
 
 /admin/collections/reload                      POST: reload config and swap engines
 /health                                        Per-collection health status
@@ -787,7 +811,7 @@ max = 70.0
 |-------|-------|
 | MAX_MAP_PIXELS | 16,777,216 (16M) |
 | MAX_MAP_DIMENSION | 4,096 px |
-| Render semaphore | CPU core count (min 4) |
+| Render semaphore | 2× CPU cores (min 8) |
 | Max LAYERS | 1 |
 | CRS whitelist | CRS:84, EPSG:4326/3857/3067/3035 |
 | FORMAT whitelist | `image/png`, `image/jpeg` |
@@ -834,7 +858,13 @@ Serves raster data as tiled map images. Tiles reuses the same rendering pipeline
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
 | `datetime` | no | latest | ISO 8601 timestamp |
-| `f` | no | `image/png` | `image/png`, `image/jpeg`, `image/webp` |
+| `f` | no | `image/png` | Raster: `image/png`, `image/jpeg`, `image/webp`. Vector: `mvt` or `application/vnd.mapbox-vector-tile`. |
+
+### Vector Tiles (MVT)
+
+When `?f=mvt` is requested against a collection backed by a `FeatureEngine` (e.g. GeoJSON, PostGIS), the tile handler converts the tile bbox into a feature query, encodes the result via `ds-mvt`, and returns Mapbox Vector Tile bytes. Layer name in the MVT payload equals the collection ID, matching the convention used by `mapbox-vector-tile-js` (the decoder bundled in MapLibre GL JS).
+
+Polygon features are clipped to a buffered tile envelope (1/16 of `extent`, matching MapLibre's default source-layer buffer) so seams between adjacent tiles remain invisible. ETag is content-derived (FNV-1a over the encoded bytes) so a data refresh produces a new ETag and clients holding the old one drop their cached copy on revalidate.
 
 ## Caching
 
@@ -944,7 +974,7 @@ Returns HTTP 503 only when all collections have failed.
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `render_semaphore_available` | gauge | — | Available render permits |
-| `render_semaphore_total` | gauge | — | Total render permits (CPU cores) |
+| `render_semaphore_total` | gauge | — | Total render permits (2× CPU cores, min 8) |
 | `storage_bytes_read_total` | counter | collection, engine_type | Bytes read from remote storage |
 
 #### Computing cache hit rates
@@ -1037,7 +1067,7 @@ CoverageJSON output is validated against the official [OGC CoverageJSON 1.0 sche
 - WMS: single LAYERS only, no SLD/SE styling, no GetFeatureInfo
 - WMS/Maps/Tiles: nearest-neighbor resampling only
 - STAC: no retry logic, no HTTP caching (ETag/Last-Modified)
-- Tiles: raster only (no vector tiles yet), WebMercatorQuad and WorldCRS84Quad only, fixed 256x256
+- Tiles: WebMercatorQuad and WorldCRS84Quad only; fixed 256x256 raster tiles; MVT is supported via `?f=mvt` for `FeatureEngine`-backed collections
 - GRIB: regular lat/lon grids only, GRIB2 only, requires index sidecar files
 - QueryData: serves latest file only, no compressed files, EDR position only, level 0 only
 
