@@ -20,6 +20,16 @@ pub fn parse_iso8601_duration(s: &str) -> Result<Duration, DataServerError> {
 
     let mut total_seconds: i64 = 0;
 
+    // Reject any sign character anywhere in `rest` up front. ISO 8601 doesn't
+    // permit negative components within a positive duration, and without this
+    // check `P1DT-2H` parses as 22h because `i64::parse("-2")` succeeds — a
+    // config typo would produce a surprising window length, not an error.
+    if rest.contains('-') || rest.contains('+') {
+        return Err(DataServerError::Config(format!(
+            "Invalid ISO 8601 duration '{s}': signed components are not permitted"
+        )));
+    }
+
     if !date_part.is_empty() {
         // Weeks (`P1W`) — natural unit for meteorological archives; reject the
         // ambiguous combination `P1W2D` which mixes weeks with other date units.
@@ -54,24 +64,24 @@ pub fn parse_iso8601_duration(s: &str) -> Result<Duration, DataServerError> {
     if !time_part.is_empty() {
         let mut remaining = time_part;
         if let Some(pos) = remaining.find('H') {
-            let v: i64 = remaining[..pos].parse().map_err(|_| {
+            let v: u64 = remaining[..pos].parse().map_err(|_| {
                 DataServerError::Config(format!("Invalid hours in ISO 8601 duration '{s}'"))
             })?;
-            total_seconds += v * 3600;
+            total_seconds += (v as i64) * 3600;
             remaining = &remaining[pos + 1..];
         }
         if let Some(pos) = remaining.find('M') {
-            let v: i64 = remaining[..pos].parse().map_err(|_| {
+            let v: u64 = remaining[..pos].parse().map_err(|_| {
                 DataServerError::Config(format!("Invalid minutes in ISO 8601 duration '{s}'"))
             })?;
-            total_seconds += v * 60;
+            total_seconds += (v as i64) * 60;
             remaining = &remaining[pos + 1..];
         }
         if let Some(pos) = remaining.find('S') {
-            let v: i64 = remaining[..pos].parse().map_err(|_| {
+            let v: u64 = remaining[..pos].parse().map_err(|_| {
                 DataServerError::Config(format!("Invalid seconds in ISO 8601 duration '{s}'"))
             })?;
-            total_seconds += v;
+            total_seconds += v as i64;
         }
     }
 
@@ -172,6 +182,17 @@ mod tests {
         // Empty T segment is technically invalid; surface the typo.
         assert!(parse_iso8601_duration("P1DT").is_err());
         assert!(parse_iso8601_duration("PT").is_err());
+    }
+
+    #[test]
+    fn iso8601_duration_rejects_signed_components() {
+        // Pre-fix, `P1DT-2H` parsed as 22h because `i64::parse("-2")` succeeds
+        // and `86400 - 7200 > 0` passed the zero-check. A config typo would
+        // produce a window of surprising length, not an error.
+        assert!(parse_iso8601_duration("P1DT-2H").is_err());
+        assert!(parse_iso8601_duration("P-1DT2H").is_err());
+        assert!(parse_iso8601_duration("PT2H-30M").is_err());
+        assert!(parse_iso8601_duration("PT+2H").is_err());
     }
 
     #[test]
