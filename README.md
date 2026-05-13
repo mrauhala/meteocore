@@ -19,7 +19,7 @@ Each engine implements one or more of the core traits.
 
 | Crate | Traits | Source |
 |-------|--------|--------|
-| `engine-csv` | `Engine` | CSV files with fixed `location, latitude, longitude, time, …` columns |
+| `engine-csv` | `Engine` + `FeatureEngine` | CSV files with fixed `location, latitude, longitude, time, …` columns |
 | `engine-geojson` | `FeatureEngine` | GeoJSON FeatureCollection files (WGS84 only) |
 | `engine-geotiff` | `Engine` + `MapEngine` | Cloud-Optimized GeoTIFF (local dir, S3, or STAC catalog) |
 | `engine-grib` | `Engine` + `MapEngine` | GRIB2 NWP data via JSON/wgrib2 index sidecars (ECMWF IFS, NOAA GFS) |
