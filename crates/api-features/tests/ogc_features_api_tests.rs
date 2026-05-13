@@ -145,6 +145,7 @@ fn build_router() -> axum::Router {
             wms: None,
             grib: None,
             postgis: None,
+            preview: None,
         },
     );
 
@@ -432,6 +433,7 @@ mod vector_tile_discovery {
                 wms: None,
                 grib: None,
                 postgis: None,
+                preview: None,
             },
         );
         let state = Arc::new(ArcSwap::from_pointee(FeaturesState {

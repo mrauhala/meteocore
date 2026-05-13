@@ -95,6 +95,7 @@ fn build_router() -> axum::Router {
             wms: None,
             grib: None,
             postgis: None,
+            preview: None,
         },
     );
 

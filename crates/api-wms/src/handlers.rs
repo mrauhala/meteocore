@@ -129,6 +129,13 @@ pub async fn wms_handler(
                 width: params.width,
                 height: params.height,
                 time: params.time,
+                // WMS picks the parameter via `LAYERS=collection/param`
+                // (parsed into layer_parameter) and then `style_info.parameter`.
+                // Both are already folded into `style_parameter` below; mirror
+                // that here so the rendered-cache distinguishes parameters.
+                parameter: layer_parameter
+                    .clone()
+                    .or_else(|| style_info.parameter.clone()),
             };
 
             let etag = cache_key.etag();

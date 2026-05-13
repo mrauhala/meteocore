@@ -1,6 +1,67 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 
 use crate::error::DataServerError;
+
+/// Parse an ISO 8601 positive duration (e.g. `"PT12H"`, `"P1D"`, `"P1DT6H"`)
+/// into a `chrono::Duration`. Rejects zero-length and signed durations —
+/// callers that need signed offsets should layer on top of this.
+pub fn parse_iso8601_duration(s: &str) -> Result<Duration, DataServerError> {
+    let rest = s.strip_prefix('P').ok_or_else(|| {
+        DataServerError::Config(format!(
+            "Invalid ISO 8601 duration '{s}': must start with 'P'"
+        ))
+    })?;
+
+    let (date_part, time_part) = if let Some(t_pos) = rest.find('T') {
+        (&rest[..t_pos], &rest[t_pos + 1..])
+    } else {
+        (rest, "")
+    };
+
+    let mut total_seconds: i64 = 0;
+
+    if !date_part.is_empty() {
+        let stripped = date_part.strip_suffix('D').ok_or_else(|| {
+            DataServerError::Config(format!("Invalid date component in ISO 8601 duration '{s}'"))
+        })?;
+        let days: i64 = stripped.parse().map_err(|_| {
+            DataServerError::Config(format!("Invalid days in ISO 8601 duration '{s}'"))
+        })?;
+        total_seconds += days * 86_400;
+    }
+
+    if !time_part.is_empty() {
+        let mut remaining = time_part;
+        if let Some(pos) = remaining.find('H') {
+            let v: i64 = remaining[..pos].parse().map_err(|_| {
+                DataServerError::Config(format!("Invalid hours in ISO 8601 duration '{s}'"))
+            })?;
+            total_seconds += v * 3600;
+            remaining = &remaining[pos + 1..];
+        }
+        if let Some(pos) = remaining.find('M') {
+            let v: i64 = remaining[..pos].parse().map_err(|_| {
+                DataServerError::Config(format!("Invalid minutes in ISO 8601 duration '{s}'"))
+            })?;
+            total_seconds += v * 60;
+            remaining = &remaining[pos + 1..];
+        }
+        if let Some(pos) = remaining.find('S') {
+            let v: i64 = remaining[..pos].parse().map_err(|_| {
+                DataServerError::Config(format!("Invalid seconds in ISO 8601 duration '{s}'"))
+            })?;
+            total_seconds += v;
+        }
+    }
+
+    if total_seconds <= 0 {
+        return Err(DataServerError::Config(format!(
+            "Invalid ISO 8601 duration '{s}': zero or negative duration"
+        )));
+    }
+
+    Ok(Duration::seconds(total_seconds))
+}
 
 /// Parses an OGC datetime interval string like "2024-01-01T00:00:00Z/2024-01-01T06:00:00Z"
 /// or a single instant "2024-01-01T00:00:00Z" (treated as a zero-width interval).
@@ -58,5 +119,34 @@ mod tests {
         let (start, end) = parse_datetime_interval("../2024-01-01T06:00:00Z").unwrap();
         assert_eq!(start, DateTime::<Utc>::MIN_UTC);
         assert_eq!(end.to_rfc3339(), "2024-01-01T06:00:00+00:00");
+    }
+
+    #[test]
+    fn iso8601_duration_basic() {
+        assert_eq!(
+            parse_iso8601_duration("PT12H").unwrap(),
+            Duration::seconds(12 * 3600)
+        );
+        assert_eq!(
+            parse_iso8601_duration("P1D").unwrap(),
+            Duration::seconds(86_400)
+        );
+        assert_eq!(
+            parse_iso8601_duration("P1DT6H").unwrap(),
+            Duration::seconds(86_400 + 6 * 3600)
+        );
+        assert_eq!(
+            parse_iso8601_duration("PT30M").unwrap(),
+            Duration::seconds(1800)
+        );
+    }
+
+    #[test]
+    fn iso8601_duration_rejects_bad_input() {
+        assert!(parse_iso8601_duration("").is_err());
+        assert!(parse_iso8601_duration("12H").is_err());
+        assert!(parse_iso8601_duration("PT0H").is_err());
+        assert!(parse_iso8601_duration("P0D").is_err());
+        assert!(parse_iso8601_duration("-PT2H").is_err());
     }
 }

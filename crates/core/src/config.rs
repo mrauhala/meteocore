@@ -65,6 +65,20 @@ pub struct CollectionConfig {
     pub wms: Option<WmsConfig>,
     /// PostGIS-specific configuration. Required when engine_type = "postgis".
     pub postgis: Option<PostgisConfig>,
+    /// Preview-SPA-specific tuning (e.g. bound the time slider). Optional.
+    pub preview: Option<PreviewConfig>,
+}
+
+/// Preview-SPA tuning knobs. Only affects what `/preview/manifest.json`
+/// emits — does NOT constrain the underlying engine.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PreviewConfig {
+    /// ISO 8601 positive duration (e.g. `"PT12H"`, `"P1D"`). When set, the
+    /// manifest's `temporal_extent.values` is filtered to entries within
+    /// `[max(values) - duration, max(values)]`. Useful for STAC-backed
+    /// collections whose archive spans years but whose useful slider range
+    /// is the most recent few hours.
+    pub time_window: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

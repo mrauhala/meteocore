@@ -68,6 +68,10 @@ pub struct CacheKey {
     pub width: u32,
     pub height: u32,
     pub time: Option<DateTime<Utc>>,
+    /// Optional parameter name override (e.g. `parameter-name=temperature`).
+    /// Distinct cache entries for the same (layer, style, bbox, time) when
+    /// the caller asks for a different parameter than the style's default.
+    pub parameter: Option<String>,
 }
 
 /// FNV-1a 64-bit mix. Fixed algorithm — safe to serialise into HTTP `ETag`
@@ -112,6 +116,13 @@ impl CacheKey {
                     .timestamp_nanos_opt()
                     .unwrap_or_else(|| t.timestamp_millis().saturating_mul(1_000_000));
                 fnv1a_mix(&mut h, &ts.to_le_bytes());
+            }
+            None => fnv1a_mix(&mut h, &[0u8]),
+        }
+        match &self.parameter {
+            Some(p) => {
+                fnv1a_mix(&mut h, &[1u8]);
+                fnv1a_mix(&mut h, p.as_bytes());
             }
             None => fnv1a_mix(&mut h, &[0u8]),
         }
@@ -433,6 +444,7 @@ mod tests {
                     .unwrap()
                     .with_timezone(&chrono::Utc),
             ),
+            parameter: None,
         };
         let mut later = base.clone();
         later.time = Some(
@@ -441,6 +453,28 @@ mod tests {
                 .with_timezone(&chrono::Utc),
         );
         assert_ne!(base.etag(), later.etag());
+    }
+
+    #[test]
+    fn cache_key_etag_changes_when_parameter_changes() {
+        let base = CacheKey {
+            layer: "ecmwf-fc".into(),
+            style: "default".into(),
+            format: 0,
+            crs: "EPSG:3857".into(),
+            bbox: [0, 0, 1, 1],
+            width: 256,
+            height: 256,
+            time: None,
+            parameter: Some("2t".into()),
+        };
+        let mut other = base.clone();
+        other.parameter = Some("10u".into());
+        assert_ne!(base.etag(), other.etag());
+
+        let mut absent = base.clone();
+        absent.parameter = None;
+        assert_ne!(base.etag(), absent.etag());
     }
 
     #[test]
@@ -458,7 +492,9 @@ mod tests {
             width: 256,
             height: 256,
             time: None,
+            parameter: None,
         };
-        assert_eq!(key.etag(), "\"c4df9fcd1a7f44aa\"");
+        // Pinned after introducing the `parameter` field (cache-bust event).
+        assert_eq!(key.etag(), "\"074133840641acde\"");
     }
 }

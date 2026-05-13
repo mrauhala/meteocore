@@ -703,6 +703,29 @@ async fn render_map(
         }
     };
 
+    // Parameter selection precedence: ?parameter-name= wins over style.parameter.
+    // Validate against the engine's advertised list when the query supplied one
+    // — passing through unrecognised names produces a confusing "default
+    // parameter rendered with wrong colormap" rather than a clear 400.
+    // `raster_info().parameters` is empty for single-parameter engines (GeoTIFF);
+    // in that case we just accept the query value and let the engine ignore it,
+    // matching `get_raster_tile`'s documented behavior.
+    if let Some(pname) = validated.parameter_name.as_deref() {
+        let info = engine.raster_info();
+        if !info.parameters.is_empty() && !info.parameters.iter().any(|(name, _)| name == pname) {
+            let supported: Vec<&str> = info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+            return Err(MapsError::BadRequest(format!(
+                "parameter-name '{pname}' is not available for collection '{collection_id}'. \
+                 Available: {}",
+                supported.join(", ")
+            )));
+        }
+    }
+    let effective_parameter = validated
+        .parameter_name
+        .clone()
+        .or_else(|| style_info.parameter.clone());
+
     // Build cache key
     let cache_key = CacheKey {
         layer: collection_id.to_string(),
@@ -717,6 +740,7 @@ async fn render_map(
         width: validated.width,
         height: validated.height,
         time,
+        parameter: effective_parameter.clone(),
     };
 
     let etag = cache_key.etag();
@@ -769,7 +793,7 @@ async fn render_map(
     let format = validated.format;
     let rendered_cache = state.rendered_cache.clone();
 
-    let style_parameter = style_info.parameter.as_deref().map(String::from);
+    let render_parameter = effective_parameter;
 
     let render_result = tokio::task::spawn_blocking(move || {
         let tile = engine.get_raster_tile(
@@ -778,7 +802,7 @@ async fn render_map(
             height,
             time,
             &output_crs,
-            style_parameter.as_deref(),
+            render_parameter.as_deref(),
         )?;
         // If every pixel is nodata, skip colorization + encoding entirely.
         if tile.is_empty() {

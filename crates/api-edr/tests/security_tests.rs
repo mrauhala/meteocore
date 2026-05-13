@@ -108,6 +108,7 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
             wms: None,
             grib: None,
             postgis: None,
+            preview: None,
         },
     );
     Arc::new(ArcSwap::from_pointee(EdrState {
