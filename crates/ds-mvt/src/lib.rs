@@ -11,7 +11,9 @@
 //! * **Property filtering** through a [`PropertyAllowlist`].
 //! * A small per-collection [`VectorTileCache`] keyed by the encoded inputs.
 //!
-//! Simplification, clipping, and feature-level retries are out of scope for v1.
+//! Polygon clipping at tile edges is implemented via Sutherland-Hodgman with a
+//! 1/16-extent buffer (see `encode.rs`). Simplification and feature-level
+//! retries are out of scope for v1.
 
 mod cache;
 mod encode;
