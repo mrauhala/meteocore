@@ -168,6 +168,10 @@ impl OdimEngine {
     /// when new files appear so operators can confirm the polling is
     /// alive.
     ///
+    /// The actual `read_dir` runs on `tokio::task::spawn_blocking`
+    /// so a slow filesystem (network mount, large directory) doesn't
+    /// stall the Tokio worker thread for the duration of the scan.
+    ///
     /// Errors from the scan (e.g. `data_dir` temporarily disappears)
     /// are logged at WARN and otherwise ignored — the previous
     /// catalog stays in place so live requests keep working.
@@ -178,7 +182,7 @@ impl OdimEngine {
 
         loop {
             tokio::select! {
-                _ = interval.tick() => self.poll_once(),
+                _ = interval.tick() => self.poll_once().await,
                 _ = shutdown_rx.changed() => {
                     tracing::info!("[{}] ODIM poll loop shutting down", self.collection_id);
                     break;
@@ -192,14 +196,29 @@ impl OdimEngine {
         let _ = self.shutdown_tx.send(());
     }
 
-    fn poll_once(&self) {
-        let scan = match scan_local_directory(&self.data_dir, &self.matcher, self.max_files) {
-            Ok(s) => s,
-            Err(e) => {
+    async fn poll_once(&self) {
+        let data_dir = self.data_dir.clone();
+        let matcher = self.matcher.clone();
+        let max_files = self.max_files;
+        let scan_result = tokio::task::spawn_blocking(move || {
+            scan_local_directory(&data_dir, &matcher, max_files)
+        })
+        .await;
+        let scan = match scan_result {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
                 tracing::warn!(
                     "[{}] ODIM catalog refresh failed: {}",
                     self.collection_id,
                     e
+                );
+                return;
+            }
+            Err(join_err) => {
+                tracing::error!(
+                    "[{}] ODIM catalog refresh task panicked: {}",
+                    self.collection_id,
+                    join_err
                 );
                 return;
             }
@@ -272,7 +291,21 @@ impl OdimEngine {
         // Use a path-keyed single-entry cache. Concurrent requests
         // for the same file get the same `Arc`; a swap happens only
         // when a different file is asked for.
-        if let Ok(guard) = self.cached.lock() {
+        //
+        // Mutex poison is recovered (rather than silently disabling
+        // the cache for the lifetime of the engine). The cached
+        // entry is just bytes + path — no invariants to protect —
+        // so the previous panic that poisoned the lock can't have
+        // corrupted what we're reading. An ERROR-level log on
+        // recovery makes the latent panic visible.
+        {
+            let guard = self.cached.lock().unwrap_or_else(|e| {
+                tracing::error!(
+                    "[{}] ODIM cache mutex was poisoned; recovering",
+                    self.collection_id
+                );
+                e.into_inner()
+            });
             if let Some((ref cached_path, ref cached_comp)) = *guard {
                 if cached_path == path {
                     return Ok(cached_comp.clone());
@@ -293,9 +326,14 @@ impl OdimEngine {
                 path.display()
             ))
         })?);
-        if let Ok(mut guard) = self.cached.lock() {
-            *guard = Some((path.to_path_buf(), composite.clone()));
-        }
+        let mut guard = self.cached.lock().unwrap_or_else(|e| {
+            tracing::error!(
+                "[{}] ODIM cache mutex was poisoned on insert; recovering",
+                self.collection_id
+            );
+            e.into_inner()
+        });
+        *guard = Some((path.to_path_buf(), composite.clone()));
         Ok(composite)
     }
 }
@@ -412,16 +450,20 @@ impl MapEngine for OdimEngine {
     fn raster_info(&self) -> RasterInfo {
         // Read native_crs and spatial_extent from the seed-loaded
         // composite under a single lock acquisition. Times come from
-        // the catalog (separate lock-free ArcSwap snapshot).
-        let (native_crs, spatial_extent) = self
-            .cached
-            .lock()
-            .ok()
-            .and_then(|g| {
-                g.as_ref()
-                    .map(|(_, c)| (crs_label(&c.crs), Some(c.wgs84_corners)))
-            })
+        // the catalog (separate lock-free ArcSwap snapshot). Recover
+        // from a poisoned mutex (same rationale as `load_composite`).
+        let cached_guard = self.cached.lock().unwrap_or_else(|e| {
+            tracing::error!(
+                "[{}] ODIM cache mutex was poisoned in raster_info; recovering",
+                self.collection_id
+            );
+            e.into_inner()
+        });
+        let (native_crs, spatial_extent) = cached_guard
+            .as_ref()
+            .map(|(_, c)| (crs_label(&c.crs), Some(c.wgs84_corners)))
             .unwrap_or_else(|| ("unknown".into(), None));
+        drop(cached_guard);
 
         let times: Vec<DateTime<Utc>> = self.catalog.load().iter().map(|e| e.time).collect();
 

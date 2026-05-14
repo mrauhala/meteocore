@@ -28,6 +28,11 @@ pub enum CatalogError {
     NoStrftimeCodes { template: String },
     #[error("filename_template `{template}` contains unknown strftime code `{code}`")]
     UnknownCode { template: String, code: String },
+    #[error(
+        "filename_template `{template}` has non-contiguous strftime codes (more than one block of date/time codes separated by literal text — e.g. `%Y_STATION_%H%M.h5`). \
+         The template parser expects all strftime codes to form a single block. Use the explicit `filename_pattern` + `timestamp_format` config form for split layouts."
+    )]
+    SplitTimestamp { template: String },
     #[error("invalid regex `{pattern}`: {source}")]
     InvalidRegex {
         pattern: String,
@@ -179,6 +184,7 @@ fn expand_template(template: &str) -> Result<(String, String), CatalogError> {
     let mut format = String::new();
     let mut in_timestamp = false;
     let mut timestamp_started = false;
+    let mut timestamp_closed = false;
     let bytes = template.as_bytes();
     let mut i = 0;
 
@@ -188,6 +194,16 @@ fn expand_template(template: &str) -> Result<(String, String), CatalogError> {
             for &(code, re) in CODES {
                 if template[i..].starts_with(code) {
                     if !in_timestamp {
+                        // Re-entering the timestamp region after it
+                        // was already closed = split layout. Emit a
+                        // dedicated error rather than letting `Regex::new`
+                        // reject the "duplicate named capture group"
+                        // with an opaque message.
+                        if timestamp_closed {
+                            return Err(CatalogError::SplitTimestamp {
+                                template: template.to_string(),
+                            });
+                        }
                         regex.push_str("(?P<timestamp>");
                         in_timestamp = true;
                     }
@@ -224,10 +240,12 @@ fn expand_template(template: &str) -> Result<(String, String), CatalogError> {
                     regex.push('Z');
                     regex.push(')');
                     in_timestamp = false;
+                    timestamp_closed = true;
                     i += 1;
                 } else {
                     regex.push(')');
                     in_timestamp = false;
+                    timestamp_closed = true;
                     regex.push_str(&regex::escape(&ch.to_string()));
                     i += 1;
                 }
@@ -278,6 +296,24 @@ mod tests {
         let m = FilenameMatcher::from_template("radar_%Y%m%dT%H%MZ.h5").unwrap();
         let ts = m.parse_timestamp("radar_20250714T1530Z.h5").unwrap();
         assert_eq!(ts.to_rfc3339(), "2025-07-14T15:30:00+00:00");
+    }
+
+    /// A template with two disjoint strftime blocks (e.g.
+    /// `%Y_STATION_%H%M.h5`) would emit two `(?P<timestamp>...)`
+    /// regex groups, which the `regex` crate rejects with an opaque
+    /// "duplicate named capture group" error. We catch this at
+    /// expand time with a dedicated `SplitTimestamp` variant so the
+    /// operator gets a clear hint to use the explicit
+    /// `filename_pattern` + `timestamp_format` form instead.
+    #[test]
+    fn split_timestamp_template_is_an_error() {
+        let err = FilenameMatcher::from_template("%Y_STATION_%H%M.h5").unwrap_err();
+        match err {
+            CatalogError::SplitTimestamp { ref template } => {
+                assert_eq!(template, "%Y_STATION_%H%M.h5");
+            }
+            other => panic!("expected SplitTimestamp, got {other:?}"),
+        }
     }
 
     /// Filenames that don't match the regex should return `None`,
