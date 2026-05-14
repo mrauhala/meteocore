@@ -356,31 +356,21 @@ pub struct OdimConfig {
     /// Directory poll interval in seconds. Default: 30.
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
-    /// Glob patterns for files to skip (e.g. atomic-write tempfiles).
-    /// Default: `["*.tmp", "*.part"]`.
-    #[serde(default = "default_exclude_patterns")]
-    pub exclude_patterns: Vec<String>,
     /// Maximum number of files to keep in the catalog (most recent by
-    /// timestamp). Default: unbounded. Useful for S3 sources where
-    /// the bucket may hold years of history.
+    /// timestamp). Default: unbounded. Useful for sources where the
+    /// directory may hold years of history.
     pub max_files: Option<usize>,
 
-    /// S3-compatible endpoint URL. When set with `bucket`, replaces
-    /// `data_path` for remote access. E.g.
-    /// `"https://fmi-opendata-radar-volume-hdf5.s3.amazonaws.com"`.
+    /// S3-compatible endpoint URL. Phase 1 ignores this — Phase 2 will
+    /// wire S3 catalogs via `ds-storage::ObjectStore`. Engine boots
+    /// with a WARN if set, so a config typo doesn't silently fall
+    /// back to local-directory mode.
     pub endpoint: Option<String>,
-    /// S3 bucket name. Required when `endpoint` is set.
+    /// S3 bucket name. Phase 2; ignored with WARN in Phase 1.
     pub bucket: Option<String>,
-    /// Object prefix, optionally with strftime templates. Re-evaluated
-    /// each poll cycle so it stays current across date boundaries.
-    /// E.g. `"%Y/%m/%d/fikor/"` for FMI's date-partitioned layout.
+    /// Object prefix, optionally with strftime templates. Phase 2;
+    /// ignored with WARN in Phase 1.
     pub prefix_pattern: Option<String>,
-    /// ISO 8601 duration for file-window filtering. Negative ⇒ past
-    /// (observations), e.g. `"-PT2H"` keeps the last 2 hours.
-    pub time_window: Option<String>,
-    /// Number of days to scan when `prefix_pattern` carries date
-    /// templates. Default: auto-derived from `time_window`.
-    pub scan_days: Option<u32>,
 }
 
 fn default_grib_poll_interval() -> u64 {

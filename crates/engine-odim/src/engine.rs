@@ -287,6 +287,16 @@ impl OdimEngine {
         }
     }
 
+    /// Read + parse the ODIM file at `path` and return a shared
+    /// `Arc<OdimComposite>` snapshot. Cached single-entry by path.
+    ///
+    /// **Blocking call** — uses `std::fs::read` and HDF5 parsing
+    /// directly. Callers from async contexts must wrap in
+    /// `tokio::task::spawn_blocking`. The `MapEngine::get_raster_tile`
+    /// call chain already runs inside `spawn_blocking` (the WMS /
+    /// Maps / Tiles handlers do this); a future `EdrEngine` impl
+    /// or a health-check pre-warmer would need its own
+    /// `spawn_blocking` to avoid stalling Tokio workers.
     fn load_composite(&self, path: &Path) -> Result<Arc<OdimComposite>, DataServerError> {
         // Use a path-keyed single-entry cache. Concurrent requests
         // for the same file get the same `Arc`; a swap happens only
