@@ -862,7 +862,10 @@ async fn render_map(
 
     // Content-derived ETag now available — do the `If-None-Match`
     // comparison here, after rendering. Same flow as `render_vector_tile`
-    // in api-tiles.
+    // in api-tiles. `x-cache` is *intentionally* absent on this 304: the
+    // cache-HIT 304 above emits `x-cache: HIT`, and the absence here is
+    // what lets clients (and the regression test) tell the two branches
+    // apart. Adding `x-cache: MISS` here would silently break that.
     if let Some(ref inm) = if_none_match {
         if ds_render::etag_matches(inm, cached.etag()) {
             return Ok(axum::response::Response::builder()

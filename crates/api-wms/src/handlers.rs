@@ -284,6 +284,12 @@ pub async fn wms_handler(
             // miss → encode → revalidate against fresh ETag.
             if let Some(ref inm) = if_none_match {
                 if ds_render::etag_matches(inm, cached.etag()) {
+                    // `x-cache` is *intentionally* absent here. The HIT-path
+                    // 304 above emits `x-cache: HIT`; the absence on this
+                    // post-render path is what lets clients and the
+                    // regression test (`if_none_match_after_cache_warm_...`)
+                    // distinguish the two branches. Adding `x-cache: MISS`
+                    // here would silently break that invariant.
                     return Ok(axum::response::Response::builder()
                         .status(StatusCode::NOT_MODIFIED)
                         .header(header::ETAG, cached.etag())
