@@ -270,7 +270,15 @@ impl OdimEngine {
                 .iter()
                 .min_by_key(|e| (e.time - target).num_seconds().abs())?;
             let gap = (pick.time - target).num_seconds().abs();
-            let stale_threshold = (self.poll_interval.as_secs() * 2).max(60) as i64;
+            // Stale-match threshold: 2× the poll interval, with a 600s
+            // floor. The floor accommodates real radar feeds which
+            // typically arrive at 5-minute cadence — without it, the
+            // default 30-second poll_interval would trip the warning
+            // on healthy feeds whenever the requested time happened
+            // to fall in the middle of a 5-min window. 600s is a
+            // conservative envelope around the 5-min cadence + clock
+            // skew + late arrivals.
+            let stale_threshold = (self.poll_interval.as_secs() * 2).max(600) as i64;
             if gap > stale_threshold {
                 tracing::warn!(
                     "[{}] ODIM request at {} matched stale entry {} (gap {}s > {}s threshold)",
