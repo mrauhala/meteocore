@@ -43,7 +43,8 @@ impl WmsError {
 
     pub fn invalid_format(format: &str) -> Self {
         WmsError::InvalidFormat(format!(
-            "Format '{format}' is not supported. Use image/png."
+            "Format '{format}' is not supported. Use {}.",
+            crate::params::SUPPORTED_FORMATS.join(", ")
         ))
     }
 
@@ -216,5 +217,22 @@ mod tests {
             !xml_str.contains("10.0.0.5"),
             "body must not echo internal connection detail, got {xml_str}"
         );
+    }
+
+    /// Lock the `InvalidFormat` message to `params::SUPPORTED_FORMATS` so a
+    /// future format addition can't leave the error hint stale. The
+    /// drift-guard test in params.rs only asserts the slice round-trips
+    /// through `parse_image_format`; the rejection message lives here.
+    #[test]
+    fn invalid_format_message_lists_every_supported_format() {
+        let WmsError::InvalidFormat(msg) = WmsError::invalid_format("image/gif") else {
+            panic!("invalid_format() must produce InvalidFormat");
+        };
+        for fmt in crate::params::SUPPORTED_FORMATS {
+            assert!(
+                msg.contains(fmt),
+                "InvalidFormat message {msg:?} should mention {fmt:?}"
+            );
+        }
     }
 }

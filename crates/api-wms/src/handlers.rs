@@ -311,10 +311,7 @@ pub async fn wms_handler(
             let width = width.min(256);
             let height = height.min(1024);
 
-            let format = match query.format.as_deref() {
-                Some("image/jpeg") => ds_render::ImageFormat::Jpeg,
-                _ => ds_render::ImageFormat::Png,
-            };
+            let format = crate::params::parse_image_format(query.format.as_deref())?;
 
             let colormap = style_info.colormap.clone();
             let min = style_info.min;

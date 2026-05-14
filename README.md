@@ -155,7 +155,7 @@ The render semaphore (sized to 2× available CPU cores, minimum 8) and rendered 
 
 /wms/?SERVICE=WMS&REQUEST=GetCapabilities      WMS 1.3.0 GetCapabilities (XML)
 /wms/?SERVICE=WMS&REQUEST=GetMap&...           WMS 1.3.0 GetMap (PNG/JPEG/WebP)
-/wms/?SERVICE=WMS&REQUEST=GetLegendGraphic&... WMS 1.3.0 GetLegendGraphic (PNG/JPEG)
+/wms/?SERVICE=WMS&REQUEST=GetLegendGraphic&... WMS 1.3.0 GetLegendGraphic (PNG/JPEG/WebP)
 
 /preview                                       Built-in MapLibre SPA (cards + map for every collection)
 /preview/manifest.json                         Aggregated discovery JSON consumed by the SPA
@@ -777,7 +777,7 @@ Internally the handler normalizes everything to WGS84 `[west, south, east, north
 | `STYLES` | no | `default` | Style name. Note: only the plural form works on this endpoint, unlike GetMap which accepts both. Tracked in #165. |
 | `WIDTH` | no | `40` | Pixels, capped at 256 |
 | `HEIGHT` | no | `200` | Pixels, capped at 1024 |
-| `FORMAT` | no | `image/png` | `image/png` or `image/jpeg`. Any other value (including the `image/webp` that capabilities advertises) silently falls back to PNG with `Content-Type: image/png` — no error is raised. Tracked in #161. |
+| `FORMAT` | no | `image/png` | `image/png`, `image/jpeg`, or `image/webp`. Any other value returns `InvalidFormat`. |
 
 Legends are static — they always carry `Cache-Control: public, max-age=86400, immutable`.
 
@@ -863,7 +863,7 @@ Or attach a reusable `[[style_bundles]]` block defined in top-level `config.toml
 | `LAYERS` count | exactly 1 |
 | Supported CRS | `CRS:84`, `EPSG:4326`, `EPSG:3857`, `EPSG:3067`, `EPSG:3035` |
 | Supported `FORMAT` (GetMap) | `image/png`, `image/jpeg`, `image/webp` |
-| Supported `FORMAT` (GetLegendGraphic) | `image/png`, `image/jpeg` |
+| Supported `FORMAT` (GetLegendGraphic) | `image/png`, `image/jpeg`, `image/webp` |
 
 ## OGC API - Maps
 
@@ -912,7 +912,6 @@ PNG/WebP responses are always RGBA (transparent for empty tiles). JPEG is RGB. E
 - `bbox` is always lon/lat (no CRS-dependent axis swap)
 - Multi-parameter selection uses `?parameter-name=`, not `LAYERS=collection/param`
 - Errors are JSON, not `ServiceExceptionReport` XML
-- WebP is a first-class output format (WMS accepts it on GetMap but not on GetLegendGraphic)
 
 ### Conformance Classes
 
