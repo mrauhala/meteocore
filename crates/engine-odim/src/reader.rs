@@ -1,13 +1,28 @@
-//! ODIM_H5 v2.x composite-reflectivity reader.
+//! ODIM_H5 composite-reflectivity reader.
 //!
 //! Parses the four pieces of metadata that distinguish an ODIM
 //! composite (COMP) file from an arbitrary HDF5 file:
 //!
 //! - `/what` — `object` (`"COMP"`), `date`/`time` (UTC stamp)
 //! - `/where` — `projdef` (PROJ.4 string), `xsize`/`ysize`,
-//!   `LL_lon`/`LL_lat`/`UR_lon`/`UR_lat` (corner coordinates in WGS84)
-//! - `/dataset1/what` — `quantity`, `gain`, `offset`, `nodata`
+//!   four corner coordinates in WGS84
+//! - per-quantity `what` group — `quantity`, `gain`, `offset`, `nodata`
 //! - `/dataset1/data1/data` — the raw 2D scaled-integer pixel array
+//!
+//! Verified producers (and their layout quirks):
+//!
+//! | Producer | ODIM version | Pixel type | Quirks                                              |
+//! |----------|--------------|------------|-----------------------------------------------------|
+//! | DMI      | v2.0         | u8         | No `/where/xsize`/`ysize`; gain/offset/nodata at root `/what`; quantity as attr on `/dataset1/data1` |
+//! | SMHI     | v2.2         | u8         | Canonical `/dataset1/data1/what/*` layout; DEFLATE compression currently fails through `hdf5-reader` 0.4 (upstream bug) |
+//!
+//! "Canonical" here means the layout described in ODIM_H5 v2.4
+//! §7.4 — gain/offset/nodata/quantity under `/dataset<n>/data<m>/what`.
+//! FMI and OPERA composites are expected to follow the canonical
+//! layout but neither has been wired through the reader yet:
+//! FMI's open-data S3 bucket ships PVOL HDF5 only (no COMP), and
+//! OPERA HDF5 on cloudferro is PVOL+SCAN. Phase 2 (STAC) will
+//! introduce additional composite sources.
 //!
 //! The output is an [`OdimComposite`] containing the parsed
 //! [`Crs`], a native-coordinate bbox, the timestamp, parameter
@@ -19,8 +34,8 @@
 //!
 //! Phase 1 narrows the scope further than the format allows:
 //! - Single dataset (`/dataset1` only), single data layer (`/data1`)
-//! - Only `u8` and `u16` raw pixel types — the two ODIM v2.x
-//!   composites we've seen in the wild use these
+//! - Only `u8` and `u16` raw pixel types — both verified ODIM v2.x
+//!   composites we've seen use these
 //! - No quality layers, no how/* attributes, no PVOL volume data
 //!
 //! See [[project_odim_engine_plan]] for the full multi-phase plan.
@@ -225,10 +240,11 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     let rows = shape[0] as usize;
     let cols = shape[1] as usize;
 
-    // Prefer explicit `/where/xsize`/`ysize` (FMI/OPERA canonical),
-    // fall back to the data-array shape (DMI variant). If both exist
-    // and disagree, trust /where — the spec wins over what could be
-    // a transposed array on the producer side.
+    // Prefer explicit `/where/xsize`/`ysize` when present (SMHI v2.2
+    // ships them); fall back to the data-array shape (DMI v2.0
+    // doesn't). If both exist and disagree, trust /where — the spec
+    // wins over what could be a transposed array on the producer
+    // side.
     let xsize = read_f64_attr("/where", "xsize")
         .map(|v| v as u32)
         .unwrap_or(cols as u32);
@@ -242,13 +258,14 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     // our forward function. This is **far more robust** than taking
     // the envelope of all four projected corners:
     //
-    //   - Our `Crs::Stereographic` uses an ellipsoidal
-    //     conformal-sphere formula. ODIM producers typically use a
-    //     plain spherical stereographic with R=6378137 (or R=6371228
-    //     for OPERA). The two disagree by ~50% in scale ~1000km from
-    //     the projection origin — the envelope of all four corners
-    //     ends up too wide, dx/dy too large, and ~all output pixels
-    //     miss the data.
+    //   - Our `Crs::Stereographic` and the producer's projection
+    //     may not numerically agree at the edges of the grid even
+    //     when both implement the same EPSG formulation (different
+    //     ellipsoid choices — DMI uses WGS84, SMHI uses Bessel —
+    //     plus implementation details). The envelope of all four
+    //     forward-projected corners thus picks up those errors and
+    //     ends up off-axis or off-size; under that bbox most output
+    //     samples miss the actual data.
     //
     //   - With xscale/yscale + anchor, the grid width/height is
     //     definitionally correct (= xsize·xscale, ysize·yscale)
@@ -278,12 +295,12 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     );
 
     // gain/offset/nodata/quantity location varies by producer:
-    // - FMI/OPERA canonical:    /dataset1/what/{gain,offset,nodata,quantity}
-    // - Alternate canonical:    /dataset1/data1/what/{...}     (some EUMETNET files)
-    // - DMI variant:            /what/{gain,offset,nodata}     at the file root,
-    //                           and `quantity` as an attribute on /dataset1/data1
-    //                           (or `/what/product` as last resort)
-    // Try each path in order. The first hit wins.
+    // - Canonical (ODIM v2.4 §7.4):  /dataset1/data1/what/{...}    (SMHI v2.2 verified)
+    // - Earlier producers:           /dataset1/what/{...}          (some EUMETNET files)
+    // - DMI variant (v2.0):          /what/{gain,offset,nodata}    at the file root,
+    //                                with `quantity` as an attribute on /dataset1/data1
+    //                                (or `/what/product` as last resort)
+    // Try each path in order; the first hit wins.
     let what_paths = ["/dataset1/what", "/dataset1/data1/what", "/what"];
     let read_first_f64 = |name: &str| -> Result<f64, ReadError> {
         for p in &what_paths {
