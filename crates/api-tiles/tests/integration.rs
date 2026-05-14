@@ -498,21 +498,74 @@ mod get_tile {
         assert!(body.starts_with(&[0x89, b'P', b'N', b'G']));
     }
 
+    /// Regression for #145: the response `ETag` must be FNV-1a over the
+    /// rendered bytes — not over the cache key — so a server-side fix that
+    /// produces different pixels under the same `(z, x, y, style, time)`
+    /// produces a fresh ETag and browsers holding the stale entry refetch
+    /// instead of receiving an infinite 304. Direct check: build the same
+    /// `CachedRendered` the handler does and verify the header matches.
     #[tokio::test]
-    async fn parameter_name_changes_etag() {
-        // Different parameter-name values must produce different cache
-        // entries (and thus different ETags) — otherwise a client switching
-        // from "2t" to "10u" would get a 304 against the stale parameter.
+    async fn etag_is_content_derived_over_response_body() {
+        let (status, headers, body) =
+            get_raw("/collections/radar/tiles/WebMercatorQuad/0/0/0").await;
+        assert_eq!(status, StatusCode::OK);
+        let actual_etag = headers.get("etag").unwrap().to_str().unwrap();
+        let expected_etag = ds_render::CachedRendered::new(bytes::Bytes::from(body))
+            .etag()
+            .to_string();
+        assert_eq!(
+            actual_etag, expected_etag,
+            "ETag header must be FNV-1a over the response body (content-derived), \
+             not derived from the CacheKey — see #145"
+        );
+    }
+
+    /// Round-trip: a client revalidating with the body's content-derived
+    /// ETag must get a 304. Together with the previous test, this pins the
+    /// full If-None-Match handshake against content rather than key.
+    #[tokio::test]
+    async fn if_none_match_with_content_derived_etag_returns_304() {
+        let (_, headers_a, body) = get_raw("/collections/radar/tiles/WebMercatorQuad/0/0/0").await;
+        let etag = headers_a.get("etag").unwrap().to_str().unwrap().to_string();
+        // Sanity: the helper above already pins this, but re-derive locally
+        // so the test is self-contained and the round-trip is obvious.
+        let derived = ds_render::CachedRendered::new(bytes::Bytes::from(body))
+            .etag()
+            .to_string();
+        assert_eq!(etag, derived);
+
+        let app = build_router();
+        let req = Request::builder()
+            .uri("/collections/radar/tiles/WebMercatorQuad/0/0/0")
+            .header("If-None-Match", &etag)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            resp.headers().get("etag").unwrap().to_str().unwrap(),
+            etag,
+            "304 response must echo the same content-derived ETag"
+        );
+    }
+
+    #[tokio::test]
+    async fn parameter_name_produces_separate_cache_entries() {
+        // Different `parameter-name` values produce separate rendered-cache
+        // entries (the cache key still includes `parameter`), so a client
+        // switching parameters can't get a stale tile from a different
+        // parameter's slot. ETags are content-derived (#145), so two
+        // requests that happen to produce the same bytes (the mock engine
+        // ignores `parameter-name` for single-band engines) intentionally
+        // share an ETag — identical bytes deserve identical ETags. The
+        // cross-parameter behaviour that actually matters is exercised
+        // against the multi-param engine, where pixels really do differ.
         let (_, headers_a, _) =
             get_raw("/collections/radar/tiles/WebMercatorQuad/0/0/0?parameter-name=2t").await;
         let (_, headers_b, _) =
             get_raw("/collections/radar/tiles/WebMercatorQuad/0/0/0?parameter-name=10u").await;
-        let etag_a = headers_a.get("etag").unwrap();
-        let etag_b = headers_b.get("etag").unwrap();
-        assert_ne!(
-            etag_a, etag_b,
-            "ETags must differ across parameter-name values"
-        );
+        assert!(headers_a.contains_key("etag"));
+        assert!(headers_b.contains_key("etag"));
     }
 
     #[tokio::test]

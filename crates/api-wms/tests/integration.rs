@@ -296,3 +296,171 @@ async fn error_tile_forces_png_content_type_even_when_jpeg_requested() {
         &body[..4.min(body.len())]
     );
 }
+
+/// Mock engine that returns a populated `RasterTile` so the regular
+/// `Ok(Some(bytes))` render+encode path runs (the EMPTY/ERROR paths
+/// have separate coverage above). Used by the #145 ETag regression
+/// tests.
+struct PopulatedMockMapEngine;
+
+impl MapEngine for PopulatedMockMapEngine {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+    ) -> Result<RasterTile, DataServerError> {
+        let pixel_count = (width * height) as usize;
+        // Linear gradient — yields a non-uniform PNG so the test isn't
+        // accidentally cheating by serving the EMPTY_TILE_PNG fast path.
+        let values: Vec<Option<f64>> = (0..pixel_count)
+            .map(|i| Some(i as f64 / pixel_count as f64))
+            .collect();
+        Ok(RasterTile {
+            width,
+            height,
+            values,
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            native_crs: "EPSG:4326".into(),
+            spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
+            times: vec![chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)],
+            parameter: "reflectivity".into(),
+            unit: "dBZ".into(),
+            parameters: vec![],
+        }
+    }
+}
+
+fn build_populated_router() -> axum::Router {
+    let engine: Arc<dyn MapEngine> = Arc::new(PopulatedMockMapEngine);
+    let mut engines = HashMap::new();
+    let mut collections = HashMap::new();
+    let mut styles_map = HashMap::new();
+
+    engines.insert("radar".to_string(), engine);
+    collections.insert(
+        "radar".to_string(),
+        CollectionConfig {
+            id: "radar".to_string(),
+            title: "Radar".to_string(),
+            description: "Populated mock for #145 ETag tests".into(),
+            data_path: None,
+            apis: vec!["wms".to_string()],
+            engine_type: "geotiff".to_string(),
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            postgis: None,
+            preview: None,
+        },
+    );
+
+    let cmap = Arc::new(LutColorMap::from_builtin(
+        BuiltinColormap::Viridis,
+        0.0,
+        1.0,
+    ));
+    let mut layer_styles = HashMap::new();
+    layer_styles.insert(
+        "default".to_string(),
+        StyleInfo {
+            name: "default".to_string(),
+            title: "Default".to_string(),
+            colormap: cmap,
+            min: 0.0,
+            max: 1.0,
+            parameter: None,
+        },
+    );
+    styles_map.insert("radar".to_string(), layer_styles);
+
+    let state = Arc::new(ArcSwap::from_pointee(WmsState {
+        engines,
+        collections,
+        styles: styles_map,
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        base_url: String::new(),
+    }));
+    api_wms::router(state)
+}
+
+const GETMAP_URI: &str = "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=radar\
+                          &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64\
+                          &FORMAT=image/png";
+
+/// Regression for #145: the WMS GetMap ETag must be FNV-1a over the
+/// rendered bytes — not over the cache key — so a server-side fix
+/// that produces different pixels under the same key surfaces a
+/// fresh ETag and clients holding the stale entry refetch instead
+/// of receiving an infinite 304.
+#[tokio::test]
+async fn etag_is_content_derived_over_response_body() {
+    let app = build_populated_router();
+    let req = Request::builder()
+        .uri(GETMAP_URI)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let headers = resp.headers().clone();
+    let actual_etag = headers.get("etag").unwrap().to_str().unwrap().to_string();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let expected_etag = ds_render::CachedRendered::new(body).etag().to_string();
+    assert_eq!(
+        actual_etag, expected_etag,
+        "ETag header must be FNV-1a over the response body (content-derived), \
+         not derived from the CacheKey — see #145"
+    );
+}
+
+/// Round-trip: a client revalidating with the body's content-derived
+/// ETag must get a 304 with the same ETag echoed back.
+#[tokio::test]
+async fn if_none_match_with_content_derived_etag_returns_304() {
+    let app_a = build_populated_router();
+    let resp_a = app_a
+        .oneshot(
+            Request::builder()
+                .uri(GETMAP_URI)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let etag = resp_a
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let app_b = build_populated_router();
+    let resp_b = app_b
+        .oneshot(
+            Request::builder()
+                .uri(GETMAP_URI)
+                .header("If-None-Match", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_b.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        resp_b.headers().get("etag").unwrap().to_str().unwrap(),
+        etag,
+        "304 response must echo the same content-derived ETag"
+    );
+}
