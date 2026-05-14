@@ -154,8 +154,8 @@ The render semaphore (sized to 2× available CPU cores, minimum 8) and rendered 
 /tiles/collections/{id}/styles/{styleId}/tiles/{tms}/{z}/{row}/{col}  Get styled tile
 
 /wms/?SERVICE=WMS&REQUEST=GetCapabilities      WMS 1.3.0 GetCapabilities (XML)
-/wms/?SERVICE=WMS&REQUEST=GetMap&...           WMS 1.3.0 GetMap (PNG image)
-/wms/?SERVICE=WMS&REQUEST=GetLegendGraphic&... WMS 1.3.0 GetLegendGraphic
+/wms/?SERVICE=WMS&REQUEST=GetMap&...           WMS 1.3.0 GetMap (PNG/JPEG/WebP)
+/wms/?SERVICE=WMS&REQUEST=GetLegendGraphic&... WMS 1.3.0 GetLegendGraphic (PNG/JPEG)
 
 /preview                                       Built-in MapLibre SPA (cards + map for every collection)
 /preview/manifest.json                         Aggregated discovery JSON consumed by the SPA
@@ -721,11 +721,22 @@ observed_property = "air_temperature"
 
 ## WMS 1.3.0
 
-Single `/wms/` route dispatches on the `REQUEST` query parameter:
+A single `/wms/` endpoint dispatches on the `REQUEST` query parameter:
 
-- **GetCapabilities**: XML capabilities with layers, CRS, extents, time dimension, styles
-- **GetMap**: Map image (PNG or JPEG)
-- **GetLegendGraphic**: Legend image showing colormap scale
+- **GetCapabilities** — XML capabilities listing layers, CRS, extents, time dimension, and styles
+- **GetMap** — render a map image as PNG, JPEG, or WebP
+- **GetLegendGraphic** — render a colormap legend strip
+
+WMS, OGC API - Maps, and OGC API - Tiles share the same `MapEngine`, render semaphore, rendered-image cache, and colormaps. Only the HTTP layer is WMS-specific.
+
+### Layer Names
+
+A layer name is either:
+
+- `{collection-id}` — for single-parameter engines (e.g. GeoTIFF)
+- `{collection-id}/{parameter}` — for multi-parameter engines (GRIB, multi-param QueryData)
+
+For multi-parameter engines, GetCapabilities emits a non-requestable parent layer (no `<Name>`) wrapping one child layer per parameter. `LAYERS=ecmwf-ifs/2t` requests the `2t` parameter; `LAYERS=ecmwf-ifs` returns `LayerNotDefined` because the parent is not directly requestable. A parameter that the engine doesn't advertise also returns `LayerNotDefined` (rather than silently falling back to the default), so callers can't cache a wrong-parameter image under a typo.
 
 ### GetMap Parameters
 
@@ -734,51 +745,77 @@ Single `/wms/` route dispatches on the `REQUEST` query parameter:
 | `SERVICE` | yes | Must be `WMS` |
 | `VERSION` | yes | Must be `1.3.0` |
 | `REQUEST` | yes | `GetMap` |
-| `LAYERS` | yes | Single layer name (= collection ID) |
+| `LAYERS` | yes | One layer name (see [Layer Names](#layer-names)) — exactly one |
 | `CRS` | yes | `CRS:84`, `EPSG:4326`, `EPSG:3857`, `EPSG:3067`, or `EPSG:3035` |
 | `BBOX` | yes | Bounding box — axis order depends on CRS (see below) |
-| `WIDTH` | yes | Image width in pixels (max 4096) |
-| `HEIGHT` | yes | Image height in pixels (max 4096) |
-| `FORMAT` | yes | `image/png` or `image/jpeg` |
-| `TRANSPARENT` | no | Default `TRUE` |
-| `STYLES` | no | Style name (default: `default`) |
-| `TIME` | no | ISO 8601 timestamp; defaults to latest available |
+| `WIDTH` | yes | Image width in pixels (max 8000) |
+| `HEIGHT` | yes | Image height in pixels (max 8000) |
+| `FORMAT` | yes | `image/png`, `image/jpeg`, or `image/webp` |
+| `STYLES` | no | Style name (empty or missing = `default`) |
+| `TIME` | no | ISO 8601 timestamp; defaults to the latest available |
+| `TRANSPARENT` | no | Accepted but currently a no-op — PNG/WebP output is always RGBA |
+| `BGCOLOR` | no | Accepted but ignored |
 
-### WMS 1.3.0 Axis Order
+### WMS 1.3.0 BBOX Axis Order
 
-**Critical:** WMS 1.3.0 BBOX axis order depends on the CRS:
+WMS 1.3.0 axis order is CRS-dependent:
 
-- **CRS:84**: `BBOX=west,south,east,north` (lon/lat)
-- **EPSG:4326**: `BBOX=south,west,north,east` (lat/lon — swapped!)
-- **EPSG:3857, EPSG:3067, EPSG:3035**: `BBOX=minx,miny,maxx,maxy` (easting/northing)
+| CRS | Axis order | Example for the same area |
+|-----|------------|---------------------------|
+| `CRS:84` | lon/lat | `BBOX=10,55,30,70` |
+| `EPSG:4326` | **lat/lon — swapped!** | `BBOX=55,10,70,30` |
+| `EPSG:3857` | easting/northing (meters) | `BBOX=1113194,7361866,3339584,11271098` |
+| `EPSG:3067`, `EPSG:3035` | easting/northing (meters) | — |
 
-### WMS Error Handling
+Internally the handler normalizes everything to WGS84 `[west, south, east, north]`. Test with both `CRS:84` and `EPSG:4326` if you maintain a client — getting this wrong silently rotates the image.
 
-Errors are returned as XML `ServiceExceptionReport` documents with WMS-specific error codes: `LayerNotDefined`, `CRSNotDefined`, `InvalidDimensionValue`, `MissingParameterValue`, `InvalidFormat`, etc.
+### GetLegendGraphic Parameters
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `LAYER` (or `LAYERS`) | yes | — | Collection ID (`{id}/{param}` is accepted but the legend depends only on the collection's styles) |
+| `STYLE` (or `STYLES`) | no | `default` | Style name |
+| `WIDTH` | no | `40` | Pixels, capped at 256 |
+| `HEIGHT` | no | `200` | Pixels, capped at 1024 |
+| `FORMAT` | no | `image/png` | `image/png` or `image/jpeg` (WebP is advertised in capabilities but legends are PNG/JPEG only) |
+
+Legends are static — they always carry `Cache-Control: public, max-age=86400, immutable`.
+
+### Errors
+
+Errors are returned as `ServiceExceptionReport` XML with WMS 1.3.0 error codes: `LayerNotDefined`, `StyleNotDefined`, `CRSNotDefined`, `InvalidDimensionValue`, `MissingParameterValue`, `InvalidFormat`, `InvalidParameterValue`, `OperationNotSupported`. HTTP status is 400 for client errors, 503 when the render semaphore is saturated (`Server busy, try again later`), and 500 for internal errors (the message is redacted in the response body; the original detail is captured via `tracing::warn!` for operators).
 
 ### Rendering Pipeline
 
-1. Parse WMS parameters, validate, normalize bbox axis order
-2. Look up `MapEngine` by layer name (= collection ID)
-3. Check rendered image cache (LRU, keyed by quantized bbox + layer + time)
-4. If miss: await render semaphore, call `MapEngine::get_raster_tile()` on a blocking thread
-5. Engine projects bbox to source CRS, selects best overview level, reads source tiles, resamples to output dimensions (nearest-neighbor)
-6. If tile is all nodata: return transparent PNG without caching
-7. Apply colormap (LUT for integer data, linear interpolation for continuous data) -> RGBA buffer
-8. Encode RGBA -> PNG, cache, return
+1. Parse and validate WMS parameters; normalize BBOX to WGS84 `[west, south, east, north]`.
+2. Resolve `MapEngine` by collection ID. For `{id}/{param}` layers, validate `{param}` against `RasterInfo::parameters`.
+3. Build a cache key from quantized bbox, layer, style, format, CRS, width, height, time, and parameter, and compute its ETag.
+4. If the request carries `If-None-Match` and the ETag matches, return `304 Not Modified` immediately.
+5. Check the rendered-image cache (shared LRU). On hit: serve with `X-Cache: HIT`.
+6. On miss: acquire a render semaphore permit (timed out → 503). Run `MapEngine::get_raster_tile()` on a blocking thread — the engine projects the bbox into the source CRS, picks the best overview, reads source tiles, and resamples (nearest-neighbor).
+7. If the tile is all nodata, return a transparent PNG and do not cache.
+8. Otherwise colorize (LUT for discrete data, linear gradient for continuous), encode to PNG/JPEG/WebP, cache, and serve with `X-Cache: MISS`.
 
-### Colormaps
+### Styling (shared with Maps and Tiles)
 
-| Built-in Name | Description | Default Range |
-|---------------|-------------|---------------|
-| `radar_dbz` | Standard radar reflectivity (blue->green->yellow->red) | 0-70 dBZ |
-| `grayscale` | Linear black->white | 0-1 |
-| `viridis` | Perceptually uniform (good default) | 0-1 |
-| `temperature` | Temperature palette (purple->blue->cyan->green->yellow->red) | -40-50 C |
-| `precipitation` | Precipitation accumulation (transparent->blue->purple->white) | 0-50 mm |
-| `wind_speed` | Wind speed (green->yellow->orange->red->purple) | 0-50 m/s |
+Styles live under each collection's `[wms]` block — Maps and Tiles read the same configuration via the shared `MapEngine`/`StyleInfo` registry, so a style defined here is available to all three APIs.
 
-Custom color stops override built-in colormaps:
+**Built-in colormaps:**
+
+| Name | Description | Default range |
+|------|-------------|---------------|
+| `radar_dbz` | Standard radar reflectivity ramp | 0–70 dBZ |
+| `radar_smhi` | SMHI radar reflectivity ramp | 0–70 dBZ |
+| `radar_fmi` | FMI radar reflectivity ramp | 0–70 dBZ |
+| `radar_bookbinder` | Bookbinder radar ramp | 0–70 dBZ |
+| `grayscale` | Linear black → white | 0–1 |
+| `viridis` | Perceptually uniform (good default) | 0–1 |
+| `temperature` | Purple → blue → cyan → green → yellow → red | -40 to 50 °C |
+| `precipitation` | Transparent → blue → purple → white | 0–50 mm |
+| `precipitation_rate` | Precipitation-rate ramp | 0–50 mm/h |
+| `wind_speed` | Green → yellow → orange → red → purple | 0–50 m/s |
+
+**Custom color stops** override the built-in colormap:
 
 ```toml
 [collections.wms]
@@ -790,7 +827,7 @@ value = 50.0
 color = "#FF0000"
 ```
 
-### Named Styles
+**Named styles** add alternatives next to `default`:
 
 ```toml
 [[collections.wms.styles]]
@@ -801,79 +838,149 @@ min = 0.0
 max = 70.0
 ```
 
-### WMS Config Fields
+Or attach a reusable `[[style_bundles]]` block defined in top-level `config.toml` via `style_bundle = "..."` — see the [Configuration](#configuration) section.
+
+**`[wms]` config fields:**
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `colormap` | no | `"viridis"` | Built-in colormap name for the default style |
-| `color_stops` | no | — | Array of `{value, color}` entries. Overrides built-in colormap. |
-| `min` | no | from colormap | Minimum value for the colormap range |
-| `max` | no | from colormap | Maximum value for the colormap range |
+| `style_bundle` | no | — | Name of a shared `[[style_bundles]]` block. Cannot coexist with the inline fields below. |
+| `colormap` | no | `viridis` | Built-in colormap for the default style |
+| `color_stops` | no | — | Array of `{value, color}` entries. Overrides `colormap` for the default style. |
+| `min` | no | from colormap | Minimum value for the default style's range |
+| `max` | no | from colormap | Maximum value for the default style's range |
 | `styles` | no | — | Array of named styles |
-| `rendered_cache_mb` | no | `512` | Rendered image cache size in MB. Set to 0 to disable. |
+| `parameters` | no | — | Per-parameter default-style overrides (multi-parameter engines) |
+| `rendered_cache_mb` | no | `512` | Shared rendered-image cache size in MB. Set to 0 to disable. |
 
-### Security Limits
+### Limits
 
 | Limit | Value |
 |-------|-------|
-| MAX_MAP_PIXELS | 16,777,216 (16M) |
-| MAX_MAP_DIMENSION | 4,096 px |
-| Render semaphore | 2× CPU cores (min 8) |
-| Max LAYERS | 1 |
-| CRS whitelist | CRS:84, EPSG:4326/3857/3067/3035 |
-| FORMAT whitelist | `image/png`, `image/jpeg` |
+| `MAX_MAP_PIXELS` (`WIDTH × HEIGHT`) | 64,000,000 |
+| `MAX_MAP_DIMENSION` (`WIDTH` or `HEIGHT`) | 8,000 px |
+| Render permits | 2× CPU cores (minimum 8) |
+| `LAYERS` count | exactly 1 |
+| Supported CRS | `CRS:84`, `EPSG:4326`, `EPSG:3857`, `EPSG:3067`, `EPSG:3035` |
+| Supported `FORMAT` (GetMap) | `image/png`, `image/jpeg`, `image/webp` |
+| Supported `FORMAT` (GetLegendGraphic) | `image/png`, `image/jpeg` |
 
 ## OGC API - Maps
 
-REST-based map image API. Maps and WMS share the `MapEngine` trait but have separate HTTP layers.
+REST-based map image API. Maps shares the `MapEngine` trait, render semaphore, rendered-image cache, and style/colormap configuration with WMS and Tiles — only the HTTP layer differs.
 
-### Maps Query Parameters
+### Routes
+
+| Route | Description |
+|-------|-------------|
+| `GET /maps/collections/{id}/map` | Render with the default style |
+| `GET /maps/collections/{id}/styles/{styleId}/map` | Render with a named style (defined under `[wms]`) |
+| `GET /maps/collections/{id}/styles` | List available styles for a collection |
+| `GET /maps/collections/{id}` | Collection metadata (extent, styles, supported CRS) |
+
+### Query Parameters
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `bbox` | yes | — | `west,south,east,north` (always lon/lat order) |
-| `width` | no | `256` | Image width in pixels (max 4096) |
-| `height` | no | `256` | Image height in pixels (max 4096) |
-| `crs` | no | `CRS:84` | Output CRS |
-| `datetime` | no | latest | ISO 8601 timestamp |
-| `f` | no | `image/png` | `image/png`, `image/jpeg`, `image/webp` |
-| `parameter-name` | no | engine default | Select a parameter on multi-parameter raster engines (GRIB, multi-param QueryData). Mirrors EDR's `parameter-name=` convention; non-OGC for OGC API - Maps today, but the `/preview` SPA dropdown depends on it. Single-parameter engines ignore the value. Unknown names against a multi-param engine return 400. |
+| `bbox` | yes | — | `west,south,east,north`, always lon/lat order |
+| `bbox-crs` | no | `CRS:84` | Only `CRS:84` (or `http://www.opengis.net/def/crs/OGC/1.3/CRS84`) is accepted — every other value returns 400 |
+| `width` | no | `256` | Image width in pixels, max 8000 |
+| `height` | no | `256` | Image height in pixels, max 8000 |
+| `crs` | no | `CRS:84` | Output CRS: `CRS:84`, `EPSG:4326`, `EPSG:3857`, `EPSG:3067`, or `EPSG:3035` |
+| `datetime` | no | latest | ISO 8601 instant; defaults to the latest timestep advertised by the engine |
+| `f` | no | `image/png` | `image/png`, `image/jpeg`, or `image/webp` |
+| `parameter-name` | no | engine default | Selects a parameter on multi-parameter raster engines (GRIB, multi-param QueryData). Single-parameter engines ignore the value. Unknown names against a multi-parameter engine return 400. Non-OGC for OGC API - Maps today, but the `/preview` SPA dropdown depends on it. |
+| `transparent` | no | — | Accepted but currently a no-op |
 
-### Key Differences from WMS
+`width × height` is additionally capped at `MAX_MAP_PIXELS = 64,000,000` (= 8000²), so a request at the per-dimension cap never trips the pixel cap with a confusing second error.
 
-- Maps uses REST paths (`/maps/collections/{id}/map`), WMS uses query parameters
-- Maps bbox is always lon/lat order (no axis-order swapping)
-- Maps supports WebP output format
-- Maps has named styles via `/collections/{id}/styles/{styleId}/map`
+### Responses
+
+PNG/WebP responses are always RGBA (transparent for empty tiles). JPEG is RGB. Each successful response carries:
+
+- `Content-Type: image/png|image/jpeg|image/webp`
+- `Content-Crs:` OGC URI of the output CRS
+- `ETag:` derived from the cache key (quantized bbox + layer + style + format + CRS + width + height + time + parameter)
+- `Cache-Control: public, max-age=86400, immutable` when `datetime` is set; `public, max-age=60, must-revalidate` otherwise
+- `X-Cache: HIT | MISS | EMPTY` for observability
+
+`If-None-Match` short-circuits to `304 Not Modified` before any cache lookup or rendering. An overloaded render semaphore returns `503 Service Unavailable` with the fixed body `{"code":"ServerBusy","description":"Server busy, try again later"}`. Internal errors return 500 with a redacted body; the original detail is captured via `tracing::warn!` for operators.
+
+### Differences from WMS
+
+- REST paths instead of `REQUEST=`/`LAYERS=` query parameters
+- `bbox` is always lon/lat (no CRS-dependent axis swap)
+- Multi-parameter selection uses `?parameter-name=`, not `LAYERS=collection/param`
+- Errors are JSON, not `ServiceExceptionReport` XML
+- WebP is a first-class output format (WMS accepts it on GetMap but not on GetLegendGraphic)
+
+### Conformance Classes
+
+`core`, `collection-map`, `styled-map`, `spatial-subsetting`, `scaling`, `datetime`, `crs`, `png`, `jpeg`. WebP is implemented but no `webp` conformance class is declared (none exists in the OGC API - Maps 1.0 spec).
 
 ## OGC API - Tiles
 
-Serves raster data as tiled map images. Tiles reuses the same rendering pipeline as Maps/WMS.
+Serves raster data via `MapEngine` (sharing styles, semaphore, and rendered-image cache with WMS/Maps) and vector data via `FeatureEngine`. The same tile URL serves both — the response type is chosen by `?f=`.
 
-### Tile Addressing
+### Routes
 
-`{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}` — all tiles are fixed 256x256 pixels.
+| Route | Description |
+|-------|-------------|
+| `GET /tiles/tileMatrixSets` | List supported tiling schemes |
+| `GET /tiles/tileMatrixSets/{tileMatrixSetId}` | Tiling scheme definition (matrices, CRS, scale denominators) |
+| `GET /tiles/collections/{id}` | Collection metadata (`dataType: map` or `vector`, TMS links, styles) |
+| `GET /tiles/collections/{id}/tiles` | List tilesets for a collection, including `tileMatrixSetLimits` per zoom |
+| `GET /tiles/collections/{id}/tiles/{tms}/{z}/{row}/{col}` | Get a tile (raster default, MVT via `?f=mvt`) |
+| `GET /tiles/collections/{id}/styles/{styleId}/tiles/{tms}/{z}/{row}/{col}` | Get a styled raster tile; `?f=mvt` is rejected here |
+
+All tiles are 256×256 pixels. Tile coordinates follow OGC convention: `tileRow` is Y top-to-bottom, `tileCol` is X left-to-right.
 
 ### Supported TileMatrixSets
 
-| ID | CRS | Description |
-|----|-----|-------------|
-| `WebMercatorQuad` | EPSG:3857 | Standard web map tiles (Google/OSM scheme) |
-| `WorldCRS84Quad` | CRS:84 | Geographic tiles in lon/lat |
+| ID | CRS | Layout | Notes |
+|----|-----|--------|-------|
+| `WebMercatorQuad` | EPSG:3857 | 1×1 at z=0, doubling per zoom | Standard web-map scheme (Google/OSM) |
+| `WorldCRS84Quad` | CRS:84 | 2×1 at z=0, doubling per zoom | Geographic (lon/lat) |
 
-### Tiles Query Parameters
+Both support `tileMatrix` 0–24 (capped by `MAX_ZOOM_LEVEL`). `tileMatrixSetLimits` advertised on `/collections/{id}/tiles` cover zooms 0 through `DEFAULT_MAX_ZOOM = 18`, which is sufficient for every collection currently shipped; clients may still request 19–24 directly.
+
+### Query Parameters
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `datetime` | no | latest | ISO 8601 timestamp |
 | `f` | no | `image/png` | Raster: `image/png`, `image/jpeg`, `image/webp`. Vector: `mvt` or `application/vnd.mapbox-vector-tile`. |
-| `parameter-name` | no | engine default | Same semantics as the Maps `parameter-name` parameter above. Ignored for `?f=mvt`. |
+| `datetime` | no | latest | ISO 8601 instant; ignored for `?f=mvt` |
+| `parameter-name` | no | engine default | Same semantics as Maps `parameter-name`. Ignored for `?f=mvt`. |
+
+`tileMatrix > 24` returns 400. Tile coordinates outside the matrix (e.g. `row=1` at `z=0` on `WebMercatorQuad`) return 404.
+
+### Raster Tiles
+
+Raster requests resolve a style (the `default` style for the unstyled route, or the path-specified `styleId`), then run the same render pipeline as WMS/Maps:
+
+1. TMS → bbox conversion (Mercator math for `WebMercatorQuad`, linear lon/lat for `WorldCRS84Quad`).
+2. ETag check / rendered-cache check.
+3. On miss: acquire render permit (timed out → 503), call `MapEngine::get_raster_tile()` with the TMS-derived `output_crs`, colorize, encode.
+4. Empty (all-nodata) tiles return a pre-generated transparent PNG with `X-Cache: EMPTY` regardless of the requested format — no engine call, no cache insert.
+
+Successful responses include `Content-Type`, `Content-Crs` (OGC URI for the TMS's CRS), `ETag`, `Cache-Control` (`max-age=86400, immutable` when `datetime` is set, `max-age=60, must-revalidate` otherwise), and `X-Cache: HIT|MISS|EMPTY`.
 
 ### Vector Tiles (MVT)
 
-When `?f=mvt` is requested against a collection backed by a `FeatureEngine` (e.g. GeoJSON, PostGIS), the tile handler converts the tile bbox into a feature query, encodes the result via `ds-mvt`, and returns Mapbox Vector Tile bytes. Layer name in the MVT payload equals the collection ID, matching the convention used by `mapbox-vector-tile-js` (the decoder bundled in MapLibre GL JS).
+When `?f=mvt` (or `?f=application/vnd.mapbox-vector-tile`) is requested against a collection backed by a `FeatureEngine` (GeoJSON, PostGIS, CSV's feature mode), the handler converts the tile bbox into a `FeatureQuery`, encodes the result via `ds-mvt`, and returns Mapbox Vector Tile bytes. The layer name in the MVT payload is the collection ID, matching the convention used by `mapbox-vector-tile-js` (bundled in MapLibre GL JS).
 
-Polygon features are clipped to a buffered tile envelope (1/16 of `extent`, matching MapLibre's default source-layer buffer) so seams between adjacent tiles remain invisible. ETag is content-derived (FNV-1a over the encoded bytes) so a data refresh produces a new ETag and clients holding the old one drop their cached copy on revalidate.
+| Behavior | Detail |
+|----------|--------|
+| Feature limit | `MAX_FEATURES_PER_TILE = 50,000`. Exceeding it returns **422 Unprocessable Content** (`tile-too-dense`) — the request is well-formed but the data can't be served at that scale. Raise the collection's `minzoom` or narrow the bbox. |
+| Polygon clipping | Features are clipped to a buffered tile envelope (1/16 of `extent`, matching MapLibre's default source-layer buffer) so seams between adjacent tiles remain invisible. |
+| ETag | Content-derived (FNV-1a over the encoded bytes) — a data change yields different bytes and therefore a different ETag, so clients holding the old one revalidate. |
+| Cache | `Cache-Control: public, max-age=300`. Cached in a separate `VectorTileCache` (not the raster `RenderedCache`), keyed by collection + TMS + z/x/y + properties hash + `FeatureEngine::data_version()` so a reload/refresh produces a clean miss instead of an infinite-revalidate loop. |
+| Styled route | `?f=mvt` is rejected on `/styles/{styleId}/tiles/...` with 400 — vector tiles aren't styled server-side. |
+| Render permit | MVT encoding shares the raster render semaphore (CPU-bound budget). Acquired *after* the feature query so engine I/O doesn't hold a slot. |
+
+### Conformance Classes
+
+`ogcapi-tiles-1`: `core`, `tileset`, `tilesets-list`, `png`, `jpeg`, `mvt`. `tms-2.0`: `tilematrixset`, `json-tilematrixset`. WebP is implemented but has no conformance class.
 
 ## Caching
 
@@ -882,10 +989,11 @@ Polygon features are clipped to a buffered tile envelope (1/16 of `extent`, matc
 Separate from the GeoTIFF source tile cache (Tier 1). Caches final PNG/JPEG/WebP bytes. Shared across WMS, Maps, and Tiles APIs.
 
 - Default size: 512 MB (configurable via `rendered_cache_mb`)
-- Cache key: quantized bbox (6 decimal places) + layer + style + format + width + height + CRS + time
+- Cache key: quantized bbox (6 decimal places) + layer + style + format + width + height + CRS + time + parameter
 - Lock-free concurrent LRU (uses `quick_cache`)
 - No TTL — immutable data. Cache invalidated on collection reload.
 - Error tiles and empty tiles (all nodata) are NOT cached.
+- MVT vector tiles use a separate `VectorTileCache` (content-derived ETag, `Cache-Control: max-age=300`); they are NOT subject to `rendered_cache_mb`.
 
 ### HTTP Cache Headers
 
