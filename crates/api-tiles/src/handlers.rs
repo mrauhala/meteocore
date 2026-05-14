@@ -1210,17 +1210,19 @@ async fn render_tile(
 
     // Content-derived ETag now available — do the `If-None-Match`
     // comparison here, after the (cheap) empty-tile clone or fresh
-    // encode. Emit `x-cache: MISS` so operators can tell post-render
-    // revalidations apart from cache-hit revalidations in logs/metrics,
-    // and tests can pin either branch by the *value* of the header
-    // rather than by its absence.
+    // encode. Forward the same `x_cache` label the 200 response would
+    // carry (`"MISS"` or `"EMPTY"`) so revalidations look the same
+    // on dashboards as initial fetches — a client revalidating a
+    // cached transparent-tile response sees `304 x-cache: EMPTY`,
+    // not a misleading `MISS`. This matters for any tile viewer
+    // panning over out-of-coverage areas.
     if let Some(ref inm) = if_none_match {
         if ds_render::etag_matches(inm, cached.etag()) {
             return Ok(axum::response::Response::builder()
                 .status(StatusCode::NOT_MODIFIED)
                 .header(header::ETAG, cached.etag())
                 .header(header::CACHE_CONTROL, cache_control)
-                .header(header::HeaderName::from_static("x-cache"), "MISS")
+                .header(header::HeaderName::from_static("x-cache"), x_cache)
                 .body(axum::body::Body::empty())
                 .unwrap()
                 .into_response());

@@ -286,17 +286,17 @@ pub async fn wms_handler(
             // miss → encode → revalidate against fresh ETag.
             if let Some(ref inm) = if_none_match {
                 if ds_render::etag_matches(inm, cached.etag()) {
-                    // 304 from the post-render branch. Emit `x-cache: MISS`
-                    // (alongside the HIT-path 304's `x-cache: HIT` above) so
-                    // operators can tell post-render revalidations apart from
-                    // cache-hit revalidations in logs and metrics, and tests
-                    // can pin either branch by the *value* of the header
-                    // rather than by its absence.
+                    // 304 from the post-render branch. Forward the same
+                    // `x_cache` label the 200 response would carry — `"MISS"`,
+                    // `"EMPTY"`, or `"ERROR"` — so revalidations look the
+                    // same on dashboards as initial fetches. A client
+                    // revalidating a cached transparent-tile response sees
+                    // `304 x-cache: EMPTY`, not a misleading `MISS`.
                     return Ok(axum::response::Response::builder()
                         .status(StatusCode::NOT_MODIFIED)
                         .header(header::ETAG, cached.etag())
                         .header(header::CACHE_CONTROL, cache_control)
-                        .header(header::HeaderName::from_static("x-cache"), "MISS")
+                        .header(header::HeaderName::from_static("x-cache"), x_cache)
                         .body(axum::body::Body::empty())
                         .unwrap()
                         .into_response());

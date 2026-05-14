@@ -517,3 +517,101 @@ async fn if_none_match_against_fresh_router_returns_304_via_miss_branch() {
         "304 must come from the post-render MISS branch, not the cache-HIT branch"
     );
 }
+
+/// Empty-tile revalidation must round-trip the `EMPTY` label, not be
+/// silently re-tagged as `MISS`. Empty tiles bypass `rendered_cache`,
+/// so an `If-None-Match` request always falls through to the
+/// post-render branch — exactly the branch the round-7 fix targets.
+/// Without the fix, every cached transparent tile that gets
+/// revalidated would show up on dashboards as `MISS`.
+#[tokio::test]
+async fn if_none_match_on_empty_tile_returns_304_with_x_cache_empty() {
+    let app = build_empty_router();
+    let uri = "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=empty\
+               &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64\
+               &FORMAT=image/png";
+
+    // Step 1: render the empty tile to capture its (deterministic) ETag.
+    let etag = {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "EMPTY");
+        resp.headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    };
+
+    // Step 2: revalidate. The post-render branch must forward
+    // `x-cache: EMPTY`, not a hard-coded MISS.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("If-None-Match", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(resp.headers().get("etag").unwrap().to_str().unwrap(), etag);
+    assert_eq!(
+        resp.headers().get("x-cache").map(|v| v.to_str().unwrap()),
+        Some("EMPTY"),
+        "post-render 304 must forward the `x_cache` label from the \
+         match arm, not hard-code `MISS` — otherwise revalidating an \
+         empty tile silently changes its dashboard category"
+    );
+}
+
+/// WMS-only: revalidating a cached error tile must round-trip the
+/// `ERROR` label. WMS is the one handler that swallows engine errors
+/// into a 200 + red error-tile (Maps/Tiles propagate as 500), so this
+/// branch only exists here. Error tiles bypass `rendered_cache`, so
+/// `If-None-Match` always reaches the post-render branch.
+#[tokio::test]
+async fn if_none_match_on_error_tile_returns_304_with_x_cache_error() {
+    let app = build_failing_router();
+    let uri = "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=broken\
+               &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64\
+               &FORMAT=image/png";
+
+    let etag = {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.headers().get("x-cache").unwrap(), "ERROR");
+        resp.headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("If-None-Match", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        resp.headers().get("x-cache").map(|v| v.to_str().unwrap()),
+        Some("ERROR"),
+        "post-render 304 must forward the `x_cache` label — error \
+         tiles revalidating must remain visible as ERROR on dashboards"
+    );
+}

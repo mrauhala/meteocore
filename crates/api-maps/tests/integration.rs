@@ -714,6 +714,51 @@ mod get_map {
         assert_eq!(headers.get("content-type").unwrap(), "image/png");
         assert_eq!(headers.get("x-cache").unwrap(), "EMPTY");
     }
+
+    /// Revalidating a cached empty-tile response must round-trip the
+    /// `EMPTY` label. Empty tiles bypass `rendered_cache`, so an
+    /// `If-None-Match` request always falls through to the post-render
+    /// branch — exactly the branch the round-7 fix targets.
+    #[tokio::test]
+    async fn if_none_match_on_empty_tile_returns_304_with_x_cache_empty() {
+        let app = build_empty_router();
+        let uri = "/collections/empty/map?bbox=10,55,30,70&f=image/png";
+
+        let etag = {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.headers().get("x-cache").unwrap(), "EMPTY");
+            resp.headers()
+                .get("etag")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("If-None-Match", &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(resp.headers().get("etag").unwrap().to_str().unwrap(), etag);
+        assert_eq!(
+            resp.headers().get("x-cache").map(|v| v.to_str().unwrap()),
+            Some("EMPTY"),
+            "post-render 304 must forward the `x_cache` label from the \
+             match arm, not hard-code `MISS` — otherwise revalidating an \
+             empty tile silently changes its dashboard category"
+        );
+    }
 }
 
 /// Mock engine that returns an all-`None` (all-nodata) `RasterTile`.

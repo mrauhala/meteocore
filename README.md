@@ -794,7 +794,7 @@ Errors are returned as `ServiceExceptionReport` XML with WMS 1.3.0 error codes: 
 5. On miss: acquire a render semaphore permit (timed out → 503). Run `MapEngine::get_raster_tile()` on a blocking thread — the engine projects the bbox into the source CRS, picks the best overview, reads source tiles, and resamples (nearest-neighbor).
 6. Empty (all-nodata) tile: encode a transparent PNG with `Content-Type: image/png`. Error: render the red error tile (WMS only). Neither is inserted into the cache.
 7. Populated tile: colorize (LUT for discrete data, linear gradient for continuous), encode to PNG/JPEG/WebP, wrap in `CachedRendered` (which derives the ETag via FNV-1a over the bytes), and insert into the cache.
-8. Compare the freshly-computed ETag against `If-None-Match` — match → `304`, otherwise return the body with `X-Cache: MISS | EMPTY | ERROR`.
+8. Compare the freshly-computed ETag against `If-None-Match` — match → `304` carrying the same `X-Cache` label the 200 would have (`MISS`, `EMPTY`, or `ERROR`), otherwise return the body with `X-Cache: MISS | EMPTY | ERROR`. Revalidations stay categorised the same as initial fetches on dashboards.
 
 ### Styling (shared with Maps and Tiles)
 
@@ -902,7 +902,7 @@ PNG/WebP responses are always RGBA (transparent for empty tiles). JPEG is RGB. E
 - `Content-Crs:` OGC URI of the output CRS
 - `ETag:` FNV-1a hash of the encoded response body — changes whenever the rendered pixels change, regardless of whether the cache key changed. This is what makes a server-side fix (e.g. colormap correction) invalidate stale browser caches instead of letting them serve infinite `304`s.
 - `Cache-Control: public, max-age=86400, immutable` when `datetime` is set; `public, max-age=60, must-revalidate` otherwise
-- `X-Cache: HIT | MISS | EMPTY` for observability. Set on every 200 and 304 response: `HIT` for cache-hit revalidations, `MISS` for post-render revalidations, `EMPTY` for transparent-tile fast-paths. Operators can grep dashboards by the value rather than reasoning about header absence.
+- `X-Cache: HIT | MISS | EMPTY | ERROR` for observability. Set on every 200 and 304 response: `HIT` for cache-hit revalidations, `MISS` for post-render revalidations, `EMPTY` for transparent-tile fast-paths, `ERROR` for the WMS error-tile fallback. The 304 carries the same label the 200 would, so revalidations stay in their original dashboard category. Operators can grep by value rather than reasoning about header absence.
 
 `If-None-Match` is evaluated against the content-derived ETag from the cache hit or the freshly-rendered bytes — not before the cache lookup. An overloaded render semaphore returns `503 Service Unavailable` with the fixed body `{"code":"ServerBusy","description":"Server busy, try again later"}`. Internal errors return 500 with a redacted body; the original detail is captured via `tracing::warn!` for operators.
 

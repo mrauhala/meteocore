@@ -725,6 +725,63 @@ mod get_tile {
         assert_eq!(headers.get("content-type").unwrap(), "image/png");
         assert_eq!(headers.get("x-cache").unwrap(), "EMPTY");
     }
+
+    /// Revalidating a cached empty-tile response must round-trip the
+    /// `EMPTY` label, not be silently re-tagged as `MISS`. Empty tiles
+    /// share the global `EMPTY_TILE_CACHED` (never inserted into
+    /// `rendered_cache`), so an `If-None-Match` request always falls
+    /// through to the post-render branch — which is exactly the branch
+    /// the round-7 fix targets. A viewer panning over out-of-coverage
+    /// areas would otherwise see `304 x-cache: MISS` for every empty
+    /// tile, hiding them from dashboards filtered on `EMPTY`.
+    #[tokio::test]
+    async fn if_none_match_on_empty_tile_returns_304_with_x_cache_empty() {
+        // Step 1: render the empty tile to capture its (deterministic) ETag.
+        let app = build_empty_router();
+        let etag = {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/collections/empty/tiles/WebMercatorQuad/0/0/0")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.headers().get("x-cache").unwrap(), "EMPTY");
+            resp.headers()
+                .get("etag")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // Step 2: revalidate. The handler must reach the post-render
+        // branch (empty tiles bypass `rendered_cache`), match the ETag,
+        // and 304 with `x-cache: EMPTY` — forwarding the same label
+        // the 200 response would carry, not the legacy hard-coded MISS.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/collections/empty/tiles/WebMercatorQuad/0/0/0")
+                    .header("If-None-Match", &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(resp.headers().get("etag").unwrap().to_str().unwrap(), etag);
+        assert_eq!(
+            resp.headers().get("x-cache").map(|v| v.to_str().unwrap()),
+            Some("EMPTY"),
+            "post-render 304 must forward the `x_cache` label from the \
+             match arm, not hard-code `MISS` — otherwise revalidating an \
+             empty tile silently changes its dashboard category"
+        );
+    }
 }
 
 /// Mock engine that returns an all-`None` (all-nodata) `RasterTile` —
