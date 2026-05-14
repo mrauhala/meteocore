@@ -32,6 +32,17 @@ static EMPTY_TILE_PNG: LazyLock<bytes::Bytes> = LazyLock::new(|| {
     )
 });
 
+/// Companion to [`EMPTY_TILE_PNG`]: the same bytes wrapped in
+/// `CachedRendered`, so the FNV-1a hash that produces the empty-tile
+/// ETag is computed **once per process** instead of on every empty-tile
+/// response. Both fields are `Clone`-cheap (`Bytes` is `Arc`-backed,
+/// `String` is a 20-byte allocation done once), so cloning per request
+/// is essentially free. `api-maps` and `api-wms` cannot use this trick
+/// — they allocate fresh empty bytes per request to match the requested
+/// dimensions — but Tiles is always 256×256.
+static EMPTY_TILE_CACHED: LazyLock<ds_render::CachedRendered> =
+    LazyLock::new(|| ds_render::CachedRendered::new(EMPTY_TILE_PNG.clone()));
+
 /// Shared state for the OGC API Tiles service.
 #[derive(Clone)]
 pub struct TilesState {
@@ -1180,12 +1191,11 @@ async fn render_tile(
     // populated tiles get cached. Wrap both in `CachedRendered` so the
     // response ETag is FNV-1a over the actual bytes — different pixels
     // produce different ETags (#145). Track the actual Content-Type per
-    // branch so the header never lies about the payload (#162).
+    // branch so the header never lies about the payload (#162). Empty
+    // tiles reuse the global `EMPTY_TILE_CACHED` so the FNV-1a hash is
+    // computed once per process instead of per request.
     let (cached, x_cache, response_content_type, insert_into_cache) = match maybe_bytes {
-        None => {
-            let cached = ds_render::CachedRendered::new(EMPTY_TILE_PNG.clone());
-            (cached, "EMPTY", "image/png", false)
-        }
+        None => (EMPTY_TILE_CACHED.clone(), "EMPTY", "image/png", false),
         Some(bytes) => {
             let cached = ds_render::CachedRendered::new(bytes::Bytes::from(bytes));
             (cached, "MISS", content_type, true)

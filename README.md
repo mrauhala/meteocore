@@ -789,12 +789,12 @@ Errors are returned as `ServiceExceptionReport` XML with WMS 1.3.0 error codes: 
 
 1. Parse and validate WMS parameters; normalize BBOX to WGS84 `[west, south, east, north]`.
 2. Resolve `MapEngine` by collection ID. For `{id}/{param}` layers, validate `{param}` against `RasterInfo::parameters`.
-3. Build a cache key from quantized bbox, layer, style, format, CRS, width, height, time, and parameter, and compute its ETag.
-4. If the request carries `If-None-Match` and the ETag matches, return `304 Not Modified` immediately.
-5. Check the rendered-image cache (shared LRU). On hit: serve with `X-Cache: HIT`.
-6. On miss: acquire a render semaphore permit (timed out → 503). Run `MapEngine::get_raster_tile()` on a blocking thread — the engine projects the bbox into the source CRS, picks the best overview, reads source tiles, and resamples (nearest-neighbor).
-7. If the tile is all nodata, return a transparent PNG and do not cache.
-8. Otherwise colorize (LUT for discrete data, linear gradient for continuous), encode to PNG/JPEG/WebP, cache, and serve with `X-Cache: MISS`.
+3. Build a cache key from quantized bbox, layer, style, format, CRS, width, height, time, and parameter.
+4. Check the rendered-image cache (shared LRU). On hit: compare the cached entry's content-derived ETag against `If-None-Match` — match → `304` with `X-Cache: HIT`, otherwise return the cached bytes with `X-Cache: HIT`.
+5. On miss: acquire a render semaphore permit (timed out → 503). Run `MapEngine::get_raster_tile()` on a blocking thread — the engine projects the bbox into the source CRS, picks the best overview, reads source tiles, and resamples (nearest-neighbor).
+6. Empty (all-nodata) tile: encode a transparent PNG with `Content-Type: image/png`. Error: render the red error tile (WMS only). Neither is inserted into the cache.
+7. Populated tile: colorize (LUT for discrete data, linear gradient for continuous), encode to PNG/JPEG/WebP, wrap in `CachedRendered` (which derives the ETag via FNV-1a over the bytes), and insert into the cache.
+8. Compare the freshly-computed ETag against `If-None-Match` — match → `304`, otherwise return the body with `X-Cache: MISS | EMPTY | ERROR`.
 
 ### Styling (shared with Maps and Tiles)
 
@@ -900,11 +900,11 @@ PNG/WebP responses are always RGBA (transparent for empty tiles). JPEG is RGB. E
 
 - `Content-Type: image/png|image/jpeg|image/webp`
 - `Content-Crs:` OGC URI of the output CRS
-- `ETag:` derived from the cache key (quantized bbox + layer + style + format + CRS + width + height + time + parameter)
+- `ETag:` FNV-1a hash of the encoded response body — changes whenever the rendered pixels change, regardless of whether the cache key changed. This is what makes a server-side fix (e.g. colormap correction) invalidate stale browser caches instead of letting them serve infinite `304`s.
 - `Cache-Control: public, max-age=86400, immutable` when `datetime` is set; `public, max-age=60, must-revalidate` otherwise
 - `X-Cache: HIT | MISS | EMPTY` for observability (also set on `304 Not Modified` from the cache-HIT branch so clients can distinguish it from a post-render-revalidation 304)
 
-`If-None-Match` short-circuits to `304 Not Modified` before any cache lookup or rendering. An overloaded render semaphore returns `503 Service Unavailable` with the fixed body `{"code":"ServerBusy","description":"Server busy, try again later"}`. Internal errors return 500 with a redacted body; the original detail is captured via `tracing::warn!` for operators.
+`If-None-Match` is evaluated against the content-derived ETag from the cache hit or the freshly-rendered bytes — not before the cache lookup. An overloaded render semaphore returns `503 Service Unavailable` with the fixed body `{"code":"ServerBusy","description":"Server busy, try again later"}`. Internal errors return 500 with a redacted body; the original detail is captured via `tracing::warn!` for operators.
 
 ### Differences from WMS
 
