@@ -428,21 +428,19 @@ fn build_entry(
 /// Parameter list emitted as `parameters: [{name, title, unit}]` in the
 /// per-collection manifest entry. Sorted by name for stable ordering.
 ///
-/// Selection rules — the manifest must only advertise parameters the Tiles /
-/// Maps handlers will actually render, so that the SPA dropdown can't pick a
-/// value that either 400s OR (worse) is silently ignored at render time:
+/// **Caller invariant:** this is only invoked when the collection has
+/// raster tiles (see `build_entry`'s `if has_raster_tiles` guard), so a
+/// `MapEngine` is always registered. Two branches:
 ///
-/// 1. `MapEngine` registered AND `raster_info().parameters` non-empty: that
-///    list is the source of truth. Names also present in EDR are enriched
-///    with EDR's richer `(label, unit)`; names absent from EDR fall back to
-///    raster-side `(short_name, title)` with an empty unit.
-/// 2. `MapEngine` registered with an *empty* `parameters` list signals a
-///    single-band engine (single-band GeoTIFF). The tile handler ignores
-///    `?parameter-name=` regardless of the value passed — so emitting any
-///    dropdown options would lie about what the SPA can actually do. No
-///    `parameters` field in the manifest, even if EDR exposes more than one.
-/// 3. Pure-EDR collection (no raster engine at all): surface EDR's full
-///    list. No tile-rendering path exists, so there's no mismatch risk.
+/// 1. `raster_info().parameters` non-empty (multi-parameter engines like
+///    GRIB / multi-param QueryData): that list is the renderable source of
+///    truth. Names also present in EDR are enriched with EDR's richer
+///    `(label, unit)`; names absent from EDR fall back to the raster-side
+///    `(short_name, title)` with an empty unit.
+/// 2. `raster_info().parameters` empty (single-band engines like
+///    single-band GeoTIFF): the tile handler ignores `?parameter-name=`
+///    regardless of value — emitting dropdown options would lie about what
+///    the SPA can do. Suppress, even if EDR is multi-param.
 fn collection_parameters(
     id: &str,
     edr: &api_edr::handlers::EdrState,
@@ -450,51 +448,34 @@ fn collection_parameters(
     tiles: &api_tiles::handlers::TilesState,
     wms: &api_wms::handlers::WmsState,
 ) -> Option<Vec<Value>> {
-    let edr_descs = edr
-        .engines
-        .get(id)
-        .map(|engine| engine.get_parameter_descriptions());
-
-    let raster_params: Option<Vec<(String, String)>> = maps
+    let raster_params: Vec<(String, String)> = maps
         .engines
         .get(id)
         .or_else(|| tiles.map_engines.get(id))
         .or_else(|| wms.engines.get(id))
-        .map(|engine| engine.raster_info().parameters);
+        .map(|engine| engine.raster_info().parameters)?;
 
-    let mut out: Vec<Value> = match (raster_params, edr_descs) {
-        (Some(raster), edr_opt) if !raster.is_empty() => {
-            // Raster-side is the renderable set; intersect EDR descriptions on
-            // top so the dropdown shows units when the EDR engine has them.
-            let edr = edr_opt.unwrap_or_default();
-            raster
-                .into_iter()
-                .map(|(name, title)| {
-                    let (label, unit) = edr
-                        .get(&name)
-                        .map(|d| (d.label.clone(), d.unit.clone()))
-                        .unwrap_or((title, String::new()));
-                    json!({ "name": name, "title": label, "unit": unit })
-                })
-                .collect()
-        }
-        // Raster engine is present but reports no parameters → single-band.
-        // Even if EDR is multi-param the tile handler will ignore the
-        // selection, so showing a dropdown would mislead users into thinking
-        // they can switch parameters. Suppress unconditionally.
-        (Some(_), _) => return None,
-        (None, Some(edr)) if !edr.is_empty() => edr
-            .into_iter()
-            .map(|(name, desc)| {
-                json!({
-                    "name": name,
-                    "title": desc.label,
-                    "unit": desc.unit,
-                })
-            })
-            .collect(),
-        _ => return None,
-    };
+    // Single-band engine → no meaningful per-request selection.
+    if raster_params.is_empty() {
+        return None;
+    }
+
+    let edr_descs = edr
+        .engines
+        .get(id)
+        .map(|engine| engine.get_parameter_descriptions())
+        .unwrap_or_default();
+
+    let mut out: Vec<Value> = raster_params
+        .into_iter()
+        .map(|(name, title)| {
+            let (label, unit) = edr_descs
+                .get(&name)
+                .map(|d| (d.label.clone(), d.unit.clone()))
+                .unwrap_or((title, String::new()));
+            json!({ "name": name, "title": label, "unit": unit })
+        })
+        .collect();
 
     out.sort_by(|a, b| {
         a.get("name")

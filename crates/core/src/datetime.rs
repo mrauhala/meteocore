@@ -82,6 +82,16 @@ pub fn parse_iso8601_duration(s: &str) -> Result<Duration, DataServerError> {
                 DataServerError::Config(format!("Invalid seconds in ISO 8601 duration '{s}'"))
             })?;
             total_seconds += v as i64;
+            remaining = &remaining[pos + 1..];
+        }
+        // Anything left in `remaining` is unparsed — a trailing number with
+        // no unit (`PT12H30` for `PT12H30M`) would otherwise be silently
+        // dropped, returning a shorter window than the operator intended.
+        if !remaining.is_empty() {
+            return Err(DataServerError::Config(format!(
+                "Invalid ISO 8601 duration '{s}': trailing characters '{remaining}' after time \
+                 components"
+            )));
         }
     }
 
@@ -207,5 +217,25 @@ mod tests {
         );
         // `P1W2D` mixes weeks with other date units — not supported.
         assert!(parse_iso8601_duration("P1W2D").is_err());
+    }
+
+    #[test]
+    fn iso8601_duration_rejects_trailing_digits_without_unit() {
+        // Without the trailing-content check, `PT12H30` (operator typo for
+        // `PT12H30M`) silently parsed as 12h, dropping the 30. The
+        // surrounding behaviour — start with PT, end with a unit suffix —
+        // would otherwise hide the typo.
+        assert!(parse_iso8601_duration("PT12H30").is_err());
+        assert!(parse_iso8601_duration("PT30M5").is_err());
+        assert!(parse_iso8601_duration("PT1H2M3").is_err());
+        // The valid forms are still accepted.
+        assert_eq!(
+            parse_iso8601_duration("PT12H30M").unwrap(),
+            Duration::seconds(12 * 3600 + 30 * 60)
+        );
+        assert_eq!(
+            parse_iso8601_duration("PT1H2M3S").unwrap(),
+            Duration::seconds(3600 + 120 + 3)
+        );
     }
 }
