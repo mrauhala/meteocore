@@ -1040,14 +1040,11 @@ async fn render_tile(
         _ => crs_to_uri("CRS:84"),
     };
 
-    // Resolve time: use explicit or default to latest
-    let time = match validated.time {
-        Some(t) => Some(t),
-        None => {
-            let info = engine.raster_info();
-            info.times.last().copied()
-        }
-    };
+    // Single `raster_info()` call covers both default-time resolution and
+    // parameter-name validation. Trait contract is O(1) but we still avoid
+    // the redundant call.
+    let raster_info = engine.raster_info();
+    let time = validated.time.or_else(|| raster_info.times.last().copied());
 
     let tile_size = params::TILE_SIZE;
 
@@ -1057,9 +1054,14 @@ async fn render_tile(
     // with an empty `raster_info().parameters` list (single-band GeoTIFF)
     // ignore the parameter at render time — we still accept the query.
     if let Some(pname) = validated.parameter_name.as_deref() {
-        let info = engine.raster_info();
-        if !info.parameters.is_empty() && !info.parameters.iter().any(|(name, _)| name == pname) {
-            let supported: Vec<&str> = info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+        if !raster_info.parameters.is_empty()
+            && !raster_info.parameters.iter().any(|(name, _)| name == pname)
+        {
+            let supported: Vec<&str> = raster_info
+                .parameters
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect();
             return Err(TilesError::BadRequest(format!(
                 "parameter-name '{pname}' is not available for collection '{collection_id}'. \
                  Available: {}",

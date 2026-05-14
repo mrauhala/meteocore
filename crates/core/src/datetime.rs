@@ -31,8 +31,16 @@ pub fn parse_iso8601_duration(s: &str) -> Result<Duration, DataServerError> {
     }
 
     if !date_part.is_empty() {
-        // Weeks (`P1W`) — natural unit for meteorological archives; reject the
-        // ambiguous combination `P1W2D` which mixes weeks with other date units.
+        // Mixed week-and-day forms (`P1W2D`) are unsupported. Catch them
+        // explicitly here — otherwise the parser falls into the days branch
+        // below, fails on `"1W2".parse::<i64>()`, and surfaces a misleading
+        // "Invalid days" message that hides the real issue.
+        if date_part.contains('W') && date_part.contains('D') {
+            return Err(DataServerError::Config(format!(
+                "Invalid ISO 8601 duration '{s}': cannot mix 'W' with other date units"
+            )));
+        }
+        // Weeks (`P1W`) — natural unit for meteorological archives.
         if let Some(stripped) = date_part.strip_suffix('W') {
             let weeks: i64 = stripped.parse().map_err(|_| {
                 DataServerError::Config(format!("Invalid weeks in ISO 8601 duration '{s}'"))
@@ -215,8 +223,15 @@ mod tests {
             parse_iso8601_duration("P2W").unwrap(),
             Duration::seconds(14 * 86_400)
         );
-        // `P1W2D` mixes weeks with other date units — not supported.
-        assert!(parse_iso8601_duration("P1W2D").is_err());
+        // `P1W2D` mixes weeks with other date units — surface a message that
+        // names the actual problem, not "Invalid days" (which is what we
+        // got before the explicit guard; an operator reading logs would have
+        // started staring at the days value, not the structure).
+        let err = parse_iso8601_duration("P1W2D").unwrap_err().to_string();
+        assert!(
+            err.contains("cannot mix 'W'"),
+            "Expected 'cannot mix W' message, got: {err}"
+        );
     }
 
     #[test]

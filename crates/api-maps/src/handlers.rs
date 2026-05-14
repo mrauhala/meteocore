@@ -694,14 +694,12 @@ async fn render_map(
     let has_explicit_time = validated.time.is_some();
     let content_crs = crs_to_uri(&validated.crs);
 
-    // Resolve time: use explicit or default to latest
-    let time = match validated.time {
-        Some(t) => Some(t),
-        None => {
-            let info = engine.raster_info();
-            info.times.last().copied()
-        }
-    };
+    // Single `raster_info()` call covers both default-time resolution and
+    // parameter-name validation. The trait now documents this as O(1), but
+    // hoisting still saves one Arc-clone-sized allocation per request on
+    // engines that materialise `RasterInfo` lazily.
+    let raster_info = engine.raster_info();
+    let time = validated.time.or_else(|| raster_info.times.last().copied());
 
     // Parameter selection precedence: ?parameter-name= wins over style.parameter.
     // Validate against the engine's advertised list when the query supplied one
@@ -711,9 +709,14 @@ async fn render_map(
     // in that case we just accept the query value and let the engine ignore it,
     // matching `get_raster_tile`'s documented behavior.
     if let Some(pname) = validated.parameter_name.as_deref() {
-        let info = engine.raster_info();
-        if !info.parameters.is_empty() && !info.parameters.iter().any(|(name, _)| name == pname) {
-            let supported: Vec<&str> = info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+        if !raster_info.parameters.is_empty()
+            && !raster_info.parameters.iter().any(|(name, _)| name == pname)
+        {
+            let supported: Vec<&str> = raster_info
+                .parameters
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect();
             return Err(MapsError::BadRequest(format!(
                 "parameter-name '{pname}' is not available for collection '{collection_id}'. \
                  Available: {}",
