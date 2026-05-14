@@ -777,7 +777,7 @@ Internally the handler normalizes everything to WGS84 `[west, south, east, north
 | `STYLES` | no | `default` | Style name. Note: only the plural form works on this endpoint, unlike GetMap which accepts both. |
 | `WIDTH` | no | `40` | Pixels, capped at 256 |
 | `HEIGHT` | no | `200` | Pixels, capped at 1024 |
-| `FORMAT` | no | `image/png` | `image/png` or `image/jpeg` (WebP is advertised in capabilities but legends are PNG/JPEG only) |
+| `FORMAT` | no | `image/png` | `image/png` or `image/jpeg`. Any other value (including the `image/webp` that capabilities advertises) silently falls back to PNG with `Content-Type: image/png` — no error is raised. Tracked in #161. |
 
 Legends are static — they always carry `Cache-Control: public, max-age=86400, immutable`.
 
