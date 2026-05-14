@@ -362,6 +362,7 @@ fn build_populated_router() -> axum::Router {
             querydata: None,
             wms: None,
             grib: None,
+            odim: None,
             postgis: None,
             preview: None,
         },
