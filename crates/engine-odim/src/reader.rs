@@ -134,6 +134,15 @@ impl RawPixels {
             RawPixels::U16(a) => a.get((row, col)).map(|v| *v as f64)?,
             RawPixels::F64(a) => a.get((row, col)).copied()?,
         };
+        // Exact equality is intentional for nodata/undetect: ODIM
+        // producers store integer sentinels (e.g. OPERA's
+        // -9_999_000 / -8_888_000) that are bit-exact representable
+        // in f64, and writers don't apply any FP arithmetic to them
+        // before serialising. An epsilon comparison here would risk
+        // either masking legitimate values (false positive) or
+        // letting a near-sentinel through (false negative); stick to
+        // exact == until a producer is observed shipping non-integer
+        // sentinels.
         if raw == nodata {
             return None;
         }
@@ -323,12 +332,19 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     );
 
     // gain/offset/nodata/quantity location varies by producer:
-    // - Canonical (ODIM v2.4 §7.4):  /dataset1/data1/what/{...}    (SMHI v2.2 verified)
-    // - Earlier producers:           /dataset1/what/{...}          (some EUMETNET files)
+    // - Earlier producers:           /dataset1/what/{...}          (some EUMETNET v2.x files)
+    // - Canonical (ODIM v2.4 §7.4):  /dataset1/data1/what/{...}    (DWD v2.3, OPERA v2.4)
     // - DMI variant (v2.0):          /what/{gain,offset,nodata}    at the file root,
     //                                with `quantity` as an attribute on /dataset1/data1
     //                                (or `/what/product` as last resort)
-    // Try each path in order; the first hit wins.
+    //
+    // Order rationale: `/dataset1/what` (earlier-producers form) is
+    // tried first because it's structurally less specific — if both
+    // the older and canonical paths happen to coexist in a hybrid
+    // file (we haven't seen one, but it's permitted by the spec),
+    // honouring the dataset-wide value matches what tools like
+    // `wradlib` do by convention. For well-formed files where only
+    // one of the paths exists, order is irrelevant.
     let what_paths = ["/dataset1/what", "/dataset1/data1/what", "/what"];
     let read_first_f64 = |name: &str| -> Result<f64, ReadError> {
         for p in &what_paths {

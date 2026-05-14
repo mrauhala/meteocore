@@ -16,10 +16,13 @@
 //!
 //! Phase 1 narrows the scope from the format's full capabilities:
 //! - Local directories only (no S3 / STAC — those land later)
-//! - No async polling — the engine is fully synchronous and
-//!   refreshes the catalog only when `new` runs. A poll loop and
-//!   `ArcSwap` swap on file changes are the next commit.
-//! - Single-parameter (one composite quantity per collection).
+//! - Single-parameter (one composite quantity per collection)
+//!
+//! A background `poll_loop` re-scans `data_dir` every
+//! `poll_interval_secs` and atomically swaps the catalog
+//! (`ArcSwap<Vec<CatalogEntry>>`) when the file set changes, so
+//! new ODIM files appear in the temporal extent without needing
+//! an admin reload.
 //!
 //! See [[project_odim_engine_plan]] for the full multi-phase plan.
 
@@ -100,6 +103,21 @@ impl OdimEngine {
         collection_id: &str,
         config: &ds_core::config::OdimConfig,
     ) -> Result<Self, EngineError> {
+        // Phase 1 supports local directories only. S3-style config
+        // fields (`endpoint`, `bucket`, `prefix_pattern`) are present
+        // in `OdimConfig` as Phase 2 stubs — if an operator filled
+        // them in expecting remote behaviour, warn loudly so the
+        // misconfiguration is visible rather than silently producing
+        // a "local data not found" error.
+        if config.endpoint.is_some() || config.bucket.is_some() || config.prefix_pattern.is_some() {
+            tracing::warn!(
+                "[{}] ODIM config carries S3 fields (endpoint/bucket/prefix_pattern) but \
+                 Phase 1 supports local directories only — these fields are ignored. \
+                 Remote source support lands in Phase 2 (STAC) / Phase 3 (PVOL S3).",
+                collection_id
+            );
+        }
+
         let matcher = build_matcher(config)?;
         let catalog = scan_local_directory(data_dir, &matcher, config.max_files)?;
         if catalog.is_empty() {
@@ -216,6 +234,11 @@ impl OdimEngine {
     /// recent entry. Returns an owned `CatalogEntry` clone because
     /// the catalog lives behind `ArcSwap` and the snapshot guard
     /// must drop before the per-request work proceeds.
+    ///
+    /// Logs a WARN when the nearest match is more than 2× the poll
+    /// interval from the requested time — operators should treat
+    /// this as a signal that the data feed has stalled or that the
+    /// client is querying outside the available window.
     fn select_entry(&self, time: Option<DateTime<Utc>>) -> Option<CatalogEntry> {
         let snapshot = self.catalog.load();
         if let Some(target) = time {
@@ -224,10 +247,22 @@ impl OdimEngine {
             // practice (24h * 5-min ODIM cadence is the upper end
             // before `max_files` trims), a linear scan is faster than
             // a binary search through the noise of branch prediction.
-            snapshot
+            let pick = snapshot
                 .iter()
-                .min_by_key(|e| (e.time - target).num_seconds().abs())
-                .cloned()
+                .min_by_key(|e| (e.time - target).num_seconds().abs())?;
+            let gap = (pick.time - target).num_seconds().abs();
+            let stale_threshold = (self.poll_interval.as_secs() * 2).max(60) as i64;
+            if gap > stale_threshold {
+                tracing::warn!(
+                    "[{}] ODIM request at {} matched stale entry {} (gap {}s > {}s threshold)",
+                    self.collection_id,
+                    target.to_rfc3339(),
+                    pick.time.to_rfc3339(),
+                    gap,
+                    stale_threshold
+                );
+            }
+            Some(pick.clone())
         } else {
             snapshot.last().cloned()
         }
@@ -376,19 +411,17 @@ impl MapEngine for OdimEngine {
 
     fn raster_info(&self) -> RasterInfo {
         // Read native_crs and spatial_extent from the seed-loaded
-        // composite. Times come from the catalog.
-        let native_crs = if let Ok(guard) = self.cached.lock() {
-            guard.as_ref().map(|(_, c)| crs_label(&c.crs))
-        } else {
-            None
-        }
-        .unwrap_or_else(|| "unknown".into());
-
-        let spatial_extent = if let Ok(guard) = self.cached.lock() {
-            guard.as_ref().map(|(_, c)| c.wgs84_corners)
-        } else {
-            None
-        };
+        // composite under a single lock acquisition. Times come from
+        // the catalog (separate lock-free ArcSwap snapshot).
+        let (native_crs, spatial_extent) = self
+            .cached
+            .lock()
+            .ok()
+            .and_then(|g| {
+                g.as_ref()
+                    .map(|(_, c)| (crs_label(&c.crs), Some(c.wgs84_corners)))
+            })
+            .unwrap_or_else(|| ("unknown".into(), None));
 
         let times: Vec<DateTime<Utc>> = self.catalog.load().iter().map(|e| e.time).collect();
 

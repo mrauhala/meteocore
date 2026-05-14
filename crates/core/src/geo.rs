@@ -1205,6 +1205,45 @@ mod tests {
         assert!((lat - 55.6761).abs() < 0.001, "lat={lat}");
     }
 
+    /// Roundtrip the four explicit DMI corner coordinates that sit
+    /// hundreds of km from the projection origin in opposite
+    /// directions. The earlier LCC-conflated `stere_forward` paired
+    /// with the Newton-iteration `stere_inverse` was self-consistent
+    /// (forward + inverse cancel) but produced wrong absolute
+    /// coordinates that broke ODIM rendering. Pinning the round-trip
+    /// at off-center points wouldn't have caught the old bug — but
+    /// it guards against a future regression that changes `forward`
+    /// without keeping `inverse` consistent (the inverse is Newton
+    /// iteration calling `forward`, so they stay locked by
+    /// construction, and this test confirms that contract).
+    #[test]
+    fn stereographic_roundtrip_dmi_far_corners() {
+        let crs = Crs::Stereographic {
+            lat0: 56.0_f64.to_radians(),
+            lon0: 10.5666_f64.to_radians(),
+            k0: 1.0,
+            false_e: 0.0,
+            false_n: 0.0,
+        };
+        for (lon, lat) in [
+            (3.0, 60.0),
+            (20.735, 59.828),
+            (4.379, 52.294),
+            (18.893, 52.294),
+        ] {
+            let (x, y) = crs.forward(lon, lat);
+            let (lon_back, lat_back) = crs.inverse(x, y).unwrap();
+            assert!(
+                (lon_back - lon).abs() < 1e-6,
+                "lon roundtrip failed at ({lon}, {lat}): got {lon_back}"
+            );
+            assert!(
+                (lat_back - lat).abs() < 1e-6,
+                "lat roundtrip failed at ({lon}, {lat}): got {lat_back}"
+            );
+        }
+    }
+
     // Test at ~1000km from center (edge of typical radar composite)
     #[test]
     fn stereographic_far_from_center() {
