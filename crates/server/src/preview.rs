@@ -429,21 +429,20 @@ fn build_entry(
 /// per-collection manifest entry. Sorted by name for stable ordering.
 ///
 /// Selection rules — the manifest must only advertise parameters the Tiles /
-/// Maps handlers will actually accept, so that the SPA dropdown can't pick a
-/// value that immediately 400s at render time:
+/// Maps handlers will actually render, so that the SPA dropdown can't pick a
+/// value that either 400s OR (worse) is silently ignored at render time:
 ///
-/// 1. If a `MapEngine` is registered AND its `raster_info().parameters` is
-///    non-empty, that list is the source of truth (it's what the raster route
-///    validates against). Names absent from EDR fall back to the raster-side
-///    `(short_name, title)` with an empty unit.
-/// 2. When the matching `EdrEngine` is also present, its richer
-///    `get_parameter_descriptions()` (per-param `unit` + `label`) is preferred
-///    for each name that survived (1).
-/// 3. Pure-EDR fallback: no raster engine OR `raster_info().parameters` empty
-///    (single-band collections like single-parameter GeoTIFF) — surface EDR's
-///    full list. The dropdown still renders, but the tile handler's
-///    "single-param engine ignores `parameter-name`" branch keeps everything
-///    consistent.
+/// 1. `MapEngine` registered AND `raster_info().parameters` non-empty: that
+///    list is the source of truth. Names also present in EDR are enriched
+///    with EDR's richer `(label, unit)`; names absent from EDR fall back to
+///    raster-side `(short_name, title)` with an empty unit.
+/// 2. `MapEngine` registered with an *empty* `parameters` list signals a
+///    single-band engine (single-band GeoTIFF). The tile handler ignores
+///    `?parameter-name=` regardless of the value passed — so emitting any
+///    dropdown options would lie about what the SPA can actually do. No
+///    `parameters` field in the manifest, even if EDR exposes more than one.
+/// 3. Pure-EDR collection (no raster engine at all): surface EDR's full
+///    list. No tile-rendering path exists, so there's no mismatch risk.
 fn collection_parameters(
     id: &str,
     edr: &api_edr::handlers::EdrState,
@@ -479,7 +478,12 @@ fn collection_parameters(
                 })
                 .collect()
         }
-        (_, Some(edr)) if !edr.is_empty() => edr
+        // Raster engine is present but reports no parameters → single-band.
+        // Even if EDR is multi-param the tile handler will ignore the
+        // selection, so showing a dropdown would mislead users into thinking
+        // they can switch parameters. Suppress unconditionally.
+        (Some(_), _) => return None,
+        (None, Some(edr)) if !edr.is_empty() => edr
             .into_iter()
             .map(|(name, desc)| {
                 json!({
@@ -826,6 +830,22 @@ mod tests {
         times: Vec<DateTime<Utc>>,
         parameter: String,
         unit: String,
+        /// `parameters` returned by `raster_info()`. Empty by default
+        /// (single-band convention). Tests for multi-parameter raster
+        /// behaviour set this explicitly.
+        parameters: Vec<(String, String)>,
+    }
+
+    impl Default for RasterMock {
+        fn default() -> Self {
+            Self {
+                spatial_extent: None,
+                times: Vec::new(),
+                parameter: "value".into(),
+                unit: String::new(),
+                parameters: Vec::new(),
+            }
+        }
     }
 
     impl MapEngine for RasterMock {
@@ -847,7 +867,7 @@ mod tests {
                 times: self.times.clone(),
                 parameter: self.parameter.clone(),
                 unit: self.unit.clone(),
-                parameters: vec![],
+                parameters: self.parameters.clone(),
             }
         }
     }
@@ -1068,6 +1088,7 @@ mod tests {
             times: vec![],
             parameter: "reflectivity".into(),
             unit: "dBZ".into(),
+            parameters: vec![],
         });
         let feature_engine: Arc<dyn FeatureEngine> = Arc::new(PointFeatureMock {
             extent: Some([20.0, 60.0, 30.0, 70.0]),
@@ -1340,6 +1361,7 @@ mod tests {
             times: times.clone(),
             parameter: "reflectivity".into(),
             unit: "dBZ".into(),
+            parameters: vec![],
         });
         tiles.map_engines.insert("radar".into(), raster);
         tiles
@@ -1382,6 +1404,7 @@ mod tests {
             times: times.clone(),
             parameter: "reflectivity".into(),
             unit: "dBZ".into(),
+            parameters: vec![],
         });
         wms.engines.insert("radar-wms".into(), engine);
         wms.collections
@@ -1463,6 +1486,7 @@ mod tests {
             times: times.clone(),
             parameter: "reflectivity".into(),
             unit: "dBZ".into(),
+            parameters: vec![],
         });
         tiles.map_engines.insert("radar".into(), raster);
         tiles.collections.insert(
@@ -1512,6 +1536,7 @@ mod tests {
             times: times.clone(),
             parameter: "reflectivity".into(),
             unit: "dBZ".into(),
+            parameters: vec![],
         });
         tiles.map_engines.insert("radar".into(), raster);
         tiles
@@ -1547,6 +1572,7 @@ mod tests {
             times: times.clone(),
             parameter: "reflectivity".into(),
             unit: "dBZ".into(),
+            parameters: vec![],
         });
         tiles.map_engines.insert("radar".into(), raster);
         tiles.collections.insert(
@@ -1639,10 +1665,15 @@ mod tests {
 
         let mut tiles = empty_tiles();
         let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
-            spatial_extent: None,
-            times: Vec::new(),
             parameter: "2t".into(),
             unit: "K".into(),
+            // GRIB shape: raster exposes the same param set as EDR.
+            parameters: vec![
+                ("2t".into(), "Temperature".into()),
+                ("msl".into(), "Pressure".into()),
+                ("10u".into(), "Wind U".into()),
+            ],
+            ..RasterMock::default()
         });
         tiles.map_engines.insert("ecmwf-fc".into(), raster);
         tiles
@@ -1661,6 +1692,81 @@ mod tests {
         assert_eq!(params[2]["name"], "msl");
         assert_eq!(params[1]["unit"], "K");
         assert_eq!(params[1]["title"], "2 metre temperature");
+    }
+
+    #[test]
+    fn manifest_omits_parameters_when_raster_is_single_band_even_if_edr_multi_param() {
+        // Reviewer scenario: single-band raster engine (empty
+        // `raster_info().parameters`) shares a collection ID with a
+        // multi-param EDR engine. The tile handler ignores `parameter-name=`
+        // for single-band engines, so emitting EDR's multi-param list would
+        // give the user a dropdown whose selections are silently ignored at
+        // render time. The manifest must instead drop the `parameters` field
+        // so the SPA shows no dropdown.
+        use ds_core::model::ParameterDescription;
+
+        struct MultiParamEdrShim;
+        impl EdrEngine for MultiParamEdrShim {
+            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+                Ok(Vec::new())
+            }
+            fn query_location(
+                &self,
+                _: &str,
+                _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                _: Option<&[String]>,
+            ) -> Result<QueryResult, DataServerError> {
+                unimplemented!()
+            }
+            fn get_parameters(&self) -> Vec<String> {
+                vec!["a".into(), "b".into()]
+            }
+            fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
+                let mut m = HashMap::new();
+                for n in ["a", "b"] {
+                    m.insert(
+                        n.to_string(),
+                        ParameterDescription {
+                            label: n.to_string(),
+                            unit: String::new(),
+                            observed_property: n.into(),
+                        },
+                    );
+                }
+                m
+            }
+            fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+                None
+            }
+            fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+                None
+            }
+        }
+
+        let mut edr = empty_edr();
+        edr.engines
+            .insert("single-band".into(), Arc::new(MultiParamEdrShim));
+        edr.collections.insert(
+            "single-band".into(),
+            config("single-band", &["edr", "tiles"]),
+        );
+
+        let mut tiles = empty_tiles();
+        let raster: Arc<dyn MapEngine> = Arc::new(RasterMock::default());
+        tiles.map_engines.insert("single-band".into(), raster);
+        tiles.collections.insert(
+            "single-band".into(),
+            config("single-band", &["edr", "tiles"]),
+        );
+
+        let state = make_state(edr, empty_features(), empty_maps(), tiles, empty_wms());
+        let m = build_manifest(&state, 0, 100);
+        assert!(
+            m["collections"][0].get("parameters").is_none(),
+            "single-band raster + multi-param EDR must NOT emit a parameters \
+             dropdown — the tile handler silently ignores parameter-name for \
+             single-band engines"
+        );
     }
 
     #[test]

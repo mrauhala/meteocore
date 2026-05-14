@@ -476,6 +476,152 @@ mod get_map {
         let (status, _) = get("/collections/radar/map?bbox=10,55,30,70&width=9000").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn parameter_name_query_is_accepted_for_single_param_engine() {
+        // `MockMapEngine.raster_info().parameters` is empty (single-band).
+        // The handler accepts any `parameter-name=` and forwards it; the
+        // engine ignores the value at render time per the trait contract.
+        let (status, _, body) =
+            get_raw("/collections/radar/map?bbox=10,55,30,70&parameter-name=anything").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.starts_with(&[0x89, b'P', b'N', b'G']));
+    }
+
+    #[tokio::test]
+    async fn parameter_name_changes_etag() {
+        // Different parameter-name values must produce different rendered-cache
+        // entries (and thus different ETags) — otherwise a client switching
+        // parameters would get a stale 304.
+        let (_, headers_a, _) =
+            get_raw("/collections/radar/map?bbox=10,55,30,70&parameter-name=2t").await;
+        let (_, headers_b, _) =
+            get_raw("/collections/radar/map?bbox=10,55,30,70&parameter-name=10u").await;
+        assert_ne!(
+            headers_a.get("etag").unwrap(),
+            headers_b.get("etag").unwrap(),
+            "ETags must differ across parameter-name values"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_parameter_name_returns_400_for_multi_param_engine() {
+        let app = build_multi_param_router();
+        let req = Request::builder()
+            .uri("/collections/wx/map?bbox=10,55,30,70&parameter-name=nope")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("Available: 2t, 10u") || text.contains("Available: 10u, 2t"),
+            "error body should list available parameters; got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn known_parameter_name_is_accepted_by_multi_param_engine() {
+        let app = build_multi_param_router();
+        let req = Request::builder()
+            .uri("/collections/wx/map?bbox=10,55,30,70&parameter-name=2t")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
+
+struct MultiParamMockEngine;
+
+impl MapEngine for MultiParamMockEngine {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _output_crs: &ds_core::map_engine::OutputCrs,
+        _parameter: Option<&str>,
+    ) -> Result<ds_core::map_engine::RasterTile, ds_core::error::DataServerError> {
+        let pixel_count = (width * height) as usize;
+        let values: Vec<Option<f64>> = (0..pixel_count).map(|i| Some(i as f64)).collect();
+        Ok(ds_core::map_engine::RasterTile {
+            width,
+            height,
+            values,
+        })
+    }
+
+    fn raster_info(&self) -> ds_core::map_engine::RasterInfo {
+        ds_core::map_engine::RasterInfo {
+            native_crs: "EPSG:4326".into(),
+            spatial_extent: Some([0.0, 0.0, 10.0, 10.0]),
+            times: vec![],
+            parameter: "2t".into(),
+            unit: "K".into(),
+            parameters: vec![
+                ("2t".into(), "Temperature".into()),
+                ("10u".into(), "U Wind".into()),
+            ],
+        }
+    }
+}
+
+fn build_multi_param_router() -> axum::Router {
+    let engine: Arc<dyn MapEngine> = Arc::new(MultiParamMockEngine);
+    let mut engines = HashMap::new();
+    let mut collections = HashMap::new();
+    let mut styles_map = HashMap::new();
+
+    engines.insert("wx".to_string(), engine);
+    collections.insert(
+        "wx".to_string(),
+        CollectionConfig {
+            id: "wx".to_string(),
+            title: "Forecast".to_string(),
+            description: "Test multi-param".to_string(),
+            data_path: None,
+            apis: vec!["maps".to_string()],
+            engine_type: "grib".to_string(),
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            postgis: None,
+            preview: None,
+        },
+    );
+
+    let cmap = Arc::new(LutColorMap::from_builtin(
+        BuiltinColormap::Viridis,
+        0.0,
+        1.0,
+    ));
+    let mut layer_styles = HashMap::new();
+    layer_styles.insert(
+        "default".to_string(),
+        StyleInfo {
+            name: "default".to_string(),
+            title: "Default".to_string(),
+            colormap: cmap,
+            min: 0.0,
+            max: 1.0,
+            parameter: None,
+        },
+    );
+    styles_map.insert("wx".to_string(), layer_styles);
+
+    let state = Arc::new(ArcSwap::from_pointee(MapsState {
+        engines,
+        collections,
+        styles: styles_map,
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        base_url: String::new(),
+    }));
+    api_maps::router(state)
 }
 
 // ---------------------------------------------------------------------------
