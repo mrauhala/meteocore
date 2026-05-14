@@ -276,10 +276,7 @@ mod tests {
     /// output pixels to land outside the source data when sampling.
     #[test]
     fn dmi_oblique_stereographic_lat_ts_equals_lat_0_gives_k0_one() {
-        let crs = parse(
-            "+proj=stere +ellps=WGS84 +lat_0=56 +lon_0=10.5666 +lat_ts=56",
-        )
-        .unwrap();
+        let crs = parse("+proj=stere +ellps=WGS84 +lat_0=56 +lon_0=10.5666 +lat_ts=56").unwrap();
         match crs {
             Crs::Stereographic { k0, .. } => {
                 assert!(

@@ -224,6 +224,7 @@ impl MapEngine for OdimEngine {
         let gain = self.gain_override.unwrap_or(composite.gain);
         let offset = self.offset_override.unwrap_or(composite.offset);
         let nodata = self.nodata_override.unwrap_or(composite.nodata);
+        let undetect = composite.undetect;
 
         let (merc_y_north, merc_y_south) = if *output_crs == OutputCrs::WebMercator {
             (lat_to_merc_y(north), lat_to_merc_y(south))
@@ -270,6 +271,7 @@ impl MapEngine for OdimEngine {
                     gain,
                     offset,
                     nodata,
+                    undetect,
                 ));
             }
         }

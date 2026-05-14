@@ -11,32 +11,33 @@
 //!
 //! Verified producers (and their layout quirks):
 //!
-//! | Producer | ODIM version | Pixel type | Quirks                                              |
-//! |----------|--------------|------------|-----------------------------------------------------|
-//! | DMI      | v2.0         | u8         | No `/where/xsize`/`ysize`; gain/offset/nodata at root `/what`; quantity as attr on `/dataset1/data1` |
-//! | SMHI     | v2.2         | u8         | Canonical `/dataset1/data1/what/*` layout; DEFLATE compression currently fails through `hdf5-reader` 0.4 (upstream bug) |
+//! | Producer | ODIM version | Pixel type | Renders | Notes                                       |
+//! |----------|--------------|------------|---------|---------------------------------------------|
+//! | DMI      | v2.0         | u8         | yes     | No `/where/xsize`/`ysize`; gain/offset/nodata at root `/what`; quantity as attr on `/dataset1/data1` |
+//! | OPERA    | v2.4         | f64        | yes     | Canonical layout; LAEA grid (EPSG:3035-style); already-decoded physical dBZ with `nodata=-9999000`, `undetect=-8888000` |
+//! | SMHI     | v2.2         | u8         | no      | Canonical layout; DEFLATE decompression fails in `hdf5-reader` 0.4 (upstream bug — `h5dump` reads the same file fine) |
 //!
-//! "Canonical" here means the layout described in ODIM_H5 v2.4
-//! §7.4 — gain/offset/nodata/quantity under `/dataset<n>/data<m>/what`.
-//! FMI and OPERA composites are expected to follow the canonical
-//! layout but neither has been wired through the reader yet:
-//! FMI's open-data S3 bucket ships PVOL HDF5 only (no COMP), and
-//! OPERA HDF5 on cloudferro is PVOL+SCAN. Phase 2 (STAC) will
-//! introduce additional composite sources.
+//! "Canonical" here means the ODIM_H5 v2.4 §7.4 layout —
+//! gain/offset/nodata/quantity under `/dataset<n>/data<m>/what`.
+//!
+//! Not currently exercised (no readily-available ODIM COMP source):
+//! - FMI — open-data S3 ships only PVOL HDF5; composites are
+//!   published as GeoTIFF, served by engine-geotiff
+//! - Per-country OPERA contributions on cloudferro — only PVOL/SCAN
 //!
 //! The output is an [`OdimComposite`] containing the parsed
 //! [`Crs`], a native-coordinate bbox, the timestamp, parameter
 //! metadata, and the raw pixel array. The raw → physical-units
-//! conversion (`raw * gain + offset`) and nodata masking happen
-//! **at sample time**, not at read time, so a multi-megapixel
+//! conversion (`raw * gain + offset`) and nodata/undetect masking
+//! happen **at sample time**, not at read time, so a multi-megapixel
 //! grid doesn't pay 16 bytes/cell to be carried around as
 //! `Vec<Option<f64>>`.
 //!
 //! Phase 1 narrows the scope further than the format allows:
 //! - Single dataset (`/dataset1` only), single data layer (`/data1`)
-//! - Only `u8` and `u16` raw pixel types — both verified ODIM v2.x
-//!   composites we've seen use these
-//! - No quality layers, no how/* attributes, no PVOL volume data
+//! - Three raw pixel types: u8, u16, f64 (all the variants we've
+//!   actually encountered)
+//! - No quality layers, no `how/*` attributes, no PVOL volume data
 //!
 //! See [[project_odim_engine_plan]] for the full multi-phase plan.
 
@@ -68,7 +69,9 @@ pub enum ReadError {
     ProjParse(#[from] proj::ParseError),
     #[error("dataset `/dataset1/data1/data` has unsupported shape: expected 2D, got {0}D")]
     UnsupportedRank(usize),
-    #[error("dataset `/dataset1/data1/data` has unsupported pixel type (Phase 1: u8 or u16)")]
+    #[error(
+        "dataset `/dataset1/data1/data` has unsupported pixel type (Phase 1: u8, u16, or f64)"
+    )]
     UnsupportedPixelType,
     #[error("dataset read failed: {0}")]
     DatasetRead(String),
@@ -76,14 +79,21 @@ pub enum ReadError {
     AttributeRead(String),
 }
 
-/// Raw pixel storage as it appears on disk. ODIM v2.x composites
-/// typically ship `u8` (single-byte reflectivity classes, 0–255) or
-/// `u16` (extended dynamic range). Both are scaled integers — the
-/// physical value is `raw as f64 * gain + offset`.
+/// Raw pixel storage as it appears on disk. ODIM composites ship
+/// one of:
+/// - `u8`  — single-byte reflectivity classes (DMI v2.0)
+/// - `u16` — extended dynamic range (some EUMETNET v2.x producers)
+/// - `f64` — already-decoded physical values (OPERA v2.4 ACRR/DBZH)
+///
+/// For the integer variants the physical value is `raw * gain + offset`.
+/// For the f64 variant the values are already in physical units, but
+/// the gain/offset metadata is still applied for symmetry — typically
+/// gain=1, offset=0, so it's a no-op.
 #[derive(Debug, Clone)]
 pub enum RawPixels {
     U8(Array2<u8>),
     U16(Array2<u16>),
+    F64(Array2<f64>),
 }
 
 impl RawPixels {
@@ -94,14 +104,21 @@ impl RawPixels {
         match self {
             RawPixels::U8(a) => a.dim(),
             RawPixels::U16(a) => a.dim(),
+            RawPixels::F64(a) => a.dim(),
         }
     }
 
     /// Read a single pixel at `(row, col)`, returning `None` for the
-    /// nodata sentinel and `Some(physical)` otherwise. `physical` is
-    /// `raw as f64 * gain + offset`. Bounds-checked by ndarray; out-
-    /// of-range indices panic in tests and return `None` in release
-    /// builds via `get` (callers should clamp upstream).
+    /// nodata or undetect sentinels and `Some(physical)` otherwise.
+    /// `physical = raw * gain + offset`. Out-of-range indices return
+    /// `None`.
+    ///
+    /// Both `nodata` ("outside coverage") and `undetect` ("radar
+    /// looked but saw nothing") are treated as masked in Phase 1 —
+    /// neither renders as a colored pixel. Splitting them into
+    /// distinct visible classes can be revisited if a use case asks
+    /// for it (e.g. precipitation accumulation overlays often want
+    /// undetect = 0 mm, not transparent).
     pub fn sample(
         &self,
         row: usize,
@@ -109,16 +126,22 @@ impl RawPixels {
         gain: f64,
         offset: f64,
         nodata: f64,
+        undetect: Option<f64>,
     ) -> Option<f64> {
         let raw = match self {
             RawPixels::U8(a) => a.get((row, col)).map(|v| *v as f64)?,
             RawPixels::U16(a) => a.get((row, col)).map(|v| *v as f64)?,
+            RawPixels::F64(a) => a.get((row, col)).copied()?,
         };
         if raw == nodata {
-            None
-        } else {
-            Some(raw * gain + offset)
+            return None;
         }
+        if let Some(u) = undetect {
+            if raw == u {
+                return None;
+            }
+        }
+        Some(raw * gain + offset)
     }
 }
 
@@ -153,6 +176,10 @@ pub struct OdimComposite {
     pub offset: f64,
     /// Raw value indicating "no data" / out-of-coverage pixel.
     pub nodata: f64,
+    /// Optional raw value indicating "no echo detected" — distinct
+    /// from `nodata` (which means the radar didn't look). ODIM v2.4
+    /// §7.4.2 makes this mandatory; older producers may omit it.
+    pub undetect: Option<f64>,
     /// The raw 2D pixel array, indexed `[row, col]` (i.e.
     /// `[y_from_top, x_from_left]`). Most ODIM producers ship rows
     /// north-to-south; callers must read `/where/UR_lat` >
@@ -316,6 +343,7 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     let gain = read_first_f64("gain")?;
     let offset = read_first_f64("offset")?;
     let nodata = read_first_f64("nodata")?;
+    let undetect = read_first_f64("undetect").ok();
 
     // Quantity has one extra fallback (DMI puts it as an attribute on
     // the `/dataset1/data1` data group itself, not in a what subgroup).
@@ -328,9 +356,10 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
             name: "quantity".into(),
         })?;
 
-    // Try u8 first (the common case for radar reflectivity classes);
-    // on failure try u16. The error from the wrong dtype is benign —
-    // `read_array` returns `Err` rather than panicking.
+    // Try u8 (DMI v2.0, SMHI v2.2), u16 (some EUMETNET v2.x), then
+    // f64 (OPERA v2.4 — pre-decoded physical values). `read_array`
+    // returns `Err` on dtype mismatch rather than panicking, so the
+    // fallback chain is safe.
     let pixels = if let Ok(arr) = ds.read_array::<u8>() {
         let a2 = arr
             .into_dimensionality::<ndarray::Ix2>()
@@ -353,6 +382,17 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
             )));
         }
         RawPixels::U16(a2)
+    } else if let Ok(arr) = ds.read_array::<f64>() {
+        let a2 = arr
+            .into_dimensionality::<ndarray::Ix2>()
+            .map_err(|e| ReadError::DatasetRead(format!("f64 reshape failed: {e}")))?;
+        if a2.dim() != (rows, cols) {
+            return Err(ReadError::DatasetRead(format!(
+                "f64 array shape {:?} doesn't match metadata {rows}x{cols}",
+                a2.dim()
+            )));
+        }
+        RawPixels::F64(a2)
     } else {
         return Err(ReadError::UnsupportedPixelType);
     };
@@ -368,6 +408,7 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
         gain,
         offset,
         nodata,
+        undetect,
         pixels,
     })
 }
@@ -439,10 +480,10 @@ mod tests {
 
         // Real radar fixture: gain=0.5, offset=-32 → reflectivity
         // class 0 maps to -32 dBZ, class 255 is the nodata sentinel.
-        assert_eq!(px.sample(0, 0, 0.5, -32.0, 255.0), Some(-32.0));
-        assert_eq!(px.sample(0, 1, 0.5, -32.0, 255.0), Some(0.0));
-        assert_eq!(px.sample(1, 0, 0.5, -32.0, 255.0), Some(32.0));
-        assert_eq!(px.sample(1, 1, 0.5, -32.0, 255.0), None);
+        assert_eq!(px.sample(0, 0, 0.5, -32.0, 255.0, None), Some(-32.0));
+        assert_eq!(px.sample(0, 1, 0.5, -32.0, 255.0, None), Some(0.0));
+        assert_eq!(px.sample(1, 0, 0.5, -32.0, 255.0, None), Some(32.0));
+        assert_eq!(px.sample(1, 1, 0.5, -32.0, 255.0, None), None);
     }
 
     /// The same sample logic must work for u16 grids — different
@@ -452,8 +493,38 @@ mod tests {
         let arr = Array2::from_shape_vec((1, 3), vec![0u16, 10_000, 65_535]).unwrap();
         let px = RawPixels::U16(arr);
 
-        assert_eq!(px.sample(0, 0, 0.01, 0.0, 65_535.0), Some(0.0));
-        assert!((px.sample(0, 1, 0.01, 0.0, 65_535.0).unwrap() - 100.0).abs() < 1e-9);
-        assert_eq!(px.sample(0, 2, 0.01, 0.0, 65_535.0), None);
+        assert_eq!(px.sample(0, 0, 0.01, 0.0, 65_535.0, None), Some(0.0));
+        assert!((px.sample(0, 1, 0.01, 0.0, 65_535.0, None).unwrap() - 100.0).abs() < 1e-9);
+        assert_eq!(px.sample(0, 2, 0.01, 0.0, 65_535.0, None), None);
+    }
+
+    /// OPERA v2.4 ships pre-decoded f64 pixels with nodata=-9999000
+    /// and undetect=-8888000. Both sentinels must mask to None; real
+    /// values fall through unchanged (gain=1, offset=0).
+    #[test]
+    fn raw_pixels_sample_handles_f64_with_undetect() {
+        let arr =
+            Array2::from_shape_vec((1, 4), vec![5.0_f64, 25.0, -9999000.0, -8888000.0]).unwrap();
+        let px = RawPixels::F64(arr);
+
+        // OPERA's real config: gain=1, offset=0
+        assert_eq!(
+            px.sample(0, 0, 1.0, 0.0, -9999000.0, Some(-8888000.0)),
+            Some(5.0)
+        );
+        assert_eq!(
+            px.sample(0, 1, 1.0, 0.0, -9999000.0, Some(-8888000.0)),
+            Some(25.0)
+        );
+        assert_eq!(
+            px.sample(0, 2, 1.0, 0.0, -9999000.0, Some(-8888000.0)),
+            None,
+            "nodata sentinel must mask"
+        );
+        assert_eq!(
+            px.sample(0, 3, 1.0, 0.0, -9999000.0, Some(-8888000.0)),
+            None,
+            "undetect sentinel must mask"
+        );
     }
 }
