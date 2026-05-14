@@ -902,7 +902,7 @@ PNG/WebP responses are always RGBA (transparent for empty tiles). JPEG is RGB. E
 - `Content-Crs:` OGC URI of the output CRS
 - `ETag:` FNV-1a hash of the encoded response body — changes whenever the rendered pixels change, regardless of whether the cache key changed. This is what makes a server-side fix (e.g. colormap correction) invalidate stale browser caches instead of letting them serve infinite `304`s.
 - `Cache-Control: public, max-age=86400, immutable` when `datetime` is set; `public, max-age=60, must-revalidate` otherwise
-- `X-Cache: HIT | MISS | EMPTY` for observability (also set on `304 Not Modified` from the cache-HIT branch so clients can distinguish it from a post-render-revalidation 304)
+- `X-Cache: HIT | MISS | EMPTY` for observability. Set on every 200 and 304 response: `HIT` for cache-hit revalidations, `MISS` for post-render revalidations, `EMPTY` for transparent-tile fast-paths. Operators can grep dashboards by the value rather than reasoning about header absence.
 
 `If-None-Match` is evaluated against the content-derived ETag from the cache hit or the freshly-rendered bytes — not before the cache lookup. An overloaded render semaphore returns `503 Service Unavailable` with the fixed body `{"code":"ServerBusy","description":"Server busy, try again later"}`. Internal errors return 500 with a redacted body; the original detail is captured via `tracing::warn!` for operators.
 

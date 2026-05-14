@@ -837,10 +837,16 @@ async fn render_map(
     // `CachedRendered` so the response ETag is FNV-1a over the actual
     // bytes — different pixels, different ETag — regardless of which
     // exit we take (#145).
-    let (cached, x_cache, response_content_type, insert_into_cache) = match render_result {
+    // Each arm produces a `CachedRendered` ready to serve. Only the
+    // populated `Ok(Some(_))` path inserts into the rendered cache; the
+    // EMPTY fast-path intentionally doesn't (its bytes are deterministic
+    // for fixed dimensions). Engine errors bail with 500 before this
+    // match.
+    let (cached, x_cache, response_content_type) = match render_result {
         Ok(Some(bytes)) => {
             let cached = ds_render::CachedRendered::new(bytes::Bytes::from(bytes));
-            (cached, "MISS", content_type, true)
+            rendered_cache.insert(cache_key, cached.clone());
+            (cached, "MISS", content_type)
         }
         Ok(None) => {
             // Empty tile: transparent PNG, never cached.
@@ -848,7 +854,7 @@ async fn render_map(
             let png = ds_render::encode_png(&rgba, width, height)
                 .map_err(|e| MapsError::Internal(format!("Failed to encode empty tile: {e}")))?;
             let cached = ds_render::CachedRendered::new(bytes::Bytes::from(png));
-            (cached, "EMPTY", "image/png", false)
+            (cached, "EMPTY", "image/png")
         }
         Err(e) => {
             tracing::warn!("Maps render error for collection '{}': {e}", collection_id);
@@ -856,22 +862,19 @@ async fn render_map(
         }
     };
 
-    if insert_into_cache {
-        rendered_cache.insert(cache_key, cached.clone());
-    }
-
     // Content-derived ETag now available — do the `If-None-Match`
     // comparison here, after rendering. Same flow as `render_vector_tile`
-    // in api-tiles. `x-cache` is *intentionally* absent on this 304: the
-    // cache-HIT 304 above emits `x-cache: HIT`, and the absence here is
-    // what lets clients (and the regression test) tell the two branches
-    // apart. Adding `x-cache: MISS` here would silently break that.
+    // in api-tiles. Emit `x-cache: MISS` so operators can tell
+    // post-render revalidations apart from cache-hit revalidations in
+    // logs/metrics, and tests can pin either branch by the *value* of
+    // the header rather than by its absence.
     if let Some(ref inm) = if_none_match {
         if ds_render::etag_matches(inm, cached.etag()) {
             return Ok(axum::response::Response::builder()
                 .status(StatusCode::NOT_MODIFIED)
                 .header(header::ETAG, cached.etag())
                 .header(header::CACHE_CONTROL, cache_control)
+                .header(header::HeaderName::from_static("x-cache"), "MISS")
                 .body(axum::body::Body::empty())
                 .unwrap()
                 .into_response());

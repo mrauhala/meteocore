@@ -251,10 +251,16 @@ pub async fn wms_handler(
             // every branch in `CachedRendered` so the response ETag is
             // FNV-1a over the actual bytes — different pixels, different
             // ETag — regardless of which exit we take (#145).
-            let (cached, x_cache, response_content_type, insert_into_cache) = match render_result {
+            // Each arm produces a `CachedRendered` ready to serve. Only the
+            // populated `Ok(Some(_))` path inserts into the rendered cache;
+            // the EMPTY and ERROR fast-paths intentionally don't (their
+            // bytes are deterministic for fixed dimensions and the
+            // engine error case shouldn't poison the cache).
+            let (cached, x_cache, response_content_type) = match render_result {
                 Ok(Some(bytes)) => {
                     let cached = ds_render::CachedRendered::new(bytes::Bytes::from(bytes));
-                    (cached, "MISS", content_type, true)
+                    rendered_cache.insert(cache_key, cached.clone());
+                    (cached, "MISS", content_type)
                 }
                 Ok(None) => {
                     // Empty tile: transparent PNG, never cached.
@@ -264,19 +270,15 @@ pub async fn wms_handler(
                             WmsError::Internal(format!("Failed to encode empty tile: {e}"))
                         })?;
                     let cached = ds_render::CachedRendered::new(bytes::Bytes::from(png));
-                    (cached, "EMPTY", "image/png", false)
+                    (cached, "EMPTY", "image/png")
                 }
                 Err(e) => {
                     tracing::warn!("WMS render error for layer '{}': {e}", params.layer);
                     let png = render_error_tile(params.width, params.height)?;
                     let cached = ds_render::CachedRendered::new(bytes::Bytes::from(png));
-                    (cached, "ERROR", "image/png", false)
+                    (cached, "ERROR", "image/png")
                 }
             };
-
-            if insert_into_cache {
-                rendered_cache.insert(cache_key, cached.clone());
-            }
 
             // Now that we have the content-derived ETag, do the
             // `If-None-Match` comparison. Same flow as `render_vector_tile`
@@ -284,16 +286,17 @@ pub async fn wms_handler(
             // miss → encode → revalidate against fresh ETag.
             if let Some(ref inm) = if_none_match {
                 if ds_render::etag_matches(inm, cached.etag()) {
-                    // `x-cache` is *intentionally* absent here. The HIT-path
-                    // 304 above emits `x-cache: HIT`; the absence on this
-                    // post-render path is what lets clients and the
-                    // regression test (`if_none_match_after_cache_warm_...`)
-                    // distinguish the two branches. Adding `x-cache: MISS`
-                    // here would silently break that invariant.
+                    // 304 from the post-render branch. Emit `x-cache: MISS`
+                    // (alongside the HIT-path 304's `x-cache: HIT` above) so
+                    // operators can tell post-render revalidations apart from
+                    // cache-hit revalidations in logs and metrics, and tests
+                    // can pin either branch by the *value* of the header
+                    // rather than by its absence.
                     return Ok(axum::response::Response::builder()
                         .status(StatusCode::NOT_MODIFIED)
                         .header(header::ETAG, cached.etag())
                         .header(header::CACHE_CONTROL, cache_control)
+                        .header(header::HeaderName::from_static("x-cache"), "MISS")
                         .body(axum::body::Body::empty())
                         .unwrap()
                         .into_response());

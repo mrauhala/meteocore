@@ -556,6 +556,51 @@ mod get_map {
         );
     }
 
+    /// Pin the post-render MISS → 304 branch. Use a fresh router (no
+    /// cache-warm) so the first `If-None-Match`-bearing request must
+    /// go through the full render path; assert the 304 carries
+    /// `x-cache: MISS` rather than the cache-HIT branch's `HIT`.
+    #[tokio::test]
+    async fn if_none_match_against_fresh_router_returns_304_via_miss_branch() {
+        // Step 1: render once on a separate fresh router to learn the ETag.
+        let etag = {
+            let warm = build_router();
+            let resp = warm
+                .oneshot(
+                    Request::builder()
+                        .uri("/collections/radar/map?bbox=10,55,30,70")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            resp.headers()
+                .get("etag")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // Step 2: brand-new router with an empty cache. Handler must
+        // render, compute the same content-derived ETag, match the
+        // header, and 304 via the post-render branch.
+        let app = build_router();
+        let req = Request::builder()
+            .uri("/collections/radar/map?bbox=10,55,30,70")
+            .header("If-None-Match", &etag)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(resp.headers().get("etag").unwrap().to_str().unwrap(), etag);
+        assert_eq!(
+            resp.headers().get("x-cache").map(|v| v.to_str().unwrap()),
+            Some("MISS"),
+            "304 must come from the post-render MISS branch, not the cache-HIT branch"
+        );
+    }
+
     /// Cross-parameter staleness protection: different `parameter-name`
     /// values must produce different rendered bytes (because the
     /// `MultiParamMockEngine` varies its output by parameter), which under

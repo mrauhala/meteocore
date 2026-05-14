@@ -1194,30 +1194,33 @@ async fn render_tile(
     // branch so the header never lies about the payload (#162). Empty
     // tiles reuse the global `EMPTY_TILE_CACHED` so the FNV-1a hash is
     // computed once per process instead of per request.
-    let (cached, x_cache, response_content_type, insert_into_cache) = match maybe_bytes {
-        None => (EMPTY_TILE_CACHED.clone(), "EMPTY", "image/png", false),
+    // Each arm produces a `CachedRendered` ready to serve. Only the
+    // populated `Some(_)` path inserts into the rendered cache; the
+    // EMPTY fast-path intentionally doesn't (the global
+    // `EMPTY_TILE_CACHED` already serves as the deterministic empty
+    // response).
+    let (cached, x_cache, response_content_type) = match maybe_bytes {
+        None => (EMPTY_TILE_CACHED.clone(), "EMPTY", "image/png"),
         Some(bytes) => {
             let cached = ds_render::CachedRendered::new(bytes::Bytes::from(bytes));
-            (cached, "MISS", content_type, true)
+            rendered_cache.insert(cache_key, cached.clone());
+            (cached, "MISS", content_type)
         }
     };
 
-    if insert_into_cache {
-        rendered_cache.insert(cache_key, cached.clone());
-    }
-
     // Content-derived ETag now available — do the `If-None-Match`
-    // comparison here, after the (cheap) empty-tile clone or fresh encode.
-    // `x-cache` is *intentionally* absent on this 304: the cache-HIT 304
-    // above emits `x-cache: HIT`, and the absence here is what lets
-    // clients (and the regression test) tell the two branches apart.
-    // Adding `x-cache: MISS` here would silently break that.
+    // comparison here, after the (cheap) empty-tile clone or fresh
+    // encode. Emit `x-cache: MISS` so operators can tell post-render
+    // revalidations apart from cache-hit revalidations in logs/metrics,
+    // and tests can pin either branch by the *value* of the header
+    // rather than by its absence.
     if let Some(ref inm) = if_none_match {
         if ds_render::etag_matches(inm, cached.etag()) {
             return Ok(axum::response::Response::builder()
                 .status(StatusCode::NOT_MODIFIED)
                 .header(header::ETAG, cached.etag())
                 .header(header::CACHE_CONTROL, cache_control)
+                .header(header::HeaderName::from_static("x-cache"), "MISS")
                 .body(axum::body::Body::empty())
                 .unwrap()
                 .into_response());
