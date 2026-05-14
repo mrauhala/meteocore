@@ -423,6 +423,11 @@ pub fn load_collections(
             "geotiff" => &["edr", "wms", "maps", "tiles"],
             "querydata" => &["edr", "wms", "maps", "tiles"],
             "grib" => &["edr", "wms", "maps", "tiles"],
+            // ODIM Phase 1 ships MapEngine only — EDR is being added in a
+            // follow-up commit. Listing it here as unsupported makes a
+            // config typo `apis = ["edr"]` fail loudly at load rather
+            // than silently serving 404s.
+            "odim" => &["wms", "maps", "tiles"],
             "postgis" => &["edr", "features", "tiles"],
             _ => &[],
         };
@@ -953,6 +958,129 @@ pub fn load_collections(
                     } else {
                         Some("no forecast data found yet (waiting for poll)".into())
                     },
+                });
+            }
+            "odim" => {
+                let data_path = match collection.data_path.as_deref() {
+                    Some(p) => p,
+                    None => {
+                        tracing::error!(
+                            "Collection '{}': engine_type 'odim' requires data_path, skipping",
+                            collection.id
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "odim".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some("missing data_path".into()),
+                        });
+                        continue;
+                    }
+                };
+                let odim_cfg = match collection.odim.as_ref() {
+                    Some(c) => c,
+                    None => {
+                        tracing::error!(
+                            "Collection '{}': engine_type 'odim' but missing [collections.odim] config, skipping",
+                            collection.id
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "odim".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some("missing [collections.odim] config".into()),
+                        });
+                        continue;
+                    }
+                };
+                let engine = match engine_odim::OdimEngine::new(
+                    std::path::Path::new(data_path),
+                    &collection.id,
+                    odim_cfg,
+                ) {
+                    Ok(e) => Arc::new(e),
+                    Err(e) => {
+                        tracing::error!(
+                            "Collection '{}': failed to initialize ODIM engine: {}",
+                            collection.id,
+                            e
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "odim".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some(format!("{e}")),
+                        });
+                        continue;
+                    }
+                };
+
+                // EDR will be wired here in a follow-up commit once
+                // `OdimEngine` implements `EdrEngine`. For now ODIM
+                // serves WMS/Maps/Tiles only.
+                let raster_params =
+                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+
+                if collection.apis.contains(&"wms".to_string()) {
+                    map_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    map_collections.insert(collection.id.clone(), collection.clone());
+                    let styles = build_styles(collection, &bundle_index);
+                    map_styles.insert(collection.id.clone(), styles);
+                    if !raster_params.is_empty() {
+                        register_parameter_layer_styles(
+                            collection,
+                            &raster_params,
+                            &mut map_styles,
+                            &bundle_index,
+                        );
+                    }
+                    info!("Collection '{}': wired to WMS API", collection.id);
+                }
+                if collection.apis.contains(&"maps".to_string()) {
+                    maps_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    maps_collections.insert(collection.id.clone(), collection.clone());
+                    let styles = build_styles(collection, &bundle_index);
+                    maps_styles.insert(collection.id.clone(), styles);
+                    if !raster_params.is_empty() {
+                        register_parameter_layer_styles(
+                            collection,
+                            &raster_params,
+                            &mut maps_styles,
+                            &bundle_index,
+                        );
+                    }
+                    info!("Collection '{}': wired to Maps API", collection.id);
+                }
+                if collection.apis.contains(&"tiles".to_string()) {
+                    tiles_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    tiles_collections.insert(collection.id.clone(), collection.clone());
+                    let styles = build_styles(collection, &bundle_index);
+                    tiles_styles.insert(collection.id.clone(), styles);
+                    if !raster_params.is_empty() {
+                        register_parameter_layer_styles(
+                            collection,
+                            &raster_params,
+                            &mut tiles_styles,
+                            &bundle_index,
+                        );
+                    }
+                    info!("Collection '{}': wired to Tiles API", collection.id);
+                }
+
+                health.push(CollectionHealth {
+                    id: collection.id.clone(),
+                    engine_type: "odim".into(),
+                    status: CollectionStatus::Ready,
+                    error: None,
                 });
             }
             "postgis" => {
