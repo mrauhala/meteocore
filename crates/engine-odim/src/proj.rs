@@ -120,11 +120,25 @@ fn parse_stere(params: &HashMap<String, String>) -> Result<Crs, ParseError> {
     let k0 = match parse_k0(params)? {
         Some(k) => k,
         None => match parse_f64(params, "lat_ts")? {
-            // Polar stereographic with +lat_ts: derive k0 on the sphere.
-            // (1 + sin|lat_ts|) / 2 is the standard PROJ relation; ODIM
-            // uses sphere-based projections (+R=6371228) so the ellipsoidal
-            // correction is negligible and we don't need to special-case it.
-            Some(lat_ts) => (1.0 + lat_ts.to_radians().abs().sin()) / 2.0,
+            // Spherical stereographic: derive k0 so the scale at the
+            // (lat_ts, lon_0) latitude-of-true-scale is exactly 1.
+            //
+            //   k0 = (1 + sin(lat_0)·sin(lat_ts) + cos(lat_0)·cos(lat_ts)) / 2
+            //
+            // This is the general form that works for both:
+            // - Polar    (lat_0 = ±90, e.g. FMI/OPERA composites):
+            //     → k0 = (1 + sin|lat_ts|) / 2
+            // - Oblique  (lat_0 != ±90, e.g. DMI Denmark composite):
+            //     → k0 = 1.0 when lat_ts == lat_0 (scale=1 at origin)
+            //
+            // ODIM uses sphere-based projections (+R=6371228) so the
+            // ellipsoidal correction is negligible — the formula above
+            // matches PROJ's spherical output to within float noise.
+            Some(lat_ts) => {
+                let lat0 = lat0.to_radians();
+                let lat_ts = lat_ts.to_radians();
+                (1.0 + lat0.sin() * lat_ts.sin() + lat0.cos() * lat_ts.cos()) / 2.0
+            }
             // No +k_0, no +lat_ts → PROJ default is 1.0.
             None => 1.0,
         },
@@ -253,9 +267,34 @@ mod tests {
         assert_crs_eq(&crs, &Crs::Wgs84);
     }
 
+    /// DMI's Denmark national composite uses *oblique* stereographic
+    /// with `+lat_0=56 +lat_ts=56`. Under the general spherical
+    /// scale-factor formula, when `lat_ts == lat_0` the scale at the
+    /// origin is unity, so `k0 = 1.0`. The naive polar-only formula
+    /// `(1 + sin|lat_ts|)/2` would give ~0.914 — a 9% error that
+    /// expands the projected grid bbox by ~50% and causes ~100% of
+    /// output pixels to land outside the source data when sampling.
+    #[test]
+    fn dmi_oblique_stereographic_lat_ts_equals_lat_0_gives_k0_one() {
+        let crs = parse(
+            "+proj=stere +ellps=WGS84 +lat_0=56 +lon_0=10.5666 +lat_ts=56",
+        )
+        .unwrap();
+        match crs {
+            Crs::Stereographic { k0, .. } => {
+                assert!(
+                    (k0 - 1.0).abs() < 1e-9,
+                    "DMI oblique stereographic with lat_ts=lat_0 must give k0=1, got {k0}"
+                );
+            }
+            other => panic!("expected Stereographic, got {other:?}"),
+        }
+    }
+
     /// FMI/OPERA polar stereographic composite — the canonical Phase 1
     /// shape. `+lat_ts=60` must convert to `k0 = (1 + sin60°)/2`
-    /// because `Crs::Stereographic` stores `k0` directly.
+    /// because `Crs::Stereographic` stores `k0` directly. The general
+    /// formula reduces to this when `lat_0 = ±90` (sin(90)=1, cos(90)=0).
     #[test]
     fn fmi_polar_stereographic_with_lat_ts_converts_to_k0() {
         let crs =

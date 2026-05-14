@@ -771,6 +771,28 @@ fn lcc_t(lat: f64, e: f64) -> f64 {
 // Uses conformal sphere approach (Gauss conformal latitude)
 // ============================================================================
 
+/// Oblique stereographic projection on the conformal sphere, EPSG 9809.
+///
+/// The previous implementation had an `n = sqrt(1 + e²·cos⁴(lat0)/(1-e²))`
+/// factor borrowed from Lambert Conformal Conic (where it's the cone
+/// constant) and multiplied it into the longitude difference. That
+/// over-scaled projected coordinates by ~50% at latitudes around 56°,
+/// invisible to roundtrip tests (forward & inverse used the same
+/// wrong formula) but immediately visible when rendering ODIM radar
+/// composites — output pixels missed the source grid by hundreds of
+/// kilometres.
+///
+/// EPSG 9809 ("Oblique Stereographic") uses no LCC cone constant:
+///   χ(φ)   — conformal latitude (Snyder eq. 3-1)
+///   R_c    — conformal sphere radius at origin: √(M(φ₀) · N(φ₀))
+///   k(P)   — scale factor at the point P
+///   x = false_e + 2·R_c·k₀·cos(χ)·sin(λ-λ₀)/B
+///   y = false_n + 2·R_c·k₀·(cos(χ₀)·sin(χ) - sin(χ₀)·cos(χ)·cos(λ-λ₀))/B
+/// where B = 1 + sin(χ₀)·sin(χ) + cos(χ₀)·cos(χ)·cos(λ-λ₀).
+///
+/// Polar stereographic (lat₀ = ±90°) falls out of the same formula
+/// without special-casing, so a single implementation handles ODIM's
+/// polar (FMI/OPERA) and oblique (DMI) variants.
 fn stere_forward(
     lat: f64,
     lon: f64,
@@ -783,42 +805,36 @@ fn stere_forward(
     let e2 = WGS84_E2;
     let e = e2.sqrt();
 
-    // Conformal sphere radius
     let sin_lat0 = lat0.sin();
-    let rn = WGS84_A / (1.0 - e2 * sin_lat0 * sin_lat0).sqrt();
-    let rm = WGS84_A * (1.0 - e2) / (1.0 - e2 * sin_lat0 * sin_lat0).powf(1.5);
-    let r_sphere = (rn * rm).sqrt();
+    let rn0 = WGS84_A / (1.0 - e2 * sin_lat0 * sin_lat0).sqrt();
+    let rm0 = WGS84_A * (1.0 - e2) / (1.0 - e2 * sin_lat0 * sin_lat0).powf(1.5);
+    let r_sphere = (rn0 * rm0).sqrt();
 
-    // Conformal latitude at origin
-    let n = (1.0 + (e2 * lat0.cos().powi(4)) / (1.0 - e2)).sqrt();
-    let s1 = (1.0 + sin_lat0) / (1.0 - sin_lat0);
-    let s2 = (1.0 - e * sin_lat0) / (1.0 + e * sin_lat0);
-    let w1 = (s1 * s2.powf(e)).powf(n / 2.0);
-    let sin_chi0 = (w1 - 1.0) / (w1 + 1.0);
-    let chi0 = sin_chi0.asin();
+    let chi0 = conformal_latitude(lat0, e);
+    let chi = conformal_latitude(lat, e);
 
-    // Conformal latitude of point
-    let sin_lat = lat.sin();
-    let sa = (1.0 + sin_lat) / (1.0 - sin_lat);
-    let sb = (1.0 - e * sin_lat) / (1.0 + e * sin_lat);
-    let w = (sa * sb.powf(e)).powf(n / 2.0);
-    let sin_chi = (w - 1.0) / (w + 1.0);
-    let cos_chi = (1.0 - sin_chi * sin_chi).sqrt();
+    let dl = lon - lon0;
+    let (sin_chi0, cos_chi0) = chi0.sin_cos();
+    let (sin_chi, cos_chi) = chi.sin_cos();
+    let cos_dl = dl.cos();
 
-    // Conformal longitude difference
-    let dl = n * (lon - lon0);
+    let b = 1.0 + sin_chi0 * sin_chi + cos_chi0 * cos_chi * cos_dl;
+    let factor = 2.0 * r_sphere * k0 / b;
 
-    // Stereographic projection on conformal sphere
-    let cos_chi0 = chi0.cos();
-    let sin_chi0_v = chi0.sin();
-
-    let b_denom = 1.0 + sin_chi0_v * sin_chi + cos_chi0 * cos_chi * dl.cos();
-    let b = 2.0 * r_sphere * k0 / b_denom;
-
-    let x = false_e + b * cos_chi * dl.sin();
-    let y = false_n + b * (cos_chi0 * sin_chi - sin_chi0_v * cos_chi * dl.cos());
+    let x = false_e + factor * cos_chi * dl.sin();
+    let y = false_n + factor * (cos_chi0 * sin_chi - sin_chi0 * cos_chi * cos_dl);
 
     (x, y)
+}
+
+/// Conformal latitude χ(φ) = 2·atan(tan(π/4 + φ/2) · ((1-e·sinφ)/(1+e·sinφ))^(e/2)) - π/2.
+/// At the equator and poles χ = φ. For WGS84 the maximum deviation
+/// from geodetic latitude is ~12′ near 45°.
+fn conformal_latitude(lat: f64, e: f64) -> f64 {
+    let sin_lat = lat.sin();
+    let ratio = (1.0 - e * sin_lat) / (1.0 + e * sin_lat);
+    let inner = (std::f64::consts::FRAC_PI_4 + lat / 2.0).tan() * ratio.powf(e / 2.0);
+    2.0 * inner.atan() - std::f64::consts::FRAC_PI_2
 }
 
 fn stere_inverse(

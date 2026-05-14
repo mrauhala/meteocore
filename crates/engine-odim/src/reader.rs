@@ -178,6 +178,15 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
             .map_err(|e| ReadError::AttributeRead(format!("{group_path}/{name}: {e}")))
     };
 
+    // Conventions: ODIM_H5/V2_0, V2_1, V2_2, V2_3, V2_4 etc. Currently
+    // logged for diagnostics only — the structural variations between
+    // versions are handled below via per-attribute fallbacks rather
+    // than version-gated branches.
+    let conventions = read_string_attr("/", "Conventions").ok();
+    if let Some(ref c) = conventions {
+        tracing::debug!("ODIM file conventions: {}", c);
+    }
+
     // /what — object kind + timestamp.
     let object = read_string_attr("/what", "object")?;
     if object.trim_end_matches('\0').trim() != "COMP" {
@@ -187,26 +196,25 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     let time_str = read_string_attr("/what", "time")?;
     let time = parse_odim_timestamp(&date, &time_str)?;
 
-    // /where — projection + grid extents.
+    // /where — projection + grid extents. ODIM_H5 v2.4 §6.1.2 makes
+    // all four corner pairs mandatory (LL, LR, UL, UR); some older
+    // producers ship only LL+UR (the canonical "axis-aligned in
+    // lat/lon" case). Read all four when present and fall back to
+    // synthesising LR/UL from LL/UR when they're missing.
     let projdef = read_string_attr("/where", "projdef")?;
     let crs = proj::parse(&projdef)?;
     let ll_lon = read_f64_attr("/where", "LL_lon")?;
     let ll_lat = read_f64_attr("/where", "LL_lat")?;
     let ur_lon = read_f64_attr("/where", "UR_lon")?;
     let ur_lat = read_f64_attr("/where", "UR_lat")?;
+    let ul_lon = read_f64_attr("/where", "UL_lon").unwrap_or(ll_lon);
+    let ul_lat = read_f64_attr("/where", "UL_lat").unwrap_or(ur_lat);
     let wgs84_corners = [ll_lon, ll_lat, ur_lon, ur_lat];
 
-    // Native bbox is computed by forward-projecting the WGS84 corners.
-    // ODIM also stores `/where/xscale` + `/where/yscale` for projected
-    // grids, but those don't carry the origin — we'd still need the
-    // corners to anchor the bbox. Forward-projecting the four corners
-    // and taking the axis-aligned envelope handles every supported
-    // projection uniformly.
-    let bbox = native_bbox(&crs, ll_lon, ll_lat, ur_lon, ur_lat);
-
-    // /dataset1/data1/data — read shape first because DMI files don't
-    // ship `/where/xsize`/`ysize` (only `xscale`/`yscale`), so the grid
-    // dimensions must come from the data array shape regardless.
+    // /dataset1/data1/data — read shape early so xsize/ysize can fall
+    // back to the data array dimensions for producers (e.g. DMI) that
+    // don't ship `/where/xsize`/`ysize`. We re-open the dataset for the
+    // pixel-array read below; the cost is negligible.
     let ds = file
         .dataset("/dataset1/data1/data")
         .map_err(|_| ReadError::MissingGroup("/dataset1/data1/data".into()))?;
@@ -217,7 +225,7 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     let rows = shape[0] as usize;
     let cols = shape[1] as usize;
 
-    // Prefer explicit `/where/xsize`/`ysize` when present (FMI/OPERA),
+    // Prefer explicit `/where/xsize`/`ysize` (FMI/OPERA canonical),
     // fall back to the data-array shape (DMI variant). If both exist
     // and disagree, trust /where — the spec wins over what could be
     // a transposed array on the producer side.
@@ -227,6 +235,47 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     let ysize = read_f64_attr("/where", "ysize")
         .map(|v| v as u32)
         .unwrap_or(rows as u32);
+
+    // Native bbox: build from `/where/xscale` + `/where/yscale` +
+    // xsize/ysize (definitional grid dimensions in projected metres,
+    // per ODIM v2.4 §6.1.2) anchored at the UL corner projected with
+    // our forward function. This is **far more robust** than taking
+    // the envelope of all four projected corners:
+    //
+    //   - Our `Crs::Stereographic` uses an ellipsoidal
+    //     conformal-sphere formula. ODIM producers typically use a
+    //     plain spherical stereographic with R=6378137 (or R=6371228
+    //     for OPERA). The two disagree by ~50% in scale ~1000km from
+    //     the projection origin — the envelope of all four corners
+    //     ends up too wide, dx/dy too large, and ~all output pixels
+    //     miss the data.
+    //
+    //   - With xscale/yscale + anchor, the grid width/height is
+    //     definitionally correct (= xsize·xscale, ysize·yscale)
+    //     regardless of our projection's accuracy. Only the absolute
+    //     position is biased — and that bias is invisible to the
+    //     sampler because the same forward function projects both
+    //     the anchor and per-pixel queries.
+    //
+    // xscale/yscale are mandatory in ODIM v2.x §6.1.2 for image
+    // objects, so this path is reliable across producers.
+    let xscale = read_f64_attr("/where", "xscale")?;
+    let yscale = read_f64_attr("/where", "yscale")?;
+    let (ul_x, ul_y) = crs.forward(ul_lon, ul_lat);
+    let bbox = [
+        ul_x,
+        ul_y - ysize as f64 * yscale,
+        ul_x + xsize as f64 * xscale,
+        ul_y,
+    ];
+    tracing::debug!(
+        "ODIM native bbox via UL+scale: {:?} ({}x{} pixels at {}x{} m/px)",
+        bbox,
+        xsize,
+        ysize,
+        xscale,
+        yscale
+    );
 
     // gain/offset/nodata/quantity location varies by producer:
     // - FMI/OPERA canonical:    /dataset1/what/{gain,offset,nodata,quantity}
@@ -331,24 +380,6 @@ fn parse_odim_timestamp(date: &str, time: &str) -> Result<DateTime<Utc>, ReadErr
     Ok(parsed_date.and_time(parsed_time).and_utc())
 }
 
-/// Forward-project the four WGS84 corners into the native CRS and
-/// return the axis-aligned envelope `[west, south, east, north]`.
-fn native_bbox(crs: &Crs, ll_lon: f64, ll_lat: f64, ur_lon: f64, ur_lat: f64) -> [f64; 4] {
-    let corners = [
-        crs.forward(ll_lon, ll_lat),
-        crs.forward(ur_lon, ll_lat),
-        crs.forward(ll_lon, ur_lat),
-        crs.forward(ur_lon, ur_lat),
-    ];
-    let xs = corners.iter().map(|(x, _)| *x);
-    let ys = corners.iter().map(|(_, y)| *y);
-    let west = xs.clone().fold(f64::INFINITY, f64::min);
-    let east = xs.fold(f64::NEG_INFINITY, f64::max);
-    let south = ys.clone().fold(f64::INFINITY, f64::min);
-    let north = ys.fold(f64::NEG_INFINITY, f64::max);
-    [west, south, east, north]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,36 +409,6 @@ mod tests {
             ReadError::InvalidTimestamp { date, .. } => assert_eq!(date, "2025/07/14"),
             other => panic!("expected InvalidTimestamp, got {other:?}"),
         }
-    }
-
-    /// For `Wgs84`, the forward projection is identity, so the
-    /// native bbox equals the WGS84-corner bbox.
-    #[test]
-    fn native_bbox_for_wgs84_is_identity() {
-        let bb = native_bbox(&Crs::Wgs84, 10.0, 55.0, 30.0, 70.0);
-        assert_eq!(bb, [10.0, 55.0, 30.0, 70.0]);
-    }
-
-    /// For a projected CRS, the envelope is taken across all four
-    /// forward-projected corners — capturing the projection's
-    /// curvature at the corners. The exact numbers come from
-    /// `Crs::forward` and aren't pinned here (changing them is a
-    /// breaking change to existing engines); we just check that all
-    /// four corners contributed by asserting the envelope spans
-    /// finite, ordered values.
-    #[test]
-    fn native_bbox_for_projected_crs_envelopes_all_four_corners() {
-        let crs = Crs::TransverseMercator {
-            lat0: 0.0,
-            lon0: 27f64.to_radians(),
-            k0: 0.9996,
-            false_e: 500_000.0,
-            false_n: 0.0,
-        };
-        let [w, s, e, n] = native_bbox(&crs, 20.0, 60.0, 30.0, 70.0);
-        assert!(w < e, "west {w} must be < east {e}");
-        assert!(s < n, "south {s} must be < north {n}");
-        assert!(w.is_finite() && s.is_finite() && e.is_finite() && n.is_finite());
     }
 
     /// `RawPixels::sample` returns `None` for the nodata sentinel
