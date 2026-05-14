@@ -16,8 +16,27 @@ pub const MAX_MAP_DIMENSION: u32 = 8000;
 /// Supported CRS identifiers.
 const SUPPORTED_CRS: &[&str] = &["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:3067", "EPSG:3035"];
 
-/// Supported output formats.
-const SUPPORTED_FORMATS: &[&str] = &["image/png", "image/jpeg", "image/webp"];
+/// Supported output formats for `GetMap` and `GetLegendGraphic`.
+///
+/// Single source of truth: capabilities iterates this slice when emitting
+/// `<Format>` children, and `parse_image_format` mirrors it. If you add a
+/// format here, extend the match in `parse_image_format` to match.
+pub const SUPPORTED_FORMATS: &[&str] = &["image/png", "image/jpeg", "image/webp"];
+
+/// Parse a WMS `FORMAT=` query parameter into the corresponding `ImageFormat`.
+///
+/// `None` (parameter omitted) defaults to PNG, matching the WMS 1.3.0
+/// convention. Any value outside `SUPPORTED_FORMATS` yields
+/// `WmsError::InvalidFormat`. Used by both `validate_get_map` and the
+/// `GetLegendGraphic` handler so the two paths can't drift.
+pub fn parse_image_format(format: Option<&str>) -> Result<ds_render::ImageFormat, WmsError> {
+    match format {
+        None | Some("image/png") => Ok(ds_render::ImageFormat::Png),
+        Some("image/jpeg") => Ok(ds_render::ImageFormat::Jpeg),
+        Some("image/webp") => Ok(ds_render::ImageFormat::Webp),
+        Some(other) => Err(WmsError::invalid_format(other)),
+    }
+}
 
 /// Raw WMS query parameters (case-insensitive keys handled by axum).
 #[derive(Debug, Deserialize)]
@@ -162,10 +181,7 @@ impl WmsQuery {
         }
 
         // FORMAT
-        let format = self.format.as_deref().unwrap_or("image/png");
-        if !SUPPORTED_FORMATS.contains(&format) {
-            return Err(WmsError::invalid_format(format));
-        }
+        let image_format = parse_image_format(self.format.as_deref())?;
 
         // TRANSPARENT
         let transparent = self
@@ -192,12 +208,6 @@ impl WmsQuery {
             "default".to_string()
         } else {
             style.to_string()
-        };
-
-        let image_format = match format {
-            "image/jpeg" => ds_render::ImageFormat::Jpeg,
-            "image/webp" => ds_render::ImageFormat::Webp,
-            _ => ds_render::ImageFormat::Png,
         };
 
         Ok(GetMapParams {
@@ -366,5 +376,64 @@ mod tests {
         assert!(parse_time("2024-01-01T00:00:00+00:00").is_ok());
         assert!(parse_time("2024-01-01T00:00").is_ok());
         assert!(parse_time("not-a-time").is_err());
+    }
+
+    #[test]
+    fn parse_image_format_accepts_all_supported_types() {
+        assert!(matches!(
+            parse_image_format(Some("image/png")).unwrap(),
+            ds_render::ImageFormat::Png
+        ));
+        assert!(matches!(
+            parse_image_format(Some("image/jpeg")).unwrap(),
+            ds_render::ImageFormat::Jpeg
+        ));
+        assert!(matches!(
+            parse_image_format(Some("image/webp")).unwrap(),
+            ds_render::ImageFormat::Webp
+        ));
+    }
+
+    #[test]
+    fn parse_image_format_defaults_to_png_when_absent() {
+        assert!(matches!(
+            parse_image_format(None).unwrap(),
+            ds_render::ImageFormat::Png
+        ));
+    }
+
+    #[test]
+    fn parse_image_format_rejects_unknown_with_invalid_format() {
+        // Locks in the fix for #161: any value outside SUPPORTED_FORMATS
+        // must return InvalidFormat, not silently fall back to PNG. The
+        // pre-fix handler returned PNG for image/gif and any other typo
+        // with no error, leaving capabilities-trusting clients confused.
+        for bogus in ["image/gif", "image/avif", "", "png", "image/webp;q=1"] {
+            let err = parse_image_format(Some(bogus)).expect_err(bogus);
+            assert!(
+                matches!(err, WmsError::InvalidFormat(_)),
+                "expected InvalidFormat for {bogus:?}, got {err:?}"
+            );
+        }
+    }
+
+    /// Pin SUPPORTED_FORMATS to the match arms in `parse_image_format` so
+    /// a future format addition can't land in one place but not the other
+    /// (the divergence flagged on #166). If you add an entry to
+    /// SUPPORTED_FORMATS, extend `parse_image_format` to handle it and
+    /// this test will start passing again.
+    #[test]
+    fn parse_image_format_covers_every_supported_format() {
+        for fmt in SUPPORTED_FORMATS {
+            let parsed = parse_image_format(Some(fmt)).unwrap_or_else(|_| {
+                panic!("SUPPORTED_FORMATS entry {fmt:?} not handled by parse_image_format")
+            });
+            assert_eq!(
+                parsed.content_type(),
+                *fmt,
+                "parse_image_format({fmt:?}) → ImageFormat with wrong content_type {}",
+                parsed.content_type()
+            );
+        }
     }
 }

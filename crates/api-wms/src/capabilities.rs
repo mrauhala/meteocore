@@ -88,21 +88,17 @@ fn write_request(writer: &mut Writer<Vec<u8>>, base_url: &str) {
     write_dcp_type(writer, base_url);
     let _ = writer.write_event(Event::End(BytesEnd::new("GetCapabilities")));
 
-    // GetMap
-    let _ = writer.write_event(Event::Start(BytesStart::new("GetMap")));
-    write_format(writer, "image/png");
-    write_format(writer, "image/jpeg");
-    write_format(writer, "image/webp");
-    write_dcp_type(writer, base_url);
-    let _ = writer.write_event(Event::End(BytesEnd::new("GetMap")));
-
-    // GetLegendGraphic
-    let _ = writer.write_event(Event::Start(BytesStart::new("GetLegendGraphic")));
-    write_format(writer, "image/png");
-    write_format(writer, "image/jpeg");
-    write_format(writer, "image/webp");
-    write_dcp_type(writer, base_url);
-    let _ = writer.write_event(Event::End(BytesEnd::new("GetLegendGraphic")));
+    // GetMap and GetLegendGraphic accept the same image formats — iterate
+    // SUPPORTED_FORMATS so the advertised list can't drift from what the
+    // handlers actually serve.
+    for op in ["GetMap", "GetLegendGraphic"] {
+        let _ = writer.write_event(Event::Start(BytesStart::new(op)));
+        for format in params::SUPPORTED_FORMATS {
+            write_format(writer, format);
+        }
+        write_dcp_type(writer, base_url);
+        let _ = writer.write_event(Event::End(BytesEnd::new(op)));
+    }
 
     let _ = writer.write_event(Event::End(BytesEnd::new("Request")));
 }
