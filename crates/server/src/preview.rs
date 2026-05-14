@@ -374,7 +374,7 @@ fn build_entry(
         entry["spatial_extent"] = json!(extent);
     }
 
-    if let Some(temporal) = resolve_temporal_extent(id, edr, maps, tiles, wms) {
+    if let Some(temporal) = resolve_temporal_extent(id, config, edr, maps, tiles, wms) {
         entry["temporal_extent"] = temporal;
     }
 
@@ -403,6 +403,7 @@ fn build_entry(
             raster_tile_descriptor(id, base_url, effective_styles),
         );
     }
+    let has_raster_tiles = tile_block.contains_key("raster");
     if !tile_block.is_empty() {
         entry["tiles"] = Value::Object(tile_block);
     }
@@ -411,7 +412,78 @@ fn build_entry(
         entry["styles"] = json!(style_list(styles));
     }
 
+    // Parameter list for the per-collection dropdown in /preview. Only emit
+    // for raster-tile-backed collections — FeatureEngine is not parameterised,
+    // and there's no rendering pathway today for switching parameters on a
+    // pure-EDR collection from the SPA.
+    if has_raster_tiles {
+        if let Some(params) = collection_parameters(id, edr, maps, tiles, wms) {
+            entry["parameters"] = json!(params);
+        }
+    }
+
     entry
+}
+
+/// Parameter list emitted as `parameters: [{name, title, unit}]` in the
+/// per-collection manifest entry. Sorted by name for stable ordering.
+///
+/// **Caller invariant:** this is only invoked when the collection has
+/// raster tiles (see `build_entry`'s `if has_raster_tiles` guard), so a
+/// `MapEngine` is always registered. Two branches:
+///
+/// 1. `raster_info().parameters` non-empty (multi-parameter engines like
+///    GRIB / multi-param QueryData): that list is the renderable source of
+///    truth. Names also present in EDR are enriched with EDR's richer
+///    `(label, unit)`; names absent from EDR fall back to the raster-side
+///    `(short_name, title)` with an empty unit.
+/// 2. `raster_info().parameters` empty (single-band engines like
+///    single-band GeoTIFF): the tile handler ignores `?parameter-name=`
+///    regardless of value — emitting dropdown options would lie about what
+///    the SPA can do. Suppress, even if EDR is multi-param.
+fn collection_parameters(
+    id: &str,
+    edr: &api_edr::handlers::EdrState,
+    maps: &api_maps::handlers::MapsState,
+    tiles: &api_tiles::handlers::TilesState,
+    wms: &api_wms::handlers::WmsState,
+) -> Option<Vec<Value>> {
+    let raster_params: Vec<(String, String)> = maps
+        .engines
+        .get(id)
+        .or_else(|| tiles.map_engines.get(id))
+        .or_else(|| wms.engines.get(id))
+        .map(|engine| engine.raster_info().parameters)?;
+
+    // Single-band engine → no meaningful per-request selection.
+    if raster_params.is_empty() {
+        return None;
+    }
+
+    let edr_descs = edr
+        .engines
+        .get(id)
+        .map(|engine| engine.get_parameter_descriptions())
+        .unwrap_or_default();
+
+    let mut out: Vec<Value> = raster_params
+        .into_iter()
+        .map(|(name, title)| {
+            let (label, unit) = edr_descs
+                .get(&name)
+                .map(|d| (d.label.clone(), d.unit.clone()))
+                .unwrap_or((title, String::new()));
+            json!({ "name": name, "title": label, "unit": unit })
+        })
+        .collect();
+
+    out.sort_by(|a, b| {
+        a.get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .cmp(b.get("name").and_then(Value::as_str).unwrap_or(""))
+    });
+    Some(out)
 }
 
 fn first_config<'a>(
@@ -483,6 +555,7 @@ fn resolve_spatial_extent(
 
 fn resolve_temporal_extent(
     id: &str,
+    config: Option<&CollectionConfig>,
     edr: &api_edr::handlers::EdrState,
     maps: &api_maps::handlers::MapsState,
     tiles: &api_tiles::handlers::TilesState,
@@ -510,7 +583,7 @@ fn resolve_temporal_extent(
     // reachable range. EDR's interval can otherwise span a wider horizon
     // (e.g. T-24h forecast bound) than the discrete raster timesteps cover,
     // leaving the user looking at a span the slider can't reach.
-    let (interval, values) = match (edr_values, raster_times) {
+    let (mut interval, mut values) = match (edr_values, raster_times) {
         (Some(v), _) => {
             let int = edr_interval.or_else(|| v.first().zip(v.last()).map(|(a, b)| (*a, *b)));
             (int, Some(v))
@@ -521,6 +594,33 @@ fn resolve_temporal_extent(
         }
         (None, None) => (edr_interval, None),
     };
+
+    // Preview-only window filter: when [collections.preview].time_window is
+    // set, drop entries older than `max(values) - duration` and re-derive
+    // start/end from the survivors. The engine sees its full range
+    // unchanged; this only shrinks what the SPA slider exposes (useful for
+    // STAC archives spanning years of 5-min radar items).
+    if let (Some(cfg), Some(vs)) = (config, values.as_mut()) {
+        if let Some(window_str) = cfg.preview.as_ref().and_then(|p| p.time_window.as_deref()) {
+            match ds_core::datetime::parse_iso8601_duration(window_str) {
+                Ok(duration) => {
+                    if let Some(latest) = vs.iter().max().copied() {
+                        let cutoff = latest - duration;
+                        vs.retain(|t| *t >= cutoff);
+                        interval = vs.first().zip(vs.last()).map(|(a, b)| (*a, *b));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        collection = id,
+                        time_window = window_str,
+                        error = %e,
+                        "preview.time_window is invalid; ignoring"
+                    );
+                }
+            }
+        }
+    }
 
     if interval.is_some() || values.is_some() {
         return Some(serialize_temporal(interval, values.as_deref()));
@@ -711,6 +811,22 @@ mod tests {
         times: Vec<DateTime<Utc>>,
         parameter: String,
         unit: String,
+        /// `parameters` returned by `raster_info()`. Empty by default
+        /// (single-band convention). Tests for multi-parameter raster
+        /// behaviour set this explicitly.
+        parameters: Vec<(String, String)>,
+    }
+
+    impl Default for RasterMock {
+        fn default() -> Self {
+            Self {
+                spatial_extent: None,
+                times: Vec::new(),
+                parameter: "value".into(),
+                unit: String::new(),
+                parameters: Vec::new(),
+            }
+        }
     }
 
     impl MapEngine for RasterMock {
@@ -732,7 +848,7 @@ mod tests {
                 times: self.times.clone(),
                 parameter: self.parameter.clone(),
                 unit: self.unit.clone(),
-                parameters: vec![],
+                parameters: self.parameters.clone(),
             }
         }
     }
@@ -847,6 +963,7 @@ mod tests {
             wms: None,
             grib: None,
             postgis: None,
+            preview: None,
         }
     }
 
@@ -952,6 +1069,7 @@ mod tests {
             times: vec![],
             parameter: "reflectivity".into(),
             unit: "dBZ".into(),
+            parameters: vec![],
         });
         let feature_engine: Arc<dyn FeatureEngine> = Arc::new(PointFeatureMock {
             extent: Some([20.0, 60.0, 30.0, 70.0]),
@@ -1224,6 +1342,7 @@ mod tests {
             times: times.clone(),
             parameter: "reflectivity".into(),
             unit: "dBZ".into(),
+            parameters: vec![],
         });
         tiles.map_engines.insert("radar".into(), raster);
         tiles
@@ -1266,6 +1385,7 @@ mod tests {
             times: times.clone(),
             parameter: "reflectivity".into(),
             unit: "dBZ".into(),
+            parameters: vec![],
         });
         wms.engines.insert("radar-wms".into(), engine);
         wms.collections
@@ -1316,6 +1436,460 @@ mod tests {
         // route exists). Worth asserting because a future refactor might
         // accidentally synthesise one.
         assert!(c.get("tiles").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // [collections.preview] tests
+    // -----------------------------------------------------------------------
+
+    fn config_with_window(id: &str, apis: &[&str], window: &str) -> CollectionConfig {
+        let mut c = config(id, apis);
+        c.preview = Some(ds_core::config::PreviewConfig {
+            time_window: Some(window.into()),
+        });
+        c
+    }
+
+    #[test]
+    fn preview_time_window_filters_values_to_recent_slice() {
+        // 100 timesteps spanning 50h at 30-min cadence. `time_window = "PT12H"`
+        // should retain only the last ~24 entries (12h × 2/hour) plus the
+        // anchor itself.
+        let start = "2026-05-13T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let times: Vec<DateTime<Utc>> = (0..100)
+            .map(|i| start + chrono::Duration::minutes(30 * i as i64))
+            .collect();
+        let latest = *times.last().unwrap();
+
+        let mut tiles = empty_tiles();
+        let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            spatial_extent: Some([0.0, 0.0, 1.0, 1.0]),
+            times: times.clone(),
+            parameter: "reflectivity".into(),
+            unit: "dBZ".into(),
+            parameters: vec![],
+        });
+        tiles.map_engines.insert("radar".into(), raster);
+        tiles.collections.insert(
+            "radar".into(),
+            config_with_window("radar", &["tiles"], "PT12H"),
+        );
+
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            tiles,
+            empty_wms(),
+        );
+        let m = build_manifest(&state, 0, 100);
+        let temporal = &m["collections"][0]["temporal_extent"];
+        let values = temporal["values"].as_array().expect("values present");
+
+        // 12h window over a 30-min cadence = 24 entries plus the anchor = 25.
+        assert_eq!(values.len(), 25, "12h × 2/hour + anchor = 25 entries");
+        let cutoff = latest - chrono::Duration::hours(12);
+        for v in values {
+            let parsed: DateTime<Utc> = v.as_str().unwrap().parse().unwrap();
+            assert!(
+                parsed >= cutoff,
+                "value {v} is older than the 12h cutoff {cutoff}"
+            );
+        }
+        // Interval must re-anchor to the filtered slice — otherwise the card
+        // header reports a 50h span while the slider only reaches 12h.
+        assert_eq!(&temporal["start"], values.first().unwrap());
+        assert_eq!(&temporal["end"], values.last().unwrap());
+        // `truncated` follows the post-filter length vs MAX_TEMPORAL_VALUES.
+        assert_eq!(temporal["truncated"], false);
+    }
+
+    #[test]
+    fn preview_time_window_unset_returns_unfiltered_values() {
+        let start = "2026-05-13T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let times: Vec<DateTime<Utc>> = (0..6)
+            .map(|i| start + chrono::Duration::hours(i as i64))
+            .collect();
+
+        let mut tiles = empty_tiles();
+        let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            spatial_extent: None,
+            times: times.clone(),
+            parameter: "reflectivity".into(),
+            unit: "dBZ".into(),
+            parameters: vec![],
+        });
+        tiles.map_engines.insert("radar".into(), raster);
+        tiles
+            .collections
+            .insert("radar".into(), config("radar", &["tiles"]));
+
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            tiles,
+            empty_wms(),
+        );
+        let m = build_manifest(&state, 0, 100);
+        let temporal = &m["collections"][0]["temporal_extent"];
+        assert_eq!(temporal["values"].as_array().map(|a| a.len()), Some(6));
+    }
+
+    #[test]
+    fn preview_time_window_invalid_is_warning_not_error() {
+        // A bad duration string should not 500 the request — the manifest
+        // should fall back to the unfiltered values and the operator gets
+        // a `WARN` line. This protects against the manifest endpoint
+        // becoming a config-error tripwire when an operator typos.
+        let start = "2026-05-13T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let times: Vec<DateTime<Utc>> = (0..4)
+            .map(|i| start + chrono::Duration::hours(i as i64))
+            .collect();
+
+        let mut tiles = empty_tiles();
+        let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            spatial_extent: None,
+            times: times.clone(),
+            parameter: "reflectivity".into(),
+            unit: "dBZ".into(),
+            parameters: vec![],
+        });
+        tiles.map_engines.insert("radar".into(), raster);
+        tiles.collections.insert(
+            "radar".into(),
+            config_with_window("radar", &["tiles"], "not-a-duration"),
+        );
+
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            tiles,
+            empty_wms(),
+        );
+        let m = build_manifest(&state, 0, 100);
+        let temporal = &m["collections"][0]["temporal_extent"];
+        assert_eq!(
+            temporal["values"].as_array().map(|a| a.len()),
+            Some(4),
+            "invalid time_window must be ignored, not applied"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `parameters` array tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn manifest_emits_parameters_for_multi_param_raster() {
+        use ds_core::model::ParameterDescription;
+        // Mock EdrEngine returning three parameters; RasterMock supplies the
+        // tile descriptor so the dropdown surfaces in the SPA.
+        struct MultiParamEdr;
+        impl EdrEngine for MultiParamEdr {
+            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+                Ok(Vec::new())
+            }
+            fn query_location(
+                &self,
+                _: &str,
+                _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                _: Option<&[String]>,
+            ) -> Result<QueryResult, DataServerError> {
+                unimplemented!()
+            }
+            fn get_parameters(&self) -> Vec<String> {
+                vec!["2t".into(), "msl".into(), "10u".into()]
+            }
+            fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
+                let mut m = HashMap::new();
+                m.insert(
+                    "2t".into(),
+                    ParameterDescription {
+                        label: "2 metre temperature".into(),
+                        unit: "K".into(),
+                        observed_property: "2t".into(),
+                    },
+                );
+                m.insert(
+                    "msl".into(),
+                    ParameterDescription {
+                        label: "Mean sea level pressure".into(),
+                        unit: "Pa".into(),
+                        observed_property: "msl".into(),
+                    },
+                );
+                m.insert(
+                    "10u".into(),
+                    ParameterDescription {
+                        label: "10 metre U wind".into(),
+                        unit: "m/s".into(),
+                        observed_property: "10u".into(),
+                    },
+                );
+                m
+            }
+            fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+                None
+            }
+            fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+                None
+            }
+        }
+
+        let mut edr = empty_edr();
+        let edr_engine: Arc<dyn EdrEngine> = Arc::new(MultiParamEdr);
+        edr.engines.insert("ecmwf-fc".into(), edr_engine);
+        edr.collections
+            .insert("ecmwf-fc".into(), config("ecmwf-fc", &["edr", "tiles"]));
+
+        let mut tiles = empty_tiles();
+        let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            parameter: "2t".into(),
+            unit: "K".into(),
+            // GRIB shape: raster exposes the same param set as EDR.
+            parameters: vec![
+                ("2t".into(), "Temperature".into()),
+                ("msl".into(), "Pressure".into()),
+                ("10u".into(), "Wind U".into()),
+            ],
+            ..RasterMock::default()
+        });
+        tiles.map_engines.insert("ecmwf-fc".into(), raster);
+        tiles
+            .collections
+            .insert("ecmwf-fc".into(), config("ecmwf-fc", &["edr", "tiles"]));
+
+        let state = make_state(edr, empty_features(), empty_maps(), tiles, empty_wms());
+        let m = build_manifest(&state, 0, 100);
+        let params = m["collections"][0]["parameters"]
+            .as_array()
+            .expect("parameters array");
+        assert_eq!(params.len(), 3);
+        // Sorted by name → 10u, 2t, msl
+        assert_eq!(params[0]["name"], "10u");
+        assert_eq!(params[1]["name"], "2t");
+        assert_eq!(params[2]["name"], "msl");
+        assert_eq!(params[1]["unit"], "K");
+        assert_eq!(params[1]["title"], "2 metre temperature");
+    }
+
+    #[test]
+    fn manifest_omits_parameters_when_raster_is_single_band_even_if_edr_multi_param() {
+        // Reviewer scenario: single-band raster engine (empty
+        // `raster_info().parameters`) shares a collection ID with a
+        // multi-param EDR engine. The tile handler ignores `parameter-name=`
+        // for single-band engines, so emitting EDR's multi-param list would
+        // give the user a dropdown whose selections are silently ignored at
+        // render time. The manifest must instead drop the `parameters` field
+        // so the SPA shows no dropdown.
+        use ds_core::model::ParameterDescription;
+
+        struct MultiParamEdrShim;
+        impl EdrEngine for MultiParamEdrShim {
+            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+                Ok(Vec::new())
+            }
+            fn query_location(
+                &self,
+                _: &str,
+                _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                _: Option<&[String]>,
+            ) -> Result<QueryResult, DataServerError> {
+                unimplemented!()
+            }
+            fn get_parameters(&self) -> Vec<String> {
+                vec!["a".into(), "b".into()]
+            }
+            fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
+                let mut m = HashMap::new();
+                for n in ["a", "b"] {
+                    m.insert(
+                        n.to_string(),
+                        ParameterDescription {
+                            label: n.to_string(),
+                            unit: String::new(),
+                            observed_property: n.into(),
+                        },
+                    );
+                }
+                m
+            }
+            fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+                None
+            }
+            fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+                None
+            }
+        }
+
+        let mut edr = empty_edr();
+        edr.engines
+            .insert("single-band".into(), Arc::new(MultiParamEdrShim));
+        edr.collections.insert(
+            "single-band".into(),
+            config("single-band", &["edr", "tiles"]),
+        );
+
+        let mut tiles = empty_tiles();
+        let raster: Arc<dyn MapEngine> = Arc::new(RasterMock::default());
+        tiles.map_engines.insert("single-band".into(), raster);
+        tiles.collections.insert(
+            "single-band".into(),
+            config("single-band", &["edr", "tiles"]),
+        );
+
+        let state = make_state(edr, empty_features(), empty_maps(), tiles, empty_wms());
+        let m = build_manifest(&state, 0, 100);
+        assert!(
+            m["collections"][0].get("parameters").is_none(),
+            "single-band raster + multi-param EDR must NOT emit a parameters \
+             dropdown — the tile handler silently ignores parameter-name for \
+             single-band engines"
+        );
+    }
+
+    #[test]
+    fn manifest_omits_parameters_for_vector_only_collection() {
+        // FeatureEngine collections aren't parameterised; emitting the array
+        // would just clutter the manifest and confuse the SPA dropdown.
+        let mut tiles = empty_tiles();
+        let feature: Arc<dyn FeatureEngine> = Arc::new(PointFeatureMock {
+            extent: Some([0.0, 0.0, 1.0, 1.0]),
+        });
+        tiles.feature_engines.insert("stations".into(), feature);
+        tiles
+            .feature_collections
+            .insert("stations".into(), config("stations", &["tiles"]));
+
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            tiles,
+            empty_wms(),
+        );
+        let m = build_manifest(&state, 0, 100);
+        assert!(m["collections"][0].get("parameters").is_none());
+    }
+
+    #[test]
+    fn manifest_parameters_intersect_with_raster_renderable_set() {
+        // Reviewer scenario: EDR advertises a param the raster engine can't
+        // render (a derived/queryable-only field). The dropdown must be the
+        // intersection so a user can never select a value that 400s at the
+        // tile route.
+        use ds_core::model::ParameterDescription;
+
+        struct WideEdr;
+        impl EdrEngine for WideEdr {
+            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+                Ok(Vec::new())
+            }
+            fn query_location(
+                &self,
+                _: &str,
+                _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                _: Option<&[String]>,
+            ) -> Result<QueryResult, DataServerError> {
+                unimplemented!()
+            }
+            fn get_parameters(&self) -> Vec<String> {
+                vec!["2t".into(), "msl".into(), "derived_index".into()]
+            }
+            fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
+                let mut m = HashMap::new();
+                m.insert(
+                    "2t".into(),
+                    ParameterDescription {
+                        label: "Temperature".into(),
+                        unit: "K".into(),
+                        observed_property: "2t".into(),
+                    },
+                );
+                m.insert(
+                    "msl".into(),
+                    ParameterDescription {
+                        label: "Mean SLP".into(),
+                        unit: "Pa".into(),
+                        observed_property: "msl".into(),
+                    },
+                );
+                m.insert(
+                    "derived_index".into(),
+                    ParameterDescription {
+                        label: "Derived index".into(),
+                        unit: "1".into(),
+                        observed_property: "derived_index".into(),
+                    },
+                );
+                m
+            }
+            fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+                None
+            }
+            fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+                None
+            }
+        }
+
+        /// MapEngine that only exposes 2 of the EDR's 3 parameters.
+        struct PartialRaster;
+        impl MapEngine for PartialRaster {
+            fn get_raster_tile(
+                &self,
+                _: [f64; 4],
+                _: u32,
+                _: u32,
+                _: Option<DateTime<Utc>>,
+                _: &OutputCrs,
+                _: Option<&str>,
+            ) -> Result<RasterTile, DataServerError> {
+                unimplemented!()
+            }
+            fn raster_info(&self) -> RasterInfo {
+                RasterInfo {
+                    native_crs: "EPSG:4326".into(),
+                    spatial_extent: None,
+                    times: vec![],
+                    parameter: "2t".into(),
+                    unit: "K".into(),
+                    // Note: "derived_index" is intentionally absent.
+                    parameters: vec![
+                        ("2t".into(), "Temperature".into()),
+                        ("msl".into(), "Mean SLP".into()),
+                    ],
+                }
+            }
+        }
+
+        let mut edr = empty_edr();
+        let e: Arc<dyn EdrEngine> = Arc::new(WideEdr);
+        edr.engines.insert("ecmwf-fc".into(), e);
+        edr.collections
+            .insert("ecmwf-fc".into(), config("ecmwf-fc", &["edr", "tiles"]));
+
+        let mut tiles = empty_tiles();
+        let r: Arc<dyn MapEngine> = Arc::new(PartialRaster);
+        tiles.map_engines.insert("ecmwf-fc".into(), r);
+        tiles
+            .collections
+            .insert("ecmwf-fc".into(), config("ecmwf-fc", &["edr", "tiles"]));
+
+        let state = make_state(edr, empty_features(), empty_maps(), tiles, empty_wms());
+        let m = build_manifest(&state, 0, 100);
+        let params = m["collections"][0]["parameters"]
+            .as_array()
+            .expect("parameters array");
+        // Only the renderable subset. EDR's rich "Temperature" label + "K"
+        // unit should still propagate for the surviving "2t" entry.
+        assert_eq!(params.len(), 2);
+        let names: Vec<&str> = params.iter().map(|p| p["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["2t", "msl"]);
+        assert!(!names.contains(&"derived_index"));
+        assert_eq!(params[0]["unit"], "K");
+        assert_eq!(params[0]["title"], "Temperature");
     }
 
     // -----------------------------------------------------------------------

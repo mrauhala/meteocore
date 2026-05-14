@@ -139,7 +139,16 @@
             enabled: false,
             hasZoomed: false,
             timeIndex: null,
-            timeValues: temporalValues(collection)
+            timeValues: temporalValues(collection),
+            // Selected parameter name for multi-parameter raster collections.
+            // null = use the server's default. The dropdown is only rendered
+            // when `parameters.length > 1`, but state holds the first entry's
+            // name unconditionally so URL builders can append it without an
+            // extra null-check.
+            parameter:
+                Array.isArray(collection.parameters) && collection.parameters.length > 0
+                    ? collection.parameters[0].name
+                    : null
         };
 
         const li = document.createElement('li');
@@ -383,7 +392,7 @@
         // No `attribution`: MapLibre renders it via innerHTML.
         map.addSource(sourceId, {
             type: 'raster',
-            tiles: [tileUrlFor(collection, currentStyle, currentTime(state))],
+            tiles: [tileUrlFor(collection, currentStyle, currentTime(state), state.parameter)],
             tileSize: 256
         });
         map.addLayer({
@@ -396,6 +405,37 @@
             layout: { visibility: 'none' },
             paint: { 'raster-opacity': 1 }
         });
+
+        // -- Parameter picker (multi-parameter raster engines only). Rendered
+        //    above the style picker so the controls flow top-to-bottom in a
+        //    "narrow my view" order: parameter → style → time.
+        if (Array.isArray(collection.parameters) && collection.parameters.length > 1) {
+            const paramLabel = document.createElement('label');
+            paramLabel.className = 'control-row';
+            const paramText = document.createElement('span');
+            paramText.className = 'control-label';
+            paramText.textContent = 'Parameter';
+            paramLabel.appendChild(paramText);
+
+            const paramSelect = document.createElement('select');
+            collection.parameters.forEach(function (p) {
+                const opt = document.createElement('option');
+                opt.value = p.name;
+                const titleText = p.title && p.title !== p.name
+                    ? p.name + ' — ' + p.title
+                    : p.name;
+                opt.textContent = p.unit ? titleText + ' (' + p.unit + ')' : titleText;
+                if (p.name === state.parameter) opt.selected = true;
+                paramSelect.appendChild(opt);
+            });
+            paramSelect.addEventListener('change', function () {
+                if (state.parameter === paramSelect.value) return;
+                state.parameter = paramSelect.value;
+                refreshSource();
+            });
+            paramLabel.appendChild(paramSelect);
+            controlsHost.appendChild(paramLabel);
+        }
 
         // -- Style picker (only if there's a real choice) --
         if (styles.length > 1) {
@@ -425,7 +465,7 @@
         function refreshSource() {
             const src = map.getSource(sourceId);
             if (src && typeof src.setTiles === 'function') {
-                src.setTiles([tileUrlFor(collection, currentStyle, currentTime(state))]);
+                src.setTiles([tileUrlFor(collection, currentStyle, currentTime(state), state.parameter)]);
             }
         }
 
@@ -443,7 +483,7 @@
     //   /tiles/.../WebMercatorQuad/{z}/{y}/{x}
     // Placeholder names come from the axum route (see preview.rs), not from
     // the generic `{tms}`/`{z}` which the server would reject.
-    function tileUrlFor(collection, styleId, time) {
+    function tileUrlFor(collection, styleId, time, parameter) {
         const raster = collection.tiles.raster;
         // 'default' style uses the plain /tiles/... route, not /styles/default/...
         const useStyled = styleId && styleId !== 'default' && raster.styled_url_template;
@@ -458,7 +498,8 @@
         // Strip manifest's absolute origin so 127.0.0.1↔localhost mismatch in
         // `server.base_url` doesn't trip CSP `connect-src 'self'`.
         template = template.replace(/^https?:\/\/[^/]+/i, '');
-        return appendTimeParam(template, time);
+        template = appendTimeParam(template, time);
+        return appendParameterName(template, parameter);
     }
 
     // ------------------------------------------------------------------
@@ -580,6 +621,14 @@
         // `datetime` query param at crates/api-tiles/src/handlers.rs:577.
         const sep = template.indexOf('?') === -1 ? '?' : '&';
         return template + sep + 'datetime=' + encodeURIComponent(time);
+    }
+
+    function appendParameterName(template, parameter) {
+        if (!parameter) return template;
+        // Matches EDR's `parameter-name=` convention; api-maps + api-tiles
+        // accept this as a non-OGC bridge until the standardised form lands.
+        const sep = template.indexOf('?') === -1 ? '?' : '&';
+        return template + sep + 'parameter-name=' + encodeURIComponent(parameter);
     }
 
     // ------------------------------------------------------------------

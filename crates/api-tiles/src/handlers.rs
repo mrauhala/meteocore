@@ -1040,16 +1040,40 @@ async fn render_tile(
         _ => crs_to_uri("CRS:84"),
     };
 
-    // Resolve time: use explicit or default to latest
-    let time = match validated.time {
-        Some(t) => Some(t),
-        None => {
-            let info = engine.raster_info();
-            info.times.last().copied()
-        }
-    };
+    // Single `raster_info()` call covers both default-time resolution and
+    // parameter-name validation. Trait contract is O(1) but we still avoid
+    // the redundant call.
+    let raster_info = engine.raster_info();
+    let time = validated.time.or_else(|| raster_info.times.last().copied());
 
     let tile_size = params::TILE_SIZE;
+
+    // Parameter selection: ?parameter-name= wins over style.parameter. Mirror
+    // the precedence and validation used by api-maps + api-wms so the SPA
+    // dropdown works identically across all three raster routes. Engines
+    // with an empty `raster_info().parameters` list (single-band GeoTIFF)
+    // ignore the parameter at render time — we still accept the query.
+    if let Some(pname) = validated.parameter_name.as_deref() {
+        if !raster_info.parameters.is_empty()
+            && !raster_info.parameters.iter().any(|(name, _)| name == pname)
+        {
+            let mut supported: Vec<&str> = raster_info
+                .parameters
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect();
+            supported.sort_unstable();
+            return Err(TilesError::BadRequest(format!(
+                "parameter-name '{pname}' is not available for collection '{collection_id}'. \
+                 Available: {}",
+                supported.join(", ")
+            )));
+        }
+    }
+    let effective_parameter = validated
+        .parameter_name
+        .clone()
+        .or_else(|| style_info.parameter.clone());
 
     // Build cache key
     let cache_key = CacheKey {
@@ -1065,6 +1089,7 @@ async fn render_tile(
         width: tile_size,
         height: tile_size,
         time,
+        parameter: effective_parameter.clone(),
     };
 
     let etag = cache_key.etag();
@@ -1115,7 +1140,7 @@ async fn render_tile(
 
     // The blocking closure returns Ok(None) for empty (all-nodata) tiles,
     // or Ok(Some(bytes)) for tiles with data.
-    let style_parameter = style_info.parameter.as_deref().map(String::from);
+    let render_parameter = effective_parameter;
 
     let render_result = tokio::task::spawn_blocking(move || {
         let tile = engine.get_raster_tile(
@@ -1124,7 +1149,7 @@ async fn render_tile(
             tile_size,
             time,
             &output_crs,
-            style_parameter.as_deref(),
+            render_parameter.as_deref(),
         )?;
 
         // If every pixel is nodata, skip colorization + encoding entirely.

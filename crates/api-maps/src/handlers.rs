@@ -694,14 +694,46 @@ async fn render_map(
     let has_explicit_time = validated.time.is_some();
     let content_crs = crs_to_uri(&validated.crs);
 
-    // Resolve time: use explicit or default to latest
-    let time = match validated.time {
-        Some(t) => Some(t),
-        None => {
-            let info = engine.raster_info();
-            info.times.last().copied()
+    // Single `raster_info()` call covers both default-time resolution and
+    // parameter-name validation. The trait now documents this as O(1), but
+    // hoisting still saves one Arc-clone-sized allocation per request on
+    // engines that materialise `RasterInfo` lazily.
+    let raster_info = engine.raster_info();
+    let time = validated.time.or_else(|| raster_info.times.last().copied());
+
+    // Parameter selection precedence: ?parameter-name= wins over style.parameter.
+    // Validate against the engine's advertised list when the query supplied one
+    // — passing through unrecognised names produces a confusing "default
+    // parameter rendered with wrong colormap" rather than a clear 400.
+    // `raster_info().parameters` is empty for single-parameter engines (GeoTIFF);
+    // in that case we just accept the query value and let the engine ignore it,
+    // matching `get_raster_tile`'s documented behavior.
+    if let Some(pname) = validated.parameter_name.as_deref() {
+        if !raster_info.parameters.is_empty()
+            && !raster_info.parameters.iter().any(|(name, _)| name == pname)
+        {
+            let mut supported: Vec<&str> = raster_info
+                .parameters
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect();
+            // Sort so the error message is deterministic. `raster_info()`
+            // returns parameters in engine-defined order — fine for GRIB
+            // today but a future HashMap-backed engine would surface a
+            // different ordering per request, confusing both log greppers
+            // and clients that try to match against the hint.
+            supported.sort_unstable();
+            return Err(MapsError::BadRequest(format!(
+                "parameter-name '{pname}' is not available for collection '{collection_id}'. \
+                 Available: {}",
+                supported.join(", ")
+            )));
         }
-    };
+    }
+    let effective_parameter = validated
+        .parameter_name
+        .clone()
+        .or_else(|| style_info.parameter.clone());
 
     // Build cache key
     let cache_key = CacheKey {
@@ -717,6 +749,7 @@ async fn render_map(
         width: validated.width,
         height: validated.height,
         time,
+        parameter: effective_parameter.clone(),
     };
 
     let etag = cache_key.etag();
@@ -769,7 +802,7 @@ async fn render_map(
     let format = validated.format;
     let rendered_cache = state.rendered_cache.clone();
 
-    let style_parameter = style_info.parameter.as_deref().map(String::from);
+    let render_parameter = effective_parameter;
 
     let render_result = tokio::task::spawn_blocking(move || {
         let tile = engine.get_raster_tile(
@@ -778,7 +811,7 @@ async fn render_map(
             height,
             time,
             &output_crs,
-            style_parameter.as_deref(),
+            render_parameter.as_deref(),
         )?;
         // If every pixel is nodata, skip colorization + encoding entirely.
         if tile.is_empty() {

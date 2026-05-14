@@ -1,6 +1,116 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 
 use crate::error::DataServerError;
+
+/// Parse an ISO 8601 positive duration (e.g. `"PT12H"`, `"P1D"`, `"P1DT6H"`)
+/// into a `chrono::Duration`. Rejects zero-length and signed durations —
+/// callers that need signed offsets should layer on top of this.
+pub fn parse_iso8601_duration(s: &str) -> Result<Duration, DataServerError> {
+    let rest = s.strip_prefix('P').ok_or_else(|| {
+        DataServerError::Config(format!(
+            "Invalid ISO 8601 duration '{s}': must start with 'P'"
+        ))
+    })?;
+
+    let (date_part, time_part) = if let Some(t_pos) = rest.find('T') {
+        (&rest[..t_pos], &rest[t_pos + 1..])
+    } else {
+        (rest, "")
+    };
+
+    let mut total_seconds: i64 = 0;
+
+    // Reject any sign character anywhere in `rest` up front. ISO 8601 doesn't
+    // permit negative components within a positive duration, and without this
+    // check `P1DT-2H` parses as 22h because `i64::parse("-2")` succeeds — a
+    // config typo would produce a surprising window length, not an error.
+    if rest.contains('-') || rest.contains('+') {
+        return Err(DataServerError::Config(format!(
+            "Invalid ISO 8601 duration '{s}': signed components are not permitted"
+        )));
+    }
+
+    if !date_part.is_empty() {
+        // Mixed week-and-day forms (`P1W2D`) are unsupported. Catch them
+        // explicitly here — otherwise the parser falls into the days branch
+        // below, fails on `"1W2".parse::<i64>()`, and surfaces a misleading
+        // "Invalid days" message that hides the real issue.
+        if date_part.contains('W') && date_part.contains('D') {
+            return Err(DataServerError::Config(format!(
+                "Invalid ISO 8601 duration '{s}': cannot mix 'W' with other date units"
+            )));
+        }
+        // Weeks (`P1W`) — natural unit for meteorological archives.
+        if let Some(stripped) = date_part.strip_suffix('W') {
+            let weeks: i64 = stripped.parse().map_err(|_| {
+                DataServerError::Config(format!("Invalid weeks in ISO 8601 duration '{s}'"))
+            })?;
+            total_seconds += weeks * 7 * 86_400;
+        } else {
+            let stripped = date_part.strip_suffix('D').ok_or_else(|| {
+                DataServerError::Config(format!(
+                    "Invalid date component in ISO 8601 duration '{s}': supported units are 'D' \
+                     (days) and 'W' (weeks)"
+                ))
+            })?;
+            let days: i64 = stripped.parse().map_err(|_| {
+                DataServerError::Config(format!("Invalid days in ISO 8601 duration '{s}'"))
+            })?;
+            total_seconds += days * 86_400;
+        }
+    }
+
+    // `PnDT` with no time components is not valid ISO 8601 — the `T` separator
+    // must be followed by at least one of H/M/S. Reject explicitly so config
+    // typos surface at load rather than silently parsing as `PnD`.
+    if rest.contains('T') && time_part.is_empty() {
+        return Err(DataServerError::Config(format!(
+            "Invalid ISO 8601 duration '{s}': 'T' separator present but no time components follow"
+        )));
+    }
+
+    if !time_part.is_empty() {
+        let mut remaining = time_part;
+        if let Some(pos) = remaining.find('H') {
+            let v: u64 = remaining[..pos].parse().map_err(|_| {
+                DataServerError::Config(format!("Invalid hours in ISO 8601 duration '{s}'"))
+            })?;
+            total_seconds += (v as i64) * 3600;
+            remaining = &remaining[pos + 1..];
+        }
+        if let Some(pos) = remaining.find('M') {
+            let v: u64 = remaining[..pos].parse().map_err(|_| {
+                DataServerError::Config(format!("Invalid minutes in ISO 8601 duration '{s}'"))
+            })?;
+            total_seconds += (v as i64) * 60;
+            remaining = &remaining[pos + 1..];
+        }
+        if let Some(pos) = remaining.find('S') {
+            let v: u64 = remaining[..pos].parse().map_err(|_| {
+                DataServerError::Config(format!("Invalid seconds in ISO 8601 duration '{s}'"))
+            })?;
+            total_seconds += v as i64;
+            remaining = &remaining[pos + 1..];
+        }
+        // Anything left in `remaining` is unparsed — a trailing number with
+        // no unit (`PT12H30` for `PT12H30M`) would otherwise be silently
+        // dropped, returning a shorter window than the operator intended.
+        if !remaining.is_empty() {
+            return Err(DataServerError::Config(format!(
+                "Invalid ISO 8601 duration '{s}': trailing characters '{remaining}' after time \
+                 components"
+            )));
+        }
+    }
+
+    if total_seconds <= 0 {
+        return Err(DataServerError::Config(format!(
+            "Invalid ISO 8601 duration '{s}': zero or negative duration"
+        )));
+    }
+
+    Ok(Duration::seconds(total_seconds))
+}
 
 /// Parses an OGC datetime interval string like "2024-01-01T00:00:00Z/2024-01-01T06:00:00Z"
 /// or a single instant "2024-01-01T00:00:00Z" (treated as a zero-width interval).
@@ -58,5 +168,89 @@ mod tests {
         let (start, end) = parse_datetime_interval("../2024-01-01T06:00:00Z").unwrap();
         assert_eq!(start, DateTime::<Utc>::MIN_UTC);
         assert_eq!(end.to_rfc3339(), "2024-01-01T06:00:00+00:00");
+    }
+
+    #[test]
+    fn iso8601_duration_basic() {
+        assert_eq!(
+            parse_iso8601_duration("PT12H").unwrap(),
+            Duration::seconds(12 * 3600)
+        );
+        assert_eq!(
+            parse_iso8601_duration("P1D").unwrap(),
+            Duration::seconds(86_400)
+        );
+        assert_eq!(
+            parse_iso8601_duration("P1DT6H").unwrap(),
+            Duration::seconds(86_400 + 6 * 3600)
+        );
+        assert_eq!(
+            parse_iso8601_duration("PT30M").unwrap(),
+            Duration::seconds(1800)
+        );
+    }
+
+    #[test]
+    fn iso8601_duration_rejects_bad_input() {
+        assert!(parse_iso8601_duration("").is_err());
+        assert!(parse_iso8601_duration("12H").is_err());
+        assert!(parse_iso8601_duration("PT0H").is_err());
+        assert!(parse_iso8601_duration("P0D").is_err());
+        assert!(parse_iso8601_duration("-PT2H").is_err());
+        // Empty T segment is technically invalid; surface the typo.
+        assert!(parse_iso8601_duration("P1DT").is_err());
+        assert!(parse_iso8601_duration("PT").is_err());
+    }
+
+    #[test]
+    fn iso8601_duration_rejects_signed_components() {
+        // Pre-fix, `P1DT-2H` parsed as 22h because `i64::parse("-2")` succeeds
+        // and `86400 - 7200 > 0` passed the zero-check. A config typo would
+        // produce a window of surprising length, not an error.
+        assert!(parse_iso8601_duration("P1DT-2H").is_err());
+        assert!(parse_iso8601_duration("P-1DT2H").is_err());
+        assert!(parse_iso8601_duration("PT2H-30M").is_err());
+        assert!(parse_iso8601_duration("PT+2H").is_err());
+    }
+
+    #[test]
+    fn iso8601_duration_supports_weeks() {
+        assert_eq!(
+            parse_iso8601_duration("P1W").unwrap(),
+            Duration::seconds(7 * 86_400)
+        );
+        assert_eq!(
+            parse_iso8601_duration("P2W").unwrap(),
+            Duration::seconds(14 * 86_400)
+        );
+        // `P1W2D` mixes weeks with other date units — surface a message that
+        // names the actual problem, not "Invalid days" (which is what we
+        // got before the explicit guard; an operator reading logs would have
+        // started staring at the days value, not the structure).
+        let err = parse_iso8601_duration("P1W2D").unwrap_err().to_string();
+        assert!(
+            err.contains("cannot mix 'W'"),
+            "Expected 'cannot mix W' message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn iso8601_duration_rejects_trailing_digits_without_unit() {
+        // Without the trailing-content check, `PT12H30` (operator typo for
+        // `PT12H30M`) silently parsed as 12h, dropping the 30. The
+        // surrounding behaviour — start with PT, end with a unit suffix —
+        // would otherwise hide the typo.
+        assert!(parse_iso8601_duration("PT12H30").is_err());
+        assert!(parse_iso8601_duration("PT30M5").is_err());
+        assert!(parse_iso8601_duration("PT1H2M3").is_err());
+        // The valid forms are still accepted.
+        assert_eq!(
+            parse_iso8601_duration("PT12H30M").unwrap(),
+            Duration::seconds(12 * 3600 + 30 * 60)
+        );
+        assert_eq!(
+            parse_iso8601_duration("PT1H2M3S").unwrap(),
+            Duration::seconds(3600 + 120 + 3)
+        );
     }
 }

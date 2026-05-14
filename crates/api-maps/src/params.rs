@@ -31,6 +31,11 @@ pub struct MapQueryParams {
     pub format: Option<String>,
     #[serde(rename = "bbox-crs")]
     pub bbox_crs: Option<String>,
+    /// EDR-style parameter selector for multi-parameter raster engines
+    /// (GRIB, multi-param QueryData). Non-OGC for now — a standardised
+    /// path/query form is on the OGC Maps roadmap and will replace this.
+    #[serde(rename = "parameter-name")]
+    pub parameter_name: Option<String>,
 }
 
 /// Validated map request parameters.
@@ -42,6 +47,7 @@ pub struct ValidatedMapParams {
     pub time: Option<DateTime<Utc>>,
     pub output_crs: ds_core::map_engine::OutputCrs,
     pub format: ds_render::ImageFormat,
+    pub parameter_name: Option<String>,
 }
 
 impl MapQueryParams {
@@ -122,6 +128,16 @@ impl MapQueryParams {
             _ => ds_core::map_engine::OutputCrs::Wgs84,
         };
 
+        // parameter-name — validation that the name is in the engine's list
+        // happens in the handler (we don't have the engine here). Just trim and
+        // reject empty/blank to keep handler logic simple.
+        let parameter_name = self
+            .parameter_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
         Ok(ValidatedMapParams {
             bbox,
             width,
@@ -130,6 +146,7 @@ impl MapQueryParams {
             time,
             output_crs,
             format,
+            parameter_name,
         })
     }
 }

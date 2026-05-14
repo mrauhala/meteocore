@@ -14,3 +14,11 @@ poll_interval_secs = 300
 
 [wms]
 style_bundle = "radar_multi"
+
+# Bound the /preview SPA's time slider to the last 12 hours. The STAC archive
+# covers >1 year of 5-minute mosaics; without this cap the slider becomes a
+# 1000-stop bar covering ~83h that's unusable for scrubbing recent radar.
+# Only affects the preview manifest — the underlying engine still loads
+# whatever the STAC catalogue advertises.
+[preview]
+time_window = "PT12H"

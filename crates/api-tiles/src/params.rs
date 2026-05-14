@@ -33,6 +33,11 @@ pub struct TileQueryParams {
     pub datetime: Option<String>,
     #[serde(rename = "f")]
     pub format: Option<String>,
+    /// EDR-style parameter selector for multi-parameter raster engines.
+    /// Non-OGC for now; a standardised form is on the OGC Tiles roadmap.
+    /// Ignored for MVT (`?f=mvt`) responses.
+    #[serde(rename = "parameter-name")]
+    pub parameter_name: Option<String>,
 }
 
 impl TileQueryParams {
@@ -49,6 +54,7 @@ impl TileQueryParams {
 pub struct ValidatedTileParams {
     pub time: Option<DateTime<Utc>>,
     pub format: ds_render::ImageFormat,
+    pub parameter_name: Option<String>,
 }
 
 impl TileQueryParams {
@@ -68,7 +74,18 @@ impl TileQueryParams {
 
         let time = self.datetime.as_deref().map(parse_time).transpose()?;
 
-        Ok(ValidatedTileParams { time, format })
+        let parameter_name = self
+            .parameter_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        Ok(ValidatedTileParams {
+            time,
+            format,
+            parameter_name,
+        })
     }
 }
 
@@ -100,6 +117,7 @@ mod tests {
         let params = TileQueryParams {
             datetime: None,
             format: None,
+            parameter_name: None,
         };
         let validated = params.validate().unwrap();
         assert!(matches!(validated.format, ds_render::ImageFormat::Png));
@@ -110,6 +128,7 @@ mod tests {
         let params = TileQueryParams {
             datetime: None,
             format: Some("image/jpeg".to_string()),
+            parameter_name: None,
         };
         let validated = params.validate().unwrap();
         assert!(matches!(validated.format, ds_render::ImageFormat::Jpeg));
@@ -120,6 +139,7 @@ mod tests {
         let params = TileQueryParams {
             datetime: None,
             format: Some("text/html".to_string()),
+            parameter_name: None,
         };
         assert!(params.validate().is_err());
     }

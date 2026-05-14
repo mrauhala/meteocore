@@ -74,5 +74,12 @@ pub trait MapEngine: Send + Sync {
     ) -> Result<RasterTile, DataServerError>;
 
     /// Return metadata for capabilities documents.
+    ///
+    /// **Expected complexity: O(1) (or as close as practical).** Callers
+    /// invoke this on the hot tile/map path to validate `?parameter-name=`
+    /// against `parameters`, before acquiring the render semaphore. Engines
+    /// should serve from an `ArcSwap`/`RwLock` snapshot, not recompute on
+    /// every call. If your engine genuinely needs to derive metadata
+    /// per-request, cache it.
     fn raster_info(&self) -> RasterInfo;
 }

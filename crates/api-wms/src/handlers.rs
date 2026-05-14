@@ -111,6 +111,27 @@ pub async fn wms_handler(
                 ))
             })?;
 
+            // Validate `LAYERS=collection/parameter` against the engine's
+            // advertised list (mirroring Maps + Tiles). Without this, an
+            // unknown parameter would silently render whatever the engine
+            // defaults to and cache that result under the invalid name —
+            // ServiceException is the correct OGC response here.
+            if let Some(pname) = layer_parameter.as_deref() {
+                let info = engine.raster_info();
+                if !info.parameters.is_empty()
+                    && !info.parameters.iter().any(|(name, _)| name == pname)
+                {
+                    let mut supported: Vec<&str> =
+                        info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+                    supported.sort_unstable();
+                    return Err(WmsError::LayerNotDefined(format!(
+                        "Parameter '{pname}' is not available for layer \
+                         '{collection_id}'. Available: {}",
+                        supported.join(", ")
+                    )));
+                }
+            }
+
             let colormap = style_info.colormap.clone();
             let content_type = params.format.content_type();
             let has_explicit_time = params.time.is_some();
@@ -129,6 +150,13 @@ pub async fn wms_handler(
                 width: params.width,
                 height: params.height,
                 time: params.time,
+                // WMS picks the parameter via `LAYERS=collection/param`
+                // (parsed into layer_parameter) and then `style_info.parameter`.
+                // Both are already folded into `style_parameter` below; mirror
+                // that here so the rendered-cache distinguishes parameters.
+                parameter: layer_parameter
+                    .clone()
+                    .or_else(|| style_info.parameter.clone()),
             };
 
             let etag = cache_key.etag();

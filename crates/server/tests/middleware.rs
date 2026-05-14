@@ -74,6 +74,7 @@ fn make_collection(id: &str) -> CollectionConfig {
         wms: None,
         grib: None,
         postgis: None,
+        preview: None,
     }
 }
 

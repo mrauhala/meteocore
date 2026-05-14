@@ -278,6 +278,13 @@ unit = "dBZ"
 
 [wms]
 colormap = "radar_dbz"
+
+# Optional: bound the /preview SPA's time slider for collections whose
+# archive is far wider than the useful scrubbing range (e.g. a STAC
+# catalogue spanning years of 5-min mosaics). ISO 8601 positive duration.
+# Only affects the preview manifest — the underlying engine is unchanged.
+[preview]
+time_window = "PT12H"
 ```
 
 **Key behaviors:**
@@ -830,6 +837,7 @@ REST-based map image API. Maps and WMS share the `MapEngine` trait but have sepa
 | `crs` | no | `CRS:84` | Output CRS |
 | `datetime` | no | latest | ISO 8601 timestamp |
 | `f` | no | `image/png` | `image/png`, `image/jpeg`, `image/webp` |
+| `parameter-name` | no | engine default | Select a parameter on multi-parameter raster engines (GRIB, multi-param QueryData). Mirrors EDR's `parameter-name=` convention; non-OGC for OGC API - Maps today, but the `/preview` SPA dropdown depends on it. Single-parameter engines ignore the value. Unknown names against a multi-param engine return 400. |
 
 ### Key Differences from WMS
 
@@ -859,6 +867,7 @@ Serves raster data as tiled map images. Tiles reuses the same rendering pipeline
 |-----------|----------|---------|-------------|
 | `datetime` | no | latest | ISO 8601 timestamp |
 | `f` | no | `image/png` | Raster: `image/png`, `image/jpeg`, `image/webp`. Vector: `mvt` or `application/vnd.mapbox-vector-tile`. |
+| `parameter-name` | no | engine default | Same semantics as the Maps `parameter-name` parameter above. Ignored for `?f=mvt`. |
 
 ### Vector Tiles (MVT)
 

@@ -231,6 +231,13 @@ max_files = 24
 # inline — mixing the two in one [wms] block is rejected at config load.
 style_bundle = "radar_multi"
 # colormap = "radar_dbz"
+
+# Optional /preview SPA tuning. Cap the time slider's `values[]` to the most
+# recent ISO 8601 duration before the latest timestep. Useful for STAC-backed
+# collections whose archive spans years but whose useful scrub range is the
+# last few hours. Does NOT constrain the underlying engine — only the manifest.
+[collections.preview]
+time_window = "PT12H"
 ```
 
 See config struct definitions in each engine crate and `ds-core/src/config.rs` for all fields.
