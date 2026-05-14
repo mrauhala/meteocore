@@ -14,8 +14,9 @@
 //! | Producer | ODIM version | Pixel type | Renders | Notes                                       |
 //! |----------|--------------|------------|---------|---------------------------------------------|
 //! | DMI      | v2.0         | u8         | yes     | No `/where/xsize`/`ysize`; gain/offset/nodata at root `/what`; quantity as attr on `/dataset1/data1` |
-//! | OPERA    | v2.4         | f64        | yes     | Canonical layout; LAEA grid (EPSG:3035-style); already-decoded physical dBZ with `nodata=-9999000`, `undetect=-8888000` |
 //! | SMHI     | v2.2         | u8         | no      | Canonical layout; DEFLATE decompression fails in `hdf5-reader` 0.4 (upstream bug — `h5dump` reads the same file fine) |
+//! | DWD      | v2.3         | u16        | yes     | Canonical layout; polar stere (lat_0=90, lat_ts=60); 250m grid over Germany; fine gain=0.00293, offset=-64 |
+//! | OPERA    | v2.4         | f64        | yes     | Canonical layout; LAEA grid (EPSG:3035-style); already-decoded physical dBZ with `nodata=-9999000`, `undetect=-8888000` |
 //!
 //! "Canonical" here means the ODIM_H5 v2.4 §7.4 layout —
 //! gain/offset/nodata/quantity under `/dataset<n>/data<m>/what`.
