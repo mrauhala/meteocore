@@ -234,32 +234,39 @@ pub async fn wms_handler(
             .await
             .map_err(|e| WmsError::Internal(format!("Render task failed: {e}")))?;
 
-            let (image_bytes, x_cache) = match render_result {
+            // The EMPTY and ERROR fast paths skip the format-aware encoder and
+            // emit PNG bytes directly. Track the *actual* Content-Type per
+            // branch so the header never lies about the payload — previously
+            // a FORMAT=image/jpeg request that hit an empty tile got PNG
+            // bytes with `Content-Type: image/jpeg`, breaking decoders that
+            // trust the Content-Type.
+            let (image_bytes, x_cache, response_content_type) = match render_result {
                 Ok(Some(bytes)) => {
                     let image_bytes = bytes::Bytes::from(bytes);
                     rendered_cache.insert(cache_key, image_bytes.clone());
-                    (image_bytes, "MISS")
+                    (image_bytes, "MISS", content_type)
                 }
                 Ok(None) => {
-                    // Empty tile: return transparent PNG without caching
+                    // Empty tile: return transparent PNG without caching.
                     let rgba = vec![0u8; (params.width * params.height * 4) as usize];
                     let png =
                         ds_render::encode_png(&rgba, params.width, params.height).map_err(|e| {
                             WmsError::Internal(format!("Failed to encode empty tile: {e}"))
                         })?;
-                    (bytes::Bytes::from(png), "EMPTY")
+                    (bytes::Bytes::from(png), "EMPTY", "image/png")
                 }
                 Err(e) => {
                     tracing::warn!("WMS render error for layer '{}': {e}", params.layer);
                     (
                         bytes::Bytes::from(render_error_tile(params.width, params.height)?),
                         "ERROR",
+                        "image/png",
                     )
                 }
             };
 
             Ok(axum::response::Response::builder()
-                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CONTENT_TYPE, response_content_type)
                 .header(header::ETAG, &etag)
                 .header(header::CACHE_CONTROL, cache_control)
                 .header(

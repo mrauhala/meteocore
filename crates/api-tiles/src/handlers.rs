@@ -1167,18 +1167,22 @@ async fn render_tile(
         TilesError::Internal(format!("Render failed: {e}"))
     })?;
 
-    // Empty tiles: return the pre-generated transparent PNG without caching.
-    let (image_bytes, x_cache) = match maybe_bytes {
-        None => (EMPTY_TILE_PNG.clone(), "EMPTY"),
+    // Empty tiles return the pre-generated transparent PNG without caching.
+    // Track the actual Content-Type per branch so the header never lies
+    // about the payload — previously a `?f=image/jpeg` request that hit an
+    // empty tile got PNG bytes with `Content-Type: image/jpeg`, breaking
+    // decoders that trust the type.
+    let (image_bytes, x_cache, response_content_type) = match maybe_bytes {
+        None => (EMPTY_TILE_PNG.clone(), "EMPTY", "image/png"),
         Some(bytes) => {
             let image_bytes = bytes::Bytes::from(bytes);
             rendered_cache.insert(cache_key, image_bytes.clone());
-            (image_bytes, "MISS")
+            (image_bytes, "MISS", content_type)
         }
     };
 
     Ok(axum::response::Response::builder()
-        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_TYPE, response_content_type)
         .header(header::ETAG, &etag)
         .header(header::CACHE_CONTROL, cache_control)
         .header(header::HeaderName::from_static("content-crs"), content_crs)
