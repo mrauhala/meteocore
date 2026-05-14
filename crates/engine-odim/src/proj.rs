@@ -18,10 +18,12 @@
 //! quiet projection mismatch would surface as wrong pixel-to-world
 //! mappings far downstream.
 
+use std::collections::HashMap;
+
 use ds_core::geo::Crs;
 
 /// Errors from [`parse`].
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, PartialEq)]
 pub enum ParseError {
     #[error("PROJ string is missing the required `+proj=` token")]
     MissingProj,
@@ -29,12 +31,390 @@ pub enum ParseError {
     UnsupportedProj(String),
     #[error("PROJ parameter `{param}={value}` is not a valid number")]
     InvalidNumber { param: String, value: String },
+    #[error("PROJ parameter `+{0}` is required for `+proj={1}` but missing")]
+    MissingParam(&'static str, &'static str),
 }
 
 /// Parse a PROJ.4 string from an ODIM `/where/projdef` value into a
-/// [`Crs`]. The full implementation lands in the next commit alongside
-/// the reader; this stub locks the module signature in place so the
-/// rest of the crate can compile against it.
-pub fn parse(_projdef: &str) -> Result<Crs, ParseError> {
-    Err(ParseError::MissingProj)
+/// [`Crs`].
+///
+/// Recognised parameters per projection:
+/// - `stere`: `+lat_0`, `+lon_0`, `+k_0`/`+k`, `+lat_ts`, `+x_0`, `+y_0`
+/// - `tmerc`: `+lat_0`, `+lon_0`, `+k_0`/`+k`, `+x_0`, `+y_0`
+/// - `laea`:  `+lat_0`, `+lon_0`, `+x_0`, `+y_0`
+/// - `longlat`: (no parameters needed beyond `+proj=longlat`)
+///
+/// Unrecognised parameters (`+R=`, `+ellps=`, `+datum=`, `+units=`,
+/// `+no_defs`, etc.) are silently ignored — ODIM uses sphere-based
+/// projections and these don't change the pixel-to-world map.
+///
+/// For polar stereographic (`+lat_0=±90`) with `+lat_ts` and without an
+/// explicit `+k_0`, the scale factor is computed on the sphere as
+/// `k0 = (1 + sin|lat_ts|) / 2`. This is the standard PROJ relationship
+/// for the FMI/OPERA polar composites where `lat_ts=60` is typical.
+pub fn parse(projdef: &str) -> Result<Crs, ParseError> {
+    let params = tokenize(projdef);
+
+    let proj = params.get("proj").ok_or(ParseError::MissingProj)?.as_str();
+
+    match proj {
+        "longlat" | "latlong" | "lonlat" | "latlon" => Ok(Crs::Wgs84),
+        "stere" => parse_stere(&params),
+        "tmerc" => parse_tmerc(&params),
+        "laea" => parse_laea(&params),
+        other => Err(ParseError::UnsupportedProj(other.to_string())),
+    }
+}
+
+/// Split a PROJ.4 string into `key → value` pairs. Bare flags
+/// (`+no_defs`) parse to an empty string. The leading `+` is stripped.
+/// Whitespace is the only separator — PROJ doesn't allow quoting and
+/// neither do we.
+fn tokenize(projdef: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for token in projdef.split_whitespace() {
+        let Some(body) = token.strip_prefix('+') else {
+            continue;
+        };
+        match body.split_once('=') {
+            Some((k, v)) => {
+                out.insert(k.to_string(), v.to_string());
+            }
+            None => {
+                out.insert(body.to_string(), String::new());
+            }
+        }
+    }
+    out
+}
+
+fn parse_f64(params: &HashMap<String, String>, key: &str) -> Result<Option<f64>, ParseError> {
+    match params.get(key) {
+        None => Ok(None),
+        Some(v) => v
+            .parse::<f64>()
+            .map(Some)
+            .map_err(|_| ParseError::InvalidNumber {
+                param: key.to_string(),
+                value: v.clone(),
+            }),
+    }
+}
+
+/// `+k_0` is the canonical form; `+k` is the historical shorthand
+/// PROJ still accepts. Prefer `+k_0` when both appear.
+fn parse_k0(params: &HashMap<String, String>) -> Result<Option<f64>, ParseError> {
+    if params.contains_key("k_0") {
+        parse_f64(params, "k_0")
+    } else {
+        parse_f64(params, "k")
+    }
+}
+
+fn parse_stere(params: &HashMap<String, String>) -> Result<Crs, ParseError> {
+    let lat0 = parse_f64(params, "lat_0")?.unwrap_or(0.0);
+    let lon0 = parse_f64(params, "lon_0")?.unwrap_or(0.0);
+    let false_e = parse_f64(params, "x_0")?.unwrap_or(0.0);
+    let false_n = parse_f64(params, "y_0")?.unwrap_or(0.0);
+
+    let k0 = match parse_k0(params)? {
+        Some(k) => k,
+        None => match parse_f64(params, "lat_ts")? {
+            // Polar stereographic with +lat_ts: derive k0 on the sphere.
+            // (1 + sin|lat_ts|) / 2 is the standard PROJ relation; ODIM
+            // uses sphere-based projections (+R=6371228) so the ellipsoidal
+            // correction is negligible and we don't need to special-case it.
+            Some(lat_ts) => (1.0 + lat_ts.to_radians().abs().sin()) / 2.0,
+            // No +k_0, no +lat_ts → PROJ default is 1.0.
+            None => 1.0,
+        },
+    };
+
+    Ok(Crs::Stereographic {
+        lat0: lat0.to_radians(),
+        lon0: lon0.to_radians(),
+        k0,
+        false_e,
+        false_n,
+    })
+}
+
+fn parse_tmerc(params: &HashMap<String, String>) -> Result<Crs, ParseError> {
+    let lat0 = parse_f64(params, "lat_0")?.unwrap_or(0.0);
+    let lon0 = parse_f64(params, "lon_0")?.unwrap_or(0.0);
+    let k0 = parse_k0(params)?.unwrap_or(1.0);
+    let false_e = parse_f64(params, "x_0")?.unwrap_or(0.0);
+    let false_n = parse_f64(params, "y_0")?.unwrap_or(0.0);
+
+    Ok(Crs::TransverseMercator {
+        lat0: lat0.to_radians(),
+        lon0: lon0.to_radians(),
+        k0,
+        false_e,
+        false_n,
+    })
+}
+
+fn parse_laea(params: &HashMap<String, String>) -> Result<Crs, ParseError> {
+    let lat0 = parse_f64(params, "lat_0")?.unwrap_or(0.0);
+    let lon0 = parse_f64(params, "lon_0")?.unwrap_or(0.0);
+    let false_e = parse_f64(params, "x_0")?.unwrap_or(0.0);
+    let false_n = parse_f64(params, "y_0")?.unwrap_or(0.0);
+
+    Ok(Crs::LambertAzimuthalEqualArea {
+        lat0: lat0.to_radians(),
+        lon0: lon0.to_radians(),
+        false_e,
+        false_n,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Asserts two `Crs` values are equal across float-comparison
+    /// tolerance. The enum doesn't derive `PartialEq` because it carries
+    /// floats, so we destructure each variant and compare individually.
+    fn assert_crs_eq(actual: &Crs, expected: &Crs) {
+        const EPS: f64 = 1e-9;
+        match (actual, expected) {
+            (Crs::Wgs84, Crs::Wgs84) => {}
+            (
+                Crs::Stereographic {
+                    lat0: a_lat0,
+                    lon0: a_lon0,
+                    k0: a_k0,
+                    false_e: a_e,
+                    false_n: a_n,
+                },
+                Crs::Stereographic {
+                    lat0: e_lat0,
+                    lon0: e_lon0,
+                    k0: e_k0,
+                    false_e: e_e,
+                    false_n: e_n,
+                },
+            ) => {
+                assert!((a_lat0 - e_lat0).abs() < EPS, "lat0: {a_lat0} vs {e_lat0}");
+                assert!((a_lon0 - e_lon0).abs() < EPS, "lon0: {a_lon0} vs {e_lon0}");
+                assert!((a_k0 - e_k0).abs() < EPS, "k0: {a_k0} vs {e_k0}");
+                assert!((a_e - e_e).abs() < EPS, "false_e: {a_e} vs {e_e}");
+                assert!((a_n - e_n).abs() < EPS, "false_n: {a_n} vs {e_n}");
+            }
+            (
+                Crs::TransverseMercator {
+                    lat0: a_lat0,
+                    lon0: a_lon0,
+                    k0: a_k0,
+                    false_e: a_e,
+                    false_n: a_n,
+                },
+                Crs::TransverseMercator {
+                    lat0: e_lat0,
+                    lon0: e_lon0,
+                    k0: e_k0,
+                    false_e: e_e,
+                    false_n: e_n,
+                },
+            ) => {
+                assert!((a_lat0 - e_lat0).abs() < EPS);
+                assert!((a_lon0 - e_lon0).abs() < EPS);
+                assert!((a_k0 - e_k0).abs() < EPS);
+                assert!((a_e - e_e).abs() < EPS);
+                assert!((a_n - e_n).abs() < EPS);
+            }
+            (
+                Crs::LambertAzimuthalEqualArea {
+                    lat0: a_lat0,
+                    lon0: a_lon0,
+                    false_e: a_e,
+                    false_n: a_n,
+                },
+                Crs::LambertAzimuthalEqualArea {
+                    lat0: e_lat0,
+                    lon0: e_lon0,
+                    false_e: e_e,
+                    false_n: e_n,
+                },
+            ) => {
+                assert!((a_lat0 - e_lat0).abs() < EPS);
+                assert!((a_lon0 - e_lon0).abs() < EPS);
+                assert!((a_e - e_e).abs() < EPS);
+                assert!((a_n - e_n).abs() < EPS);
+            }
+            (a, e) => panic!("CRS variant mismatch: {a:?} vs {e:?}"),
+        }
+    }
+
+    #[test]
+    fn longlat_maps_to_wgs84() {
+        let crs = parse("+proj=longlat +ellps=WGS84 +no_defs").unwrap();
+        assert_crs_eq(&crs, &Crs::Wgs84);
+    }
+
+    /// FMI/OPERA polar stereographic composite — the canonical Phase 1
+    /// shape. `+lat_ts=60` must convert to `k0 = (1 + sin60°)/2`
+    /// because `Crs::Stereographic` stores `k0` directly.
+    #[test]
+    fn fmi_polar_stereographic_with_lat_ts_converts_to_k0() {
+        let crs =
+            parse("+proj=stere +lat_0=90 +lon_0=0 +lat_ts=60 +R=6371228 +x_0=0 +y_0=0 +no_defs")
+                .unwrap();
+
+        let expected_k0 = (1.0 + 60f64.to_radians().sin()) / 2.0;
+        assert_crs_eq(
+            &crs,
+            &Crs::Stereographic {
+                lat0: 90f64.to_radians(),
+                lon0: 0.0,
+                k0: expected_k0,
+                false_e: 0.0,
+                false_n: 0.0,
+            },
+        );
+    }
+
+    /// Single-site oblique stereographic. `+k_0=1` is the explicit
+    /// form; no `+lat_ts`. False easting/northing carry through.
+    #[test]
+    fn oblique_stereographic_with_explicit_k0() {
+        let crs = parse("+proj=stere +lat_0=56 +lon_0=10.5667 +k_0=1.0 +x_0=0 +y_0=0 +ellps=WGS84")
+            .unwrap();
+
+        assert_crs_eq(
+            &crs,
+            &Crs::Stereographic {
+                lat0: 56f64.to_radians(),
+                lon0: 10.5667f64.to_radians(),
+                k0: 1.0,
+                false_e: 0.0,
+                false_n: 0.0,
+            },
+        );
+    }
+
+    /// `+k` (no underscore) is PROJ's historical shorthand for `+k_0`.
+    /// We accept either; both forms appear in real-world ODIM files.
+    #[test]
+    fn stere_accepts_legacy_k_shorthand() {
+        let crs = parse("+proj=stere +lat_0=90 +lon_0=0 +k=0.933 +x_0=0 +y_0=0").unwrap();
+        assert_crs_eq(
+            &crs,
+            &Crs::Stereographic {
+                lat0: 90f64.to_radians(),
+                lon0: 0.0,
+                k0: 0.933,
+                false_e: 0.0,
+                false_n: 0.0,
+            },
+        );
+    }
+
+    /// EPSG:3067 TM35FIN — the projection FMI publishes single-site
+    /// radar data in.
+    #[test]
+    fn tmerc_epsg3067_tm35fin() {
+        let crs = parse("+proj=tmerc +lat_0=0 +lon_0=27 +k=0.9996 +x_0=500000 +y_0=0 +ellps=GRS80")
+            .unwrap();
+
+        assert_crs_eq(
+            &crs,
+            &Crs::TransverseMercator {
+                lat0: 0.0,
+                lon0: 27f64.to_radians(),
+                k0: 0.9996,
+                false_e: 500_000.0,
+                false_n: 0.0,
+            },
+        );
+    }
+
+    /// EPSG:3035 ETRS89-LAEA — the OPERA pan-European grid.
+    #[test]
+    fn laea_epsg3035_etrs89() {
+        let crs =
+            parse("+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +ellps=GRS80").unwrap();
+
+        assert_crs_eq(
+            &crs,
+            &Crs::LambertAzimuthalEqualArea {
+                lat0: 52f64.to_radians(),
+                lon0: 10f64.to_radians(),
+                false_e: 4_321_000.0,
+                false_n: 3_210_000.0,
+            },
+        );
+    }
+
+    /// Missing `+proj=` is the most common malformed-input case: a
+    /// truncated PROJ string from a partial HDF5 read. Surface it as
+    /// a structured error rather than silently defaulting to lon/lat.
+    #[test]
+    fn missing_proj_token_is_an_error() {
+        let err = parse("+lat_0=90 +lon_0=0").unwrap_err();
+        assert_eq!(err, ParseError::MissingProj);
+    }
+
+    /// Unsupported `+proj=` should name the offender so an operator
+    /// can decide whether to add support or fix the file.
+    #[test]
+    fn unsupported_proj_lists_the_value() {
+        let err = parse("+proj=merc +lat_0=0").unwrap_err();
+        assert_eq!(err, ParseError::UnsupportedProj("merc".into()));
+    }
+
+    /// A non-numeric `+lat_0` is a real-world failure mode for files
+    /// written by buggy producers (e.g. ASCII garbage spliced into the
+    /// projdef). Refuse with a structured error.
+    #[test]
+    fn non_numeric_parameter_is_an_error() {
+        let err = parse("+proj=stere +lat_0=ninety +lon_0=0").unwrap_err();
+        assert_eq!(
+            err,
+            ParseError::InvalidNumber {
+                param: "lat_0".into(),
+                value: "ninety".into(),
+            }
+        );
+    }
+
+    /// Bare flags like `+no_defs` mustn't perturb anything. PROJ
+    /// strings shipped by real producers always include at least one
+    /// such flag.
+    #[test]
+    fn bare_flags_are_ignored() {
+        let crs = parse("+proj=longlat +no_defs +wktext").unwrap();
+        assert_crs_eq(&crs, &Crs::Wgs84);
+    }
+
+    /// All four `longlat` aliases PROJ recognises. ODIM v2.x doesn't
+    /// distinguish between them so neither should we.
+    #[test]
+    fn all_longlat_aliases_map_to_wgs84() {
+        for proj in ["longlat", "latlong", "lonlat", "latlon"] {
+            let projdef = format!("+proj={proj}");
+            let crs = parse(&projdef).unwrap();
+            assert_crs_eq(&crs, &Crs::Wgs84);
+        }
+    }
+
+    /// Defaults: stere with no parameters except `+proj=stere` should
+    /// produce a CRS with `lat0=0, lon0=0, k0=1.0, false_e=false_n=0`.
+    /// PROJ has the same defaults; surprising a downstream caller with
+    /// a different-flavoured "default" would mask bugs.
+    #[test]
+    fn stere_defaults_match_proj_defaults() {
+        let crs = parse("+proj=stere").unwrap();
+        assert_crs_eq(
+            &crs,
+            &Crs::Stereographic {
+                lat0: 0.0,
+                lon0: 0.0,
+                k0: 1.0,
+                false_e: 0.0,
+                false_n: 0.0,
+            },
+        );
+    }
 }
