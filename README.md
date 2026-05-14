@@ -960,7 +960,7 @@ Raster requests resolve a style (the `default` style for the unstyled route, or 
 1. TMS → bbox conversion (Mercator math for `WebMercatorQuad`, linear lon/lat for `WorldCRS84Quad`).
 2. ETag check / rendered-cache check.
 3. On miss: acquire render permit (timed out → 503), call `MapEngine::get_raster_tile()` with the TMS-derived `output_crs`, colorize, encode.
-4. Empty (all-nodata) tiles return a pre-generated transparent PNG with `X-Cache: EMPTY` regardless of the requested format — no engine call, no cache insert.
+4. Empty (all-nodata) tiles return a pre-generated transparent PNG with `X-Cache: EMPTY` and `Content-Type: image/png` regardless of the requested format — no engine call, no cache insert. Clients that strictly need JPEG/WebP output should check `X-Cache: EMPTY` and refetch only if needed; the alternative would be re-encoding a known-uniform buffer on every empty tile.
 
 Successful responses include `Content-Type`, `Content-Crs` (OGC URI for the TMS's CRS), `ETag`, `Cache-Control` (`max-age=86400, immutable` when `datetime` is set, `max-age=60, must-revalidate` otherwise), and `X-Cache: HIT|MISS|EMPTY`.
 

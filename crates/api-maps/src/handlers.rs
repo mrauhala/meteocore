@@ -822,18 +822,23 @@ async fn render_map(
     .await
     .map_err(|e| MapsError::Internal(format!("Render task failed: {e}")))?;
 
-    let (image_bytes, x_cache) = match render_result {
+    // The EMPTY fast path skips the format-aware encoder and emits PNG
+    // bytes directly. Track the actual Content-Type per branch so the
+    // header never lies about the payload — previously an `f=image/jpeg`
+    // request that hit an empty tile got PNG bytes with
+    // `Content-Type: image/jpeg`, breaking decoders that trust the type.
+    let (image_bytes, x_cache, response_content_type) = match render_result {
         Ok(Some(bytes)) => {
             let image_bytes = bytes::Bytes::from(bytes);
             rendered_cache.insert(cache_key, image_bytes.clone());
-            (image_bytes, "MISS")
+            (image_bytes, "MISS", content_type)
         }
         Ok(None) => {
-            // Empty tile: return transparent PNG without caching
+            // Empty tile: return transparent PNG without caching.
             let rgba = vec![0u8; (width * height * 4) as usize];
             let png = ds_render::encode_png(&rgba, width, height)
                 .map_err(|e| MapsError::Internal(format!("Failed to encode empty tile: {e}")))?;
-            (bytes::Bytes::from(png), "EMPTY")
+            (bytes::Bytes::from(png), "EMPTY", "image/png")
         }
         Err(e) => {
             tracing::warn!("Maps render error for collection '{}': {e}", collection_id);
@@ -842,7 +847,7 @@ async fn render_map(
     };
 
     Ok(axum::response::Response::builder()
-        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_TYPE, response_content_type)
         .header(header::ETAG, &etag)
         .header(header::CACHE_CONTROL, cache_control)
         .header(header::HeaderName::from_static("content-crs"), content_crs)

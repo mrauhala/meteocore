@@ -547,6 +547,136 @@ mod get_tile {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
+
+    /// Regression for #162: when the engine produces an all-nodata tile,
+    /// the handler short-circuits to the pre-generated `EMPTY_TILE_PNG`
+    /// global without going through the format-aware encoder. Before
+    /// the fix the response carried the *requested* Content-Type (e.g.
+    /// image/jpeg) over PNG bytes, breaking decoders that trust the
+    /// header. Both header and body must agree.
+    #[tokio::test]
+    async fn empty_tile_forces_png_content_type_even_when_jpeg_requested() {
+        let app = build_empty_router();
+        let req = Request::builder()
+            .uri("/collections/empty/tiles/WebMercatorQuad/0/0/0?f=image/jpeg")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let headers = resp.headers().clone();
+        assert_eq!(
+            headers.get("content-type").unwrap(),
+            "image/png",
+            "empty-tile response must self-declare PNG, not the requested image/jpeg"
+        );
+        assert_eq!(headers.get("x-cache").unwrap(), "EMPTY");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            body.starts_with(&[0x89, b'P', b'N', b'G']),
+            "body must be a real PNG, got first bytes {:?}",
+            &body[..4.min(body.len())]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_tile_forces_png_content_type_even_when_webp_requested() {
+        let app = build_empty_router();
+        let req = Request::builder()
+            .uri("/collections/empty/tiles/WebMercatorQuad/0/0/0?f=image/webp")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let headers = resp.headers().clone();
+        assert_eq!(headers.get("content-type").unwrap(), "image/png");
+        assert_eq!(headers.get("x-cache").unwrap(), "EMPTY");
+    }
+}
+
+/// Mock engine that returns an all-`None` (all-nodata) `RasterTile` —
+/// drives the empty-tile fast path that bypasses the format-aware
+/// encoder. The regression test for #162 lives in `mod get_tile` above.
+struct EmptyMockMapEngine;
+
+impl MapEngine for EmptyMockMapEngine {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+    ) -> Result<RasterTile, DataServerError> {
+        let pixel_count = (width * height) as usize;
+        Ok(RasterTile {
+            width,
+            height,
+            values: vec![None; pixel_count],
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        MockMapEngine::make_info()
+    }
+}
+
+fn build_empty_router() -> axum::Router {
+    let engine: Arc<dyn MapEngine> = Arc::new(EmptyMockMapEngine);
+    let mut engines = HashMap::new();
+    let mut collections = HashMap::new();
+    let mut styles_map = HashMap::new();
+
+    engines.insert("empty".to_string(), engine);
+    collections.insert(
+        "empty".to_string(),
+        CollectionConfig {
+            id: "empty".to_string(),
+            title: "Empty".to_string(),
+            description: "All-nodata fixture for #162".to_string(),
+            data_path: None,
+            apis: vec!["tiles".to_string()],
+            engine_type: "geotiff".to_string(),
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            postgis: None,
+            preview: None,
+        },
+    );
+
+    let cmap = Arc::new(LutColorMap::from_builtin(
+        BuiltinColormap::Viridis,
+        0.0,
+        1.0,
+    ));
+    let mut layer_styles = HashMap::new();
+    layer_styles.insert(
+        "default".to_string(),
+        StyleInfo {
+            name: "default".to_string(),
+            title: "Default".to_string(),
+            colormap: cmap,
+            min: 0.0,
+            max: 1.0,
+            parameter: None,
+        },
+    );
+    styles_map.insert("empty".to_string(), layer_styles);
+
+    let state = Arc::new(ArcSwap::from_pointee(TilesState {
+        map_engines: engines,
+        collections,
+        styles: styles_map,
+        feature_engines: HashMap::new(),
+        feature_collections: HashMap::new(),
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        vector_tile_cache: Arc::new(VectorTileCache::new(16)),
+        base_url: String::new(),
+    }));
+    api_tiles::router(state)
 }
 
 struct MultiParamMockEngine;
