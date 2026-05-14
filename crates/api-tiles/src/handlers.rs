@@ -1057,11 +1057,12 @@ async fn render_tile(
         if !raster_info.parameters.is_empty()
             && !raster_info.parameters.iter().any(|(name, _)| name == pname)
         {
-            let supported: Vec<&str> = raster_info
+            let mut supported: Vec<&str> = raster_info
                 .parameters
                 .iter()
                 .map(|(n, _)| n.as_str())
                 .collect();
+            supported.sort_unstable();
             return Err(TilesError::BadRequest(format!(
                 "parameter-name '{pname}' is not available for collection '{collection_id}'. \
                  Available: {}",

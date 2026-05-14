@@ -515,9 +515,10 @@ mod get_map {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let text = std::str::from_utf8(&body).unwrap();
+        // Sorted alphabetically — "10u" < "2t" by lexicographic comparison.
         assert!(
-            text.contains("Available: 2t, 10u") || text.contains("Available: 10u, 2t"),
-            "error body should list available parameters; got: {text}"
+            text.contains("Available: 10u, 2t"),
+            "error body should list available parameters in sorted order; got: {text}"
         );
     }
 

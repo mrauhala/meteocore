@@ -121,8 +121,9 @@ pub async fn wms_handler(
                 if !info.parameters.is_empty()
                     && !info.parameters.iter().any(|(name, _)| name == pname)
                 {
-                    let supported: Vec<&str> =
+                    let mut supported: Vec<&str> =
                         info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+                    supported.sort_unstable();
                     return Err(WmsError::LayerNotDefined(format!(
                         "Parameter '{pname}' is not available for layer \
                          '{collection_id}'. Available: {}",

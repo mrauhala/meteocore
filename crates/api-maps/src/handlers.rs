@@ -712,11 +712,17 @@ async fn render_map(
         if !raster_info.parameters.is_empty()
             && !raster_info.parameters.iter().any(|(name, _)| name == pname)
         {
-            let supported: Vec<&str> = raster_info
+            let mut supported: Vec<&str> = raster_info
                 .parameters
                 .iter()
                 .map(|(n, _)| n.as_str())
                 .collect();
+            // Sort so the error message is deterministic. `raster_info()`
+            // returns parameters in engine-defined order — fine for GRIB
+            // today but a future HashMap-backed engine would surface a
+            // different ordering per request, confusing both log greppers
+            // and clients that try to match against the hint.
+            supported.sort_unstable();
             return Err(MapsError::BadRequest(format!(
                 "parameter-name '{pname}' is not available for collection '{collection_id}'. \
                  Available: {}",
