@@ -509,18 +509,37 @@ mod get_map {
         );
     }
 
-    /// Round-trip: a client revalidating with the body's content-derived
-    /// ETag must get a 304. Pins the full If-None-Match handshake.
+    /// Round-trip after a cache warm: a client revalidating with the
+    /// body's content-derived ETag must get a 304 via the **cache-HIT**
+    /// branch (the cache lookup happens before the If-None-Match check
+    /// — see `cached.etag()` comparison in the handler). Sharing one
+    /// router across both calls is load-bearing; building two routers
+    /// would leave the second call's `RenderedCache` empty and the 304
+    /// would fire on the post-render MISS branch instead.
     #[tokio::test]
-    async fn if_none_match_with_content_derived_etag_returns_304() {
-        let (_, headers_a, body) = get_raw("/collections/radar/map?bbox=10,55,30,70").await;
-        let etag = headers_a.get("etag").unwrap().to_str().unwrap().to_string();
-        let derived = ds_render::CachedRendered::new(bytes::Bytes::from(body))
-            .etag()
-            .to_string();
-        assert_eq!(etag, derived);
-
+    async fn if_none_match_after_cache_warm_returns_304_via_cache_hit() {
         let app = build_router();
+        // First request populates the rendered cache.
+        let resp_a = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/collections/radar/map?bbox=10,55,30,70")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let etag = resp_a
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Cache is warm. Same key + matching If-None-Match → cache HIT →
+        // ETag compare against `cached.etag()` → 304.
         let req = Request::builder()
             .uri("/collections/radar/map?bbox=10,55,30,70")
             .header("If-None-Match", &etag)
@@ -531,27 +550,42 @@ mod get_map {
         assert_eq!(resp.headers().get("etag").unwrap().to_str().unwrap(), etag);
     }
 
+    /// Cross-parameter staleness protection: different `parameter-name`
+    /// values must produce different rendered bytes (because the
+    /// `MultiParamMockEngine` varies its output by parameter), which under
+    /// content-derived ETags (#145) means different ETags. Combined with
+    /// `parameter` being part of the cache key, a client switching
+    /// parameters can't get a 304 against the previous parameter's entry.
     #[tokio::test]
-    async fn parameter_name_produces_separate_cache_entries() {
-        // Different `parameter-name` values produce separate rendered-cache
-        // entries (the cache key still includes `parameter`), so a client
-        // switching parameters can't get a stale tile from a different
-        // parameter's slot. ETags are content-derived (#145), so two
-        // requests that happen to produce the same bytes (the mock engine
-        // ignores `parameter-name` for single-band engines) intentionally
-        // share an ETag — that's correct: identical bytes deserve identical
-        // ETags. The cross-parameter behaviour that actually matters is
-        // exercised against the multi-param engine, where the engine
-        // produces distinct pixels per parameter — see the test below.
-        let (_, headers_a, _) =
-            get_raw("/collections/radar/map?bbox=10,55,30,70&parameter-name=2t").await;
-        let (_, headers_b, _) =
-            get_raw("/collections/radar/map?bbox=10,55,30,70&parameter-name=10u").await;
-        // Both succeeded and both populated the rendered cache under
-        // different keys — the ETag value is whatever FNV-1a says about
-        // the bytes, so equality is the *expected* outcome here.
-        assert!(headers_a.contains_key("etag"));
-        assert!(headers_b.contains_key("etag"));
+    async fn parameter_name_changes_content_etag_on_multi_param_engine() {
+        let app = build_multi_param_router();
+        let resp_2t = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/collections/wx/map?bbox=10,55,30,70&parameter-name=2t")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let resp_10u = app
+            .oneshot(
+                Request::builder()
+                    .uri("/collections/wx/map?bbox=10,55,30,70&parameter-name=10u")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let etag_2t = resp_2t.headers().get("etag").unwrap().to_str().unwrap();
+        let etag_10u = resp_10u.headers().get("etag").unwrap().to_str().unwrap();
+        assert_ne!(
+            etag_2t, etag_10u,
+            "parameter-name varies the rendered pixels, so the content-derived \
+             ETag must differ — otherwise a client switching from 2t to 10u \
+             would get a stale 304"
+        );
     }
 
     #[tokio::test]
@@ -725,10 +759,25 @@ impl MapEngine for MultiParamMockEngine {
         height: u32,
         _time: Option<chrono::DateTime<chrono::Utc>>,
         _output_crs: &ds_core::map_engine::OutputCrs,
-        _parameter: Option<&str>,
+        parameter: Option<&str>,
     ) -> Result<ds_core::map_engine::RasterTile, ds_core::error::DataServerError> {
+        // Vary the pixel values by parameter so the `parameter` field on the
+        // cache key actually changes the rendered bytes — the cross-parameter
+        // ETag test depends on this. Fold the parameter name into a value
+        // in [0, 1] (within the style's min/max range) so the colormap
+        // produces a different uniform fill per parameter.
+        let fill: f64 = parameter
+            .map(|p| {
+                let mut h: u64 = 0xcbf29ce484222325;
+                for &b in p.as_bytes() {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                ((h & 0xff) as f64) / 255.0
+            })
+            .unwrap_or(0.0);
         let pixel_count = (width * height) as usize;
-        let values: Vec<Option<f64>> = (0..pixel_count).map(|i| Some(i as f64)).collect();
+        let values: Vec<Option<f64>> = vec![Some(fill); pixel_count];
         Ok(ds_core::map_engine::RasterTile {
             width,
             height,

@@ -170,15 +170,14 @@ pub fn quantize_bbox(bbox: &[f64; 4]) -> [i64; 4] {
 /// server-side fix indefinitely, since `If-None-Match` would keep
 /// returning 304 against fresh content (the bug #145 fixed for raster
 /// tiles, mirroring #136's fix for vector tiles).
+/// Both fields are private to seal the invariant `etag == FNV-1a(bytes)`.
+/// `bytes` was previously `pub`, which let a caller mutate the payload
+/// without updating the ETag and silently break `If-None-Match`
+/// (a browser holding the real ETag would get a full 200 instead of 304,
+/// or vice-versa).
 #[derive(Debug, Clone)]
 pub struct CachedRendered {
-    pub bytes: Bytes,
-    /// Private so the only path that sets it is `CachedRendered::new`,
-    /// which seals the invariant `etag == FNV-1a(bytes)`. Without this
-    /// seal, a caller could construct a `CachedRendered` with a
-    /// mismatched ETag and silently break `If-None-Match` (a browser
-    /// holding the real ETag would get a full 200 instead of 304, or
-    /// vice-versa).
+    bytes: Bytes,
     etag: String,
 }
 
@@ -197,9 +196,24 @@ impl CachedRendered {
         Self { bytes, etag }
     }
 
-    /// Quoted hex16 ETag string suitable for the `ETag` response header.
+    /// Quoted 16-hex-char (64-bit FNV-1a) ETag string suitable for the
+    /// `ETag` response header.
     pub fn etag(&self) -> &str {
         &self.etag
+    }
+
+    /// Borrow the cached bytes — e.g. for byte-length accounting in the
+    /// cache weighter.
+    pub fn bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+
+    /// Consume the entry and yield the bytes — used by the handlers when
+    /// building the HTTP response body. Move semantics keep the invariant
+    /// intact: there is no way to retain the `CachedRendered` while
+    /// swapping out its bytes.
+    pub fn into_bytes(self) -> Bytes {
+        self.bytes
     }
 }
 
@@ -209,8 +223,8 @@ struct RenderedWeighter;
 
 impl quick_cache::Weighter<CacheKey, CachedRendered> for RenderedWeighter {
     fn weight(&self, _key: &CacheKey, val: &CachedRendered) -> u64 {
-        // bytes + 18 bytes for the quoted hex64 ETag string + 64 byte overhead
-        val.bytes.len() as u64 + val.etag.len() as u64 + 64
+        // bytes + 18-byte quoted 16-hex-char (64-bit FNV-1a) ETag string + 64-byte overhead
+        val.bytes().len() as u64 + val.etag().len() as u64 + 64
     }
 }
 

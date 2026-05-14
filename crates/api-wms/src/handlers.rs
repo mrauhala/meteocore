@@ -194,7 +194,7 @@ pub async fn wms_handler(
                         "nosniff",
                     )
                     .header(header::HeaderName::from_static("x-cache"), "HIT")
-                    .body(axum::body::Body::from(cached.bytes))
+                    .body(axum::body::Body::from(cached.into_bytes()))
                     .unwrap()
                     .into_response());
             }
@@ -298,7 +298,7 @@ pub async fn wms_handler(
                     "nosniff",
                 )
                 .header(header::HeaderName::from_static("x-cache"), x_cache)
-                .body(axum::body::Body::from(cached.bytes))
+                .body(axum::body::Body::from(cached.into_bytes()))
                 .unwrap()
                 .into_response())
         }

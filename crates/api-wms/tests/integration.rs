@@ -424,12 +424,18 @@ async fn etag_is_content_derived_over_response_body() {
     );
 }
 
-/// Round-trip: a client revalidating with the body's content-derived
-/// ETag must get a 304 with the same ETag echoed back.
+/// Round-trip after a cache warm: a client revalidating with the
+/// body's content-derived ETag must get a 304 via the **cache-HIT**
+/// branch (the cache lookup happens before the If-None-Match check —
+/// see `cached.etag()` comparison in the handler). Sharing one router
+/// across both calls is load-bearing; building two routers would leave
+/// the second call's `RenderedCache` empty and the 304 would fire on
+/// the post-render MISS branch instead.
 #[tokio::test]
-async fn if_none_match_with_content_derived_etag_returns_304() {
-    let app_a = build_populated_router();
-    let resp_a = app_a
+async fn if_none_match_after_cache_warm_returns_304_via_cache_hit() {
+    let app = build_populated_router();
+    let resp_a = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri(GETMAP_URI)
@@ -446,8 +452,7 @@ async fn if_none_match_with_content_derived_etag_returns_304() {
         .unwrap()
         .to_string();
 
-    let app_b = build_populated_router();
-    let resp_b = app_b
+    let resp_b = app
         .oneshot(
             Request::builder()
                 .uri(GETMAP_URI)
