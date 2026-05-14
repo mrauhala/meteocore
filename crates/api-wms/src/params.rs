@@ -417,11 +417,10 @@ mod tests {
         }
     }
 
-    /// Pin SUPPORTED_FORMATS to the match arms in `parse_image_format` so
-    /// a future format addition can't land in one place but not the other
-    /// (the divergence flagged on #166). If you add an entry to
-    /// SUPPORTED_FORMATS, extend `parse_image_format` to handle it and
-    /// this test will start passing again.
+    /// Adding an entry to `SUPPORTED_FORMATS` without extending the match in
+    /// `parse_image_format` will cause this test to fail — update both
+    /// together. (Introduced to prevent the same capabilities-vs-handler
+    /// drift that caused #161.)
     #[test]
     fn parse_image_format_covers_every_supported_format() {
         for fmt in SUPPORTED_FORMATS {
