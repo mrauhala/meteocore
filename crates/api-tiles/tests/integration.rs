@@ -498,20 +498,154 @@ mod get_tile {
         assert!(body.starts_with(&[0x89, b'P', b'N', b'G']));
     }
 
+    /// Regression for #145: the response `ETag` must be FNV-1a over the
+    /// rendered bytes — not over the cache key — so a server-side fix that
+    /// produces different pixels under the same `(z, x, y, style, time)`
+    /// produces a fresh ETag and browsers holding the stale entry refetch
+    /// instead of receiving an infinite 304. Direct check: build the same
+    /// `CachedRendered` the handler does and verify the header matches.
     #[tokio::test]
-    async fn parameter_name_changes_etag() {
-        // Different parameter-name values must produce different cache
-        // entries (and thus different ETags) — otherwise a client switching
-        // from "2t" to "10u" would get a 304 against the stale parameter.
-        let (_, headers_a, _) =
-            get_raw("/collections/radar/tiles/WebMercatorQuad/0/0/0?parameter-name=2t").await;
-        let (_, headers_b, _) =
-            get_raw("/collections/radar/tiles/WebMercatorQuad/0/0/0?parameter-name=10u").await;
-        let etag_a = headers_a.get("etag").unwrap();
-        let etag_b = headers_b.get("etag").unwrap();
+    async fn etag_is_content_derived_over_response_body() {
+        let (status, headers, body) =
+            get_raw("/collections/radar/tiles/WebMercatorQuad/0/0/0").await;
+        assert_eq!(status, StatusCode::OK);
+        let actual_etag = headers.get("etag").unwrap().to_str().unwrap();
+        let expected_etag = ds_render::CachedRendered::new(bytes::Bytes::from(body))
+            .etag()
+            .to_string();
+        assert_eq!(
+            actual_etag, expected_etag,
+            "ETag header must be FNV-1a over the response body (content-derived), \
+             not derived from the CacheKey — see #145"
+        );
+    }
+
+    /// Pin the cache-HIT→304 branch specifically. The handler returns 304
+    /// from two places: the cache-HIT branch (this test, asserted via
+    /// `x-cache: HIT`) and the post-render MISS branch. A fresh router
+    /// would still 304 — just via the MISS path — so the `x-cache`
+    /// assertion is what makes "we exercised the HIT branch" testable.
+    #[tokio::test]
+    async fn if_none_match_after_cache_warm_returns_304_via_cache_hit() {
+        let app = build_router();
+        let resp_a = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/collections/radar/tiles/WebMercatorQuad/0/0/0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let etag = resp_a
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let req = Request::builder()
+            .uri("/collections/radar/tiles/WebMercatorQuad/0/0/0")
+            .header("If-None-Match", &etag)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            resp.headers().get("etag").unwrap().to_str().unwrap(),
+            etag,
+            "304 response must echo the same content-derived ETag"
+        );
+        assert_eq!(
+            resp.headers().get("x-cache").map(|v| v.to_str().unwrap()),
+            Some("HIT"),
+            "304 must come from the cache-HIT branch, not post-render MISS"
+        );
+    }
+
+    /// Pin the post-render MISS → 304 branch. Use a fresh router (no
+    /// cache-warm) so the first `If-None-Match`-bearing request must
+    /// go through the full render path; assert the 304 carries
+    /// `x-cache: MISS` rather than the cache-HIT branch's `HIT`. Tests
+    /// the path the other test deliberately bypasses.
+    #[tokio::test]
+    async fn if_none_match_against_fresh_router_returns_304_via_miss_branch() {
+        // Step 1: render once on a separate fresh router to learn the ETag.
+        let etag = {
+            let warm = build_router();
+            let resp = warm
+                .oneshot(
+                    Request::builder()
+                        .uri("/collections/radar/tiles/WebMercatorQuad/0/0/0")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            resp.headers()
+                .get("etag")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // Step 2: brand-new router with an empty cache. The handler must
+        // render, compute the same content-derived ETag, see the match,
+        // and 304 via the post-render branch.
+        let app = build_router();
+        let req = Request::builder()
+            .uri("/collections/radar/tiles/WebMercatorQuad/0/0/0")
+            .header("If-None-Match", &etag)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(resp.headers().get("etag").unwrap().to_str().unwrap(), etag);
+        assert_eq!(
+            resp.headers().get("x-cache").map(|v| v.to_str().unwrap()),
+            Some("MISS"),
+            "304 must come from the post-render MISS branch, not the cache-HIT branch"
+        );
+    }
+
+    /// Cross-parameter staleness protection: different `parameter-name`
+    /// values must produce different rendered bytes (because the
+    /// `MultiParamMockEngine` varies its output by parameter), which under
+    /// content-derived ETags (#145) means different ETags. Combined with
+    /// `parameter` being part of the cache key, a client switching
+    /// parameters can't get a 304 against the previous parameter's entry.
+    #[tokio::test]
+    async fn parameter_name_changes_content_etag_on_multi_param_engine() {
+        let app = build_multi_param_router();
+        let resp_2t = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/collections/wx/tiles/WebMercatorQuad/0/0/0?parameter-name=2t")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let resp_10u = app
+            .oneshot(
+                Request::builder()
+                    .uri("/collections/wx/tiles/WebMercatorQuad/0/0/0?parameter-name=10u")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let etag_2t = resp_2t.headers().get("etag").unwrap().to_str().unwrap();
+        let etag_10u = resp_10u.headers().get("etag").unwrap().to_str().unwrap();
         assert_ne!(
-            etag_a, etag_b,
-            "ETags must differ across parameter-name values"
+            etag_2t, etag_10u,
+            "parameter-name varies the rendered pixels, so the content-derived \
+             ETag must differ — otherwise a client switching from 2t to 10u \
+             would get a stale 304"
         );
     }
 
@@ -590,6 +724,63 @@ mod get_tile {
         let headers = resp.headers().clone();
         assert_eq!(headers.get("content-type").unwrap(), "image/png");
         assert_eq!(headers.get("x-cache").unwrap(), "EMPTY");
+    }
+
+    /// Revalidating a cached empty-tile response must round-trip the
+    /// `EMPTY` label, not be silently re-tagged as `MISS`. Empty tiles
+    /// share the global `EMPTY_TILE_CACHED` (never inserted into
+    /// `rendered_cache`), so an `If-None-Match` request always falls
+    /// through to the post-render branch — which is exactly the branch
+    /// the round-7 fix targets. A viewer panning over out-of-coverage
+    /// areas would otherwise see `304 x-cache: MISS` for every empty
+    /// tile, hiding them from dashboards filtered on `EMPTY`.
+    #[tokio::test]
+    async fn if_none_match_on_empty_tile_returns_304_with_x_cache_empty() {
+        // Step 1: render the empty tile to capture its (deterministic) ETag.
+        let app = build_empty_router();
+        let etag = {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/collections/empty/tiles/WebMercatorQuad/0/0/0")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.headers().get("x-cache").unwrap(), "EMPTY");
+            resp.headers()
+                .get("etag")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // Step 2: revalidate. The handler must reach the post-render
+        // branch (empty tiles bypass `rendered_cache`), match the ETag,
+        // and 304 with `x-cache: EMPTY` — forwarding the same label
+        // the 200 response would carry, not the legacy hard-coded MISS.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/collections/empty/tiles/WebMercatorQuad/0/0/0")
+                    .header("If-None-Match", &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(resp.headers().get("etag").unwrap().to_str().unwrap(), etag);
+        assert_eq!(
+            resp.headers().get("x-cache").map(|v| v.to_str().unwrap()),
+            Some("EMPTY"),
+            "post-render 304 must forward the `x_cache` label from the \
+             match arm, not hard-code `MISS` — otherwise revalidating an \
+             empty tile silently changes its dashboard category"
+        );
     }
 }
 
@@ -689,10 +880,25 @@ impl MapEngine for MultiParamMockEngine {
         height: u32,
         _time: Option<chrono::DateTime<chrono::Utc>>,
         _output_crs: &OutputCrs,
-        _parameter: Option<&str>,
+        parameter: Option<&str>,
     ) -> Result<RasterTile, DataServerError> {
+        // Vary the pixel values by parameter so the `parameter` field on
+        // the cache key actually changes the rendered bytes — the
+        // cross-parameter ETag test depends on this. Fold the name into
+        // a value in [0, 1] (within the style's min/max range) so the
+        // colormap produces a different uniform fill per parameter.
+        let fill: f64 = parameter
+            .map(|p| {
+                let mut h: u64 = 0xcbf29ce484222325;
+                for &b in p.as_bytes() {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                ((h & 0xff) as f64) / 255.0
+            })
+            .unwrap_or(0.0);
         let pixel_count = (width * height) as usize;
-        let values: Vec<Option<f64>> = (0..pixel_count).map(|i| Some(i as f64)).collect();
+        let values: Vec<Option<f64>> = vec![Some(fill); pixel_count];
         Ok(RasterTile {
             width,
             height,

@@ -161,13 +161,70 @@ pub fn quantize_bbox(bbox: &[f64; 4]) -> [i64; 4] {
     ]
 }
 
+/// Cached rendered image payload plus its content-derived ETag.
+///
+/// The ETag hashes the encoded bytes themselves via FNV-1a so two cache
+/// entries under the same `CacheKey` with different content (e.g. data
+/// refresh, encoder change, colormap fix) produce different ETags. A
+/// stable key-derived ETag would let stale browser caches survive a
+/// server-side fix indefinitely, since `If-None-Match` would keep
+/// returning 304 against fresh content (the bug #145 fixed for raster
+/// tiles, mirroring #136's fix for vector tiles).
+/// Both fields are private to seal the invariant `etag == FNV-1a(bytes)`.
+/// `bytes` was previously `pub`, which let a caller mutate the payload
+/// without updating the ETag and silently break `If-None-Match`
+/// (a browser holding the real ETag would get a full 200 instead of 304,
+/// or vice-versa).
+#[derive(Debug, Clone)]
+pub struct CachedRendered {
+    bytes: Bytes,
+    etag: String,
+}
+
+impl CachedRendered {
+    /// Build a cache entry from encoded bytes, deriving the ETag from
+    /// the content via FNV-1a. Format matches `ds_mvt::CachedTile::etag`
+    /// and `CacheKey::etag` so the same `etag_matches` helper works
+    /// across raster and vector responses. FNV-1a (not the stdlib
+    /// `DefaultHasher`) so the ETag is stable across rustc versions —
+    /// a binary rebuild against unchanged content keeps the same ETag
+    /// and browser caches survive the redeploy.
+    pub fn new(bytes: Bytes) -> Self {
+        let mut h = FNV1A_OFFSET;
+        fnv1a_mix(&mut h, bytes.as_ref());
+        let etag = format!("\"{h:016x}\"");
+        Self { bytes, etag }
+    }
+
+    /// Quoted 16-hex-char (64-bit FNV-1a) ETag string suitable for the
+    /// `ETag` response header.
+    pub fn etag(&self) -> &str {
+        &self.etag
+    }
+
+    /// Borrow the cached bytes — e.g. for byte-length accounting in the
+    /// cache weighter.
+    pub fn bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+
+    /// Consume the entry and yield the bytes — used by the handlers when
+    /// building the HTTP response body. Move semantics keep the invariant
+    /// intact: there is no way to retain the `CachedRendered` while
+    /// swapping out its bytes.
+    pub fn into_bytes(self) -> Bytes {
+        self.bytes
+    }
+}
+
 /// Weight function: count the byte size of each cached rendered image.
 #[derive(Clone)]
 struct RenderedWeighter;
 
-impl quick_cache::Weighter<CacheKey, Bytes> for RenderedWeighter {
-    fn weight(&self, _key: &CacheKey, val: &Bytes) -> u64 {
-        val.len() as u64 + 64 // data + overhead
+impl quick_cache::Weighter<CacheKey, CachedRendered> for RenderedWeighter {
+    fn weight(&self, _key: &CacheKey, val: &CachedRendered) -> u64 {
+        // bytes + 18-byte quoted 16-hex-char (64-bit FNV-1a) ETag string + 64-byte overhead
+        val.bytes().len() as u64 + val.etag().len() as u64 + 64
     }
 }
 
@@ -176,7 +233,7 @@ impl quick_cache::Weighter<CacheKey, Bytes> for RenderedWeighter {
 /// No TTL — radar measurements are immutable once produced.
 /// Cache is invalidated on collection reload.
 pub struct RenderedCache {
-    cache: Cache<CacheKey, Bytes, RenderedWeighter>,
+    cache: Cache<CacheKey, CachedRendered, RenderedWeighter>,
     capacity_bytes: u64,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -199,7 +256,7 @@ impl RenderedCache {
         }
     }
 
-    pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
+    pub fn get(&self, key: &CacheKey) -> Option<CachedRendered> {
         let result = self.cache.get(key);
         if result.is_some() {
             self.hits.fetch_add(1, Ordering::Relaxed);
@@ -209,7 +266,7 @@ impl RenderedCache {
         result
     }
 
-    pub fn insert(&self, key: CacheKey, value: Bytes) {
+    pub fn insert(&self, key: CacheKey, value: CachedRendered) {
         self.cache.insert(key, value);
     }
 
@@ -496,5 +553,36 @@ mod tests {
         };
         // Pinned after introducing the `parameter` field (cache-bust event).
         assert_eq!(key.etag(), "\"074133840641acde\"");
+    }
+
+    #[test]
+    fn cached_rendered_etag_is_stable_for_same_bytes() {
+        // Same bytes -> same ETag. The ETag is content-derived so a binary
+        // rebuild against unchanged content keeps the same ETag and browser
+        // caches survive the redeploy.
+        let a = CachedRendered::new(Bytes::from_static(b"\x89PNG\r\n\x1a\n... pixels ..."));
+        let b = CachedRendered::new(Bytes::from_static(b"\x89PNG\r\n\x1a\n... pixels ..."));
+        assert_eq!(a.etag(), b.etag());
+    }
+
+    #[test]
+    fn cached_rendered_etag_differs_for_distinct_bytes() {
+        // This is the #145 regression check: two encodings under the same
+        // CacheKey (e.g. a server-side colormap fix that produces different
+        // PNG pixels) must produce different ETags so a browser holding the
+        // pre-fix entry refetches instead of getting an infinite 304.
+        let pre_fix = CachedRendered::new(Bytes::from_static(b"old-broken-png-bytes"));
+        let post_fix = CachedRendered::new(Bytes::from_static(b"new-correct-png-bytes"));
+        assert_ne!(pre_fix.etag(), post_fix.etag());
+    }
+
+    #[test]
+    fn cached_rendered_etag_uses_stable_fnv1a_not_default_hasher() {
+        // Pinned golden value — mirrors `cache_key_etag_uses_stable_fnv1a_not_default_hasher`
+        // and `ds_mvt::CachedTile`'s analogue. If this changes you've either
+        // intentionally rotated the algorithm (cache-bust event for browser
+        // ETag caches) or accidentally regressed to a non-stable hasher.
+        let cached = CachedRendered::new(Bytes::from_static(b"hello"));
+        assert_eq!(cached.etag(), "\"a430d84680aabd0b\"");
     }
 }

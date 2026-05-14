@@ -159,36 +159,47 @@ pub async fn wms_handler(
                     .or_else(|| style_info.parameter.clone()),
             };
 
-            let etag = cache_key.etag();
             let cache_control = cache_control_value(has_explicit_time);
+            // Read If-None-Match into an owned String so it survives the move
+            // into spawn_blocking and the cache-hit/miss branches below.
+            let if_none_match = headers
+                .get(header::IF_NONE_MATCH)
+                .and_then(|h| h.to_str().ok())
+                .map(str::to_string);
 
-            // Check If-None-Match — return 304 before any cache lookup or rendering
-            if let Some(inm) = headers.get(header::IF_NONE_MATCH) {
-                if let Ok(inm_str) = inm.to_str() {
-                    if ds_render::etag_matches(inm_str, &etag) {
+            // Cache lookup runs BEFORE the If-None-Match check. The ETag is
+            // content-derived (see `CachedRendered::new`), so a key-derived
+            // 304 short-circuit would be wrong: it would return 304 for any
+            // request matching the cache key, even after a server-side fix
+            // produces different pixels. Mirror the MVT path in
+            // `render_vector_tile` (the bug #145 fixed for raster tiles).
+            if let Some(cached) = state.rendered_cache.get(&cache_key) {
+                if let Some(ref inm) = if_none_match {
+                    if ds_render::etag_matches(inm, cached.etag()) {
+                        // 304 from the cache-HIT branch. The `x-cache: HIT`
+                        // header lets the regression test (and curious
+                        // clients) distinguish this from a post-render
+                        // MISS→304, which the handler also serves.
                         return Ok(axum::response::Response::builder()
                             .status(StatusCode::NOT_MODIFIED)
-                            .header(header::ETAG, &etag)
+                            .header(header::ETAG, cached.etag())
                             .header(header::CACHE_CONTROL, cache_control)
+                            .header(header::HeaderName::from_static("x-cache"), "HIT")
                             .body(axum::body::Body::empty())
                             .unwrap()
                             .into_response());
                     }
                 }
-            }
-
-            // Check rendered cache
-            if let Some(cached) = state.rendered_cache.get(&cache_key) {
                 return Ok(axum::response::Response::builder()
                     .header(header::CONTENT_TYPE, content_type)
-                    .header(header::ETAG, &etag)
+                    .header(header::ETAG, cached.etag())
                     .header(header::CACHE_CONTROL, cache_control)
                     .header(
                         header::HeaderName::from_static("x-content-type-options"),
                         "nosniff",
                     )
                     .header(header::HeaderName::from_static("x-cache"), "HIT")
-                    .body(axum::body::Body::from(cached))
+                    .body(axum::body::Body::from(cached.into_bytes()))
                     .unwrap()
                     .into_response());
             }
@@ -236,45 +247,72 @@ pub async fn wms_handler(
 
             // The EMPTY and ERROR fast paths skip the format-aware encoder and
             // emit PNG bytes directly. Track the *actual* Content-Type per
-            // branch so the header never lies about the payload — previously
-            // a FORMAT=image/jpeg request that hit an empty tile got PNG
-            // bytes with `Content-Type: image/jpeg`, breaking decoders that
-            // trust the Content-Type.
-            let (image_bytes, x_cache, response_content_type) = match render_result {
+            // branch so the header never lies about the payload (#162). Wrap
+            // every branch in `CachedRendered` so the response ETag is
+            // FNV-1a over the actual bytes — different pixels, different
+            // ETag — regardless of which exit we take (#145).
+            // Each arm produces a `CachedRendered` ready to serve. Only the
+            // populated `Ok(Some(_))` path inserts into the rendered cache;
+            // the EMPTY and ERROR fast-paths intentionally don't (their
+            // bytes are deterministic for fixed dimensions and the
+            // engine error case shouldn't poison the cache).
+            let (cached, x_cache, response_content_type) = match render_result {
                 Ok(Some(bytes)) => {
-                    let image_bytes = bytes::Bytes::from(bytes);
-                    rendered_cache.insert(cache_key, image_bytes.clone());
-                    (image_bytes, "MISS", content_type)
+                    let cached = ds_render::CachedRendered::new(bytes::Bytes::from(bytes));
+                    rendered_cache.insert(cache_key, cached.clone());
+                    (cached, "MISS", content_type)
                 }
                 Ok(None) => {
-                    // Empty tile: return transparent PNG without caching.
+                    // Empty tile: transparent PNG, never cached.
                     let rgba = vec![0u8; (params.width * params.height * 4) as usize];
                     let png =
                         ds_render::encode_png(&rgba, params.width, params.height).map_err(|e| {
                             WmsError::Internal(format!("Failed to encode empty tile: {e}"))
                         })?;
-                    (bytes::Bytes::from(png), "EMPTY", "image/png")
+                    let cached = ds_render::CachedRendered::new(bytes::Bytes::from(png));
+                    (cached, "EMPTY", "image/png")
                 }
                 Err(e) => {
                     tracing::warn!("WMS render error for layer '{}': {e}", params.layer);
-                    (
-                        bytes::Bytes::from(render_error_tile(params.width, params.height)?),
-                        "ERROR",
-                        "image/png",
-                    )
+                    let png = render_error_tile(params.width, params.height)?;
+                    let cached = ds_render::CachedRendered::new(bytes::Bytes::from(png));
+                    (cached, "ERROR", "image/png")
                 }
             };
 
+            // Now that we have the content-derived ETag, do the
+            // `If-None-Match` comparison. Same flow as `render_vector_tile`
+            // in api-tiles: cache lookup → revalidate against cached ETag,
+            // miss → encode → revalidate against fresh ETag.
+            if let Some(ref inm) = if_none_match {
+                if ds_render::etag_matches(inm, cached.etag()) {
+                    // 304 from the post-render branch. Forward the same
+                    // `x_cache` label the 200 response would carry — `"MISS"`,
+                    // `"EMPTY"`, or `"ERROR"` — so revalidations look the
+                    // same on dashboards as initial fetches. A client
+                    // revalidating a cached transparent-tile response sees
+                    // `304 x-cache: EMPTY`, not a misleading `MISS`.
+                    return Ok(axum::response::Response::builder()
+                        .status(StatusCode::NOT_MODIFIED)
+                        .header(header::ETAG, cached.etag())
+                        .header(header::CACHE_CONTROL, cache_control)
+                        .header(header::HeaderName::from_static("x-cache"), x_cache)
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                        .into_response());
+                }
+            }
+
             Ok(axum::response::Response::builder()
                 .header(header::CONTENT_TYPE, response_content_type)
-                .header(header::ETAG, &etag)
+                .header(header::ETAG, cached.etag())
                 .header(header::CACHE_CONTROL, cache_control)
                 .header(
                     header::HeaderName::from_static("x-content-type-options"),
                     "nosniff",
                 )
                 .header(header::HeaderName::from_static("x-cache"), x_cache)
-                .body(axum::body::Body::from(image_bytes))
+                .body(axum::body::Body::from(cached.into_bytes()))
                 .unwrap()
                 .into_response())
         }

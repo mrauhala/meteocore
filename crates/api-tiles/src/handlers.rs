@@ -32,6 +32,17 @@ static EMPTY_TILE_PNG: LazyLock<bytes::Bytes> = LazyLock::new(|| {
     )
 });
 
+/// Companion to [`EMPTY_TILE_PNG`]: the same bytes wrapped in
+/// `CachedRendered`, so the FNV-1a hash that produces the empty-tile
+/// ETag is computed **once per process** instead of on every empty-tile
+/// response. Both fields are `Clone`-cheap (`Bytes` is `Arc`-backed,
+/// `String` is a 20-byte allocation done once), so cloning per request
+/// is essentially free. `api-maps` and `api-wms` cannot use this trick
+/// — they allocate fresh empty bytes per request to match the requested
+/// dimensions — but Tiles is always 256×256.
+static EMPTY_TILE_CACHED: LazyLock<ds_render::CachedRendered> =
+    LazyLock::new(|| ds_render::CachedRendered::new(EMPTY_TILE_PNG.clone()));
+
 /// Shared state for the OGC API Tiles service.
 #[derive(Clone)]
 pub struct TilesState {
@@ -1092,29 +1103,38 @@ async fn render_tile(
         parameter: effective_parameter.clone(),
     };
 
-    let etag = cache_key.etag();
     let cache_control = cache_control_value(has_explicit_time);
+    let if_none_match = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_string);
 
-    // Check If-None-Match — return 304 before any cache lookup or rendering
-    if let Some(inm) = headers.get(header::IF_NONE_MATCH) {
-        if let Ok(inm_str) = inm.to_str() {
-            if ds_render::etag_matches(inm_str, &etag) {
+    // Cache lookup runs BEFORE the If-None-Match check. The ETag is
+    // content-derived (see `CachedRendered::new`), so a key-derived 304
+    // short-circuit would be wrong: it would let a browser holding the
+    // pre-fix entry keep getting 304 after the server starts producing
+    // different pixels. Mirror the MVT path in `render_vector_tile` (the
+    // bug #145 fixed for raster tiles).
+    if let Some(cached) = state.rendered_cache.get(&cache_key) {
+        if let Some(ref inm) = if_none_match {
+            if ds_render::etag_matches(inm, cached.etag()) {
+                // 304 from the cache-HIT branch. The `x-cache: HIT` header
+                // lets the regression test (and curious clients) distinguish
+                // this from a post-render MISS→304, which the handler also
+                // serves.
                 return Ok(axum::response::Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
-                    .header(header::ETAG, &etag)
+                    .header(header::ETAG, cached.etag())
                     .header(header::CACHE_CONTROL, cache_control)
+                    .header(header::HeaderName::from_static("x-cache"), "HIT")
                     .body(axum::body::Body::empty())
                     .unwrap()
                     .into_response());
             }
         }
-    }
-
-    // Check rendered cache
-    if let Some(cached) = state.rendered_cache.get(&cache_key) {
         return Ok(axum::response::Response::builder()
             .header(header::CONTENT_TYPE, content_type)
-            .header(header::ETAG, &etag)
+            .header(header::ETAG, cached.etag())
             .header(header::CACHE_CONTROL, cache_control)
             .header(header::HeaderName::from_static("content-crs"), content_crs)
             .header(
@@ -1122,7 +1142,7 @@ async fn render_tile(
                 "nosniff",
             )
             .header(header::HeaderName::from_static("x-cache"), "HIT")
-            .body(axum::body::Body::from(cached))
+            .body(axum::body::Body::from(cached.into_bytes()))
             .unwrap()
             .into_response());
     }
@@ -1167,23 +1187,51 @@ async fn render_tile(
         TilesError::Internal(format!("Render failed: {e}"))
     })?;
 
-    // Empty tiles return the pre-generated transparent PNG without caching.
-    // Track the actual Content-Type per branch so the header never lies
-    // about the payload — previously a `?f=image/jpeg` request that hit an
-    // empty tile got PNG bytes with `Content-Type: image/jpeg`, breaking
-    // decoders that trust the type.
-    let (image_bytes, x_cache, response_content_type) = match maybe_bytes {
-        None => (EMPTY_TILE_PNG.clone(), "EMPTY", "image/png"),
+    // Empty tiles return the pre-generated transparent PNG without caching;
+    // populated tiles get cached. Wrap both in `CachedRendered` so the
+    // response ETag is FNV-1a over the actual bytes — different pixels
+    // produce different ETags (#145). Track the actual Content-Type per
+    // branch so the header never lies about the payload (#162). Empty
+    // tiles reuse the global `EMPTY_TILE_CACHED` so the FNV-1a hash is
+    // computed once per process instead of per request.
+    // Each arm produces a `CachedRendered` ready to serve. Only the
+    // populated `Some(_)` path inserts into the rendered cache; the
+    // EMPTY fast-path intentionally doesn't (the global
+    // `EMPTY_TILE_CACHED` already serves as the deterministic empty
+    // response).
+    let (cached, x_cache, response_content_type) = match maybe_bytes {
+        None => (EMPTY_TILE_CACHED.clone(), "EMPTY", "image/png"),
         Some(bytes) => {
-            let image_bytes = bytes::Bytes::from(bytes);
-            rendered_cache.insert(cache_key, image_bytes.clone());
-            (image_bytes, "MISS", content_type)
+            let cached = ds_render::CachedRendered::new(bytes::Bytes::from(bytes));
+            rendered_cache.insert(cache_key, cached.clone());
+            (cached, "MISS", content_type)
         }
     };
 
+    // Content-derived ETag now available — do the `If-None-Match`
+    // comparison here, after the (cheap) empty-tile clone or fresh
+    // encode. Forward the same `x_cache` label the 200 response would
+    // carry (`"MISS"` or `"EMPTY"`) so revalidations look the same
+    // on dashboards as initial fetches — a client revalidating a
+    // cached transparent-tile response sees `304 x-cache: EMPTY`,
+    // not a misleading `MISS`. This matters for any tile viewer
+    // panning over out-of-coverage areas.
+    if let Some(ref inm) = if_none_match {
+        if ds_render::etag_matches(inm, cached.etag()) {
+            return Ok(axum::response::Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header(header::ETAG, cached.etag())
+                .header(header::CACHE_CONTROL, cache_control)
+                .header(header::HeaderName::from_static("x-cache"), x_cache)
+                .body(axum::body::Body::empty())
+                .unwrap()
+                .into_response());
+        }
+    }
+
     Ok(axum::response::Response::builder()
         .header(header::CONTENT_TYPE, response_content_type)
-        .header(header::ETAG, &etag)
+        .header(header::ETAG, cached.etag())
         .header(header::CACHE_CONTROL, cache_control)
         .header(header::HeaderName::from_static("content-crs"), content_crs)
         .header(
@@ -1191,7 +1239,7 @@ async fn render_tile(
             "nosniff",
         )
         .header(header::HeaderName::from_static("x-cache"), x_cache)
-        .body(axum::body::Body::from(image_bytes))
+        .body(axum::body::Body::from(cached.into_bytes()))
         .unwrap()
         .into_response())
 }
