@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/mrauhala/meteocore/compare/v0.2.0...v0.3.0) (2026-05-14)
+
+
+### Features
+
+* **preview:** parameter dropdown + bounded time slider ([#157](https://github.com/mrauhala/meteocore/issues/157)) ([7cd874e](https://github.com/mrauhala/meteocore/commit/7cd874e6f720eaad7d8fff2691f08e02e2bea684))
+
 ## [0.2.0](https://github.com/mrauhala/meteocore/compare/v0.1.0...v0.2.0) (2026-05-12)
 
 
