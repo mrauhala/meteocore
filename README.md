@@ -912,7 +912,6 @@ PNG/WebP responses are always RGBA (transparent for empty tiles). JPEG is RGB. E
 - `bbox` is always lon/lat (no CRS-dependent axis swap)
 - Multi-parameter selection uses `?parameter-name=`, not `LAYERS=collection/param`
 - Errors are JSON, not `ServiceExceptionReport` XML
-- WebP is a first-class output format on every endpoint
 
 ### Conformance Classes
 
