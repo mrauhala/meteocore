@@ -190,8 +190,6 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     // /where — projection + grid extents.
     let projdef = read_string_attr("/where", "projdef")?;
     let crs = proj::parse(&projdef)?;
-    let xsize = read_f64_attr("/where", "xsize")? as u32;
-    let ysize = read_f64_attr("/where", "ysize")? as u32;
     let ll_lon = read_f64_attr("/where", "LL_lon")?;
     let ll_lat = read_f64_attr("/where", "LL_lat")?;
     let ur_lon = read_f64_attr("/where", "UR_lon")?;
@@ -206,21 +204,9 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     // projection uniformly.
     let bbox = native_bbox(&crs, ll_lon, ll_lat, ur_lon, ur_lat);
 
-    // /dataset1/what — quantity, gain, offset, nodata.
-    // ODIM v2.x has two layouts for the per-quantity what group:
-    // some producers put it under `/dataset1/what`, others under
-    // `/dataset1/data1/what`. Try the canonical location first.
-    let what_path = if file.group("/dataset1/what").is_ok() {
-        "/dataset1/what"
-    } else {
-        "/dataset1/data1/what"
-    };
-    let quantity = read_string_attr(what_path, "quantity")?;
-    let gain = read_f64_attr(what_path, "gain")?;
-    let offset = read_f64_attr(what_path, "offset")?;
-    let nodata = read_f64_attr(what_path, "nodata")?;
-
-    // /dataset1/data1/data — the raw 2D scaled-integer array.
+    // /dataset1/data1/data — read shape first because DMI files don't
+    // ship `/where/xsize`/`ysize` (only `xscale`/`yscale`), so the grid
+    // dimensions must come from the data array shape regardless.
     let ds = file
         .dataset("/dataset1/data1/data")
         .map_err(|_| ReadError::MissingGroup("/dataset1/data1/data".into()))?;
@@ -230,6 +216,51 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     }
     let rows = shape[0] as usize;
     let cols = shape[1] as usize;
+
+    // Prefer explicit `/where/xsize`/`ysize` when present (FMI/OPERA),
+    // fall back to the data-array shape (DMI variant). If both exist
+    // and disagree, trust /where — the spec wins over what could be
+    // a transposed array on the producer side.
+    let xsize = read_f64_attr("/where", "xsize")
+        .map(|v| v as u32)
+        .unwrap_or(cols as u32);
+    let ysize = read_f64_attr("/where", "ysize")
+        .map(|v| v as u32)
+        .unwrap_or(rows as u32);
+
+    // gain/offset/nodata/quantity location varies by producer:
+    // - FMI/OPERA canonical:    /dataset1/what/{gain,offset,nodata,quantity}
+    // - Alternate canonical:    /dataset1/data1/what/{...}     (some EUMETNET files)
+    // - DMI variant:            /what/{gain,offset,nodata}     at the file root,
+    //                           and `quantity` as an attribute on /dataset1/data1
+    //                           (or `/what/product` as last resort)
+    // Try each path in order. The first hit wins.
+    let what_paths = ["/dataset1/what", "/dataset1/data1/what", "/what"];
+    let read_first_f64 = |name: &str| -> Result<f64, ReadError> {
+        for p in &what_paths {
+            if let Ok(v) = read_f64_attr(p, name) {
+                return Ok(v);
+            }
+        }
+        Err(ReadError::MissingAttribute {
+            group: what_paths.join(" | "),
+            name: name.to_string(),
+        })
+    };
+    let gain = read_first_f64("gain")?;
+    let offset = read_first_f64("offset")?;
+    let nodata = read_first_f64("nodata")?;
+
+    // Quantity has one extra fallback (DMI puts it as an attribute on
+    // the `/dataset1/data1` data group itself, not in a what subgroup).
+    let quantity = read_string_attr("/dataset1/what", "quantity")
+        .or_else(|_| read_string_attr("/dataset1/data1/what", "quantity"))
+        .or_else(|_| read_string_attr("/dataset1/data1", "quantity"))
+        .or_else(|_| read_string_attr("/what", "product"))
+        .map_err(|_| ReadError::MissingAttribute {
+            group: "/dataset1/what | /dataset1/data1/what | /dataset1/data1 | /what".into(),
+            name: "quantity".into(),
+        })?;
 
     // Try u8 first (the common case for radar reflectivity classes);
     // on failure try u16. The error from the wrong dtype is benign —
