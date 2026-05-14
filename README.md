@@ -774,7 +774,7 @@ Internally the handler normalizes everything to WGS84 `[west, south, east, north
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
 | `LAYER` (or `LAYERS`) | yes | — | Collection ID (`{id}/{param}` is accepted but the legend depends only on the collection's styles) |
-| `STYLES` | no | `default` | Style name. Note: only the plural form works on this endpoint, unlike GetMap which accepts both. |
+| `STYLES` | no | `default` | Style name. Note: only the plural form works on this endpoint, unlike GetMap which accepts both. Tracked in #165. |
 | `WIDTH` | no | `40` | Pixels, capped at 256 |
 | `HEIGHT` | no | `200` | Pixels, capped at 1024 |
 | `FORMAT` | no | `image/png` | `image/png` or `image/jpeg`. Any other value (including the `image/webp` that capabilities advertises) silently falls back to PNG with `Content-Type: image/png` — no error is raised. Tracked in #161. |
