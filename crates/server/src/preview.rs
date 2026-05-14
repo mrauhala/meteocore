@@ -962,6 +962,7 @@ mod tests {
             querydata: None,
             wms: None,
             grib: None,
+            odim: None,
             postgis: None,
             preview: None,
         }

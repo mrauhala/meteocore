@@ -1,0 +1,17 @@
+[package]
+name = "engine-odim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ds-core = { path = "../core" }
+ds-storage = { path = "../storage" }
+hdf5-reader = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+arc-swap = "1"
+regex = "1"
+tokio = { version = "1", features = ["rt", "sync", "time", "fs"] }
+tracing = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"

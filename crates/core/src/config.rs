@@ -61,6 +61,8 @@ pub struct CollectionConfig {
     pub querydata: Option<QueryDataConfig>,
     /// GRIB-specific configuration. Required when engine_type = "grib".
     pub grib: Option<GribConfig>,
+    /// ODIM_H5 radar-specific configuration. Required when engine_type = "odim".
+    pub odim: Option<OdimConfig>,
     /// WMS map rendering configuration. Required when apis contains "wms".
     pub wms: Option<WmsConfig>,
     /// PostGIS-specific configuration. Required when engine_type = "postgis".
@@ -307,6 +309,78 @@ pub struct QueryDataConfig {
     /// Directory poll interval in seconds. Default: 30.
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
+}
+
+/// Configuration for the ODIM_H5 weather-radar engine
+/// (`engine_type = "odim"`).
+///
+/// Phase 1 supports COMP (composite) reflectivity files from a local
+/// directory or an S3-compatible bucket. STAC sources land in
+/// Phase 2; PVOL polar-volume EDR trajectory queries land in Phase 3.
+/// See [[project_odim_engine_plan]] for the full multi-phase roadmap.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OdimConfig {
+    /// Strftime filename template. ODIM files typically encode time
+    /// in the filename (e.g. `"202503251200_radar_fi.h5"` or
+    /// `"%Y%m%dT%H%M_polar_finland_anjalankoski.h5"`). Auto-derives
+    /// the regex and timestamp format. Preferred over `filename_pattern`.
+    pub filename_template: Option<String>,
+    /// Explicit regex with named `(?P<timestamp>…)` capture group, for
+    /// filenames `filename_template` can't express. Requires
+    /// `timestamp_format`.
+    pub filename_pattern: Option<String>,
+    /// chrono strftime format for parsing `filename_pattern`'s
+    /// timestamp capture.
+    pub timestamp_format: Option<String>,
+
+    /// Parameter name advertised to clients (e.g. `"reflectivity"`).
+    /// One parameter per collection in Phase 1 — multi-parameter PVOL
+    /// volumes ship in Phase 3.
+    pub parameter: String,
+    /// Unit of measurement (e.g. `"dBZ"`). Pure metadata: the engine
+    /// does not convert between units.
+    pub unit: String,
+
+    /// Override nodata sentinel. Takes precedence over the file's
+    /// `/dataset1/data1/what/nodata` attribute. Useful when a
+    /// producer ships files with a missing or mis-declared nodata
+    /// value.
+    pub nodata: Option<f64>,
+    /// Override gain factor. Takes precedence over `/dataset1/data1/
+    /// what/gain` (or root-level `/what/gain` for producers that
+    /// place it there). `physical = raw * gain + offset`.
+    pub gain: Option<f64>,
+    /// Override offset. Same precedence rules as `gain`.
+    pub offset: Option<f64>,
+
+    /// Directory poll interval in seconds. Default: 30.
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// Glob patterns for files to skip (e.g. atomic-write tempfiles).
+    /// Default: `["*.tmp", "*.part"]`.
+    #[serde(default = "default_exclude_patterns")]
+    pub exclude_patterns: Vec<String>,
+    /// Maximum number of files to keep in the catalog (most recent by
+    /// timestamp). Default: unbounded. Useful for S3 sources where
+    /// the bucket may hold years of history.
+    pub max_files: Option<usize>,
+
+    /// S3-compatible endpoint URL. When set with `bucket`, replaces
+    /// `data_path` for remote access. E.g.
+    /// `"https://fmi-opendata-radar-volume-hdf5.s3.amazonaws.com"`.
+    pub endpoint: Option<String>,
+    /// S3 bucket name. Required when `endpoint` is set.
+    pub bucket: Option<String>,
+    /// Object prefix, optionally with strftime templates. Re-evaluated
+    /// each poll cycle so it stays current across date boundaries.
+    /// E.g. `"%Y/%m/%d/fikor/"` for FMI's date-partitioned layout.
+    pub prefix_pattern: Option<String>,
+    /// ISO 8601 duration for file-window filtering. Negative ⇒ past
+    /// (observations), e.g. `"-PT2H"` keeps the last 2 hours.
+    pub time_window: Option<String>,
+    /// Number of days to scan when `prefix_pattern` carries date
+    /// templates. Default: auto-derived from `time_window`.
+    pub scan_days: Option<u32>,
 }
 
 fn default_grib_poll_interval() -> u64 {
