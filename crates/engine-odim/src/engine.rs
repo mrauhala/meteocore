@@ -25,18 +25,25 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
 use ds_core::geo::Crs;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
+use tokio::sync::watch;
 
 use crate::catalog::{scan_local_directory, CatalogEntry, FilenameMatcher};
 use crate::reader::{read_composite, OdimComposite};
 
 /// `MapEngine` implementation backed by an ODIM_H5 composite catalog.
+///
+/// Holds an [`ArcSwap`]-protected catalog so the async poll loop can
+/// publish refreshed entries (new files, removed files) without
+/// disturbing in-flight reads.
 pub struct OdimEngine {
-    catalog: Vec<CatalogEntry>,
+    catalog: Arc<ArcSwap<Vec<CatalogEntry>>>,
     collection_id: String,
     parameter: String,
     unit: String,
@@ -48,6 +55,12 @@ pub struct OdimEngine {
     /// at high request rates — keeping the last file resident makes
     /// hot-tile loops effectively free of read cost.
     cached: Mutex<Option<(PathBuf, Arc<OdimComposite>)>>,
+    /// Source state for the poll loop.
+    data_dir: PathBuf,
+    matcher: FilenameMatcher,
+    max_files: Option<usize>,
+    poll_interval: Duration,
+    shutdown_tx: watch::Sender<()>,
 }
 
 /// Errors from [`OdimEngine::new`]. Per-tile errors are mapped to
@@ -112,8 +125,10 @@ impl OdimEngine {
                 })?,
             );
 
+        let (shutdown_tx, _) = watch::channel(());
+
         Ok(Self {
-            catalog,
+            catalog: Arc::new(ArcSwap::from_pointee(catalog)),
             collection_id: collection_id.to_string(),
             parameter: config.parameter.clone(),
             unit: config.unit.clone(),
@@ -121,25 +136,101 @@ impl OdimEngine {
             offset_override: config.offset,
             nodata_override: config.nodata,
             cached: Mutex::new(Some((seed_path, composite))),
+            data_dir: data_dir.to_path_buf(),
+            matcher,
+            max_files: config.max_files,
+            poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
+            shutdown_tx,
         })
+    }
+
+    /// Run the directory poll loop. Exits when [`OdimEngine::shutdown`]
+    /// is called. Each tick re-scans `data_dir`, atomically swaps the
+    /// catalog `ArcSwap` if the file set changed, and logs at INFO
+    /// when new files appear so operators can confirm the polling is
+    /// alive.
+    ///
+    /// Errors from the scan (e.g. `data_dir` temporarily disappears)
+    /// are logged at WARN and otherwise ignored — the previous
+    /// catalog stays in place so live requests keep working.
+    pub async fn poll_loop(&self) {
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let mut interval = tokio::time::interval(self.poll_interval);
+        interval.tick().await; // skip immediate first tick (already loaded at boot)
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => self.poll_once(),
+                _ = shutdown_rx.changed() => {
+                    tracing::info!("[{}] ODIM poll loop shutting down", self.collection_id);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Signal the polling loop to stop. Idempotent.
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(());
+    }
+
+    fn poll_once(&self) {
+        let scan = match scan_local_directory(&self.data_dir, &self.matcher, self.max_files) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "[{}] ODIM catalog refresh failed: {}",
+                    self.collection_id,
+                    e
+                );
+                return;
+            }
+        };
+        // Diff against the previous catalog using count + most-recent
+        // timestamp. Producing-side renames are rare; this is cheap
+        // and accurate for the append-only / rolling-window case ODIM
+        // producers actually use.
+        let prev = self.catalog.load();
+        let prev_count = prev.len();
+        let prev_latest = prev.last().map(|e| e.time);
+        let new_latest = scan.last().map(|e| e.time);
+        if prev_count != scan.len() || prev_latest != new_latest {
+            tracing::info!(
+                "[{}] ODIM catalog refreshed: {} → {} files, latest {} → {}",
+                self.collection_id,
+                prev_count,
+                scan.len(),
+                prev_latest
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_else(|| "<none>".into()),
+                new_latest
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_else(|| "<none>".into()),
+            );
+            self.catalog.store(Arc::new(scan));
+        }
     }
 
     /// Pick the catalog entry whose timestamp is closest to `time`
     /// (exact match preferred). If `time` is `None`, return the most
-    /// recent entry. Empty-catalog and missing-time cases bubble up
-    /// as `LocationNotFound` from the caller.
-    fn select_entry(&self, time: Option<DateTime<Utc>>) -> Option<&CatalogEntry> {
-        let Some(target) = time else {
-            return self.catalog.last();
-        };
-        // The catalog is sorted by time ascending — pick the
-        // smallest-abs-difference entry. With only ~24 entries in
-        // practice (24h * 5-min ODIM cadence is the upper end before
-        // `max_files` trims), a linear scan is faster than a binary
-        // search through the noise of branch prediction.
-        self.catalog
-            .iter()
-            .min_by_key(|e| (e.time - target).num_seconds().abs())
+    /// recent entry. Returns an owned `CatalogEntry` clone because
+    /// the catalog lives behind `ArcSwap` and the snapshot guard
+    /// must drop before the per-request work proceeds.
+    fn select_entry(&self, time: Option<DateTime<Utc>>) -> Option<CatalogEntry> {
+        let snapshot = self.catalog.load();
+        if let Some(target) = time {
+            // The catalog is sorted by time ascending — pick the
+            // smallest-abs-difference entry. With only ~24 entries in
+            // practice (24h * 5-min ODIM cadence is the upper end
+            // before `max_files` trims), a linear scan is faster than
+            // a binary search through the noise of branch prediction.
+            snapshot
+                .iter()
+                .min_by_key(|e| (e.time - target).num_seconds().abs())
+                .cloned()
+        } else {
+            snapshot.last().cloned()
+        }
     }
 
     fn load_composite(&self, path: &Path) -> Result<Arc<OdimComposite>, DataServerError> {
@@ -299,7 +390,7 @@ impl MapEngine for OdimEngine {
             None
         };
 
-        let times: Vec<DateTime<Utc>> = self.catalog.iter().map(|e| e.time).collect();
+        let times: Vec<DateTime<Utc>> = self.catalog.load().iter().map(|e| e.time).collect();
 
         RasterInfo {
             native_crs,
