@@ -137,9 +137,11 @@ dependencies = [
  "chrono",
  "ds-core",
  "ds-render",
+ "http-body-util",
  "quick-xml",
  "serde",
  "tokio",
+ "tower",
  "tracing",
 ]
 
