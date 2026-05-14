@@ -43,7 +43,7 @@ impl WmsError {
 
     pub fn invalid_format(format: &str) -> Self {
         WmsError::InvalidFormat(format!(
-            "Format '{format}' is not supported. Use image/png."
+            "Format '{format}' is not supported. Use image/png, image/jpeg, or image/webp."
         ))
     }
 

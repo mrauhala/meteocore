@@ -312,8 +312,10 @@ pub async fn wms_handler(
             let height = height.min(1024);
 
             let format = match query.format.as_deref() {
+                None | Some("image/png") => ds_render::ImageFormat::Png,
                 Some("image/jpeg") => ds_render::ImageFormat::Jpeg,
-                _ => ds_render::ImageFormat::Png,
+                Some("image/webp") => ds_render::ImageFormat::Webp,
+                Some(other) => return Err(WmsError::invalid_format(other)),
             };
 
             let colormap = style_info.colormap.clone();
