@@ -609,6 +609,11 @@ async fn if_none_match_on_error_tile_returns_304_with_x_cache_error() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
     assert_eq!(
+        resp.headers().get("etag").unwrap().to_str().unwrap(),
+        etag,
+        "304 response must echo the same content-derived ETag back to the client"
+    );
+    assert_eq!(
         resp.headers().get("x-cache").map(|v| v.to_str().unwrap()),
         Some("ERROR"),
         "post-render 304 must forward the `x_cache` label — error \
