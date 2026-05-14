@@ -152,14 +152,18 @@ jobs:
             ${{ matrix.target }}-cargo-
 
       - name: Build release binary
-        # `--locked` deliberately omitted while release-please's
-        # `cargo-workspace` plugin is not yet configured to bump
-        # `Cargo.lock` alongside `Cargo.toml`. Without the plugin a
-        # tag built with `--locked` fails on the version drift. Restore
-        # `--locked` once #153 lands; the obligation lives there, not here.
+        # `--locked` enforces that the lockfile committed at the tag
+        # exactly matches Cargo.toml — so a release tag can't silently
+        # pick up a new transitive dep version. This works because
+        # release-please's `cargo-workspace` plugin rewrites
+        # `Cargo.lock` alongside the `Cargo.toml` version bump in the
+        # release PR (see `release-please-config.json::plugins`).
+        # If a future release PR ever lands without a matching
+        # `Cargo.lock` bump, this step fails loudly rather than
+        # producing a release built against a drifted lockfile.
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo build --release --target "${TARGET}" -p server
+        run: cargo build --release --locked --target "${TARGET}" -p server
 
       - name: Package tarball
         # All inputs flow through `env:` so the shell never sees an
