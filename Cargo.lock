@@ -888,6 +888,7 @@ dependencies = [
  "ds-core",
  "ds-storage",
  "hdf5-reader",
+ "ndarray",
  "regex",
  "serde",
  "thiserror 2.0.18",

@@ -19,3 +19,4 @@
 //! integration map that Phase 2 will draw on.
 
 pub mod proj;
+pub mod reader;
