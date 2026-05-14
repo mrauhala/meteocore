@@ -509,13 +509,14 @@ mod get_map {
         );
     }
 
-    /// Round-trip after a cache warm: a client revalidating with the
-    /// body's content-derived ETag must get a 304 via the **cache-HIT**
-    /// branch (the cache lookup happens before the If-None-Match check
-    /// — see `cached.etag()` comparison in the handler). Sharing one
-    /// router across both calls is load-bearing; building two routers
-    /// would leave the second call's `RenderedCache` empty and the 304
-    /// would fire on the post-render MISS branch instead.
+    /// Pin the cache-HIT→304 branch specifically. The handler returns 304
+    /// from two places: the cache-HIT branch (this test, asserted via
+    /// `x-cache: HIT`) and the post-render MISS branch (which also
+    /// compares `If-None-Match` against the freshly-computed ETag and
+    /// returns 304 when matched). A fresh router would still 304 — just
+    /// via the MISS path — so the `x-cache` assertion is what makes
+    /// "we exercised the HIT branch" testable. Sharing one router across
+    /// both calls is how we warm the cache for that branch.
     #[tokio::test]
     async fn if_none_match_after_cache_warm_returns_304_via_cache_hit() {
         let app = build_router();
@@ -539,7 +540,7 @@ mod get_map {
             .to_string();
 
         // Cache is warm. Same key + matching If-None-Match → cache HIT →
-        // ETag compare against `cached.etag()` → 304.
+        // ETag compare against `cached.etag()` → 304 with `x-cache: HIT`.
         let req = Request::builder()
             .uri("/collections/radar/map?bbox=10,55,30,70")
             .header("If-None-Match", &etag)
@@ -548,6 +549,11 @@ mod get_map {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(resp.headers().get("etag").unwrap().to_str().unwrap(), etag);
+        assert_eq!(
+            resp.headers().get("x-cache").map(|v| v.to_str().unwrap()),
+            Some("HIT"),
+            "304 must come from the cache-HIT branch, not post-render MISS"
+        );
     }
 
     /// Cross-parameter staleness protection: different `parameter-name`

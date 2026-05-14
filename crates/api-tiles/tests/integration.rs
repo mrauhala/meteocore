@@ -520,13 +520,11 @@ mod get_tile {
         );
     }
 
-    /// Round-trip after a cache warm: a client revalidating with the
-    /// body's content-derived ETag must get a 304 via the **cache-HIT**
-    /// branch (the cache lookup happens before the If-None-Match check
-    /// — see `cached.etag()` comparison in the handler). Sharing one
-    /// router across both calls is load-bearing; building two routers
-    /// would leave the second call's `RenderedCache` empty and the 304
-    /// would fire on the post-render MISS branch instead.
+    /// Pin the cache-HIT→304 branch specifically. The handler returns 304
+    /// from two places: the cache-HIT branch (this test, asserted via
+    /// `x-cache: HIT`) and the post-render MISS branch. A fresh router
+    /// would still 304 — just via the MISS path — so the `x-cache`
+    /// assertion is what makes "we exercised the HIT branch" testable.
     #[tokio::test]
     async fn if_none_match_after_cache_warm_returns_304_via_cache_hit() {
         let app = build_router();
@@ -559,6 +557,11 @@ mod get_tile {
             resp.headers().get("etag").unwrap().to_str().unwrap(),
             etag,
             "304 response must echo the same content-derived ETag"
+        );
+        assert_eq!(
+            resp.headers().get("x-cache").map(|v| v.to_str().unwrap()),
+            Some("HIT"),
+            "304 must come from the cache-HIT branch, not post-render MISS"
         );
     }
 

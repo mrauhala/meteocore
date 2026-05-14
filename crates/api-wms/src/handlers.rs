@@ -176,10 +176,15 @@ pub async fn wms_handler(
             if let Some(cached) = state.rendered_cache.get(&cache_key) {
                 if let Some(ref inm) = if_none_match {
                     if ds_render::etag_matches(inm, cached.etag()) {
+                        // 304 from the cache-HIT branch. The `x-cache: HIT`
+                        // header lets the regression test (and curious
+                        // clients) distinguish this from a post-render
+                        // MISS→304, which the handler also serves.
                         return Ok(axum::response::Response::builder()
                             .status(StatusCode::NOT_MODIFIED)
                             .header(header::ETAG, cached.etag())
                             .header(header::CACHE_CONTROL, cache_control)
+                            .header(header::HeaderName::from_static("x-cache"), "HIT")
                             .body(axum::body::Body::empty())
                             .unwrap()
                             .into_response());

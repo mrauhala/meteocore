@@ -902,7 +902,7 @@ PNG/WebP responses are always RGBA (transparent for empty tiles). JPEG is RGB. E
 - `Content-Crs:` OGC URI of the output CRS
 - `ETag:` derived from the cache key (quantized bbox + layer + style + format + CRS + width + height + time + parameter)
 - `Cache-Control: public, max-age=86400, immutable` when `datetime` is set; `public, max-age=60, must-revalidate` otherwise
-- `X-Cache: HIT | MISS | EMPTY` for observability
+- `X-Cache: HIT | MISS | EMPTY` for observability (also set on `304 Not Modified` from the cache-HIT branch so clients can distinguish it from a post-render-revalidation 304)
 
 `If-None-Match` short-circuits to `304 Not Modified` before any cache lookup or rendering. An overloaded render semaphore returns `503 Service Unavailable` with the fixed body `{"code":"ServerBusy","description":"Server busy, try again later"}`. Internal errors return 500 with a redacted body; the original detail is captured via `tracing::warn!` for operators.
 
