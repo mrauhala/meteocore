@@ -18,5 +18,6 @@
 //! plan and [[exploration_stac_integration_points]] for the STAC
 //! integration map that Phase 2 will draw on.
 
+pub mod catalog;
 pub mod proj;
 pub mod reader;
