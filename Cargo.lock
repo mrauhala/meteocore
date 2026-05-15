@@ -790,6 +790,7 @@ name = "ds-storage"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "chrono",
  "ds-core",
  "futures",
  "object_store",
@@ -885,6 +886,7 @@ dependencies = [
  "arc-swap",
  "chrono",
  "ds-core",
+ "ds-storage",
  "hdf5-reader",
  "ndarray",
  "regex",

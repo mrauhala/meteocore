@@ -8,17 +8,15 @@
 //! 1. A regex that matches just the timestamp portion of the filename
 //! 2. A chrono strftime format for parsing the matched substring
 //!
-//! Then a local-directory scan walks the directory, applies the regex
-//! to each filename, parses the timestamp, and returns a sorted list
-//! of `(timestamp, path)` entries.
-//!
-//! Phase 1 scope is local directories only. S3-backed catalogs land
-//! in Phase 1.5 once the engine wiring is proven end-to-end (see
-//! [[project_odim_engine_plan]]).
+//! A scan — local-directory ([`scan_local_directory`]) or S3/HTTP
+//! object-store ([`scan_remote`]) — applies the regex to each
+//! filename, parses the timestamp, and returns a sorted list of
+//! `(timestamp, path)` entries.
 
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
+use ds_core::error::DataServerError;
 use regex::Regex;
 use tracing::warn;
 
@@ -184,6 +182,103 @@ pub fn scan_local_directory(
         }
     }
     entries.sort_by_key(|e| e.time);
+    if let Some(cap) = max_files {
+        if entries.len() > cap {
+            let start = entries.len() - cap;
+            entries.drain(..start);
+        }
+    }
+    Ok(entries)
+}
+
+/// Skip remote objects larger than this — a guard against fetching a
+/// mis-uploaded or non-ODIM blob into memory. ODIM COMP composites run
+/// from ~35 KB (FMI single-radar) to a few MB (OPERA pan-European);
+/// 64 MB is a generous ceiling above any real composite.
+const MAX_REMOTE_FILE_SIZE: u64 = 64 * 1024 * 1024;
+
+/// Scan an S3/HTTP object store for ODIM files under the given set of
+/// (already date-expanded) key prefixes.
+///
+/// Each prefix is `list`ed; object basenames are matched against
+/// `matcher`. Matched entries' `path` holds the full object key — not
+/// a filesystem path — which `OdimEngine` resolves back through the
+/// object store when loading composites.
+///
+/// `time_filter`, when set, drops entries whose timestamp falls
+/// outside the `(start, end)` range. `max_files` caps the result to
+/// the most recent N. Returns entries sorted by timestamp ascending.
+///
+/// A prefix that fails to `list` (e.g. a date partition that doesn't
+/// exist yet) is logged and skipped. If *every* prefix fails the call
+/// errors rather than silently returning an empty catalog.
+pub fn scan_remote(
+    store: &ds_storage::DataStore,
+    prefixes: &[String],
+    matcher: &FilenameMatcher,
+    time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    max_files: Option<usize>,
+) -> Result<Vec<CatalogEntry>, DataServerError> {
+    use ds_storage::object_store::path::Path as ObjectPath;
+
+    let mut entries: Vec<CatalogEntry> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for prefix in prefixes {
+        let listed = match store.list(&ObjectPath::from(prefix.as_str())) {
+            Ok(objects) => objects,
+            Err(e) => {
+                errors.push(format!("'{prefix}': {e}"));
+                continue;
+            }
+        };
+        for obj in listed {
+            if obj.size as u64 > MAX_REMOTE_FILE_SIZE {
+                warn!(
+                    "[catalog] skipping oversized remote object `{}` ({} bytes)",
+                    obj.location, obj.size
+                );
+                continue;
+            }
+            let key = obj.location.to_string();
+            let name = key.rsplit('/').next().unwrap_or(key.as_str());
+            let Some(time) = matcher.parse_timestamp(name) else {
+                continue;
+            };
+            if let Some((start, end)) = time_filter {
+                if time < start || time > end {
+                    continue;
+                }
+            }
+            entries.push(CatalogEntry {
+                time,
+                path: PathBuf::from(key),
+            });
+        }
+    }
+
+    if entries.is_empty() && !errors.is_empty() {
+        return Err(DataServerError::Engine(format!(
+            "all {} ODIM S3 prefix scan(s) failed: {}",
+            errors.len(),
+            errors.join("; ")
+        )));
+    }
+    if !errors.is_empty() {
+        warn!(
+            "[catalog] {} ODIM S3 prefix scan(s) failed (kept {} entries from the rest): {}",
+            errors.len(),
+            entries.len(),
+            errors.join("; ")
+        );
+    }
+
+    // Sort by timestamp ascending; on a duplicate timestamp order the
+    // key descending so the lexicographically-last key survives the
+    // `dedup_by` (which keeps the first of each equal-timestamp run).
+    entries.sort_by(|a, b| a.time.cmp(&b.time).then_with(|| b.path.cmp(&a.path)));
+    entries.dedup_by(|a, b| a.time == b.time);
+
     if let Some(cap) = max_files {
         if entries.len() > cap {
             let start = entries.len() - cap;
@@ -459,5 +554,72 @@ mod tests {
                 "20250714T0400_radar_fi.h5".to_string(),
             ]
         );
+    }
+
+    /// `scan_remote` against a `DataStore` backed by the local
+    /// filesystem — exercises the list → match → filter → cap pipeline
+    /// without needing a live S3 endpoint. The `LocalFileSystem`
+    /// object store behaves like S3 for `list`, so this covers the
+    /// real remote code path.
+    #[test]
+    fn scan_remote_matches_filters_and_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "OPERA@20260515T0000@0@DBZH.h5",
+            "OPERA@20260515T0005@0@DBZH.h5",
+            "OPERA@20260515T0010@0@DBZH.h5",
+            "OPERA@20260515T0015@0@DBZH.h5",
+            "README.md",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let (store, _) = ds_storage::build_store(dir.path().to_str().unwrap()).unwrap();
+        let matcher = FilenameMatcher::from_template("OPERA@%Y%m%dT%H%M@0@DBZH.h5").unwrap();
+
+        // max_files caps to the most recent 2; README is skipped.
+        let capped = scan_remote(&store, &["".to_string()], &matcher, None, Some(2)).unwrap();
+        let times: Vec<_> = capped.iter().map(|e| e.time.to_rfc3339()).collect();
+        assert_eq!(
+            times,
+            ["2026-05-15T00:10:00+00:00", "2026-05-15T00:15:00+00:00"]
+        );
+
+        // time_filter drops entries outside the [00:05, 00:10] range.
+        let start = "2026-05-15T00:05:00Z".parse().unwrap();
+        let end = "2026-05-15T00:10:00Z".parse().unwrap();
+        let windowed =
+            scan_remote(&store, &["".to_string()], &matcher, Some((start, end)), None).unwrap();
+        let times: Vec<_> = windowed.iter().map(|e| e.time.to_rfc3339()).collect();
+        assert_eq!(
+            times,
+            ["2026-05-15T00:05:00+00:00", "2026-05-15T00:10:00+00:00"]
+        );
+    }
+
+    /// Entries from multiple prefixes are merged; a prefix that yields
+    /// nothing (or fails to `list`) doesn't sink the scan as long as
+    /// another prefix produces entries.
+    #[test]
+    fn scan_remote_merges_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("good")).unwrap();
+        std::fs::write(
+            dir.path().join("good/OPERA@20260515T0000@0@DBZH.h5"),
+            b"x",
+        )
+        .unwrap();
+        let (store, _) = ds_storage::build_store(dir.path().to_str().unwrap()).unwrap();
+        let matcher = FilenameMatcher::from_template("OPERA@%Y%m%dT%H%M@0@DBZH.h5").unwrap();
+
+        let entries = scan_remote(
+            &store,
+            &["good".to_string(), "missing".to_string()],
+            &matcher,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].time.to_rfc3339(), "2026-05-15T00:00:00+00:00");
     }
 }

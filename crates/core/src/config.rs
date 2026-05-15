@@ -361,16 +361,21 @@ pub struct OdimConfig {
     /// directory may hold years of history.
     pub max_files: Option<usize>,
 
-    /// S3-compatible endpoint URL. Phase 1 ignores this — Phase 2 will
-    /// wire S3 catalogs via `ds-storage::ObjectStore`. Engine boots
-    /// with a WARN if set, so a config typo doesn't silently fall
-    /// back to local-directory mode.
+    /// S3-compatible endpoint URL (e.g. `https://s3.waw3-1.cloudferro.com`).
+    /// When `endpoint` + `bucket` are set the engine reads from S3;
+    /// otherwise it scans the collection's local `data_path`.
     pub endpoint: Option<String>,
-    /// S3 bucket name. Phase 2; ignored with WARN in Phase 1.
+    /// S3 bucket name. Required when `endpoint` is set.
     pub bucket: Option<String>,
-    /// Object prefix, optionally with strftime templates. Phase 2;
-    /// ignored with WARN in Phase 1.
+    /// Object key prefix, optionally carrying strftime templates
+    /// (e.g. `%Y/%m/%d/OPERA/COMP/`). Expanded per UTC date on every
+    /// poll so the scan stays current across day boundaries.
     pub prefix_pattern: Option<String>,
+    /// ISO 8601 duration bounding which timesteps to keep, relative to
+    /// now (e.g. `-PT12H` for the last 12 hours). Drives both prefix
+    /// date expansion and timestamp filtering for S3 sources. When
+    /// unset, the scan falls back to a fixed recent-days window.
+    pub time_window: Option<String>,
 }
 
 fn default_grib_poll_interval() -> u64 {
