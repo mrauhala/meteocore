@@ -306,9 +306,14 @@ impl OdimEngine {
     /// or a health-check pre-warmer would need its own
     /// `spawn_blocking` to avoid stalling Tokio workers.
     fn load_composite(&self, path: &Path) -> Result<Arc<OdimComposite>, DataServerError> {
-        // Use a path-keyed single-entry cache. Concurrent requests
-        // for the same file get the same `Arc`; a swap happens only
-        // when a different file is asked for.
+        // Use a path-keyed single-entry cache. Cache hits return the
+        // same `Arc` to every caller; on a cold miss two concurrent
+        // `spawn_blocking` callers may both read the file and both
+        // write the cache slot — the second write overwrites the
+        // first with an identical, immutable composite. The cost is
+        // at most one redundant read at the moment the slot fills,
+        // never visible to clients. A swap to a different path
+        // happens only when a different file is asked for.
         //
         // Mutex poison is recovered (rather than silently disabling
         // the cache for the lifetime of the engine). The cached
