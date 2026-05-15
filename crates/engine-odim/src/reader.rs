@@ -250,9 +250,14 @@ fn wgs84_envelope(crs: &Crs, bbox: [f64; 4]) -> [f64; 4] {
     }
 
     // If every reprojection failed (a pathological CRS), fall back
-    // to the native bbox unchanged rather than emit `[MAX,…,MIN]`.
+    // to a conservative global extent. Returning the native `bbox`
+    // here would be a unit-confusion bug: for a projected CRS it is
+    // in metres, and the caller expects WGS84 degrees. `[-180, -90,
+    // 180, 90]` is over-broad but at least dimensionally valid.
+    // (Unreachable for any real grid — `Crs::Wgs84::inverse` is the
+    // identity and projected inverses succeed near the grid.)
     if min_lon > max_lon {
-        return bbox;
+        return [-180.0, -90.0, 180.0, 90.0];
     }
     [min_lon, min_lat, max_lon, max_lat]
 }
