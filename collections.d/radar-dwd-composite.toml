@@ -20,7 +20,7 @@ ODIM_H5 v2.3. 250m polar stereographic grid covering Germany and \
 neighbouring countries.\
 """
 engine_type = "odim"
-apis = ["wms", "maps", "tiles"]
+apis = ["edr", "wms", "maps", "tiles"]
 data_path = "testdata/radar-dwd"
 
 [odim]
