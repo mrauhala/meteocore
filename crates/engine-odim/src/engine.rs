@@ -57,6 +57,17 @@ pub struct OdimEngine {
     pub(crate) gain_override: Option<f64>,
     pub(crate) offset_override: Option<f64>,
     pub(crate) nodata_override: Option<f64>,
+    /// Native-CRS label and WGS84 corner envelope captured from the
+    /// seed composite at construction. Every timestep of a given
+    /// ODIM collection shares the same grid, so these are stable
+    /// for the engine's lifetime. Holding them as plain fields lets
+    /// `raster_info()` (MapEngine) and `get_spatial_extent()` (EDR)
+    /// answer collection metadata without touching the render
+    /// cache `Mutex` — and, crucially, without depending on whether
+    /// a `get_raster_tile` call has warmed that cache yet (an
+    /// `apis = ["edr"]`-only collection never issues one).
+    pub(crate) seed_native_crs: String,
+    pub(crate) seed_spatial_extent: [f64; 4],
     /// Single-entry path-keyed cache. ODIM composites are small (a
     /// few MB) but HDF5 parsing dominates `get_raster_tile` latency
     /// at high request rates — keeping the last file resident makes
@@ -160,6 +171,9 @@ impl OdimEngine {
                 })?,
             );
 
+        let seed_native_crs = crs_label(&composite.crs);
+        let seed_spatial_extent = composite.wgs84_corners;
+
         Ok(Self {
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
             collection_id: collection_id.to_string(),
@@ -168,6 +182,8 @@ impl OdimEngine {
             gain_override: config.gain,
             offset_override: config.offset,
             nodata_override: config.nodata,
+            seed_native_crs,
+            seed_spatial_extent,
             cached: Mutex::new(Some((seed_path, composite))),
             data_dir: data_dir.to_path_buf(),
             matcher,
@@ -532,28 +548,16 @@ impl MapEngine for OdimEngine {
     }
 
     fn raster_info(&self) -> RasterInfo {
-        // Read native_crs and spatial_extent from the seed-loaded
-        // composite under a single lock acquisition. Times come from
-        // the catalog (separate lock-free ArcSwap snapshot). Recover
-        // from a poisoned mutex (same rationale as `load_composite`).
-        let cached_guard = self.cached.lock().unwrap_or_else(|e| {
-            tracing::error!(
-                "[{}] ODIM cache mutex was poisoned in raster_info; recovering",
-                self.collection_id
-            );
-            e.into_inner()
-        });
-        let (native_crs, spatial_extent) = cached_guard
-            .as_ref()
-            .map(|(_, c)| (crs_label(&c.crs), Some(c.wgs84_corners)))
-            .unwrap_or_else(|| ("unknown".into(), None));
-        drop(cached_guard);
-
+        // `native_crs` / `spatial_extent` come from the seed fields
+        // captured at construction — every timestep shares the same
+        // grid, so this needs neither the render-cache `Mutex` nor a
+        // warmed cache. Times come from the lock-free `ArcSwap`
+        // catalog snapshot.
         let times: Vec<DateTime<Utc>> = self.catalog.load().iter().map(|e| e.time).collect();
 
         RasterInfo {
-            native_crs,
-            spatial_extent,
+            native_crs: self.seed_native_crs.clone(),
+            spatial_extent: Some(self.seed_spatial_extent),
             times,
             parameter: self.parameter.clone(),
             unit: self.unit.clone(),

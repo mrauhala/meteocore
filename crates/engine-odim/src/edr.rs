@@ -415,8 +415,13 @@ impl EdrEngine for OdimEngine {
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
     ) -> Result<QueryResult, DataServerError> {
-        Err(DataServerError::InvalidParameter(
-            "ODIM engine does not support named location queries. \
+        // An ODIM composite is a gridded field with no named
+        // locations, so any location id is genuinely "not found" →
+        // HTTP 404 (`LocationNotFound`), not "bad request" (400).
+        // Same variant `CsvEngine`/`PostgisEngine` use for an
+        // unknown location id.
+        Err(DataServerError::LocationNotFound(
+            "ODIM engine has no named locations. \
              Use the position query endpoint instead (e.g. /position?coords=POINT(lon lat))."
                 .into(),
         ))
@@ -450,17 +455,11 @@ impl EdrEngine for OdimEngine {
     }
 
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
-        // The seed composite loaded at construction carries the
-        // WGS84 corner envelope; read it under the same recovered
-        // mutex `raster_info` uses.
-        let guard = self.cached.lock().unwrap_or_else(|e| {
-            tracing::error!(
-                "[{}] ODIM cache mutex was poisoned in get_spatial_extent; recovering",
-                self.collection_id
-            );
-            e.into_inner()
-        });
-        guard.as_ref().map(|(_, c)| c.wgs84_corners)
+        // Seed field captured at construction — stable for the
+        // engine's lifetime and independent of whether the render
+        // cache has been warmed, so an `apis = ["edr"]`-only
+        // collection still reports a real extent.
+        Some(self.seed_spatial_extent)
     }
 
     fn supported_query_types(&self) -> Vec<String> {
