@@ -1,0 +1,32 @@
+# DWD Germany radar composite HX (ODIM_H5 v2.3)
+#
+# Reads `composite_hx_YYYYMMDD_HHMM-hd5.h5` files: 4400×4800 grid at
+# 250m/px covering Germany + neighbours, polar stereographic projection
+# (lat_0=90, lat_ts=60, lon_0=10 — same family as FMI/OPERA composites).
+# DBZH quantity, u16 pixels with fine gain=0.00293, offset=-64 → -64 to
+# +128 dBZ range. nodata=65535, undetect=0.
+#
+# Sample files in `testdata/radar-dwd/` were fetched from DWD open data:
+#   https://opendata.dwd.de/weather/radar/composite/hx/
+#
+# DWD's URL names files without an extension; saved locally with `.h5`
+# appended for matcher clarity.
+
+id = "radar-dwd-composite"
+title = "DWD Germany Radar Composite HX (DBZH)"
+description = """\
+Deutscher Wetterdienst pan-Germany maximum-reflectivity composite via \
+ODIM_H5 v2.3. 250m polar stereographic grid covering Germany and \
+neighbouring countries.\
+"""
+engine_type = "odim"
+apis = ["wms", "maps", "tiles"]
+data_path = "testdata/radar-dwd"
+
+[odim]
+filename_template = "composite_hx_%Y%m%d_%H%M-hd5.h5"
+parameter = "reflectivity"
+unit = "dBZ"
+
+[wms]
+colormap = "radar_dbz"

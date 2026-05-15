@@ -1,0 +1,30 @@
+# EUMETNET OPERA pan-European radar composite (ODIM_H5 v2.4)
+#
+# Reads `OPERA@YYYYMMDDTHHMM@0@DBZH.h5` files: 4400×3800 grid at 2km/px
+# over Europe, Lambert Azimuthal Equal Area projection (EPSG:3035-style:
+# +lat_0=55 +lon_0=10 +ellps=WGS84). DBZH quantity, f64 pixels in
+# physical dBZ units (gain=1, offset=0); nodata=-9999000 and
+# undetect=-8888000 sentinels.
+#
+# Sample files in `testdata/radar-opera/` were fetched from cloudferro's
+# `openradar-24h` S3 bucket:
+#   https://s3.waw3-1.cloudferro.com/openradar-24h/YYYY/MM/DD/OPERA/COMP/
+
+id = "radar-opera-composite"
+title = "OPERA Pan-European Radar Composite (DBZH)"
+description = """\
+EUMETNET OPERA pan-European weather-radar composite via ODIM_H5 v2.4. \
+Maximum reflectivity (DBZH) on a 2km Lambert Azimuthal Equal Area grid \
+covering Europe.\
+"""
+engine_type = "odim"
+apis = ["wms", "maps", "tiles"]
+data_path = "testdata/radar-opera"
+
+[odim]
+filename_template = "OPERA@%Y%m%dT%H%M@0@DBZH.h5"
+parameter = "reflectivity"
+unit = "dBZ"
+
+[wms]
+colormap = "radar_dbz"

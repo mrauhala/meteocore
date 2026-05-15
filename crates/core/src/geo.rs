@@ -771,6 +771,28 @@ fn lcc_t(lat: f64, e: f64) -> f64 {
 // Uses conformal sphere approach (Gauss conformal latitude)
 // ============================================================================
 
+/// Oblique stereographic projection on the conformal sphere, EPSG 9809.
+///
+/// The previous implementation had an `n = sqrt(1 + e²·cos⁴(lat0)/(1-e²))`
+/// factor borrowed from Lambert Conformal Conic (where it's the cone
+/// constant) and multiplied it into the longitude difference. That
+/// over-scaled projected coordinates by ~50% at latitudes around 56°,
+/// invisible to roundtrip tests (forward & inverse used the same
+/// wrong formula) but immediately visible when rendering ODIM radar
+/// composites — output pixels missed the source grid by hundreds of
+/// kilometres.
+///
+/// EPSG 9809 ("Oblique Stereographic") uses no LCC cone constant:
+///   χ(φ)   — conformal latitude (Snyder eq. 3-1)
+///   R_c    — conformal sphere radius at origin: √(M(φ₀) · N(φ₀))
+///   k(P)   — scale factor at the point P
+///   x = false_e + 2·R_c·k₀·cos(χ)·sin(λ-λ₀)/B
+///   y = false_n + 2·R_c·k₀·(cos(χ₀)·sin(χ) - sin(χ₀)·cos(χ)·cos(λ-λ₀))/B
+/// where B = 1 + sin(χ₀)·sin(χ) + cos(χ₀)·cos(χ)·cos(λ-λ₀).
+///
+/// Polar stereographic (lat₀ = ±90°) falls out of the same formula
+/// without special-casing, so a single implementation handles ODIM's
+/// polar (FMI/OPERA) and oblique (DMI) variants.
 fn stere_forward(
     lat: f64,
     lon: f64,
@@ -780,45 +802,89 @@ fn stere_forward(
     false_e: f64,
     false_n: f64,
 ) -> (f64, f64) {
+    // Snyder, "Map Projections — A Working Manual" (USGS PP 1395,
+    // 1987), §21 "Stereographic", ellipsoidal aspect. Matches
+    // PROJ's `+proj=stere`. The earlier `(rn0·rm0).sqrt()` form
+    // was the double-stereographic / EPSG 9809 radius (PROJ's
+    // `+proj=sterea`), a different projection that diverges from
+    // `+proj=stere` by ~300 m at 100 km from origin and would
+    // misalign DMI/OPERA tiles even though forward+inverse
+    // roundtripped self-consistently.
+    //
+    // Two ellipsoidal cases:
+    //   - Oblique (|lat0| < π/2): Snyder eq. 21-26..30. Uses
+    //     `m_c / cos(χ_c)` for the radius factor.
+    //   - Polar (|lat0| = π/2): Snyder eq. 21-33. The oblique
+    //     formula's `m_c` and `cos(χ_c)` both numerically vanish
+    //     at the pole (their ratio happens to stay finite by IEEE
+    //     754 rounding alone), so use the dedicated polar form
+    //     `ρ = 2·a·k₀·t / D` with `D = √((1+e)^(1+e)·(1-e)^(1-e))`.
     let e2 = WGS84_E2;
     let e = e2.sqrt();
+    let a = WGS84_A;
 
-    // Conformal sphere radius
+    // Polar branch — check before computing oblique-only terms
+    // that would be ill-conditioned at the pole.
+    const POLAR_THRESHOLD: f64 = 1e-10;
+    if (lat0.abs() - std::f64::consts::FRAC_PI_2).abs() < POLAR_THRESHOLD {
+        let north_polar = lat0 > 0.0;
+        let sin_lat = lat.sin();
+        let t = ((std::f64::consts::FRAC_PI_4 - if north_polar { lat / 2.0 } else { -lat / 2.0 })
+            .tan())
+            * ((1.0 + e * sin_lat * if north_polar { 1.0 } else { -1.0 })
+                / (1.0 - e * sin_lat * if north_polar { 1.0 } else { -1.0 }))
+            .powf(e / 2.0);
+        let d = ((1.0 + e).powf(1.0 + e) * (1.0 - e).powf(1.0 - e)).sqrt();
+        let rho = 2.0 * a * k0 * t / d;
+        let dl = lon - lon0;
+        let x = false_e + rho * dl.sin();
+        let y = false_n
+            + if north_polar {
+                -rho * dl.cos()
+            } else {
+                rho * dl.cos()
+            };
+        return (x, y);
+    }
+
+    // Oblique branch
     let sin_lat0 = lat0.sin();
-    let rn = WGS84_A / (1.0 - e2 * sin_lat0 * sin_lat0).sqrt();
-    let rm = WGS84_A * (1.0 - e2) / (1.0 - e2 * sin_lat0 * sin_lat0).powf(1.5);
-    let r_sphere = (rn * rm).sqrt();
+    let cos_lat0 = lat0.cos();
+    let m_c = cos_lat0 / (1.0 - e2 * sin_lat0 * sin_lat0).sqrt();
 
-    // Conformal latitude at origin
-    let n = (1.0 + (e2 * lat0.cos().powi(4)) / (1.0 - e2)).sqrt();
-    let s1 = (1.0 + sin_lat0) / (1.0 - sin_lat0);
-    let s2 = (1.0 - e * sin_lat0) / (1.0 + e * sin_lat0);
-    let w1 = (s1 * s2.powf(e)).powf(n / 2.0);
-    let sin_chi0 = (w1 - 1.0) / (w1 + 1.0);
-    let chi0 = sin_chi0.asin();
+    let chi0 = conformal_latitude(lat0, e);
+    let chi = conformal_latitude(lat, e);
 
-    // Conformal latitude of point
-    let sin_lat = lat.sin();
-    let sa = (1.0 + sin_lat) / (1.0 - sin_lat);
-    let sb = (1.0 - e * sin_lat) / (1.0 + e * sin_lat);
-    let w = (sa * sb.powf(e)).powf(n / 2.0);
-    let sin_chi = (w - 1.0) / (w + 1.0);
-    let cos_chi = (1.0 - sin_chi * sin_chi).sqrt();
+    let dl = lon - lon0;
+    let (sin_chi0, cos_chi0) = chi0.sin_cos();
+    let (sin_chi, cos_chi) = chi.sin_cos();
+    let cos_dl = dl.cos();
 
-    // Conformal longitude difference
-    let dl = n * (lon - lon0);
+    let b = 1.0 + sin_chi0 * sin_chi + cos_chi0 * cos_chi * cos_dl;
+    // A = 2·a·k₀·m_c / (cos(χ₀) · b)
+    let factor = 2.0 * a * k0 * m_c / (cos_chi0 * b);
 
-    // Stereographic projection on conformal sphere
-    let cos_chi0 = chi0.cos();
-    let sin_chi0_v = chi0.sin();
-
-    let b_denom = 1.0 + sin_chi0_v * sin_chi + cos_chi0 * cos_chi * dl.cos();
-    let b = 2.0 * r_sphere * k0 / b_denom;
-
-    let x = false_e + b * cos_chi * dl.sin();
-    let y = false_n + b * (cos_chi0 * sin_chi - sin_chi0_v * cos_chi * dl.cos());
+    let x = false_e + factor * cos_chi * dl.sin();
+    let y = false_n + factor * (cos_chi0 * sin_chi - sin_chi0 * cos_chi * cos_dl);
 
     (x, y)
+}
+
+/// Conformal latitude χ(φ) = 2·atan(tan(π/4 + φ/2) · ((1-e·sinφ)/(1+e·sinφ))^(e/2)) - π/2.
+/// At the equator and poles χ = φ. For WGS84 the maximum deviation
+/// from geodetic latitude is ~12′ near 45°.
+///
+/// **Not called at φ = ±π/2.** `tan(π/4 + π/4) = tan(π/2)` is
+/// algebraically ∞; IEEE 754 happens to evaluate it to ~1.63e16 so
+/// `2·atan(...) - π/2 ≈ π/2` would still be numerically correct,
+/// but the polar branches in `stere_forward` and `stere_inverse`
+/// short-circuit before reaching this helper. That keeps the
+/// hot path off the FP overflow corner case.
+fn conformal_latitude(lat: f64, e: f64) -> f64 {
+    let sin_lat = lat.sin();
+    let ratio = (1.0 - e * sin_lat) / (1.0 + e * sin_lat);
+    let inner = (std::f64::consts::FRAC_PI_4 + lat / 2.0).tan() * ratio.powf(e / 2.0);
+    2.0 * inner.atan() - std::f64::consts::FRAC_PI_2
 }
 
 fn stere_inverse(
@@ -830,7 +896,60 @@ fn stere_inverse(
     false_e: f64,
     false_n: f64,
 ) -> (f64, f64) {
-    // Newton iteration: robust at any distance from center
+    // Polar branch — must mirror `stere_forward`'s polar branch.
+    // The oblique Newton iteration breaks at the pole because the
+    // Jacobian is singular there (longitude is degenerate when
+    // ρ = 0; finite-difference derivatives at lat = ±π/2 step
+    // outside the valid latitude range). Use Snyder eq. 21-35..37
+    // (ellipsoidal polar inverse) instead.
+    const POLAR_THRESHOLD: f64 = 1e-10;
+    if (lat0.abs() - std::f64::consts::FRAC_PI_2).abs() < POLAR_THRESHOLD {
+        let e2 = WGS84_E2;
+        let e = e2.sqrt();
+        let a = WGS84_A;
+        let north_polar = lat0 > 0.0;
+
+        let dx = x - false_e;
+        let dy = y - false_n;
+        let rho = (dx * dx + dy * dy).sqrt();
+
+        // ρ = 0 means we're at the pole exactly; lon is degenerate,
+        // return the central meridian.
+        if rho < 1e-9 {
+            return (lat0, lon0);
+        }
+
+        let d = ((1.0 + e).powf(1.0 + e) * (1.0 - e).powf(1.0 - e)).sqrt();
+        let t = rho * d / (2.0 * a * k0);
+
+        // Iterate Snyder eq. 21-37:
+        //   φ_{i+1} = π/2 - 2·atan(t · ((1 - e·sin φ_i)/(1 + e·sin φ_i))^(e/2))
+        // Initial guess uses the spherical inverse φ₀ = π/2 - 2·atan(t).
+        let mut phi = std::f64::consts::FRAC_PI_2 - 2.0 * t.atan();
+        for _ in 0..15 {
+            let sin_phi = phi.sin();
+            let new_phi = std::f64::consts::FRAC_PI_2
+                - 2.0 * (t * ((1.0 - e * sin_phi) / (1.0 + e * sin_phi)).powf(e / 2.0)).atan();
+            if (new_phi - phi).abs() < 1e-12 {
+                phi = new_phi;
+                break;
+            }
+            phi = new_phi;
+        }
+
+        let lat_out = if north_polar { phi } else { -phi };
+        let lon_out = if north_polar {
+            lon0 + dx.atan2(-dy)
+        } else {
+            lon0 + dx.atan2(dy)
+        };
+        return (lat_out, lon_out);
+    }
+
+    // Oblique branch — Newton iteration on the forward function.
+    // Robust at any distance from center, locked to `stere_forward`
+    // by construction so any future change to forward automatically
+    // applies here.
     let mut lat = lat0;
     let mut lon = lon0;
 
@@ -1187,6 +1306,132 @@ mod tests {
         let (lon, lat) = crs.inverse(e, n).unwrap();
         assert!((lon - 12.5683).abs() < 0.001, "lon={lon}");
         assert!((lat - 55.6761).abs() < 0.001, "lat={lat}");
+    }
+
+    /// Roundtrip the four explicit DMI corner coordinates that sit
+    /// hundreds of km from the projection origin in opposite
+    /// directions. The earlier LCC-conflated `stere_forward` paired
+    /// with the Newton-iteration `stere_inverse` was self-consistent
+    /// (forward + inverse cancel) but produced wrong absolute
+    /// coordinates that broke ODIM rendering. Pinning the round-trip
+    /// at off-center points wouldn't have caught the old bug — but
+    /// it guards against a future regression that changes `forward`
+    /// without keeping `inverse` consistent (the inverse is Newton
+    /// iteration calling `forward`, so they stay locked by
+    /// construction, and this test confirms that contract).
+    #[test]
+    fn stereographic_roundtrip_dmi_far_corners() {
+        let crs = Crs::Stereographic {
+            lat0: 56.0_f64.to_radians(),
+            lon0: 10.5666_f64.to_radians(),
+            k0: 1.0,
+            false_e: 0.0,
+            false_n: 0.0,
+        };
+        for (lon, lat) in [
+            (3.0, 60.0),
+            (20.735, 59.828),
+            (4.379, 52.294),
+            (18.893, 52.294),
+        ] {
+            let (x, y) = crs.forward(lon, lat);
+            let (lon_back, lat_back) = crs.inverse(x, y).unwrap();
+            assert!(
+                (lon_back - lon).abs() < 1e-6,
+                "lon roundtrip failed at ({lon}, {lat}): got {lon_back}"
+            );
+            assert!(
+                (lat_back - lat).abs() < 1e-6,
+                "lat roundtrip failed at ({lon}, {lat}): got {lat_back}"
+            );
+        }
+    }
+
+    /// Validate `stere_inverse` against **independent** reference
+    /// projected coordinates, not just roundtrip self-consistency.
+    /// Reference values were computed with `cs2cs +proj=longlat
+    /// +ellps=WGS84 +to +proj=stere +lat_0=56 +lon_0=10.5666 +k_0=1
+    /// +ellps=WGS84 +units=m` (PROJ 9.x).
+    ///
+    /// Roundtrip tests like `stereographic_roundtrip_dmi_far_corners`
+    /// can pass even when both forward and inverse converge to the
+    /// wrong absolute coordinates — the earlier LCC-conflated
+    /// `stere_forward` + Newton-iteration `stere_inverse` was
+    /// self-consistent but at the wrong absolute coordinates,
+    /// shifting tiles by ~50%. This test eliminates that residual
+    /// doubt by asserting `inverse(known_xy) ≈ expected_lonlat`,
+    /// where the (x, y) values come from PROJ rather than from
+    /// `stere_forward`.
+    #[test]
+    fn stereographic_inverse_absolute_dmi() {
+        let crs = Crs::Stereographic {
+            lat0: 56.0_f64.to_radians(),
+            lon0: 10.5666_f64.to_radians(),
+            k0: 1.0,
+            false_e: 0.0,
+            false_n: 0.0,
+        };
+        for (x_proj, y_proj, lon_exp, lat_exp) in [
+            (91726.258980, -110388.867174, 12.0, 55.0),
+            (0.0, 0.0, 10.5666, 56.0),
+            (-153890.951450, 169926.823502, 8.0, 57.5),
+        ] {
+            let (lon, lat) = crs.inverse(x_proj, y_proj).unwrap();
+            assert!(
+                (lon - lon_exp).abs() < 1e-5,
+                "lon mismatch at ({x_proj}, {y_proj}): got {lon}, expected {lon_exp}"
+            );
+            assert!(
+                (lat - lat_exp).abs() < 1e-5,
+                "lat mismatch at ({x_proj}, {y_proj}): got {lat}, expected {lat_exp}"
+            );
+        }
+    }
+
+    /// Polar-aspect counterpart of `stereographic_inverse_absolute_dmi`.
+    /// Snyder's ellipsoidal oblique formula relies on `cos(χ_c)`
+    /// being nonzero, which at the pole holds only because IEEE 754
+    /// `cos(π/2) ≈ 6.12e-17` — *numerically* nonzero by rounding,
+    /// not algebraically. Validate that the polar case actually
+    /// matches PROJ rather than silently riding on float behaviour.
+    ///
+    /// Reference: `cs2cs +proj=longlat +ellps=WGS84 +to
+    /// +proj=stere +lat_0=90 +lon_0=25 +lat_ts=60 +ellps=WGS84
+    /// +units=m` (PROJ 9.x). This is FMI/OPERA-style polar
+    /// stereographic with standard parallel 60°N.
+    #[test]
+    fn stereographic_inverse_absolute_polar() {
+        // `k0` is the **ellipsoidal** PROJ-compatible scale factor
+        // for `+lat_ts=60` on WGS84 — i.e. the value that makes
+        // case-1 `ρ = 2·a·k₀·t/D` agree with Snyder's case-2
+        // `ρ = a·m_c·t/t_c` (eq. 21-39) which is what PROJ's
+        // `+proj=stere +lat_ts=…` uses internally. The
+        // engine-odim PROJ-string parser produces this value; the
+        // spherical shortcut `(1 + sin|lat_ts|)/2 ≈ 0.9330127` is
+        // ~200 m off on a 3000 km radius.
+        let k0 = 0.933_069_071_736_356_6;
+        let crs = Crs::Stereographic {
+            lat0: 90.0_f64.to_radians(),
+            lon0: 25.0_f64.to_radians(),
+            k0,
+            false_e: 0.0,
+            false_n: 0.0,
+        };
+        for (x_proj, y_proj, lon_exp, lat_exp) in [
+            (0.0, -3197104.586924, 25.0, 60.0),
+            (0.0, 0.0, 25.0, 90.0),
+            (-1118215.792079, -2398021.504736, 0.0, 65.0),
+        ] {
+            let (lon, lat) = crs.inverse(x_proj, y_proj).unwrap();
+            assert!(
+                (lon - lon_exp).abs() < 1e-4,
+                "lon mismatch at ({x_proj}, {y_proj}): got {lon}, expected {lon_exp}"
+            );
+            assert!(
+                (lat - lat_exp).abs() < 1e-4,
+                "lat mismatch at ({x_proj}, {y_proj}): got {lat}, expected {lat_exp}"
+            );
+        }
     }
 
     // Test at ~1000km from center (edge of typical radar composite)

@@ -61,6 +61,8 @@ pub struct CollectionConfig {
     pub querydata: Option<QueryDataConfig>,
     /// GRIB-specific configuration. Required when engine_type = "grib".
     pub grib: Option<GribConfig>,
+    /// ODIM_H5 radar-specific configuration. Required when engine_type = "odim".
+    pub odim: Option<OdimConfig>,
     /// WMS map rendering configuration. Required when apis contains "wms".
     pub wms: Option<WmsConfig>,
     /// PostGIS-specific configuration. Required when engine_type = "postgis".
@@ -307,6 +309,68 @@ pub struct QueryDataConfig {
     /// Directory poll interval in seconds. Default: 30.
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
+}
+
+/// Configuration for the ODIM_H5 weather-radar engine
+/// (`engine_type = "odim"`).
+///
+/// Phase 1 supports COMP (composite) reflectivity files from a local
+/// directory or an S3-compatible bucket. STAC sources land in
+/// Phase 2; PVOL polar-volume EDR trajectory queries land in Phase 3.
+/// See [[project_odim_engine_plan]] for the full multi-phase roadmap.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OdimConfig {
+    /// Strftime filename template. ODIM files typically encode time
+    /// in the filename (e.g. `"202503251200_radar_fi.h5"` or
+    /// `"%Y%m%dT%H%M_polar_finland_anjalankoski.h5"`). Auto-derives
+    /// the regex and timestamp format. Preferred over `filename_pattern`.
+    pub filename_template: Option<String>,
+    /// Explicit regex with named `(?P<timestamp>…)` capture group, for
+    /// filenames `filename_template` can't express. Requires
+    /// `timestamp_format`.
+    pub filename_pattern: Option<String>,
+    /// chrono strftime format for parsing `filename_pattern`'s
+    /// timestamp capture.
+    pub timestamp_format: Option<String>,
+
+    /// Parameter name advertised to clients (e.g. `"reflectivity"`).
+    /// One parameter per collection in Phase 1 — multi-parameter PVOL
+    /// volumes ship in Phase 3.
+    pub parameter: String,
+    /// Unit of measurement (e.g. `"dBZ"`). Pure metadata: the engine
+    /// does not convert between units.
+    pub unit: String,
+
+    /// Override nodata sentinel. Takes precedence over the file's
+    /// `/dataset1/data1/what/nodata` attribute. Useful when a
+    /// producer ships files with a missing or mis-declared nodata
+    /// value.
+    pub nodata: Option<f64>,
+    /// Override gain factor. Takes precedence over `/dataset1/data1/
+    /// what/gain` (or root-level `/what/gain` for producers that
+    /// place it there). `physical = raw * gain + offset`.
+    pub gain: Option<f64>,
+    /// Override offset. Same precedence rules as `gain`.
+    pub offset: Option<f64>,
+
+    /// Directory poll interval in seconds. Default: 30.
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// Maximum number of files to keep in the catalog (most recent by
+    /// timestamp). Default: unbounded. Useful for sources where the
+    /// directory may hold years of history.
+    pub max_files: Option<usize>,
+
+    /// S3-compatible endpoint URL. Phase 1 ignores this — Phase 2 will
+    /// wire S3 catalogs via `ds-storage::ObjectStore`. Engine boots
+    /// with a WARN if set, so a config typo doesn't silently fall
+    /// back to local-directory mode.
+    pub endpoint: Option<String>,
+    /// S3 bucket name. Phase 2; ignored with WARN in Phase 1.
+    pub bucket: Option<String>,
+    /// Object prefix, optionally with strftime templates. Phase 2;
+    /// ignored with WARN in Phase 1.
+    pub prefix_pattern: Option<String>,
 }
 
 fn default_grib_poll_interval() -> u64 {
