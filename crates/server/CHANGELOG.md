@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.0](https://github.com/mrauhala/meteocore/compare/v0.2.0...v0.3.0) (2026-05-15)
+
+
+### Features
+
+* **engine-odim:** EdrEngine — position + area queries (Phase 1.5) ([#177](https://github.com/mrauhala/meteocore/issues/177)) ([cbcd017](https://github.com/mrauhala/meteocore/commit/cbcd017f031aa0dd02137bb809b2f873d1bbd7c3))
+* **engine-odim:** ODIM_H5 weather radar engine (Phase 1, MapEngine) ([#176](https://github.com/mrauhala/meteocore/issues/176)) ([253bf54](https://github.com/mrauhala/meteocore/commit/253bf54f9c1989c7d7ee4dcab88a400339c3cf85))
+* **preview:** parameter dropdown + bounded time slider ([#157](https://github.com/mrauhala/meteocore/issues/157)) ([7cd874e](https://github.com/mrauhala/meteocore/commit/7cd874e6f720eaad7d8fff2691f08e02e2bea684))
+
 ## [0.2.0](https://github.com/mrauhala/meteocore/compare/v0.1.0...v0.2.0) (2026-05-12)
 
 
