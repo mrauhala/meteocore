@@ -945,6 +945,7 @@ mod tests {
             querydata_engines: RwLock::new(Vec::new()),
             grib_engines: RwLock::new(Vec::new()),
             odim_engines: RwLock::new(Vec::new()),
+            odim_volume_engines: RwLock::new(Vec::new()),
             postgis_engines: RwLock::new(Vec::new()),
             reload_lock: tokio::sync::Mutex::new(()),
             admin_token: None,

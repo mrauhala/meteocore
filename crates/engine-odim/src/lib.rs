@@ -22,6 +22,9 @@ pub mod catalog;
 pub mod edr;
 pub mod engine;
 pub mod proj;
+pub mod pvol;
 pub mod reader;
+pub mod volume_engine;
 
 pub use engine::{EngineError, OdimEngine};
+pub use volume_engine::PolarVolumeEngine;

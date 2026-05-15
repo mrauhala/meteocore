@@ -339,6 +339,7 @@ pub struct ServerState {
     pub querydata_engines: RwLock<Vec<Arc<engine_querydata::QueryDataEngine>>>,
     pub grib_engines: RwLock<Vec<Arc<engine_grib::GribEngine>>>,
     pub odim_engines: RwLock<Vec<Arc<engine_odim::OdimEngine>>>,
+    pub odim_volume_engines: RwLock<Vec<Arc<engine_odim::PolarVolumeEngine>>>,
     pub postgis_engines: RwLock<Vec<Arc<engine_postgis::PostgisEngine>>>,
     /// Serializes reload requests to prevent concurrent reloads from racing.
     pub reload_lock: tokio::sync::Mutex<()>,
@@ -364,6 +365,7 @@ pub struct LoadResult {
     pub querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>>,
     pub grib_engines: Vec<Arc<engine_grib::GribEngine>>,
     pub odim_engines: Vec<Arc<engine_odim::OdimEngine>>,
+    pub odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>>,
     pub postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>>,
 }
 
@@ -402,6 +404,7 @@ pub fn load_collections(
     let mut querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>> = Vec::new();
     let mut grib_engines: Vec<Arc<engine_grib::GribEngine>> = Vec::new();
     let mut odim_engines: Vec<Arc<engine_odim::OdimEngine>> = Vec::new();
+    let mut odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>> = Vec::new();
     let mut postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>> = Vec::new();
     // Pool registry is local to this load: collections sharing a DSN share a
     // pool via Arc<Pool>. Across reloads, pools are rebuilt — documented
@@ -427,6 +430,7 @@ pub fn load_collections(
             "querydata" => &["edr", "wms", "maps", "tiles"],
             "grib" => &["edr", "wms", "maps", "tiles"],
             "odim" => &["edr", "wms", "maps", "tiles"],
+            "odim-volume" => &["wms", "maps", "tiles"],
             "postgis" => &["edr", "features", "tiles"],
             _ => &[],
         };
@@ -1074,6 +1078,113 @@ pub fn load_collections(
                     error: None,
                 });
             }
+            "odim-volume" => {
+                let odim_cfg = match collection.odim.as_ref() {
+                    Some(c) => c,
+                    None => {
+                        tracing::error!(
+                            "Collection '{}': engine_type 'odim-volume' but missing [collections.odim] config, skipping",
+                            collection.id
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "odim-volume".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some("missing [collections.odim] config".into()),
+                        });
+                        continue;
+                    }
+                };
+                let engine = match engine_odim::PolarVolumeEngine::new(
+                    &collection.id,
+                    collection.data_path.as_deref(),
+                    odim_cfg,
+                ) {
+                    Ok(e) => Arc::new(e),
+                    Err(e) => {
+                        tracing::error!(
+                            "Collection '{}': failed to initialize ODIM polar-volume engine: {}",
+                            collection.id,
+                            e
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "odim-volume".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some(format!("{e}")),
+                        });
+                        continue;
+                    }
+                };
+
+                odim_volume_engines.push(engine.clone());
+
+                // PVOL is multi-parameter (one layer per <site>:<quantity>).
+                let raster_params =
+                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+
+                if collection.apis.contains(&"wms".to_string()) {
+                    map_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    map_collections.insert(collection.id.clone(), collection.clone());
+                    let styles = build_styles(collection, &bundle_index);
+                    map_styles.insert(collection.id.clone(), styles);
+                    if !raster_params.is_empty() {
+                        register_parameter_layer_styles(
+                            collection,
+                            &raster_params,
+                            &mut map_styles,
+                            &bundle_index,
+                        );
+                    }
+                    info!("Collection '{}': wired to WMS API", collection.id);
+                }
+                if collection.apis.contains(&"maps".to_string()) {
+                    maps_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    maps_collections.insert(collection.id.clone(), collection.clone());
+                    let styles = build_styles(collection, &bundle_index);
+                    maps_styles.insert(collection.id.clone(), styles);
+                    if !raster_params.is_empty() {
+                        register_parameter_layer_styles(
+                            collection,
+                            &raster_params,
+                            &mut maps_styles,
+                            &bundle_index,
+                        );
+                    }
+                    info!("Collection '{}': wired to Maps API", collection.id);
+                }
+                if collection.apis.contains(&"tiles".to_string()) {
+                    tiles_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    tiles_collections.insert(collection.id.clone(), collection.clone());
+                    let styles = build_styles(collection, &bundle_index);
+                    tiles_styles.insert(collection.id.clone(), styles);
+                    if !raster_params.is_empty() {
+                        register_parameter_layer_styles(
+                            collection,
+                            &raster_params,
+                            &mut tiles_styles,
+                            &bundle_index,
+                        );
+                    }
+                    info!("Collection '{}': wired to Tiles API", collection.id);
+                }
+
+                health.push(CollectionHealth {
+                    id: collection.id.clone(),
+                    engine_type: "odim-volume".into(),
+                    status: CollectionStatus::Ready,
+                    error: None,
+                });
+            }
             "postgis" => {
                 let postgis_cfg = match collection.postgis.as_ref() {
                     Some(c) => c,
@@ -1303,6 +1414,7 @@ pub fn load_collections(
         querydata_engines,
         grib_engines,
         odim_engines,
+        odim_volume_engines,
         postgis_engines,
     }
 }
@@ -1669,6 +1781,13 @@ pub async fn reload_handler(
         for engine in old_odim.iter() {
             engine.shutdown();
         }
+        let old_odim_volume = state
+            .odim_volume_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        for engine in old_odim_volume.iter() {
+            engine.shutdown();
+        }
     }
 
     let result = load_collections(&config.collections, &config.style_bundles, &base_url);
@@ -1721,6 +1840,12 @@ pub async fn reload_handler(
             poller.poll_loop().await;
         });
     }
+    for engine in &result.odim_volume_engines {
+        let poller = engine.clone();
+        tokio::spawn(async move {
+            poller.poll_loop().await;
+        });
+    }
 
     // Atomically swap state
     state.edr.store(Arc::new(result.edr_state));
@@ -1750,6 +1875,10 @@ pub async fn reload_handler(
         .odim_engines
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.odim_engines;
+    *state
+        .odim_volume_engines
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = result.odim_volume_engines;
     *state
         .postgis_engines
         .write()

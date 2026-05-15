@@ -1,0 +1,27 @@
+# FMI weather-radar polar volumes (ODIM_H5 PVOL).
+#
+# Each radar site is a stack of elevation sweeps, each with multiple
+# dual-pol moments (TH, DBZH, VRADH, ZDR, RHOHV...). The odim-volume
+# engine renders the lowest sweep of a chosen site as a Cartesian
+# raster; the WMS layer tree is one group per radar site, with the
+# moments as quantity sub-layers (parameter = `<site>:<quantity>`).
+#
+# data_path here points at the local test fixture directory; an S3
+# source for the FMI volume bucket lands in a later milestone.
+
+id = "radar-fmi-volume"
+title = "FMI Radar Polar Volumes"
+description = """\
+Finnish weather-radar polar volumes (ODIM_H5 PVOL). One layer group \
+per radar site; reflectivity and dual-polarisation moments as \
+sub-layers, rendered from the lowest elevation sweep.\
+"""
+engine_type = "odim-volume"
+apis = ["wms", "maps", "tiles"]
+data_path = "testdata/radar-fmi-pvol"
+
+[odim]
+poll_interval_secs = 300
+
+[wms]
+colormap = "radar_dbz"

@@ -334,12 +334,15 @@ pub struct OdimConfig {
     pub timestamp_format: Option<String>,
 
     /// Parameter name advertised to clients (e.g. `"reflectivity"`).
-    /// One parameter per collection in Phase 1 — multi-parameter PVOL
-    /// volumes ship in Phase 3.
-    pub parameter: String,
+    /// Required for single-parameter `engine_type = "odim"` (COMP)
+    /// collections. Unused — and may be omitted — by the multi-parameter
+    /// `engine_type = "odim-volume"` (PVOL) engine, which derives one
+    /// parameter per `<site>:<quantity>` pair from the volume files.
+    pub parameter: Option<String>,
     /// Unit of measurement (e.g. `"dBZ"`). Pure metadata: the engine
-    /// does not convert between units.
-    pub unit: String,
+    /// does not convert between units. Required for `engine_type = "odim"`;
+    /// optional for `engine_type = "odim-volume"`.
+    pub unit: Option<String>,
 
     /// Override nodata sentinel. Takes precedence over the file's
     /// `/dataset1/data1/what/nodata` attribute. Useful when a
