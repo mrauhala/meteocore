@@ -245,6 +245,16 @@ impl OdimEngine {
         data_path: Option<&str>,
         config: &ds_core::config::OdimConfig,
     ) -> Result<Self, EngineError> {
+        // `time_window` only constrains S3 prefix expansion + timestamp
+        // filtering. A local `data_path` source ignores it — warn so a
+        // misplaced setting doesn't silently do nothing.
+        if config.time_window.is_some() && config.endpoint.is_none() {
+            tracing::warn!(
+                "[{collection_id}] `time_window` is set but has no effect on a \
+                 local `data_path` ODIM source — it only applies to S3 sources"
+            );
+        }
+
         let matcher = build_matcher(config)?;
         let source = build_source(collection_id, data_path, config)?;
 

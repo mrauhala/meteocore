@@ -111,13 +111,6 @@ impl TimeWindow {
         }
         dates
     }
-
-    /// Upper bound on the number of days the window could touch — used
-    /// as a static fallback when an exact `scan_dates` isn't available.
-    pub fn max_scan_days(&self) -> u32 {
-        let days = (self.seconds.unsigned_abs() / 3_600 / 24) as u32;
-        (days + 2).max(2)
-    }
 }
 
 fn parse_component(s: &str, suffix: char, original: &str) -> Result<i64, DataServerError> {
