@@ -170,6 +170,10 @@ enum Source {
 /// for local files, the object key for remote ones — sidesteps that.
 type FileId = String;
 
+/// An inclusive `(start, end)` UTC time range — a parsed `time_window`
+/// resolved against "now".
+type TimeRange = (DateTime<Utc>, DateTime<Utc>);
+
 /// Resolve the engine's [`Source`] from config. `endpoint` + `bucket`
 /// select an S3 source; their absence falls back to the local
 /// `data_path`. Setting exactly one of `endpoint` / `bucket` is a
@@ -375,12 +379,46 @@ fn enumerate_local<'a>(
 /// errors rather than silently returning an empty catalog. Mirrors
 /// `catalog::scan_remote`'s error tolerance.
 #[allow(clippy::type_complexity)]
+/// Extract an acquisition timestamp from an object key by finding the
+/// first run of ≥ 12 consecutive ASCII digits in the basename and
+/// parsing its leading 12 as `%Y%m%d%H%M` (UTC).
+///
+/// Handles both source layouts — FMI `202605150000_fivih_PVOL.h5`
+/// (timestamp leads) and DMI `dkste_202512150405.vol.h5` (timestamp
+/// follows the station code). Returns `None` when no such digit run
+/// exists; the caller then keeps the file and relies on the
+/// post-parse `time_window` filter.
+fn parse_key_timestamp(key: &str) -> Option<DateTime<Utc>> {
+    let basename = key.rsplit('/').next().unwrap_or(key);
+    let bytes = basename.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i - start >= 12 {
+                return chrono::NaiveDateTime::parse_from_str(
+                    &basename[start..start + 12],
+                    "%Y%m%d%H%M",
+                )
+                .ok()
+                .map(|t| t.and_utc());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
 fn enumerate_remote<'a>(
     collection_id: &str,
     store: &'a ds_storage::DataStore,
     prefix_pattern: &str,
     time_window: &Option<TimeWindow>,
-) -> Result<(Vec<PendingFile<'a>>, Option<(DateTime<Utc>, DateTime<Utc>)>), EngineError> {
+) -> Result<(Vec<PendingFile<'a>>, Option<TimeRange>), EngineError> {
     use ds_storage::object_store::path::Path as ObjectPath;
 
     let now = Utc::now();
@@ -410,6 +448,20 @@ fn enumerate_remote<'a>(
             let key = obj.location.to_string();
             if !key.to_ascii_lowercase().ends_with(".h5") {
                 continue;
+            }
+            // Drop out-of-window objects *before* fetching. A per-day
+            // prefix lists a whole day (~288 files at 5-min cadence);
+            // without this pre-filter every one would be downloaded and
+            // HDF5-parsed just to be trimmed by `filter_catalog_by_time`
+            // afterwards — gigabytes of needless transfer. A key whose
+            // name carries no parseable timestamp falls through and is
+            // caught by the post-parse window filter instead.
+            if let Some((start, end)) = time_filter {
+                if let Some(ts) = parse_key_timestamp(&key) {
+                    if ts < start || ts > end {
+                        continue;
+                    }
+                }
             }
             if obj.size as u64 > MAX_REMOTE_FILE_SIZE {
                 tracing::warn!(
@@ -1303,5 +1355,25 @@ mod tests {
             build_source("c", Some("/dir"), &bucket_only),
             Err(EngineError::IncompleteS3Config)
         ));
+    }
+
+    /// The pre-fetch window filter hinges on reading a timestamp from
+    /// the object key — for both the FMI (timestamp-leading) and DMI
+    /// (timestamp-trailing) filename layouts.
+    #[test]
+    fn parse_key_timestamp_handles_fmi_and_dmi_layouts() {
+        // FMI: timestamp leads the basename.
+        let fmi = parse_key_timestamp("2026/05/15/fivih/202605150000_fivih_PVOL.h5")
+            .expect("FMI key timestamp");
+        assert_eq!(fmi.to_rfc3339(), "2026-05-15T00:00:00+00:00");
+
+        // DMI: timestamp follows the station code.
+        let dmi = parse_key_timestamp("dkste_202512150405.vol.h5").expect("DMI key timestamp");
+        assert_eq!(dmi.to_rfc3339(), "2025-12-15T04:05:00+00:00");
+
+        // No ≥12-digit run, or an unparseable stamp → None (the file
+        // then falls through to the post-parse window filter).
+        assert!(parse_key_timestamp("radar_volume.h5").is_none());
+        assert!(parse_key_timestamp("999999999999_x.h5").is_none());
     }
 }
