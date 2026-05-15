@@ -259,8 +259,34 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     let ll_lat = read_f64_attr("/where", "LL_lat")?;
     let ur_lon = read_f64_attr("/where", "UR_lon")?;
     let ur_lat = read_f64_attr("/where", "UR_lat")?;
-    let ul_lon = read_f64_attr("/where", "UL_lon").unwrap_or(ll_lon);
-    let ul_lat = read_f64_attr("/where", "UL_lat").unwrap_or(ur_lat);
+    // The `ul_lon = ll_lon, ul_lat = ur_lat` synthesis below is only
+    // correct for axis-aligned lon/lat grids. On a projected grid
+    // (stereographic, LAEA, TM, LCC) the UL corner's WGS84
+    // longitude differs materially from LL's because the projection
+    // bends the parallels — a 1984×1728 grid at 500 m/px can show
+    // several degrees of offset. Refuse the synthesis there so a
+    // future producer that omits UL on a projected composite fails
+    // loudly rather than producing a corrupted bbox anchor.
+    let ul_lon = match read_f64_attr("/where", "UL_lon") {
+        Ok(v) => v,
+        Err(_) if matches!(crs, Crs::Wgs84) => ll_lon,
+        Err(_) => {
+            return Err(ReadError::MissingAttribute {
+                group: "/where".into(),
+                name: "UL_lon (mandatory on projected grids)".into(),
+            });
+        }
+    };
+    let ul_lat = match read_f64_attr("/where", "UL_lat") {
+        Ok(v) => v,
+        Err(_) if matches!(crs, Crs::Wgs84) => ur_lat,
+        Err(_) => {
+            return Err(ReadError::MissingAttribute {
+                group: "/where".into(),
+                name: "UL_lat (mandatory on projected grids)".into(),
+            });
+        }
+    };
     let wgs84_corners = [ll_lon, ll_lat, ur_lon, ur_lat];
 
     // /dataset1/data1/data — read shape early so xsize/ysize can fall
@@ -338,14 +364,12 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     //                                with `quantity` as an attribute on /dataset1/data1
     //                                (or `/what/product` as last resort)
     //
-    // Order rationale: `/dataset1/what` (earlier-producers form) is
-    // tried first because it's structurally less specific — if both
-    // the older and canonical paths happen to coexist in a hybrid
-    // file (we haven't seen one, but it's permitted by the spec),
-    // honouring the dataset-wide value matches what tools like
-    // `wradlib` do by convention. For well-formed files where only
-    // one of the paths exists, order is irrelevant.
-    let what_paths = ["/dataset1/what", "/dataset1/data1/what", "/what"];
+    // Order rationale: canonical path (`/dataset1/data1/what`,
+    // ODIM v2.4 §7.4) wins over the older `/dataset1/what` form in
+    // a hybrid file that ships both — a writer populating the
+    // canonical location is the authoritative source, and tolerating
+    // the older path is just a backwards-compat fallback.
+    let what_paths = ["/dataset1/data1/what", "/dataset1/what", "/what"];
     let read_first_f64 = |name: &str| -> Result<f64, ReadError> {
         for p in &what_paths {
             if let Ok(v) = read_f64_attr(p, name) {
@@ -364,12 +388,12 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
 
     // Quantity has one extra fallback (DMI puts it as an attribute on
     // the `/dataset1/data1` data group itself, not in a what subgroup).
-    let quantity = read_string_attr("/dataset1/what", "quantity")
-        .or_else(|_| read_string_attr("/dataset1/data1/what", "quantity"))
+    let quantity = read_string_attr("/dataset1/data1/what", "quantity")
+        .or_else(|_| read_string_attr("/dataset1/what", "quantity"))
         .or_else(|_| read_string_attr("/dataset1/data1", "quantity"))
         .or_else(|_| read_string_attr("/what", "product"))
         .map_err(|_| ReadError::MissingAttribute {
-            group: "/dataset1/what | /dataset1/data1/what | /dataset1/data1 | /what".into(),
+            group: "/dataset1/data1/what | /dataset1/what | /dataset1/data1 | /what".into(),
             name: "quantity".into(),
         })?;
 

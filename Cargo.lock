@@ -883,10 +883,8 @@ name = "engine-odim"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
- "bytes",
  "chrono",
  "ds-core",
- "ds-storage",
  "hdf5-reader",
  "ndarray",
  "regex",

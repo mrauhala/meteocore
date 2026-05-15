@@ -287,6 +287,20 @@ mod tests {
         assert_eq!(ts.to_rfc3339(), "2025-07-14T15:30:00+00:00");
     }
 
+    /// OPERA composites use `@` to delimit the timestamp from
+    /// surrounding tokens (product/version/quantity). `@` isn't in
+    /// the explicit separator set, so it falls into the general
+    /// "close timestamp group and emit literal" branch — pinning
+    /// the expected behaviour here guards against an `expand_template`
+    /// refactor silently breaking OPERA.
+    #[test]
+    fn opera_at_separator_template() {
+        let m = FilenameMatcher::from_template("OPERA@%Y%m%dT%H%M@0@DBZH.h5").unwrap();
+        let ts = m.parse_timestamp("OPERA@20250714T1530@0@DBZH.h5").unwrap();
+        assert_eq!(ts.to_rfc3339(), "2025-07-14T15:30:00+00:00");
+        assert_eq!(m.parse_timestamp("OPERA@20250714T1530@0@DBZH.h5.tmp"), None);
+    }
+
     /// Trailing `Z` (UTC marker) is part of the timestamp region.
     /// Without this, the matcher would close the capture group
     /// before the `Z` and the chrono parser would reject `2025…30`
