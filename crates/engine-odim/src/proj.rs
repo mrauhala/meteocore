@@ -562,6 +562,30 @@ mod tests {
         ));
     }
 
+    /// `thiserror` supports `{name:fmt}` format specs (not just
+    /// bare `{name}`) — the `#[error(...)]` body desugars to a
+    /// standard `write!` so anything `format!` accepts works. This
+    /// test pins that contract: the `{percent:.3}` spec in
+    /// `ParseError::SphereProjection` must render the numeric
+    /// value with three decimal digits, not the literal text
+    /// `{percent:.3}`.
+    #[test]
+    fn sphere_projection_error_renders_percent_format_spec() {
+        let err = ParseError::SphereProjection {
+            radius: 6_371_228.0,
+            percent: 0.108_125,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("0.108"),
+            "expected `{{percent:.3}}` to render the value, got: {msg}"
+        );
+        assert!(
+            !msg.contains("{percent"),
+            "thiserror format spec rendered literally: {msg}"
+        );
+    }
+
     /// Defaults: stere with no parameters except `+proj=stere` should
     /// produce a CRS with `lat0=0, lon0=0, k0=1.0, false_e=false_n=0`.
     /// PROJ has the same defaults; surprising a downstream caller with

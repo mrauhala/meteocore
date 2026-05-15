@@ -873,6 +873,13 @@ fn stere_forward(
 /// Conformal latitude χ(φ) = 2·atan(tan(π/4 + φ/2) · ((1-e·sinφ)/(1+e·sinφ))^(e/2)) - π/2.
 /// At the equator and poles χ = φ. For WGS84 the maximum deviation
 /// from geodetic latitude is ~12′ near 45°.
+///
+/// **Not called at φ = ±π/2.** `tan(π/4 + π/4) = tan(π/2)` is
+/// algebraically ∞; IEEE 754 happens to evaluate it to ~1.63e16 so
+/// `2·atan(...) - π/2 ≈ π/2` would still be numerically correct,
+/// but the polar branches in `stere_forward` and `stere_inverse`
+/// short-circuit before reaching this helper. That keeps the
+/// hot path off the FP overflow corner case.
 fn conformal_latitude(lat: f64, e: f64) -> f64 {
     let sin_lat = lat.sin();
     let ratio = (1.0 - e * sin_lat) / (1.0 + e * sin_lat);
