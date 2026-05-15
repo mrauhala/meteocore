@@ -51,9 +51,15 @@ fn dmi_engine() -> (engine_odim::OdimEngine, tempfile::TempDir) {
 }
 
 /// `MapEngine::raster_info()` advertises the native CRS as
-/// stereographic and the WGS84 corner envelope as Denmark-ish — a
-/// sanity check that the projection-string parser, projection math,
-/// and metadata bookkeeping are connected.
+/// stereographic and the WGS84 envelope as Denmark-and-surrounds —
+/// a sanity check that the projection-string parser, projection
+/// math, and metadata bookkeeping are connected.
+///
+/// The envelope is the edge-sampled lon/lat extent of the
+/// stereographic grid (`reader::wgs84_envelope`), not the raw
+/// LL→UR corner diagonal — a DMI 500 m composite covers Denmark
+/// plus the surrounding seas and neighbouring coastlines, and the
+/// grid edges bow slightly past the corner latitudes/longitudes.
 #[test]
 fn raster_info_reports_dmi_extents() {
     let (engine, _guard) = dmi_engine();
@@ -67,15 +73,27 @@ fn raster_info_reports_dmi_extents() {
     let bbox = info
         .spatial_extent
         .expect("DMI fixture has a spatial extent");
-    assert!(
-        bbox[0] > 0.0 && bbox[2] < 25.0,
-        "longitude bbox should cover Denmark-ish range, got {bbox:?}"
-    );
-    assert!(
-        bbox[1] > 50.0 && bbox[3] < 60.0,
-        "latitude bbox should cover Denmark-ish range, got {bbox:?}"
-    );
+    assert_dmi_envelope(bbox);
     assert_eq!(info.times.len(), 1, "fixture has a single timestep");
+}
+
+/// Sanity-check a DMI-fixture WGS84 envelope `[w, s, e, n]`. The
+/// fixture's grid is fixed, so the edge-sampled envelope is
+/// deterministic (~`[3.0, 52.15, 20.74, 60.21]`); these bands are
+/// wide enough not to be brittle to projection-math tweaks but
+/// tight enough to catch a gross regression (e.g. the old
+/// LL→UR-corner shortcut, or a degenerate `[MAX,…,MIN]`).
+fn assert_dmi_envelope(bbox: [f64; 4]) {
+    let [w, s, e, n] = bbox;
+    assert!(w < e && s < n, "envelope must be well-formed, got {bbox:?}");
+    assert!(
+        (0.0..6.0).contains(&w) && (16.0..24.0).contains(&e),
+        "longitude envelope should cover Denmark-and-surrounds, got {bbox:?}"
+    );
+    assert!(
+        (48.0..56.0).contains(&s) && (57.0..63.0).contains(&n),
+        "latitude envelope should cover Denmark-and-surrounds, got {bbox:?}"
+    );
 }
 
 /// `MapEngine::get_raster_tile()` produces a 64×64 tile over
@@ -179,10 +197,7 @@ fn edr_metadata_is_consistent() {
     let bbox = engine
         .get_spatial_extent()
         .expect("fixture has a spatial extent");
-    assert!(
-        bbox[0] > 0.0 && bbox[2] < 25.0 && bbox[1] > 50.0 && bbox[3] < 60.0,
-        "spatial extent should cover Denmark-ish range, got {bbox:?}"
-    );
+    assert_dmi_envelope(bbox);
 
     // ODIM has no station list — locations is empty, query_location
     // is unsupported.

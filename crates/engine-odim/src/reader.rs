@@ -170,11 +170,18 @@ pub struct OdimComposite {
     /// outer pixel boundaries (not pixel centres). For projected
     /// CRSes this is in metres; for `Wgs84` it's in degrees.
     pub bbox: [f64; 4],
-    /// WGS84-corner bbox `[ll_lon, ll_lat, ur_lon, ur_lat]` straight
-    /// from the file's `/where` group. Kept alongside `bbox` so
-    /// callers can pick whichever frame is cheaper for their query
-    /// without re-running the projection forward.
-    pub wgs84_corners: [f64; 4],
+    /// WGS84 bounding box `[west, south, east, north]` — the
+    /// envelope of the grid in lon/lat, computed by sampling points
+    /// along every edge of `bbox` and inverse-projecting them.
+    ///
+    /// **Not** the file's raw `LL`/`UR` corner attributes: for a
+    /// projected grid (LAEA, stereographic, …) the grid is a
+    /// quadrilateral that bows in lon/lat, so its true lon/lat
+    /// extent is wider than the LL→UR diagonal. OPERA's LAEA grid,
+    /// for instance, reaches ~29° further west at its `UL` corner
+    /// than at `LL`. Edge sampling captures that (the same approach
+    /// `ds_core::geo::GeoTransform::bbox` uses for GeoTIFF).
+    pub wgs84_bbox: [f64; 4],
     /// Nominal acquisition time (UTC), parsed from
     /// `/what/date` + `/what/time`.
     pub time: DateTime<Utc>,
@@ -197,6 +204,57 @@ pub struct OdimComposite {
     /// because flipping a 2000×2000 u16 array is wasteful when
     /// callers can flip indices for free.
     pub pixels: RawPixels,
+}
+
+/// Compute the WGS84 envelope `[west, south, east, north]` of a
+/// native-CRS `bbox` `[west, south, east, north]` by sampling
+/// `EDGE_SAMPLES` points along every edge and inverse-projecting
+/// each. Points that fail to reproject are skipped.
+///
+/// Sampling the edges (not just the four corners) is what captures
+/// the bow of a projected grid in lon/lat — the same technique
+/// `ds_core::geo::GeoTransform::bbox` uses for GeoTIFF, so the two
+/// raster engines report consistent extents for the same data.
+fn wgs84_envelope(crs: &Crs, bbox: [f64; 4]) -> [f64; 4] {
+    /// Samples per edge. 20 matches `GeoTransform::bbox`; enough to
+    /// pin the bow of a continental LAEA grid to well under a pixel.
+    const EDGE_SAMPLES: usize = 20;
+
+    let [w, s, e, n] = bbox;
+    let mut min_lon = f64::MAX;
+    let mut max_lon = f64::MIN;
+    let mut min_lat = f64::MAX;
+    let mut max_lat = f64::MIN;
+    let mut accumulate = |lon: f64, lat: f64| {
+        min_lon = min_lon.min(lon);
+        max_lon = max_lon.max(lon);
+        min_lat = min_lat.min(lat);
+        max_lat = max_lat.max(lat);
+    };
+    for i in 0..=EDGE_SAMPLES {
+        let frac = i as f64 / EDGE_SAMPLES as f64;
+        // Top + bottom edges (x varies, y pinned).
+        let x = w + frac * (e - w);
+        for &y in &[s, n] {
+            if let Some((lon, lat)) = crs.inverse(x, y) {
+                accumulate(lon, lat);
+            }
+        }
+        // Left + right edges (y varies, x pinned).
+        let y = s + frac * (n - s);
+        for &x in &[w, e] {
+            if let Some((lon, lat)) = crs.inverse(x, y) {
+                accumulate(lon, lat);
+            }
+        }
+    }
+
+    // If every reprojection failed (a pathological CRS), fall back
+    // to the native bbox unchanged rather than emit `[MAX,…,MIN]`.
+    if min_lon > max_lon {
+        return bbox;
+    }
+    [min_lon, min_lat, max_lon, max_lat]
 }
 
 /// Parse an ODIM_H5 composite from a byte slice. The whole file must
@@ -248,28 +306,20 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     let time_str = read_string_attr("/what", "time")?;
     let time = parse_odim_timestamp(&date, &time_str)?;
 
-    // /where — projection + grid extents. ODIM_H5 v2.4 §6.1.2 makes
-    // all four corner pairs mandatory (LL, LR, UL, UR); some older
-    // producers ship only LL+UR (the canonical "axis-aligned in
-    // lat/lon" case). Read all four when present and fall back to
-    // synthesising LR/UL from LL/UR when they're missing.
+    // /where — projection + grid extents. We need the UL corner as
+    // the anchor for the native `bbox` (built further down). ODIM
+    // v2.4 §6.1.2 makes all four corner pairs mandatory, but some
+    // older producers ship only LL+UR for the axis-aligned
+    // lon/lat case; for those (`Crs::Wgs84` only) synthesise UL as
+    // `(LL_lon, UR_lat)`. On a projected grid that synthesis is
+    // wrong — the UL corner's lon/lat differs materially from LL's
+    // because the projection bows the parallels — so refuse it and
+    // fail loudly rather than anchor the bbox at a corrupt point.
     let projdef = read_string_attr("/where", "projdef")?;
     let crs = proj::parse(&projdef)?;
-    let ll_lon = read_f64_attr("/where", "LL_lon")?;
-    let ll_lat = read_f64_attr("/where", "LL_lat")?;
-    let ur_lon = read_f64_attr("/where", "UR_lon")?;
-    let ur_lat = read_f64_attr("/where", "UR_lat")?;
-    // The `ul_lon = ll_lon, ul_lat = ur_lat` synthesis below is only
-    // correct for axis-aligned lon/lat grids. On a projected grid
-    // (stereographic, LAEA, TM, LCC) the UL corner's WGS84
-    // longitude differs materially from LL's because the projection
-    // bends the parallels — a 1984×1728 grid at 500 m/px can show
-    // several degrees of offset. Refuse the synthesis there so a
-    // future producer that omits UL on a projected composite fails
-    // loudly rather than producing a corrupted bbox anchor.
     let ul_lon = match read_f64_attr("/where", "UL_lon") {
         Ok(v) => v,
-        Err(_) if matches!(crs, Crs::Wgs84) => ll_lon,
+        Err(_) if matches!(crs, Crs::Wgs84) => read_f64_attr("/where", "LL_lon")?,
         Err(_) => {
             return Err(ReadError::MissingAttribute {
                 group: "/where".into(),
@@ -279,7 +329,7 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     };
     let ul_lat = match read_f64_attr("/where", "UL_lat") {
         Ok(v) => v,
-        Err(_) if matches!(crs, Crs::Wgs84) => ur_lat,
+        Err(_) if matches!(crs, Crs::Wgs84) => read_f64_attr("/where", "UR_lat")?,
         Err(_) => {
             return Err(ReadError::MissingAttribute {
                 group: "/where".into(),
@@ -287,7 +337,6 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
             });
         }
     };
-    let wgs84_corners = [ll_lon, ll_lat, ur_lon, ur_lat];
 
     // /dataset1/data1/data — read shape early so xsize/ysize can fall
     // back to the data array dimensions for producers (e.g. DMI) that
@@ -392,6 +441,12 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
         xscale,
         yscale
     );
+
+    // WGS84 envelope: sample every edge of the native `bbox` and
+    // inverse-project. The LL→UR diagonal alone under-reports a
+    // projected grid's lon/lat extent (see `wgs84_bbox` docs).
+    let wgs84_bbox = wgs84_envelope(&crs, bbox);
+    tracing::debug!("ODIM WGS84 envelope: {:?}", wgs84_bbox);
 
     // gain/offset/nodata/quantity location varies by producer:
     // - Earlier producers:           /dataset1/what/{...}          (some EUMETNET v2.x files)
@@ -512,7 +567,7 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
         xsize,
         ysize,
         bbox,
-        wgs84_corners,
+        wgs84_bbox,
         time,
         quantity,
         gain,
@@ -551,6 +606,75 @@ fn parse_odim_timestamp(date: &str, time: &str) -> Result<DateTime<Utc>, ReadErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `wgs84_envelope` must capture the lon/lat bow of a projected
+    /// grid, not the LL→UR corner diagonal — and not even just the
+    /// four-corner envelope. Regression for the OPERA LAEA case:
+    ///
+    /// - the grid's `UL` corner reaches ~39.5° W while `LL` is only
+    ///   at ~10.4° W, so an LL→UR diagonal under-reports the west
+    ///   edge by ~29°;
+    /// - the grid's *top edge* bows to ~73.9° N — ~6° past both the
+    ///   `UL` (67.0°) and `UR` (67.6°) corners — so even a
+    ///   four-corner envelope under-reports the north edge.
+    ///   Per-edge sampling is what catches this.
+    ///
+    /// Inputs reproduce the real OPERA composite:
+    ///   projdef `+proj=laea +lat_0=55 +lon_0=10 +x_0=1950000
+    ///            +y_0=-2100000 +ellps=WGS84`
+    ///   grid    3800×4400 at 1000 m, UL anchored at the projected
+    ///           origin → native bbox `[0, -4.4e6, 3.8e6, 0]` m.
+    /// Verified against a live server: envelope ≈
+    ///   `[-39.536, 31.746, 57.812, 73.922]`.
+    #[test]
+    fn wgs84_envelope_captures_laea_trapezoid() {
+        let crs = Crs::LambertAzimuthalEqualArea {
+            lat0: 55.0_f64.to_radians(),
+            lon0: 10.0_f64.to_radians(),
+            false_e: 1_950_000.0,
+            false_n: -2_100_000.0,
+        };
+        let native_bbox = [0.0, -4_400_000.0, 3_800_000.0, 0.0];
+        let [w, s, e, n] = wgs84_envelope(&crs, native_bbox);
+
+        assert!(
+            w < e && s < n,
+            "envelope must be well-formed: {w},{s},{e},{n}"
+        );
+        // The LL→UR shortcut would report west ≈ -10.4 (LL_lon); the
+        // true western reach is the UL corner near -39.5° W.
+        assert!(
+            (-41.0..-38.0).contains(&w),
+            "west should reach the UL corner (~-39.5°), got {w}"
+        );
+        assert!(
+            (56.0..60.0).contains(&e),
+            "east should reach the UR corner (~57.8°), got {e}"
+        );
+        assert!(
+            (30.0..33.0).contains(&s),
+            "south should sit near the LL/LR edge (~31.7°), got {s}"
+        );
+        // The corner shortcut (or a four-corner envelope) would
+        // report north ≈ 67.6° (UR_lat); edge sampling finds the
+        // top edge's ~73.9° bow.
+        assert!(
+            n > 72.0,
+            "north should capture the top-edge bow (~73.9°), got {n}"
+        );
+    }
+
+    /// For a `Wgs84` (axis-aligned lon/lat) grid the envelope is just
+    /// the native bbox — `Crs::Wgs84::inverse` is the identity, so no
+    /// distortion is introduced.
+    #[test]
+    fn wgs84_envelope_is_identity_for_wgs84_grid() {
+        let bbox = [10.0, 50.0, 25.0, 60.0];
+        let env = wgs84_envelope(&Crs::Wgs84, bbox);
+        for (got, want) in env.iter().zip(bbox.iter()) {
+            assert!((got - want).abs() < 1e-9, "got {env:?}, want {bbox:?}");
+        }
+    }
 
     /// Date+time parsing accepts the canonical ODIM format.
     #[test]

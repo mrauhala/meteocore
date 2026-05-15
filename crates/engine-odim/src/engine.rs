@@ -174,7 +174,7 @@ impl OdimEngine {
             );
 
         let seed_native_crs = crs_label(&composite.crs);
-        let seed_spatial_extent = composite.wgs84_corners;
+        let seed_spatial_extent = composite.wgs84_bbox;
         let seed_xsize = composite.xsize;
         let seed_ysize = composite.ysize;
 
