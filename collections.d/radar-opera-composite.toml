@@ -18,7 +18,7 @@ Maximum reflectivity (DBZH) on a 2km Lambert Azimuthal Equal Area grid \
 covering Europe.\
 """
 engine_type = "odim"
-apis = ["wms", "maps", "tiles"]
+apis = ["edr", "wms", "maps", "tiles"]
 data_path = "testdata/radar-opera"
 
 [odim]

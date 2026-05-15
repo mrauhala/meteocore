@@ -18,7 +18,7 @@ Files are 500m maximum-reflectivity composite (`dk.com.*.500_max.h5`) \
 in stereographic projection centered on Denmark.\
 """
 engine_type = "odim"
-apis = ["wms", "maps", "tiles"]
+apis = ["edr", "wms", "maps", "tiles"]
 data_path = "testdata/radar-dmi"
 
 [odim]

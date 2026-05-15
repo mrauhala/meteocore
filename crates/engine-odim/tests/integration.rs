@@ -12,7 +12,9 @@
 use std::path::Path;
 
 use ds_core::config::OdimConfig;
+use ds_core::edr_engine::EdrEngine;
 use ds_core::map_engine::{MapEngine, OutputCrs};
+use ds_core::model::{AreaQueryResult, DomainDescription};
 
 /// Construct an `OdimEngine` over `testdata/odim-dmi-fixture.h5`
 /// (a real DMI v2.0 ODIM_H5 composite shipped in this repo). Returns
@@ -145,4 +147,158 @@ fn get_raster_tile_full_extent_does_not_panic() {
         .expect("full-extent render succeeds");
 
     assert_eq!(tile.values.len(), 32 * 32);
+}
+
+// ---------------------------------------------------------------------------
+// EdrEngine (Phase 1.5)
+// ---------------------------------------------------------------------------
+
+/// EDR collection-metadata accessors report sane values for the DMI
+/// fixture: one parameter, position+area query types, a single-step
+/// temporal extent, and a Denmark-ish spatial extent.
+#[test]
+fn edr_metadata_is_consistent() {
+    let (engine, _guard) = dmi_engine();
+
+    assert_eq!(engine.get_parameters(), vec!["reflectivity".to_string()]);
+
+    let mut qt = engine.supported_query_types();
+    qt.sort();
+    assert_eq!(qt, vec!["area".to_string(), "position".to_string()]);
+
+    let (start, end) = engine
+        .get_temporal_extent()
+        .expect("fixture has a temporal extent");
+    assert_eq!(start, end, "single-file fixture → degenerate interval");
+
+    let times = engine
+        .get_available_times()
+        .expect("fixture advertises discrete times");
+    assert_eq!(times.len(), 1);
+
+    let bbox = engine
+        .get_spatial_extent()
+        .expect("fixture has a spatial extent");
+    assert!(
+        bbox[0] > 0.0 && bbox[2] < 25.0 && bbox[1] > 50.0 && bbox[3] < 60.0,
+        "spatial extent should cover Denmark-ish range, got {bbox:?}"
+    );
+
+    // ODIM has no station list — locations is empty, query_location
+    // is unsupported.
+    assert!(engine.get_locations().unwrap().is_empty());
+    assert!(engine.query_location("anything", None, None).is_err());
+}
+
+/// `query_position` over central Denmark returns a `PointSeries`
+/// coverage: x/y pinned to the requested point, one timestep, an
+/// `NdArray` shaped `[1]` over the `t` axis. Pixel content isn't
+/// asserted — the checked-in fixture is a clear-air snapshot.
+#[test]
+fn edr_query_position_returns_point_series() {
+    let (engine, _guard) = dmi_engine();
+    let result = engine
+        .query_position("POINT(10.5 56.0)", None, None)
+        .expect("position query succeeds");
+
+    match result.domain {
+        DomainDescription::PointSeries { x, y, ref t } => {
+            assert_eq!((x, y), (10.5, 56.0));
+            assert_eq!(t.len(), 1);
+        }
+        other => panic!("expected PointSeries, got {other:?}"),
+    }
+    let range = result
+        .ranges
+        .get("reflectivity")
+        .expect("range keyed by parameter name");
+    assert_eq!(range.shape, vec![1]);
+    assert_eq!(range.axis_names, vec!["t".to_string()]);
+    assert_eq!(range.values.len(), 1);
+}
+
+/// A position query for a point far outside the composite still
+/// returns a well-formed coverage — the single value is simply
+/// `None` (off-grid), not an error.
+#[test]
+fn edr_query_position_off_grid_is_none() {
+    let (engine, _guard) = dmi_engine();
+    let result = engine
+        .query_position("POINT(-140.0 12.0)", None, None)
+        .expect("off-grid position query still succeeds");
+    let range = &result.ranges["reflectivity"];
+    assert_eq!(range.values, vec![None]);
+}
+
+/// An unknown `parameters` filter is rejected.
+#[test]
+fn edr_query_position_rejects_unknown_parameter() {
+    let (engine, _guard) = dmi_engine();
+    let err = engine
+        .query_position("POINT(10.5 56.0)", None, Some(&["temperature".to_string()]))
+        .unwrap_err();
+    assert!(format!("{err}").contains("Unknown parameter"));
+}
+
+/// `query_area` over a Denmark bbox returns a `Single` `Grid`
+/// coverage whose `NdArray` length equals the product of its shape
+/// dimensions (the CoverageJSON NdArray invariant).
+#[test]
+fn edr_query_area_returns_grid() {
+    let (engine, _guard) = dmi_engine();
+    let result = engine
+        .query_area("9.0,55.0,12.0,57.5", None, None)
+        .expect("area query succeeds");
+
+    let coverage = match result {
+        AreaQueryResult::Single(qr) => qr,
+        AreaQueryResult::Collection(_) => panic!("ODIM area query must return Single"),
+    };
+
+    let (nx, ny) = match coverage.domain {
+        DomainDescription::Grid {
+            ref x,
+            ref y,
+            ref t,
+        } => {
+            assert!(t.is_none(), "single-file fixture → no time axis");
+            (x.len(), y.len())
+        }
+        other => panic!("expected Grid, got {other:?}"),
+    };
+    assert!(nx > 0 && ny > 0);
+
+    let range = &coverage.ranges["reflectivity"];
+    assert_eq!(range.shape, vec![ny, nx]);
+    assert_eq!(range.axis_names, vec!["y".to_string(), "x".to_string()]);
+    assert_eq!(
+        range.values.len(),
+        ny * nx,
+        "NdArray length must equal the product of shape dims"
+    );
+}
+
+/// A `POLYGON(...)` area query masks cells outside the ring to
+/// `None`. A degenerate thin triangle leaves most of its bbox grid
+/// masked, so the masked-cell count is strictly positive.
+#[test]
+fn edr_query_area_masks_outside_polygon() {
+    let (engine, _guard) = dmi_engine();
+    let result = engine
+        .query_area(
+            "POLYGON((9.0 55.0, 12.0 55.0, 9.0 57.0, 9.0 55.0))",
+            None,
+            None,
+        )
+        .expect("polygon area query succeeds");
+    let coverage = match result {
+        AreaQueryResult::Single(qr) => qr,
+        AreaQueryResult::Collection(_) => panic!("expected Single"),
+    };
+    let range = &coverage.ranges["reflectivity"];
+    let masked = range.values.iter().filter(|v| v.is_none()).count();
+    assert!(
+        masked > 0,
+        "a thin triangle must leave some bbox cells outside the polygon"
+    );
 }

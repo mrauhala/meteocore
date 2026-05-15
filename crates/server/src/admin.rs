@@ -426,11 +426,7 @@ pub fn load_collections(
             "geotiff" => &["edr", "wms", "maps", "tiles"],
             "querydata" => &["edr", "wms", "maps", "tiles"],
             "grib" => &["edr", "wms", "maps", "tiles"],
-            // ODIM Phase 1 ships MapEngine only — EDR is being added in a
-            // follow-up commit. Listing it here as unsupported makes a
-            // config typo `apis = ["edr"]` fail loudly at load rather
-            // than silently serving 404s.
-            "odim" => &["wms", "maps", "tiles"],
+            "odim" => &["edr", "wms", "maps", "tiles"],
             "postgis" => &["edr", "features", "tiles"],
             _ => &[],
         };
@@ -1020,9 +1016,15 @@ pub fn load_collections(
 
                 odim_engines.push(engine.clone());
 
-                // EDR will be wired here in a follow-up commit once
-                // `OdimEngine` implements `EdrEngine`. For now ODIM
-                // serves WMS/Maps/Tiles only.
+                if collection.apis.contains(&"edr".to_string()) {
+                    edr_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+                    );
+                    edr_collections.insert(collection.id.clone(), collection.clone());
+                    info!("Collection '{}': wired to EDR API", collection.id);
+                }
+
                 let raster_params =
                     ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
 

@@ -19,6 +19,7 @@
 //! integration map that Phase 2 will draw on.
 
 pub mod catalog;
+pub mod edr;
 pub mod engine;
 pub mod proj;
 pub mod reader;

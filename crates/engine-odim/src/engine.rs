@@ -48,18 +48,20 @@ use crate::reader::{read_composite, OdimComposite};
 /// publish refreshed entries (new files, removed files) without
 /// disturbing in-flight reads.
 pub struct OdimEngine {
-    catalog: Arc<ArcSwap<Vec<CatalogEntry>>>,
-    collection_id: String,
-    parameter: String,
-    unit: String,
-    gain_override: Option<f64>,
-    offset_override: Option<f64>,
-    nodata_override: Option<f64>,
+    // Fields used by both the `MapEngine` impl (this file) and the
+    // `EdrEngine` impl (`edr.rs`) are `pub(crate)`.
+    pub(crate) catalog: Arc<ArcSwap<Vec<CatalogEntry>>>,
+    pub(crate) collection_id: String,
+    pub(crate) parameter: String,
+    pub(crate) unit: String,
+    pub(crate) gain_override: Option<f64>,
+    pub(crate) offset_override: Option<f64>,
+    pub(crate) nodata_override: Option<f64>,
     /// Single-entry path-keyed cache. ODIM composites are small (a
     /// few MB) but HDF5 parsing dominates `get_raster_tile` latency
     /// at high request rates — keeping the last file resident makes
     /// hot-tile loops effectively free of read cost.
-    cached: Mutex<Option<(PathBuf, Arc<OdimComposite>)>>,
+    pub(crate) cached: Mutex<Option<(PathBuf, Arc<OdimComposite>)>>,
     /// Source state for the poll loop.
     data_dir: PathBuf,
     matcher: FilenameMatcher,
@@ -342,7 +344,10 @@ impl OdimEngine {
     /// Maps / Tiles handlers do this); a future `EdrEngine` impl
     /// or a health-check pre-warmer would need its own
     /// `spawn_blocking` to avoid stalling Tokio workers.
-    fn load_composite(&self, path: &Path) -> Result<Arc<OdimComposite>, DataServerError> {
+    pub(crate) fn load_composite(
+        &self,
+        path: &Path,
+    ) -> Result<Arc<OdimComposite>, DataServerError> {
         // Use a path-keyed single-entry cache. Cache hits return the
         // same `Arc` to every caller; on a cold miss two concurrent
         // `spawn_blocking` callers may both read the file and both
