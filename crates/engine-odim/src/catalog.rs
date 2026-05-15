@@ -109,6 +109,20 @@ impl FilenameMatcher {
                 pattern: pattern.to_string(),
             });
         }
+        // Belt-and-suspenders alongside the doc comment: surface a
+        // runtime WARN for an operator who reads the config docs
+        // but not this constructor's source. `^`/`$` anchors are
+        // optional by spec — we don't reject — but most callers
+        // want them, and forgetting them silently admits
+        // `.tmp`/`.part` partial-upload markers as catalog entries.
+        if !pattern.starts_with('^') || !pattern.ends_with('$') {
+            warn!(
+                "[catalog] filename_pattern `{pattern}` is not fully anchored (`^...$`) — \
+                 partial-upload markers like `.tmp` / `.part` may match and be served as \
+                 valid catalog entries. Add `^` and `$` to your pattern unless this is \
+                 intentional."
+            );
+        }
         let regex = Regex::new(pattern).map_err(|e| CatalogError::InvalidRegex {
             pattern: pattern.to_string(),
             source: e,

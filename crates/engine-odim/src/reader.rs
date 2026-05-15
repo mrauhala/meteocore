@@ -308,12 +308,30 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     // doesn't). If both exist and disagree, trust /where — the spec
     // wins over what could be a transposed array on the producer
     // side.
-    let xsize = read_f64_attr("/where", "xsize")
-        .map(|v| v as u32)
-        .unwrap_or(cols as u32);
-    let ysize = read_f64_attr("/where", "ysize")
-        .map(|v| v as u32)
-        .unwrap_or(rows as u32);
+    //
+    // Range-check the f64 → u32 cast: a negative xsize wraps to a
+    // huge u32, a value > u32::MAX silently truncates, and a NaN
+    // becomes 0. All three would silently corrupt the bbox
+    // computation downstream. Reject them rather than fall back —
+    // we'd rather refuse a bad file than render with a wrong extent.
+    let xsize = match read_f64_attr("/where", "xsize") {
+        Ok(v) if v.is_finite() && v > 0.0 && v <= u32::MAX as f64 => v as u32,
+        Ok(v) => {
+            return Err(ReadError::DatasetRead(format!(
+                "/where/xsize is not a positive finite integer-valued f64 in [1, u32::MAX]: {v}"
+            )));
+        }
+        Err(_) => cols as u32,
+    };
+    let ysize = match read_f64_attr("/where", "ysize") {
+        Ok(v) if v.is_finite() && v > 0.0 && v <= u32::MAX as f64 => v as u32,
+        Ok(v) => {
+            return Err(ReadError::DatasetRead(format!(
+                "/where/ysize is not a positive finite integer-valued f64 in [1, u32::MAX]: {v}"
+            )));
+        }
+        Err(_) => rows as u32,
+    };
 
     // Native bbox: build from `/where/xscale` + `/where/yscale` +
     // xsize/ysize (definitional grid dimensions in projected metres,
@@ -397,23 +415,18 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
             name: "quantity".into(),
         })?;
 
-    // Try u8 (DMI v2.0, SMHI v2.2), u16 (some EUMETNET v2.x), then
-    // f64 (OPERA v2.4 — pre-decoded physical values). `read_array`
-    // returns `Err` on dtype mismatch rather than panicking, so the
-    // fallback chain is safe.
-    //
-    // The u8 probe is the most common dtype for ODIM composites
-    // (it's what DMI and SMHI both ship). Surface its error at
-    // WARN so a decompression bug in `hdf5-reader 0.4` (which
-    // currently silently fails DEFLATE on certain SMHI files and
-    // makes them look dtype-mismatched) is diagnosable instead of
-    // collapsing to a generic `UnsupportedPixelType` at the end of
-    // the chain.
+    // Try u8 (DMI v2.0, SMHI v2.2), u16 (some EUMETNET v2.x, DWD
+    // v2.3), then f64 (OPERA v2.4 — pre-decoded physical values).
+    // `read_array` returns `Err` on dtype mismatch rather than
+    // panicking, so the fallback chain is safe. Per-probe errors
+    // are captured at `debug!` (every load of a DWD or OPERA file
+    // would otherwise spam the u8 error) and only escalated to
+    // `warn!` when every probe fails — at that point a likely
+    // upstream cause (hdf5-reader 0.4 silently mis-handling
+    // DEFLATE on certain SMHI files) is worth surfacing.
     let u8_probe = ds.read_array::<u8>();
     if let Err(ref e) = u8_probe {
-        tracing::warn!(
-            "ODIM u8 pixel-array read failed (possible hdf5-reader DEFLATE bug on SMHI files): {e}"
-        );
+        tracing::debug!("ODIM u8 pixel-array probe failed: {e}");
     }
     let pixels = if let Ok(arr) = u8_probe {
         let a2 = arr
@@ -426,30 +439,54 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
             )));
         }
         RawPixels::U8(a2)
-    } else if let Ok(arr) = ds.read_array::<u16>() {
-        let a2 = arr
-            .into_dimensionality::<ndarray::Ix2>()
-            .map_err(|e| ReadError::DatasetRead(format!("u16 reshape failed: {e}")))?;
-        if a2.dim() != (rows, cols) {
-            return Err(ReadError::DatasetRead(format!(
-                "u16 array shape {:?} doesn't match metadata {rows}x{cols}",
-                a2.dim()
-            )));
-        }
-        RawPixels::U16(a2)
-    } else if let Ok(arr) = ds.read_array::<f64>() {
-        let a2 = arr
-            .into_dimensionality::<ndarray::Ix2>()
-            .map_err(|e| ReadError::DatasetRead(format!("f64 reshape failed: {e}")))?;
-        if a2.dim() != (rows, cols) {
-            return Err(ReadError::DatasetRead(format!(
-                "f64 array shape {:?} doesn't match metadata {rows}x{cols}",
-                a2.dim()
-            )));
-        }
-        RawPixels::F64(a2)
     } else {
-        return Err(ReadError::UnsupportedPixelType);
+        let u16_probe = ds.read_array::<u16>();
+        if let Err(ref e) = u16_probe {
+            tracing::debug!("ODIM u16 pixel-array probe failed: {e}");
+        }
+        if let Ok(arr) = u16_probe {
+            let a2 = arr
+                .into_dimensionality::<ndarray::Ix2>()
+                .map_err(|e| ReadError::DatasetRead(format!("u16 reshape failed: {e}")))?;
+            if a2.dim() != (rows, cols) {
+                return Err(ReadError::DatasetRead(format!(
+                    "u16 array shape {:?} doesn't match metadata {rows}x{cols}",
+                    a2.dim()
+                )));
+            }
+            RawPixels::U16(a2)
+        } else {
+            let f64_probe = ds.read_array::<f64>();
+            if let Err(ref e) = f64_probe {
+                tracing::debug!("ODIM f64 pixel-array probe failed: {e}");
+            }
+            if let Ok(arr) = f64_probe {
+                let a2 = arr
+                    .into_dimensionality::<ndarray::Ix2>()
+                    .map_err(|e| ReadError::DatasetRead(format!("f64 reshape failed: {e}")))?;
+                if a2.dim() != (rows, cols) {
+                    return Err(ReadError::DatasetRead(format!(
+                        "f64 array shape {:?} doesn't match metadata {rows}x{cols}",
+                        a2.dim()
+                    )));
+                }
+                RawPixels::F64(a2)
+            } else {
+                // All three probes failed. This is the only point at
+                // which a u8 probe error indicates something genuinely
+                // wrong (a real u8 file that hdf5-reader couldn't
+                // decompress, or an unsupported dtype like i32). Log
+                // both the u8 and u16 errors at WARN since either may
+                // be the diagnostic clue an operator needs.
+                if let Err(e) = &u8_probe {
+                    tracing::warn!(
+                        "ODIM pixel-array unreadable as u8/u16/f64; u8 probe error \
+                         (possible hdf5-reader DEFLATE bug on SMHI files): {e}"
+                    );
+                }
+                return Err(ReadError::UnsupportedPixelType);
+            }
+        }
     };
 
     Ok(OdimComposite {

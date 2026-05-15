@@ -803,18 +803,51 @@ fn stere_forward(
     false_n: f64,
 ) -> (f64, f64) {
     // Snyder, "Map Projections — A Working Manual" (USGS PP 1395,
-    // 1987), §21 "Stereographic", eq. 21-26 through 21-30
-    // (ellipsoidal oblique aspect). This matches PROJ's
-    // `+proj=stere`. The earlier `(rn0·rm0).sqrt()` form was the
-    // double-stereographic / EPSG 9809 radius (PROJ's
+    // 1987), §21 "Stereographic", ellipsoidal aspect. Matches
+    // PROJ's `+proj=stere`. The earlier `(rn0·rm0).sqrt()` form
+    // was the double-stereographic / EPSG 9809 radius (PROJ's
     // `+proj=sterea`), a different projection that diverges from
     // `+proj=stere` by ~300 m at 100 km from origin and would
     // misalign DMI/OPERA tiles even though forward+inverse
     // roundtripped self-consistently.
+    //
+    // Two ellipsoidal cases:
+    //   - Oblique (|lat0| < π/2): Snyder eq. 21-26..30. Uses
+    //     `m_c / cos(χ_c)` for the radius factor.
+    //   - Polar (|lat0| = π/2): Snyder eq. 21-33. The oblique
+    //     formula's `m_c` and `cos(χ_c)` both numerically vanish
+    //     at the pole (their ratio happens to stay finite by IEEE
+    //     754 rounding alone), so use the dedicated polar form
+    //     `ρ = 2·a·k₀·t / D` with `D = √((1+e)^(1+e)·(1-e)^(1-e))`.
     let e2 = WGS84_E2;
     let e = e2.sqrt();
     let a = WGS84_A;
 
+    // Polar branch — check before computing oblique-only terms
+    // that would be ill-conditioned at the pole.
+    const POLAR_THRESHOLD: f64 = 1e-10;
+    if (lat0.abs() - std::f64::consts::FRAC_PI_2).abs() < POLAR_THRESHOLD {
+        let north_polar = lat0 > 0.0;
+        let sin_lat = lat.sin();
+        let t = ((std::f64::consts::FRAC_PI_4 - if north_polar { lat / 2.0 } else { -lat / 2.0 })
+            .tan())
+            * ((1.0 + e * sin_lat * if north_polar { 1.0 } else { -1.0 })
+                / (1.0 - e * sin_lat * if north_polar { 1.0 } else { -1.0 }))
+            .powf(e / 2.0);
+        let d = ((1.0 + e).powf(1.0 + e) * (1.0 - e).powf(1.0 - e)).sqrt();
+        let rho = 2.0 * a * k0 * t / d;
+        let dl = lon - lon0;
+        let x = false_e + rho * dl.sin();
+        let y = false_n
+            + if north_polar {
+                -rho * dl.cos()
+            } else {
+                rho * dl.cos()
+            };
+        return (x, y);
+    }
+
+    // Oblique branch
     let sin_lat0 = lat0.sin();
     let cos_lat0 = lat0.cos();
     let m_c = cos_lat0 / (1.0 - e2 * sin_lat0 * sin_lat0).sqrt();
@@ -856,7 +889,60 @@ fn stere_inverse(
     false_e: f64,
     false_n: f64,
 ) -> (f64, f64) {
-    // Newton iteration: robust at any distance from center
+    // Polar branch — must mirror `stere_forward`'s polar branch.
+    // The oblique Newton iteration breaks at the pole because the
+    // Jacobian is singular there (longitude is degenerate when
+    // ρ = 0; finite-difference derivatives at lat = ±π/2 step
+    // outside the valid latitude range). Use Snyder eq. 21-35..37
+    // (ellipsoidal polar inverse) instead.
+    const POLAR_THRESHOLD: f64 = 1e-10;
+    if (lat0.abs() - std::f64::consts::FRAC_PI_2).abs() < POLAR_THRESHOLD {
+        let e2 = WGS84_E2;
+        let e = e2.sqrt();
+        let a = WGS84_A;
+        let north_polar = lat0 > 0.0;
+
+        let dx = x - false_e;
+        let dy = y - false_n;
+        let rho = (dx * dx + dy * dy).sqrt();
+
+        // ρ = 0 means we're at the pole exactly; lon is degenerate,
+        // return the central meridian.
+        if rho < 1e-9 {
+            return (lat0, lon0);
+        }
+
+        let d = ((1.0 + e).powf(1.0 + e) * (1.0 - e).powf(1.0 - e)).sqrt();
+        let t = rho * d / (2.0 * a * k0);
+
+        // Iterate Snyder eq. 21-37:
+        //   φ_{i+1} = π/2 - 2·atan(t · ((1 - e·sin φ_i)/(1 + e·sin φ_i))^(e/2))
+        // Initial guess uses the spherical inverse φ₀ = π/2 - 2·atan(t).
+        let mut phi = std::f64::consts::FRAC_PI_2 - 2.0 * t.atan();
+        for _ in 0..15 {
+            let sin_phi = phi.sin();
+            let new_phi = std::f64::consts::FRAC_PI_2
+                - 2.0 * (t * ((1.0 - e * sin_phi) / (1.0 + e * sin_phi)).powf(e / 2.0)).atan();
+            if (new_phi - phi).abs() < 1e-12 {
+                phi = new_phi;
+                break;
+            }
+            phi = new_phi;
+        }
+
+        let lat_out = if north_polar { phi } else { -phi };
+        let lon_out = if north_polar {
+            lon0 + dx.atan2(-dy)
+        } else {
+            lon0 + dx.atan2(dy)
+        };
+        return (lat_out, lon_out);
+    }
+
+    // Oblique branch — Newton iteration on the forward function.
+    // Robust at any distance from center, locked to `stere_forward`
+    // by construction so any future change to forward automatically
+    // applies here.
     let mut lat = lat0;
     let mut lon = lon0;
 
@@ -1290,6 +1376,52 @@ mod tests {
             );
             assert!(
                 (lat - lat_exp).abs() < 1e-5,
+                "lat mismatch at ({x_proj}, {y_proj}): got {lat}, expected {lat_exp}"
+            );
+        }
+    }
+
+    /// Polar-aspect counterpart of `stereographic_inverse_absolute_dmi`.
+    /// Snyder's ellipsoidal oblique formula relies on `cos(χ_c)`
+    /// being nonzero, which at the pole holds only because IEEE 754
+    /// `cos(π/2) ≈ 6.12e-17` — *numerically* nonzero by rounding,
+    /// not algebraically. Validate that the polar case actually
+    /// matches PROJ rather than silently riding on float behaviour.
+    ///
+    /// Reference: `cs2cs +proj=longlat +ellps=WGS84 +to
+    /// +proj=stere +lat_0=90 +lon_0=25 +lat_ts=60 +ellps=WGS84
+    /// +units=m` (PROJ 9.x). This is FMI/OPERA-style polar
+    /// stereographic with standard parallel 60°N.
+    #[test]
+    fn stereographic_inverse_absolute_polar() {
+        // `k0` is the **ellipsoidal** PROJ-compatible scale factor
+        // for `+lat_ts=60` on WGS84 — i.e. the value that makes
+        // case-1 `ρ = 2·a·k₀·t/D` agree with Snyder's case-2
+        // `ρ = a·m_c·t/t_c` (eq. 21-39) which is what PROJ's
+        // `+proj=stere +lat_ts=…` uses internally. The
+        // engine-odim PROJ-string parser produces this value; the
+        // spherical shortcut `(1 + sin|lat_ts|)/2 ≈ 0.9330127` is
+        // ~200 m off on a 3000 km radius.
+        let k0 = 0.933_069_071_736_356_6;
+        let crs = Crs::Stereographic {
+            lat0: 90.0_f64.to_radians(),
+            lon0: 25.0_f64.to_radians(),
+            k0,
+            false_e: 0.0,
+            false_n: 0.0,
+        };
+        for (x_proj, y_proj, lon_exp, lat_exp) in [
+            (0.0, -3197104.586924, 25.0, 60.0),
+            (0.0, 0.0, 25.0, 90.0),
+            (-1118215.792079, -2398021.504736, 0.0, 65.0),
+        ] {
+            let (lon, lat) = crs.inverse(x_proj, y_proj).unwrap();
+            assert!(
+                (lon - lon_exp).abs() < 1e-4,
+                "lon mismatch at ({x_proj}, {y_proj}): got {lon}, expected {lon_exp}"
+            );
+            assert!(
+                (lat - lat_exp).abs() < 1e-4,
                 "lat mismatch at ({x_proj}, {y_proj}): got {lat}, expected {lat_exp}"
             );
         }
