@@ -315,6 +315,17 @@ impl OdimEngine {
         // never visible to clients. A swap to a different path
         // happens only when a different file is asked for.
         //
+        // Different-path concurrent misses (e.g. two adjacent
+        // timestep requests arriving during a time-slider scrub)
+        // are tolerated but not optimised: both callers fall
+        // through to `std::fs::read`, both decode, and whichever
+        // takes the write lock last evicts the other's entry. Both
+        // callers still get a valid `Arc` (data is correct,
+        // composites are immutable) — the cost is at most one
+        // extra file read per burst. A future LRU upgrade should
+        // be a multi-entry cache rather than this single-slot
+        // version to eliminate that cost.
+        //
         // Mutex poison is recovered (rather than silently disabling
         // the cache for the lifetime of the engine). The cached
         // entry is just bytes + path — no invariants to protect —

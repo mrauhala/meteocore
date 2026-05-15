@@ -33,6 +33,10 @@ pub enum ParseError {
     InvalidNumber { param: String, value: String },
     #[error("PROJ parameter `+{0}` is required for `+proj={1}` but missing")]
     MissingParam(&'static str, &'static str),
+    #[error(
+        "PROJ parameter `+R={radius}` indicates a sphere-based projection, but Phase 1's stere_forward/stere_inverse hardcodes WGS84 ellipsoid constants. Producer `xscale`/`yscale` would be in sphere metres while our forward output is in ellipsoid metres — bbox would be off by ~{percent:.3}%. Tracked as a follow-up; for now ship `+ellps=WGS84` instead, or omit `+R=` (which we then treat as WGS84)."
+    )]
+    SphereProjection { radius: f64, percent: f64 },
 }
 
 /// Parse a PROJ.4 string from an ODIM `/where/projdef` value into a
@@ -44,9 +48,21 @@ pub enum ParseError {
 /// - `laea`:  `+lat_0`, `+lon_0`, `+x_0`, `+y_0`
 /// - `longlat`: (no parameters needed beyond `+proj=longlat`)
 ///
-/// Unrecognised parameters (`+R=`, `+ellps=`, `+datum=`, `+units=`,
-/// `+no_defs`, etc.) are silently ignored — ODIM uses sphere-based
-/// projections and these don't change the pixel-to-world map.
+/// Unrecognised parameters (`+ellps=`, `+datum=`, `+units=`,
+/// `+no_defs`, etc.) are silently ignored — for the three Phase 1
+/// tested producers (DMI, DWD, OPERA, all `+ellps=WGS84`) the
+/// hardcoded WGS84 constants in `stere_forward` already match.
+///
+/// **`+R=` is the exception**: if a producer ships a custom sphere
+/// radius (e.g. FMI's `+R=6371228`), `stere_forward` would still
+/// compute WGS84-ellipsoid metres while the file's `xscale`/`yscale`
+/// are in sphere metres — producing a bbox that's wrong by ~0.1%
+/// (~5 px at OPERA scale). Until we add sphere-radius support
+/// (carry `R` through `Crs::Stereographic` and either scale or
+/// branch in `stere_forward`), reject `+R=` with a clear error
+/// when it differs materially from `WGS84_A`. A value within
+/// `WGS84_A_TOLERANCE` is accepted (some producers ship
+/// `+R=6378137` as a no-op).
 ///
 /// For polar stereographic (`+lat_0=±90`) with `+lat_ts` and without an
 /// explicit `+k_0`, the scale factor is computed on the sphere as
@@ -111,7 +127,29 @@ fn parse_k0(params: &HashMap<String, String>) -> Result<Option<f64>, ParseError>
     }
 }
 
+/// WGS84 semi-major axis in metres (matches `ds_core::geo::WGS84_A`).
+const WGS84_A: f64 = 6_378_137.0;
+/// Tolerance for accepting `+R=` as WGS84-compatible. The producer
+/// is reaffirming the WGS84 sphere within ~1 metre.
+const WGS84_A_TOLERANCE: f64 = 1.0;
+
+/// Reject `+R=` when it differs materially from `WGS84_A`. See the
+/// module-level doc for rationale: until `Crs::Stereographic`
+/// carries a radius, the file's `xscale`/`yscale` (in producer
+/// sphere metres) would be combined with `stere_forward` output
+/// (in WGS84 ellipsoid metres) and the bbox would drift.
+fn check_radius(params: &HashMap<String, String>) -> Result<(), ParseError> {
+    if let Some(r) = parse_f64(params, "R")? {
+        if (r - WGS84_A).abs() > WGS84_A_TOLERANCE {
+            let percent = (r - WGS84_A).abs() / WGS84_A * 100.0;
+            return Err(ParseError::SphereProjection { radius: r, percent });
+        }
+    }
+    Ok(())
+}
+
 fn parse_stere(params: &HashMap<String, String>) -> Result<Crs, ParseError> {
+    check_radius(params)?;
     let lat0 = parse_f64(params, "lat_0")?.unwrap_or(0.0);
     let lon0 = parse_f64(params, "lon_0")?.unwrap_or(0.0);
     let false_e = parse_f64(params, "x_0")?.unwrap_or(0.0);
@@ -184,6 +222,7 @@ fn parse_stere(params: &HashMap<String, String>) -> Result<Crs, ParseError> {
 }
 
 fn parse_tmerc(params: &HashMap<String, String>) -> Result<Crs, ParseError> {
+    check_radius(params)?;
     let lat0 = parse_f64(params, "lat_0")?.unwrap_or(0.0);
     let lon0 = parse_f64(params, "lon_0")?.unwrap_or(0.0);
     let k0 = parse_k0(params)?.unwrap_or(1.0);
@@ -200,6 +239,7 @@ fn parse_tmerc(params: &HashMap<String, String>) -> Result<Crs, ParseError> {
 }
 
 fn parse_laea(params: &HashMap<String, String>) -> Result<Crs, ParseError> {
+    check_radius(params)?;
     let lat0 = parse_f64(params, "lat_0")?.unwrap_or(0.0);
     let lon0 = parse_f64(params, "lon_0")?.unwrap_or(0.0);
     let false_e = parse_f64(params, "x_0")?.unwrap_or(0.0);
@@ -335,8 +375,12 @@ mod tests {
     ///   k0  = m_c · D / (2 · t_c)  ≈  0.9330690717363566
     #[test]
     fn fmi_polar_stereographic_with_lat_ts_converts_to_k0() {
+        // Use `+ellps=WGS84` rather than the historical FMI
+        // `+R=6371228`; the sphere-radius case is now rejected
+        // explicitly by `check_radius` and exercised by
+        // `sphere_radius_distinct_from_wgs84_is_rejected`.
         let crs =
-            parse("+proj=stere +lat_0=90 +lon_0=0 +lat_ts=60 +R=6371228 +x_0=0 +y_0=0 +no_defs")
+            parse("+proj=stere +lat_0=90 +lon_0=0 +lat_ts=60 +ellps=WGS84 +x_0=0 +y_0=0 +no_defs")
                 .unwrap();
 
         assert_crs_eq(
@@ -473,6 +517,49 @@ mod tests {
             let crs = parse(&projdef).unwrap();
             assert_crs_eq(&crs, &Crs::Wgs84);
         }
+    }
+
+    /// `+R=6371228` (the common ODIM/PROJ "mean Earth radius") is
+    /// rejected with `SphereProjection` to prevent silent bbox
+    /// drift versus the WGS84 ellipsoid metres our `stere_forward`
+    /// hardcodes. Phase 1's three tested producers ship
+    /// `+ellps=WGS84` (no `+R=`) so this never fires in practice;
+    /// the rejection is here so a future FMI / KNMI sphere-based
+    /// producer fails loudly at config-load time instead of
+    /// silently producing tiles ~0.1% off.
+    #[test]
+    fn sphere_radius_distinct_from_wgs84_is_rejected() {
+        let err = parse("+proj=stere +lat_0=90 +lon_0=25 +lat_ts=60 +R=6371228").unwrap_err();
+        match err {
+            ParseError::SphereProjection { radius, .. } => {
+                assert!((radius - 6_371_228.0).abs() < 0.5);
+            }
+            other => panic!("expected SphereProjection, got {other:?}"),
+        }
+    }
+
+    /// `+R=6378137` (= `WGS84_A` exactly) is accepted as a no-op.
+    /// Some producers re-declare the WGS84 semi-major axis as
+    /// `+R=` redundantly; rejecting that would create a false
+    /// alarm.
+    #[test]
+    fn sphere_radius_matching_wgs84_a_is_accepted() {
+        let crs = parse("+proj=stere +lat_0=56 +lon_0=10.5666 +k=1 +R=6378137").unwrap();
+        assert!(matches!(crs, Crs::Stereographic { .. }));
+    }
+
+    /// Same rejection rule applies to tmerc and laea — the bbox
+    /// unit-mismatch concern isn't projection-specific.
+    #[test]
+    fn sphere_radius_rejected_for_tmerc_and_laea() {
+        assert!(matches!(
+            parse("+proj=tmerc +lat_0=0 +lon_0=27 +k=0.9996 +R=6371228"),
+            Err(ParseError::SphereProjection { .. })
+        ));
+        assert!(matches!(
+            parse("+proj=laea +lat_0=52 +lon_0=10 +R=6371228"),
+            Err(ParseError::SphereProjection { .. })
+        ));
     }
 
     /// Defaults: stere with no parameters except `+proj=stere` should
