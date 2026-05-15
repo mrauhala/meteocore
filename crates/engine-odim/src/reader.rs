@@ -310,28 +310,30 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     // side.
     //
     // Range-check the f64 → u32 cast: a negative xsize wraps to a
-    // huge u32, a value > u32::MAX silently truncates, and a NaN
-    // becomes 0. All three would silently corrupt the bbox
-    // computation downstream. Reject them rather than fall back —
-    // we'd rather refuse a bad file than render with a wrong extent.
-    let xsize = match read_f64_attr("/where", "xsize") {
-        Ok(v) if v.is_finite() && v > 0.0 && v <= u32::MAX as f64 => v as u32,
-        Ok(v) => {
-            return Err(ReadError::DatasetRead(format!(
-                "/where/xsize is not a positive finite integer-valued f64 in [1, u32::MAX]: {v}"
-            )));
+    // huge u32, an out-of-range value silently truncates, and a NaN
+    // becomes 0. All would silently corrupt the bbox computation
+    // downstream. Reject them rather than fall back — we'd rather
+    // refuse a bad file than render with a wrong extent.
+    //
+    // The cap is `MAX_GRID_DIM`, not `u32::MAX`: a malformed file
+    // declaring `xsize = 4e9` would otherwise pass a `u32::MAX`
+    // check and reach `hdf5-reader`'s allocation path, attempting a
+    // multi-gigabyte allocation before any controlled error fires.
+    // 100 000 is comfortably larger than any real ODIM composite
+    // (OPERA's pan-European grid is ~4400 wide) so a legitimate
+    // file is never rejected.
+    const MAX_GRID_DIM: f64 = 100_000.0;
+    let read_grid_dim = |name: &str, fallback: u32| -> Result<u32, ReadError> {
+        match read_f64_attr("/where", name) {
+            Ok(v) if v.is_finite() && (1.0..=MAX_GRID_DIM).contains(&v) => Ok(v as u32),
+            Ok(v) => Err(ReadError::DatasetRead(format!(
+                "/where/{name} is not a finite integer-valued f64 in [1, {MAX_GRID_DIM}]: {v}"
+            ))),
+            Err(_) => Ok(fallback),
         }
-        Err(_) => cols as u32,
     };
-    let ysize = match read_f64_attr("/where", "ysize") {
-        Ok(v) if v.is_finite() && v > 0.0 && v <= u32::MAX as f64 => v as u32,
-        Ok(v) => {
-            return Err(ReadError::DatasetRead(format!(
-                "/where/ysize is not a positive finite integer-valued f64 in [1, u32::MAX]: {v}"
-            )));
-        }
-        Err(_) => rows as u32,
-    };
+    let xsize = read_grid_dim("xsize", cols as u32)?;
+    let ysize = read_grid_dim("ysize", rows as u32)?;
 
     // Native bbox: build from `/where/xscale` + `/where/yscale` +
     // xsize/ysize (definitional grid dimensions in projected metres,
@@ -357,8 +359,24 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     //
     // xscale/yscale are mandatory in ODIM v2.x §6.1.2 for image
     // objects, so this path is reliable across producers.
-    let xscale = read_f64_attr("/where", "xscale")?;
-    let yscale = read_f64_attr("/where", "yscale")?;
+    //
+    // Validate finite + strictly positive: a zero, negative, or NaN
+    // scale propagates silently into `src_dx`/`src_dy` in
+    // `get_raster_tile`, where it produces an all-transparent tile
+    // (every sample maps outside the grid) with no error — a
+    // confusing failure mode. Reject at read time instead.
+    let read_scale = |name: &str| -> Result<f64, ReadError> {
+        let v = read_f64_attr("/where", name)?;
+        if v.is_finite() && v > 0.0 {
+            Ok(v)
+        } else {
+            Err(ReadError::DatasetRead(format!(
+                "/where/{name} is not a finite positive f64: {v}"
+            )))
+        }
+    };
+    let xscale = read_scale("xscale")?;
+    let yscale = read_scale("yscale")?;
     let (ul_x, ul_y) = crs.forward(ul_lon, ul_lat);
     let bbox = [
         ul_x,
