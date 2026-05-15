@@ -230,8 +230,10 @@ pub fn scan_local_directory(
 /// Skip remote objects larger than this — a guard against fetching a
 /// mis-uploaded or non-ODIM blob into memory. ODIM COMP composites run
 /// from ~35 KB (FMI single-radar) to a few MB (OPERA pan-European);
-/// 64 MB is a generous ceiling above any real composite.
-const MAX_REMOTE_FILE_SIZE: u64 = 64 * 1024 * 1024;
+/// 64 MB is a generous ceiling above any real composite. Enforced both
+/// at `list` time ([`scan_remote`]) and at `get` time (the engine's
+/// `fetch_bytes`) so an object that grew after listing is still caught.
+pub(crate) const MAX_REMOTE_FILE_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Scan an S3/HTTP object store for ODIM files under the given set of
 /// (already date-expanded) key prefixes.
@@ -312,9 +314,12 @@ pub fn scan_remote(
         );
     }
 
-    // Sort by timestamp ascending; on a duplicate timestamp order the
-    // key descending so the lexicographically-last key survives the
-    // `dedup_by` (which keeps the first of each equal-timestamp run).
+    // Sort by timestamp ascending. Within an equal-timestamp run,
+    // order the key *descending* so the lexicographically-greatest key
+    // lands first (at the lower array index). `dedup_by` retains the
+    // first element of each run — so that greatest key is the one that
+    // survives. The sort direction (descending) and the dedup
+    // behaviour (keep-first) must stay consistent for this to hold.
     entries.sort_by(|a, b| {
         a.time
             .cmp(&b.time)

@@ -111,6 +111,12 @@ fn scan_source(
 }
 
 /// Fetch the raw bytes of one ODIM file from its catalog location.
+///
+/// Remote fetches re-check the object size against
+/// [`crate::catalog::MAX_REMOTE_FILE_SIZE`] via `head` before `get`.
+/// `scan_remote` already filters by size at list time, but an object
+/// can grow between listing and fetching — the `head` closes that gap
+/// so a runaway object can't be pulled unbounded into memory.
 fn fetch_bytes(location: &Location) -> Result<Vec<u8>, DataServerError> {
     match location {
         Location::Local(path) => std::fs::read(path).map_err(|e| {
@@ -121,6 +127,14 @@ fn fetch_bytes(location: &Location) -> Result<Vec<u8>, DataServerError> {
         }),
         Location::Remote { store, key } => {
             let object = ds_storage::object_store::path::Path::from(key.as_str());
+            let meta = store.head(&object)?;
+            if meta.size as u64 > crate::catalog::MAX_REMOTE_FILE_SIZE {
+                return Err(DataServerError::Engine(format!(
+                    "ODIM object `{key}` is {} bytes — exceeds the {}-byte limit",
+                    meta.size,
+                    crate::catalog::MAX_REMOTE_FILE_SIZE
+                )));
+            }
             store.get(&object).map(|b| b.to_vec())
         }
     }
