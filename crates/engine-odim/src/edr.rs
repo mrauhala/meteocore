@@ -50,6 +50,16 @@ use crate::reader::OdimComposite;
 /// 1 MB while still being finer than most display use cases need.
 const MAX_AREA_DIM: usize = 256;
 
+/// Cap on the number of timesteps an area query may span. The area
+/// coverage is an `ny × nx` grid (each ≤ `MAX_AREA_DIM`) *per*
+/// timestep, so an unbounded count would let one request allocate
+/// hundreds of MB. 64 × 256 × 256 `Option<f64>` ≈ 67 MB worst case,
+/// which bounds a deliberate area-over-time query while still
+/// rejecting a "give me everything" request against a full
+/// 5-min-cadence catalog (~288 entries). A position query has no
+/// such cap because it yields only `N` scalars, not `N · ny · nx`.
+const MAX_AREA_TIMESTEPS: usize = 64;
+
 /// Parse an EDR `coords` value for a position query into
 /// `(lat, lon)`. Accepts WKT `POINT(lon lat)` and the bare
 /// `lon,lat` shorthand — the same two forms the other engines
@@ -301,12 +311,29 @@ impl OdimEngine {
             ));
         }
 
-        // Load the first composite to size the output grid against
-        // the source's native resolution.
-        let first = self.load_composite(&entries[0].path)?;
-        let [ll_lon, ll_lat, ur_lon, ur_lat] = first.wgs84_corners;
-        let deg_per_px_lon = ((ur_lon - ll_lon).abs() / first.xsize as f64).max(f64::MIN_POSITIVE);
-        let deg_per_px_lat = ((ur_lat - ll_lat).abs() / first.ysize as f64).max(f64::MIN_POSITIVE);
+        // Bound the response size. An area query produces an
+        // `ny × nx` grid per timestep (`ny`, `nx` ≤ `MAX_AREA_DIM`),
+        // so an unfiltered query over a full 5-min-cadence catalog
+        // (`max_files` up to ~288) would allocate hundreds of MB.
+        // Cap the timestep count and tell the client to narrow
+        // `datetime` rather than silently truncating their request.
+        if entries.len() > MAX_AREA_TIMESTEPS {
+            return Err(DataServerError::InvalidParameter(format!(
+                "Area query spans {} timesteps; the maximum is {MAX_AREA_TIMESTEPS}. \
+                 Narrow the `datetime` range.",
+                entries.len()
+            )));
+        }
+
+        // Grid resolution comes from the seed composite's dimensions
+        // (every timestep shares the same grid) — no probe load, so
+        // a single unreadable first file no longer hard-fails the
+        // whole query the way an earlier `load_composite(...)?` did.
+        let [ll_lon, ll_lat, ur_lon, ur_lat] = self.seed_spatial_extent;
+        let deg_per_px_lon =
+            ((ur_lon - ll_lon).abs() / self.seed_xsize as f64).max(f64::MIN_POSITIVE);
+        let deg_per_px_lat =
+            ((ur_lat - ll_lat).abs() / self.seed_ysize as f64).max(f64::MIN_POSITIVE);
 
         let west = polygon.bbox.west;
         let south = polygon.bbox.south;

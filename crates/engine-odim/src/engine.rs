@@ -57,17 +57,19 @@ pub struct OdimEngine {
     pub(crate) gain_override: Option<f64>,
     pub(crate) offset_override: Option<f64>,
     pub(crate) nodata_override: Option<f64>,
-    /// Native-CRS label and WGS84 corner envelope captured from the
-    /// seed composite at construction. Every timestep of a given
-    /// ODIM collection shares the same grid, so these are stable
-    /// for the engine's lifetime. Holding them as plain fields lets
-    /// `raster_info()` (MapEngine) and `get_spatial_extent()` (EDR)
-    /// answer collection metadata without touching the render
-    /// cache `Mutex` — and, crucially, without depending on whether
-    /// a `get_raster_tile` call has warmed that cache yet (an
-    /// `apis = ["edr"]`-only collection never issues one).
+    /// Native-CRS label, WGS84 corner envelope, and grid dimensions
+    /// captured from the seed composite at construction. Every
+    /// timestep of a given ODIM collection shares the same grid, so
+    /// these are stable for the engine's lifetime. Holding them as
+    /// plain fields lets `raster_info()` (MapEngine) and the EDR
+    /// metadata / area-grid-sizing paths answer without touching the
+    /// render cache `Mutex` — and, crucially, without depending on
+    /// whether a `get_raster_tile` call has warmed that cache yet
+    /// (an `apis = ["edr"]`-only collection never issues one).
     pub(crate) seed_native_crs: String,
     pub(crate) seed_spatial_extent: [f64; 4],
+    pub(crate) seed_xsize: u32,
+    pub(crate) seed_ysize: u32,
     /// Single-entry path-keyed cache. ODIM composites are small (a
     /// few MB) but HDF5 parsing dominates `get_raster_tile` latency
     /// at high request rates — keeping the last file resident makes
@@ -173,6 +175,8 @@ impl OdimEngine {
 
         let seed_native_crs = crs_label(&composite.crs);
         let seed_spatial_extent = composite.wgs84_corners;
+        let seed_xsize = composite.xsize;
+        let seed_ysize = composite.ysize;
 
         Ok(Self {
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
@@ -184,6 +188,8 @@ impl OdimEngine {
             nodata_override: config.nodata,
             seed_native_crs,
             seed_spatial_extent,
+            seed_xsize,
+            seed_ysize,
             cached: Mutex::new(Some((seed_path, composite))),
             data_dir: data_dir.to_path_buf(),
             matcher,

@@ -278,6 +278,67 @@ fn edr_query_area_returns_grid() {
     );
 }
 
+/// An unbounded area query (`datetime = None`) over a catalog with
+/// more than `MAX_AREA_TIMESTEPS` (64) entries is rejected with a
+/// `400`-class error rather than allocating a hundreds-of-MB
+/// coverage cube. Builds a 65-file catalog by copying the DMI
+/// fixture to distinct 5-minute-spaced timestamps.
+#[test]
+fn edr_query_area_rejects_too_many_timesteps() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/odim-dmi-fixture.h5")
+        .canonicalize()
+        .expect("fixture path canonicalises");
+    // 65 files at 5-min spacing from 2026-05-14 00:00 — one past the
+    // 64-timestep cap.
+    for i in 0..65 {
+        let total_min = i * 5;
+        let hh = total_min / 60;
+        let mm = total_min % 60;
+        let name = format!("dk.com.20260514{hh:02}{mm:02}.500_max.h5");
+        std::fs::copy(&src, dir.path().join(name)).expect("copy fixture");
+    }
+
+    let config = OdimConfig {
+        filename_template: Some("dk.com.%Y%m%d%H%M.500_max.h5".into()),
+        filename_pattern: None,
+        timestamp_format: None,
+        parameter: "reflectivity".into(),
+        unit: "dBZ".into(),
+        nodata: None,
+        gain: None,
+        offset: None,
+        poll_interval_secs: 30,
+        max_files: None,
+        endpoint: None,
+        bucket: None,
+        prefix_pattern: None,
+    };
+    let engine = engine_odim::OdimEngine::new(dir.path(), "dmi-cap-test", &config)
+        .expect("engine builds over the 65-file catalog");
+
+    // No datetime filter → all 65 entries → over the cap → error.
+    let err = engine
+        .query_area("9.0,55.0,12.0,57.5", None, None)
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("maximum is 64"),
+        "expected a timestep-cap error, got: {err}"
+    );
+
+    // A narrow datetime range keeps it under the cap → succeeds.
+    use chrono::{TimeZone, Utc};
+    let start = Utc.with_ymd_and_hms(2026, 5, 14, 0, 0, 0).unwrap();
+    let end = Utc.with_ymd_and_hms(2026, 5, 14, 0, 30, 0).unwrap();
+    assert!(
+        engine
+            .query_area("9.0,55.0,12.0,57.5", Some((start, end)), None)
+            .is_ok(),
+        "a 7-timestep window must stay under the cap"
+    );
+}
+
 /// A `POLYGON(...)` area query masks cells outside the ring to
 /// `None`. A degenerate thin triangle leaves most of its bbox grid
 /// masked, so the masked-cell count is strictly positive.
