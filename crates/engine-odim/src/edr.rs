@@ -22,6 +22,12 @@
 //! directories hold at most `max_files` entries (typically ≤288 at
 //! 5-min cadence), so this is acceptable for v1; a multi-entry
 //! composite cache is a follow-up.
+//!
+//! Those reads are blocking (HDF5 parse). The api-edr handlers call
+//! `EdrEngine` methods directly from `async fn`s without
+//! `spawn_blocking`, so the work currently lands on a Tokio worker —
+//! a pre-existing api-edr gap that affects every EDR engine, tracked
+//! in issue #178 and to be fixed in the api-edr handlers.
 
 use std::collections::HashMap;
 

@@ -355,11 +355,18 @@ impl OdimEngine {
     ///
     /// **Blocking call** — uses `std::fs::read` and HDF5 parsing
     /// directly. Callers from async contexts must wrap in
-    /// `tokio::task::spawn_blocking`. The `MapEngine::get_raster_tile`
-    /// call chain already runs inside `spawn_blocking` (the WMS /
-    /// Maps / Tiles handlers do this); a future `EdrEngine` impl
-    /// or a health-check pre-warmer would need its own
-    /// `spawn_blocking` to avoid stalling Tokio workers.
+    /// `tokio::task::spawn_blocking`. Two call paths reach here:
+    ///
+    /// - `MapEngine::get_raster_tile` — already runs inside
+    ///   `spawn_blocking` (the WMS / Maps / Tiles handlers do this).
+    /// - `EdrEngine::query_position` / `query_area` (see `edr.rs`) —
+    ///   the api-edr handlers currently call these directly from an
+    ///   `async fn` *without* `spawn_blocking`, so this blocking
+    ///   work lands on a Tokio worker. That is a pre-existing
+    ///   api-edr-level gap affecting every EDR engine (GeoTIFF,
+    ///   QueryData, GRIB all do blocking I/O in `query_position`
+    ///   too) — tracked in issue #178, to be fixed in the api-edr
+    ///   handlers rather than per-engine.
     pub(crate) fn load_composite(
         &self,
         path: &Path,
