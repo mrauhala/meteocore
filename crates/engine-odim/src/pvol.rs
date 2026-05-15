@@ -286,6 +286,8 @@ fn read_sweep(
     let nrays = read_f64_attr(&where_path, "nrays")? as usize;
     let rscale = read_f64_attr(&where_path, "rscale")?;
     // rstart / a1gate are optional with documented defaults.
+    // ODIM_H5 v2.4 Table 4 defines rstart in metres (same unit as
+    // rscale) — no km→m scaling, despite older OPERA conventions.
     let rstart = read_f64_attr(&where_path, "rstart").unwrap_or(0.0);
     let a1gate = read_f64_attr(&where_path, "a1gate").unwrap_or(0.0) as usize;
 
