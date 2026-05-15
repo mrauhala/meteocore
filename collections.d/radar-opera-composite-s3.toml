@@ -1,0 +1,37 @@
+# EUMETNET OPERA pan-European radar composite (ODIM_H5 v2.4) — S3 source.
+#
+# Streams `OPERA@YYYYMMDDTHHMM@0@DBZH.h5` composites directly from
+# CloudFerro's public `openradar-24h` bucket — no local mirror, no
+# gdalwarp preprocessing. New timesteps land every 5 minutes; the
+# bucket keeps a rolling 24h window.
+#
+#   https://s3.waw3-1.cloudferro.com/openradar-24h/YYYY/MM/DD/OPERA/COMP/
+#
+# 4400x3800 grid at 2km/px over Europe, Lambert Azimuthal Equal Area
+# (+lat_0=55 +lon_0=10 +ellps=WGS84). DBZH quantity in physical dBZ.
+#
+# The local-fixture twin of this collection is `radar-opera-composite`.
+
+id = "radar-opera-composite-s3"
+title = "OPERA Pan-European Radar Composite (DBZH, S3)"
+description = """\
+EUMETNET OPERA pan-European weather-radar composite via ODIM_H5 v2.4, \
+streamed from CloudFerro S3. Maximum reflectivity (DBZH) on a 2km \
+Lambert Azimuthal Equal Area grid covering Europe.\
+"""
+engine_type = "odim"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[odim]
+endpoint = "https://s3.waw3-1.cloudferro.com"
+bucket = "openradar-24h"
+prefix_pattern = "%Y/%m/%d/OPERA/COMP/"
+filename_template = "OPERA@%Y%m%dT%H%M@0@DBZH.h5"
+parameter = "reflectivity"
+unit = "dBZ"
+# Keep only the last 12h of the 24h bucket in the catalog.
+time_window = "-PT12H"
+poll_interval_secs = 300
+
+[wms]
+colormap = "radar_dbz"

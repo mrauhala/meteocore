@@ -243,7 +243,7 @@ impl OdimEngine {
         let mut values = Vec::with_capacity(entries.len());
         for entry in &entries {
             times.push(entry.time);
-            match self.load_composite(&entry.path) {
+            match self.load_composite(&entry.location) {
                 Ok(composite) => {
                     let gain = self.gain_override.unwrap_or(composite.gain);
                     let offset = self.offset_override.unwrap_or(composite.offset);
@@ -264,7 +264,7 @@ impl OdimEngine {
                     tracing::warn!(
                         "[{}] EDR position query: failed to load `{}`: {e}",
                         self.collection_id,
-                        entry.path.display()
+                        entry.location.id()
                     );
                     values.push(None);
                 }
@@ -362,13 +362,13 @@ impl OdimEngine {
 
         for entry in &entries {
             times.push(entry.time);
-            let composite = match self.load_composite(&entry.path) {
+            let composite = match self.load_composite(&entry.location) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(
                         "[{}] EDR area query: failed to load `{}`: {e}",
                         self.collection_id,
-                        entry.path.display()
+                        entry.location.id()
                     );
                     all_values.extend(std::iter::repeat_n(None, ny * nx));
                     continue;

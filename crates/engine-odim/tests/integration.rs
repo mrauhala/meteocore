@@ -42,10 +42,15 @@ fn dmi_engine() -> (engine_odim::OdimEngine, tempfile::TempDir) {
         endpoint: None,
         bucket: None,
         prefix_pattern: None,
+        time_window: None,
     };
 
-    let engine = engine_odim::OdimEngine::new(dir.path(), "dmi-test", &config)
-        .expect("OdimEngine::new succeeds on the DMI fixture");
+    let engine = engine_odim::OdimEngine::new(
+        "dmi-test",
+        Some(dir.path().to_str().expect("utf8 fixture path")),
+        &config,
+    )
+    .expect("OdimEngine::new succeeds on the DMI fixture");
 
     (engine, dir)
 }
@@ -329,9 +334,14 @@ fn edr_query_area_rejects_too_many_timesteps() {
         endpoint: None,
         bucket: None,
         prefix_pattern: None,
+        time_window: None,
     };
-    let engine = engine_odim::OdimEngine::new(dir.path(), "dmi-cap-test", &config)
-        .expect("engine builds over the 65-file catalog");
+    let engine = engine_odim::OdimEngine::new(
+        "dmi-cap-test",
+        Some(dir.path().to_str().expect("utf8 fixture path")),
+        &config,
+    )
+    .expect("engine builds over the 65-file catalog");
 
     // No datetime filter → all 65 entries → over the cap → error.
     let err = engine

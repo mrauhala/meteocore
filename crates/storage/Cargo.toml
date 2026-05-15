@@ -7,6 +7,7 @@ edition = "2021"
 ds-core = { path = "../core" }
 object_store = { version = "0.11", features = ["aws", "http"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+chrono = "0.4"
 bytes = "1"
 futures = "0.3"
 url = "2"

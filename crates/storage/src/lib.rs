@@ -3,6 +3,7 @@
 //! Provides a synchronous `DataStore` over the `object_store` crate,
 //! supporting local filesystem, S3, and HTTP backends.
 
+pub mod discovery;
 mod error;
 
 use std::ops::Range;

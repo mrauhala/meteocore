@@ -1,10 +1,11 @@
 //! `MapEngine` impl backed by an ODIM_H5 composite catalog.
 //!
 //! At construction time, [`OdimEngine::new`] scans the configured
-//! local directory for ODIM files matching the `filename_template`
-//! pattern and pre-loads the most recent one so `raster_info()`
-//! can answer with non-empty `spatial_extent` and `times`. After
-//! that, every `get_raster_tile` call:
+//! source — a local directory or an S3/HTTP object-store prefix — for
+//! ODIM files matching the `filename_template` pattern and pre-loads
+//! the most recent one so `raster_info()` can answer with non-empty
+//! `spatial_extent` and `times`. After that, every `get_raster_tile`
+//! call:
 //!
 //! 1. Picks the catalog entry matching the requested time (or the
 //!    most recent if `time` is `None`).
@@ -14,11 +15,12 @@
 //!    or Web-Mercator output coords into the composite's native
 //!    CRS, and samples via nearest-neighbour.
 //!
-//! Phase 1 narrows the scope from the format's full capabilities:
-//! - Local directories only (no S3 / STAC — those land later)
+//! Scope is still narrowed from the format's full capabilities:
+//! - Single-dataset COMP composites (no PVOL polar volumes yet)
 //! - Single-parameter (one composite quantity per collection)
+//! - STAC sources land in a later phase
 //!
-//! A background `poll_loop` re-scans `data_dir` every
+//! A background `poll_loop` re-scans the source every
 //! `poll_interval_secs` and atomically swaps the catalog
 //! (`ArcSwap<Vec<CatalogEntry>>`) when the file set changes, so
 //! new ODIM files appear in the temporal extent without needing
@@ -26,7 +28,7 @@
 //!
 //! See [[project_odim_engine_plan]] for the full multi-phase plan.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,8 +41,104 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Notify;
 
-use crate::catalog::{scan_local_directory, CatalogEntry, FilenameMatcher};
+use ds_storage::discovery::{expand_prefix_for_dates, expand_prefix_pattern, TimeWindow};
+
+use crate::catalog::{scan_local_directory, scan_remote, CatalogEntry, FilenameMatcher, Location};
 use crate::reader::{read_composite, OdimComposite};
+
+/// Days of date-partitioned prefixes to scan when an S3 source has no
+/// `time_window`. Two days covers the just-after-midnight case where
+/// the recent tail still straddles yesterday's partition.
+const DEFAULT_SCAN_DAYS: u32 = 2;
+
+/// Where an [`OdimEngine`] reads ODIM files from.
+#[derive(Clone)]
+enum Source {
+    /// A local filesystem directory, scanned with `read_dir`.
+    Local { data_dir: PathBuf },
+    /// An S3/HTTP object store. `prefix_pattern` may carry strftime
+    /// codes (e.g. `%Y/%m/%d/OPERA/COMP/`); it is expanded per UTC
+    /// date on every scan so the listing stays current across day
+    /// boundaries. `time_window`, when set, bounds both the dates
+    /// expanded and the timestamps kept. `endpoint` / `bucket` are
+    /// retained purely for diagnostics (the `store` already targets
+    /// them) so log and error messages can name the store.
+    Remote {
+        store: ds_storage::DataStore,
+        endpoint: String,
+        bucket: String,
+        prefix_pattern: String,
+        time_window: Option<TimeWindow>,
+    },
+}
+
+/// Scan `source` for ODIM files, returning catalog entries sorted by
+/// timestamp ascending. Blocking — remote scans bridge async object-
+/// store I/O internally (see [`ds_storage::DataStore`]).
+fn scan_source(
+    source: &Source,
+    matcher: &FilenameMatcher,
+    max_files: Option<usize>,
+) -> Result<Vec<CatalogEntry>, EngineError> {
+    match source {
+        Source::Local { data_dir } => Ok(scan_local_directory(data_dir, matcher, max_files)?),
+        Source::Remote {
+            store,
+            prefix_pattern,
+            time_window,
+            ..
+        } => {
+            let now = Utc::now();
+            let (prefixes, time_filter) = match time_window {
+                Some(tw) => (
+                    expand_prefix_for_dates(prefix_pattern, &tw.scan_dates(now)),
+                    Some(tw.to_range(now)),
+                ),
+                None => (
+                    expand_prefix_pattern(prefix_pattern, DEFAULT_SCAN_DAYS),
+                    None,
+                ),
+            };
+            Ok(scan_remote(
+                store,
+                &prefixes,
+                matcher,
+                time_filter,
+                max_files,
+            )?)
+        }
+    }
+}
+
+/// Fetch the raw bytes of one ODIM file from its catalog location.
+///
+/// Remote fetches re-check the object size against
+/// [`crate::catalog::MAX_REMOTE_FILE_SIZE`] via `head` before `get`.
+/// `scan_remote` already filters by size at list time, but an object
+/// can grow between listing and fetching — the `head` closes that gap
+/// so a runaway object can't be pulled unbounded into memory.
+fn fetch_bytes(location: &Location) -> Result<Vec<u8>, DataServerError> {
+    match location {
+        Location::Local(path) => std::fs::read(path).map_err(|e| {
+            DataServerError::Engine(format!(
+                "failed to read ODIM file `{}`: {e}",
+                path.display()
+            ))
+        }),
+        Location::Remote { store, key } => {
+            let object = ds_storage::object_store::path::Path::from(key.as_str());
+            let meta = store.head(&object)?;
+            if meta.size as u64 > crate::catalog::MAX_REMOTE_FILE_SIZE {
+                return Err(DataServerError::Engine(format!(
+                    "ODIM object `{key}` is {} bytes — exceeds the {}-byte limit",
+                    meta.size,
+                    crate::catalog::MAX_REMOTE_FILE_SIZE
+                )));
+            }
+            store.get(&object).map(|b| b.to_vec())
+        }
+    }
+}
 
 /// `MapEngine` implementation backed by an ODIM_H5 composite catalog.
 ///
@@ -70,13 +168,13 @@ pub struct OdimEngine {
     pub(crate) seed_spatial_extent: [f64; 4],
     pub(crate) seed_xsize: u32,
     pub(crate) seed_ysize: u32,
-    /// Single-entry path-keyed cache. ODIM composites are small (a
-    /// few MB) but HDF5 parsing dominates `get_raster_tile` latency
-    /// at high request rates — keeping the last file resident makes
-    /// hot-tile loops effectively free of read cost.
-    pub(crate) cached: Mutex<Option<(PathBuf, Arc<OdimComposite>)>>,
-    /// Source state for the poll loop.
-    data_dir: PathBuf,
+    /// Single-entry cache keyed by [`Location::id`]. ODIM composites
+    /// are small (a few MB) but HDF5 parsing dominates `get_raster_tile`
+    /// latency at high request rates — keeping the last file resident
+    /// makes hot-tile loops effectively free of read cost.
+    pub(crate) cached: Mutex<Option<(String, Arc<OdimComposite>)>>,
+    /// Local directory or S3/HTTP object store the poll loop re-scans.
+    source: Source,
     matcher: FilenameMatcher,
     max_files: Option<usize>,
     poll_interval: Duration,
@@ -105,54 +203,65 @@ pub enum EngineError {
     #[error("filename pattern build failed: {0}")]
     BadPattern(#[from] crate::catalog::CatalogError),
     #[error(
-        "no ODIM files found in `{dir}` matching the configured filename pattern — \
-         verify the directory exists and the template matches the producer's layout"
+        "ODIM collection has no source — set a local `data_path` or an S3 \
+         `endpoint` + `bucket`"
     )]
-    NoFiles { dir: PathBuf },
-    #[error("failed to read seed composite `{path}`: {source}")]
-    SeedReadFailed {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to parse seed composite `{path}`: {source}")]
+    NoSource,
+    #[error(
+        "ODIM S3 config is incomplete — `endpoint` and `bucket` must both be \
+         set (or both omitted for a local `data_path` source)"
+    )]
+    IncompleteS3Config,
+    #[error(
+        "ODIM S3 source is missing `prefix_pattern` — set it to the bucket's \
+         date-partitioned key prefix (e.g. `%Y/%m/%d/OPERA/COMP/`), or to an \
+         empty string to scan the bucket root"
+    )]
+    MissingPrefixPattern,
+    #[error(
+        "no ODIM files found at `{location}` matching the configured filename \
+         pattern — verify the source exists and the template matches the \
+         producer's layout"
+    )]
+    NoFiles { location: String },
+    #[error("ODIM source error: {0}")]
+    Storage(#[from] DataServerError),
+    #[error("failed to parse seed composite `{location}`: {source}")]
     SeedParseFailed {
-        path: PathBuf,
+        location: String,
         #[source]
         source: crate::reader::ReadError,
     },
 }
 
 impl OdimEngine {
-    /// Build an engine by scanning `data_dir` for files matching the
-    /// configured filename pattern. Loads the most recent file
-    /// synchronously to populate metadata; raises [`EngineError`]
-    /// when the directory is empty.
+    /// Build an engine by scanning its configured source for files
+    /// matching the filename pattern. The source is a local directory
+    /// (`data_path`) or an S3 bucket (`endpoint`/`bucket`/`prefix_pattern`).
+    /// Loads the most recent file synchronously to populate metadata;
+    /// raises [`EngineError`] when the source yields no files.
     pub fn new(
-        data_dir: &Path,
         collection_id: &str,
+        data_path: Option<&str>,
         config: &ds_core::config::OdimConfig,
     ) -> Result<Self, EngineError> {
-        // Phase 1 supports local directories only. S3-style config
-        // fields (`endpoint`, `bucket`, `prefix_pattern`) are present
-        // in `OdimConfig` as Phase 2 stubs — if an operator filled
-        // them in expecting remote behaviour, warn loudly so the
-        // misconfiguration is visible rather than silently producing
-        // a "local data not found" error.
-        if config.endpoint.is_some() || config.bucket.is_some() || config.prefix_pattern.is_some() {
+        // `time_window` only constrains S3 prefix expansion + timestamp
+        // filtering. A local `data_path` source ignores it — warn so a
+        // misplaced setting doesn't silently do nothing.
+        if config.time_window.is_some() && config.endpoint.is_none() {
             tracing::warn!(
-                "[{}] ODIM config carries S3 fields (endpoint/bucket/prefix_pattern) but \
-                 Phase 1 supports local directories only — these fields are ignored. \
-                 Remote source support lands in Phase 2 (STAC) / Phase 3 (PVOL S3).",
-                collection_id
+                "[{collection_id}] `time_window` is set but has no effect on a \
+                 local `data_path` ODIM source — it only applies to S3 sources"
             );
         }
 
         let matcher = build_matcher(config)?;
-        let catalog = scan_local_directory(data_dir, &matcher, config.max_files)?;
+        let source = build_source(collection_id, data_path, config)?;
+
+        let catalog = scan_source(&source, &matcher, config.max_files)?;
         if catalog.is_empty() {
             return Err(EngineError::NoFiles {
-                dir: data_dir.to_path_buf(),
+                location: source_label(&source),
             });
         }
 
@@ -160,15 +269,12 @@ impl OdimEngine {
         // populate `spatial_extent` and `times` immediately, and so a
         // misconfigured filename pattern surfaces at engine
         // construction rather than at first request.
-        let seed_path = catalog.last().expect("catalog non-empty").path.clone();
-        let bytes = std::fs::read(&seed_path).map_err(|e| EngineError::SeedReadFailed {
-            path: seed_path.clone(),
-            source: e,
-        })?;
+        let seed_location = catalog.last().expect("catalog non-empty").location.clone();
+        let bytes = fetch_bytes(&seed_location)?;
         let composite =
             Arc::new(
                 read_composite(&bytes).map_err(|e| EngineError::SeedParseFailed {
-                    path: seed_path.clone(),
+                    location: seed_location.id(),
                     source: e,
                 })?,
             );
@@ -190,8 +296,8 @@ impl OdimEngine {
             seed_spatial_extent,
             seed_xsize,
             seed_ysize,
-            cached: Mutex::new(Some((seed_path, composite))),
-            data_dir: data_dir.to_path_buf(),
+            cached: Mutex::new(Some((seed_location.id(), composite))),
+            source,
             matcher,
             max_files: config.max_files,
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
@@ -200,19 +306,19 @@ impl OdimEngine {
         })
     }
 
-    /// Run the directory poll loop. Exits when [`OdimEngine::shutdown`]
-    /// is called. Each tick re-scans `data_dir`, atomically swaps the
+    /// Run the source poll loop. Exits when [`OdimEngine::shutdown`]
+    /// is called. Each tick re-scans the source, atomically swaps the
     /// catalog `ArcSwap` if the file set changed, and logs at INFO
     /// when new files appear so operators can confirm the polling is
     /// alive.
     ///
-    /// The actual `read_dir` runs on `tokio::task::spawn_blocking`
-    /// so a slow filesystem (network mount, large directory) doesn't
-    /// stall the Tokio worker thread for the duration of the scan.
+    /// The scan runs on `tokio::task::spawn_blocking` so neither a
+    /// slow filesystem (network mount, large directory) nor a slow S3
+    /// `list` stalls a Tokio worker thread for its duration.
     ///
-    /// Errors from the scan (e.g. `data_dir` temporarily disappears)
-    /// are logged at WARN and otherwise ignored — the previous
-    /// catalog stays in place so live requests keep working.
+    /// Errors from the scan (source temporarily unavailable, S3
+    /// timeout) are logged at WARN and otherwise ignored — the
+    /// previous catalog stays in place so live requests keep working.
     pub async fn poll_loop(&self) {
         let mut interval = tokio::time::interval(self.poll_interval);
         interval.tick().await; // skip immediate first tick (already loaded at boot)
@@ -258,13 +364,11 @@ impl OdimEngine {
     }
 
     async fn poll_once(&self) {
-        let data_dir = self.data_dir.clone();
+        let source = self.source.clone();
         let matcher = self.matcher.clone();
         let max_files = self.max_files;
-        let scan_result = tokio::task::spawn_blocking(move || {
-            scan_local_directory(&data_dir, &matcher, max_files)
-        })
-        .await;
+        let scan_result =
+            tokio::task::spawn_blocking(move || scan_source(&source, &matcher, max_files)).await;
         let scan = match scan_result {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
@@ -359,9 +463,9 @@ impl OdimEngine {
     /// Read + parse the ODIM file at `path` and return a shared
     /// `Arc<OdimComposite>` snapshot. Cached single-entry by path.
     ///
-    /// **Blocking call** — uses `std::fs::read` and HDF5 parsing
-    /// directly. Callers from async contexts must wrap in
-    /// `tokio::task::spawn_blocking`. Two call paths reach here:
+    /// **Blocking call** — reads the file (local `read` or S3 `get`)
+    /// and parses HDF5 directly. Callers from async contexts must wrap
+    /// in `tokio::task::spawn_blocking`. Two call paths reach here:
     ///
     /// - `MapEngine::get_raster_tile` — already runs inside
     ///   `spawn_blocking` (the WMS / Maps / Tiles handlers do this).
@@ -375,21 +479,21 @@ impl OdimEngine {
     ///   handlers rather than per-engine.
     pub(crate) fn load_composite(
         &self,
-        path: &Path,
+        location: &Location,
     ) -> Result<Arc<OdimComposite>, DataServerError> {
-        // Use a path-keyed single-entry cache. Cache hits return the
+        // Use an id-keyed single-entry cache. Cache hits return the
         // same `Arc` to every caller; on a cold miss two concurrent
         // `spawn_blocking` callers may both read the file and both
         // write the cache slot — the second write overwrites the
         // first with an identical, immutable composite. The cost is
         // at most one redundant read at the moment the slot fills,
-        // never visible to clients. A swap to a different path
-        // happens only when a different file is asked for.
+        // never visible to clients. A swap to a different file
+        // happens only when a different entry is asked for.
         //
         // Different-path concurrent misses (e.g. two adjacent
         // timestep requests arriving during a time-slider scrub)
         // are tolerated but not optimised: both callers fall
-        // through to `std::fs::read`, both decode, and whichever
+        // through to a fresh fetch, both decode, and whichever
         // takes the write lock last evicts the other's entry. Both
         // callers still get a valid `Arc` (data is correct,
         // composites are immutable) — the cost is at most one
@@ -399,10 +503,11 @@ impl OdimEngine {
         //
         // Mutex poison is recovered (rather than silently disabling
         // the cache for the lifetime of the engine). The cached
-        // entry is just bytes + path — no invariants to protect —
-        // so the previous panic that poisoned the lock can't have
-        // corrupted what we're reading. An ERROR-level log on
-        // recovery makes the latent panic visible.
+        // entry is just an id string + composite — no invariants to
+        // protect — so the previous panic that poisoned the lock
+        // can't have corrupted what we're reading. An ERROR-level log
+        // on recovery makes the latent panic visible.
+        let cache_key = location.id();
         {
             let guard = self.cached.lock().unwrap_or_else(|e| {
                 tracing::error!(
@@ -411,24 +516,18 @@ impl OdimEngine {
                 );
                 e.into_inner()
             });
-            if let Some((ref cached_path, ref cached_comp)) = *guard {
-                if cached_path == path {
+            if let Some((ref cached_key, ref cached_comp)) = *guard {
+                if *cached_key == cache_key {
                     return Ok(cached_comp.clone());
                 }
             }
         }
-        let bytes = std::fs::read(path).map_err(|e| {
-            DataServerError::Engine(format!(
-                "[{}] failed to read ODIM file `{}`: {e}",
-                self.collection_id,
-                path.display()
-            ))
-        })?;
+        let bytes = fetch_bytes(location)
+            .map_err(|e| DataServerError::Engine(format!("[{}] {e}", self.collection_id)))?;
         let composite = Arc::new(read_composite(&bytes).map_err(|e| {
             DataServerError::Engine(format!(
                 "[{}] failed to parse ODIM file `{}`: {e}",
-                self.collection_id,
-                path.display()
+                self.collection_id, cache_key
             ))
         })?);
         let mut guard = self.cached.lock().unwrap_or_else(|e| {
@@ -438,7 +537,7 @@ impl OdimEngine {
             );
             e.into_inner()
         });
-        *guard = Some((path.to_path_buf(), composite.clone()));
+        *guard = Some((cache_key, composite.clone()));
         Ok(composite)
     }
 }
@@ -454,6 +553,67 @@ fn build_matcher(config: &ds_core::config::OdimConfig) -> Result<FilenameMatcher
         return Ok(FilenameMatcher::from_pattern(pattern, format)?);
     }
     Err(EngineError::NoFilenamePattern)
+}
+
+/// Resolve the engine's [`Source`] from config. `endpoint` + `bucket`
+/// select an S3 source; their absence falls back to the local
+/// `data_path`. Setting exactly one of `endpoint` / `bucket` is a
+/// configuration error rather than a silent fallback.
+fn build_source(
+    collection_id: &str,
+    data_path: Option<&str>,
+    config: &ds_core::config::OdimConfig,
+) -> Result<Source, EngineError> {
+    match (config.endpoint.as_deref(), config.bucket.as_deref()) {
+        (Some(endpoint), Some(bucket)) => {
+            // A missing `prefix_pattern` is almost always a config
+            // mistake: it would list the whole bucket on every poll.
+            // An explicit empty string is a deliberate flat-bucket
+            // opt-in and is allowed.
+            let prefix_pattern = config
+                .prefix_pattern
+                .clone()
+                .ok_or(EngineError::MissingPrefixPattern)?;
+            let store = ds_storage::build_s3_store_from_parts(endpoint, bucket)?;
+            let time_window = match &config.time_window {
+                Some(s) => Some(TimeWindow::parse(s)?),
+                None => None,
+            };
+            tracing::info!(
+                "[{}] ODIM S3 source: endpoint={endpoint} bucket={bucket} prefix='{prefix_pattern}'",
+                collection_id
+            );
+            Ok(Source::Remote {
+                store,
+                endpoint: endpoint.to_string(),
+                bucket: bucket.to_string(),
+                prefix_pattern,
+                time_window,
+            })
+        }
+        (None, None) => {
+            let data_path = data_path.ok_or(EngineError::NoSource)?;
+            Ok(Source::Local {
+                data_dir: PathBuf::from(data_path),
+            })
+        }
+        _ => Err(EngineError::IncompleteS3Config),
+    }
+}
+
+/// Human-readable description of a [`Source`] for error messages —
+/// names the local directory, or the S3 endpoint/bucket/prefix, so an
+/// operator reading a log entry knows exactly which store to check.
+fn source_label(source: &Source) -> String {
+    match source {
+        Source::Local { data_dir } => data_dir.display().to_string(),
+        Source::Remote {
+            endpoint,
+            bucket,
+            prefix_pattern,
+            ..
+        } => format!("s3 {endpoint}/{bucket}/{prefix_pattern}"),
+    }
 }
 
 /// Convert WGS84 latitude (degrees) to Web Mercator Y (metres).
@@ -495,7 +655,7 @@ impl MapEngine for OdimEngine {
                 self.collection_id
             ))
         })?;
-        let composite = self.load_composite(&entry.path)?;
+        let composite = self.load_composite(&entry.location)?;
 
         let [west, south, east, north] = bbox;
         let gain = self.gain_override.unwrap_or(composite.gain);

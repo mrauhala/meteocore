@@ -960,22 +960,6 @@ pub fn load_collections(
                 });
             }
             "odim" => {
-                let data_path = match collection.data_path.as_deref() {
-                    Some(p) => p,
-                    None => {
-                        tracing::error!(
-                            "Collection '{}': engine_type 'odim' requires data_path, skipping",
-                            collection.id
-                        );
-                        health.push(CollectionHealth {
-                            id: collection.id.clone(),
-                            engine_type: "odim".into(),
-                            status: CollectionStatus::Failed,
-                            error: Some("missing data_path".into()),
-                        });
-                        continue;
-                    }
-                };
                 let odim_cfg = match collection.odim.as_ref() {
                     Some(c) => c,
                     None => {
@@ -993,8 +977,8 @@ pub fn load_collections(
                     }
                 };
                 let engine = match engine_odim::OdimEngine::new(
-                    std::path::Path::new(data_path),
                     &collection.id,
+                    collection.data_path.as_deref(),
                     odim_cfg,
                 ) {
                     Ok(e) => Arc::new(e),
