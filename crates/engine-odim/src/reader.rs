@@ -401,7 +401,21 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
     // f64 (OPERA v2.4 — pre-decoded physical values). `read_array`
     // returns `Err` on dtype mismatch rather than panicking, so the
     // fallback chain is safe.
-    let pixels = if let Ok(arr) = ds.read_array::<u8>() {
+    //
+    // The u8 probe is the most common dtype for ODIM composites
+    // (it's what DMI and SMHI both ship). Surface its error at
+    // WARN so a decompression bug in `hdf5-reader 0.4` (which
+    // currently silently fails DEFLATE on certain SMHI files and
+    // makes them look dtype-mismatched) is diagnosable instead of
+    // collapsing to a generic `UnsupportedPixelType` at the end of
+    // the chain.
+    let u8_probe = ds.read_array::<u8>();
+    if let Err(ref e) = u8_probe {
+        tracing::warn!(
+            "ODIM u8 pixel-array read failed (possible hdf5-reader DEFLATE bug on SMHI files): {e}"
+        );
+    }
+    let pixels = if let Ok(arr) = u8_probe {
         let a2 = arr
             .into_dimensionality::<ndarray::Ix2>()
             .map_err(|e| ReadError::DatasetRead(format!("u8 reshape failed: {e}")))?;

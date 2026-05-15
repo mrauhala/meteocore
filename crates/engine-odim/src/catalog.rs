@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use regex::Regex;
+use tracing::warn;
 
 /// Errors from catalog construction and scanning.
 #[derive(Debug, thiserror::Error)]
@@ -91,6 +92,17 @@ impl FilenameMatcher {
     /// this when the producer's filename layout can't be expressed
     /// as a single contiguous strftime template (e.g. when there
     /// are literal `%` characters or interleaved tokens).
+    ///
+    /// **The pattern is not auto-anchored.** Unlike
+    /// [`from_template`], which wraps its regex in `^...$`, this
+    /// constructor leaves anchoring to the caller. An unanchored
+    /// pattern will match any substring of a filename — including
+    /// partial-upload markers such as `radar.h5.tmp` or `radar.h5.part`
+    /// — which means `scan_local_directory` will accept the partial
+    /// file as a valid catalog entry and could serve a corrupt or
+    /// half-written tile as the "latest" timestep. Always include
+    /// `^` and `$` in your pattern unless you have a deliberate
+    /// reason not to.
     pub fn from_pattern(pattern: &str, timestamp_format: &str) -> Result<Self, CatalogError> {
         if !pattern.contains("(?P<timestamp>") {
             return Err(CatalogError::NoTimestampCapture {
@@ -138,7 +150,14 @@ pub fn scan_local_directory(
     })?;
 
     let mut entries = Vec::new();
-    for raw in read.flatten() {
+    for raw in read {
+        let raw = match raw {
+            Ok(entry) => entry,
+            Err(e) => {
+                warn!("[catalog] failed to read entry in `{}`: {e}", dir.display());
+                continue;
+            }
+        };
         let path = raw.path();
         if !path.is_file() {
             continue;

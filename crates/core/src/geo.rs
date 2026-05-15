@@ -802,13 +802,22 @@ fn stere_forward(
     false_e: f64,
     false_n: f64,
 ) -> (f64, f64) {
+    // Snyder, "Map Projections — A Working Manual" (USGS PP 1395,
+    // 1987), §21 "Stereographic", eq. 21-26 through 21-30
+    // (ellipsoidal oblique aspect). This matches PROJ's
+    // `+proj=stere`. The earlier `(rn0·rm0).sqrt()` form was the
+    // double-stereographic / EPSG 9809 radius (PROJ's
+    // `+proj=sterea`), a different projection that diverges from
+    // `+proj=stere` by ~300 m at 100 km from origin and would
+    // misalign DMI/OPERA tiles even though forward+inverse
+    // roundtripped self-consistently.
     let e2 = WGS84_E2;
     let e = e2.sqrt();
+    let a = WGS84_A;
 
     let sin_lat0 = lat0.sin();
-    let rn0 = WGS84_A / (1.0 - e2 * sin_lat0 * sin_lat0).sqrt();
-    let rm0 = WGS84_A * (1.0 - e2) / (1.0 - e2 * sin_lat0 * sin_lat0).powf(1.5);
-    let r_sphere = (rn0 * rm0).sqrt();
+    let cos_lat0 = lat0.cos();
+    let m_c = cos_lat0 / (1.0 - e2 * sin_lat0 * sin_lat0).sqrt();
 
     let chi0 = conformal_latitude(lat0, e);
     let chi = conformal_latitude(lat, e);
@@ -819,7 +828,8 @@ fn stere_forward(
     let cos_dl = dl.cos();
 
     let b = 1.0 + sin_chi0 * sin_chi + cos_chi0 * cos_chi * cos_dl;
-    let factor = 2.0 * r_sphere * k0 / b;
+    // A = 2·a·k₀·m_c / (cos(χ₀) · b)
+    let factor = 2.0 * a * k0 * m_c / (cos_chi0 * b);
 
     let x = false_e + factor * cos_chi * dl.sin();
     let y = false_n + factor * (cos_chi0 * sin_chi - sin_chi0 * cos_chi * cos_dl);
@@ -1240,6 +1250,47 @@ mod tests {
             assert!(
                 (lat_back - lat).abs() < 1e-6,
                 "lat roundtrip failed at ({lon}, {lat}): got {lat_back}"
+            );
+        }
+    }
+
+    /// Validate `stere_inverse` against **independent** reference
+    /// projected coordinates, not just roundtrip self-consistency.
+    /// Reference values were computed with `cs2cs +proj=longlat
+    /// +ellps=WGS84 +to +proj=stere +lat_0=56 +lon_0=10.5666 +k_0=1
+    /// +ellps=WGS84 +units=m` (PROJ 9.x).
+    ///
+    /// Roundtrip tests like `stereographic_roundtrip_dmi_far_corners`
+    /// can pass even when both forward and inverse converge to the
+    /// wrong absolute coordinates — the earlier LCC-conflated
+    /// `stere_forward` + Newton-iteration `stere_inverse` was
+    /// self-consistent but at the wrong absolute coordinates,
+    /// shifting tiles by ~50%. This test eliminates that residual
+    /// doubt by asserting `inverse(known_xy) ≈ expected_lonlat`,
+    /// where the (x, y) values come from PROJ rather than from
+    /// `stere_forward`.
+    #[test]
+    fn stereographic_inverse_absolute_dmi() {
+        let crs = Crs::Stereographic {
+            lat0: 56.0_f64.to_radians(),
+            lon0: 10.5666_f64.to_radians(),
+            k0: 1.0,
+            false_e: 0.0,
+            false_n: 0.0,
+        };
+        for (x_proj, y_proj, lon_exp, lat_exp) in [
+            (91726.258980, -110388.867174, 12.0, 55.0),
+            (0.0, 0.0, 10.5666, 56.0),
+            (-153890.951450, 169926.823502, 8.0, 57.5),
+        ] {
+            let (lon, lat) = crs.inverse(x_proj, y_proj).unwrap();
+            assert!(
+                (lon - lon_exp).abs() < 1e-5,
+                "lon mismatch at ({x_proj}, {y_proj}): got {lon}, expected {lon_exp}"
+            );
+            assert!(
+                (lat - lat_exp).abs() < 1e-5,
+                "lat mismatch at ({x_proj}, {y_proj}): got {lat}, expected {lat_exp}"
             );
         }
     }
