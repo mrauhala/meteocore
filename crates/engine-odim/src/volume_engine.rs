@@ -31,9 +31,19 @@
 //!   range / 4⁄3-Earth ground-range correction is deferred. For a
 //!   near-horizon lowest sweep the error is small; see [`polar_sample`].
 //!
-//! A background `poll_loop` re-scans `data_path` every
+//! A background `poll_loop` re-scans the source every
 //! `poll_interval_secs` and atomically swaps the catalog so new volume
 //! files appear without an admin reload — mirroring `OdimEngine`.
+//!
+//! ## Sources
+//!
+//! A PVOL collection reads its `.h5` files from either a local
+//! filesystem directory (`data_path`) or an S3/HTTP object store
+//! (`endpoint` + `bucket` + `prefix_pattern`) — the same two-source
+//! model as the COMP [`crate::engine::OdimEngine`]. An S3 source streams
+//! FMI polar volumes straight out of the open-data bucket; a
+//! `time_window` bounds both the date-partitioned prefixes scanned and
+//! the timestamps kept.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -47,8 +57,17 @@ use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use tokio::sync::Notify;
 
+use ds_storage::discovery::{expand_prefix_for_dates, expand_prefix_pattern, TimeWindow};
+
+use crate::catalog::MAX_REMOTE_FILE_SIZE;
 use crate::engine::EngineError;
 use crate::pvol::{read_polar_volume, PolarVolume};
+
+/// Days of date-partitioned prefixes to scan when an S3 source has no
+/// `time_window`. Two days covers the just-after-midnight case where
+/// the recent tail still straddles yesterday's partition. Mirrors
+/// `OdimEngine`'s constant of the same name.
+const DEFAULT_SCAN_DAYS: u32 = 2;
 
 /// Separator between the ODIM node id and the radar quantity in an
 /// advertised parameter name (`fianj:DBZH`). See the module docs for
@@ -115,6 +134,104 @@ fn merc_y_to_lat(y: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Source
+// ---------------------------------------------------------------------------
+
+/// Where a [`PolarVolumeEngine`] reads PVOL `.h5` files from.
+///
+/// Mirrors [`crate::engine::OdimEngine`]'s `Source` exactly: a local
+/// filesystem directory or an S3/HTTP object store.
+#[derive(Clone)]
+enum Source {
+    /// A local filesystem directory, scanned with `read_dir`.
+    Local { data_dir: PathBuf },
+    /// An S3/HTTP object store. `prefix_pattern` may carry strftime
+    /// codes (e.g. `%Y/%m/%d/fivih/`); it is expanded per UTC date on
+    /// every scan so the listing stays current across day boundaries.
+    /// `time_window`, when set, bounds both the dates expanded and the
+    /// timestamps kept. `endpoint` / `bucket` are retained for
+    /// diagnostics so log and error messages can name the store.
+    Remote {
+        store: ds_storage::DataStore,
+        endpoint: String,
+        bucket: String,
+        prefix_pattern: String,
+        time_window: Option<TimeWindow>,
+    },
+}
+
+/// Stable file-identity for the parse cache.
+///
+/// The cache must **not** key on `PathBuf`: an S3/HTTP object key is
+/// not a filesystem path — keys always use `/` regardless of host OS,
+/// so round-tripping a key through `PathBuf` would corrupt it on a
+/// platform with a different separator (the deliberate choice made in
+/// `catalog::Location`). A plain `String` identity — the path string
+/// for local files, the object key for remote ones — sidesteps that.
+type FileId = String;
+
+/// Resolve the engine's [`Source`] from config. `endpoint` + `bucket`
+/// select an S3 source; their absence falls back to the local
+/// `data_path`. Setting exactly one of `endpoint` / `bucket` is a
+/// configuration error rather than a silent fallback. Mirrors
+/// `OdimEngine`'s `build_source`.
+fn build_source(
+    collection_id: &str,
+    data_path: Option<&str>,
+    config: &ds_core::config::OdimConfig,
+) -> Result<Source, EngineError> {
+    match (config.endpoint.as_deref(), config.bucket.as_deref()) {
+        (Some(endpoint), Some(bucket)) => {
+            // A missing `prefix_pattern` is almost always a config
+            // mistake: it would list the whole bucket on every poll.
+            // An explicit empty string is a deliberate flat-bucket
+            // opt-in and is allowed.
+            let prefix_pattern = config
+                .prefix_pattern
+                .clone()
+                .ok_or(EngineError::MissingPrefixPattern)?;
+            let store = ds_storage::build_s3_store_from_parts(endpoint, bucket)?;
+            let time_window = match &config.time_window {
+                Some(s) => Some(TimeWindow::parse(s)?),
+                None => None,
+            };
+            tracing::info!(
+                "[{collection_id}] PVOL S3 source: endpoint={endpoint} bucket={bucket} \
+                 prefix='{prefix_pattern}'"
+            );
+            Ok(Source::Remote {
+                store,
+                endpoint: endpoint.to_string(),
+                bucket: bucket.to_string(),
+                prefix_pattern,
+                time_window,
+            })
+        }
+        (None, None) => {
+            let data_path = data_path.ok_or(EngineError::NoSource)?;
+            Ok(Source::Local {
+                data_dir: PathBuf::from(data_path),
+            })
+        }
+        _ => Err(EngineError::IncompleteS3Config),
+    }
+}
+
+/// Human-readable description of a [`Source`] for log / error
+/// messages.
+fn source_label(source: &Source) -> String {
+    match source {
+        Source::Local { data_dir } => data_dir.display().to_string(),
+        Source::Remote {
+            endpoint,
+            bucket,
+            prefix_pattern,
+            ..
+        } => format!("s3 {endpoint}/{bucket}/{prefix_pattern}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Catalog
 // ---------------------------------------------------------------------------
 
@@ -123,9 +240,10 @@ fn merc_y_to_lat(y: f64) -> f64 {
 /// snapshot without re-parsing HDF5.
 #[derive(Clone)]
 struct VolumeEntry {
-    /// Source file path — the parse-cache key; used to evict cache
-    /// entries the (`max_files`-capped) catalog no longer references.
-    path: PathBuf,
+    /// Source file identity — the parse-cache key (local path string or
+    /// S3 object key); used to evict cache entries the (`max_files`-
+    /// capped) catalog no longer references.
+    id: FileId,
     /// Parsed volume — `Arc` so repeated requests share one parse.
     volume: Arc<PolarVolume>,
 }
@@ -167,15 +285,61 @@ fn site_coverage_bbox(lon: f64, lat: f64, radius_m: f64) -> [f64; 4] {
     ]
 }
 
-/// Scan `data_dir` for `.h5` polar-volume files, reusing already-parsed
-/// volumes from `cache` (keyed by path) so a poll cycle doesn't
-/// re-parse unchanged files. Returns the freshly built [`Catalog`].
-fn scan_directory(
+/// One file the scan should ingest: a stable identity plus a thunk
+/// that fetches its raw bytes on a cache miss. Decouples enumeration
+/// (local `read_dir` vs S3 `list`) from the shared parse/cache/group
+/// logic in [`build_catalog`].
+struct PendingFile<'a> {
+    /// Cache-key identity — local path string or S3 object key.
+    id: FileId,
+    /// Fetch the raw HDF5 bytes. Only called on a cache miss.
+    fetch: Box<dyn FnOnce() -> Result<Vec<u8>, String> + 'a>,
+}
+
+/// Scan `source` for `.h5` polar-volume files and build the catalog,
+/// reusing already-parsed volumes from `cache` (keyed by file identity)
+/// so a poll cycle doesn't re-download / re-parse unchanged files.
+///
+/// Blocking — remote scans bridge async object-store I/O internally.
+fn scan_source(
     collection_id: &str,
-    data_dir: &std::path::Path,
-    cache: &Mutex<HashMap<PathBuf, Arc<PolarVolume>>>,
+    source: &Source,
+    cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
     max_files: Option<usize>,
 ) -> Result<Catalog, EngineError> {
+    match source {
+        Source::Local { data_dir } => {
+            let pending = enumerate_local(collection_id, data_dir)?;
+            let by_site = build_catalog(collection_id, pending, cache);
+            Ok(derive_catalog(by_site, cache, max_files))
+        }
+        Source::Remote {
+            store,
+            prefix_pattern,
+            time_window,
+            ..
+        } => {
+            let (pending, time_filter) =
+                enumerate_remote(collection_id, store, prefix_pattern, time_window)?;
+            let mut by_site = build_catalog(collection_id, pending, cache);
+            // A `time_window` also bounds the timestamps kept: the
+            // object listing can include volumes just outside the
+            // window (the prefix is a whole UTC day).
+            if let Some((start, end)) = time_filter {
+                for list in by_site.values_mut() {
+                    list.retain(|e| e.volume.time >= start && e.volume.time <= end);
+                }
+            }
+            Ok(derive_catalog(by_site, cache, max_files))
+        }
+    }
+}
+
+/// Enumerate `.h5` files directly in a local directory. Non-recursive.
+fn enumerate_local<'a>(
+    collection_id: &str,
+    data_dir: &'a std::path::Path,
+) -> Result<Vec<PendingFile<'a>>, EngineError> {
     let read_dir = std::fs::read_dir(data_dir).map_err(|e| {
         EngineError::Storage(DataServerError::Engine(format!(
             "[{collection_id}] failed to read PVOL directory `{}`: {e}",
@@ -183,8 +347,7 @@ fn scan_directory(
         )))
     })?;
 
-    let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
-
+    let mut pending = Vec::new();
     for entry in read_dir.flatten() {
         let path = entry.path();
         let is_h5 = path
@@ -194,22 +357,139 @@ fn scan_directory(
         if !is_h5 || !path.is_file() {
             continue;
         }
+        let id = path.display().to_string();
+        pending.push(PendingFile {
+            id,
+            fetch: Box::new(move || std::fs::read(&path).map_err(|e| format!("read failed: {e}"))),
+        });
+    }
+    Ok(pending)
+}
+
+/// Enumerate `.h5` objects under an S3/HTTP store's date-expanded
+/// prefixes. Returns the pending-file list plus the optional
+/// `(start, end)` time filter the window implies.
+///
+/// A prefix that fails to `list` (e.g. a date partition that doesn't
+/// exist yet) is logged and skipped. If *every* prefix fails the call
+/// errors rather than silently returning an empty catalog. Mirrors
+/// `catalog::scan_remote`'s error tolerance.
+#[allow(clippy::type_complexity)]
+fn enumerate_remote<'a>(
+    collection_id: &str,
+    store: &'a ds_storage::DataStore,
+    prefix_pattern: &str,
+    time_window: &Option<TimeWindow>,
+) -> Result<(Vec<PendingFile<'a>>, Option<(DateTime<Utc>, DateTime<Utc>)>), EngineError> {
+    use ds_storage::object_store::path::Path as ObjectPath;
+
+    let now = Utc::now();
+    let (prefixes, time_filter) = match time_window {
+        Some(tw) => (
+            expand_prefix_for_dates(prefix_pattern, &tw.scan_dates(now)),
+            Some(tw.to_range(now)),
+        ),
+        None => (
+            expand_prefix_pattern(prefix_pattern, DEFAULT_SCAN_DAYS),
+            None,
+        ),
+    };
+
+    let mut pending: Vec<PendingFile<'a>> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for prefix in &prefixes {
+        let listed = match store.list(&ObjectPath::from(prefix.as_str())) {
+            Ok(objects) => objects,
+            Err(e) => {
+                errors.push(format!("'{prefix}': {e}"));
+                continue;
+            }
+        };
+        for obj in listed {
+            let key = obj.location.to_string();
+            if !key.to_ascii_lowercase().ends_with(".h5") {
+                continue;
+            }
+            if obj.size as u64 > MAX_REMOTE_FILE_SIZE {
+                tracing::warn!(
+                    "[{collection_id}] skipping oversized PVOL object `{key}` ({} bytes)",
+                    obj.size
+                );
+                continue;
+            }
+            let store_clone = store.clone();
+            let key_for_fetch = key.clone();
+            pending.push(PendingFile {
+                id: key,
+                fetch: Box::new(move || {
+                    let object = ObjectPath::from(key_for_fetch.as_str());
+                    // Re-check size at `get` time — an object can grow
+                    // between `list` and `get`.
+                    let meta = store_clone
+                        .head(&object)
+                        .map_err(|e| format!("head failed: {e}"))?;
+                    if meta.size as u64 > MAX_REMOTE_FILE_SIZE {
+                        return Err(format!(
+                            "object is {} bytes — exceeds the {MAX_REMOTE_FILE_SIZE}-byte limit",
+                            meta.size
+                        ));
+                    }
+                    store_clone
+                        .get(&object)
+                        .map(|b| b.to_vec())
+                        .map_err(|e| format!("get failed: {e}"))
+                }),
+            });
+        }
+    }
+
+    if pending.is_empty() && !errors.is_empty() {
+        return Err(EngineError::Storage(DataServerError::Engine(format!(
+            "[{collection_id}] all {} PVOL S3 prefix scan(s) failed: {}",
+            errors.len(),
+            errors.join("; ")
+        ))));
+    }
+    if !errors.is_empty() {
+        tracing::warn!(
+            "[{collection_id}] {} PVOL S3 prefix scan(s) failed (kept {} object(s) from the \
+             rest): {}",
+            errors.len(),
+            pending.len(),
+            errors.join("; ")
+        );
+    }
+    Ok((pending, time_filter))
+}
+
+/// Parse the enumerated pending files (reusing cached parses) and group
+/// the volumes by `site.nod`. A file that fails to fetch or parse is
+/// logged and skipped — it does not sink the whole scan. The grouped
+/// map is finalised (sorted, capped, metadata-derived) by
+/// [`derive_catalog`].
+fn build_catalog(
+    collection_id: &str,
+    pending: Vec<PendingFile<'_>>,
+    cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
+) -> HashMap<String, Vec<VolumeEntry>> {
+    let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+
+    for file in pending {
+        let PendingFile { id, fetch } = file;
 
         // Cache hit — reuse the parsed volume.
         let cached = {
             let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-            guard.get(&path).cloned()
+            guard.get(&id).cloned()
         };
         let volume = match cached {
             Some(v) => v,
             None => {
-                let bytes = match std::fs::read(&path) {
+                let bytes = match fetch() {
                     Ok(b) => b,
                     Err(e) => {
-                        tracing::warn!(
-                            "[{collection_id}] skipping PVOL file `{}`: read failed: {e}",
-                            path.display()
-                        );
+                        tracing::warn!("[{collection_id}] skipping PVOL file `{id}`: {e}");
                         continue;
                     }
                 };
@@ -219,13 +499,12 @@ fn scan_directory(
                         cache
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .insert(path.clone(), v.clone());
+                            .insert(id.clone(), v.clone());
                         v
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "[{collection_id}] skipping PVOL file `{}`: parse failed: {e}",
-                            path.display()
+                            "[{collection_id}] skipping PVOL file `{id}`: parse failed: {e}"
                         );
                         continue;
                     }
@@ -235,8 +514,7 @@ fn scan_directory(
 
         let Some(nod) = volume.site.nod.clone() else {
             tracing::warn!(
-                "[{collection_id}] skipping PVOL file `{}`: no NOD identifier in /what/source",
-                path.display()
+                "[{collection_id}] skipping PVOL file `{id}`: no NOD identifier in /what/source"
             );
             continue;
         };
@@ -244,12 +522,26 @@ fn scan_directory(
         by_site
             .entry(nod)
             .or_default()
-            .push(VolumeEntry { path, volume });
+            .push(VolumeEntry { id, volume });
     }
 
-    // Sort each site's volumes by time ascending, then cap each site
-    // to the most-recent `max_files` — an archive directory holding
-    // years of data must not load and cache every file.
+    by_site
+}
+
+/// Finalise the grouped volume map into a [`Catalog`]: sort and cap
+/// each site's list, evict stale parse-cache entries, and derive the
+/// parameter list, temporal extent, and spatial extent.
+///
+/// `max_files` caps each site to its most-recent N volumes — an archive
+/// directory (or a wide S3 `time_window`) must not load and cache every
+/// file.
+fn derive_catalog(
+    mut by_site: HashMap<String, Vec<VolumeEntry>>,
+    cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
+    max_files: Option<usize>,
+) -> Catalog {
+    // Sort each site's volumes by time ascending, then cap to the
+    // most-recent `max_files`.
     for list in by_site.values_mut() {
         list.sort_by_key(|e| e.volume.time);
         if let Some(cap) = max_files {
@@ -258,13 +550,15 @@ fn scan_directory(
             }
         }
     }
+    // An S3 `time_window` filter can empty a site's list entirely.
+    by_site.retain(|_, list| !list.is_empty());
 
     // Evict parse-cache entries the catalog no longer references —
-    // files deleted from disk, plus volumes aged out of a site's
+    // files dropped from the source, plus volumes aged out of a site's
     // `max_files` window. `kept` is a set, so this is O(cache).
     {
-        let kept: std::collections::HashSet<&PathBuf> =
-            by_site.values().flatten().map(|e| &e.path).collect();
+        let kept: std::collections::HashSet<&FileId> =
+            by_site.values().flatten().map(|e| &e.id).collect();
         let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         guard.retain(|k, _| kept.contains(k));
     }
@@ -317,12 +611,12 @@ fn scan_directory(
         });
     }
 
-    Ok(Catalog {
+    Catalog {
         by_site,
         parameters,
         times,
         spatial_extent,
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -336,18 +630,24 @@ fn scan_directory(
 /// [`PolarVolumeEngine::shutdown`].
 pub struct PolarVolumeEngine {
     collection_id: String,
-    /// Directory of `.h5` polar-volume files, re-scanned by the poll loop.
-    data_dir: PathBuf,
+    /// Local directory or S3/HTTP object store, re-scanned by the poll loop.
+    source: Source,
     /// Per-site cap on retained volumes (`OdimConfig.max_files`) — keeps
-    /// an archive directory from loading every file into the catalog.
+    /// an archive source from loading every file into the catalog.
     max_files: Option<usize>,
     /// Lock-free catalog snapshot for `raster_info()` + `get_raster_tile`.
     catalog: Arc<ArcSwap<Catalog>>,
-    /// Multi-entry parse cache keyed by file path — a PVOL network of
+    /// Multi-entry parse cache keyed by file identity (local path
+    /// string or S3 object key — see [`FileId`]). A PVOL network of
     /// ~10 sites at 5-min cadence keeps tens of volumes resident; HDF5
-    /// parsing (not the few-MB read) dominates, so caching every parsed
-    /// volume keeps both the poll loop and hot tile requests cheap.
-    parse_cache: Mutex<HashMap<PathBuf, Arc<PolarVolume>>>,
+    /// parsing (and, for S3, the multi-MB download) dominates, so
+    /// caching every parsed volume keeps both the poll loop and hot
+    /// tile requests cheap. The key is a `String`, not a `PathBuf`,
+    /// because S3 object keys are not filesystem paths.
+    ///
+    /// Behind an `Arc` so a `poll_once` scan can be moved onto a
+    /// `spawn_blocking` task without borrowing `self`.
+    parse_cache: Arc<Mutex<HashMap<FileId, Arc<PolarVolume>>>>,
     poll_interval: Duration,
     shutdown: AtomicBool,
     shutdown_notify: Notify,
@@ -361,33 +661,38 @@ impl PolarVolumeEngine {
     /// loop will pick files up later) — only an unreadable directory or
     /// a missing `data_path` is a hard error.
     ///
+    /// The source is a local directory (`data_path`) or an S3/HTTP
+    /// bucket (`endpoint` + `bucket` + `prefix_pattern`) — mirroring the
+    /// COMP [`crate::engine::OdimEngine`].
+    ///
     /// `config` is the shared [`ds_core::config::OdimConfig`]; the
     /// volume engine ignores its `parameter`/`unit` fields (a PVOL
-    /// collection is inherently multi-parameter) and uses only
-    /// `poll_interval_secs`. S3 fields are not yet supported for PVOL.
+    /// collection is inherently multi-parameter) and uses
+    /// `poll_interval_secs` plus the S3 source fields.
     pub fn new(
         collection_id: &str,
         data_path: Option<&str>,
         config: &ds_core::config::OdimConfig,
     ) -> Result<Self, EngineError> {
-        if config.endpoint.is_some() || config.bucket.is_some() {
+        // `time_window` only constrains S3 prefix expansion + timestamp
+        // filtering. A local `data_path` source ignores it — warn so a
+        // misplaced setting doesn't silently do nothing.
+        if config.time_window.is_some() && config.endpoint.is_none() {
             tracing::warn!(
-                "[{collection_id}] `endpoint`/`bucket` are set but the PVOL \
-                 (`odim-volume`) engine only supports a local `data_path` \
-                 source — the S3 settings are ignored"
+                "[{collection_id}] `time_window` is set but has no effect on a \
+                 local `data_path` PVOL source — it only applies to S3 sources"
             );
         }
 
-        let data_path = data_path.ok_or(EngineError::NoSource)?;
-        let data_dir = PathBuf::from(data_path);
+        let source = build_source(collection_id, data_path, config)?;
 
-        let parse_cache = Mutex::new(HashMap::new());
-        let catalog = scan_directory(collection_id, &data_dir, &parse_cache, config.max_files)?;
+        let parse_cache = Arc::new(Mutex::new(HashMap::new()));
+        let catalog = scan_source(collection_id, &source, &parse_cache, config.max_files)?;
         if catalog.by_site.is_empty() {
             tracing::warn!(
-                "[{collection_id}] no PVOL `.h5` files found in `{}` yet — \
+                "[{collection_id}] no PVOL `.h5` files found at `{}` yet — \
                  the catalog will populate on the next poll",
-                data_dir.display()
+                source_label(&source)
             );
         } else {
             tracing::info!(
@@ -400,7 +705,7 @@ impl PolarVolumeEngine {
 
         Ok(Self {
             collection_id: collection_id.to_string(),
-            data_dir,
+            source,
             max_files: config.max_files,
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
             parse_cache,
@@ -410,7 +715,7 @@ impl PolarVolumeEngine {
         })
     }
 
-    /// Re-scan the directory and atomically swap the catalog. Exits
+    /// Re-scan the source and atomically swap the catalog. Exits
     /// when [`shutdown`](Self::shutdown) is called. Mirrors
     /// `OdimEngine::poll_loop` — `AtomicBool` flag + `Notify` wake-up.
     pub async fn poll_loop(&self) {
@@ -425,12 +730,48 @@ impl PolarVolumeEngine {
             tokio::select! {
                 _ = interval.tick() => {
                     if !self.shutdown.load(Ordering::Acquire) {
-                        self.poll_once();
+                        self.poll_once().await;
                     }
                 }
                 _ = self.shutdown_notify.notified() => {}
             }
         }
+    }
+
+    /// Build an engine over a pre-constructed object store, bypassing
+    /// `endpoint`/`bucket` parsing.
+    ///
+    /// **Test-only.** Exists so the integration suite can exercise the
+    /// full remote scan path (`list` → `get` → parse → group-by-site)
+    /// against a `DataStore` backed by `object_store`'s
+    /// `LocalFileSystem` — the same trick PR #182 used for the COMP
+    /// engine — without a live S3 endpoint. `prefix_pattern` is used
+    /// verbatim (pass `""` to scan the store root); no `time_window`.
+    #[doc(hidden)]
+    pub fn new_remote_for_test(
+        collection_id: &str,
+        store: ds_storage::DataStore,
+        prefix_pattern: &str,
+    ) -> Result<Self, EngineError> {
+        let source = Source::Remote {
+            store,
+            endpoint: "test://local".to_string(),
+            bucket: "test".to_string(),
+            prefix_pattern: prefix_pattern.to_string(),
+            time_window: None,
+        };
+        let parse_cache = Arc::new(Mutex::new(HashMap::new()));
+        let catalog = scan_source(collection_id, &source, &parse_cache, None)?;
+        Ok(Self {
+            collection_id: collection_id.to_string(),
+            source,
+            max_files: None,
+            catalog: Arc::new(ArcSwap::from_pointee(catalog)),
+            parse_cache,
+            poll_interval: Duration::from_secs(30),
+            shutdown: AtomicBool::new(false),
+            shutdown_notify: Notify::new(),
+        })
     }
 
     /// Signal the poll loop to stop. Idempotent; safe to call before
@@ -441,14 +782,22 @@ impl PolarVolumeEngine {
         }
     }
 
-    fn poll_once(&self) {
-        match scan_directory(
-            &self.collection_id,
-            &self.data_dir,
-            &self.parse_cache,
-            self.max_files,
-        ) {
-            Ok(catalog) => {
+    /// Re-scan the source and atomically swap the catalog.
+    ///
+    /// The scan — directory walk or S3 `list` + multi-MB `get`s plus
+    /// HDF5 parsing — is blocking, so it runs on `spawn_blocking` rather
+    /// than stalling a Tokio worker. Mirrors `OdimEngine::poll_once`.
+    async fn poll_once(&self) {
+        let collection_id = self.collection_id.clone();
+        let source = self.source.clone();
+        let cache = Arc::clone(&self.parse_cache);
+        let max_files = self.max_files;
+        let scan_result = tokio::task::spawn_blocking(move || {
+            scan_source(&collection_id, &source, &cache, max_files)
+        })
+        .await;
+        match scan_result {
+            Ok(Ok(catalog)) => {
                 let prev = self.catalog.load();
                 let changed = prev.by_site.len() != catalog.by_site.len()
                     || prev.times.last() != catalog.times.last()
@@ -465,8 +814,14 @@ impl PolarVolumeEngine {
                 }
                 self.catalog.store(Arc::new(catalog));
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!("[{}] PVOL catalog refresh failed: {e}", self.collection_id);
+            }
+            Err(join_err) => {
+                tracing::error!(
+                    "[{}] PVOL catalog refresh task panicked: {join_err}",
+                    self.collection_id
+                );
             }
         }
     }
@@ -847,5 +1202,106 @@ mod tests {
         assert!(w < 25.0 && e > 25.0 && s < 60.0 && n > 60.0);
         // ~250 km ≈ 2.25° of latitude.
         assert!((n - s - 4.5).abs() < 0.5, "lat span ≈ 4.5°, got {}", n - s);
+    }
+
+    // -----------------------------------------------------------------
+    // build_source — source selection + config validation
+    // -----------------------------------------------------------------
+
+    /// Minimal `OdimConfig` with every field defaulted; tests override
+    /// only the fields they exercise.
+    fn empty_config() -> ds_core::config::OdimConfig {
+        ds_core::config::OdimConfig {
+            filename_template: None,
+            filename_pattern: None,
+            timestamp_format: None,
+            parameter: None,
+            unit: None,
+            nodata: None,
+            gain: None,
+            offset: None,
+            poll_interval_secs: 30,
+            max_files: None,
+            endpoint: None,
+            bucket: None,
+            prefix_pattern: None,
+            time_window: None,
+        }
+    }
+
+    /// With no `endpoint`/`bucket`, `build_source` selects a local
+    /// directory source from `data_path`.
+    #[test]
+    fn build_source_selects_local_when_no_s3_fields() {
+        let config = empty_config();
+        match build_source("c", Some("/some/dir"), &config).unwrap() {
+            Source::Local { data_dir } => assert_eq!(data_dir, PathBuf::from("/some/dir")),
+            Source::Remote { .. } => panic!("expected a Local source"),
+        }
+    }
+
+    /// A missing `data_path` with no S3 fields is `NoSource`.
+    #[test]
+    fn build_source_no_path_no_s3_is_no_source() {
+        let config = empty_config();
+        assert!(matches!(
+            build_source("c", None, &config),
+            Err(EngineError::NoSource)
+        ));
+    }
+
+    /// `endpoint` + `bucket` + `prefix_pattern` selects a remote source.
+    #[test]
+    fn build_source_selects_remote_with_full_s3_config() {
+        let mut config = empty_config();
+        config.endpoint = Some("https://s3-eu-west-1.amazonaws.com".into());
+        config.bucket = Some("fmi-opendata-radar-volume-hdf5".into());
+        config.prefix_pattern = Some("%Y/%m/%d/fivih/".into());
+        config.time_window = Some("-PT3H".into());
+        match build_source("c", None, &config).unwrap() {
+            Source::Remote {
+                bucket,
+                prefix_pattern,
+                time_window,
+                ..
+            } => {
+                assert_eq!(bucket, "fmi-opendata-radar-volume-hdf5");
+                assert_eq!(prefix_pattern, "%Y/%m/%d/fivih/");
+                assert!(time_window.is_some());
+            }
+            Source::Local { .. } => panic!("expected a Remote source"),
+        }
+    }
+
+    /// An S3 source without `prefix_pattern` is rejected — it would
+    /// otherwise list the whole bucket on every poll.
+    #[test]
+    fn build_source_s3_without_prefix_pattern_errors() {
+        let mut config = empty_config();
+        config.endpoint = Some("https://s3-eu-west-1.amazonaws.com".into());
+        config.bucket = Some("fmi-opendata-radar-volume-hdf5".into());
+        assert!(matches!(
+            build_source("c", None, &config),
+            Err(EngineError::MissingPrefixPattern)
+        ));
+    }
+
+    /// Setting exactly one of `endpoint` / `bucket` is a config error,
+    /// not a silent fallback to the local source.
+    #[test]
+    fn build_source_endpoint_xor_bucket_errors() {
+        let mut endpoint_only = empty_config();
+        endpoint_only.endpoint = Some("https://s3.example.com".into());
+        assert!(matches!(
+            build_source("c", Some("/dir"), &endpoint_only),
+            Err(EngineError::IncompleteS3Config)
+        ));
+
+        let mut bucket_only = empty_config();
+        bucket_only.bucket = Some("some-bucket".into());
+        assert!(matches!(
+            build_source("c", Some("/dir"), &bucket_only),
+            Err(EngineError::IncompleteS3Config)
+        ));
     }
 }
