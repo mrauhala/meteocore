@@ -10,8 +10,8 @@
 //!
 //! A scan — local-directory ([`scan_local_directory`]) or S3/HTTP
 //! object-store ([`scan_remote`]) — applies the regex to each
-//! filename, parses the timestamp, and returns a sorted list of
-//! `(timestamp, path)` entries.
+//! filename, parses the timestamp, and returns a list of
+//! [`CatalogEntry`] values sorted by timestamp ascending.
 
 use std::path::{Path, PathBuf};
 
@@ -49,10 +49,43 @@ pub enum CatalogError {
 }
 
 /// One file in the catalog, sorted by `time` ascending.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CatalogEntry {
     pub time: DateTime<Utc>,
-    pub path: PathBuf,
+    pub location: Location,
+}
+
+/// Where one catalog entry's bytes live.
+///
+/// Local and remote entries are deliberately distinct types, not a
+/// shared `PathBuf`: an S3/HTTP object key is **not** a filesystem
+/// path. Keys always use `/` regardless of host OS, so round-tripping
+/// one through `PathBuf` would corrupt it on a platform with a
+/// different separator. A `Remote` location also carries the
+/// [`ds_storage::DataStore`] handle (a cheap `Arc` clone) so the
+/// entry is self-sufficient — it can be fetched without threading the
+/// engine's source state back through every call site.
+#[derive(Debug, Clone)]
+pub enum Location {
+    /// A local filesystem path.
+    Local(PathBuf),
+    /// An object store plus the full object key within it.
+    Remote {
+        store: ds_storage::DataStore,
+        key: String,
+    },
+}
+
+impl Location {
+    /// Stable identity string — used for cache keying and log /
+    /// error messages. For `Local` this is the path; for `Remote`
+    /// the object key.
+    pub fn id(&self) -> String {
+        match self {
+            Location::Local(path) => path.display().to_string(),
+            Location::Remote { key, .. } => key.clone(),
+        }
+    }
 }
 
 /// Compiled regex + chrono format for matching ODIM filenames and
@@ -178,7 +211,10 @@ pub fn scan_local_directory(
             continue;
         };
         if let Some(time) = matcher.parse_timestamp(name) {
-            entries.push(CatalogEntry { time, path });
+            entries.push(CatalogEntry {
+                time,
+                location: Location::Local(path),
+            });
         }
     }
     entries.sort_by_key(|e| e.time);
@@ -252,7 +288,10 @@ pub fn scan_remote(
             }
             entries.push(CatalogEntry {
                 time,
-                path: PathBuf::from(key),
+                location: Location::Remote {
+                    store: store.clone(),
+                    key,
+                },
             });
         }
     }
@@ -276,7 +315,11 @@ pub fn scan_remote(
     // Sort by timestamp ascending; on a duplicate timestamp order the
     // key descending so the lexicographically-last key survives the
     // `dedup_by` (which keeps the first of each equal-timestamp run).
-    entries.sort_by(|a, b| a.time.cmp(&b.time).then_with(|| b.path.cmp(&a.path)));
+    entries.sort_by(|a, b| {
+        a.time
+            .cmp(&b.time)
+            .then_with(|| b.location.id().cmp(&a.location.id()))
+    });
     entries.dedup_by(|a, b| a.time == b.time);
 
     if let Some(cap) = max_files {
@@ -545,7 +588,7 @@ mod tests {
         assert_eq!(entries.len(), 2);
         let names: Vec<_> = entries
             .iter()
-            .map(|e| e.path.file_name().unwrap().to_str().unwrap().to_string())
+            .map(|e| e.location.id().rsplit('/').next().unwrap().to_string())
             .collect();
         assert_eq!(
             names,
@@ -587,13 +630,50 @@ mod tests {
         // time_filter drops entries outside the [00:05, 00:10] range.
         let start = "2026-05-15T00:05:00Z".parse().unwrap();
         let end = "2026-05-15T00:10:00Z".parse().unwrap();
-        let windowed =
-            scan_remote(&store, &["".to_string()], &matcher, Some((start, end)), None).unwrap();
+        let windowed = scan_remote(
+            &store,
+            &["".to_string()],
+            &matcher,
+            Some((start, end)),
+            None,
+        )
+        .unwrap();
         let times: Vec<_> = windowed.iter().map(|e| e.time.to_rfc3339()).collect();
         assert_eq!(
             times,
             ["2026-05-15T00:05:00+00:00", "2026-05-15T00:10:00+00:00"]
         );
+    }
+
+    /// Two objects under different prefixes share a timestamp. `dedup`
+    /// must collapse them to exactly one entry, deterministically
+    /// keeping the lexicographically-last key. Pins the tie-break so a
+    /// future change to the sort predicate can't silently flip the
+    /// winner.
+    #[test]
+    fn scan_remote_dedups_duplicate_timestamps_keeping_last_key() {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["a", "b"] {
+            std::fs::create_dir(dir.path().join(sub)).unwrap();
+            std::fs::write(
+                dir.path().join(sub).join("OPERA@20260515T0000@0@DBZH.h5"),
+                b"x",
+            )
+            .unwrap();
+        }
+        let (store, _) = ds_storage::build_store(dir.path().to_str().unwrap()).unwrap();
+        let matcher = FilenameMatcher::from_template("OPERA@%Y%m%dT%H%M@0@DBZH.h5").unwrap();
+
+        let entries = scan_remote(
+            &store,
+            &["a".to_string(), "b".to_string()],
+            &matcher,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1, "duplicate timestamp must collapse to one");
+        assert_eq!(entries[0].location.id(), "b/OPERA@20260515T0000@0@DBZH.h5");
     }
 
     /// Entries from multiple prefixes are merged; a prefix that yields
@@ -603,11 +683,7 @@ mod tests {
     fn scan_remote_merges_prefixes() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("good")).unwrap();
-        std::fs::write(
-            dir.path().join("good/OPERA@20260515T0000@0@DBZH.h5"),
-            b"x",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("good/OPERA@20260515T0000@0@DBZH.h5"), b"x").unwrap();
         let (store, _) = ds_storage::build_store(dir.path().to_str().unwrap()).unwrap();
         let matcher = FilenameMatcher::from_template("OPERA@%Y%m%dT%H%M@0@DBZH.h5").unwrap();
 
