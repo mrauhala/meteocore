@@ -33,7 +33,7 @@ pub struct RasterInfo {
     pub native_crs: String,
     /// Native spatial extent [west, south, east, north] in WGS84.
     pub spatial_extent: Option<[f64; 4]>,
-    /// Available timestamps, most recent first.
+    /// Available timestamps, oldest first (ascending).
     pub times: Vec<DateTime<Utc>>,
     /// Default parameter name (e.g., "reflectivity").
     pub parameter: String,

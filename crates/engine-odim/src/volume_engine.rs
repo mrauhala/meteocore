@@ -659,8 +659,7 @@ impl MapEngine for PolarVolumeEngine {
         RasterInfo {
             native_crs: "CRS:84".to_string(),
             spatial_extent: catalog.spatial_extent,
-            // Most-recent-first, matching the `RasterInfo::times` contract.
-            times: catalog.times.iter().rev().copied().collect(),
+            times: catalog.times.clone(),
             parameter,
             // PVOL quantities span multiple physical units (dBZ, m/s,
             // dB, …); the per-layer unit is not a single collection
