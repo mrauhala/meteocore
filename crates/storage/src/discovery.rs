@@ -67,6 +67,15 @@ impl TimeWindow {
             }
             if let Some(pos) = remaining.find('S') {
                 total_seconds += parse_int(&remaining[..pos], "seconds", s)?;
+                remaining = &remaining[pos + 1..];
+            }
+            // Reject anything left over — e.g. `PT2H5` (a bare `5`
+            // with no unit) or `PT2H30M5SFOO` — rather than silently
+            // dropping it and returning a partial duration.
+            if !remaining.is_empty() {
+                return Err(DataServerError::Config(format!(
+                    "Invalid time_window '{s}': unexpected trailing characters '{remaining}'"
+                )));
             }
         }
 
@@ -187,6 +196,10 @@ mod tests {
         assert!(TimeWindow::parse("2H").is_err());
         assert!(TimeWindow::parse("").is_err());
         assert!(TimeWindow::parse("P").is_err());
+        // Trailing characters must not be silently dropped.
+        assert!(TimeWindow::parse("PT2H5").is_err());
+        assert!(TimeWindow::parse("PT2H30M5SFOO").is_err());
+        assert!(TimeWindow::parse("PT2HFOO").is_err());
     }
 
     #[test]
