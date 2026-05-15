@@ -123,6 +123,9 @@ fn merc_y_to_lat(y: f64) -> f64 {
 /// snapshot without re-parsing HDF5.
 #[derive(Clone)]
 struct VolumeEntry {
+    /// Source file path — the parse-cache key; used to evict cache
+    /// entries the (`max_files`-capped) catalog no longer references.
+    path: PathBuf,
     /// Parsed volume — `Arc` so repeated requests share one parse.
     volume: Arc<PolarVolume>,
 }
@@ -171,6 +174,7 @@ fn scan_directory(
     collection_id: &str,
     data_dir: &std::path::Path,
     cache: &Mutex<HashMap<PathBuf, Arc<PolarVolume>>>,
+    max_files: Option<usize>,
 ) -> Result<Catalog, EngineError> {
     let read_dir = std::fs::read_dir(data_dir).map_err(|e| {
         EngineError::Storage(DataServerError::Engine(format!(
@@ -180,8 +184,6 @@ fn scan_directory(
     })?;
 
     let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
-    // Files seen this scan — used to evict dropped files from the cache.
-    let mut seen: Vec<PathBuf> = Vec::new();
 
     for entry in read_dir.flatten() {
         let path = entry.path();
@@ -192,7 +194,6 @@ fn scan_directory(
         if !is_h5 || !path.is_file() {
             continue;
         }
-        seen.push(path.clone());
 
         // Cache hit — reuse the parsed volume.
         let cached = {
@@ -240,18 +241,32 @@ fn scan_directory(
             continue;
         };
 
-        by_site.entry(nod).or_default().push(VolumeEntry { volume });
+        by_site
+            .entry(nod)
+            .or_default()
+            .push(VolumeEntry { path, volume });
     }
 
-    // Evict cache entries for files that no longer exist.
-    {
-        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        guard.retain(|k, _| seen.contains(k));
-    }
-
-    // Sort each site's volumes by time ascending.
+    // Sort each site's volumes by time ascending, then cap each site
+    // to the most-recent `max_files` — an archive directory holding
+    // years of data must not load and cache every file.
     for list in by_site.values_mut() {
         list.sort_by_key(|e| e.volume.time);
+        if let Some(cap) = max_files {
+            if list.len() > cap {
+                list.drain(..list.len() - cap);
+            }
+        }
+    }
+
+    // Evict parse-cache entries the catalog no longer references —
+    // files deleted from disk, plus volumes aged out of a site's
+    // `max_files` window. `kept` is a set, so this is O(cache).
+    {
+        let kept: std::collections::HashSet<&PathBuf> =
+            by_site.values().flatten().map(|e| &e.path).collect();
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        guard.retain(|k, _| kept.contains(k));
     }
 
     // Derive parameters from each site's lowest sweep.
@@ -274,6 +289,9 @@ fn scan_directory(
         }
     }
     parameters.sort_by(|a, b| a.0.cmp(&b.0));
+    // A producer shipping a sweep with a duplicate quantity name would
+    // otherwise advertise the same `<nod>:<quantity>` layer twice.
+    parameters.dedup_by(|a, b| a.0 == b.0);
 
     // Distinct, sorted volume times across all sites.
     let mut times: Vec<DateTime<Utc>> = by_site
@@ -320,6 +338,9 @@ pub struct PolarVolumeEngine {
     collection_id: String,
     /// Directory of `.h5` polar-volume files, re-scanned by the poll loop.
     data_dir: PathBuf,
+    /// Per-site cap on retained volumes (`OdimConfig.max_files`) — keeps
+    /// an archive directory from loading every file into the catalog.
+    max_files: Option<usize>,
     /// Lock-free catalog snapshot for `raster_info()` + `get_raster_tile`.
     catalog: Arc<ArcSwap<Catalog>>,
     /// Multi-entry parse cache keyed by file path — a PVOL network of
@@ -361,7 +382,7 @@ impl PolarVolumeEngine {
         let data_dir = PathBuf::from(data_path);
 
         let parse_cache = Mutex::new(HashMap::new());
-        let catalog = scan_directory(collection_id, &data_dir, &parse_cache)?;
+        let catalog = scan_directory(collection_id, &data_dir, &parse_cache, config.max_files)?;
         if catalog.by_site.is_empty() {
             tracing::warn!(
                 "[{collection_id}] no PVOL `.h5` files found in `{}` yet — \
@@ -380,6 +401,7 @@ impl PolarVolumeEngine {
         Ok(Self {
             collection_id: collection_id.to_string(),
             data_dir,
+            max_files: config.max_files,
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
             parse_cache,
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
@@ -420,7 +442,12 @@ impl PolarVolumeEngine {
     }
 
     fn poll_once(&self) {
-        match scan_directory(&self.collection_id, &self.data_dir, &self.parse_cache) {
+        match scan_directory(
+            &self.collection_id,
+            &self.data_dir,
+            &self.parse_cache,
+            self.max_files,
+        ) {
             Ok(catalog) => {
                 let prev = self.catalog.load();
                 let changed = prev.by_site.len() != catalog.by_site.len()
@@ -655,10 +682,9 @@ mod tests {
     #[test]
     fn bearing_due_north_is_zero() {
         let (_d, az) = ground_distance_bearing(25.0, 60.0, 25.0, 60.5);
-        assert!(
-            !(0.01..=359.99).contains(&az),
-            "due-north bearing ≈ 0°, got {az}"
-        );
+        // `rem_euclid(360)` keeps `az` in [0, 360), so due-north is a
+        // small positive angle — assert that directly.
+        assert!(az < 0.01, "due-north bearing ≈ 0°, got {az}");
     }
 
     /// A pixel ~10 km due east of the site has bearing ≈ 90° and
