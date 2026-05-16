@@ -32,8 +32,8 @@ fn dmi_engine() -> (engine_odim::OdimEngine, tempfile::TempDir) {
         filename_template: Some("dk.com.%Y%m%d%H%M.500_max.h5".into()),
         filename_pattern: None,
         timestamp_format: None,
-        parameter: "reflectivity".into(),
-        unit: "dBZ".into(),
+        parameter: Some("reflectivity".into()),
+        unit: Some("dBZ".into()),
         nodata: None,
         gain: None,
         offset: None,
@@ -324,8 +324,8 @@ fn edr_query_area_rejects_too_many_timesteps() {
         filename_template: Some("dk.com.%Y%m%d%H%M.500_max.h5".into()),
         filename_pattern: None,
         timestamp_format: None,
-        parameter: "reflectivity".into(),
-        unit: "dBZ".into(),
+        parameter: Some("reflectivity".into()),
+        unit: Some("dBZ".into()),
         nodata: None,
         gain: None,
         offset: None,
@@ -387,4 +387,149 @@ fn edr_query_area_masks_outside_polygon() {
         masked > 0,
         "a thin triangle must leave some bbox cells outside the polygon"
     );
+}
+
+// ---------------------------------------------------------------------------
+// PolarVolumeEngine — ODIM polar-volume (PVOL) MapEngine
+// ---------------------------------------------------------------------------
+
+/// End-to-end render against the real FMI Anjalankoski polar volume
+/// (`testdata/radar-fmi-pvol/202605150000_fianj_PVOL.h5`).
+///
+/// The 15 MB fixture is **not committed to git**, so this test skips
+/// gracefully when it is absent — CI stays green; a local checkout
+/// with the fixture exercises the full PVOL render pipeline.
+#[test]
+fn pvol_engine_renders_fmi_anjalankoski_volume() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/radar-fmi-pvol/202605150000_fianj_PVOL.h5");
+    if !fixture.exists() {
+        eprintln!(
+            "skipping pvol_engine_renders_fmi_anjalankoski_volume: fixture absent at {fixture:?}"
+        );
+        return;
+    }
+
+    // The PVOL engine scans a directory; point it at the directory the
+    // fixture lives in.
+    let data_dir = fixture
+        .parent()
+        .expect("fixture has a parent directory")
+        .to_str()
+        .expect("utf8 fixture dir");
+
+    // `odim-volume` ignores `parameter`/`unit`; both may be `None`.
+    let config = OdimConfig {
+        filename_template: None,
+        filename_pattern: None,
+        timestamp_format: None,
+        parameter: None,
+        unit: None,
+        nodata: None,
+        gain: None,
+        offset: None,
+        poll_interval_secs: 30,
+        max_files: None,
+        endpoint: None,
+        bucket: None,
+        prefix_pattern: None,
+        time_window: None,
+    };
+
+    let engine = engine_odim::PolarVolumeEngine::new("fianj-pvol-test", Some(data_dir), &config)
+        .expect("PolarVolumeEngine::new over the PVOL directory");
+
+    let info = engine.raster_info();
+    assert_eq!(info.native_crs, "CRS:84");
+    assert!(!info.times.is_empty(), "PVOL catalog must have a timestep");
+    assert!(
+        info.spatial_extent.is_some(),
+        "PVOL catalog must report a coverage bbox"
+    );
+
+    // The FMI Anjalankoski volume's lowest sweep exposes TH (and DBZH).
+    // At least one `fianj:<quantity>` parameter must surface.
+    let fianj_params: Vec<&str> = info
+        .parameters
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|n| n.starts_with("fianj:"))
+        .collect();
+    assert!(
+        !fianj_params.is_empty(),
+        "expected fianj:<quantity> parameters, got {:?}",
+        info.parameters
+    );
+    // Prefer TH if present (every FMI lowest sweep carries it), else
+    // any available fianj quantity.
+    let render_param = if fianj_params.contains(&"fianj:TH") {
+        "fianj:TH".to_string()
+    } else if fianj_params.contains(&"fianj:DBZH") {
+        "fianj:DBZH".to_string()
+    } else {
+        fianj_params[0].to_string()
+    };
+
+    // Render a tile over the radar's coverage bbox. Anjalankoski sits
+    // near 27.11°E, 60.90°N; a ~2° box centred there is well inside
+    // the ~250 km sweep, so a real volume must produce some echoes.
+    let bbox = [26.0, 60.0, 28.2, 61.8];
+    let tile = engine
+        .get_raster_tile(bbox, 128, 128, None, &OutputCrs::Wgs84, Some(&render_param))
+        .expect("PVOL get_raster_tile over the coverage bbox");
+
+    assert_eq!(tile.width, 128);
+    assert_eq!(tile.height, 128);
+    assert_eq!(tile.values.len(), 128 * 128);
+    let non_none = tile.values.iter().filter(|v| v.is_some()).count();
+    assert!(
+        non_none > 0,
+        "a render over the radar's own coverage bbox must sample some \
+         non-None values (parameter {render_param})"
+    );
+}
+
+/// A `get_raster_tile` call with no `parameter` (or an unparseable
+/// one) on a PVOL collection is a clean error, not a panic.
+#[test]
+fn pvol_engine_rejects_missing_parameter() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/radar-fmi-pvol/202605150000_fianj_PVOL.h5");
+    if !fixture.exists() {
+        eprintln!("skipping pvol_engine_rejects_missing_parameter: fixture absent");
+        return;
+    }
+    let data_dir = fixture.parent().unwrap().to_str().unwrap();
+    let config = OdimConfig {
+        filename_template: None,
+        filename_pattern: None,
+        timestamp_format: None,
+        parameter: None,
+        unit: None,
+        nodata: None,
+        gain: None,
+        offset: None,
+        poll_interval_secs: 30,
+        max_files: None,
+        endpoint: None,
+        bucket: None,
+        prefix_pattern: None,
+        time_window: None,
+    };
+    let engine =
+        engine_odim::PolarVolumeEngine::new("fianj-pvol-test", Some(data_dir), &config).unwrap();
+
+    // `RasterTile` has no `Debug`, so match rather than `unwrap_err`.
+    match engine.get_raster_tile(
+        [26.0, 60.0, 28.0, 62.0],
+        8,
+        8,
+        None,
+        &OutputCrs::Wgs84,
+        None,
+    ) {
+        Err(ds_core::error::DataServerError::InvalidParameter(_)) => {}
+        Err(other) => panic!("missing parameter must be InvalidParameter, got {other:?}"),
+        Ok(_) => panic!("missing parameter on a PVOL collection must error"),
+    }
 }

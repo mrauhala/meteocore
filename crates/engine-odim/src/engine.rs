@@ -232,6 +232,12 @@ pub enum EngineError {
         #[source]
         source: crate::reader::ReadError,
     },
+    #[error(
+        "ODIM COMP collection is missing `[odim].{field}` — single-parameter \
+         `engine_type = \"odim\"` collections must set both `parameter` and \
+         `unit` (only `engine_type = \"odim-volume\"` may omit them)"
+    )]
+    MissingCompField { field: &'static str },
 }
 
 impl OdimEngine {
@@ -254,6 +260,18 @@ impl OdimEngine {
                  local `data_path` ODIM source — it only applies to S3 sources"
             );
         }
+
+        // COMP is single-parameter — `parameter`/`unit` are mandatory.
+        // (The shared `OdimConfig` makes both `Option` so the
+        // multi-parameter `odim-volume` engine can omit them.)
+        let parameter = config
+            .parameter
+            .clone()
+            .ok_or(EngineError::MissingCompField { field: "parameter" })?;
+        let unit = config
+            .unit
+            .clone()
+            .ok_or(EngineError::MissingCompField { field: "unit" })?;
 
         let matcher = build_matcher(config)?;
         let source = build_source(collection_id, data_path, config)?;
@@ -287,8 +305,8 @@ impl OdimEngine {
         Ok(Self {
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
             collection_id: collection_id.to_string(),
-            parameter: config.parameter.clone(),
-            unit: config.unit.clone(),
+            parameter,
+            unit,
             gain_override: config.gain,
             offset_override: config.offset,
             nodata_override: config.nodata,

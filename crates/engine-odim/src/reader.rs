@@ -78,6 +78,10 @@ pub enum ReadError {
     DatasetRead(String),
     #[error("attribute read failed: {0}")]
     AttributeRead(String),
+    #[error("polar volume contains no `/datasetN` elevation sweeps")]
+    NoSweeps,
+    #[error("elevation sweep `{dataset}` contains no `/dataM` moment groups")]
+    NoMoments { dataset: String },
 }
 
 /// Raw pixel storage as it appears on disk. ODIM composites ship
@@ -143,11 +147,25 @@ impl RawPixels {
         // letting a near-sentinel through (false negative); stick to
         // exact == until a producer is observed shipping non-integer
         // sentinels.
-        if raw == nodata {
+        //
+        // NaN-aware: some PVOL producers declare `nodata`/`undetect`
+        // as NaN. `raw == nodata` is always false when `nodata` is
+        // NaN (IEEE-754), so it would never mask — and a NaN raw
+        // value would fall through to `raw * gain + offset = NaN`,
+        // which the colorizer renders as a stray pixel. Treat a NaN
+        // sentinel as "mask any NaN raw"; also mask a NaN raw value
+        // unconditionally, since a NaN physical value is never
+        // meaningful radar data.
+        if raw.is_nan() {
+            return None;
+        }
+        if nodata.is_nan() {
+            // sentinel is NaN — only NaN raws (handled above) match it
+        } else if raw == nodata {
             return None;
         }
         if let Some(u) = undetect {
-            if raw == u {
+            if !u.is_nan() && raw == u {
                 return None;
             }
         }
