@@ -370,15 +370,6 @@ fn enumerate_local<'a>(
     Ok(pending)
 }
 
-/// Enumerate `.h5` objects under an S3/HTTP store's date-expanded
-/// prefixes. Returns the pending-file list plus the optional
-/// `(start, end)` time filter the window implies.
-///
-/// A prefix that fails to `list` (e.g. a date partition that doesn't
-/// exist yet) is logged and skipped. If *every* prefix fails the call
-/// errors rather than silently returning an empty catalog. Mirrors
-/// `catalog::scan_remote`'s error tolerance.
-#[allow(clippy::type_complexity)]
 /// Extract an acquisition timestamp from an object key by finding the
 /// first run of ≥ 12 consecutive ASCII digits in the basename and
 /// parsing its leading 12 as `%Y%m%d%H%M` (UTC).
@@ -413,6 +404,15 @@ fn parse_key_timestamp(key: &str) -> Option<DateTime<Utc>> {
     None
 }
 
+/// Enumerate `.h5` objects under an S3/HTTP store's date-expanded
+/// prefixes. Returns the pending-file list plus the optional
+/// `(start, end)` time filter the window implies.
+///
+/// A prefix that fails to `list` (e.g. a date partition that doesn't
+/// exist yet) is logged and skipped. If *every* prefix fails the call
+/// errors rather than silently returning an empty catalog. Mirrors
+/// `catalog::scan_remote`'s error tolerance.
+#[allow(clippy::type_complexity)]
 fn enumerate_remote<'a>(
     collection_id: &str,
     store: &'a ds_storage::DataStore,
@@ -476,8 +476,10 @@ fn enumerate_remote<'a>(
                 id: key,
                 fetch: Box::new(move || {
                     let object = ObjectPath::from(key_for_fetch.as_str());
-                    // Re-check size at `get` time — an object can grow
-                    // between `list` and `get`.
+                    // Re-check size before `get`: `list` already
+                    // filtered by size; this `head` closes the
+                    // grow-between-list-and-get gap. Mirrors the COMP
+                    // engine's `fetch_bytes` head-before-get.
                     let meta = store_clone
                         .head(&object)
                         .map_err(|e| format!("head failed: {e}"))?;
