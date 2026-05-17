@@ -160,6 +160,24 @@ async fn main() {
     let base_url = config.server.base_url();
     info!("Base URL: {base_url}");
 
+    // Bind the listen socket before loading collections: engine
+    // construction runs synchronous S3/disk scans that can take
+    // minutes, so a port conflict must fail fast rather than after
+    // that whole load. The listener is held until `axum::serve`.
+    let addr = format!("{}:{}", config.server.host, config.server.port);
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("Failed to bind {addr}: {e}");
+            std::process::exit(1);
+        }
+    };
+    // The socket is bound + listening from here, but HTTP is not served
+    // until `axum::serve` below — keep the message explicit so a
+    // log-watching operator isn't misled. (A TCP-only readiness probe
+    // will see the port open early; probe `/health` over HTTP instead.)
+    info!("Socket bound to {addr} — loading collections, not yet serving");
+
     let result = admin::load_collections(&config.collections, &config.style_bundles, &base_url);
 
     let loaded = result
@@ -314,12 +332,7 @@ async fn main() {
     // Normalize trailing slashes (e.g., /wms/ → /wms) before routing
     let app = NormalizePathLayer::trim_trailing_slash().layer(app);
 
-    let addr = format!("{}:{}", config.server.host, config.server.port);
-    info!("Starting server on {addr}");
-
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .expect("Failed to bind");
+    info!("Server ready, accepting requests");
 
     axum::serve(
         listener,
