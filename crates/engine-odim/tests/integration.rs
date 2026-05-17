@@ -489,6 +489,104 @@ fn pvol_engine_renders_fmi_anjalankoski_volume() {
     );
 }
 
+/// Exercises the PVOL engine's **remote (S3/HTTP) scan** end-to-end
+/// without a network: a `ds_storage::DataStore` backed by
+/// `object_store`'s `LocalFileSystem` behaves like S3 for `list` /
+/// `get`, so building one over `testdata/radar-fmi-pvol/` drives the
+/// real remote code path — the same trick PR #182 used for the COMP
+/// engine.
+///
+/// Asserts the Anjalankoski (`fianj`) volume is discovered with its
+/// 13 elevation sweeps. The 15 MB fixture is **not committed to git**,
+/// so the test skips gracefully when it is absent.
+#[test]
+fn pvol_engine_remote_scan_discovers_fmi_volume() {
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/radar-fmi-pvol");
+    let fixture = fixture_dir.join("202605150000_fianj_PVOL.h5");
+    if !fixture.exists() {
+        eprintln!("skipping pvol_engine_remote_scan_discovers_fmi_volume: fixture absent");
+        return;
+    }
+
+    // A `DataStore` over the fixture directory — `LocalFileSystem`
+    // exercises the same `list`/`get` surface the S3 backend does.
+    let (store, _base) = ds_storage::build_store(
+        fixture_dir
+            .canonicalize()
+            .expect("fixture dir canonicalises")
+            .to_str()
+            .expect("utf8 fixture dir"),
+    )
+    .expect("build a DataStore over the fixture directory");
+
+    // The FMI Anjalankoski polar volume carries 13 elevation sweeps —
+    // assert that directly from the parsed fixture so the remote-scan
+    // path below is verified against a known volume shape.
+    let bytes = std::fs::read(&fixture).expect("read PVOL fixture bytes");
+    let volume = engine_odim::pvol::read_polar_volume(&bytes).expect("parse PVOL fixture");
+    assert_eq!(volume.site.nod.as_deref(), Some("fianj"));
+    assert_eq!(
+        volume.sweeps.len(),
+        13,
+        "FMI Anjalankoski volume has 13 elevation sweeps"
+    );
+
+    // Empty prefix scans the store root, where the fixture lives.
+    let engine =
+        engine_odim::PolarVolumeEngine::new_remote_for_test("fianj-remote-test", store, "")
+            .expect("PolarVolumeEngine remote scan over the fixture directory");
+
+    let info = engine.raster_info();
+    assert_eq!(info.native_crs, "CRS:84");
+    assert!(
+        !info.times.is_empty(),
+        "remote scan must discover the volume's timestep"
+    );
+    assert!(
+        info.spatial_extent.is_some(),
+        "remote scan must report a coverage bbox"
+    );
+
+    // The `fianj` site must surface with `fianj:<quantity>` parameters.
+    let fianj_params: Vec<&str> = info
+        .parameters
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|n| n.starts_with("fianj:"))
+        .collect();
+    assert!(
+        !fianj_params.is_empty(),
+        "remote scan must discover fianj:<quantity> parameters, got {:?}",
+        info.parameters
+    );
+
+    // The FMI Anjalankoski polar volume has 13 elevation sweeps — a
+    // render over its coverage bbox proves the streamed-then-parsed
+    // volume is intact end-to-end.
+    let render_param = fianj_params
+        .iter()
+        .find(|n| **n == "fianj:TH")
+        .or_else(|| fianj_params.iter().find(|n| **n == "fianj:DBZH"))
+        .copied()
+        .unwrap_or(fianj_params[0])
+        .to_string();
+    let tile = engine
+        .get_raster_tile(
+            [26.0, 60.0, 28.2, 61.8],
+            64,
+            64,
+            None,
+            &OutputCrs::Wgs84,
+            Some(&render_param),
+        )
+        .expect("render of the remotely-scanned volume succeeds");
+    assert_eq!(tile.values.len(), 64 * 64);
+    assert!(
+        tile.values.iter().any(Option::is_some),
+        "a render over the radar's own coverage must sample some echoes"
+    );
+}
+
 /// A `get_raster_tile` call with no `parameter` (or an unparseable
 /// one) on a PVOL collection is a clean error, not a panic.
 #[test]
