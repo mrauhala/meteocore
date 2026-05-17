@@ -172,7 +172,11 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    info!("Listening on {addr}");
+    // The socket is bound + listening from here, but HTTP is not served
+    // until `axum::serve` below — keep the message explicit so a
+    // log-watching operator isn't misled. (A TCP-only readiness probe
+    // will see the port open early; probe `/health` over HTTP instead.)
+    info!("Socket bound to {addr} — loading collections, not yet serving");
 
     let result = admin::load_collections(&config.collections, &config.style_bundles, &base_url);
 
