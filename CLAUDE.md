@@ -107,7 +107,7 @@ All CoverageJSON output **must** validate against the OGC CoverageJSON 1.0 schem
 - **Coverage**: requires `type` ("Coverage"), `domain`, `parameters`, `ranges`
 - **Domain**: requires `type` ("Domain"), `axes`, `referencing`. `domainType` triggers axis constraints.
 - **PointSeries**: x/y are single-value axes, t is string-values axis, z is an optional single-value axis.
-- **Grid**: x/y are numeric-values axes, t and z optional. NdArray shape: `[t, y, x]` or `[y, x]`.
+- **Grid**: x/y are numeric-values axes, t and z optional. NdArray shape: `[t, y, x]`, `[y, x]`, `[z, y, x]`, or `[t, z, y, x]`.
 - **VerticalProfile**: x/y single-value, z numeric-values axis, t optional single-value. NdArray shape: `[z]`.
 - **Parameter**: requires `observedProperty` with `label` as i18n object `{"en": "..."}`.
 - **NdArray**: requires `shape` and `axisNames` when values has >1 item. `values.length` must equal product of `shape`.
