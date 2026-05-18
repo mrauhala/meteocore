@@ -125,6 +125,25 @@ fn coverage_with_multiple_params_validates() {
     validate(&json, &schema);
 }
 
+/// The ODIM polar-volume engine emits multi-quantity `PointSeries`
+/// coverages with **blank units** (ODIM moment groups carry no unit
+/// attribute). Confirm that shape — distinct from the populated-unit
+/// case above — still validates.
+#[test]
+fn coverage_with_blank_units_validates() {
+    let schema = load_schema();
+    let times: Vec<DateTime<Utc>> = (0..3).map(make_time).collect();
+    let result = make_query_result(
+        times,
+        vec![
+            ("DBZH", "", vec![Some(12.5), None, Some(18.0)]),
+            ("VRADH", "", vec![Some(-4.2), Some(-3.8), None]),
+        ],
+    );
+    let json = query_result_to_coverage_json(&result);
+    validate(&json, &schema);
+}
+
 #[test]
 fn coverage_with_single_param_validates() {
     let schema = load_schema();

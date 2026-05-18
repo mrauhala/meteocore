@@ -53,15 +53,20 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
+use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
+use ds_core::feature::{parse_area_coords, parse_point_coords};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
+use ds_core::model::{
+    AreaQueryResult, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+};
 use tokio::sync::Notify;
 
 use ds_storage::discovery::{expand_prefix_for_dates, expand_prefix_pattern, TimeWindow};
 
 use crate::catalog::MAX_REMOTE_FILE_SIZE;
 use crate::engine::EngineError;
-use crate::pvol::{read_polar_volume, PolarVolume};
+use crate::pvol::{read_polar_volume, PolarMoment, PolarVolume, Sweep};
 
 /// Days of date-partitioned prefixes to scan when an S3 source has no
 /// `time_window`. Two days covers the just-after-midnight case where
@@ -259,8 +264,14 @@ struct Catalog {
     /// ascending.
     by_site: HashMap<String, Vec<VolumeEntry>>,
     /// `(parameter_name, title)` pairs — one per `<nod>:<quantity>`
-    /// from each site's lowest sweep. Sorted for stable output.
+    /// from each site's lowest sweep. Sorted for stable output. This is
+    /// the Map/WMS layer list (site-scoped).
     parameters: Vec<(String, String)>,
+    /// Distinct ODIM quantity names across every site's lowest sweep,
+    /// sorted — the EDR parameter list. Unlike `parameters` these carry
+    /// no `<site>:` prefix: in EDR the site is the *location* and the
+    /// quantity is the *parameter*.
+    quantities: Vec<String>,
     /// All distinct volume times across every site, sorted ascending.
     times: Vec<DateTime<Utc>>,
     /// Union of per-site coverage bboxes `[w, s, e, n]` in WGS84.
@@ -617,8 +628,10 @@ fn derive_catalog(
         guard.retain(|k, _| kept.contains(k));
     }
 
-    // Derive parameters from each site's lowest sweep.
+    // Derive parameters (Map layers) and quantities (EDR parameters)
+    // from each site's lowest sweep.
     let mut parameters: Vec<(String, String)> = Vec::new();
+    let mut quantities: Vec<String> = Vec::new();
     for (nod, list) in &by_site {
         // Use the most recent volume's lowest sweep for the quantity
         // list — quantity sets are stable across a site's volumes.
@@ -634,12 +647,16 @@ fn derive_catalog(
                 None => name.clone(),
             };
             parameters.push((name, title));
+            quantities.push(moment.quantity.clone());
         }
     }
     parameters.sort_by(|a, b| a.0.cmp(&b.0));
     // A producer shipping a sweep with a duplicate quantity name would
     // otherwise advertise the same `<nod>:<quantity>` layer twice.
     parameters.dedup_by(|a, b| a.0 == b.0);
+    // Quantities recur across sites — collapse to the distinct set.
+    quantities.sort();
+    quantities.dedup();
 
     // Distinct, sorted volume times across all sites.
     let mut times: Vec<DateTime<Utc>> = by_site
@@ -668,6 +685,7 @@ fn derive_catalog(
     Catalog {
         by_site,
         parameters,
+        quantities,
         times,
         spatial_extent,
     }
@@ -881,6 +899,48 @@ impl PolarVolumeEngine {
     }
 }
 
+/// Sample one moment of a sweep at a WGS84 `(lon, lat)`.
+///
+/// Computes ground distance + azimuth from the site, maps them to a
+/// range bin and stored ray, and reads the raw array with gain/offset/
+/// nodata applied. `None` when the point is out of range or the bin is
+/// `nodata`/`undetect`. **Ground-range interim** — see [`polar_sample`].
+fn sample_sweep_moment(
+    sweep: &Sweep,
+    moment: &PolarMoment,
+    site_lon: f64,
+    site_lat: f64,
+    lon: f64,
+    lat: f64,
+) -> Option<f64> {
+    if sweep.nrays == 0 || sweep.nbins == 0 {
+        return None;
+    }
+    let (dist, az) = ground_distance_bearing(site_lon, site_lat, lon, lat);
+
+    // Range bin. Ground-range interim — a slant-range / 4⁄3-Earth
+    // correction is deferred.
+    let bin = ((dist - sweep.rstart) / sweep.rscale).floor() as i64;
+    if bin < 0 || bin >= sweep.nbins as i64 {
+        return None;
+    }
+
+    // Azimuth ray. ODIM rays are stored north-first, clockwise, already
+    // re-sorted into geographic order — `a1gate` records *acquisition*
+    // order only and must NOT offset the stored-array index here.
+    let ray = (az / (360.0 / sweep.nrays as f64)).floor() as usize % sweep.nrays;
+
+    // `RawPixels` is indexed [ray, bin].
+    moment.data.sample(
+        ray,
+        bin as usize,
+        moment.gain,
+        moment.offset,
+        moment.nodata,
+        Some(moment.undetect),
+    )
+}
+
 /// Resample one polar moment of a sweep into a Cartesian output grid.
 ///
 /// `bbox` is `[west, south, east, north]` in WGS84 degrees. For
@@ -930,14 +990,11 @@ fn polar_sample(
 
     let [west, south, east, north] = bbox;
     let (site_lon, site_lat) = (volume.site.lon, volume.site.lat);
-    let nrays = sweep.nrays;
-    let nbins = sweep.nbins;
-    if nrays == 0 || nbins == 0 {
+    if sweep.nrays == 0 || sweep.nbins == 0 {
         return Err(DataServerError::Engine(
             "PVOL lowest sweep has zero rays or bins".into(),
         ));
     }
-    let ray_step_deg = 360.0 / nrays as f64;
 
     let (merc_y_north, merc_y_south) = if *output_crs == OutputCrs::WebMercator {
         (lat_to_merc_y(north), lat_to_merc_y(south))
@@ -958,30 +1015,8 @@ fn polar_sample(
             let frac_x = (ox as f64 + 0.5) / width as f64;
             let lon = west + frac_x * (east - west);
 
-            let (dist, az) = ground_distance_bearing(site_lon, site_lat, lon, lat);
-
-            // Range bin. Ground-range interim — see the doc comment;
-            // a slant-range / 4⁄3-Earth correction is deferred.
-            let bin = ((dist - sweep.rstart) / sweep.rscale).floor() as i64;
-            if bin < 0 || bin >= nbins as i64 {
-                values.push(None);
-                continue;
-            }
-
-            // Azimuth ray. ODIM rays are stored north-first, clockwise,
-            // already re-sorted into geographic order — `a1gate`
-            // records *acquisition* order only and must NOT offset the
-            // stored-array index here.
-            let ray = (az / ray_step_deg).floor() as usize % nrays;
-
-            // `RawPixels` is indexed [ray, bin].
-            values.push(moment.data.sample(
-                ray,
-                bin as usize,
-                moment.gain,
-                moment.offset,
-                moment.nodata,
-                Some(moment.undetect),
+            values.push(sample_sweep_moment(
+                sweep, moment, site_lon, site_lat, lon, lat,
             ));
         }
     }
@@ -1079,10 +1114,281 @@ impl MapEngine for PolarVolumeEngine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// EdrEngine
+// ---------------------------------------------------------------------------
+
+/// `ParameterDescription` for an ODIM quantity. ODIM moment groups
+/// carry no unit attribute and quantities span several physical units,
+/// so the unit is left blank (matching `raster_info`); the label
+/// mirrors the `EdrEngine` default-description convention.
+fn quantity_description(quantity: &str) -> ParameterDescription {
+    ParameterDescription {
+        label: quantity.replace('_', " "),
+        unit: String::new(),
+        observed_property: quantity.to_string(),
+    }
+}
+
+/// NOD code of the radar site nearest to `(lon, lat)` by ground
+/// distance. `None` only when the catalog holds no sites.
+fn nearest_site(catalog: &Catalog, lon: f64, lat: f64) -> Option<&str> {
+    catalog
+        .by_site
+        .iter()
+        .filter_map(|(nod, list)| {
+            let site = &list.last()?.volume.site;
+            let (dist, _) = ground_distance_bearing(site.lon, site.lat, lon, lat);
+            Some((nod.as_str(), dist))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(nod, _)| nod)
+}
+
+/// Build a `PointSeries` coverage for one radar site: sample the lowest
+/// sweep of every volume in `volumes` (time-sorted) at WGS84
+/// `(lon, lat)` — one value per quantity per timestep.
+///
+/// `(lon, lat)` is both the coverage's domain point and the sample
+/// point: for a location query it is the radar site itself; for a
+/// position query it is the requested point against the nearest site.
+///
+/// **M3a interim** — only the lowest elevation sweep is sampled. The
+/// vertical (`z`) dimension that turns a no-`z` query into a profile
+/// across all sweeps arrives with M3b (#185).
+fn build_site_point_series(
+    volumes: &[VolumeEntry],
+    lon: f64,
+    lat: f64,
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    parameters: Option<&[String]>,
+) -> Result<QueryResult, DataServerError> {
+    let selected: Vec<&VolumeEntry> = match datetime {
+        Some((start, end)) => volumes
+            .iter()
+            .filter(|e| e.volume.time >= start && e.volume.time <= end)
+            .collect(),
+        None => volumes.iter().collect(),
+    };
+    if selected.is_empty() {
+        return Err(DataServerError::LocationNotFound(
+            "No PVOL data available for the requested time range".into(),
+        ));
+    }
+
+    // The lowest sweep of the most recent volume defines the available
+    // quantity set (stable across a site's volumes); intersect it with
+    // the optional `parameters` filter.
+    let available: Vec<String> = selected
+        .last()
+        .and_then(|e| e.volume.sweeps.first())
+        .map(|s| s.moments.iter().map(|m| m.quantity.clone()).collect())
+        .unwrap_or_default();
+    let quantities: Vec<String> = match parameters {
+        Some(req) => available
+            .into_iter()
+            .filter(|q| req.iter().any(|p| p == q))
+            .collect(),
+        None => available,
+    };
+    if quantities.is_empty() {
+        return Err(DataServerError::InvalidParameter(
+            "No requested parameter is available at this PVOL site".into(),
+        ));
+    }
+
+    let times: Vec<DateTime<Utc>> = selected.iter().map(|e| e.volume.time).collect();
+
+    let mut ranges = HashMap::new();
+    let mut param_descs = HashMap::new();
+    for quantity in &quantities {
+        let values: Vec<Option<f64>> = selected
+            .iter()
+            .map(|e| {
+                let sweep = e.volume.sweeps.first()?;
+                let moment = sweep.moments.iter().find(|m| &m.quantity == quantity)?;
+                sample_sweep_moment(
+                    sweep,
+                    moment,
+                    e.volume.site.lon,
+                    e.volume.site.lat,
+                    lon,
+                    lat,
+                )
+            })
+            .collect();
+        ranges.insert(
+            quantity.clone(),
+            NdArray {
+                shape: vec![times.len()],
+                axis_names: vec!["t".to_string()],
+                values,
+            },
+        );
+        param_descs.insert(quantity.clone(), quantity_description(quantity));
+    }
+
+    Ok(QueryResult {
+        domain: DomainDescription::PointSeries {
+            x: lon,
+            y: lat,
+            t: times,
+        },
+        parameters: param_descs,
+        ranges,
+    })
+}
+
+impl EdrEngine for PolarVolumeEngine {
+    /// One EDR location per radar site — `id` is the ODIM NOD code and
+    /// the point geometry is the antenna position.
+    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        let catalog = self.catalog.load();
+        let mut locations: Vec<Location> = catalog
+            .by_site
+            .iter()
+            .filter_map(|(nod, list)| {
+                let site = &list.last()?.volume.site;
+                Some(Location {
+                    id: nod.clone(),
+                    label: site.plc.clone().unwrap_or_else(|| nod.clone()),
+                    latitude: site.lat,
+                    longitude: site.lon,
+                })
+            })
+            .collect();
+        locations.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(locations)
+    }
+
+    /// Query one radar site by NOD code — a `PointSeries` of every
+    /// quantity at the site, sampled from the lowest sweep.
+    fn query_location(
+        &self,
+        location_id: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+    ) -> Result<QueryResult, DataServerError> {
+        let catalog = self.catalog.load();
+        let volumes = catalog
+            .by_site
+            .get(location_id)
+            .ok_or_else(|| DataServerError::LocationNotFound(location_id.to_string()))?;
+        // The location *is* the radar site, so the coverage point is
+        // the antenna itself.
+        let site = &volumes
+            .last()
+            .ok_or_else(|| DataServerError::LocationNotFound(location_id.to_string()))?
+            .volume
+            .site;
+        build_site_point_series(volumes, site.lon, site.lat, datetime, parameters)
+    }
+
+    fn get_parameters(&self) -> Vec<String> {
+        self.catalog.load().quantities.clone()
+    }
+
+    fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        let catalog = self.catalog.load();
+        Some((*catalog.times.first()?, *catalog.times.last()?))
+    }
+
+    /// PVOL volumes arrive at discrete (typically 5-min) steps, so
+    /// advertise the exact timestamps rather than just the interval —
+    /// same rationale as the COMP engine.
+    fn get_available_times(&self) -> Option<Vec<DateTime<Utc>>> {
+        let times = self.catalog.load().times.clone();
+        (!times.is_empty()).then_some(times)
+    }
+
+    fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+        self.catalog.load().spatial_extent
+    }
+
+    fn supported_query_types(&self) -> Vec<String> {
+        vec![
+            "locations".to_string(),
+            "position".to_string(),
+            "area".to_string(),
+        ]
+    }
+
+    /// Position query — a `PointSeries` sampled from the radar site
+    /// nearest the requested point.
+    fn query_position(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+    ) -> Result<QueryResult, DataServerError> {
+        let (lat, lon) = parse_point_coords(coords)?;
+        let catalog = self.catalog.load();
+        let nod = nearest_site(&catalog, lon, lat).ok_or_else(|| {
+            DataServerError::LocationNotFound("PVOL catalog has no radar sites".into())
+        })?;
+        // `nearest_site` returns a key it read from `by_site`, so the
+        // lookup cannot miss — but a graceful error beats a panicking
+        // request thread should a refactor ever break that invariant.
+        let volumes = catalog.by_site.get(nod).ok_or_else(|| {
+            DataServerError::Engine("internal: nearest_site returned a missing by_site key".into())
+        })?;
+        build_site_point_series(volumes, lon, lat, datetime, parameters)
+    }
+
+    /// Area query — a `CoverageCollection` of one `PointSeries` per
+    /// radar site whose antenna falls inside the polygon.
+    fn query_area(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+    ) -> Result<AreaQueryResult, DataServerError> {
+        let polygon = parse_area_coords(coords)?;
+        let catalog = self.catalog.load();
+
+        // Stable, sorted iteration so the collection order is
+        // deterministic across requests.
+        let mut nods: Vec<&String> = catalog.by_site.keys().collect();
+        nods.sort();
+
+        let mut coverages = Vec::new();
+        for nod in nods {
+            let volumes = &catalog.by_site[nod];
+            let Some(site) = volumes.last().map(|e| &e.volume.site) else {
+                continue;
+            };
+            if !polygon.contains(site.lon, site.lat) {
+                continue;
+            }
+            match build_site_point_series(volumes, site.lon, site.lat, datetime, parameters) {
+                Ok(qr) => coverages.push(qr),
+                // A site inside the polygon is skipped — not fatal to
+                // the whole area query — when it has no data in the
+                // requested window (`LocationNotFound`) or none of the
+                // requested quantities (`InvalidParameter`): a
+                // heterogeneous network mixes single- and dual-pol
+                // radars, so a `ZDR` filter legitimately misses some
+                // sites while matching others.
+                Err(
+                    DataServerError::LocationNotFound(_) | DataServerError::InvalidParameter(_),
+                ) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        if coverages.is_empty() {
+            return Err(DataServerError::LocationNotFound(
+                "No radar sites with data found within the requested area".into(),
+            ));
+        }
+        Ok(AreaQueryResult::Collection(coverages))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pvol::{PolarMoment, RadarSite, Sweep};
+    use crate::pvol::RadarSite;
     use crate::reader::RawPixels;
     use ndarray::Array2;
 
@@ -1377,5 +1683,104 @@ mod tests {
         // then falls through to the post-parse window filter).
         assert!(parse_key_timestamp("radar_volume.h5").is_none());
         assert!(parse_key_timestamp("999999999999_x.h5").is_none());
+    }
+
+    // --- EdrEngine helpers -------------------------------------------------
+
+    /// Wrap a synthetic volume in a `VolumeEntry` for catalog tests.
+    fn entry(volume: PolarVolume, id: &str) -> VolumeEntry {
+        VolumeEntry {
+            id: id.to_string(),
+            volume: Arc::new(volume),
+        }
+    }
+
+    /// `build_site_point_series` yields a `PointSeries` at the queried
+    /// point, with one time-aligned range per quantity.
+    #[test]
+    fn build_site_point_series_yields_point_series() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let volumes = vec![entry(synthetic_volume(site_lon, site_lat), "v0")];
+        // 10.5 km due east — safely mid-bin 10 of the 1 km-spaced sweep,
+        // so the sampled bin index is robust against rounding.
+        let dlon = 10_500.0 / (EARTH_RADIUS_M * site_lat.to_radians().cos()) * 180.0
+            / std::f64::consts::PI;
+        let result =
+            build_site_point_series(&volumes, site_lon + dlon, site_lat, None, None).unwrap();
+        match result.domain {
+            DomainDescription::PointSeries { x, y, t } => {
+                assert!((x - (site_lon + dlon)).abs() < 1e-9);
+                assert!((y - site_lat).abs() < 1e-9);
+                assert_eq!(t.len(), 1);
+            }
+            _ => panic!("expected PointSeries"),
+        }
+        let dbzh = result.ranges.get("DBZH").expect("DBZH range");
+        assert_eq!(dbzh.shape, vec![1]);
+        assert_eq!(dbzh.axis_names, vec!["t".to_string()]);
+        // raw[ray][bin] = bin, gain 1 → the sampled value is the bin
+        // index, i.e. ground distance / 1 km.
+        assert_eq!(dbzh.values[0], Some(10.0));
+        assert!(result.parameters.contains_key("DBZH"));
+    }
+
+    /// An out-of-window `datetime` range yields `LocationNotFound`.
+    #[test]
+    fn build_site_point_series_empty_window_errors() {
+        let volumes = vec![entry(synthetic_volume(25.0, 60.0), "v0")];
+        let past = DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        match build_site_point_series(&volumes, 25.0, 60.0, Some((past, past)), None) {
+            Err(DataServerError::LocationNotFound(_)) => {}
+            other => panic!("expected LocationNotFound, got {other:?}"),
+        }
+    }
+
+    /// A `parameters` filter naming no real quantity is rejected.
+    #[test]
+    fn build_site_point_series_unknown_parameter_errors() {
+        let volumes = vec![entry(synthetic_volume(25.0, 60.0), "v0")];
+        let filter = ["NONESUCH".to_string()];
+        match build_site_point_series(&volumes, 25.0, 60.0, None, Some(&filter)) {
+            Err(DataServerError::InvalidParameter(_)) => {}
+            other => panic!("expected InvalidParameter, got {other:?}"),
+        }
+    }
+
+    /// `nearest_site` picks the site with the smallest ground distance.
+    #[test]
+    fn nearest_site_picks_closest() {
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "west".to_string(),
+            vec![entry(synthetic_volume(20.0, 60.0), "w")],
+        );
+        by_site.insert(
+            "east".to_string(),
+            vec![entry(synthetic_volume(30.0, 60.0), "e")],
+        );
+        let catalog = Catalog {
+            by_site,
+            parameters: vec![],
+            quantities: vec![],
+            times: vec![],
+            spatial_extent: None,
+        };
+        assert_eq!(nearest_site(&catalog, 29.0, 60.0), Some("east"));
+        assert_eq!(nearest_site(&catalog, 21.0, 60.0), Some("west"));
+    }
+
+    /// An empty catalog has no nearest site.
+    #[test]
+    fn nearest_site_empty_catalog_is_none() {
+        let catalog = Catalog {
+            by_site: HashMap::new(),
+            parameters: vec![],
+            quantities: vec![],
+            times: vec![],
+            spatial_extent: None,
+        };
+        assert_eq!(nearest_site(&catalog, 25.0, 60.0), None);
     }
 }

@@ -631,3 +631,152 @@ fn pvol_engine_rejects_missing_parameter() {
         Ok(_) => panic!("missing parameter on a PVOL collection must error"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// PolarVolumeEngine — EdrEngine (M3a: sites as locations + position queries)
+// ---------------------------------------------------------------------------
+
+/// Build a PVOL engine over the local `radar-fmi-pvol` fixture
+/// directory, or `None` when the (uncommitted, 15 MB) fixture is
+/// absent — so these tests skip gracefully in CI.
+fn pvol_fixture_engine() -> Option<engine_odim::PolarVolumeEngine> {
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/radar-fmi-pvol");
+    if !fixture_dir.join("202605150000_fianj_PVOL.h5").exists() {
+        return None;
+    }
+    let config = OdimConfig {
+        filename_template: None,
+        filename_pattern: None,
+        timestamp_format: None,
+        parameter: None,
+        unit: None,
+        nodata: None,
+        gain: None,
+        offset: None,
+        poll_interval_secs: 30,
+        max_files: None,
+        endpoint: None,
+        bucket: None,
+        prefix_pattern: None,
+        time_window: None,
+    };
+    Some(
+        engine_odim::PolarVolumeEngine::new(
+            "fianj-edr-test",
+            Some(fixture_dir.to_str().expect("utf8 fixture dir")),
+            &config,
+        )
+        .expect("PolarVolumeEngine::new over the PVOL fixture directory"),
+    )
+}
+
+/// `get_locations` exposes each radar site as an EDR location keyed by
+/// its ODIM NOD code, with the antenna position as the point geometry.
+#[test]
+fn pvol_edr_get_locations_lists_sites() {
+    let Some(engine) = pvol_fixture_engine() else {
+        eprintln!("skipping pvol_edr_get_locations_lists_sites: fixture absent");
+        return;
+    };
+    let locations = EdrEngine::get_locations(&engine).expect("get_locations");
+    assert!(
+        !locations.is_empty(),
+        "the PVOL fixture must surface at least one radar site"
+    );
+    let fianj = locations
+        .iter()
+        .find(|l| l.id == "fianj")
+        .expect("Anjalankoski site keyed by NOD code `fianj`");
+    // Anjalankoski sits near 27.1°E, 60.9°N.
+    assert!(
+        (26.0..28.5).contains(&fianj.longitude) && (60.0..61.8).contains(&fianj.latitude),
+        "fianj antenna near 27.1E/60.9N, got {},{}",
+        fianj.longitude,
+        fianj.latitude
+    );
+    assert!(!fianj.label.is_empty(), "a location carries a label");
+}
+
+/// A position query near a radar samples its lowest sweep and returns
+/// a `PointSeries` whose ranges are aligned with the time axis.
+#[test]
+fn pvol_edr_query_position_returns_point_series() {
+    let Some(engine) = pvol_fixture_engine() else {
+        eprintln!("skipping pvol_edr_query_position_returns_point_series: fixture absent");
+        return;
+    };
+    // ~30 km north of Anjalankoski — inside the lowest sweep.
+    let result = EdrEngine::query_position(&engine, "POINT(27.1 61.2)", None, None)
+        .expect("position query inside radar coverage");
+    match &result.domain {
+        DomainDescription::PointSeries { x, y, t } => {
+            assert!((*x - 27.1).abs() < 1e-9 && (*y - 61.2).abs() < 1e-9);
+            assert!(!t.is_empty(), "PointSeries must carry a time axis");
+            for arr in result.ranges.values() {
+                assert_eq!(arr.shape, vec![t.len()]);
+                assert_eq!(arr.axis_names, vec!["t".to_string()]);
+                assert_eq!(arr.values.len(), t.len());
+            }
+        }
+        other => panic!("position query must yield a PointSeries, got {other:?}"),
+    }
+    assert!(
+        !result.ranges.is_empty(),
+        "the volume's lowest sweep exposes at least one quantity"
+    );
+}
+
+/// `query_location` by NOD code returns the site's `PointSeries`; an
+/// unknown id is `LocationNotFound` (HTTP 404), not a panic.
+#[test]
+fn pvol_edr_query_location_by_nod() {
+    let Some(engine) = pvol_fixture_engine() else {
+        eprintln!("skipping pvol_edr_query_location_by_nod: fixture absent");
+        return;
+    };
+    let result = EdrEngine::query_location(&engine, "fianj", None, None)
+        .expect("query_location for the fianj site");
+    assert!(matches!(
+        result.domain,
+        DomainDescription::PointSeries { .. }
+    ));
+    assert!(!result.ranges.is_empty());
+
+    match EdrEngine::query_location(&engine, "nosuchsite", None, None) {
+        Err(ds_core::error::DataServerError::LocationNotFound(_)) => {}
+        other => panic!("unknown location id must be LocationNotFound, got {other:?}"),
+    }
+}
+
+/// An area query collects one `PointSeries` per radar site inside the
+/// polygon; a polygon far from any radar is `LocationNotFound`.
+#[test]
+fn pvol_edr_query_area_collects_sites() {
+    let Some(engine) = pvol_fixture_engine() else {
+        eprintln!("skipping pvol_edr_query_area_collects_sites: fixture absent");
+        return;
+    };
+    // A bbox enclosing Anjalankoski (27.1E, 60.9N).
+    let result = EdrEngine::query_area(&engine, "25.0,59.0,29.0,62.5", None, None)
+        .expect("area query enclosing the fianj site");
+    match result {
+        AreaQueryResult::Collection(coverages) => {
+            assert!(
+                !coverages.is_empty(),
+                "the polygon encloses fianj, so the collection is non-empty"
+            );
+            for qr in &coverages {
+                assert!(matches!(qr.domain, DomainDescription::PointSeries { .. }));
+            }
+        }
+        AreaQueryResult::Single(_) => {
+            panic!("a point/observation area query must return a Collection")
+        }
+    }
+
+    // A polygon far from any FMI radar matches nothing.
+    match EdrEngine::query_area(&engine, "0.0,0.0,1.0,1.0", None, None) {
+        Err(ds_core::error::DataServerError::LocationNotFound(_)) => {}
+        other => panic!("an empty area must be LocationNotFound, got {other:?}"),
+    }
+}
