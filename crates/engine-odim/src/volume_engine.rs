@@ -58,8 +58,10 @@ use ds_core::error::DataServerError;
 use ds_core::feature::{parse_area_coords, parse_point_coords};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
-    AreaQueryResult, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    VerticalCoord,
 };
+use ds_core::vertical::{VerticalDimension, VerticalKind};
 use tokio::sync::Notify;
 
 use ds_storage::discovery::{expand_prefix_for_dates, expand_prefix_pattern, TimeWindow};
@@ -276,6 +278,16 @@ struct Catalog {
     times: Vec<DateTime<Utc>>,
     /// Union of per-site coverage bboxes `[w, s, e, n]` in WGS84.
     spatial_extent: Option<[f64; 4]>,
+    /// The collection's vertical axis — elevation angle (degrees), the
+    /// union of every site's sweep angles. `None` until the catalog has
+    /// at least one volume.
+    vertical: Option<VerticalDimension>,
+}
+
+/// Round an elevation angle to 0.1° so near-identical sweep angles from
+/// different sites or volumes collapse to one catalogue level.
+fn round_elevation(deg: f64) -> f64 {
+    (deg * 10.0).round() / 10.0
 }
 
 /// WGS84 bounding box `[w, s, e, n]` of the circular coverage area of
@@ -682,12 +694,25 @@ fn derive_catalog(
         });
     }
 
+    // Vertical axis: the union of every site's sweep elevation angles
+    // (from each site's most-recent volume), rounded and sorted ascending.
+    let mut levels: Vec<f64> = by_site
+        .values()
+        .filter_map(|list| list.last())
+        .flat_map(|e| e.volume.sweeps.iter().map(|s| round_elevation(s.elangle)))
+        .collect();
+    levels.sort_by(f64::total_cmp);
+    levels.dedup();
+    let vertical =
+        (!levels.is_empty()).then(|| VerticalDimension::new(VerticalKind::ElevationAngle, levels));
+
     Catalog {
         by_site,
         parameters,
         quantities,
         times,
         spatial_extent,
+        vertical,
     }
 }
 
@@ -941,6 +966,16 @@ fn sample_sweep_moment(
     )
 }
 
+/// The sweep whose elevation angle is nearest `target` degrees. `None`
+/// only when the volume has no sweeps.
+fn nearest_sweep(volume: &PolarVolume, target: f64) -> Option<&Sweep> {
+    volume.sweeps.iter().min_by(|a, b| {
+        (a.elangle - target)
+            .abs()
+            .total_cmp(&(b.elangle - target).abs())
+    })
+}
+
 /// Resample one polar moment of a sweep into a Cartesian output grid.
 ///
 /// `bbox` is `[west, south, east, north]` in WGS84 degrees. For
@@ -960,6 +995,9 @@ fn sample_sweep_moment(
 /// 4⁄3-Earth ground-range correction is deferred — for the lowest
 /// elevation sweep this M2 interim, the near-horizon geometry keeps the
 /// slant-vs-ground discrepancy small.
+///
+/// `z` selects the elevation sweep: `Some(angle)` renders the sweep
+/// nearest that angle, `None` renders the lowest sweep.
 fn polar_sample(
     volume: &PolarVolume,
     quantity: &str,
@@ -967,9 +1005,14 @@ fn polar_sample(
     width: u32,
     height: u32,
     output_crs: &OutputCrs,
+    z: Option<f64>,
 ) -> Result<RasterTile, DataServerError> {
-    // Lowest elevation sweep — M1 sorts `sweeps` ascending by elangle.
-    let sweep = volume.sweeps.first().ok_or_else(|| {
+    // M1 sorts `sweeps` ascending by elangle, so `first()` is the lowest.
+    let sweep = match z {
+        Some(target) => nearest_sweep(volume, target),
+        None => volume.sweeps.first(),
+    }
+    .ok_or_else(|| {
         DataServerError::Engine(format!(
             "PVOL site `{}` has no elevation sweeps",
             volume.site.nod.as_deref().unwrap_or("?")
@@ -1048,6 +1091,7 @@ impl MapEngine for PolarVolumeEngine {
         time: Option<DateTime<Utc>>,
         output_crs: &OutputCrs,
         parameter: Option<&str>,
+        z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
         // A PVOL collection is inherently multi-parameter — the caller
         // must name a `<nod>:<quantity>` layer.
@@ -1089,7 +1133,7 @@ impl MapEngine for PolarVolumeEngine {
             ))
         })?;
 
-        polar_sample(&entry.volume, quantity, bbox, width, height, output_crs)
+        polar_sample(&entry.volume, quantity, bbox, width, height, output_crs, z)
     }
 
     fn raster_info(&self) -> RasterInfo {
@@ -1110,6 +1154,7 @@ impl MapEngine for PolarVolumeEngine {
             // constant, so leave it blank.
             unit: String::new(),
             parameters,
+            vertical: catalog.vertical.clone(),
         }
     }
 }
@@ -1145,40 +1190,13 @@ fn nearest_site(catalog: &Catalog, lon: f64, lat: f64) -> Option<&str> {
         .map(|(nod, _)| nod)
 }
 
-/// Build a `PointSeries` coverage for one radar site: sample the lowest
-/// sweep of every volume in `volumes` (time-sorted) at WGS84
-/// `(lon, lat)` — one value per quantity per timestep.
-///
-/// `(lon, lat)` is both the coverage's domain point and the sample
-/// point: for a location query it is the radar site itself; for a
-/// position query it is the requested point against the nearest site.
-///
-/// **M3a interim** — only the lowest elevation sweep is sampled. The
-/// vertical (`z`) dimension that turns a no-`z` query into a profile
-/// across all sweeps arrives with M3b (#185).
-fn build_site_point_series(
-    volumes: &[VolumeEntry],
-    lon: f64,
-    lat: f64,
-    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+/// Resolve the quantity set for a PVOL site query: the lowest sweep's
+/// moments of the most recent selected volume (stable across a site's
+/// volumes), intersected with the optional `parameters` filter.
+fn resolve_quantities(
+    selected: &[&VolumeEntry],
     parameters: Option<&[String]>,
-) -> Result<QueryResult, DataServerError> {
-    let selected: Vec<&VolumeEntry> = match datetime {
-        Some((start, end)) => volumes
-            .iter()
-            .filter(|e| e.volume.time >= start && e.volume.time <= end)
-            .collect(),
-        None => volumes.iter().collect(),
-    };
-    if selected.is_empty() {
-        return Err(DataServerError::LocationNotFound(
-            "No PVOL data available for the requested time range".into(),
-        ));
-    }
-
-    // The lowest sweep of the most recent volume defines the available
-    // quantity set (stable across a site's volumes); intersect it with
-    // the optional `parameters` filter.
+) -> Result<Vec<String>, DataServerError> {
     let available: Vec<String> = selected
         .last()
         .and_then(|e| e.volume.sweeps.first())
@@ -1196,16 +1214,93 @@ fn build_site_point_series(
             "No requested parameter is available at this PVOL site".into(),
         ));
     }
+    Ok(quantities)
+}
 
-    let times: Vec<DateTime<Utc>> = selected.iter().map(|e| e.volume.time).collect();
+/// Snap requested elevation angles to the catalog's canonical sweep-angle
+/// set, dropping duplicates while preserving request order.
+fn snap_levels(requested: &[f64], canonical: &[f64]) -> Vec<f64> {
+    let mut out: Vec<f64> = Vec::new();
+    for &want in requested {
+        if let Some(&lvl) = canonical
+            .iter()
+            .min_by(|a, b| (**a - want).abs().total_cmp(&(**b - want).abs()))
+        {
+            if !out.contains(&lvl) {
+                out.push(lvl);
+            }
+        }
+    }
+    out
+}
+
+/// One `VerticalProfile` coverage: every elevation sweep of `entry`'s
+/// volume sampled at WGS84 `(lon, lat)`, with the sweep angles as the
+/// `z` axis.
+fn volume_profile(entry: &VolumeEntry, lon: f64, lat: f64, quantities: &[String]) -> QueryResult {
+    let levels: Vec<f64> = entry
+        .volume
+        .sweeps
+        .iter()
+        .map(|s| round_elevation(s.elangle))
+        .collect();
+    let (site_lon, site_lat) = (entry.volume.site.lon, entry.volume.site.lat);
 
     let mut ranges = HashMap::new();
     let mut param_descs = HashMap::new();
-    for quantity in &quantities {
+    for quantity in quantities {
+        let values: Vec<Option<f64>> = entry
+            .volume
+            .sweeps
+            .iter()
+            .map(|sweep| {
+                let moment = sweep.moments.iter().find(|m| &m.quantity == quantity)?;
+                sample_sweep_moment(sweep, moment, site_lon, site_lat, lon, lat)
+            })
+            .collect();
+        ranges.insert(
+            quantity.clone(),
+            NdArray {
+                shape: vec![levels.len()],
+                axis_names: vec!["z".to_string()],
+                values,
+            },
+        );
+        param_descs.insert(quantity.clone(), quantity_description(quantity));
+    }
+
+    QueryResult {
+        domain: DomainDescription::VerticalProfile {
+            x: lon,
+            y: lat,
+            t: Some(entry.volume.time),
+            z: VerticalCoord {
+                kind: VerticalKind::ElevationAngle,
+                values: levels,
+            },
+        },
+        parameters: param_descs,
+        ranges,
+    }
+}
+
+/// One `PointSeries` coverage pinned to elevation angle `level`: the
+/// sweep nearest `level` in each selected volume, sampled at `(lon, lat)`.
+fn level_series(
+    selected: &[&VolumeEntry],
+    lon: f64,
+    lat: f64,
+    level: f64,
+    quantities: &[String],
+    times: &[DateTime<Utc>],
+) -> QueryResult {
+    let mut ranges = HashMap::new();
+    let mut param_descs = HashMap::new();
+    for quantity in quantities {
         let values: Vec<Option<f64>> = selected
             .iter()
             .map(|e| {
-                let sweep = e.volume.sweeps.first()?;
+                let sweep = nearest_sweep(&e.volume, level)?;
                 let moment = sweep.moments.iter().find(|m| &m.quantity == quantity)?;
                 sample_sweep_moment(
                     sweep,
@@ -1228,15 +1323,100 @@ fn build_site_point_series(
         param_descs.insert(quantity.clone(), quantity_description(quantity));
     }
 
-    Ok(QueryResult {
+    QueryResult {
         domain: DomainDescription::PointSeries {
             x: lon,
             y: lat,
-            t: times,
+            t: times.to_vec(),
+            z: Some(VerticalCoord {
+                kind: VerticalKind::ElevationAngle,
+                values: vec![level],
+            }),
         },
         parameters: param_descs,
         ranges,
-    })
+    }
+}
+
+/// Build the EDR coverages for one radar site at WGS84 `(lon, lat)`.
+///
+/// `(lon, lat)` is both the coverage's domain point and the sample
+/// point: for a location query it is the radar site itself; for a
+/// position query it is the requested point against the nearest site.
+///
+/// With `levels = None` the result is one `VerticalProfile` per timestep
+/// (reflectivity vs. elevation angle); with `levels = Some(..)` it is one
+/// `PointSeries` per requested level (a time series at that sweep).
+fn site_coverages(
+    volumes: &[VolumeEntry],
+    lon: f64,
+    lat: f64,
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    parameters: Option<&[String]>,
+    levels: Option<&[f64]>,
+) -> Result<Vec<QueryResult>, DataServerError> {
+    let selected: Vec<&VolumeEntry> = match datetime {
+        Some((start, end)) => volumes
+            .iter()
+            .filter(|e| e.volume.time >= start && e.volume.time <= end)
+            .collect(),
+        None => volumes.iter().collect(),
+    };
+    if selected.is_empty() {
+        return Err(DataServerError::LocationNotFound(
+            "No PVOL data available for the requested time range".into(),
+        ));
+    }
+
+    let quantities = resolve_quantities(&selected, parameters)?;
+
+    match levels {
+        None => Ok(selected
+            .iter()
+            .map(|e| volume_profile(e, lon, lat, &quantities))
+            .collect()),
+        Some(lvls) => {
+            let times: Vec<DateTime<Utc>> = selected.iter().map(|e| e.volume.time).collect();
+            Ok(lvls
+                .iter()
+                .map(|&lvl| level_series(&selected, lon, lat, lvl, &quantities, &times))
+                .collect())
+        }
+    }
+}
+
+/// Resolve a requested EDR `z` selector against the catalog's vertical
+/// axis. `None` (or an empty selector) means "every level — a profile".
+fn resolve_levels(
+    catalog: &Catalog,
+    z: Option<&[f64]>,
+) -> Result<Option<Vec<f64>>, DataServerError> {
+    let Some(zs) = z.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let canonical = catalog
+        .vertical
+        .as_ref()
+        .map(|v| v.levels.as_slice())
+        .ok_or_else(|| {
+            DataServerError::InvalidParameter(
+                "this PVOL collection has no elevation sweeps to select with `z`".into(),
+            )
+        })?;
+    let snapped = snap_levels(zs, canonical);
+    Ok((!snapped.is_empty()).then_some(snapped))
+}
+
+/// Wrap one site's coverages: a request pinned to exactly one level is a
+/// single `PointSeries` (`Single`); every other shape is a `Collection`.
+fn finalize_single_site(covs: Vec<QueryResult>, levels: &Option<Vec<f64>>) -> CoverageResponse {
+    if matches!(levels, Some(l) if l.len() == 1) {
+        if let Some(qr) = covs.into_iter().next() {
+            return CoverageResponse::Single(qr);
+        }
+        return CoverageResponse::Collection(Vec::new());
+    }
+    CoverageResponse::Collection(covs)
 }
 
 impl EdrEngine for PolarVolumeEngine {
@@ -1261,14 +1441,16 @@ impl EdrEngine for PolarVolumeEngine {
         Ok(locations)
     }
 
-    /// Query one radar site by NOD code — a `PointSeries` of every
-    /// quantity at the site, sampled from the lowest sweep.
+    /// Query one radar site by NOD code. With no `z` the result is a
+    /// `CoverageCollection` of `VerticalProfile`s (one per timestep);
+    /// with `z` it is a `PointSeries` per selected elevation sweep.
     fn query_location(
         &self,
         location_id: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
+        z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         let catalog = self.catalog.load();
         let volumes = catalog
             .by_site
@@ -1281,11 +1463,24 @@ impl EdrEngine for PolarVolumeEngine {
             .ok_or_else(|| DataServerError::LocationNotFound(location_id.to_string()))?
             .volume
             .site;
-        build_site_point_series(volumes, site.lon, site.lat, datetime, parameters)
+        let levels = resolve_levels(&catalog, z)?;
+        let covs = site_coverages(
+            volumes,
+            site.lon,
+            site.lat,
+            datetime,
+            parameters,
+            levels.as_deref(),
+        )?;
+        Ok(finalize_single_site(covs, &levels))
     }
 
     fn get_parameters(&self) -> Vec<String> {
         self.catalog.load().quantities.clone()
+    }
+
+    fn get_vertical_extent(&self) -> Option<VerticalDimension> {
+        self.catalog.load().vertical.clone()
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
@@ -1313,14 +1508,15 @@ impl EdrEngine for PolarVolumeEngine {
         ]
     }
 
-    /// Position query — a `PointSeries` sampled from the radar site
-    /// nearest the requested point.
+    /// Position query against the radar site nearest the requested
+    /// point — same `z`-driven shape as [`query_location`].
     fn query_position(
         &self,
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
+        z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         let (lat, lon) = parse_point_coords(coords)?;
         let catalog = self.catalog.load();
         let nod = nearest_site(&catalog, lon, lat).ok_or_else(|| {
@@ -1332,19 +1528,24 @@ impl EdrEngine for PolarVolumeEngine {
         let volumes = catalog.by_site.get(nod).ok_or_else(|| {
             DataServerError::Engine("internal: nearest_site returned a missing by_site key".into())
         })?;
-        build_site_point_series(volumes, lon, lat, datetime, parameters)
+        let levels = resolve_levels(&catalog, z)?;
+        let covs = site_coverages(volumes, lon, lat, datetime, parameters, levels.as_deref())?;
+        Ok(finalize_single_site(covs, &levels))
     }
 
-    /// Area query — a `CoverageCollection` of one `PointSeries` per
-    /// radar site whose antenna falls inside the polygon.
+    /// Area query — a `CoverageCollection` flattening every in-polygon
+    /// radar site's coverages (a `VerticalProfile` per timestep with no
+    /// `z`, a `PointSeries` per level with `z`).
     fn query_area(
         &self,
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<AreaQueryResult, DataServerError> {
+        z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         let polygon = parse_area_coords(coords)?;
         let catalog = self.catalog.load();
+        let levels = resolve_levels(&catalog, z)?;
 
         // Stable, sorted iteration so the collection order is
         // deterministic across requests.
@@ -1360,8 +1561,15 @@ impl EdrEngine for PolarVolumeEngine {
             if !polygon.contains(site.lon, site.lat) {
                 continue;
             }
-            match build_site_point_series(volumes, site.lon, site.lat, datetime, parameters) {
-                Ok(qr) => coverages.push(qr),
+            match site_coverages(
+                volumes,
+                site.lon,
+                site.lat,
+                datetime,
+                parameters,
+                levels.as_deref(),
+            ) {
+                Ok(covs) => coverages.extend(covs),
                 // A site inside the polygon is skipped — not fatal to
                 // the whole area query — when it has no data in the
                 // requested window (`LocationNotFound`) or none of the
@@ -1381,7 +1589,7 @@ impl EdrEngine for PolarVolumeEngine {
                 "No radar sites with data found within the requested area".into(),
             ));
         }
-        Ok(AreaQueryResult::Collection(coverages))
+        Ok(CoverageResponse::Collection(coverages))
     }
 }
 
@@ -1486,7 +1694,7 @@ mod tests {
             site_lon + dlon_50km,
             site_lat + 0.001,
         ];
-        let tile = polar_sample(&vol, "DBZH", bbox, 50, 1, &OutputCrs::Wgs84).unwrap();
+        let tile = polar_sample(&vol, "DBZH", bbox, 50, 1, &OutputCrs::Wgs84, None).unwrap();
 
         assert_eq!(tile.values.len(), 50);
         // Leftmost pixel ≈ at the site → bin 0.
@@ -1519,7 +1727,7 @@ mod tests {
             site_lon + dlon + 0.01,
             site_lat + 0.001,
         ];
-        let tile = polar_sample(&vol, "DBZH", bbox, 4, 1, &OutputCrs::Wgs84).unwrap();
+        let tile = polar_sample(&vol, "DBZH", bbox, 4, 1, &OutputCrs::Wgs84, None).unwrap();
         assert!(
             tile.values.iter().all(Option::is_none),
             "pixels past max range must be None"
@@ -1538,6 +1746,7 @@ mod tests {
             4,
             4,
             &OutputCrs::Wgs84,
+            None,
         ) {
             Err(DataServerError::InvalidParameter(_)) => {}
             Err(other) => panic!("expected InvalidParameter, got {other:?}"),
@@ -1695,43 +1904,72 @@ mod tests {
         }
     }
 
-    /// `build_site_point_series` yields a `PointSeries` at the queried
-    /// point, with one time-aligned range per quantity.
+    /// With a pinned `z` level, `site_coverages` yields one `PointSeries`
+    /// at the queried point, with one time-aligned range per quantity.
     #[test]
-    fn build_site_point_series_yields_point_series() {
+    fn site_coverages_level_yields_point_series() {
         let (site_lon, site_lat) = (25.0, 60.0);
         let volumes = vec![entry(synthetic_volume(site_lon, site_lat), "v0")];
         // 10.5 km due east — safely mid-bin 10 of the 1 km-spaced sweep,
         // so the sampled bin index is robust against rounding.
         let dlon = 10_500.0 / (EARTH_RADIUS_M * site_lat.to_radians().cos()) * 180.0
             / std::f64::consts::PI;
-        let result =
-            build_site_point_series(&volumes, site_lon + dlon, site_lat, None, None).unwrap();
-        match result.domain {
-            DomainDescription::PointSeries { x, y, t } => {
+        let covs = site_coverages(
+            &volumes,
+            site_lon + dlon,
+            site_lat,
+            None,
+            None,
+            Some(&[0.5]),
+        )
+        .unwrap();
+        assert_eq!(covs.len(), 1);
+        match &covs[0].domain {
+            DomainDescription::PointSeries { x, y, t, z } => {
                 assert!((x - (site_lon + dlon)).abs() < 1e-9);
                 assert!((y - site_lat).abs() < 1e-9);
                 assert_eq!(t.len(), 1);
+                assert_eq!(z.as_ref().expect("z axis").values, vec![0.5]);
             }
             _ => panic!("expected PointSeries"),
         }
-        let dbzh = result.ranges.get("DBZH").expect("DBZH range");
+        let dbzh = covs[0].ranges.get("DBZH").expect("DBZH range");
         assert_eq!(dbzh.shape, vec![1]);
         assert_eq!(dbzh.axis_names, vec!["t".to_string()]);
         // raw[ray][bin] = bin, gain 1 → the sampled value is the bin
         // index, i.e. ground distance / 1 km.
         assert_eq!(dbzh.values[0], Some(10.0));
-        assert!(result.parameters.contains_key("DBZH"));
+        assert!(covs[0].parameters.contains_key("DBZH"));
+    }
+
+    /// With no `z`, `site_coverages` yields one `VerticalProfile` per
+    /// timestep, with the sweep angles as the `z` axis.
+    #[test]
+    fn site_coverages_no_z_yields_vertical_profile() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let volumes = vec![entry(synthetic_volume(site_lon, site_lat), "v0")];
+        let covs = site_coverages(&volumes, site_lon, site_lat, None, None, None).unwrap();
+        assert_eq!(covs.len(), 1);
+        match &covs[0].domain {
+            DomainDescription::VerticalProfile { z, .. } => {
+                assert_eq!(z.values, vec![0.5]);
+            }
+            _ => panic!("expected VerticalProfile"),
+        }
+        assert_eq!(
+            covs[0].ranges.get("DBZH").expect("DBZH range").shape,
+            vec![1]
+        );
     }
 
     /// An out-of-window `datetime` range yields `LocationNotFound`.
     #[test]
-    fn build_site_point_series_empty_window_errors() {
+    fn site_coverages_empty_window_errors() {
         let volumes = vec![entry(synthetic_volume(25.0, 60.0), "v0")];
         let past = DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        match build_site_point_series(&volumes, 25.0, 60.0, Some((past, past)), None) {
+        match site_coverages(&volumes, 25.0, 60.0, Some((past, past)), None, None) {
             Err(DataServerError::LocationNotFound(_)) => {}
             other => panic!("expected LocationNotFound, got {other:?}"),
         }
@@ -1739,10 +1977,10 @@ mod tests {
 
     /// A `parameters` filter naming no real quantity is rejected.
     #[test]
-    fn build_site_point_series_unknown_parameter_errors() {
+    fn site_coverages_unknown_parameter_errors() {
         let volumes = vec![entry(synthetic_volume(25.0, 60.0), "v0")];
         let filter = ["NONESUCH".to_string()];
-        match build_site_point_series(&volumes, 25.0, 60.0, None, Some(&filter)) {
+        match site_coverages(&volumes, 25.0, 60.0, None, Some(&filter), None) {
             Err(DataServerError::InvalidParameter(_)) => {}
             other => panic!("expected InvalidParameter, got {other:?}"),
         }
@@ -1766,6 +2004,7 @@ mod tests {
             quantities: vec![],
             times: vec![],
             spatial_extent: None,
+            vertical: None,
         };
         assert_eq!(nearest_site(&catalog, 29.0, 60.0), Some("east"));
         assert_eq!(nearest_site(&catalog, 21.0, 60.0), Some("west"));
@@ -1780,6 +2019,7 @@ mod tests {
             quantities: vec![],
             times: vec![],
             spatial_extent: None,
+            vertical: None,
         };
         assert_eq!(nearest_site(&catalog, 25.0, 60.0), None);
     }

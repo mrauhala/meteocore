@@ -4,8 +4,9 @@ use chrono::{DateTime, Utc};
 use jsonschema::Validator;
 use serde_json::Value;
 
-use api_edr::response::{area_query_result_to_json, query_result_to_coverage_json};
+use api_edr::response::{coverage_response_to_json, query_result_to_coverage_json};
 use ds_core::model::*;
+use ds_core::vertical::VerticalKind;
 
 fn load_schema() -> Value {
     let schema_str = std::fs::read_to_string(concat!(
@@ -67,6 +68,7 @@ fn make_query_result(
             x: 24.9384,
             y: 60.1699,
             t: times,
+            z: None,
         },
         parameters,
         ranges,
@@ -338,7 +340,7 @@ fn make_grid_query_result(
     }
 
     QueryResult {
-        domain: DomainDescription::Grid { x, y, t },
+        domain: DomainDescription::Grid { x, y, t, z: None },
         parameters,
         ranges,
     }
@@ -483,13 +485,12 @@ fn coverage_collection_validates() {
         ),
     ];
 
-    let result = AreaQueryResult::Collection(coverages);
-    let json = area_query_result_to_json(&result);
+    let result = CoverageResponse::Collection(coverages);
+    let json = coverage_response_to_json(&result);
 
     assert_eq!(json["type"], "CoverageCollection");
     assert_eq!(json["domainType"], "PointSeries");
     assert!(json["parameters"].is_object());
-    assert!(json["referencing"].is_array());
     let items = json["coverages"].as_array().unwrap();
     assert_eq!(items.len(), 2);
     for item in items {
@@ -514,16 +515,16 @@ fn coverage_collection_single_station_validates() {
         ],
     )];
 
-    let result = AreaQueryResult::Collection(coverages);
-    let json = area_query_result_to_json(&result);
+    let result = CoverageResponse::Collection(coverages);
+    let json = coverage_response_to_json(&result);
     validate(&json, &schema);
 }
 
 #[test]
 fn coverage_collection_empty_validates() {
     let schema = load_schema();
-    let result = AreaQueryResult::Collection(vec![]);
-    let json = area_query_result_to_json(&result);
+    let result = CoverageResponse::Collection(vec![]);
+    let json = coverage_response_to_json(&result);
     assert_eq!(json["type"], "CoverageCollection");
     assert!(json["coverages"].as_array().unwrap().is_empty());
     validate(&json, &schema);
@@ -537,8 +538,158 @@ fn area_query_single_result_validates() {
     let values: Vec<Option<f64>> =
         vec![Some(1.0), Some(2.0), Some(3.0), Some(4.0), None, Some(6.0)];
     let qr = make_grid_query_result(x, y, None, vec![("reflectivity", "dBZ", values)]);
-    let result = AreaQueryResult::Single(qr);
-    let json = area_query_result_to_json(&result);
+    let result = CoverageResponse::Single(qr);
+    let json = coverage_response_to_json(&result);
     assert_eq!(json["type"], "Coverage");
+    validate(&json, &schema);
+}
+
+// --- VerticalProfile + z-axis tests (#185) ---
+
+/// A `PointSeries` pinned to a single vertical level validates — the `z`
+/// axis is a single-value numeric axis with a `VerticalCRS` reference.
+#[test]
+fn point_series_with_z_validates() {
+    let schema = load_schema();
+    let times = vec![make_time(0), make_time(1)];
+    let mut result = make_query_result(times, vec![("DBZH", "dBZ", vec![Some(12.0), Some(15.0)])]);
+    if let DomainDescription::PointSeries { z, .. } = &mut result.domain {
+        *z = Some(VerticalCoord {
+            kind: VerticalKind::ElevationAngle,
+            values: vec![0.5],
+        });
+    }
+    let json = query_result_to_coverage_json(&result);
+    assert_eq!(json["domain"]["axes"]["z"]["values"][0], 0.5);
+    validate(&json, &schema);
+}
+
+/// A `VerticalProfile` coverage (radar reflectivity vs. elevation angle)
+/// validates against the schema's `VerticalProfile` domain constraints.
+#[test]
+fn vertical_profile_validates() {
+    let schema = load_schema();
+    let levels = vec![0.5, 1.5, 3.0, 5.0];
+    let mut parameters = HashMap::new();
+    parameters.insert(
+        "DBZH".to_string(),
+        ParameterDescription {
+            label: "DBZH".to_string(),
+            unit: String::new(),
+            observed_property: "DBZH".to_string(),
+        },
+    );
+    let mut ranges = HashMap::new();
+    ranges.insert(
+        "DBZH".to_string(),
+        NdArray {
+            shape: vec![levels.len()],
+            axis_names: vec!["z".to_string()],
+            values: vec![Some(20.0), Some(18.0), None, Some(5.0)],
+        },
+    );
+    let result = QueryResult {
+        domain: DomainDescription::VerticalProfile {
+            x: 24.9,
+            y: 60.1,
+            t: Some(make_time(0)),
+            z: VerticalCoord {
+                kind: VerticalKind::ElevationAngle,
+                values: levels,
+            },
+        },
+        parameters,
+        ranges,
+    };
+    let json = query_result_to_coverage_json(&result);
+    assert_eq!(json["domain"]["domainType"], "VerticalProfile");
+    validate(&json, &schema);
+}
+
+/// A `CoverageCollection` of `VerticalProfile`s — the shape a no-`z`
+/// radar position query returns — validates.
+#[test]
+fn vertical_profile_collection_validates() {
+    let schema = load_schema();
+    let make_profile = |hour: u32| {
+        let mut parameters = HashMap::new();
+        parameters.insert(
+            "DBZH".to_string(),
+            ParameterDescription {
+                label: "DBZH".to_string(),
+                unit: String::new(),
+                observed_property: "DBZH".to_string(),
+            },
+        );
+        let mut ranges = HashMap::new();
+        ranges.insert(
+            "DBZH".to_string(),
+            NdArray {
+                shape: vec![2],
+                axis_names: vec!["z".to_string()],
+                values: vec![Some(10.0), Some(8.0)],
+            },
+        );
+        QueryResult {
+            domain: DomainDescription::VerticalProfile {
+                x: 24.9,
+                y: 60.1,
+                t: Some(make_time(hour)),
+                z: VerticalCoord {
+                    kind: VerticalKind::ElevationAngle,
+                    values: vec![0.5, 1.5],
+                },
+            },
+            parameters,
+            ranges,
+        }
+    };
+    let result = CoverageResponse::Collection(vec![make_profile(0), make_profile(1)]);
+    let json = coverage_response_to_json(&result);
+    assert_eq!(json["type"], "CoverageCollection");
+    assert_eq!(json["domainType"], "VerticalProfile");
+    validate(&json, &schema);
+}
+
+/// A `Grid` carrying a vertical (`z`) axis validates — the shape an area
+/// query against a 3-D raster collection produces.
+#[test]
+fn grid_with_z_validates() {
+    let schema = load_schema();
+    let mut parameters = HashMap::new();
+    parameters.insert(
+        "temperature".to_string(),
+        ParameterDescription {
+            label: "temperature".to_string(),
+            unit: "K".to_string(),
+            observed_property: "temperature".to_string(),
+        },
+    );
+    let mut ranges = HashMap::new();
+    // shape [z, y, x] = [2, 2, 2] = 8 values.
+    ranges.insert(
+        "temperature".to_string(),
+        NdArray {
+            shape: vec![2, 2, 2],
+            axis_names: vec!["z".to_string(), "y".to_string(), "x".to_string()],
+            values: (0..8).map(|i| Some(i as f64)).collect(),
+        },
+    );
+    let result = QueryResult {
+        domain: DomainDescription::Grid {
+            x: vec![10.0, 10.5],
+            y: vec![60.0, 60.5],
+            t: None,
+            z: Some(VerticalCoord {
+                kind: VerticalKind::Pressure,
+                values: vec![850.0, 500.0],
+            }),
+        },
+        parameters,
+        ranges,
+    };
+    let json = query_result_to_coverage_json(&result);
+    assert_eq!(json["domain"]["domainType"], "Grid");
+    assert!(json["domain"]["axes"]["z"]["values"].is_array());
     validate(&json, &schema);
 }

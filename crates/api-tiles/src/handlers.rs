@@ -201,6 +201,19 @@ fn build_collection_metadata(
                 }
             }
         }
+
+        if let Some(vertical) = &info.vertical {
+            let vertical_json = json!({
+                "interval": vertical.extent().map(|(lo, hi)| [[lo, hi]]),
+                "values": vertical.levels,
+                "vrs": format!("{} ({})", vertical.label, vertical.unit)
+            });
+            if let Some(extent) = metadata.get_mut("extent") {
+                extent["vertical"] = vertical_json;
+            } else {
+                metadata["extent"] = json!({ "vertical": vertical_json });
+            }
+        }
     }
 
     metadata
@@ -361,7 +374,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "description": "Column index"
                     },
                     {"$ref": "#/components/parameters/datetime"},
-                    {"$ref": "#/components/parameters/f"}
+                    {"$ref": "#/components/parameters/f"},
+                    {"$ref": "#/components/parameters/elevation"}
                 ],
                 "responses": {
                     "200": {
@@ -465,6 +479,13 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         ]
                     },
                     "description": "Output format. `mvt` selects Mapbox Vector Tile (only on collections with a FeatureEngine)."
+                },
+                "elevation": {
+                    "name": "elevation",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "number"},
+                    "description": "Vertical level (e.g. radar elevation angle). Only valid for collections with a vertical dimension."
                 }
             }
         }
@@ -1086,6 +1107,14 @@ async fn render_tile(
         .clone()
         .or_else(|| style_info.parameter.clone());
 
+    // Reject an `elevation` against a collection with no vertical axis.
+    if validated.z.is_some() && raster_info.vertical.is_none() {
+        return Err(TilesError::BadRequest(format!(
+            "collection '{collection_id}' has no vertical dimension; \
+             the `elevation` parameter is not supported"
+        )));
+    }
+
     // Build cache key
     let cache_key = CacheKey {
         layer: collection_id.to_string(),
@@ -1101,6 +1130,7 @@ async fn render_tile(
         height: tile_size,
         time,
         parameter: effective_parameter.clone(),
+        z: validated.z.map(ds_render::quantize_z),
     };
 
     let cache_control = cache_control_value(has_explicit_time);
@@ -1161,6 +1191,7 @@ async fn render_tile(
     // The blocking closure returns Ok(None) for empty (all-nodata) tiles,
     // or Ok(Some(bytes)) for tiles with data.
     let render_parameter = effective_parameter;
+    let render_z = validated.z;
 
     let render_result = tokio::task::spawn_blocking(move || {
         let tile = engine.get_raster_tile(
@@ -1170,6 +1201,7 @@ async fn render_tile(
             time,
             &output_crs,
             render_parameter.as_deref(),
+            render_z,
         )?;
 
         // If every pixel is nodata, skip colorization + encoding entirely.

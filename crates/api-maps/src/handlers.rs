@@ -178,6 +178,19 @@ fn build_collection_metadata(
         }
     }
 
+    if let Some(vertical) = &info.vertical {
+        let vertical_json = json!({
+            "interval": vertical.extent().map(|(lo, hi)| [[lo, hi]]),
+            "values": vertical.levels,
+            "vrs": format!("{} ({})", vertical.label, vertical.unit)
+        });
+        if let Some(extent) = metadata.get_mut("extent") {
+            extent["vertical"] = vertical_json;
+        } else {
+            metadata["extent"] = json!({ "vertical": vertical_json });
+        }
+    }
+
     metadata
 }
 
@@ -263,7 +276,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     {"$ref": "#/components/parameters/datetime"},
                     {"$ref": "#/components/parameters/transparent"},
                     {"$ref": "#/components/parameters/f"},
-                    {"$ref": "#/components/parameters/bbox-crs"}
+                    {"$ref": "#/components/parameters/bbox-crs"},
+                    {"$ref": "#/components/parameters/elevation"}
                 ],
                 "responses": {
                     "200": {
@@ -331,7 +345,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     {"$ref": "#/components/parameters/datetime"},
                     {"$ref": "#/components/parameters/transparent"},
                     {"$ref": "#/components/parameters/f"},
-                    {"$ref": "#/components/parameters/bbox-crs"}
+                    {"$ref": "#/components/parameters/bbox-crs"},
+                    {"$ref": "#/components/parameters/elevation"}
                 ],
                 "responses": {
                     "200": {
@@ -477,6 +492,13 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "required": false,
                     "schema": {"type": "string"},
                     "description": "CRS for bbox coordinates. Only CRS:84 supported."
+                },
+                "elevation": {
+                    "name": "elevation",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "number"},
+                    "description": "Vertical level (e.g. radar elevation angle). Only valid for collections with a vertical dimension."
                 }
             },
             "schemas": {
@@ -735,6 +757,15 @@ async fn render_map(
         .clone()
         .or_else(|| style_info.parameter.clone());
 
+    // Reject an `elevation` against a collection with no vertical axis
+    // rather than silently rendering the default layer.
+    if validated.z.is_some() && raster_info.vertical.is_none() {
+        return Err(MapsError::BadRequest(format!(
+            "collection '{collection_id}' has no vertical dimension; \
+             the `elevation` parameter is not supported"
+        )));
+    }
+
     // Build cache key
     let cache_key = CacheKey {
         layer: collection_id.to_string(),
@@ -750,6 +781,7 @@ async fn render_map(
         height: validated.height,
         time,
         parameter: effective_parameter.clone(),
+        z: validated.z.map(ds_render::quantize_z),
     };
 
     let cache_control = cache_control_value(has_explicit_time);
@@ -812,6 +844,7 @@ async fn render_map(
     let rendered_cache = state.rendered_cache.clone();
 
     let render_parameter = effective_parameter;
+    let render_z = validated.z;
 
     let render_result = tokio::task::spawn_blocking(move || {
         let tile = engine.get_raster_tile(
@@ -821,6 +854,7 @@ async fn render_map(
             time,
             &output_crs,
             render_parameter.as_deref(),
+            render_z,
         )?;
         // If every pixel is nodata, skip colorization + encoding entirely.
         if tile.is_empty() {

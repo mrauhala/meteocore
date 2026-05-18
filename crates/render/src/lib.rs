@@ -72,6 +72,15 @@ pub struct CacheKey {
     /// Distinct cache entries for the same (layer, style, bbox, time) when
     /// the caller asks for a different parameter than the style's default.
     pub parameter: Option<String>,
+    /// Optional vertical level, quantized to millidegrees/milli-units so the
+    /// key stays `Hash`/`Eq`. Use [`quantize_z`] to build it.
+    pub z: Option<i64>,
+}
+
+/// Quantize a vertical level for use in a [`CacheKey`] — millidegrees /
+/// milli-units, enough to keep distinct elevation sweeps apart.
+pub fn quantize_z(z: f64) -> i64 {
+    (z * 1000.0).round() as i64
 }
 
 /// FNV-1a 64-bit mix. Fixed algorithm — safe to serialise into HTTP `ETag`
@@ -123,6 +132,13 @@ impl CacheKey {
             Some(p) => {
                 fnv1a_mix(&mut h, &[1u8]);
                 fnv1a_mix(&mut h, p.as_bytes());
+            }
+            None => fnv1a_mix(&mut h, &[0u8]),
+        }
+        match self.z {
+            Some(z) => {
+                fnv1a_mix(&mut h, &[1u8]);
+                fnv1a_mix(&mut h, &z.to_le_bytes());
             }
             None => fnv1a_mix(&mut h, &[0u8]),
         }
@@ -502,6 +518,7 @@ mod tests {
                     .with_timezone(&chrono::Utc),
             ),
             parameter: None,
+            z: None,
         };
         let mut later = base.clone();
         later.time = Some(
@@ -524,6 +541,7 @@ mod tests {
             height: 256,
             time: None,
             parameter: Some("2t".into()),
+            z: None,
         };
         let mut other = base.clone();
         other.parameter = Some("10u".into());
@@ -550,9 +568,10 @@ mod tests {
             height: 256,
             time: None,
             parameter: None,
+            z: None,
         };
-        // Pinned after introducing the `parameter` field (cache-bust event).
-        assert_eq!(key.etag(), "\"074133840641acde\"");
+        // Pinned after introducing the `z` field (cache-bust event).
+        assert_eq!(key.etag(), "\"95776756a198bd3a\"");
     }
 
     #[test]

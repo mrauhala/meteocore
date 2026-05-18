@@ -38,6 +38,9 @@ pub struct TileQueryParams {
     /// Ignored for MVT (`?f=mvt`) responses.
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
+    /// Vertical level selector (e.g. a radar elevation angle). Ignored by
+    /// collections with no vertical dimension and for MVT responses.
+    pub elevation: Option<String>,
 }
 
 impl TileQueryParams {
@@ -55,6 +58,8 @@ pub struct ValidatedTileParams {
     pub time: Option<DateTime<Utc>>,
     pub format: ds_render::ImageFormat,
     pub parameter_name: Option<String>,
+    /// Vertical level, parsed from the `elevation` query parameter.
+    pub z: Option<f64>,
 }
 
 impl TileQueryParams {
@@ -81,10 +86,23 @@ impl TileQueryParams {
             .filter(|s| !s.is_empty())
             .map(str::to_string);
 
+        let z = match self
+            .elevation
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(raw) => Some(raw.parse::<f64>().map_err(|_| {
+                TilesError::BadRequest(format!("elevation '{raw}' is not a number"))
+            })?),
+            None => None,
+        };
+
         Ok(ValidatedTileParams {
             time,
             format,
             parameter_name,
+            z,
         })
     }
 }
@@ -118,6 +136,7 @@ mod tests {
             datetime: None,
             format: None,
             parameter_name: None,
+            elevation: None,
         };
         let validated = params.validate().unwrap();
         assert!(matches!(validated.format, ds_render::ImageFormat::Png));
@@ -129,6 +148,7 @@ mod tests {
             datetime: None,
             format: Some("image/jpeg".to_string()),
             parameter_name: None,
+            elevation: None,
         };
         let validated = params.validate().unwrap();
         assert!(matches!(validated.format, ds_render::ImageFormat::Jpeg));
@@ -140,6 +160,7 @@ mod tests {
             datetime: None,
             format: Some("text/html".to_string()),
             parameter_name: None,
+            elevation: None,
         };
         assert!(params.validate().is_err());
     }

@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::error::DataServerError;
+use crate::vertical::VerticalDimension;
 
 /// The output CRS for map rendering, determining how pixels map to coordinates.
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +43,10 @@ pub struct RasterInfo {
     /// All available parameters. Empty means single-parameter engine (use `parameter`).
     /// For multi-parameter engines (e.g., querydata), each entry is a (short_name, title) pair.
     pub parameters: Vec<(String, String)>,
+    /// The collection's vertical axis, when it has one (e.g. radar elevation
+    /// sweeps, pressure levels). `None` for collections with no vertical
+    /// dimension.
+    pub vertical: Option<VerticalDimension>,
 }
 
 /// Trait for serving raster data as map images.
@@ -62,7 +67,12 @@ pub trait MapEngine: Send + Sync {
     /// Engines that serve a single parameter (e.g., GeoTIFF) ignore this.
     /// The value comes from the style's `parameter` config field.
     ///
+    /// The optional `z` selects a vertical level (e.g. radar elevation angle,
+    /// pressure level). Engines with no vertical dimension ignore it; engines
+    /// that have one resolve it against `raster_info().vertical`.
+    ///
     /// The engine handles CRS reprojection to source data internally.
+    #[allow(clippy::too_many_arguments)] // bbox/size/time/crs/parameter/z are all genuine selectors
     fn get_raster_tile(
         &self,
         bbox: [f64; 4],
@@ -71,6 +81,7 @@ pub trait MapEngine: Send + Sync {
         time: Option<DateTime<Utc>>,
         output_crs: &OutputCrs,
         parameter: Option<&str>,
+        z: Option<f64>,
     ) -> Result<RasterTile, DataServerError>;
 
     /// Return metadata for capabilities documents.

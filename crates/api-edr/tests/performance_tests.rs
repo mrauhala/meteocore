@@ -81,7 +81,8 @@ impl EdrEngine for ScalableEngine {
         location_id: &str,
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         let idx: usize = location_id
             .strip_prefix("loc_")
             .and_then(|s| s.parse().ok())
@@ -121,15 +122,16 @@ impl EdrEngine for ScalableEngine {
             );
         }
 
-        Ok(QueryResult {
+        Ok(CoverageResponse::Single(QueryResult {
             domain: DomainDescription::PointSeries {
                 x: 24.0 + (idx as f64 * 0.01),
                 y: 60.0 + (idx as f64 * 0.01),
                 t: times,
+                z: None,
             },
             parameters,
             ranges,
-        })
+        }))
     }
 
     fn get_parameters(&self) -> Vec<String> {

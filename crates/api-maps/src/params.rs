@@ -36,6 +36,9 @@ pub struct MapQueryParams {
     /// path/query form is on the OGC Maps roadmap and will replace this.
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
+    /// Vertical level selector (e.g. a radar elevation angle). Ignored by
+    /// collections with no vertical dimension.
+    pub elevation: Option<String>,
 }
 
 /// Validated map request parameters.
@@ -48,6 +51,8 @@ pub struct ValidatedMapParams {
     pub output_crs: ds_core::map_engine::OutputCrs,
     pub format: ds_render::ImageFormat,
     pub parameter_name: Option<String>,
+    /// Vertical level, parsed from the `elevation` query parameter.
+    pub z: Option<f64>,
 }
 
 impl MapQueryParams {
@@ -138,6 +143,20 @@ impl MapQueryParams {
             .filter(|s| !s.is_empty())
             .map(str::to_string);
 
+        // ELEVATION — a single vertical level. Multi-value selection is an
+        // EDR concern; a map renders exactly one layer.
+        let z = match self
+            .elevation
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(raw) => Some(raw.parse::<f64>().map_err(|_| {
+                MapsError::BadRequest(format!("elevation '{raw}' is not a number"))
+            })?),
+            None => None,
+        };
+
         Ok(ValidatedMapParams {
             bbox,
             width,
@@ -147,6 +166,7 @@ impl MapQueryParams {
             output_crs,
             format,
             parameter_name,
+            z,
         })
     }
 }

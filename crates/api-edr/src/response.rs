@@ -1,4 +1,4 @@
-use ds_core::model::{AreaQueryResult, DomainDescription, Location, QueryResult};
+use ds_core::model::{CoverageResponse, DomainDescription, Location, QueryResult, VerticalCoord};
 use serde_json::{json, Map, Number, Value};
 
 /// Pre-built reference system objects (shared across all responses).
@@ -18,6 +18,26 @@ fn temporal_ref() -> Value {
         "system": {
             "type": "TemporalRS",
             "calendar": "Gregorian"
+        }
+    })
+}
+
+/// CoverageJSON `referencing` entry for a vertical (`z`) coordinate. The
+/// vertical CRS is described by its coordinate-system axis (name,
+/// direction, unit) rather than an identifier — vertical coordinate
+/// kinds like radar elevation angle have no standard CRS URI.
+fn vertical_ref(z: &VerticalCoord) -> Value {
+    json!({
+        "coordinates": ["z"],
+        "system": {
+            "type": "VerticalCRS",
+            "cs": {
+                "csAxes": [{
+                    "name": { "en": z.kind.default_label() },
+                    "direction": z.kind.direction(),
+                    "unit": { "symbol": z.kind.default_unit() }
+                }]
+            }
         }
     })
 }
@@ -98,7 +118,7 @@ fn build_ndarray(ndarray: &ds_core::model::NdArray) -> Value {
     Value::Object(obj)
 }
 
-pub fn query_result_to_coverage_json(result: &QueryResult) -> Value {
+fn build_parameters(result: &QueryResult) -> Map<String, Value> {
     let mut parameters = Map::with_capacity(result.parameters.len());
     for (name, desc) in &result.parameters {
         parameters.insert(
@@ -106,26 +126,41 @@ pub fn query_result_to_coverage_json(result: &QueryResult) -> Value {
             build_parameter(&desc.label, &desc.unit, &desc.observed_property),
         );
     }
+    parameters
+}
 
+fn build_ranges(result: &QueryResult) -> Map<String, Value> {
     let mut ranges = Map::with_capacity(result.ranges.len());
     for (name, ndarray) in &result.ranges {
         ranges.insert(name.clone(), build_ndarray(ndarray));
     }
+    ranges
+}
 
-    let domain = build_domain(&result.domain);
-
+pub fn query_result_to_coverage_json(result: &QueryResult) -> Value {
     let mut coverage = Map::with_capacity(4);
     coverage.insert("type".into(), Value::String("Coverage".into()));
-    coverage.insert("domain".into(), domain);
-    coverage.insert("parameters".into(), Value::Object(parameters));
-    coverage.insert("ranges".into(), Value::Object(ranges));
+    coverage.insert("domain".into(), build_domain(&result.domain));
+    coverage.insert("parameters".into(), Value::Object(build_parameters(result)));
+    coverage.insert("ranges".into(), Value::Object(build_ranges(result)));
     Value::Object(coverage)
 }
 
-pub fn area_query_result_to_json(result: &AreaQueryResult) -> Value {
+/// CoverageJSON `domainType` string for a domain description.
+fn domain_type_name(domain: &DomainDescription) -> &'static str {
+    match domain {
+        DomainDescription::PointSeries { .. } => "PointSeries",
+        DomainDescription::Grid { .. } => "Grid",
+        DomainDescription::VerticalProfile { .. } => "VerticalProfile",
+    }
+}
+
+/// Serialise an EDR query result — a single `Coverage` or, for multiple
+/// coverages, a `CoverageCollection`.
+pub fn coverage_response_to_json(result: &CoverageResponse) -> Value {
     match result {
-        AreaQueryResult::Single(qr) => query_result_to_coverage_json(qr),
-        AreaQueryResult::Collection(coverages) => {
+        CoverageResponse::Single(qr) => query_result_to_coverage_json(qr),
+        CoverageResponse::Collection(coverages) => {
             if coverages.is_empty() {
                 return json!({
                     "type": "CoverageCollection",
@@ -133,39 +168,26 @@ pub fn area_query_result_to_json(result: &AreaQueryResult) -> Value {
                 });
             }
 
-            // Hoist shared parameters and referencing to collection level
-            let first = &coverages[0];
-            let mut parameters = Map::with_capacity(first.parameters.len());
-            for (name, desc) in &first.parameters {
-                parameters.insert(
-                    name.clone(),
-                    build_parameter(&desc.label, &desc.unit, &desc.observed_property),
-                );
-            }
+            // Hoist the shared parameters to collection level; each
+            // coverage's domain keeps its own `referencing` so a
+            // collection may mix domain shapes safely.
+            let parameters = build_parameters(&coverages[0]);
 
             let coverage_items: Vec<Value> = coverages
                 .iter()
                 .map(|qr| {
-                    let domain = build_domain(&qr.domain);
-
-                    let mut ranges = Map::with_capacity(qr.ranges.len());
-                    for (name, ndarray) in &qr.ranges {
-                        ranges.insert(name.clone(), build_ndarray(ndarray));
-                    }
-
                     let mut cov = Map::with_capacity(3);
                     cov.insert("type".into(), Value::String("Coverage".into()));
-                    cov.insert("domain".into(), domain);
-                    cov.insert("ranges".into(), Value::Object(ranges));
+                    cov.insert("domain".into(), build_domain(&qr.domain));
+                    cov.insert("ranges".into(), Value::Object(build_ranges(qr)));
                     Value::Object(cov)
                 })
                 .collect();
 
             json!({
                 "type": "CoverageCollection",
-                "domainType": "PointSeries",
+                "domainType": domain_type_name(&coverages[0].domain),
                 "parameters": parameters,
-                "referencing": [spatial_ref(), temporal_ref()],
                 "coverages": coverage_items
             })
         }
@@ -174,20 +196,25 @@ pub fn area_query_result_to_json(result: &AreaQueryResult) -> Value {
 
 fn build_domain(desc: &DomainDescription) -> Value {
     match desc {
-        DomainDescription::PointSeries { x, y, t } => {
+        DomainDescription::PointSeries { x, y, t, z } => {
             let times: Vec<String> = t.iter().map(|t| t.to_rfc3339()).collect();
+            let mut axes = Map::new();
+            axes.insert("x".into(), json!({ "values": [x] }));
+            axes.insert("y".into(), json!({ "values": [y] }));
+            axes.insert("t".into(), json!({ "values": times }));
+            let mut referencing = vec![spatial_ref(), temporal_ref()];
+            if let Some(zc) = z {
+                axes.insert("z".into(), json!({ "values": zc.values }));
+                referencing.push(vertical_ref(zc));
+            }
             json!({
                 "type": "Domain",
                 "domainType": "PointSeries",
-                "axes": {
-                    "x": { "values": [x] },
-                    "y": { "values": [y] },
-                    "t": { "values": times }
-                },
-                "referencing": [spatial_ref(), temporal_ref()]
+                "axes": axes,
+                "referencing": referencing
             })
         }
-        DomainDescription::Grid { x, y, t } => {
+        DomainDescription::Grid { x, y, t, z } => {
             let mut axes = Map::new();
             axes.insert("x".into(), json!({ "values": x }));
             axes.insert("y".into(), json!({ "values": y }));
@@ -199,10 +226,31 @@ fn build_domain(desc: &DomainDescription) -> Value {
                 axes.insert("t".into(), json!({ "values": time_strings }));
                 referencing.push(temporal_ref());
             }
+            if let Some(zc) = z {
+                axes.insert("z".into(), json!({ "values": zc.values }));
+                referencing.push(vertical_ref(zc));
+            }
 
             json!({
                 "type": "Domain",
                 "domainType": "Grid",
+                "axes": axes,
+                "referencing": referencing
+            })
+        }
+        DomainDescription::VerticalProfile { x, y, t, z } => {
+            let mut axes = Map::new();
+            axes.insert("x".into(), json!({ "values": [x] }));
+            axes.insert("y".into(), json!({ "values": [y] }));
+            axes.insert("z".into(), json!({ "values": z.values }));
+            let mut referencing = vec![spatial_ref(), vertical_ref(z)];
+            if let Some(time) = t {
+                axes.insert("t".into(), json!({ "values": [time.to_rfc3339()] }));
+                referencing.push(temporal_ref());
+            }
+            json!({
+                "type": "Domain",
+                "domainType": "VerticalProfile",
                 "axes": axes,
                 "referencing": referencing
             })

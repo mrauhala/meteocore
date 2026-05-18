@@ -132,6 +132,13 @@ pub async fn wms_handler(
                 }
             }
 
+            // Reject an `ELEVATION` against a layer with no vertical axis.
+            if params.elevation.is_some() && engine.raster_info().vertical.is_none() {
+                return Err(WmsError::invalid_parameter(&format!(
+                    "Layer '{collection_id}' has no ELEVATION dimension"
+                )));
+            }
+
             let colormap = style_info.colormap.clone();
             let content_type = params.format.content_type();
             let has_explicit_time = params.time.is_some();
@@ -157,6 +164,7 @@ pub async fn wms_handler(
                 parameter: layer_parameter
                     .clone()
                     .or_else(|| style_info.parameter.clone()),
+                z: params.elevation.map(ds_render::quantize_z),
             };
 
             let cache_control = cache_control_value(has_explicit_time);
@@ -221,6 +229,7 @@ pub async fn wms_handler(
             let time = params.time;
             let output_crs = params.output_crs;
             let format = params.format;
+            let elevation = params.elevation;
             let rendered_cache = state.rendered_cache.clone();
 
             // Layer parameter (from "collection/param") takes priority over style parameter
@@ -235,6 +244,7 @@ pub async fn wms_handler(
                     time,
                     &output_crs,
                     style_parameter.as_deref(),
+                    elevation,
                 )?;
                 // If every pixel is nodata, skip colorization + encoding entirely.
                 if tile.is_empty() {

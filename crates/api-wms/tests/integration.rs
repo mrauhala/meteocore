@@ -36,6 +36,7 @@ impl MapEngine for EmptyMockMapEngine {
         _time: Option<chrono::DateTime<chrono::Utc>>,
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
+        _z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
         let pixel_count = (width * height) as usize;
         Ok(RasterTile {
@@ -55,6 +56,7 @@ impl MapEngine for EmptyMockMapEngine {
             parameter: "reflectivity".into(),
             unit: "dBZ".into(),
             parameters: vec![],
+            vertical: None,
         }
     }
 }
@@ -187,6 +189,7 @@ impl MapEngine for FailingMockMapEngine {
         _time: Option<chrono::DateTime<chrono::Utc>>,
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
+        _z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
         Err(DataServerError::Engine("intentional render failure".into()))
     }
@@ -201,6 +204,7 @@ impl MapEngine for FailingMockMapEngine {
             parameter: "reflectivity".into(),
             unit: "dBZ".into(),
             parameters: vec![],
+            vertical: None,
         }
     }
 }
@@ -314,6 +318,7 @@ impl MapEngine for PopulatedMockMapEngine {
         _time: Option<chrono::DateTime<chrono::Utc>>,
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
+        _z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
         let pixel_count = (width * height) as usize;
         // Linear gradient — yields a non-uniform PNG so the test isn't
@@ -338,6 +343,7 @@ impl MapEngine for PopulatedMockMapEngine {
             parameter: "reflectivity".into(),
             unit: "dBZ".into(),
             parameters: vec![],
+            vertical: None,
         }
     }
 }

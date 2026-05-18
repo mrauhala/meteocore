@@ -50,7 +50,7 @@ fn bench_query_position(c: &mut Criterion) {
         b.iter(|| {
             black_box(
                 engine
-                    .query_position(black_box(coords), None, None)
+                    .query_position(black_box(coords), None, None, None)
                     .unwrap(),
             )
         })
@@ -62,13 +62,13 @@ fn bench_query_position_cached(c: &mut Criterion) {
     let coords = "POINT(25.0 60.5)";
 
     // Warm the cache
-    let _ = engine.query_position(coords, None, None);
+    let _ = engine.query_position(coords, None, None, None);
 
     c.bench_function("geotiff_query_position_cached", |b| {
         b.iter(|| {
             black_box(
                 engine
-                    .query_position(black_box(coords), None, None)
+                    .query_position(black_box(coords), None, None, None)
                     .unwrap(),
             )
         })
@@ -81,10 +81,16 @@ fn bench_query_area_small(c: &mut Criterion) {
     let coords = "POLYGON((24.5 60.0, 25.0 60.0, 25.0 60.5, 24.5 60.5, 24.5 60.0))";
 
     // Warm cache
-    let _ = engine.query_area(coords, None, None);
+    let _ = engine.query_area(coords, None, None, None);
 
     c.bench_function("geotiff_query_area_small", |b| {
-        b.iter(|| black_box(engine.query_area(black_box(coords), None, None).unwrap()))
+        b.iter(|| {
+            black_box(
+                engine
+                    .query_area(black_box(coords), None, None, None)
+                    .unwrap(),
+            )
+        })
     });
 }
 
@@ -94,10 +100,16 @@ fn bench_query_area_large(c: &mut Criterion) {
     let coords = "POLYGON((22.0 59.0, 26.0 59.0, 26.0 62.0, 22.0 62.0, 22.0 59.0))";
 
     // Warm cache
-    let _ = engine.query_area(coords, None, None);
+    let _ = engine.query_area(coords, None, None, None);
 
     c.bench_function("geotiff_query_area_large", |b| {
-        b.iter(|| black_box(engine.query_area(black_box(coords), None, None).unwrap()))
+        b.iter(|| {
+            black_box(
+                engine
+                    .query_area(black_box(coords), None, None, None)
+                    .unwrap(),
+            )
+        })
     });
 }
 

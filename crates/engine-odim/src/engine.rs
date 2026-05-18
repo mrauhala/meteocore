@@ -666,6 +666,7 @@ impl MapEngine for OdimEngine {
         time: Option<DateTime<Utc>>,
         output_crs: &OutputCrs,
         _parameter: Option<&str>,
+        _z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
         let entry = self.select_entry(time).ok_or_else(|| {
             DataServerError::Engine(format!(
@@ -753,6 +754,7 @@ impl MapEngine for OdimEngine {
             parameter: self.parameter.clone(),
             unit: self.unit.clone(),
             parameters: vec![],
+            vertical: None, // 2-D composite, no vertical dimension
         }
     }
 }

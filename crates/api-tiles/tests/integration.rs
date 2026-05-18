@@ -41,6 +41,7 @@ impl MockMapEngine {
             parameter: "reflectivity".to_string(),
             unit: "dBZ".to_string(),
             parameters: vec![],
+            vertical: None,
         }
     }
 }
@@ -54,6 +55,7 @@ impl MapEngine for MockMapEngine {
         _time: Option<chrono::DateTime<chrono::Utc>>,
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
+        _z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
         let pixel_count = (width * height) as usize;
         let values: Vec<Option<f64>> = (0..pixel_count)
@@ -799,6 +801,7 @@ impl MapEngine for EmptyMockMapEngine {
         _time: Option<chrono::DateTime<chrono::Utc>>,
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
+        _z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
         let pixel_count = (width * height) as usize;
         Ok(RasterTile {
@@ -883,6 +886,7 @@ impl MapEngine for MultiParamMockEngine {
         _time: Option<chrono::DateTime<chrono::Utc>>,
         _output_crs: &OutputCrs,
         parameter: Option<&str>,
+        _z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
         // Vary the pixel values by parameter so the `parameter` field on
         // the cache key actually changes the rendered bytes — the
@@ -919,6 +923,7 @@ impl MapEngine for MultiParamMockEngine {
                 ("2t".into(), "Temperature".into()),
                 ("10u".into(), "U Wind".into()),
             ],
+            vertical: None,
         }
     }
 }

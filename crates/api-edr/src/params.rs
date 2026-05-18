@@ -6,6 +6,7 @@ pub struct LocationQueryParams {
     pub datetime: Option<String>,
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
+    pub z: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -14,6 +15,7 @@ pub struct PositionQueryParams {
     pub datetime: Option<String>,
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
+    pub z: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -22,6 +24,28 @@ pub struct AreaQueryParams {
     pub datetime: Option<String>,
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
+    pub z: Option<String>,
+}
+
+/// Parse the EDR `z` query parameter — a comma-separated list of numeric
+/// vertical levels (e.g. `z=850,700,500` or a single `z=0.5`). An absent
+/// or blank value yields `None` (the whole vertical extent / a profile).
+pub fn parse_z(z: Option<&str>) -> Result<Option<Vec<f64>>, DataServerError> {
+    let Some(raw) = z.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let levels: Vec<f64> = raw
+        .split(',')
+        .map(|part| {
+            part.trim().parse::<f64>().map_err(|_| {
+                DataServerError::InvalidParameter(format!(
+                    "Invalid `z` value '{}' — expected a number",
+                    part.trim()
+                ))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok((!levels.is_empty()).then_some(levels))
 }
 
 /// Split a position-query `coords` value into one or more `POINT(lon lat)` WKT

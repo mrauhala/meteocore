@@ -21,30 +21,10 @@ impl CsvEngine {
     pub fn new(store: CsvDataStore) -> Self {
         Self { store }
     }
-}
 
-impl EdrEngine for CsvEngine {
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
-        let mut locations = Vec::new();
-        let mut seen = HashMap::new();
-
-        for row in &self.store.rows {
-            if seen.contains_key(&row.location) {
-                continue;
-            }
-            seen.insert(&row.location, true);
-            locations.push(Location {
-                id: row.location.clone(),
-                label: row.location.clone(),
-                latitude: row.latitude,
-                longitude: row.longitude,
-            });
-        }
-
-        Ok(locations)
-    }
-
-    fn query_location(
+    /// Build a `PointSeries` coverage for one location. Shared by
+    /// `query_location` and `query_area`.
+    fn location_series(
         &self,
         location_id: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -100,6 +80,7 @@ impl EdrEngine for CsvEngine {
             x: first_row.longitude,
             y: first_row.latitude,
             t: times.clone(),
+            z: None,
         };
 
         // Build parameter descriptions
@@ -153,6 +134,42 @@ impl EdrEngine for CsvEngine {
             parameters: param_descs,
             ranges,
         })
+    }
+}
+
+impl EdrEngine for CsvEngine {
+    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        let mut locations = Vec::new();
+        let mut seen = HashMap::new();
+
+        for row in &self.store.rows {
+            if seen.contains_key(&row.location) {
+                continue;
+            }
+            seen.insert(&row.location, true);
+            locations.push(Location {
+                id: row.location.clone(),
+                label: row.location.clone(),
+                latitude: row.latitude,
+                longitude: row.longitude,
+            });
+        }
+
+        Ok(locations)
+    }
+
+    fn query_location(
+        &self,
+        location_id: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Ok(CoverageResponse::Single(self.location_series(
+            location_id,
+            datetime,
+            parameters,
+        )?))
     }
 
     fn get_parameters(&self) -> Vec<String> {
@@ -211,7 +228,8 @@ impl EdrEngine for CsvEngine {
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<AreaQueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         const MAX_LOCATIONS: usize = 500;
 
         let polygon = parse_area_coords(coords)?;
@@ -247,10 +265,10 @@ impl EdrEngine for CsvEngine {
         // Build a PointSeries QueryResult for each matching location
         let mut coverages = Vec::with_capacity(matching_locations.len());
         for loc_id in &matching_locations {
-            coverages.push(self.query_location(loc_id, datetime, parameters)?);
+            coverages.push(self.location_series(loc_id, datetime, parameters)?);
         }
 
-        Ok(AreaQueryResult::Collection(coverages))
+        Ok(CoverageResponse::Collection(coverages))
     }
 
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {

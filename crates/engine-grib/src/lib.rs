@@ -745,7 +745,8 @@ impl EdrEngine for GribEngine {
         _location_id: &str,
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         Err(DataServerError::InvalidParameter(
             "GRIB engine does not support location queries; use position or area instead"
                 .to_string(),
@@ -805,7 +806,8 @@ impl EdrEngine for GribEngine {
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         let (lon, lat) = parse_coords(coords)?;
         let catalog = self.catalog.load();
 
@@ -930,15 +932,16 @@ impl EdrEngine for GribEngine {
             );
         }
 
-        Ok(QueryResult {
+        Ok(CoverageResponse::Single(QueryResult {
             domain: DomainDescription::PointSeries {
                 x: lon,
                 y: lat,
                 t: valid_times,
+                z: None,
             },
             parameters: param_descs,
             ranges,
-        })
+        }))
     }
 
     fn query_area(
@@ -946,7 +949,8 @@ impl EdrEngine for GribEngine {
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<AreaQueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         let bbox = parse_bbox_from_wkt(coords)?;
         let (_step, step_file) = self.resolve_time(datetime)?;
 
@@ -1042,11 +1046,12 @@ impl EdrEngine for GribEngine {
             );
         }
 
-        Ok(AreaQueryResult::Single(QueryResult {
+        Ok(CoverageResponse::Single(QueryResult {
             domain: DomainDescription::Grid {
                 x: x_coords,
                 y: y_coords,
                 t: None,
+                z: None,
             },
             parameters: param_descs,
             ranges,
@@ -1067,7 +1072,9 @@ impl MapEngine for GribEngine {
         time: Option<DateTime<Utc>>,
         output_crs: &OutputCrs,
         parameter: Option<&str>,
+        z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
+        let _ = z; // GRIB collections expose no vertical dimension yet (#185)
         let datetime = time.map(|t| (t, t));
         let (_step, step_file) = self.resolve_time(datetime)?;
 
@@ -1147,6 +1154,7 @@ impl MapEngine for GribEngine {
             parameter: default_param,
             unit: default_unit,
             parameters: params,
+            vertical: None,
         }
     }
 }
