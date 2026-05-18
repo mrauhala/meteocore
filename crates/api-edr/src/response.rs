@@ -168,10 +168,15 @@ pub fn coverage_response_to_json(result: &CoverageResponse) -> Value {
                 });
             }
 
-            // Hoist the shared parameters to collection level; each
-            // coverage's domain keeps its own `referencing` so a
-            // collection may mix domain shapes safely.
-            let parameters = build_parameters(&coverages[0]);
+            // Hoist parameters to collection level — the union across
+            // every coverage, so a (hypothetical) mixed-parameter
+            // collection still advertises them all rather than only the
+            // first coverage's. Each coverage's domain keeps its own
+            // `referencing`, so a collection may mix domain shapes safely.
+            let mut parameters = Map::new();
+            for qr in coverages {
+                parameters.append(&mut build_parameters(qr));
+            }
 
             // A collection-level `domainType` is only emitted when every
             // coverage agrees (it is an optional hint). A heterogeneous

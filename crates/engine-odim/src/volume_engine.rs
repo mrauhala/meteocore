@@ -1409,19 +1409,26 @@ fn resolve_levels(
 
 /// Wrap one site's coverages: a request pinned to exactly one level is a
 /// single `PointSeries` (`Single`); every other shape is a `Collection`.
-fn finalize_single_site(covs: Vec<QueryResult>, levels: &Option<Vec<f64>>) -> CoverageResponse {
+fn finalize_single_site(
+    covs: Vec<QueryResult>,
+    levels: &Option<Vec<f64>>,
+) -> Result<CoverageResponse, DataServerError> {
     if matches!(levels, Some(l) if l.len() == 1) {
         // `site_coverages` builds exactly one coverage per requested
-        // level, so a single-level request yields exactly one. `expect`
-        // (not `debug_assert`) so a future contract violation fails
-        // loudly in release rather than silently returning no data.
-        return CoverageResponse::Single(
-            covs.into_iter()
-                .next()
-                .expect("a single-level query must produce exactly one coverage"),
-        );
+        // level, so a single-level request yields exactly one. A missing
+        // coverage would be an internal invariant violation — surface it
+        // as a logged 500, not an opaque `spawn_blocking` panic.
+        return covs
+            .into_iter()
+            .next()
+            .map(CoverageResponse::Single)
+            .ok_or_else(|| {
+                DataServerError::Engine(
+                    "internal: single-level query produced no coverage (invariant violated)".into(),
+                )
+            });
     }
-    CoverageResponse::Collection(covs)
+    Ok(CoverageResponse::Collection(covs))
 }
 
 impl EdrEngine for PolarVolumeEngine {
@@ -1477,7 +1484,7 @@ impl EdrEngine for PolarVolumeEngine {
             parameters,
             levels.as_deref(),
         )?;
-        Ok(finalize_single_site(covs, &levels))
+        finalize_single_site(covs, &levels)
     }
 
     fn get_parameters(&self) -> Vec<String> {
@@ -1535,7 +1542,7 @@ impl EdrEngine for PolarVolumeEngine {
         })?;
         let levels = resolve_levels(&catalog, z)?;
         let covs = site_coverages(volumes, lon, lat, datetime, parameters, levels.as_deref())?;
-        Ok(finalize_single_site(covs, &levels))
+        finalize_single_site(covs, &levels)
     }
 
     /// Area query — a `CoverageCollection` flattening every in-polygon
