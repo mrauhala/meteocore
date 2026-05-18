@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.0](https://github.com/mrauhala/meteocore/compare/v0.3.0...v0.4.0) (2026-05-18)
+
+
+### Features
+
+* **engine-odim:** EDR support for the odim-volume engine (M3a) ([#199](https://github.com/mrauhala/meteocore/issues/199)) ([fae2169](https://github.com/mrauhala/meteocore/commit/fae2169300c393768c5da7a294fd4f3fa3c0d58a))
+* **engine-odim:** PVOL polar-volume reader + Cartesian display ([#187](https://github.com/mrauhala/meteocore/issues/187)) ([4cb87aa](https://github.com/mrauhala/meteocore/commit/4cb87aa7ac908b2863f3825f42e7db4e0e153ede))
+* **engine-odim:** S3 object-store source (Phase 2) ([#182](https://github.com/mrauhala/meteocore/issues/182)) ([9a54d03](https://github.com/mrauhala/meteocore/commit/9a54d0334056daedbd392d10965ddfb2171a2e1d))
+
+
+### Bug Fixes
+
+* **server:** bind listen port before loading collections ([#191](https://github.com/mrauhala/meteocore/issues/191)) ([2eab30c](https://github.com/mrauhala/meteocore/commit/2eab30c3a02c3d4cc8cf43292e965aa0c64cb9e6))
+
 ## [0.3.0](https://github.com/mrauhala/meteocore/compare/v0.2.0...v0.3.0) (2026-05-15)
 
 
