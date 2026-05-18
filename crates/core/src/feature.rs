@@ -313,6 +313,50 @@ pub fn parse_area_coords(coords: &str) -> Result<QueryPolygon, DataServerError> 
     ))
 }
 
+/// Parse an EDR position-query `coords` value into `(lat, lon)`.
+///
+/// Accepts WKT `POINT(lon lat)` (a leading space before `(` is
+/// tolerated for PROJ-style input) and the bare `lon,lat` shorthand.
+/// Longitude/latitude must be finite and within `±180` / `±90`, so a
+/// transposed `lat,lon` pair fails loudly rather than querying a
+/// nonsense location.
+pub fn parse_point_coords(coords: &str) -> Result<(f64, f64), DataServerError> {
+    let trimmed = coords.trim();
+
+    let pair = if let Some(inner) = trimmed
+        .strip_prefix("POINT(")
+        .or_else(|| trimmed.strip_prefix("POINT ("))
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        inner.split_whitespace().collect::<Vec<_>>()
+    } else {
+        trimmed.split(',').map(str::trim).collect::<Vec<_>>()
+    };
+
+    if pair.len() != 2 {
+        return Err(DataServerError::InvalidParameter(
+            "Expected POINT(lon lat) or lon,lat format".into(),
+        ));
+    }
+    let lon: f64 = pair[0].parse().map_err(|_| {
+        DataServerError::InvalidParameter(format!("Invalid longitude: {}", pair[0]))
+    })?;
+    let lat: f64 = pair[1]
+        .parse()
+        .map_err(|_| DataServerError::InvalidParameter(format!("Invalid latitude: {}", pair[1])))?;
+    if !lon.is_finite() || !lat.is_finite() {
+        return Err(DataServerError::InvalidParameter(
+            "Coordinates must be finite numbers".into(),
+        ));
+    }
+    if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
+        return Err(DataServerError::InvalidParameter(format!(
+            "Coordinates out of range: lon={lon}, lat={lat}"
+        )));
+    }
+    Ok((lat, lon))
+}
+
 /// A typed property value. Keeps ds-core free of serde_json.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PropertyValue {
@@ -604,5 +648,35 @@ mod tests {
     #[test]
     fn parse_rejects_out_of_range_coords() {
         assert!(parse_area_coords("POLYGON((0 0, 200 0, 200 10, 0 10, 0 0))").is_err());
+    }
+
+    #[test]
+    fn parse_point_coords_accepts_wkt_and_bare_pair() {
+        // WKT, with and without the PROJ-style space before `(`.
+        assert_eq!(
+            parse_point_coords("POINT(10.5 56.0)").unwrap(),
+            (56.0, 10.5)
+        );
+        assert_eq!(
+            parse_point_coords("POINT (10.5 56.0)").unwrap(),
+            (56.0, 10.5)
+        );
+        // Bare `lon,lat` shorthand, surrounding whitespace tolerated.
+        assert_eq!(parse_point_coords("10.5, 56.0").unwrap(), (56.0, 10.5));
+        assert_eq!(parse_point_coords("  -3.2,48.7 ").unwrap(), (48.7, -3.2));
+    }
+
+    #[test]
+    fn parse_point_coords_rejects_malformed_and_out_of_range() {
+        assert!(parse_point_coords("POINT(10.5)").is_err());
+        assert!(parse_point_coords("10.5").is_err());
+        assert!(parse_point_coords("a,b").is_err());
+        assert!(parse_point_coords("10.5,56.0,3").is_err());
+        // Out-of-range so a transposed lat,lon pair fails loudly.
+        assert!(parse_point_coords("200.0, 10.0").is_err());
+        assert!(parse_point_coords("POINT(10 91)").is_err());
+        // Non-finite.
+        assert!(parse_point_coords("NaN, 10.0").is_err());
+        assert!(parse_point_coords("inf, 10.0").is_err());
     }
 }

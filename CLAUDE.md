@@ -130,7 +130,8 @@ Currently implemented: `PointSeries`, `Grid`.
 | GeoJSON | `FeatureEngine` | Features |
 | GeoTIFF | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | GRIB | `EdrEngine` + `MapEngine` | EDR, WMS, Maps, Tiles |
-| ODIM | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
+| ODIM COMP | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
+| ODIM PVOL | `EdrEngine` + `MapEngine` | EDR (position, locations, area), WMS, Maps, Tiles |
 | QueryData | `EdrEngine` + `MapEngine` | EDR (position only), WMS, Maps, Tiles |
 | PostGIS | `EdrEngine` + `FeatureEngine` | EDR (position, locations, area), Features |
 

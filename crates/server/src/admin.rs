@@ -430,7 +430,7 @@ pub fn load_collections(
             "querydata" => &["edr", "wms", "maps", "tiles"],
             "grib" => &["edr", "wms", "maps", "tiles"],
             "odim" => &["edr", "wms", "maps", "tiles"],
-            "odim-volume" => &["wms", "maps", "tiles"],
+            "odim-volume" => &["edr", "wms", "maps", "tiles"],
             "postgis" => &["edr", "features", "tiles"],
             _ => &[],
         };
@@ -1118,6 +1118,15 @@ pub fn load_collections(
                 };
 
                 odim_volume_engines.push(engine.clone());
+
+                if collection.apis.contains(&"edr".to_string()) {
+                    edr_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+                    );
+                    edr_collections.insert(collection.id.clone(), collection.clone());
+                    info!("Collection '{}': wired to EDR API", collection.id);
+                }
 
                 // PVOL is multi-parameter (one layer per <site>:<quantity>).
                 let raster_params =
