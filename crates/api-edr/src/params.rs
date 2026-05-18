@@ -30,6 +30,10 @@ pub struct AreaQueryParams {
 /// Parse the EDR `z` query parameter — a comma-separated list of numeric
 /// vertical levels (e.g. `z=850,700,500` or a single `z=0.5`). An absent
 /// or blank value yields `None` (the whole vertical extent / a profile).
+///
+/// The EDR `min/max` interval form is not supported — pass the discrete
+/// levels explicitly (the available set is advertised in the collection's
+/// vertical extent).
 pub fn parse_z(z: Option<&str>) -> Result<Option<Vec<f64>>, DataServerError> {
     let Some(raw) = z.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
@@ -37,17 +41,21 @@ pub fn parse_z(z: Option<&str>) -> Result<Option<Vec<f64>>, DataServerError> {
     let levels: Vec<f64> = raw
         .split(',')
         .map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err(DataServerError::InvalidParameter(
+                    "`z` has an empty element — check for a stray comma".into(),
+                ));
+            }
             // `parse::<f64>()` also accepts "inf"/"nan"; reject those so a
             // non-finite level can't reach `quantize_z` (→ `i64::MAX`
             // cache aliasing) or `nearest_sweep` (NaN distance comparisons).
-            part.trim()
-                .parse::<f64>()
+            part.parse::<f64>()
                 .ok()
                 .filter(|v| v.is_finite())
                 .ok_or_else(|| {
                     DataServerError::InvalidParameter(format!(
-                        "Invalid `z` value '{}' — expected a finite number",
-                        part.trim()
+                        "Invalid `z` value '{part}' — expected a finite number"
                     ))
                 })
         })

@@ -1412,18 +1412,14 @@ fn resolve_levels(
 fn finalize_single_site(covs: Vec<QueryResult>, levels: &Option<Vec<f64>>) -> CoverageResponse {
     if matches!(levels, Some(l) if l.len() == 1) {
         // `site_coverages` builds exactly one coverage per requested
-        // level, so a single-level request always yields exactly one.
-        debug_assert_eq!(
-            covs.len(),
-            1,
-            "a single-level query must produce exactly one coverage"
+        // level, so a single-level request yields exactly one. `expect`
+        // (not `debug_assert`) so a future contract violation fails
+        // loudly in release rather than silently returning no data.
+        return CoverageResponse::Single(
+            covs.into_iter()
+                .next()
+                .expect("a single-level query must produce exactly one coverage"),
         );
-        return covs
-            .into_iter()
-            .next()
-            .map_or(CoverageResponse::Collection(Vec::new()), |qr| {
-                CoverageResponse::Single(qr)
-            });
     }
     CoverageResponse::Collection(covs)
 }

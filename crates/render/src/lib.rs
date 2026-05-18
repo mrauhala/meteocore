@@ -79,7 +79,11 @@ pub struct CacheKey {
 
 /// Quantize a vertical level for use in a [`CacheKey`] — millidegrees /
 /// milli-units, enough to keep distinct elevation sweeps apart.
+///
+/// `z` must be finite; a non-finite value would saturate the `as i64`
+/// cast to a meaningless key. Callers validate `z` at the API boundary.
 pub fn quantize_z(z: f64) -> i64 {
+    debug_assert!(z.is_finite(), "quantize_z requires a finite z value");
     (z * 1000.0).round() as i64
 }
 
