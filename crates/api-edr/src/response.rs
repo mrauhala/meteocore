@@ -173,6 +173,19 @@ pub fn coverage_response_to_json(result: &CoverageResponse) -> Value {
             // collection may mix domain shapes safely.
             let parameters = build_parameters(&coverages[0]);
 
+            // The collection-level `domainType` below is taken from the
+            // first coverage; today every engine emits a homogeneous
+            // collection. Assert that invariant so a future engine that
+            // mixes domain types fails loudly in tests rather than
+            // emitting a `domainType` that mismatches some coverages.
+            let first_type = domain_type_name(&coverages[0].domain);
+            debug_assert!(
+                coverages
+                    .iter()
+                    .all(|c| domain_type_name(&c.domain) == first_type),
+                "CoverageCollection coverages must share one domain type"
+            );
+
             let coverage_items: Vec<Value> = coverages
                 .iter()
                 .map(|qr| {
@@ -186,7 +199,7 @@ pub fn coverage_response_to_json(result: &CoverageResponse) -> Value {
 
             json!({
                 "type": "CoverageCollection",
-                "domainType": domain_type_name(&coverages[0].domain),
+                "domainType": first_type,
                 "parameters": parameters,
                 "coverages": coverage_items
             })

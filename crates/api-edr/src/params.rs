@@ -37,12 +37,19 @@ pub fn parse_z(z: Option<&str>) -> Result<Option<Vec<f64>>, DataServerError> {
     let levels: Vec<f64> = raw
         .split(',')
         .map(|part| {
-            part.trim().parse::<f64>().map_err(|_| {
-                DataServerError::InvalidParameter(format!(
-                    "Invalid `z` value '{}' — expected a number",
-                    part.trim()
-                ))
-            })
+            // `parse::<f64>()` also accepts "inf"/"nan"; reject those so a
+            // non-finite level can't reach `quantize_z` (→ `i64::MAX`
+            // cache aliasing) or `nearest_sweep` (NaN distance comparisons).
+            part.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| {
+                    DataServerError::InvalidParameter(format!(
+                        "Invalid `z` value '{}' — expected a finite number",
+                        part.trim()
+                    ))
+                })
         })
         .collect::<Result<_, _>>()?;
     Ok((!levels.is_empty()).then_some(levels))

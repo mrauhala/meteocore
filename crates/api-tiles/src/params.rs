@@ -92,9 +92,16 @@ impl TileQueryParams {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            Some(raw) => Some(raw.parse::<f64>().map_err(|_| {
-                TilesError::BadRequest(format!("elevation '{raw}' is not a number"))
-            })?),
+            Some(raw) => Some(
+                raw.parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite())
+                    .ok_or_else(|| {
+                        TilesError::BadRequest(format!(
+                            "elevation '{raw}' is not a finite number"
+                        ))
+                    })?,
+            ),
             None => None,
         };
 

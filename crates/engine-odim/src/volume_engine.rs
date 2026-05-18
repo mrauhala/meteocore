@@ -1411,6 +1411,13 @@ fn resolve_levels(
 /// single `PointSeries` (`Single`); every other shape is a `Collection`.
 fn finalize_single_site(covs: Vec<QueryResult>, levels: &Option<Vec<f64>>) -> CoverageResponse {
     if matches!(levels, Some(l) if l.len() == 1) {
+        // `site_coverages` builds exactly one coverage per requested
+        // level, so a single-level request always yields exactly one.
+        debug_assert_eq!(
+            covs.len(),
+            1,
+            "a single-level query must produce exactly one coverage"
+        );
         if let Some(qr) = covs.into_iter().next() {
             return CoverageResponse::Single(qr);
         }

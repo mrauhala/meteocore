@@ -151,9 +151,16 @@ impl MapQueryParams {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            Some(raw) => Some(raw.parse::<f64>().map_err(|_| {
-                MapsError::BadRequest(format!("elevation '{raw}' is not a number"))
-            })?),
+            Some(raw) => Some(
+                raw.parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite())
+                    .ok_or_else(|| {
+                        MapsError::BadRequest(format!(
+                            "elevation '{raw}' is not a finite number"
+                        ))
+                    })?,
+            ),
             None => None,
         };
 
