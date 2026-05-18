@@ -461,8 +461,8 @@ The engine can discover GeoTIFF files via a STAC API instead of directory listin
 **Config example:**
 ```toml
 [[collections]]
-id = "met-norway-radar"
-title = "MET Norway Radar Mosaic"
+id = "radar-no-composite-dbzh-stac-cog"
+title = "MET Norway — radar reflectivity mosaic (STAC, COG)"
 engine_type = "geotiff"
 apis = ["edr", "wms"]
 

@@ -10,15 +10,11 @@
 # 4400x3800 grid at 2km/px over Europe, Lambert Azimuthal Equal Area
 # (+lat_0=55 +lon_0=10 +ellps=WGS84). DBZH quantity in physical dBZ.
 #
-# The local-fixture twin of this collection is `radar-opera-composite`.
+# The local-fixture twin of this collection is `radar-eu-composite-dbzh-local-h5`.
 
-id = "radar-opera-composite-s3"
-title = "OPERA Pan-European Radar Composite (DBZH, S3)"
-description = """\
-EUMETNET OPERA pan-European weather-radar composite via ODIM_H5 v2.4, \
-streamed from CloudFerro S3. Maximum reflectivity (DBZH) on a 2km \
-Lambert Azimuthal Equal Area grid covering Europe.\
-"""
+id = "radar-eu-composite-dbzh-s3-h5"
+title = "OPERA — radar reflectivity composite (S3, ODIM_H5)"
+description = "Pan-European radar reflectivity (DBZH) composite from EUMETNET OPERA, streamed from CloudFerro S3 as native ODIM_H5. ETRS89-LAEA."
 engine_type = "odim"
 apis = ["edr", "wms", "maps", "tiles"]
 

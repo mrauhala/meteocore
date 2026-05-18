@@ -1,6 +1,6 @@
-id = "radar"
-title = "Weather Radar Reflectivity"
-description = "Radar composite from MET Norway (preprocessed to WGS84)"
+id = "radar-no-composite-dbzh-local-cog-wgs84"
+title = "MET Norway — radar reflectivity mosaic (local, WGS84)"
+description = "Norwegian radar reflectivity (DBZH) mosaic from MET Norway, reprojected to WGS84, from local sample files."
 data_path = "testdata/radar"
 engine_type = "geotiff"
 apis = ["edr", "wms", "maps", "tiles"]

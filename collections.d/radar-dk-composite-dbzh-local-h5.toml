@@ -10,13 +10,9 @@
 # STAC-backed live fetch is Phase 2 of the engine roadmap; for now they
 # need to be downloaded into the directory by hand.
 
-id = "radar-dmi-composite"
-title = "DMI Denmark Radar Composite (500m max reflectivity)"
-description = """\
-Denmark national weather-radar composite via ODIM_H5. \
-Files are 500m maximum-reflectivity composite (`dk.com.*.500_max.h5`) \
-in stereographic projection centered on Denmark.\
-"""
+id = "radar-dk-composite-dbzh-local-h5"
+title = "DMI — radar reflectivity composite (local, ODIM_H5)"
+description = "Danish 500 m maximum-reflectivity (DBZH) radar composite from DMI, native ODIM_H5 from local sample files. Stereographic projection."
 engine_type = "odim"
 apis = ["edr", "wms", "maps", "tiles"]
 data_path = "testdata/radar-dmi"

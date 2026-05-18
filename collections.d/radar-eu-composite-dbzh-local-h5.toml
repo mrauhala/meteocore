@@ -10,13 +10,9 @@
 # `openradar-24h` S3 bucket:
 #   https://s3.waw3-1.cloudferro.com/openradar-24h/YYYY/MM/DD/OPERA/COMP/
 
-id = "radar-opera-composite"
-title = "OPERA Pan-European Radar Composite (DBZH)"
-description = """\
-EUMETNET OPERA pan-European weather-radar composite via ODIM_H5 v2.4. \
-Maximum reflectivity (DBZH) on a 2km Lambert Azimuthal Equal Area grid \
-covering Europe.\
-"""
+id = "radar-eu-composite-dbzh-local-h5"
+title = "OPERA — radar reflectivity composite (local, ODIM_H5)"
+description = "Pan-European radar reflectivity (DBZH) composite from EUMETNET OPERA, native ODIM_H5 from local sample files. ETRS89-LAEA."
 engine_type = "odim"
 apis = ["edr", "wms", "maps", "tiles"]
 data_path = "testdata/radar-opera"

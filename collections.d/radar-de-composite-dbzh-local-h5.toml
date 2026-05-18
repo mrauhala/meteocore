@@ -12,13 +12,9 @@
 # DWD's URL names files without an extension; saved locally with `.h5`
 # appended for matcher clarity.
 
-id = "radar-dwd-composite"
-title = "DWD Germany Radar Composite HX (DBZH)"
-description = """\
-Deutscher Wetterdienst pan-Germany maximum-reflectivity composite via \
-ODIM_H5 v2.3. 250m polar stereographic grid covering Germany and \
-neighbouring countries.\
-"""
+id = "radar-de-composite-dbzh-local-h5"
+title = "DWD — radar reflectivity composite (local, ODIM_H5)"
+description = "German radar reflectivity (DBZH) composite (HX product) from DWD, native ODIM_H5 from local sample files. Polar stereographic projection."
 engine_type = "odim"
 apis = ["edr", "wms", "maps", "tiles"]
 data_path = "testdata/radar-dwd"
