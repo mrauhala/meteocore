@@ -313,7 +313,13 @@ pub fn parse_area_coords(coords: &str) -> Result<QueryPolygon, DataServerError> 
     ))
 }
 
-/// Parse an EDR position-query `coords` value into `(lat, lon)`.
+/// Parse an EDR position-query `coords` value.
+///
+/// **Returns `(lat, lon)` — latitude first**, matching the
+/// position-query callers in `engine-odim` and `engine-geotiff`. Note
+/// that `engine-grib`'s local `parse_coords` returns `(lon, lat)`; a
+/// future migration of that engine onto this shared parser must
+/// account for the swapped order.
 ///
 /// Accepts WKT `POINT(lon lat)` (a leading space before `(` is
 /// tolerated for PROJ-style input) and the bare `lon,lat` shorthand.

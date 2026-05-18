@@ -1326,10 +1326,12 @@ impl EdrEngine for PolarVolumeEngine {
         let nod = nearest_site(&catalog, lon, lat).ok_or_else(|| {
             DataServerError::LocationNotFound("PVOL catalog has no radar sites".into())
         })?;
-        let volumes = catalog
-            .by_site
-            .get(nod)
-            .expect("nearest_site returns an existing by_site key");
+        // `nearest_site` returns a key it read from `by_site`, so the
+        // lookup cannot miss — but a graceful error beats a panicking
+        // request thread should a refactor ever break that invariant.
+        let volumes = catalog.by_site.get(nod).ok_or_else(|| {
+            DataServerError::Engine("internal: nearest_site returned a missing by_site key".into())
+        })?;
         build_site_point_series(volumes, lon, lat, datetime, parameters)
     }
 
@@ -1360,9 +1362,16 @@ impl EdrEngine for PolarVolumeEngine {
             }
             match build_site_point_series(volumes, site.lon, site.lat, datetime, parameters) {
                 Ok(qr) => coverages.push(qr),
-                // A site inside the polygon but with no data in the
-                // requested window is skipped, not fatal.
-                Err(DataServerError::LocationNotFound(_)) => continue,
+                // A site inside the polygon is skipped — not fatal to
+                // the whole area query — when it has no data in the
+                // requested window (`LocationNotFound`) or none of the
+                // requested quantities (`InvalidParameter`): a
+                // heterogeneous network mixes single- and dual-pol
+                // radars, so a `ZDR` filter legitimately misses some
+                // sites while matching others.
+                Err(
+                    DataServerError::LocationNotFound(_) | DataServerError::InvalidParameter(_),
+                ) => continue,
                 Err(e) => return Err(e),
             }
         }
