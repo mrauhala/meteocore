@@ -38,8 +38,9 @@ pub struct TileQueryParams {
     /// Ignored for MVT (`?f=mvt`) responses.
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
-    /// Vertical level selector (e.g. a radar elevation angle). Ignored by
-    /// collections with no vertical dimension and for MVT responses.
+    /// Vertical level selector (e.g. a radar elevation angle). Rejected
+    /// with HTTP 400 for collections with no vertical dimension; ignored
+    /// for MVT responses.
     pub elevation: Option<String>,
 }
 

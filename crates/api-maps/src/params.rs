@@ -36,8 +36,8 @@ pub struct MapQueryParams {
     /// path/query form is on the OGC Maps roadmap and will replace this.
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
-    /// Vertical level selector (e.g. a radar elevation angle). Ignored by
-    /// collections with no vertical dimension.
+    /// Vertical level selector (e.g. a radar elevation angle). Rejected
+    /// with HTTP 400 for collections with no vertical dimension.
     pub elevation: Option<String>,
 }
 

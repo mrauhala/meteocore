@@ -173,18 +173,15 @@ pub fn coverage_response_to_json(result: &CoverageResponse) -> Value {
             // collection may mix domain shapes safely.
             let parameters = build_parameters(&coverages[0]);
 
-            // The collection-level `domainType` below is taken from the
-            // first coverage; today every engine emits a homogeneous
-            // collection. Assert that invariant so a future engine that
-            // mixes domain types fails loudly in tests rather than
-            // emitting a `domainType` that mismatches some coverages.
+            // A collection-level `domainType` is only emitted when every
+            // coverage agrees (it is an optional hint). A heterogeneous
+            // collection omits it rather than emitting a type that
+            // mismatches some coverages — each coverage's domain still
+            // carries its own `domainType`.
             let first_type = domain_type_name(&coverages[0].domain);
-            debug_assert!(
-                coverages
-                    .iter()
-                    .all(|c| domain_type_name(&c.domain) == first_type),
-                "CoverageCollection coverages must share one domain type"
-            );
+            let homogeneous = coverages
+                .iter()
+                .all(|c| domain_type_name(&c.domain) == first_type);
 
             let coverage_items: Vec<Value> = coverages
                 .iter()
@@ -197,12 +194,14 @@ pub fn coverage_response_to_json(result: &CoverageResponse) -> Value {
                 })
                 .collect();
 
-            json!({
-                "type": "CoverageCollection",
-                "domainType": first_type,
-                "parameters": parameters,
-                "coverages": coverage_items
-            })
+            let mut collection = Map::with_capacity(4);
+            collection.insert("type".into(), Value::String("CoverageCollection".into()));
+            if homogeneous {
+                collection.insert("domainType".into(), Value::String(first_type.into()));
+            }
+            collection.insert("parameters".into(), Value::Object(parameters));
+            collection.insert("coverages".into(), Value::Array(coverage_items));
+            Value::Object(collection)
         }
     }
 }
