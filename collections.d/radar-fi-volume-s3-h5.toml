@@ -1,0 +1,36 @@
+# FMI weather-radar polar volumes, streamed from S3 (ODIM_H5 PVOL).
+#
+# Streams polar volumes directly from FMI's open-data S3 bucket — no
+# local copy. FMI publishes one ODIM_H5 PVOL file per acquisition under
+# a date-partitioned, per-site key prefix; objects land at
+# `s3://fmi-opendata-radar-volume-hdf5/YYYY/MM/DD/<site>/` with
+# filenames `YYYYMMDDHHMM_<site>_PVOL.h5`.
+#
+# The odim-volume engine renders the lowest elevation sweep of each
+# site as a Cartesian raster; the WMS layer tree is one group per radar
+# site with the dual-pol moments as quantity sub-layers (TH, DBZH,
+# VRADH, ZDR, RHOHV...). Parameter names are `<site>:<quantity>`, e.g.
+# `fivih:DBZH`.
+#
+# `prefix_pattern` currently targets the Vihti site (`fivih`); widening
+# this collection to the full FMI radar network — with sites exposed as
+# EDR locations — is milestone M3 of the odim-volume roadmap.
+#
+# `time_window = "-PT3H"` bounds both the date-partitioned prefixes
+# listed and the volume timestamps kept to the most recent 3 hours.
+
+id = "radar-fi-volume-s3-h5"
+title = "FMI — radar polar volumes (S3, ODIM_H5)"
+description = "Finnish radar polar volumes (ODIM_H5 PVOL) streamed from FMI's open-data S3 bucket — every elevation sweep and dual-polarisation moment. Currently the Vihti site; the full FMI network is planned (M3)."
+engine_type = "odim-volume"
+apis = ["wms", "maps", "tiles"]
+
+[odim]
+endpoint = "https://s3-eu-west-1.amazonaws.com"
+bucket = "fmi-opendata-radar-volume-hdf5"
+prefix_pattern = "%Y/%m/%d/fivih/"
+time_window = "-PT3H"
+poll_interval_secs = 300
+
+[wms]
+colormap = "radar_dbz"

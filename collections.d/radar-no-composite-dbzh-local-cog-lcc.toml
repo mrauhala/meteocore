@@ -1,0 +1,15 @@
+id = "radar-no-composite-dbzh-local-cog-lcc"
+title = "MET Norway — radar reflectivity mosaic (local, native LCC)"
+description = "Norwegian radar reflectivity (DBZH) mosaic from MET Norway, served in its native Lambert Conformal Conic projection from local sample files."
+data_path = "testdata/radar-native"
+engine_type = "geotiff"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[geotiff]
+filename_template = "norway_%Y%m%dT%H%MZ.tiff"
+parameter = "reflectivity"
+unit = "dBZ"
+poll_interval_secs = 60
+
+[wms]
+style_bundle = "radar_multi"

@@ -1,6 +1,6 @@
-id = "opera-reflectivity"
-title = "OPERA European Radar Reflectivity"
-description = "Radar reflectivity composite (DBZH) from EUMETNET OPERA, LAEA projection (CloudFerro S3)"
+id = "radar-eu-composite-dbzh-s3-cog"
+title = "OPERA — radar reflectivity composite (S3, COG)"
+description = "Pan-European radar reflectivity (DBZH) composite from EUMETNET OPERA via CloudFerro S3. ETRS89-LAEA, Cloud-Optimized GeoTIFF."
 engine_type = "geotiff"
 apis = ["edr", "wms", "maps", "tiles"]
 

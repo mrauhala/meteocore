@@ -1,6 +1,6 @@
-id = "opera-precipitation"
-title = "OPERA European Radar Composite"
-description = "1h accumulated precipitation from EUMETNET OPERA, LAEA projection (CloudFerro S3)"
+id = "radar-eu-composite-acrr-s3-cog"
+title = "OPERA — radar 1 h precipitation (S3, COG)"
+description = "Pan-European 1-hour accumulated radar precipitation (ACRR) from EUMETNET OPERA via CloudFerro S3. ETRS89-LAEA, Cloud-Optimized GeoTIFF."
 engine_type = "geotiff"
 apis = ["edr", "wms", "maps", "tiles"]
 
