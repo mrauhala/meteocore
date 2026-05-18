@@ -410,6 +410,14 @@ mod get_map {
         assert!(headers.contains_key("etag"));
     }
 
+    /// `elevation` against a collection with no vertical dimension
+    /// (`MockMapEngine.raster_info().vertical` is `None`) is a 400.
+    #[tokio::test]
+    async fn elevation_against_non_vertical_collection_returns_400() {
+        let (status, _, _) = get_raw("/collections/radar/map?bbox=10,55,30,70&elevation=0.5").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn explicit_time_immutable_cache() {
         let (_, headers, _) =

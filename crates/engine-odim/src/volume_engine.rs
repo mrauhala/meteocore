@@ -1190,18 +1190,27 @@ fn nearest_site(catalog: &Catalog, lon: f64, lat: f64) -> Option<&str> {
         .map(|(nod, _)| nod)
 }
 
-/// Resolve the quantity set for a PVOL site query: the lowest sweep's
-/// moments of the most recent selected volume (stable across a site's
-/// volumes), intersected with the optional `parameters` filter.
+/// Resolve the quantity set for a PVOL site query: the union of every
+/// sweep's moments in the most recent selected volume — a profile
+/// samples all sweeps, and a quantity may be present only on higher
+/// elevations (e.g. dual-PRF `VRADH`/`WRADH`) — intersected with the
+/// optional `parameters` filter.
 fn resolve_quantities(
     selected: &[&VolumeEntry],
     parameters: Option<&[String]>,
 ) -> Result<Vec<String>, DataServerError> {
-    let available: Vec<String> = selected
+    let mut available: Vec<String> = selected
         .last()
-        .and_then(|e| e.volume.sweeps.first())
-        .map(|s| s.moments.iter().map(|m| m.quantity.clone()).collect())
+        .map(|e| {
+            e.volume
+                .sweeps
+                .iter()
+                .flat_map(|s| s.moments.iter().map(|m| m.quantity.clone()))
+                .collect()
+        })
         .unwrap_or_default();
+    available.sort();
+    available.dedup();
     let quantities: Vec<String> = match parameters {
         Some(req) => available
             .into_iter()

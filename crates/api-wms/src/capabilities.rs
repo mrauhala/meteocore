@@ -245,7 +245,7 @@ fn write_layer_metadata(writer: &mut Writer<Vec<u8>>, info: &RasterInfo) {
         if !vertical.levels.is_empty() {
             let mut dim = BytesStart::new("Dimension");
             dim.push_attribute(("name", "elevation"));
-            dim.push_attribute(("units", vertical.unit.as_str()));
+            dim.push_attribute(("units", vertical.unit()));
             let default = format!("{}", vertical.levels[0]);
             dim.push_attribute(("default", default.as_str()));
             dim.push_attribute(("nearestValue", "1"));

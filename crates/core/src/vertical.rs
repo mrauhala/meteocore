@@ -60,27 +60,32 @@ impl VerticalKind {
 
 /// A collection's single vertical axis: the kind of coordinate plus the
 /// discrete levels available for querying.
+///
+/// The label and unit are derived from [`VerticalKind`] (see
+/// [`label`](Self::label) / [`unit`](Self::unit)) so there is a single
+/// source of truth — the CoverageJSON `VerticalCRS` description and the
+/// advertised collection metadata can never disagree.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerticalDimension {
     pub kind: VerticalKind,
-    /// Human-readable axis label (e.g. `"Elevation angle"`).
-    pub label: String,
-    /// Unit symbol (e.g. `"deg"`, `"hPa"`).
-    pub unit: String,
     /// Available level values, in the engine's natural order.
     pub levels: Vec<f64>,
 }
 
 impl VerticalDimension {
-    /// Build a descriptor for `kind`, taking the label and unit from the
-    /// kind's defaults.
+    /// Build a descriptor for `kind` over the given `levels`.
     pub fn new(kind: VerticalKind, levels: Vec<f64>) -> Self {
-        Self {
-            kind,
-            label: kind.default_label().to_string(),
-            unit: kind.default_unit().to_string(),
-            levels,
-        }
+        Self { kind, levels }
+    }
+
+    /// Human-readable axis label (e.g. `"Elevation angle"`).
+    pub fn label(&self) -> &'static str {
+        self.kind.default_label()
+    }
+
+    /// Unit symbol (e.g. `"deg"`, `"hPa"`).
+    pub fn unit(&self) -> &'static str {
+        self.kind.default_unit()
     }
 
     /// The `[min, max]` extent of the available levels, or `None` when there

@@ -930,6 +930,18 @@ mod error_responses {
         assert!(json.get("description").is_some());
     }
 
+    /// A `z` selector against a collection with no vertical extent
+    /// (`MockEngine` does not override `get_vertical_extent`) is a 400 —
+    /// guards the `reject_z_without_vertical` check from a silent
+    /// refactor regression.
+    #[tokio::test]
+    async fn z_against_non_vertical_collection_returns_400() {
+        let (status, json) = get("/collections/weather/locations/helsinki?z=0.5").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(json.get("code").is_some(), "400 error must have 'code'");
+        assert!(json.get("description").is_some());
+    }
+
     #[tokio::test]
     async fn error_code_is_string() {
         let (_, json) = get("/collections/nonexistent").await;
