@@ -202,11 +202,12 @@ fn build_collection_metadata(
             }
         }
 
+        // `vrs` is omitted — no standard OGC vertical-CRS URI exists for
+        // kinds like radar elevation angle, and `vrs` is optional.
         if let Some(vertical) = &info.vertical {
             let vertical_json = json!({
                 "interval": vertical.extent().map(|(lo, hi)| [[lo, hi]]),
                 "values": vertical.levels,
-                "vrs": format!("{} ({})", vertical.label, vertical.unit)
             });
             if let Some(extent) = metadata.get_mut("extent") {
                 extent["vertical"] = vertical_json;

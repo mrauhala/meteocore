@@ -491,6 +491,10 @@ fn coverage_collection_validates() {
     assert_eq!(json["type"], "CoverageCollection");
     assert_eq!(json["domainType"], "PointSeries");
     assert!(json["parameters"].is_object());
+    // No collection-level `referencing`: each coverage's domain carries
+    // its own, so a collection may mix domain shapes (e.g. VerticalProfile
+    // needs a VerticalCRS that PointSeries does not). The schema permits
+    // this — see the `coverageCollection` conditional.
     let items = json["coverages"].as_array().unwrap();
     assert_eq!(items.len(), 2);
     for item in items {

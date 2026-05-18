@@ -698,17 +698,15 @@ fn build_collection_metadata(
     }
 
     // Vertical extent — advertise the available levels so a client knows
-    // what `z` values it may request.
+    // what `z` values it may request. `vrs` is intentionally omitted:
+    // vertical coordinate kinds like radar elevation angle have no
+    // standard OGC vertical-CRS URI, and `vrs` is optional in OGC EDR.
     if let Some(vertical) = engine.get_vertical_extent() {
         let mut vertical_obj = serde_json::Map::new();
         if let Some((lo, hi)) = vertical.extent() {
             vertical_obj.insert("interval".to_string(), json!([[lo, hi]]));
         }
         vertical_obj.insert("values".to_string(), json!(vertical.levels));
-        vertical_obj.insert(
-            "vrs".to_string(),
-            json!(format!("{} ({})", vertical.label, vertical.unit)),
-        );
         extent.insert("vertical".to_string(), json!(vertical_obj));
     }
 

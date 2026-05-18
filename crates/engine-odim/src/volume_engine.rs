@@ -1418,10 +1418,12 @@ fn finalize_single_site(covs: Vec<QueryResult>, levels: &Option<Vec<f64>>) -> Co
             1,
             "a single-level query must produce exactly one coverage"
         );
-        if let Some(qr) = covs.into_iter().next() {
-            return CoverageResponse::Single(qr);
-        }
-        return CoverageResponse::Collection(Vec::new());
+        return covs
+            .into_iter()
+            .next()
+            .map_or(CoverageResponse::Collection(Vec::new()), |qr| {
+                CoverageResponse::Single(qr)
+            });
     }
     CoverageResponse::Collection(covs)
 }

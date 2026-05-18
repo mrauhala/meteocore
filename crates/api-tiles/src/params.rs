@@ -97,9 +97,7 @@ impl TileQueryParams {
                     .ok()
                     .filter(|v| v.is_finite())
                     .ok_or_else(|| {
-                        TilesError::BadRequest(format!(
-                            "elevation '{raw}' is not a finite number"
-                        ))
+                        TilesError::BadRequest(format!("elevation '{raw}' is not a finite number"))
                     })?,
             ),
             None => None,

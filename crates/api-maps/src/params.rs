@@ -156,9 +156,7 @@ impl MapQueryParams {
                     .ok()
                     .filter(|v| v.is_finite())
                     .ok_or_else(|| {
-                        MapsError::BadRequest(format!(
-                            "elevation '{raw}' is not a finite number"
-                        ))
+                        MapsError::BadRequest(format!("elevation '{raw}' is not a finite number"))
                     })?,
             ),
             None => None,
