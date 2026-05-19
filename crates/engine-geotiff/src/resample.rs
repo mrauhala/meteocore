@@ -40,6 +40,20 @@ const MAX_CELLS: u32 = 256;
 /// the 0.5 px resolution of nearest-neighbour resampling.
 const MAX_INTERP_ERROR_PX: f64 = 0.2;
 
+/// Interior probe points `(tx, ty)` within a cell, used by `estimate_error`.
+/// The centre is the dominant (quadratic) bilinear-residual peak; the quarter
+/// points catch the asymmetric higher-order part that a real projection adds
+/// and the centre alone would miss. Sampling several points per cell also
+/// means a cell counts toward the estimate if *any* probe lands on the raster,
+/// not just its centre.
+const ERROR_PROBES: [(f64, f64); 5] = [
+    (0.5, 0.5),
+    (0.25, 0.25),
+    (0.75, 0.25),
+    (0.25, 0.75),
+    (0.75, 0.75),
+];
+
 /// Coarse grid of exact output→source pixel correspondences, with bilinear
 /// interpolation for interior pixels.
 pub(crate) struct ProjectionGrid {
@@ -124,12 +138,16 @@ impl ProjectionGrid {
 
     /// Estimate the worst-case bilinear-interpolation error, in source pixels.
     ///
-    /// For each cell it compares the interpolated value at the cell centre
-    /// (where the bilinear residual of a smooth function peaks) against the
-    /// exact projection. Cells whose centre projects far outside the raster are
-    /// skipped — their pixels resolve to nodata regardless of interpolation
-    /// error, so refining for them would be wasted work (and could needlessly
-    /// hit the [`MAX_CELLS`] cap on a viewport that mostly misses the raster).
+    /// For each cell it compares the bilinearly-interpolated value against the
+    /// exact projection at several interior probe points ([`ERROR_PROBES`]) and
+    /// keeps the largest deviation. Probing more than just the cell centre
+    /// makes this a robust proxy for the true per-pixel maximum even when the
+    /// projection's higher-order (non-quadratic) terms shift the residual peak
+    /// off-centre. Probe points whose exact projection falls far outside the
+    /// raster are skipped — those output pixels resolve to nodata regardless of
+    /// interpolation error, so refining for them would be wasted work (and
+    /// could needlessly hit the [`MAX_CELLS`] cap on a viewport that mostly
+    /// misses the raster).
     fn estimate_error(
         &self,
         gt: &GeoTransform,
@@ -142,20 +160,21 @@ impl ProjectionGrid {
 
         let mut max = 0.0_f64;
         for j in 0..self.cells_y {
-            let lat = lat_at((j as f64 + 0.5) / self.cells_y as f64);
             for i in 0..self.cells_x {
-                let lon = lon_at((i as f64 + 0.5) / self.cells_x as f64);
-                let (ec, er) = gt.world_to_pixel_f64(lon, lat);
-                if !in_window(ec, er) {
-                    continue;
-                }
-                // Bilinear value at the cell centre is the mean of its corners.
                 let n = j * self.stride + i;
                 let (c00, c10) = (self.nodes[n], self.nodes[n + 1]);
                 let (c01, c11) = (self.nodes[n + self.stride], self.nodes[n + self.stride + 1]);
-                let ic = (c00.0 + c10.0 + c01.0 + c11.0) / 4.0;
-                let ir = (c00.1 + c10.1 + c01.1 + c11.1) / 4.0;
-                max = max.max((ic - ec).abs()).max((ir - er).abs());
+                for (tx, ty) in ERROR_PROBES {
+                    let lon = lon_at((i as f64 + tx) / self.cells_x as f64);
+                    let lat = lat_at((j as f64 + ty) / self.cells_y as f64);
+                    let (ec, er) = gt.world_to_pixel_f64(lon, lat);
+                    if !in_window(ec, er) {
+                        continue;
+                    }
+                    let ic = bilerp(c00.0, c10.0, c01.0, c11.0, tx, ty);
+                    let ir = bilerp(c00.1, c10.1, c01.1, c11.1, tx, ty);
+                    max = max.max((ic - ec).abs()).max((ir - er).abs());
+                }
             }
         }
         max
