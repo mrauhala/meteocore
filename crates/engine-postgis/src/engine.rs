@@ -15,7 +15,7 @@ use deadpool_postgres::Pool;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::model::{
-    AreaQueryResult, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
 };
 use tokio_postgres::Row;
 
@@ -147,7 +147,8 @@ impl EdrEngine for PostgisEngine {
         location_id: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         let source_keys = resolve_source_keys(&self.config, parameters)?;
         let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
 
@@ -156,14 +157,14 @@ impl EdrEngine for PostgisEngine {
 
         let (lon, lat) = lookup_station_coords(&self.load_meta(), location_id)?;
         let rows_per_query = run_queries_sync(&self.pool, &queries)?;
-        assemble_query_result(
+        Ok(CoverageResponse::Single(assemble_query_result(
             &self.config,
             location_id,
             lon,
             lat,
             &queries,
             rows_per_query,
-        )
+        )?))
     }
 
     fn query_position(
@@ -171,10 +172,11 @@ impl EdrEngine for PostgisEngine {
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
+        z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         let (lon, lat) = parse_coords(coords)?;
         let station_id = resolve_nearest_station(&self.pool, &self.config, lon, lat)?;
-        self.query_location(&station_id, datetime, parameters)
+        self.query_location(&station_id, datetime, parameters, z)
     }
 
     fn query_area(
@@ -182,14 +184,15 @@ impl EdrEngine for PostgisEngine {
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<AreaQueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         let polygon_wkt = normalize_area_wkt(coords)?;
         let source_keys = resolve_source_keys(&self.config, parameters)?;
         let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
 
         let stations = run_stations_in_polygon_sync(&self.pool, &self.config, &polygon_wkt)?;
         if stations.is_empty() {
-            return Ok(AreaQueryResult::Collection(vec![]));
+            return Ok(CoverageResponse::Collection(vec![]));
         }
         if stations.len() >= MAX_STATIONS_IN_POLYGON {
             return Err(DataServerError::Engine(format!(
@@ -220,7 +223,7 @@ impl EdrEngine for PostgisEngine {
                 Err(e) => return Err(e),
             }
         }
-        Ok(AreaQueryResult::Collection(results))
+        Ok(CoverageResponse::Collection(results))
     }
 }
 
@@ -458,6 +461,7 @@ fn assemble_long(
         x: lon,
         y: lat,
         t: all_times.clone(),
+        z: None,
     };
 
     let mut param_descs = HashMap::new();
@@ -560,6 +564,7 @@ fn assemble_wide(
         x: lon,
         y: lat,
         t: times.clone(),
+        z: None,
     };
 
     let mut param_descs = HashMap::new();
@@ -643,6 +648,7 @@ fn assemble_per_parameter(
         x: lon,
         y: lat,
         t: all_times.clone(),
+        z: None,
     };
 
     let mut param_descs = HashMap::new();

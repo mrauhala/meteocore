@@ -34,6 +34,7 @@ impl MapEngine for MockMapEngine {
         _time: Option<chrono::DateTime<chrono::Utc>>,
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
+        _z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
         let n = (width * height) as usize;
         Ok(RasterTile {
@@ -53,6 +54,7 @@ impl MapEngine for MockMapEngine {
             parameter: "reflectivity".to_string(),
             unit: "dBZ".to_string(),
             parameters: vec![],
+            vertical: None,
         }
     }
 }

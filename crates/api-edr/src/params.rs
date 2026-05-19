@@ -6,6 +6,7 @@ pub struct LocationQueryParams {
     pub datetime: Option<String>,
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
+    pub z: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -14,6 +15,7 @@ pub struct PositionQueryParams {
     pub datetime: Option<String>,
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
+    pub z: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -22,6 +24,43 @@ pub struct AreaQueryParams {
     pub datetime: Option<String>,
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
+    pub z: Option<String>,
+}
+
+/// Parse the EDR `z` query parameter — a comma-separated list of numeric
+/// vertical levels (e.g. `z=850,700,500` or a single `z=0.5`). An absent
+/// or blank value yields `None` (the whole vertical extent / a profile).
+///
+/// The EDR `min/max` interval form is not supported — pass the discrete
+/// levels explicitly (the available set is advertised in the collection's
+/// vertical extent).
+pub fn parse_z(z: Option<&str>) -> Result<Option<Vec<f64>>, DataServerError> {
+    let Some(raw) = z.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let levels: Vec<f64> = raw
+        .split(',')
+        .map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return Err(DataServerError::InvalidParameter(
+                    "`z` has an empty element — check for a stray comma".into(),
+                ));
+            }
+            // `parse::<f64>()` also accepts "inf"/"nan"; reject those so a
+            // non-finite level can't reach `quantize_z` (→ `i64::MAX`
+            // cache aliasing) or `nearest_sweep` (NaN distance comparisons).
+            part.parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| {
+                    DataServerError::InvalidParameter(format!(
+                        "Invalid `z` value '{part}' — expected a finite number"
+                    ))
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok((!levels.is_empty()).then_some(levels))
 }
 
 /// Split a position-query `coords` value into one or more `POINT(lon lat)` WKT

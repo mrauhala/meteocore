@@ -239,6 +239,24 @@ fn write_layer_metadata(writer: &mut Writer<Vec<u8>>, info: &RasterInfo) {
 
         let _ = writer.write_event(Event::End(BytesEnd::new("Dimension")));
     }
+
+    // Elevation dimension — advertised only for layers with a vertical axis.
+    if let Some(vertical) = &info.vertical {
+        if !vertical.levels.is_empty() {
+            let mut dim = BytesStart::new("Dimension");
+            dim.push_attribute(("name", "elevation"));
+            dim.push_attribute(("units", vertical.unit()));
+            let default = format!("{}", vertical.levels[0]);
+            dim.push_attribute(("default", default.as_str()));
+            dim.push_attribute(("nearestValue", "1"));
+            let _ = writer.write_event(Event::Start(dim));
+
+            let level_values: Vec<String> = vertical.levels.iter().map(|v| v.to_string()).collect();
+            let _ = writer.write_event(Event::Text(BytesText::new(&level_values.join(","))));
+
+            let _ = writer.write_event(Event::End(BytesEnd::new("Dimension")));
+        }
+    }
 }
 
 /// Write style elements for a layer.

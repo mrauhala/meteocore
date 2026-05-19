@@ -71,6 +71,8 @@ pub struct WmsQuery {
     pub bgcolor: Option<String>,
     #[serde(alias = "TIME", alias = "Time")]
     pub time: Option<String>,
+    #[serde(alias = "ELEVATION", alias = "Elevation")]
+    pub elevation: Option<String>,
 }
 
 /// Validated GetMap parameters.
@@ -88,6 +90,8 @@ pub struct GetMapParams {
     pub output_crs: OutputCrs,
     /// Output image format.
     pub format: ds_render::ImageFormat,
+    /// Vertical level from the WMS `ELEVATION` dimension, when supplied.
+    pub elevation: Option<f64>,
 }
 
 impl WmsQuery {
@@ -193,6 +197,33 @@ impl WmsQuery {
         // TIME
         let time = self.time.as_deref().map(parse_time).transpose()?;
 
+        // ELEVATION — a single vertical level. WMS 1.3.0 permits a
+        // comma-separated list, but this server renders one layer per
+        // request, so a list is rejected with an explicit message.
+        let elevation = match self
+            .elevation
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(raw) if raw.contains(',') => {
+                return Err(WmsError::invalid_parameter(
+                    "ELEVATION must be a single value; comma-separated lists are not supported",
+                ));
+            }
+            Some(raw) => Some(
+                raw.parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite())
+                    .ok_or_else(|| {
+                        WmsError::invalid_parameter(&format!(
+                            "ELEVATION '{raw}' is not a finite number"
+                        ))
+                    })?,
+            ),
+            None => None,
+        };
+
         let output_crs = match crs.as_str() {
             "EPSG:3857" => OutputCrs::WebMercator,
             _ => OutputCrs::Wgs84,
@@ -221,6 +252,7 @@ impl WmsQuery {
             time,
             output_crs,
             format: image_format,
+            elevation,
         })
     }
 }

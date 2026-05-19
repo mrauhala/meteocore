@@ -41,6 +41,7 @@ impl MockMapEngine {
             parameter: "reflectivity".to_string(),
             unit: "dBZ".to_string(),
             parameters: vec![],
+            vertical: None,
         }
     }
 }
@@ -54,6 +55,7 @@ impl MapEngine for MockMapEngine {
         _time: Option<chrono::DateTime<chrono::Utc>>,
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
+        _z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
         let pixel_count = (width * height) as usize;
         let values: Vec<Option<f64>> = (0..pixel_count)
@@ -432,6 +434,15 @@ mod get_tile {
         assert!(headers.contains_key("cache-control"));
     }
 
+    /// `elevation` against a collection with no vertical dimension
+    /// (`MockMapEngine.raster_info().vertical` is `None`) is a 400.
+    #[tokio::test]
+    async fn elevation_against_non_vertical_collection_returns_400() {
+        let (status, _, _) =
+            get_raw("/collections/radar/tiles/WebMercatorQuad/0/0/0?elevation=0.5").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn explicit_datetime_gets_immutable_cache() {
         let (_, headers, _) =
@@ -799,6 +810,7 @@ impl MapEngine for EmptyMockMapEngine {
         _time: Option<chrono::DateTime<chrono::Utc>>,
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
+        _z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
         let pixel_count = (width * height) as usize;
         Ok(RasterTile {
@@ -883,6 +895,7 @@ impl MapEngine for MultiParamMockEngine {
         _time: Option<chrono::DateTime<chrono::Utc>>,
         _output_crs: &OutputCrs,
         parameter: Option<&str>,
+        _z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
         // Vary the pixel values by parameter so the `parameter` field on
         // the cache key actually changes the rendered bytes — the
@@ -919,6 +932,7 @@ impl MapEngine for MultiParamMockEngine {
                 ("2t".into(), "Temperature".into()),
                 ("10u".into(), "U Wind".into()),
             ],
+            vertical: None,
         }
     }
 }

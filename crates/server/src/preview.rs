@@ -768,7 +768,7 @@ mod tests {
     use ds_core::feature::{Feature, FeaturePage, FeatureQuery};
     use ds_core::feature_engine::FeatureEngine;
     use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
-    use ds_core::model::{Location, QueryResult};
+    use ds_core::model::{CoverageResponse, Location};
 
     use crate::admin::ServerState;
 
@@ -788,7 +788,8 @@ mod tests {
             _location_id: &str,
             _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
             _parameters: Option<&[String]>,
-        ) -> Result<QueryResult, DataServerError> {
+            _z: Option<&[f64]>,
+        ) -> Result<CoverageResponse, DataServerError> {
             unimplemented!()
         }
         fn get_parameters(&self) -> Vec<String> {
@@ -838,6 +839,7 @@ mod tests {
             _t: Option<DateTime<Utc>>,
             _crs: &OutputCrs,
             _param: Option<&str>,
+            _z: Option<f64>,
         ) -> Result<RasterTile, DataServerError> {
             unimplemented!()
         }
@@ -849,6 +851,7 @@ mod tests {
                 parameter: self.parameter.clone(),
                 unit: self.unit.clone(),
                 parameters: self.parameters.clone(),
+                vertical: None,
             }
         }
     }
@@ -1235,7 +1238,8 @@ mod tests {
                 _: &str,
                 _: Option<(DateTime<Utc>, DateTime<Utc>)>,
                 _: Option<&[String]>,
-            ) -> Result<QueryResult, DataServerError> {
+                _: Option<&[f64]>,
+            ) -> Result<CoverageResponse, DataServerError> {
                 unimplemented!()
             }
             fn get_parameters(&self) -> Vec<String> {
@@ -1307,7 +1311,8 @@ mod tests {
                 _: &str,
                 _: Option<(DateTime<Utc>, DateTime<Utc>)>,
                 _: Option<&[String]>,
-            ) -> Result<QueryResult, DataServerError> {
+                _: Option<&[f64]>,
+            ) -> Result<CoverageResponse, DataServerError> {
                 unimplemented!()
             }
             fn get_parameters(&self) -> Vec<String> {
@@ -1599,7 +1604,8 @@ mod tests {
                 _: &str,
                 _: Option<(DateTime<Utc>, DateTime<Utc>)>,
                 _: Option<&[String]>,
-            ) -> Result<QueryResult, DataServerError> {
+                _: Option<&[f64]>,
+            ) -> Result<CoverageResponse, DataServerError> {
                 unimplemented!()
             }
             fn get_parameters(&self) -> Vec<String> {
@@ -1699,7 +1705,8 @@ mod tests {
                 _: &str,
                 _: Option<(DateTime<Utc>, DateTime<Utc>)>,
                 _: Option<&[String]>,
-            ) -> Result<QueryResult, DataServerError> {
+                _: Option<&[f64]>,
+            ) -> Result<CoverageResponse, DataServerError> {
                 unimplemented!()
             }
             fn get_parameters(&self) -> Vec<String> {
@@ -1795,7 +1802,8 @@ mod tests {
                 _: &str,
                 _: Option<(DateTime<Utc>, DateTime<Utc>)>,
                 _: Option<&[String]>,
-            ) -> Result<QueryResult, DataServerError> {
+                _: Option<&[f64]>,
+            ) -> Result<CoverageResponse, DataServerError> {
                 unimplemented!()
             }
             fn get_parameters(&self) -> Vec<String> {
@@ -1848,6 +1856,7 @@ mod tests {
                 _: Option<DateTime<Utc>>,
                 _: &OutputCrs,
                 _: Option<&str>,
+                _: Option<f64>,
             ) -> Result<RasterTile, DataServerError> {
                 unimplemented!()
             }
@@ -1863,6 +1872,7 @@ mod tests {
                         ("2t".into(), "Temperature".into()),
                         ("msl".into(), "Mean SLP".into()),
                     ],
+                    vertical: None,
                 }
             }
         }

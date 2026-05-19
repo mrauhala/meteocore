@@ -8,3 +8,4 @@ pub mod geo;
 pub mod map_engine;
 pub mod model;
 pub mod openapi;
+pub mod vertical;

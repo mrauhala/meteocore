@@ -36,6 +36,7 @@ impl MapEngine for EmptyMockMapEngine {
         _time: Option<chrono::DateTime<chrono::Utc>>,
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
+        _z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
         let pixel_count = (width * height) as usize;
         Ok(RasterTile {
@@ -55,6 +56,7 @@ impl MapEngine for EmptyMockMapEngine {
             parameter: "reflectivity".into(),
             unit: "dBZ".into(),
             parameters: vec![],
+            vertical: None,
         }
     }
 }
@@ -187,6 +189,7 @@ impl MapEngine for FailingMockMapEngine {
         _time: Option<chrono::DateTime<chrono::Utc>>,
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
+        _z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
         Err(DataServerError::Engine("intentional render failure".into()))
     }
@@ -201,6 +204,7 @@ impl MapEngine for FailingMockMapEngine {
             parameter: "reflectivity".into(),
             unit: "dBZ".into(),
             parameters: vec![],
+            vertical: None,
         }
     }
 }
@@ -314,6 +318,7 @@ impl MapEngine for PopulatedMockMapEngine {
         _time: Option<chrono::DateTime<chrono::Utc>>,
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
+        _z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
         let pixel_count = (width * height) as usize;
         // Linear gradient — yields a non-uniform PNG so the test isn't
@@ -338,6 +343,7 @@ impl MapEngine for PopulatedMockMapEngine {
             parameter: "reflectivity".into(),
             unit: "dBZ".into(),
             parameters: vec![],
+            vertical: None,
         }
     }
 }
@@ -401,6 +407,19 @@ fn build_populated_router() -> axum::Router {
 const GETMAP_URI: &str = "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=radar\
                           &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64\
                           &FORMAT=image/png";
+
+/// `ELEVATION` against a layer with no vertical dimension
+/// (`raster_info().vertical` is `None`) is a 400 ServiceException.
+#[tokio::test]
+async fn elevation_against_non_vertical_layer_returns_400() {
+    let app = build_populated_router();
+    let req = Request::builder()
+        .uri(format!("{GETMAP_URI}&ELEVATION=0.5"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
 
 /// Regression for #145: the WMS GetMap ETag must be FNV-1a over the
 /// rendered bytes — not over the cache key — so a server-side fix

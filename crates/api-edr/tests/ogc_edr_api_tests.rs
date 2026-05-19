@@ -73,6 +73,7 @@ impl MockEngine {
                 x: 24.9384,
                 y: 60.1699,
                 t: times,
+                z: None,
             },
             parameters,
             ranges,
@@ -90,9 +91,10 @@ impl EdrEngine for MockEngine {
         location_id: &str,
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         if location_id == "helsinki" || location_id == "tampere" {
-            Ok(Self::sample_query_result())
+            Ok(CoverageResponse::Single(Self::sample_query_result()))
         } else {
             Err(DataServerError::LocationNotFound(location_id.into()))
         }
@@ -122,7 +124,8 @@ impl EdrEngine for MockEngine {
         coords: &str,
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
-    ) -> Result<AreaQueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         let polygon = ds_core::feature::parse_area_coords(coords)?;
         let mut coverages = Vec::new();
         for loc in Self::sample_locations() {
@@ -135,7 +138,7 @@ impl EdrEngine for MockEngine {
                 "No locations found within the requested area".into(),
             ));
         }
-        Ok(AreaQueryResult::Collection(coverages))
+        Ok(CoverageResponse::Collection(coverages))
     }
 
     fn query_position(
@@ -143,7 +146,8 @@ impl EdrEngine for MockEngine {
         coords: &str,
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         // Accept any well-formed POINT(lon lat). Parsing is handled here to
         // exercise the handler's MULTIPOINT fan-out (which normalizes each
         // sub-point to POINT before calling the engine).
@@ -165,7 +169,7 @@ impl EdrEngine for MockEngine {
         let _lat: f64 = parts[1].parse().map_err(|_| {
             DataServerError::InvalidParameter(format!("bad latitude: {}", parts[1]))
         })?;
-        Ok(Self::sample_query_result())
+        Ok(CoverageResponse::Single(Self::sample_query_result()))
     }
 }
 
@@ -923,6 +927,18 @@ mod error_responses {
         let (status, json) = get("/collections/unknown/locations").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(json.get("code").is_some());
+        assert!(json.get("description").is_some());
+    }
+
+    /// A `z` selector against a collection with no vertical extent
+    /// (`MockEngine` does not override `get_vertical_extent`) is a 400 —
+    /// guards the `reject_z_without_vertical` check from a silent
+    /// refactor regression.
+    #[tokio::test]
+    async fn z_against_non_vertical_collection_returns_400() {
+        let (status, json) = get("/collections/weather/locations/helsinki?z=0.5").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(json.get("code").is_some(), "400 error must have 'code'");
         assert!(json.get("description").is_some());
     }
 

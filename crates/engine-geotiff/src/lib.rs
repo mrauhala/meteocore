@@ -990,6 +990,7 @@ impl GeoTiffEngine {
             x: lon,
             y: lat,
             t: times,
+            z: None,
         };
 
         let mut param_descs = HashMap::new();
@@ -1122,12 +1123,14 @@ impl GeoTiffEngine {
                 x: x_values.clone(),
                 y: y_values.clone(),
                 t: Some(times),
+                z: None,
             }
         } else {
             DomainDescription::Grid {
                 x: x_values.clone(),
                 y: y_values.clone(),
                 t: None,
+                z: None,
             }
         };
 
@@ -1189,9 +1192,10 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         time: Option<DateTime<Utc>>,
         output_crs: &ds_core::map_engine::OutputCrs,
         parameter: Option<&str>,
+        z: Option<f64>,
     ) -> Result<ds_core::map_engine::RasterTile, DataServerError> {
-        let _ = parameter; // GeoTIFF engine serves a single band per collection
-                           // For STAC: ensure we have items around the requested time
+        let _ = (parameter, z); // GeoTIFF engine serves a single 2-D band per collection
+                                // For STAC: ensure we have items around the requested time
         if let StoreMode::RemoteStac { ref client, .. } = self.store_mode {
             self.check_stac_circuit_breaker()?;
 
@@ -1460,6 +1464,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             parameter: self.parameter.clone(),
             unit: self.unit.clone(),
             parameters: vec![], // single-parameter engine
+            vertical: None,     // single-layer raster, no vertical dimension
         }
     }
 }
@@ -1474,7 +1479,8 @@ impl EdrEngine for GeoTiffEngine {
         _location_id: &str,
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         Err(DataServerError::InvalidParameter(
             "GeoTIFF engine does not support named location queries. \
              Use the position query endpoint instead (e.g., /position?coords=POINT(lon lat))."
@@ -1487,9 +1493,12 @@ impl EdrEngine for GeoTiffEngine {
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         let (lat, lon) = parse_coords(coords)?;
-        self.query_point(lat, lon, datetime, parameters)
+        Ok(CoverageResponse::Single(
+            self.query_point(lat, lon, datetime, parameters)?,
+        ))
     }
 
     fn query_area(
@@ -1497,7 +1506,8 @@ impl EdrEngine for GeoTiffEngine {
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<AreaQueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         let polygon = ds_core::feature::parse_area_coords(coords)?;
 
         // Get pixel range and geo_transform for accurate per-pixel coordinates.
@@ -1534,6 +1544,7 @@ impl EdrEngine for GeoTiffEngine {
             ref x,
             ref y,
             ref t,
+            ..
         } = result.domain
         {
             let nt = t.as_ref().map_or(1, |tv| tv.len());
@@ -1572,7 +1583,7 @@ impl EdrEngine for GeoTiffEngine {
             }
         }
 
-        Ok(AreaQueryResult::Single(result))
+        Ok(CoverageResponse::Single(result))
     }
 
     fn supported_query_types(&self) -> Vec<String> {

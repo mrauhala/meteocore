@@ -3,17 +3,25 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 use crate::error::DataServerError;
-use crate::model::{AreaQueryResult, Location, ParameterDescription, QueryResult};
+use crate::model::{CoverageResponse, Location, ParameterDescription};
+use crate::vertical::VerticalDimension;
 
 pub trait EdrEngine: Send + Sync {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError>;
 
+    /// Execute a query for a named location.
+    ///
+    /// `z` selects vertical levels: `None` returns every level (a profile),
+    /// `Some([v])` pins one level, `Some([v1, v2, …])` selects several.
+    /// Engines with no vertical dimension ignore it (the API layer rejects
+    /// a `z` against a collection that has no vertical extent).
     fn query_location(
         &self,
         location_id: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError>;
+        z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError>;
 
     fn get_parameters(&self) -> Vec<String>;
 
@@ -45,6 +53,12 @@ pub trait EdrEngine: Send + Sync {
 
     fn get_spatial_extent(&self) -> Option<[f64; 4]>;
 
+    /// Returns the collection's vertical axis, when it has one.
+    /// Default: None (the collection has no vertical dimension).
+    fn get_vertical_extent(&self) -> Option<VerticalDimension> {
+        None
+    }
+
     /// Returns the EDR query types this engine supports.
     /// Default: `["locations"]`. Override for engines that support position, area, etc.
     fn supported_query_types(&self) -> Vec<String> {
@@ -58,8 +72,9 @@ pub trait EdrEngine: Send + Sync {
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<AreaQueryResult, DataServerError> {
-        let _ = (coords, datetime, parameters);
+        z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let _ = (coords, datetime, parameters, z);
         Err(DataServerError::InvalidParameter(
             "Area query not supported by this engine".into(),
         ))
@@ -72,8 +87,9 @@ pub trait EdrEngine: Send + Sync {
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
-        let _ = (coords, datetime, parameters);
+        z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let _ = (coords, datetime, parameters, z);
         Err(DataServerError::InvalidParameter(
             "Position query not supported by this engine".into(),
         ))

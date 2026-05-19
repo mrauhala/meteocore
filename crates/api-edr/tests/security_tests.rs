@@ -35,7 +35,8 @@ impl EdrEngine for MockEngine {
         location_id: &str,
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         if location_id != "helsinki" {
             return Err(DataServerError::LocationNotFound(location_id.to_string()));
         }
@@ -60,15 +61,16 @@ impl EdrEngine for MockEngine {
             },
         );
 
-        Ok(QueryResult {
+        Ok(CoverageResponse::Single(QueryResult {
             domain: DomainDescription::PointSeries {
                 x: 24.9384,
                 y: 60.1699,
                 t: vec![time],
+                z: None,
             },
             parameters,
             ranges,
-        })
+        }))
     }
 
     fn get_parameters(&self) -> Vec<String> {

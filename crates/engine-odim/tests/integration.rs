@@ -14,7 +14,7 @@ use std::path::Path;
 use ds_core::config::OdimConfig;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::map_engine::{MapEngine, OutputCrs};
-use ds_core::model::{AreaQueryResult, DomainDescription};
+use ds_core::model::{CoverageResponse, DomainDescription};
 
 /// Construct an `OdimEngine` over `testdata/odim-dmi-fixture.h5`
 /// (a real DMI v2.0 ODIM_H5 composite shipped in this repo). Returns
@@ -119,6 +119,7 @@ fn get_raster_tile_over_denmark_renders() {
             None,
             &OutputCrs::Wgs84,
             None,
+            None,
         )
         .expect("render succeeds");
 
@@ -143,6 +144,7 @@ fn get_raster_tile_in_web_mercator_renders() {
             None,
             &OutputCrs::WebMercator,
             None,
+            None,
         )
         .expect("Mercator render succeeds");
 
@@ -166,7 +168,7 @@ fn get_raster_tile_full_extent_does_not_panic() {
     let bbox = info.spatial_extent.expect("fixture has spatial extent");
 
     let tile = engine
-        .get_raster_tile(bbox, 32, 32, None, &OutputCrs::Wgs84, None)
+        .get_raster_tile(bbox, 32, 32, None, &OutputCrs::Wgs84, None, None)
         .expect("full-extent render succeeds");
 
     assert_eq!(tile.values.len(), 32 * 32);
@@ -207,7 +209,7 @@ fn edr_metadata_is_consistent() {
     // ODIM has no station list — locations is empty, query_location
     // is unsupported.
     assert!(engine.get_locations().unwrap().is_empty());
-    assert!(engine.query_location("anything", None, None).is_err());
+    assert!(engine.query_location("anything", None, None, None).is_err());
 }
 
 /// `query_position` over central Denmark returns a `PointSeries`
@@ -217,12 +219,16 @@ fn edr_metadata_is_consistent() {
 #[test]
 fn edr_query_position_returns_point_series() {
     let (engine, _guard) = dmi_engine();
-    let result = engine
-        .query_position("POINT(10.5 56.0)", None, None)
+    let response = engine
+        .query_position("POINT(10.5 56.0)", None, None, None)
         .expect("position query succeeds");
+    let result = match response {
+        CoverageResponse::Single(qr) => qr,
+        CoverageResponse::Collection(_) => panic!("a no-vertical COMP query must return Single"),
+    };
 
     match result.domain {
-        DomainDescription::PointSeries { x, y, ref t } => {
+        DomainDescription::PointSeries { x, y, ref t, .. } => {
             assert_eq!((x, y), (10.5, 56.0));
             assert_eq!(t.len(), 1);
         }
@@ -243,9 +249,13 @@ fn edr_query_position_returns_point_series() {
 #[test]
 fn edr_query_position_off_grid_is_none() {
     let (engine, _guard) = dmi_engine();
-    let result = engine
-        .query_position("POINT(-140.0 12.0)", None, None)
+    let response = engine
+        .query_position("POINT(-140.0 12.0)", None, None, None)
         .expect("off-grid position query still succeeds");
+    let result = match response {
+        CoverageResponse::Single(qr) => qr,
+        CoverageResponse::Collection(_) => panic!("expected Single"),
+    };
     let range = &result.ranges["reflectivity"];
     assert_eq!(range.values, vec![None]);
 }
@@ -255,7 +265,12 @@ fn edr_query_position_off_grid_is_none() {
 fn edr_query_position_rejects_unknown_parameter() {
     let (engine, _guard) = dmi_engine();
     let err = engine
-        .query_position("POINT(10.5 56.0)", None, Some(&["temperature".to_string()]))
+        .query_position(
+            "POINT(10.5 56.0)",
+            None,
+            Some(&["temperature".to_string()]),
+            None,
+        )
         .unwrap_err();
     assert!(format!("{err}").contains("Unknown parameter"));
 }
@@ -267,12 +282,12 @@ fn edr_query_position_rejects_unknown_parameter() {
 fn edr_query_area_returns_grid() {
     let (engine, _guard) = dmi_engine();
     let result = engine
-        .query_area("9.0,55.0,12.0,57.5", None, None)
+        .query_area("9.0,55.0,12.0,57.5", None, None, None)
         .expect("area query succeeds");
 
     let coverage = match result {
-        AreaQueryResult::Single(qr) => qr,
-        AreaQueryResult::Collection(_) => panic!("ODIM area query must return Single"),
+        CoverageResponse::Single(qr) => qr,
+        CoverageResponse::Collection(_) => panic!("ODIM area query must return Single"),
     };
 
     let (nx, ny) = match coverage.domain {
@@ -280,6 +295,7 @@ fn edr_query_area_returns_grid() {
             ref x,
             ref y,
             ref t,
+            ..
         } => {
             assert!(t.is_none(), "single-file fixture → no time axis");
             (x.len(), y.len())
@@ -345,7 +361,7 @@ fn edr_query_area_rejects_too_many_timesteps() {
 
     // No datetime filter → all 65 entries → over the cap → error.
     let err = engine
-        .query_area("9.0,55.0,12.0,57.5", None, None)
+        .query_area("9.0,55.0,12.0,57.5", None, None, None)
         .unwrap_err();
     assert!(
         format!("{err}").contains("maximum is 64"),
@@ -358,7 +374,7 @@ fn edr_query_area_rejects_too_many_timesteps() {
     let end = Utc.with_ymd_and_hms(2026, 5, 14, 0, 30, 0).unwrap();
     assert!(
         engine
-            .query_area("9.0,55.0,12.0,57.5", Some((start, end)), None)
+            .query_area("9.0,55.0,12.0,57.5", Some((start, end)), None, None)
             .is_ok(),
         "a 7-timestep window must stay under the cap"
     );
@@ -375,11 +391,12 @@ fn edr_query_area_masks_outside_polygon() {
             "POLYGON((9.0 55.0, 12.0 55.0, 9.0 57.0, 9.0 55.0))",
             None,
             None,
+            None,
         )
         .expect("polygon area query succeeds");
     let coverage = match result {
-        AreaQueryResult::Single(qr) => qr,
-        AreaQueryResult::Collection(_) => panic!("expected Single"),
+        CoverageResponse::Single(qr) => qr,
+        CoverageResponse::Collection(_) => panic!("expected Single"),
     };
     let range = &coverage.ranges["reflectivity"];
     let masked = range.values.iter().filter(|v| v.is_none()).count();
@@ -475,7 +492,15 @@ fn pvol_engine_renders_fmi_anjalankoski_volume() {
     // the ~250 km sweep, so a real volume must produce some echoes.
     let bbox = [26.0, 60.0, 28.2, 61.8];
     let tile = engine
-        .get_raster_tile(bbox, 128, 128, None, &OutputCrs::Wgs84, Some(&render_param))
+        .get_raster_tile(
+            bbox,
+            128,
+            128,
+            None,
+            &OutputCrs::Wgs84,
+            Some(&render_param),
+            None,
+        )
         .expect("PVOL get_raster_tile over the coverage bbox");
 
     assert_eq!(tile.width, 128);
@@ -578,6 +603,7 @@ fn pvol_engine_remote_scan_discovers_fmi_volume() {
             None,
             &OutputCrs::Wgs84,
             Some(&render_param),
+            None,
         )
         .expect("render of the remotely-scanned volume succeeds");
     assert_eq!(tile.values.len(), 64 * 64);
@@ -624,6 +650,7 @@ fn pvol_engine_rejects_missing_parameter() {
         8,
         None,
         &OutputCrs::Wgs84,
+        None,
         None,
     ) {
         Err(ds_core::error::DataServerError::InvalidParameter(_)) => {}
@@ -697,59 +724,96 @@ fn pvol_edr_get_locations_lists_sites() {
     assert!(!fianj.label.is_empty(), "a location carries a label");
 }
 
-/// A position query near a radar samples its lowest sweep and returns
-/// a `PointSeries` whose ranges are aligned with the time axis.
+/// A position query with no `z` returns a `CoverageCollection` of
+/// `VerticalProfile`s — one per timestep — sampling every sweep.
 #[test]
-fn pvol_edr_query_position_returns_point_series() {
+fn pvol_edr_query_position_returns_vertical_profiles() {
     let Some(engine) = pvol_fixture_engine() else {
-        eprintln!("skipping pvol_edr_query_position_returns_point_series: fixture absent");
+        eprintln!("skipping pvol_edr_query_position_returns_vertical_profiles: fixture absent");
         return;
     };
     // ~30 km north of Anjalankoski — inside the lowest sweep.
-    let result = EdrEngine::query_position(&engine, "POINT(27.1 61.2)", None, None)
+    let response = EdrEngine::query_position(&engine, "POINT(27.1 61.2)", None, None, None)
         .expect("position query inside radar coverage");
-    match &result.domain {
-        DomainDescription::PointSeries { x, y, t } => {
-            assert!((*x - 27.1).abs() < 1e-9 && (*y - 61.2).abs() < 1e-9);
-            assert!(!t.is_empty(), "PointSeries must carry a time axis");
-            for arr in result.ranges.values() {
-                assert_eq!(arr.shape, vec![t.len()]);
-                assert_eq!(arr.axis_names, vec!["t".to_string()]);
-                assert_eq!(arr.values.len(), t.len());
+    let coverages = match response {
+        CoverageResponse::Collection(c) => c,
+        CoverageResponse::Single(_) => panic!("a no-z PVOL query must return a Collection"),
+    };
+    assert!(!coverages.is_empty(), "fixture has at least one timestep");
+    for qr in &coverages {
+        match &qr.domain {
+            DomainDescription::VerticalProfile { x, y, z, .. } => {
+                assert!((*x - 27.1).abs() < 1e-9 && (*y - 61.2).abs() < 1e-9);
+                assert!(!z.values.is_empty(), "a profile spans the sweep angles");
+                for arr in qr.ranges.values() {
+                    assert_eq!(arr.shape, vec![z.values.len()]);
+                    assert_eq!(arr.axis_names, vec!["z".to_string()]);
+                }
             }
+            other => panic!("expected VerticalProfile, got {other:?}"),
         }
-        other => panic!("position query must yield a PointSeries, got {other:?}"),
+        assert!(
+            !qr.ranges.is_empty(),
+            "a sweep exposes at least one quantity"
+        );
     }
-    assert!(
-        !result.ranges.is_empty(),
-        "the volume's lowest sweep exposes at least one quantity"
-    );
 }
 
-/// `query_location` by NOD code returns the site's `PointSeries`; an
-/// unknown id is `LocationNotFound` (HTTP 404), not a panic.
+/// A position query pinned to a single `z` level returns one
+/// `PointSeries` (a `Single` coverage).
+#[test]
+fn pvol_edr_query_position_with_z_returns_point_series() {
+    let Some(engine) = pvol_fixture_engine() else {
+        eprintln!("skipping pvol_edr_query_position_with_z_returns_point_series: fixture absent");
+        return;
+    };
+    let vertical = EdrEngine::get_vertical_extent(&engine).expect("PVOL has a vertical extent");
+    let level = vertical.levels[0];
+    let response =
+        EdrEngine::query_position(&engine, "POINT(27.1 61.2)", None, None, Some(&[level]))
+            .expect("z-pinned position query");
+    let result = match response {
+        CoverageResponse::Single(qr) => qr,
+        CoverageResponse::Collection(_) => panic!("a single-z query must return Single"),
+    };
+    match &result.domain {
+        DomainDescription::PointSeries { z, .. } => {
+            assert_eq!(z.as_ref().expect("z axis").values, vec![level]);
+        }
+        other => panic!("expected PointSeries, got {other:?}"),
+    }
+}
+
+/// `query_location` by NOD code returns the site's vertical profiles;
+/// an unknown id is `LocationNotFound` (HTTP 404), not a panic.
 #[test]
 fn pvol_edr_query_location_by_nod() {
     let Some(engine) = pvol_fixture_engine() else {
         eprintln!("skipping pvol_edr_query_location_by_nod: fixture absent");
         return;
     };
-    let result = EdrEngine::query_location(&engine, "fianj", None, None)
+    let response = EdrEngine::query_location(&engine, "fianj", None, None, None)
         .expect("query_location for the fianj site");
-    assert!(matches!(
-        result.domain,
-        DomainDescription::PointSeries { .. }
-    ));
-    assert!(!result.ranges.is_empty());
+    let coverages = match response {
+        CoverageResponse::Collection(c) => c,
+        CoverageResponse::Single(_) => panic!("a no-z site query must return a Collection"),
+    };
+    assert!(!coverages.is_empty());
+    for qr in &coverages {
+        assert!(matches!(
+            qr.domain,
+            DomainDescription::VerticalProfile { .. }
+        ));
+    }
 
-    match EdrEngine::query_location(&engine, "nosuchsite", None, None) {
+    match EdrEngine::query_location(&engine, "nosuchsite", None, None, None) {
         Err(ds_core::error::DataServerError::LocationNotFound(_)) => {}
         other => panic!("unknown location id must be LocationNotFound, got {other:?}"),
     }
 }
 
-/// An area query collects one `PointSeries` per radar site inside the
-/// polygon; a polygon far from any radar is `LocationNotFound`.
+/// An area query collects every in-polygon radar site's coverages; a
+/// polygon far from any radar is `LocationNotFound`.
 #[test]
 fn pvol_edr_query_area_collects_sites() {
     let Some(engine) = pvol_fixture_engine() else {
@@ -757,25 +821,28 @@ fn pvol_edr_query_area_collects_sites() {
         return;
     };
     // A bbox enclosing Anjalankoski (27.1E, 60.9N).
-    let result = EdrEngine::query_area(&engine, "25.0,59.0,29.0,62.5", None, None)
+    let result = EdrEngine::query_area(&engine, "25.0,59.0,29.0,62.5", None, None, None)
         .expect("area query enclosing the fianj site");
     match result {
-        AreaQueryResult::Collection(coverages) => {
+        CoverageResponse::Collection(coverages) => {
             assert!(
                 !coverages.is_empty(),
                 "the polygon encloses fianj, so the collection is non-empty"
             );
             for qr in &coverages {
-                assert!(matches!(qr.domain, DomainDescription::PointSeries { .. }));
+                assert!(matches!(
+                    qr.domain,
+                    DomainDescription::VerticalProfile { .. }
+                ));
             }
         }
-        AreaQueryResult::Single(_) => {
+        CoverageResponse::Single(_) => {
             panic!("a point/observation area query must return a Collection")
         }
     }
 
     // A polygon far from any FMI radar matches nothing.
-    match EdrEngine::query_area(&engine, "0.0,0.0,1.0,1.0", None, None) {
+    match EdrEngine::query_area(&engine, "0.0,0.0,1.0,1.0", None, None, None) {
         Err(ds_core::error::DataServerError::LocationNotFound(_)) => {}
         other => panic!("an empty area must be LocationNotFound, got {other:?}"),
     }

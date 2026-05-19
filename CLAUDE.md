@@ -106,8 +106,9 @@ All CoverageJSON output **must** validate against the OGC CoverageJSON 1.0 schem
 
 - **Coverage**: requires `type` ("Coverage"), `domain`, `parameters`, `ranges`
 - **Domain**: requires `type` ("Domain"), `axes`, `referencing`. `domainType` triggers axis constraints.
-- **PointSeries**: x/y are single-value axes, t is string-values axis. No additional axes allowed.
-- **Grid**: x/y are numeric-values axes, t is optional. NdArray shape: `[t, y, x]` or `[y, x]`.
+- **PointSeries**: x/y are single-value axes, t is string-values axis, z is an optional single-value axis.
+- **Grid**: x/y are numeric-values axes, t and z optional. NdArray shape: `[t, y, x]`, `[y, x]`, `[z, y, x]`, or `[t, z, y, x]`.
+- **VerticalProfile**: x/y single-value, z numeric-values axis, t optional single-value. NdArray shape: `[z]`.
 - **Parameter**: requires `observedProperty` with `label` as i18n object `{"en": "..."}`.
 - **NdArray**: requires `shape` and `axisNames` when values has >1 item. `values.length` must equal product of `shape`.
 - **i18n objects**: Keys must be BCP 47 language tags (e.g. `"en"`).
@@ -120,7 +121,17 @@ All CoverageJSON output **must** validate against the OGC CoverageJSON 1.0 schem
 3. Check schema's `domainBase.dependencies.domainType` for axis requirements
 4. Add a validation test in `covjson_validation.rs`
 
-Currently implemented: `PointSeries`, `Grid`.
+Currently implemented: `PointSeries`, `Grid`, `VerticalProfile`.
+
+### Vertical dimension
+
+Collections may expose a single vertical axis (`ds_core::vertical::VerticalDimension`,
+surfaced on `RasterInfo.vertical` and `EdrEngine::get_vertical_extent`). `MapEngine::get_raster_tile`
+takes `z: Option<f64>` (one rendered layer); the `EdrEngine` query methods take
+`z: Option<&[f64]>` (one or more levels). The ODIM `odim-volume` engine uses it for
+radar elevation angle. WMS exposes it as the `ELEVATION` dimension; Maps/Tiles as an
+`elevation` query parameter; EDR as the `z` query parameter. The API layer rejects a
+`z`/`elevation` against a collection with no vertical extent (HTTP 400).
 
 ## Engine Capabilities
 

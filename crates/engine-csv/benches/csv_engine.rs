@@ -26,7 +26,7 @@ fn bench_query_location(c: &mut Criterion) {
         b.iter(|| {
             black_box(
                 engine
-                    .query_location(black_box(loc_id), None, None)
+                    .query_location(black_box(loc_id), None, None, None)
                     .unwrap(),
             )
         })
@@ -37,7 +37,7 @@ fn bench_query_location(c: &mut Criterion) {
         b.iter(|| {
             black_box(
                 engine
-                    .query_location(black_box(loc_id), None, Some(&params))
+                    .query_location(black_box(loc_id), None, Some(&params), None)
                     .unwrap(),
             )
         })
@@ -66,7 +66,13 @@ fn bench_query_area(c: &mut Criterion) {
     let coords = "POLYGON((24.0 60.0, 26.0 60.0, 26.0 61.0, 24.0 61.0, 24.0 60.0))";
 
     c.bench_function("csv_query_area", |b| {
-        b.iter(|| black_box(engine.query_area(black_box(coords), None, None).unwrap()))
+        b.iter(|| {
+            black_box(
+                engine
+                    .query_area(black_box(coords), None, None, None)
+                    .unwrap(),
+            )
+        })
     });
 }
 

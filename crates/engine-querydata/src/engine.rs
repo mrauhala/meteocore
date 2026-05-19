@@ -10,7 +10,9 @@ use tokio::sync::watch;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
-use ds_core::model::{DomainDescription, Location, NdArray, ParameterDescription, QueryResult};
+use ds_core::model::{
+    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+};
 
 use crate::parse::QueryData;
 
@@ -175,7 +177,8 @@ impl EdrEngine for QueryDataEngine {
         _location_id: &str,
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         Err(DataServerError::InvalidParameter(
             "QueryData engine does not support location queries (use position query)".into(),
         ))
@@ -226,7 +229,8 @@ impl EdrEngine for QueryDataEngine {
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         let (lat, lon) = parse_coords(coords)?;
         let data = self.load_data();
 
@@ -259,6 +263,7 @@ impl EdrEngine for QueryDataEngine {
             x: lon,
             y: lat,
             t: times,
+            z: None,
         };
 
         let mut params_map = HashMap::new();
@@ -289,11 +294,11 @@ impl EdrEngine for QueryDataEngine {
             );
         }
 
-        Ok(QueryResult {
+        Ok(CoverageResponse::Single(QueryResult {
             domain,
             parameters: params_map,
             ranges,
-        })
+        }))
     }
 }
 
@@ -306,7 +311,9 @@ impl MapEngine for QueryDataEngine {
         time: Option<DateTime<Utc>>,
         output_crs: &OutputCrs,
         parameter: Option<&str>,
+        z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
+        let _ = z; // QueryData collections expose no vertical dimension yet (#185)
         let data = self.load_data();
         let param_idx = if let Some(param_name) = parameter {
             data.param_index_by_name(param_name)
@@ -389,6 +396,7 @@ impl MapEngine for QueryDataEngine {
             parameter: param_name,
             unit: String::new(),
             parameters,
+            vertical: None,
         }
     }
 }
@@ -643,9 +651,13 @@ mod tests {
         }
         let engine = QueryDataEngine::new(&test_dir(), "test", None, 30).unwrap();
 
-        let result = engine
-            .query_position("POINT(36.8 -1.3)", None, None)
+        let response = engine
+            .query_position("POINT(36.8 -1.3)", None, None, None)
             .unwrap();
+        let result = match response {
+            CoverageResponse::Single(qr) => qr,
+            CoverageResponse::Collection(_) => panic!("expected Single"),
+        };
 
         assert_eq!(result.parameters.len(), 10);
         assert_eq!(result.ranges.len(), 10);
@@ -663,9 +675,13 @@ mod tests {
         let engine = QueryDataEngine::new(&test_dir(), "test", None, 30).unwrap();
 
         let params = vec!["2 Metre Temperature (2t)".to_string()];
-        let result = engine
-            .query_position("POINT(36.8 -1.3)", None, Some(&params))
+        let response = engine
+            .query_position("POINT(36.8 -1.3)", None, Some(&params), None)
             .unwrap();
+        let result = match response {
+            CoverageResponse::Single(qr) => qr,
+            CoverageResponse::Collection(_) => panic!("expected Single"),
+        };
 
         assert_eq!(result.parameters.len(), 1);
         assert!(result.parameters.contains_key("2 Metre Temperature (2t)"));
@@ -687,6 +703,7 @@ mod tests {
                 16,
                 None,
                 &OutputCrs::Wgs84,
+                None,
                 None,
             )
             .unwrap();

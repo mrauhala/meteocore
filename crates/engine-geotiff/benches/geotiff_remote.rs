@@ -73,7 +73,7 @@ fn bench_position_cache_comparison(c: &mut Criterion) {
         b.iter(|| {
             black_box(
                 engine_nocache
-                    .query_position(black_box(coords), None, None)
+                    .query_position(black_box(coords), None, None, None)
                     .unwrap(),
             )
         })
@@ -87,19 +87,19 @@ fn bench_position_cache_comparison(c: &mut Criterion) {
             let engine = load_engine(64);
             black_box(
                 engine
-                    .query_position(black_box(coords), None, None)
+                    .query_position(black_box(coords), None, None, None)
                     .unwrap(),
             )
         })
     });
 
     // With cache, warm
-    let _ = engine_cached.query_position(coords, None, None);
+    let _ = engine_cached.query_position(coords, None, None, None);
     group.bench_function("cache_warm", |b| {
         b.iter(|| {
             black_box(
                 engine_cached
-                    .query_position(black_box(coords), None, None)
+                    .query_position(black_box(coords), None, None, None)
                     .unwrap(),
             )
         })
@@ -140,7 +140,13 @@ fn bench_area_scaling(c: &mut Criterion) {
 
     for (label, coords) in &areas {
         group.bench_with_input(BenchmarkId::new("no_cache", label), coords, |b, coords| {
-            b.iter(|| black_box(engine.query_area(black_box(coords), None, None).unwrap()))
+            b.iter(|| {
+                black_box(
+                    engine
+                        .query_area(black_box(coords), None, None, None)
+                        .unwrap(),
+                )
+            })
         });
     }
 
@@ -159,7 +165,7 @@ fn bench_concurrent_position(c: &mut Criterion) {
     let coords = "POINT(25.0 60.5)";
 
     // Warm cache
-    let _ = engine.query_position(coords, None, None);
+    let _ = engine.query_position(coords, None, None, None);
 
     for concurrency in [1, 2, 4, 8, 16] {
         group.bench_with_input(
@@ -172,8 +178,13 @@ fn bench_concurrent_position(c: &mut Criterion) {
                             let eng = engine.clone();
                             std::thread::spawn(move || {
                                 black_box(
-                                    eng.query_position(black_box("POINT(25.0 60.5)"), None, None)
-                                        .unwrap(),
+                                    eng.query_position(
+                                        black_box("POINT(25.0 60.5)"),
+                                        None,
+                                        None,
+                                        None,
+                                    )
+                                    .unwrap(),
                                 )
                             })
                         })

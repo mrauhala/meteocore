@@ -12,15 +12,12 @@ use ds_core::config::CollectionConfig;
 use ds_core::datetime::parse_datetime_interval;
 use ds_core::edr_engine::EdrEngine;
 
-use ds_core::model::AreaQueryResult;
+use ds_core::model::CoverageResponse;
 
 use crate::params::{
-    split_position_coords, AreaQueryParams, LocationQueryParams, PositionQueryParams,
+    parse_z, split_position_coords, AreaQueryParams, LocationQueryParams, PositionQueryParams,
 };
-use crate::response::{
-    area_query_result_to_json, locations_to_geojson, query_result_to_coverage_json,
-    LocationsContext,
-};
+use crate::response::{coverage_response_to_json, locations_to_geojson, LocationsContext};
 
 /// Shared state for the EDR API: a registry of collection engines + metadata.
 #[derive(Clone)]
@@ -46,6 +43,26 @@ fn lookup_collection<'a>(
     })?;
     let config = state.collections.get(id).unwrap();
     Ok((engine, config))
+}
+
+/// Reject a `z` selector against a collection with no vertical dimension.
+/// Collections that have one let the engine resolve `z`; collections that
+/// don't return HTTP 400 rather than silently ignoring the parameter.
+fn reject_z_without_vertical(
+    engine: &Arc<dyn EdrEngine>,
+    z: &Option<Vec<f64>>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if z.is_some() && engine.get_vertical_extent().is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "BadRequest",
+                "description": "This collection has no vertical dimension; \
+                                the `z` query parameter is not supported"
+            })),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
@@ -145,7 +162,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "schema": {"type": "string"}
                     },
                     {"$ref": "#/components/parameters/datetime"},
-                    {"$ref": "#/components/parameters/parameter-name"}
+                    {"$ref": "#/components/parameters/parameter-name"},
+                    {"$ref": "#/components/parameters/z"}
                 ],
                 "responses": {
                     "200": {
@@ -173,7 +191,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 "parameters": [
                     {"$ref": "#/components/parameters/coords-point"},
                     {"$ref": "#/components/parameters/datetime"},
-                    {"$ref": "#/components/parameters/parameter-name"}
+                    {"$ref": "#/components/parameters/parameter-name"},
+                    {"$ref": "#/components/parameters/z"}
                 ],
                 "responses": {
                     "200": {
@@ -201,7 +220,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 "parameters": [
                     {"$ref": "#/components/parameters/coords-polygon"},
                     {"$ref": "#/components/parameters/datetime"},
-                    {"$ref": "#/components/parameters/parameter-name"}
+                    {"$ref": "#/components/parameters/parameter-name"},
+                    {"$ref": "#/components/parameters/z"}
                 ],
                 "responses": {
                     "200": {
@@ -282,12 +302,19 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "schema": {"type": "string"},
                     "description": "Comma-separated list of parameter names to include"
                 },
+                "z": {
+                    "name": "z",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "description": "Vertical level selector — a single value or a comma-separated list (e.g. z=0.5 or z=850,700,500). Only valid for collections that advertise a vertical extent. Each requested value is snapped to the nearest level in the collection's advertised vertical extent; the response domain reports the snapped level."
+                },
                 "coords-point": {
                     "name": "coords",
                     "in": "query",
                     "required": true,
                     "schema": {"type": "string"},
-                    "description": "WKT POINT or MULTIPOINT geometry. Examples: POINT(24.94 60.17), MULTIPOINT((24.94 60.17),(23.76 61.5))"
+                    "description": "WKT POINT or MULTIPOINT geometry. Examples: POINT(24.94 60.17), MULTIPOINT((24.94 60.17),(23.76 61.5)). Note: for a MULTIPOINT against a collection with a vertical extent, every point's coverages are flattened into one CoverageCollection — per-point grouping is not preserved."
                 },
                 "coords-polygon": {
                     "name": "coords",
@@ -432,8 +459,16 @@ pub async fn location_query(
         .as_deref()
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
+    let z = parse_z(params.z.as_deref()).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+        )
+    })?;
+    reject_z_without_vertical(engine, &z)?;
+
     let result = engine
-        .query_location(&loc_id, datetime, param_names.as_deref())
+        .query_location(&loc_id, datetime, param_names.as_deref(), z.as_deref())
         .map_err(|e| match &e {
             ds_core::error::DataServerError::LocationNotFound(_) => (
                 StatusCode::NOT_FOUND,
@@ -452,7 +487,7 @@ pub async fn location_query(
             }
         })?;
 
-    let body = serde_json::to_string(&query_result_to_coverage_json(&result)).unwrap();
+    let body = serde_json::to_string(&coverage_response_to_json(&result)).unwrap();
     Ok((
         [(header::CONTENT_TYPE, "application/prs.coverage+json")],
         body,
@@ -483,6 +518,14 @@ pub async fn position_query(
         .parameter_name
         .as_deref()
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
+
+    let z = parse_z(params.z.as_deref()).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+        )
+    })?;
+    reject_z_without_vertical(engine, &z)?;
 
     // Split coords into one or more POINT(lon lat) strings. A single POINT is
     // passed through to the engine as-is; MULTIPOINT is fanned out into one
@@ -518,24 +561,29 @@ pub async fn position_query(
 
     if points.len() == 1 {
         let result = engine
-            .query_position(&points[0], datetime, param_names.as_deref())
+            .query_position(&points[0], datetime, param_names.as_deref(), z.as_deref())
             .map_err(|e| map_engine_error(&e))?;
-        let body = serde_json::to_string(&query_result_to_coverage_json(&result)).unwrap();
+        let body = serde_json::to_string(&coverage_response_to_json(&result)).unwrap();
         return Ok((
             [(header::CONTENT_TYPE, "application/prs.coverage+json")],
             body,
         ));
     }
 
+    // MULTIPOINT — fan out one query per point and flatten every point's
+    // coverages into a single CoverageCollection.
     let mut coverages = Vec::with_capacity(points.len());
     for point in &points {
         let qr = engine
-            .query_position(point, datetime, param_names.as_deref())
+            .query_position(point, datetime, param_names.as_deref(), z.as_deref())
             .map_err(|e| map_engine_error(&e))?;
-        coverages.push(qr);
+        match qr {
+            CoverageResponse::Single(q) => coverages.push(q),
+            CoverageResponse::Collection(v) => coverages.extend(v),
+        }
     }
 
-    let body = serde_json::to_string(&area_query_result_to_json(&AreaQueryResult::Collection(
+    let body = serde_json::to_string(&coverage_response_to_json(&CoverageResponse::Collection(
         coverages,
     )))
     .unwrap();
@@ -570,8 +618,21 @@ pub async fn area_query(
         .as_deref()
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
+    let z = parse_z(params.z.as_deref()).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+        )
+    })?;
+    reject_z_without_vertical(engine, &z)?;
+
     let result = engine
-        .query_area(&params.coords, datetime, param_names.as_deref())
+        .query_area(
+            &params.coords,
+            datetime,
+            param_names.as_deref(),
+            z.as_deref(),
+        )
         .map_err(|e| match &e {
             ds_core::error::DataServerError::InvalidParameter(_)
             | ds_core::error::DataServerError::InvalidBbox(_)
@@ -593,7 +654,7 @@ pub async fn area_query(
             }
         })?;
 
-    let body = serde_json::to_string(&area_query_result_to_json(&result)).unwrap();
+    let body = serde_json::to_string(&coverage_response_to_json(&result)).unwrap();
     Ok((
         [(header::CONTENT_TYPE, "application/prs.coverage+json")],
         body,
@@ -634,6 +695,19 @@ fn build_collection_metadata(
         }
 
         extent.insert("temporal".to_string(), json!(temporal_obj));
+    }
+
+    // Vertical extent — advertise the available levels so a client knows
+    // what `z` values it may request. `vrs` is intentionally omitted:
+    // vertical coordinate kinds like radar elevation angle have no
+    // standard OGC vertical-CRS URI, and `vrs` is optional in OGC EDR.
+    if let Some(vertical) = engine.get_vertical_extent() {
+        let mut vertical_obj = serde_json::Map::new();
+        if let Some((lo, hi)) = vertical.extent() {
+            vertical_obj.insert("interval".to_string(), json!([[lo, hi]]));
+        }
+        vertical_obj.insert("values".to_string(), json!(vertical.levels));
+        extent.insert("vertical".to_string(), json!(vertical_obj));
     }
 
     let parameter_names: serde_json::Map<String, serde_json::Value> = param_descs

@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
+use crate::vertical::VerticalKind;
+
 #[derive(Debug, Clone)]
 pub struct Location {
     pub id: String,
@@ -9,19 +11,37 @@ pub struct Location {
     pub longitude: f64,
 }
 
+/// A vertical coordinate carried by a domain: the kind of level plus the
+/// concrete level values selected for this coverage.
+#[derive(Debug, Clone)]
+pub struct VerticalCoord {
+    pub kind: VerticalKind,
+    pub values: Vec<f64>,
+}
+
 #[derive(Debug, Clone)]
 pub enum DomainDescription {
-    /// A time series at a single point (x, y fixed, t varies).
+    /// A time series at a single point (x, y fixed, t varies). `z`, when
+    /// present, pins the series to a single vertical level.
     PointSeries {
         x: f64,
         y: f64,
         t: Vec<DateTime<Utc>>,
+        z: Option<VerticalCoord>,
     },
-    /// A regular grid, optionally with a time dimension.
+    /// A regular grid, optionally with time and vertical dimensions.
     Grid {
         x: Vec<f64>,
         y: Vec<f64>,
         t: Option<Vec<DateTime<Utc>>>,
+        z: Option<VerticalCoord>,
+    },
+    /// A vertical profile at a single point and time (x, y, t fixed, z varies).
+    VerticalProfile {
+        x: f64,
+        y: f64,
+        t: Option<DateTime<Utc>>,
+        z: VerticalCoord,
     },
 }
 
@@ -46,11 +66,13 @@ pub struct QueryResult {
     pub ranges: HashMap<String, NdArray>,
 }
 
-/// Result of an area query — either a single coverage (grid) or a collection of coverages (stations).
+/// Result of an EDR position / area / location query — either a single
+/// coverage (e.g. a Grid) or a collection of coverages (e.g. one PointSeries
+/// per station, or one VerticalProfile per timestep).
 #[derive(Debug, Clone)]
-pub enum AreaQueryResult {
-    /// A single coverage, e.g. a Grid from GeoTIFF.
+pub enum CoverageResponse {
+    /// A single coverage.
     Single(QueryResult),
-    /// Multiple coverages (one per location), e.g. PointSeries from CSV stations.
+    /// Multiple coverages, serialised as a CoverageJSON `CoverageCollection`.
     Collection(Vec<QueryResult>),
 }

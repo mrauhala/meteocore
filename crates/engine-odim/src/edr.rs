@@ -36,7 +36,7 @@ use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::{parse_area_coords, QueryPolygon};
 use ds_core::model::{
-    AreaQueryResult, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
+    CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
 };
 
 use crate::catalog::CatalogEntry;
@@ -286,6 +286,7 @@ impl OdimEngine {
                 x: lon,
                 y: lat,
                 t: times,
+                z: None,
             },
             parameters: self.parameter_map(),
             ranges,
@@ -402,6 +403,7 @@ impl OdimEngine {
                     x: x_values,
                     y: y_values,
                     t: Some(times),
+                    z: None,
                 },
                 vec![entries.len(), ny, nx],
                 vec!["t".to_string(), "y".to_string(), "x".to_string()],
@@ -412,6 +414,7 @@ impl OdimEngine {
                     x: x_values,
                     y: y_values,
                     t: None,
+                    z: None,
                 },
                 vec![ny, nx],
                 vec!["y".to_string(), "x".to_string()],
@@ -447,7 +450,8 @@ impl EdrEngine for OdimEngine {
         _location_id: &str,
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         // An ODIM composite is a gridded field with no named
         // locations, so any location id is genuinely "not found" →
         // HTTP 404 (`LocationNotFound`), not "bad request" (400).
@@ -504,9 +508,12 @@ impl EdrEngine for OdimEngine {
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<QueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         let (lat, lon) = parse_point_coords(coords)?;
-        self.query_point(lat, lon, datetime, parameters)
+        Ok(CoverageResponse::Single(
+            self.query_point(lat, lon, datetime, parameters)?,
+        ))
     }
 
     fn query_area(
@@ -514,10 +521,11 @@ impl EdrEngine for OdimEngine {
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<AreaQueryResult, DataServerError> {
+        _z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
         let polygon = parse_area_coords(coords)?;
         let result = self.query_polygon(&polygon, datetime, parameters)?;
-        Ok(AreaQueryResult::Single(result))
+        Ok(CoverageResponse::Single(result))
     }
 }
 
