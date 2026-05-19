@@ -52,6 +52,15 @@ fn count_data(tile: &ds_core::map_engine::RasterTile) -> usize {
 // of pixels carry data — the resampler must still place that data correctly.
 const COVERED_BBOX: [f64; 4] = [20.0, 60.0, 32.0, 67.0];
 
+// Lower bound on the share of output pixels that must carry data for a render
+// over `COVERED_BBOX`. This is intentionally coupled to the committed fixture:
+// the FMI composite in `testdata/radar-tm35fin/` has dense echo over southern
+// Finland and fills well over half of this bbox. The 25% floor sits far below
+// that actual coverage, so the assertion proves the resampler placed a broad
+// swath of projected data without being brittle to the exact echo pattern. If
+// the fixture is ever regenerated from a clearer-sky scan, revisit this floor.
+const MIN_DATA_FRACTION_DENOM: usize = 4;
+
 #[test]
 fn renders_projected_geotiff_to_wgs84() {
     let engine = tm35fin_engine();
@@ -65,9 +74,9 @@ fn renders_projected_geotiff_to_wgs84() {
     assert_eq!(tile.values.len() as u32, w * h);
     let data = count_data(&tile);
     // The coarse-grid resampler must pull a substantial amount of the
-    // projected source data into the output (not just a stray pixel).
+    // projected source data into the output (see MIN_DATA_FRACTION_DENOM).
     assert!(
-        data > (w * h) as usize / 4,
+        data > (w * h) as usize / MIN_DATA_FRACTION_DENOM,
         "expected broad data coverage, got {data}/{} pixels",
         w * h
     );
@@ -131,6 +140,8 @@ fn renders_via_overview_for_small_output() {
         .get_raster_tile(bbox, w, h, None, &OutputCrs::Wgs84, None, None)
         .expect("overview render should succeed");
     assert_eq!(tile.values.len() as u32, w * h);
+    // The whole-extent render of this echo-dense fixture always has data;
+    // the assertion's job is to confirm the overview path renders at all.
     assert!(
         count_data(&tile) > 0,
         "overview render must still place projected data"
@@ -140,10 +151,13 @@ fn renders_via_overview_for_small_output() {
 #[test]
 fn partially_overlapping_bbox_is_partially_filled() {
     let engine = tm35fin_engine();
-    // Straddles the western edge of coverage: the left part of the bbox is
-    // off-raster, the right part is on it — so the resampler must place data
-    // on one side only. This catches gross projection mis-placement.
-    let bbox = [-30.0, 60.0, 15.0, 68.0];
+    // Straddles the southern edge of coverage: the lat 50–56 strip is below
+    // the raster (its bottom edge runs near lat ~56), the lat 56–62 strip is
+    // on it and over echo-dense southern Finland. So the resampler must place
+    // data on one side and nodata on the other — catching gross projection
+    // mis-placement. The on-raster half is the same dense region the
+    // COVERED_BBOX tests use, so `data > 0` is not brittle to the echo pattern.
+    let bbox = [20.0, 50.0, 32.0, 62.0];
     let (w, h) = (128, 128);
     let tile = engine
         .get_raster_tile(bbox, w, h, None, &OutputCrs::Wgs84, None, None)
