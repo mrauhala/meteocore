@@ -48,21 +48,22 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
-# Serialise release runs. Every push to main starts a run, and two runs
-# overlapping is a known way to leave release-please half-done — racing on
-# the shared `release-please--branches--main` branch and the `autorelease:*`
-# labels. `cancel-in-progress: false` queues instead of cancelling, so a
-# release in flight is never interrupted; GitHub keeps only the newest
-# pending run, which (running on the latest commit) still covers the rest.
-concurrency:
-  group: release
-  cancel-in-progress: false
-
 jobs:
   release-please:
     # Skip on workflow_dispatch — that path explicitly targets an
     # existing tag and bypasses release-please.
     if: github.event_name == 'push'
+    # Serialise release-please across overlapping pushes. Two runs racing
+    # on the shared `release-please--branches--main` branch and the
+    # `autorelease:*` labels is a known way to leave release-please
+    # half-done. `cancel-in-progress: false` queues instead of cancelling
+    # so a release in flight is never interrupted. Scoped to this job
+    # only — the build/publish jobs operate on an immutable tag, share no
+    # mutable state, and must not be made to queue behind a release run
+    # (a workflow_dispatch artifact rebuild especially).
+    concurrency:
+      group: release-please
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -91,24 +92,44 @@ jobs:
       # not cut the tag/GitHub release, so `releases_created` is false and
       # every downstream build job silently skips. Without this step the
       # miss is invisible — the job still reports success — and is only
-      # noticed days later. If the merged commit is a release-PR merge but
-      # no release was created, fail the run so it surfaces immediately.
+      # noticed days later.
       - name: Guard against a missed release
         if: steps.release.outputs.releases_created != 'true'
         env:
           HEAD_MSG: ${{ github.event.head_commit.message }}
+          HEAD_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           subject="$(printf '%s\n' "$HEAD_MSG" | head -n1)"
-          if printf '%s' "$subject" | grep -qE '^chore(\(.+\))?: release '; then
-            echo "::error::Release PR merged ('$subject') but release-please created no release."
-            echo "Recovery runbook:"
-            echo "  1. gh release create <vX.Y.Z> --target <merge-sha> --notes-file <changelog section>"
-            echo "  2. gh pr edit <release-pr#> --remove-label 'autorelease: pending' --add-label 'autorelease: tagged'"
-            echo "  3. gh workflow run release.yml -f tag=<vX.Y.Z>   # build + publish artifacts"
-            echo "  4. re-run this workflow so release-please opens the next release PR"
-            exit 1
+          # Release PRs are squash-merged, so the merge commit subject is
+          # the PR title ("chore: release …"). A standard (non-squash)
+          # merge would read "Merge pull request …" and not match — that
+          # is acceptable: this repo squash-merges throughout.
+          if ! printf '%s' "$subject" | grep -qE '^chore(\(.+\))?: release '; then
+            echo "Not a release-PR merge — nothing to guard."
+            exit 0
           fi
-          echo "No release expected for this push — nothing to guard."
+          # A release PR merged but release-please reported no release.
+          # That is only a real miss if the commit is also untagged: after
+          # a manual recovery (or a release-please retry on a later run) a
+          # v* tag points at this commit, so re-running the workflow must
+          # not false-positive.
+          if gh api --paginate "repos/${REPO}/git/refs/tags" \
+              --jq '.[].object.sha' | grep -qx "${HEAD_SHA}"; then
+            echo "A tag already points at this release commit — release exists. OK."
+            exit 0
+          fi
+          echo "::error::Release PR merged ('$subject') but release-please created no release and this commit is untagged."
+          echo "Recovery runbook:"
+          echo "  1. version=\$(jq -r '.\"crates/server\"' .release-please-manifest.json)"
+          echo "  2. gh release create \"v\$version\" --target ${HEAD_SHA} --notes-file <changelog section>"
+          echo "  3. gh pr edit <release-pr#> --remove-label 'autorelease: pending' --add-label 'autorelease: tagged'"
+          echo "  4. gh workflow run release.yml -f tag=\"v\$version\"   # build + publish artifacts"
+          echo "  5. push any commit to main — that advances HEAD past the release commit so"
+          echo "     release-please opens the next release PR (re-running this run would not,"
+          echo "     since it stays on the release commit)."
+          exit 1
 
   # Resolve the tag for the build matrix from whichever entry path
   # fired this run. Centralising the resolution here means the build
