@@ -48,6 +48,16 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# Serialise release runs. Every push to main starts a run, and two runs
+# overlapping is a known way to leave release-please half-done — racing on
+# the shared `release-please--branches--main` branch and the `autorelease:*`
+# labels. `cancel-in-progress: false` queues instead of cancelling, so a
+# release in flight is never interrupted; GitHub keeps only the newest
+# pending run, which (running on the latest commit) still covers the rest.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release-please:
     # Skip on workflow_dispatch — that path explicitly targets an
@@ -75,6 +85,30 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # Loud guard against the silent failure that stranded v0.4.0: a
+      # release PR ("chore: release …") was merged, but release-please did
+      # not cut the tag/GitHub release, so `releases_created` is false and
+      # every downstream build job silently skips. Without this step the
+      # miss is invisible — the job still reports success — and is only
+      # noticed days later. If the merged commit is a release-PR merge but
+      # no release was created, fail the run so it surfaces immediately.
+      - name: Guard against a missed release
+        if: steps.release.outputs.releases_created != 'true'
+        env:
+          HEAD_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          subject="$(printf '%s\n' "$HEAD_MSG" | head -n1)"
+          if printf '%s' "$subject" | grep -qE '^chore(\(.+\))?: release '; then
+            echo "::error::Release PR merged ('$subject') but release-please created no release."
+            echo "Recovery runbook:"
+            echo "  1. gh release create <vX.Y.Z> --target <merge-sha> --notes-file <changelog section>"
+            echo "  2. gh pr edit <release-pr#> --remove-label 'autorelease: pending' --add-label 'autorelease: tagged'"
+            echo "  3. gh workflow run release.yml -f tag=<vX.Y.Z>   # build + publish artifacts"
+            echo "  4. re-run this workflow so release-please opens the next release PR"
+            exit 1
+          fi
+          echo "No release expected for this push — nothing to guard."
 
   # Resolve the tag for the build matrix from whichever entry path
   # fired this run. Centralising the resolution here means the build
