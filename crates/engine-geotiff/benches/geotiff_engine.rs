@@ -2,6 +2,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 use ds_core::config::GeoTiffConfig;
 use ds_core::edr_engine::EdrEngine;
+use ds_core::map_engine::{MapEngine, OutputCrs};
 use engine_geotiff::GeoTiffEngine;
 
 fn make_config() -> GeoTiffConfig {
@@ -113,6 +114,42 @@ fn bench_query_area_large(c: &mut Criterion) {
     });
 }
 
+fn load_tm35fin_engine() -> GeoTiffEngine {
+    // The 480×360 EPSG:3067 (Transverse Mercator) radar fixture — exercises
+    // the coarse-grid resampler's per-pixel projection avoidance (issue #203).
+    let mut config = make_config();
+    config.filename_template = Some("radar_tm35_%Y%m%dT%H%MZ.tif".to_string());
+    GeoTiffEngine::new(
+        "radar-tm35fin",
+        Some("../../testdata/radar-tm35fin"),
+        &config,
+    )
+    .unwrap()
+}
+
+fn bench_get_raster_tile_projected(c: &mut Criterion) {
+    let engine = load_tm35fin_engine();
+    // Finland-sized bbox, fullscreen-ish output — the hot WMS render path.
+    let bbox = [20.0, 60.0, 32.0, 67.0];
+    c.bench_function("geotiff_get_raster_tile_tm35fin_1024", |b| {
+        b.iter(|| {
+            black_box(
+                engine
+                    .get_raster_tile(
+                        black_box(bbox),
+                        1024,
+                        1024,
+                        None,
+                        &OutputCrs::WebMercator,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+            )
+        })
+    });
+}
+
 fn bench_get_parameters(c: &mut Criterion) {
     let engine = load_engine();
     c.bench_function("geotiff_get_parameters", |b| {
@@ -141,6 +178,7 @@ criterion_group!(
     bench_query_position_cached,
     bench_query_area_small,
     bench_query_area_large,
+    bench_get_raster_tile_projected,
     bench_get_parameters,
     bench_get_temporal_extent,
     bench_get_spatial_extent,
