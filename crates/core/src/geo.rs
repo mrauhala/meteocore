@@ -276,15 +276,30 @@ impl GeoTransform {
 }
 
 impl GeoTransform {
+    /// Convert WGS84 (lon, lat) to *fractional, unclamped* pixel coordinates.
+    ///
+    /// Returns `(col, row)` as floats **before** flooring or bounds-checking;
+    /// either value may be negative or exceed the raster size when the point
+    /// lies outside the raster. This exposes the raw projection primitive so
+    /// callers that need many nearby points can sample the (expensive) CRS
+    /// forward transform on a coarse grid and bilinearly interpolate the
+    /// result — see `engine-geotiff`'s coarse-grid resampler (issue #203).
+    pub fn world_to_pixel_f64(&self, lon: f64, lat: f64) -> (f64, f64) {
+        let (x, y) = self.crs.forward(lon, lat);
+        let col = (x - self.origin_x) / self.pixel_width;
+        let row = (self.origin_y - y) / self.pixel_height;
+        (col, row)
+    }
+
     /// Convert WGS84 (lon, lat) to pixel coordinate (col, row).
     /// Handles CRS transformation internally.
     /// Returns None if the coordinate is outside the raster bounds.
     pub fn world_to_pixel(&self, lon: f64, lat: f64) -> Option<(u32, u32)> {
-        let (x, y) = self.crs.forward(lon, lat);
         // Use floor() to match bbox_to_pixels() rounding — `as i64` truncates
         // toward zero which maps slightly-negative values to 0 (wrong pixel).
-        let col_f = ((x - self.origin_x) / self.pixel_width).floor();
-        let row_f = ((self.origin_y - y) / self.pixel_height).floor();
+        let (col_f, row_f) = self.world_to_pixel_f64(lon, lat);
+        let col_f = col_f.floor();
+        let row_f = row_f.floor();
 
         if col_f >= 0.0 && col_f < self.width as f64 && row_f >= 0.0 && row_f < self.height as f64 {
             Some((col_f as u32, row_f as u32))
@@ -1063,6 +1078,22 @@ mod tests {
         let gt = wgs84_transform();
         assert!(gt.world_to_pixel(-10.0, 65.0).is_none());
         assert!(gt.world_to_pixel(10.0, 80.0).is_none());
+    }
+
+    #[test]
+    fn world_to_pixel_f64_matches_world_to_pixel() {
+        let gt = wgs84_transform();
+        // Inside the raster: world_to_pixel is floor() + bounds-check of the
+        // fractional coordinates from world_to_pixel_f64.
+        let (cf, rf) = gt.world_to_pixel_f64(10.0, 65.0);
+        let (col, row) = gt.world_to_pixel(10.0, 65.0).unwrap();
+        assert_eq!(col, cf.floor() as u32);
+        assert_eq!(row, rf.floor() as u32);
+        // Outside the raster: world_to_pixel_f64 still returns finite
+        // (negative / out-of-range) coordinates rather than clamping.
+        let (cf, _) = gt.world_to_pixel_f64(-10.0, 65.0);
+        assert!(cf < 0.0 && cf.is_finite());
+        assert!(gt.world_to_pixel(-10.0, 65.0).is_none());
     }
 
     #[test]

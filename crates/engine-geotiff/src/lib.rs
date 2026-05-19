@@ -2,6 +2,7 @@ mod cache;
 mod catalog;
 mod parse;
 mod reader;
+mod resample;
 pub mod stac;
 mod time_window;
 
@@ -1363,43 +1364,49 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                 )
             }?;
 
-            // Pre-compute Mercator Y bounds if needed
-            let (merc_y_north, merc_y_south) =
-                if *output_crs == ds_core::map_engine::OutputCrs::WebMercator {
-                    (lat_to_merc_y(north), lat_to_merc_y(south))
+            // Map output pixels to source pixels through a coarse projection
+            // grid instead of projecting every pixel: the CRS forward transform
+            // dominates render CPU for projected sources (issue #203).
+            let to_web_mercator = *output_crs == ds_core::map_engine::OutputCrs::WebMercator;
+            let (merc_y_north, merc_y_south) = if to_web_mercator {
+                (lat_to_merc_y(north), lat_to_merc_y(south))
+            } else {
+                (0.0, 0.0) // unused
+            };
+            let lon_at = |frac_x: f64| west + frac_x * (east - west);
+            let lat_at = |frac_y: f64| {
+                if to_web_mercator {
+                    // In Mercator, pixels have equal spacing in Y meters:
+                    // interpolate in Mercator Y, then convert back to latitude.
+                    merc_y_to_lat(merc_y_north - frac_y * (merc_y_north - merc_y_south))
                 } else {
-                    (0.0, 0.0) // unused
-                };
+                    // Linear interpolation in latitude.
+                    north - frac_y * (north - south)
+                }
+            };
+            let grid = resample::ProjectionGrid::build(&gt, width, height, lon_at, lat_at);
 
-            // Resample source grid to output dimensions using nearest-neighbor
+            // Resample source grid to output dimensions using nearest-neighbor.
             for oy in 0..height {
                 for ox in 0..width {
-                    let frac_x = (ox as f64 + 0.5) / width as f64;
-                    let frac_y = (oy as f64 + 0.5) / height as f64;
-                    let lon = west + frac_x * (east - west);
-                    let lat = if *output_crs == ds_core::map_engine::OutputCrs::WebMercator {
-                        // In Mercator, pixels have equal spacing in Y meters.
-                        // Interpolate in Mercator Y, then convert back to lat.
-                        let merc_y = merc_y_north - frac_y * (merc_y_north - merc_y_south);
-                        merc_y_to_lat(merc_y)
+                    let (col_f, row_f) = grid.sample(ox, oy);
+                    if !col_f.is_finite() || !row_f.is_finite() {
+                        values.push(None);
+                        continue;
+                    }
+                    let col = col_f.floor();
+                    let row = row_f.floor();
+                    if col >= col_start as f64
+                        && col < col_end as f64
+                        && row >= row_start as f64
+                        && row < row_end as f64
+                    {
+                        let sc = col as usize - col_start as usize;
+                        let sr = row as usize - row_start as usize;
+                        let idx = sr * src_nx + sc;
+                        values.push(pixels.get(idx).copied().unwrap_or(None));
                     } else {
-                        // Linear interpolation in latitude
-                        north - frac_y * (north - south)
-                    };
-
-                    match gt.world_to_pixel(lon, lat) {
-                        Some((col, row))
-                            if col >= col_start
-                                && col < col_end
-                                && row >= row_start
-                                && row < row_end =>
-                        {
-                            let sc = (col - col_start) as usize;
-                            let sr = (row - row_start) as usize;
-                            let idx = sr * src_nx + sc;
-                            values.push(pixels.get(idx).copied().unwrap_or(None));
-                        }
-                        _ => values.push(None),
+                        values.push(None);
                     }
                 }
             }
