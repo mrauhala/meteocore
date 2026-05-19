@@ -118,6 +118,26 @@ fn bbox_outside_coverage_is_empty() {
 }
 
 #[test]
+fn renders_via_overview_for_small_output() {
+    // A small output of the whole raster forces `select_overview` to pick a
+    // COG overview level, so the coarse-grid resampler runs against an
+    // overview GeoTransform rather than the full-resolution one. The fixture
+    // ships 240×180 and 120×90 overviews.
+    let engine = tm35fin_engine();
+    // Bbox spanning the fixture's full extent (trapezoid lon ~6.7–43°E).
+    let bbox = [8.0, 57.0, 42.0, 71.0];
+    let (w, h) = (96, 96);
+    let tile = engine
+        .get_raster_tile(bbox, w, h, None, &OutputCrs::Wgs84, None, None)
+        .expect("overview render should succeed");
+    assert_eq!(tile.values.len() as u32, w * h);
+    assert!(
+        count_data(&tile) > 0,
+        "overview render must still place projected data"
+    );
+}
+
+#[test]
 fn partially_overlapping_bbox_is_partially_filled() {
     let engine = tm35fin_engine();
     // Straddles the western edge of coverage: the left part of the bbox is

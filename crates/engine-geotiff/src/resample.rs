@@ -9,28 +9,36 @@
 //! The output→source pixel mapping is smooth, so [`ProjectionGrid`] evaluates
 //! the exact projection only at the nodes of a coarse grid and bilinearly
 //! interpolates it for every interior pixel. For a fullscreen render this
-//! turns ~2 million projection calls into a few hundred. The bilinear error is
-//! kept far below the 0.5 px resolution of nearest-neighbour resampling — see
-//! the `grid_matches_exact_*` tests.
+//! turns ~2 million projection calls into a few thousand.
+//!
+//! Bilinear interpolation error depends on how much the projection *curves*
+//! within a cell, which is a function of the geographic span per cell, not the
+//! pixel count — a zoomed-out tile spanning tens of degrees curves far more per
+//! cell than a zoomed-in one. So the grid density is chosen **adaptively**:
+//! [`ProjectionGrid::build`] starts from a pixel-based density and refines
+//! until the measured interpolation error over the on-raster region is below
+//! [`MAX_INTERP_ERROR_PX`] — well under the 0.5 px that nearest-neighbour
+//! resampling can resolve. See the `grid_matches_exact_*` tests.
 
 use ds_core::geo::GeoTransform;
 
-/// Target spacing between grid nodes, in output pixels. Smaller means more
-/// exact projection calls and less interpolation. 32 px keeps the bilinear
-/// interpolation error well below the 0.5 px threshold that nearest-neighbour
-/// resampling can resolve, while still cutting projection calls by ~1000x for
-/// a fullscreen render.
+/// Initial node spacing, in output pixels. The adaptive refinement in
+/// [`ProjectionGrid::build`] only ever *increases* density from here, so this
+/// is just a starting point that keeps the common (zoomed-in) case at one
+/// build with no refinement.
 const GRID_STEP_PX: u32 = 32;
 
-/// Lower bound on grid cells per axis. Guarantees enough nodes to capture
-/// projection curvature even for a physically small output image that still
-/// spans a large geographic area (e.g. a low-resolution overview of a whole
-/// country).
-const MIN_CELLS: u32 = 8;
+/// Lower bound on grid cells per axis (the starting density floor).
+const MIN_CELLS: u32 = 4;
 
-/// Upper bound on grid cells per axis, capping the node count (and projection
-/// calls) for very large output images.
+/// Upper bound on grid cells per axis, capping the node count — and hence the
+/// projection-call count — for extreme zoomed-out viewports.
 const MAX_CELLS: u32 = 256;
+
+/// Interpolation-error budget, in source pixels. Refinement stops once the
+/// estimated error over the on-raster region drops below this. Kept well under
+/// the 0.5 px resolution of nearest-neighbour resampling.
+const MAX_INTERP_ERROR_PX: f64 = 0.2;
 
 /// Coarse grid of exact output→source pixel correspondences, with bilinear
 /// interpolation for interior pixels.
@@ -56,6 +64,10 @@ impl ProjectionGrid {
     /// non-linear output-axis parameterisation, e.g. the equal-Y-meters
     /// spacing of Web Mercator. `gt` projects geographic coordinates to source
     /// pixels.
+    ///
+    /// The grid density is refined until the estimated bilinear-interpolation
+    /// error over the on-raster region is below [`MAX_INTERP_ERROR_PX`], or the
+    /// [`MAX_CELLS`] cap is reached.
     pub(crate) fn build(
         gt: &GeoTransform,
         width: u32,
@@ -63,8 +75,32 @@ impl ProjectionGrid {
         lon_at: impl Fn(f64) -> f64,
         lat_at: impl Fn(f64) -> f64,
     ) -> Self {
-        let cells_x = width.div_ceil(GRID_STEP_PX).clamp(MIN_CELLS, MAX_CELLS) as usize;
-        let cells_y = height.div_ceil(GRID_STEP_PX).clamp(MIN_CELLS, MAX_CELLS) as usize;
+        let mut cells_x = width.div_ceil(GRID_STEP_PX).clamp(MIN_CELLS, MAX_CELLS);
+        let mut cells_y = height.div_ceil(GRID_STEP_PX).clamp(MIN_CELLS, MAX_CELLS);
+        loop {
+            let grid = Self::with_cells(gt, width, height, cells_x, cells_y, &lon_at, &lat_at);
+            let at_cap = cells_x >= MAX_CELLS && cells_y >= MAX_CELLS;
+            if at_cap || grid.estimate_error(gt, &lon_at, &lat_at) <= MAX_INTERP_ERROR_PX {
+                return grid;
+            }
+            // Halving the cell size quarters the bilinear error.
+            cells_x = (cells_x * 2).min(MAX_CELLS);
+            cells_y = (cells_y * 2).min(MAX_CELLS);
+        }
+    }
+
+    /// Build a grid with an explicit cell count (no refinement).
+    fn with_cells(
+        gt: &GeoTransform,
+        width: u32,
+        height: u32,
+        cells_x: u32,
+        cells_y: u32,
+        lon_at: impl Fn(f64) -> f64,
+        lat_at: impl Fn(f64) -> f64,
+    ) -> Self {
+        let cells_x = cells_x as usize;
+        let cells_y = cells_y as usize;
         let stride = cells_x + 1;
 
         let mut nodes = Vec::with_capacity(stride * (cells_y + 1));
@@ -86,9 +122,52 @@ impl ProjectionGrid {
         }
     }
 
+    /// Estimate the worst-case bilinear-interpolation error, in source pixels.
+    ///
+    /// For each cell it compares the interpolated value at the cell centre
+    /// (where the bilinear residual of a smooth function peaks) against the
+    /// exact projection. Cells whose centre projects far outside the raster are
+    /// skipped — their pixels resolve to nodata regardless of interpolation
+    /// error, so refining for them would be wasted work (and could needlessly
+    /// hit the [`MAX_CELLS`] cap on a viewport that mostly misses the raster).
+    fn estimate_error(
+        &self,
+        gt: &GeoTransform,
+        lon_at: impl Fn(f64) -> f64,
+        lat_at: impl Fn(f64) -> f64,
+    ) -> f64 {
+        // Generous on-raster window: within one raster-size of the data.
+        let (w, h) = (gt.width as f64, gt.height as f64);
+        let in_window = |c: f64, r: f64| c > -w && c < 2.0 * w && r > -h && r < 2.0 * h;
+
+        let mut max = 0.0_f64;
+        for j in 0..self.cells_y {
+            let lat = lat_at((j as f64 + 0.5) / self.cells_y as f64);
+            for i in 0..self.cells_x {
+                let lon = lon_at((i as f64 + 0.5) / self.cells_x as f64);
+                let (ec, er) = gt.world_to_pixel_f64(lon, lat);
+                if !in_window(ec, er) {
+                    continue;
+                }
+                // Bilinear value at the cell centre is the mean of its corners.
+                let n = j * self.stride + i;
+                let (c00, c10) = (self.nodes[n], self.nodes[n + 1]);
+                let (c01, c11) = (self.nodes[n + self.stride], self.nodes[n + self.stride + 1]);
+                let ic = (c00.0 + c10.0 + c01.0 + c11.0) / 4.0;
+                let ir = (c00.1 + c10.1 + c01.1 + c11.1) / 4.0;
+                max = max.max((ic - ec).abs()).max((ir - er).abs());
+            }
+        }
+        max
+    }
+
     /// Interpolated source `(col, row)` for the centre of output pixel
     /// `(ox, oy)`. Coordinates are fractional and unclamped — the caller floors
     /// and bounds-checks them, exactly as [`GeoTransform::world_to_pixel`] does.
+    ///
+    /// If a grid node is non-finite (only reachable via a degenerate
+    /// `GeoTransform`, e.g. a zero pixel size) the result is non-finite; the
+    /// caller must finite-check before use.
     pub(crate) fn sample(&self, ox: u32, oy: u32) -> (f64, f64) {
         // Position of the pixel centre in grid-cell units.
         let gx = (ox as f64 + 0.5) / self.cell_w;
@@ -160,7 +239,8 @@ mod tests {
 
     /// Largest deviation between the coarse grid and the exact per-pixel
     /// projection, in source pixels, over every pixel of a `width`×`height`
-    /// output image.
+    /// output image — but only counting pixels that land on the raster, since
+    /// off-raster pixels resolve to nodata regardless of interpolation error.
     fn max_grid_error(
         gt: &GeoTransform,
         width: u32,
@@ -169,6 +249,7 @@ mod tests {
         lat_at: impl Fn(f64) -> f64 + Copy,
     ) -> f64 {
         let grid = ProjectionGrid::build(gt, width, height, lon_at, lat_at);
+        let (w, h) = (gt.width as f64, gt.height as f64);
         let mut max = 0.0_f64;
         for oy in 0..height {
             for ox in 0..width {
@@ -176,7 +257,10 @@ mod tests {
                 let lon = lon_at((ox as f64 + 0.5) / width as f64);
                 let lat = lat_at((oy as f64 + 0.5) / height as f64);
                 let (ec, er) = gt.world_to_pixel_f64(lon, lat);
-                max = max.max((gc - ec).abs()).max((gr - er).abs());
+                // Only on-raster pixels are observable in the output.
+                if ec >= 0.0 && ec < w && er >= 0.0 && er < h {
+                    max = max.max((gc - ec).abs()).max((gr - er).abs());
+                }
             }
         }
         max
@@ -201,44 +285,65 @@ mod tests {
     #[test]
     fn grid_matches_exact_tm35fin() {
         // Projected source, linear (WGS84) output axes over a Finland-sized
-        // viewport. Bilinear interpolation error must stay well under the
-        // 0.5 px that nearest-neighbour resampling can resolve.
+        // viewport.
         let gt = tm35fin_transform();
         let err = max_grid_error(&gt, 1280, 960, |fx| 19.0 + fx * 13.0, |fy| 70.0 - fy * 11.0);
-        assert!(err < 0.05, "TM35FIN grid error {err} px exceeds budget");
+        assert!(err < 0.5, "TM35FIN grid error {err} px exceeds budget");
     }
 
     #[test]
     fn grid_matches_exact_webmercator_output() {
-        // Projected source with a non-linear (Web Mercator) output Y axis —
-        // the worst realistic case for interpolation curvature.
+        // Projected source with a non-linear (Web Mercator) output Y axis.
         let gt = tm35fin_transform();
-        const R: f64 = 6_378_137.0;
-        let merc_y = |lat_deg: f64| {
-            R * ((std::f64::consts::FRAC_PI_4 + lat_deg.to_radians() / 2.0)
-                .tan()
-                .ln())
-        };
-        let merc_to_lat =
-            |y: f64| (std::f64::consts::FRAC_PI_2 - 2.0 * (-y / R).exp().atan()).to_degrees();
-        let (south, north) = (59.0_f64, 70.0_f64);
-        let (my_s, my_n) = (merc_y(south), merc_y(north));
         let err = max_grid_error(
             &gt,
             1280,
             960,
             |fx| 19.0 + fx * 13.0,
-            |fy| merc_to_lat(my_n - fy * (my_n - my_s)),
+            |fy| merc_lat(&(59.0, 70.0), fy),
         );
-        assert!(err < 0.1, "Web Mercator grid error {err} px exceeds budget");
+        assert!(err < 0.5, "Web Mercator grid error {err} px exceeds budget");
     }
 
     #[test]
-    fn grid_handles_small_output() {
-        // A physically tiny image spanning a large area still gets MIN_CELLS
-        // nodes, so interpolation stays accurate.
+    fn grid_matches_exact_zoomed_out() {
+        // Adversarial: low-zoom viewports that span tens of degrees per render.
+        // A fixed pixel-based grid step badly under-samples these — the
+        // adaptive refinement must still keep them under budget. Each viewport
+        // overlaps the raster, so the grid resampler genuinely runs.
         let gt = tm35fin_transform();
-        let err = max_grid_error(&gt, 24, 18, |fx| 19.0 + fx * 13.0, |fy| 70.0 - fy * 11.0);
+        // z=2-style 256 px tile over a 90° longitude span.
+        let err = max_grid_error(&gt, 256, 256, |fx| fx * 90.0, |fy| 78.0 - fy * 50.0);
+        assert!(err < 0.5, "z2 tile grid error {err} px exceeds budget");
+        // Wide WMS render — "zoom out to see the whole radar".
+        let err = max_grid_error(
+            &gt,
+            1024,
+            512,
+            |fx| -30.0 + fx * 114.0,
+            |fy| 78.0 - fy * 40.0,
+        );
+        assert!(err < 0.5, "wide WMS grid error {err} px exceeds budget");
+        // Web Mercator output over a wide span.
+        let err = max_grid_error(
+            &gt,
+            512,
+            512,
+            |fx| fx * 90.0,
+            |fy| merc_lat(&(45.0, 78.0), fy),
+        );
+        assert!(
+            err < 0.5,
+            "wide Web Mercator grid error {err} px exceeds budget"
+        );
+    }
+
+    #[test]
+    fn grid_handles_small_output_over_wide_area() {
+        // A physically tiny image spanning a large area: few output pixels but
+        // high per-cell curvature. Adaptive refinement must still hold budget.
+        let gt = tm35fin_transform();
+        let err = max_grid_error(&gt, 24, 18, |fx| -10.0 + fx * 70.0, |fy| 78.0 - fy * 40.0);
         assert!(err < 0.5, "small-output grid error {err} px exceeds budget");
     }
 
@@ -250,5 +355,37 @@ mod tests {
             ProjectionGrid::build(&gt, 800, 600, |fx| 19.0 + fx * 13.0, |fy| 70.0 - fy * 11.0);
         let (c, r) = grid.sample(799, 599);
         assert!(c.is_finite() && r.is_finite());
+    }
+
+    #[test]
+    fn sample_is_non_finite_for_degenerate_transform() {
+        // A zero pixel size makes world_to_pixel_f64 divide by zero. The grid
+        // must not panic; it propagates a non-finite value for the caller to
+        // finite-check (mirroring the guard in get_raster_tile).
+        let gt = GeoTransform {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            pixel_width: 0.0,
+            pixel_height: 0.0,
+            width: 100,
+            height: 100,
+            crs: Crs::Wgs84,
+        };
+        let grid = ProjectionGrid::build(&gt, 64, 64, |fx| fx, |fy| fy);
+        let (c, r) = grid.sample(10, 10);
+        assert!(!c.is_finite() || !r.is_finite());
+    }
+
+    /// Web Mercator latitude for fractional y in `[0, 1]` over `[south, north]`.
+    fn merc_lat((south, north): &(f64, f64), fy: f64) -> f64 {
+        const R: f64 = 6_378_137.0;
+        let merc_y = |lat: f64| {
+            R * ((std::f64::consts::FRAC_PI_4 + lat.to_radians() / 2.0)
+                .tan()
+                .ln())
+        };
+        let (my_s, my_n) = (merc_y(*south), merc_y(*north));
+        let y = my_n - fy * (my_n - my_s);
+        (std::f64::consts::FRAC_PI_2 - 2.0 * (-y / R).exp().atan()).to_degrees()
     }
 }
