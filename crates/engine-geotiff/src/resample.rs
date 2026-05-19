@@ -4,7 +4,7 @@
 //! grid. The naive approach projects every output pixel through the CRS forward
 //! transform, which for a projected source (e.g. EPSG:3067 Transverse Mercator)
 //! costs roughly a dozen transcendental ops *per pixel* — the dominant
-//! per-render CPU cost (issue #203).
+//! per-render CPU cost.
 //!
 //! The output→source pixel mapping is smooth, so [`ProjectionGrid`] evaluates
 //! the exact projection only at the nodes of a coarse grid and bilinearly
@@ -93,8 +93,21 @@ impl ProjectionGrid {
         let mut cells_y = height.div_ceil(GRID_STEP_PX).clamp(MIN_CELLS, MAX_CELLS);
         loop {
             let grid = Self::with_cells(gt, width, height, cells_x, cells_y, &lon_at, &lat_at);
-            let at_cap = cells_x >= MAX_CELLS && cells_y >= MAX_CELLS;
-            if at_cap || grid.estimate_error(gt, &lon_at, &lat_at) <= MAX_INTERP_ERROR_PX {
+            let error = grid.estimate_error(gt, &lon_at, &lat_at);
+            if error <= MAX_INTERP_ERROR_PX {
+                return grid;
+            }
+            if cells_x >= MAX_CELLS && cells_y >= MAX_CELLS {
+                // Extreme viewport: even the densest grid cannot meet the
+                // budget. Accept it, but make the degradation observable
+                // rather than letting it pass silently.
+                tracing::warn!(
+                    estimated_error_px = error,
+                    budget_px = MAX_INTERP_ERROR_PX,
+                    "projection grid hit the MAX_CELLS cap with interpolation \
+                     error above budget; rendered output may be slightly \
+                     misregistered for this viewport"
+                );
                 return grid;
             }
             // Halving the cell size quarters the bilinear error.

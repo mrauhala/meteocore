@@ -1366,7 +1366,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
 
             // Map output pixels to source pixels through a coarse projection
             // grid instead of projecting every pixel: the CRS forward transform
-            // dominates render CPU for projected sources (issue #203).
+            // dominates render CPU for projected sources.
             let to_web_mercator = *output_crs == ds_core::map_engine::OutputCrs::WebMercator;
             let (merc_y_north, merc_y_south) = if to_web_mercator {
                 (lat_to_merc_y(north), lat_to_merc_y(south))
