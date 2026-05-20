@@ -1,3 +1,19 @@
 {
+  "crates/core": "0.4.0",
+  "crates/storage": "0.4.0",
+  "crates/render": "0.4.0",
+  "crates/ds-mvt": "0.4.0",
+  "crates/engine-csv": "0.4.0",
+  "crates/engine-geojson": "0.4.0",
+  "crates/engine-geotiff": "0.4.0",
+  "crates/engine-grib": "0.4.0",
+  "crates/engine-odim": "0.4.0",
+  "crates/engine-postgis": "0.4.0",
+  "crates/engine-querydata": "0.4.0",
+  "crates/api-edr": "0.4.0",
+  "crates/api-features": "0.4.0",
+  "crates/api-wms": "0.4.0",
+  "crates/api-maps": "0.4.0",
+  "crates/api-tiles": "0.4.0",
   "crates/server": "0.4.0"
 }

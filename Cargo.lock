@@ -66,7 +66,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "api-edr"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "api-features"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "api-maps"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "api-tiles"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "api-wms"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "ds-core"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "serde",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "ds-mvt"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "ds-core",
@@ -774,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "ds-render"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "ds-storage"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "engine-csv"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "engine-geojson"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "criterion",
  "ds-core",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "engine-geotiff"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "engine-grib"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -881,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "engine-odim"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -899,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "engine-postgis"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "engine-querydata"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "chrono",

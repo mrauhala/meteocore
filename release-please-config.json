@@ -21,15 +21,48 @@
     { "type": "style", "section": "Styles", "hidden": true }
   ],
   "plugins": [
+    { "type": "cargo-workspace", "merge": true },
     {
-      "type": "cargo-workspace",
-      "merge": true
+      "type": "linked-versions",
+      "groupName": "meteocore",
+      "components": [
+        "meteocore",
+        "ds-core",
+        "ds-storage",
+        "ds-render",
+        "ds-mvt",
+        "engine-csv",
+        "engine-geojson",
+        "engine-geotiff",
+        "engine-grib",
+        "engine-odim",
+        "engine-postgis",
+        "engine-querydata",
+        "api-edr",
+        "api-features",
+        "api-wms",
+        "api-maps",
+        "api-tiles"
+      ]
     }
   ],
   "packages": {
-    "crates/server": {
-      "package-name": "meteocore",
-      "component": "meteocore"
-    }
+    "crates/core":             { "package-name": "ds-core",          "component": "ds-core",          "bootstrap-sha": "fb12a38bf5414d807c351b2daebc41deb072e85e" },
+    "crates/storage":          { "package-name": "ds-storage",       "component": "ds-storage",       "bootstrap-sha": "fb12a38bf5414d807c351b2daebc41deb072e85e" },
+    "crates/render":           { "package-name": "ds-render",        "component": "ds-render",        "bootstrap-sha": "fb12a38bf5414d807c351b2daebc41deb072e85e" },
+    "crates/ds-mvt":           { "package-name": "ds-mvt",           "component": "ds-mvt",           "bootstrap-sha": "fb12a38bf5414d807c351b2daebc41deb072e85e" },
+    "crates/engine-csv":       { "package-name": "engine-csv",       "component": "engine-csv",       "bootstrap-sha": "fb12a38bf5414d807c351b2daebc41deb072e85e" },
+    "crates/engine-geojson":   { "package-name": "engine-geojson",   "component": "engine-geojson",   "bootstrap-sha": "fb12a38bf5414d807c351b2daebc41deb072e85e" },
+    "crates/engine-geotiff":   { "package-name": "engine-geotiff",   "component": "engine-geotiff",   "bootstrap-sha": "fb12a38bf5414d807c351b2daebc41deb072e85e" },
+    "crates/engine-grib":      { "package-name": "engine-grib",      "component": "engine-grib",      "bootstrap-sha": "fb12a38bf5414d807c351b2daebc41deb072e85e" },
+    "crates/engine-odim":      { "package-name": "engine-odim",      "component": "engine-odim",      "bootstrap-sha": "fb12a38bf5414d807c351b2daebc41deb072e85e" },
+    "crates/engine-postgis":   { "package-name": "engine-postgis",   "component": "engine-postgis",   "bootstrap-sha": "fb12a38bf5414d807c351b2daebc41deb072e85e" },
+    "crates/engine-querydata": { "package-name": "engine-querydata", "component": "engine-querydata", "bootstrap-sha": "fb12a38bf5414d807c351b2daebc41deb072e85e" },
+    "crates/api-edr":          { "package-name": "api-edr",          "component": "api-edr",          "bootstrap-sha": "fb12a38bf5414d807c351b2daebc41deb072e85e" },
+    "crates/api-features":     { "package-name": "api-features",     "component": "api-features",     "bootstrap-sha": "fb12a38bf5414d807c351b2daebc41deb072e85e" },
+    "crates/api-wms":          { "package-name": "api-wms",          "component": "api-wms",          "bootstrap-sha": "fb12a38bf5414d807c351b2daebc41deb072e85e" },
+    "crates/api-maps":         { "package-name": "api-maps",         "component": "api-maps",         "bootstrap-sha": "fb12a38bf5414d807c351b2daebc41deb072e85e" },
+    "crates/api-tiles":        { "package-name": "api-tiles",        "component": "api-tiles",        "bootstrap-sha": "fb12a38bf5414d807c351b2daebc41deb072e85e" },
+    "crates/server":           { "package-name": "meteocore",        "component": "meteocore" }
   }
 }
