@@ -468,7 +468,7 @@
     {
       "title": "Cache Hit Rate Over Time",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 45 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 45 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "fieldConfig": {
         "defaults": {
@@ -494,6 +494,38 @@
         {
           "expr": "sum(rate(metatile_cache_hits_total[5m])) / clamp_min(sum(rate(metatile_cache_hits_total[5m])) + sum(rate(metatile_cache_misses_total[5m])), 0.0001)",
           "legendFormat": "Meta-Tile Cache"
+        }
+      ]
+    },
+    {
+      "title": "Cache Fill (% of capacity)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 45 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Bytes held / configured capacity. A line pinned near 100% means the cache is full and evicting on every insert — the working set exceeds capacity (consider raising the *_cache_mb).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "fillOpacity": 5, "lineWidth": 2 },
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.9 },
+              { "color": "red", "value": 0.98 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "metatile_cache_bytes / clamp_min(metatile_cache_capacity_bytes, 1)",
+          "legendFormat": "Meta-Tile"
+        },
+        {
+          "expr": "rendered_cache_bytes / clamp_min(rendered_cache_capacity_bytes, 1)",
+          "legendFormat": "Rendered"
         }
       ]
     },

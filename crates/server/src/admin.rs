@@ -429,6 +429,7 @@ pub fn load_collections(
     collections: &[CollectionConfig],
     style_bundles: &[StyleBundle],
     base_url: &str,
+    metatile_cache_mb: u64,
 ) -> LoadResult {
     let bundle_index: HashMap<&str, &StyleBundle> =
         style_bundles.iter().map(|b| (b.id.as_str(), b)).collect();
@@ -1417,18 +1418,10 @@ pub fn load_collections(
         .next()
         .unwrap_or(128);
 
-    // Meta-tile pixel cache size (#202). Read only from WMS-registered
-    // collections (`map_collections`) — meta-tiling is a WMS-only path, so a
-    // Maps-only collection's `[wms]` block must not influence it. Take the
-    // MINIMUM (not the first) so the `metatile_cache_mb = 0` kill switch wins if
-    // any WMS collection sets it — the cache is global, so one collection must be
-    // able to disable meta-tiling server-wide.
-    let metatile_cache_mb = map_collections
-        .values()
-        .filter_map(|c| c.wms.as_ref())
-        .map(|w| w.metatile_cache_mb)
-        .min()
-        .unwrap_or(1024);
+    // Meta-tile pixel cache size (#202) is a server-wide setting
+    // (`[server] metatile_cache_mb`) — the cache is global to all WMS
+    // collections, so it is passed in as a single value (no per-collection
+    // aggregation). `0` disables meta-tiling.
 
     // 2× cores (min 8) — the render slot's "ownership" of a CPU is loose
     // because decode/encode interleaves with bilinear passes; configurable
@@ -1870,7 +1863,12 @@ pub async fn reload_handler(
         }
     }
 
-    let result = load_collections(&config.collections, &config.style_bundles, &base_url);
+    let result = load_collections(
+        &config.collections,
+        &config.style_bundles,
+        &base_url,
+        config.server.metatile_cache_mb,
+    );
 
     let loaded = result
         .health

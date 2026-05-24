@@ -177,6 +177,7 @@ host = "0.0.0.0"
 port = 8000
 # base_url = "https://api.example.com"  # optional, for absolute links behind a proxy
 # collections_dir = "collections.d"     # optional, load per-collection .toml files from directory
+# metatile_cache_mb = 1024              # optional, global WMS meta-tile cache (MB); 0 disables meta-tiling
 
 [[collections]]
 id = "weather"
@@ -228,6 +229,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `port` | yes | — | Bind port |
 | `base_url` | no | `http://{host}:{port}` | External base URL for absolute links (set when behind a reverse proxy) |
 | `collections_dir` | no | — | Directory of per-collection `.toml` config files (see [Per-File Collection Configs](#per-file-collection-configs)) |
+| `metatile_cache_mb` | no | `1024` | Size (MB) of the global Web Mercator meta-tile cache (#202). Server-wide, not per-collection. `0` disables meta-tiling (EPSG:3857 GetMap reverts to a direct render; reload-reversible). Consumed by WMS today; Maps/Tiles will share it when meta-tiling extends to them. |
 
 ### Collection Config Fields
 
@@ -852,8 +854,7 @@ Or attach a reusable `[[style_bundles]]` block defined in top-level `config.toml
 | `max` | no | from colormap | Maximum value for the default style's range |
 | `styles` | no | — | Array of named styles |
 | `parameters` | no | — | Per-parameter default-style overrides (multi-parameter engines) |
-| `rendered_cache_mb` | no | `512` | Shared rendered-image cache size in MB. Set to 0 to disable. |
-| `metatile_cache_mb` | no | `1024` | Web Mercator meta-tile (decoded-RGBA) cache size in MB. Set to 0 to disable meta-tiling (direct render). Global cache: the **minimum** across WMS collections wins, so `0` on any collection disables meta-tiling server-wide. |
+| `rendered_cache_mb` | no | `512` | Shared rendered-image cache size in MB. Set to 0 to disable. (Global cache; lives under `[wms]` for backward compatibility — see note.) |
 
 ### Limits
 
@@ -1000,7 +1001,7 @@ Separate from the GeoTIFF source tile cache (Tier 1). Caches final PNG/JPEG/WebP
 
 A fullscreen WMS client requests an arbitrary bbox + size per pan/zoom, so the Tier-2 rendered cache (keyed on the exact bbox) rarely hits. For EPSG:3857 GetMap, the WMS handler instead decomposes each request into fixed 256×256 tiles aligned to the WebMercatorQuad grid, renders and caches *those* (decoded RGBA), and resamples them to the exact viewport — so the expensive decode/projection/colorize work is cached at tile granularity and reused across overlapping views.
 
-- Default size: 1024 MB (configurable via `metatile_cache_mb`); **set to 0 to disable** meta-tiling (reverts to a direct single-shot render, reload-reversible). The cache is global; the size is the **minimum** `metatile_cache_mb` across WMS collections, so `0` anywhere disables it server-wide (unlike `rendered_cache_mb`, which takes the first value).
+- Default size: 1024 MB, configured server-wide via **`[server] metatile_cache_mb`** (it is a single global cache, not per-collection); **set to 0 to disable** meta-tiling (reverts to a direct single-shot render, reload-reversible). Consumed by the WMS GetMap path today; Maps/Tiles render directly and would share this cache when meta-tiling extends to them.
 - Cache key: layer + parameter + style + time + elevation + ladder level + tile col/row.
 - Resolution ladder: half-octave steps coinciding with standard WebMercator zooms; snaps to the finest step ≤ the request resolution (always downsampled, never upscaled).
 - Web Mercator only; other CRSs and degenerate/oversized requests fall back to the direct render.
