@@ -75,7 +75,7 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 4. Add the crate as a dependency of `crates/server/Cargo.toml`
 5. Add a match arm for the new `engine_type` in `server/src/main.rs`
 6. Wire it into the appropriate registries based on the collection's `apis` config
-7. **Obey the Engine Performance & Concurrency Rules below** — especially: the poll loop must `spawn_blocking`, and the render/decode path must not project per output pixel.
+7. **Obey the Engine Performance & Concurrency Rules below** — especially: spawn the poll loop on the dedicated background runtime (not the request runtime), and the render/decode path must not project per output pixel.
 
 ## Engine Performance & Concurrency Rules
 
