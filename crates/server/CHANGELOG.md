@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/mrauhala/meteocore/compare/v0.4.0...v0.5.0) (2026-05-19)
+
+
+### Features
+
+* vertical (elevation/level) dimension for MapEngine + EdrEngine ([#200](https://github.com/mrauhala/meteocore/issues/200)) ([cbd4abd](https://github.com/mrauhala/meteocore/commit/cbd4abd8becb3085ccdf0a1ae780fa814f0b4f75))
+
 ## [0.4.0](https://github.com/mrauhala/meteocore/compare/v0.3.0...v0.4.0) (2026-05-18)
 
 
