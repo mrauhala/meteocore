@@ -382,7 +382,11 @@ pub struct OdimConfig {
 }
 
 fn default_grib_poll_interval() -> u64 {
-    300
+    // 10 minutes. NWP models typically publish a new run every 6 h (some less
+    // often), with steps trickling in over ~1-2 h, so frequent polling mostly
+    // re-lists unchanged runs. Override per collection via `poll_interval_secs`
+    // for the rare model that updates more often.
+    600
 }
 
 fn default_grid_cache_mb() -> u64 {
@@ -401,7 +405,7 @@ pub struct GribConfig {
     pub index_suffix: Option<String>,
     /// Suffix for GRIB data files. Default: ".grib2"
     pub data_suffix: Option<String>,
-    /// Poll interval in seconds. Default: 300 (5 min)
+    /// Poll interval in seconds. Default: 600 (10 min)
     #[serde(default = "default_grib_poll_interval")]
     pub poll_interval_secs: u64,
     /// Maximum number of forecast runs to retain. Default: 4
