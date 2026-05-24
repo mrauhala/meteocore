@@ -1,7 +1,44 @@
 mod admin;
 mod preview;
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
+
+/// Dedicated multi-thread runtime for background collection poll loops.
+///
+/// Poll/scan loops do blocking I/O via `ds_storage::DataStore`, which parks the
+/// calling worker thread (`block_in_place`) for the whole network round-trip.
+/// Running them on the main request-serving runtime lets a slow/heavy poll
+/// (e.g. a GRIB new-run probe doing dozens of sequential byte-range reads)
+/// starve the worker pool and spike WMS latency for every collection (#221).
+/// Isolating polls on their own runtime keeps that blocking off the request
+/// path. `block_in_place` still works here because this is a multi-thread
+/// runtime; it would panic on a `spawn_blocking` pool thread, which is why we
+/// use a separate runtime rather than wrapping the sync scan in `spawn_blocking`.
+///
+/// The runtime lives in a `OnceLock` for the whole process. On exit it is
+/// leaked (statics are not dropped), so poll tasks are aborted rather than
+/// drained — which is safe here: a poll only reads the (read-only) data store
+/// and swaps an in-memory `ArcSwap` catalog atomically, so an aborted scan
+/// leaves no partial or corrupt state and the catalog is simply rebuilt on the
+/// next start. Poll loops also observe the per-engine shutdown watch channel
+/// and exit their `select!` cleanly when signalled before exit.
+///
+/// `worker_threads(4)` gives headroom so several collections polling at once
+/// (or a reload spawning fresh loops while old scans are still blocked) don't
+/// serialise on too few threads; `block_in_place` additionally lets Tokio spin
+/// up temporary replacement workers while a poll blocks.
+pub(crate) fn poll_runtime() -> &'static tokio::runtime::Handle {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .thread_name("mc-poll")
+            .enable_all()
+            .build()
+            .expect("failed to build background poll runtime")
+    })
+    .handle()
+}
 
 use arc_swap::ArcSwap;
 use axum::body::Body;
@@ -199,34 +236,35 @@ async fn main() {
         config.collections.len()
     );
 
-    // Spawn poll loops
+    // Spawn poll loops on the dedicated background runtime so their blocking
+    // I/O never parks a request-serving worker (#221).
     for engine in &result.geotiff_engines {
         let poller = engine.clone();
-        tokio::spawn(async move {
+        poll_runtime().spawn(async move {
             poller.poll_loop().await;
         });
     }
     for engine in &result.querydata_engines {
         let poller = engine.clone();
-        tokio::spawn(async move {
+        poll_runtime().spawn(async move {
             poller.poll_loop().await;
         });
     }
     for engine in &result.grib_engines {
         let poller = engine.clone();
-        tokio::spawn(async move {
+        poll_runtime().spawn(async move {
             poller.poll_loop().await;
         });
     }
     for engine in &result.odim_engines {
         let poller = engine.clone();
-        tokio::spawn(async move {
+        poll_runtime().spawn(async move {
             poller.poll_loop().await;
         });
     }
     for engine in &result.odim_volume_engines {
         let poller = engine.clone();
-        tokio::spawn(async move {
+        poll_runtime().spawn(async move {
             poller.poll_loop().await;
         });
     }

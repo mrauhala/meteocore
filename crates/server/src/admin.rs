@@ -1824,34 +1824,35 @@ pub async fn reload_handler(
         ));
     }
 
-    // Spawn poll loops for new engines
+    // Spawn poll loops for new engines on the dedicated background runtime
+    // so their blocking I/O never parks a request-serving worker (#221).
     for engine in &result.geotiff_engines {
         let poller = engine.clone();
-        tokio::spawn(async move {
+        crate::poll_runtime().spawn(async move {
             poller.poll_loop().await;
         });
     }
     for engine in &result.querydata_engines {
         let poller = engine.clone();
-        tokio::spawn(async move {
+        crate::poll_runtime().spawn(async move {
             poller.poll_loop().await;
         });
     }
     for engine in &result.grib_engines {
         let poller = engine.clone();
-        tokio::spawn(async move {
+        crate::poll_runtime().spawn(async move {
             poller.poll_loop().await;
         });
     }
     for engine in &result.odim_engines {
         let poller = engine.clone();
-        tokio::spawn(async move {
+        crate::poll_runtime().spawn(async move {
             poller.poll_loop().await;
         });
     }
     for engine in &result.odim_volume_engines {
         let poller = engine.clone();
-        tokio::spawn(async move {
+        crate::poll_runtime().spawn(async move {
             poller.poll_loop().await;
         });
     }

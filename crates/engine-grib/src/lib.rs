@@ -8,6 +8,7 @@ pub mod wgrib2_index;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Datelike, Utc};
@@ -81,6 +82,15 @@ const DEFAULT_RUN_HOURS: &[u32] = &[0, 6, 12, 18];
 /// Number of days to scan back (today + yesterday handles overnight transitions).
 const SCAN_DAYS: u32 = 2;
 
+/// How often to force a full re-list of all run prefixes, ignoring the settled
+/// skip. NWP runs publish sequentially so older runs are normally static, but a
+/// provider can append late/corrected step files to an already-scanned run; a
+/// periodic full scan catches those new paths within this bound while still
+/// skipping the per-poll re-list the rest of the time. (Same-key content
+/// rewrites of an existing index file are a separate, pre-existing limitation
+/// of the path-keyed `known_indexes` dedup, not addressed here.)
+const SETTLED_REVALIDATE_INTERVAL: Duration = Duration::from_secs(3600);
+
 /// Engine for serving GRIB2 NWP forecast data.
 ///
 /// Discovers GRIB files via index sidecar files on S3/HTTP, fetches individual
@@ -99,6 +109,17 @@ pub struct GribEngine {
     /// Index files already downloaded and parsed (by S3 path). Avoids
     /// re-downloading unchanged index files on every poll cycle.
     known_indexes: Mutex<HashSet<String>>,
+    /// Run prefixes that have been fully listed in a previous scan and are no
+    /// longer the newest run. Listing a run prefix returns *all* its (often
+    /// hundreds of) step files; once a newer run exists, an older run is
+    /// static (NWP runs publish sequentially), so we skip re-listing it. Only
+    /// unknown prefixes (new/not-yet-published runs) and the single newest
+    /// known run are listed each scan. See `scan_once`.
+    settled_prefixes: Mutex<HashSet<String>>,
+    /// When the last full re-list (ignoring `settled_prefixes`) ran. `None`
+    /// until the first scan. Drives the periodic re-validation in `scan_once`
+    /// (see [`SETTLED_REVALIDATE_INTERVAL`]).
+    last_full_scan: Mutex<Option<Instant>>,
     /// Which index file format this collection uses.
     index_format: index::IndexFormat,
     /// Parameter metadata cache keyed by short name. Populated lazily on
@@ -177,6 +198,8 @@ impl GribEngine {
             shutdown_tx,
             param_filter: config.parameters.clone(),
             known_indexes: Mutex::new(HashSet::new()),
+            settled_prefixes: Mutex::new(HashSet::new()),
+            last_full_scan: Mutex::new(None),
             index_format,
             param_meta: RwLock::new(HashMap::new()),
         };
@@ -260,11 +283,37 @@ impl GribEngine {
         let mut all_index_paths: Vec<ds_storage::object_store::path::Path> = Vec::new();
         let mut runs_with_hits = 0usize;
         let mut listed_prefixes = 0usize;
+        let mut skipped_settled = 0usize;
+        // Run prefixes we've already fully scanned and that are no longer the
+        // newest run are "settled": NWP runs publish sequentially, so an older
+        // run is static and re-listing its hundreds of step files every poll is
+        // wasted work (and wasted `block_in_place` round-trips — #221). We skip
+        // them and only list unknown prefixes (new / not-yet-published runs)
+        // plus the newest run still gaining steps. Prefixes with hits this scan
+        // are collected newest-first; after the loop all but the newest are
+        // settled.
+        // Periodically force a full re-list so late/corrected step files added
+        // to an already-settled run are still picked up (bounded by
+        // SETTLED_REVALIDATE_INTERVAL).
+        // Only *read* the timer here; reset it after the listing pass actually
+        // succeeds, so an S3 outage (every list errors) doesn't reset the clock
+        // and suppress re-validation for another full interval.
+        let force_full = self
+            .last_full_scan
+            .lock()
+            .unwrap()
+            .is_none_or(|t| t.elapsed() >= SETTLED_REVALIDATE_INTERVAL);
+        let settled_snapshot = self.settled_prefixes.lock().unwrap().clone();
+        let mut listed_with_hits: Vec<String> = Vec::new();
         for (_ref_time, prefix) in &prefixes {
             if let Some(budget) = scan_budget {
                 if runs_with_hits >= budget {
                     break;
                 }
+            }
+            if !force_full && settled_snapshot.contains(prefix) {
+                skipped_settled += 1;
+                continue;
             }
             listed_prefixes += 1;
             let obj_prefix = ds_storage::object_store::path::Path::from(prefix.as_str());
@@ -296,13 +345,39 @@ impl GribEngine {
             }
             if hits_in_this_prefix > 0 {
                 runs_with_hits += 1;
+                listed_with_hits.push(prefix.clone());
             }
         }
+
+        // Settle every run we listed with hits except the newest (first in the
+        // newest-first iteration order), which may still be gaining steps.
+        // Prune the settled set to the current scan window so it cannot grow
+        // unbounded as old runs age out (and so a prefix that ever reappears is
+        // rescanned).
+        {
+            let window: HashSet<&str> = prefixes.iter().map(|(_, p)| p.as_str()).collect();
+            let mut settled = self.settled_prefixes.lock().unwrap();
+            settle_completed_runs(&mut settled, &listed_with_hits, &window);
+        }
+
+        // Reset the re-validation clock after a forced full pass. The clock
+        // only *paces* a best-effort hourly re-list of settled runs to catch
+        // late/corrected steps; it is intentionally not conditioned on per-
+        // prefix list success. A transient outage during the one forced scan
+        // in an interval simply defers re-validation to the next interval —
+        // harmless, because the newest (unsettled) run is still listed every
+        // poll regardless. (Conditioning the reset on "no list errors" instead
+        // lets a single chronically-unreachable prefix pin force_full on
+        // forever, defeating the settled-skip optimization entirely.)
+        if force_full {
+            *self.last_full_scan.lock().unwrap() = Some(Instant::now());
+        }
         tracing::debug!(
-            "Collection '{}': listed {}/{} prefixes, {} runs produced hits, {} candidate index files",
+            "Collection '{}': listed {}/{} prefixes ({} settled, skipped), {} runs produced hits, {} candidate index files",
             self.collection_id,
             listed_prefixes,
             prefixes.len(),
+            skipped_settled,
             runs_with_hits,
             all_index_paths.len()
         );
@@ -1318,9 +1393,104 @@ fn build_scan_prefixes(
     out
 }
 
+/// Update the set of "settled" run prefixes after a scan.
+///
+/// `listed_with_hits_newest_first` are the run prefixes that produced index
+/// files this scan, **ordered newest-first** — this ordering is load-bearing:
+/// the first element is treated as the still-active newest run and left
+/// unsettled, every other element is marked settled. (NWP runs publish
+/// sequentially, so once a newer run exists an older one is static and need not
+/// be re-listed; the newest stays unsettled so its still-trickling steps keep
+/// being picked up.) The caller derives the order from `build_scan_prefixes`,
+/// which sorts `Reverse` by ref-time. `window` is the current scan window;
+/// settled prefixes outside it are pruned so the set cannot grow unbounded as
+/// old runs age out.
+fn settle_completed_runs(
+    settled: &mut HashSet<String>,
+    listed_with_hits_newest_first: &[String],
+    window: &HashSet<&str>,
+) {
+    for prefix in listed_with_hits_newest_first.iter().skip(1) {
+        settled.insert(prefix.clone());
+    }
+    settled.retain(|p| window.contains(p.as_str()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn win<'a>(prefixes: &'a [&'a str]) -> HashSet<&'a str> {
+        prefixes.iter().copied().collect()
+    }
+
+    #[test]
+    fn settle_keeps_newest_unsettled() {
+        // First scan lists three runs (newest-first); the two older ones settle,
+        // the newest stays unsettled so its trickling steps keep being scanned.
+        let mut settled = HashSet::new();
+        let listed = [
+            "runN".to_string(),
+            "runN-1".to_string(),
+            "runN-2".to_string(),
+        ];
+        settle_completed_runs(&mut settled, &listed, &win(&["runN", "runN-1", "runN-2"]));
+        assert!(!settled.contains("runN"), "newest run must not be settled");
+        assert!(settled.contains("runN-1"));
+        assert!(settled.contains("runN-2"));
+    }
+
+    #[test]
+    fn settle_evolves_when_new_run_appears() {
+        // Scan 1: runs N-1..N-3 published; N-2/N-3 settle, N-1 newest.
+        let mut settled = HashSet::new();
+        let window = win(&["runN-1", "runN-2", "runN-3"]);
+        settle_completed_runs(
+            &mut settled,
+            &[
+                "runN-1".to_string(),
+                "runN-2".to_string(),
+                "runN-3".to_string(),
+            ],
+            &window,
+        );
+        assert_eq!(
+            settled,
+            ["runN-2", "runN-3"].iter().map(|s| s.to_string()).collect()
+        );
+
+        // Scan 2: nothing new; only the unsettled newest (N-1) was listed.
+        settle_completed_runs(&mut settled, &["runN-1".to_string()], &window);
+        assert!(
+            !settled.contains("runN-1"),
+            "newest still re-listed, not settled"
+        );
+
+        // Scan 3: new run N appears; both N (new) and N-1 (was newest) were
+        // listed → N-1 now settles, N becomes the newest unsettled run.
+        let window3 = win(&["runN", "runN-1", "runN-2", "runN-3"]);
+        settle_completed_runs(
+            &mut settled,
+            &["runN".to_string(), "runN-1".to_string()],
+            &window3,
+        );
+        assert!(
+            !settled.contains("runN"),
+            "new newest run must stay unsettled"
+        );
+        assert!(settled.contains("runN-1"), "previous newest now settled");
+    }
+
+    #[test]
+    fn settle_prunes_out_of_window_prefixes() {
+        // Aged-out prefixes drop from the settled set so it can't grow forever.
+        let mut settled: HashSet<String> = ["old1", "old2", "runN-1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        settle_completed_runs(&mut settled, &[], &win(&["runN", "runN-1"]));
+        assert_eq!(settled, ["runN-1"].iter().map(|s| s.to_string()).collect());
+    }
 
     #[test]
     fn test_parse_coords_point() {
