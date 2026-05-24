@@ -1392,19 +1392,22 @@ fn build_scan_prefixes(
 
 /// Update the set of "settled" run prefixes after a scan.
 ///
-/// `listed_with_hits` are the run prefixes that produced index files this scan,
-/// in newest-first order. Every one except the newest is marked settled (NWP
-/// runs publish sequentially, so once a newer run exists an older one is static
-/// and need not be re-listed). The newest is left unsettled so its still-
-/// trickling steps keep being picked up. `window` is the current scan window;
+/// `listed_with_hits_newest_first` are the run prefixes that produced index
+/// files this scan, **ordered newest-first** — this ordering is load-bearing:
+/// the first element is treated as the still-active newest run and left
+/// unsettled, every other element is marked settled. (NWP runs publish
+/// sequentially, so once a newer run exists an older one is static and need not
+/// be re-listed; the newest stays unsettled so its still-trickling steps keep
+/// being picked up.) The caller derives the order from `build_scan_prefixes`,
+/// which sorts `Reverse` by ref-time. `window` is the current scan window;
 /// settled prefixes outside it are pruned so the set cannot grow unbounded as
 /// old runs age out.
 fn settle_completed_runs(
     settled: &mut HashSet<String>,
-    listed_with_hits: &[String],
+    listed_with_hits_newest_first: &[String],
     window: &HashSet<&str>,
 ) {
-    for prefix in listed_with_hits.iter().skip(1) {
+    for prefix in listed_with_hits_newest_first.iter().skip(1) {
         settled.insert(prefix.clone());
     }
     settled.retain(|p| window.contains(p.as_str()));
