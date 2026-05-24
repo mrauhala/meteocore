@@ -75,6 +75,29 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 4. Add the crate as a dependency of `crates/server/Cargo.toml`
 5. Add a match arm for the new `engine_type` in `server/src/main.rs`
 6. Wire it into the appropriate registries based on the collection's `apis` config
+7. **Obey the Engine Performance & Concurrency Rules below** — especially: the poll loop must `spawn_blocking`, and the render/decode path must not project per output pixel.
+
+## Engine Performance & Concurrency Rules
+
+Hard-won from production incidents (epic #201; spike investigation #221/#222). These are *generic* — apply them to every engine and rendering feature, not just the ones where they were found.
+
+### Concurrency / the shared Tokio runtime
+
+- **Poll/scan loops must not block the request-serving runtime.** All engines share ONE multi-thread Tokio runtime (worker count ≈ CPU cores) for the HTTP handlers; a `poll_loop`/`scan_once`/`poll_once` that does blocking I/O directly on a worker thread parks that worker for the whole operation, and when several collections' polls overlap the pool starves and **every** collection's requests spike — periodic multi-second p99 even at low load (#221, #208). **The mechanism in use: run all poll loops on the dedicated background runtime (`poll_runtime()` in `server/src/main.rs`), never the main one** — so their blocking parks background threads, not request workers. A blocking scan *may* additionally be wrapped in `tokio::task::spawn_blocking` (the ODIM engine does for its HDF5 scan) — but **not** when it calls `ds-storage`, whose `block_in_place` (below) *panics* on a `spawn_blocking` pool thread; that panic is exactly why poll isolation uses a separate runtime rather than `spawn_blocking`. Note: as of this writing the grib (`scan_once` inside `poll_loop`), geotiff and querydata (`poll_once`) bodies still do their blocking I/O directly and are made safe only by running on the background runtime — they are *not* individually converted to `spawn_blocking` (#221).
+- **`ds-storage` (`DataStore`) is a *sync* bridge over async object_store.** Its methods call `block_in_place(|| handle.block_on(..))` when a runtime handle exists, and **construct a brand-new `Runtime` when one does not** (`crates/storage/src/lib.rs`). `block_in_place` is only valid on a multi-thread-runtime *worker* thread — it panics on a `spawn_blocking` pool thread. So: (a) call `DataStore` from the background poll runtime (or another dedicated runtime), never from a request-handler task (parks a request worker) and never wrapped in `spawn_blocking` (panics); (b) never call it from a non-Tokio thread such as a **rayon** pool — that hits the `Runtime::new()`-per-call fallback (#222). If you need parallel remote fetches, use async concurrency (`join_all`) on the runtime, or pass a `Handle` into the worker, not rayon + `DataStore`.
+- **N sequential blocking network calls multiply the stall.** The grib new-run probe did up to 32 sequential byte-range reads on one thread (~seconds). Batch/parallelise (bounded) or cap per cycle; never loop blocking I/O.
+- **Background metadata refresh must not contend with request serving.** Discovering new data (S3 LIST, STAC HTTP, GRIB index, COG header) is background work — keep it off the request-serving worker threads.
+
+### Rendering / raster
+
+- **Never project per output pixel.** The CRS forward transform (≈ a dozen transcendental ops for TM/LAEA/LCC/Stereographic) dominates render cost. Evaluate the projection on a coarse, curvature-adaptive grid and bilinearly interpolate the output→source pixel map (`engine-geotiff/src/resample.rs` is the reference; #203). Per-pixel projection was a ~10× regression.
+- **A cache only helps if its key matches the access pattern.** The rendered-image cache keyed on exact bbox+width+height gets ~3% hits for fullscreen arbitrary-viewport WMS — pure wasted RAM (#202). Cache at a granularity that actually repeats (tile-aligned), or don't allocate the cache.
+- **Decode to compact native types, not `Vec<Option<f64>>`.** Boxing every sample to `Option<f64>` is a 16× memory blowup and allocator churn; carry native ints with a nodata sentinel (#206). Wire up the typed fast paths you build (e.g. `IntegerLutColorMap`, #207) instead of leaving them dead.
+
+### Hot-path discipline
+
+- **Capability/metadata accessors used per request must be O(1) from a snapshot** (`ArcSwap`/`RwLock` read), never recompute or allocate per call (e.g. `raster_info()` cloning all timestamps — #211).
+- **Before blaming a mechanism for a latency spike, check the magnitude adds up.** A 2.3 MB local read from page cache is ~tens of ms, not seconds; multi-second stalls at low load almost always mean *blocking/contention* (a parked runtime worker, a held lock, sequential network calls), not extra CPU.
 
 ## Adding a New API Endpoint
 
