@@ -8,6 +8,7 @@ pub mod wgrib2_index;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Datelike, Utc};
@@ -81,6 +82,15 @@ const DEFAULT_RUN_HOURS: &[u32] = &[0, 6, 12, 18];
 /// Number of days to scan back (today + yesterday handles overnight transitions).
 const SCAN_DAYS: u32 = 2;
 
+/// How often to force a full re-list of all run prefixes, ignoring the settled
+/// skip. NWP runs publish sequentially so older runs are normally static, but a
+/// provider can append late/corrected step files to an already-scanned run; a
+/// periodic full scan catches those new paths within this bound while still
+/// skipping the per-poll re-list the rest of the time. (Same-key content
+/// rewrites of an existing index file are a separate, pre-existing limitation
+/// of the path-keyed `known_indexes` dedup, not addressed here.)
+const SETTLED_REVALIDATE_INTERVAL: Duration = Duration::from_secs(3600);
+
 /// Engine for serving GRIB2 NWP forecast data.
 ///
 /// Discovers GRIB files via index sidecar files on S3/HTTP, fetches individual
@@ -106,6 +116,10 @@ pub struct GribEngine {
     /// unknown prefixes (new/not-yet-published runs) and the single newest
     /// known run are listed each scan. See `scan_once`.
     settled_prefixes: Mutex<HashSet<String>>,
+    /// When the last full re-list (ignoring `settled_prefixes`) ran. `None`
+    /// until the first scan. Drives the periodic re-validation in `scan_once`
+    /// (see [`SETTLED_REVALIDATE_INTERVAL`]).
+    last_full_scan: Mutex<Option<Instant>>,
     /// Which index file format this collection uses.
     index_format: index::IndexFormat,
     /// Parameter metadata cache keyed by short name. Populated lazily on
@@ -185,6 +199,7 @@ impl GribEngine {
             param_filter: config.parameters.clone(),
             known_indexes: Mutex::new(HashSet::new()),
             settled_prefixes: Mutex::new(HashSet::new()),
+            last_full_scan: Mutex::new(None),
             index_format,
             param_meta: RwLock::new(HashMap::new()),
         };
@@ -277,6 +292,17 @@ impl GribEngine {
         // plus the newest run still gaining steps. Prefixes with hits this scan
         // are collected newest-first; after the loop all but the newest are
         // settled.
+        // Periodically force a full re-list so late/corrected step files added
+        // to an already-settled run are still picked up (bounded by
+        // SETTLED_REVALIDATE_INTERVAL).
+        let force_full = {
+            let mut last = self.last_full_scan.lock().unwrap();
+            let due = last.is_none_or(|t| t.elapsed() >= SETTLED_REVALIDATE_INTERVAL);
+            if due {
+                *last = Some(Instant::now());
+            }
+            due
+        };
         let settled_snapshot = self.settled_prefixes.lock().unwrap().clone();
         let mut listed_with_hits: Vec<String> = Vec::new();
         for (_ref_time, prefix) in &prefixes {
@@ -285,7 +311,7 @@ impl GribEngine {
                     break;
                 }
             }
-            if settled_snapshot.contains(prefix) {
+            if !force_full && settled_snapshot.contains(prefix) {
                 skipped_settled += 1;
                 continue;
             }

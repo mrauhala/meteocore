@@ -14,11 +14,24 @@ use std::sync::{Arc, OnceLock, RwLock};
 /// path. `block_in_place` still works here because this is a multi-thread
 /// runtime; it would panic on a `spawn_blocking` pool thread, which is why we
 /// use a separate runtime rather than wrapping the sync scan in `spawn_blocking`.
+///
+/// The runtime lives in a `OnceLock` for the whole process. On exit it is
+/// leaked (statics are not dropped), so poll tasks are aborted rather than
+/// drained — which is safe here: a poll only reads the (read-only) data store
+/// and swaps an in-memory `ArcSwap` catalog atomically, so an aborted scan
+/// leaves no partial or corrupt state and the catalog is simply rebuilt on the
+/// next start. Poll loops also observe the per-engine shutdown watch channel
+/// and exit their `select!` cleanly when signalled before exit.
+///
+/// `worker_threads(4)` gives headroom so several collections polling at once
+/// (or a reload spawning fresh loops while old scans are still blocked) don't
+/// serialise on too few threads; `block_in_place` additionally lets Tokio spin
+/// up temporary replacement workers while a poll blocks.
 pub(crate) fn poll_runtime() -> &'static tokio::runtime::Handle {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(4)
             .thread_name("mc-poll")
             .enable_all()
             .build()
