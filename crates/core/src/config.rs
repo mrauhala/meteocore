@@ -25,6 +25,15 @@ pub struct ServerSettings {
     /// Resolved relative to the parent directory of the main config file.
     /// Each file defines one collection using `CollectionConfig` fields directly.
     pub collections_dir: Option<String>,
+    /// Size in MB of the global Web Mercator meta-tile (decoded-RGBA) cache
+    /// (#202). A single server-wide cache, not per-collection. Currently
+    /// consumed only by the WMS GetMap path; api-maps/api-tiles still render
+    /// directly and would share this same cache once meta-tiling is extended to
+    /// them (follow-up). Default: 1024. Set to `0` to disable meta-tiling
+    /// entirely (the EPSG:3857 GetMap path reverts to a direct single-shot
+    /// render), reversible via config reload.
+    #[serde(default = "default_metatile_cache_mb")]
+    pub metatile_cache_mb: u64,
 }
 
 impl ServerSettings {
@@ -106,14 +115,12 @@ pub struct WmsConfig {
     #[serde(default)]
     pub parameters: Vec<WmsParameterConfig>,
     /// Rendered image cache size in MB. Default: 128.
+    ///
+    /// NOTE: like the meta-tile cache, this is actually a *global* shared cache,
+    /// not per-collection; it lives here for backward compatibility. New global
+    /// cache knobs (e.g. `[server] metatile_cache_mb`) go under `[server]`.
     #[serde(default = "default_rendered_cache_mb")]
     pub rendered_cache_mb: u64,
-    /// Meta-tile pixel cache size in MB (decoded 256×256 RGBA tiles shared by
-    /// the Web Mercator WMS meta-tiling path, #202). Default: 1024. Set to `0`
-    /// to disable meta-tiling entirely (kill switch): the Web Mercator GetMap
-    /// path reverts to a direct single-shot render, reversible via config reload.
-    #[serde(default = "default_metatile_cache_mb")]
-    pub metatile_cache_mb: u64,
 }
 
 /// Per-parameter default colormap configuration for WMS.
