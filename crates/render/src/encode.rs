@@ -77,8 +77,19 @@ pub fn encode_jpeg(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Data
 
 /// Encode an RGBA buffer to WebP bytes.
 ///
-/// Uses lossy encoding with quality 80 for a good size/quality tradeoff.
+/// Uses lossless encoding. Our raster output is colormapped radar/NWP tiles:
+/// hard class boundaries drawn from a small palette. Lossy WebP introduces
+/// ringing around those edges and can shift pixels off the palette, which
+/// effectively corrupts the encoded data values. Lossless preserves every
+/// pixel exactly while still compressing the limited palette well.
 /// WebP supports alpha channel natively, so no transparency compositing needed.
+///
+/// We set libwebp's `exact` flag so the RGB channels are preserved even under
+/// fully transparent (alpha == 0) pixels. By default libwebp's lossless mode
+/// rewrites the RGB of transparent regions to improve compression, which would
+/// make the output not byte-exact. For nodata pixels the RGB is irrelevant to
+/// the viewer, but keeping the encode truly exact avoids surprises and keeps
+/// the round-trip guarantee unconditional.
 pub fn encode_webp(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, DataServerError> {
     let expected_len = (width * height * 4) as usize;
     if rgba.len() != expected_len {
@@ -92,7 +103,26 @@ pub fn encode_webp(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Data
     }
 
     let encoder = webp::Encoder::from_rgba(rgba, width, height);
-    let memory = encoder.encode(80.0);
+
+    // Mirror `Encoder::encode_lossless()` but enable `exact` to keep transparent
+    // pixels' RGB intact. `WebPConfig::new()` only fails if libwebp's version
+    // doesn't match the header — treat that as a render error rather than panic.
+    //
+    // `WebPConfig::new()` uses the default preset, which leaves `method = 4`
+    // (a lossy-oriented effort level). `encode_lossless()` applies the lossless
+    // preset which sets `method = 0` (fastest lossless encoder); we replicate
+    // that here so we don't pay extra encode latency under the render semaphore.
+    let mut config = webp::WebPConfig::new()
+        .map_err(|()| DataServerError::Render("WebP config init failed".to_string()))?;
+    config.lossless = 1;
+    config.method = 0;
+    config.alpha_compression = 0;
+    config.quality = 75.0;
+    config.exact = 1;
+
+    let memory = encoder
+        .encode_advanced(&config)
+        .map_err(|e| DataServerError::Render(format!("WebP encode error: {e:?}")))?;
     Ok(memory.to_vec())
 }
 
@@ -134,6 +164,50 @@ mod tests {
         // WebP files start with RIFF header
         assert_eq!(&bytes[..4], b"RIFF");
         assert_eq!(&bytes[8..12], b"WEBP");
+    }
+
+    #[test]
+    fn test_encode_webp_lossless_roundtrip() {
+        // 4x4 RGBA with sharp edges, distinct per-channel values, and varied
+        // alpha (incl. a non-opaque pixel) so the decoder takes the RGBA path.
+        // Lossy WebP would shift these values; lossless must reproduce them
+        // byte-for-byte.
+        let width = 4u32;
+        let height = 4u32;
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                if x == 0 && y == 0 {
+                    // Fully transparent pixel with NON-ZERO RGB: proves the
+                    // RGB channels survive even where alpha == 0. A lossy (or
+                    // alpha-discarding) codec would not reproduce (200,100,50,0).
+                    rgba.extend_from_slice(&[200, 100, 50, 0]);
+                    continue;
+                }
+                let r = (x * 60) as u8;
+                let g = (y * 60) as u8;
+                let b = ((x + y) * 30) as u8;
+                // Hard edge: half opaque.
+                let a = if (x + y) % 2 == 0 { 128 } else { 255 };
+                rgba.extend_from_slice(&[r, g, b, a]);
+            }
+        }
+
+        let bytes = encode_webp(&rgba, width, height).expect("encode should succeed");
+
+        let decoded = webp::Decoder::new(&bytes)
+            .decode()
+            .expect("encoded WebP should decode");
+        assert_eq!(decoded.width(), width);
+        assert_eq!(decoded.height(), height);
+        assert!(decoded.is_alpha(), "decoded image should retain alpha");
+
+        // WebPImage derefs to its raw RGBA bytes.
+        assert_eq!(
+            &*decoded,
+            rgba.as_slice(),
+            "lossless WebP must reproduce the input RGBA exactly"
+        );
     }
 
     #[test]
