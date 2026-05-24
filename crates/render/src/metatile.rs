@@ -83,8 +83,15 @@ fn level_res(level: i32) -> f64 {
 
 /// Snap a ground resolution to the finest half-octave ladder level whose
 /// resolution is still ≤ `res` (i.e. never coarser → the mosaic is downsampled,
-/// never upscaled). A small epsilon makes an exact standard-zoom resolution snap
-/// to its even level instead of one step finer.
+/// never upscaled).
+///
+/// A small epsilon (`1e-6` in log2 space) makes an *exact* standard-zoom
+/// resolution snap to its own level instead of one step finer — without it,
+/// floating-point noise would round every discrete-zoom request up a half-octave
+/// and force a needless 1.41× over-render. The bounded cost: a resolution that
+/// falls *just below* a step, within the epsilon band, can snap down to it and
+/// upscale by at most `2^(5e-7) ≈ 1.0000003×` (sub-nanometre per pixel) — visually
+/// nil, and well worth avoiding the per-request over-render.
 ///
 /// Clamped at the **low** end to level 0 (`Z0_RES`, the whole world in one tile);
 /// a request coarser than that still downsamples, so 0 is safe. The **high** end
@@ -350,7 +357,11 @@ where
     let to_global_x = |x_m: f64| (x_m + ORIGIN) / span * TILE_PX as f64;
     let to_global_y = |y_m: f64| (ORIGIN - y_m) / span * TILE_PX as f64;
 
-    let mut out = vec![0u8; (width * height * 4) as usize];
+    // usize arithmetic throughout: `width * height * 4` overflows `u32` past
+    // ~46 340 px/side. Callers must keep `width * height` within a sane bound
+    // (the WMS handler enforces MAX_MAP_PIXELS = 64M, MAX_MAP_DIMENSION = 8000).
+    let (w_us, h_us) = (width as usize, height as usize);
+    let mut out = vec![0u8; w_us * h_us * 4];
     for py in 0..height {
         let y_m = north_m - (py as f64 + 0.5) * res_y;
         let gy = to_global_y(y_m);
@@ -358,7 +369,7 @@ where
             let x_m = west_m + (px as f64 + 0.5) * res_x;
             let gx = to_global_x(x_m);
             let rgba = sample_bilinear(&tiles, gx, gy);
-            let o = ((py * width + px) * 4) as usize;
+            let o = (py as usize * w_us + px as usize) * 4;
             out[o..o + 4].copy_from_slice(&rgba);
         }
     }
@@ -463,8 +474,9 @@ mod tests {
 
     #[test]
     fn snap_never_upscales_and_is_bounded() {
-        // For a resolution between zoom 8 and 9, the chosen level must be finer
-        // (≤ res) and at most one half-octave finer than the floor.
+        // For a resolution well between zoom 8 and 9 (outside the snap_level
+        // epsilon band — see its doc for the bounded ~2^(5e-7) exception), the
+        // chosen level must be finer (≤ res) and at most one half-octave finer.
         let res8 = Z0_RES / 2f64.powi(8);
         let res9 = Z0_RES / 2f64.powi(9);
         let res = (res8 + res9) / 2.0; // between two standard zooms
