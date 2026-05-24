@@ -235,7 +235,10 @@ pub async fn wms_handler(
             let elevation = params.elevation;
             let z_q = elevation.map(ds_render::quantize_z);
             let layer = params.layer.clone();
-            let style = params.style.clone();
+            // Key meta-tiles on the *resolved* style name, not the raw STYLES
+            // param: `STYLES=` (empty → default) and `STYLES=default` resolve to
+            // the same StyleInfo, so they must share cached tiles.
+            let style = style_info.name.clone();
             let rendered_cache = state.rendered_cache.clone();
             let tile_cache = state.tile_cache.clone();
 
@@ -278,6 +281,9 @@ pub async fn wms_handler(
                             time,
                             z: z_q,
                         };
+                        // `bbox` is in WGS84 degrees here — the params layer
+                        // converts EPSG:3857 metres to degrees before this point;
+                        // render_metatiled re-projects back to metres internally.
                         let outcome = ds_render::render_metatiled(
                             bbox,
                             width,

@@ -119,14 +119,14 @@ pub struct TileKey {
     row: i64,
 }
 
-/// A cached tile's decoded, colorized pixels: `TILE_PX × TILE_PX × 4` RGBA.
+/// A cached tile's decoded, colorized pixels. `Some` holds the
+/// `TILE_PX × TILE_PX × 4` RGBA buffer; `None` marks an all-nodata tile, cached
+/// as a lightweight marker so a sparse extent (e.g. radar outside coverage) is
+/// neither re-decoded on every request nor allowed to crowd the cache with
+/// 256 KB zero buffers. A `None` marker is still a cache *hit*.
 #[derive(Clone)]
 pub struct CachedTilePixels {
-    rgba: Arc<[u8]>,
-    /// Whether the tile has any non-nodata pixels. Lets an all-transparent
-    /// region take the [`MetaTile::Empty`] fast path even when every covering
-    /// tile is a cache hit.
-    has_data: bool,
+    rgba: Option<Arc<[u8]>>,
 }
 
 #[derive(Clone)]
@@ -134,8 +134,9 @@ struct TilePixelWeighter;
 
 impl quick_cache::Weighter<TileKey, CachedTilePixels> for TilePixelWeighter {
     fn weight(&self, key: &TileKey, val: &CachedTilePixels) -> u64 {
-        // Pixel bytes + a flat allowance for the owned key strings + node overhead.
-        val.rgba.len() as u64
+        // Pixel bytes (zero for a nodata marker) + a flat allowance for the
+        // owned key strings + node overhead.
+        val.rgba.as_ref().map_or(0, |r| r.len()) as u64
             + key.layer.len() as u64
             + key.parameter.as_ref().map_or(0, String::len) as u64
             + key.style.len() as u64
@@ -266,8 +267,9 @@ where
         return Ok(MetaTile::Fallback);
     }
 
-    // Render or fetch each covering tile's RGBA pixels.
-    let mut tiles: HashMap<(i64, i64), Arc<[u8]>> = HashMap::with_capacity(ncols * nrows);
+    // Render or fetch each covering tile's RGBA pixels. `None` = an all-nodata
+    // tile (cached as a marker, drawn transparent at assembly time).
+    let mut tiles: HashMap<(i64, i64), Option<Arc<[u8]>>> = HashMap::with_capacity(ncols * nrows);
     let mut any_data = false;
     for row in row0..=row1 {
         for col in col0..=col1 {
@@ -283,7 +285,7 @@ where
             };
             let rgba = if let Some(c) = cache.cache.get(&key) {
                 cache.hits.fetch_add(1, Ordering::Relaxed);
-                any_data |= c.has_data;
+                any_data |= c.rgba.is_some();
                 c.rgba
             } else {
                 cache.misses.fetch_add(1, Ordering::Relaxed);
@@ -299,21 +301,24 @@ where
                     y_to_lat(ty_top),
                 ];
                 let tile = render_tile(tbbox, TILE_PX, TILE_PX)?;
-                let has_data = !tile.is_empty();
-                let rgba: Arc<[u8]> = if has_data {
-                    any_data = true;
-                    Arc::from(colorize(&tile, colormap).into_boxed_slice())
+                // All-nodata tiles are cached as a `None` marker: cheap to store
+                // (no 256 KB buffer) yet still a cache hit, so a sparse extent is
+                // not re-decoded every request nor crowds out real-data tiles.
+                let entry: Option<Arc<[u8]>> = if tile.is_empty() {
+                    None
                 } else {
-                    Arc::from(vec![0u8; (TILE_PX * TILE_PX * 4) as usize].into_boxed_slice())
+                    any_data = true;
+                    Some(Arc::<[u8]>::from(
+                        colorize(&tile, colormap).into_boxed_slice(),
+                    ))
                 };
                 cache.cache.insert(
                     key,
                     CachedTilePixels {
-                        rgba: rgba.clone(),
-                        has_data,
+                        rgba: entry.clone(),
                     },
                 );
-                rgba
+                entry
             };
             tiles.insert((col, row), rgba);
         }
@@ -356,24 +361,26 @@ where
 /// Fetch one global tile-pixel (nearest) from the covering set; transparent if
 /// the pixel falls outside the rendered tiles (only possible ≤1px past an edge).
 #[inline]
-fn global_pixel(tiles: &HashMap<(i64, i64), Arc<[u8]>>, xi: i64, yi: i64) -> [u8; 4] {
+fn global_pixel(tiles: &HashMap<(i64, i64), Option<Arc<[u8]>>>, xi: i64, yi: i64) -> [u8; 4] {
     let col = xi.div_euclid(TILE_PX as i64);
     let row = yi.div_euclid(TILE_PX as i64);
     let lx = xi.rem_euclid(TILE_PX as i64) as usize;
     let ly = yi.rem_euclid(TILE_PX as i64) as usize;
     match tiles.get(&(col, row)) {
-        Some(rgba) => {
+        // Present with data; nodata markers (`Some(None)`) and absent tiles
+        // (≤1px past an edge) are transparent.
+        Some(Some(rgba)) => {
             let o = (ly * TILE_PX as usize + lx) * 4;
             [rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3]]
         }
-        None => [0, 0, 0, 0],
+        _ => [0, 0, 0, 0],
     }
 }
 
 /// Premultiplied-alpha bilinear sample of the mosaic at global tile-pixel
 /// coordinates `(gx, gy)` (pixel centres at integer + 0.5).
 #[inline]
-fn sample_bilinear(tiles: &HashMap<(i64, i64), Arc<[u8]>>, gx: f64, gy: f64) -> [u8; 4] {
+fn sample_bilinear(tiles: &HashMap<(i64, i64), Option<Arc<[u8]>>>, gx: f64, gy: f64) -> [u8; 4] {
     let fx = gx - 0.5;
     let fy = gy - 0.5;
     let x0 = fx.floor();

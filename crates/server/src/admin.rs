@@ -1417,13 +1417,16 @@ pub fn load_collections(
         .next()
         .unwrap_or(128);
 
-    // Meta-tile pixel cache size (#202) — same selection rule as above.
+    // Meta-tile pixel cache size (#202). Take the MINIMUM across WMS
+    // collections (not the first) so the `metatile_cache_mb = 0` kill switch
+    // wins if any collection sets it — the cache is global, so one collection
+    // must be able to disable meta-tiling server-wide.
     let metatile_cache_mb = map_collections
         .values()
         .chain(maps_collections.values())
         .filter_map(|c| c.wms.as_ref())
         .map(|w| w.metatile_cache_mb)
-        .next()
+        .min()
         .unwrap_or(512);
 
     // 2× cores (min 8) — the render slot's "ownership" of a CPU is loose
