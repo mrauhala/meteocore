@@ -7,7 +7,7 @@ pub use colormap::{
     LutColorMap,
 };
 pub use encode::{encode_jpeg, encode_png, encode_webp};
-pub use metatile::{render_metatiled, MetaTile, TileKeyPrefix, TilePixelCache};
+pub use metatile::{render_metatiled, MetaTile, MetaTileStats, TileKeyPrefix, TilePixelCache};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

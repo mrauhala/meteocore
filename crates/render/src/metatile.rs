@@ -33,6 +33,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use quick_cache::sync::Cache;
@@ -208,10 +209,31 @@ impl TilePixelCache {
     }
 }
 
+/// Per-render phase timing, returned with [`MetaTile::Image`] so the caller can
+/// log where a slow render spent its time (the framework-free render layer can't
+/// log itself). Times are wall-clock milliseconds.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MetaTileStats {
+    /// Covering tiles for this request.
+    pub tiles: u32,
+    /// Of those, how many were cache misses (rendered via the engine closure).
+    pub misses: u32,
+    /// Time in the tile loop — engine `get_raster_tile` (file read + decode +
+    /// reproject) plus colorize, for the `misses`. Cache hits are ~free.
+    pub tile_render_ms: u64,
+    /// Time assembling the mosaic into the output (premultiplied bilinear).
+    pub assemble_ms: u64,
+    /// Time encoding the final image (PNG/JPEG/WebP).
+    pub encode_ms: u64,
+}
+
 /// Outcome of a meta-tiled render.
 pub enum MetaTile {
-    /// Assembled, encoded image bytes in the requested format.
-    Image(Vec<u8>),
+    /// Assembled, encoded image bytes in the requested format, plus phase timing.
+    Image {
+        bytes: Vec<u8>,
+        stats: MetaTileStats,
+    },
     /// Every covered pixel is nodata — the caller should emit its own
     /// transparent tile (matching the existing all-nodata fast path).
     Empty,
@@ -291,6 +313,8 @@ where
     // tile (cached as a marker, drawn transparent at assembly time).
     let mut tiles: HashMap<(i64, i64), Option<Arc<[u8]>>> = HashMap::with_capacity(ncols * nrows);
     let mut any_data = false;
+    let mut misses: u32 = 0;
+    let t_render = Instant::now();
     for row in row0..=row1 {
         for col in col0..=col1 {
             let key = TileKey {
@@ -309,6 +333,7 @@ where
                 c.rgba
             } else {
                 cache.misses.fetch_add(1, Ordering::Relaxed);
+                misses += 1;
                 // Tile bbox in metres → WGS84 degrees for the engine call.
                 let tx0 = -ORIGIN + col as f64 * span;
                 let tx1 = tx0 + span;
@@ -343,6 +368,7 @@ where
             tiles.insert((col, row), rgba);
         }
     }
+    let tile_render_ms = t_render.elapsed().as_millis() as u64;
 
     if !any_data {
         return Ok(MetaTile::Empty);
@@ -361,6 +387,7 @@ where
     // ~46 340 px/side. Callers must keep `width * height` within a sane bound
     // (the WMS handler enforces MAX_MAP_PIXELS = 64M, MAX_MAP_DIMENSION = 8000).
     let (w_us, h_us) = (width as usize, height as usize);
+    let t_assemble = Instant::now();
     let mut out = vec![0u8; w_us * h_us * 4];
     for py in 0..height {
         let y_m = north_m - (py as f64 + 0.5) * res_y;
@@ -373,13 +400,25 @@ where
             out[o..o + 4].copy_from_slice(&rgba);
         }
     }
+    let assemble_ms = t_assemble.elapsed().as_millis() as u64;
 
+    let t_encode = Instant::now();
     let bytes = match format {
         ImageFormat::Png => crate::encode_png(&out, width, height)?,
         ImageFormat::Jpeg => crate::encode_jpeg(&out, width, height)?,
         ImageFormat::Webp => crate::encode_webp(&out, width, height)?,
     };
-    Ok(MetaTile::Image(bytes))
+    let encode_ms = t_encode.elapsed().as_millis() as u64;
+    Ok(MetaTile::Image {
+        bytes,
+        stats: MetaTileStats {
+            tiles: (ncols * nrows) as u32,
+            misses,
+            tile_render_ms,
+            assemble_ms,
+            encode_ms,
+        },
+    })
 }
 
 /// Fetch one global tile-pixel (nearest) from the covering set; transparent if
@@ -549,7 +588,7 @@ mod tests {
         )
         .unwrap();
         let bytes = match out {
-            MetaTile::Image(b) => b,
+            MetaTile::Image { bytes, .. } => bytes,
             _ => panic!("expected an image"),
         };
         assert!(
@@ -759,7 +798,7 @@ mod tests {
         )
         .unwrap();
         let bytes = match out {
-            MetaTile::Image(b) => b,
+            MetaTile::Image { bytes, .. } => bytes,
             _ => panic!("expected image"),
         };
         let (dw, dh, rgba) = decode_rgba(&bytes);
@@ -813,7 +852,7 @@ mod tests {
         )
         .unwrap();
         let bytes_y = match out_y {
-            MetaTile::Image(b) => b,
+            MetaTile::Image { bytes, .. } => bytes,
             _ => panic!("expected image"),
         };
         let (_, _, rgba_y) = decode_rgba(&bytes_y);
