@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/mrauhala/meteocore/compare/v0.5.0...v0.5.1) (2026-05-24)
+
+
+### Performance Improvements
+
+* **server,engine-grib:** isolate poll loops from request runtime + skip settled GRIB runs ([#221](https://github.com/mrauhala/meteocore/issues/221)) ([#226](https://github.com/mrauhala/meteocore/issues/226)) ([1e5fb8d](https://github.com/mrauhala/meteocore/commit/1e5fb8dcb3376b9ba3a07d9b587bab62a2d34c78))
+
 ## [0.5.0](https://github.com/mrauhala/meteocore/compare/v0.4.0...v0.5.0) (2026-05-19)
 
 

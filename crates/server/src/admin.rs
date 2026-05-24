@@ -44,8 +44,13 @@ static HTTP_REQUEST_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
             "http_request_duration_seconds",
             "HTTP request duration in seconds",
         )
+        // Buckets include 1.5/2/3/4 between 1s and 5s: without them, any
+        // request in (1, 5] is linearly interpolated by histogram_quantile
+        // across that wide bucket, so a handful of ~1.5s requests at low
+        // traffic read as a ~4-5s p99 in Grafana. 10s separates genuine
+        // >5s outliers from the merely-slow.
         .buckets(vec![
-            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0,
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 10.0,
         ]),
         &["method", "path"],
     )
