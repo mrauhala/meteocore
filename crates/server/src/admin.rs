@@ -201,6 +201,56 @@ static RENDERED_CACHE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
     gauge
 });
 
+// Meta-tile pixel cache (#202) — global, decoded-RGBA tiles for the Web
+// Mercator WMS meta-tiling path. Distinct from the per-collection GeoTIFF
+// compressed-byte tile cache (`tile_cache_*`).
+static METATILE_CACHE_HITS: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter =
+        IntCounter::new("metatile_cache_hits_total", "Meta-tile pixel cache hits").unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static METATILE_CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "metatile_cache_misses_total",
+        "Meta-tile pixel cache misses",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static METATILE_CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "metatile_cache_bytes",
+        "Bytes currently held in the meta-tile pixel cache",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static METATILE_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "metatile_cache_capacity_bytes",
+        "Configured meta-tile pixel cache capacity in bytes",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static METATILE_CACHE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "metatile_cache_entries",
+        "Number of entries currently in the meta-tile pixel cache",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
 // GRIB grid cache (per-collection).
 static GRID_CACHE_HITS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
@@ -276,6 +326,7 @@ struct CacheCounterState {
     tile: HashMap<String, (u64, u64)>,
     grid: HashMap<String, (u64, u64)>,
     rendered: (u64, u64),
+    metatile: (u64, u64),
 }
 
 static RENDER_SEMAPHORE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -1366,6 +1417,15 @@ pub fn load_collections(
         .next()
         .unwrap_or(128);
 
+    // Meta-tile pixel cache size (#202) — same selection rule as above.
+    let metatile_cache_mb = map_collections
+        .values()
+        .chain(maps_collections.values())
+        .filter_map(|c| c.wms.as_ref())
+        .map(|w| w.metatile_cache_mb)
+        .next()
+        .unwrap_or(512);
+
     // 2× cores (min 8) — the render slot's "ownership" of a CPU is loose
     // because decode/encode interleaves with bilinear passes; configurable
     // knob tracked in #147.
@@ -1377,6 +1437,7 @@ pub fn load_collections(
     tracing::info!("Render concurrency: {render_concurrency} (2× available CPUs, min 8)");
     let render_semaphore = Arc::new(tokio::sync::Semaphore::new(render_concurrency));
     let rendered_cache = Arc::new(ds_render::RenderedCache::new(rendered_cache_mb));
+    let tile_cache = Arc::new(ds_render::TilePixelCache::new(metatile_cache_mb));
     // Vector-tile (MVT) cache is independent of the raster cache because the
     // workloads differ (1–50 KB vs 30–200 KB per tile). 128 MB matches the
     // raster default; a config knob lands when an operator asks for it.
@@ -1402,6 +1463,7 @@ pub fn load_collections(
             styles: map_styles,
             render_semaphore: render_semaphore.clone(),
             rendered_cache: rendered_cache.clone(),
+            tile_cache,
             base_url: base_url.to_string(),
         },
         maps_state: MapsState {
@@ -2060,6 +2122,22 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     RENDERED_CACHE_BYTES.set(wms.rendered_cache.weight() as i64);
     RENDERED_CACHE_CAPACITY_BYTES.set(wms.rendered_cache.capacity() as i64);
     RENDERED_CACHE_ENTRIES.set(wms.rendered_cache.len() as i64);
+
+    // Meta-tile pixel cache: global, same delta-tracking as the rendered cache.
+    let (m_hits, m_misses) = wms.tile_cache.stats();
+    let (last_mh, last_mm) = counter_state.metatile;
+    if m_hits < last_mh || m_misses < last_mm {
+        counter_state.metatile = (m_hits, m_misses);
+        METATILE_CACHE_HITS.inc_by(0);
+        METATILE_CACHE_MISSES.inc_by(0);
+    } else {
+        METATILE_CACHE_HITS.inc_by(m_hits - last_mh);
+        METATILE_CACHE_MISSES.inc_by(m_misses - last_mm);
+        counter_state.metatile = (m_hits, m_misses);
+    }
+    METATILE_CACHE_BYTES.set(wms.tile_cache.weight() as i64);
+    METATILE_CACHE_CAPACITY_BYTES.set(wms.tile_cache.capacity() as i64);
+    METATILE_CACHE_ENTRIES.set(wms.tile_cache.len() as i64);
 
     // Tile cache: per-collection
     if let Ok(engines) = state.geotiff_engines.read() {

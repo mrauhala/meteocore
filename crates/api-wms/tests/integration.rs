@@ -114,6 +114,7 @@ fn build_empty_router() -> axum::Router {
         styles: styles_map,
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
+        tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
         base_url: String::new(),
     }));
     api_wms::router(state)
@@ -261,6 +262,7 @@ fn build_failing_router() -> axum::Router {
         styles: styles_map,
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
+        tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
         base_url: String::new(),
     }));
     api_wms::router(state)
@@ -399,6 +401,7 @@ fn build_populated_router() -> axum::Router {
         styles: styles_map,
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
+        tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
         base_url: String::new(),
     }));
     api_wms::router(state)
@@ -640,5 +643,224 @@ async fn if_none_match_on_error_tile_returns_304_with_x_cache_error() {
         Some("ERROR"),
         "post-render 304 must forward the `x_cache` label — error \
          tiles revalidating must remain visible as ERROR on dashboards"
+    );
+}
+
+// --- Meta-tiling (#202) ----------------------------------------------------
+
+/// Data-producing engine that counts every `get_raster_tile` call. Lets the
+/// meta-tiling tests prove that overlapping viewports reuse cached tiles
+/// (fewer fresh engine renders) and that the non-3857 / kill-switch paths
+/// bypass meta-tiling entirely.
+struct CountingMockMapEngine {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl MapEngine for CountingMockMapEngine {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+    ) -> Result<RasterTile, DataServerError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // All in-range, opaque pixels so tiles are cached (have_data) and
+        // colorize to a non-transparent image.
+        Ok(RasterTile {
+            width,
+            height,
+            values: vec![Some(0.5); (width * height) as usize],
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            native_crs: "EPSG:3857".into(),
+            spatial_extent: Some([-20.0, 30.0, 40.0, 80.0]),
+            times: vec![chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)],
+            parameter: "reflectivity".into(),
+            unit: "dBZ".into(),
+            parameters: vec![],
+            vertical: None,
+        }
+    }
+}
+
+/// Build a WMS router over a single `data` collection backed by a counting
+/// engine, returning handles to the shared meta-tile cache and the engine's
+/// call counter so tests can assert reuse. `metatile_mb = 0` exercises the
+/// kill switch (meta-tiling bypassed).
+fn build_counting_router(
+    metatile_mb: u64,
+) -> (
+    axum::Router,
+    Arc<ds_render::TilePixelCache>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let engine: Arc<dyn MapEngine> = Arc::new(CountingMockMapEngine {
+        calls: calls.clone(),
+    });
+    let mut engines = HashMap::new();
+    let mut collections = HashMap::new();
+    let mut styles_map = HashMap::new();
+
+    engines.insert("data".to_string(), engine);
+    collections.insert(
+        "data".to_string(),
+        CollectionConfig {
+            id: "data".to_string(),
+            title: "Data".to_string(),
+            description: "Data-producing fixture for meta-tiling (#202)".to_string(),
+            data_path: None,
+            apis: vec!["wms".to_string()],
+            engine_type: "geotiff".to_string(),
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            odim: None,
+            postgis: None,
+            preview: None,
+        },
+    );
+
+    let cmap = Arc::new(LutColorMap::from_builtin(
+        BuiltinColormap::Viridis,
+        0.0,
+        1.0,
+    ));
+    let mut layer_styles = HashMap::new();
+    layer_styles.insert(
+        "default".to_string(),
+        StyleInfo {
+            name: "default".to_string(),
+            title: "Default".to_string(),
+            colormap: cmap,
+            min: 0.0,
+            max: 1.0,
+            parameter: None,
+        },
+    );
+    styles_map.insert("data".to_string(), layer_styles);
+
+    let tile_cache = Arc::new(ds_render::TilePixelCache::new(metatile_mb));
+    let state = Arc::new(ArcSwap::from_pointee(WmsState {
+        engines,
+        collections,
+        styles: styles_map,
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        tile_cache: tile_cache.clone(),
+        base_url: String::new(),
+    }));
+    (api_wms::router(state), tile_cache, calls)
+}
+
+async fn get_map(app: &axum::Router, crs: &str, bbox: &str, w: u32, h: u32) -> StatusCode {
+    let uri = format!(
+        "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=data&STYLES=\
+         &FORMAT=image/png&CRS={crs}&BBOX={bbox}&WIDTH={w}&HEIGHT={h}"
+    );
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    resp.status()
+}
+
+/// Two overlapping EPSG:3857 fullscreen requests at the same resolution must
+/// reuse cached meta-tiles: the second request hits the tile cache and renders
+/// strictly fewer fresh tiles than the first. This is the core #202 win.
+#[tokio::test]
+async fn meta_tiling_reuses_tiles_across_overlapping_viewports() {
+    let (app, tile_cache, calls) = build_counting_router(64);
+
+    // Request A.
+    let s1 = get_map(
+        &app,
+        "EPSG:3857",
+        "2000000,8000000,3000000,9000000",
+        512,
+        512,
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+    let calls_a = calls.load(std::sync::atomic::Ordering::Relaxed);
+    let (hits_a, misses_a) = tile_cache.stats();
+    assert!(calls_a > 0, "first request renders tiles");
+    assert_eq!(
+        misses_a as usize, calls_a,
+        "every fresh tile is a cache miss"
+    );
+    assert_eq!(hits_a, 0, "no hits on a cold cache");
+
+    // Request B: panned east by 200 km, same size/resolution → overlaps A.
+    let s2 = get_map(
+        &app,
+        "EPSG:3857",
+        "2200000,8000000,3200000,9000000",
+        512,
+        512,
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+    let calls_b_delta = calls.load(std::sync::atomic::Ordering::Relaxed) - calls_a;
+    let (hits_b, _) = tile_cache.stats();
+    assert!(hits_b > 0, "overlapping viewport must hit cached tiles");
+    assert!(
+        calls_b_delta < calls_a,
+        "panned request must render fewer fresh tiles ({calls_b_delta}) than the cold first one ({calls_a})"
+    );
+}
+
+/// Non-Web-Mercator requests (here CRS:84) bypass meta-tiling and render
+/// directly: the meta-tile cache is never touched.
+#[tokio::test]
+async fn non_web_mercator_bypasses_meta_tiling() {
+    let (app, tile_cache, calls) = build_counting_router(64);
+    let status = get_map(&app, "CRS:84", "10,55,30,70", 256, 256).await;
+    assert_eq!(status, StatusCode::OK);
+    let (hits, misses) = tile_cache.stats();
+    assert_eq!(
+        (hits, misses),
+        (0, 0),
+        "CRS:84 must not touch the meta-tile cache"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "direct render makes exactly one engine call"
+    );
+}
+
+/// Kill switch: `metatile_cache_mb = 0` disables meta-tiling even for EPSG:3857,
+/// reverting to a single direct render. Reversible via config reload.
+#[tokio::test]
+async fn zero_metatile_cache_disables_meta_tiling() {
+    let (app, tile_cache, calls) = build_counting_router(0);
+    let status = get_map(
+        &app,
+        "EPSG:3857",
+        "2000000,8000000,3000000,9000000",
+        512,
+        512,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (hits, misses) = tile_cache.stats();
+    assert_eq!((hits, misses), (0, 0), "disabled cache is never consulted");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "kill switch must fall back to a single direct render"
     );
 }

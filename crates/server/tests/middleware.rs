@@ -117,6 +117,7 @@ fn build_wms_router() -> axum::Router {
         styles,
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
+        tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
         base_url: String::new(),
     }));
     api_wms::router(state)
@@ -315,6 +316,7 @@ mod load_shedding {
             styles,
             render_semaphore: Arc::new(tokio::sync::Semaphore::new(0)), // 0 permits!
             rendered_cache: Arc::new(RenderedCache::new(16)),
+            tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
             base_url: String::new(),
         }));
         let app = api_wms::router(state);
