@@ -204,7 +204,7 @@ Styles are listed in GetCapabilities and include LegendURL links.
 [collections.wms]
 colormap = "radar_dbz"
 rendered_cache_mb = 512    # Default: 512 MB. Set to 0 to disable.
-metatile_cache_mb = 512    # Default: 512 MB. Set to 0 to disable meta-tiling.
+metatile_cache_mb = 1024   # Default: 1024 MB. Set to 0 to disable meta-tiling.
 ```
 
 The rendered image cache stores final PNG/JPEG bytes keyed by bbox, style, format, dimensions, CRS, and timestamp. No TTL — radar data is immutable once produced. Cache is invalidated on collection reload (`POST /admin/collections/reload`).

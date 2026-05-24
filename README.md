@@ -853,7 +853,7 @@ Or attach a reusable `[[style_bundles]]` block defined in top-level `config.toml
 | `styles` | no | — | Array of named styles |
 | `parameters` | no | — | Per-parameter default-style overrides (multi-parameter engines) |
 | `rendered_cache_mb` | no | `512` | Shared rendered-image cache size in MB. Set to 0 to disable. |
-| `metatile_cache_mb` | no | `512` | Web Mercator meta-tile (decoded-RGBA) cache size in MB. Set to 0 to disable meta-tiling (direct render). |
+| `metatile_cache_mb` | no | `1024` | Web Mercator meta-tile (decoded-RGBA) cache size in MB. Set to 0 to disable meta-tiling (direct render). Global cache: the **minimum** across WMS collections wins, so `0` on any collection disables meta-tiling server-wide. |
 
 ### Limits
 
@@ -1000,7 +1000,7 @@ Separate from the GeoTIFF source tile cache (Tier 1). Caches final PNG/JPEG/WebP
 
 A fullscreen WMS client requests an arbitrary bbox + size per pan/zoom, so the Tier-2 rendered cache (keyed on the exact bbox) rarely hits. For EPSG:3857 GetMap, the WMS handler instead decomposes each request into fixed 256×256 tiles aligned to the WebMercatorQuad grid, renders and caches *those* (decoded RGBA), and resamples them to the exact viewport — so the expensive decode/projection/colorize work is cached at tile granularity and reused across overlapping views.
 
-- Default size: 512 MB (configurable via `metatile_cache_mb`); **set to 0 to disable** meta-tiling (reverts to a direct single-shot render, reload-reversible).
+- Default size: 1024 MB (configurable via `metatile_cache_mb`); **set to 0 to disable** meta-tiling (reverts to a direct single-shot render, reload-reversible). The cache is global; the size is the **minimum** `metatile_cache_mb` across WMS collections, so `0` anywhere disables it server-wide (unlike `rendered_cache_mb`, which takes the first value).
 - Cache key: layer + parameter + style + time + elevation + ladder level + tile col/row.
 - Resolution ladder: half-octave steps coinciding with standard WebMercator zooms; snaps to the finest step ≤ the request resolution (always downsampled, never upscaled).
 - Web Mercator only; other CRSs and degenerate/oversized requests fall back to the direct render.

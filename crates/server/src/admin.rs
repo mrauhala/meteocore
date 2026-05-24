@@ -1427,7 +1427,7 @@ pub fn load_collections(
         .filter_map(|c| c.wms.as_ref())
         .map(|w| w.metatile_cache_mb)
         .min()
-        .unwrap_or(512);
+        .unwrap_or(1024);
 
     // 2× cores (min 8) — the render slot's "ownership" of a CPU is loose
     // because decode/encode interleaves with bilinear passes; configurable

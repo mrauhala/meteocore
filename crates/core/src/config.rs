@@ -109,7 +109,7 @@ pub struct WmsConfig {
     #[serde(default = "default_rendered_cache_mb")]
     pub rendered_cache_mb: u64,
     /// Meta-tile pixel cache size in MB (decoded 256×256 RGBA tiles shared by
-    /// the Web Mercator WMS meta-tiling path, #202). Default: 512. Set to `0`
+    /// the Web Mercator WMS meta-tiling path, #202). Default: 1024. Set to `0`
     /// to disable meta-tiling entirely (kill switch): the Web Mercator GetMap
     /// path reverts to a direct single-shot render, reversible via config reload.
     #[serde(default = "default_metatile_cache_mb")]
@@ -164,7 +164,7 @@ fn default_rendered_cache_mb() -> u64 {
 }
 
 fn default_metatile_cache_mb() -> u64 {
-    512
+    1024
 }
 
 /// Shared WMS style set: one default + zero or more named extras.

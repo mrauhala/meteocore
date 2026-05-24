@@ -85,13 +85,20 @@ fn level_res(level: i32) -> f64 {
 /// resolution is still ≤ `res` (i.e. never coarser → the mosaic is downsampled,
 /// never upscaled). A small epsilon makes an exact standard-zoom resolution snap
 /// to its even level instead of one step finer.
+///
+/// Clamped at the **low** end to level 0 (`Z0_RES`, the whole world in one tile);
+/// a request coarser than that still downsamples, so 0 is safe. The **high** end
+/// is intentionally *not* clamped: a value `> MAX_LEVEL` means the request is
+/// finer than the deepest ladder step (~9 mm/px — an absurd over-zoom), and the
+/// caller declines to meta-tiling [`MetaTile::Fallback`] rather than clamp (which
+/// would render coarser-than-requested tiles and silently upscale).
 fn snap_level(res_m_per_px: f64) -> i32 {
     if !res_m_per_px.is_finite() || res_m_per_px <= 0.0 {
-        return MAX_LEVEL;
+        return MAX_LEVEL + 1; // decline → Fallback
     }
     // L_level = Z0_RES / 2^(level/2) ≤ res  ⇔  level ≥ 2·log2(Z0_RES / res)
     let level = (2.0 * (Z0_RES / res_m_per_px).log2() - 1e-6).ceil() as i32;
-    level.clamp(0, MAX_LEVEL)
+    level.max(0)
 }
 
 /// The fixed part of a tile's cache key (everything but the tile's grid
@@ -250,6 +257,12 @@ where
     // axis is upscaled), then derive the tile grid at that level.
     let res = ((east_m - west_m) / width as f64).min((north_m - south_m) / height as f64);
     let level = snap_level(res);
+    if level > MAX_LEVEL {
+        // Requested resolution is finer than the deepest ladder step (~9 mm/px —
+        // an absurd over-zoom). Meta-tiling would have to upscale; render
+        // directly at the exact requested resolution instead.
+        return Ok(MetaTile::Fallback);
+    }
     let span = TILE_PX as f64 * level_res(level); // tile edge length in metres
 
     // Covering tile index range. Origin is the world top-left (-ORIGIN, +ORIGIN);
@@ -597,6 +610,43 @@ mod tests {
             [-179.0, -85.0, 179.0, 85.0],
             8192,
             8192,
+            &prefix,
+            &SolidRed,
+            ImageFormat::Png,
+            &cache,
+            solid_tile,
+        )
+        .unwrap();
+        assert!(matches!(out, MetaTile::Fallback));
+    }
+
+    #[test]
+    fn extreme_resolution_declines_to_fallback() {
+        // A resolution finer than the deepest ladder step (~9 mm/px) would force
+        // upscaling; snap_level must signal it and render_metatiled must decline
+        // to Fallback rather than clamp + upscale.
+        assert!(
+            snap_level(0.001) > MAX_LEVEL,
+            "1 mm/px is finer than the ladder"
+        );
+        assert_eq!(
+            snap_level(Z0_RES / 2f64.powi(20)),
+            40,
+            "in-range still snaps"
+        );
+        let cache = TilePixelCache::new(16);
+        let prefix = TileKeyPrefix {
+            layer: "l".into(),
+            parameter: None,
+            style: "default".into(),
+            time: None,
+            z: None,
+        };
+        // ~1 µm/px viewport (tiny bbox, large image).
+        let out = render_metatiled(
+            [24.9400, 60.1700, 24.9401, 60.1701],
+            2048,
+            2048,
             &prefix,
             &SolidRed,
             ImageFormat::Png,
