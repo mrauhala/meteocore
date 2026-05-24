@@ -75,6 +75,29 @@ The core crate is named `ds-core` in Cargo.toml (imported as `ds_core` in Rust).
 4. Add the crate as a dependency of `crates/server/Cargo.toml`
 5. Add a match arm for the new `engine_type` in `server/src/main.rs`
 6. Wire it into the appropriate registries based on the collection's `apis` config
+7. **Obey the Engine Performance & Concurrency Rules below** — especially: the poll loop must `spawn_blocking`, and the render/decode path must not project per output pixel.
+
+## Engine Performance & Concurrency Rules
+
+Hard-won from production incidents (epic #201; spike investigation #221/#222). These are *generic* — apply them to every engine and rendering feature, not just the ones where they were found.
+
+### Concurrency / the shared Tokio runtime
+
+- **Poll/scan loops MUST `spawn_blocking`.** All engines share ONE multi-thread Tokio runtime whose worker count ≈ CPU cores (e.g. 12). The HTTP handlers *and* every collection's poll loop run on it. A `poll_loop`/`scan_once`/`poll_once` that does blocking I/O directly on a worker thread parks that worker for the whole operation; when several collections' polls overlap, the pool starves and **every** collection's requests spike — periodic multi-second p99 even at low load (#221, #208). Wrap the body in `tokio::task::spawn_blocking`. **Reference implementation: `engine-odim` (`crates/engine-odim/src/engine.rs` — its scan runs under `spawn_blocking`).** Counter-examples that caused the incident: grib `scan_once` (`engine-grib/src/lib.rs:203`), geotiff/querydata `poll_once`.
+- **`ds-storage` (`DataStore`) is a *sync* bridge over async object_store.** Its methods call `block_in_place(|| handle.block_on(..))` when a runtime handle exists, and **construct a brand-new `Runtime` when one does not** (`crates/storage/src/lib.rs`). So: (a) never call `DataStore` from a hot async path without `spawn_blocking`; (b) never call it from a non-Tokio thread (e.g. a **rayon** pool) — that hits the `Runtime::new()`-per-call fallback (#222). If you need parallel remote fetches, use async concurrency (`join_all`) on the Tokio runtime, or pass a `Handle` into the worker, not rayon + `DataStore`.
+- **N sequential blocking network calls multiply the stall.** The grib new-run probe did up to 32 sequential byte-range reads on one thread (~seconds). Batch/parallelise (bounded) or cap per cycle; never loop blocking I/O.
+- **Background metadata refresh must not contend with request serving.** Discovering new data (S3 LIST, STAC HTTP, GRIB index, COG header) is background work — keep it off the request-serving worker threads.
+
+### Rendering / raster
+
+- **Never project per output pixel.** The CRS forward transform (≈ a dozen transcendental ops for TM/LAEA/LCC/Stereographic) dominates render cost. Evaluate the projection on a coarse, curvature-adaptive grid and bilinearly interpolate the output→source pixel map (`engine-geotiff/src/resample.rs` is the reference; #203). Per-pixel projection was a ~10× regression.
+- **A cache only helps if its key matches the access pattern.** The rendered-image cache keyed on exact bbox+width+height gets ~3% hits for fullscreen arbitrary-viewport WMS — pure wasted RAM (#202). Cache at a granularity that actually repeats (tile-aligned), or don't allocate the cache.
+- **Decode to compact native types, not `Vec<Option<f64>>`.** Boxing every sample to `Option<f64>` is a 16× memory blowup and allocator churn; carry native ints with a nodata sentinel (#206). Wire up the typed fast paths you build (e.g. `IntegerLutColorMap`, #207) instead of leaving them dead.
+
+### Hot-path discipline
+
+- **Capability/metadata accessors used per request must be O(1) from a snapshot** (`ArcSwap`/`RwLock` read), never recompute or allocate per call (e.g. `raster_info()` cloning all timestamps — #211).
+- **Before blaming a mechanism for a latency spike, check the magnitude adds up.** A 2.3 MB local read from page cache is ~tens of ms, not seconds; multi-second stalls at low load almost always mean *blocking/contention* (a parked runtime worker, a held lock, sequential network calls), not extra CPU.
 
 ## Adding a New API Endpoint
 
