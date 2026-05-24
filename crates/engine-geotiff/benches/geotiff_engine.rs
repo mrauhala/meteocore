@@ -151,20 +151,29 @@ fn bench_get_raster_tile_projected(c: &mut Criterion) {
 }
 
 /// The production COG: `testdata/fmi-radar/20260406064000_fmi_radar_composite_dbz.tif`
-/// (2.87 MB, the `fmi-radar-composite-dbz` collection that drives the ~1.5 s
-/// cold-render tail). Used to profile where a cold meta-tile render spends time.
-fn load_fmi_engine() -> GeoTiffEngine {
+/// (the `fmi-radar-composite-dbz` collection that drives the ~1.5 s cold-render
+/// tail). Used to profile where a cold meta-tile render spends time.
+///
+/// This is a large local-only fixture **not committed to the repo** (see
+/// `testdata/RADAR_SOURCES.md`). Returns `None` when absent so `cargo bench`
+/// skips these on CI / fresh clones instead of panicking.
+fn load_fmi_engine() -> Option<GeoTiffEngine> {
+    if !std::path::Path::new("../../testdata/fmi-radar").exists() {
+        return None;
+    }
     let mut config = make_config();
     config.filename_template = Some("%Y%m%d%H%M%S_fmi_radar_composite_dbz.tif".to_string());
     config.parameter = "reflectivity".to_string();
-    GeoTiffEngine::new("fmi-radar", Some("../../testdata/fmi-radar"), &config)
-        .expect("fmi-radar fixture should build")
+    GeoTiffEngine::new("fmi-radar", Some("../../testdata/fmi-radar"), &config).ok()
 }
 
 /// One 256×256 Web Mercator meta-tile over southern Finland — the unit of work
 /// meta-tiling (#202) calls `get_raster_tile` for, repeated N× per cold render.
 fn bench_get_raster_tile_fmi_metatile(c: &mut Criterion) {
-    let engine = load_fmi_engine();
+    let Some(engine) = load_fmi_engine() else {
+        eprintln!("skipping fmi 256 metatile bench: testdata/fmi-radar absent");
+        return;
+    };
     let bbox = [24.0, 60.0, 25.5, 61.0];
     c.bench_function("geotiff_get_raster_tile_fmi_256_metatile", |b| {
         b.iter(|| {
@@ -188,7 +197,10 @@ fn bench_get_raster_tile_fmi_metatile(c: &mut Criterion) {
 /// A fullscreen single-shot render over all of Finland — the direct (non-meta)
 /// path, for comparison against the per-tile cost above.
 fn bench_get_raster_tile_fmi_fullscreen(c: &mut Criterion) {
-    let engine = load_fmi_engine();
+    let Some(engine) = load_fmi_engine() else {
+        eprintln!("skipping fmi 1024 fullscreen bench: testdata/fmi-radar absent");
+        return;
+    };
     let bbox = [19.0, 59.0, 32.0, 71.0];
     c.bench_function("geotiff_get_raster_tile_fmi_1024_fullscreen", |b| {
         b.iter(|| {

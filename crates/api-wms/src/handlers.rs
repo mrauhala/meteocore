@@ -253,6 +253,10 @@ pub async fn wms_handler(
             let style_parameter =
                 layer_parameter.or_else(|| style_info.parameter.as_deref().map(String::from));
 
+            // Spans spawn_blocking *dispatch* + execution, so `render_ms` includes
+            // any wait for a free blocking-pool thread (itself a useful signal: if
+            // render_ms greatly exceeds the internal phase sum
+            // tile_render_ms+assemble_ms+encode_ms, the gap is scheduling latency).
             let t_render = std::time::Instant::now();
             let render_outcome = tokio::task::spawn_blocking(
                 move || -> Result<(Option<Vec<u8>>, Option<ds_render::MetaTileStats>), DataServerError> {
@@ -338,7 +342,11 @@ pub async fn wms_handler(
                 Ok((bytes, stats)) => (Ok(bytes), stats),
                 Err(e) => (Err(e), None),
             };
-            if render_ms >= SLOW_RENDER_LOG_MS {
+            // Only log *successful* slow renders (the 200-status tail we're
+            // diagnosing). A slow render that errored has `meta_stats == None`
+            // too, so without this guard it would be mislabelled "direct render";
+            // errors are already surfaced by the WmsError::render warn arm below.
+            if render_ms >= SLOW_RENDER_LOG_MS && render_result.is_ok() {
                 match meta_stats {
                     Some(s) => tracing::info!(
                         layer = %params.layer,
