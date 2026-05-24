@@ -64,6 +64,26 @@ impl DataStore {
         Ok(result)
     }
 
+    /// Like [`Self::get_range`], but drives the fetch on an explicitly-provided
+    /// runtime `Handle` (`handle.block_on`). Use this when calling from a thread
+    /// that is **not** a Tokio worker and has no current handle — e.g. a `rayon`
+    /// pool worker — so the I/O reuses the main runtime instead of `block_on`'s
+    /// `try_current()` fallback that constructs a brand-new `Runtime` per call
+    /// (#222). Must NOT be called from within an async execution context.
+    pub fn get_range_on(
+        &self,
+        path: &ObjectPath,
+        range: Range<usize>,
+        handle: &tokio::runtime::Handle,
+    ) -> Result<Bytes, DataServerError> {
+        let result = self.block_on_with(Some(handle), async {
+            self.inner.get_range(path, range).await
+        })?;
+        self.bytes_read
+            .fetch_add(result.len() as u64, Ordering::Relaxed);
+        Ok(result)
+    }
+
     /// Return total bytes read from this store since creation.
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read.load(Ordering::Relaxed)
@@ -95,6 +115,23 @@ impl DataStore {
     where
         F: std::future::Future<Output = Result<T, object_store::Error>>,
     {
+        self.block_on_with(None, future)
+    }
+
+    /// Core sync→async bridge. With an explicit `handle` (caller is on a
+    /// non-Tokio thread such as a rayon worker) it drives the future on that
+    /// runtime via `handle.block_on` — no `block_in_place` (which would panic
+    /// off a worker thread) and no per-call `Runtime::new`. With `None` it
+    /// uses `block_in_place` when already inside a runtime, else spins up a
+    /// temporary runtime (tests / CLI).
+    fn block_on_with<F, T>(
+        &self,
+        handle: Option<&tokio::runtime::Handle>,
+        future: F,
+    ) -> Result<T, DataServerError>
+    where
+        F: std::future::Future<Output = Result<T, object_store::Error>>,
+    {
         let timed = async {
             match tokio::time::timeout(Self::REQUEST_TIMEOUT, future).await {
                 Ok(result) => result,
@@ -104,19 +141,20 @@ impl DataStore {
                 }),
             }
         };
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                let result = tokio::task::block_in_place(|| handle.block_on(timed));
-                result.map_err(|e| DataServerError::from(StorageError::from(e)))
-            }
-            Err(_) => {
-                // No runtime — create a temporary one (e.g., in tests or CLI tools)
-                let rt = tokio::runtime::Runtime::new()
-                    .map_err(|e| DataServerError::Storage(format!("Cannot create runtime: {e}")))?;
-                let result = rt.block_on(timed);
-                result.map_err(|e| DataServerError::from(StorageError::from(e)))
-            }
-        }
+        let result = match handle {
+            Some(h) => h.block_on(timed),
+            None => match tokio::runtime::Handle::try_current() {
+                Ok(handle) => tokio::task::block_in_place(|| handle.block_on(timed)),
+                Err(_) => {
+                    // No runtime — create a temporary one (e.g., tests / CLI tools)
+                    let rt = tokio::runtime::Runtime::new().map_err(|e| {
+                        DataServerError::Storage(format!("Cannot create runtime: {e}"))
+                    })?;
+                    rt.block_on(timed)
+                }
+            },
+        };
+        result.map_err(|e| DataServerError::from(StorageError::from(e)))
     }
 
     /// Get the underlying async ObjectStore for use in async contexts
@@ -353,6 +391,28 @@ mod tests {
         let first = &entries[0].location;
         let header = store.get_range(first, 0..4).unwrap();
         // TIFF magic: II (little-endian) = 0x49 0x49 0x2A 0x00
+        assert_eq!(&header[0..2], b"II", "Expected little-endian TIFF header");
+    }
+
+    // get_range_on must work when called from a thread that is NOT a Tokio
+    // worker (mirrors the rayon tile-fetch pool): it should drive the fetch on
+    // the supplied handle, not panic via block_in_place, and not spin up a new
+    // Runtime per call (#222).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_range_on_from_foreign_thread() {
+        let (store, _prefix) = build_store("testdata/radar")
+            .unwrap_or_else(|_| build_store("../../testdata/radar").expect("testdata/radar"));
+        let entries = store.list(&ObjectPath::from("")).unwrap();
+        let first = entries[0].location.clone();
+
+        let handle = tokio::runtime::Handle::current();
+        let store_ref = &store;
+        // A plain OS thread has no current Tokio handle (like a rayon worker).
+        let header = std::thread::scope(|s| {
+            s.spawn(|| store_ref.get_range_on(&first, 0..4, &handle).unwrap())
+                .join()
+                .unwrap()
+        });
         assert_eq!(&header[0..2], b"II", "Expected little-endian TIFF header");
     }
 }

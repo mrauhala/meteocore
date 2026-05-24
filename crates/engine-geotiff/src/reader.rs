@@ -995,6 +995,9 @@ fn read_remote_chunk_f64(
     file_path: &Path,
     band_index: usize,
     ifd_index: u16,
+    // Runtime handle to drive the fetch on when called from a non-Tokio
+    // (rayon) thread; `None` for callers already on a runtime worker. See #222.
+    handle: Option<&tokio::runtime::Handle>,
 ) -> Result<Vec<Option<f64>>, DataServerError> {
     let idx = chunk_index as usize;
     if idx >= tile_info.tile_offsets.len() {
@@ -1037,13 +1040,19 @@ fn read_remote_chunk_f64(
         ))
     })?;
 
+    // Fetch a byte range, reusing the caller's runtime handle when on a rayon
+    // thread (avoids a per-call Runtime::new — see #222).
+    let fetch_range = |range: std::ops::Range<usize>| match handle {
+        Some(h) => store.get_range_on(obj_path, range, h),
+        None => store.get_range(obj_path, range),
+    };
+
     // Check cache for compressed bytes (keyed by file + chunk + IFD level)
     let compressed = if let Some(c) = cache {
         if let Some(cached) = c.get(file_path, chunk_index, ifd_index) {
             cached
         } else {
-            let fetched = store
-                .get_range(obj_path, offset..end)
+            let fetched = fetch_range(offset..end)
                 .map_err(|e| DataServerError::Engine(format!("Failed to read tile range: {e}")))?;
             // Validate response length matches request
             if fetched.len() != byte_count {
@@ -1058,8 +1067,7 @@ fn read_remote_chunk_f64(
             fetched
         }
     } else {
-        let fetched = store
-            .get_range(obj_path, offset..end)
+        let fetched = fetch_range(offset..end)
             .map_err(|e| DataServerError::Engine(format!("Failed to read tile range: {e}")))?;
         if fetched.len() != byte_count {
             return Err(DataServerError::Engine(format!(
@@ -1090,10 +1098,13 @@ fn read_http_range(
     http: &reqwest::Client,
     url: &str,
     range: std::ops::Range<usize>,
+    // Runtime handle to drive the request on when called from a non-Tokio
+    // (rayon) thread; `None` for callers already on a runtime worker. See #222.
+    handle: Option<&tokio::runtime::Handle>,
 ) -> Result<Bytes, DataServerError> {
     let range_header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
     let url_owned = url.to_string();
-    block_on_async(async {
+    let fut = async {
         let resp = http
             .get(&url_owned)
             .header(reqwest::header::RANGE, &range_header)
@@ -1109,7 +1120,11 @@ fn read_http_range(
         resp.bytes()
             .await
             .map_err(|e| DataServerError::Engine(format!("Failed to read body: {e}")))
-    })
+    };
+    match handle {
+        Some(h) => h.block_on(fut),
+        None => block_on_async(fut),
+    }
 }
 
 /// Read and decode a tile from an HTTP source via byte-range read (reqwest).
@@ -1125,6 +1140,9 @@ fn read_http_chunk_f64(
     file_path: &Path,
     band_index: usize,
     ifd_index: u16,
+    // Runtime handle for the fetch when on a non-Tokio (rayon) thread; `None`
+    // for callers already on a runtime worker. See #222.
+    handle: Option<&tokio::runtime::Handle>,
 ) -> Result<Vec<Option<f64>>, DataServerError> {
     let idx = chunk_index as usize;
     if idx >= tile_info.tile_offsets.len() {
@@ -1166,7 +1184,7 @@ fn read_http_chunk_f64(
         if let Some(cached) = c.get(file_path, chunk_index, ifd_index) {
             cached
         } else {
-            let fetched = read_http_range(http, url, offset..end)?;
+            let fetched = read_http_range(http, url, offset..end, handle)?;
             if fetched.len() != byte_count {
                 return Err(DataServerError::Engine(format!(
                     "Tile {} truncated: requested {} bytes, got {}",
@@ -1179,7 +1197,7 @@ fn read_http_chunk_f64(
             fetched
         }
     } else {
-        let fetched = read_http_range(http, url, offset..end)?;
+        let fetched = read_http_range(http, url, offset..end, handle)?;
         if fetched.len() != byte_count {
             return Err(DataServerError::Engine(format!(
                 "Tile {} truncated: requested {} bytes, got {}",
@@ -1239,7 +1257,8 @@ pub fn read_pixel(
             cache,
             file_path,
             band_index,
-            0, // full resolution IFD
+            0,    // full resolution IFD
+            None, // single-pixel read: caller is already on a runtime worker
         )?,
         DataSource::HttpDirect {
             url,
@@ -1254,7 +1273,8 @@ pub fn read_pixel(
             cache,
             file_path,
             band_index,
-            0, // full resolution IFD
+            0,    // full resolution IFD
+            None, // single-pixel read: caller is already on a runtime worker
         )?,
         _ => {
             let mut decoder = source.open_decoder()?;
@@ -1706,6 +1726,13 @@ fn read_bbox_parallel(
         .flat_map(|tr| (tile_col_start..tile_col_end).map(move |tc| (tr, tc)))
         .collect();
 
+    // Capture the current runtime handle (we're on a spawn_blocking worker)
+    // so the rayon workers can drive their fetches on the existing runtime
+    // instead of spawning a fresh Runtime per tile (#222). `None` only if no
+    // runtime is current (e.g. tests), in which case the storage layer falls
+    // back to its own temporary runtime.
+    let rt_handle = tokio::runtime::Handle::try_current().ok();
+
     // Fetch all tiles in parallel using the shared thread pool.
     // Failed tiles are logged at error level and replaced with nodata.
     let tile_pixel_count = (metadata.tile_width * metadata.tile_height) as usize;
@@ -1732,6 +1759,7 @@ fn read_bbox_parallel(
                             file_path,
                             band_index,
                             ifd_index,
+                            rt_handle.as_ref(),
                         )
                     },
                     tile_row,
@@ -1796,6 +1824,9 @@ fn read_bbox_parallel_http(
     let http_clone = http.clone();
     let url_owned = url.to_string();
 
+    // Reuse the current runtime for the rayon workers' fetches (#222).
+    let rt_handle = tokio::runtime::Handle::try_current().ok();
+
     let tile_pixel_count = (metadata.tile_width * metadata.tile_height) as usize;
     let tile_results: Vec<TileFetchResult> = TILE_FETCH_POOL.install(|| {
         tile_coords
@@ -1820,6 +1851,7 @@ fn read_bbox_parallel_http(
                             file_path,
                             band_index,
                             ifd_index,
+                            rt_handle.as_ref(),
                         )
                     },
                     tile_row,
