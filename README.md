@@ -853,6 +853,7 @@ Or attach a reusable `[[style_bundles]]` block defined in top-level `config.toml
 | `styles` | no | — | Array of named styles |
 | `parameters` | no | — | Per-parameter default-style overrides (multi-parameter engines) |
 | `rendered_cache_mb` | no | `512` | Shared rendered-image cache size in MB. Set to 0 to disable. |
+| `metatile_cache_mb` | no | `512` | Web Mercator meta-tile (decoded-RGBA) cache size in MB. Set to 0 to disable meta-tiling (direct render). |
 
 ### Limits
 
@@ -995,6 +996,16 @@ Separate from the GeoTIFF source tile cache (Tier 1). Caches final PNG/JPEG/WebP
 - Error tiles and empty tiles (all nodata) are NOT cached.
 - MVT vector tiles use a separate `VectorTileCache` (content-derived ETag, `Cache-Control: max-age=300`); they are NOT subject to `rendered_cache_mb`.
 
+### Meta-Tile Cache (Web Mercator WMS)
+
+A fullscreen WMS client requests an arbitrary bbox + size per pan/zoom, so the Tier-2 rendered cache (keyed on the exact bbox) rarely hits. For EPSG:3857 GetMap, the WMS handler instead decomposes each request into fixed 256×256 tiles aligned to the WebMercatorQuad grid, renders and caches *those* (decoded RGBA), and resamples them to the exact viewport — so the expensive decode/projection/colorize work is cached at tile granularity and reused across overlapping views.
+
+- Default size: 512 MB (configurable via `metatile_cache_mb`); **set to 0 to disable** meta-tiling (reverts to a direct single-shot render, reload-reversible).
+- Cache key: layer + parameter + style + time + elevation + ladder level + tile col/row.
+- Resolution ladder: half-octave steps coinciding with standard WebMercator zooms; snaps to the finest step ≤ the request resolution (always downsampled, never upscaled).
+- Web Mercator only; other CRSs and degenerate/oversized requests fall back to the direct render.
+- Distinct from the per-collection GeoTIFF source tile cache (`tile_cache_*`).
+
 ### HTTP Cache Headers
 
 | Scenario | Cache-Control | ETag |
@@ -1075,6 +1086,16 @@ Returns HTTP 503 only when all collections have failed.
 | `rendered_cache_bytes` | gauge | — | Bytes currently held |
 | `rendered_cache_capacity_bytes` | gauge | — | Configured capacity |
 | `rendered_cache_entries` | gauge | — | Number of cached entries |
+
+**Meta-tile cache** (global, Web Mercator WMS decoded-RGBA tiles):
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `metatile_cache_hits_total` | counter | — | Meta-tile pixel cache hits |
+| `metatile_cache_misses_total` | counter | — | Meta-tile pixel cache misses |
+| `metatile_cache_bytes` | gauge | — | Bytes currently held |
+| `metatile_cache_capacity_bytes` | gauge | — | Configured capacity |
+| `metatile_cache_entries` | gauge | — | Number of cached entries |
 
 **GRIB grid cache** (per-collection, decoded grid cache):
 
