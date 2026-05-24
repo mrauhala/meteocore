@@ -7,7 +7,8 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
 use ds_core::config::CollectionConfig;
-use ds_core::map_engine::MapEngine;
+use ds_core::error::DataServerError;
+use ds_core::map_engine::{MapEngine, OutputCrs};
 use ds_render::{CacheKey, RenderedCache, StyleInfo};
 
 use crate::error::WmsError;
@@ -21,6 +22,8 @@ pub struct WmsState {
     pub styles: HashMap<String, HashMap<String, StyleInfo>>,
     pub render_semaphore: Arc<tokio::sync::Semaphore>,
     pub rendered_cache: Arc<RenderedCache>,
+    /// Decoded-RGBA meta-tile cache for the Web Mercator GetMap path (#202).
+    pub tile_cache: Arc<ds_render::TilePixelCache>,
     pub base_url: String,
 }
 
@@ -227,33 +230,91 @@ pub async fn wms_handler(
             let width = params.width;
             let height = params.height;
             let time = params.time;
-            let output_crs = params.output_crs;
+            let output_crs = params.output_crs.clone();
             let format = params.format;
             let elevation = params.elevation;
+            let z_q = elevation.map(ds_render::quantize_z);
+            let layer = params.layer.clone();
+            // Key meta-tiles on the *resolved* style name, not the raw STYLES
+            // param: `STYLES=` (empty → default) and `STYLES=default` resolve to
+            // the same StyleInfo, so they must share cached tiles.
+            let style = style_info.name.clone();
             let rendered_cache = state.rendered_cache.clone();
+            let tile_cache = state.tile_cache.clone();
 
             // Layer parameter (from "collection/param") takes priority over style parameter
             let style_parameter =
                 layer_parameter.or_else(|| style_info.parameter.as_deref().map(String::from));
 
-            let render_result = tokio::task::spawn_blocking(move || {
-                let tile = engine.get_raster_tile(
-                    bbox,
-                    width,
-                    height,
-                    time,
-                    &output_crs,
-                    style_parameter.as_deref(),
-                    elevation,
-                )?;
-                // If every pixel is nodata, skip colorization + encoding entirely.
-                if tile.is_empty() {
-                    return Ok(None);
-                }
-                ds_render::render_tile(&tile, colormap.as_ref(), format).map(Some)
-            })
-            .await
-            .map_err(|e| WmsError::Internal(format!("Render task failed: {e}")))?;
+            let render_result =
+                tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>, DataServerError> {
+                    // Direct single-shot render: one get_raster_tile → colorize → encode.
+                    let direct = || -> Result<Option<Vec<u8>>, DataServerError> {
+                        let tile = engine.get_raster_tile(
+                            bbox,
+                            width,
+                            height,
+                            time,
+                            &output_crs,
+                            style_parameter.as_deref(),
+                            elevation,
+                        )?;
+                        // If every pixel is nodata, skip colorization + encoding entirely.
+                        if tile.is_empty() {
+                            return Ok(None);
+                        }
+                        ds_render::render_tile(&tile, colormap.as_ref(), format).map(Some)
+                    };
+
+                    // Web Mercator: decompose into cached 256×256 meta-tiles and
+                    // resample to the exact viewport (#202). The expensive
+                    // per-tile work is cached and reused across overlapping
+                    // fullscreen views; other CRSs render directly. A zero-byte
+                    // tile cache (`metatile_cache_mb = 0`) is the kill switch:
+                    // it bypasses meta-tiling so an operator can revert to the
+                    // direct path via config reload, no redeploy.
+                    if output_crs == OutputCrs::WebMercator && tile_cache.capacity() > 0 {
+                        let prefix = ds_render::TileKeyPrefix {
+                            layer,
+                            parameter: style_parameter.clone(),
+                            style,
+                            time,
+                            z: z_q,
+                        };
+                        // `bbox` is in WGS84 degrees here — the params layer
+                        // converts EPSG:3857 metres to degrees before this point;
+                        // render_metatiled re-projects back to metres internally.
+                        let outcome = ds_render::render_metatiled(
+                            bbox,
+                            width,
+                            height,
+                            &prefix,
+                            colormap.as_ref(),
+                            format,
+                            tile_cache.as_ref(),
+                            |tbbox, tw, th| {
+                                engine.get_raster_tile(
+                                    tbbox,
+                                    tw,
+                                    th,
+                                    time,
+                                    &OutputCrs::WebMercator,
+                                    style_parameter.as_deref(),
+                                    elevation,
+                                )
+                            },
+                        )?;
+                        match outcome {
+                            ds_render::MetaTile::Image(b) => Ok(Some(b)),
+                            ds_render::MetaTile::Empty => Ok(None),
+                            ds_render::MetaTile::Fallback => direct(),
+                        }
+                    } else {
+                        direct()
+                    }
+                })
+                .await
+                .map_err(|e| WmsError::Internal(format!("Render task failed: {e}")))?;
 
             // The EMPTY and ERROR fast paths skip the format-aware encoder and
             // emit PNG bytes directly. Track the *actual* Content-Type per

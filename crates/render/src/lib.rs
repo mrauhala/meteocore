@@ -1,11 +1,13 @@
 pub mod colormap;
 mod encode;
+pub mod metatile;
 
 pub use colormap::{
     parse_hex_color, BuiltinColormap, ColorMap, ColorStop, IntegerLutColorMap, LinearColorMap,
     LutColorMap,
 };
 pub use encode::{encode_jpeg, encode_png, encode_webp};
+pub use metatile::{render_metatiled, MetaTile, TileKeyPrefix, TilePixelCache};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -388,7 +390,7 @@ pub fn render_legend(
 }
 
 /// Colorize a raster tile into an RGBA buffer using a colormap.
-fn colorize(tile: &RasterTile, colormap: &dyn ColorMap) -> Vec<u8> {
+pub(crate) fn colorize(tile: &RasterTile, colormap: &dyn ColorMap) -> Vec<u8> {
     let mut rgba = Vec::with_capacity((tile.width * tile.height * 4) as usize);
     for value in &tile.values {
         let color = colormap.color(*value);

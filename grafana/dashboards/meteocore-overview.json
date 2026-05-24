@@ -245,7 +245,7 @@
     {
       "title": "Tile Cache Hit Rate",
       "type": "gauge",
-      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 31 },
+      "gridPos": { "h": 6, "w": 5, "x": 0, "y": 31 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "fieldConfig": {
         "defaults": {
@@ -271,7 +271,7 @@
     {
       "title": "Rendered Cache Hit Rate",
       "type": "gauge",
-      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 31 },
+      "gridPos": { "h": 6, "w": 5, "x": 5, "y": 31 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "fieldConfig": {
         "defaults": {
@@ -295,9 +295,35 @@
       ]
     },
     {
+      "title": "Meta-Tile Cache Hit Rate",
+      "type": "gauge",
+      "gridPos": { "h": 6, "w": 5, "x": 10, "y": 31 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "green", "value": 0.8 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(metatile_cache_hits_total[5m])) / clamp_min(sum(rate(metatile_cache_hits_total[5m])) + sum(rate(metatile_cache_misses_total[5m])), 0.0001)",
+          "legendFormat": "Hit Rate"
+        }
+      ]
+    },
+    {
       "title": "GRIB Grid Cache Hit Rate",
       "type": "gauge",
-      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 31 },
+      "gridPos": { "h": 6, "w": 5, "x": 15, "y": 31 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "fieldConfig": {
         "defaults": {
@@ -323,7 +349,7 @@
     {
       "title": "Render Semaphore",
       "type": "gauge",
-      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 31 },
+      "gridPos": { "h": 6, "w": 4, "x": 20, "y": 31 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "fieldConfig": {
         "defaults": {
@@ -393,6 +419,14 @@
         {
           "expr": "sum(rate(grid_cache_misses_total[5m]))",
           "legendFormat": "Grid Misses"
+        },
+        {
+          "expr": "sum(rate(metatile_cache_hits_total[5m]))",
+          "legendFormat": "Meta-Tile Hits"
+        },
+        {
+          "expr": "sum(rate(metatile_cache_misses_total[5m]))",
+          "legendFormat": "Meta-Tile Misses"
         }
       ]
     },
@@ -456,6 +490,10 @@
         {
           "expr": "sum(rate(grid_cache_hits_total[5m])) / clamp_min(sum(rate(grid_cache_hits_total[5m])) + sum(rate(grid_cache_misses_total[5m])), 0.0001)",
           "legendFormat": "GRIB Grid Cache"
+        },
+        {
+          "expr": "sum(rate(metatile_cache_hits_total[5m])) / clamp_min(sum(rate(metatile_cache_hits_total[5m])) + sum(rate(metatile_cache_misses_total[5m])), 0.0001)",
+          "legendFormat": "Meta-Tile Cache"
         }
       ]
     },
