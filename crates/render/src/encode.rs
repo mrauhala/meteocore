@@ -83,6 +83,13 @@ pub fn encode_jpeg(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Data
 /// effectively corrupts the encoded data values. Lossless preserves every
 /// pixel exactly while still compressing the limited palette well.
 /// WebP supports alpha channel natively, so no transparency compositing needed.
+///
+/// We set libwebp's `exact` flag so the RGB channels are preserved even under
+/// fully transparent (alpha == 0) pixels. By default libwebp's lossless mode
+/// rewrites the RGB of transparent regions to improve compression, which would
+/// make the output not byte-exact. For nodata pixels the RGB is irrelevant to
+/// the viewer, but keeping the encode truly exact avoids surprises and keeps
+/// the round-trip guarantee unconditional.
 pub fn encode_webp(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, DataServerError> {
     let expected_len = (width * height * 4) as usize;
     if rgba.len() != expected_len {
@@ -96,7 +103,20 @@ pub fn encode_webp(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Data
     }
 
     let encoder = webp::Encoder::from_rgba(rgba, width, height);
-    let memory = encoder.encode_lossless();
+
+    // Mirror `Encoder::encode_lossless()` but enable `exact` to keep transparent
+    // pixels' RGB intact. `WebPConfig::new()` only fails if libwebp's version
+    // doesn't match the header — treat that as a render error rather than panic.
+    let mut config = webp::WebPConfig::new()
+        .map_err(|()| DataServerError::Render("WebP config init failed".to_string()))?;
+    config.lossless = 1;
+    config.alpha_compression = 0;
+    config.quality = 75.0;
+    config.exact = 1;
+
+    let memory = encoder
+        .encode_advanced(&config)
+        .map_err(|e| DataServerError::Render(format!("WebP encode error: {e:?}")))?;
     Ok(memory.to_vec())
 }
 
@@ -151,17 +171,18 @@ mod tests {
         let mut rgba = Vec::with_capacity((width * height * 4) as usize);
         for y in 0..height {
             for x in 0..width {
+                if x == 0 && y == 0 {
+                    // Fully transparent pixel with NON-ZERO RGB: proves the
+                    // RGB channels survive even where alpha == 0. A lossy (or
+                    // alpha-discarding) codec would not reproduce (200,100,50,0).
+                    rgba.extend_from_slice(&[200, 100, 50, 0]);
+                    continue;
+                }
                 let r = (x * 60) as u8;
                 let g = (y * 60) as u8;
                 let b = ((x + y) * 30) as u8;
-                // Hard edge: half opaque, with one fully transparent pixel.
-                let a = if x == 0 && y == 0 {
-                    0
-                } else if (x + y) % 2 == 0 {
-                    128
-                } else {
-                    255
-                };
+                // Hard edge: half opaque.
+                let a = if (x + y) % 2 == 0 { 128 } else { 255 };
                 rgba.extend_from_slice(&[r, g, b, a]);
             }
         }
