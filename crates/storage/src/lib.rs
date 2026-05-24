@@ -69,7 +69,9 @@ impl DataStore {
     /// that is **not** a Tokio worker and has no current handle — e.g. a `rayon`
     /// pool worker — so the I/O reuses the main runtime instead of `block_on`'s
     /// `try_current()` fallback that constructs a brand-new `Runtime` per call
-    /// (#222). Must NOT be called from within an async execution context.
+    /// (#222). Must NOT be called from within an async task (a running future);
+    /// a `spawn_blocking` thread or a rayon worker is fine (`handle.block_on`
+    /// is valid there).
     pub fn get_range_on(
         &self,
         path: &ObjectPath,

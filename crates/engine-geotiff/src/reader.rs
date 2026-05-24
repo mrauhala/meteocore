@@ -1726,11 +1726,12 @@ fn read_bbox_parallel(
         .flat_map(|tr| (tile_col_start..tile_col_end).map(move |tc| (tr, tc)))
         .collect();
 
-    // Capture the current runtime handle (we're on a spawn_blocking worker)
-    // so the rayon workers can drive their fetches on the existing runtime
-    // instead of spawning a fresh Runtime per tile (#222). `None` only if no
-    // runtime is current (e.g. tests), in which case the storage layer falls
-    // back to its own temporary runtime.
+    // Capture the current runtime handle (this runs inside the request
+    // runtime — whether on a spawn_blocking thread or an async task doesn't
+    // matter, we only pass the handle down) so the rayon workers can drive
+    // their fetches on the existing runtime instead of spawning a fresh
+    // Runtime per tile (#222). `None` only if no runtime is current (e.g.
+    // tests), in which case the storage layer falls back to a temporary one.
     let rt_handle = tokio::runtime::Handle::try_current().ok();
 
     // Fetch all tiles in parallel using the shared thread pool.
