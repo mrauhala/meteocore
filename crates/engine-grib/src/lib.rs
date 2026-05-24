@@ -306,6 +306,7 @@ impl GribEngine {
         let settled_snapshot = self.settled_prefixes.lock().unwrap().clone();
         let mut listed_with_hits: Vec<String> = Vec::new();
         let mut any_list_ok = false;
+        let mut any_list_err = false;
         for (_ref_time, prefix) in &prefixes {
             if let Some(budget) = scan_budget {
                 if runs_with_hits >= budget {
@@ -337,6 +338,7 @@ impl GribEngine {
                     }
                 }
                 Err(e) => {
+                    any_list_err = true;
                     tracing::debug!(
                         "Collection '{}': failed to list prefix '{}': {}",
                         self.collection_id,
@@ -362,11 +364,12 @@ impl GribEngine {
             settle_completed_runs(&mut settled, &listed_with_hits, &window);
         }
 
-        // Reset the re-validation clock only after a forced full pass that
-        // actually listed at least one prefix successfully — so a total S3
-        // outage retries the full scan next poll instead of waiting another
-        // interval (see SETTLED_REVALIDATE_INTERVAL).
-        if force_full && any_list_ok {
+        // Reset the re-validation clock only after a forced full pass in which
+        // every list call succeeded — so neither a total nor a *partial* S3
+        // outage resets the clock while some settled prefixes went unchecked.
+        // On any list error we retry the full scan next poll instead of waiting
+        // another interval (see SETTLED_REVALIDATE_INTERVAL).
+        if force_full && any_list_ok && !any_list_err {
             *self.last_full_scan.lock().unwrap() = Some(Instant::now());
         }
         tracing::debug!(
