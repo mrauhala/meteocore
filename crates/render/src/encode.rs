@@ -107,9 +107,15 @@ pub fn encode_webp(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Data
     // Mirror `Encoder::encode_lossless()` but enable `exact` to keep transparent
     // pixels' RGB intact. `WebPConfig::new()` only fails if libwebp's version
     // doesn't match the header — treat that as a render error rather than panic.
+    //
+    // `WebPConfig::new()` uses the default preset, which leaves `method = 4`
+    // (a lossy-oriented effort level). `encode_lossless()` applies the lossless
+    // preset which sets `method = 0` (fastest lossless encoder); we replicate
+    // that here so we don't pay extra encode latency under the render semaphore.
     let mut config = webp::WebPConfig::new()
         .map_err(|()| DataServerError::Render("WebP config init failed".to_string()))?;
     config.lossless = 1;
+    config.method = 0;
     config.alpha_compression = 0;
     config.quality = 75.0;
     config.exact = 1;
