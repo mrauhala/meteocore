@@ -295,16 +295,17 @@ impl GribEngine {
         // Periodically force a full re-list so late/corrected step files added
         // to an already-settled run are still picked up (bounded by
         // SETTLED_REVALIDATE_INTERVAL).
-        let force_full = {
-            let mut last = self.last_full_scan.lock().unwrap();
-            let due = last.is_none_or(|t| t.elapsed() >= SETTLED_REVALIDATE_INTERVAL);
-            if due {
-                *last = Some(Instant::now());
-            }
-            due
-        };
+        // Only *read* the timer here; reset it after the listing pass actually
+        // succeeds, so an S3 outage (every list errors) doesn't reset the clock
+        // and suppress re-validation for another full interval.
+        let force_full = self
+            .last_full_scan
+            .lock()
+            .unwrap()
+            .is_none_or(|t| t.elapsed() >= SETTLED_REVALIDATE_INTERVAL);
         let settled_snapshot = self.settled_prefixes.lock().unwrap().clone();
         let mut listed_with_hits: Vec<String> = Vec::new();
+        let mut any_list_ok = false;
         for (_ref_time, prefix) in &prefixes {
             if let Some(budget) = scan_budget {
                 if runs_with_hits >= budget {
@@ -320,6 +321,7 @@ impl GribEngine {
             let mut hits_in_this_prefix = 0usize;
             match self.store.list(&obj_prefix) {
                 Ok(objects) => {
+                    any_list_ok = true;
                     for obj in objects {
                         let loc = obj.location.as_ref();
                         if !loc.ends_with(index_suffix) {
@@ -358,6 +360,14 @@ impl GribEngine {
             let window: HashSet<&str> = prefixes.iter().map(|(_, p)| p.as_str()).collect();
             let mut settled = self.settled_prefixes.lock().unwrap();
             settle_completed_runs(&mut settled, &listed_with_hits, &window);
+        }
+
+        // Reset the re-validation clock only after a forced full pass that
+        // actually listed at least one prefix successfully — so a total S3
+        // outage retries the full scan next poll instead of waiting another
+        // interval (see SETTLED_REVALIDATE_INTERVAL).
+        if force_full && any_list_ok {
+            *self.last_full_scan.lock().unwrap() = Some(Instant::now());
         }
         tracing::debug!(
             "Collection '{}': listed {}/{} prefixes ({} settled, skipped), {} runs produced hits, {} candidate index files",
