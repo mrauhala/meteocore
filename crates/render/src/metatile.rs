@@ -30,13 +30,13 @@
 //! CRSs fall back to a direct single-shot render. Degenerate or pathologically
 //! large requests return [`MetaTile::Fallback`] so the caller renders directly.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use quick_cache::sync::Cache;
+use rayon::prelude::*;
 
 use ds_core::error::DataServerError;
 use ds_core::map_engine::RasterTile;
@@ -312,9 +312,11 @@ where
         return Ok(MetaTile::Fallback);
     }
 
-    // Render or fetch each covering tile's RGBA pixels. `None` = an all-nodata
-    // tile (cached as a marker, drawn transparent at assembly time).
-    let mut tiles: HashMap<(i64, i64), Option<Arc<[u8]>>> = HashMap::with_capacity(ncols * nrows);
+    // Render or fetch each covering tile's RGBA pixels into a flat row-major
+    // mosaic (`(row-row0)*ncols + (col-col0)`); `None` = an all-nodata tile
+    // (drawn transparent at assembly). A `Vec` (indexed, not hashed) is what
+    // lets the per-pixel assembly avoid ~4 hashmap lookups/pixel (#240).
+    let mut mosaic_tiles: Vec<Option<Arc<[u8]>>> = Vec::with_capacity(ncols * nrows);
     let mut any_data = false;
     let mut misses: u32 = 0;
     let tiles_count = (ncols * nrows) as u32;
@@ -369,7 +371,7 @@ where
                 );
                 entry
             };
-            tiles.insert((col, row), rgba);
+            mosaic_tiles.push(rgba);
         }
     }
     let tile_loop_ms = t_loop.elapsed().as_millis() as u64;
@@ -389,11 +391,17 @@ where
     // Resample the tile mosaic into the exact viewport. Output pixels are
     // uniform in Mercator metres, so this is a pure affine map into global
     // tile-pixel space, sampled with premultiplied-alpha bilinear (avoids dark
-    // fringes bleeding from transparent nodata pixels).
+    // fringes from transparent nodata). Pure CPU, per-output-row independent,
+    // and touches no engine/DataStore — safe to run on the rayon pool (#240).
+    let mosaic = Mosaic {
+        tiles: mosaic_tiles,
+        col0,
+        row0,
+        ncols: ncols as i64,
+        nrows: nrows as i64,
+    };
     let res_x = (east_m - west_m) / width as f64;
     let res_y = (north_m - south_m) / height as f64;
-    let to_global_x = |x_m: f64| (x_m + ORIGIN) / span * TILE_PX as f64;
-    let to_global_y = |y_m: f64| (ORIGIN - y_m) / span * TILE_PX as f64;
 
     // usize arithmetic throughout: `width * height * 4` overflows `u32` past
     // ~46 340 px/side. Callers must keep `width * height` within a sane bound
@@ -401,17 +409,18 @@ where
     let (w_us, h_us) = (width as usize, height as usize);
     let t_assemble = Instant::now();
     let mut out = vec![0u8; w_us * h_us * 4];
-    for py in 0..height {
-        let y_m = north_m - (py as f64 + 0.5) * res_y;
-        let gy = to_global_y(y_m);
-        for px in 0..width {
-            let x_m = west_m + (px as f64 + 0.5) * res_x;
-            let gx = to_global_x(x_m);
-            let rgba = sample_bilinear(&tiles, gx, gy);
-            let o = (py as usize * w_us + px as usize) * 4;
-            out[o..o + 4].copy_from_slice(&rgba);
-        }
-    }
+    out.par_chunks_mut(w_us * 4)
+        .enumerate()
+        .for_each(|(py, row_out)| {
+            let y_m = north_m - (py as f64 + 0.5) * res_y;
+            let gy = (ORIGIN - y_m) / span * TILE_PX as f64;
+            for px in 0..w_us {
+                let x_m = west_m + (px as f64 + 0.5) * res_x;
+                let gx = (x_m + ORIGIN) / span * TILE_PX as f64;
+                let o = px * 4;
+                row_out[o..o + 4].copy_from_slice(&sample_bilinear(&mosaic, gx, gy));
+            }
+        });
     let assemble_ms = t_assemble.elapsed().as_millis() as u64;
 
     let t_encode = Instant::now();
@@ -433,29 +442,47 @@ where
     })
 }
 
-/// Fetch one global tile-pixel (nearest) from the covering set; transparent if
-/// the pixel falls outside the rendered tiles (only possible ≤1px past an edge).
-#[inline]
-fn global_pixel(tiles: &HashMap<(i64, i64), Option<Arc<[u8]>>>, xi: i64, yi: i64) -> [u8; 4] {
-    let col = xi.div_euclid(TILE_PX as i64);
-    let row = yi.div_euclid(TILE_PX as i64);
-    let lx = xi.rem_euclid(TILE_PX as i64) as usize;
-    let ly = yi.rem_euclid(TILE_PX as i64) as usize;
-    match tiles.get(&(col, row)) {
-        // Present with data; nodata markers (`Some(None)`) and absent tiles
-        // (≤1px past an edge) are transparent.
-        Some(Some(rgba)) => {
-            let o = (ly * TILE_PX as usize + lx) * 4;
-            [rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3]]
+/// The covering tiles as a flat row-major grid, indexed (not hashed) by global
+/// tile-pixel coordinate. `tiles[(row-row0)*ncols + (col-col0)]`.
+struct Mosaic {
+    tiles: Vec<Option<Arc<[u8]>>>,
+    col0: i64,
+    row0: i64,
+    ncols: i64,
+    nrows: i64,
+}
+
+impl Mosaic {
+    /// Fetch one global tile-pixel (nearest); transparent for nodata markers and
+    /// for pixels outside the covered grid (only possible ≤1px past an edge).
+    #[inline]
+    fn pixel(&self, xi: i64, yi: i64) -> [u8; 4] {
+        let col = xi.div_euclid(TILE_PX as i64);
+        let row = yi.div_euclid(TILE_PX as i64);
+        if col < self.col0
+            || col >= self.col0 + self.ncols
+            || row < self.row0
+            || row >= self.row0 + self.nrows
+        {
+            return [0, 0, 0, 0];
         }
-        _ => [0, 0, 0, 0],
+        let idx = ((row - self.row0) * self.ncols + (col - self.col0)) as usize;
+        match &self.tiles[idx] {
+            Some(rgba) => {
+                let lx = xi.rem_euclid(TILE_PX as i64) as usize;
+                let ly = yi.rem_euclid(TILE_PX as i64) as usize;
+                let o = (ly * TILE_PX as usize + lx) * 4;
+                [rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3]]
+            }
+            None => [0, 0, 0, 0],
+        }
     }
 }
 
 /// Premultiplied-alpha bilinear sample of the mosaic at global tile-pixel
 /// coordinates `(gx, gy)` (pixel centres at integer + 0.5).
 #[inline]
-fn sample_bilinear(tiles: &HashMap<(i64, i64), Option<Arc<[u8]>>>, gx: f64, gy: f64) -> [u8; 4] {
+fn sample_bilinear(mosaic: &Mosaic, gx: f64, gy: f64) -> [u8; 4] {
     let fx = gx - 0.5;
     let fy = gy - 0.5;
     let x0 = fx.floor();
@@ -464,10 +491,10 @@ fn sample_bilinear(tiles: &HashMap<(i64, i64), Option<Arc<[u8]>>>, gx: f64, gy: 
     let dy = fy - y0;
     let (x0, y0) = (x0 as i64, y0 as i64);
 
-    let c00 = premul(global_pixel(tiles, x0, y0));
-    let c10 = premul(global_pixel(tiles, x0 + 1, y0));
-    let c01 = premul(global_pixel(tiles, x0, y0 + 1));
-    let c11 = premul(global_pixel(tiles, x0 + 1, y0 + 1));
+    let c00 = premul(mosaic.pixel(x0, y0));
+    let c10 = premul(mosaic.pixel(x0 + 1, y0));
+    let c01 = premul(mosaic.pixel(x0, y0 + 1));
+    let c11 = premul(mosaic.pixel(x0 + 1, y0 + 1));
 
     let mut acc = [0.0f64; 4];
     for i in 0..4 {

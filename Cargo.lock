@@ -782,6 +782,7 @@ dependencies = [
  "jpeg-encoder",
  "png",
  "quick_cache",
+ "rayon",
  "webp",
 ]
 
