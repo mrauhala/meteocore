@@ -1273,19 +1273,27 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         let overview = metadata
             .select_overview(west, south, east, north, width, height)
             .or_else(|| {
-                // select_overview returned None — either no overviews exist,
-                // or all overviews have enough pixels. Check if full resolution
-                // exceeds the source pixel limit, and if so pick the finest
-                // overview that fits under the limit.
+                // select_overview returned None, which now means one of: no
+                // overviews exist; full resolution already fits the output; or
+                // the output exceeds the biggest overview by more than the
+                // bounded-upscale factor (i.e. it is at/near native resolution).
+                // In the last two cases we'd read full resolution — but if that
+                // would blow the MAX_MAP_PIXELS decode budget we must fall back
+                // to an overview regardless of the upscale bound: the hard pixel
+                // cap overrides the soft 2× quality preference (an over-cap
+                // upscale is still logged by the `Using overview …` debug below).
+                // Pick the finest overview that fits under the limit.
                 if let Some((c0, r0, c1, r1)) = metadata
                     .geo_transform
                     .bbox_to_pixels(west, south, east, north)
                 {
                     let full_pixels = ((c1 - c0) as usize) * ((r1 - r0) as usize);
                     if full_pixels > reader::max_map_pixels() {
-                        // Find the finest overview that fits under the limit
-                        // (overviews are sorted coarsest-last, iterate in reverse)
-                        for ov in metadata.overviews.iter().rev() {
+                        // Pick the finest overview that fits under the limit.
+                        // Overviews are sorted finest-first, so iterate in order
+                        // and take the first that fits — the highest quality
+                        // within the pixel budget.
+                        for ov in &metadata.overviews {
                             let ov_gt = metadata.overview_geo_transform(ov);
                             if let Some((oc0, or0, oc1, or1)) =
                                 ov_gt.bbox_to_pixels(west, south, east, north)
@@ -1296,7 +1304,8 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                                 }
                             }
                         }
-                        // All overviews still exceed limit — use coarsest
+                        // Even the coarsest overview exceeds the limit — use it
+                        // anyway as the smallest available source.
                         metadata.overviews.last()
                     } else {
                         None
