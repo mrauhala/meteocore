@@ -864,3 +864,157 @@ async fn zero_metatile_cache_disables_meta_tiling() {
         "kill switch must fall back to a single direct render"
     );
 }
+
+// --- Full-request latency, single vs concurrent --------------------------------
+//
+// Lesson from #242: a component bench can show a win while the *whole request*
+// regresses under load. This drives the real router end-to-end (handler →
+// meta-tile render → encode → response), single vs N concurrent, with a
+// prod-width semaphore and a CPU-burning mock engine (simulating decode). Run
+// `--release --nocapture` for meaningful numbers.
+//
+// IMPORTANT — scope: this guards *single-request* render-path latency and gross
+// concurrent blow-ups. It does NOT reliably reproduce the production convoy #242
+// caused — that needed a *shared host* (meteocore contending with co-tenant
+// containers for cores) plus the real player burst; on a dedicated dev box even
+// sem=24 / 24 concurrent renders schedule fine. Load-dependent regressions like
+// convoy are caught by **production observability** (the #238 `slow WMS …` phase
+// logs split by isolated-vs-concurrent), not by this bench. Use both.
+struct SlowMockMapEngine {
+    spin: std::time::Duration,
+}
+impl MapEngine for SlowMockMapEngine {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        _t: Option<chrono::DateTime<chrono::Utc>>,
+        _crs: &OutputCrs,
+        _p: Option<&str>,
+        _z: Option<f64>,
+    ) -> Result<RasterTile, DataServerError> {
+        let s = std::time::Instant::now();
+        while s.elapsed() < self.spin {
+            std::hint::spin_loop();
+        }
+        Ok(RasterTile {
+            width,
+            height,
+            values: vec![Some(0.5); (width * height) as usize],
+        })
+    }
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            native_crs: "EPSG:3857".into(),
+            spatial_extent: Some([-20.0, 30.0, 40.0, 80.0]),
+            times: vec![chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)],
+            parameter: "reflectivity".into(),
+            unit: "dBZ".into(),
+            parameters: vec![],
+            vertical: None,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn render_latency_single_vs_concurrent() {
+    use std::time::{Duration, Instant};
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    let sem = (cores * 2).max(8); // prod-like render concurrency
+    let engine: Arc<dyn MapEngine> = Arc::new(SlowMockMapEngine {
+        spin: Duration::from_micros(2000),
+    });
+    let mut engines = HashMap::new();
+    engines.insert("data".to_string(), engine);
+    let mut collections = HashMap::new();
+    collections.insert(
+        "data".to_string(),
+        CollectionConfig {
+            id: "data".into(),
+            title: "Data".into(),
+            description: "latency fixture".into(),
+            data_path: None,
+            apis: vec!["wms".into()],
+            engine_type: "geotiff".into(),
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            odim: None,
+            postgis: None,
+            preview: None,
+        },
+    );
+    let cmap = Arc::new(LutColorMap::from_builtin(
+        BuiltinColormap::Viridis,
+        0.0,
+        1.0,
+    ));
+    let mut layer_styles = HashMap::new();
+    layer_styles.insert(
+        "default".to_string(),
+        StyleInfo {
+            name: "default".into(),
+            title: "Default".into(),
+            colormap: cmap,
+            min: 0.0,
+            max: 1.0,
+            parameter: None,
+        },
+    );
+    let mut styles = HashMap::new();
+    styles.insert("data".to_string(), layer_styles);
+    let state = Arc::new(ArcSwap::from_pointee(WmsState {
+        engines,
+        collections,
+        styles,
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(sem)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        tile_cache: Arc::new(ds_render::TilePixelCache::new(256)),
+        base_url: String::new(),
+    }));
+    let app = api_wms::router(state);
+
+    let uri = |i: u64| {
+        let minx = 100_000 * i as i64;
+        format!("/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=data&STYLES=&FORMAT=image/webp&CRS=EPSG:3857&WIDTH=2048&HEIGHT=2048&BBOX={minx},7000000,{},9000000", minx + 2_000_000)
+    };
+    let fire = |app: axum::Router, i: u64| async move {
+        let t = Instant::now();
+        let resp = app
+            .oneshot(Request::builder().uri(uri(i)).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        (resp.status(), t.elapsed().as_millis() as u64)
+    };
+
+    let (s0, single) = fire(app.clone(), 0).await;
+    assert_eq!(s0, StatusCode::OK);
+
+    let n = (cores * 2) as u64;
+    let start = Instant::now();
+    let handles: Vec<_> = (1..=n)
+        .map(|i| tokio::spawn(fire(app.clone(), i)))
+        .collect();
+    let mut lat = Vec::new();
+    for h in handles {
+        let (st, ms) = h.await.unwrap();
+        assert_eq!(st, StatusCode::OK);
+        lat.push(ms);
+    }
+    let wall = start.elapsed().as_millis() as u64;
+    lat.sort_unstable();
+    let p50 = lat[lat.len() / 2];
+    let max = *lat.last().unwrap();
+    let ratio = max as f64 / single.max(1) as f64;
+    eprintln!("RENDER-LATENCY (cores={cores} sem={sem} n={n}): single={single}ms concurrent p50={p50}ms max={max}ms wall={wall}ms | max/single={ratio:.1}x");
+    assert!(
+        max < single.max(50) * 80,
+        "concurrent max {max}ms ≫ single {single}ms (×{ratio:.0}) — possible render convoy"
+    );
+}
