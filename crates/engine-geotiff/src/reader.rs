@@ -506,15 +506,17 @@ impl TiffMetadata {
         }
     }
 
-    /// Select the best overview level for the given output dimensions.
+    /// Select the overview level to read for the given bbox and output size.
     ///
-    /// Returns the overview whose resolution is closest to (but not less than)
-    /// the output resolution. Returns `None` if full resolution should be used.
-    /// Select the best overview level for the given bbox and output dimensions.
-    ///
-    /// Compares how many source pixels the bbox covers at each level against
-    /// the output dimensions. Picks the smallest level where the source pixel
-    /// coverage still exceeds the output (no upscaling).
+    /// Compares how many source pixels the bbox covers at each level against the
+    /// output dimensions and picks the coarsest level that still covers the
+    /// output without upscaling (least data to decode). If no overview is large
+    /// enough — the output exceeds the biggest overview but is still below full
+    /// resolution — the biggest overview is used anyway provided the implied
+    /// (nearest-neighbour) upscale stays within `MIN_OVERVIEW_FRACTION`; beyond
+    /// that the output is at/near native resolution and `None` is returned so the
+    /// caller reads full resolution. Also returns `None` when the bbox misses the
+    /// raster or full resolution already fits the output.
     pub fn select_overview(
         &self,
         bbox_west: f64,
@@ -542,47 +544,56 @@ impl TiffMetadata {
             return None;
         }
 
-        // Pick the coarsest overview that still provides at least
-        // `MIN_OVERVIEW_FRACTION` of the requested resolution — i.e. tolerate a
-        // bounded bilinear upscale (at most `1 / MIN_OVERVIEW_FRACTION`).
-        //
-        // A strict never-upscale rule (`>= output_*`) creates a latency cliff:
-        // any output only slightly wider than the largest overview falls all the
-        // way through to full resolution. On the production FMI composite (base
-        // 4963×7316, largest overview 2481 px) a 2650-px-wide retina GetMap
-        // decoded the entire 36 MP base (~770 ms) instead of the 9 MP overview
-        // (~350 ms) — for what is only a 1.07× upscale. Measured live: render
-        // jumped from 348 ms at 2481 px to 653 ms at 2550 px.
-        //
-        // Overviews are sorted by decreasing resolution (largest first), so the
-        // last level to clear the floor is the coarsest acceptable one (least
-        // data to decode).
-        const MIN_OVERVIEW_FRACTION: f64 = 0.5; // accept up to a 2× bilinear upscale
-        let min_cols = (output_width as f64 * MIN_OVERVIEW_FRACTION).ceil() as u32;
-        let min_rows = (output_height as f64 * MIN_OVERVIEW_FRACTION).ceil() as u32;
+        // Pass 1 — strict never-upscale. Pick the coarsest overview that still
+        // has at least as many source pixels as the output (least data read, no
+        // upscaling). Overviews are sorted largest-first and both axes shrink
+        // monotonically across levels, so the qualifying levels are a prefix:
+        // once an axis falls short, every coarser level falls short too, so we
+        // can stop. This leaves every output an overview *can* satisfy selected
+        // exactly as before — no change to mid-zoom selection.
         let mut best: Option<&OverviewLevel> = None;
         for ov in &self.overviews {
             let ov_gt = self.overview_geo_transform(ov);
-            if let Some((c0, r0, c1, r1)) =
-                ov_gt.bbox_to_pixels(bbox_west, bbox_south, bbox_east, bbox_north)
-            {
-                let ov_cols = c1 - c0;
-                let ov_rows = r1 - r0;
-                if ov_cols >= min_cols && ov_rows >= min_rows {
-                    // Enough pixels (within the upscale tolerance) — a candidate.
+            match ov_gt.bbox_to_pixels(bbox_west, bbox_south, bbox_east, bbox_north) {
+                Some((c0, r0, c1, r1))
+                    if (c1 - c0) >= output_width && (r1 - r0) >= output_height =>
+                {
                     best = Some(ov);
-                } else {
-                    // Below the floor — stop, use the previous (finer) candidate.
-                    break;
                 }
-            } else {
-                // bbox_to_pixels returned None — this overview's pixels are too
-                // coarse to detect the intersection. Stop and use previous candidate.
-                break;
+                _ => break,
             }
         }
+        if best.is_some() {
+            return best;
+        }
 
-        best
+        // Pass 2 — bounded upscale at the cliff. The output is larger than the
+        // biggest overview but (per the early return above) smaller than full
+        // resolution. A strict never-upscale rule falls straight through to the
+        // full-resolution IFD here — and on the production FMI composite (base
+        // 4963×7316, biggest overview 2481 px) a 2650-px-wide retina GetMap then
+        // decoded the entire 36 MP base (measured ~770 ms) instead of the 9 MP
+        // overview (~350 ms), for what is only a 1.07× upscale. Live, render
+        // jumped from 348 ms at 2481 px to 653 ms at 2550 px.
+        //
+        // So accept the biggest overview as long as the implied upscale stays
+        // within MIN_OVERVIEW_FRACTION (the resample is nearest-neighbour, so an
+        // upscale is blocky pixel replication — bounded to keep it tolerable).
+        // Beyond that bound the output is at/near native resolution, where full
+        // resolution is genuinely the better source, so return None and let the
+        // caller read it. This confines full-resolution decodes to ~native-res
+        // requests instead of every retina viewport just above an overview.
+        const MIN_OVERVIEW_FRACTION: f64 = 0.5; // accept up to a 2× nearest-neighbour upscale
+        let largest = self.overviews.first()?;
+        let lg = self.overview_geo_transform(largest);
+        let (c0, r0, c1, r1) = lg.bbox_to_pixels(bbox_west, bbox_south, bbox_east, bbox_north)?;
+        let min_cols = (output_width as f64 * MIN_OVERVIEW_FRACTION).ceil() as u32;
+        let min_rows = (output_height as f64 * MIN_OVERVIEW_FRACTION).ceil() as u32;
+        if (c1 - c0) >= min_cols && (r1 - r0) >= min_rows {
+            Some(largest)
+        } else {
+            None
+        }
     }
 
     /// Build a GeoTransform for an overview level.
@@ -2603,14 +2614,85 @@ mod tests {
     }
 
     #[test]
-    fn select_overview_prefers_coarser_within_tolerance() {
+    fn select_overview_mid_zoom_unchanged_never_upscales() {
         let m = fmi_like_meta();
-        // 1300-wide output: ov1 (1240) is within the 2× floor (≈1.05× upscale)
-        // and reads ~4× less than ov0, so it is preferred.
+        // 1300-wide output is satisfied by ov0 (2481 ≥ 1300) without upscaling,
+        // so the bounded-upscale pass must NOT engage: selection is identical to
+        // the original strict never-upscale behaviour. Guards against the fix
+        // silently retuning every mid-zoom level to a coarser overview.
         let ov = m
             .select_overview(FULL.0, FULL.1, FULL.2, FULL.3, 1300, 1068)
             .unwrap();
-        assert_eq!(ov.ifd_index, 2);
+        assert_eq!(
+            ov.ifd_index, 1,
+            "mid-zoom must still pick ov0, not a coarser level"
+        );
+    }
+
+    #[test]
+    fn select_overview_bounded_upscale_caps_at_2x() {
+        // Sparse pyramid: biggest overview is a 3× decimation (1654 px), leaving
+        // a >2× gap to full resolution. An output needing more than a 2× upscale
+        // off that overview must read full resolution, not upscale the overview 3×.
+        let ov = |ifd: usize, w: u32, h: u32| OverviewLevel {
+            ifd_index: ifd,
+            width: w,
+            height: h,
+            tile_width: 256,
+            tile_height: 256,
+            tiles_across: w.div_ceil(256),
+            tiles_down: h.div_ceil(256),
+            tile_info: None,
+        };
+        let mut m = fmi_like_meta();
+        m.overviews = vec![ov(1, 1654, 2439), ov(2, 620, 914)];
+        // 3000 px ≤ 2× of 1654 (1.81× upscale) → use the overview.
+        assert_eq!(
+            m.select_overview(FULL.0, FULL.1, FULL.2, FULL.3, 3000, 1000)
+                .unwrap()
+                .ifd_index,
+            1
+        );
+        // 3500 px > 2× of 1654 → full resolution, not a 2.1× upscale.
+        assert!(m
+            .select_overview(FULL.0, FULL.1, FULL.2, FULL.3, 3500, 1000)
+            .is_none());
+    }
+
+    /// Like `fmi_like_meta` but in the production CRS (EPSG:3067 / TM35FIN), so
+    /// `bbox_to_pixels` exercises the 20-samples-per-edge curvature envelope
+    /// rather than a clean axis-aligned scale.
+    fn tm35fin_meta() -> TiffMetadata {
+        let mut m = fmi_like_meta();
+        m.geo_transform = ds_core::geo::GeoTransform {
+            origin_x: 150_000.0,
+            origin_y: 7_780_000.0,
+            pixel_width: 115.0,
+            pixel_height: 153.0,
+            width: 4963,
+            height: 7316,
+            crs: ds_core::geo::Crs::TransverseMercator {
+                lat0: 0.0,
+                lon0: 27.0_f64.to_radians(),
+                k0: 0.9996,
+                false_e: 500_000.0,
+                false_n: 0.0,
+            },
+        };
+        m
+    }
+
+    #[test]
+    fn select_overview_cliff_fix_holds_for_projected_crs() {
+        let m = tm35fin_meta();
+        // Generous Finland lon/lat bbox (covers the grid). Under TM the pixel
+        // counts come from the curvature envelope, not a clean affine scale. A
+        // 2650-px retina GetMap must still use the overview (ifd 1), not the
+        // 36 MP full resolution — the same cliff fix, on the real projection.
+        let ov = m
+            .select_overview(18.0, 58.0, 33.0, 71.0, 2650, 2177)
+            .expect("projected-CRS retina render must use an overview, not full-res");
+        assert_eq!(ov.ifd_index, 1);
     }
 
     // --- Nodata comparison tests ---
