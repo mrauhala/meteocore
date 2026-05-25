@@ -218,12 +218,14 @@ pub struct MetaTileStats {
     pub tiles: u32,
     /// Of those, how many were cache misses (rendered via the engine closure).
     pub misses: u32,
-    /// Time in the tile loop — engine `get_raster_tile` (file read + decode +
-    /// reproject) plus colorize, for the `misses`. Cache hits are ~free.
-    pub tile_render_ms: u64,
+    /// Wall time of the whole tile loop: engine `get_raster_tile` (file read +
+    /// decode + reproject) plus colorize for the `misses`, plus cache lookups
+    /// for hits (normally negligible). For a cold render (all misses) this is
+    /// the miss-render time — the metric the cold-tail diagnosis cares about.
+    pub tile_loop_ms: u64,
     /// Time assembling the mosaic into the output (premultiplied bilinear).
     pub assemble_ms: u64,
-    /// Time encoding the final image (PNG/JPEG/WebP).
+    /// Time encoding the final image (PNG/JPEG/WebP). 0 for an all-nodata render.
     pub encode_ms: u64,
 }
 
@@ -235,8 +237,9 @@ pub enum MetaTile {
         stats: MetaTileStats,
     },
     /// Every covered pixel is nodata — the caller should emit its own
-    /// transparent tile (matching the existing all-nodata fast path).
-    Empty,
+    /// transparent tile (matching the existing all-nodata fast path). `stats`
+    /// still carries the tile-loop timing (assemble/encode are skipped, so 0).
+    Empty { stats: MetaTileStats },
     /// Meta-tiling declined (degenerate bbox or > `MAX_TILES` tiles); the caller
     /// should fall back to a direct single-shot render.
     Fallback,
@@ -314,7 +317,8 @@ where
     let mut tiles: HashMap<(i64, i64), Option<Arc<[u8]>>> = HashMap::with_capacity(ncols * nrows);
     let mut any_data = false;
     let mut misses: u32 = 0;
-    let t_render = Instant::now();
+    let tiles_count = (ncols * nrows) as u32;
+    let t_loop = Instant::now();
     for row in row0..=row1 {
         for col in col0..=col1 {
             let key = TileKey {
@@ -368,10 +372,18 @@ where
             tiles.insert((col, row), rgba);
         }
     }
-    let tile_render_ms = t_render.elapsed().as_millis() as u64;
+    let tile_loop_ms = t_loop.elapsed().as_millis() as u64;
 
     if !any_data {
-        return Ok(MetaTile::Empty);
+        return Ok(MetaTile::Empty {
+            stats: MetaTileStats {
+                tiles: tiles_count,
+                misses,
+                tile_loop_ms,
+                assemble_ms: 0,
+                encode_ms: 0,
+            },
+        });
     }
 
     // Resample the tile mosaic into the exact viewport. Output pixels are
@@ -412,9 +424,9 @@ where
     Ok(MetaTile::Image {
         bytes,
         stats: MetaTileStats {
-            tiles: (ncols * nrows) as u32,
+            tiles: tiles_count,
             misses,
-            tile_render_ms,
+            tile_loop_ms,
             assemble_ms,
             encode_ms,
         },
@@ -643,7 +655,7 @@ mod tests {
             empty_tile,
         )
         .unwrap();
-        assert!(matches!(out, MetaTile::Empty));
+        assert!(matches!(out, MetaTile::Empty { .. }));
     }
 
     #[test]

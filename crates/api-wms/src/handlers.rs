@@ -26,8 +26,9 @@ const SLOW_RENDER_LOG_MS: u64 = 400;
 enum RenderPath {
     /// Web Mercator meta-tiling, with per-phase stats.
     Meta(ds_render::MetaTileStats),
-    /// Meta-tiling path, but every covered pixel was nodata (no stats).
-    MetaEmpty,
+    /// Meta-tiling path, every covered pixel nodata — carries the tile-loop
+    /// timing (assemble/encode skipped).
+    MetaEmpty(ds_render::MetaTileStats),
     /// Meta-tiling declined (degenerate / >MAX_TILES / extreme zoom) → direct.
     Fallback,
     /// Genuine non-meta path (non-3857 CRS, or meta cache disabled).
@@ -335,7 +336,9 @@ pub async fn wms_handler(
                             ds_render::MetaTile::Image { bytes, stats } => {
                                 Ok((Some(bytes), RenderPath::Meta(stats)))
                             }
-                            ds_render::MetaTile::Empty => Ok((None, RenderPath::MetaEmpty)),
+                            ds_render::MetaTile::Empty { stats } => {
+                                Ok((None, RenderPath::MetaEmpty(stats)))
+                            }
                             ds_render::MetaTile::Fallback => {
                                 direct().map(|o| (o, RenderPath::Fallback))
                             }
@@ -353,41 +356,46 @@ pub async fn wms_handler(
             // match below; the path + timing are logged for slow renders so prod
             // pinpoints the cost (queue wait vs tile render vs assemble vs encode).
             // `render_path` is irrelevant on error (the log is gated on success).
+            // `render_path` is `None` on error (no fabricated placeholder); the
+            // slow-log is gated on success anyway, so it's never read on error.
             let (render_result, render_path): (
                 Result<Option<Vec<u8>>, DataServerError>,
-                RenderPath,
+                Option<RenderPath>,
             ) = match render_outcome {
-                Ok((bytes, path)) => (Ok(bytes), path),
-                Err(e) => (Err(e), RenderPath::Direct),
+                Ok((bytes, path)) => (Ok(bytes), Some(path)),
+                Err(e) => (Err(e), None),
             };
             // Only log *successful* slow renders (the 200-status tail we're
             // diagnosing); errors are surfaced by the WmsError render warn arm
-            // below. The four arms stay distinct so a meta render that fell back
-            // to direct isn't conflated with a genuine non-meta render.
+            // below. The arms stay distinct so a meta render that fell back to
+            // direct isn't conflated with a genuine non-meta render.
             if render_ms >= SLOW_RENDER_LOG_MS && render_result.is_ok() {
                 match render_path {
-                    RenderPath::Meta(s) => tracing::info!(
+                    Some(RenderPath::Meta(s)) => tracing::info!(
                         layer = %params.layer,
                         sem_wait_ms,
                         render_ms,
                         tiles = s.tiles,
                         misses = s.misses,
-                        tile_render_ms = s.tile_render_ms,
+                        tile_loop_ms = s.tile_loop_ms,
                         assemble_ms = s.assemble_ms,
                         encode_ms = s.encode_ms,
                         width = params.width,
                         height = params.height,
                         "slow WMS meta-tile render"
                     ),
-                    RenderPath::MetaEmpty => tracing::info!(
+                    Some(RenderPath::MetaEmpty(s)) => tracing::info!(
                         layer = %params.layer,
                         sem_wait_ms,
                         render_ms,
+                        tiles = s.tiles,
+                        misses = s.misses,
+                        tile_loop_ms = s.tile_loop_ms,
                         width = params.width,
                         height = params.height,
                         "slow WMS meta-tile render (all nodata)"
                     ),
-                    RenderPath::Fallback => tracing::info!(
+                    Some(RenderPath::Fallback) => tracing::info!(
                         layer = %params.layer,
                         sem_wait_ms,
                         render_ms,
@@ -395,7 +403,7 @@ pub async fn wms_handler(
                         height = params.height,
                         "slow WMS render (meta-tiling fell back to direct)"
                     ),
-                    RenderPath::Direct => tracing::info!(
+                    Some(RenderPath::Direct) => tracing::info!(
                         layer = %params.layer,
                         sem_wait_ms,
                         render_ms,
@@ -403,6 +411,7 @@ pub async fn wms_handler(
                         height = params.height,
                         "slow WMS direct render (non-meta CRS)"
                     ),
+                    None => {}
                 }
             }
 
