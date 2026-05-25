@@ -150,6 +150,82 @@ fn bench_get_raster_tile_projected(c: &mut Criterion) {
     });
 }
 
+/// The production COG: `testdata/fmi-radar/20260406064000_fmi_radar_composite_dbz.tif`
+/// (the `fmi-radar-composite-dbz` collection that drives the ~1.5 s cold-render
+/// tail). Used to profile where a cold meta-tile render spends time.
+///
+/// This is a large local-only fixture **not committed to the repo** (see
+/// `testdata/RADAR_SOURCES.md`). Returns `None` when absent so `cargo bench`
+/// skips these on CI / fresh clones instead of panicking.
+fn load_fmi_engine() -> Option<GeoTiffEngine> {
+    let mut config = make_config();
+    config.filename_template = Some("%Y%m%d%H%M%S_fmi_radar_composite_dbz.tif".to_string());
+    config.parameter = "reflectivity".to_string();
+    let engine = GeoTiffEngine::new("fmi-radar", Some("../../testdata/fmi-radar"), &config).ok()?;
+    // `new()` succeeds with an *empty* catalog when the directory is missing or
+    // no file matches the template — guard on a timestep actually having loaded,
+    // so the benches skip cleanly (rather than `unwrap`-panicking) on CI / fresh
+    // clones where this large local-only fixture is absent.
+    if engine.raster_info().times.is_empty() {
+        return None;
+    }
+    Some(engine)
+}
+
+/// One 256×256 Web Mercator meta-tile over southern Finland — the unit of work
+/// meta-tiling (#202) calls `get_raster_tile` for, repeated N× per cold render.
+fn bench_get_raster_tile_fmi_metatile(c: &mut Criterion) {
+    let Some(engine) = load_fmi_engine() else {
+        eprintln!("skipping fmi 256 metatile bench: testdata/fmi-radar absent");
+        return;
+    };
+    let bbox = [24.0, 60.0, 25.5, 61.0];
+    c.bench_function("geotiff_get_raster_tile_fmi_256_metatile", |b| {
+        b.iter(|| {
+            black_box(
+                engine
+                    .get_raster_tile(
+                        black_box(bbox),
+                        256,
+                        256,
+                        None,
+                        &OutputCrs::WebMercator,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+            )
+        })
+    });
+}
+
+/// A fullscreen single-shot render over all of Finland — the direct (non-meta)
+/// path, for comparison against the per-tile cost above.
+fn bench_get_raster_tile_fmi_fullscreen(c: &mut Criterion) {
+    let Some(engine) = load_fmi_engine() else {
+        eprintln!("skipping fmi 1024 fullscreen bench: testdata/fmi-radar absent");
+        return;
+    };
+    let bbox = [19.0, 59.0, 32.0, 71.0];
+    c.bench_function("geotiff_get_raster_tile_fmi_1024_fullscreen", |b| {
+        b.iter(|| {
+            black_box(
+                engine
+                    .get_raster_tile(
+                        black_box(bbox),
+                        1024,
+                        1024,
+                        None,
+                        &OutputCrs::WebMercator,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+            )
+        })
+    });
+}
+
 fn bench_get_parameters(c: &mut Criterion) {
     let engine = load_engine();
     c.bench_function("geotiff_get_parameters", |b| {
@@ -179,6 +255,8 @@ criterion_group!(
     bench_query_area_small,
     bench_query_area_large,
     bench_get_raster_tile_projected,
+    bench_get_raster_tile_fmi_metatile,
+    bench_get_raster_tile_fmi_fullscreen,
     bench_get_parameters,
     bench_get_temporal_extent,
     bench_get_spatial_extent,

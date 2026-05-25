@@ -14,6 +14,27 @@ use ds_render::{CacheKey, RenderedCache, StyleInfo};
 use crate::error::WmsError;
 use crate::params::{WmsQuery, WmsRequestType};
 
+/// Log a phase breakdown for any GetMap render at or above this wall-clock time,
+/// so production tells us where a slow render's time actually goes (queue wait
+/// vs tile render vs assemble vs encode). Diagnostic for the cold-render tail.
+const SLOW_RENDER_LOG_MS: u64 = 400;
+
+/// Which path a GetMap render took, for the slow-render diagnostic log. Keeps the
+/// four cases distinct (a meta render, an all-nodata meta render, a meta render
+/// that *fell back* to direct, and a genuine non-meta render) rather than
+/// conflating the last three under one "direct" label.
+enum RenderPath {
+    /// Web Mercator meta-tiling, with per-phase stats.
+    Meta(ds_render::MetaTileStats),
+    /// Meta-tiling path, every covered pixel nodata — carries the tile-loop
+    /// timing (assemble/encode skipped).
+    MetaEmpty(ds_render::MetaTileStats),
+    /// Meta-tiling declined (degenerate / >MAX_TILES / extreme zoom) → direct.
+    Fallback,
+    /// Genuine non-meta path (non-3857 CRS, or meta cache disabled).
+    Direct,
+}
+
 #[derive(Clone)]
 pub struct WmsState {
     pub engines: HashMap<String, Arc<dyn MapEngine>>,
@@ -216,6 +237,7 @@ pub async fn wms_handler(
             }
 
             // Acquire render semaphore (with timeout to shed load under pressure)
+            let t_sem = std::time::Instant::now();
             let _permit =
                 tokio::time::timeout(ds_render::RENDER_TIMEOUT, state.render_semaphore.acquire())
                     .await
@@ -223,6 +245,7 @@ pub async fn wms_handler(
                         WmsError::ServiceUnavailable("Server busy, try again later".to_string())
                     })?
                     .map_err(|_| WmsError::Internal("Render semaphore closed".to_string()))?;
+            let sem_wait_ms = t_sem.elapsed().as_millis() as u64;
 
             // Render on a blocking thread
             let engine = engine.clone();
@@ -246,8 +269,13 @@ pub async fn wms_handler(
             let style_parameter =
                 layer_parameter.or_else(|| style_info.parameter.as_deref().map(String::from));
 
-            let render_result =
-                tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>, DataServerError> {
+            // Spans spawn_blocking *dispatch* + execution, so `render_ms` includes
+            // any wait for a free blocking-pool thread (itself a useful signal: if
+            // render_ms greatly exceeds the internal phase sum
+            // tile_render_ms+assemble_ms+encode_ms, the gap is scheduling latency).
+            let t_render = std::time::Instant::now();
+            let render_outcome = tokio::task::spawn_blocking(
+                move || -> Result<(Option<Vec<u8>>, RenderPath), DataServerError> {
                     // Direct single-shot render: one get_raster_tile → colorize → encode.
                     let direct = || -> Result<Option<Vec<u8>>, DataServerError> {
                         let tile = engine.get_raster_tile(
@@ -305,16 +333,90 @@ pub async fn wms_handler(
                             },
                         )?;
                         match outcome {
-                            ds_render::MetaTile::Image(b) => Ok(Some(b)),
-                            ds_render::MetaTile::Empty => Ok(None),
-                            ds_render::MetaTile::Fallback => direct(),
+                            ds_render::MetaTile::Image { bytes, stats } => {
+                                Ok((Some(bytes), RenderPath::Meta(stats)))
+                            }
+                            ds_render::MetaTile::Empty { stats } => {
+                                Ok((None, RenderPath::MetaEmpty(stats)))
+                            }
+                            ds_render::MetaTile::Fallback => {
+                                direct().map(|o| (o, RenderPath::Fallback))
+                            }
                         }
                     } else {
-                        direct()
+                        direct().map(|o| (o, RenderPath::Direct))
                     }
-                })
-                .await
-                .map_err(|e| WmsError::Internal(format!("Render task failed: {e}")))?;
+                },
+            )
+            .await
+            .map_err(|e| WmsError::Internal(format!("Render task failed: {e}")))?;
+            let render_ms = t_render.elapsed().as_millis() as u64;
+
+            // Split the render outcome: bytes flow into the existing response
+            // match below; the path + timing are logged for slow renders so prod
+            // pinpoints the cost (queue wait vs tile render vs assemble vs encode).
+            // `render_path` is irrelevant on error (the log is gated on success).
+            // `render_path` is `None` on error (no fabricated placeholder); the
+            // slow-log is gated on success anyway, so it's never read on error.
+            let (render_result, render_path): (
+                Result<Option<Vec<u8>>, DataServerError>,
+                Option<RenderPath>,
+            ) = match render_outcome {
+                Ok((bytes, path)) => (Ok(bytes), Some(path)),
+                Err(e) => (Err(e), None),
+            };
+            // Only log *successful* slow renders (the 200-status tail we're
+            // diagnosing); errors are surfaced by the WmsError render warn arm
+            // below. The arms stay distinct so a meta render that fell back to
+            // direct isn't conflated with a genuine non-meta render.
+            if render_ms >= SLOW_RENDER_LOG_MS && render_result.is_ok() {
+                match render_path {
+                    Some(RenderPath::Meta(s)) => tracing::info!(
+                        layer = %params.layer,
+                        sem_wait_ms,
+                        render_ms,
+                        tiles = s.tiles,
+                        misses = s.misses,
+                        tile_loop_ms = s.tile_loop_ms,
+                        assemble_ms = s.assemble_ms,
+                        encode_ms = s.encode_ms,
+                        width = params.width,
+                        height = params.height,
+                        "slow WMS meta-tile render"
+                    ),
+                    Some(RenderPath::MetaEmpty(s)) => tracing::info!(
+                        layer = %params.layer,
+                        sem_wait_ms,
+                        render_ms,
+                        tiles = s.tiles,
+                        misses = s.misses,
+                        tile_loop_ms = s.tile_loop_ms,
+                        width = params.width,
+                        height = params.height,
+                        "slow WMS meta-tile render (all nodata)"
+                    ),
+                    Some(RenderPath::Fallback) => tracing::info!(
+                        layer = %params.layer,
+                        sem_wait_ms,
+                        render_ms,
+                        width = params.width,
+                        height = params.height,
+                        "slow WMS render (meta-tiling fell back to direct)"
+                    ),
+                    // `Direct` covers both a non-Web-Mercator CRS and a Web
+                    // Mercator request with meta-tiling disabled (metatile_cache_mb
+                    // = 0), so the label stays generic rather than claiming a CRS.
+                    Some(RenderPath::Direct) => tracing::info!(
+                        layer = %params.layer,
+                        sem_wait_ms,
+                        render_ms,
+                        width = params.width,
+                        height = params.height,
+                        "slow WMS direct render"
+                    ),
+                    None => {}
+                }
+            }
 
             // The EMPTY and ERROR fast paths skip the format-aware encoder and
             // emit PNG bytes directly. Track the *actual* Content-Type per
