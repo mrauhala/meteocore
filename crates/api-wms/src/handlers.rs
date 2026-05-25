@@ -403,13 +403,16 @@ pub async fn wms_handler(
                         height = params.height,
                         "slow WMS render (meta-tiling fell back to direct)"
                     ),
+                    // `Direct` covers both a non-Web-Mercator CRS and a Web
+                    // Mercator request with meta-tiling disabled (metatile_cache_mb
+                    // = 0), so the label stays generic rather than claiming a CRS.
                     Some(RenderPath::Direct) => tracing::info!(
                         layer = %params.layer,
                         sem_wait_ms,
                         render_ms,
                         width = params.width,
                         height = params.height,
-                        "slow WMS direct render (non-meta CRS)"
+                        "slow WMS direct render"
                     ),
                     None => {}
                 }
