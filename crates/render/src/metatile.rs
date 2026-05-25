@@ -36,7 +36,6 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use quick_cache::sync::Cache;
-use rayon::prelude::*;
 
 use ds_core::error::DataServerError;
 use ds_core::map_engine::RasterTile;
@@ -391,8 +390,20 @@ where
     // Resample the tile mosaic into the exact viewport. Output pixels are
     // uniform in Mercator metres, so this is a pure affine map into global
     // tile-pixel space, sampled with premultiplied-alpha bilinear (avoids dark
-    // fringes from transparent nodata). Pure CPU, per-output-row independent,
-    // and touches no engine/DataStore — safe to run on the rayon pool (#240).
+    // fringes from transparent nodata).
+    //
+    // Single-threaded ON PURPOSE. This runs inside a per-request render task and
+    // the WMS handler serves many renders concurrently (a radar player prefetches
+    // ~10 timesteps per view change). Parallelising this per-row loop with rayon
+    // (#240/#242) routed every concurrent render's assembly through the one global
+    // rayon pool, where they convoy: ~10 prefetch renders oversubscribe the pool
+    // and park on its latches, inflating each assembly from ~25 ms (uncontended)
+    // to ~750 ms (measured in prod — even on warm, all-tiles-cached renders),
+    // serialising the burst into ~7 s with the CPU idle (parking, not compute).
+    // Keeping it sequential lets request concurrency be the parallelism: each
+    // assembly uses one core and the renders spread across cores instead of
+    // fighting over one pool. See feedback: no per-request rayon on a concurrent
+    // render path.
     let mosaic = Mosaic {
         tiles: mosaic_tiles,
         col0,
@@ -409,7 +420,7 @@ where
     let (w_us, h_us) = (width as usize, height as usize);
     let t_assemble = Instant::now();
     let mut out = vec![0u8; w_us * h_us * 4];
-    out.par_chunks_mut(w_us * 4)
+    out.chunks_mut(w_us * 4)
         .enumerate()
         .for_each(|(py, row_out)| {
             let y_m = north_m - (py as f64 + 0.5) * res_y;
