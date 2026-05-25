@@ -560,6 +560,12 @@ impl TiffMetadata {
                 {
                     best = Some(ov);
                 }
+                // Stop at the first level that doesn't qualify. Overviews are
+                // visited finest-first and both reasons to fall here are monotone
+                // in that direction: a level with too few source pixels is only
+                // followed by coarser (even smaller) levels, and a level whose
+                // bbox maps to < 1 pixel is only followed by coarser (even more
+                // sub-pixel) levels — so no later level can qualify either.
                 _ => break,
             }
         }
