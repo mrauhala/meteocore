@@ -2657,6 +2657,14 @@ mod tests {
         assert!(m
             .select_overview(FULL.0, FULL.1, FULL.2, FULL.3, 3500, 1000)
             .is_none());
+        // Row axis binds independently: width fits (1500 ≤ 1654) but height needs
+        // a >2× upscale (min_rows = 2500 > 2439), so it must still fall to full
+        // resolution. Guards the `(r1 - r0) >= min_rows` half of Pass 2.
+        assert!(
+            m.select_overview(FULL.0, FULL.1, FULL.2, FULL.3, 3000, 5000)
+                .is_none(),
+            "row axis exceeds 2× overview height → must read full resolution"
+        );
     }
 
     /// Like `fmi_like_meta` but in the production CRS (EPSG:3067 / TM35FIN), so
