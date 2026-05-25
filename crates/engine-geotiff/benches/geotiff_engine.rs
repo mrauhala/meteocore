@@ -158,13 +158,18 @@ fn bench_get_raster_tile_projected(c: &mut Criterion) {
 /// `testdata/RADAR_SOURCES.md`). Returns `None` when absent so `cargo bench`
 /// skips these on CI / fresh clones instead of panicking.
 fn load_fmi_engine() -> Option<GeoTiffEngine> {
-    if !std::path::Path::new("../../testdata/fmi-radar").exists() {
-        return None;
-    }
     let mut config = make_config();
     config.filename_template = Some("%Y%m%d%H%M%S_fmi_radar_composite_dbz.tif".to_string());
     config.parameter = "reflectivity".to_string();
-    GeoTiffEngine::new("fmi-radar", Some("../../testdata/fmi-radar"), &config).ok()
+    let engine = GeoTiffEngine::new("fmi-radar", Some("../../testdata/fmi-radar"), &config).ok()?;
+    // `new()` succeeds with an *empty* catalog when the directory is missing or
+    // no file matches the template — guard on a timestep actually having loaded,
+    // so the benches skip cleanly (rather than `unwrap`-panicking) on CI / fresh
+    // clones where this large local-only fixture is absent.
+    if engine.raster_info().times.is_empty() {
+        return None;
+    }
+    Some(engine)
 }
 
 /// One 256×256 Web Mercator meta-tile over southern Finland — the unit of work
