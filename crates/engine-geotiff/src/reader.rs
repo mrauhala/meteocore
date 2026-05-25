@@ -542,9 +542,24 @@ impl TiffMetadata {
             return None;
         }
 
-        // Find the smallest overview where the bbox still covers enough
-        // source pixels to fill the output without upscaling.
-        // Overviews are sorted by decreasing resolution (largest first).
+        // Pick the coarsest overview that still provides at least
+        // `MIN_OVERVIEW_FRACTION` of the requested resolution — i.e. tolerate a
+        // bounded bilinear upscale (at most `1 / MIN_OVERVIEW_FRACTION`).
+        //
+        // A strict never-upscale rule (`>= output_*`) creates a latency cliff:
+        // any output only slightly wider than the largest overview falls all the
+        // way through to full resolution. On the production FMI composite (base
+        // 4963×7316, largest overview 2481 px) a 2650-px-wide retina GetMap
+        // decoded the entire 36 MP base (~770 ms) instead of the 9 MP overview
+        // (~350 ms) — for what is only a 1.07× upscale. Measured live: render
+        // jumped from 348 ms at 2481 px to 653 ms at 2550 px.
+        //
+        // Overviews are sorted by decreasing resolution (largest first), so the
+        // last level to clear the floor is the coarsest acceptable one (least
+        // data to decode).
+        const MIN_OVERVIEW_FRACTION: f64 = 0.5; // accept up to a 2× bilinear upscale
+        let min_cols = (output_width as f64 * MIN_OVERVIEW_FRACTION).ceil() as u32;
+        let min_rows = (output_height as f64 * MIN_OVERVIEW_FRACTION).ceil() as u32;
         let mut best: Option<&OverviewLevel> = None;
         for ov in &self.overviews {
             let ov_gt = self.overview_geo_transform(ov);
@@ -553,11 +568,11 @@ impl TiffMetadata {
             {
                 let ov_cols = c1 - c0;
                 let ov_rows = r1 - r0;
-                if ov_cols >= output_width && ov_rows >= output_height {
-                    // This overview has enough pixels — it's a candidate
+                if ov_cols >= min_cols && ov_rows >= min_rows {
+                    // Enough pixels (within the upscale tolerance) — a candidate.
                     best = Some(ov);
                 } else {
-                    // Too small — stop, use previous candidate
+                    // Below the floor — stop, use the previous (finer) candidate.
                     break;
                 }
             } else {
@@ -2502,6 +2517,100 @@ mod tests {
             mismatches,
             sequential_result.len()
         );
+    }
+
+    // --- Overview selection (latency-cliff) tests ---
+
+    /// Mirrors the production FMI radar composite COG: a 4963×7316 base with a
+    /// power-of-two overview pyramid whose largest overview is 2481 px wide.
+    /// CRS is WGS84 so bbox-to-pixel is an axis-aligned scale, letting these
+    /// tests reason purely about the overview-selection arithmetic.
+    fn fmi_like_meta() -> TiffMetadata {
+        let ov = |ifd: usize, w: u32, h: u32| OverviewLevel {
+            ifd_index: ifd,
+            width: w,
+            height: h,
+            tile_width: 256,
+            tile_height: 256,
+            tiles_across: w.div_ceil(256),
+            tiles_down: h.div_ceil(256),
+            tile_info: None,
+        };
+        TiffMetadata {
+            width: 4963,
+            height: 7316,
+            tile_width: 256,
+            tile_height: 256,
+            tiles_across: 4963u32.div_ceil(256),
+            tiles_down: 7316u32.div_ceil(256),
+            samples_per_pixel: 1,
+            // A valid WGS84 extent (20–30°E, 55–70°N) so bbox→pixel is a clean
+            // affine scale; the absolute geography is irrelevant to the test.
+            geo_transform: ds_core::geo::GeoTransform {
+                origin_x: 20.0,
+                origin_y: 70.0,
+                pixel_width: 10.0 / 4963.0,
+                pixel_height: 15.0 / 7316.0,
+                width: 4963,
+                height: 7316,
+                crs: ds_core::geo::Crs::Wgs84,
+            },
+            nodata: Some(255.0),
+            scale: None,
+            offset: None,
+            overviews: vec![
+                ov(1, 2481, 3658),
+                ov(2, 1240, 1829),
+                ov(3, 620, 914),
+                ov(4, 310, 457),
+                ov(5, 155, 228),
+            ],
+        }
+    }
+
+    // Full geographic extent of `fmi_like_meta` (west, south, east, north).
+    const FULL: (f64, f64, f64, f64) = (20.0, 55.0, 30.0, 70.0);
+
+    #[test]
+    fn select_overview_just_above_cliff_uses_overview_not_full_res() {
+        let m = fmi_like_meta();
+        // 2650 px is just above the 2481-px largest overview. Under the old
+        // strict never-upscale rule this returned None → full-res 36 MP decode.
+        let ov = m
+            .select_overview(FULL.0, FULL.1, FULL.2, FULL.3, 2650, 2177)
+            .expect("must use an overview, not fall back to full resolution");
+        assert_eq!(ov.ifd_index, 1, "should pick the 2481-px overview");
+    }
+
+    #[test]
+    fn select_overview_largest_retina_still_avoids_full_res() {
+        let m = fmi_like_meta();
+        // 3783 px (a 1.52× upscale off ov0) must still use the overview.
+        let ov = m
+            .select_overview(FULL.0, FULL.1, FULL.2, FULL.3, 3783, 3108)
+            .expect("3783-wide output should still use an overview");
+        assert_eq!(ov.ifd_index, 1);
+    }
+
+    #[test]
+    fn select_overview_full_res_when_output_matches_base() {
+        let m = fmi_like_meta();
+        // At native resolution no coarser level clears the upscale floor, so
+        // full resolution is the correct choice.
+        assert!(m
+            .select_overview(FULL.0, FULL.1, FULL.2, FULL.3, 4963, 7316)
+            .is_none());
+    }
+
+    #[test]
+    fn select_overview_prefers_coarser_within_tolerance() {
+        let m = fmi_like_meta();
+        // 1300-wide output: ov1 (1240) is within the 2× floor (≈1.05× upscale)
+        // and reads ~4× less than ov0, so it is preferred.
+        let ov = m
+            .select_overview(FULL.0, FULL.1, FULL.2, FULL.3, 1300, 1068)
+            .unwrap();
+        assert_eq!(ov.ifd_index, 2);
     }
 
     // --- Nodata comparison tests ---
