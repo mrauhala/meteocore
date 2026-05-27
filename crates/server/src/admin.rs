@@ -1693,8 +1693,8 @@ fn register_parameter_layer_styles(
 
 /// Wrap `cmap` in [`ds_render::IntegerLutColorMap`] when the value range fits
 /// a small precomputed LUT (#207). Skipped for non-finite/inverted bounds,
-/// spans <16 entries (`v as i64` rounds toward zero, so a fine-resolution
-/// gradient would collapse), or spans over the 65 535-entry cap.
+/// spans below 16 entries (≥1-unit-per-stop is too coarse for sub-unit
+/// gradients like viridis 0..1), or spans over the 65 536-entry cap.
 fn maybe_wrap_integer_lut(
     cmap: Arc<dyn ds_render::ColorMap>,
     min: f64,
@@ -2531,6 +2531,15 @@ mod tests {
                 "colour mismatch at v={v}"
             );
         }
+        // Out-of-range saturates to the boundary entry (not transparent),
+        // matching the float path's clamp — at integer endpoints we CAN
+        // compare to src by construction.
+        assert_eq!(wrapped.color(Some(-100.0)), src.color(Some(-32.0)));
+        assert_eq!(wrapped.color(Some(200.0)), src.color(Some(95.0)));
+        // (The non-integer rounding direction — round-nearest, not toward
+        // zero — is pinned in ds-render's IntegerLutColorMap tests where the
+        // colormap has distinct colours per integer. radar_dbz's low end is
+        // transparent so it can't distinguish the directions here.)
     }
 
     #[test]
