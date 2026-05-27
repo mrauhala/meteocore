@@ -16,6 +16,12 @@ pub const MAX_MAP_DIMENSION: u32 = 8000;
 const SUPPORTED_CRS: &[&str] = &["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:3067", "EPSG:3035"];
 
 /// Supported output formats.
+///
+/// `image/png` auto-selects an 8-bit indexed-palette encoding ("PNG8") when
+/// the rendered image carries ≤256 distinct colours (every colormap layer);
+/// the encoder falls back to 32-bit RGBA above that. Content-type is
+/// `image/png` either way — clients can't tell, and no second `f=` value is
+/// needed.
 const SUPPORTED_FORMATS: &[&str] = &["image/png", "image/jpeg", "image/webp"];
 
 /// Query parameters for OGC API Maps get_map / get_styled_map endpoints.

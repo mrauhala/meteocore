@@ -742,14 +742,39 @@ mod tests {
     }
 
     /// Decode the RGBA pixels of a PNG produced by [`render_metatiled`].
+    ///
+    /// `encode_png` auto-selects an 8-bit indexed-palette encoding for
+    /// buffers with ≤256 distinct colours (the common colormap case) and
+    /// falls back to 32-bit RGBA otherwise. Either branch must round-trip
+    /// to the same per-pixel RGBA — handle both colour types here so the
+    /// fidelity tests below don't constrain which branch ran.
     fn decode_rgba(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
         let decoder = png::Decoder::new(bytes);
         let mut reader = decoder.read_info().unwrap();
+        let info_meta = reader.info().clone();
         let mut buf = vec![0u8; reader.output_buffer_size()];
-        let info = reader.next_frame(&mut buf).unwrap();
-        assert_eq!(info.color_type, png::ColorType::Rgba, "expected RGBA PNG");
-        buf.truncate(info.buffer_size());
-        (info.width, info.height, buf)
+        let frame = reader.next_frame(&mut buf).unwrap();
+        let w = frame.width;
+        let h = frame.height;
+        let used = &buf[..frame.buffer_size()];
+        match frame.color_type {
+            png::ColorType::Rgba => (w, h, used.to_vec()),
+            png::ColorType::Indexed => {
+                let plte = info_meta.palette.as_deref().unwrap_or(&[]);
+                let trns = info_meta.trns.as_deref().unwrap_or(&[]);
+                let mut out = Vec::with_capacity((w * h * 4) as usize);
+                for &idx in used {
+                    let p = idx as usize;
+                    let r = plte[p * 3];
+                    let g = plte[p * 3 + 1];
+                    let b = plte[p * 3 + 2];
+                    let a = if p < trns.len() { trns[p] } else { 255 };
+                    out.extend_from_slice(&[r, g, b, a]);
+                }
+                (w, h, out)
+            }
+            other => panic!("unexpected decoded PNG colour type: {other:?}"),
+        }
     }
 
     /// The strongest fidelity guard: assemble a field whose value at every pixel
