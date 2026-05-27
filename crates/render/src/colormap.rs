@@ -89,6 +89,14 @@ impl ColorMap for LutColorMap {
     fn color(&self, value: Option<f64>) -> [u8; 4] {
         match value {
             None => self.nodata_color,
+            // NaN/±∞ are not real data — colour them as nodata, matching
+            // `IntegerLutColorMap` and `LinearColorMap`. Without this guard
+            // the normalised index goes through `NaN as usize = 0` (Rust 1.45+
+            // saturating cast) and returns `lut[0]` (the first stop's colour),
+            // which the integer-LUT wrap (#207) would silently switch to
+            // `nodata_color` — a real divergence for any pipeline that lets
+            // NaN reach the colorizer.
+            Some(v) if !v.is_finite() => self.nodata_color,
             Some(v) => {
                 if self.max <= self.min {
                     return self.lut[0];
@@ -202,6 +210,10 @@ impl ColorMap for LinearColorMap {
     fn color(&self, value: Option<f64>) -> [u8; 4] {
         match value {
             None => self.nodata_color,
+            // Match the NaN guard in LutColorMap / IntegerLutColorMap — otherwise
+            // a NaN falls through every comparison in `interpolate_stops` and
+            // returns the LAST stop's colour, diverging from the other paths.
+            Some(v) if !v.is_finite() => self.nodata_color,
             Some(v) => interpolate_stops(&self.stops, v),
         }
     }
@@ -793,6 +805,35 @@ mod tests {
         // Out of range above → last entry.
         assert_eq!(lut.color(Some(11.0)), linear.color(Some(10.0)));
         assert_eq!(lut.color(Some(1e9)), linear.color(Some(10.0)));
+    }
+
+    #[test]
+    fn test_all_colormaps_treat_nan_and_infinity_as_nodata() {
+        // All three colormap types must agree on non-finite inputs — otherwise
+        // `maybe_wrap_integer_lut` (the #207 wrap) silently changes behaviour
+        // when an engine lets NaN reach the colorizer.
+        let stops = vec![
+            ColorStop {
+                value: 0.0,
+                color: [255, 0, 0, 255],
+            },
+            ColorStop {
+                value: 10.0,
+                color: [0, 255, 0, 255],
+            },
+        ];
+        let lut = LutColorMap::from_stops(&stops, 0.0, 10.0);
+        let lin = LinearColorMap::new(stops);
+        let int_lut = IntegerLutColorMap::from_colormap(&lin, 0, 10).unwrap();
+        for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(lut.color(Some(v)), [0, 0, 0, 0], "LutColorMap on {v}");
+            assert_eq!(lin.color(Some(v)), [0, 0, 0, 0], "LinearColorMap on {v}");
+            assert_eq!(
+                int_lut.color(Some(v)),
+                [0, 0, 0, 0],
+                "IntegerLutColorMap on {v}"
+            );
+        }
     }
 
     #[test]

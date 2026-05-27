@@ -1693,7 +1693,7 @@ fn register_parameter_layer_styles(
 
 /// Wrap `cmap` in [`ds_render::IntegerLutColorMap`] when the value range fits
 /// a small precomputed LUT (#207). Skipped for non-finite/inverted bounds,
-/// spans below 16 entries (≥1-unit-per-stop is too coarse for sub-unit
+/// spans below 16 integer steps (≥1-unit-per-stop is too coarse for sub-unit
 /// gradients like viridis 0..1), or spans over the 65 536-entry cap.
 fn maybe_wrap_integer_lut(
     cmap: Arc<dyn ds_render::ColorMap>,
