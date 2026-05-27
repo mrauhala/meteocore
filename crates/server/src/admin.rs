@@ -1691,20 +1691,10 @@ fn register_parameter_layer_styles(
     }
 }
 
-/// Wrap a colormap with [`ds_render::IntegerLutColorMap`] when the value range
-/// fits in a small precomputed LUT, replacing 3 FP ops/pixel with a direct
-/// array index (#207). Skips:
-///   * non-finite or inverted ranges,
-///   * ranges narrower than 16 integers — the truncation `v as i64` would map
-///     many distinct sub-unit values to the same LUT entry, visibly degrading
-///     a fine-resolution gradient (e.g. viridis on 0..1),
-///   * ranges over the 65 536-entry cap — too big to be useful as a LUT.
-///
-/// Values outside `[min, max]` after the wrap fall to fully-transparent,
-/// matching the pre-wrap clamp behaviour for nodata. Sub-unit data inside the
-/// range truncates toward `min` (e.g. fmi radar dBZ with `scale = 0.5` shows
-/// the same colour for -31.5 and -31), which is invisible at the dBZ class
-/// granularity the colormaps are designed around.
+/// Wrap `cmap` in [`ds_render::IntegerLutColorMap`] when the value range fits
+/// a small precomputed LUT (#207). Skipped for non-finite/inverted bounds,
+/// spans <16 entries (`v as i64` rounds toward zero, so a fine-resolution
+/// gradient would collapse), or spans over the 65 535-entry cap.
 fn maybe_wrap_integer_lut(
     cmap: Arc<dyn ds_render::ColorMap>,
     min: f64,
