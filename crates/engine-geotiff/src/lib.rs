@@ -295,6 +295,22 @@ impl GeoTiffEngine {
                 let directory = directory.canonicalize().map_err(|e| {
                     DataServerError::Engine(format!("Cannot resolve directory {data_path}: {e}"))
                 })?;
+                // Local-file path uses `mmap` (#204). The kernel raises
+                // `SIGBUS` — unrecoverable, kills the process — if a mapped
+                // file is truncated while the mapping is live. Publishers MUST
+                // use atomic rename (write a tempfile, then `rename(2)` into
+                // place), not in-place overwrite (`cp`, `rsync --inplace`,
+                // FTP). Atomic rename creates a new inode, leaving the
+                // existing mmap valid; the catalog rescan picks up the new
+                // inode on the next poll. Log this at startup so operators
+                // don't silently enable the crash path.
+                tracing::warn!(
+                    collection = %collection_id,
+                    data_path = %data_path,
+                    "Local GeoTIFF data_path uses mmap for #204; publishers MUST use \
+                     atomic rename (NOT in-place overwrite like `cp`/`rsync --inplace`). \
+                     In-place overwrite can raise SIGBUS and kill the server."
+                );
                 (
                     StoreMode::Local {
                         directory,

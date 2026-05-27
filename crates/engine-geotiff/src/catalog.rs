@@ -43,6 +43,16 @@ pub enum FileState {
 pub struct FileEntry {
     pub path: PathBuf,
     pub file_size: u64,
+    /// File modification time captured at scan. `None` for remote/STAC entries
+    /// (no filesystem mtime). Used together with `file_size` and `inode` to
+    /// detect when a local file's bytes have been replaced.
+    pub mtime: Option<std::time::SystemTime>,
+    /// Inode number captured at scan (Unix only). `None` for remote/STAC
+    /// entries and on platforms without `MetadataExt::ino()`. Closes the
+    /// same-second atomic-rename gap that `mtime` alone can't catch on
+    /// 1-second-resolution filesystems (HFS+/APFS/FAT/some NFS) — see #253
+    /// round-3 finding.
+    pub inode: Option<u64>,
     pub state: FileState,
 }
 
@@ -53,10 +63,14 @@ impl FileEntry {
         source: DataSource,
         metadata: TiffMetadata,
         file_size: u64,
+        mtime: Option<std::time::SystemTime>,
+        inode: Option<u64>,
     ) -> Self {
         Self {
             path,
             file_size,
+            mtime,
+            inode,
             state: FileState::Loaded {
                 metadata: Arc::new(metadata),
                 source: Arc::new(source),
@@ -69,6 +83,8 @@ impl FileEntry {
         Self {
             path,
             file_size,
+            mtime: None,
+            inode: None,
             state: FileState::Stub { stub },
         }
     }
@@ -326,11 +342,24 @@ pub fn scan_directory(
 
         let path = entry.path();
 
-        // Get file size
-        let file_size = match entry.metadata() {
-            Ok(m) => m.len(),
+        // Get file size, mtime, and inode in one stat. mtime is
+        // `Option<SystemTime>` because some filesystems (FAT, exotic NFS
+        // configs) don't expose it; inode is Unix-only. Together they catch
+        // the same-second atomic-rename case that mtime alone misses on
+        // 1-second-resolution filesystems (#253 round-3 finding).
+        let dir_meta = match entry.metadata() {
+            Ok(m) => m,
             Err(_) => continue,
         };
+        let file_size = dir_meta.len();
+        let current_mtime = dir_meta.modified().ok();
+        #[cfg(unix)]
+        let current_inode = {
+            use std::os::unix::fs::MetadataExt;
+            Some(dir_meta.ino())
+        };
+        #[cfg(not(unix))]
+        let current_inode: Option<u64> = None;
 
         // File readiness: check size stability for genuinely NEW files only.
         // Files already in the catalog (existing) skip the readiness check.
@@ -365,31 +394,49 @@ pub fn scan_directory(
             // else: initial scan (existing empty) — accept immediately
         }
 
-        // Reuse cached metadata if file size unchanged
-        let metadata = if let Some(entry) = existing_entry {
-            if entry.file_size == file_size {
-                match entry.metadata().map(|m| (**m).clone()) {
-                    Some(m) => m,
-                    None => match TiffMetadata::from_file(&path) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            tracing::warn!("Skipping {}: {e}", path.display());
-                            continue;
-                        }
-                    },
-                }
-            } else {
-                match TiffMetadata::from_file(&path) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::warn!("Skipping {}: {e}", path.display());
-                        continue;
+        // Reuse the prior entry's `DataSource` (and its warm mmap cache from
+        // #204) when the file is unchanged — otherwise the OnceLock would be
+        // replaced every poll cycle and the mmap re-issued on the next render.
+        //
+        // The unchanged-test compares `file_size` + `mtime` + `inode`. Size
+        // alone misses a same-byte-count atomic replacement (#253 round-2);
+        // mtime alone misses the same-second case on 1-second-resolution
+        // filesystems because `rename(2)` doesn't bump mtime — only ctime
+        // and the parent dir's mtime (#253 round-3). Inode comparison closes
+        // that gap on Unix: every atomic rename produces a new inode number.
+        // If any side's mtime or inode is `None` (unusual filesystem,
+        // non-Unix), we conservatively rebuild the source — costs one extra
+        // mmap, never serves stale data.
+        let cached_unchanged = existing_entry
+            .filter(|e| {
+                e.file_size == file_size
+                    && match (e.mtime, current_mtime) {
+                        (Some(prev), Some(now)) => prev == now,
+                        _ => false,
                     }
-                }
-            }
+                    && match (e.inode, current_inode) {
+                        (Some(prev), Some(now)) => prev == now,
+                        // On platforms where we never have inode info, fall
+                        // back to size+mtime only.
+                        (None, None) => true,
+                        _ => false,
+                    }
+            })
+            .and_then(|e| e.source().map(|s| (e, s)));
+
+        let (source, metadata) = if let Some((entry, old_source)) = cached_unchanged {
+            // `cached_unchanged` is only `Some` when `entry.source()` is
+            // `Some`, which only happens for `FileState::Loaded { metadata,
+            // source }`. `FileState::Loaded` always carries both fields
+            // together, so `metadata()` here is guaranteed `Some`.
+            let meta_arc = entry
+                .metadata()
+                .expect("Loaded entry always carries metadata alongside source");
+            ((**old_source).clone(), (**meta_arc).clone())
         } else {
-            match TiffMetadata::from_file(&path) {
-                Ok(m) => m,
+            let source = DataSource::from_path(&path);
+            match TiffMetadata::from_source(&source) {
+                Ok(m) => (source, m),
                 Err(e) => {
                     tracing::warn!("Skipping {}: {e}", path.display());
                     continue;
@@ -411,10 +458,16 @@ pub fn scan_directory(
             );
         }
 
-        let source = DataSource::from_path(&path);
         entries.insert(
             datetime,
-            FileEntry::loaded(path, source, metadata, file_size),
+            FileEntry::loaded(
+                path,
+                source,
+                metadata,
+                file_size,
+                current_mtime,
+                current_inode,
+            ),
         );
     }
 
@@ -564,7 +617,7 @@ pub fn scan_remote_with_limit(
             };
             entries.insert(
                 *datetime,
-                FileEntry::loaded(pseudo_path, source, metadata, *file_size),
+                FileEntry::loaded(pseudo_path, source, metadata, *file_size, None, None),
             );
             continue;
         }
@@ -598,7 +651,7 @@ pub fn scan_remote_with_limit(
 
         entries.insert(
             *datetime,
-            FileEntry::loaded(pseudo_path, source, metadata, *file_size),
+            FileEntry::loaded(pseudo_path, source, metadata, *file_size, None, None),
         );
     }
 
@@ -810,7 +863,7 @@ mod tests {
         let path = PathBuf::from("/tmp/test.tif");
         let source = DataSource::from_path(&path);
         let metadata = dummy_metadata();
-        let entry = FileEntry::loaded(path.clone(), source, metadata, 1024);
+        let entry = FileEntry::loaded(path.clone(), source, metadata, 1024, None, None);
 
         assert!(entry.metadata().is_some());
         assert!(entry.source().is_some());
@@ -844,7 +897,7 @@ mod tests {
         let path = PathBuf::from("/tmp/test.tif");
         let source = DataSource::from_path(&path);
         let metadata = dummy_metadata();
-        let loaded = FileEntry::loaded(path, source, metadata, 1024);
+        let loaded = FileEntry::loaded(path, source, metadata, 1024, None, None);
         assert!(loaded.is_loaded());
 
         // A stub entry should return false
@@ -855,5 +908,396 @@ mod tests {
         };
         let unloaded = FileEntry::stac_stub(stub_path, 0, stub);
         assert!(!unloaded.is_loaded());
+    }
+
+    /// Regression test for the #253 reviewer catch (#204 follow-up): a poll
+    /// cycle that re-scans the same directory must reuse the prior
+    /// `DataSource` for unchanged files, so the `mmap_cache` from #204
+    /// survives across scans instead of being thrown away on every cycle.
+    #[test]
+    fn scan_directory_reuses_data_source_across_polls() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        // Find a directory of real radar TIFFs.
+        let dir = ["testdata/radar", "../../testdata/radar"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_dir())
+            .expect("testdata/radar fixture");
+
+        let pattern = Regex::new(r"radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif").unwrap();
+        let mut pending = BTreeMap::new();
+
+        // First scan — `existing` is empty, all files freshly mmapped.
+        let first = scan_directory(
+            &dir,
+            &pattern,
+            "%Y%m%dT%H%MZ",
+            &[],
+            &mut pending,
+            &HashMap::new(),
+        )
+        .expect("first scan");
+        assert!(!first.entries.is_empty(), "fixture should contain TIFFs");
+
+        // Force the lazy mmap_cache to populate on one entry so we can prove
+        // its Arc identity survives the second scan. `from_source` opens a
+        // decoder internally → triggers `load_mmap` → populates the OnceLock.
+        let (sample_ts, sample_entry) = first.entries.iter().next().unwrap();
+        let sample_source = sample_entry.source().expect("loaded entry has source");
+        let _ = TiffMetadata::from_source(sample_source)
+            .expect("from_source should succeed and populate the mmap cache");
+
+        // Snapshot the Arc<Mmap> pointer that lives inside the LocalFile.
+        let cached_mmap_ptr = match &**sample_source {
+            DataSource::LocalFile { mmap_cache, .. } => {
+                let cached = mmap_cache.get().expect("mmap_cache populated");
+                let mmap = cached.as_ref().expect("mmap succeeded");
+                Arc::as_ptr(mmap)
+            }
+            _ => panic!("expected LocalFile"),
+        };
+
+        // Second scan — pass the first catalog as `existing`.
+        let path_index: HashMap<&Path, &FileEntry> = first
+            .entries
+            .values()
+            .map(|e| (e.path.as_path(), e))
+            .collect();
+        let second = scan_directory(
+            &dir,
+            &pattern,
+            "%Y%m%dT%H%MZ",
+            &[],
+            &mut pending,
+            &path_index,
+        )
+        .expect("second scan");
+
+        // The entry for the same timestamp must reuse the prior source (same
+        // mmap_cache OnceLock, populated with the same Arc<Mmap>).
+        let reused_entry = second
+            .entries
+            .get(sample_ts)
+            .expect("second scan keeps the same entry");
+        let reused_source = reused_entry.source().expect("loaded after reuse");
+        let reused_mmap_ptr = match &**reused_source {
+            DataSource::LocalFile { mmap_cache, .. } => {
+                // If get() returns None here, EITHER scan_directory rebuilt
+                // the DataSource (the bug this test guards against) OR the
+                // committed fixture's mtime/inode changed between the two
+                // scans (e.g. CI ran `git lfs pull` or another process
+                // touched testdata/radar between the two scan calls).
+                // Surface both possibilities so a failing CI run isn't
+                // misleading.
+                let cached = match mmap_cache.get() {
+                    Some(c) => c,
+                    None => panic!(
+                        "second-scan mmap_cache is empty — either scan_directory \
+                         rebuilt the DataSource instead of reusing it (the regression \
+                         this test guards against), OR the fixture's mtime/inode was \
+                         touched between the two scans. Verify the fixture wasn't \
+                         modified by checking `stat testdata/radar/*.tif`."
+                    ),
+                };
+                let mmap = cached
+                    .as_ref()
+                    .expect("mmap was successful on the first scan");
+                Arc::as_ptr(mmap)
+            }
+            _ => panic!("expected LocalFile after reuse"),
+        };
+
+        // The strongest assertion is that the inner `Arc<Mmap>` is literally
+        // the same allocation across scans: if `scan_directory` had rebuilt
+        // the `DataSource` from scratch (the bug), the new OnceLock would be
+        // empty and we couldn't even reach the assertion above — `.get()`
+        // would return None. As a belt-and-braces check, also assert the
+        // OnceLock allocation itself is the same.
+        assert_eq!(
+            cached_mmap_ptr, reused_mmap_ptr,
+            "scan_directory must reuse the prior DataSource's mmap, not re-issue Mmap::map"
+        );
+
+        let cached_lock_ptr = match &**sample_source {
+            DataSource::LocalFile { mmap_cache, .. } => Arc::as_ptr(mmap_cache),
+            _ => unreachable!(),
+        };
+        let reused_lock_ptr = match &**reused_source {
+            DataSource::LocalFile { mmap_cache, .. } => Arc::as_ptr(mmap_cache),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            cached_lock_ptr, reused_lock_ptr,
+            "scan_directory must clone the prior DataSource (sharing Arc<OnceLock<...>>) for unchanged files"
+        );
+    }
+
+    /// Regression test for the #253 round-2 reviewer catch: when a local file
+    /// is atomically replaced with a new file of the SAME byte count, the
+    /// cached mmap must NOT be reused — otherwise renders would keep serving
+    /// the prior inode's pixels until the next size-changing publish.
+    ///
+    /// Reproduces by copying a real fixture into a tempdir, scanning it,
+    /// bumping the file's mtime by 2 s (mtime resolution on macOS is 1 s),
+    /// and scanning again. The second scan must produce a different
+    /// `Arc<OnceLock<...>>` (the source was rebuilt, not cloned).
+    #[test]
+    fn scan_directory_rebuilds_source_when_mtime_changes() {
+        use std::collections::HashMap;
+        use std::process;
+        use std::sync::Arc;
+        use std::time::{Duration, SystemTime};
+
+        // Copy a real fixture into a unique tempdir so we can mutate its
+        // mtime without touching the committed testdata.
+        let src_dir = ["testdata/radar", "../../testdata/radar"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_dir())
+            .expect("testdata/radar fixture");
+        let src_file = std::fs::read_dir(&src_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|s| s == "tif")
+                    .unwrap_or(false)
+            })
+            .expect("at least one .tif in fixture");
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "meteocore_mtime_test_{}_{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        // Always clean up.
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(tmp_dir.clone());
+
+        let dst_name = src_file.file_name();
+        let dst_path = tmp_dir.join(&dst_name);
+        std::fs::copy(src_file.path(), &dst_path).unwrap();
+
+        let pattern = Regex::new(r"radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif").unwrap();
+        let mut pending = BTreeMap::new();
+
+        let first = scan_directory(
+            &tmp_dir,
+            &pattern,
+            "%Y%m%dT%H%MZ",
+            &[],
+            &mut pending,
+            &HashMap::new(),
+        )
+        .expect("first scan");
+        assert_eq!(first.entries.len(), 1);
+
+        let first_entry = first.entries.values().next().unwrap();
+        let first_lock_ptr = match &**first_entry.source().unwrap() {
+            DataSource::LocalFile { mmap_cache, .. } => Arc::as_ptr(mmap_cache),
+            _ => panic!(),
+        };
+        let original_size = first_entry.file_size;
+
+        // Bump mtime by 2 s. macOS HFS+/APFS have 1 s resolution; +2 s clears
+        // the boundary safely. Write the SAME byte count so size stays equal.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&dst_path)
+            .unwrap();
+        let new_mtime = SystemTime::now() + Duration::from_secs(2);
+        file.set_modified(new_mtime).unwrap();
+        drop(file);
+        // Verify size didn't change — that's the whole point of this test.
+        assert_eq!(
+            std::fs::metadata(&dst_path).unwrap().len(),
+            original_size,
+            "this test only exercises the bug when size stays equal"
+        );
+
+        // Second scan with the previous catalog as `existing`.
+        let path_index: HashMap<&Path, &FileEntry> = first
+            .entries
+            .values()
+            .map(|e| (e.path.as_path(), e))
+            .collect();
+        let second = scan_directory(
+            &tmp_dir,
+            &pattern,
+            "%Y%m%dT%H%MZ",
+            &[],
+            &mut pending,
+            &path_index,
+        )
+        .expect("second scan");
+
+        let second_entry = second.entries.values().next().unwrap();
+        let second_lock_ptr = match &**second_entry.source().unwrap() {
+            DataSource::LocalFile { mmap_cache, .. } => Arc::as_ptr(mmap_cache),
+            _ => panic!(),
+        };
+
+        assert_ne!(
+            first_lock_ptr, second_lock_ptr,
+            "mtime change must rebuild the DataSource so the next render picks up the new inode"
+        );
+        // The new entry must also record the new mtime so a third scan with
+        // no further change reuses the cache again.
+        assert!(second_entry.mtime.is_some());
+        assert_ne!(first_entry.mtime, second_entry.mtime);
+    }
+
+    /// Regression test for the #253 round-3 reviewer catch: same-size,
+    /// same-mtime, different-inode atomic replacement (the case that mtime
+    /// alone misses on 1-second-resolution filesystems). Inode comparison
+    /// must catch this and force a rebuild.
+    ///
+    /// Reproduces by writing two same-size, same-mtime files to a tempdir
+    /// across two scans, asserting the second scan rebuilds the DataSource
+    /// because the inode number differs.
+    #[cfg(unix)]
+    #[test]
+    fn scan_directory_rebuilds_source_when_inode_changes_same_size_same_mtime() {
+        use std::collections::HashMap;
+        use std::os::unix::fs::MetadataExt;
+        use std::process;
+        use std::sync::Arc;
+        use std::time::SystemTime;
+
+        let src_dir = ["testdata/radar", "../../testdata/radar"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_dir())
+            .expect("testdata/radar fixture");
+        let src_file = std::fs::read_dir(&src_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|s| s == "tif")
+                    .unwrap_or(false)
+            })
+            .expect(".tif in fixture");
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "meteocore_inode_test_{}_{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(tmp_dir.clone());
+
+        let dst_path = tmp_dir.join(src_file.file_name());
+        std::fs::copy(src_file.path(), &dst_path).unwrap();
+
+        let pattern = Regex::new(r"radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif").unwrap();
+        let mut pending = BTreeMap::new();
+
+        let first = scan_directory(
+            &tmp_dir,
+            &pattern,
+            "%Y%m%dT%H%MZ",
+            &[],
+            &mut pending,
+            &HashMap::new(),
+        )
+        .expect("first scan");
+        let first_entry = first.entries.values().next().unwrap();
+        let first_inode = first_entry.inode.expect("Unix scan captures inode");
+        let first_mtime = first_entry.mtime.expect("Unix scan captures mtime");
+        let first_lock_ptr = match &**first_entry.source().unwrap() {
+            DataSource::LocalFile { mmap_cache, .. } => Arc::as_ptr(mmap_cache),
+            _ => panic!(),
+        };
+
+        // Atomically replace the file with a new copy at the SAME byte count.
+        // Write to a sibling tempfile, restore the same mtime, then rename
+        // over the original — same path, same size, same mtime, NEW inode.
+        let replacement = tmp_dir.join("replacement.tif.tmp");
+        std::fs::copy(src_file.path(), &replacement).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(first_mtime)
+            .unwrap();
+        std::fs::rename(&replacement, &dst_path).unwrap();
+
+        let after_meta = std::fs::metadata(&dst_path).unwrap();
+        assert_eq!(after_meta.len(), first_entry.file_size, "size unchanged");
+        // Test is only meaningful if the inode actually changed — sanity check.
+        // (On the unusual filesystem where rename preserves inode, skip.)
+        if after_meta.ino() == first_inode {
+            eprintln!(
+                "skip: filesystem preserves inode across rename ({}), test inapplicable",
+                first_inode
+            );
+            return;
+        }
+        // If the kernel happened to give the replacement a coarser mtime than
+        // our set_modified, the mtime test alone would already catch it and
+        // this test wouldn't exercise inode-specifically. Force same mtime
+        // explicitly post-rename.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&dst_path)
+            .unwrap()
+            .set_modified(first_mtime)
+            .unwrap();
+
+        let path_index: HashMap<&Path, &FileEntry> = first
+            .entries
+            .values()
+            .map(|e| (e.path.as_path(), e))
+            .collect();
+        let second = scan_directory(
+            &tmp_dir,
+            &pattern,
+            "%Y%m%dT%H%MZ",
+            &[],
+            &mut pending,
+            &path_index,
+        )
+        .expect("second scan");
+
+        let second_entry = second.entries.values().next().unwrap();
+        let second_lock_ptr = match &**second_entry.source().unwrap() {
+            DataSource::LocalFile { mmap_cache, .. } => Arc::as_ptr(mmap_cache),
+            _ => panic!(),
+        };
+        let second_inode = second_entry.inode.expect("Unix scan captures inode");
+
+        assert_ne!(
+            first_inode, second_inode,
+            "test setup: replacement must change inode"
+        );
+        assert_ne!(
+            first_lock_ptr, second_lock_ptr,
+            "inode change must rebuild the DataSource even when size+mtime are unchanged"
+        );
     }
 }
