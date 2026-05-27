@@ -365,22 +365,24 @@ pub fn scan_directory(
             // else: initial scan (existing empty) — accept immediately
         }
 
-        // Reuse cached metadata if file size unchanged
-        let metadata = if let Some(entry) = existing_entry {
-            if entry.file_size == file_size {
-                match entry.metadata().map(|m| (**m).clone()) {
-                    Some(m) => m,
-                    None => match TiffMetadata::from_file(&path) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            tracing::warn!("Skipping {}: {e}", path.display());
-                            continue;
-                        }
-                    },
-                }
+        // Reuse the prior entry's `DataSource` (and its warm mmap cache from
+        // #204) when the file size hasn't changed — otherwise the OnceLock is
+        // replaced every poll cycle and the mmap is re-issued on the next
+        // render. For genuinely new or size-changed files build the source
+        // once and parse metadata through it, so we don't mmap the file twice
+        // (once via `from_file` then again for the stored entry).
+        let cached_unchanged = existing_entry
+            .filter(|e| e.file_size == file_size)
+            .and_then(|e| e.source().map(|s| (e, s)));
+
+        let (source, metadata) = if let Some((entry, old_source)) = cached_unchanged {
+            if let Some(meta_arc) = entry.metadata() {
+                ((**old_source).clone(), (**meta_arc).clone())
             } else {
-                match TiffMetadata::from_file(&path) {
-                    Ok(m) => m,
+                // Stub entry with no metadata yet — parse via the existing
+                // source so we reuse its mmap cache instead of opening fresh.
+                match TiffMetadata::from_source(old_source) {
+                    Ok(m) => ((**old_source).clone(), m),
                     Err(e) => {
                         tracing::warn!("Skipping {}: {e}", path.display());
                         continue;
@@ -388,8 +390,9 @@ pub fn scan_directory(
                 }
             }
         } else {
-            match TiffMetadata::from_file(&path) {
-                Ok(m) => m,
+            let source = DataSource::from_path(&path);
+            match TiffMetadata::from_source(&source) {
+                Ok(m) => (source, m),
                 Err(e) => {
                     tracing::warn!("Skipping {}: {e}", path.display());
                     continue;
@@ -411,7 +414,6 @@ pub fn scan_directory(
             );
         }
 
-        let source = DataSource::from_path(&path);
         entries.insert(
             datetime,
             FileEntry::loaded(path, source, metadata, file_size),
@@ -855,5 +857,115 @@ mod tests {
         };
         let unloaded = FileEntry::stac_stub(stub_path, 0, stub);
         assert!(!unloaded.is_loaded());
+    }
+
+    /// Regression test for the #253 reviewer catch (#204 follow-up): a poll
+    /// cycle that re-scans the same directory must reuse the prior
+    /// `DataSource` for unchanged files, so the `mmap_cache` from #204
+    /// survives across scans instead of being thrown away on every cycle.
+    #[test]
+    fn scan_directory_reuses_data_source_across_polls() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        // Find a directory of real radar TIFFs.
+        let dir = ["testdata/radar", "../../testdata/radar"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_dir())
+            .expect("testdata/radar fixture");
+
+        let pattern = Regex::new(r"radar_(?P<timestamp>\d{8}T\d{4}Z)\.tif").unwrap();
+        let mut pending = BTreeMap::new();
+
+        // First scan — `existing` is empty, all files freshly mmapped.
+        let first = scan_directory(
+            &dir,
+            &pattern,
+            "%Y%m%dT%H%MZ",
+            &[],
+            &mut pending,
+            &HashMap::new(),
+        )
+        .expect("first scan");
+        assert!(!first.entries.is_empty(), "fixture should contain TIFFs");
+
+        // Force the lazy mmap_cache to populate on one entry so we can prove
+        // its Arc identity survives the second scan. `from_source` opens a
+        // decoder internally → triggers `load_mmap` → populates the OnceLock.
+        let (sample_ts, sample_entry) = first.entries.iter().next().unwrap();
+        let sample_source = sample_entry.source().expect("loaded entry has source");
+        let _ = TiffMetadata::from_source(sample_source)
+            .expect("from_source should succeed and populate the mmap cache");
+
+        // Snapshot the Arc<Mmap> pointer that lives inside the LocalFile.
+        let cached_mmap_ptr = match &**sample_source {
+            DataSource::LocalFile { mmap_cache, .. } => {
+                let cached = mmap_cache.get().expect("mmap_cache populated");
+                let mmap = cached.as_ref().expect("mmap succeeded");
+                Arc::as_ptr(mmap)
+            }
+            _ => panic!("expected LocalFile"),
+        };
+
+        // Second scan — pass the first catalog as `existing`.
+        let path_index: HashMap<&Path, &FileEntry> = first
+            .entries
+            .values()
+            .map(|e| (e.path.as_path(), e))
+            .collect();
+        let second = scan_directory(
+            &dir,
+            &pattern,
+            "%Y%m%dT%H%MZ",
+            &[],
+            &mut pending,
+            &path_index,
+        )
+        .expect("second scan");
+
+        // The entry for the same timestamp must reuse the prior source (same
+        // mmap_cache OnceLock, populated with the same Arc<Mmap>).
+        let reused_entry = second
+            .entries
+            .get(sample_ts)
+            .expect("second scan keeps the same entry");
+        let reused_source = reused_entry.source().expect("loaded after reuse");
+        let reused_mmap_ptr = match &**reused_source {
+            DataSource::LocalFile { mmap_cache, .. } => {
+                let cached = mmap_cache
+                    .get()
+                    .expect("mmap_cache must already be populated after reuse");
+                let mmap = cached
+                    .as_ref()
+                    .expect("mmap was successful on the first scan");
+                Arc::as_ptr(mmap)
+            }
+            _ => panic!("expected LocalFile after reuse"),
+        };
+
+        // The strongest assertion is that the inner `Arc<Mmap>` is literally
+        // the same allocation across scans: if `scan_directory` had rebuilt
+        // the `DataSource` from scratch (the bug), the new OnceLock would be
+        // empty and we couldn't even reach the assertion above — `.get()`
+        // would return None. As a belt-and-braces check, also assert the
+        // OnceLock allocation itself is the same.
+        assert_eq!(
+            cached_mmap_ptr, reused_mmap_ptr,
+            "scan_directory must reuse the prior DataSource's mmap, not re-issue Mmap::map"
+        );
+
+        let cached_lock_ptr = match &**sample_source {
+            DataSource::LocalFile { mmap_cache, .. } => Arc::as_ptr(mmap_cache),
+            _ => unreachable!(),
+        };
+        let reused_lock_ptr = match &**reused_source {
+            DataSource::LocalFile { mmap_cache, .. } => Arc::as_ptr(mmap_cache),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            cached_lock_ptr, reused_lock_ptr,
+            "scan_directory must clone the prior DataSource (sharing Arc<OnceLock<...>>) for unchanged files"
+        );
     }
 }

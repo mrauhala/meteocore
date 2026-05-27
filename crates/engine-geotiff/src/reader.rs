@@ -161,9 +161,13 @@ impl DataSource {
     }
 
     /// Map a local file lazily and cache the result (success or error) for the
-    /// lifetime of this `DataSource`. A cached error means we won't retry —
-    /// the catalog scan would have hit the same error and either skipped the
-    /// entry or failed loudly.
+    /// lifetime of this `DataSource`. A cached error means this `DataSource`
+    /// won't retry — but the next catalog scan rebuilds a fresh `DataSource`
+    /// when the file is new or its size has changed, so the recovery window
+    /// for a transient failure (`EMFILE`, `ENOMEM`, NFS hiccup, …) is at most
+    /// one `poll_interval_secs`. Files whose mmap fails on the initial scan
+    /// are skipped by the scan loop with a warning rather than poisoning the
+    /// catalog.
     ///
     /// Safety note on `Mmap::map`: read-only mapping of a file that, by our
     /// publishing convention, is replaced via atomic rename (creating a new
@@ -293,11 +297,6 @@ pub struct TiffMetadata {
 }
 
 impl TiffMetadata {
-    /// Parse metadata from a GeoTIFF file path.
-    pub fn from_file(path: &Path) -> Result<Self, DataServerError> {
-        Self::from_source(&DataSource::from_path(path))
-    }
-
     /// Parse metadata from any data source.
     pub fn from_source(source: &DataSource) -> Result<Self, DataServerError> {
         let mut decoder = source.open_decoder()?;
@@ -2419,7 +2418,7 @@ mod tests {
         let tif_path = find_first_tif(&dir);
 
         // Full-file path: parse from local file
-        let full_meta = TiffMetadata::from_file(&tif_path).unwrap();
+        let full_meta = TiffMetadata::from_source(&DataSource::from_path(&tif_path)).unwrap();
 
         // Range-read path: use local store + get_range
         let (store, _prefix) = ds_storage::build_store(dir.to_str().unwrap()).unwrap();
@@ -2453,7 +2452,7 @@ mod tests {
         let tif_path = find_first_tif(&dir);
 
         // Full-file read
-        let full_meta = TiffMetadata::from_file(&tif_path).unwrap();
+        let full_meta = TiffMetadata::from_source(&DataSource::from_path(&tif_path)).unwrap();
         let full_source = DataSource::from_path(&tif_path);
 
         // Range-read setup
@@ -2534,7 +2533,7 @@ mod tests {
         let tif_path = find_first_tif(&dir);
 
         // Sequential: read via local file (uses decode_chunk_f64 path)
-        let full_meta = TiffMetadata::from_file(&tif_path).unwrap();
+        let full_meta = TiffMetadata::from_source(&DataSource::from_path(&tif_path)).unwrap();
         let full_source = DataSource::from_path(&tif_path);
 
         // Pick a bbox that spans multiple tiles but stays under MAX_AREA_PIXELS
