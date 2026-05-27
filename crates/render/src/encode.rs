@@ -470,12 +470,28 @@ mod tests {
         // ETag stability hinges on byte-identical output for byte-identical
         // input. Two encodes of the same buffer must produce the same bytes —
         // no encoder-side timestamps or randomisation.
+        //
+        // The pattern is constrained to 16 distinct colours so this test
+        // exercises the **indexed-palette path** specifically — that path's
+        // determinism is *our* invariant (palette ordered by first
+        // pixel-occurrence). The RGBA fallback's determinism is the `png`
+        // crate's responsibility and is incidentally covered elsewhere.
         let rgba = rgba_from(64, 64, |x, y| {
-            [((x * 4) & 0xFF) as u8, ((y * 4) & 0xFF) as u8, 0, 255]
+            [((x % 4) * 64) as u8, ((y % 4) * 64) as u8, 0, 255]
         });
         let a = encode_png(&rgba, 64, 64).unwrap();
         let b = encode_png(&rgba, 64, 64).unwrap();
         assert_eq!(a, b, "PNG encoding must be deterministic for a given input");
+        // Guard against a silent regression: if this test ever falls back to
+        // RGBA (e.g. someone widens the colour range above 256), it would
+        // stop testing the invariant it claims to.
+        let decoder = png::Decoder::new(&a[..]);
+        let reader = decoder.read_info().unwrap();
+        assert_eq!(
+            reader.info().color_type,
+            png::ColorType::Indexed,
+            "this test must exercise the indexed-palette path, not the RGBA fallback"
+        );
     }
 
     #[test]
