@@ -1691,6 +1691,40 @@ fn register_parameter_layer_styles(
     }
 }
 
+/// Wrap `cmap` in [`ds_render::IntegerLutColorMap`] when the value range fits
+/// a small precomputed LUT (#207). Skipped for non-finite/inverted bounds,
+/// spans below 16 integer steps (≥1-unit-per-stop is too coarse for sub-unit
+/// gradients like viridis 0..1), or spans over the 65 536-entry cap.
+fn maybe_wrap_integer_lut(
+    cmap: Arc<dyn ds_render::ColorMap>,
+    min: f64,
+    max: f64,
+) -> Arc<dyn ds_render::ColorMap> {
+    if !min.is_finite() || !max.is_finite() {
+        return cmap;
+    }
+    let lo = min.floor() as i64;
+    let hi = max.ceil() as i64;
+    let span = match hi.checked_sub(lo) {
+        Some(s) if (16..65_536).contains(&s) => s,
+        _ => return cmap,
+    };
+    match ds_render::IntegerLutColorMap::from_colormap(cmap.as_ref(), lo, hi) {
+        Some(lut) => {
+            tracing::debug!(
+                "Wired IntegerLutColorMap [{lo}..{hi}] ({} entries) for colorize",
+                span + 1
+            );
+            Arc::new(lut)
+        }
+        // Currently unreachable given the (16..65_536) gate above (max span 65 535
+        // → range 65 536, which `from_colormap` accepts since its check is
+        // `range > MAX_INTEGER_LUT_SIZE`). Kept as a safe fallback for the day
+        // either bound is loosened.
+        None => cmap,
+    }
+}
+
 /// Build a colormap and value range from WMS config fields.
 fn build_colormap_from_wms_config(
     colormap_name: Option<&str>,
@@ -1714,7 +1748,9 @@ fn build_colormap_from_wms_config(
         if !stops.is_empty() {
             let min = min_override.unwrap_or_else(|| stops.first().map(|s| s.value).unwrap_or(0.0));
             let max = max_override.unwrap_or_else(|| stops.last().map(|s| s.value).unwrap_or(1.0));
-            return (Arc::new(ds_render::LinearColorMap::new(stops)), min, max);
+            let cmap: Arc<dyn ds_render::ColorMap> =
+                Arc::new(ds_render::LinearColorMap::new(stops));
+            return (maybe_wrap_integer_lut(cmap, min, max), min, max);
         }
     }
 
@@ -1724,25 +1760,20 @@ fn build_colormap_from_wms_config(
         let stops = ds_render::colormap::builtin_stops(&builtin);
         let min = min_override.unwrap_or_else(|| stops.first().map(|s| s.value).unwrap_or(0.0));
         let max = max_override.unwrap_or_else(|| stops.last().map(|s| s.value).unwrap_or(1.0));
-        return (
-            Arc::new(ds_render::LutColorMap::from_builtin(builtin, min, max)),
-            min,
-            max,
-        );
+        let cmap: Arc<dyn ds_render::ColorMap> =
+            Arc::new(ds_render::LutColorMap::from_builtin(builtin, min, max));
+        return (maybe_wrap_integer_lut(cmap, min, max), min, max);
     }
 
     // Default: viridis 0..1
     let min = min_override.unwrap_or(0.0);
     let max = max_override.unwrap_or(1.0);
-    (
-        Arc::new(ds_render::LutColorMap::from_builtin(
-            ds_render::BuiltinColormap::Viridis,
-            min,
-            max,
-        )),
+    let cmap: Arc<dyn ds_render::ColorMap> = Arc::new(ds_render::LutColorMap::from_builtin(
+        ds_render::BuiltinColormap::Viridis,
         min,
         max,
-    )
+    ));
+    (maybe_wrap_integer_lut(cmap, min, max), min, max)
 }
 
 /// Update the health gauges from the current health vector.
@@ -2476,9 +2507,92 @@ pub async fn request_logging_middleware(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_styles, classify_route, is_safe_request_id};
+    use super::{build_styles, classify_route, is_safe_request_id, maybe_wrap_integer_lut};
     use ds_core::config::{CollectionConfig, StyleBundle};
     use std::collections::HashMap;
+    use std::sync::Arc;
+
+    // --- maybe_wrap_integer_lut (#207) ---
+
+    #[test]
+    fn integer_lut_wraps_when_range_fits_and_is_wide_enough() {
+        let src: Arc<dyn ds_render::ColorMap> = Arc::new(ds_render::LutColorMap::from_builtin(
+            ds_render::BuiltinColormap::RadarDbz,
+            -32.0,
+            95.0,
+        ));
+        let wrapped = maybe_wrap_integer_lut(src.clone(), -32.0, 95.0);
+        // It was replaced (no longer the same Arc).
+        assert!(
+            !Arc::ptr_eq(&src, &wrapped),
+            "expected wrap on the radar_dbz -32..95 range"
+        );
+        // Colour at integer values matches the source — the LUT just precomputes.
+        for v in [-32i64, -16, 0, 25, 50, 95] {
+            assert_eq!(
+                wrapped.color(Some(v as f64)),
+                src.color(Some(v as f64)),
+                "colour mismatch at v={v}"
+            );
+        }
+        // Out-of-range saturates to the boundary entry (not transparent),
+        // matching the float path's clamp — at integer endpoints we CAN
+        // compare to src by construction.
+        assert_eq!(wrapped.color(Some(-100.0)), src.color(Some(-32.0)));
+        assert_eq!(wrapped.color(Some(200.0)), src.color(Some(95.0)));
+        // (The non-integer rounding direction — round-nearest, not toward
+        // zero — is pinned in ds-render's IntegerLutColorMap tests where the
+        // colormap has distinct colours per integer. radar_dbz's low end is
+        // transparent so it can't distinguish the directions here.)
+    }
+
+    #[test]
+    fn integer_lut_skips_narrow_range() {
+        // viridis 0..1 → only 2 integer entries → truncation would collapse the
+        // gradient. Must NOT wrap.
+        let src: Arc<dyn ds_render::ColorMap> = Arc::new(ds_render::LutColorMap::from_builtin(
+            ds_render::BuiltinColormap::Viridis,
+            0.0,
+            1.0,
+        ));
+        let wrapped = maybe_wrap_integer_lut(src.clone(), 0.0, 1.0);
+        assert!(
+            Arc::ptr_eq(&src, &wrapped),
+            "expected no wrap for a narrow (<16-entry) range"
+        );
+    }
+
+    #[test]
+    fn integer_lut_skips_huge_range() {
+        // > 65 535 entries can't fit the integer LUT; fall back to the source.
+        let src: Arc<dyn ds_render::ColorMap> = Arc::new(ds_render::LutColorMap::from_builtin(
+            ds_render::BuiltinColormap::Viridis,
+            -100_000.0,
+            100_000.0,
+        ));
+        let wrapped = maybe_wrap_integer_lut(src.clone(), -100_000.0, 100_000.0);
+        assert!(
+            Arc::ptr_eq(&src, &wrapped),
+            "expected no wrap for an over-cap range"
+        );
+    }
+
+    #[test]
+    fn integer_lut_skips_non_finite_bounds() {
+        let src: Arc<dyn ds_render::ColorMap> = Arc::new(ds_render::LutColorMap::from_builtin(
+            ds_render::BuiltinColormap::Viridis,
+            0.0,
+            1.0,
+        ));
+        assert!(Arc::ptr_eq(
+            &src,
+            &maybe_wrap_integer_lut(src.clone(), f64::NAN, 1.0)
+        ));
+        assert!(Arc::ptr_eq(
+            &src,
+            &maybe_wrap_integer_lut(src.clone(), 0.0, f64::INFINITY)
+        ));
+    }
 
     #[test]
     fn accepts_typical_uuid() {

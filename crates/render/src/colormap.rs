@@ -2,6 +2,13 @@
 pub trait ColorMap: Send + Sync {
     /// Map a value to an RGBA color. None = nodata → transparent.
     fn color(&self, value: Option<f64>) -> [u8; 4];
+
+    /// Colour returned for `None` / NaN / ±∞ inputs. Defaults to fully transparent.
+    /// Overridden by concrete impls that carry an explicit nodata colour so
+    /// wrappers like `IntegerLutColorMap::from_colormap` can preserve it.
+    fn nodata_color(&self) -> [u8; 4] {
+        [0, 0, 0, 0]
+    }
 }
 
 /// A color stop for defining gradient colormaps.
@@ -86,9 +93,21 @@ impl LutColorMap {
 }
 
 impl ColorMap for LutColorMap {
+    fn nodata_color(&self) -> [u8; 4] {
+        self.nodata_color
+    }
+
     fn color(&self, value: Option<f64>) -> [u8; 4] {
         match value {
             None => self.nodata_color,
+            // NaN/±∞ are not real data — colour them as nodata. Deliberate
+            // behaviour change: before #250, NaN here hit the saturating cast
+            // `NaN as usize = 0` and returned `lut[0]` (opaque for built-ins
+            // like Viridis/Temperature); `LinearColorMap` returned the LAST
+            // stop. The two were quietly inconsistent. This guard unifies all
+            // three colormap impls on `nodata_color`, which is what a NaN
+            // pixel actually means.
+            Some(v) if !v.is_finite() => self.nodata_color,
             Some(v) => {
                 if self.max <= self.min {
                     return self.lut[0];
@@ -105,10 +124,11 @@ impl ColorMap for LutColorMap {
 
 /// Pre-computed integer LUT colormap. O(1) per pixel with direct indexing.
 ///
-/// For integer data types (UInt8, UInt16, Int16), all possible output colors
-/// are pre-computed into a flat array. Lookup is a single index operation
-/// with no floating-point math — significantly faster than even the
-/// normalized LUT approach for integer raster data.
+/// All colors over the configured integer range are pre-computed into a flat
+/// array. Per-pixel lookup is one subtract + one `.round()` + clamp + index —
+/// matching [`LutColorMap`]'s round-nearest + saturate-clamp semantics at
+/// integer entries, while replacing its `(v - min) / (max - min) * (len - 1)`
+/// normalisation with a single offset shift.
 ///
 /// Maximum supported range: 65,536 entries (~256 KB for UInt16/Int16).
 pub struct IntegerLutColorMap {
@@ -128,11 +148,12 @@ impl IntegerLutColorMap {
     ///
     /// Returns `None` if the range exceeds 65,536 entries.
     pub fn from_colormap(source: &dyn ColorMap, min_val: i64, max_val: i64) -> Option<Self> {
+        let nodata_color = source.nodata_color();
         if max_val < min_val {
             return Some(Self {
                 lut: Vec::new(),
                 offset: 0,
-                nodata_color: [0, 0, 0, 0],
+                nodata_color,
             });
         }
         let range = (max_val - min_val + 1) as usize;
@@ -147,22 +168,33 @@ impl IntegerLutColorMap {
         Some(Self {
             lut,
             offset: min_val,
-            nodata_color: [0, 0, 0, 0],
+            nodata_color,
         })
     }
 }
 
 impl ColorMap for IntegerLutColorMap {
+    fn nodata_color(&self) -> [u8; 4] {
+        self.nodata_color
+    }
+
     fn color(&self, value: Option<f64>) -> [u8; 4] {
+        // Round-nearest + saturate-clamp, matching `LutColorMap`/`LinearColorMap`
+        // semantics. `v as i64` would truncate toward zero (23.6 → 23, -0.7 → 0)
+        // which diverges from the float path's `.round()` (24 and -1). Out-of-range
+        // values clamp to the first/last entry rather than fall to transparent,
+        // also matching the float path; transparent here would silently hide
+        // pixels just outside the configured range.
         match value {
             None => self.nodata_color,
+            Some(v) if !v.is_finite() => self.nodata_color,
             Some(v) => {
-                let index = (v as i64 - self.offset) as usize;
-                if index < self.lut.len() {
-                    self.lut[index]
-                } else {
-                    [0, 0, 0, 0] // transparent for out-of-range
+                if self.lut.is_empty() {
+                    return self.nodata_color;
                 }
+                let last = (self.lut.len() - 1) as i64;
+                let idx = (v - self.offset as f64).round() as i64;
+                self.lut[idx.clamp(0, last) as usize]
             }
         }
     }
@@ -191,9 +223,17 @@ impl LinearColorMap {
 }
 
 impl ColorMap for LinearColorMap {
+    fn nodata_color(&self) -> [u8; 4] {
+        self.nodata_color
+    }
+
     fn color(&self, value: Option<f64>) -> [u8; 4] {
         match value {
             None => self.nodata_color,
+            // Match the NaN guard in LutColorMap / IntegerLutColorMap — otherwise
+            // a NaN falls through every comparison in `interpolate_stops` and
+            // returns the LAST stop's colour, diverging from the other paths.
+            Some(v) if !v.is_finite() => self.nodata_color,
             Some(v) => interpolate_stops(&self.stops, v),
         }
     }
@@ -766,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn test_integer_lut_out_of_range_transparent() {
+    fn test_integer_lut_out_of_range_saturates() {
         let linear = LinearColorMap::new(vec![
             ColorStop {
                 value: 0.0,
@@ -779,10 +819,72 @@ mod tests {
         ]);
         let lut = IntegerLutColorMap::from_colormap(&linear, 0, 10).unwrap();
 
-        // Out of range below
-        assert_eq!(lut.color(Some(-1.0)), [0, 0, 0, 0]);
-        // Out of range above
-        assert_eq!(lut.color(Some(11.0)), [0, 0, 0, 0]);
+        // Out of range below → first entry (saturate, matching LutColorMap clamp).
+        assert_eq!(lut.color(Some(-1.0)), linear.color(Some(0.0)));
+        assert_eq!(lut.color(Some(-100.0)), linear.color(Some(0.0)));
+        // Out of range above → last entry.
+        assert_eq!(lut.color(Some(11.0)), linear.color(Some(10.0)));
+        assert_eq!(lut.color(Some(1e9)), linear.color(Some(10.0)));
+    }
+
+    #[test]
+    fn test_all_colormaps_treat_nan_and_infinity_as_nodata() {
+        // All three colormap types must agree on non-finite inputs — otherwise
+        // `maybe_wrap_integer_lut` (the #207 wrap) silently changes behaviour
+        // when an engine lets NaN reach the colorizer.
+        let stops = vec![
+            ColorStop {
+                value: 0.0,
+                color: [255, 0, 0, 255],
+            },
+            ColorStop {
+                value: 10.0,
+                color: [0, 255, 0, 255],
+            },
+        ];
+        let lut = LutColorMap::from_stops(&stops, 0.0, 10.0);
+        let lin = LinearColorMap::new(stops);
+        let int_lut = IntegerLutColorMap::from_colormap(&lin, 0, 10).unwrap();
+        for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(lut.color(Some(v)), [0, 0, 0, 0], "LutColorMap on {v}");
+            assert_eq!(lin.color(Some(v)), [0, 0, 0, 0], "LinearColorMap on {v}");
+            assert_eq!(
+                int_lut.color(Some(v)),
+                [0, 0, 0, 0],
+                "IntegerLutColorMap on {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_integer_lut_rounds_nearest_not_toward_zero() {
+        // Pins round-nearest in IntegerLutColorMap (not truncate-toward-zero,
+        // which would diverge for negative values). We pin behaviour INTERNAL
+        // to the LUT here — IntegerLutColorMap has 1 entry per integer unit
+        // while LutColorMap uses a fixed 4096-entry table, so the two paths
+        // can't be expected to match at non-integer inputs.
+        let linear = LinearColorMap::new(vec![
+            ColorStop {
+                value: -10.0,
+                color: [0, 0, 0, 255],
+            },
+            ColorStop {
+                value: 10.0,
+                color: [255, 255, 255, 255],
+            },
+        ]);
+        let lut = IntegerLutColorMap::from_colormap(&linear, -10, 10).unwrap();
+        // 4.7 rounds up to 5, NOT toward zero (which would yield 4).
+        assert_eq!(lut.color(Some(4.7)), lut.color(Some(5.0)));
+        assert_ne!(lut.color(Some(4.7)), lut.color(Some(4.0)));
+        // -0.7 rounds to the nearer integer (-1), NOT toward zero (which would
+        // collapse it onto entry 0 — the bug the rounding fix prevents).
+        assert_ne!(lut.color(Some(-0.7)), lut.color(Some(0.0)));
+        assert_eq!(lut.color(Some(-0.7)), lut.color(Some(-1.0)));
+        // -0.5 is half-way; Rust's `.round()` rounds away from zero in the
+        // (non-negative) index-space coordinate after the offset shift, so in
+        // value space it rounds toward `max` here.
+        assert_eq!(lut.color(Some(-0.5)), lut.color(Some(0.0)));
     }
 
     #[test]
@@ -801,6 +903,37 @@ mod tests {
         assert_eq!(lut.color(None), [0, 0, 0, 0]);
     }
 
+    /// `from_colormap` must copy the source's `nodata_color`, not hardcode
+    /// transparent — otherwise a colormap with grey/opaque nodata would
+    /// silently flip to transparent when wrapped.
+    #[test]
+    fn test_integer_lut_preserves_source_nodata_color() {
+        // Mock colormap with a non-default (opaque grey) nodata colour.
+        struct GreyNodata;
+        impl ColorMap for GreyNodata {
+            fn color(&self, value: Option<f64>) -> [u8; 4] {
+                match value {
+                    None => self.nodata_color(),
+                    Some(v) if !v.is_finite() => self.nodata_color(),
+                    Some(_) => [255, 0, 0, 255],
+                }
+            }
+            fn nodata_color(&self) -> [u8; 4] {
+                [128, 128, 128, 255]
+            }
+        }
+
+        let lut = IntegerLutColorMap::from_colormap(&GreyNodata, 0, 10).unwrap();
+        assert_eq!(lut.color(None), [128, 128, 128, 255]);
+        assert_eq!(lut.color(Some(f64::NAN)), [128, 128, 128, 255]);
+        assert_eq!(lut.nodata_color(), [128, 128, 128, 255]);
+
+        // Empty-range path (max < min) must propagate it too.
+        let empty = IntegerLutColorMap::from_colormap(&GreyNodata, 10, 5).unwrap();
+        assert_eq!(empty.color(None), [128, 128, 128, 255]);
+        assert_eq!(empty.color(Some(0.0)), [128, 128, 128, 255]);
+    }
+
     #[test]
     fn test_integer_lut_single_value_range() {
         let linear = LinearColorMap::new(vec![
@@ -815,9 +948,9 @@ mod tests {
         ]);
         let lut = IntegerLutColorMap::from_colormap(&linear, 50, 50).unwrap();
         assert_eq!(lut.color(Some(50.0)), linear.color(Some(50.0)));
-        // Out of range
-        assert_eq!(lut.color(Some(49.0)), [0, 0, 0, 0]);
-        assert_eq!(lut.color(Some(51.0)), [0, 0, 0, 0]);
+        // Out of range → saturate to the single available entry.
+        assert_eq!(lut.color(Some(49.0)), linear.color(Some(50.0)));
+        assert_eq!(lut.color(Some(51.0)), linear.color(Some(50.0)));
     }
 
     #[test]
