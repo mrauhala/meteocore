@@ -2,6 +2,13 @@
 pub trait ColorMap: Send + Sync {
     /// Map a value to an RGBA color. None = nodata → transparent.
     fn color(&self, value: Option<f64>) -> [u8; 4];
+
+    /// Colour returned for `None` / NaN / ±∞ inputs. Defaults to fully transparent.
+    /// Overridden by concrete impls that carry an explicit nodata colour so
+    /// wrappers like `IntegerLutColorMap::from_colormap` can preserve it.
+    fn nodata_color(&self) -> [u8; 4] {
+        [0, 0, 0, 0]
+    }
 }
 
 /// A color stop for defining gradient colormaps.
@@ -86,6 +93,10 @@ impl LutColorMap {
 }
 
 impl ColorMap for LutColorMap {
+    fn nodata_color(&self) -> [u8; 4] {
+        self.nodata_color
+    }
+
     fn color(&self, value: Option<f64>) -> [u8; 4] {
         match value {
             None => self.nodata_color,
@@ -137,11 +148,12 @@ impl IntegerLutColorMap {
     ///
     /// Returns `None` if the range exceeds 65,536 entries.
     pub fn from_colormap(source: &dyn ColorMap, min_val: i64, max_val: i64) -> Option<Self> {
+        let nodata_color = source.nodata_color();
         if max_val < min_val {
             return Some(Self {
                 lut: Vec::new(),
                 offset: 0,
-                nodata_color: [0, 0, 0, 0],
+                nodata_color,
             });
         }
         let range = (max_val - min_val + 1) as usize;
@@ -156,12 +168,16 @@ impl IntegerLutColorMap {
         Some(Self {
             lut,
             offset: min_val,
-            nodata_color: [0, 0, 0, 0],
+            nodata_color,
         })
     }
 }
 
 impl ColorMap for IntegerLutColorMap {
+    fn nodata_color(&self) -> [u8; 4] {
+        self.nodata_color
+    }
+
     fn color(&self, value: Option<f64>) -> [u8; 4] {
         // Round-nearest + saturate-clamp, matching `LutColorMap`/`LinearColorMap`
         // semantics. `v as i64` would truncate toward zero (23.6 → 23, -0.7 → 0)
@@ -207,6 +223,10 @@ impl LinearColorMap {
 }
 
 impl ColorMap for LinearColorMap {
+    fn nodata_color(&self) -> [u8; 4] {
+        self.nodata_color
+    }
+
     fn color(&self, value: Option<f64>) -> [u8; 4] {
         match value {
             None => self.nodata_color,
@@ -881,6 +901,37 @@ mod tests {
         ]);
         let lut = IntegerLutColorMap::from_colormap(&linear, 0, 10).unwrap();
         assert_eq!(lut.color(None), [0, 0, 0, 0]);
+    }
+
+    /// `from_colormap` must copy the source's `nodata_color`, not hardcode
+    /// transparent — otherwise a colormap with grey/opaque nodata would
+    /// silently flip to transparent when wrapped.
+    #[test]
+    fn test_integer_lut_preserves_source_nodata_color() {
+        // Mock colormap with a non-default (opaque grey) nodata colour.
+        struct GreyNodata;
+        impl ColorMap for GreyNodata {
+            fn color(&self, value: Option<f64>) -> [u8; 4] {
+                match value {
+                    None => self.nodata_color(),
+                    Some(v) if !v.is_finite() => self.nodata_color(),
+                    Some(_) => [255, 0, 0, 255],
+                }
+            }
+            fn nodata_color(&self) -> [u8; 4] {
+                [128, 128, 128, 255]
+            }
+        }
+
+        let lut = IntegerLutColorMap::from_colormap(&GreyNodata, 0, 10).unwrap();
+        assert_eq!(lut.color(None), [128, 128, 128, 255]);
+        assert_eq!(lut.color(Some(f64::NAN)), [128, 128, 128, 255]);
+        assert_eq!(lut.nodata_color(), [128, 128, 128, 255]);
+
+        // Empty-range path (max < min) must propagate it too.
+        let empty = IntegerLutColorMap::from_colormap(&GreyNodata, 10, 5).unwrap();
+        assert_eq!(empty.color(None), [128, 128, 128, 255]);
+        assert_eq!(empty.color(Some(0.0)), [128, 128, 128, 255]);
     }
 
     #[test]
