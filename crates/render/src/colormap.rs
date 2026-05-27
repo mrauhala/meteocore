@@ -89,13 +89,13 @@ impl ColorMap for LutColorMap {
     fn color(&self, value: Option<f64>) -> [u8; 4] {
         match value {
             None => self.nodata_color,
-            // NaN/±∞ are not real data — colour them as nodata, matching
-            // `IntegerLutColorMap` and `LinearColorMap`. Without this guard
-            // the normalised index goes through `NaN as usize = 0` (Rust 1.45+
-            // saturating cast) and returns `lut[0]` (the first stop's colour),
-            // which the integer-LUT wrap (#207) would silently switch to
-            // `nodata_color` — a real divergence for any pipeline that lets
-            // NaN reach the colorizer.
+            // NaN/±∞ are not real data — colour them as nodata. Deliberate
+            // behaviour change: before #250, NaN here hit the saturating cast
+            // `NaN as usize = 0` and returned `lut[0]` (opaque for built-ins
+            // like Viridis/Temperature); `LinearColorMap` returned the LAST
+            // stop. The two were quietly inconsistent. This guard unifies all
+            // three colormap impls on `nodata_color`, which is what a NaN
+            // pixel actually means.
             Some(v) if !v.is_finite() => self.nodata_color,
             Some(v) => {
                 if self.max <= self.min {

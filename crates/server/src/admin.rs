@@ -1717,6 +1717,10 @@ fn maybe_wrap_integer_lut(
             );
             Arc::new(lut)
         }
+        // Currently unreachable given the (16..65_536) gate above (max span 65 535
+        // → range 65 536, which `from_colormap` accepts since its check is
+        // `range > MAX_INTEGER_LUT_SIZE`). Kept as a safe fallback for the day
+        // either bound is loosened.
         None => cmap,
     }
 }
