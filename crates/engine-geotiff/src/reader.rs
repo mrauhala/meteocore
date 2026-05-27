@@ -1,10 +1,11 @@
 use std::fs::File;
-use std::io::{BufReader, Cursor};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use bytes::Bytes;
 use ds_core::error::DataServerError;
+use memmap2::Mmap;
 use tiff::decoder::{Decoder, DecodingResult};
 use tiff::tags::Tag;
 
@@ -96,11 +97,39 @@ pub struct RemoteTileInfo {
     pub tile_height: u32,
 }
 
+/// Backing bytes for a [`Decoder`] — either heap-owned (downloaded payload) or
+/// memory-mapped (local file). Both impl `AsRef<[u8]>` so a single
+/// [`DecoderWrapper`] variant covers both.
+#[derive(Clone)]
+enum SharedBytes {
+    Heap(Bytes),
+    Mmap(Arc<Mmap>),
+}
+
+impl AsRef<[u8]> for SharedBytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Heap(b) => b,
+            Self::Mmap(m) => m,
+        }
+    }
+}
+
+/// Lazily-populated mmap cache. Shared across clones of `DataSource::LocalFile`
+/// so the file is mmaped once per catalog entry and reused on every render.
+type MmapCache = Arc<OnceLock<Result<Arc<Mmap>, String>>>;
+
 /// Data source for reading GeoTIFF data.
 #[derive(Debug, Clone)]
 pub enum DataSource {
-    /// Local filesystem path.
-    LocalFile(PathBuf),
+    /// Local filesystem path. The mmap is built lazily on first decoder open
+    /// (which in practice is the catalog scan) and cached for the lifetime of
+    /// this entry — every subsequent render reuses the same mapping with no
+    /// per-request `File::open` / `BufReader` / IFD re-parse from disk (#204).
+    LocalFile {
+        path: PathBuf,
+        mmap_cache: MmapCache,
+    },
     /// In-memory bytes (downloaded from S3/HTTP). Used as fallback.
     InMemory(Bytes),
     /// Remote file accessed via byte-range reads. Only IFD metadata is cached;
@@ -121,31 +150,59 @@ pub enum DataSource {
 
 impl DataSource {
     pub fn from_path(path: &Path) -> Self {
-        DataSource::LocalFile(path.to_path_buf())
+        DataSource::LocalFile {
+            path: path.to_path_buf(),
+            mmap_cache: Arc::new(OnceLock::new()),
+        }
     }
 
     pub fn from_bytes(data: impl Into<Bytes>) -> Self {
         DataSource::InMemory(data.into())
     }
 
+    /// Map a local file lazily and cache the result (success or error) for the
+    /// lifetime of this `DataSource`. A cached error means we won't retry —
+    /// the catalog scan would have hit the same error and either skipped the
+    /// entry or failed loudly.
+    ///
+    /// Safety note on `Mmap::map`: read-only mapping of a file that, by our
+    /// publishing convention, is replaced via atomic rename (creating a new
+    /// inode) rather than overwritten in place. An in-place overwrite would
+    /// produce torn reads — same hazard as the previous `File::open` path.
+    fn load_mmap(
+        path: &Path,
+        cache: &OnceLock<Result<Arc<Mmap>, String>>,
+    ) -> Result<Arc<Mmap>, DataServerError> {
+        let cached = cache.get_or_init(|| {
+            let file =
+                File::open(path).map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
+            // SAFETY: see the doc comment above — read-only mapping of a file
+            // we treat as immutable for the lifetime of this `DataSource`.
+            let mmap = unsafe { Mmap::map(&file) }
+                .map_err(|e| format!("Cannot mmap {}: {e}", path.display()))?;
+            Ok(Arc::new(mmap))
+        });
+        match cached {
+            Ok(m) => Ok(Arc::clone(m)),
+            Err(msg) => Err(DataServerError::Engine(msg.clone())),
+        }
+    }
+
     /// Open a decoder for this data source (LocalFile and InMemory only).
     fn open_decoder(&self) -> Result<DecoderWrapper, DataServerError> {
         match self {
-            DataSource::LocalFile(path) => {
-                let file = File::open(path).map_err(|e| {
-                    DataServerError::Engine(format!("Cannot open {}: {e}", path.display()))
-                })?;
-                Ok(DecoderWrapper::File(
-                    Decoder::new(BufReader::new(file)).map_err(|e| {
-                        DataServerError::Engine(format!("Invalid TIFF {}: {e}", path.display()))
-                    })?,
-                ))
+            DataSource::LocalFile { path, mmap_cache } => {
+                let mmap = Self::load_mmap(path, mmap_cache)?;
+                let cursor = Cursor::new(SharedBytes::Mmap(mmap));
+                Ok(DecoderWrapper(Decoder::new(cursor).map_err(|e| {
+                    DataServerError::Engine(format!("Invalid TIFF {}: {e}", path.display()))
+                })?))
             }
             DataSource::InMemory(bytes) => {
-                let cursor = Cursor::new(bytes.to_vec());
-                Ok(DecoderWrapper::Memory(Decoder::new(cursor).map_err(
-                    |e| DataServerError::Engine(format!("Invalid TIFF (in-memory): {e}")),
-                )?))
+                let cursor = Cursor::new(SharedBytes::Heap(bytes.clone()));
+                Ok(DecoderWrapper(Decoder::new(cursor).map_err(|e| {
+                    DataServerError::Engine(format!("Invalid TIFF (in-memory): {e}"))
+                })?))
             }
             DataSource::Remote { .. } | DataSource::HttpDirect { .. } => {
                 Err(DataServerError::Engine(
@@ -157,7 +214,7 @@ impl DataSource {
 
     fn display_name(&self) -> String {
         match self {
-            DataSource::LocalFile(p) => p.display().to_string(),
+            DataSource::LocalFile { path, .. } => path.display().to_string(),
             DataSource::InMemory(_) => "<in-memory>".to_string(),
             DataSource::Remote { path, .. } => format!("<remote:{}>", path),
             DataSource::HttpDirect { url, .. } => format!("<http:{}>", url),
@@ -165,62 +222,38 @@ impl DataSource {
     }
 }
 
-/// Wraps Decoder over different reader types to avoid generics leaking everywhere.
-enum DecoderWrapper {
-    File(Decoder<BufReader<File>>),
-    Memory(Decoder<Cursor<Vec<u8>>>),
-}
+/// Newtype over the unified `Decoder<Cursor<SharedBytes>>` so existing call
+/// sites in this file don't need to thread the cursor type around.
+struct DecoderWrapper(Decoder<Cursor<SharedBytes>>);
 
 impl DecoderWrapper {
     fn dimensions(&mut self) -> Result<(u32, u32), DataServerError> {
-        match self {
-            Self::File(d) => d
-                .dimensions()
-                .map_err(|e| DataServerError::Engine(format!("{e}"))),
-            Self::Memory(d) => d
-                .dimensions()
-                .map_err(|e| DataServerError::Engine(format!("{e}"))),
-        }
+        self.0
+            .dimensions()
+            .map_err(|e| DataServerError::Engine(format!("{e}")))
     }
 
     #[allow(dead_code)]
     fn colortype(&mut self) -> Result<tiff::ColorType, DataServerError> {
-        match self {
-            Self::File(d) => d
-                .colortype()
-                .map_err(|e| DataServerError::Engine(format!("{e}"))),
-            Self::Memory(d) => d
-                .colortype()
-                .map_err(|e| DataServerError::Engine(format!("{e}"))),
-        }
+        self.0
+            .colortype()
+            .map_err(|e| DataServerError::Engine(format!("{e}")))
     }
 
     fn get_tag(&mut self, tag: Tag) -> Result<tiff::decoder::ifd::Value, tiff::TiffError> {
-        match self {
-            Self::File(d) => d.get_tag(tag),
-            Self::Memory(d) => d.get_tag(tag),
-        }
+        self.0.get_tag(tag)
     }
 
     fn read_chunk(&mut self, idx: u32) -> Result<DecodingResult, tiff::TiffError> {
-        match self {
-            Self::File(d) => d.read_chunk(idx),
-            Self::Memory(d) => d.read_chunk(idx),
-        }
+        self.0.read_chunk(idx)
     }
 
     fn seek_to_image(&mut self, index: usize) -> Result<(), tiff::TiffError> {
-        match self {
-            Self::File(d) => d.seek_to_image(index),
-            Self::Memory(d) => d.seek_to_image(index),
-        }
+        self.0.seek_to_image(index)
     }
 
     fn more_images(&self) -> bool {
-        match self {
-            Self::File(d) => d.more_images(),
-            Self::Memory(d) => d.more_images(),
-        }
+        self.0.more_images()
     }
 }
 
@@ -262,7 +295,7 @@ pub struct TiffMetadata {
 impl TiffMetadata {
     /// Parse metadata from a GeoTIFF file path.
     pub fn from_file(path: &Path) -> Result<Self, DataServerError> {
-        Self::from_source(&DataSource::LocalFile(path.to_path_buf()))
+        Self::from_source(&DataSource::from_path(path))
     }
 
     /// Parse metadata from any data source.
@@ -426,8 +459,8 @@ impl TiffMetadata {
     ) -> Option<(Self, RemoteTileInfo)> {
         let read_size = HEADER_READ_SIZE.min(file_size as usize);
         let header_bytes = store.get_range(path, 0..read_size).ok()?;
-        let cursor = Cursor::new(header_bytes.to_vec());
-        let mut decoder = DecoderWrapper::Memory(Decoder::new(cursor).ok()?);
+        let cursor = Cursor::new(SharedBytes::Heap(header_bytes));
+        let mut decoder = DecoderWrapper(Decoder::new(cursor).ok()?);
 
         let metadata =
             Self::from_decoder_wrapper(&mut decoder, format!("<remote:{}>", path)).ok()?;
@@ -467,8 +500,8 @@ impl TiffMetadata {
             }
             resp.bytes().await.ok()
         })?;
-        let cursor = Cursor::new(header_bytes.to_vec());
-        let mut decoder = DecoderWrapper::Memory(Decoder::new(cursor).ok()?);
+        let cursor = Cursor::new(SharedBytes::Heap(header_bytes));
+        let mut decoder = DecoderWrapper(Decoder::new(cursor).ok()?);
         let metadata = Self::from_decoder_wrapper(&mut decoder, format!("<http:{}>", url)).ok()?;
         let tile_info = extract_tile_info(&mut decoder, &metadata)?;
         Some((metadata, tile_info))
@@ -2326,6 +2359,58 @@ mod tests {
             }
         }
         panic!("No .tif files found in {}", dir.display());
+    }
+
+    /// Regression test for #204: a `DataSource::LocalFile` must mmap the file
+    /// exactly once and reuse the same `Arc<Mmap>` across every subsequent
+    /// decoder open, so per-request rendering avoids `File::open`/`BufReader`
+    /// and the on-disk IFD re-parse.
+    #[test]
+    fn local_file_mmaps_once_and_reuses_across_calls() {
+        let dir = find_test_radar_dir();
+        let tif_path = find_first_tif(&dir);
+
+        let source = DataSource::from_path(&tif_path);
+        // First open populates the cache.
+        let _decoder1 = source.open_decoder().expect("first open");
+
+        let cached_ptr = match &source {
+            DataSource::LocalFile { mmap_cache, .. } => {
+                let entry = mmap_cache
+                    .get()
+                    .expect("mmap cache populated after first open");
+                let mmap = entry.as_ref().expect("mmap should succeed for the fixture");
+                Arc::as_ptr(mmap)
+            }
+            _ => panic!("from_path should produce LocalFile"),
+        };
+
+        // Subsequent opens must NOT re-mmap — they must yield the same Arc.
+        for _ in 0..5 {
+            let _ = source.open_decoder().expect("subsequent open");
+            let entry = match &source {
+                DataSource::LocalFile { mmap_cache, .. } => mmap_cache.get().unwrap(),
+                _ => unreachable!(),
+            };
+            let mmap = entry.as_ref().unwrap();
+            assert_eq!(
+                Arc::as_ptr(mmap),
+                cached_ptr,
+                "open_decoder must reuse the cached Arc<Mmap>, not allocate a fresh one"
+            );
+        }
+
+        // Cloning the DataSource shares the cache too — a fresh clone must see
+        // the same mmap, not start over.
+        let source_clone = source.clone();
+        let _ = source_clone.open_decoder().unwrap();
+        let cloned_ptr = match &source_clone {
+            DataSource::LocalFile { mmap_cache, .. } => {
+                Arc::as_ptr(mmap_cache.get().unwrap().as_ref().unwrap())
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(cloned_ptr, cached_ptr, "Clone must share the mmap cache");
     }
 
     #[test]
