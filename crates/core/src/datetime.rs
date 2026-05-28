@@ -148,12 +148,64 @@ pub fn format_iso8601_duration(seconds: i64) -> Option<String> {
     Some(out)
 }
 
+/// OGC API Common Part 2 `extent.temporal.grid` descriptor.
+///
+/// Serialises (via `serde`, the only serialization dependency ds-core carries)
+/// to `{ "cellsCount": N, "resolution": "<ISO 8601>" }` for a regular series or
+/// `{ "cellsCount": N, "coordinates": [<rfc3339>, …] }` for an irregular one.
+/// Defined here — not in the API crates — so the Maps and Tiles
+/// `extent.temporal.grid` builders share one definition and the JSON shape
+/// can't drift between `/maps/...` and `/tiles/...`. The API crates turn it
+/// into JSON with `serde_json::to_value` (ds-core never builds `serde_json::Value`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(untagged)]
+pub enum TemporalGrid {
+    Regular {
+        #[serde(rename = "cellsCount")]
+        cells_count: usize,
+        resolution: String,
+    },
+    Irregular {
+        #[serde(rename = "cellsCount")]
+        cells_count: usize,
+        coordinates: Vec<String>,
+    },
+}
+
+/// Build the [`TemporalGrid`] descriptor for an ascending timestamp series: a
+/// single resolution when the step is regular (see [`regular_step_duration`]),
+/// else the full coordinates list. Returns `None` for fewer than two
+/// timestamps.
+pub fn temporal_grid(times: &[DateTime<Utc>]) -> Option<TemporalGrid> {
+    if times.len() < 2 {
+        return None;
+    }
+    let cells_count = times.len();
+    if let Some(resolution) = regular_step_duration(times) {
+        return Some(TemporalGrid::Regular {
+            cells_count,
+            resolution,
+        });
+    }
+    let coordinates = times.iter().map(|t| t.to_rfc3339()).collect();
+    Some(TemporalGrid::Irregular {
+        cells_count,
+        coordinates,
+    })
+}
+
 /// Detect a regular sampling step across `times` (assumed ascending) and
 /// return it as a canonical ISO 8601 duration. Returns `None` when there are
 /// fewer than two timestamps or the gaps vary by more than 2 seconds (an
 /// irregular series). The reported step is the rounded mean gap, so ±1 s
 /// jitter on any single interval doesn't shift it or flip a regular series to
 /// irregular. Shared by the Maps and Tiles `extent.temporal.grid` builders.
+///
+/// Caveat: the 2-second spread tolerance is absolute, sized for ±1 s clock
+/// jitter on the minute-and-coarser cadences every current engine produces.
+/// A truly alternating sub-minute series (e.g. gaps `[1, 3, 1, 3]`, spread 2)
+/// would be reported as "regular PT2S". If a sub-minute engine is ever added,
+/// revisit this threshold (e.g. make it relative to the mean step).
 pub fn regular_step_duration(times: &[DateTime<Utc>]) -> Option<String> {
     if times.len() < 2 {
         return None;
@@ -329,6 +381,36 @@ mod tests {
             t("2024-01-01T03:00:00Z"),
         ];
         assert_eq!(regular_step_duration(&jittered).as_deref(), Some("PT1H"));
+    }
+
+    #[test]
+    fn temporal_grid_picks_regular_or_irregular_variant() {
+        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(temporal_grid(&[]), None);
+        let regular = [t("2024-01-01T00:00:00Z"), t("2024-01-01T00:05:00Z")];
+        assert_eq!(
+            temporal_grid(&regular),
+            Some(TemporalGrid::Regular {
+                cells_count: 2,
+                resolution: "PT5M".to_string()
+            })
+        );
+        let irregular = [
+            t("2024-01-01T00:00:00Z"),
+            t("2024-01-01T01:00:00Z"),
+            t("2024-01-01T03:00:00Z"),
+        ];
+        assert_eq!(
+            temporal_grid(&irregular),
+            Some(TemporalGrid::Irregular {
+                cells_count: 3,
+                coordinates: vec![
+                    "2024-01-01T00:00:00+00:00".to_string(),
+                    "2024-01-01T01:00:00+00:00".to_string(),
+                    "2024-01-01T03:00:00+00:00".to_string(),
+                ]
+            })
+        );
     }
 
     #[test]

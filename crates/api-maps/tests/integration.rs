@@ -1366,7 +1366,7 @@ mod extent_edge_cases {
     }
 
     #[tokio::test]
-    async fn storage_crs_omitted_for_projected_native_crs() {
+    async fn storage_crs_and_spatial_grid_omitted_for_projected_native_crs() {
         let json =
             fetch_collection_json(Arc::new(ProjectedMockEngine), "proj", vec!["maps".into()]).await;
         // Mislabelling a projected grid as CRS84 is worse than omitting it.
@@ -1375,8 +1375,13 @@ mod extent_edge_cases {
             "storageCrs must be absent for a native CRS with no OGC URI, got {:?}",
             json.get("storageCrs")
         );
-        // Spatial grid is still advertised.
-        assert!(json["extent"]["spatial"]["grid"].is_array());
+        // The bbox is still advertised...
+        assert!(json["extent"]["spatial"]["bbox"].is_array());
+        // ...but not a CRS84-degree grid: a projected grid isn't degree-regular.
+        assert!(
+            json["extent"]["spatial"].get("grid").is_none(),
+            "projected grids must not advertise a CRS84-degree spatial.grid"
+        );
     }
 
     #[tokio::test]

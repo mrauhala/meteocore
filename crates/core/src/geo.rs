@@ -80,6 +80,16 @@ pub fn native_crs_uri(label: &str) -> Option<&'static str> {
     }
 }
 
+/// True when `label` denotes a geographic lon/lat CRS whose cells are regular
+/// in degrees (`CRS:84` / `EPSG:4326`). For projected grids (EPSG:3067/3035/
+/// 3857, TM/LAEA/LCC/stere) and rotated lat/lon, a CRS84-degree
+/// `extent.spatial.grid` resolution would only approximate a grid that isn't
+/// degree-regular, so callers omit the grid for those rather than imply a
+/// regularity that doesn't hold.
+pub fn is_geographic_crs(label: &str) -> bool {
+    matches!(label, "CRS:84" | "EPSG:4326")
+}
+
 /// Positive longitude and latitude spans (degrees) of a CRS84 bbox
 /// `[west, south, east, north]`. Handles an anti-meridian crossing where
 /// `east < west` (e.g. a STAC bbox like `[170.0, …, -170.0, …]`, a 20°-wide
@@ -1107,6 +1117,24 @@ mod tests {
         // Generic engine labels for projections without a stable code: omitted.
         for label in ["TM", "LAEA", "LCC", "stere", "rotated_ll", "projected", ""] {
             assert_eq!(native_crs_uri(label), None, "label {label:?} must not map");
+        }
+    }
+
+    #[test]
+    fn is_geographic_crs_only_for_lonlat() {
+        assert!(is_geographic_crs("CRS:84"));
+        assert!(is_geographic_crs("EPSG:4326"));
+        // Projected / rotated grids are not degree-regular.
+        for label in [
+            "EPSG:3857",
+            "EPSG:3067",
+            "EPSG:3035",
+            "TM",
+            "LAEA",
+            "stere",
+            "rotated_ll",
+        ] {
+            assert!(!is_geographic_crs(label), "{label} must not be geographic");
         }
     }
 

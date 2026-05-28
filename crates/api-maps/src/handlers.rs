@@ -190,10 +190,12 @@ fn build_extent(info: &ds_core::map_engine::RasterInfo) -> Option<serde_json::Va
             "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
         });
         // Per-axis grid resolution in CRS84 degrees, derived from the native
-        // cell counts and the WGS84 bbox. `crs84_bbox_spans` keeps the spans
-        // positive even when the bbox crosses the anti-meridian.
+        // cell counts and the WGS84 bbox. Only for geographic (lon/lat) grids:
+        // for projected sources the cells aren't degree-regular, so a single
+        // CRS84-degree resolution would imply a regularity that doesn't hold.
+        // `crs84_bbox_spans` keeps the spans positive across the anti-meridian.
         if let Some([nx, ny]) = info.grid_size {
-            if nx > 0 && ny > 0 {
+            if nx > 0 && ny > 0 && ds_core::geo::is_geographic_crs(&info.native_crs) {
                 let (lon_span, lat_span) = ds_core::geo::crs84_bbox_spans(bbox);
                 spatial["grid"] = json!([
                     { "cellsCount": nx, "resolution": lon_span / nx as f64 },
@@ -212,8 +214,10 @@ fn build_extent(info: &ds_core::map_engine::RasterInfo) -> Option<serde_json::Va
                 "interval": [[start, end]],
                 "trs": "http://www.opengis.net/def/uom/ISO-8601/0/Gregorian"
             });
-            if let Some(grid) = temporal_grid(&info.times) {
-                temporal["grid"] = grid;
+            // Shared descriptor from ds-core so Maps and Tiles can't drift.
+            if let Some(grid) = ds_core::datetime::temporal_grid(&info.times) {
+                temporal["grid"] =
+                    serde_json::to_value(grid).expect("TemporalGrid serializes to JSON");
             }
             extent.insert("temporal".to_string(), temporal);
         }
@@ -247,25 +251,6 @@ fn build_extent(info: &ds_core::map_engine::RasterInfo) -> Option<serde_json::Va
     } else {
         Some(serde_json::Value::Object(extent))
     }
-}
-
-/// Build the `extent.temporal.grid` descriptor from the ordered timestamps. A
-/// regular step yields `{cellsCount, resolution}` (ISO 8601 duration); an
-/// irregular series yields `{cellsCount, coordinates}`. Returns `None` for
-/// fewer than two timestamps.
-fn temporal_grid(times: &[chrono::DateTime<chrono::Utc>]) -> Option<serde_json::Value> {
-    if times.len() < 2 {
-        return None;
-    }
-    let cells = times.len();
-    // Regular series -> a single ISO 8601 resolution; irregular -> the full
-    // coordinates list. Regularity detection lives in ds-core so the Maps and
-    // Tiles builders can't drift apart.
-    if let Some(resolution) = ds_core::datetime::regular_step_duration(times) {
-        return Some(json!({ "cellsCount": cells, "resolution": resolution }));
-    }
-    let coordinates: Vec<String> = times.iter().map(|t| t.to_rfc3339()).collect();
-    Some(json!({ "cellsCount": cells, "coordinates": coordinates }))
 }
 
 // ---------------------------------------------------------------------------
