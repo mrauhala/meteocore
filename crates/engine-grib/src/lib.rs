@@ -1230,6 +1230,10 @@ impl MapEngine for GribEngine {
             unit: default_unit,
             parameters: params,
             vertical: None,
+            // Grid ni/nj are only known after a message is decoded; the
+            // catalog metadata doesn't carry them, so leave the spatial grid
+            // unadvertised for now (tracked as a follow-up).
+            grid_size: None,
         }
     }
 }

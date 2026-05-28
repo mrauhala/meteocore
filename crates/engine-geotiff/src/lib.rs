@@ -1489,6 +1489,13 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
 
         let times: Vec<DateTime<Utc>> = catalog.entries.keys().cloned().collect();
 
+        // Native full-resolution grid dimensions, taken from the first loaded
+        // entry (all entries in a collection share the same grid).
+        let grid_size = catalog
+            .entries
+            .values()
+            .find_map(|entry| entry.metadata().map(|m| [m.width, m.height]));
+
         ds_core::map_engine::RasterInfo {
             native_crs: crs_name,
             spatial_extent: catalog.spatial_extent,
@@ -1497,6 +1504,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             unit: self.unit.clone(),
             parameters: vec![], // single-parameter engine
             vertical: None,     // single-layer raster, no vertical dimension
+            grid_size,
         }
     }
 }

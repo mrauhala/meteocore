@@ -112,6 +112,42 @@ pub fn parse_iso8601_duration(s: &str) -> Result<Duration, DataServerError> {
     Ok(Duration::seconds(total_seconds))
 }
 
+/// Format a strictly-positive whole-second duration as a canonical ISO 8601
+/// string (`300` → `"PT5M"`, `3600` → `"PT1H"`, `86400` → `"P1D"`,
+/// `5400` → `"PT1H30M"`, `90000` → `"P1DT1H"`). Returns `None` for zero or
+/// negative input. Used to advertise the temporal grid resolution in OGC API
+/// Common Part 2 `extent.temporal.grid.resolution`.
+pub fn format_iso8601_duration(seconds: i64) -> Option<String> {
+    if seconds <= 0 {
+        return None;
+    }
+
+    let days = seconds / 86_400;
+    let mut rem = seconds % 86_400;
+    let hours = rem / 3600;
+    rem %= 3600;
+    let minutes = rem / 60;
+    let secs = rem % 60;
+
+    let mut out = String::from("P");
+    if days > 0 {
+        out.push_str(&format!("{days}D"));
+    }
+    if hours > 0 || minutes > 0 || secs > 0 {
+        out.push('T');
+        if hours > 0 {
+            out.push_str(&format!("{hours}H"));
+        }
+        if minutes > 0 {
+            out.push_str(&format!("{minutes}M"));
+        }
+        if secs > 0 {
+            out.push_str(&format!("{secs}S"));
+        }
+    }
+    Some(out)
+}
+
 /// Parses an OGC datetime interval string like "2024-01-01T00:00:00Z/2024-01-01T06:00:00Z"
 /// or a single instant "2024-01-01T00:00:00Z" (treated as a zero-width interval).
 /// Also supports open intervals with ".." (e.g., "../2024-01-01T06:00:00Z").
@@ -232,6 +268,35 @@ mod tests {
             err.contains("cannot mix 'W'"),
             "Expected 'cannot mix W' message, got: {err}"
         );
+    }
+
+    #[test]
+    fn format_iso8601_duration_canonical_forms() {
+        assert_eq!(format_iso8601_duration(300).as_deref(), Some("PT5M"));
+        assert_eq!(format_iso8601_duration(3600).as_deref(), Some("PT1H"));
+        assert_eq!(format_iso8601_duration(86_400).as_deref(), Some("P1D"));
+        assert_eq!(format_iso8601_duration(5400).as_deref(), Some("PT1H30M"));
+        assert_eq!(format_iso8601_duration(90).as_deref(), Some("PT1M30S"));
+        assert_eq!(format_iso8601_duration(90_000).as_deref(), Some("P1DT1H"));
+        assert_eq!(format_iso8601_duration(45).as_deref(), Some("PT45S"));
+    }
+
+    #[test]
+    fn format_iso8601_duration_rejects_non_positive() {
+        assert_eq!(format_iso8601_duration(0), None);
+        assert_eq!(format_iso8601_duration(-300), None);
+    }
+
+    #[test]
+    fn format_iso8601_duration_roundtrips_through_parser() {
+        for secs in [60_i64, 300, 900, 3600, 10_800, 86_400, 90_000] {
+            let formatted = format_iso8601_duration(secs).unwrap();
+            assert_eq!(
+                parse_iso8601_duration(&formatted).unwrap(),
+                Duration::seconds(secs),
+                "roundtrip failed for {secs}s -> {formatted}"
+            );
+        }
     }
 
     #[test]

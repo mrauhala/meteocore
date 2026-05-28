@@ -397,6 +397,7 @@ impl MapEngine for QueryDataEngine {
             unit: String::new(),
             parameters,
             vertical: None,
+            grid_size: Some([gt.width, gt.height]),
         }
     }
 }

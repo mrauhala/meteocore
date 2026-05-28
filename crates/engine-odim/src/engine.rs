@@ -755,6 +755,7 @@ impl MapEngine for OdimEngine {
             unit: self.unit.clone(),
             parameters: vec![],
             vertical: None, // 2-D composite, no vertical dimension
+            grid_size: Some([self.seed_xsize, self.seed_ysize]),
         }
     }
 }

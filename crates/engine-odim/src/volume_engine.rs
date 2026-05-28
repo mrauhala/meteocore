@@ -1155,6 +1155,9 @@ impl MapEngine for PolarVolumeEngine {
             unit: String::new(),
             parameters,
             vertical: catalog.vertical.clone(),
+            // Polar volume — no regular CRS84 cell grid, so the spatial grid
+            // resolution is not meaningful here.
+            grid_size: None,
         }
     }
 }

@@ -47,6 +47,12 @@ pub struct RasterInfo {
     /// sweeps, pressure levels). `None` for collections with no vertical
     /// dimension.
     pub vertical: Option<VerticalDimension>,
+    /// Native grid cell counts `[x_cells, y_cells]` (columns, rows), used to
+    /// advertise spatial resolution via OGC API Common Part 2
+    /// `extent.spatial.grid`. `None` when the source has no regular geographic
+    /// grid (e.g. polar radar volumes) or when the cell counts are not cheaply
+    /// available without decoding data.
+    pub grid_size: Option<[u32; 2]>,
 }
 
 /// Trait for serving raster data as map images.
