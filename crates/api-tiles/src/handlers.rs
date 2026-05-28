@@ -168,6 +168,14 @@ fn build_collection_metadata(
         ]
     });
 
+    // Advertise `storageCrs` for raster collections when the native CRS has a
+    // stable OGC URI (mirrors api-maps). Omitted for vector collections and
+    // for projected grids with no canonical URI.
+    if let Some(storage_crs) = raster_info.and_then(|i| ds_core::geo::native_crs_uri(&i.native_crs))
+    {
+        metadata["storageCrs"] = json!(storage_crs);
+    }
+
     if let Some(extent) = build_extent(raster_info, feature_extent) {
         metadata["extent"] = extent;
     }
@@ -263,22 +271,11 @@ fn temporal_grid(times: &[chrono::DateTime<chrono::Utc>]) -> Option<serde_json::
         return None;
     }
     let cells = times.len();
-    let gaps: Vec<i64> = times
-        .windows(2)
-        .map(|w| (w[1] - w[0]).num_seconds())
-        .collect();
-    let min = *gaps.iter().min().unwrap();
-    let max = *gaps.iter().max().unwrap();
-    // Regular when every gap agrees within a 2-second spread (absorbs ±1 s
-    // rounding/leap-second jitter on any interval, not just the first) and is
-    // strictly positive. Anchor the advertised resolution to the rounded mean
-    // step so a jittered endpoint can't bias it.
-    if min > 0 && max - min <= 2 {
-        let count = gaps.len() as i64;
-        let avg = (gaps.iter().sum::<i64>() + count / 2) / count;
-        if let Some(resolution) = ds_core::datetime::format_iso8601_duration(avg) {
-            return Some(json!({ "cellsCount": cells, "resolution": resolution }));
-        }
+    // Regular series -> a single ISO 8601 resolution; irregular -> the full
+    // coordinates list. Regularity detection lives in ds-core so the Maps and
+    // Tiles builders can't drift apart.
+    if let Some(resolution) = ds_core::datetime::regular_step_duration(times) {
+        return Some(json!({ "cellsCount": cells, "resolution": resolution }));
     }
     let coordinates: Vec<String> = times.iter().map(|t| t.to_rfc3339()).collect();
     Some(json!({ "cellsCount": cells, "coordinates": coordinates }))

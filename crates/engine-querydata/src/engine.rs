@@ -368,7 +368,9 @@ impl MapEngine for QueryDataEngine {
         let bbox = gt.bbox();
 
         let native_crs = match data.grid.area.crs {
-            ds_core::geo::Crs::Wgs84 => "EPSG:4326".to_string(),
+            // Internal grids are lon-first, so CRS:84 (not EPSG:4326, which is
+            // lat-first) — this is the value surfaced as OGC `storageCrs`.
+            ds_core::geo::Crs::Wgs84 => "CRS:84".to_string(),
             ds_core::geo::Crs::RotatedLatLon { .. } => "rotated_ll".to_string(),
             _ => "projected".to_string(),
         };
@@ -727,7 +729,8 @@ mod tests {
         let info = engine.raster_info();
 
         assert_eq!(info.parameter, "2 Metre Temperature (2t)");
-        assert_eq!(info.native_crs, "EPSG:4326");
+        // Lon-first geographic grid -> CRS:84 (not lat-first EPSG:4326).
+        assert_eq!(info.native_crs, "CRS:84");
         assert_eq!(info.times.len(), 49);
         assert!(info.spatial_extent.is_some());
     }

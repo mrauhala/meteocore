@@ -387,6 +387,15 @@ mod collections {
     }
 
     #[tokio::test]
+    async fn raster_collection_advertises_storage_crs() {
+        let (_, json) = get("/collections/radar").await;
+        assert_eq!(
+            json["storageCrs"],
+            "http://www.opengis.net/def/crs/EPSG/0/4326"
+        );
+    }
+
+    #[tokio::test]
     async fn temporal_extent_has_regular_grid_resolution() {
         let (_, json) = get("/collections/radar").await;
         let grid = &json["extent"]["temporal"]["grid"];

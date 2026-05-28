@@ -148,6 +148,30 @@ pub fn format_iso8601_duration(seconds: i64) -> Option<String> {
     Some(out)
 }
 
+/// Detect a regular sampling step across `times` (assumed ascending) and
+/// return it as a canonical ISO 8601 duration. Returns `None` when there are
+/// fewer than two timestamps or the gaps vary by more than 2 seconds (an
+/// irregular series). The reported step is the rounded mean gap, so ±1 s
+/// jitter on any single interval doesn't shift it or flip a regular series to
+/// irregular. Shared by the Maps and Tiles `extent.temporal.grid` builders.
+pub fn regular_step_duration(times: &[DateTime<Utc>]) -> Option<String> {
+    if times.len() < 2 {
+        return None;
+    }
+    let gaps: Vec<i64> = times
+        .windows(2)
+        .map(|w| (w[1] - w[0]).num_seconds())
+        .collect();
+    let min = *gaps.iter().min()?;
+    let max = *gaps.iter().max()?;
+    if min <= 0 || max - min > 2 {
+        return None;
+    }
+    let count = gaps.len() as i64;
+    let avg = (gaps.iter().sum::<i64>() + count / 2) / count;
+    format_iso8601_duration(avg)
+}
+
 /// Parses an OGC datetime interval string like "2024-01-01T00:00:00Z/2024-01-01T06:00:00Z"
 /// or a single instant "2024-01-01T00:00:00Z" (treated as a zero-width interval).
 /// Also supports open intervals with ".." (e.g., "../2024-01-01T06:00:00Z").
@@ -285,6 +309,40 @@ mod tests {
     fn format_iso8601_duration_rejects_non_positive() {
         assert_eq!(format_iso8601_duration(0), None);
         assert_eq!(format_iso8601_duration(-300), None);
+    }
+
+    #[test]
+    fn regular_step_duration_detects_regular_series() {
+        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        // Exactly regular.
+        let times = [
+            t("2024-01-01T00:00:00Z"),
+            t("2024-01-01T00:05:00Z"),
+            t("2024-01-01T00:10:00Z"),
+        ];
+        assert_eq!(regular_step_duration(&times).as_deref(), Some("PT5M"));
+        // ±1 s jitter on the first interval is still regular -> mean PT1H.
+        let jittered = [
+            t("2024-01-01T00:00:00Z"),
+            t("2024-01-01T00:59:59Z"),
+            t("2024-01-01T02:00:00Z"),
+            t("2024-01-01T03:00:00Z"),
+        ];
+        assert_eq!(regular_step_duration(&jittered).as_deref(), Some("PT1H"));
+    }
+
+    #[test]
+    fn regular_step_duration_rejects_irregular_and_short() {
+        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(regular_step_duration(&[]), None);
+        assert_eq!(regular_step_duration(&[t("2024-01-01T00:00:00Z")]), None);
+        // 1 h then 2 h -> irregular.
+        let irregular = [
+            t("2024-01-01T00:00:00Z"),
+            t("2024-01-01T01:00:00Z"),
+            t("2024-01-01T03:00:00Z"),
+        ];
+        assert_eq!(regular_step_duration(&irregular), None);
     }
 
     #[test]

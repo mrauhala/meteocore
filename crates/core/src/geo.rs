@@ -59,6 +59,27 @@ pub enum Crs {
     },
 }
 
+/// Map an engine's internal native-CRS label (as stored in
+/// `RasterInfo.native_crs`) to a canonical OGC CRS URI, or `None` when the
+/// label has no stable URI — engines tag projected grids they can't pin to a
+/// specific EPSG code with generic names ("TM", "LAEA", "projected",
+/// "rotated_ll"). Used for the OGC API `storageCrs` field, where a wrong URI is
+/// worse than an absent one, so this deliberately never falls back to CRS84.
+///
+/// `"EPSG:4326"` (lat-first) and `"CRS:84"` (lon-first) map to their distinct
+/// URIs: emitting one for the other would invite a conformant client to swap
+/// axes and transpose the image.
+pub fn native_crs_uri(label: &str) -> Option<&'static str> {
+    match label {
+        "CRS:84" => Some("http://www.opengis.net/def/crs/OGC/1.3/CRS84"),
+        "EPSG:4326" => Some("http://www.opengis.net/def/crs/EPSG/0/4326"),
+        "EPSG:3857" => Some("http://www.opengis.net/def/crs/EPSG/0/3857"),
+        "EPSG:3067" => Some("http://www.opengis.net/def/crs/EPSG/0/3067"),
+        "EPSG:3035" => Some("http://www.opengis.net/def/crs/EPSG/0/3035"),
+        _ => None,
+    }
+}
+
 impl Crs {
     /// Forward-transform WGS84 (lon_deg, lat_deg) to projected (easting, northing).
     /// For Wgs84, returns (lon, lat) unchanged.
