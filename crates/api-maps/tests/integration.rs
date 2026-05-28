@@ -1108,3 +1108,98 @@ mod errors {
         assert!(json["code"].is_string());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Vertical extent tests (radar elevation angle, OGC API Common Part 2 form)
+// ---------------------------------------------------------------------------
+
+mod vertical_extent {
+    use super::*;
+    use ds_core::vertical::{VerticalDimension, VerticalKind};
+
+    struct VerticalMockEngine;
+
+    impl MapEngine for VerticalMockEngine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+        ) -> Result<RasterTile, DataServerError> {
+            Ok(RasterTile {
+                width,
+                height,
+                values: vec![None; (width * height) as usize],
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "EPSG:4326".into(),
+                spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
+                times: vec![],
+                parameter: "DBZH".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: Some(VerticalDimension::new(
+                    VerticalKind::ElevationAngle,
+                    vec![0.5, 1.5, 5.0],
+                )),
+                grid_size: None,
+            }
+        }
+    }
+
+    async fn fetch_collection() -> Value {
+        let engine: Arc<dyn MapEngine> = Arc::new(VerticalMockEngine);
+        let mut engines = HashMap::new();
+        let mut collections = HashMap::new();
+        engines.insert("pvol".to_string(), engine);
+        collections.insert(
+            "pvol".to_string(),
+            CollectionConfig {
+                id: "pvol".to_string(),
+                title: "Radar Volume".to_string(),
+                description: "PVOL".to_string(),
+                data_path: None,
+                apis: vec!["maps".to_string()],
+                engine_type: "odim".to_string(),
+                geotiff: None,
+                querydata: None,
+                wms: None,
+                grib: None,
+                odim: None,
+                postgis: None,
+                preview: None,
+            },
+        );
+        let state = Arc::new(ArcSwap::from_pointee(MapsState {
+            engines,
+            collections,
+            styles: HashMap::new(),
+            render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            rendered_cache: Arc::new(RenderedCache::new(16)),
+            base_url: String::new(),
+        }));
+        let (_, json) = get_on(api_maps::router(state), "/collections/pvol").await;
+        json
+    }
+
+    #[tokio::test]
+    async fn vertical_extent_has_common_part2_form() {
+        let json = fetch_collection().await;
+        let v = &json["extent"]["vertical"];
+        // Back-compat fields retained.
+        assert_eq!(v["values"], serde_json::json!([0.5, 1.5, 5.0]));
+        assert_eq!(v["interval"], serde_json::json!([[0.5, 5.0]]));
+        // OGC API Common Part 2 additive form.
+        assert_eq!(v["unit"], "deg");
+        assert_eq!(v["grid"]["coordinates"], serde_json::json!([0.5, 1.5, 5.0]));
+        // vrs is intentionally omitted for radar elevation angle.
+        assert!(v.get("vrs").is_none());
+    }
+}
