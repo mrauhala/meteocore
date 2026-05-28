@@ -137,8 +137,11 @@ fn encode_png_indexed(
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_compression(png::Compression::Fast);
         encoder.set_palette(plte);
-        if let Some(ref t) = trns {
-            encoder.set_trns(t.clone());
+        // Move `trns` into the encoder rather than cloning — it's a local that
+        // drops right after this block, and this fires on every indexed encode
+        // with a transparent class (≈ every radar tile).
+        if let Some(t) = trns {
+            encoder.set_trns(t);
         }
 
         let mut writer = encoder
