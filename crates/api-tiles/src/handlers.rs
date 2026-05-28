@@ -228,16 +228,22 @@ fn build_extent(
         // `vrs` is omitted: the only kind in use (radar elevation angle) has
         // no standard OGC vertical-CRS URI.
         if let Some(vertical) = &info.vertical {
-            let levels = &vertical.levels;
-            extent.insert(
-                "vertical".to_string(),
-                json!({
-                    "interval": vertical.extent().map(|(lo, hi)| [[lo, hi]]),
-                    "values": levels,
-                    "unit": vertical.unit(),
-                    "grid": { "coordinates": levels }
-                }),
-            );
+            // Only emit the vertical extent when there are levels: OGC API
+            // Common Part 2 requires `interval` to be a non-null array when the
+            // extent object is present, so an empty `VerticalDimension` is
+            // omitted rather than emitting `"interval": null`.
+            if let Some((lo, hi)) = vertical.extent() {
+                let levels = &vertical.levels;
+                extent.insert(
+                    "vertical".to_string(),
+                    json!({
+                        "interval": [[lo, hi]],
+                        "values": levels,
+                        "unit": vertical.unit(),
+                        "grid": { "coordinates": levels }
+                    }),
+                );
+            }
         }
     }
 

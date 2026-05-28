@@ -1482,7 +1482,10 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                     ds_core::geo::Crs::LambertAzimuthalEqualArea { .. } => "EPSG:3035".to_string(),
                     ds_core::geo::Crs::LambertConformalConic { .. } => "projected".to_string(),
                     ds_core::geo::Crs::Stereographic { .. } => "projected".to_string(),
-                    ds_core::geo::Crs::RotatedLatLon { .. } => "EPSG:4326".to_string(),
+                    // Rotated lat/lon is NOT EPSG:4326 — it has no standard
+                    // EPSG code. Use the same internal label as engine-querydata
+                    // so `storageCrs` is omitted rather than mislabelled.
+                    ds_core::geo::Crs::RotatedLatLon { .. } => "rotated_ll".to_string(),
                 })
             })
             .unwrap_or_else(|| "EPSG:4326".to_string());

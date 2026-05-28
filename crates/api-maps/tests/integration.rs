@@ -1212,6 +1212,58 @@ mod vertical_extent {
         // vrs is intentionally omitted for radar elevation angle.
         assert!(v.get("vrs").is_none());
     }
+
+    /// A `VerticalDimension` with no levels must not emit `"interval": null`
+    /// (invalid per OGC API Common Part 2) — the whole vertical extent is
+    /// omitted instead.
+    struct EmptyVerticalMockEngine;
+
+    impl MapEngine for EmptyVerticalMockEngine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+        ) -> Result<RasterTile, DataServerError> {
+            Ok(RasterTile {
+                width,
+                height,
+                values: vec![None; (width * height) as usize],
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "EPSG:4326".into(),
+                spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
+                times: vec![],
+                parameter: "DBZH".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: Some(VerticalDimension::new(VerticalKind::ElevationAngle, vec![])),
+                grid_size: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_vertical_dimension_omits_extent() {
+        let json = fetch_collection_json(
+            Arc::new(EmptyVerticalMockEngine),
+            "empty-z",
+            vec!["maps".to_string()],
+        )
+        .await;
+        assert!(
+            json["extent"].get("vertical").is_none(),
+            "vertical extent must be omitted when there are no levels, got {:?}",
+            json["extent"].get("vertical")
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1508,3 +1508,106 @@ mod mvt {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Temporal-grid jitter (mirrors the api-maps regression test, since
+// temporal_grid is duplicated across the two crates)
+// ---------------------------------------------------------------------------
+
+mod temporal_grid_jitter {
+    use super::*;
+
+    struct JitteredTimesMockEngine;
+
+    impl MapEngine for JitteredTimesMockEngine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+        ) -> Result<RasterTile, DataServerError> {
+            Ok(RasterTile {
+                width,
+                height,
+                values: vec![None; (width * height) as usize],
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            // Gaps: 3599 s, 3601 s, 3600 s -> spread 2, mean 3600 -> PT1H.
+            let t = |s: &str| {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            };
+            RasterInfo {
+                native_crs: "EPSG:4326".into(),
+                spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
+                times: vec![
+                    t("2024-01-01T00:00:00Z"),
+                    t("2024-01-01T00:59:59Z"),
+                    t("2024-01-01T02:00:00Z"),
+                    t("2024-01-01T03:00:00Z"),
+                ],
+                parameter: "reflectivity".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn temporal_grid_treats_jittered_series_as_regular() {
+        let engine: Arc<dyn MapEngine> = Arc::new(JitteredTimesMockEngine);
+        let mut engines = HashMap::new();
+        let mut collections = HashMap::new();
+        engines.insert("jit".to_string(), engine);
+        collections.insert(
+            "jit".to_string(),
+            CollectionConfig {
+                id: "jit".to_string(),
+                title: "Jittered".to_string(),
+                description: "Jittered".to_string(),
+                data_path: None,
+                apis: vec!["tiles".to_string()],
+                engine_type: "geotiff".to_string(),
+                geotiff: None,
+                querydata: None,
+                wms: None,
+                grib: None,
+                odim: None,
+                postgis: None,
+                preview: None,
+            },
+        );
+        let state = Arc::new(ArcSwap::from_pointee(TilesState {
+            map_engines: engines,
+            collections,
+            styles: HashMap::new(),
+            feature_engines: HashMap::new(),
+            feature_collections: HashMap::new(),
+            render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            rendered_cache: Arc::new(RenderedCache::new(16)),
+            vector_tile_cache: Arc::new(VectorTileCache::new(16)),
+            base_url: String::new(),
+        }));
+        let app = api_tiles::router(state);
+        let req = Request::builder()
+            .uri("/collections/jit")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let grid = &json["extent"]["temporal"]["grid"];
+        assert_eq!(grid["cellsCount"], 4);
+        assert_eq!(grid["resolution"], "PT1H");
+        assert!(grid.get("coordinates").is_none());
+    }
+}
