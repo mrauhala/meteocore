@@ -2,7 +2,6 @@ mod cache;
 mod catalog;
 mod parse;
 mod reader;
-mod resample;
 pub mod stac;
 mod time_window;
 
@@ -1468,7 +1467,15 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                     north - frac_y * (north - south)
                 }
             };
-            let grid = resample::ProjectionGrid::build(&gt, width, height, lon_at, lat_at);
+            let grid = ds_core::resample::ProjectionGrid::build(
+                width,
+                height,
+                gt.width,
+                gt.height,
+                lon_at,
+                lat_at,
+                |lon, lat| gt.world_to_pixel_f64(lon, lat),
+            );
 
             // Resample source grid to output dimensions using nearest-neighbor.
             for oy in 0..height {
