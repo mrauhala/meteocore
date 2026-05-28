@@ -190,13 +190,14 @@ fn build_extent(info: &ds_core::map_engine::RasterInfo) -> Option<serde_json::Va
             "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
         });
         // Per-axis grid resolution in CRS84 degrees, derived from the native
-        // cell counts and the WGS84 bbox [west, south, east, north].
+        // cell counts and the WGS84 bbox. `crs84_bbox_spans` keeps the spans
+        // positive even when the bbox crosses the anti-meridian.
         if let Some([nx, ny]) = info.grid_size {
             if nx > 0 && ny > 0 {
-                let [w, s, e, n] = bbox;
+                let (lon_span, lat_span) = ds_core::geo::crs84_bbox_spans(bbox);
                 spatial["grid"] = json!([
-                    { "cellsCount": nx, "resolution": (e - w) / nx as f64 },
-                    { "cellsCount": ny, "resolution": (n - s) / ny as f64 }
+                    { "cellsCount": nx, "resolution": lon_span / nx as f64 },
+                    { "cellsCount": ny, "resolution": lat_span / ny as f64 }
                 ]);
             }
         }
@@ -632,8 +633,15 @@ pub async fn conformance() -> impl IntoResponse {
             "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/datetime",
             "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/crs",
             "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/png",
-            "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg",
-            "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/tilesets"
+            "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg"
+            // NOTE: the OGC API Maps "Map Tilesets" class
+            // (.../conf/tilesets) is intentionally NOT declared. Its abstract
+            // tests require maps-native /collections/{id}/map/tiles endpoints,
+            // which we don't implement — raster tiles are served by the
+            // standalone OGC API Tiles service and merely *discovered* from a
+            // maps collection via the `tilesets-map` link relation. Declaring
+            // the class without the endpoints would be a false conformance
+            // claim.
         ]
     }))
 }

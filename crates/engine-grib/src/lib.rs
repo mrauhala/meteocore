@@ -1223,7 +1223,10 @@ impl MapEngine for GribEngine {
             .to_string();
 
         RasterInfo {
-            native_crs: "EPSG:4326".to_string(),
+            // Regular lat/lon grids served lon-first -> CRS:84, not the
+            // lat-first EPSG:4326 (which would make a conformant client swap
+            // axes). Matches engine-geotiff/odim/querydata for `storageCrs`.
+            native_crs: "CRS:84".to_string(),
             spatial_extent: Some([-180.0, -90.0, 180.0, 90.0]),
             times,
             parameter: default_param,

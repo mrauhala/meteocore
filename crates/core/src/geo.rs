@@ -80,6 +80,17 @@ pub fn native_crs_uri(label: &str) -> Option<&'static str> {
     }
 }
 
+/// Positive longitude and latitude spans (degrees) of a CRS84 bbox
+/// `[west, south, east, north]`. Handles an anti-meridian crossing where
+/// `east < west` (e.g. a STAC bbox like `[170.0, …, -170.0, …]`, a 20°-wide
+/// box, not a 340°-wide one). Used to derive spatial grid resolution, which
+/// must be positive per the OGC API Common Part 2 schema.
+pub fn crs84_bbox_spans(bbox: [f64; 4]) -> (f64, f64) {
+    let [w, s, e, n] = bbox;
+    let lon_span = if e >= w { e - w } else { e - w + 360.0 };
+    (lon_span, (n - s).abs())
+}
+
 impl Crs {
     /// Forward-transform WGS84 (lon_deg, lat_deg) to projected (easting, northing).
     /// For Wgs84, returns (lon, lat) unchanged.
@@ -1073,6 +1084,46 @@ fn rotlatlon_inverse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_crs_uri_maps_known_labels_and_omits_the_rest() {
+        assert_eq!(
+            native_crs_uri("CRS:84"),
+            Some("http://www.opengis.net/def/crs/OGC/1.3/CRS84")
+        );
+        // EPSG:4326 (lat-first) maps to its own distinct URI, never CRS84.
+        assert_eq!(
+            native_crs_uri("EPSG:4326"),
+            Some("http://www.opengis.net/def/crs/EPSG/0/4326")
+        );
+        assert_eq!(
+            native_crs_uri("EPSG:3067"),
+            Some("http://www.opengis.net/def/crs/EPSG/0/3067")
+        );
+        assert_eq!(
+            native_crs_uri("EPSG:3035"),
+            Some("http://www.opengis.net/def/crs/EPSG/0/3035")
+        );
+        // Generic engine labels for projections without a stable code: omitted.
+        for label in ["TM", "LAEA", "LCC", "stere", "rotated_ll", "projected", ""] {
+            assert_eq!(native_crs_uri(label), None, "label {label:?} must not map");
+        }
+    }
+
+    #[test]
+    fn crs84_bbox_spans_handles_normal_and_antimeridian() {
+        // Normal bbox.
+        let (lon, lat) = crs84_bbox_spans([10.0, 55.0, 30.0, 70.0]);
+        assert!((lon - 20.0).abs() < 1e-9);
+        assert!((lat - 15.0).abs() < 1e-9);
+        // Anti-meridian crossing: east < west is a 20°-wide box, not 340°.
+        let (lon, _) = crs84_bbox_spans([170.0, 60.0, -170.0, 70.0]);
+        assert!(
+            (lon - 20.0).abs() < 1e-9,
+            "anti-meridian span should be 20, got {lon}"
+        );
+        assert!(lon > 0.0, "resolution span must be positive");
+    }
 
     fn wgs84_transform() -> GeoTransform {
         GeoTransform {

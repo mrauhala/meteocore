@@ -203,12 +203,13 @@ fn build_extent(
         });
         // Per-axis grid resolution in CRS84 degrees, derived from the native
         // cell counts (raster collections only) and the WGS84 bbox.
+        // `crs84_bbox_spans` keeps the spans positive across the anti-meridian.
         if let Some([nx, ny]) = raster_info.and_then(|i| i.grid_size) {
             if nx > 0 && ny > 0 {
-                let [w, s, e, n] = bbox;
+                let (lon_span, lat_span) = ds_core::geo::crs84_bbox_spans(bbox);
                 spatial["grid"] = json!([
-                    { "cellsCount": nx, "resolution": (e - w) / nx as f64 },
-                    { "cellsCount": ny, "resolution": (n - s) / ny as f64 }
+                    { "cellsCount": nx, "resolution": lon_span / nx as f64 },
+                    { "cellsCount": ny, "resolution": lat_span / ny as f64 }
                 ]);
             }
         }

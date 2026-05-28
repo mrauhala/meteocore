@@ -27,7 +27,8 @@ impl MockMapEngine {
 
     fn make_info() -> RasterInfo {
         RasterInfo {
-            native_crs: "EPSG:4326".to_string(),
+            // CRS:84 (lon-first) is what real WGS84 engines emit.
+            native_crs: "CRS:84".to_string(),
             spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
             times: vec![
                 chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
@@ -307,12 +308,16 @@ mod conformance {
     }
 
     #[tokio::test]
-    async fn declares_map_tilesets() {
+    async fn omits_map_tilesets_conformance_class() {
+        // We link to map tilesets (tilesets-map rel) but do NOT implement the
+        // Map Tilesets class's /map/tiles endpoints, so the class must not be
+        // declared — that would be a false conformance claim. (Tiles are
+        // served by the standalone OGC API Tiles service.)
         let (_, json) = get("/conformance").await;
         let classes = json["conformsTo"].as_array().unwrap();
-        assert!(classes
+        assert!(!classes
             .iter()
-            .any(|c| c.as_str().unwrap().ends_with("conf/tilesets")));
+            .any(|c| c.as_str().unwrap().contains("conf/tilesets")));
     }
 }
 
@@ -403,9 +408,10 @@ mod collections {
     #[tokio::test]
     async fn collection_advertises_storage_crs() {
         let (_, json) = get("/collections/radar").await;
+        // WGS84 data is lon-first -> CRS84 URI, not the lat-first EPSG:4326 one.
         assert_eq!(
             json["storageCrs"],
-            "http://www.opengis.net/def/crs/EPSG/0/4326"
+            "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
         );
     }
 
@@ -1389,5 +1395,54 @@ mod extent_edge_cases {
             grid.get("coordinates").is_none(),
             "regular series must not fall back to a coordinates list"
         );
+    }
+
+    /// Engine whose bbox crosses the anti-meridian (east < west).
+    struct AntiMeridianMockEngine;
+
+    impl MapEngine for AntiMeridianMockEngine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+        ) -> Result<RasterTile, DataServerError> {
+            Ok(RasterTile {
+                width,
+                height,
+                values: vec![None; (width * height) as usize],
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                // 20°-wide box straddling 180°: east (-170) < west (170).
+                spatial_extent: Some([170.0, 60.0, -170.0, 70.0]),
+                times: vec![],
+                parameter: "reflectivity".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: Some([2000, 1000]),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn spatial_grid_resolution_positive_across_antimeridian() {
+        let json =
+            fetch_collection_json(Arc::new(AntiMeridianMockEngine), "am", vec!["maps".into()])
+                .await;
+        let grid = json["extent"]["spatial"]["grid"].as_array().unwrap();
+        // 20° / 2000 cells = 0.01, positive — not the -340°/2000 a naive
+        // (east - west) would give.
+        let lon_res = grid[0]["resolution"].as_f64().unwrap();
+        assert!(lon_res > 0.0, "resolution must be positive, got {lon_res}");
+        assert!((lon_res - 0.01).abs() < 1e-9);
     }
 }

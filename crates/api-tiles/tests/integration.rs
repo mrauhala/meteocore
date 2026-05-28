@@ -28,7 +28,8 @@ impl MockMapEngine {
 
     fn make_info() -> RasterInfo {
         RasterInfo {
-            native_crs: "EPSG:4326".to_string(),
+            // CRS:84 (lon-first) is what real WGS84 engines emit.
+            native_crs: "CRS:84".to_string(),
             spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
             times: vec![
                 chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
@@ -392,9 +393,10 @@ mod collections {
     #[tokio::test]
     async fn raster_collection_advertises_storage_crs() {
         let (_, json) = get("/collections/radar").await;
+        // WGS84 data is lon-first -> CRS84 URI, not the lat-first EPSG:4326 one.
         assert_eq!(
             json["storageCrs"],
-            "http://www.opengis.net/def/crs/EPSG/0/4326"
+            "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
         );
     }
 
