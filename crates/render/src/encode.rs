@@ -25,7 +25,12 @@ const PNG8_MAX_COLORS: usize = 256;
 /// produce byte-identical output and the content-derived ETag stays stable
 /// across requests + redeploys (#145 invariant).
 pub fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, DataServerError> {
-    let expected_len = (width * height * 4) as usize;
+    // Cast to usize *before* multiplying so the product can't silently wrap
+    // u32. Unreachable via the API layer (dimensions are capped well below
+    // u32::MAX there), but `encode_png` has no internal cap — a non-API
+    // caller (fuzz target, test, future engine code) could otherwise pass a
+    // wrapped `expected_len` and slip an inconsistent buffer past this check.
+    let expected_len = (width as usize) * (height as usize) * 4;
     if rgba.len() != expected_len {
         return Err(DataServerError::Render(format!(
             "RGBA buffer length {} does not match {}x{}x4 = {}",
@@ -83,7 +88,7 @@ fn encode_png_indexed(
 ) -> Result<Option<Vec<u8>>, DataServerError> {
     let mut palette_index: HashMap<[u8; 4], u8> = HashMap::with_capacity(PNG8_MAX_COLORS);
     let mut palette: Vec<[u8; 4]> = Vec::with_capacity(PNG8_MAX_COLORS);
-    let mut indices: Vec<u8> = Vec::with_capacity((width * height) as usize);
+    let mut indices: Vec<u8> = Vec::with_capacity((width as usize) * (height as usize));
 
     for pixel in rgba.chunks_exact(4) {
         let key = [pixel[0], pixel[1], pixel[2], pixel[3]];
@@ -125,7 +130,7 @@ fn encode_png_indexed(
     // Indexed PNG compresses dramatically better than RGBA at the same zlib
     // level — keep `Fast` so encoding stays well under the render budget
     // while still shrinking the body 3–4× vs the RGBA path.
-    let mut buf = Vec::with_capacity((width * height) as usize / 2);
+    let mut buf = Vec::with_capacity((width as usize) * (height as usize) / 2);
     {
         let mut encoder = png::Encoder::new(&mut buf, width, height);
         encoder.set_color(png::ColorType::Indexed);
