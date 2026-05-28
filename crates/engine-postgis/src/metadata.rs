@@ -382,7 +382,7 @@ async fn fetch_temporal_extent(
     let hi: Option<DateTime<Utc>> = row
         .try_get("hi")
         .map_err(|e| MetadataError::Decode(e.to_string()))?;
-    Ok(lo.and_then(|lo_v| hi.map(|hi_v| (lo_v, hi_v))))
+    Ok(lo.zip(hi))
 }
 
 #[cfg(test)]
