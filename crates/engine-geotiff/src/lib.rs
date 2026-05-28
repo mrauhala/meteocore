@@ -1249,10 +1249,12 @@ fn crs_label(crs: &ds_core::geo::Crs) -> String {
                 "LAEA".to_string()
             }
         }
-        ds_core::geo::Crs::LambertConformalConic { .. } => "projected".to_string(),
-        ds_core::geo::Crs::Stereographic { .. } => "projected".to_string(),
+        // No stable EPSG code for arbitrary LCC/Stereographic params; use the
+        // same descriptive labels as engine-odim so native_crs_uri (the single
+        // storageCrs source of truth) treats both engines identically.
+        ds_core::geo::Crs::LambertConformalConic { .. } => "LCC".to_string(),
+        ds_core::geo::Crs::Stereographic { .. } => "stere".to_string(),
         // Rotated lat/lon is NOT EPSG:4326 — it has no standard EPSG code.
-        // Match engine-querydata so `storageCrs` is omitted, not mislabelled.
         ds_core::geo::Crs::RotatedLatLon { .. } => "rotated_ll".to_string(),
     }
 }
@@ -2050,6 +2052,30 @@ mod tests {
             ds_core::geo::native_crs_uri("CRS:84"),
             Some("http://www.opengis.net/def/crs/OGC/1.3/CRS84")
         );
+    }
+
+    #[test]
+    fn crs_label_lcc_and_stereographic_match_odim_vocabulary() {
+        let lcc = ds_core::geo::Crs::LambertConformalConic {
+            lat1: 0.0,
+            lat2: 0.0,
+            lat0: 0.0,
+            lon0: 0.0,
+            false_e: 0.0,
+            false_n: 0.0,
+        };
+        let stere = ds_core::geo::Crs::Stereographic {
+            lat0: 0.0,
+            lon0: 0.0,
+            k0: 1.0,
+            false_e: 0.0,
+            false_n: 0.0,
+        };
+        assert_eq!(crs_label(&lcc), "LCC");
+        assert_eq!(crs_label(&stere), "stere");
+        // Neither resolves to a storageCrs URI (no stable EPSG code).
+        assert!(ds_core::geo::native_crs_uri("LCC").is_none());
+        assert!(ds_core::geo::native_crs_uri("stere").is_none());
     }
 
     #[test]

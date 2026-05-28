@@ -370,7 +370,10 @@ impl MapEngine for QueryDataEngine {
         let native_crs = match data.grid.area.crs {
             // Internal grids are lon-first, so CRS:84 (not EPSG:4326, which is
             // lat-first) — this is the value surfaced as OGC `storageCrs`.
+            // Generic labels match engine-geotiff/engine-odim so
+            // ds_core::geo::native_crs_uri treats every engine consistently.
             ds_core::geo::Crs::Wgs84 => "CRS:84".to_string(),
+            ds_core::geo::Crs::Stereographic { .. } => "stere".to_string(),
             ds_core::geo::Crs::RotatedLatLon { .. } => "rotated_ll".to_string(),
             _ => "projected".to_string(),
         };

@@ -394,7 +394,10 @@ mod collections {
         // `apis` is a vendor extension with no OGC schema; it must not leak
         // into the standard collection JSON.
         let (_, json) = get("/collections/radar").await;
-        assert!(json.get("apis").is_none() || json["apis"].is_null());
+        assert!(
+            json.get("apis").is_none(),
+            "apis must not be present in the standard collection JSON"
+        );
     }
 
     #[tokio::test]
