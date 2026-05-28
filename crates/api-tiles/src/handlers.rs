@@ -208,7 +208,7 @@ fn build_extent(
         // regularity that doesn't hold. `crs84_bbox_spans` keeps the spans
         // positive across the anti-meridian.
         if let Some([nx, ny]) = raster_info
-            .filter(|i| ds_core::geo::is_geographic_crs(&i.native_crs))
+            .filter(|i| ds_core::geo::is_crs84_grid(&i.native_crs))
             .and_then(|i| i.grid_size)
         {
             let (lon_span, lat_span) = ds_core::geo::crs84_bbox_spans(bbox);

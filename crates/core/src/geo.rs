@@ -87,14 +87,19 @@ pub fn native_crs_uri(label: &str) -> Option<&'static str> {
     }
 }
 
-/// True when `label` denotes a geographic lon/lat CRS whose cells are regular
-/// in degrees (`CRS:84` / `EPSG:4326`). For projected grids (EPSG:3067/3035/
-/// 3857, TM/LAEA/LCC/stere) and rotated lat/lon, a CRS84-degree
-/// `extent.spatial.grid` resolution would only approximate a grid that isn't
-/// degree-regular, so callers omit the grid for those rather than imply a
-/// regularity that doesn't hold.
-pub fn is_geographic_crs(label: &str) -> bool {
-    matches!(label, "CRS:84" | "EPSG:4326")
+/// True when `label` denotes a CRS:84 lon/lat degree grid — the case where a
+/// lon-first `extent.spatial.grid` (axis 0 = longitude, axis 1 = latitude) is
+/// an exact description of the source.
+///
+/// Deliberately matches **only** `"CRS:84"`, not `"EPSG:4326"`: we always emit
+/// the grid axes lon-first to match the CRS84 spatial extent, whereas EPSG:4326
+/// is lat-first, so emitting our lon-first grid for an EPSG:4326-labelled source
+/// would violate the OGC API Common Part 2 axis-order rule. Projected grids
+/// (EPSG:3067/3035/3857, TM/LAEA/LCC/stere) and rotated lat/lon are excluded
+/// too — their cells aren't degree-regular — so callers omit the grid rather
+/// than imply a regularity (or axis order) that doesn't hold.
+pub fn is_crs84_grid(label: &str) -> bool {
+    label == "CRS:84"
 }
 
 /// Positive longitude and latitude spans (degrees) of a CRS84 bbox
@@ -1128,9 +1133,10 @@ mod tests {
     }
 
     #[test]
-    fn is_geographic_crs_only_for_lonlat() {
-        assert!(is_geographic_crs("CRS:84"));
-        assert!(is_geographic_crs("EPSG:4326"));
+    fn is_crs84_grid_only_for_lonfirst_crs84() {
+        assert!(is_crs84_grid("CRS:84"));
+        // EPSG:4326 is lat-first: our lon-first grid axes wouldn't match it.
+        assert!(!is_crs84_grid("EPSG:4326"));
         // Projected / rotated grids are not degree-regular.
         for label in [
             "EPSG:3857",
@@ -1141,7 +1147,7 @@ mod tests {
             "stere",
             "rotated_ll",
         ] {
-            assert!(!is_geographic_crs(label), "{label} must not be geographic");
+            assert!(!is_crs84_grid(label), "{label} must not emit a CRS84 grid");
         }
     }
 

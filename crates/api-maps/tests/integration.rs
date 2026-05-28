@@ -1021,7 +1021,7 @@ impl MapEngine for MultiParamMockEngine {
 
     fn raster_info(&self) -> ds_core::map_engine::RasterInfo {
         ds_core::map_engine::RasterInfo {
-            native_crs: "EPSG:4326".into(),
+            native_crs: "CRS:84".into(),
             spatial_extent: Some([0.0, 0.0, 10.0, 10.0]),
             times: vec![],
             parameter: "2t".into(),
@@ -1184,7 +1184,7 @@ mod vertical_extent {
 
         fn raster_info(&self) -> RasterInfo {
             RasterInfo {
-                native_crs: "EPSG:4326".into(),
+                native_crs: "CRS:84".into(),
                 spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
                 times: vec![],
                 parameter: "DBZH".into(),
@@ -1247,7 +1247,7 @@ mod vertical_extent {
 
         fn raster_info(&self) -> RasterInfo {
             RasterInfo {
-                native_crs: "EPSG:4326".into(),
+                native_crs: "CRS:84".into(),
                 spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
                 times: vec![],
                 parameter: "DBZH".into(),
@@ -1348,7 +1348,7 @@ mod extent_edge_cases {
                     .with_timezone(&chrono::Utc)
             };
             RasterInfo {
-                native_crs: "EPSG:4326".into(),
+                native_crs: "CRS:84".into(),
                 spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
                 times: vec![
                     t("2024-01-01T00:00:00Z"),
