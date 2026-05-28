@@ -852,6 +852,7 @@ mod tests {
                 unit: self.unit.clone(),
                 parameters: self.parameters.clone(),
                 vertical: None,
+                grid_size: None,
             }
         }
     }
@@ -1874,6 +1875,7 @@ mod tests {
                         ("msl".into(), "Mean SLP".into()),
                     ],
                     vertical: None,
+                    grid_size: None,
                 }
             }
         }

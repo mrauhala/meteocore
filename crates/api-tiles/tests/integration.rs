@@ -28,7 +28,8 @@ impl MockMapEngine {
 
     fn make_info() -> RasterInfo {
         RasterInfo {
-            native_crs: "EPSG:4326".to_string(),
+            // CRS:84 (lon-first) is what real WGS84 engines emit.
+            native_crs: "CRS:84".to_string(),
             spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
             times: vec![
                 chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
@@ -42,6 +43,8 @@ impl MockMapEngine {
             unit: "dBZ".to_string(),
             parameters: vec![],
             vertical: None,
+            // bbox [10,55,30,70] over 2000x1500 cells => 0.01° per cell.
+            grid_size: Some([2000, 1500]),
         }
     }
 }
@@ -368,10 +371,41 @@ mod collections {
     }
 
     #[tokio::test]
-    async fn collection_exposes_apis_array() {
+    async fn collection_omits_nonstandard_apis_field() {
         let (_, json) = get("/collections/radar").await;
-        let apis = json["apis"].as_array().expect("apis must be present");
-        assert!(apis.iter().any(|a| a == "tiles"));
+        assert!(
+            json.get("apis").is_none(),
+            "apis must not be present in the standard collection JSON"
+        );
+    }
+
+    #[tokio::test]
+    async fn spatial_extent_has_grid_resolution() {
+        let (_, json) = get("/collections/radar").await;
+        let grid = json["extent"]["spatial"]["grid"]
+            .as_array()
+            .expect("spatial.grid must be present for raster collections");
+        assert_eq!(grid.len(), 2);
+        assert_eq!(grid[0]["cellsCount"], 2000);
+        assert_eq!(grid[1]["cellsCount"], 1500);
+    }
+
+    #[tokio::test]
+    async fn raster_collection_advertises_storage_crs() {
+        let (_, json) = get("/collections/radar").await;
+        // WGS84 data is lon-first -> CRS84 URI, not the lat-first EPSG:4326 one.
+        assert_eq!(
+            json["storageCrs"],
+            "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
+        );
+    }
+
+    #[tokio::test]
+    async fn temporal_extent_has_regular_grid_resolution() {
+        let (_, json) = get("/collections/radar").await;
+        let grid = &json["extent"]["temporal"]["grid"];
+        assert_eq!(grid["cellsCount"], 2);
+        assert_eq!(grid["resolution"], "PT1H");
     }
 
     #[tokio::test]
@@ -923,7 +957,7 @@ impl MapEngine for MultiParamMockEngine {
 
     fn raster_info(&self) -> RasterInfo {
         RasterInfo {
-            native_crs: "EPSG:4326".into(),
+            native_crs: "CRS:84".into(),
             spatial_extent: Some([0.0, 0.0, 10.0, 10.0]),
             times: vec![],
             parameter: "2t".into(),
@@ -933,6 +967,7 @@ impl MapEngine for MultiParamMockEngine {
                 ("10u".into(), "U Wind".into()),
             ],
             vertical: None,
+            grid_size: None,
         }
     }
 }
@@ -1485,5 +1520,108 @@ mod mvt {
             any_mvt_link,
             "vector-only collection tilesets must include at least one MVT item link"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Temporal-grid jitter (mirrors the api-maps regression test, since
+// temporal_grid is duplicated across the two crates)
+// ---------------------------------------------------------------------------
+
+mod temporal_grid_jitter {
+    use super::*;
+
+    struct JitteredTimesMockEngine;
+
+    impl MapEngine for JitteredTimesMockEngine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+        ) -> Result<RasterTile, DataServerError> {
+            Ok(RasterTile {
+                width,
+                height,
+                values: vec![None; (width * height) as usize],
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            // Gaps: 3599 s, 3601 s, 3600 s -> spread 2, mean 3600 -> PT1H.
+            let t = |s: &str| {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            };
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
+                times: vec![
+                    t("2024-01-01T00:00:00Z"),
+                    t("2024-01-01T00:59:59Z"),
+                    t("2024-01-01T02:00:00Z"),
+                    t("2024-01-01T03:00:00Z"),
+                ],
+                parameter: "reflectivity".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn temporal_grid_treats_jittered_series_as_regular() {
+        let engine: Arc<dyn MapEngine> = Arc::new(JitteredTimesMockEngine);
+        let mut engines = HashMap::new();
+        let mut collections = HashMap::new();
+        engines.insert("jit".to_string(), engine);
+        collections.insert(
+            "jit".to_string(),
+            CollectionConfig {
+                id: "jit".to_string(),
+                title: "Jittered".to_string(),
+                description: "Jittered".to_string(),
+                data_path: None,
+                apis: vec!["tiles".to_string()],
+                engine_type: "geotiff".to_string(),
+                geotiff: None,
+                querydata: None,
+                wms: None,
+                grib: None,
+                odim: None,
+                postgis: None,
+                preview: None,
+            },
+        );
+        let state = Arc::new(ArcSwap::from_pointee(TilesState {
+            map_engines: engines,
+            collections,
+            styles: HashMap::new(),
+            feature_engines: HashMap::new(),
+            feature_collections: HashMap::new(),
+            render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            rendered_cache: Arc::new(RenderedCache::new(16)),
+            vector_tile_cache: Arc::new(VectorTileCache::new(16)),
+            base_url: String::new(),
+        }));
+        let app = api_tiles::router(state);
+        let req = Request::builder()
+            .uri("/collections/jit")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let grid = &json["extent"]["temporal"]["grid"];
+        assert_eq!(grid["cellsCount"], 4);
+        assert_eq!(grid["resolution"], "PT1H");
+        assert!(grid.get("coordinates").is_none());
     }
 }

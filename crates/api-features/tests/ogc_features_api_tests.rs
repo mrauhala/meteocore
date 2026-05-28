@@ -392,10 +392,14 @@ mod collections {
     }
 
     #[tokio::test]
-    async fn collection_detail_exposes_apis_array() {
+    async fn collection_detail_omits_nonstandard_apis_field() {
+        // `apis` is a vendor extension with no OGC schema; it must not leak
+        // into the standard collection JSON.
         let (_, json) = get("/collections/cities").await;
-        let apis = json["apis"].as_array().expect("apis must be present");
-        assert!(apis.iter().any(|a| a == "features"));
+        assert!(
+            json.get("apis").is_none(),
+            "apis must not be present in the standard collection JSON"
+        );
     }
 
     #[tokio::test]
@@ -455,11 +459,15 @@ mod vector_tile_discovery {
     }
 
     #[tokio::test]
-    async fn collection_with_tiles_api_advertises_apis_array() {
+    async fn collection_with_tiles_api_still_omits_apis_array() {
+        // Even when the operator wires both Features and Tiles, the vendor
+        // `apis` field stays out of the standard collection JSON — discovery
+        // is via the `tilesets-vector` link asserted below.
         let json = fetch("/collections/cities").await;
-        let apis = json["apis"].as_array().expect("apis must be present");
-        assert!(apis.iter().any(|a| a == "features"));
-        assert!(apis.iter().any(|a| a == "tiles"));
+        assert!(
+            json.get("apis").is_none(),
+            "apis must not be present in the standard collection JSON"
+        );
     }
 
     #[tokio::test]

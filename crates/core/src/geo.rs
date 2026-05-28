@@ -59,6 +59,60 @@ pub enum Crs {
     },
 }
 
+/// Map an engine's internal native-CRS label (as stored in
+/// `RasterInfo.native_crs`) to a canonical OGC CRS URI, or `None` when the
+/// label has no stable URI — engines tag projected grids they can't pin to a
+/// specific EPSG code with generic names ("TM", "LAEA", "projected",
+/// "rotated_ll"). Used for the OGC API `storageCrs` field, where a wrong URI is
+/// worse than an absent one, so this deliberately never falls back to CRS84.
+///
+/// `"EPSG:4326"` (lat-first) and `"CRS:84"` (lon-first) map to their distinct
+/// URIs: emitting one for the other would invite a conformant client to swap
+/// axes and transpose the image.
+///
+/// This is keyed on the engine's `native_crs` *label*: a CRS only gets a
+/// `storageCrs` if some engine's `crs_label` emits the matching string. The
+/// `"EPSG:4326"` and `"EPSG:3857"` arms are forward-looking — no current engine
+/// emits those labels (WGS84 grids are tagged `"CRS:84"`, and there is no Web
+/// Mercator `Crs` variant) — so a new engine for one of those must emit the
+/// label here for the URI to apply.
+pub fn native_crs_uri(label: &str) -> Option<&'static str> {
+    match label {
+        "CRS:84" => Some("http://www.opengis.net/def/crs/OGC/1.3/CRS84"),
+        "EPSG:4326" => Some("http://www.opengis.net/def/crs/EPSG/0/4326"),
+        "EPSG:3857" => Some("http://www.opengis.net/def/crs/EPSG/0/3857"),
+        "EPSG:3067" => Some("http://www.opengis.net/def/crs/EPSG/0/3067"),
+        "EPSG:3035" => Some("http://www.opengis.net/def/crs/EPSG/0/3035"),
+        _ => None,
+    }
+}
+
+/// True when `label` denotes a CRS:84 lon/lat degree grid — the case where a
+/// lon-first `extent.spatial.grid` (axis 0 = longitude, axis 1 = latitude) is
+/// an exact description of the source.
+///
+/// Deliberately matches **only** `"CRS:84"`, not `"EPSG:4326"`: we always emit
+/// the grid axes lon-first to match the CRS84 spatial extent, whereas EPSG:4326
+/// is lat-first, so emitting our lon-first grid for an EPSG:4326-labelled source
+/// would violate the OGC API Common Part 2 axis-order rule. Projected grids
+/// (EPSG:3067/3035/3857, TM/LAEA/LCC/stere) and rotated lat/lon are excluded
+/// too — their cells aren't degree-regular — so callers omit the grid rather
+/// than imply a regularity (or axis order) that doesn't hold.
+pub fn is_crs84_grid(label: &str) -> bool {
+    label == "CRS:84"
+}
+
+/// Positive longitude and latitude spans (degrees) of a CRS84 bbox
+/// `[west, south, east, north]`. Handles an anti-meridian crossing where
+/// `east < west` (e.g. a STAC bbox like `[170.0, …, -170.0, …]`, a 20°-wide
+/// box, not a 340°-wide one). Used to derive spatial grid resolution, which
+/// must be positive per the OGC API Common Part 2 schema.
+pub fn crs84_bbox_spans(bbox: [f64; 4]) -> (f64, f64) {
+    let [w, s, e, n] = bbox;
+    let lon_span = if e >= w { e - w } else { e - w + 360.0 };
+    (lon_span, (n - s).abs())
+}
+
 impl Crs {
     /// Forward-transform WGS84 (lon_deg, lat_deg) to projected (easting, northing).
     /// For Wgs84, returns (lon, lat) unchanged.
@@ -1052,6 +1106,65 @@ fn rotlatlon_inverse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_crs_uri_maps_known_labels_and_omits_the_rest() {
+        assert_eq!(
+            native_crs_uri("CRS:84"),
+            Some("http://www.opengis.net/def/crs/OGC/1.3/CRS84")
+        );
+        // EPSG:4326 (lat-first) maps to its own distinct URI, never CRS84.
+        assert_eq!(
+            native_crs_uri("EPSG:4326"),
+            Some("http://www.opengis.net/def/crs/EPSG/0/4326")
+        );
+        assert_eq!(
+            native_crs_uri("EPSG:3067"),
+            Some("http://www.opengis.net/def/crs/EPSG/0/3067")
+        );
+        assert_eq!(
+            native_crs_uri("EPSG:3035"),
+            Some("http://www.opengis.net/def/crs/EPSG/0/3035")
+        );
+        // Generic engine labels for projections without a stable code: omitted.
+        for label in ["TM", "LAEA", "LCC", "stere", "rotated_ll", "projected", ""] {
+            assert_eq!(native_crs_uri(label), None, "label {label:?} must not map");
+        }
+    }
+
+    #[test]
+    fn is_crs84_grid_only_for_lonfirst_crs84() {
+        assert!(is_crs84_grid("CRS:84"));
+        // EPSG:4326 is lat-first: our lon-first grid axes wouldn't match it.
+        assert!(!is_crs84_grid("EPSG:4326"));
+        // Projected / rotated grids are not degree-regular.
+        for label in [
+            "EPSG:3857",
+            "EPSG:3067",
+            "EPSG:3035",
+            "TM",
+            "LAEA",
+            "stere",
+            "rotated_ll",
+        ] {
+            assert!(!is_crs84_grid(label), "{label} must not emit a CRS84 grid");
+        }
+    }
+
+    #[test]
+    fn crs84_bbox_spans_handles_normal_and_antimeridian() {
+        // Normal bbox.
+        let (lon, lat) = crs84_bbox_spans([10.0, 55.0, 30.0, 70.0]);
+        assert!((lon - 20.0).abs() < 1e-9);
+        assert!((lat - 15.0).abs() < 1e-9);
+        // Anti-meridian crossing: east < west is a 20°-wide box, not 340°.
+        let (lon, _) = crs84_bbox_spans([170.0, 60.0, -170.0, 70.0]);
+        assert!(
+            (lon - 20.0).abs() < 1e-9,
+            "anti-meridian span should be 20, got {lon}"
+        );
+        assert!(lon > 0.0, "resolution span must be positive");
+    }
 
     fn wgs84_transform() -> GeoTransform {
         GeoTransform {

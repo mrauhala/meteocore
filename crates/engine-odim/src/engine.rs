@@ -755,14 +755,20 @@ impl MapEngine for OdimEngine {
             unit: self.unit.clone(),
             parameters: vec![],
             vertical: None, // 2-D composite, no vertical dimension
+            grid_size: Some([self.seed_xsize, self.seed_ysize]),
         }
     }
 }
 
 /// Human-readable identifier for a `Crs`. Used by `raster_info()` —
-/// approximate, not an authoritative EPSG mapping. ODIM composites
-/// in the wild use spheres so EPSG codes don't strictly apply
-/// anyway.
+/// approximate, not an authoritative EPSG mapping. ODIM composites in the wild
+/// use spheres, so EPSG codes don't strictly apply; this engine deliberately
+/// never claims one (unlike engine-geotiff, which upgrades TM35FIN/ETRS89-LAEA
+/// ellipsoidal grids to their EPSG codes).
+///
+/// The generic (non-EPSG) labels must match engine-geotiff's vocabulary so
+/// that `ds_core::geo::native_crs_uri` — the single source of truth for
+/// `storageCrs` — maps both engines' output consistently.
 fn crs_label(crs: &Crs) -> String {
     match crs {
         Crs::Wgs84 => "CRS:84".into(),
@@ -770,7 +776,7 @@ fn crs_label(crs: &Crs) -> String {
         Crs::LambertAzimuthalEqualArea { .. } => "LAEA".into(),
         Crs::LambertConformalConic { .. } => "LCC".into(),
         Crs::Stereographic { .. } => "stere".into(),
-        Crs::RotatedLatLon { .. } => "rotated_latlon".into(),
+        Crs::RotatedLatLon { .. } => "rotated_ll".into(),
     }
 }
 
@@ -803,7 +809,17 @@ mod tests {
             false_e: 0.0,
             false_n: 0.0,
         };
+        // Generic labels must match engine-geotiff's vocabulary (no EPSG claim
+        // for spherical composites) so native_crs_uri maps both consistently.
         assert_eq!(crs_label(&stere), "stere");
+        let rot = Crs::RotatedLatLon {
+            south_pole_lat: 0.0,
+            south_pole_lon: 0.0,
+        };
+        assert_eq!(crs_label(&rot), "rotated_ll");
+        // None of the generic projected labels resolve to a storageCrs URI.
+        assert!(ds_core::geo::native_crs_uri("stere").is_none());
+        assert!(ds_core::geo::native_crs_uri("rotated_ll").is_none());
     }
 
     /// `shutdown()` called before `poll_loop()` ever starts must

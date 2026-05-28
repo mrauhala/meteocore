@@ -119,80 +119,143 @@ fn build_collection_metadata(
         }
     }
 
+    let mut links = vec![
+        json!({
+            "href": format!("{base_url}/maps/collections/{}", config.id),
+            "rel": "self",
+            "type": "application/json",
+            "title": config.title
+        }),
+        json!({
+            "href": format!("{base_url}/maps/collections/{}/map", config.id),
+            "rel": "map",
+            "type": "image/png",
+            "title": "Map"
+        }),
+        json!({
+            "href": format!("{base_url}/maps/collections/{}/styles", config.id),
+            "rel": "styles",
+            "type": "application/json",
+            "title": "Styles"
+        }),
+    ];
+
+    // Map tilesets — rendered (raster) tiles are an OGC API Maps "map
+    // tileset", discoverable from the maps collection via the `tilesets-map`
+    // relation. Only advertise it when the operator exposed this collection
+    // through the Tiles API (the standalone `/tiles` router still serves it).
+    if config.apis.iter().any(|a| a == "tiles") {
+        links.push(json!({
+            "href": format!("{base_url}/tiles/collections/{}/tiles", config.id),
+            "rel": "http://www.opengis.net/def/rel/ogc/1.0/tilesets-map",
+            "type": "application/json",
+            "title": "Map tilesets"
+        }));
+    }
+
     let mut metadata = json!({
         "id": config.id,
         "title": config.title,
         "description": config.description,
-        "apis": config.apis,
         "dataType": "map",
         "crs": crs_uris,
         "styles": style_list,
-        "links": [
-            {
-                "href": format!("{base_url}/maps/collections/{}", config.id),
-                "rel": "self",
-                "type": "application/json",
-                "title": config.title
-            },
-            {
-                "href": format!("{base_url}/maps/collections/{}/map", config.id),
-                "rel": "map",
-                "type": "image/png",
-                "title": "Map"
-            },
-            {
-                "href": format!("{base_url}/maps/collections/{}/styles", config.id),
-                "rel": "styles",
-                "type": "application/json",
-                "title": "Styles"
-            }
-        ]
+        "links": links
     });
 
-    if let Some(bbox) = info.spatial_extent {
-        metadata["extent"] = json!({
-            "spatial": {
-                "bbox": [bbox],
-                "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
-            }
-        });
+    // Only advertise `storageCrs` when the native CRS has a stable OGC URI.
+    // Engines label projected/rotated grids with internal names ("TM",
+    // "LAEA", "projected", "rotated_ll", …) that have no URI; emitting CRS84
+    // for those would mislabel the storage grid, so omit it instead.
+    if let Some(storage_crs) = ds_core::geo::native_crs_uri(&info.native_crs) {
+        metadata["storageCrs"] = json!(storage_crs);
     }
 
-    if !info.times.is_empty() {
-        let first = info.times.first().map(|t| t.to_rfc3339());
-        let last = info.times.last().map(|t| t.to_rfc3339());
-        if let (Some(start), Some(end)) = (first, last) {
-            if let Some(extent) = metadata.get_mut("extent") {
-                extent["temporal"] = json!({
-                    "interval": [[start, end]],
-                    "trs": "http://www.opengis.net/def/uom/ISO-8601/0/Gregorian"
-                });
-            } else {
-                metadata["extent"] = json!({
-                    "temporal": {
-                        "interval": [[start, end]],
-                        "trs": "http://www.opengis.net/def/uom/ISO-8601/0/Gregorian"
-                    }
-                });
-            }
-        }
-    }
-
-    // `vrs` is omitted — no standard OGC vertical-CRS URI exists for
-    // kinds like radar elevation angle, and `vrs` is optional.
-    if let Some(vertical) = &info.vertical {
-        let vertical_json = json!({
-            "interval": vertical.extent().map(|(lo, hi)| [[lo, hi]]),
-            "values": vertical.levels,
-        });
-        if let Some(extent) = metadata.get_mut("extent") {
-            extent["vertical"] = vertical_json;
-        } else {
-            metadata["extent"] = json!({ "vertical": vertical_json });
-        }
+    if let Some(extent) = build_extent(info) {
+        metadata["extent"] = extent;
     }
 
     metadata
+}
+
+/// Build the OGC API Common Part 2 `extent` object (spatial, temporal,
+/// vertical) including the `grid` resolution descriptors. Returns `None` when
+/// the collection advertises no spatial, temporal, or vertical extent.
+fn build_extent(info: &ds_core::map_engine::RasterInfo) -> Option<serde_json::Value> {
+    let mut extent = serde_json::Map::new();
+
+    if let Some(bbox) = info.spatial_extent {
+        let mut spatial = json!({
+            "bbox": [bbox],
+            "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
+        });
+        // Per-axis grid resolution in CRS84 degrees, derived from the native
+        // cell counts and the WGS84 bbox. Only for geographic (lon/lat) grids:
+        // for projected sources the cells aren't degree-regular, so a single
+        // CRS84-degree resolution would imply a regularity that doesn't hold.
+        // `crs84_bbox_spans` keeps the spans positive across the anti-meridian.
+        // Check the CRS first (cheap), then compute spans — mirrors api-tiles.
+        if let Some([nx, ny]) = info.grid_size {
+            if nx > 0 && ny > 0 && ds_core::geo::is_crs84_grid(&info.native_crs) {
+                let (lon_span, lat_span) = ds_core::geo::crs84_bbox_spans(bbox);
+                // Skip a degenerate (zero-span) bbox too: 0.0/nx would emit
+                // "resolution": 0.0, which is invalid per OGC API Common Part 2.
+                if lon_span > 0.0 && lat_span > 0.0 {
+                    spatial["grid"] = json!([
+                        { "cellsCount": nx, "resolution": lon_span / nx as f64 },
+                        { "cellsCount": ny, "resolution": lat_span / ny as f64 }
+                    ]);
+                }
+            }
+        }
+        extent.insert("spatial".to_string(), spatial);
+    }
+
+    if !info.times.is_empty() {
+        let start = info.times.first().map(|t| t.to_rfc3339());
+        let end = info.times.last().map(|t| t.to_rfc3339());
+        if let (Some(start), Some(end)) = (start, end) {
+            let mut temporal = json!({
+                "interval": [[start, end]],
+                "trs": "http://www.opengis.net/def/uom/ISO-8601/0/Gregorian"
+            });
+            // Shared descriptor from ds-core so Maps and Tiles can't drift.
+            if let Some(grid) = ds_core::datetime::temporal_grid(&info.times) {
+                temporal["grid"] =
+                    serde_json::to_value(grid).expect("TemporalGrid serializes to JSON");
+            }
+            extent.insert("temporal".to_string(), temporal);
+        }
+    }
+
+    // Vertical — keep `interval` + `values` (back-compat) and additively add
+    // the OGC API Common Part 2 form (`unit` + `grid.coordinates`). `vrs` is
+    // omitted: the only kind in use (radar elevation angle) has no standard
+    // OGC vertical-CRS URI.
+    if let Some(vertical) = &info.vertical {
+        // Only emit the vertical extent when there are levels: OGC API Common
+        // Part 2 requires `interval` to be a non-null array when the extent
+        // object is present, so an empty `VerticalDimension` is omitted rather
+        // than emitting `"interval": null`.
+        if let Some((lo, hi)) = vertical.extent() {
+            let levels = &vertical.levels;
+            extent.insert(
+                "vertical".to_string(),
+                json!({
+                    "interval": [[lo, hi]],
+                    "values": levels,
+                    "unit": vertical.unit(),
+                    "grid": { "coordinates": levels }
+                }),
+            );
+        }
+    }
+
+    if extent.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(extent))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +624,14 @@ pub async fn conformance() -> impl IntoResponse {
             "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/crs",
             "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/png",
             "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg"
+            // NOTE: the OGC API Maps "Map Tilesets" class
+            // (.../conf/tilesets) is intentionally NOT declared. Its abstract
+            // tests require maps-native /collections/{id}/map/tiles endpoints,
+            // which we don't implement — raster tiles are served by the
+            // standalone OGC API Tiles service and merely *discovered* from a
+            // maps collection via the `tilesets-map` link relation. Declaring
+            // the class without the endpoints would be a false conformance
+            // claim.
         ]
     }))
 }

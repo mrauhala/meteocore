@@ -1200,6 +1200,65 @@ fn filter_by_datetime(
     }
 }
 
+/// Map a parsed [`Crs`](ds_core::geo::Crs) to the engine's native-CRS label
+/// (stored in `RasterInfo.native_crs`, surfaced as OGC `storageCrs`).
+///
+/// Projected variants only claim a specific EPSG code when their parameters
+/// match a grid with a stable code (TM35FIN → EPSG:3067, ETRS89-LAEA Europe →
+/// EPSG:3035); any other zone gets a generic label so the API layer omits
+/// `storageCrs` rather than asserting a wrong code. WGS84 maps to `"CRS:84"`
+/// (lon-first), not `"EPSG:4326"` (lat-first), to match the engine's internal
+/// axis order. Rotated lat/lon has no standard EPSG code.
+fn crs_label(crs: &ds_core::geo::Crs) -> String {
+    // Parameter tolerances: angles compared in radians, offsets in metres.
+    const ANG: f64 = 1e-9;
+    const OFF: f64 = 1e-3;
+    match crs {
+        ds_core::geo::Crs::Wgs84 => "CRS:84".to_string(),
+        ds_core::geo::Crs::TransverseMercator {
+            lat0,
+            lon0,
+            k0,
+            false_e,
+            false_n,
+        } => {
+            let is_tm35fin = lat0.abs() < ANG
+                && (lon0 - 27.0_f64.to_radians()).abs() < ANG
+                && (k0 - 0.9996).abs() < 1e-9
+                && (false_e - 500_000.0).abs() < OFF
+                && false_n.abs() < OFF;
+            if is_tm35fin {
+                "EPSG:3067".to_string()
+            } else {
+                "TM".to_string()
+            }
+        }
+        ds_core::geo::Crs::LambertAzimuthalEqualArea {
+            lat0,
+            lon0,
+            false_e,
+            false_n,
+        } => {
+            let is_etrs89_laea = (lat0 - 52.0_f64.to_radians()).abs() < ANG
+                && (lon0 - 10.0_f64.to_radians()).abs() < ANG
+                && (false_e - 4_321_000.0).abs() < OFF
+                && (false_n - 3_210_000.0).abs() < OFF;
+            if is_etrs89_laea {
+                "EPSG:3035".to_string()
+            } else {
+                "LAEA".to_string()
+            }
+        }
+        // No stable EPSG code for arbitrary LCC/Stereographic params; use the
+        // same descriptive labels as engine-odim so native_crs_uri (the single
+        // storageCrs source of truth) treats both engines identically.
+        ds_core::geo::Crs::LambertConformalConic { .. } => "LCC".to_string(),
+        ds_core::geo::Crs::Stereographic { .. } => "stere".to_string(),
+        // Rotated lat/lon is NOT EPSG:4326 — it has no standard EPSG code.
+        ds_core::geo::Crs::RotatedLatLon { .. } => "rotated_ll".to_string(),
+    }
+}
+
 impl ds_core::map_engine::MapEngine for GeoTiffEngine {
     fn get_raster_tile(
         &self,
@@ -1475,19 +1534,19 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         let crs_name = catalog
             .entries
             .values()
-            .find_map(|entry| {
-                entry.metadata().map(|m| match &m.geo_transform.crs {
-                    ds_core::geo::Crs::Wgs84 => "EPSG:4326".to_string(),
-                    ds_core::geo::Crs::TransverseMercator { .. } => "EPSG:3067".to_string(),
-                    ds_core::geo::Crs::LambertAzimuthalEqualArea { .. } => "EPSG:3035".to_string(),
-                    ds_core::geo::Crs::LambertConformalConic { .. } => "projected".to_string(),
-                    ds_core::geo::Crs::Stereographic { .. } => "projected".to_string(),
-                    ds_core::geo::Crs::RotatedLatLon { .. } => "EPSG:4326".to_string(),
-                })
-            })
-            .unwrap_or_else(|| "EPSG:4326".to_string());
+            .find_map(|entry| entry.metadata().map(|m| crs_label(&m.geo_transform.crs)))
+            // No metadata could be read; the engine works internally in
+            // lon-first geographic coordinates, so default to CRS:84.
+            .unwrap_or_else(|| "CRS:84".to_string());
 
         let times: Vec<DateTime<Utc>> = catalog.entries.keys().cloned().collect();
+
+        // Native full-resolution grid dimensions, taken from the first loaded
+        // entry (all entries in a collection share the same grid).
+        let grid_size = catalog
+            .entries
+            .values()
+            .find_map(|entry| entry.metadata().map(|m| [m.width, m.height]));
 
         ds_core::map_engine::RasterInfo {
             native_crs: crs_name,
@@ -1497,6 +1556,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             unit: self.unit.clone(),
             parameters: vec![], // single-parameter engine
             vertical: None,     // single-layer raster, no vertical dimension
+            grid_size,
         }
     }
 }
@@ -1931,6 +1991,91 @@ mod tests {
     fn expand_prefix_static() {
         let result = expand_prefix_pattern("some/fixed/prefix", 2);
         assert_eq!(result, vec!["some/fixed/prefix"]);
+    }
+
+    #[test]
+    fn crs_label_wgs84_is_crs84_not_epsg4326() {
+        // Internal data is lon-first; EPSG:4326 would imply lat-first.
+        assert_eq!(crs_label(&ds_core::geo::Crs::Wgs84), "CRS:84");
+    }
+
+    #[test]
+    fn crs_label_tm_only_claims_3067_for_tm35fin() {
+        let tm35fin = ds_core::geo::Crs::TransverseMercator {
+            lat0: 0.0,
+            lon0: 27.0_f64.to_radians(),
+            k0: 0.9996,
+            false_e: 500_000.0,
+            false_n: 0.0,
+        };
+        assert_eq!(crs_label(&tm35fin), "EPSG:3067");
+        // A different TM zone (e.g. UTM 33N central meridian 15°E) is not 3067.
+        let utm33n = ds_core::geo::Crs::TransverseMercator {
+            lat0: 0.0,
+            lon0: 15.0_f64.to_radians(),
+            k0: 0.9996,
+            false_e: 500_000.0,
+            false_n: 0.0,
+        };
+        assert_eq!(crs_label(&utm33n), "TM");
+    }
+
+    #[test]
+    fn crs_label_laea_only_claims_3035_for_etrs89() {
+        let etrs89 = ds_core::geo::Crs::LambertAzimuthalEqualArea {
+            lat0: 52.0_f64.to_radians(),
+            lon0: 10.0_f64.to_radians(),
+            false_e: 4_321_000.0,
+            false_n: 3_210_000.0,
+        };
+        assert_eq!(crs_label(&etrs89), "EPSG:3035");
+        let other = ds_core::geo::Crs::LambertAzimuthalEqualArea {
+            lat0: 0.0,
+            lon0: 0.0,
+            false_e: 0.0,
+            false_n: 0.0,
+        };
+        assert_eq!(crs_label(&other), "LAEA");
+    }
+
+    #[test]
+    fn crs_label_rotated_has_no_epsg() {
+        let rot = ds_core::geo::Crs::RotatedLatLon {
+            south_pole_lat: (-30.0_f64).to_radians(),
+            south_pole_lon: 0.0,
+        };
+        assert_eq!(crs_label(&rot), "rotated_ll");
+        // And the generic labels have no storageCrs URI.
+        assert!(ds_core::geo::native_crs_uri("rotated_ll").is_none());
+        assert!(ds_core::geo::native_crs_uri("TM").is_none());
+        assert_eq!(
+            ds_core::geo::native_crs_uri("CRS:84"),
+            Some("http://www.opengis.net/def/crs/OGC/1.3/CRS84")
+        );
+    }
+
+    #[test]
+    fn crs_label_lcc_and_stereographic_match_odim_vocabulary() {
+        let lcc = ds_core::geo::Crs::LambertConformalConic {
+            lat1: 0.0,
+            lat2: 0.0,
+            lat0: 0.0,
+            lon0: 0.0,
+            false_e: 0.0,
+            false_n: 0.0,
+        };
+        let stere = ds_core::geo::Crs::Stereographic {
+            lat0: 0.0,
+            lon0: 0.0,
+            k0: 1.0,
+            false_e: 0.0,
+            false_n: 0.0,
+        };
+        assert_eq!(crs_label(&lcc), "LCC");
+        assert_eq!(crs_label(&stere), "stere");
+        // Neither resolves to a storageCrs URI (no stable EPSG code).
+        assert!(ds_core::geo::native_crs_uri("LCC").is_none());
+        assert!(ds_core::geo::native_crs_uri("stere").is_none());
     }
 
     #[test]
