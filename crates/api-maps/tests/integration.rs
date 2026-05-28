@@ -186,6 +186,42 @@ async fn get_raw(uri: &str) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
     (status, headers, body)
 }
 
+/// Fetch the collection JSON for an ad-hoc single-engine router. Used by the
+/// extent edge-case tests that need a bespoke `RasterInfo`.
+async fn fetch_collection_json(engine: Arc<dyn MapEngine>, id: &str, apis: Vec<String>) -> Value {
+    let mut engines = HashMap::new();
+    let mut collections = HashMap::new();
+    engines.insert(id.to_string(), engine);
+    collections.insert(
+        id.to_string(),
+        CollectionConfig {
+            id: id.to_string(),
+            title: "Test".to_string(),
+            description: "Test".to_string(),
+            data_path: None,
+            apis,
+            engine_type: "geotiff".to_string(),
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            odim: None,
+            postgis: None,
+            preview: None,
+        },
+    );
+    let state = Arc::new(ArcSwap::from_pointee(MapsState {
+        engines,
+        collections,
+        styles: HashMap::new(),
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        base_url: String::new(),
+    }));
+    let (_, json) = get_on(api_maps::router(state), &format!("/collections/{id}")).await;
+    json
+}
+
 // ---------------------------------------------------------------------------
 // Landing page tests
 // ---------------------------------------------------------------------------
@@ -1155,38 +1191,12 @@ mod vertical_extent {
     }
 
     async fn fetch_collection() -> Value {
-        let engine: Arc<dyn MapEngine> = Arc::new(VerticalMockEngine);
-        let mut engines = HashMap::new();
-        let mut collections = HashMap::new();
-        engines.insert("pvol".to_string(), engine);
-        collections.insert(
-            "pvol".to_string(),
-            CollectionConfig {
-                id: "pvol".to_string(),
-                title: "Radar Volume".to_string(),
-                description: "PVOL".to_string(),
-                data_path: None,
-                apis: vec!["maps".to_string()],
-                engine_type: "odim".to_string(),
-                geotiff: None,
-                querydata: None,
-                wms: None,
-                grib: None,
-                odim: None,
-                postgis: None,
-                preview: None,
-            },
-        );
-        let state = Arc::new(ArcSwap::from_pointee(MapsState {
-            engines,
-            collections,
-            styles: HashMap::new(),
-            render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
-            rendered_cache: Arc::new(RenderedCache::new(16)),
-            base_url: String::new(),
-        }));
-        let (_, json) = get_on(api_maps::router(state), "/collections/pvol").await;
-        json
+        fetch_collection_json(
+            Arc::new(VerticalMockEngine),
+            "pvol",
+            vec!["maps".to_string()],
+        )
+        .await
     }
 
     #[tokio::test]
@@ -1201,5 +1211,128 @@ mod vertical_extent {
         assert_eq!(v["grid"]["coordinates"], serde_json::json!([0.5, 1.5, 5.0]));
         // vrs is intentionally omitted for radar elevation angle.
         assert!(v.get("vrs").is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Extent edge cases (storageCrs omission, temporal-grid jitter)
+// ---------------------------------------------------------------------------
+
+mod extent_edge_cases {
+    use super::*;
+
+    /// Engine whose native CRS is a projection with no canonical OGC URI
+    /// (engines label these "TM"/"LAEA"/"projected"/…).
+    struct ProjectedMockEngine;
+
+    impl MapEngine for ProjectedMockEngine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+        ) -> Result<RasterTile, DataServerError> {
+            Ok(RasterTile {
+                width,
+                height,
+                values: vec![None; (width * height) as usize],
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "LAEA".into(),
+                spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
+                times: vec![],
+                parameter: "reflectivity".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: Some([2000, 1500]),
+            }
+        }
+    }
+
+    /// Engine whose timestamps are genuinely hourly but carry ±1 s jitter on
+    /// the first interval — the regression case for the gap-spread check.
+    struct JitteredTimesMockEngine;
+
+    impl MapEngine for JitteredTimesMockEngine {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+        ) -> Result<RasterTile, DataServerError> {
+            Ok(RasterTile {
+                width,
+                height,
+                values: vec![None; (width * height) as usize],
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            // Gaps: 3599 s, 3601 s, 3600 s -> spread 2, mean 3600 -> PT1H.
+            let t = |s: &str| {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            };
+            RasterInfo {
+                native_crs: "EPSG:4326".into(),
+                spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
+                times: vec![
+                    t("2024-01-01T00:00:00Z"),
+                    t("2024-01-01T00:59:59Z"),
+                    t("2024-01-01T02:00:00Z"),
+                    t("2024-01-01T03:00:00Z"),
+                ],
+                parameter: "reflectivity".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_crs_omitted_for_projected_native_crs() {
+        let json =
+            fetch_collection_json(Arc::new(ProjectedMockEngine), "proj", vec!["maps".into()]).await;
+        // Mislabelling a projected grid as CRS84 is worse than omitting it.
+        assert!(
+            json.get("storageCrs").is_none(),
+            "storageCrs must be absent for a native CRS with no OGC URI, got {:?}",
+            json.get("storageCrs")
+        );
+        // Spatial grid is still advertised.
+        assert!(json["extent"]["spatial"]["grid"].is_array());
+    }
+
+    #[tokio::test]
+    async fn temporal_grid_treats_jittered_series_as_regular() {
+        let json = fetch_collection_json(
+            Arc::new(JitteredTimesMockEngine),
+            "jit",
+            vec!["maps".into()],
+        )
+        .await;
+        let grid = &json["extent"]["temporal"]["grid"];
+        assert_eq!(grid["cellsCount"], 4);
+        // Despite the ±1 s jitter on the first interval, the series is regular.
+        assert_eq!(grid["resolution"], "PT1H");
+        assert!(
+            grid.get("coordinates").is_none(),
+            "regular series must not fall back to a coordinates list"
+        );
     }
 }

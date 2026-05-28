@@ -159,16 +159,41 @@ fn build_collection_metadata(
         "description": config.description,
         "dataType": "map",
         "crs": crs_uris,
-        "storageCrs": crs_to_uri(&info.native_crs),
         "styles": style_list,
         "links": links
     });
+
+    // Only advertise `storageCrs` when the native CRS has a stable OGC URI.
+    // Engines label projected/rotated grids with internal names ("TM",
+    // "LAEA", "projected", "rotated_ll", …) that have no URI; emitting CRS84
+    // for those would mislabel the storage grid, so omit it instead.
+    if let Some(storage_crs) = native_crs_to_uri(&info.native_crs) {
+        metadata["storageCrs"] = json!(storage_crs);
+    }
 
     if let Some(extent) = build_extent(info) {
         metadata["extent"] = extent;
     }
 
     metadata
+}
+
+/// Map an engine's native CRS label to an OGC URI for `storageCrs`, or `None`
+/// when there is no stable URI for it. Unlike [`crs_to_uri`] (which serves the
+/// `Content-Crs` header for request-validated CRS values and defaults to
+/// CRS84), this never falls back: engines populate `RasterInfo.native_crs`
+/// with internal labels ("TM", "LAEA", "projected", "rotated_ll", …) for
+/// projections that have no canonical URI, and a wrong `storageCrs` is worse
+/// than an absent one.
+fn native_crs_to_uri(crs: &str) -> Option<&'static str> {
+    match crs {
+        "CRS:84" => Some("http://www.opengis.net/def/crs/OGC/1.3/CRS84"),
+        "EPSG:4326" => Some("http://www.opengis.net/def/crs/EPSG/0/4326"),
+        "EPSG:3857" => Some("http://www.opengis.net/def/crs/EPSG/0/3857"),
+        "EPSG:3067" => Some("http://www.opengis.net/def/crs/EPSG/0/3067"),
+        "EPSG:3035" => Some("http://www.opengis.net/def/crs/EPSG/0/3035"),
+        _ => None,
+    }
 }
 
 /// Build the OGC API Common Part 2 `extent` object (spatial, temporal,
@@ -244,14 +269,20 @@ fn temporal_grid(times: &[chrono::DateTime<chrono::Utc>]) -> Option<serde_json::
         return None;
     }
     let cells = times.len();
-    let step = (times[1] - times[0]).num_seconds();
-    // Allow a 1-second tolerance to absorb leap-second / rounding jitter.
-    let regular = step > 0
-        && times
-            .windows(2)
-            .all(|w| ((w[1] - w[0]).num_seconds() - step).abs() <= 1);
-    if regular {
-        if let Some(resolution) = ds_core::datetime::format_iso8601_duration(step) {
+    let gaps: Vec<i64> = times
+        .windows(2)
+        .map(|w| (w[1] - w[0]).num_seconds())
+        .collect();
+    let min = *gaps.iter().min().unwrap();
+    let max = *gaps.iter().max().unwrap();
+    // Regular when every gap agrees within a 2-second spread (absorbs ±1 s
+    // rounding/leap-second jitter on any interval, not just the first) and is
+    // strictly positive. Anchor the advertised resolution to the rounded mean
+    // step so a jittered endpoint can't bias it.
+    if min > 0 && max - min <= 2 {
+        let count = gaps.len() as i64;
+        let avg = (gaps.iter().sum::<i64>() + count / 2) / count;
+        if let Some(resolution) = ds_core::datetime::format_iso8601_duration(avg) {
             return Some(json!({ "cellsCount": cells, "resolution": resolution }));
         }
     }

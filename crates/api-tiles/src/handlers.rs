@@ -257,14 +257,20 @@ fn temporal_grid(times: &[chrono::DateTime<chrono::Utc>]) -> Option<serde_json::
         return None;
     }
     let cells = times.len();
-    let step = (times[1] - times[0]).num_seconds();
-    // Allow a 1-second tolerance to absorb leap-second / rounding jitter.
-    let regular = step > 0
-        && times
-            .windows(2)
-            .all(|w| ((w[1] - w[0]).num_seconds() - step).abs() <= 1);
-    if regular {
-        if let Some(resolution) = ds_core::datetime::format_iso8601_duration(step) {
+    let gaps: Vec<i64> = times
+        .windows(2)
+        .map(|w| (w[1] - w[0]).num_seconds())
+        .collect();
+    let min = *gaps.iter().min().unwrap();
+    let max = *gaps.iter().max().unwrap();
+    // Regular when every gap agrees within a 2-second spread (absorbs ±1 s
+    // rounding/leap-second jitter on any interval, not just the first) and is
+    // strictly positive. Anchor the advertised resolution to the rounded mean
+    // step so a jittered endpoint can't bias it.
+    if min > 0 && max - min <= 2 {
+        let count = gaps.len() as i64;
+        let avg = (gaps.iter().sum::<i64>() + count / 2) / count;
+        if let Some(resolution) = ds_core::datetime::format_iso8601_duration(avg) {
             return Some(json!({ "cellsCount": cells, "resolution": resolution }));
         }
     }
