@@ -55,6 +55,7 @@ impl MapEngine for MockMapEngine {
             unit: "dBZ".to_string(),
             parameters: vec![],
             vertical: None,
+            grid_size: None,
         }
     }
 }

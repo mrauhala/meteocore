@@ -119,80 +119,144 @@ fn build_collection_metadata(
         }
     }
 
+    let mut links = vec![
+        json!({
+            "href": format!("{base_url}/maps/collections/{}", config.id),
+            "rel": "self",
+            "type": "application/json",
+            "title": config.title
+        }),
+        json!({
+            "href": format!("{base_url}/maps/collections/{}/map", config.id),
+            "rel": "map",
+            "type": "image/png",
+            "title": "Map"
+        }),
+        json!({
+            "href": format!("{base_url}/maps/collections/{}/styles", config.id),
+            "rel": "styles",
+            "type": "application/json",
+            "title": "Styles"
+        }),
+    ];
+
+    // Map tilesets — rendered (raster) tiles are an OGC API Maps "map
+    // tileset", discoverable from the maps collection via the `tilesets-map`
+    // relation. Only advertise it when the operator exposed this collection
+    // through the Tiles API (the standalone `/tiles` router still serves it).
+    if config.apis.iter().any(|a| a == "tiles") {
+        links.push(json!({
+            "href": format!("{base_url}/tiles/collections/{}/tiles", config.id),
+            "rel": "http://www.opengis.net/def/rel/ogc/1.0/tilesets-map",
+            "type": "application/json",
+            "title": "Map tilesets"
+        }));
+    }
+
     let mut metadata = json!({
         "id": config.id,
         "title": config.title,
         "description": config.description,
-        "apis": config.apis,
         "dataType": "map",
         "crs": crs_uris,
+        "storageCrs": crs_to_uri(&info.native_crs),
         "styles": style_list,
-        "links": [
-            {
-                "href": format!("{base_url}/maps/collections/{}", config.id),
-                "rel": "self",
-                "type": "application/json",
-                "title": config.title
-            },
-            {
-                "href": format!("{base_url}/maps/collections/{}/map", config.id),
-                "rel": "map",
-                "type": "image/png",
-                "title": "Map"
-            },
-            {
-                "href": format!("{base_url}/maps/collections/{}/styles", config.id),
-                "rel": "styles",
-                "type": "application/json",
-                "title": "Styles"
-            }
-        ]
+        "links": links
     });
 
-    if let Some(bbox) = info.spatial_extent {
-        metadata["extent"] = json!({
-            "spatial": {
-                "bbox": [bbox],
-                "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
-            }
-        });
-    }
-
-    if !info.times.is_empty() {
-        let first = info.times.first().map(|t| t.to_rfc3339());
-        let last = info.times.last().map(|t| t.to_rfc3339());
-        if let (Some(start), Some(end)) = (first, last) {
-            if let Some(extent) = metadata.get_mut("extent") {
-                extent["temporal"] = json!({
-                    "interval": [[start, end]],
-                    "trs": "http://www.opengis.net/def/uom/ISO-8601/0/Gregorian"
-                });
-            } else {
-                metadata["extent"] = json!({
-                    "temporal": {
-                        "interval": [[start, end]],
-                        "trs": "http://www.opengis.net/def/uom/ISO-8601/0/Gregorian"
-                    }
-                });
-            }
-        }
-    }
-
-    // `vrs` is omitted — no standard OGC vertical-CRS URI exists for
-    // kinds like radar elevation angle, and `vrs` is optional.
-    if let Some(vertical) = &info.vertical {
-        let vertical_json = json!({
-            "interval": vertical.extent().map(|(lo, hi)| [[lo, hi]]),
-            "values": vertical.levels,
-        });
-        if let Some(extent) = metadata.get_mut("extent") {
-            extent["vertical"] = vertical_json;
-        } else {
-            metadata["extent"] = json!({ "vertical": vertical_json });
-        }
+    if let Some(extent) = build_extent(info) {
+        metadata["extent"] = extent;
     }
 
     metadata
+}
+
+/// Build the OGC API Common Part 2 `extent` object (spatial, temporal,
+/// vertical) including the `grid` resolution descriptors. Returns `None` when
+/// the collection advertises no spatial, temporal, or vertical extent.
+fn build_extent(info: &ds_core::map_engine::RasterInfo) -> Option<serde_json::Value> {
+    let mut extent = serde_json::Map::new();
+
+    if let Some(bbox) = info.spatial_extent {
+        let mut spatial = json!({
+            "bbox": [bbox],
+            "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
+        });
+        // Per-axis grid resolution in CRS84 degrees, derived from the native
+        // cell counts and the WGS84 bbox [west, south, east, north].
+        if let Some([nx, ny]) = info.grid_size {
+            if nx > 0 && ny > 0 {
+                let [w, s, e, n] = bbox;
+                spatial["grid"] = json!([
+                    { "cellsCount": nx, "resolution": (e - w) / nx as f64 },
+                    { "cellsCount": ny, "resolution": (n - s) / ny as f64 }
+                ]);
+            }
+        }
+        extent.insert("spatial".to_string(), spatial);
+    }
+
+    if !info.times.is_empty() {
+        let start = info.times.first().map(|t| t.to_rfc3339());
+        let end = info.times.last().map(|t| t.to_rfc3339());
+        if let (Some(start), Some(end)) = (start, end) {
+            let mut temporal = json!({
+                "interval": [[start, end]],
+                "trs": "http://www.opengis.net/def/uom/ISO-8601/0/Gregorian"
+            });
+            if let Some(grid) = temporal_grid(&info.times) {
+                temporal["grid"] = grid;
+            }
+            extent.insert("temporal".to_string(), temporal);
+        }
+    }
+
+    // Vertical — keep `interval` + `values` (back-compat) and additively add
+    // the OGC API Common Part 2 form (`unit` + `grid.coordinates`). `vrs` is
+    // omitted: the only kind in use (radar elevation angle) has no standard
+    // OGC vertical-CRS URI.
+    if let Some(vertical) = &info.vertical {
+        let levels = &vertical.levels;
+        extent.insert(
+            "vertical".to_string(),
+            json!({
+                "interval": vertical.extent().map(|(lo, hi)| [[lo, hi]]),
+                "values": levels,
+                "unit": vertical.unit(),
+                "grid": { "coordinates": levels }
+            }),
+        );
+    }
+
+    if extent.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(extent))
+    }
+}
+
+/// Build the `extent.temporal.grid` descriptor from the ordered timestamps. A
+/// regular step yields `{cellsCount, resolution}` (ISO 8601 duration); an
+/// irregular series yields `{cellsCount, coordinates}`. Returns `None` for
+/// fewer than two timestamps.
+fn temporal_grid(times: &[chrono::DateTime<chrono::Utc>]) -> Option<serde_json::Value> {
+    if times.len() < 2 {
+        return None;
+    }
+    let cells = times.len();
+    let step = (times[1] - times[0]).num_seconds();
+    // Allow a 1-second tolerance to absorb leap-second / rounding jitter.
+    let regular = step > 0
+        && times
+            .windows(2)
+            .all(|w| ((w[1] - w[0]).num_seconds() - step).abs() <= 1);
+    if regular {
+        if let Some(resolution) = ds_core::datetime::format_iso8601_duration(step) {
+            return Some(json!({ "cellsCount": cells, "resolution": resolution }));
+        }
+    }
+    let coordinates: Vec<String> = times.iter().map(|t| t.to_rfc3339()).collect();
+    Some(json!({ "cellsCount": cells, "coordinates": coordinates }))
 }
 
 // ---------------------------------------------------------------------------
@@ -560,7 +624,8 @@ pub async fn conformance() -> impl IntoResponse {
             "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/datetime",
             "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/crs",
             "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/png",
-            "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg"
+            "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg",
+            "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/tilesets"
         ]
     }))
 }

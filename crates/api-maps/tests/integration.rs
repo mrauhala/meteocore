@@ -41,6 +41,8 @@ impl MockMapEngine {
             unit: "dBZ".to_string(),
             parameters: vec![],
             vertical: None,
+            // bbox [10,55,30,70] over 2000x1500 cells => 0.01° per cell.
+            grid_size: Some([2000, 1500]),
         }
     }
 }
@@ -77,6 +79,10 @@ impl MapEngine for MockMapEngine {
 // ---------------------------------------------------------------------------
 
 fn build_router() -> axum::Router {
+    build_router_with_apis(vec!["maps".to_string()])
+}
+
+fn build_router_with_apis(apis: Vec<String>) -> axum::Router {
     let engine: Arc<dyn MapEngine> = Arc::new(MockMapEngine::new());
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
@@ -90,7 +96,7 @@ fn build_router() -> axum::Router {
             title: "Test Radar".to_string(),
             description: "Test radar data".to_string(),
             data_path: None,
-            apis: vec!["maps".to_string()],
+            apis,
             engine_type: "geotiff".to_string(),
             geotiff: None,
             querydata: None,
@@ -148,7 +154,14 @@ fn build_router() -> axum::Router {
 }
 
 async fn get(uri: &str) -> (StatusCode, Value) {
-    let app = build_router();
+    get_on(build_router(), uri).await
+}
+
+async fn get_with_apis(uri: &str, apis: Vec<String>) -> (StatusCode, Value) {
+    get_on(build_router_with_apis(apis), uri).await
+}
+
+async fn get_on(app: axum::Router, uri: &str) -> (StatusCode, Value) {
     let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
@@ -256,6 +269,15 @@ mod conformance {
             .iter()
             .any(|c| c.as_str().unwrap().contains("conf/png")));
     }
+
+    #[tokio::test]
+    async fn declares_map_tilesets() {
+        let (_, json) = get("/conformance").await;
+        let classes = json["conformsTo"].as_array().unwrap();
+        assert!(classes
+            .iter()
+            .any(|c| c.as_str().unwrap().ends_with("conf/tilesets")));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -332,10 +354,67 @@ mod collections {
     }
 
     #[tokio::test]
-    async fn collection_exposes_apis_array() {
+    async fn collection_omits_nonstandard_apis_field() {
+        // `apis` is a vendor extension with no OGC schema; it must not leak
+        // into the standard collection JSON.
         let (_, json) = get("/collections/radar").await;
-        let apis = json["apis"].as_array().expect("apis must be present");
-        assert!(apis.iter().any(|a| a == "maps"));
+        assert!(json.get("apis").is_none() || json["apis"].is_null());
+    }
+
+    #[tokio::test]
+    async fn collection_advertises_storage_crs() {
+        let (_, json) = get("/collections/radar").await;
+        assert_eq!(
+            json["storageCrs"],
+            "http://www.opengis.net/def/crs/EPSG/0/4326"
+        );
+    }
+
+    #[tokio::test]
+    async fn spatial_extent_has_grid_resolution() {
+        let (_, json) = get("/collections/radar").await;
+        let grid = json["extent"]["spatial"]["grid"]
+            .as_array()
+            .expect("spatial.grid must be present");
+        assert_eq!(grid.len(), 2, "one grid axis per spatial dimension");
+        // bbox [10,55,30,70] over 2000x1500 cells => 0.01° per cell.
+        assert_eq!(grid[0]["cellsCount"], 2000);
+        assert_eq!(grid[1]["cellsCount"], 1500);
+        assert!((grid[0]["resolution"].as_f64().unwrap() - 0.01).abs() < 1e-9);
+        assert!((grid[1]["resolution"].as_f64().unwrap() - 0.01).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn temporal_extent_has_regular_grid_resolution() {
+        let (_, json) = get("/collections/radar").await;
+        let grid = &json["extent"]["temporal"]["grid"];
+        // Two timestamps one hour apart => regular PT1H step.
+        assert_eq!(grid["cellsCount"], 2);
+        assert_eq!(grid["resolution"], "PT1H");
+    }
+
+    #[tokio::test]
+    async fn collection_omits_tilesets_map_link_without_tiles_api() {
+        let (_, json) = get("/collections/radar").await;
+        let links = json["links"].as_array().unwrap();
+        assert!(!links
+            .iter()
+            .any(|l| l["rel"] == "http://www.opengis.net/def/rel/ogc/1.0/tilesets-map"));
+    }
+
+    #[tokio::test]
+    async fn collection_advertises_tilesets_map_link_with_tiles_api() {
+        let (_, json) =
+            get_with_apis("/collections/radar", vec!["maps".into(), "tiles".into()]).await;
+        let links = json["links"].as_array().unwrap();
+        let tileset_link = links
+            .iter()
+            .find(|l| l["rel"] == "http://www.opengis.net/def/rel/ogc/1.0/tilesets-map")
+            .expect("tilesets-map link must be present when tiles API is enabled");
+        assert!(tileset_link["href"]
+            .as_str()
+            .unwrap()
+            .ends_with("/tiles/collections/radar/tiles"));
     }
 
     #[tokio::test]
@@ -907,6 +986,7 @@ impl MapEngine for MultiParamMockEngine {
                 ("10u".into(), "U Wind".into()),
             ],
             vertical: None,
+            grid_size: None,
         }
     }
 }

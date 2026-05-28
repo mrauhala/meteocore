@@ -564,10 +564,11 @@ mod collections {
     }
 
     #[tokio::test]
-    async fn collection_exposes_apis_array() {
+    async fn collection_omits_nonstandard_apis_field() {
+        // `apis` is a vendor extension with no OGC schema; it must not leak
+        // into the standard collection JSON.
         let (_, json) = get("/collections/weather").await;
-        let apis = json["apis"].as_array().expect("apis must be present");
-        assert!(apis.iter().any(|a| a == "edr"));
+        assert!(json.get("apis").is_none() || json["apis"].is_null());
     }
 }
 

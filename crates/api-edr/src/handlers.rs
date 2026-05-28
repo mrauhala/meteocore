@@ -769,7 +769,6 @@ fn build_collection_metadata(
         "id": config.id,
         "title": config.title,
         "description": config.description,
-        "apis": config.apis,
         "links": [
             {
                 "href": format!("{base_url}/edr/collections/{}", config.id),

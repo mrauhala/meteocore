@@ -57,6 +57,7 @@ impl MapEngine for EmptyMockMapEngine {
             unit: "dBZ".into(),
             parameters: vec![],
             vertical: None,
+            grid_size: None,
         }
     }
 }
@@ -206,6 +207,7 @@ impl MapEngine for FailingMockMapEngine {
             unit: "dBZ".into(),
             parameters: vec![],
             vertical: None,
+            grid_size: None,
         }
     }
 }
@@ -346,6 +348,7 @@ impl MapEngine for PopulatedMockMapEngine {
             unit: "dBZ".into(),
             parameters: vec![],
             vertical: None,
+            grid_size: None,
         }
     }
 }
@@ -689,6 +692,7 @@ impl MapEngine for CountingMockMapEngine {
             unit: "dBZ".into(),
             parameters: vec![],
             vertical: None,
+            grid_size: None,
         }
     }
 }

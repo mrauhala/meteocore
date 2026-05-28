@@ -489,7 +489,6 @@ fn build_collection_metadata(
         "id": config.id,
         "title": config.title,
         "description": config.description,
-        "apis": config.apis,
         "itemType": "feature",
         "crs": [
             "http://www.opengis.net/def/crs/OGC/1.3/CRS84"

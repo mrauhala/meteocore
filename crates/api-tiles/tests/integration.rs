@@ -42,6 +42,8 @@ impl MockMapEngine {
             unit: "dBZ".to_string(),
             parameters: vec![],
             vertical: None,
+            // bbox [10,55,30,70] over 2000x1500 cells => 0.01° per cell.
+            grid_size: Some([2000, 1500]),
         }
     }
 }
@@ -368,10 +370,28 @@ mod collections {
     }
 
     #[tokio::test]
-    async fn collection_exposes_apis_array() {
+    async fn collection_omits_nonstandard_apis_field() {
         let (_, json) = get("/collections/radar").await;
-        let apis = json["apis"].as_array().expect("apis must be present");
-        assert!(apis.iter().any(|a| a == "tiles"));
+        assert!(json.get("apis").is_none() || json["apis"].is_null());
+    }
+
+    #[tokio::test]
+    async fn spatial_extent_has_grid_resolution() {
+        let (_, json) = get("/collections/radar").await;
+        let grid = json["extent"]["spatial"]["grid"]
+            .as_array()
+            .expect("spatial.grid must be present for raster collections");
+        assert_eq!(grid.len(), 2);
+        assert_eq!(grid[0]["cellsCount"], 2000);
+        assert_eq!(grid[1]["cellsCount"], 1500);
+    }
+
+    #[tokio::test]
+    async fn temporal_extent_has_regular_grid_resolution() {
+        let (_, json) = get("/collections/radar").await;
+        let grid = &json["extent"]["temporal"]["grid"];
+        assert_eq!(grid["cellsCount"], 2);
+        assert_eq!(grid["resolution"], "PT1H");
     }
 
     #[tokio::test]
@@ -933,6 +953,7 @@ impl MapEngine for MultiParamMockEngine {
                 ("10u".into(), "U Wind".into()),
             ],
             vertical: None,
+            grid_size: None,
         }
     }
 }
