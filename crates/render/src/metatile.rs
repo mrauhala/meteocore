@@ -607,6 +607,20 @@ mod tests {
             bytes.starts_with(&[0x89, b'P', b'N', b'G']),
             "valid PNG header"
         );
+        // The SolidRed mosaic is ≤256 colours (solid red + transparent edge),
+        // so the encode path must take the indexed-palette branch. Pinning
+        // the colour type here ensures a regression that bypasses
+        // `encode_png_indexed` (always falling back to RGBA) is caught in the
+        // metatile assembly path too, not only in the encoder unit tests.
+        {
+            let decoder = png::Decoder::new(&bytes[..]);
+            let reader = decoder.read_info().unwrap();
+            assert_eq!(
+                reader.info().color_type,
+                png::ColorType::Indexed,
+                "a ≤256-colour mosaic must encode via the indexed-palette path"
+            );
+        }
         let (misses_first, _) = (cache.stats().1, ());
         assert!(misses_first > 0, "first render populates the tile cache");
 
@@ -760,7 +774,13 @@ mod tests {
         match frame.color_type {
             png::ColorType::Rgba => (w, h, used.to_vec()),
             png::ColorType::Indexed => {
-                let plte = info_meta.palette.as_deref().unwrap_or(&[]);
+                // `.expect` keeps a malformed indexed PNG (PLTE missing)
+                // legible rather than panicking with an opaque OOB index on
+                // the next line. Our encoder always writes a PLTE.
+                let plte = info_meta
+                    .palette
+                    .as_deref()
+                    .expect("indexed PNG must carry a PLTE chunk");
                 let trns = info_meta.trns.as_deref().unwrap_or(&[]);
                 let mut out = Vec::with_capacity((w * h * 4) as usize);
                 for &idx in used {

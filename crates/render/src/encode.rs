@@ -358,7 +358,14 @@ mod tests {
         let mut rgba = Vec::with_capacity((w * h * 4) as usize);
         match frame.color_type {
             png::ColorType::Indexed => {
-                let plte = info.palette.as_deref().unwrap_or(&[]);
+                // An indexed PNG without a PLTE is malformed; `.expect` keeps
+                // the failure legible instead of an opaque OOB index panic on
+                // the next line (the encoder always writes one, so this only
+                // fires on a truncated/foreign fixture).
+                let plte = info
+                    .palette
+                    .as_deref()
+                    .expect("indexed PNG must carry a PLTE chunk");
                 let trns = info.trns.as_deref().unwrap_or(&[]);
                 for &idx in used {
                     let p = idx as usize;
@@ -373,6 +380,16 @@ mod tests {
             other => panic!("unexpected decoded colour type: {other:?}"),
         }
         (w, h, frame.color_type, rgba)
+    }
+
+    /// Whether a PNG stream carries a `tRNS` chunk, determined by decoding
+    /// the header rather than scanning raw bytes — a raw `b"tRNS"` search
+    /// can match inside the DEFLATE-compressed IDAT payload and fire
+    /// spuriously on larger images.
+    fn png_has_trns(bytes: &[u8]) -> bool {
+        let decoder = png::Decoder::new(bytes);
+        let reader = decoder.read_info().unwrap();
+        reader.info().trns.is_some()
     }
 
     #[test]
@@ -519,7 +536,7 @@ mod tests {
         let rgba = rgba_from(4, 4, |x, y| [x as u8 * 10, y as u8 * 10, 128, 255]);
         let bytes = encode_png(&rgba, 4, 4).unwrap();
         assert!(
-            !bytes.windows(4).any(|w| w == b"tRNS"),
+            !png_has_trns(&bytes),
             "fully-opaque palette must not emit a tRNS chunk"
         );
 
@@ -533,7 +550,7 @@ mod tests {
         });
         let bytes = encode_png(&rgba_alpha, 4, 4).unwrap();
         assert!(
-            bytes.windows(4).any(|w| w == b"tRNS"),
+            png_has_trns(&bytes),
             "palette with any non-opaque entry must emit tRNS"
         );
     }
