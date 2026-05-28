@@ -607,6 +607,20 @@ mod tests {
             bytes.starts_with(&[0x89, b'P', b'N', b'G']),
             "valid PNG header"
         );
+        // The SolidRed mosaic is ≤256 colours (solid red + transparent edge),
+        // so the encode path must take the indexed-palette branch. Pinning
+        // the colour type here ensures a regression that bypasses
+        // `encode_png_indexed` (always falling back to RGBA) is caught in the
+        // metatile assembly path too, not only in the encoder unit tests.
+        {
+            let decoder = png::Decoder::new(&bytes[..]);
+            let reader = decoder.read_info().unwrap();
+            assert_eq!(
+                reader.info().color_type,
+                png::ColorType::Indexed,
+                "a ≤256-colour mosaic must encode via the indexed-palette path"
+            );
+        }
         let (misses_first, _) = (cache.stats().1, ());
         assert!(misses_first > 0, "first render populates the tile cache");
 
@@ -742,14 +756,45 @@ mod tests {
     }
 
     /// Decode the RGBA pixels of a PNG produced by [`render_metatiled`].
+    ///
+    /// `encode_png` auto-selects an 8-bit indexed-palette encoding for
+    /// buffers with ≤256 distinct colours (the common colormap case) and
+    /// falls back to 32-bit RGBA otherwise. Either branch must round-trip
+    /// to the same per-pixel RGBA — handle both colour types here so the
+    /// fidelity tests below don't constrain which branch ran.
     fn decode_rgba(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
         let decoder = png::Decoder::new(bytes);
         let mut reader = decoder.read_info().unwrap();
+        let info_meta = reader.info().clone();
         let mut buf = vec![0u8; reader.output_buffer_size()];
-        let info = reader.next_frame(&mut buf).unwrap();
-        assert_eq!(info.color_type, png::ColorType::Rgba, "expected RGBA PNG");
-        buf.truncate(info.buffer_size());
-        (info.width, info.height, buf)
+        let frame = reader.next_frame(&mut buf).unwrap();
+        let w = frame.width;
+        let h = frame.height;
+        let used = &buf[..frame.buffer_size()];
+        match frame.color_type {
+            png::ColorType::Rgba => (w, h, used.to_vec()),
+            png::ColorType::Indexed => {
+                // `.expect` keeps a malformed indexed PNG (PLTE missing)
+                // legible rather than panicking with an opaque OOB index on
+                // the next line. Our encoder always writes a PLTE.
+                let plte = info_meta
+                    .palette
+                    .as_deref()
+                    .expect("indexed PNG must carry a PLTE chunk");
+                let trns = info_meta.trns.as_deref().unwrap_or(&[]);
+                let mut out = Vec::with_capacity((w * h * 4) as usize);
+                for &idx in used {
+                    let p = idx as usize;
+                    let r = plte[p * 3];
+                    let g = plte[p * 3 + 1];
+                    let b = plte[p * 3 + 2];
+                    let a = if p < trns.len() { trns[p] } else { 255 };
+                    out.extend_from_slice(&[r, g, b, a]);
+                }
+                (w, h, out)
+            }
+            other => panic!("unexpected decoded PNG colour type: {other:?}"),
+        }
     }
 
     /// The strongest fidelity guard: assemble a field whose value at every pixel

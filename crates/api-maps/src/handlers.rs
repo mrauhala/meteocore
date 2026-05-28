@@ -485,7 +485,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "default": "image/png",
                         "enum": ["image/png", "image/jpeg", "image/webp"]
                     },
-                    "description": "Output format"
+                    "description": "Output format. `image/png` auto-emits an 8-bit indexed-palette PNG (~3–4× smaller) for colormap-rendered layers; falls back to 32-bit RGBA above 256 distinct colours."
                 },
                 "bbox-crs": {
                     "name": "bbox-crs",

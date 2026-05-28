@@ -21,6 +21,11 @@ pub const TILE_SIZE: u32 = 256;
 pub const MAX_FEATURES_PER_TILE: usize = 50_000;
 
 /// Supported raster output formats for map tiles.
+///
+/// `image/png` auto-selects an 8-bit indexed-palette encoding ("PNG8") when
+/// the rendered tile carries ≤256 distinct colours (every colormap layer);
+/// the encoder falls back to 32-bit RGBA above that. Content-type is
+/// `image/png` either way — no second `f=` value is needed.
 const SUPPORTED_FORMATS: &[&str] = &["image/png", "image/jpeg", "image/webp"];
 
 /// MVT format aliases. Either form works in `?f=` for clients that prefer

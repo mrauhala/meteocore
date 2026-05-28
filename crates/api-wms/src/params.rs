@@ -21,6 +21,12 @@ const SUPPORTED_CRS: &[&str] = &["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:3067"
 /// Single source of truth: capabilities iterates this slice when emitting
 /// `<Format>` children, and `parse_image_format` mirrors it. If you add a
 /// format here, extend the match in `parse_image_format` to match.
+///
+/// `image/png` auto-selects an 8-bit indexed-palette encoding ("PNG8") when
+/// the rendered image carries ≤256 distinct colours (every colormap layer);
+/// the encoder falls back to 32-bit RGBA above that. Content-type is
+/// `image/png` either way — no second `FORMAT=` value is needed because the
+/// choice is invisible to clients.
 pub const SUPPORTED_FORMATS: &[&str] = &["image/png", "image/jpeg", "image/webp"];
 
 /// Parse a WMS `FORMAT=` query parameter into the corresponding `ImageFormat`.

@@ -479,7 +479,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                             "application/vnd.mapbox-vector-tile"
                         ]
                     },
-                    "description": "Output format. `mvt` selects Mapbox Vector Tile (only on collections with a FeatureEngine)."
+                    "description": "Output format. `image/png` auto-emits an 8-bit indexed-palette PNG (~3–4× smaller) for colormap-rendered layers; falls back to 32-bit RGBA above 256 distinct colours. `mvt` selects Mapbox Vector Tile (only on collections with a FeatureEngine)."
                 },
                 "elevation": {
                     "name": "elevation",

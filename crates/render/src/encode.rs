@@ -1,11 +1,36 @@
+use std::collections::HashMap;
+
 use ds_core::error::DataServerError;
+
+/// Maximum number of distinct RGBA colours that can fit in an 8-bit indexed PNG.
+const PNG8_MAX_COLORS: usize = 256;
 
 /// Encode an RGBA buffer to PNG bytes.
 ///
-/// Uses compression level 1 (fast) — optimized for real-time serving.
-/// Typical 256x256 radar tile: ~50-80KB, encoding time <3ms.
+/// Auto-selects the encoding based on the buffer's colour count:
+///
+/// * **≤256 distinct RGBA values** → 8-bit indexed-palette PNG ("PNG8"). For
+///   colormap-rendered layers (radar, classification, single-parameter
+///   rasters) this produces a visually identical image at roughly 3–4×
+///   smaller bytes than the 32-bit RGBA path. Matches what FMI's GeoServer
+///   emits for its styled raster layers, with no client opt-in required.
+/// * **>256 distinct values** → 32-bit RGBA PNG. Continuous gradients and
+///   multi-band false-colour layers land here.
+///
+/// Content-type is `image/png` either way — there is no API knob to choose
+/// between them, since the per-pixel scan is bounded (≤ one HashMap insert
+/// per output pixel, early-exit at 257) and clients can't tell the two
+/// encodings apart without decoding. The scan is deterministic (palette
+/// ordered by first pixel-occurrence) so two encodes of the same buffer
+/// produce byte-identical output and the content-derived ETag stays stable
+/// across requests + redeploys (#145 invariant).
 pub fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, DataServerError> {
-    let expected_len = (width * height * 4) as usize;
+    // Cast to usize *before* multiplying so the product can't silently wrap
+    // u32. Unreachable via the API layer (dimensions are capped well below
+    // u32::MAX there), but `encode_png` has no internal cap — a non-API
+    // caller (fuzz target, test, future engine code) could otherwise pass a
+    // wrapped `expected_len` and slip an inconsistent buffer past this check.
+    let expected_len = (width as usize) * (height as usize) * 4;
     if rgba.len() != expected_len {
         return Err(DataServerError::Render(format!(
             "RGBA buffer length {} does not match {}x{}x4 = {}",
@@ -15,8 +40,19 @@ pub fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, DataS
             expected_len,
         )));
     }
+    // Length is validated; the two helpers can skip re-checking it.
+    match encode_png_indexed(rgba, width, height)? {
+        Some(bytes) => Ok(bytes),
+        None => encode_png_rgba(rgba, width, height),
+    }
+}
 
-    let mut buf = Vec::with_capacity(expected_len / 2); // rough estimate
+/// Encode an RGBA buffer as a 32-bit RGBA PNG.
+///
+/// Internal helper for the >256-colour fallback path of [`encode_png`].
+/// `rgba` length is assumed pre-validated by the caller.
+fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, DataServerError> {
+    let mut buf = Vec::with_capacity(rgba.len() / 2); // rough estimate
     {
         let mut encoder = png::Encoder::new(&mut buf, width, height);
         encoder.set_color(png::ColorType::Rgba);
@@ -33,6 +69,90 @@ pub fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, DataS
     }
 
     Ok(buf)
+}
+
+/// Try to encode an RGBA buffer as an 8-bit indexed-palette PNG.
+///
+/// Returns `Ok(Some(bytes))` when the buffer fits in ≤256 distinct RGBA
+/// colours, `Ok(None)` when it doesn't (caller's signal to fall back to
+/// the 32-bit RGBA path), or `Err(_)` on a true encoder failure.
+///
+/// The scan is single-pass and deterministic: the palette is ordered by
+/// first pixel-occurrence, so two encodes of the same buffer produce
+/// byte-identical output. `rgba` length is assumed pre-validated by the
+/// caller.
+fn encode_png_indexed(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Option<Vec<u8>>, DataServerError> {
+    let mut palette_index: HashMap<[u8; 4], u8> = HashMap::with_capacity(PNG8_MAX_COLORS);
+    let mut palette: Vec<[u8; 4]> = Vec::with_capacity(PNG8_MAX_COLORS);
+    let mut indices: Vec<u8> = Vec::with_capacity((width as usize) * (height as usize));
+
+    for pixel in rgba.chunks_exact(4) {
+        let key = [pixel[0], pixel[1], pixel[2], pixel[3]];
+        if let Some(&idx) = palette_index.get(&key) {
+            indices.push(idx);
+            continue;
+        }
+        if palette.len() >= PNG8_MAX_COLORS {
+            // Palette would overflow — signal the caller to fall through to
+            // the RGBA path. No partial state escapes this function.
+            return Ok(None);
+        }
+        let idx = palette.len() as u8;
+        palette_index.insert(key, idx);
+        palette.push(key);
+        indices.push(idx);
+    }
+
+    // Flatten the palette into the PLTE chunk (RGB triples) and, when any
+    // entry has α < 255, the tRNS chunk (per-entry alpha bytes). PNG specifies
+    // tRNS as a prefix: entries beyond its length default to opaque, so we
+    // emit it only up to the last non-opaque entry to keep it short.
+    let mut plte = Vec::with_capacity(palette.len() * 3);
+    for &[r, g, b, _] in &palette {
+        plte.extend_from_slice(&[r, g, b]);
+    }
+    let last_non_opaque = palette
+        .iter()
+        .rposition(|&[_, _, _, a]| a != 255)
+        .map(|i| i + 1);
+    let trns: Option<Vec<u8>> = last_non_opaque.map(|len| {
+        let mut v = Vec::with_capacity(len);
+        for &[_, _, _, a] in &palette[..len] {
+            v.push(a);
+        }
+        v
+    });
+
+    // Indexed PNG compresses dramatically better than RGBA at the same zlib
+    // level — keep `Fast` so encoding stays well under the render budget
+    // while still shrinking the body 3–4× vs the RGBA path.
+    let mut buf = Vec::with_capacity((width as usize) * (height as usize) / 2);
+    {
+        let mut encoder = png::Encoder::new(&mut buf, width, height);
+        encoder.set_color(png::ColorType::Indexed);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        encoder.set_palette(plte);
+        // Move `trns` into the encoder rather than cloning — it's a local that
+        // drops right after this block, and this fires on every indexed encode
+        // with a transparent class (≈ every radar tile).
+        if let Some(t) = trns {
+            encoder.set_trns(t);
+        }
+
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| DataServerError::Render(format!("PNG8 header error: {e}")))?;
+        writer
+            .write_image_data(&indices)
+            .map_err(|e| DataServerError::Render(format!("PNG8 write error: {e}")))?;
+    }
+
+    Ok(Some(buf))
 }
 
 /// Encode an RGBA buffer to JPEG bytes.
@@ -216,5 +336,230 @@ mod tests {
         let rgba = vec![0, 0, 0, 0, 255, 0, 0, 255]; // 2x1: transparent, red
         let result = encode_jpeg(&rgba, 2, 1);
         assert!(result.is_ok());
+    }
+
+    // --- Auto-PNG8 (indexed-palette) --------------------------------------
+
+    /// Build a `width × height` RGBA tile by mapping each pixel through `f`.
+    fn rgba_from<F: Fn(u32, u32) -> [u8; 4]>(width: u32, height: u32, f: F) -> Vec<u8> {
+        let mut out = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                out.extend_from_slice(&f(x, y));
+            }
+        }
+        out
+    }
+
+    /// Decode a PNG back to straight RGBA so the per-pixel-equivalence
+    /// roundtrip assertions stay framework-agnostic. Returns the colour
+    /// type too so a test can assert which branch (indexed vs RGBA) ran.
+    fn decode_png_to_rgba(bytes: &[u8]) -> (u32, u32, png::ColorType, Vec<u8>) {
+        let decoder = png::Decoder::new(bytes);
+        let mut reader = decoder.read_info().unwrap();
+        let info = reader.info().clone();
+        let mut raw = vec![0u8; reader.output_buffer_size()];
+        let frame = reader.next_frame(&mut raw).unwrap();
+        let w = frame.width;
+        let h = frame.height;
+        let used = &raw[..frame.buffer_size()];
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        match frame.color_type {
+            png::ColorType::Indexed => {
+                // An indexed PNG without a PLTE is malformed; `.expect` keeps
+                // the failure legible instead of an opaque OOB index panic on
+                // the next line (the encoder always writes one, so this only
+                // fires on a truncated/foreign fixture).
+                let plte = info
+                    .palette
+                    .as_deref()
+                    .expect("indexed PNG must carry a PLTE chunk");
+                let trns = info.trns.as_deref().unwrap_or(&[]);
+                for &idx in used {
+                    let p = idx as usize;
+                    let r = plte[p * 3];
+                    let g = plte[p * 3 + 1];
+                    let b = plte[p * 3 + 2];
+                    let a = if p < trns.len() { trns[p] } else { 255 };
+                    rgba.extend_from_slice(&[r, g, b, a]);
+                }
+            }
+            png::ColorType::Rgba => rgba.extend_from_slice(used),
+            other => panic!("unexpected decoded colour type: {other:?}"),
+        }
+        (w, h, frame.color_type, rgba)
+    }
+
+    /// Whether a PNG stream carries a `tRNS` chunk, determined by decoding
+    /// the header rather than scanning raw bytes — a raw `b"tRNS"` search
+    /// can match inside the DEFLATE-compressed IDAT payload and fire
+    /// spuriously on larger images.
+    fn png_has_trns(bytes: &[u8]) -> bool {
+        let decoder = png::Decoder::new(bytes);
+        let reader = decoder.read_info().unwrap();
+        reader.info().trns.is_some()
+    }
+
+    #[test]
+    fn encode_png_auto_palettes_when_under_256_colors() {
+        // 16-colour pattern over 256×256: `encode_png` must auto-select the
+        // indexed-palette path and round-trip every pixel byte-for-byte.
+        // Pixel-equivalence is the headline correctness guarantee for a
+        // colormap-output layer.
+        let palette: [[u8; 4]; 16] = [
+            [0, 0, 0, 0],
+            [10, 20, 30, 255],
+            [200, 0, 0, 255],
+            [0, 200, 0, 255],
+            [0, 0, 200, 255],
+            [255, 255, 0, 255],
+            [0, 255, 255, 255],
+            [255, 0, 255, 255],
+            [128, 128, 128, 200],
+            [64, 64, 64, 150],
+            [255, 128, 0, 255],
+            [128, 0, 255, 255],
+            [0, 128, 255, 255],
+            [128, 255, 0, 255],
+            [255, 0, 128, 255],
+            [0, 255, 128, 255],
+        ];
+        let rgba = rgba_from(256, 256, |x, y| palette[((x + y) % 16) as usize]);
+        let bytes = encode_png(&rgba, 256, 256).unwrap();
+        let (w, h, ct, decoded) = decode_png_to_rgba(&bytes);
+        assert_eq!((w, h), (256, 256));
+        assert_eq!(
+            ct,
+            png::ColorType::Indexed,
+            "≤256-colour input must auto-emit an indexed PNG"
+        );
+        assert_eq!(
+            decoded, rgba,
+            "auto-PNG8 path must round-trip every pixel exactly"
+        );
+    }
+
+    #[test]
+    fn encode_png_auto_palette_is_at_least_three_times_smaller() {
+        // Issue #252 sets the bar at "≥3× smaller for the same image" — pit
+        // the auto-PNG8 path against the explicit RGBA fallback on a frame
+        // with entropy-rich pixel-to-pixel transitions (not just big
+        // contiguous bands, which compress trivially under both encoders).
+        // Use a 16-entry palette in a noisy pseudo-random pattern so RGBA
+        // gets its realistic ~3 byte/px DEFLATE share and the indexed path
+        // lands near 1 byte/px.
+        let palette: [[u8; 4]; 16] = [
+            [0, 0, 0, 0],
+            [0, 128, 255, 255],
+            [0, 200, 0, 255],
+            [255, 255, 0, 255],
+            [255, 128, 0, 255],
+            [255, 0, 0, 255],
+            [180, 0, 180, 255],
+            [255, 255, 255, 255],
+            [0, 50, 200, 255],
+            [0, 230, 0, 255],
+            [200, 200, 0, 255],
+            [255, 100, 0, 255],
+            [200, 0, 0, 255],
+            [150, 0, 150, 255],
+            [80, 80, 80, 255],
+            [40, 40, 40, 200],
+        ];
+        // Cheap, deterministic LCG so each pixel picks an unrelated palette
+        // entry — defeats run-length compression on the RGBA side while still
+        // keeping the buffer in-palette for the indexed path.
+        let rgba = rgba_from(1024, 1024, |x, y| {
+            let mut s: u32 = x
+                .wrapping_mul(1_103_515_245)
+                .wrapping_add(y.wrapping_mul(12_345));
+            s ^= s >> 16;
+            palette[(s as usize) & 0xF]
+        });
+        // Public auto path: hits the indexed branch.
+        let auto = encode_png(&rgba, 1024, 1024).unwrap();
+        // Forced RGBA path for the size comparison — accessible because
+        // tests live inside the same module.
+        let rgba_only = encode_png_rgba(&rgba, 1024, 1024).unwrap();
+        assert!(
+            (rgba_only.len() as f64 / auto.len() as f64) >= 3.0,
+            "auto-PNG8 {} bytes vs forced-RGBA {} bytes — ratio {:.2}× must clear 3×",
+            auto.len(),
+            rgba_only.len(),
+            rgba_only.len() as f64 / auto.len() as f64,
+        );
+    }
+
+    #[test]
+    fn encode_png_is_deterministic() {
+        // ETag stability hinges on byte-identical output for byte-identical
+        // input. Two encodes of the same buffer must produce the same bytes —
+        // no encoder-side timestamps or randomisation.
+        //
+        // The pattern is constrained to 16 distinct colours so this test
+        // exercises the **indexed-palette path** specifically — that path's
+        // determinism is *our* invariant (palette ordered by first
+        // pixel-occurrence). The RGBA fallback's determinism is the `png`
+        // crate's responsibility and is incidentally covered elsewhere.
+        let rgba = rgba_from(64, 64, |x, y| {
+            [((x % 4) * 64) as u8, ((y % 4) * 64) as u8, 0, 255]
+        });
+        let a = encode_png(&rgba, 64, 64).unwrap();
+        let b = encode_png(&rgba, 64, 64).unwrap();
+        assert_eq!(a, b, "PNG encoding must be deterministic for a given input");
+        // Guard against a silent regression: if this test ever falls back to
+        // RGBA (e.g. someone widens the colour range above 256), it would
+        // stop testing the invariant it claims to.
+        let decoder = png::Decoder::new(&a[..]);
+        let reader = decoder.read_info().unwrap();
+        assert_eq!(
+            reader.info().color_type,
+            png::ColorType::Indexed,
+            "this test must exercise the indexed-palette path, not the RGBA fallback"
+        );
+    }
+
+    #[test]
+    fn encode_png_falls_back_to_rgba_above_256_colors() {
+        // 257 distinct opaque colours along a row → palette overflow forces
+        // the RGBA fallback. Decoded output must declare RGBA colour type so
+        // we know which branch ran.
+        let mut rgba = Vec::with_capacity(257 * 4);
+        for i in 0..257u32 {
+            rgba.extend_from_slice(&[(i & 0xFF) as u8, (i >> 8) as u8, 0, 255]);
+        }
+        let bytes = encode_png(&rgba, 257, 1).unwrap();
+        let decoder = png::Decoder::new(&bytes[..]);
+        let reader = decoder.read_info().unwrap();
+        assert_eq!(
+            reader.info().color_type,
+            png::ColorType::Rgba,
+            "above 256 colours must fall back to RGBA"
+        );
+    }
+
+    #[test]
+    fn encode_png_writes_trns_only_when_palette_has_alpha() {
+        // All-opaque palette → no `tRNS` chunk (saves bytes; matches GeoServer).
+        let rgba = rgba_from(4, 4, |x, y| [x as u8 * 10, y as u8 * 10, 128, 255]);
+        let bytes = encode_png(&rgba, 4, 4).unwrap();
+        assert!(
+            !png_has_trns(&bytes),
+            "fully-opaque palette must not emit a tRNS chunk"
+        );
+
+        // Add a transparent entry → `tRNS` chunk must appear.
+        let rgba_alpha = rgba_from(4, 4, |x, y| {
+            if x == 0 && y == 0 {
+                [0, 0, 0, 0]
+            } else {
+                [x as u8 * 10, y as u8 * 10, 128, 255]
+            }
+        });
+        let bytes = encode_png(&rgba_alpha, 4, 4).unwrap();
+        assert!(
+            png_has_trns(&bytes),
+            "palette with any non-opaque entry must emit tRNS"
+        );
     }
 }

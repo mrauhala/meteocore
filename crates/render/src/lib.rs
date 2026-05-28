@@ -24,6 +24,13 @@ use ds_core::error::DataServerError;
 use ds_core::map_engine::RasterTile;
 
 /// Output image format.
+///
+/// [`Png`] auto-selects an 8-bit indexed-palette encoding ("PNG8") when the
+/// rendered image carries ≤256 distinct RGBA colours — typical of every
+/// colormap-rendered layer (radar, classification, single-parameter rasters).
+/// Bytes are roughly 3–4× smaller than the 32-bit RGBA path for the same
+/// image; content-type is `image/png` either way. See [`encode_png`] for the
+/// byte-level contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImageFormat {
     Png,
