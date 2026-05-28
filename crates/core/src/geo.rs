@@ -69,6 +69,13 @@ pub enum Crs {
 /// `"EPSG:4326"` (lat-first) and `"CRS:84"` (lon-first) map to their distinct
 /// URIs: emitting one for the other would invite a conformant client to swap
 /// axes and transpose the image.
+///
+/// This is keyed on the engine's `native_crs` *label*: a CRS only gets a
+/// `storageCrs` if some engine's `crs_label` emits the matching string. The
+/// `"EPSG:4326"` and `"EPSG:3857"` arms are forward-looking — no current engine
+/// emits those labels (WGS84 grids are tagged `"CRS:84"`, and there is no Web
+/// Mercator `Crs` variant) — so a new engine for one of those must emit the
+/// label here for the URI to apply.
 pub fn native_crs_uri(label: &str) -> Option<&'static str> {
     match label {
         "CRS:84" => Some("http://www.opengis.net/def/crs/OGC/1.3/CRS84"),

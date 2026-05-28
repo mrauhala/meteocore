@@ -195,8 +195,15 @@ fn build_extent(info: &ds_core::map_engine::RasterInfo) -> Option<serde_json::Va
         // CRS84-degree resolution would imply a regularity that doesn't hold.
         // `crs84_bbox_spans` keeps the spans positive across the anti-meridian.
         if let Some([nx, ny]) = info.grid_size {
-            if nx > 0 && ny > 0 && ds_core::geo::is_geographic_crs(&info.native_crs) {
-                let (lon_span, lat_span) = ds_core::geo::crs84_bbox_spans(bbox);
+            let (lon_span, lat_span) = ds_core::geo::crs84_bbox_spans(bbox);
+            // Skip a degenerate (zero-span) bbox too: 0.0/nx would emit
+            // "resolution": 0.0, which is invalid per OGC API Common Part 2.
+            if nx > 0
+                && ny > 0
+                && lon_span > 0.0
+                && lat_span > 0.0
+                && ds_core::geo::is_geographic_crs(&info.native_crs)
+            {
                 spatial["grid"] = json!([
                     { "cellsCount": nx, "resolution": lon_span / nx as f64 },
                     { "cellsCount": ny, "resolution": lat_span / ny as f64 }
