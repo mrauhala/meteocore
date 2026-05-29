@@ -683,9 +683,10 @@ fn derive_catalog(
         .filter_map(|list| list.last())
         .flat_map(|e| e.volume.sweeps.iter().map(|s| round_elevation(s.elangle)))
         .collect();
+    // Drop non-finite angles before the extent — see the matching filter in
+    // `volume_profile`. `total_cmp` keeps a total order for sort + dedup.
+    levels.retain(|v| v.is_finite());
     levels.sort_by(f64::total_cmp);
-    // `total_cmp` (not `==`) so a NaN elevation still deduplicates — see
-    // the matching dedup in `volume_profile`.
     levels.dedup_by(|a, b| a.total_cmp(b).is_eq());
     let vertical =
         (!levels.is_empty()).then(|| VerticalDimension::new(VerticalKind::ElevationAngle, levels));
@@ -1252,9 +1253,12 @@ fn volume_profile(entry: &VolumeEntry, lon: f64, lat: f64, quantities: &[String]
         .iter()
         .map(|s| round_elevation(s.elangle))
         .collect();
+    // Drop non-finite angles (a malformed file with a NaN elangle) before
+    // they reach the z axis — a NaN there serialises to JSON `null` and
+    // breaks the numeric axis. `total_cmp` (not `==`) keeps a total order for
+    // the sort + dedup over the remaining finite f64s.
+    levels.retain(|v| v.is_finite());
     levels.sort_by(f64::total_cmp);
-    // `total_cmp` (not `==`) so a NaN elevation — which `Vec::dedup`'s
-    // `PartialEq` would never collapse — still deduplicates.
     levels.dedup_by(|a, b| a.total_cmp(b).is_eq());
     let (site_lon, site_lat) = (entry.volume.site.lon, entry.volume.site.lat);
 
@@ -2063,6 +2067,31 @@ mod tests {
             "VRADH cut at 2.0° must be sampled"
         );
         assert!(vradh.values[2].is_none(), "no VRADH cut at 5.0°");
+    }
+
+    /// A malformed sweep with a NaN elevation must be dropped from the z
+    /// axis — a NaN there serialises to JSON `null` and breaks CoverageJSON's
+    /// numeric axis.
+    #[test]
+    fn volume_profile_drops_nan_elevation() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let mut vol = synthetic_volume(site_lon, site_lat);
+        let mut nan_sweep = vol.sweeps[0].clone();
+        nan_sweep.elangle = f64::NAN;
+        vol.sweeps.push(nan_sweep);
+
+        let profile = volume_profile(&entry(vol, "v0"), site_lon, site_lat, &["DBZH".to_string()]);
+        match &profile.domain {
+            DomainDescription::VerticalProfile { z, .. } => {
+                assert!(
+                    z.values.iter().all(|v| v.is_finite()),
+                    "z axis must contain no NaN, got {:?}",
+                    z.values
+                );
+                assert_eq!(z.values, vec![0.5], "only the finite sweep survives");
+            }
+            _ => panic!("expected VerticalProfile"),
+        }
     }
 
     /// An out-of-window `datetime` range yields `LocationNotFound`.
