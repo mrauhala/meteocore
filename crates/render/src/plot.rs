@@ -176,8 +176,10 @@ pub fn render_chart(panels: &[Panel], width: u32, height: u32) -> Result<Vec<u8>
     if panels.is_empty() {
         return Err(DataServerError::Render("no panels to plot".into()));
     }
-    let width = width.clamp(160, 4096);
-    let height = height.clamp(120, 4096);
+    // Bound the worst-case canvas: this runs synchronously on the request
+    // worker, so cap the buffer well below the WMS raster sizes.
+    let width = width.clamp(160, 2000);
+    let height = height.clamp(120, 2000);
     let mut cv = Canvas::new(width, height);
 
     let n = panels.len() as i32;
@@ -269,7 +271,9 @@ fn draw_panel(cv: &mut Canvas, panel: &Panel, top: i32, panel_h: i32) {
         cv.text(x0 - 6 - lw, yy - 3, &label, BLACK, 1);
     }
 
-    // X ticks + gridlines + labels.
+    // X ticks + gridlines + labels. A time axis spanning more than a day
+    // needs the date too, else both ends can read "00:00".
+    let multiday = panel.x_is_time && (xmax - xmin) > 86_400.0;
     for t in x_ticks(panel, xmin, xmax, 5) {
         if t < xmin || t > xmax {
             continue;
@@ -278,7 +282,7 @@ fn draw_panel(cv: &mut Canvas, panel: &Panel, top: i32, panel_h: i32) {
         cv.vline(xx, y0 + 1, y1 - 1, GRID);
         cv.vline(xx, y1, y1 + 3, FRAME);
         let label = if panel.x_is_time {
-            format_time(t)
+            format_time(t, multiday)
         } else {
             format_value(t)
         };
@@ -408,9 +412,11 @@ fn format_value(v: f64) -> String {
     }
 }
 
-/// Format epoch seconds as `HH:MM` (UTC).
-fn format_time(epoch_secs: f64) -> String {
+/// Format epoch seconds as `HH:MM` (UTC), or `MM-DD HH:MM` when the axis
+/// spans more than a day and bare times would be ambiguous.
+fn format_time(epoch_secs: f64, with_date: bool) -> String {
     match DateTime::from_timestamp(epoch_secs.round() as i64, 0) {
+        Some(dt) if with_date => dt.format("%m-%d %H:%M").to_string(),
         Some(dt) => dt.format("%H:%M").to_string(),
         None => String::new(),
     }
@@ -675,8 +681,11 @@ mod tests {
 
     #[test]
     fn format_time_is_hh_mm() {
-        // 2026-05-15T00:00:00Z = 1_778_889_600
-        assert_eq!(format_time(1_778_889_600.0), "00:00");
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-05-15T13:45:00Z")
+            .unwrap()
+            .timestamp() as f64;
+        assert_eq!(format_time(ts, false), "13:45");
+        assert_eq!(format_time(ts, true), "05-15 13:45");
     }
 
     #[test]

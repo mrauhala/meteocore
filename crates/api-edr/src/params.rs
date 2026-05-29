@@ -51,10 +51,12 @@ pub fn parse_edr_format(f: Option<&str>) -> Result<EdrFormat, DataServerError> {
 }
 
 /// Clamp the requested plot dimensions to a sane range, defaulting to 800×600.
+/// The upper bound is intentionally modest — the plot renders synchronously on
+/// the request worker, so the worst-case buffer stays small.
 pub fn plot_dimensions(width: Option<u32>, height: Option<u32>) -> (u32, u32) {
     (
-        width.unwrap_or(800).clamp(160, 4096),
-        height.unwrap_or(600).clamp(120, 4096),
+        width.unwrap_or(800).clamp(160, 2000),
+        height.unwrap_or(600).clamp(120, 2000),
     )
 }
 
