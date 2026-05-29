@@ -107,6 +107,14 @@ impl DecodedGrid {
     /// Convert (lon, lat) to (col, row) grid indices plus fractional offsets (dx, dy).
     /// dx/dy are in [0, 1) representing the position within the grid cell.
     fn lonlat_to_fractional(&self, lon: f64, lat: f64) -> Option<(usize, usize, f64, f64)> {
+        // An out-of-domain projected output pixel arrives as NaN (OutputCrs::
+        // Projected inverse failure). NaN must be rejected up front: every
+        // comparison below is false for NaN and `NaN as isize` saturates to 0,
+        // so the bounds guard would pass and this would return grid-origin
+        // data (rendered as a colour) instead of None (transparent).
+        if !lon.is_finite() || !lat.is_finite() {
+            return None;
+        }
         // Normalize longitude to grid range
         let mut lon = lon;
         if lon < self.lon_first {
@@ -312,5 +320,64 @@ impl GridCache {
     /// Whether the cache is currently empty.
     pub fn is_empty(&self) -> bool {
         self.cache.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2×2 regular lat/lon grid (10–11°E, 59–60°N) for sampling tests.
+    fn grid_2x2() -> DecodedGrid {
+        DecodedGrid {
+            ni: 2,
+            nj: 2,
+            lon_first: 10.0,
+            lat_first: 60.0,
+            lon_inc: 1.0,
+            lat_inc: -1.0,
+            values: Arc::new(vec![1.0, 2.0, 3.0, 4.0]),
+            triple: (0, 0, 0),
+            centre: 0,
+            first_surface_type: 1,
+            first_surface_value: None,
+        }
+    }
+
+    #[test]
+    fn bilinear_value_rejects_nan_lonlat() {
+        // Regression for the OutputCrs::Projected NaN path: an out-of-domain
+        // pixel arrives as NaN and must resolve to None (transparent), not
+        // grid-origin data — NaN bypasses the bounds guard otherwise.
+        let g = grid_2x2();
+        assert_eq!(g.bilinear_value(f64::NAN, 59.5), None);
+        assert_eq!(g.bilinear_value(10.5, f64::NAN), None);
+        assert_eq!(g.bilinear_value(f64::NAN, f64::NAN), None);
+        assert_eq!(g.bilinear_value(f64::INFINITY, 59.5), None);
+        // A normal in-grid sample still returns a value.
+        assert!(g.bilinear_value(10.5, 59.5).is_some());
+    }
+
+    #[test]
+    fn resample_projected_out_of_domain_is_all_none() {
+        // EPSG:3035 (LAEA) inverse is undefined near the antipode of its
+        // centre; a bbox far outside the grid must render fully transparent,
+        // never a NaN/grid-origin colour.
+        let g = grid_2x2();
+        let crs = ds_core::geo::projected_output_crs("EPSG:3035").unwrap();
+        // Projected metres nowhere near the 10–11°E / 59–60°N grid.
+        let out = g.resample(
+            [-5_000_000.0, -5_000_000.0, -4_900_000.0, -4_900_000.0],
+            8,
+            8,
+            &OutputCrs::Projected {
+                crs,
+                bbox: [-5_000_000.0, -5_000_000.0, -4_900_000.0, -4_900_000.0],
+            },
+        );
+        assert!(
+            out.iter().all(|v| v.is_none()),
+            "out-of-domain projected render must be all-None, got {out:?}"
+        );
     }
 }

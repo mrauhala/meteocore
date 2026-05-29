@@ -458,6 +458,15 @@ fn interpolate(
     level_idx: usize,
     time_idx: usize,
 ) -> Option<f64> {
+    // An out-of-domain projected output pixel arrives as NaN (OutputCrs::
+    // Projected inverse failure). Reject before the forward transform: NaN
+    // comparisons are false and `NaN as i64/usize` saturates to 0, so the
+    // bounds guards below would pass and return grid-origin data instead of
+    // None (transparent).
+    if !lon.is_finite() || !lat.is_finite() {
+        return None;
+    }
+
     let gt = data.grid.geo_transform();
     let (x, y) = gt.crs.forward(lon, lat);
 

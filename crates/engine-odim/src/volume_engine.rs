@@ -1031,6 +1031,14 @@ fn polar_sample(
         for ox in 0..width {
             let frac_x = (ox as f64 + 0.5) / width as f64;
             let (lon, lat) = output_crs.project_node(bbox, frac_x, frac_y);
+            // An out-of-domain projected output pixel arrives as NaN (OutputCrs::
+            // Projected inverse failure). NaN would propagate through
+            // ground_distance_bearing and saturate to (ray=0, bin=0), returning
+            // real radar data at the sweep origin instead of None (transparent).
+            if !lon.is_finite() || !lat.is_finite() {
+                values.push(None);
+                continue;
+            }
 
             values.push(sample_sweep_moment(
                 sweep, moment, site_lon, site_lat, lon, lat,
