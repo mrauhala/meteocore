@@ -1268,7 +1268,10 @@ fn volume_profile(entry: &VolumeEntry, lon: f64, lat: f64, quantities: &[String]
                     .volume
                     .sweeps
                     .iter()
-                    .filter(|s| round_elevation(s.elangle) == level)
+                    // `total_cmp` (not `==`) to stay consistent with the
+                    // `dedup_by` that built `levels`: a NaN level matches the
+                    // NaN-angle sweep instead of matching nothing.
+                    .filter(|s| round_elevation(s.elangle).total_cmp(&level).is_eq())
                     // First non-null sample among the cuts at this angle that
                     // carry the quantity: a cut missing the quantity, or one
                     // returning nodata at this point, falls through to its
