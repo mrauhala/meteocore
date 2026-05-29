@@ -337,7 +337,7 @@ impl GeoTransform {
     /// lies outside the raster. This exposes the raw projection primitive so
     /// callers that need many nearby points can sample the (expensive) CRS
     /// forward transform on a coarse grid and bilinearly interpolate the
-    /// result — see `engine-geotiff`'s coarse-grid resampler.
+    /// result — see [`crate::resample::ProjectionGrid`].
     pub fn world_to_pixel_f64(&self, lon: f64, lat: f64) -> (f64, f64) {
         let (x, y) = self.crs.forward(lon, lat);
         let col = (x - self.origin_x) / self.pixel_width;

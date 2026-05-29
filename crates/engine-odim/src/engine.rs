@@ -37,6 +37,7 @@ use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
 use ds_core::geo::Crs;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
+use ds_core::resample::ProjectionGrid;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Notify;
@@ -693,30 +694,53 @@ impl MapEngine for OdimEngine {
         let src_dy = (src_n - src_s) / composite.ysize as f64;
         let (rows, cols) = composite.pixels.shape();
 
+        // Map output pixels to source pixels through a coarse projection grid
+        // instead of forward-projecting every pixel: `crs.forward` is a full
+        // CRS transform (≈ a dozen transcendental ops for TM/LAEA/LCC/Stereo)
+        // and per-pixel it dominates render CPU on large viewports (#236/#203).
+        let to_web_mercator = *output_crs == OutputCrs::WebMercator;
+        let lon_at = |frac_x: f64| west + frac_x * (east - west);
+        let lat_at = |frac_y: f64| {
+            if to_web_mercator {
+                // In Mercator, pixels have equal spacing in Y meters:
+                // interpolate in Mercator Y, then convert back to latitude.
+                merc_y_to_lat(merc_y_north - frac_y * (merc_y_north - merc_y_south))
+            } else {
+                // Linear interpolation in latitude.
+                north - frac_y * (north - south)
+            }
+        };
+        // World (lon/lat) → fractional source pixel. ODIM rows go north→south,
+        // so the row index counts from the north edge — that orientation lives
+        // here, not in the sampling loop.
+        let world_to_src_px = |lon: f64, lat: f64| {
+            let (x, y) = composite.crs.forward(lon, lat);
+            ((x - src_w) / src_dx, (src_n - y) / src_dy)
+        };
+        let grid = ProjectionGrid::build(
+            width,
+            height,
+            cols as u32,
+            rows as u32,
+            lon_at,
+            lat_at,
+            world_to_src_px,
+        );
+
+        // Resample source grid to output dimensions using nearest-neighbour.
+        // The grid interpolates only the output→source coordinate map; the data
+        // values are still sampled nearest-neighbour (radar dBZ must not be
+        // blended across nodata/undetect edges).
         let mut values = Vec::with_capacity((width * height) as usize);
         for oy in 0..height {
-            let frac_y = (oy as f64 + 0.5) / height as f64;
-            let lat = if *output_crs == OutputCrs::WebMercator {
-                let merc_y = merc_y_north - frac_y * (merc_y_north - merc_y_south);
-                merc_y_to_lat(merc_y)
-            } else {
-                north - frac_y * (north - south)
-            };
             for ox in 0..width {
-                let frac_x = (ox as f64 + 0.5) / width as f64;
-                let lon = west + frac_x * (east - west);
-
-                // Forward-project (lon, lat) into the composite's
-                // native CRS, then nearest-neighbour into the source
-                // pixel grid. ODIM rows go north→south so the row
-                // index counts from the north edge.
-                let (x, y) = composite.crs.forward(lon, lat);
-                if !x.is_finite() || !y.is_finite() {
+                let (col_f, row_f) = grid.sample(ox, oy);
+                if !col_f.is_finite() || !row_f.is_finite() {
                     values.push(None);
                     continue;
                 }
-                let col = ((x - src_w) / src_dx).floor() as i64;
-                let row = ((src_n - y) / src_dy).floor() as i64;
+                let col = col_f.floor() as i64;
+                let row = row_f.floor() as i64;
                 if col < 0 || col >= cols as i64 || row < 0 || row >= rows as i64 {
                     values.push(None);
                     continue;
