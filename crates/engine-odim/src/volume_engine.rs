@@ -1237,24 +1237,38 @@ fn snap_levels(requested: &[f64], canonical: &[f64]) -> Vec<f64> {
 /// volume sampled at WGS84 `(lon, lat)`, with the sweep angles as the
 /// `z` axis.
 fn volume_profile(entry: &VolumeEntry, lon: f64, lat: f64, quantities: &[String]) -> QueryResult {
-    let levels: Vec<f64> = entry
+    // A radar may run split cuts — two sweeps at the same nominal
+    // elevation angle (e.g. separate surveillance and Doppler scans),
+    // so the raw per-sweep angles can repeat (FMI volumes carry two
+    // sweeps at 2.0°). CoverageJSON axis values must be unique
+    // (`uniqueItems`), so collapse to distinct angles — matching the
+    // catalog's deduped vertical extent — and sample each quantity from
+    // whichever sweep at that angle carries it.
+    let mut levels: Vec<f64> = entry
         .volume
         .sweeps
         .iter()
         .map(|s| round_elevation(s.elangle))
         .collect();
+    levels.sort_by(f64::total_cmp);
+    levels.dedup();
     let (site_lon, site_lat) = (entry.volume.site.lon, entry.volume.site.lat);
 
     let mut ranges = HashMap::new();
     let mut param_descs = HashMap::new();
     for quantity in quantities {
-        let values: Vec<Option<f64>> = entry
-            .volume
-            .sweeps
+        let values: Vec<Option<f64>> = levels
             .iter()
-            .map(|sweep| {
-                let moment = sweep.moments.iter().find(|m| &m.quantity == quantity)?;
-                sample_sweep_moment(sweep, moment, site_lon, site_lat, lon, lat)
+            .map(|&level| {
+                entry
+                    .volume
+                    .sweeps
+                    .iter()
+                    .filter(|s| round_elevation(s.elangle) == level)
+                    .find_map(|sweep| {
+                        let moment = sweep.moments.iter().find(|m| &m.quantity == quantity)?;
+                        sample_sweep_moment(sweep, moment, site_lon, site_lat, lon, lat)
+                    })
             })
             .collect();
         ranges.insert(
@@ -1971,6 +1985,51 @@ mod tests {
             covs[0].ranges.get("DBZH").expect("DBZH range").shape,
             vec![1]
         );
+    }
+
+    /// A radar running split cuts has two sweeps at the same nominal
+    /// elevation angle. The `VerticalProfile` `z` axis must collapse
+    /// them to distinct values — CoverageJSON axis values are
+    /// `uniqueItems` — and the per-quantity range must shrink to match,
+    /// sampling each angle from whichever sweep carries the quantity.
+    #[test]
+    fn volume_profile_dedups_split_cut_elevation_angles() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        // A real FMI scan strategy: two sweeps at 2.0° (a surveillance
+        // cut carrying DBZH, a Doppler cut carrying VRADH).
+        let mut vol = synthetic_volume(site_lon, site_lat);
+        let make_sweep = |elangle: f64, quantity: &str| {
+            let mut s = vol.sweeps[0].clone();
+            s.elangle = elangle;
+            s.moments[0].quantity = quantity.to_string();
+            s
+        };
+        vol.sweeps = vec![
+            make_sweep(0.5, "DBZH"),
+            make_sweep(2.0, "DBZH"),
+            make_sweep(2.0, "VRADH"),
+            make_sweep(5.0, "DBZH"),
+        ];
+
+        let profile = volume_profile(
+            &entry(vol, "v0"),
+            site_lon + 0.05,
+            site_lat,
+            &["DBZH".to_string()],
+        );
+        match &profile.domain {
+            DomainDescription::VerticalProfile { z, .. } => {
+                assert_eq!(z.values, vec![0.5, 2.0, 5.0], "z axis must be deduped");
+            }
+            _ => panic!("expected VerticalProfile"),
+        }
+        let dbzh = profile.ranges.get("DBZH").expect("DBZH range");
+        assert_eq!(
+            dbzh.shape,
+            vec![3],
+            "range shape follows the deduped z axis"
+        );
+        assert_eq!(dbzh.values.len(), 3);
     }
 
     /// An out-of-window `datetime` range yields `LocationNotFound`.
