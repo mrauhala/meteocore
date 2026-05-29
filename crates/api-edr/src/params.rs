@@ -50,14 +50,11 @@ pub fn parse_edr_format(f: Option<&str>) -> Result<EdrFormat, DataServerError> {
     }
 }
 
-/// Clamp the requested plot dimensions to a sane range, defaulting to 800×600.
-/// The upper bound is intentionally modest — the plot renders synchronously on
-/// the request worker, so the worst-case buffer stays small.
+/// Default plot dimensions when `width`/`height` aren't supplied. The actual
+/// safe range is enforced inside `ds_render::render_chart`, so user input
+/// passes through unclamped here — one source of truth for the bounds.
 pub fn plot_dimensions(width: Option<u32>, height: Option<u32>) -> (u32, u32) {
-    (
-        width.unwrap_or(800).clamp(160, 2000),
-        height.unwrap_or(600).clamp(120, 2000),
-    )
+    (width.unwrap_or(800), height.unwrap_or(600))
 }
 
 #[derive(Debug, Deserialize)]
