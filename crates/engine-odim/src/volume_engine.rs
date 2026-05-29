@@ -684,7 +684,9 @@ fn derive_catalog(
         .flat_map(|e| e.volume.sweeps.iter().map(|s| round_elevation(s.elangle)))
         .collect();
     levels.sort_by(f64::total_cmp);
-    levels.dedup();
+    // `total_cmp` (not `==`) so a NaN elevation still deduplicates — see
+    // the matching dedup in `volume_profile`.
+    levels.dedup_by(|a, b| a.total_cmp(b).is_eq());
     let vertical =
         (!levels.is_empty()).then(|| VerticalDimension::new(VerticalKind::ElevationAngle, levels));
 
@@ -1251,7 +1253,9 @@ fn volume_profile(entry: &VolumeEntry, lon: f64, lat: f64, quantities: &[String]
         .map(|s| round_elevation(s.elangle))
         .collect();
     levels.sort_by(f64::total_cmp);
-    levels.dedup();
+    // `total_cmp` (not `==`) so a NaN elevation — which `Vec::dedup`'s
+    // `PartialEq` would never collapse — still deduplicates.
+    levels.dedup_by(|a, b| a.total_cmp(b).is_eq());
     let (site_lon, site_lat) = (entry.volume.site.lon, entry.volume.site.lat);
 
     let mut ranges = HashMap::new();
@@ -1265,6 +1269,11 @@ fn volume_profile(entry: &VolumeEntry, lon: f64, lat: f64, quantities: &[String]
                     .sweeps
                     .iter()
                     .filter(|s| round_elevation(s.elangle) == level)
+                    // First non-null sample among the cuts at this angle that
+                    // carry the quantity: a cut missing the quantity, or one
+                    // returning nodata at this point, falls through to its
+                    // split-cut sibling. With a single sweep this is just that
+                    // sweep's sample (None when absent or nodata).
                     .find_map(|sweep| {
                         let moment = sweep.moments.iter().find(|m| &m.quantity == quantity)?;
                         sample_sweep_moment(sweep, moment, site_lon, site_lat, lon, lat)
@@ -2011,11 +2020,13 @@ mod tests {
             make_sweep(5.0, "DBZH"),
         ];
 
+        // Sample a point ~2.8 km from the site, well within every sweep's
+        // range, querying both quantities at once.
         let profile = volume_profile(
             &entry(vol, "v0"),
             site_lon + 0.05,
             site_lat,
-            &["DBZH".to_string()],
+            &["DBZH".to_string(), "VRADH".to_string()],
         );
         match &profile.domain {
             DomainDescription::VerticalProfile { z, .. } => {
@@ -2023,13 +2034,32 @@ mod tests {
             }
             _ => panic!("expected VerticalProfile"),
         }
+
+        // DBZH lives on a cut at every angle → a sample at each z level.
         let dbzh = profile.ranges.get("DBZH").expect("DBZH range");
         assert_eq!(
             dbzh.shape,
             vec![3],
             "range shape follows the deduped z axis"
         );
-        assert_eq!(dbzh.values.len(), 3);
+        assert!(
+            dbzh.values.iter().all(Option::is_some),
+            "DBZH sampled at every level, got {:?}",
+            dbzh.values
+        );
+
+        // VRADH lives only on the Doppler cut at 2.0°. Even though a DBZH cut
+        // shares that angle, the per-angle search must pick the VRADH-carrying
+        // sibling — so only the z=2.0 entry is populated, proving split-cut
+        // selection is per-quantity (not "first sweep at the angle wins").
+        let vradh = profile.ranges.get("VRADH").expect("VRADH range");
+        assert_eq!(vradh.shape, vec![3]);
+        assert!(vradh.values[0].is_none(), "no VRADH cut at 0.5°");
+        assert!(
+            vradh.values[1].is_some(),
+            "VRADH cut at 2.0° must be sampled"
+        );
+        assert!(vradh.values[2].is_none(), "no VRADH cut at 5.0°");
     }
 
     /// An out-of-window `datetime` range yields `LocationNotFound`.
