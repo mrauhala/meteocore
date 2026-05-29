@@ -269,7 +269,14 @@ struct Catalog {
 /// Round an elevation angle to 0.1° so near-identical sweep angles from
 /// different sites or volumes collapse to one catalogue level.
 fn round_elevation(deg: f64) -> f64 {
-    (deg * 10.0).round() / 10.0
+    let r = (deg * 10.0).round() / 10.0;
+    // Normalise -0.0 → +0.0 so downstream dedup/equality treats slightly-
+    // negative grazing angles as a single zero level.
+    if r == 0.0 {
+        0.0
+    } else {
+        r
+    }
 }
 
 /// WGS84 bounding box `[w, s, e, n]` of the circular coverage area of
@@ -684,10 +691,11 @@ fn derive_catalog(
         .flat_map(|e| e.volume.sweeps.iter().map(|s| round_elevation(s.elangle)))
         .collect();
     // Drop non-finite angles before the extent — see the matching filter in
-    // `volume_profile`. `total_cmp` keeps a total order for sort + dedup.
+    // `volume_profile`. `round_elevation` normalises -0.0 → +0.0, so plain
+    // `dedup` after `sort_by(total_cmp)` collapses every duplicate.
     levels.retain(|v| v.is_finite());
     levels.sort_by(f64::total_cmp);
-    levels.dedup_by(|a, b| a.total_cmp(b).is_eq());
+    levels.dedup();
     let vertical =
         (!levels.is_empty()).then(|| VerticalDimension::new(VerticalKind::ElevationAngle, levels));
 
@@ -1255,11 +1263,11 @@ fn volume_profile(entry: &VolumeEntry, lon: f64, lat: f64, quantities: &[String]
         .collect();
     // Drop non-finite angles (a malformed file with a NaN elangle) before
     // they reach the z axis — a NaN there serialises to JSON `null` and
-    // breaks the numeric axis. `total_cmp` (not `==`) keeps a total order for
-    // the sort + dedup over the remaining finite f64s.
+    // breaks the numeric axis. `round_elevation` normalises -0.0 to +0.0,
+    // so plain `dedup` after `sort_by(total_cmp)` collapses every duplicate.
     levels.retain(|v| v.is_finite());
     levels.sort_by(f64::total_cmp);
-    levels.dedup_by(|a, b| a.total_cmp(b).is_eq());
+    levels.dedup();
     let (site_lon, site_lat) = (entry.volume.site.lon, entry.volume.site.lat);
 
     let mut ranges = HashMap::new();
@@ -1268,21 +1276,21 @@ fn volume_profile(entry: &VolumeEntry, lon: f64, lat: f64, quantities: &[String]
         let values: Vec<Option<f64>> = levels
             .iter()
             .map(|&level| {
+                // For a split cut (two sweeps at the same nominal angle, e.g.
+                // a surveillance and a Doppler cut), the *first* sweep that
+                // carries the quantity is authoritative — its sample stands
+                // even when nodata, so a genuine no-echo is not silently
+                // replaced by the sibling's measurement.
                 entry
                     .volume
                     .sweeps
                     .iter()
-                    // `total_cmp` (not `==`) to stay consistent with the
-                    // `dedup_by` that built `levels`: a NaN level matches the
-                    // NaN-angle sweep instead of matching nothing.
-                    .filter(|s| round_elevation(s.elangle).total_cmp(&level).is_eq())
-                    // First non-null sample among the cuts at this angle that
-                    // carry the quantity: a cut missing the quantity, or one
-                    // returning nodata at this point, falls through to its
-                    // split-cut sibling. With a single sweep this is just that
-                    // sweep's sample (None when absent or nodata).
-                    .find_map(|sweep| {
-                        let moment = sweep.moments.iter().find(|m| &m.quantity == quantity)?;
+                    .find(|s| {
+                        round_elevation(s.elangle) == level
+                            && s.moments.iter().any(|m| m.quantity == *quantity)
+                    })
+                    .and_then(|sweep| {
+                        let moment = sweep.moments.iter().find(|m| m.quantity == *quantity)?;
                         sample_sweep_moment(sweep, moment, site_lon, site_lat, lon, lat)
                     })
             })
@@ -1640,6 +1648,21 @@ mod tests {
     use crate::pvol::RadarSite;
     use crate::reader::RawPixels;
     use ndarray::Array2;
+
+    /// `round_elevation` collapses a slightly-negative grazing angle to a
+    /// canonical `+0.0` — otherwise `-0.0` and `+0.0` would survive dedup and
+    /// the z axis would carry both as separate "0" levels.
+    #[test]
+    fn round_elevation_normalises_negative_zero() {
+        let r = round_elevation(-0.04);
+        assert_eq!(r, 0.0);
+        assert!(
+            r.is_sign_positive(),
+            "expected +0.0 after normalisation, got {r}"
+        );
+        // NaN propagates (caller is responsible for filtering with retain).
+        assert!(round_elevation(f64::NAN).is_nan());
+    }
 
     /// A pixel due north of the site has bearing ≈ 0°.
     #[test]
