@@ -38,7 +38,10 @@ fn render_coverage_response(
 ) -> Result<Response, HandlerError> {
     match format {
         EdrFormat::CoverageJson => {
-            let body = serde_json::to_string(&coverage_response_to_json(&result)).unwrap();
+            let body = serde_json::to_string(&coverage_response_to_json(&result)).map_err(|e| {
+                tracing::error!("EDR CoverageJSON serialise error: {e}");
+                server_error()
+            })?;
             Ok((
                 [(header::CONTENT_TYPE, "application/prs.coverage+json")],
                 body,

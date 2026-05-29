@@ -26,6 +26,21 @@ pub fn coverage_response_to_panels(resp: &CoverageResponse) -> Result<Vec<Panel>
         return Err(DataServerError::InvalidParameter("no data to plot".into()));
     }
 
+    // Reject heterogeneous-domain collections explicitly: `build_panel`
+    // dispatches on the first coverage's domain, so a mixed-kind collection
+    // would silently drop the non-matching coverages instead of producing
+    // partial output. Engines emit homogeneous responses today; this guard
+    // is a defensive contract check.
+    let first_kind = domain_kind(&coverages[0].domain);
+    if coverages
+        .iter()
+        .any(|q| domain_kind(&q.domain) != first_kind)
+    {
+        return Err(DataServerError::InvalidParameter(
+            "PNG output requires every coverage to share a domain type".into(),
+        ));
+    }
+
     // Stable, de-duplicated parameter order across every coverage.
     let mut params: Vec<String> = Vec::new();
     for q in coverages {
@@ -117,6 +132,15 @@ fn build_panel(param: &str, coverages: &[QueryResult]) -> Result<Panel, DataServ
         DomainDescription::Grid { .. } => Err(DataServerError::InvalidParameter(
             "PNG output is not available for gridded (area) responses".into(),
         )),
+    }
+}
+
+/// Classify a domain so a heterogeneous-domain collection can be rejected.
+fn domain_kind(d: &DomainDescription) -> &'static str {
+    match d {
+        DomainDescription::VerticalProfile { .. } => "VerticalProfile",
+        DomainDescription::PointSeries { .. } => "PointSeries",
+        DomainDescription::Grid { .. } => "Grid",
     }
 }
 
@@ -330,5 +354,35 @@ mod tests {
             },
         };
         assert!(coverage_response_to_panels(&CoverageResponse::Single(q)).is_err());
+    }
+
+    /// A collection that mixes domain types is rejected explicitly — the
+    /// per-panel dispatch would otherwise silently drop the non-matching
+    /// coverages and produce partial output.
+    #[test]
+    fn heterogeneous_collection_is_rejected() {
+        let p = profile(VerticalKind::ElevationAngle, vec![0.5], vec![Some(1.0)]);
+        let mut parameters = HashMap::new();
+        parameters.insert("t2m".to_string(), pdesc("Temperature", "K"));
+        let mut ranges = HashMap::new();
+        ranges.insert(
+            "t2m".to_string(),
+            NdArray {
+                shape: vec![1],
+                axis_names: vec!["t".into()],
+                values: vec![Some(280.0)],
+            },
+        );
+        let ts = QueryResult {
+            domain: DomainDescription::PointSeries {
+                x: 25.0,
+                y: 60.0,
+                t: vec![DateTime::from_timestamp(1_778_889_600, 0).unwrap()],
+                z: None,
+            },
+            parameters,
+            ranges,
+        };
+        assert!(coverage_response_to_panels(&CoverageResponse::Collection(vec![p, ts])).is_err());
     }
 }
