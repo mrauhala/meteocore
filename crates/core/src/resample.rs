@@ -260,9 +260,21 @@ impl ProjectionGrid {
     /// `(ox, oy)`. Coordinates are fractional and unclamped — the caller floors
     /// and bounds-checks them, exactly as `GeoTransform::world_to_pixel` does.
     ///
-    /// If a grid node is non-finite (only reachable via a degenerate source
-    /// mapping, e.g. a zero pixel size) the result is non-finite; the caller
-    /// must finite-check before use.
+    /// If any of a cell's four nodes is non-finite the bilinear blend is
+    /// non-finite for *every* pixel in that cell; the caller must finite-check
+    /// before use (and a non-finite result resolves to nodata/transparent).
+    /// Non-finite nodes arise when `out_to_world` or `world_to_src_px` returns
+    /// NaN — i.e. a degenerate source mapping (zero pixel size) **or** a
+    /// projected output CRS whose inverse is undefined for an out-of-domain
+    /// node (`OutputCrs::Projected` past the projection's valid area). The
+    /// consequence is that the on-raster region can be under-filled by up to one
+    /// coarse cell (≤ `GRID_STEP_PX`, more at low zoom) right at that domain
+    /// boundary. This is accepted: it only bites thousands of km outside the
+    /// useful extent of EPSG:3067/3035 (whose Newton inverses return finite
+    /// values across all of Europe, so nodes there are finite), and resolving a
+    /// boundary that cuts through a cell exactly would defeat the coarse-grid
+    /// optimisation. Engines that must be pixel-exact at such a boundary should
+    /// fall back to per-pixel projection for cells `sample` reports as nodata.
     pub fn sample(&self, ox: u32, oy: u32) -> (f64, f64) {
         // Position of the pixel centre in grid-cell units.
         let gx = (ox as f64 + 0.5) / self.cell_w;
