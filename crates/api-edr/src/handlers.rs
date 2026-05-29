@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
@@ -12,12 +12,64 @@ use ds_core::config::CollectionConfig;
 use ds_core::datetime::parse_datetime_interval;
 use ds_core::edr_engine::EdrEngine;
 
+use ds_core::error::DataServerError;
 use ds_core::model::CoverageResponse;
+use ds_render::render_chart;
 
 use crate::params::{
-    parse_z, split_position_coords, AreaQueryParams, LocationQueryParams, PositionQueryParams,
+    parse_edr_format, parse_z, plot_dimensions, split_position_coords, AreaQueryParams, EdrFormat,
+    LocationQueryParams, PositionQueryParams,
 };
+use crate::plot_convert::coverage_response_to_panels;
 use crate::response::{coverage_response_to_json, locations_to_geojson, LocationsContext};
+
+type HandlerError = (StatusCode, Json<serde_json::Value>);
+
+/// Serialise an EDR coverage response in the requested output format.
+///
+/// `CoverageJSON` is the default; `PNG` renders a vertical-profile or
+/// time-series plot (one stacked panel per parameter). A response that can't
+/// be plotted (a gridded/area result) maps to 400.
+fn render_coverage_response(
+    result: CoverageResponse,
+    format: EdrFormat,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<Response, HandlerError> {
+    match format {
+        EdrFormat::CoverageJson => {
+            let body = serde_json::to_string(&coverage_response_to_json(&result)).unwrap();
+            Ok((
+                [(header::CONTENT_TYPE, "application/prs.coverage+json")],
+                body,
+            )
+                .into_response())
+        }
+        EdrFormat::Png => {
+            let panels = coverage_response_to_panels(&result).map_err(|e| bad_request(&e))?;
+            let (w, h) = plot_dimensions(width, height);
+            let png = render_chart(&panels, w, h).map_err(|e| {
+                tracing::error!("EDR plot render error: {e}");
+                server_error()
+            })?;
+            Ok(([(header::CONTENT_TYPE, "image/png")], png).into_response())
+        }
+    }
+}
+
+fn bad_request(e: &DataServerError) -> HandlerError {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+    )
+}
+
+fn server_error() -> HandlerError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "code": "ServerError", "description": "Internal server error" })),
+    )
+}
 
 /// Shared state for the EDR API: a registry of collection engines + metadata.
 #[derive(Clone)]
@@ -163,7 +215,14 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     },
                     {"$ref": "#/components/parameters/datetime"},
                     {"$ref": "#/components/parameters/parameter-name"},
-                    {"$ref": "#/components/parameters/z"}
+                    {"$ref": "#/components/parameters/z"},
+                    {
+                        "name": "f",
+                        "in": "query",
+                        "description": "Output format: CoverageJSON (default) or PNG (a vertical-profile / time-series plot).",
+                        "required": false,
+                        "schema": {"type": "string", "enum": ["CoverageJSON", "PNG"]}
+                    }
                 ],
                 "responses": {
                     "200": {
@@ -171,6 +230,9 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "content": {
                             "application/prs.coverage+json": {
                                 "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                            },
+                            "image/png": {
+                                "schema": {"type": "string", "format": "binary"}
                             }
                         }
                     },
@@ -192,7 +254,14 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     {"$ref": "#/components/parameters/coords-point"},
                     {"$ref": "#/components/parameters/datetime"},
                     {"$ref": "#/components/parameters/parameter-name"},
-                    {"$ref": "#/components/parameters/z"}
+                    {"$ref": "#/components/parameters/z"},
+                    {
+                        "name": "f",
+                        "in": "query",
+                        "description": "Output format: CoverageJSON (default) or PNG (a vertical-profile / time-series plot).",
+                        "required": false,
+                        "schema": {"type": "string", "enum": ["CoverageJSON", "PNG"]}
+                    }
                 ],
                 "responses": {
                     "200": {
@@ -200,6 +269,9 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "content": {
                             "application/prs.coverage+json": {
                                 "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                            },
+                            "image/png": {
+                                "schema": {"type": "string", "format": "binary"}
                             }
                         }
                     },
@@ -487,11 +559,8 @@ pub async fn location_query(
             }
         })?;
 
-    let body = serde_json::to_string(&coverage_response_to_json(&result)).unwrap();
-    Ok((
-        [(header::CONTENT_TYPE, "application/prs.coverage+json")],
-        body,
-    ))
+    let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
+    render_coverage_response(result, format, params.width, params.height)
 }
 
 pub async fn position_query(
@@ -559,15 +628,13 @@ pub async fn position_query(
         }
     };
 
+    let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
+
     if points.len() == 1 {
         let result = engine
             .query_position(&points[0], datetime, param_names.as_deref(), z.as_deref())
             .map_err(|e| map_engine_error(&e))?;
-        let body = serde_json::to_string(&coverage_response_to_json(&result)).unwrap();
-        return Ok((
-            [(header::CONTENT_TYPE, "application/prs.coverage+json")],
-            body,
-        ));
+        return render_coverage_response(result, format, params.width, params.height);
     }
 
     // MULTIPOINT — fan out one query per point and flatten every point's
@@ -583,14 +650,12 @@ pub async fn position_query(
         }
     }
 
-    let body = serde_json::to_string(&coverage_response_to_json(&CoverageResponse::Collection(
-        coverages,
-    )))
-    .unwrap();
-    Ok((
-        [(header::CONTENT_TYPE, "application/prs.coverage+json")],
-        body,
-    ))
+    render_coverage_response(
+        CoverageResponse::Collection(coverages),
+        format,
+        params.width,
+        params.height,
+    )
 }
 
 pub async fn area_query(
@@ -600,6 +665,13 @@ pub async fn area_query(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
+
+    // An area result is gridded / multi-coverage, not a single line plot.
+    if parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))? == EdrFormat::Png {
+        return Err(bad_request(&DataServerError::InvalidParameter(
+            "PNG output is not available for area queries".into(),
+        )));
+    }
 
     let datetime = params
         .datetime
@@ -738,11 +810,11 @@ fn build_collection_metadata(
         let (endpoint, output_formats) = match qt.as_str() {
             "locations" => (
                 format!("{base_url}/edr/collections/{}/locations", config.id),
-                json!(["CoverageJSON", "GeoJSON"]),
+                json!(["CoverageJSON", "GeoJSON", "PNG"]),
             ),
             "position" => (
                 format!("{base_url}/edr/collections/{}/position", config.id),
-                json!(["CoverageJSON"]),
+                json!(["CoverageJSON", "PNG"]),
             ),
             "area" => (
                 format!("{base_url}/edr/collections/{}/area", config.id),
@@ -781,6 +853,6 @@ fn build_collection_metadata(
         "data_queries": data_queries,
         "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
         "parameter_names": parameter_names,
-        "output_formats": ["CoverageJSON", "GeoJSON"]
+        "output_formats": ["CoverageJSON", "GeoJSON", "PNG"]
     })
 }

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 ds-core = { path = "../core" }
+ds-render = { path = "../render" }
 arc-swap = "1"
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
