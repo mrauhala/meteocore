@@ -1247,7 +1247,12 @@ fn snap_levels(requested: &[f64], canonical: &[f64]) -> Vec<f64> {
 /// One `VerticalProfile` coverage: every elevation sweep of `entry`'s
 /// volume sampled at WGS84 `(lon, lat)`, with the sweep angles as the
 /// `z` axis.
-fn volume_profile(entry: &VolumeEntry, lon: f64, lat: f64, quantities: &[String]) -> QueryResult {
+fn volume_profile(
+    entry: &VolumeEntry,
+    lon: f64,
+    lat: f64,
+    quantities: &[String],
+) -> Option<QueryResult> {
     // A radar may run split cuts — two sweeps at the same nominal
     // elevation angle (e.g. separate surveillance and Doppler scans),
     // so the raw per-sweep angles can repeat (FMI volumes carry two
@@ -1268,6 +1273,13 @@ fn volume_profile(entry: &VolumeEntry, lon: f64, lat: f64, quantities: &[String]
     levels.retain(|v| v.is_finite());
     levels.sort_by(f64::total_cmp);
     levels.dedup();
+    // No usable sweep (a severely malformed volume where every elangle was
+    // non-finite) — skip this coverage rather than emit a `VerticalProfile`
+    // with an empty z axis, which the CoverageJSON schema rejects
+    // (`numericValuesAxis.values` has `minItems: 1`).
+    if levels.is_empty() {
+        return None;
+    }
     let (site_lon, site_lat) = (entry.volume.site.lon, entry.volume.site.lat);
 
     let mut ranges = HashMap::new();
@@ -1306,7 +1318,7 @@ fn volume_profile(entry: &VolumeEntry, lon: f64, lat: f64, quantities: &[String]
         param_descs.insert(quantity.clone(), quantity_description(quantity));
     }
 
-    QueryResult {
+    Some(QueryResult {
         domain: DomainDescription::VerticalProfile {
             x: lon,
             y: lat,
@@ -1318,7 +1330,7 @@ fn volume_profile(entry: &VolumeEntry, lon: f64, lat: f64, quantities: &[String]
         },
         parameters: param_descs,
         ranges,
-    }
+    })
 }
 
 /// One `PointSeries` coverage pinned to elevation angle `level`: the
@@ -1410,7 +1422,9 @@ fn site_coverages(
     match levels {
         None => Ok(selected
             .iter()
-            .map(|e| volume_profile(e, lon, lat, &quantities))
+            // `filter_map` drops volumes that produced no plottable profile
+            // (every elangle non-finite — `volume_profile` returns `None`).
+            .filter_map(|e| volume_profile(e, lon, lat, &quantities))
             .collect()),
         Some(lvls) => {
             let times: Vec<DateTime<Utc>> = selected.iter().map(|e| e.volume.time).collect();
@@ -2057,7 +2071,8 @@ mod tests {
             site_lon + 0.05,
             site_lat,
             &["DBZH".to_string(), "VRADH".to_string()],
-        );
+        )
+        .expect("finite sweeps must produce a coverage");
         match &profile.domain {
             DomainDescription::VerticalProfile { z, .. } => {
                 assert_eq!(z.values, vec![0.5, 2.0, 5.0], "z axis must be deduped");
@@ -2103,7 +2118,8 @@ mod tests {
         nan_sweep.elangle = f64::NAN;
         vol.sweeps.push(nan_sweep);
 
-        let profile = volume_profile(&entry(vol, "v0"), site_lon, site_lat, &["DBZH".to_string()]);
+        let profile = volume_profile(&entry(vol, "v0"), site_lon, site_lat, &["DBZH".to_string()])
+            .expect("one finite sweep remains, so a coverage is produced");
         match &profile.domain {
             DomainDescription::VerticalProfile { z, .. } => {
                 assert!(
@@ -2115,6 +2131,21 @@ mod tests {
             }
             _ => panic!("expected VerticalProfile"),
         }
+    }
+
+    /// A volume where *every* sweep has a non-finite elevation angle
+    /// (severely malformed) returns no coverage rather than emitting a
+    /// `VerticalProfile` with an empty z axis (`numericValuesAxis.values`
+    /// has `minItems: 1`).
+    #[test]
+    fn volume_profile_all_nan_returns_none() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let mut vol = synthetic_volume(site_lon, site_lat);
+        for s in &mut vol.sweeps {
+            s.elangle = f64::NAN;
+        }
+        let result = volume_profile(&entry(vol, "v0"), site_lon, site_lat, &["DBZH".to_string()]);
+        assert!(result.is_none(), "expected None, got {result:?}");
     }
 
     /// An out-of-window `datetime` range yields `LocationNotFound`.
