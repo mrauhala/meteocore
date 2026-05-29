@@ -177,7 +177,15 @@ pub async fn wms_handler(
                     ds_render::ImageFormat::Webp => 2,
                 },
                 crs: params.crs.clone(),
-                bbox: ds_render::quantize_bbox(&params.bbox),
+                // For a projected output CRS the rendered pixels are laid out
+                // over the projected-metres bbox (carried in `output_crs`), not
+                // the WGS84 envelope in `params.bbox` — two requests with
+                // different projected bboxes can share an envelope, so key on the
+                // metres to avoid serving one's tile for the other (#267 review).
+                bbox: match &params.output_crs {
+                    OutputCrs::Projected { bbox, .. } => ds_render::quantize_bbox(bbox),
+                    _ => ds_render::quantize_bbox(&params.bbox),
+                },
                 width: params.width,
                 height: params.height,
                 time: params.time,

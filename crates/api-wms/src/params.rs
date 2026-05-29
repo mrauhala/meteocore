@@ -149,12 +149,13 @@ impl WmsQuery {
         }
         let crs = crs.to_string();
 
-        // BBOX
+        // BBOX — also resolves the output CRS (axis order + reprojection both
+        // depend on the CRS, so they're determined together).
         let bbox_str = self
             .bbox
             .as_deref()
             .ok_or(WmsError::missing_parameter("BBOX"))?;
-        let bbox = parse_bbox(bbox_str, &crs)?;
+        let (bbox, output_crs) = parse_bbox(bbox_str, &crs)?;
 
         // WIDTH
         let width: u32 = self
@@ -230,11 +231,6 @@ impl WmsQuery {
             None => None,
         };
 
-        let output_crs = match crs.as_str() {
-            "EPSG:3857" => OutputCrs::WebMercator,
-            _ => OutputCrs::Wgs84,
-        };
-
         // STYLES — empty string or missing = "default"
         let style = self
             .styles
@@ -269,15 +265,25 @@ pub enum WmsRequestType {
     GetLegendGraphic,
 }
 
-/// Parse BBOX string, handling WMS 1.3.0 axis order.
+/// Parse a BBOX string and resolve the output CRS, handling WMS 1.3.0 axis
+/// order and reprojection.
 ///
 /// WMS 1.3.0 axis order depends on CRS:
-/// - EPSG:4326 → lat,lon order: BBOX=south,west,north,east
 /// - CRS:84    → lon,lat order: BBOX=west,south,east,north
-/// - EPSG:3857 → easting,northing: not yet supported for direct passthrough
+/// - EPSG:4326 → lat,lon order: BBOX=south,west,north,east (swapped)
+/// - EPSG:3857/3067/3035 → easting,northing: BBOX=minx,miny,maxx,maxy
 ///
-/// Returns [west, south, east, north] in WGS84.
-fn parse_bbox(bbox_str: &str, crs: &str) -> Result<[f64; 4], WmsError> {
+/// Returns the WGS84 bounding box `[west, south, east, north]` the engine reads
+/// against, paired with the [`OutputCrs`] that tells the engine how output
+/// pixels map to coordinates:
+/// - CRS:84 / EPSG:4326 → bbox is already WGS84 degrees; [`OutputCrs::Wgs84`].
+/// - EPSG:3857 → bbox metres reprojected to a WGS84 box; [`OutputCrs::WebMercator`].
+/// - EPSG:3067 / EPSG:3035 → bbox is projected metres; [`OutputCrs::Projected`]
+///   carries it, and the returned WGS84 box is its inverse-projected envelope so
+///   the engine reads the right source window (#160/#251). Previously these two
+///   codes fell through to `Wgs84` and the engine read projected metres as
+///   degrees → fully-transparent tiles.
+fn parse_bbox(bbox_str: &str, crs: &str) -> Result<([f64; 4], OutputCrs), WmsError> {
     let parts: Vec<f64> = bbox_str
         .split(',')
         .map(|s| {
@@ -302,7 +308,7 @@ fn parse_bbox(bbox_str: &str, crs: &str) -> Result<[f64; 4], WmsError> {
         }
     }
 
-    // WMS 1.3.0 axis order: EPSG:4326 uses lat/lon, CRS:84 uses lon/lat
+    // WMS 1.3.0 axis order: EPSG:4326 uses lat/lon, everything else x/y.
     let [x1, y1, x2, y2] = match crs {
         "EPSG:4326" => {
             // BBOX = south, west, north, east (lat/lon order) → normalize to x/y
@@ -321,23 +327,39 @@ fn parse_bbox(bbox_str: &str, crs: &str) -> Result<[f64; 4], WmsError> {
         ));
     }
 
-    // Reproject to WGS84 [west, south, east, north] if needed
-    let [west, south, east, north] = match crs {
+    match crs {
         "EPSG:3857" => {
-            // Web Mercator meters → WGS84 degrees
+            // Web Mercator metres → WGS84 degrees; pixel Y stays Mercator-spaced.
             let (lon1, lat1) = epsg3857_to_wgs84(x1, y1);
             let (lon2, lat2) = epsg3857_to_wgs84(x2, y2);
-            [lon1, lat1, lon2, lat2]
+            Ok(([lon1, lat1, lon2, lat2], OutputCrs::WebMercator))
+        }
+        "EPSG:3067" | "EPSG:3035" => {
+            // Projected metres: keep them in the OutputCrs so the engine lays
+            // output pixels out in the projection, and pass its inverse-
+            // projected WGS84 envelope as the read window.
+            let proj_crs = ds_core::geo::projected_output_crs(crs).ok_or_else(|| {
+                WmsError::invalid_parameter(&format!("CRS '{crs}' has no projection definition"))
+            })?;
+            let proj_bbox = [x1, y1, x2, y2];
+            // None means the whole bbox is outside the projection's valid domain
+            // — reject (400) rather than letting the engine read a global window.
+            let wgs84 = ds_core::geo::wgs84_envelope(&proj_crs, proj_bbox).ok_or_else(|| {
+                WmsError::invalid_parameter("BBOX is outside the valid area of the requested CRS")
+            })?;
+            Ok((
+                wgs84,
+                OutputCrs::Projected {
+                    crs: proj_crs,
+                    bbox: proj_bbox,
+                },
+            ))
         }
         _ => {
-            // CRS:84 and EPSG:4326 are already in WGS84 degrees
-            // EPSG:3067 and EPSG:3035 — the engine handles reprojection internally
-            // via GeoTransform::world_to_pixel which calls Crs::forward
-            [x1, y1, x2, y2]
+            // CRS:84 and EPSG:4326 are already in WGS84 degrees.
+            Ok(([x1, y1, x2, y2], OutputCrs::Wgs84))
         }
-    };
-
-    Ok([west, south, east, north])
+    }
 }
 
 /// Convert EPSG:3857 (Web Mercator) coordinates to WGS84 (lon/lat degrees).
@@ -380,15 +402,17 @@ mod tests {
 
     #[test]
     fn test_bbox_crs84() {
-        let bbox = parse_bbox("10,55,30,70", "CRS:84").unwrap();
+        let (bbox, crs) = parse_bbox("10,55,30,70", "CRS:84").unwrap();
         assert_eq!(bbox, [10.0, 55.0, 30.0, 70.0]);
+        assert_eq!(crs, OutputCrs::Wgs84);
     }
 
     #[test]
     fn test_bbox_epsg4326_axis_swap() {
         // EPSG:4326 uses lat/lon order: south,west,north,east
-        let bbox = parse_bbox("55,10,70,30", "EPSG:4326").unwrap();
+        let (bbox, crs) = parse_bbox("55,10,70,30", "EPSG:4326").unwrap();
         assert_eq!(bbox, [10.0, 55.0, 30.0, 70.0]);
+        assert_eq!(crs, OutputCrs::Wgs84);
     }
 
     #[test]
@@ -400,12 +424,70 @@ mod tests {
     #[test]
     fn test_bbox_epsg3857_reprojection() {
         // Web Mercator bbox covering roughly lon 1.5-14.3, lat 53.0-63.0
-        let bbox = parse_bbox("171318.93,6897641.62,2528475.00,9153471.98", "EPSG:3857").unwrap();
+        let (bbox, crs) =
+            parse_bbox("171318.93,6897641.62,2528475.00,9153471.98", "EPSG:3857").unwrap();
         // Should be reprojected to WGS84 degrees
         assert!((bbox[0] - 1.539).abs() < 0.01); // west ≈ 1.54°
         assert!((bbox[1] - 52.536).abs() < 0.01); // south ≈ 52.54°
         assert!((bbox[2] - 22.714).abs() < 0.01); // east ≈ 22.71°
         assert!((bbox[3] - 63.216).abs() < 0.01); // north ≈ 63.22°
+        assert_eq!(crs, OutputCrs::WebMercator);
+    }
+
+    #[test]
+    fn test_bbox_epsg3067_projected() {
+        // Regression for #251/#160: FMI's native TM35FIN extent. The bbox is in
+        // EPSG:3067 metres and must NOT be passed through as WGS84 degrees.
+        let (bbox, crs) = parse_bbox(
+            "-118331.366408,6335621.167014,875567.731907,7907751.537264",
+            "EPSG:3067",
+        )
+        .unwrap();
+
+        // OutputCrs carries the projected request rectangle verbatim.
+        match &crs {
+            OutputCrs::Projected {
+                bbox: proj,
+                crs: proj_crs,
+            } => {
+                assert_eq!(
+                    *proj,
+                    [
+                        -118331.366408,
+                        6335621.167014,
+                        875567.731907,
+                        7907751.537264
+                    ]
+                );
+                // EPSG:3067 is Transverse Mercator (TM35FIN).
+                assert!(matches!(
+                    proj_crs,
+                    ds_core::geo::Crs::TransverseMercator { .. }
+                ));
+            }
+            other => panic!("expected Projected, got {other:?}"),
+        }
+
+        // The returned WGS84 envelope must be plausible Nordic degrees, NOT the
+        // metres treated as degrees (a metres-as-degrees bug puts these in the
+        // millions). FMI's composite is wide, so the lon span reaches ~10–37°E.
+        let [west, south, east, north] = bbox;
+        assert!(
+            (-30.0..60.0).contains(&west) && (-30.0..60.0).contains(&east),
+            "envelope lon {west}..{east} should be degrees"
+        );
+        assert!(
+            (45.0..75.0).contains(&south) && (45.0..75.0).contains(&north),
+            "envelope lat {south}..{north} should be degrees"
+        );
+        assert!(west < east && south < north);
+    }
+
+    #[test]
+    fn test_bbox_epsg3035_projected() {
+        // EPSG:3035 (ETRS89-LAEA) is also projected metres → Projected, not Wgs84.
+        let (_bbox, crs) = parse_bbox("4200000,3200000,5300000,5000000", "EPSG:3035").unwrap();
+        assert!(matches!(crs, OutputCrs::Projected { .. }));
     }
 
     #[test]

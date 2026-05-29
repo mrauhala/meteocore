@@ -1449,31 +1449,16 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
 
             // Map output pixels to source pixels through a coarse projection
             // grid instead of projecting every pixel: the CRS forward transform
-            // dominates render CPU for projected sources.
-            let to_web_mercator = *output_crs == ds_core::map_engine::OutputCrs::WebMercator;
-            let (merc_y_north, merc_y_south) = if to_web_mercator {
-                (lat_to_merc_y(north), lat_to_merc_y(south))
-            } else {
-                (0.0, 0.0) // unused
-            };
-            let lon_at = |frac_x: f64| west + frac_x * (east - west);
-            let lat_at = |frac_y: f64| {
-                if to_web_mercator {
-                    // In Mercator, pixels have equal spacing in Y meters:
-                    // interpolate in Mercator Y, then convert back to latitude.
-                    merc_y_to_lat(merc_y_north - frac_y * (merc_y_north - merc_y_south))
-                } else {
-                    // Linear interpolation in latitude.
-                    north - frac_y * (north - south)
-                }
-            };
-            let grid = ds_core::resample::ProjectionGrid::build(
+            // dominates render CPU for projected sources. The output→world axis
+            // mapping (linear lon/lat, Mercator Y, or a projected output CRS) is
+            // the shared `OutputCrs::project_node`, so EPSG:3067/3035 output is
+            // handled here without per-engine axis math (#160).
+            let grid = ds_core::resample::ProjectionGrid::build_2d(
                 width,
                 height,
                 gt.width,
                 gt.height,
-                lon_at,
-                lat_at,
+                |fx, fy| output_crs.project_node(bbox, fx, fy),
                 |lon, lat| gt.world_to_pixel_f64(lon, lat),
             );
 
@@ -1717,19 +1702,6 @@ impl EdrEngine for GeoTiffEngine {
 
 /// Validate GeoTIFF config for common mistakes that would otherwise cause
 /// confusing runtime behavior.
-/// Convert latitude (degrees) to Web Mercator Y (meters).
-fn lat_to_merc_y(lat_deg: f64) -> f64 {
-    const R: f64 = 6_378_137.0;
-    let lat_rad = lat_deg.to_radians();
-    R * ((std::f64::consts::FRAC_PI_4 + lat_rad / 2.0).tan()).ln()
-}
-
-/// Convert Web Mercator Y (meters) to latitude (degrees).
-fn merc_y_to_lat(y: f64) -> f64 {
-    const R: f64 = 6_378_137.0;
-    (std::f64::consts::FRAC_PI_2 - 2.0 * (-y / R).exp().atan()).to_degrees()
-}
-
 fn validate_config(
     collection_id: &str,
     data_path: Option<&str>,

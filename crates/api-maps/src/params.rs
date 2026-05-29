@@ -134,9 +134,37 @@ impl MapQueryParams {
         // DATETIME / TIME
         let time = self.datetime.as_deref().map(parse_time).transpose()?;
 
-        let output_crs = match crs.as_str() {
-            "EPSG:3857" => ds_core::map_engine::OutputCrs::WebMercator,
-            _ => ds_core::map_engine::OutputCrs::Wgs84,
+        // OGC API Maps fixes `bbox-crs` to CRS:84 (checked above), so `bbox` is
+        // always WGS84 degrees; the `crs` parameter selects the *output* CRS.
+        // For a projected output CRS the map frame must cover the requested
+        // geographic box, so forward-project it to a projected envelope, render
+        // the projection over that, and widen the WGS84 read window to the
+        // envelope's inverse so the engine reads the right source pixels
+        // (#160 — previously these codes silently rendered as WGS84).
+        let (bbox, output_crs) = match crs.as_str() {
+            "EPSG:3857" => (bbox, ds_core::map_engine::OutputCrs::WebMercator),
+            "EPSG:3067" | "EPSG:3035" => {
+                let proj_crs = ds_core::geo::projected_output_crs(&crs).ok_or_else(|| {
+                    MapsError::BadRequest(format!("CRS '{crs}' has no projection definition"))
+                })?;
+                let proj_bbox = ds_core::geo::projected_envelope(&proj_crs, bbox);
+                // None means the projected frame is entirely outside the CRS's
+                // valid domain — reject (400) rather than reading a global window.
+                let wgs84 =
+                    ds_core::geo::wgs84_envelope(&proj_crs, proj_bbox).ok_or_else(|| {
+                        MapsError::BadRequest(
+                            "bbox is outside the valid area of the requested crs".to_string(),
+                        )
+                    })?;
+                (
+                    wgs84,
+                    ds_core::map_engine::OutputCrs::Projected {
+                        crs: proj_crs,
+                        bbox: proj_bbox,
+                    },
+                )
+            }
+            _ => (bbox, ds_core::map_engine::OutputCrs::Wgs84),
         };
 
         // parameter-name — validation that the name is in the engine's list
@@ -275,5 +303,57 @@ mod tests {
     #[test]
     fn test_parse_time_invalid() {
         assert!(parse_time("not-a-time").is_err());
+    }
+
+    fn query_with_crs(crs: &str) -> MapQueryParams {
+        MapQueryParams {
+            // CRS:84 bbox over Finland (bbox-crs is always CRS:84 in OGC Maps).
+            bbox: Some("19,59,32,70".to_string()),
+            width: Some(256),
+            height: Some(256),
+            crs: Some(crs.to_string()),
+            datetime: None,
+            transparent: None,
+            format: None,
+            bbox_crs: None,
+            parameter_name: None,
+            elevation: None,
+        }
+    }
+
+    #[test]
+    fn validate_projected_output_crs_3067() {
+        // #160: a projected output CRS must produce OutputCrs::Projected, not a
+        // silent Wgs84 fallback. The bbox stays CRS:84 (bbox-crs), but the
+        // engine read window widens to the projected frame's WGS84 envelope.
+        let validated = query_with_crs("EPSG:3067").validate().unwrap();
+        match validated.output_crs {
+            ds_core::map_engine::OutputCrs::Projected { ref crs, bbox } => {
+                assert!(matches!(crs, ds_core::geo::Crs::TransverseMercator { .. }));
+                // Projected envelope of the CRS:84 box: easting near the 500 km
+                // false-easting band, northing in the millions of metres.
+                assert!(bbox[1] > 5_000_000.0 && bbox[3] > 6_000_000.0, "{bbox:?}");
+            }
+            other => panic!("expected Projected, got {other:?}"),
+        }
+        // The read window stays in plausible WGS84 degrees.
+        let [w, s, e, n] = validated.bbox;
+        assert!(
+            w > 10.0 && e < 40.0 && s > 55.0 && n < 75.0,
+            "{:?}",
+            validated.bbox
+        );
+    }
+
+    #[test]
+    fn validate_wgs84_and_webmercator_unchanged() {
+        assert_eq!(
+            query_with_crs("CRS:84").validate().unwrap().output_crs,
+            ds_core::map_engine::OutputCrs::Wgs84
+        );
+        assert_eq!(
+            query_with_crs("EPSG:3857").validate().unwrap().output_crs,
+            ds_core::map_engine::OutputCrs::WebMercator
+        );
     }
 }

@@ -635,29 +635,6 @@ fn source_label(source: &Source) -> String {
     }
 }
 
-/// Convert WGS84 latitude (degrees) to Web Mercator Y (metres).
-/// Used to interpolate output-row latitudes in equal-Mercator-Y
-/// steps when `OutputCrs::WebMercator` is requested.
-fn lat_to_merc_y(lat_deg: f64) -> f64 {
-    const R: f64 = 6_378_137.0;
-    let lat_rad = lat_deg.to_radians();
-    R * ((std::f64::consts::FRAC_PI_4 + lat_rad / 2.0).tan()).ln()
-}
-
-/// Inverse of [`lat_to_merc_y`].
-///
-/// The formula `π/2 - 2·atan(exp(-y/R))` is algebraically
-/// equivalent to the standard EPSG:3857 inverse
-/// `2·atan(exp(y/R)) - π/2`, but uses the negated exponent so the
-/// `exp()` term decays toward zero as |y| grows rather than growing
-/// without bound — that keeps the math numerically stable across the
-/// full ±π/2 latitude range under f64 arithmetic. EPSG:3857 dataset:
-/// https://epsg.io/3857.
-fn merc_y_to_lat(y: f64) -> f64 {
-    const R: f64 = 6_378_137.0;
-    (std::f64::consts::FRAC_PI_2 - 2.0 * (-y / R).exp().atan()).to_degrees()
-}
-
 impl MapEngine for OdimEngine {
     fn get_raster_tile(
         &self,
@@ -677,17 +654,10 @@ impl MapEngine for OdimEngine {
         })?;
         let composite = self.load_composite(&entry.location)?;
 
-        let [west, south, east, north] = bbox;
         let gain = self.gain_override.unwrap_or(composite.gain);
         let offset = self.offset_override.unwrap_or(composite.offset);
         let nodata = self.nodata_override.unwrap_or(composite.nodata);
         let undetect = composite.undetect;
-
-        let (merc_y_north, merc_y_south) = if *output_crs == OutputCrs::WebMercator {
-            (lat_to_merc_y(north), lat_to_merc_y(south))
-        } else {
-            (0.0, 0.0)
-        };
 
         let [src_w, src_s, src_e, src_n] = composite.bbox;
         let src_dx = (src_e - src_w) / composite.xsize as f64;
@@ -698,18 +668,10 @@ impl MapEngine for OdimEngine {
         // instead of forward-projecting every pixel: `crs.forward` is a full
         // CRS transform (≈ a dozen transcendental ops for TM/LAEA/LCC/Stereo)
         // and per-pixel it dominates render CPU on large viewports (#236/#203).
-        let to_web_mercator = *output_crs == OutputCrs::WebMercator;
-        let lon_at = |frac_x: f64| west + frac_x * (east - west);
-        let lat_at = |frac_y: f64| {
-            if to_web_mercator {
-                // In Mercator, pixels have equal spacing in Y meters:
-                // interpolate in Mercator Y, then convert back to latitude.
-                merc_y_to_lat(merc_y_north - frac_y * (merc_y_north - merc_y_south))
-            } else {
-                // Linear interpolation in latitude.
-                north - frac_y * (north - south)
-            }
-        };
+        // The output→world axis mapping (linear lon/lat, Mercator Y, or a
+        // projected output CRS such as EPSG:3067/3035) is the shared
+        // `OutputCrs::project_node` (#160).
+        //
         // World (lon/lat) → fractional source pixel. ODIM rows go north→south,
         // so the row index counts from the north edge — that orientation lives
         // here, not in the sampling loop.
@@ -717,13 +679,12 @@ impl MapEngine for OdimEngine {
             let (x, y) = composite.crs.forward(lon, lat);
             ((x - src_w) / src_dx, (src_n - y) / src_dy)
         };
-        let grid = ProjectionGrid::build(
+        let grid = ProjectionGrid::build_2d(
             width,
             height,
             cols as u32,
             rows as u32,
-            lon_at,
-            lat_at,
+            |fx, fy| output_crs.project_node(bbox, fx, fy),
             world_to_src_px,
         );
 
@@ -807,18 +768,6 @@ fn crs_label(crs: &Crs) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn lat_merc_round_trip_is_identity() {
-        for lat in [-60.0, -30.0, 0.0, 30.0, 60.0] {
-            let y = lat_to_merc_y(lat);
-            let lat_back = merc_y_to_lat(y);
-            assert!(
-                (lat - lat_back).abs() < 1e-9,
-                "lat={lat} y={y} back={lat_back}"
-            );
-        }
-    }
 
     #[test]
     fn crs_label_covers_every_variant() {

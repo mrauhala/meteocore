@@ -87,9 +87,6 @@ pub const SITE_QUANTITY_SEP: char = ':';
 /// ranges (≤ ~250 km) is far below one output pixel.
 const EARTH_RADIUS_M: f64 = 6_371_000.0;
 
-/// Web-Mercator sphere radius (metres) — EPSG:3857 uses 6378137.
-const MERC_RADIUS_M: f64 = 6_378_137.0;
-
 // ---------------------------------------------------------------------------
 // Geodesic helper
 // ---------------------------------------------------------------------------
@@ -123,21 +120,6 @@ pub fn ground_distance_bearing(lon0: f64, lat0: f64, lon1: f64, lat1: f64) -> (f
     let bearing = y.atan2(x).to_degrees().rem_euclid(360.0);
 
     (distance, bearing)
-}
-
-// ---------------------------------------------------------------------------
-// Web-Mercator row interpolation (mirrors engine.rs)
-// ---------------------------------------------------------------------------
-
-/// WGS84 latitude (degrees) → Web-Mercator Y (metres).
-fn lat_to_merc_y(lat_deg: f64) -> f64 {
-    let lat_rad = lat_deg.to_radians();
-    MERC_RADIUS_M * ((std::f64::consts::FRAC_PI_4 + lat_rad / 2.0).tan()).ln()
-}
-
-/// Inverse of [`lat_to_merc_y`].
-fn merc_y_to_lat(y: f64) -> f64 {
-    (std::f64::consts::FRAC_PI_2 - 2.0 * (-y / MERC_RADIUS_M).exp().atan()).to_degrees()
 }
 
 // ---------------------------------------------------------------------------
@@ -978,11 +960,11 @@ fn nearest_sweep(volume: &PolarVolume, target: f64) -> Option<&Sweep> {
 
 /// Resample one polar moment of a sweep into a Cartesian output grid.
 ///
-/// `bbox` is `[west, south, east, north]` in WGS84 degrees. For
-/// [`OutputCrs::WebMercator`], output row latitudes are interpolated in
-/// Mercator-Y so pixels are square in the projection; for
-/// [`OutputCrs::Wgs84`] they are linear in latitude. For each output
-/// pixel centre the algorithm:
+/// `bbox` is `[west, south, east, north]` in WGS84 degrees. Each output pixel's
+/// WGS84 lon/lat comes from [`OutputCrs::project_node`], so the output axes
+/// follow the requested CRS: linear lon/lat for `Wgs84`, equal-Mercator-Y rows
+/// for `WebMercator`, or linear-in-projected-metres for a `Projected` CRS
+/// (EPSG:3067/3035). For each output pixel centre the algorithm:
 ///
 /// 1. computes ground distance + azimuth from the site via
 ///    [`ground_distance_bearing`];
@@ -1031,7 +1013,6 @@ fn polar_sample(
             ))
         })?;
 
-    let [west, south, east, north] = bbox;
     let (site_lon, site_lat) = (volume.site.lon, volume.site.lat);
     if sweep.nrays == 0 || sweep.nbins == 0 {
         return Err(DataServerError::Engine(
@@ -1039,24 +1020,30 @@ fn polar_sample(
         ));
     }
 
-    let (merc_y_north, merc_y_south) = if *output_crs == OutputCrs::WebMercator {
-        (lat_to_merc_y(north), lat_to_merc_y(south))
-    } else {
-        (0.0, 0.0)
-    };
-
+    // Polar sampling is inherently per-pixel (each output pixel resolves to a
+    // ground distance + bearing from the site), so unlike the gridded engines
+    // this loop maps each pixel's WGS84 lon/lat with the shared
+    // `OutputCrs::project_node` directly — covering linear lon/lat, Mercator Y,
+    // and projected output CRSs (EPSG:3067/3035) in one place (#160).
+    //
+    // For `OutputCrs::Projected` this adds one `Crs::inverse` per pixel on top of
+    // the inherent per-pixel polar geometry. A coarse-grid map (as the gridded
+    // engines use) doesn't drop in cleanly here because the polar sampler is not
+    // a smooth source-pixel function; tracked in #268 if it proves to matter.
     let mut values: Vec<Option<f64>> = Vec::with_capacity((width as usize) * (height as usize));
     for oy in 0..height {
         let frac_y = (oy as f64 + 0.5) / height as f64;
-        let lat = if *output_crs == OutputCrs::WebMercator {
-            let merc_y = merc_y_north - frac_y * (merc_y_north - merc_y_south);
-            merc_y_to_lat(merc_y)
-        } else {
-            north - frac_y * (north - south)
-        };
         for ox in 0..width {
             let frac_x = (ox as f64 + 0.5) / width as f64;
-            let lon = west + frac_x * (east - west);
+            let (lon, lat) = output_crs.project_node(bbox, frac_x, frac_y);
+            // An out-of-domain projected output pixel arrives as NaN (OutputCrs::
+            // Projected inverse failure). NaN would propagate through
+            // ground_distance_bearing and saturate to (ray=0, bin=0), returning
+            // real radar data at the sweep origin instead of None (transparent).
+            if !lon.is_finite() || !lat.is_finite() {
+                values.push(None);
+                continue;
+            }
 
             values.push(sample_sweep_moment(
                 sweep, moment, site_lon, site_lat, lon, lat,
