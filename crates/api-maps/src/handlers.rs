@@ -848,7 +848,16 @@ async fn render_map(
             ds_render::ImageFormat::Webp => 2,
         },
         crs: validated.crs.clone(),
-        bbox: ds_render::quantize_bbox(&validated.bbox),
+        // Projected output renders over the projected-metres bbox carried in
+        // `output_crs`, not the WGS84 envelope in `validated.bbox`; key on the
+        // metres so two projected requests sharing an envelope don't collide
+        // (#267 review).
+        bbox: match &validated.output_crs {
+            ds_core::map_engine::OutputCrs::Projected { bbox, .. } => {
+                ds_render::quantize_bbox(bbox)
+            }
+            _ => ds_render::quantize_bbox(&validated.bbox),
+        },
         width: validated.width,
         height: validated.height,
         time,

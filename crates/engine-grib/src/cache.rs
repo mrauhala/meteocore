@@ -76,12 +76,30 @@ impl DecodedGrid {
         if !col_f.is_finite() || !row_f.is_finite() {
             return None;
         }
-        let col = col_f.floor() as isize;
+        let col = self.wrap_col(col_f).floor() as isize;
         let row = row_f.floor() as isize;
         if col < 0 || col >= self.ni as isize || row < 0 || row >= self.nj as isize {
             return None;
         }
         Some(self.values[row as usize * self.ni + col as usize])
+    }
+
+    /// Wrap a fractional column into `[0, ni)` for (near-)global grids — a
+    /// column outside the grid on a 360°-spanning grid names the same meridian
+    /// one wrap away. Regional grids (span < 360°) don't wrap, so an
+    /// out-of-range column stays out of range (genuine nodata).
+    ///
+    /// The wrap lives here (and is idempotent via `rem_euclid`) rather than in
+    /// [`Self::lonlat_to_src_px`], so the lon→col mapping stays continuous for
+    /// [`ProjectionGrid::build_2d`]'s node interpolation while [`Self::nearest_value`]
+    /// and [`Self::bilinear_at`] still resolve wrapped meridians.
+    fn wrap_col(&self, col_f: f64) -> f64 {
+        let cols_per_360 = 360.0 / self.lon_inc;
+        if (self.ni as f64) >= cols_per_360 - 0.5 {
+            col_f.rem_euclid(cols_per_360)
+        } else {
+            col_f
+        }
     }
 
     /// Bilinear interpolation at (lon, lat).
@@ -93,18 +111,17 @@ impl DecodedGrid {
     }
 
     /// Map (lon, lat) to fractional source-grid pixel `(col_f, row_f)` — the
-    /// cheap affine inverse of the grid's regular lat/lon spacing, plus the
-    /// ±360° longitude normalisation. No bounds or finiteness check: this is the
-    /// per-node mapping fed to [`ProjectionGrid::build_2d`] and the front half of
-    /// [`Self::bilinear_value`]; [`Self::bilinear_at`] does the checking.
+    /// cheap affine inverse of the grid's regular lat/lon spacing.
+    ///
+    /// **No longitude wrap here.** The wrap is applied in [`Self::bilinear_at`]
+    /// instead, so this mapping stays *continuous* in longitude. That matters
+    /// because [`ProjectionGrid::build_2d`] bilinearly interpolates the `col_f`
+    /// values between coarse nodes: if this wrapped, two adjacent nodes
+    /// straddling `lon_first` (e.g. a projected viewport crossing Greenwich on a
+    /// 0–360° global grid) would get `col_f` like 1428 and 12, and the midpoint
+    /// would interpolate to ~720 — sampling ~180° away. No bounds/finiteness
+    /// check: that is [`Self::bilinear_at`]'s job.
     fn lonlat_to_src_px(&self, lon: f64, lat: f64) -> (f64, f64) {
-        let mut lon = lon;
-        if lon < self.lon_first {
-            lon += 360.0;
-        }
-        if lon >= self.lon_first + (self.ni as f64) * self.lon_inc {
-            lon -= 360.0;
-        }
         (
             (lon - self.lon_first) / self.lon_inc,
             (lat - self.lat_first) / self.lat_inc,
@@ -122,6 +139,9 @@ impl DecodedGrid {
         if !col_f.is_finite() || !row_f.is_finite() {
             return None;
         }
+        // Apply the deferred ±360° longitude wrap here (once, idempotently —
+        // replacing the old sequential-`if` that could double-adjust).
+        let col_f = self.wrap_col(col_f);
         let col = col_f.floor() as isize;
         let row = row_f.floor() as isize;
         if col < 0 || col >= self.ni as isize || row < 0 || row >= self.nj as isize {
@@ -142,8 +162,10 @@ impl DecodedGrid {
 
         // Skip interpolation if any neighbor is NaN
         if v00.is_nan() || v10.is_nan() || v01.is_nan() || v11.is_nan() {
-            // Fall back to nearest non-NaN
-            return if !v00.is_nan() { Some(v00) } else { None };
+            // Fall back to the nearest non-NaN of the four neighbours (not just
+            // v00 — otherwise a NaN at v00 with valid v10/v01/v11 would widen the
+            // nodata hole by one source pixel).
+            return [v00, v10, v01, v11].into_iter().find(|v| !v.is_nan());
         }
 
         let val = v00 * (1.0 - dx) * (1.0 - dy)
@@ -412,6 +434,53 @@ mod tests {
         );
         // Every produced value is finite (no NaN leaked through build_2d).
         assert!(out.iter().flatten().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn build_2d_projected_handles_lon_first_seam() {
+        // Regression for the #267 round-4 finding: a projected viewport
+        // straddling the grid's lon_first (Greenwich, on a 0–360° global grid)
+        // must not let build_2d interpolate col_f across the wrap seam. The grid
+        // value is cos(lon): ~1 near lon 0, but ~ -1 at lon 180. A seam bug
+        // interpolates adjacent nodes (col ~359 and ~1) to col ~180 and samples
+        // ~ -1; the fix (raw affine in lonlat_to_src_px, wrap in bilinear_at)
+        // keeps col_f continuous so every sample stays near the true meridian.
+        let (ni, nj) = (360usize, 21usize);
+        let mut values = vec![0.0f64; ni * nj];
+        for r in 0..nj {
+            for c in 0..ni {
+                values[r * ni + c] = (c as f64).to_radians().cos(); // c == lon°
+            }
+        }
+        let g = DecodedGrid {
+            ni,
+            nj,
+            lon_first: 0.0,
+            lat_first: 60.0,
+            lon_inc: 1.0,
+            lat_inc: -1.0,
+            values: Arc::new(values),
+            triple: (0, 0, 0),
+            centre: 0,
+            first_surface_type: 1,
+            first_surface_value: None,
+        };
+        let crs = ds_core::geo::projected_output_crs("EPSG:3035").unwrap();
+        // Western Europe, straddling the Greenwich meridian.
+        let proj = ds_core::geo::projected_envelope(&crs, [-5.0, 45.0, 10.0, 55.0]);
+        let read = ds_core::geo::wgs84_envelope(&crs, proj).unwrap();
+        let out = g.resample(read, 64, 64, &OutputCrs::Projected { crs, bbox: proj });
+
+        assert!(
+            out.iter().all(|v| v.is_some()),
+            "the whole viewport is inside the grid; no holes expected"
+        );
+        for v in out.iter().flatten() {
+            assert!(
+                *v > 0.5,
+                "lon_first seam mis-sample: cos={v} (≈ -1 means it sampled ~180° away)"
+            );
+        }
     }
 
     #[test]

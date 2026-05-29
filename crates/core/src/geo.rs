@@ -185,7 +185,10 @@ fn edge_envelope(bbox: [f64; 4], map: impl Fn(f64, f64) -> Option<(f64, f64)>) -
             }
         }
     }
-    if min_x > max_x {
+    // Both axes update together from the same `Some((x, y))`, so either bound
+    // being un-touched means *no* point transformed — check both for symmetry /
+    // defence rather than relying on x alone.
+    if min_x > max_x || min_y > max_y {
         None
     } else {
         Some([min_x, min_y, max_x, max_y])
