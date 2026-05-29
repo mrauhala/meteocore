@@ -207,6 +207,10 @@ impl DecodedGrid {
     /// source is a regular lat/lon grid, so [`Self::bilinear_value`] samples it
     /// directly from lon/lat — only the projected case adds a per-pixel inverse,
     /// and the common `Wgs84`/`WebMercator` paths keep their previous arithmetic.
+    ///
+    /// TODO(#268): the projected path runs `Crs::inverse` per output pixel,
+    /// against the CLAUDE.md "never project per output pixel" rule. Route it
+    /// through `ProjectionGrid::build_2d` like engine-geotiff/odim-COMP do.
     pub fn resample(
         &self,
         bbox: [f64; 4],

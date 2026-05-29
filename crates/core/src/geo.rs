@@ -203,9 +203,20 @@ fn edge_envelope(bbox: [f64; 4], map: impl Fn(f64, f64) -> Option<(f64, f64)>) -
 ///
 /// Falls back to the conservative global extent `[-180, -90, 180, 90]` if every
 /// reprojection fails — over-broad but dimensionally valid (returning the
-/// metres `bbox` would be a unit-confusion bug). Unreachable for any real grid.
+/// metres `bbox` would be a unit-confusion bug). Unreachable for any real grid,
+/// but a mis-configured / out-of-domain bbox would otherwise silently widen the
+/// caller's read window to the whole globe, so the fallback warns. ds-core is
+/// framework-free (no `tracing`), so this goes to stderr — same convention as
+/// `resample.rs`'s MAX_CELLS warning.
 pub fn wgs84_envelope(crs: &Crs, bbox: [f64; 4]) -> [f64; 4] {
-    edge_envelope(bbox, |x, y| crs.inverse(x, y)).unwrap_or([-180.0, -90.0, 180.0, 90.0])
+    edge_envelope(bbox, |x, y| crs.inverse(x, y)).unwrap_or_else(|| {
+        eprintln!(
+            "WARN ds_core::geo::wgs84_envelope: every edge sample of bbox \
+             {bbox:?} failed inverse projection; falling back to global extent \
+             [-180, -90, 180, 90] (likely a bbox outside the projection's valid area)"
+        );
+        [-180.0, -90.0, 180.0, 90.0]
+    })
 }
 
 /// Projected envelope `[min_e, min_n, max_e, max_n]` (in `crs`'s metres) of a

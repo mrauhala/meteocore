@@ -334,6 +334,10 @@ impl MapEngine for QueryDataEngine {
         // (`Projected`, inverse-projected per pixel; #160). `interpolate` then
         // bilinearly samples the source grid (which may itself be projected) at
         // that lon/lat.
+        //
+        // TODO(#268): the projected path runs `Crs::inverse` per output pixel,
+        // against the CLAUDE.md "never project per output pixel" rule. Route it
+        // through `ProjectionGrid::build_2d` like engine-geotiff/odim-COMP do.
         for row in 0..height {
             let fy = (row as f64 + 0.5) / height as f64;
             for col in 0..width {
