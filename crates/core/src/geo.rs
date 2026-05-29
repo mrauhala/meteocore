@@ -201,22 +201,14 @@ fn edge_envelope(bbox: [f64; 4], map: impl Fn(f64, f64) -> Option<(f64, f64)>) -
 /// corners. Used to derive the WGS84 read window for a projected-output render
 /// (the engine still reads source pixels by lon/lat).
 ///
-/// Falls back to the conservative global extent `[-180, -90, 180, 90]` if every
-/// reprojection fails — over-broad but dimensionally valid (returning the
-/// metres `bbox` would be a unit-confusion bug). Unreachable for any real grid,
-/// but a mis-configured / out-of-domain bbox would otherwise silently widen the
-/// caller's read window to the whole globe, so the fallback warns. ds-core is
-/// framework-free (no `tracing`), so this goes to stderr — same convention as
-/// `resample.rs`'s MAX_CELLS warning.
-pub fn wgs84_envelope(crs: &Crs, bbox: [f64; 4]) -> [f64; 4] {
-    edge_envelope(bbox, |x, y| crs.inverse(x, y)).unwrap_or_else(|| {
-        eprintln!(
-            "WARN ds_core::geo::wgs84_envelope: every edge sample of bbox \
-             {bbox:?} failed inverse projection; falling back to global extent \
-             [-180, -90, 180, 90] (likely a bbox outside the projection's valid area)"
-        );
-        [-180.0, -90.0, 180.0, 90.0]
-    })
+/// Returns `None` when **every** sampled point fails to inverse-project — i.e.
+/// the projected bbox lies entirely outside the projection's valid domain. The
+/// caller must surface that as a client error (HTTP 400), *not* fall back to a
+/// global extent: a global read window on a planet-scale GRIB/COG source would
+/// decode the whole dataset for one bogus request (a DoS vector). Unreachable
+/// for any valid EPSG:3067/3035 bbox.
+pub fn wgs84_envelope(crs: &Crs, bbox: [f64; 4]) -> Option<[f64; 4]> {
+    edge_envelope(bbox, |x, y| crs.inverse(x, y))
 }
 
 /// Projected envelope `[min_e, min_n, max_e, max_n]` (in `crs`'s metres) of a
@@ -1254,7 +1246,7 @@ mod tests {
         let original = [19.0, 59.0, 32.0, 70.0];
         let proj = projected_envelope(&crs, original);
         assert!(proj[0] < proj[2] && proj[1] < proj[3], "proj {proj:?}");
-        let back = wgs84_envelope(&crs, proj);
+        let back = wgs84_envelope(&crs, proj).expect("in-domain bbox has an envelope");
         assert!(
             back[0] <= original[0] + 1e-6
                 && back[1] <= original[1] + 1e-6
@@ -1278,7 +1270,8 @@ mod tests {
                 875567.731907,
                 7907751.537264,
             ],
-        );
+        )
+        .expect("in-domain bbox has an envelope");
         let [w, s, e, n] = env;
         assert!(
             (10.0..30.0).contains(&w) && (20.0..40.0).contains(&e),
@@ -1288,6 +1281,29 @@ mod tests {
             (55.0..72.0).contains(&s) && (60.0..72.0).contains(&n),
             "lat {s}..{n}"
         );
+    }
+
+    #[test]
+    fn edge_envelope_is_none_when_every_sample_fails() {
+        // Backs the wgs84_envelope DoS guard (#267 review): if no sampled point
+        // transforms, the envelope is None so the caller returns HTTP 400 —
+        // never a fabricated or global-extent box that would trigger a
+        // whole-dataset read. (The projection inverses are Newton-based and
+        // return finite values almost everywhere, so this contract is exercised
+        // at the edge-sampling level rather than via a specific CRS.)
+        assert_eq!(edge_envelope([0.0, 0.0, 1.0, 1.0], |_, _| None), None);
+        // And Some, with correct min/max, when points do transform.
+        assert_eq!(
+            edge_envelope([0.0, 0.0, 2.0, 4.0], |a, b| Some((a, b))),
+            Some([0.0, 0.0, 2.0, 4.0])
+        );
+    }
+
+    #[test]
+    fn wgs84_envelope_some_for_valid_projected_bbox() {
+        let crs = projected_output_crs("EPSG:3035").unwrap();
+        let proj = projected_envelope(&crs, [5.0, 48.0, 15.0, 55.0]);
+        assert!(wgs84_envelope(&crs, proj).is_some());
     }
 
     #[test]

@@ -329,21 +329,47 @@ impl MapEngine for QueryDataEngine {
         let mut values = Vec::with_capacity((width * height) as usize);
 
         // Each output pixel's WGS84 lon/lat comes from the shared
-        // `OutputCrs::project_node`: linear lon/lat (`Wgs84`), equal-Mercator-Y
-        // rows (`WebMercator`), or a projected output CRS such as EPSG:3067/3035
-        // (`Projected`, inverse-projected per pixel; #160). `interpolate` then
-        // bilinearly samples the source grid (which may itself be projected) at
-        // that lon/lat.
-        //
-        // TODO(#268): the projected path runs `Crs::inverse` per output pixel,
-        // against the CLAUDE.md "never project per output pixel" rule. Route it
-        // through `ProjectionGrid::build_2d` like engine-geotiff/odim-COMP do.
-        for row in 0..height {
-            let fy = (row as f64 + 0.5) / height as f64;
-            for col in 0..width {
-                let fx = (col as f64 + 0.5) / width as f64;
-                let (lon, lat) = output_crs.project_node(bbox, fx, fy);
-                values.push(interpolate(&data, lon, lat, param_idx, 0, time_idx));
+        // `OutputCrs::project_node` (linear lon/lat, Mercator-Y, or a projected
+        // output CRS; #160), and the source grid — itself possibly projected
+        // (stereographic / rotated lat-lon) — is sampled by `world_to_grid_px`
+        // (`Crs::forward` + affine) then bilinear.
+        match output_crs {
+            OutputCrs::Projected { .. } => {
+                // Projected output runs `Crs::inverse` per node, and the source
+                // mapping runs `Crs::forward` per node; compose both into a
+                // coarse `ProjectionGrid` and bilinearly interpolate the
+                // output→source pixel map, rather than projecting per output
+                // pixel (CLAUDE.md "never project per output pixel"; #268). This
+                // also removes the per-pixel *source* forward projection on this
+                // path. Projected output is regional, so the grid stays accurate.
+                let gt = data.grid.geo_transform();
+                let grid = ds_core::resample::ProjectionGrid::build_2d(
+                    width,
+                    height,
+                    data.grid.nx,
+                    data.grid.ny,
+                    |fx, fy| output_crs.project_node(bbox, fx, fy),
+                    |lon, lat| world_to_grid_px(&gt, lon, lat),
+                );
+                for oy in 0..height {
+                    for ox in 0..width {
+                        let (col_f, row_f) = grid.sample(ox, oy);
+                        values.push(sample_grid_bilinear(
+                            &data, col_f, row_f, param_idx, 0, time_idx,
+                        ));
+                    }
+                }
+            }
+            OutputCrs::Wgs84 | OutputCrs::WebMercator => {
+                // `project_node` is cheap here (no projection); sample per pixel.
+                for row in 0..height {
+                    let fy = (row as f64 + 0.5) / height as f64;
+                    for col in 0..width {
+                        let fx = (col as f64 + 0.5) / width as f64;
+                        let (lon, lat) = output_crs.project_node(bbox, fx, fy);
+                        values.push(interpolate(&data, lon, lat, param_idx, 0, time_idx));
+                    }
+                }
             }
         }
 
@@ -450,6 +476,10 @@ fn log_loaded(collection_id: &str, path: &Path, data: &QueryData) {
 }
 
 /// Bilinear interpolation at (lon, lat) for a given parameter and time.
+///
+/// Used by EDR position queries and the `Wgs84`/`WebMercator` map path. The
+/// projected map path instead drives [`sample_grid_bilinear`] through a coarse
+/// [`ProjectionGrid`] to avoid per-pixel projection (#268).
 fn interpolate(
     data: &QueryData,
     lon: f64,
@@ -458,20 +488,47 @@ fn interpolate(
     level_idx: usize,
     time_idx: usize,
 ) -> Option<f64> {
-    // An out-of-domain projected output pixel arrives as NaN (OutputCrs::
-    // Projected inverse failure). Reject before the forward transform: NaN
-    // comparisons are false and `NaN as i64/usize` saturates to 0, so the
-    // bounds guards below would pass and return grid-origin data instead of
-    // None (transparent).
+    // An out-of-domain projected output pixel arrives as NaN; reject before the
+    // forward transform (see `sample_grid_bilinear` for why NaN is dangerous).
     if !lon.is_finite() || !lat.is_finite() {
         return None;
     }
-
     let gt = data.grid.geo_transform();
-    let (x, y) = gt.crs.forward(lon, lat);
+    let (col_f, row_f) = world_to_grid_px(&gt, lon, lat);
+    sample_grid_bilinear(data, col_f, row_f, param_idx, level_idx, time_idx)
+}
 
-    let col_f = (x - gt.origin_x) / gt.pixel_width - 0.5;
-    let row_f = (gt.origin_y - y) / gt.pixel_height - 0.5;
+/// Map WGS84 (lon, lat) to fractional source-grid pixel `(col_f, row_f)` — the
+/// source `Crs::forward` plus the grid's affine, with the half-pixel centre
+/// offset. This is the (possibly projected) per-node mapping fed to
+/// [`ProjectionGrid::build_2d`] and the front half of [`interpolate`].
+fn world_to_grid_px(gt: &ds_core::geo::GeoTransform, lon: f64, lat: f64) -> (f64, f64) {
+    let (x, y) = gt.crs.forward(lon, lat);
+    (
+        (x - gt.origin_x) / gt.pixel_width - 0.5,
+        (gt.origin_y - y) / gt.pixel_height - 0.5,
+    )
+}
+
+/// Bilinearly sample the grid at fractional source pixel `(col_f, row_f)`,
+/// falling back to nearest when a bilinear neighbour is nodata.
+///
+/// Returns `None` (transparent) for non-finite inputs or points off the grid.
+/// Non-finite is the out-of-domain projected pixel case (`project_node` → NaN):
+/// rejected up front because NaN comparisons are false and `NaN as i64/usize`
+/// saturates to 0, so the bounds guards would otherwise pass and return
+/// grid-origin data.
+fn sample_grid_bilinear(
+    data: &QueryData,
+    col_f: f64,
+    row_f: f64,
+    param_idx: usize,
+    level_idx: usize,
+    time_idx: usize,
+) -> Option<f64> {
+    if !col_f.is_finite() || !row_f.is_finite() {
+        return None;
+    }
 
     let col0 = col_f.floor() as i64;
     let row0 = row_f.floor() as i64;
@@ -717,6 +774,44 @@ mod tests {
         assert_eq!(tile.values.len(), 256);
         let non_none = tile.values.iter().filter(|v| v.is_some()).count();
         assert!(non_none > 0, "Tile should have some data values");
+    }
+
+    #[test]
+    fn map_engine_raster_tile_projected_via_build_2d() {
+        // Exercises the OutputCrs::Projected coarse-grid path (#268). TM math is
+        // globally valid, so projecting the fixture's own region into EPSG:3067
+        // metres and back must still place data and never leak NaN — even though
+        // the fixture is nowhere near the TM35FIN zone.
+        if !test_file_exists() {
+            return;
+        }
+        let engine =
+            QueryDataEngine::new(&test_dir(), "test", Some("2 Metre Temperature (2t)"), 30)
+                .unwrap();
+        let crs = ds_core::geo::projected_output_crs("EPSG:3067").unwrap();
+        let proj = ds_core::geo::projected_envelope(&crs, [33.0, -5.0, 42.0, 5.0]);
+        let read = ds_core::geo::wgs84_envelope(&crs, proj).expect("in-domain envelope");
+        let tile = engine
+            .get_raster_tile(
+                read,
+                16,
+                16,
+                None,
+                &OutputCrs::Projected { crs, bbox: proj },
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(tile.values.len(), 256);
+        assert!(
+            tile.values.iter().filter(|v| v.is_some()).count() > 0,
+            "projected build_2d tile should have data"
+        );
+        assert!(
+            tile.values.iter().flatten().all(|v| v.is_finite()),
+            "no NaN may leak through the build_2d path"
+        );
     }
 
     #[test]

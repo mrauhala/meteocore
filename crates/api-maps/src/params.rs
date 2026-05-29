@@ -148,7 +148,14 @@ impl MapQueryParams {
                     MapsError::BadRequest(format!("CRS '{crs}' has no projection definition"))
                 })?;
                 let proj_bbox = ds_core::geo::projected_envelope(&proj_crs, bbox);
-                let wgs84 = ds_core::geo::wgs84_envelope(&proj_crs, proj_bbox);
+                // None means the projected frame is entirely outside the CRS's
+                // valid domain — reject (400) rather than reading a global window.
+                let wgs84 =
+                    ds_core::geo::wgs84_envelope(&proj_crs, proj_bbox).ok_or_else(|| {
+                        MapsError::BadRequest(
+                            "bbox is outside the valid area of the requested crs".to_string(),
+                        )
+                    })?;
                 (
                     wgs84,
                     ds_core::map_engine::OutputCrs::Projected {

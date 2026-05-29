@@ -342,7 +342,11 @@ fn parse_bbox(bbox_str: &str, crs: &str) -> Result<([f64; 4], OutputCrs), WmsErr
                 WmsError::invalid_parameter(&format!("CRS '{crs}' has no projection definition"))
             })?;
             let proj_bbox = [x1, y1, x2, y2];
-            let wgs84 = ds_core::geo::wgs84_envelope(&proj_crs, proj_bbox);
+            // None means the whole bbox is outside the projection's valid domain
+            // — reject (400) rather than letting the engine read a global window.
+            let wgs84 = ds_core::geo::wgs84_envelope(&proj_crs, proj_bbox).ok_or_else(|| {
+                WmsError::invalid_parameter("BBOX is outside the valid area of the requested CRS")
+            })?;
             Ok((
                 wgs84,
                 OutputCrs::Projected {

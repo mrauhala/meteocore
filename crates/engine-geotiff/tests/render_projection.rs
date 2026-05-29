@@ -124,7 +124,7 @@ fn renders_projected_geotiff_to_epsg3067() {
     // Finland-native client sends), and derive the WGS84 read window the API
     // layer would pass alongside it.
     let proj_bbox = ds_core::geo::projected_envelope(&crs, COVERED_BBOX);
-    let wgs84 = ds_core::geo::wgs84_envelope(&crs, proj_bbox);
+    let wgs84 = ds_core::geo::wgs84_envelope(&crs, proj_bbox).expect("in-domain bbox has envelope");
     let output_crs = OutputCrs::Projected {
         crs,
         bbox: proj_bbox,

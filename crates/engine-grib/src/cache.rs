@@ -70,17 +70,66 @@ impl DecodedGrid {
     }
 
     /// Get the value at the grid point nearest to (lon, lat).
-    /// Returns None if the point is outside the grid.
+    /// Returns None if the point is outside the grid (or non-finite).
     pub fn nearest_value(&self, lon: f64, lat: f64) -> Option<f64> {
-        let (col, row, _, _) = self.lonlat_to_fractional(lon, lat)?;
-        Some(self.values[row * self.ni + col])
+        let (col_f, row_f) = self.lonlat_to_src_px(lon, lat);
+        if !col_f.is_finite() || !row_f.is_finite() {
+            return None;
+        }
+        let col = col_f.floor() as isize;
+        let row = row_f.floor() as isize;
+        if col < 0 || col >= self.ni as isize || row < 0 || row >= self.nj as isize {
+            return None;
+        }
+        Some(self.values[row as usize * self.ni + col as usize])
     }
 
     /// Bilinear interpolation at (lon, lat).
     /// Interpolates between the 4 surrounding grid points.
     /// Returns None if the point is outside the grid.
     pub fn bilinear_value(&self, lon: f64, lat: f64) -> Option<f64> {
-        let (col, row, dx, dy) = self.lonlat_to_fractional(lon, lat)?;
+        let (col_f, row_f) = self.lonlat_to_src_px(lon, lat);
+        self.bilinear_at(col_f, row_f)
+    }
+
+    /// Map (lon, lat) to fractional source-grid pixel `(col_f, row_f)` — the
+    /// cheap affine inverse of the grid's regular lat/lon spacing, plus the
+    /// ±360° longitude normalisation. No bounds or finiteness check: this is the
+    /// per-node mapping fed to [`ProjectionGrid::build_2d`] and the front half of
+    /// [`Self::bilinear_value`]; [`Self::bilinear_at`] does the checking.
+    fn lonlat_to_src_px(&self, lon: f64, lat: f64) -> (f64, f64) {
+        let mut lon = lon;
+        if lon < self.lon_first {
+            lon += 360.0;
+        }
+        if lon >= self.lon_first + (self.ni as f64) * self.lon_inc {
+            lon -= 360.0;
+        }
+        (
+            (lon - self.lon_first) / self.lon_inc,
+            (lat - self.lat_first) / self.lat_inc,
+        )
+    }
+
+    /// Bilinearly sample the grid at fractional source pixel `(col_f, row_f)`.
+    ///
+    /// Returns `None` (transparent) for non-finite inputs or points outside the
+    /// grid. Non-finite is the out-of-domain projected pixel case (`project_node`
+    /// → NaN): it must be rejected up front because `NaN` comparisons are false
+    /// and `NaN as isize` saturates to 0, so the bounds guard would otherwise
+    /// pass and return grid-origin data rendered as a colour.
+    fn bilinear_at(&self, col_f: f64, row_f: f64) -> Option<f64> {
+        if !col_f.is_finite() || !row_f.is_finite() {
+            return None;
+        }
+        let col = col_f.floor() as isize;
+        let row = row_f.floor() as isize;
+        if col < 0 || col >= self.ni as isize || row < 0 || row >= self.nj as isize {
+            return None;
+        }
+        let (col, row) = (col as usize, row as usize);
+        let dx = col_f - col as f64;
+        let dy = row_f - row as f64;
 
         // Right and bottom neighbors (clamp to grid edge)
         let col1 = (col + 1).min(self.ni - 1);
@@ -102,42 +151,6 @@ impl DecodedGrid {
             + v01 * (1.0 - dx) * dy
             + v11 * dx * dy;
         Some(val)
-    }
-
-    /// Convert (lon, lat) to (col, row) grid indices plus fractional offsets (dx, dy).
-    /// dx/dy are in [0, 1) representing the position within the grid cell.
-    fn lonlat_to_fractional(&self, lon: f64, lat: f64) -> Option<(usize, usize, f64, f64)> {
-        // An out-of-domain projected output pixel arrives as NaN (OutputCrs::
-        // Projected inverse failure). NaN must be rejected up front: every
-        // comparison below is false for NaN and `NaN as isize` saturates to 0,
-        // so the bounds guard would pass and this would return grid-origin
-        // data (rendered as a colour) instead of None (transparent).
-        if !lon.is_finite() || !lat.is_finite() {
-            return None;
-        }
-        // Normalize longitude to grid range
-        let mut lon = lon;
-        if lon < self.lon_first {
-            lon += 360.0;
-        }
-        if lon >= self.lon_first + (self.ni as f64) * self.lon_inc {
-            lon -= 360.0;
-        }
-
-        let col_f = (lon - self.lon_first) / self.lon_inc;
-        let row_f = (lat - self.lat_first) / self.lat_inc;
-
-        let col = col_f.floor() as isize;
-        let row = row_f.floor() as isize;
-
-        if col < 0 || col >= self.ni as isize || row < 0 || row >= self.nj as isize {
-            return None;
-        }
-
-        let dx = col_f - col as f64;
-        let dy = row_f - row as f64;
-
-        Some((col as usize, row as usize, dx, dy))
     }
 
     /// Extract a grid subset for the given bbox [west, south, east, north].
@@ -209,16 +222,16 @@ impl DecodedGrid {
     ///
     /// `bbox` is the WGS84 bounding box `[west, south, east, north]`. Each output
     /// pixel's lon/lat comes from the shared [`OutputCrs::project_node`], so the
-    /// output axes follow the requested CRS — linear lon/lat (`Wgs84`),
-    /// equal-Mercator-Y rows (`WebMercator`), or a projected output CRS such as
-    /// EPSG:3067/3035 (`Projected`, inverse-projected per pixel; #160). The
-    /// source is a regular lat/lon grid, so [`Self::bilinear_value`] samples it
-    /// directly from lon/lat — only the projected case adds a per-pixel inverse,
-    /// and the common `Wgs84`/`WebMercator` paths keep their previous arithmetic.
+    /// output axes follow the requested CRS.
     ///
-    /// TODO(#268): the projected path runs `Crs::inverse` per output pixel,
-    /// against the CLAUDE.md "never project per output pixel" rule. Route it
-    /// through `ProjectionGrid::build_2d` like engine-geotiff/odim-COMP do.
+    /// - `Wgs84` / `WebMercator`: `project_node` is cheap (no projection), so we
+    ///   sample per pixel. This path also keeps the ±360° longitude wrap that a
+    ///   global grid needs for viewports crossing the antimeridian.
+    /// - `Projected` (EPSG:3067/3035): `project_node` runs `Crs::inverse` per
+    ///   node — so map output→source through [`ProjectionGrid::build_2d`] (coarse
+    ///   grid + bilinear) rather than per pixel, per the CLAUDE.md "never project
+    ///   per output pixel" rule (matches engine-geotiff/odim-COMP). Projected
+    ///   output is regional, so no cell crosses the antimeridian wrap.
     pub fn resample(
         &self,
         bbox: [f64; 4],
@@ -230,12 +243,32 @@ impl DecodedGrid {
         let h = height as usize;
         let mut out = Vec::with_capacity(w * h);
 
-        for row in 0..h {
-            let fy = (row as f64 + 0.5) / h as f64;
-            for col in 0..w {
-                let fx = (col as f64 + 0.5) / w as f64;
-                let (lon, lat) = output_crs.project_node(bbox, fx, fy);
-                out.push(self.bilinear_value(lon, lat));
+        match output_crs {
+            OutputCrs::Projected { .. } => {
+                let grid = ds_core::resample::ProjectionGrid::build_2d(
+                    width,
+                    height,
+                    self.ni as u32,
+                    self.nj as u32,
+                    |fx, fy| output_crs.project_node(bbox, fx, fy),
+                    |lon, lat| self.lonlat_to_src_px(lon, lat),
+                );
+                for oy in 0..height {
+                    for ox in 0..width {
+                        let (col_f, row_f) = grid.sample(ox, oy);
+                        out.push(self.bilinear_at(col_f, row_f));
+                    }
+                }
+            }
+            OutputCrs::Wgs84 | OutputCrs::WebMercator => {
+                for row in 0..h {
+                    let fy = (row as f64 + 0.5) / h as f64;
+                    for col in 0..w {
+                        let fx = (col as f64 + 0.5) / w as f64;
+                        let (lon, lat) = output_crs.project_node(bbox, fx, fy);
+                        out.push(self.bilinear_value(lon, lat));
+                    }
+                }
             }
         }
 
@@ -359,10 +392,33 @@ mod tests {
     }
 
     #[test]
+    fn resample_projected_in_domain_has_data_via_build_2d() {
+        // The OutputCrs::Projected path goes through ProjectionGrid::build_2d
+        // (no per-pixel inverse). A projected bbox covering the 10–11°E/59–60°N
+        // grid must resample to real values, not all-None.
+        let g = grid_2x2();
+        let crs = ds_core::geo::projected_output_crs("EPSG:3035").unwrap();
+        // Forward the grid's WGS84 footprint into EPSG:3035 metres.
+        let proj = ds_core::geo::projected_envelope(&crs, [10.0, 59.0, 11.0, 60.0]);
+        let out = g.resample(
+            ds_core::geo::wgs84_envelope(&crs, proj).unwrap(),
+            16,
+            16,
+            &OutputCrs::Projected { crs, bbox: proj },
+        );
+        assert!(
+            out.iter().any(|v| v.is_some()),
+            "projected render over the grid footprint must place data"
+        );
+        // Every produced value is finite (no NaN leaked through build_2d).
+        assert!(out.iter().flatten().all(|v| v.is_finite()));
+    }
+
+    #[test]
     fn resample_projected_out_of_domain_is_all_none() {
-        // EPSG:3035 (LAEA) inverse is undefined near the antipode of its
-        // centre; a bbox far outside the grid must render fully transparent,
-        // never a NaN/grid-origin colour.
+        // A projected bbox whose inverse-projected lon/lat fall far outside the
+        // 10–11°E / 59–60°N grid must render fully transparent — every sample
+        // resolves off-grid (or NaN) → None, never a grid-origin colour.
         let g = grid_2x2();
         let crs = ds_core::geo::projected_output_crs("EPSG:3035").unwrap();
         // Projected metres nowhere near the 10–11°E / 59–60°N grid.

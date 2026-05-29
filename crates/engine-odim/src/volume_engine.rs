@@ -1025,6 +1025,11 @@ fn polar_sample(
     // this loop maps each pixel's WGS84 lon/lat with the shared
     // `OutputCrs::project_node` directly — covering linear lon/lat, Mercator Y,
     // and projected output CRSs (EPSG:3067/3035) in one place (#160).
+    //
+    // For `OutputCrs::Projected` this adds one `Crs::inverse` per pixel on top of
+    // the inherent per-pixel polar geometry. A coarse-grid map (as the gridded
+    // engines use) doesn't drop in cleanly here because the polar sampler is not
+    // a smooth source-pixel function; tracked in #268 if it proves to matter.
     let mut values: Vec<Option<f64>> = Vec::with_capacity((width as usize) * (height as usize));
     for oy in 0..height {
         let frac_y = (oy as f64 + 0.5) / height as f64;
