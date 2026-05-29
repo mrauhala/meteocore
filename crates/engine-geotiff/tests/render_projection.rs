@@ -113,6 +113,49 @@ fn web_mercator_and_wgs84_render_consistently() {
 }
 
 #[test]
+fn renders_projected_geotiff_to_epsg3067() {
+    // Regression for #251/#160: rendering with a *projected* output CRS
+    // (EPSG:3067) must place real data, not a fully-transparent tile. The
+    // source raster is itself TM35FIN, so output crs=3067 is a near-identity
+    // resample and should be at least as well-covered as the WGS84 render.
+    let engine = tm35fin_engine();
+    let crs = ds_core::geo::projected_output_crs("EPSG:3067").expect("3067 defined");
+    // Project COVERED_BBOX into EPSG:3067 metres (the request rectangle a
+    // Finland-native client sends), and derive the WGS84 read window the API
+    // layer would pass alongside it.
+    let proj_bbox = ds_core::geo::projected_envelope(&crs, COVERED_BBOX);
+    let wgs84 = ds_core::geo::wgs84_envelope(&crs, proj_bbox);
+    let output_crs = OutputCrs::Projected {
+        crs,
+        bbox: proj_bbox,
+    };
+    let (w, h) = (256, 256);
+    let tile = engine
+        .get_raster_tile(wgs84, w, h, None, &output_crs, None, None)
+        .expect("projected render should succeed");
+
+    assert_eq!(tile.values.len() as u32, w * h);
+    let data = count_data(&tile);
+    assert!(
+        data > (w * h) as usize / MIN_DATA_FRACTION_DENOM,
+        "EPSG:3067 render must place a broad swath of data, got {data}/{} \
+         (the #251 bug returned 0)",
+        w * h
+    );
+
+    // Sanity: the projected render covers a comparable amount of data to the
+    // WGS84 render over the same geographic region.
+    let wgs = engine
+        .get_raster_tile(COVERED_BBOX, w, h, None, &OutputCrs::Wgs84, None, None)
+        .expect("wgs84 render should succeed");
+    let (dp, dw) = (data as f64, count_data(&wgs) as f64);
+    assert!(
+        (dp - dw).abs() / dw < 0.25,
+        "EPSG:3067 ({dp}) and WGS84 ({dw}) data counts diverge too far"
+    );
+}
+
+#[test]
 fn bbox_outside_coverage_is_empty() {
     let engine = tm35fin_engine();
     // Mid-Atlantic — nowhere near the TM35FIN raster.

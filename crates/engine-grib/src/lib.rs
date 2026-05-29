@@ -1172,8 +1172,7 @@ impl MapEngine for GribEngine {
 
         let grid = self.fetch_grid(&step_file, param_name, level)?;
 
-        let web_mercator = matches!(output_crs, OutputCrs::WebMercator);
-        let values = grid.resample(bbox, width, height, web_mercator);
+        let values = grid.resample(bbox, width, height, output_crs);
 
         // Apply unit conversion so colormap ranges use display units.
         // fetch_grid populates the metadata cache from the decoded message's

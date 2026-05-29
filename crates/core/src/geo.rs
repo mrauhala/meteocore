@@ -9,7 +9,7 @@ const WGS84_E2: f64 = 2.0 * WGS84_F - WGS84_F * WGS84_F; // eccentricity squared
 ///
 /// Stores projection parameters and provides forward/inverse transforms
 /// between WGS84 geographic coordinates and projected coordinates.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Crs {
     /// WGS84 geographic (EPSG:4326 / CRS84). Coordinates are (lon, lat) in degrees.
     Wgs84,
@@ -111,6 +111,113 @@ pub fn crs84_bbox_spans(bbox: [f64; 4]) -> (f64, f64) {
     let [w, s, e, n] = bbox;
     let lon_span = if e >= w { e - w } else { e - w + 360.0 };
     (lon_span, (n - s).abs())
+}
+
+/// Projection definition for a projected CRS the server accepts as a WMS / OGC
+/// API Maps **output** CRS, keyed by its EPSG identifier.
+///
+/// Returns `None` for the geographic codes (`CRS:84` / `EPSG:4326`, which need
+/// no projection) and for `EPSG:3857` (Web Mercator has its own dedicated
+/// output path, [`crate::map_engine::OutputCrs::WebMercator`]). The parameters
+/// match the authoritative EPSG definitions and the ones engine-geotiff already
+/// derives from GeoTIFF GeoKeys:
+/// - **EPSG:3067** (ETRS89 / TM35FIN) — Transverse Mercator, central meridian
+///   27°E, k₀=0.9996, false easting 500 km.
+/// - **EPSG:3035** (ETRS89-extended / LAEA Europe) — Lambert Azimuthal Equal
+///   Area centred at 52°N 10°E, false easting 4 321 km, northing 3 210 km.
+///
+/// This is the single source of truth so api-wms and api-maps build identical
+/// output projections (#160).
+pub fn projected_output_crs(epsg: &str) -> Option<Crs> {
+    match epsg {
+        "EPSG:3067" => Some(Crs::TransverseMercator {
+            lat0: 0.0,
+            lon0: 27.0_f64.to_radians(),
+            k0: 0.9996,
+            false_e: 500_000.0,
+            false_n: 0.0,
+        }),
+        "EPSG:3035" => Some(Crs::LambertAzimuthalEqualArea {
+            lat0: 52.0_f64.to_radians(),
+            lon0: 10.0_f64.to_radians(),
+            false_e: 4_321_000.0,
+            false_n: 3_210_000.0,
+        }),
+        _ => None,
+    }
+}
+
+/// Edge samples per side used by [`wgs84_envelope`] / [`projected_envelope`].
+/// 20 matches `GeoTransform::bbox`'s sampling — enough to pin the bow of a
+/// continental TM/LAEA box to well under a pixel.
+const ENVELOPE_EDGE_SAMPLES: usize = 20;
+
+/// Accumulate the axis-aligned min/max of points produced by `map` along the
+/// four edges of `bbox` (`[min_a, min_b, max_a, max_b]`). `map` returns `None`
+/// for points that don't transform (e.g. outside a projection's valid domain);
+/// those are skipped. Returns `None` if every sampled point failed.
+fn edge_envelope(bbox: [f64; 4], map: impl Fn(f64, f64) -> Option<(f64, f64)>) -> Option<[f64; 4]> {
+    let [min_a, min_b, max_a, max_b] = bbox;
+    let mut min_x = f64::MAX;
+    let mut max_x = f64::MIN;
+    let mut min_y = f64::MAX;
+    let mut max_y = f64::MIN;
+    for i in 0..=ENVELOPE_EDGE_SAMPLES {
+        let frac = i as f64 / ENVELOPE_EDGE_SAMPLES as f64;
+        // Top + bottom edges (a varies, b pinned to each end).
+        let a = min_a + frac * (max_a - min_a);
+        for &b in &[min_b, max_b] {
+            if let Some((x, y)) = map(a, b) {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+        // Left + right edges (b varies, a pinned to each end).
+        let b = min_b + frac * (max_b - min_b);
+        for &a in &[min_a, max_a] {
+            if let Some((x, y)) = map(a, b) {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    if min_x > max_x {
+        None
+    } else {
+        Some([min_x, min_y, max_x, max_y])
+    }
+}
+
+/// WGS84 lon/lat envelope `[west, south, east, north]` of a projected bbox
+/// `[min_e, min_n, max_e, max_n]` (in `crs`'s metres), found by inverse-
+/// projecting points sampled along the four edges.
+///
+/// Projection curvature means the extreme lon/lat can fall in the middle of an
+/// edge, not only at a corner, so this samples the edges rather than just the
+/// corners. Used to derive the WGS84 read window for a projected-output render
+/// (the engine still reads source pixels by lon/lat).
+///
+/// Falls back to the conservative global extent `[-180, -90, 180, 90]` if every
+/// reprojection fails — over-broad but dimensionally valid (returning the
+/// metres `bbox` would be a unit-confusion bug). Unreachable for any real grid.
+pub fn wgs84_envelope(crs: &Crs, bbox: [f64; 4]) -> [f64; 4] {
+    edge_envelope(bbox, |x, y| crs.inverse(x, y)).unwrap_or([-180.0, -90.0, 180.0, 90.0])
+}
+
+/// Projected envelope `[min_e, min_n, max_e, max_n]` (in `crs`'s metres) of a
+/// WGS84 bbox `[west, south, east, north]`, found by forward-projecting points
+/// sampled along the four edges.
+///
+/// The inverse of [`wgs84_envelope`]: used by OGC API Maps, where the request
+/// `bbox` is in CRS:84 but the output `crs` is projected — the projected map
+/// frame must cover the requested geographic box. `Crs::forward` is total, so
+/// this always returns `Some`; the `unwrap_or` is a defensive identity fallback.
+pub fn projected_envelope(crs: &Crs, bbox: [f64; 4]) -> [f64; 4] {
+    edge_envelope(bbox, |lon, lat| Some(crs.forward(lon, lat))).unwrap_or(bbox)
 }
 
 impl Crs {
@@ -1106,6 +1213,71 @@ fn rotlatlon_inverse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projected_output_crs_pins_epsg_parameters() {
+        // EPSG:3067 (TM35FIN): on the central meridian (27°E) easting is exactly
+        // the false easting (500 km), independent of latitude — this pins the
+        // central meridian + false easting against the authoritative definition.
+        let tm = projected_output_crs("EPSG:3067").expect("3067 defined");
+        let (e, _n) = tm.forward(27.0, 60.0);
+        assert!((e - 500_000.0).abs() < 1e-3, "3067 easting at λ0 = {e}");
+        // EPSG:3035 (ETRS89-LAEA): at the projection centre (10°E, 52°N) the
+        // result is exactly the false easting/northing (4321 km, 3210 km).
+        let laea = projected_output_crs("EPSG:3035").expect("3035 defined");
+        let (e, n) = laea.forward(10.0, 52.0);
+        assert!((e - 4_321_000.0).abs() < 1e-3, "3035 FE = {e}");
+        assert!((n - 3_210_000.0).abs() < 1e-3, "3035 FN = {n}");
+        // Geographic and Web Mercator codes have no projected definition here.
+        for code in ["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:9999", ""] {
+            assert!(projected_output_crs(code).is_none(), "{code} must be None");
+        }
+    }
+
+    #[test]
+    fn envelope_roundtrip_contains_original_box() {
+        // Forward a CRS:84 Finland box into EPSG:3067, then inverse-envelope
+        // back: the WGS84 envelope must *contain* the original box (projection
+        // bow can only widen it). This mirrors the api-maps read-window logic.
+        let crs = projected_output_crs("EPSG:3067").unwrap();
+        let original = [19.0, 59.0, 32.0, 70.0];
+        let proj = projected_envelope(&crs, original);
+        assert!(proj[0] < proj[2] && proj[1] < proj[3], "proj {proj:?}");
+        let back = wgs84_envelope(&crs, proj);
+        assert!(
+            back[0] <= original[0] + 1e-6
+                && back[1] <= original[1] + 1e-6
+                && back[2] >= original[2] - 1e-6
+                && back[3] >= original[3] - 1e-6,
+            "envelope {back:?} must contain {original:?}"
+        );
+    }
+
+    #[test]
+    fn wgs84_envelope_of_projected_metres_is_degrees_not_metres() {
+        // Regression for #251: a projected-metres bbox must come back as
+        // plausible degrees, never the metres passed through unchanged.
+        let crs = projected_output_crs("EPSG:3067").unwrap();
+        // FMI's native TM35FIN extent.
+        let env = wgs84_envelope(
+            &crs,
+            [
+                -118331.366408,
+                6335621.167014,
+                875567.731907,
+                7907751.537264,
+            ],
+        );
+        let [w, s, e, n] = env;
+        assert!(
+            (10.0..30.0).contains(&w) && (20.0..40.0).contains(&e),
+            "lon {w}..{e}"
+        );
+        assert!(
+            (55.0..72.0).contains(&s) && (60.0..72.0).contains(&n),
+            "lat {s}..{n}"
+        );
+    }
 
     #[test]
     fn native_crs_uri_maps_known_labels_and_omits_the_rest() {

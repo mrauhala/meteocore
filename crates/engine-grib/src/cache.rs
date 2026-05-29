@@ -6,6 +6,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use ds_core::map_engine::OutputCrs;
+
 /// Cache key: identifies a specific GRIB message.
 /// Uses `Arc<str>` instead of `String` for a smaller allocation (no capacity field).
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -196,33 +198,31 @@ impl DecodedGrid {
     }
 
     /// Resample grid to output dimensions for map rendering.
-    /// bbox is [west, south, east, north] in WGS84.
+    ///
+    /// `bbox` is the WGS84 bounding box `[west, south, east, north]`. Each output
+    /// pixel's lon/lat comes from the shared [`OutputCrs::project_node`], so the
+    /// output axes follow the requested CRS — linear lon/lat (`Wgs84`),
+    /// equal-Mercator-Y rows (`WebMercator`), or a projected output CRS such as
+    /// EPSG:3067/3035 (`Projected`, inverse-projected per pixel; #160). The
+    /// source is a regular lat/lon grid, so [`Self::bilinear_value`] samples it
+    /// directly from lon/lat — only the projected case adds a per-pixel inverse,
+    /// and the common `Wgs84`/`WebMercator` paths keep their previous arithmetic.
     pub fn resample(
         &self,
         bbox: [f64; 4],
         width: u32,
         height: u32,
-        web_mercator: bool,
+        output_crs: &OutputCrs,
     ) -> Vec<Option<f64>> {
-        let [west, south, east, north] = bbox;
         let w = width as usize;
         let h = height as usize;
         let mut out = Vec::with_capacity(w * h);
 
         for row in 0..h {
-            // For WebMercator, compute latitude using Mercator inverse
-            let lat = if web_mercator {
-                let y_frac = 1.0 - (row as f64 + 0.5) / h as f64;
-                let y_merc_south = south.to_radians().sin().atanh();
-                let y_merc_north = north.to_radians().sin().atanh();
-                let y_merc = y_merc_south + y_frac * (y_merc_north - y_merc_south);
-                y_merc.sinh().atan().to_degrees()
-            } else {
-                north - (row as f64 + 0.5) * (north - south) / h as f64
-            };
-
+            let fy = (row as f64 + 0.5) / h as f64;
             for col in 0..w {
-                let lon = west + (col as f64 + 0.5) * (east - west) / w as f64;
+                let fx = (col as f64 + 0.5) / w as f64;
+                let (lon, lat) = output_crs.project_node(bbox, fx, fy);
                 out.push(self.bilinear_value(lon, lat));
             }
         }

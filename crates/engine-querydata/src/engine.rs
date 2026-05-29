@@ -326,23 +326,19 @@ impl MapEngine for QueryDataEngine {
             DataServerError::Engine("No data available for the requested time".into())
         })?;
 
-        let [west, south, east, north] = bbox;
         let mut values = Vec::with_capacity((width * height) as usize);
 
+        // Each output pixel's WGS84 lon/lat comes from the shared
+        // `OutputCrs::project_node`: linear lon/lat (`Wgs84`), equal-Mercator-Y
+        // rows (`WebMercator`), or a projected output CRS such as EPSG:3067/3035
+        // (`Projected`, inverse-projected per pixel; #160). `interpolate` then
+        // bilinearly samples the source grid (which may itself be projected) at
+        // that lon/lat.
         for row in 0..height {
-            let lat = match output_crs {
-                OutputCrs::Wgs84 => north - (row as f64 + 0.5) * (north - south) / height as f64,
-                OutputCrs::WebMercator => {
-                    let merc_north = lat_to_merc_y(north);
-                    let merc_south = lat_to_merc_y(south);
-                    let merc_y =
-                        merc_north - (row as f64 + 0.5) * (merc_north - merc_south) / height as f64;
-                    merc_y_to_lat(merc_y)
-                }
-            };
-
+            let fy = (row as f64 + 0.5) / height as f64;
             for col in 0..width {
-                let lon = west + (col as f64 + 0.5) * (east - west) / width as f64;
+                let fx = (col as f64 + 0.5) / width as f64;
+                let (lon, lat) = output_crs.project_node(bbox, fx, fy);
                 values.push(interpolate(&data, lon, lat, param_idx, 0, time_idx));
             }
         }
@@ -586,17 +582,6 @@ fn parse_coords(coords: &str) -> Result<(f64, f64), DataServerError> {
     Err(DataServerError::InvalidParameter(
         "Expected POINT(lon lat) or lon,lat format".into(),
     ))
-}
-
-fn lat_to_merc_y(lat_deg: f64) -> f64 {
-    const R: f64 = 6_378_137.0;
-    let lat_rad = lat_deg.to_radians();
-    R * ((std::f64::consts::FRAC_PI_4 + lat_rad / 2.0).tan()).ln()
-}
-
-fn merc_y_to_lat(y: f64) -> f64 {
-    const R: f64 = 6_378_137.0;
-    (std::f64::consts::FRAC_PI_2 - 2.0 * (-y / R).exp().atan()).to_degrees()
 }
 
 #[cfg(test)]

@@ -108,6 +108,35 @@ impl ProjectionGrid {
         lat_at: impl Fn(f64) -> f64,
         world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
     ) -> Self {
+        // Separable axes (linear lon / linear-or-Mercator lat) are the common
+        // case; express them through the general 2-D mapping.
+        Self::build_2d(
+            out_width,
+            out_height,
+            src_cols,
+            src_rows,
+            |fx, fy| (lon_at(fx), lat_at(fy)),
+            world_to_src_px,
+        )
+    }
+
+    /// Like [`build`](Self::build) but with a fully 2-D output→world
+    /// parameterisation: `out_to_world(fx, fy)` maps a fractional output
+    /// position `(fx, fy)` in `[0, 1]²` to geographic `(lon, lat)` degrees.
+    ///
+    /// Required for a **projected output CRS** (e.g. EPSG:3067), where lon and
+    /// lat each depend on *both* output axes because the inverse projection
+    /// mixes easting and northing — so the separable `lon_at(fx)` / `lat_at(fy)`
+    /// decomposition of [`build`](Self::build) does not hold (#160). Engines
+    /// pass `|fx, fy| output_crs.project_node(bbox, fx, fy)`.
+    pub fn build_2d(
+        out_width: u32,
+        out_height: u32,
+        src_cols: u32,
+        src_rows: u32,
+        out_to_world: impl Fn(f64, f64) -> (f64, f64),
+        world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
+    ) -> Self {
         let mut cells_x = out_width.div_ceil(GRID_STEP_PX).clamp(MIN_CELLS, MAX_CELLS);
         let mut cells_y = out_height
             .div_ceil(GRID_STEP_PX)
@@ -118,11 +147,10 @@ impl ProjectionGrid {
                 out_height,
                 cells_x,
                 cells_y,
-                &lon_at,
-                &lat_at,
+                &out_to_world,
                 &world_to_src_px,
             );
-            let error = grid.estimate_error(src_cols, src_rows, &lon_at, &lat_at, &world_to_src_px);
+            let error = grid.estimate_error(src_cols, src_rows, &out_to_world, &world_to_src_px);
             if error <= MAX_INTERP_ERROR_PX {
                 return grid;
             }
@@ -149,14 +177,13 @@ impl ProjectionGrid {
     }
 
     /// Build a grid with an explicit cell count (no refinement).
-    #[allow(clippy::too_many_arguments)] // output dims + cell counts + 3 mapping closures are all genuine inputs
+    #[allow(clippy::too_many_arguments)] // output dims + cell counts + 2 mapping closures are all genuine inputs
     fn with_cells(
         out_width: u32,
         out_height: u32,
         cells_x: u32,
         cells_y: u32,
-        lon_at: impl Fn(f64) -> f64,
-        lat_at: impl Fn(f64) -> f64,
+        out_to_world: impl Fn(f64, f64) -> (f64, f64),
         world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
     ) -> Self {
         let cells_x = cells_x as usize;
@@ -165,9 +192,9 @@ impl ProjectionGrid {
 
         let mut nodes = Vec::with_capacity(stride * (cells_y + 1));
         for j in 0..=cells_y {
-            let lat = lat_at(j as f64 / cells_y as f64);
+            let fy = j as f64 / cells_y as f64;
             for i in 0..=cells_x {
-                let lon = lon_at(i as f64 / cells_x as f64);
+                let (lon, lat) = out_to_world(i as f64 / cells_x as f64, fy);
                 nodes.push(world_to_src_px(lon, lat));
             }
         }
@@ -198,8 +225,7 @@ impl ProjectionGrid {
         &self,
         src_cols: u32,
         src_rows: u32,
-        lon_at: impl Fn(f64) -> f64,
-        lat_at: impl Fn(f64) -> f64,
+        out_to_world: impl Fn(f64, f64) -> (f64, f64),
         world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
     ) -> f64 {
         // Generous on-raster window: within one raster-size of the data.
@@ -213,8 +239,10 @@ impl ProjectionGrid {
                 let (c00, c10) = (self.nodes[n], self.nodes[n + 1]);
                 let (c01, c11) = (self.nodes[n + self.stride], self.nodes[n + self.stride + 1]);
                 for (tx, ty) in ERROR_PROBES {
-                    let lon = lon_at((i as f64 + tx) / self.cells_x as f64);
-                    let lat = lat_at((j as f64 + ty) / self.cells_y as f64);
+                    let (lon, lat) = out_to_world(
+                        (i as f64 + tx) / self.cells_x as f64,
+                        (j as f64 + ty) / self.cells_y as f64,
+                    );
                     let (ec, er) = world_to_src_px(lon, lat);
                     if !in_window(ec, er) {
                         continue;
