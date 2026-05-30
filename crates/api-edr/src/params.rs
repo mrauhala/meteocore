@@ -7,6 +7,11 @@ pub struct LocationQueryParams {
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
     pub z: Option<String>,
+    /// Output format: `CoverageJSON` (default) or `PNG` (plot).
+    pub f: Option<String>,
+    /// PNG plot dimensions (ignored for CoverageJSON).
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -16,6 +21,40 @@ pub struct PositionQueryParams {
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
     pub z: Option<String>,
+    /// Output format: `CoverageJSON` (default) or `PNG` (plot).
+    pub f: Option<String>,
+    /// PNG plot dimensions (ignored for CoverageJSON).
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+/// EDR response output format selected by the `f` query parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdrFormat {
+    /// OGC CoverageJSON (the default).
+    CoverageJson,
+    /// A rendered PNG plot (vertical profile or time series).
+    Png,
+}
+
+/// Parse the `f` query parameter. Absent/blank → CoverageJSON. `coveragejson`
+/// and `png` are accepted case-insensitively; anything else is a 400.
+pub fn parse_edr_format(f: Option<&str>) -> Result<EdrFormat, DataServerError> {
+    match f.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(EdrFormat::CoverageJson),
+        Some(s) if s.eq_ignore_ascii_case("coveragejson") => Ok(EdrFormat::CoverageJson),
+        Some(s) if s.eq_ignore_ascii_case("png") => Ok(EdrFormat::Png),
+        Some(other) => Err(DataServerError::InvalidParameter(format!(
+            "Unsupported output format '{other}' — expected 'CoverageJSON' or 'PNG'"
+        ))),
+    }
+}
+
+/// Default plot dimensions when `width`/`height` aren't supplied. The actual
+/// safe range is enforced inside `ds_render::render_chart`, so user input
+/// passes through unclamped here — one source of truth for the bounds.
+pub fn plot_dimensions(width: Option<u32>, height: Option<u32>) -> (u32, u32) {
+    (width.unwrap_or(800), height.unwrap_or(600))
 }
 
 #[derive(Debug, Deserialize)]
@@ -25,6 +64,9 @@ pub struct AreaQueryParams {
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
     pub z: Option<String>,
+    /// Output format. Area queries only support `CoverageJSON`; `PNG` is
+    /// rejected (an area result is gridded / multi-coverage, not a single plot).
+    pub f: Option<String>,
 }
 
 /// Parse the EDR `z` query parameter — a comma-separated list of numeric

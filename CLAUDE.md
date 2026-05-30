@@ -54,7 +54,7 @@ When completing work, close the relevant issue: `gh issue close <number>`.
 - **ds-core has no framework dependencies.** Only chrono, serde, thiserror, toml. Keep it that way. Use `PropertyValue` enum instead of `serde_json::Value` for feature properties.
 - **CRS and GeoTransform live in ds-core** (`ds_core::geo`), shared by all engines.
 - **ds-render has no framework dependencies.** Only ds-core and `png`.
-- **API crates depend only on ds-core** (and ds-render for api-wms/api-maps), not on any engine crate. API state is a registry of engines keyed by collection ID.
+- **API crates depend only on ds-core** (and ds-render for api-wms/api-maps, plus api-edr for its `f=png` profile/time-series plots), not on any engine crate. API state is a registry of engines keyed by collection ID.
 - **EDR, Features, Maps, Tiles, and WMS are separate services** with separate base routes (`/edr/...`, `/features/...`, `/maps/...`, `/tiles/...`, `/wms/...`).
 - **WMS uses XML, not JSON.** All XML output in api-wms uses `quick-xml::Writer` for proper escaping. Never build XML with `format!()` or string concatenation (XML injection risk).
 - **CORS is applied at the server level**, not in individual API crates. The `CorsLayer` lives in `server/src/main.rs`.

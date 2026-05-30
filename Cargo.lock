@@ -72,6 +72,7 @@ dependencies = [
  "axum",
  "chrono",
  "ds-core",
+ "ds-render",
  "http-body-util",
  "jsonschema",
  "serde",

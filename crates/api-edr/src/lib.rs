@@ -1,5 +1,6 @@
 pub mod handlers;
 pub mod params;
+pub(crate) mod plot_convert;
 pub mod response;
 
 use axum::routing::get;
