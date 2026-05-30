@@ -269,7 +269,14 @@ struct Catalog {
 /// Round an elevation angle to 0.1° so near-identical sweep angles from
 /// different sites or volumes collapse to one catalogue level.
 fn round_elevation(deg: f64) -> f64 {
-    (deg * 10.0).round() / 10.0
+    let r = (deg * 10.0).round() / 10.0;
+    // Normalise -0.0 → +0.0 so downstream dedup/equality treats slightly-
+    // negative grazing angles as a single zero level.
+    if r == 0.0 {
+        0.0
+    } else {
+        r
+    }
 }
 
 /// WGS84 bounding box `[w, s, e, n]` of the circular coverage area of
@@ -683,6 +690,10 @@ fn derive_catalog(
         .filter_map(|list| list.last())
         .flat_map(|e| e.volume.sweeps.iter().map(|s| round_elevation(s.elangle)))
         .collect();
+    // Drop non-finite angles before the extent — see the matching filter in
+    // `volume_profile`. `round_elevation` normalises -0.0 → +0.0, so plain
+    // `dedup` after `sort_by(total_cmp)` collapses every duplicate.
+    levels.retain(|v| v.is_finite());
     levels.sort_by(f64::total_cmp);
     levels.dedup();
     let vertical =
@@ -1236,25 +1247,64 @@ fn snap_levels(requested: &[f64], canonical: &[f64]) -> Vec<f64> {
 /// One `VerticalProfile` coverage: every elevation sweep of `entry`'s
 /// volume sampled at WGS84 `(lon, lat)`, with the sweep angles as the
 /// `z` axis.
-fn volume_profile(entry: &VolumeEntry, lon: f64, lat: f64, quantities: &[String]) -> QueryResult {
-    let levels: Vec<f64> = entry
+fn volume_profile(
+    entry: &VolumeEntry,
+    lon: f64,
+    lat: f64,
+    quantities: &[String],
+) -> Option<QueryResult> {
+    // A radar may run split cuts — two sweeps at the same nominal
+    // elevation angle (e.g. separate surveillance and Doppler scans),
+    // so the raw per-sweep angles can repeat (FMI volumes carry two
+    // sweeps at 2.0°). CoverageJSON axis values must be unique
+    // (`uniqueItems`), so collapse to distinct angles — matching the
+    // catalog's deduped vertical extent — and sample each quantity from
+    // whichever sweep at that angle carries it.
+    let mut levels: Vec<f64> = entry
         .volume
         .sweeps
         .iter()
         .map(|s| round_elevation(s.elangle))
         .collect();
+    // Drop non-finite angles (a malformed file with a NaN elangle) before
+    // they reach the z axis — a NaN there serialises to JSON `null` and
+    // breaks the numeric axis. `round_elevation` normalises -0.0 to +0.0,
+    // so plain `dedup` after `sort_by(total_cmp)` collapses every duplicate.
+    levels.retain(|v| v.is_finite());
+    levels.sort_by(f64::total_cmp);
+    levels.dedup();
+    // No usable sweep (a severely malformed volume where every elangle was
+    // non-finite) — skip this coverage rather than emit a `VerticalProfile`
+    // with an empty z axis, which the CoverageJSON schema rejects
+    // (`numericValuesAxis.values` has `minItems: 1`).
+    if levels.is_empty() {
+        return None;
+    }
     let (site_lon, site_lat) = (entry.volume.site.lon, entry.volume.site.lat);
 
     let mut ranges = HashMap::new();
     let mut param_descs = HashMap::new();
     for quantity in quantities {
-        let values: Vec<Option<f64>> = entry
-            .volume
-            .sweeps
+        let values: Vec<Option<f64>> = levels
             .iter()
-            .map(|sweep| {
-                let moment = sweep.moments.iter().find(|m| &m.quantity == quantity)?;
-                sample_sweep_moment(sweep, moment, site_lon, site_lat, lon, lat)
+            .map(|&level| {
+                // For a split cut (two sweeps at the same nominal angle, e.g.
+                // a surveillance and a Doppler cut), the *first* sweep that
+                // carries the quantity is authoritative — its sample stands
+                // even when nodata, so a genuine no-echo is not silently
+                // replaced by the sibling's measurement.
+                entry
+                    .volume
+                    .sweeps
+                    .iter()
+                    .find(|s| {
+                        round_elevation(s.elangle) == level
+                            && s.moments.iter().any(|m| m.quantity == *quantity)
+                    })
+                    .and_then(|sweep| {
+                        let moment = sweep.moments.iter().find(|m| m.quantity == *quantity)?;
+                        sample_sweep_moment(sweep, moment, site_lon, site_lat, lon, lat)
+                    })
             })
             .collect();
         ranges.insert(
@@ -1268,7 +1318,7 @@ fn volume_profile(entry: &VolumeEntry, lon: f64, lat: f64, quantities: &[String]
         param_descs.insert(quantity.clone(), quantity_description(quantity));
     }
 
-    QueryResult {
+    Some(QueryResult {
         domain: DomainDescription::VerticalProfile {
             x: lon,
             y: lat,
@@ -1280,7 +1330,7 @@ fn volume_profile(entry: &VolumeEntry, lon: f64, lat: f64, quantities: &[String]
         },
         parameters: param_descs,
         ranges,
-    }
+    })
 }
 
 /// One `PointSeries` coverage pinned to elevation angle `level`: the
@@ -1372,7 +1422,9 @@ fn site_coverages(
     match levels {
         None => Ok(selected
             .iter()
-            .map(|e| volume_profile(e, lon, lat, &quantities))
+            // `filter_map` drops volumes that produced no plottable profile
+            // (every elangle non-finite — `volume_profile` returns `None`).
+            .filter_map(|e| volume_profile(e, lon, lat, &quantities))
             .collect()),
         Some(lvls) => {
             let times: Vec<DateTime<Utc>> = selected.iter().map(|e| e.volume.time).collect();
@@ -1610,6 +1662,21 @@ mod tests {
     use crate::pvol::RadarSite;
     use crate::reader::RawPixels;
     use ndarray::Array2;
+
+    /// `round_elevation` collapses a slightly-negative grazing angle to a
+    /// canonical `+0.0` — otherwise `-0.0` and `+0.0` would survive dedup and
+    /// the z axis would carry both as separate "0" levels.
+    #[test]
+    fn round_elevation_normalises_negative_zero() {
+        let r = round_elevation(-0.04);
+        assert_eq!(r, 0.0);
+        assert!(
+            r.is_sign_positive(),
+            "expected +0.0 after normalisation, got {r}"
+        );
+        // NaN propagates (caller is responsible for filtering with retain).
+        assert!(round_elevation(f64::NAN).is_nan());
+    }
 
     /// A pixel due north of the site has bearing ≈ 0°.
     #[test]
@@ -1971,6 +2038,114 @@ mod tests {
             covs[0].ranges.get("DBZH").expect("DBZH range").shape,
             vec![1]
         );
+    }
+
+    /// A radar running split cuts has two sweeps at the same nominal
+    /// elevation angle. The `VerticalProfile` `z` axis must collapse
+    /// them to distinct values — CoverageJSON axis values are
+    /// `uniqueItems` — and the per-quantity range must shrink to match,
+    /// sampling each angle from whichever sweep carries the quantity.
+    #[test]
+    fn volume_profile_dedups_split_cut_elevation_angles() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        // A real FMI scan strategy: two sweeps at 2.0° (a surveillance
+        // cut carrying DBZH, a Doppler cut carrying VRADH).
+        let mut vol = synthetic_volume(site_lon, site_lat);
+        let make_sweep = |elangle: f64, quantity: &str| {
+            let mut s = vol.sweeps[0].clone();
+            s.elangle = elangle;
+            s.moments[0].quantity = quantity.to_string();
+            s
+        };
+        vol.sweeps = vec![
+            make_sweep(0.5, "DBZH"),
+            make_sweep(2.0, "DBZH"),
+            make_sweep(2.0, "VRADH"),
+            make_sweep(5.0, "DBZH"),
+        ];
+
+        // Sample a point ~2.8 km from the site, well within every sweep's
+        // range, querying both quantities at once.
+        let profile = volume_profile(
+            &entry(vol, "v0"),
+            site_lon + 0.05,
+            site_lat,
+            &["DBZH".to_string(), "VRADH".to_string()],
+        )
+        .expect("finite sweeps must produce a coverage");
+        match &profile.domain {
+            DomainDescription::VerticalProfile { z, .. } => {
+                assert_eq!(z.values, vec![0.5, 2.0, 5.0], "z axis must be deduped");
+            }
+            _ => panic!("expected VerticalProfile"),
+        }
+
+        // DBZH lives on a cut at every angle → a sample at each z level.
+        let dbzh = profile.ranges.get("DBZH").expect("DBZH range");
+        assert_eq!(
+            dbzh.shape,
+            vec![3],
+            "range shape follows the deduped z axis"
+        );
+        assert!(
+            dbzh.values.iter().all(Option::is_some),
+            "DBZH sampled at every level, got {:?}",
+            dbzh.values
+        );
+
+        // VRADH lives only on the Doppler cut at 2.0°. Even though a DBZH cut
+        // shares that angle, the per-angle search must pick the VRADH-carrying
+        // sibling — so only the z=2.0 entry is populated, proving split-cut
+        // selection is per-quantity (not "first sweep at the angle wins").
+        let vradh = profile.ranges.get("VRADH").expect("VRADH range");
+        assert_eq!(vradh.shape, vec![3]);
+        assert!(vradh.values[0].is_none(), "no VRADH cut at 0.5°");
+        assert!(
+            vradh.values[1].is_some(),
+            "VRADH cut at 2.0° must be sampled"
+        );
+        assert!(vradh.values[2].is_none(), "no VRADH cut at 5.0°");
+    }
+
+    /// A malformed sweep with a NaN elevation must be dropped from the z
+    /// axis — a NaN there serialises to JSON `null` and breaks CoverageJSON's
+    /// numeric axis.
+    #[test]
+    fn volume_profile_drops_nan_elevation() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let mut vol = synthetic_volume(site_lon, site_lat);
+        let mut nan_sweep = vol.sweeps[0].clone();
+        nan_sweep.elangle = f64::NAN;
+        vol.sweeps.push(nan_sweep);
+
+        let profile = volume_profile(&entry(vol, "v0"), site_lon, site_lat, &["DBZH".to_string()])
+            .expect("one finite sweep remains, so a coverage is produced");
+        match &profile.domain {
+            DomainDescription::VerticalProfile { z, .. } => {
+                assert!(
+                    z.values.iter().all(|v| v.is_finite()),
+                    "z axis must contain no NaN, got {:?}",
+                    z.values
+                );
+                assert_eq!(z.values, vec![0.5], "only the finite sweep survives");
+            }
+            _ => panic!("expected VerticalProfile"),
+        }
+    }
+
+    /// A volume where *every* sweep has a non-finite elevation angle
+    /// (severely malformed) returns no coverage rather than emitting a
+    /// `VerticalProfile` with an empty z axis (`numericValuesAxis.values`
+    /// has `minItems: 1`).
+    #[test]
+    fn volume_profile_all_nan_returns_none() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let mut vol = synthetic_volume(site_lon, site_lat);
+        for s in &mut vol.sweeps {
+            s.elangle = f64::NAN;
+        }
+        let result = volume_profile(&entry(vol, "v0"), site_lon, site_lat, &["DBZH".to_string()]);
+        assert!(result.is_none(), "expected None, got {result:?}");
     }
 
     /// An out-of-window `datetime` range yields `LocationNotFound`.
