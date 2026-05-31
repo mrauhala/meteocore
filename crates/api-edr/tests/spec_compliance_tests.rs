@@ -598,6 +598,7 @@ async fn finding_16_data_queries_link_structure() {
     let vars = &link["variables"];
     assert_eq!(vars["query_type"], "locations");
     assert!(vars["output_formats"].is_array());
+    assert_eq!(vars["default_output_format"], "CoverageJSON");
 }
 
 // ===========================================================================
