@@ -833,7 +833,8 @@ fn build_collection_metadata(
                     "rel": "data",
                     "variables": {
                         "query_type": qt,
-                        "output_formats": output_formats
+                        "output_formats": output_formats,
+                        "default_output_format": "CoverageJSON"
                     }
                 }
             }),
