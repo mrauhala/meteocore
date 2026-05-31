@@ -135,8 +135,12 @@ pub fn destination_point(lon0: f64, lat0: f64, distance_m: f64, bearing_deg: f64
     let lat = sin_lat.asin();
     let y = brg.sin() * ang.sin() * lat0_r.cos();
     let x = ang.cos() - lat0_r.sin() * sin_lat;
+    // Normalise longitude into (−180, 180]: a path starting near ±180°
+    // can otherwise return a lon outside that range, which would leak
+    // into the CoverageJSON `Section` nodes verbatim.
     let lon = lon0_r + y.atan2(x);
-    (lon.to_degrees(), lat.to_degrees())
+    let lon_deg = (lon.to_degrees() + 540.0).rem_euclid(360.0) - 180.0;
+    (lon_deg, lat.to_degrees())
 }
 
 // ---------------------------------------------------------------------------
@@ -1598,11 +1602,16 @@ fn angle_window(z: Option<&[f64]>, volume: &PolarVolume) -> Result<(f64, f64), D
 /// at `TRAJECTORY_MAX_Z_LEVELS`. Selecting a lower top elevation angle (a
 /// narrower `z`) therefore zooms the vertical axis onto that band.
 fn height_axis(hi_angle_deg: f64, max_ground_dist_m: f64) -> Vec<f64> {
-    // The ground distance is a close slant-range proxy at the low
-    // elevation angles that dominate radar coverage — accurate enough for
-    // an axis ceiling.
-    let r = max_ground_dist_m.max(1_000.0);
-    let (_, h) = slant_to_ground_height(r, hi_angle_deg.max(0.0));
+    // `slant_to_ground_height` wants a slant range, so convert the path's
+    // farthest *ground* distance to slant via `ground / cos(el)` (exact
+    // for a flat beam, and the dominant term at radar elevation angles).
+    // Using the ground distance directly would under-size the ceiling by
+    // ~cos(el) — ~3.5 % (≈ 420 m on a 100 km path) at 15°, clipping
+    // real coverage near the top of the beam.
+    let el = hi_angle_deg.max(0.0);
+    let cos_el = el.to_radians().cos().max(1e-3);
+    let r = (max_ground_dist_m / cos_el).max(1_000.0);
+    let (_, h) = slant_to_ground_height(r, el);
     let top = h.clamp(TRAJECTORY_DEFAULT_Z_STEP_M, 25_000.0);
     let n =
         ((top / TRAJECTORY_DEFAULT_Z_STEP_M).ceil() as usize + 1).clamp(2, TRAJECTORY_MAX_Z_LEVELS);
@@ -1701,19 +1710,32 @@ fn sample_polar_slant(
 /// Build one `Section` coverage: the volume's polar field resampled on
 /// `(along-path-distance, height-above-antenna)` and exposed via the
 /// CoverageJSON composite axis `[t, lon, lat]` plus a numeric `z` axis
-/// in metres. `envelope` is the elevation-angle window `[lo, hi]` — cells
-/// whose 4/3-Earth-inverted beam angle falls outside it become nodata, so
-/// the caller's `z` angle selection drives which sweeps contribute.
+/// in metres. `window` is the caller's selected elevation-angle band
+/// `[lo, hi]` (from `z`) — cells whose 4/3-Earth-inverted beam angle
+/// falls outside it become nodata.
+///
+/// The guard actually applied is `window ∩ this volume's own sweep
+/// envelope`: a multi-timestep request derives `window` once from the
+/// newest volume, but an older entry whose scan strategy reached a
+/// lower ceiling must not have a cell that inverts to (say) 20° matched
+/// to its 10° top sweep — intersecting per entry keeps each timestep
+/// honest about the angles it actually surveyed.
 fn volume_section(
     entry: &VolumeEntry,
     path: &[(f64, f64)],
     heights_m: &[f64],
     quantities: &[String],
-    envelope: (f64, f64),
+    window: (f64, f64),
 ) -> Option<QueryResult> {
     if path.len() < 2 || heights_m.is_empty() || quantities.is_empty() {
         return None;
     }
+    // Per-entry effective envelope: the selected window clamped to this
+    // volume's surveyed sweep range. A volume with no finite sweeps is
+    // skipped; one that doesn't cover the window yields all-nodata cells
+    // (an inverted envelope rejects every beam angle).
+    let entry_env = sweep_envelope(&entry.volume)?;
+    let envelope = (window.0.max(entry_env.0), window.1.min(entry_env.1));
     let site = &entry.volume.site;
     let t = entry.volume.time;
     let nodes: Vec<(DateTime<Utc>, f64, f64)> =
@@ -2212,6 +2234,23 @@ mod tests {
         assert!((az - 45.0).abs() < 1e-3, "round-trip bearing, got {az}");
     }
 
+    /// Crossing the antimeridian eastbound keeps the longitude in
+    /// (−180, 180]: starting at 179.9° and travelling east must wrap to a
+    /// small negative longitude, not 180.x°, so the value is valid in a
+    /// CoverageJSON node.
+    #[test]
+    fn destination_point_normalises_longitude_across_antimeridian() {
+        let (lon, _lat) = destination_point(179.9, 0.0, 50_000.0, 90.0);
+        assert!(
+            (-180.0..=180.0).contains(&lon),
+            "lon must be normalised into (−180, 180], got {lon}"
+        );
+        assert!(
+            lon < 0.0,
+            "eastbound past 180° wraps to negative, got {lon}"
+        );
+    }
+
     /// 4/3-Earth forward + inverse are mutual inverses to sub-metre /
     /// sub-mdeg residuals over the radar-relevant envelope
     /// (≤ 250 km range, 0°–30° elevation, up to 20 km height). This is
@@ -2382,19 +2421,73 @@ mod tests {
     /// the selected top angle and is clamped to ≤ 25 km.
     #[test]
     fn height_axis_tracks_top_angle_and_caps() {
-        // A 5° beam at 100 km ground distance reaches a few km up.
-        let low = height_axis(5.0, 100_000.0);
+        // A 2° beam at 30 km ground distance reaches ~1 km up.
+        let low = height_axis(2.0, 30_000.0);
         assert!(low.first() == Some(&0.0), "axis starts at 0");
         assert!(low.windows(2).all(|w| w[1] > w[0]), "monotonic ascending");
         assert!(*low.last().unwrap() <= 25_000.0);
         // A higher top angle reaches higher (taller axis ceiling).
-        let high = height_axis(15.0, 100_000.0);
+        let high = height_axis(15.0, 30_000.0);
         assert!(*high.last().unwrap() > *low.last().unwrap());
+        // The slant correction (ground/cos el) makes the 15° ceiling a
+        // touch higher than using the ground distance as slant directly —
+        // a few hundred metres on a 30 km path — so real coverage near the
+        // top of the beam isn't clipped. (Both are well under the 25 km
+        // cap at 30 km, so the correction is observable here.)
+        let (_, h_ground_as_slant) = slant_to_ground_height(30_000.0, 15.0);
+        assert!(*high.last().unwrap() <= 25_000.0, "below the cap at 30 km");
+        assert!(
+            *high.last().unwrap() > h_ground_as_slant,
+            "cos-corrected ceiling {} must exceed the ground-as-slant value {}",
+            high.last().unwrap(),
+            h_ground_as_slant
+        );
         // A near-vertical beam at long range is capped at 25 km, not
         // hundreds of km.
         let capped = height_axis(89.0, 200_000.0);
         assert!(*capped.last().unwrap() <= 25_000.0 + 1.0);
         assert!(capped.len() <= 100, "level count capped");
+    }
+
+    /// `volume_section` clamps the caller's angle window to *this volume's*
+    /// surveyed sweep range. A window wider than the volume's sweeps (as
+    /// happens when the window is derived from a newer, deeper scan) must
+    /// not fabricate data: a cell that inverts to an elevation the volume
+    /// never scanned stays nodata rather than snapping to its top sweep.
+    #[test]
+    fn volume_section_clamps_window_to_per_volume_sweeps() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        // The synthetic volume has a single 0.5° sweep.
+        let vol = synthetic_volume(site_lon, site_lat);
+        let e = entry(vol, "v0");
+
+        // A node ~10 km due east: at height 0 the beam grazes the surface
+        // (el ≈ 0°, inside the 0.5° sweep envelope ±1°); at 1500 m it
+        // climbs to el ≈ 8–9° — inside the *window* (0.5–25°) but outside
+        // this volume's actual range, so it must be nodata.
+        let dlon_10km = 10_000.0 / (EARTH_RADIUS_M * site_lat.to_radians().cos()) * 180.0
+            / std::f64::consts::PI;
+        let path = vec![(site_lon, site_lat), (site_lon + dlon_10km, site_lat)];
+        let heights = vec![0.0, 1500.0];
+        let window = (0.5, 25.0); // wider than the volume's 0.5° sweep
+
+        let qr = volume_section(&e, &path, &heights, &["DBZH".to_string()], window)
+            .expect("section produced");
+        let nd = qr.ranges.get("DBZH").expect("DBZH range");
+        // Layout is row-major [node][height]; the far node is index 1, so
+        // its first cell starts at `heights.len()`.
+        let nz = heights.len();
+        let far_surface = nd.values[nz]; // (10 km, 0 m)
+        let far_high = nd.values[nz + 1]; // (10 km, 1500 m)
+        assert!(
+            far_surface.is_some(),
+            "the surface cell grazes the 0.5° sweep and must sample"
+        );
+        assert!(
+            far_high.is_none(),
+            "a cell at ~8° must stay nodata — the volume never scanned that \
+             angle, even though it's inside the requested window"
+        );
     }
 
     /// Build a synthetic single-site, single-sweep, single-moment

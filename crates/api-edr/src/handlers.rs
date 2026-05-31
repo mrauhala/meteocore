@@ -897,8 +897,15 @@ pub async fn trajectory_query(
             // Render the cross-section as a colour-mapped heatmap using
             // the collection's WMS colormap (or a data-scaled viridis
             // fallback).
+            // A failure here is an internal inconsistency (the engine
+            // already returned a Section for this trajectory query), not
+            // a client mistake — log it and return a generic 500 rather
+            // than leaking the internal message in a 400.
             let (heatmaps, colormap) = section_response_to_heatmaps(&result, config.wms.as_ref())
-                .map_err(|e| bad_request(&e))?;
+                .map_err(|e| {
+                tracing::error!("Trajectory PNG section conversion error: {e}");
+                server_error()
+            })?;
             let (w, h) = plot_dimensions(params.width, params.height);
             let png = render_heatmap(&heatmaps, colormap.as_ref(), w, h).map_err(|e| {
                 tracing::error!("Trajectory PNG render error: {e}");
