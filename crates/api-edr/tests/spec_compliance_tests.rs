@@ -597,7 +597,74 @@ async fn finding_16_data_queries_link_structure() {
     // Verify variables structure
     let vars = &link["variables"];
     assert_eq!(vars["query_type"], "locations");
-    assert!(vars["output_formats"].is_array());
+    let formats = vars["output_formats"].as_array().expect("output_formats");
+    assert!(
+        !formats.iter().any(|v| v == "GeoJSON"),
+        "GeoJSON must not appear in locations output_formats — f=GeoJSON returns HTTP 400"
+    );
+    assert_eq!(vars["default_output_format"], "CoverageJSON");
+
+    // Prove the comment above: f=GeoJSON on the data endpoint returns 400.
+    let (status, _) = get_json("/collections/weather/locations/station1?f=GeoJSON").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "f=GeoJSON must be rejected on the locations data endpoint"
+    );
+}
+
+#[tokio::test]
+async fn data_queries_default_output_format_set_for_all_query_types() {
+    struct AllQueriesEngine;
+    impl EdrEngine for AllQueriesEngine {
+        fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+            Ok(vec![])
+        }
+        fn query_location(
+            &self,
+            location_id: &str,
+            _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+            _: Option<&[String]>,
+            _: Option<&[f64]>,
+        ) -> Result<ds_core::model::CoverageResponse, DataServerError> {
+            Err(DataServerError::LocationNotFound(location_id.into()))
+        }
+        fn get_parameters(&self) -> Vec<String> {
+            vec!["t".to_string()]
+        }
+        fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+            None
+        }
+        fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+            Some([0.0, 0.0, 1.0, 1.0])
+        }
+        fn supported_query_types(&self) -> Vec<String> {
+            vec!["locations".into(), "position".into(), "area".into()]
+        }
+    }
+
+    let state = make_edr_state(Arc::new(AllQueriesEngine));
+    let app = api_edr::router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/collections/weather")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "/collections/weather");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+
+    for qt in ["locations", "position", "area"] {
+        let vars = &json["data_queries"][qt]["link"]["variables"];
+        assert_eq!(
+            vars["default_output_format"], "CoverageJSON",
+            "data_queries[{qt}].link.variables.default_output_format must be \"CoverageJSON\""
+        );
+    }
 }
 
 // ===========================================================================
@@ -805,6 +872,12 @@ async fn finding_27_conformance_valid() {
     for item in conforms_to {
         assert!(item.is_string(), "each conformsTo entry must be a string");
     }
+    assert!(
+        !conforms_to.iter().any(|v| v
+            .as_str()
+            .is_some_and(|s| s.ends_with("/conf/edr-geojson"))),
+        "edr-geojson conformance class must not be advertised — data queries return HTTP 400 for f=GeoJSON"
+    );
 }
 
 // ===========================================================================

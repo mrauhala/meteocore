@@ -436,7 +436,6 @@ pub async fn conformance() -> impl IntoResponse {
             "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/core",
             "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/collections",
             "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/json",
-            "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/edr-geojson",
             "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/covjson"
         ]
     }))
@@ -813,7 +812,7 @@ fn build_collection_metadata(
         let (endpoint, output_formats) = match qt.as_str() {
             "locations" => (
                 format!("{base_url}/edr/collections/{}/locations", config.id),
-                json!(["CoverageJSON", "GeoJSON", "PNG"]),
+                json!(["CoverageJSON", "PNG"]),
             ),
             "position" => (
                 format!("{base_url}/edr/collections/{}/position", config.id),
@@ -833,7 +832,8 @@ fn build_collection_metadata(
                     "rel": "data",
                     "variables": {
                         "query_type": qt,
-                        "output_formats": output_formats
+                        "output_formats": output_formats,
+                        "default_output_format": "CoverageJSON"
                     }
                 }
             }),
@@ -856,6 +856,6 @@ fn build_collection_metadata(
         "data_queries": data_queries,
         "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
         "parameter_names": parameter_names,
-        "output_formats": ["CoverageJSON", "GeoJSON", "PNG"]
+        "output_formats": ["CoverageJSON", "PNG"]
     })
 }
