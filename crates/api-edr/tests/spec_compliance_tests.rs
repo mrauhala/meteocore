@@ -597,7 +597,11 @@ async fn finding_16_data_queries_link_structure() {
     // Verify variables structure
     let vars = &link["variables"];
     assert_eq!(vars["query_type"], "locations");
-    assert!(vars["output_formats"].is_array());
+    let formats = vars["output_formats"].as_array().expect("output_formats");
+    assert!(
+        !formats.iter().any(|v| v == "GeoJSON"),
+        "GeoJSON must not appear in locations output_formats — f=GeoJSON returns HTTP 400"
+    );
     assert_eq!(vars["default_output_format"], "CoverageJSON");
 }
 
@@ -642,6 +646,7 @@ async fn data_queries_default_output_format_set_for_all_query_types() {
         )
         .await
         .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "/collections/weather");
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let json: Value = serde_json::from_slice(&bytes).unwrap();
 
