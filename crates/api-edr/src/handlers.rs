@@ -436,7 +436,6 @@ pub async fn conformance() -> impl IntoResponse {
             "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/core",
             "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/collections",
             "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/json",
-            "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/edr-geojson",
             "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/covjson"
         ]
     }))
