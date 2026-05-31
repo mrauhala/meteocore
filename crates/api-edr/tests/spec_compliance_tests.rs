@@ -603,6 +603,14 @@ async fn finding_16_data_queries_link_structure() {
         "GeoJSON must not appear in locations output_formats — f=GeoJSON returns HTTP 400"
     );
     assert_eq!(vars["default_output_format"], "CoverageJSON");
+
+    // Prove the comment above: f=GeoJSON on the data endpoint returns 400.
+    let (status, _) = get_json("/collections/weather/locations/station1?f=GeoJSON").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "f=GeoJSON must be rejected on the locations data endpoint"
+    );
 }
 
 #[tokio::test]
@@ -864,6 +872,12 @@ async fn finding_27_conformance_valid() {
     for item in conforms_to {
         assert!(item.is_string(), "each conformsTo entry must be a string");
     }
+    assert!(
+        !conforms_to.iter().any(|v| v
+            .as_str()
+            .is_some_and(|s| s.ends_with("/conf/edr-geojson"))),
+        "edr-geojson conformance class must not be advertised — data queries return HTTP 400 for f=GeoJSON"
+    );
 }
 
 // ===========================================================================
