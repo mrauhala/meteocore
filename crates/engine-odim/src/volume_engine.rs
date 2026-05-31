@@ -1554,26 +1554,42 @@ fn resample_path(vertices: &[(f64, f64)]) -> Vec<(f64, f64)> {
 /// arrives as the angles in range). `None`/empty selects the volume's
 /// full sweep span. The window is clamped to the volume's actual sweep
 /// range so a heterogeneous fleet (a site missing an advertised angle)
-/// degrades to nodata rather than fabricating data. `None` only when the
-/// volume has no finite sweeps.
-fn angle_window(z: Option<&[f64]>, volume: &PolarVolume) -> Option<(f64, f64)> {
-    let (smin, smax) = sweep_envelope(volume)?;
-    match z.filter(|s| !s.is_empty()) {
-        None => Some((smin, smax)),
-        Some(zs) => {
-            let mut lo = f64::INFINITY;
-            let mut hi = f64::NEG_INFINITY;
-            for &v in zs.iter().filter(|v| v.is_finite()) {
-                lo = lo.min(v);
-                hi = hi.max(v);
-            }
-            if !lo.is_finite() {
-                return Some((smin, smax));
-            }
-            // Clamp into the site's surveyed range.
-            Some((lo.max(smin), hi.min(smax)))
-        }
+/// degrades to nodata rather than fabricating data.
+///
+/// Errors:
+/// - `Engine` when the volume has no finite sweeps (a malformed file).
+/// - `InvalidParameter` when an explicit `z` list falls **entirely**
+///   outside the surveyed range, e.g. `z=40,50` on a 0.5–25° radar — the
+///   clamp would otherwise invert to `(40, 25)` and silently produce an
+///   all-nodata Section. (The interval form is already rejected earlier
+///   by `resolve_z_levels`; this guards the comma-list form, which the
+///   API layer passes through unvalidated.)
+fn angle_window(z: Option<&[f64]>, volume: &PolarVolume) -> Result<(f64, f64), DataServerError> {
+    let (smin, smax) = sweep_envelope(volume)
+        .ok_or_else(|| DataServerError::Engine("PVOL volume has no finite sweep angles".into()))?;
+    let Some(zs) = z.filter(|s| !s.is_empty()) else {
+        return Ok((smin, smax));
+    };
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for &v in zs.iter().filter(|v| v.is_finite()) {
+        lo = lo.min(v);
+        hi = hi.max(v);
     }
+    if !lo.is_finite() {
+        return Ok((smin, smax));
+    }
+    // Clamp into the site's surveyed range. An inverted clamp means the
+    // whole request sits beyond the surveyed angles — surface that rather
+    // than returning a silently empty Section.
+    let (clo, chi) = (lo.max(smin), hi.min(smax));
+    if clo > chi {
+        return Err(DataServerError::InvalidParameter(format!(
+            "requested elevation angle(s) {lo}–{hi}° are outside this radar's \
+             surveyed range {smin}–{smax}°"
+        )));
+    }
+    Ok((clo, chi))
 }
 
 /// Build the cross-section height axis (metres above antenna): a regular
@@ -2091,11 +2107,11 @@ impl EdrEngine for PolarVolumeEngine {
 
         // `z` carries the requested elevation angles (resolved by the API
         // layer against the advertised extent). Derive the angle window
-        // and the matching height axis from the most recent volume.
+        // and the matching height axis from the most recent volume. An
+        // out-of-range `z` list surfaces as `InvalidParameter` (400)
+        // rather than a silently empty Section.
         let ref_volume = &selected.last().unwrap().volume;
-        let window = angle_window(z, ref_volume).ok_or_else(|| {
-            DataServerError::Engine("PVOL volume has no finite sweep angles".into())
-        })?;
+        let window = angle_window(z, ref_volume)?;
         // The path's farthest ground distance from the radar sizes the
         // height-axis ceiling for the selected top angle.
         let max_ground_dist = path
@@ -2327,7 +2343,8 @@ mod tests {
     }
 
     /// `angle_window` selects the requested elevation-angle span, clamped
-    /// to the volume's actual sweep range; `None` selects the full span.
+    /// to the volume's actual sweep range; `None` selects the full span;
+    /// a request entirely above the top sweep is a 400, not silent nodata.
     #[test]
     fn angle_window_selects_and_clamps() {
         let (site_lon, site_lat) = (25.0, 60.0);
@@ -2344,11 +2361,21 @@ mod tests {
             .collect();
 
         // No z → full sweep span.
-        assert_eq!(angle_window(None, &vol), Some((0.5, 15.0)));
+        assert_eq!(angle_window(None, &vol).unwrap(), (0.5, 15.0));
         // A sub-range → exactly that window.
-        assert_eq!(angle_window(Some(&[1.5, 5.0, 9.0]), &vol), Some((1.5, 9.0)));
-        // A request past the top sweep clamps to the surveyed range.
-        assert_eq!(angle_window(Some(&[5.0, 45.0]), &vol), Some((5.0, 15.0)));
+        assert_eq!(
+            angle_window(Some(&[1.5, 5.0, 9.0]), &vol).unwrap(),
+            (1.5, 9.0)
+        );
+        // A request straddling the top sweep clamps to the surveyed range.
+        assert_eq!(angle_window(Some(&[5.0, 45.0]), &vol).unwrap(), (5.0, 15.0));
+        // A discrete list entirely above the top sweep would invert the
+        // clamp to (40, 15) → would silently produce an all-nodata
+        // Section. It must be a clear `InvalidParameter` instead.
+        match angle_window(Some(&[40.0, 50.0]), &vol) {
+            Err(DataServerError::InvalidParameter(_)) => {}
+            other => panic!("expected InvalidParameter for out-of-range z, got {other:?}"),
+        }
     }
 
     /// `height_axis` builds a monotonic 0..top grid whose ceiling tracks
