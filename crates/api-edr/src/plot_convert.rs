@@ -228,7 +228,7 @@ fn section_colormap(
     if let Some(w) = wms {
         // Inline custom stops win.
         if !w.color_stops.is_empty() {
-            let stops: Vec<ds_render::ColorStop> = w
+            let mut stops: Vec<ds_render::ColorStop> = w
                 .color_stops
                 .iter()
                 .filter_map(|s| {
@@ -240,6 +240,11 @@ fn section_colormap(
                         })
                 })
                 .collect();
+            // Sort ascending by value: config stops may be authored
+            // highest-first (a natural radar-dBZ legend order), which
+            // would otherwise give `min > max` (reversed colour-bar
+            // labels) and a broken `LinearColorMap` bracket lookup.
+            stops.sort_by(|a, b| a.value.total_cmp(&b.value));
             if !stops.is_empty() {
                 let min = w
                     .min
@@ -671,5 +676,42 @@ mod tests {
     fn section_heatmap_rejects_non_section() {
         let p = profile(VerticalKind::ElevationAngle, vec![0.5], vec![Some(1.0)]);
         assert!(section_response_to_heatmaps(&CoverageResponse::Single(p), None).is_err());
+    }
+
+    /// Descending-order `color_stops` (a natural radar-dBZ legend order)
+    /// must still yield `value_min < value_max` — the colour bar would
+    /// otherwise label max→min top-to-bottom against the gradient.
+    #[test]
+    fn section_colormap_sorts_descending_color_stops() {
+        use ds_core::config::{ColorStop, WmsConfig};
+        let wms = WmsConfig {
+            style_bundle: None,
+            colormap: None,
+            // Authored highest-value-first.
+            color_stops: vec![
+                ColorStop {
+                    value: 60.0,
+                    color: "#ff0000".into(),
+                },
+                ColorStop {
+                    value: 30.0,
+                    color: "#00ff00".into(),
+                },
+                ColorStop {
+                    value: 0.0,
+                    color: "#0000ff".into(),
+                },
+            ],
+            min: None,
+            max: None,
+            styles: vec![],
+            parameters: vec![],
+            rendered_cache_mb: 0,
+        };
+        let qr = section("DBZH", "dBZ");
+        let (heatmaps, _cmap) =
+            section_response_to_heatmaps(&CoverageResponse::Single(qr), Some(&wms)).unwrap();
+        assert_eq!(heatmaps[0].value_min, 0.0, "min from the lowest stop");
+        assert_eq!(heatmaps[0].value_max, 60.0, "max from the highest stop");
     }
 }

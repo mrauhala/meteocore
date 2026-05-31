@@ -1515,10 +1515,13 @@ fn resample_path(vertices: &[(f64, f64)]) -> Vec<(f64, f64)> {
         total += d;
     }
     if total <= 0.0 {
-        // Degenerate polyline (all vertices coincide) — return endpoints
-        // verbatim so the caller still produces a Section, with the
-        // single-cell domain telling the user what happened.
-        return vec![vertices[0], *vertices.last().unwrap()];
+        // Degenerate polyline (all vertices coincide). `parse_linestring_coords`
+        // already rejects an all-identical LINESTRING with a 400, so this is
+        // only reachable via a direct call — return a single node so the
+        // caller's `path.len() < 2` guard turns it into an error rather than
+        // emitting a Section with two identical (and schema-invalid)
+        // composite-axis nodes.
+        return vec![vertices[0]];
     }
     let n =
         ((total / TRAJECTORY_NODE_SPACING_M).ceil() as usize + 1).clamp(2, TRAJECTORY_MAX_NODES);
@@ -2447,6 +2450,20 @@ mod tests {
         let capped = height_axis(89.0, 200_000.0);
         assert!(*capped.last().unwrap() <= 25_000.0 + 1.0);
         assert!(capped.len() <= 100, "level count capped");
+    }
+
+    /// A zero-length polyline (all vertices coincident) resamples to a
+    /// *single* node, so `query_trajectory`'s `path.len() < 2` guard turns
+    /// it into a 400 rather than a Section with duplicate composite nodes.
+    /// (`parse_linestring_coords` rejects this upstream too; this guards a
+    /// direct call.)
+    #[test]
+    fn resample_path_degenerate_returns_single_node() {
+        let coincident = vec![(25.0, 60.0), (25.0, 60.0)];
+        assert_eq!(resample_path(&coincident).len(), 1);
+        // A real path still resamples to ≥2 nodes.
+        let real = vec![(25.0, 60.0), (25.5, 60.5)];
+        assert!(resample_path(&real).len() >= 2);
     }
 
     /// `volume_section` clamps the caller's angle window to *this volume's*

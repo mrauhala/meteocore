@@ -235,9 +235,24 @@ pub fn render_heatmap(
     }
     let width = width.clamp(160, 2000);
     let height = height.clamp(120, 2000);
+
+    // Each stacked panel needs room for its top/bottom margins plus a few
+    // plot rows; below that `draw_heatmap_panel` would silently skip
+    // drawing and return an all-white PNG. Fail loudly with an actionable
+    // message instead (raise `height` or filter to one parameter).
+    const MIN_PANEL_PX: u32 = 64;
+    let n = heatmaps.len() as u32;
+    if height < n * MIN_PANEL_PX {
+        return Err(DataServerError::Render(format!(
+            "image height {height}px is too small for {n} stacked panel(s) \
+             (need ≥ {}px); raise `height` or filter to one parameter with \
+             `parameter-name`",
+            n * MIN_PANEL_PX
+        )));
+    }
     let mut cv = Canvas::new(width, height);
 
-    let n = heatmaps.len() as i32;
+    let n = n as i32;
     let panel_h = cv.h / n;
     for (i, hm) in heatmaps.iter().enumerate() {
         let top = i as i32 * panel_h;
@@ -1012,6 +1027,21 @@ mod tests {
         // 50% black over white ≈ mid grey.
         let g = over_white([0, 0, 0, 128]);
         assert!(g[0] > 120 && g[0] < 135);
+    }
+
+    #[test]
+    fn heatmap_too_small_for_panel_count_errors() {
+        let cmap = crate::colormap::LutColorMap::from_builtin(
+            crate::colormap::BuiltinColormap::Viridis,
+            0.0,
+            1.0,
+        );
+        // 3 panels in a 120px-tall image → 40px each, below the drawable
+        // minimum: a clear error, not a silent all-white PNG.
+        let three = vec![sample_heatmap(), sample_heatmap(), sample_heatmap()];
+        assert!(render_heatmap(&three, &cmap, 600, 120).is_err());
+        // The same three panels in a tall-enough image render fine.
+        assert!(render_heatmap(&three, &cmap, 600, 600).is_ok());
     }
 
     #[test]

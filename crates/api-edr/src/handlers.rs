@@ -795,7 +795,10 @@ pub async fn area_query(
             }
         })?;
 
-    let body = serde_json::to_string(&coverage_response_to_json(&result)).unwrap();
+    let body = serde_json::to_string(&coverage_response_to_json(&result)).map_err(|e| {
+        tracing::error!("Area CoverageJSON serialise error: {e}");
+        server_error()
+    })?;
     Ok((
         [(header::CONTENT_TYPE, "application/prs.coverage+json")],
         body,
@@ -856,37 +859,51 @@ pub async fn trajectory_query(
     // sweeps); an interval `z=0.3/15` expands to the angles in range.
     let z = resolve_request_z(engine, params.z.as_deref())?;
 
-    let result = engine
-        .query_trajectory(
-            &params.coords,
-            datetime,
-            param_names.as_deref(),
-            z.as_deref(),
-        )
-        .map_err(|e| match &e {
-            ds_core::error::DataServerError::InvalidParameter(_)
-            | ds_core::error::DataServerError::InvalidBbox(_)
-            | ds_core::error::DataServerError::InvalidDatetime(_) => (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-            ),
-            ds_core::error::DataServerError::LocationNotFound(_)
-            | ds_core::error::DataServerError::CollectionNotFound(_) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "code": "NotFound", "description": e.to_string() })),
-            ),
-            _ => {
-                tracing::error!("Trajectory query error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "code": "ServerError", "description": "Internal server error" })),
-                )
-            }
-        })?;
+    // The cross-section sampler is the heaviest EDR path — up to
+    // nodes × z-levels × quantities × timesteps `sample_polar_slant`
+    // iterations (millions, seconds of CPU). Run it on the blocking pool
+    // so it doesn't park a request-serving worker and head-of-line-block
+    // other requests. Safe here: the trajectory path reads an in-memory
+    // `ArcSwap` catalog snapshot and never touches `DataStore` (whose
+    // `block_in_place` would panic on a `spawn_blocking` thread). The
+    // general "wrap every EdrEngine query" work is tracked in #178.
+    let engine = engine.clone();
+    let coords = params.coords.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        engine.query_trajectory(&coords, datetime, param_names.as_deref(), z.as_deref())
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("Trajectory query task join error: {e}");
+        server_error()
+    })?
+    .map_err(|e| match &e {
+        ds_core::error::DataServerError::InvalidParameter(_)
+        | ds_core::error::DataServerError::InvalidBbox(_)
+        | ds_core::error::DataServerError::InvalidDatetime(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+        ),
+        ds_core::error::DataServerError::LocationNotFound(_)
+        | ds_core::error::DataServerError::CollectionNotFound(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "code": "NotFound", "description": e.to_string() })),
+        ),
+        _ => {
+            tracing::error!("Trajectory query error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "code": "ServerError", "description": "Internal server error" })),
+            )
+        }
+    })?;
 
     match format {
         EdrFormat::CoverageJson => {
-            let body = serde_json::to_string(&coverage_response_to_json(&result)).unwrap();
+            let body = serde_json::to_string(&coverage_response_to_json(&result)).map_err(|e| {
+                tracing::error!("Trajectory CoverageJSON serialise error: {e}");
+                server_error()
+            })?;
             Ok((
                 [(header::CONTENT_TYPE, "application/prs.coverage+json")],
                 body,
