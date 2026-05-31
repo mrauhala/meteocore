@@ -192,6 +192,39 @@ fn coverage_with_all_nulls_validates() {
     validate(&json, &schema);
 }
 
+/// A non-finite `Some(NaN)` / `Some(inf)` measurement must serialise to
+/// JSON `null`, not `0` — a fabricated zero would be indistinguishable
+/// from a genuine reading. Regression for the claude-review finding on
+/// PR #275.
+#[test]
+fn coverage_with_non_finite_values_encodes_null_not_zero() {
+    let schema = load_schema();
+    let times = vec![make_time(0), make_time(1), make_time(2)];
+    let result = make_query_result(
+        times,
+        vec![(
+            "temperature",
+            "°C",
+            vec![Some(f64::NAN), Some(f64::INFINITY), Some(-1.5)],
+        )],
+    );
+    let json = query_result_to_coverage_json(&result);
+    let values = &json["ranges"]["temperature"]["values"];
+    assert!(
+        values[0].is_null(),
+        "NaN must encode as null, got {}",
+        values[0]
+    );
+    assert!(
+        values[1].is_null(),
+        "inf must encode as null, got {}",
+        values[1]
+    );
+    assert_eq!(values[2], serde_json::json!(-1.5));
+    // Still schema-valid (CoverageJSON allows null in numeric ranges).
+    validate(&json, &schema);
+}
+
 #[test]
 fn coverage_required_fields_present() {
     let schema = load_schema();

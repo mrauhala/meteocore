@@ -1174,12 +1174,14 @@ mod unimplemented_queries {
     }
 
     #[tokio::test]
-    #[ignore = "trajectory query not yet implemented"]
-    async fn trajectory_query() {
-        // GET /collections/{id}/trajectory?coords=LINESTRING(24 60,25 61)
-        let (status, _) =
-            get("/collections/weather/trajectory?coords=LINESTRING(24 60,25 61)").await;
-        assert_eq!(status, StatusCode::OK);
+    async fn trajectory_query_unsupported_engine_returns_404() {
+        // `MockEngine` does not advertise `trajectory` in
+        // `supported_query_types`, so the route must answer 404 (the
+        // capability is absent for this collection) rather than 400.
+        let (status, json) =
+            get("/collections/weather/trajectory?coords=LINESTRING(24%2060,25%2061)").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["code"], "NotFound");
     }
 
     #[tokio::test]

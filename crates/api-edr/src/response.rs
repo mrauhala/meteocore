@@ -104,7 +104,13 @@ fn build_ndarray(ndarray: &ds_core::model::NdArray) -> Value {
         .values
         .iter()
         .map(|v| match v {
-            Some(f) => Value::Number(Number::from_f64(*f).unwrap_or(Number::from(0))),
+            // `Number::from_f64` returns `None` for NaN / ±inf (JSON has
+            // no representation), so a non-finite measurement must encode
+            // as `null` — not `0`, which would be indistinguishable from a
+            // genuine zero reading. Flagged by claude-review on PR #275.
+            Some(f) => Number::from_f64(*f)
+                .map(Value::Number)
+                .unwrap_or(Value::Null),
             None => Value::Null,
         })
         .collect();

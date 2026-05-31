@@ -807,6 +807,28 @@ pub async fn trajectory_query(
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
 
+    // An engine that doesn't advertise `trajectory` has no cross-section
+    // capability. Return 404 (the resource doesn't exist for this
+    // collection) rather than letting the default trait method answer
+    // 400 (which wrongly implies the *request* was malformed). Keeps the
+    // live route consistent with the `api_definition` OpenAPI gating and
+    // the `data_queries` collection metadata. Flagged by claude-review.
+    if !engine
+        .supported_query_types()
+        .iter()
+        .any(|q| q == "trajectory")
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "code": "NotFound",
+                "description": format!(
+                    "Collection '{id}' does not support trajectory (cross-section) queries"
+                )
+            })),
+        ));
+    }
+
     // A Section is a 2-D cross-section — not a single plot.
     if parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))? == EdrFormat::Png {
         return Err(bad_request(&DataServerError::InvalidParameter(

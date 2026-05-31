@@ -2124,6 +2124,22 @@ impl EdrEngine for PolarVolumeEngine {
         // matching scale.
         let top_default = coverage_top_default(&selected.last().unwrap().volume);
         let heights = resolve_heights(z, top_default);
+        // When the caller passed explicit levels and the 1 mm-tolerance
+        // dedup collapsed some, surface that — it's a benign noise-removal
+        // most of the time, but logging it means a user who fat-fingered
+        // two near-identical levels can see why their axis shrank rather
+        // than silently getting fewer rows than requested.
+        if let Some(requested) = z {
+            if requested.len() > 2 && heights.len() < requested.len() {
+                tracing::debug!(
+                    "[{}] trajectory z: {} requested level(s) collapsed to {} after \
+                     1mm-tolerance dedup",
+                    self.collection_id,
+                    requested.len(),
+                    heights.len()
+                );
+            }
+        }
         if heights.is_empty() {
             return Err(DataServerError::InvalidParameter(
                 "trajectory `z` resolved to an empty axis".into(),
