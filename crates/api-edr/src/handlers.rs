@@ -17,8 +17,8 @@ use ds_core::model::CoverageResponse;
 use ds_render::{render_chart, render_heatmap};
 
 use crate::params::{
-    parse_edr_format, parse_z, plot_dimensions, split_position_coords, AreaQueryParams, EdrFormat,
-    LocationQueryParams, PositionQueryParams, TrajectoryQueryParams,
+    parse_edr_format, parse_z, plot_dimensions, resolve_z_levels, split_position_coords,
+    AreaQueryParams, EdrFormat, LocationQueryParams, PositionQueryParams, TrajectoryQueryParams,
 };
 use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{coverage_response_to_json, locations_to_geojson, LocationsContext};
@@ -100,14 +100,23 @@ fn lookup_collection<'a>(
     Ok((engine, config))
 }
 
-/// Reject a `z` selector against a collection with no vertical dimension.
-/// Collections that have one let the engine resolve `z`; collections that
-/// don't return HTTP 400 rather than silently ignoring the parameter.
-fn reject_z_without_vertical(
+/// Parse and resolve the request `z` parameter into the concrete level
+/// list an engine samples.
+///
+/// - Absent / blank → `None` (whole vertical extent).
+/// - A `z` against a collection with no vertical dimension → 400 (rather
+///   than silently ignored).
+/// - An interval (`z=min/max`) is expanded against the collection's
+///   advertised levels; a list passes through for the engine to snap.
+fn resolve_request_z(
     engine: &Arc<dyn EdrEngine>,
-    z: &Option<Vec<f64>>,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if z.is_some() && engine.get_vertical_extent().is_none() {
+    z: Option<&str>,
+) -> Result<Option<Vec<f64>>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(sel) = parse_z(z).map_err(|e| bad_request(&e))? else {
+        return Ok(None);
+    };
+    let extent = engine.get_vertical_extent();
+    if extent.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -117,7 +126,8 @@ fn reject_z_without_vertical(
             })),
         ));
     }
-    Ok(())
+    let levels = resolve_z_levels(&sel, extent.as_ref()).map_err(|e| bad_request(&e))?;
+    Ok(Some(levels))
 }
 
 pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
@@ -470,7 +480,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "in": "query",
                     "required": false,
                     "schema": {"type": "string"},
-                    "description": "Height range for the cross-section z axis, in metres above the radar antenna. Forms: z=H (single-height slice), z=Hmin,Hmax (range bracketed by the default vertical step), z=H1,H2,H3,… (explicit levels). Absent → 0..coverage-top derived from the radar's highest sweep."
+                    "description": "Elevation-angle selection for the cross-section, matching the collection's advertised vertical extent (sweep angles in degrees). Forms: z=5 (one sweep), z=0.5,1.5,5 (a list), or z=0.3/15 (a min/max interval → every advertised angle in range). The selected angle window bounds which sweeps build the RHI; the rendered z axis is derived height above the antenna (metres). Absent → all sweeps."
                 }
             },
             "schemas": {
@@ -607,13 +617,7 @@ pub async fn location_query(
         .as_deref()
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
-    let z = parse_z(params.z.as_deref()).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-        )
-    })?;
-    reject_z_without_vertical(engine, &z)?;
+    let z = resolve_request_z(engine, params.z.as_deref())?;
 
     let result = engine
         .query_location(&loc_id, datetime, param_names.as_deref(), z.as_deref())
@@ -664,13 +668,7 @@ pub async fn position_query(
         .as_deref()
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
-    let z = parse_z(params.z.as_deref()).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-        )
-    })?;
-    reject_z_without_vertical(engine, &z)?;
+    let z = resolve_request_z(engine, params.z.as_deref())?;
 
     // Split coords into one or more POINT(lon lat) strings. A single POINT is
     // passed through to the engine as-is; MULTIPOINT is fanned out into one
@@ -766,13 +764,7 @@ pub async fn area_query(
         .as_deref()
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
-    let z = parse_z(params.z.as_deref()).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-        )
-    })?;
-    reject_z_without_vertical(engine, &z)?;
+    let z = resolve_request_z(engine, params.z.as_deref())?;
 
     let result = engine
         .query_area(
@@ -858,16 +850,10 @@ pub async fn trajectory_query(
         .as_deref()
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
-    let z = parse_z(params.z.as_deref()).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-        )
-    })?;
-    // Trajectory `z` is a height range in metres, not a vertical-extent
-    // pin against the collection's elevation-angle axis, so the standard
-    // `reject_z_without_vertical` gate doesn't apply — the engine accepts
-    // it whenever it can produce a Section.
+    // Trajectory `z` selects elevation angles from the collection's
+    // advertised vertical extent (the cross-section is built from those
+    // sweeps); an interval `z=0.3/15` expands to the angles in range.
+    let z = resolve_request_z(engine, params.z.as_deref())?;
 
     let result = engine
         .query_trajectory(

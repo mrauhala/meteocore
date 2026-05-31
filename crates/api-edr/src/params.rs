@@ -71,10 +71,10 @@ pub struct AreaQueryParams {
 
 /// Trajectory (vertical cross-section) query parameters. Accepts a WKT
 /// `LINESTRING(lon lat, lon lat, …)` and the standard EDR filters; `z`
-/// here selects the *height* axis (metres above antenna), with the same
-/// "single height pins a slice, two values bracket a range" semantics
-/// used elsewhere. The corridor variant (`corridor-width` /
-/// `corridor-height`) ships in a follow-up.
+/// selects *elevation angles* from the collection's advertised vertical
+/// extent (a list or a `min/max` interval), bounding which sweeps build
+/// the cross-section — whose own axis is derived height. The corridor
+/// variant (`corridor-width` / `corridor-height`) ships in a follow-up.
 #[derive(Debug, Deserialize)]
 pub struct TrajectoryQueryParams {
     pub coords: String,
@@ -90,40 +90,109 @@ pub struct TrajectoryQueryParams {
     pub height: Option<u32>,
 }
 
-/// Parse the EDR `z` query parameter — a comma-separated list of numeric
-/// vertical levels (e.g. `z=850,700,500` or a single `z=0.5`). An absent
-/// or blank value yields `None` (the whole vertical extent / a profile).
-///
-/// The EDR `min/max` interval form is not supported — pass the discrete
-/// levels explicitly (the available set is advertised in the collection's
-/// vertical extent).
-pub fn parse_z(z: Option<&str>) -> Result<Option<Vec<f64>>, DataServerError> {
+/// A parsed EDR `z` selector: either an explicit list of levels or a
+/// closed `min/max` interval. The interval is resolved against the
+/// collection's advertised vertical levels at the handler boundary (see
+/// [`resolve_z_levels`]) so engines keep their `Option<&[f64]>` contract.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ZSelector {
+    /// Discrete levels (`z=0.5` or `z=850,700,500`).
+    Levels(Vec<f64>),
+    /// A closed interval `z=min/max` (OGC EDR interval form).
+    Interval { min: f64, max: f64 },
+}
+
+/// Parse one finite `f64` from a `z` token, rejecting `inf`/`nan` (a
+/// non-finite level would poison `quantize_z` cache keys and `nearest_sweep`
+/// comparisons downstream).
+fn parse_z_value(part: &str) -> Result<f64, DataServerError> {
+    part.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| {
+            DataServerError::InvalidParameter(format!(
+                "Invalid `z` value '{}' — expected a finite number",
+                part.trim()
+            ))
+        })
+}
+
+/// Parse the EDR `z` query parameter. Accepts a comma-separated list of
+/// numeric levels (`z=850,700,500` / a single `z=0.5`) **or** the OGC
+/// `min/max` interval form (`z=850/500`, order-independent). An absent or
+/// blank value yields `None` (the whole vertical extent / a profile).
+pub fn parse_z(z: Option<&str>) -> Result<Option<ZSelector>, DataServerError> {
     let Some(raw) = z.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
+
+    // Interval form `min/max` — exactly one slash, two finite endpoints.
+    if raw.contains('/') {
+        let parts: Vec<&str> = raw.split('/').collect();
+        if parts.len() != 2 {
+            return Err(DataServerError::InvalidParameter(
+                "`z` interval must be `min/max` (one slash, two values)".into(),
+            ));
+        }
+        let a = parse_z_value(parts[0])?;
+        let b = parse_z_value(parts[1])?;
+        let (min, max) = if a <= b { (a, b) } else { (b, a) };
+        return Ok(Some(ZSelector::Interval { min, max }));
+    }
+
     let levels: Vec<f64> = raw
         .split(',')
         .map(|part| {
-            let part = part.trim();
-            if part.is_empty() {
+            if part.trim().is_empty() {
                 return Err(DataServerError::InvalidParameter(
                     "`z` has an empty element — check for a stray comma".into(),
                 ));
             }
-            // `parse::<f64>()` also accepts "inf"/"nan"; reject those so a
-            // non-finite level can't reach `quantize_z` (→ `i64::MAX`
-            // cache aliasing) or `nearest_sweep` (NaN distance comparisons).
-            part.parse::<f64>()
-                .ok()
-                .filter(|v| v.is_finite())
-                .ok_or_else(|| {
-                    DataServerError::InvalidParameter(format!(
-                        "Invalid `z` value '{part}' — expected a finite number"
-                    ))
-                })
+            parse_z_value(part)
         })
         .collect::<Result<_, _>>()?;
-    Ok((!levels.is_empty()).then_some(levels))
+    Ok((!levels.is_empty()).then_some(ZSelector::Levels(levels)))
+}
+
+/// Resolve a [`ZSelector`] into the concrete level list an engine samples.
+///
+/// - `Levels` pass through unchanged (the engine snaps each to its nearest
+///   available level).
+/// - `Interval { min, max }` expands to the collection's advertised levels
+///   that fall within `[min, max]` (inclusive). An interval that selects no
+///   advertised level is a 400 — the caller asked for a band the collection
+///   doesn't cover.
+///
+/// `extent` is the collection's advertised vertical levels; it must be
+/// present for an interval (callers gate `z` against a missing vertical
+/// dimension first).
+pub fn resolve_z_levels(
+    sel: &ZSelector,
+    extent: Option<&ds_core::vertical::VerticalDimension>,
+) -> Result<Vec<f64>, DataServerError> {
+    match sel {
+        ZSelector::Levels(v) => Ok(v.clone()),
+        ZSelector::Interval { min, max } => {
+            let levels = extent.map(|e| e.levels.as_slice()).ok_or_else(|| {
+                DataServerError::InvalidParameter(
+                    "a `z` interval needs a collection with a vertical extent".into(),
+                )
+            })?;
+            let selected: Vec<f64> = levels
+                .iter()
+                .copied()
+                .filter(|v| *v >= *min && *v <= *max)
+                .collect();
+            if selected.is_empty() {
+                return Err(DataServerError::InvalidParameter(format!(
+                    "`z` interval {min}/{max} selects none of the collection's \
+                     available levels"
+                )));
+            }
+            Ok(selected)
+        }
+    }
 }
 
 /// Split a position-query `coords` value into one or more `POINT(lon lat)` WKT
@@ -212,6 +281,89 @@ fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ds_core::vertical::{VerticalDimension, VerticalKind};
+
+    #[test]
+    fn parse_z_none_and_blank() {
+        assert_eq!(parse_z(None).unwrap(), None);
+        assert_eq!(parse_z(Some("   ")).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_z_single_and_list() {
+        assert_eq!(
+            parse_z(Some("0.5")).unwrap(),
+            Some(ZSelector::Levels(vec![0.5]))
+        );
+        assert_eq!(
+            parse_z(Some("850,700,500")).unwrap(),
+            Some(ZSelector::Levels(vec![850.0, 700.0, 500.0]))
+        );
+    }
+
+    #[test]
+    fn parse_z_interval_orders_endpoints() {
+        assert_eq!(
+            parse_z(Some("0.3/15")).unwrap(),
+            Some(ZSelector::Interval {
+                min: 0.3,
+                max: 15.0
+            })
+        );
+        // Reversed endpoints normalise to (min, max).
+        assert_eq!(
+            parse_z(Some("850/500")).unwrap(),
+            Some(ZSelector::Interval {
+                min: 500.0,
+                max: 850.0
+            })
+        );
+    }
+
+    #[test]
+    fn parse_z_rejects_bad_interval_and_values() {
+        assert!(parse_z(Some("1/2/3")).is_err());
+        assert!(parse_z(Some("a/2")).is_err());
+        assert!(parse_z(Some("nan")).is_err());
+        assert!(parse_z(Some("1,,3")).is_err());
+    }
+
+    #[test]
+    fn resolve_z_levels_passes_through_list() {
+        let sel = ZSelector::Levels(vec![1.5, 9.0]);
+        assert_eq!(resolve_z_levels(&sel, None).unwrap(), vec![1.5, 9.0]);
+    }
+
+    #[test]
+    fn resolve_z_levels_expands_interval_against_extent() {
+        let ext = VerticalDimension::new(
+            VerticalKind::ElevationAngle,
+            vec![
+                0.3, 0.7, 1.5, 2.0, 3.0, 5.0, 7.0, 9.0, 11.0, 15.0, 25.0, 45.0,
+            ],
+        );
+        let sel = ZSelector::Interval {
+            min: 0.3,
+            max: 15.0,
+        };
+        let got = resolve_z_levels(&sel, Some(&ext)).unwrap();
+        assert_eq!(
+            got,
+            vec![0.3, 0.7, 1.5, 2.0, 3.0, 5.0, 7.0, 9.0, 11.0, 15.0]
+        );
+    }
+
+    #[test]
+    fn resolve_z_levels_interval_outside_extent_is_error() {
+        let ext = VerticalDimension::new(VerticalKind::ElevationAngle, vec![0.3, 0.7, 1.5]);
+        let sel = ZSelector::Interval {
+            min: 20.0,
+            max: 30.0,
+        };
+        assert!(resolve_z_levels(&sel, Some(&ext)).is_err());
+        // An interval with no extent at all is also an error.
+        assert!(resolve_z_levels(&sel, None).is_err());
+    }
 
     #[test]
     fn single_point_passthrough() {

@@ -865,14 +865,15 @@ fn pvol_edr_query_trajectory_returns_section() {
     };
     // A ~50 km north-bound leg starting south-west of Anjalankoski
     // (~27.1°E, 60.9°N), so the path crosses the radar's lowest sweep
-    // coverage along its length.
+    // coverage along its length. `z` here selects the 0.5°–5° elevation
+    // angle band (the cross-section's vertical axis is derived height).
     let coords = "LINESTRING(27.1 60.6, 27.1 61.1)";
     let response = EdrEngine::query_trajectory(
         &engine,
         coords,
         None,
         Some(&["DBZH".to_string()]),
-        Some(&[0.0, 6_000.0]),
+        Some(&[0.5, 5.0]),
     )
     .expect("trajectory query inside radar coverage");
     let qr = match &response {
@@ -919,14 +920,14 @@ fn pvol_edr_query_trajectory_out_of_coverage_yields_empty_cells() {
         return;
     };
     // A line near the antipode of FMI radars — every sample is out of
-    // range.
+    // range. `z` selects a low elevation-angle band.
     let coords = "LINESTRING(-150 -30, -150 -29)";
     match EdrEngine::query_trajectory(
         &engine,
         coords,
         None,
         Some(&["DBZH".to_string()]),
-        Some(&[0.0, 4_000.0]),
+        Some(&[0.5, 3.0]),
     ) {
         Ok(response) => {
             let qr = match response {

@@ -1547,51 +1547,51 @@ fn resample_path(vertices: &[(f64, f64)]) -> Vec<(f64, f64)> {
     out
 }
 
-/// Resolve the cross-section z (height-above-antenna) axis. `z`
-/// semantics for trajectory queries:
-///   - `None` / empty → 0..top with `TRAJECTORY_DEFAULT_Z_STEP_M`
-///     spacing, where `top` is the radar's highest sweep top height at
-///     200 km slant range (a reasonable ceiling for radar coverage).
-///   - `Some(&[h])` → single-height slice (degenerate Section).
-///   - `Some(&[hmin, hmax])` → regularly-spaced levels covering the
-///     range with the default step.
-///   - `Some(&[..])` (3+) → those exact levels, sorted + deduped.
-fn resolve_heights(z: Option<&[f64]>, top_default: f64) -> Vec<f64> {
-    fn regular(min: f64, max: f64) -> Vec<f64> {
-        let lo = min.min(max).max(0.0);
-        let hi = min.max(max).max(lo);
-        if (hi - lo).abs() < f64::EPSILON {
-            return vec![lo];
-        }
-        let n = (((hi - lo) / TRAJECTORY_DEFAULT_Z_STEP_M).ceil() as usize + 1)
-            .clamp(2, TRAJECTORY_MAX_Z_LEVELS);
-        let step = (hi - lo) / (n - 1) as f64;
-        (0..n).map(|i| lo + i as f64 * step).collect()
-    }
-    match z {
-        None | Some(&[]) => regular(0.0, top_default.max(TRAJECTORY_DEFAULT_Z_STEP_M)),
-        // Negative values are rejected upstream in `query_trajectory`,
-        // so each arm here can take its input verbatim. `.max(0.0)`
-        // kept on the single-value arm as belt-and-braces (the kind
-        // could one day be called from a non-trajectory path).
-        Some([h]) => vec![h.max(0.0)],
-        Some([a, b]) => regular(*a, *b),
-        Some(levels) => {
-            // Dedup tolerance is 1 mm rather than `f64::EPSILON`:
-            // metre-scale heights produced by floating-point arithmetic
-            // can differ by sub-millimetre noise, which `EPSILON`
-            // (~2.2e-16) would not collapse. 1 mm is sub-resolution for
-            // every meteorological vertical axis here. Flagged by
-            // claude-review on PR #275.
-            let mut v: Vec<f64> = levels.iter().copied().filter(|x| x.is_finite()).collect();
-            v.sort_by(f64::total_cmp);
-            v.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
-            if v.len() > TRAJECTORY_MAX_Z_LEVELS {
-                v.truncate(TRAJECTORY_MAX_Z_LEVELS);
+/// The elevation-angle window `[lo, hi]` (degrees) for a cross-section.
+///
+/// `z` carries the requested elevation angles (resolved by the API layer
+/// against the collection's advertised extent — an interval `0.3/15`
+/// arrives as the angles in range). `None`/empty selects the volume's
+/// full sweep span. The window is clamped to the volume's actual sweep
+/// range so a heterogeneous fleet (a site missing an advertised angle)
+/// degrades to nodata rather than fabricating data. `None` only when the
+/// volume has no finite sweeps.
+fn angle_window(z: Option<&[f64]>, volume: &PolarVolume) -> Option<(f64, f64)> {
+    let (smin, smax) = sweep_envelope(volume)?;
+    match z.filter(|s| !s.is_empty()) {
+        None => Some((smin, smax)),
+        Some(zs) => {
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for &v in zs.iter().filter(|v| v.is_finite()) {
+                lo = lo.min(v);
+                hi = hi.max(v);
             }
-            v
+            if !lo.is_finite() {
+                return Some((smin, smax));
+            }
+            // Clamp into the site's surveyed range.
+            Some((lo.max(smin), hi.min(smax)))
         }
     }
+}
+
+/// Build the cross-section height axis (metres above antenna): a regular
+/// `0..top` grid where `top` is the height of the `hi_angle` beam at the
+/// path's farthest ground distance, clamped to `[step, 25 km]` and capped
+/// at `TRAJECTORY_MAX_Z_LEVELS`. Selecting a lower top elevation angle (a
+/// narrower `z`) therefore zooms the vertical axis onto that band.
+fn height_axis(hi_angle_deg: f64, max_ground_dist_m: f64) -> Vec<f64> {
+    // The ground distance is a close slant-range proxy at the low
+    // elevation angles that dominate radar coverage — accurate enough for
+    // an axis ceiling.
+    let r = max_ground_dist_m.max(1_000.0);
+    let (_, h) = slant_to_ground_height(r, hi_angle_deg.max(0.0));
+    let top = h.clamp(TRAJECTORY_DEFAULT_Z_STEP_M, 25_000.0);
+    let n =
+        ((top / TRAJECTORY_DEFAULT_Z_STEP_M).ceil() as usize + 1).clamp(2, TRAJECTORY_MAX_Z_LEVELS);
+    let step = top / (n - 1) as f64;
+    (0..n).map(|i| i as f64 * step).collect()
 }
 
 /// Tolerance (degrees) for the sweep-envelope guard in
@@ -1682,47 +1682,22 @@ fn sample_polar_slant(
     )
 }
 
-/// Heuristic "top of radar coverage" used when `z` is unspecified. The
-/// height of the highest sweep at 200 km slant range, under the
-/// 4/3-Earth model — gives a meaningful ceiling for the default z axis
-/// without hard-coding an altitude. Clamped to `[2 km, 25 km]` so a
-/// vertically pointing or 90°-pointing research radar does not blow
-/// the default axis up past the troposphere (flagged by claude-review
-/// on PR #275 — `TRAJECTORY_MAX_Z_LEVELS = 100` would otherwise produce
-/// km-spaced default levels for top-el ≈ 90°).
-fn coverage_top_default(volume: &PolarVolume) -> f64 {
-    let top_el = volume
-        .sweeps
-        .iter()
-        .map(|s| s.elangle)
-        .filter(|v| v.is_finite())
-        .fold(f64::NEG_INFINITY, f64::max);
-    let raw = if top_el.is_finite() {
-        let (_, h) = slant_to_ground_height(200_000.0, top_el);
-        h
-    } else {
-        15_000.0
-    };
-    raw.clamp(2_000.0, 25_000.0)
-}
-
 /// Build one `Section` coverage: the volume's polar field resampled on
 /// `(along-path-distance, height-above-antenna)` and exposed via the
 /// CoverageJSON composite axis `[t, lon, lat]` plus a numeric `z` axis
-/// in metres.
+/// in metres. `envelope` is the elevation-angle window `[lo, hi]` — cells
+/// whose 4/3-Earth-inverted beam angle falls outside it become nodata, so
+/// the caller's `z` angle selection drives which sweeps contribute.
 fn volume_section(
     entry: &VolumeEntry,
     path: &[(f64, f64)],
     heights_m: &[f64],
     quantities: &[String],
+    envelope: (f64, f64),
 ) -> Option<QueryResult> {
     if path.len() < 2 || heights_m.is_empty() || quantities.is_empty() {
         return None;
     }
-    // Pre-compute the sweep envelope once per volume — `sample_polar_slant`
-    // would otherwise refold over every sweep on every cell. A volume with
-    // no finite sweep angles cannot be sampled at all.
-    let envelope = sweep_envelope(&entry.volume)?;
     let site = &entry.volume.site;
     let t = entry.volume.time;
     let nodes: Vec<(DateTime<Utc>, f64, f64)> =
@@ -2051,7 +2026,15 @@ impl EdrEngine for PolarVolumeEngine {
     /// Trajectory query — a vertical cross-section along a WKT
     /// `LINESTRING`. Returns a `Section` coverage per timestep: the
     /// composite axis carries one `(t, lon, lat)` triple per along-path
-    /// node; the `z` axis is height above the antenna in metres.
+    /// node; the `z` axis is **height above the antenna in metres**
+    /// (derived via the 4/3-Earth beam geometry).
+    ///
+    /// `z` *selects elevation angles* — it matches the collection's
+    /// advertised vertical extent (sweep angles in degrees), resolved by
+    /// the API layer so an interval `z=0.3/15` arrives as the angles in
+    /// range. The selected `[min, max]` angle window bounds which sweeps
+    /// contribute and sizes the derived height axis; cells whose beam
+    /// angle falls outside the window are nodata. `None` uses every sweep.
     ///
     /// **Single radar per cross-section**: the site nearest the path
     /// centroid is picked, and the whole Section is sampled against
@@ -2069,18 +2052,6 @@ impl EdrEngine for PolarVolumeEngine {
         if path.len() < 2 {
             return Err(DataServerError::InvalidParameter(
                 "LINESTRING must trace a non-degenerate path".into(),
-            ));
-        }
-        // Reject negative `z` values up-front. `resolve_heights` would
-        // otherwise clamp them silently (single-value arm) or pass them
-        // through (3+ arm), advertising a "Height above antenna"
-        // (direction: up) axis with negative values that are physically
-        // impossible. A 400 surfaces the mistake to the caller rather
-        // than burying it in an all-None response row. Found by
-        // claude-review on PR #275.
-        if z.is_some_and(|levels| levels.iter().any(|&h| h < 0.0)) {
-            return Err(DataServerError::InvalidParameter(
-                "trajectory `z` values must be ≥ 0 (metres above antenna)".into(),
             ));
         }
 
@@ -2119,27 +2090,22 @@ impl EdrEngine for PolarVolumeEngine {
 
         let quantities = resolve_quantities(&selected, parameters)?;
 
-        // Vertical axis defaults derive from the most recent volume's
-        // sweep envelope — a heterogeneous fleet then still gets a
-        // matching scale.
-        let top_default = coverage_top_default(&selected.last().unwrap().volume);
-        let heights = resolve_heights(z, top_default);
-        // When the caller passed explicit levels and the 1 mm-tolerance
-        // dedup collapsed some, surface that — it's a benign noise-removal
-        // most of the time, but logging it means a user who fat-fingered
-        // two near-identical levels can see why their axis shrank rather
-        // than silently getting fewer rows than requested.
-        if let Some(requested) = z {
-            if requested.len() > 2 && heights.len() < requested.len() {
-                tracing::debug!(
-                    "[{}] trajectory z: {} requested level(s) collapsed to {} after \
-                     1mm-tolerance dedup",
-                    self.collection_id,
-                    requested.len(),
-                    heights.len()
-                );
-            }
-        }
+        // `z` carries the requested elevation angles (resolved by the API
+        // layer against the advertised extent). Derive the angle window
+        // and the matching height axis from the most recent volume.
+        let ref_volume = &selected.last().unwrap().volume;
+        let window = angle_window(z, ref_volume).ok_or_else(|| {
+            DataServerError::Engine("PVOL volume has no finite sweep angles".into())
+        })?;
+        // The path's farthest ground distance from the radar sizes the
+        // height-axis ceiling for the selected top angle.
+        let max_ground_dist = path
+            .iter()
+            .map(|&(lon, lat)| {
+                ground_distance_bearing(ref_volume.site.lon, ref_volume.site.lat, lon, lat).0
+            })
+            .fold(0.0_f64, f64::max);
+        let heights = height_axis(window.1, max_ground_dist);
         if heights.is_empty() {
             return Err(DataServerError::InvalidParameter(
                 "trajectory `z` resolved to an empty axis".into(),
@@ -2148,7 +2114,7 @@ impl EdrEngine for PolarVolumeEngine {
 
         let coverages: Vec<QueryResult> = selected
             .iter()
-            .filter_map(|e| volume_section(e, &path, &heights, &quantities))
+            .filter_map(|e| volume_section(e, &path, &heights, &quantities, window))
             .collect();
         if coverages.is_empty() {
             return Err(DataServerError::LocationNotFound(
@@ -2361,39 +2327,48 @@ mod tests {
         assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, f64::NAN).is_none());
     }
 
-    /// `coverage_top_default` is clamped to 25 km even for a research
-    /// volume whose highest sweep is near 90° — without the cap, the
-    /// 4/3-Earth height at 200 km slant range for a 90° beam is 200 km,
-    /// and `resolve_heights` would emit 100 levels spaced 2 km apart.
-    /// Found by claude-review on PR #275.
+    /// `angle_window` selects the requested elevation-angle span, clamped
+    /// to the volume's actual sweep range; `None` selects the full span.
     #[test]
-    fn coverage_top_default_caps_at_25km() {
+    fn angle_window_selects_and_clamps() {
         let (site_lon, site_lat) = (25.0, 60.0);
         let mut vol = synthetic_volume(site_lon, site_lat);
-        // Replace the single 0.5° sweep with a vertically-pointing one.
-        vol.sweeps[0].elangle = 89.5;
-        let top = coverage_top_default(&vol);
-        assert!(
-            top <= 25_000.0 + 1.0,
-            "expected ceiling clamp at 25 km, got {top}"
-        );
-        assert!(top >= 2_000.0, "floor still respected, got {top}");
+        // Give it a fan of sweeps 0.5°..15°.
+        let base = vol.sweeps[0].clone();
+        vol.sweeps = [0.5, 1.5, 5.0, 9.0, 15.0]
+            .iter()
+            .map(|&el| {
+                let mut s = base.clone();
+                s.elangle = el;
+                s
+            })
+            .collect();
+
+        // No z → full sweep span.
+        assert_eq!(angle_window(None, &vol), Some((0.5, 15.0)));
+        // A sub-range → exactly that window.
+        assert_eq!(angle_window(Some(&[1.5, 5.0, 9.0]), &vol), Some((1.5, 9.0)));
+        // A request past the top sweep clamps to the surveyed range.
+        assert_eq!(angle_window(Some(&[5.0, 45.0]), &vol), Some((5.0, 15.0)));
     }
 
-    /// `resolve_heights` collapses near-duplicate explicit levels at a
-    /// millimetre tolerance, not at `f64::EPSILON`. Two levels differing
-    /// by sub-mm noise from float arithmetic must not survive as
-    /// separate axis points.
+    /// `height_axis` builds a monotonic 0..top grid whose ceiling tracks
+    /// the selected top angle and is clamped to ≤ 25 km.
     #[test]
-    fn resolve_heights_dedups_at_millimetre_tolerance() {
-        // 1 mm apart — would NOT dedup at `EPSILON`, but does at 1e-3.
-        let levels = [1_000.0_f64, 1_000.000_001, 2_000.0];
-        let out = resolve_heights(Some(&levels), 15_000.0);
-        assert_eq!(out.len(), 2, "1 mm-apart levels must collapse, got {out:?}");
-        // 1 cm apart — still distinct.
-        let levels = [1_000.0_f64, 1_000.01, 2_000.0];
-        let out = resolve_heights(Some(&levels), 15_000.0);
-        assert_eq!(out.len(), 3, "1 cm-apart levels stay distinct, got {out:?}");
+    fn height_axis_tracks_top_angle_and_caps() {
+        // A 5° beam at 100 km ground distance reaches a few km up.
+        let low = height_axis(5.0, 100_000.0);
+        assert!(low.first() == Some(&0.0), "axis starts at 0");
+        assert!(low.windows(2).all(|w| w[1] > w[0]), "monotonic ascending");
+        assert!(*low.last().unwrap() <= 25_000.0);
+        // A higher top angle reaches higher (taller axis ceiling).
+        let high = height_axis(15.0, 100_000.0);
+        assert!(*high.last().unwrap() > *low.last().unwrap());
+        // A near-vertical beam at long range is capped at 25 km, not
+        // hundreds of km.
+        let capped = height_axis(89.0, 200_000.0);
+        assert!(*capped.last().unwrap() <= 25_000.0 + 1.0);
+        assert!(capped.len() <= 100, "level count capped");
     }
 
     /// Build a synthetic single-site, single-sweep, single-moment
