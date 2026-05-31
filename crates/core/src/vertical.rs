@@ -19,6 +19,12 @@ pub enum VerticalKind {
     Height,
     /// Radar beam elevation angle (degrees). Increasing value is upward.
     ElevationAngle,
+    /// Metres above a radar antenna, used as the cross-section vertical
+    /// axis (`Section` domain). Distinct from `Height` so the
+    /// CoverageJSON `VerticalCRS` axis can carry the antenna-relative
+    /// label rather than a generic "Height" — the value is *not* metres
+    /// above mean sea level.
+    HeightAboveAntenna,
     /// Ordinal model / hybrid level. Increasing value is downward.
     ModelLevel,
     /// Isentropic (potential-temperature) level (K). Increasing value is upward.
@@ -32,6 +38,7 @@ impl VerticalKind {
             VerticalKind::Pressure => "hPa",
             VerticalKind::Height => "m",
             VerticalKind::ElevationAngle => "deg",
+            VerticalKind::HeightAboveAntenna => "m",
             VerticalKind::ModelLevel => "1",
             VerticalKind::Isentropic => "K",
         }
@@ -43,6 +50,7 @@ impl VerticalKind {
             VerticalKind::Pressure => "Pressure",
             VerticalKind::Height => "Height",
             VerticalKind::ElevationAngle => "Elevation angle",
+            VerticalKind::HeightAboveAntenna => "Height above antenna",
             VerticalKind::ModelLevel => "Model level",
             VerticalKind::Isentropic => "Isentropic level",
         }
@@ -53,7 +61,10 @@ impl VerticalKind {
     pub fn direction(self) -> &'static str {
         match self {
             VerticalKind::Pressure | VerticalKind::ModelLevel => "down",
-            VerticalKind::Height | VerticalKind::ElevationAngle | VerticalKind::Isentropic => "up",
+            VerticalKind::Height
+            | VerticalKind::ElevationAngle
+            | VerticalKind::HeightAboveAntenna
+            | VerticalKind::Isentropic => "up",
         }
     }
 }

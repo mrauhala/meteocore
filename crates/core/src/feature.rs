@@ -363,6 +363,88 @@ pub fn parse_point_coords(coords: &str) -> Result<(f64, f64), DataServerError> {
     Ok((lat, lon))
 }
 
+/// Parse a WKT `LINESTRING(lon lat, lon lat, ...)` into a `Vec<(lon, lat)>`
+/// (engine-friendly order — note `parse_point_coords` returns `(lat, lon)`
+/// for legacy reasons; cross-section paths always carry `(lon, lat)` here).
+///
+/// A leading space before `(` is tolerated. `LINESTRINGZ` / `LINESTRINGM` /
+/// `LINESTRINGZM` are rejected — per-node z and time are deferred to a
+/// follow-up. At least two distinct nodes are required (a single node is
+/// not a path; the position query covers that case).
+pub fn parse_linestring_coords(coords: &str) -> Result<Vec<(f64, f64)>, DataServerError> {
+    let trimmed = coords.trim();
+
+    // Reject Z/M variants explicitly so the error message points at the
+    // dimensional mismatch rather than failing as "not a number".
+    for variant in ["LINESTRINGZM", "LINESTRINGZ", "LINESTRINGM"] {
+        if trimmed.len() >= variant.len() && trimmed[..variant.len()].eq_ignore_ascii_case(variant)
+        {
+            return Err(DataServerError::InvalidParameter(format!(
+                "{variant} is not supported — pass a plain 2-D LINESTRING(lon lat, lon lat, …)"
+            )));
+        }
+    }
+
+    let inner = strip_wkt_prefix(trimmed, "LINESTRING").ok_or_else(|| {
+        DataServerError::InvalidParameter(
+            "Expected WKT LINESTRING(lon lat, lon lat, …) geometry".into(),
+        )
+    })?;
+
+    let mut nodes = Vec::new();
+    for part in inner.split(',') {
+        let tokens: Vec<&str> = part.split_whitespace().collect();
+        if tokens.len() != 2 {
+            return Err(DataServerError::InvalidParameter(format!(
+                "LINESTRING node '{}' is not 'lon lat'",
+                part.trim()
+            )));
+        }
+        let lon: f64 = tokens[0].parse().map_err(|_| {
+            DataServerError::InvalidParameter(format!("Invalid longitude: {}", tokens[0]))
+        })?;
+        let lat: f64 = tokens[1].parse().map_err(|_| {
+            DataServerError::InvalidParameter(format!("Invalid latitude: {}", tokens[1]))
+        })?;
+        if !lon.is_finite() || !lat.is_finite() {
+            return Err(DataServerError::InvalidParameter(
+                "LINESTRING coordinates must be finite".into(),
+            ));
+        }
+        if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
+            return Err(DataServerError::InvalidParameter(format!(
+                "LINESTRING node out of range: lon={lon}, lat={lat}"
+            )));
+        }
+        nodes.push((lon, lat));
+    }
+
+    if nodes.len() < 2 {
+        return Err(DataServerError::InvalidParameter(
+            "LINESTRING must have at least two nodes — use POINT(...) for a single location".into(),
+        ));
+    }
+
+    Ok(nodes)
+}
+
+/// Strip a leading `KEYWORD(` / `KEYWORD (` and the matching trailing `)`.
+/// Case-insensitive on the keyword. Returns `None` when the input does not
+/// match the wrapper shape.
+fn strip_wkt_prefix<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
+    if s.len() < keyword.len() + 2 {
+        return None;
+    }
+    if !s[..keyword.len()].eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let after = s[keyword.len()..].trim_start();
+    after
+        .strip_prefix('(')
+        .and_then(|inner| inner.strip_suffix(')'))
+        .map(str::trim)
+}
+
 /// A typed property value. Keeps ds-core free of serde_json.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PropertyValue {
@@ -684,5 +766,40 @@ mod tests {
         // Non-finite.
         assert!(parse_point_coords("NaN, 10.0").is_err());
         assert!(parse_point_coords("inf, 10.0").is_err());
+    }
+
+    #[test]
+    fn parse_linestring_accepts_two_or_more_nodes() {
+        let nodes = parse_linestring_coords("LINESTRING(10 50, 11 51)").unwrap();
+        assert_eq!(nodes, vec![(10.0, 50.0), (11.0, 51.0)]);
+
+        let nodes =
+            parse_linestring_coords("linestring ( 24.94 60.17 , 25.5 60.5 , 26.0 61.0 )").unwrap();
+        assert_eq!(nodes.len(), 3);
+        assert!((nodes[2].0 - 26.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_linestring_rejects_z_and_m_variants() {
+        for s in [
+            "LINESTRINGZ(10 50 0, 11 51 100)",
+            "LINESTRINGM(10 50 0, 11 51 1)",
+            "LINESTRINGZM(10 50 0 1, 11 51 100 2)",
+        ] {
+            let err = parse_linestring_coords(s).unwrap_err();
+            assert!(
+                format!("{err:?}").contains("not supported"),
+                "expected Z/M-rejected error, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_linestring_rejects_single_node_and_malformed() {
+        assert!(parse_linestring_coords("LINESTRING(10 50)").is_err());
+        assert!(parse_linestring_coords("LINESTRING(10, 50)").is_err());
+        assert!(parse_linestring_coords("POINT(10 50)").is_err());
+        assert!(parse_linestring_coords("LINESTRING(200 50, 11 51)").is_err());
+        assert!(parse_linestring_coords("LINESTRING(NaN 50, 11 51)").is_err());
     }
 }

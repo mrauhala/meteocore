@@ -132,6 +132,9 @@ fn build_panel(param: &str, coverages: &[QueryResult]) -> Result<Panel, DataServ
         DomainDescription::Grid { .. } => Err(DataServerError::InvalidParameter(
             "PNG output is not available for gridded (area) responses".into(),
         )),
+        DomainDescription::Section { .. } => Err(DataServerError::InvalidParameter(
+            "PNG output is not available for cross-section (trajectory) responses".into(),
+        )),
     }
 }
 
@@ -141,6 +144,7 @@ fn domain_kind(d: &DomainDescription) -> &'static str {
         DomainDescription::VerticalProfile { .. } => "VerticalProfile",
         DomainDescription::PointSeries { .. } => "PointSeries",
         DomainDescription::Grid { .. } => "Grid",
+        DomainDescription::Section { .. } => "Section",
     }
 }
 

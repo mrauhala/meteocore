@@ -18,7 +18,7 @@ use ds_render::render_chart;
 
 use crate::params::{
     parse_edr_format, parse_z, plot_dimensions, split_position_coords, AreaQueryParams, EdrFormat,
-    LocationQueryParams, PositionQueryParams,
+    LocationQueryParams, PositionQueryParams, TrajectoryQueryParams,
 };
 use crate::plot_convert::coverage_response_to_panels;
 use crate::response::{coverage_response_to_json, locations_to_geojson, LocationsContext};
@@ -313,6 +313,37 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 }
             }
         });
+
+        // Trajectory query (vertical cross-section). Engines that don't
+        // support it return an `InvalidParameter` 400 — same precedent
+        // as the unconditional `/area` and `/position` entries above.
+        let trajectory_path = format!("/edr/collections/{id}/trajectory");
+        collection_paths[&trajectory_path] = json!({
+            "get": {
+                "summary": format!("Trajectory cross-section for {}", config.title),
+                "operationId": format!("getTrajectory_{id}"),
+                "tags": [id],
+                "parameters": [
+                    {"$ref": "#/components/parameters/coords-linestring"},
+                    {"$ref": "#/components/parameters/datetime"},
+                    {"$ref": "#/components/parameters/parameter-name"},
+                    {"$ref": "#/components/parameters/z-trajectory"}
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Coverage data — CoverageJSON Section domain",
+                        "content": {
+                            "application/prs.coverage+json": {
+                                "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                            }
+                        }
+                    },
+                    "400": {"description": "Bad request"},
+                    "404": {"description": "Not found"},
+                    "500": {"description": "Server error"}
+                }
+            }
+        });
     }
 
     let mut paths = json!({
@@ -397,6 +428,20 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "required": true,
                     "schema": {"type": "string"},
                     "description": "WKT POLYGON geometry, e.g. POLYGON((24 60, 26 60, 26 61, 24 61, 24 60))"
+                },
+                "coords-linestring": {
+                    "name": "coords",
+                    "in": "query",
+                    "required": true,
+                    "schema": {"type": "string"},
+                    "description": "WKT LINESTRING geometry (lon lat, lon lat, …). LINESTRINGZ/M variants are not accepted — per-node z and time will arrive in a follow-up."
+                },
+                "z-trajectory": {
+                    "name": "z",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "description": "Height range for the cross-section z axis, in metres above the radar antenna. Forms: z=H (single-height slice), z=Hmin,Hmax (range bracketed by the default vertical step), z=H1,H2,H3,… (explicit levels). Absent → 0..coverage-top derived from the radar's highest sweep."
                 }
             },
             "schemas": {
@@ -735,6 +780,84 @@ pub async fn area_query(
     ))
 }
 
+pub async fn trajectory_query(
+    Path(id): Path<String>,
+    Query(params): Query<TrajectoryQueryParams>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let state = state.load_full();
+    let (engine, _config) = lookup_collection(&state, &id)?;
+
+    // A Section is a 2-D cross-section — not a single plot.
+    if parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))? == EdrFormat::Png {
+        return Err(bad_request(&DataServerError::InvalidParameter(
+            "PNG output is not available for trajectory queries".into(),
+        )));
+    }
+
+    let datetime = params
+        .datetime
+        .as_deref()
+        .map(parse_datetime_interval)
+        .transpose()
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+            )
+        })?;
+
+    let param_names: Option<Vec<String>> = params
+        .parameter_name
+        .as_deref()
+        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
+
+    let z = parse_z(params.z.as_deref()).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+        )
+    })?;
+    // Trajectory `z` is a height range in metres, not a vertical-extent
+    // pin against the collection's elevation-angle axis, so the standard
+    // `reject_z_without_vertical` gate doesn't apply — the engine accepts
+    // it whenever it can produce a Section.
+
+    let result = engine
+        .query_trajectory(
+            &params.coords,
+            datetime,
+            param_names.as_deref(),
+            z.as_deref(),
+        )
+        .map_err(|e| match &e {
+            ds_core::error::DataServerError::InvalidParameter(_)
+            | ds_core::error::DataServerError::InvalidBbox(_)
+            | ds_core::error::DataServerError::InvalidDatetime(_) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+            ),
+            ds_core::error::DataServerError::LocationNotFound(_)
+            | ds_core::error::DataServerError::CollectionNotFound(_) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "code": "NotFound", "description": e.to_string() })),
+            ),
+            _ => {
+                tracing::error!("Trajectory query error: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "code": "ServerError", "description": "Internal server error" })),
+                )
+            }
+        })?;
+
+    let body = serde_json::to_string(&coverage_response_to_json(&result)).unwrap();
+    Ok((
+        [(header::CONTENT_TYPE, "application/prs.coverage+json")],
+        body,
+    ))
+}
+
 fn build_collection_metadata(
     engine: &dyn EdrEngine,
     config: &CollectionConfig,
@@ -820,6 +943,10 @@ fn build_collection_metadata(
             ),
             "area" => (
                 format!("{base_url}/edr/collections/{}/area", config.id),
+                json!(["CoverageJSON"]),
+            ),
+            "trajectory" => (
+                format!("{base_url}/edr/collections/{}/trajectory", config.id),
                 json!(["CoverageJSON"]),
             ),
             _ => continue,

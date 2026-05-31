@@ -94,4 +94,24 @@ pub trait EdrEngine: Send + Sync {
             "Position query not supported by this engine".into(),
         ))
     }
+
+    /// Execute a trajectory (vertical cross-section) query along a WKT
+    /// `LINESTRING`. The result is a CoverageJSON `Section` domain (or a
+    /// collection of them, one per timestep): a 2-D field over an
+    /// along-path composite axis and a vertical `z` axis. `z`, when set,
+    /// pins the height range — engines free to interpret as a discrete
+    /// list, a `[min, max]` interval, or both.
+    /// Default implementation returns an error.
+    fn query_trajectory(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let _ = (coords, datetime, parameters, z);
+        Err(DataServerError::InvalidParameter(
+            "Trajectory query not supported by this engine".into(),
+        ))
+    }
 }

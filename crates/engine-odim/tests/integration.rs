@@ -847,3 +847,125 @@ fn pvol_edr_query_area_collects_sites() {
         other => panic!("an empty area must be LocationNotFound, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// PolarVolumeEngine — EdrEngine (M4: trajectory cross-sections)
+// ---------------------------------------------------------------------------
+
+/// A trajectory query returns a `Section` coverage whose composite axis
+/// has one `(t, lon, lat)` triple per along-path node and whose `z`
+/// axis is height above antenna in metres. The range ndarray is
+/// `[nodes, z]`, and at least one cell over the radar's own coverage
+/// must sample a finite value.
+#[test]
+fn pvol_edr_query_trajectory_returns_section() {
+    let Some(engine) = pvol_fixture_engine() else {
+        eprintln!("skipping pvol_edr_query_trajectory_returns_section: fixture absent");
+        return;
+    };
+    // A ~50 km north-bound leg starting south-west of Anjalankoski
+    // (~27.1°E, 60.9°N), so the path crosses the radar's lowest sweep
+    // coverage along its length.
+    let coords = "LINESTRING(27.1 60.6, 27.1 61.1)";
+    let response = EdrEngine::query_trajectory(
+        &engine,
+        coords,
+        None,
+        Some(&["DBZH".to_string()]),
+        Some(&[0.0, 6_000.0]),
+    )
+    .expect("trajectory query inside radar coverage");
+    let qr = match &response {
+        CoverageResponse::Single(q) => q.clone(),
+        CoverageResponse::Collection(c) => {
+            assert!(!c.is_empty(), "a non-empty fixture yields ≥1 section");
+            c[0].clone()
+        }
+    };
+
+    let (nodes, z) = match &qr.domain {
+        DomainDescription::Section { nodes, z } => (nodes, z),
+        other => panic!("expected Section domain, got {other:?}"),
+    };
+    assert!(
+        nodes.len() >= 2,
+        "Section path must keep ≥2 along-path nodes"
+    );
+    assert!(z.values.len() >= 2, "Section z axis must have ≥2 levels");
+
+    let dbzh = qr.ranges.get("DBZH").expect("DBZH range");
+    assert_eq!(dbzh.shape, vec![nodes.len(), z.values.len()]);
+    assert_eq!(
+        dbzh.axis_names,
+        vec!["composite".to_string(), "z".to_string()]
+    );
+    let non_none = dbzh.values.iter().filter(|v| v.is_some()).count();
+    assert!(
+        non_none > 0,
+        "a section over the radar's own coverage must sample ≥1 finite value"
+    );
+}
+
+/// A trajectory whose path lies entirely outside any radar's coverage
+/// still yields a Section, but every cell is nodata. Far-out paths
+/// fall back to the catalog's `nearest_site` and produce a Section
+/// shaped against that site's z extent.
+#[test]
+fn pvol_edr_query_trajectory_out_of_coverage_yields_empty_cells() {
+    let Some(engine) = pvol_fixture_engine() else {
+        eprintln!(
+            "skipping pvol_edr_query_trajectory_out_of_coverage_yields_empty_cells: fixture absent"
+        );
+        return;
+    };
+    // A line near the antipode of FMI radars — every sample is out of
+    // range.
+    let coords = "LINESTRING(-150 -30, -150 -29)";
+    match EdrEngine::query_trajectory(
+        &engine,
+        coords,
+        None,
+        Some(&["DBZH".to_string()]),
+        Some(&[0.0, 4_000.0]),
+    ) {
+        Ok(response) => {
+            let qr = match response {
+                CoverageResponse::Single(q) => q,
+                CoverageResponse::Collection(c) => c.into_iter().next().expect("non-empty fixture"),
+            };
+            let dbzh = qr.ranges.get("DBZH").expect("DBZH range");
+            assert!(
+                dbzh.values.iter().all(Option::is_none),
+                "out-of-coverage trajectory must produce all-None values"
+            );
+        }
+        Err(ds_core::error::DataServerError::LocationNotFound(_)) => {
+            // Acceptable degenerate: every selected volume yielded no
+            // Section (e.g. catalog held no sites for the time range).
+        }
+        Err(e) => panic!("unexpected error for far-from-radar trajectory: {e:?}"),
+    }
+}
+
+/// LINESTRING parsing failures bubble up as `InvalidParameter` so the
+/// API layer can map to HTTP 400.
+#[test]
+fn pvol_edr_query_trajectory_rejects_malformed_linestring() {
+    let Some(engine) = pvol_fixture_engine() else {
+        eprintln!(
+            "skipping pvol_edr_query_trajectory_rejects_malformed_linestring: fixture absent"
+        );
+        return;
+    };
+    for bad in [
+        "POINT(27.1 60.9)",
+        "LINESTRING(27.1 60.9)",
+        "LINESTRINGZ(27.1 60.9 0, 27.1 61.1 100)",
+        "LINESTRING(NaN 60.9, 27.1 61.1)",
+    ] {
+        match EdrEngine::query_trajectory(&engine, bad, None, None, None) {
+            Err(ds_core::error::DataServerError::InvalidParameter(_)) => {}
+            other => panic!("expected InvalidParameter for `{bad}`, got {other:?}"),
+        }
+    }
+}

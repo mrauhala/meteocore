@@ -697,3 +697,63 @@ fn grid_with_z_validates() {
     assert!(json["domain"]["axes"]["z"]["values"].is_array());
     validate(&json, &schema);
 }
+
+// --- Section domain (#198 — radar cross-section / trajectory) ---
+
+#[test]
+fn section_coverage_validates_against_schema() {
+    let schema = load_schema();
+    let t = make_time(12);
+    let nodes = vec![
+        (t, 24.0, 60.0),
+        (t, 24.5, 60.25),
+        (t, 25.0, 60.5),
+        (t, 25.5, 60.75),
+    ];
+    let heights = vec![0.0, 500.0, 1000.0, 2000.0, 5000.0];
+    let mut parameters = HashMap::new();
+    parameters.insert(
+        "DBZH".to_string(),
+        ParameterDescription {
+            label: "Reflectivity".to_string(),
+            unit: "dBZ".to_string(),
+            observed_property: "DBZH".to_string(),
+        },
+    );
+    let mut ranges = HashMap::new();
+    let values: Vec<Option<f64>> = (0..nodes.len() * heights.len())
+        .map(|i| if i % 3 == 0 { None } else { Some(i as f64) })
+        .collect();
+    ranges.insert(
+        "DBZH".to_string(),
+        NdArray {
+            shape: vec![nodes.len(), heights.len()],
+            axis_names: vec!["composite".to_string(), "z".to_string()],
+            values,
+        },
+    );
+
+    let result = QueryResult {
+        domain: DomainDescription::Section {
+            nodes,
+            z: VerticalCoord {
+                kind: VerticalKind::HeightAboveAntenna,
+                values: heights,
+            },
+        },
+        parameters,
+        ranges,
+    };
+
+    let json = query_result_to_coverage_json(&result);
+    assert_eq!(json["domain"]["domainType"], "Section");
+    let composite = &json["domain"]["axes"]["composite"];
+    assert_eq!(composite["dataType"], "tuple");
+    assert_eq!(composite["coordinates"], serde_json::json!(["t", "x", "y"]));
+    assert!(composite["values"].is_array());
+    let first = &composite["values"][0];
+    assert_eq!(first.as_array().unwrap().len(), 3);
+    assert!(json["domain"]["axes"]["z"]["values"].is_array());
+
+    validate(&json, &schema);
+}

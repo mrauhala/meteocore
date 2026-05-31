@@ -69,6 +69,25 @@ pub struct AreaQueryParams {
     pub f: Option<String>,
 }
 
+/// Trajectory (vertical cross-section) query parameters. Accepts a WKT
+/// `LINESTRING(lon lat, lon lat, …)` and the standard EDR filters; `z`
+/// here selects the *height* axis (metres above antenna), with the same
+/// "single height pins a slice, two values bracket a range" semantics
+/// used elsewhere. The corridor variant (`corridor-width` /
+/// `corridor-height`) ships in a follow-up.
+#[derive(Debug, Deserialize)]
+pub struct TrajectoryQueryParams {
+    pub coords: String,
+    pub datetime: Option<String>,
+    #[serde(rename = "parameter-name")]
+    pub parameter_name: Option<String>,
+    pub z: Option<String>,
+    /// Output format. Trajectory queries return a `Section` domain —
+    /// a 2-D cross-section, not a single plot — so `f=PNG` is rejected
+    /// (same precedent as `area_query`).
+    pub f: Option<String>,
+}
+
 /// Parse the EDR `z` query parameter — a comma-separated list of numeric
 /// vertical levels (e.g. `z=850,700,500` or a single `z=0.5`). An absent
 /// or blank value yields `None` (the whole vertical extent / a profile).
