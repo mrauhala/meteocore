@@ -895,15 +895,26 @@ fn build_collection_metadata(
     }
 
     // Vertical extent — advertise the available levels so a client knows
-    // what `z` values it may request. `vrs` is intentionally omitted:
-    // vertical coordinate kinds like radar elevation angle have no
-    // standard OGC vertical-CRS URI, and `vrs` is optional in OGC EDR.
+    // what `z` values it may request.
+    //
+    // OGC EDR 1.1 requires `interval` items, `values` items, and `vrs`
+    // — and `interval`/`values` are typed as STRINGS in the schema
+    // (lines 670–676 of `schemas/ogcapi-edr-1.1-bundled.json`), not
+    // numbers. Floats round-trip through `Display` so a client can
+    // parse them back when needed. `vrs` is taken from the kind's
+    // built-in WKT/URI so a radar collection still validates against
+    // the EDR schema.
     if let Some(vertical) = engine.get_vertical_extent() {
         let mut vertical_obj = serde_json::Map::new();
         if let Some((lo, hi)) = vertical.extent() {
-            vertical_obj.insert("interval".to_string(), json!([[lo, hi]]));
+            vertical_obj.insert(
+                "interval".to_string(),
+                json!([[lo.to_string(), hi.to_string()]]),
+            );
         }
-        vertical_obj.insert("values".to_string(), json!(vertical.levels));
+        let values: Vec<String> = vertical.levels.iter().map(|v| v.to_string()).collect();
+        vertical_obj.insert("values".to_string(), json!(values));
+        vertical_obj.insert("vrs".to_string(), json!(vertical.kind.vrs()));
         extent.insert("vertical".to_string(), json!(vertical_obj));
     }
 

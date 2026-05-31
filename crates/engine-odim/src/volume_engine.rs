@@ -1516,8 +1516,8 @@ fn resample_path(vertices: &[(f64, f64)]) -> Vec<(f64, f64)> {
         // single-cell domain telling the user what happened.
         return vec![vertices[0], *vertices.last().unwrap()];
     }
-    let n = ((total / TRAJECTORY_NODE_SPACING_M).ceil() as usize + 1)
-        .clamp(2, TRAJECTORY_MAX_NODES);
+    let n =
+        ((total / TRAJECTORY_NODE_SPACING_M).ceil() as usize + 1).clamp(2, TRAJECTORY_MAX_NODES);
     let step = total / (n - 1) as f64;
 
     let mut out = Vec::with_capacity(n);

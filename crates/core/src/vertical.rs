@@ -67,6 +67,49 @@ impl VerticalKind {
             | VerticalKind::Isentropic => "up",
         }
     }
+
+    /// Vertical reference system string for OGC EDR collection metadata
+    /// (`extent.vertical.vrs`). The OGC EDR 1.1 schema marks `vrs` as a
+    /// required string with no standard URI for non-altimetric kinds
+    /// (radar elevation, model level, isentropic), so we emit a WKT2
+    /// `VERTCRS[...]` describing the axis. For `Height` an EPSG URI is
+    /// available and preferred; everything else uses an inline WKT.
+    pub fn vrs(self) -> &'static str {
+        match self {
+            // EPSG:5714 = "MSL height", the closest match for altimetric height.
+            VerticalKind::Height => "http://www.opengis.net/def/crs/EPSG/0/5714",
+            // EPSG:5798 = "WMO standard atmospheric pressure" — pressure altitude.
+            VerticalKind::Pressure => "http://www.opengis.net/def/crs/EPSG/0/5798",
+            VerticalKind::ElevationAngle => {
+                "VERTCRS[\"Elevation angle\",\
+                 VDATUM[\"Antenna horizon\"],\
+                 CS[vertical,1],\
+                 AXIS[\"Elevation (deg)\",up],\
+                 UNIT[\"degree\",0.0174532925199433]]"
+            }
+            VerticalKind::HeightAboveAntenna => {
+                "VERTCRS[\"Height above antenna\",\
+                 VDATUM[\"Antenna phase centre\"],\
+                 CS[vertical,1],\
+                 AXIS[\"Height (m)\",up],\
+                 UNIT[\"metre\",1]]"
+            }
+            VerticalKind::ModelLevel => {
+                "VERTCRS[\"Model level\",\
+                 VDATUM[\"Model surface\"],\
+                 CS[vertical,1],\
+                 AXIS[\"Level\",down],\
+                 UNIT[\"unity\",1]]"
+            }
+            VerticalKind::Isentropic => {
+                "VERTCRS[\"Isentropic\",\
+                 VDATUM[\"Potential temperature\"],\
+                 CS[vertical,1],\
+                 AXIS[\"Theta (K)\",up],\
+                 UNIT[\"kelvin\",1]]"
+            }
+        }
+    }
 }
 
 /// A collection's single vertical axis: the kind of coordinate plus the

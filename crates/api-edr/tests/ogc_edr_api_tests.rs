@@ -412,6 +412,90 @@ mod collections {
         }
     }
 
+    /// `/collections` validates against the OGC EDR 1.1 bundled OpenAPI
+    /// schema for `GET /collections` 200 `application/json`. The
+    /// `extent.vertical` block in particular requires `vrs` and typed
+    /// strings for `interval` / `values` — this test guards against the
+    /// regressions that broke a real radar collection. A dedicated
+    /// vertical-aware mock fires that branch without disturbing the
+    /// `no-vertical` invariant the rest of the suite relies on.
+    #[tokio::test]
+    async fn listing_validates_against_ogc_edr_schema() {
+        // Reuse MockEngine for everything except `get_vertical_extent`
+        // by wrapping it — that way every other handler invariant
+        // (locations, parameters, etc.) is exercised identically.
+        struct VerticalMockEngine(MockEngine);
+        impl EdrEngine for VerticalMockEngine {
+            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+                self.0.get_locations()
+            }
+            fn query_location(
+                &self,
+                location_id: &str,
+                dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                params: Option<&[String]>,
+                z: Option<&[f64]>,
+            ) -> Result<CoverageResponse, DataServerError> {
+                self.0.query_location(location_id, dt, params, z)
+            }
+            fn get_parameters(&self) -> Vec<String> {
+                self.0.get_parameters()
+            }
+            fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+                self.0.get_temporal_extent()
+            }
+            fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+                self.0.get_spatial_extent()
+            }
+            fn get_vertical_extent(&self) -> Option<ds_core::vertical::VerticalDimension> {
+                Some(ds_core::vertical::VerticalDimension::new(
+                    ds_core::vertical::VerticalKind::Pressure,
+                    vec![1000.0, 850.0, 700.0, 500.0, 250.0],
+                ))
+            }
+            fn supported_query_types(&self) -> Vec<String> {
+                self.0.supported_query_types()
+            }
+        }
+
+        let engine: Arc<dyn EdrEngine> = Arc::new(VerticalMockEngine(MockEngine));
+        let router = api_edr::router(make_edr_state(engine));
+        let req = Request::builder()
+            .uri("/collections")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        let schema_str = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../schemas/ogcapi-edr-1.1-bundled.json"
+        ))
+        .expect("read bundled OGC EDR schema");
+        let bundle: Value = serde_json::from_str(&schema_str).expect("parse schema");
+        let collections_schema = &bundle["paths"]["/collections"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"];
+        assert!(
+            !collections_schema.is_null(),
+            "Schema path /collections.get.responses.200 must resolve in the bundled spec"
+        );
+
+        let validator =
+            jsonschema::Validator::new(collections_schema).expect("compile collections schema");
+        let errors: Vec<String> = validator
+            .iter_errors(&json)
+            .map(|e| format!("- {} (at {})", e, e.instance_path))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "OGC EDR /collections schema violations:\n{}\n\nResponse:\n{}",
+            errors.join("\n"),
+            serde_json::to_string_pretty(&json).unwrap()
+        );
+    }
+
     // -- Single collection detail --
 
     #[tokio::test]
