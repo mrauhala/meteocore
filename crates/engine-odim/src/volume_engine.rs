@@ -2056,15 +2056,14 @@ impl EdrEngine for PolarVolumeEngine {
         }
 
         let catalog = self.catalog.load();
-        // Path centroid (mean lon/lat) — good enough for picking which
-        // radar owns the line at v1 (no multi-radar stitching).
-        let (cx, cy) = {
-            let (sx, sy) = path
-                .iter()
-                .fold((0.0_f64, 0.0_f64), |(ax, ay), &(x, y)| (ax + x, ay + y));
-            let n = path.len() as f64;
-            (sx / n, sy / n)
-        };
+        // Pick the radar nearest the path's *middle node* (not an
+        // arithmetic-mean centroid) to choose which site owns the line.
+        // A real on-path point is antimeridian-safe — averaging the
+        // longitudes of e.g. 178° and −178° gives 0°, which would pick a
+        // European radar for a Pacific path. The midpoint node is a true
+        // resampled `(lon, lat)` on the great-circle path. (v1: single
+        // radar per cross-section, no multi-radar stitching.)
+        let (cx, cy) = path[path.len() / 2];
         let nod = nearest_site(&catalog, cx, cy)
             .ok_or_else(|| {
                 DataServerError::LocationNotFound("PVOL catalog has no radar sites".into())

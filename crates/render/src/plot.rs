@@ -294,15 +294,35 @@ fn draw_heatmap_panel(
         return;
     }
 
-    // Fill the plot area: each output pixel maps to a (node, level) cell
-    // by nearest-neighbour. Screen y grows downward and height grows
-    // upward, so the top row is the highest level.
+    let (ymin, ymax) = (hm.y_values[0], hm.y_values[nz - 1]);
+
+    // Fill the plot area. Each output pixel maps to a (node, level) cell:
+    // the column is index-linear in node, the row is *value-linear* in the
+    // vertical coordinate — the pixel's height value is found, then its
+    // nearest level by value. Value-linear matches the y-tick placement
+    // below (`py`), so labels line up even when the z levels are not
+    // uniformly spaced (a caller passing irregular `y_values`).
     let pw = x1 - x0;
     let ph = y1 - y0;
+    let nearest_level = |h: f64| -> usize {
+        // y_values is ascending; pick the index minimising |value − h|.
+        let mut best = 0usize;
+        let mut best_d = f64::INFINITY;
+        for (i, &yv) in hm.y_values.iter().enumerate() {
+            let d = (yv - h).abs();
+            if d < best_d {
+                best_d = d;
+                best = i;
+            }
+        }
+        best
+    };
+    let span = (ymax - ymin).max(f64::EPSILON);
     for sy in 0..ph {
-        // frac 0 at top (max height) → level index from the top.
+        // Screen y grows downward; the top row is the max height value.
         let frac_y = (sy as f64 + 0.5) / ph as f64;
-        let level = (((1.0 - frac_y) * nz as f64) as usize).min(nz - 1);
+        let h = ymax - frac_y * span;
+        let level = nearest_level(h);
         for sx in 0..pw {
             let frac_x = (sx as f64 + 0.5) / pw as f64;
             let node = ((frac_x * nx as f64) as usize).min(nx - 1);
@@ -314,7 +334,6 @@ fn draw_heatmap_panel(
     cv.rect(x0, y0, x1, y1, FRAME);
 
     // Y ticks (height) — value grows up, so the top is the max.
-    let (ymin, ymax) = (hm.y_values[0], hm.y_values[nz - 1]);
     let py = |y: f64| -> i32 {
         let frac = (y - ymin) / (ymax - ymin).max(f64::EPSILON);
         y1 - (frac * (y1 - y0) as f64).round() as i32
@@ -993,6 +1012,40 @@ mod tests {
         // 50% black over white ≈ mid grey.
         let g = over_white([0, 0, 0, 128]);
         assert!(g[0] > 120 && g[0] < 135);
+    }
+
+    #[test]
+    fn heatmap_handles_non_uniform_z_levels() {
+        // Strongly non-uniform z levels (0, 100, 9000 m). Value-linear
+        // cell-fill + tick placement must agree, and the result is a
+        // valid PNG of the requested size. Before the fix the bottom two
+        // bands (0 and 100 m) each occupied a third of the height while
+        // ticks were placed by value — labels floated off their bands.
+        let cmap = crate::colormap::LutColorMap::from_builtin(
+            crate::colormap::BuiltinColormap::Viridis,
+            0.0,
+            30.0,
+        );
+        let hm = Heatmap {
+            title: "DBZH".into(),
+            x_label: "Distance (km)".into(),
+            y_label: "Height (m)".into(),
+            value_label: "dBZ".into(),
+            x_values: vec![0.0, 10.0, 20.0],
+            y_values: vec![0.0, 100.0, 9000.0],
+            values: vec![
+                Some(5.0),
+                Some(10.0),
+                Some(15.0),
+                Some(20.0),
+                Some(25.0),
+                Some(30.0),
+            ],
+            value_min: 0.0,
+            value_max: 30.0,
+        };
+        let png = render_heatmap(&[hm], &cmap, 600, 400).unwrap();
+        assert_eq!(decode_dims(&png), (600, 400));
     }
 
     #[test]

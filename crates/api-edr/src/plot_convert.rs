@@ -288,19 +288,22 @@ fn section_colormap(
 /// Convert a cross-section (`Section`) coverage response into stacked
 /// heatmaps plus the shared colormap, ready for [`ds_render::render_heatmap`].
 ///
-/// One heatmap is produced per quantity in the **first** coverage (a
-/// multi-timestep request renders its earliest section — a PNG is a
-/// single snapshot). The x axis is cumulative great-circle distance (km)
-/// along the path; the y axis is the vertical coordinate (height above
-/// antenna, m). All quantities share the collection colormap; for a
-/// correctly-scaled single panel, filter with `parameter-name`.
+/// One heatmap is produced per quantity in the **latest** coverage (a
+/// multi-timestep request renders its most recent section — a PNG is a
+/// single snapshot, and the newest scan is the right default for radar
+/// imagery). The x axis is cumulative great-circle distance (km) along
+/// the path; the y axis is the vertical coordinate (height above antenna,
+/// m). All quantities share the collection colormap; for a correctly-
+/// scaled single panel, filter with `parameter-name`.
 pub fn section_response_to_heatmaps(
     resp: &CoverageResponse,
     wms: Option<&WmsConfig>,
 ) -> Result<(Vec<Heatmap>, Box<dyn ColorMap>), DataServerError> {
     let qr = match resp {
         CoverageResponse::Single(q) => q,
-        CoverageResponse::Collection(v) => v.first().ok_or_else(|| {
+        // The engine returns the per-timestep sections oldest-first
+        // (`by_site` is time-ascending), so the newest is `last`.
+        CoverageResponse::Collection(v) => v.last().ok_or_else(|| {
             DataServerError::InvalidParameter("no cross-section data to plot".into())
         })?,
     };

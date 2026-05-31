@@ -341,9 +341,10 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
         // Trajectory query (vertical cross-section). Only advertised
         // for engines that report `trajectory` in
         // `supported_query_types` — keeps the OpenAPI spec consistent
-        // with `data_queries` in the collection metadata. Engines
-        // without the capability return `InvalidParameter → 400` from
-        // the default trait method if a client still calls the path.
+        // with `data_queries` in the collection metadata. A client that
+        // calls the path on a non-trajectory engine gets a 404 from the
+        // handler's capability guard (the resource doesn't exist for
+        // that collection).
         if supported.contains("trajectory") {
             let trajectory_path = format!("/edr/collections/{id}/trajectory");
             collection_paths[&trajectory_path] = json!({
