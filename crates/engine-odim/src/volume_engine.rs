@@ -1605,6 +1605,16 @@ fn sample_polar_slant(
     if sweep.nrays == 0 || sweep.nbins == 0 {
         return None;
     }
+    // A malformed sweep with `rscale <= 0` would silently mis-sample:
+    // `rscale = 0` makes the divisor zero (a NaN cast to `i64` becomes
+    // 0, sampling the first bin with wrong-range data); `rscale < 0`
+    // flips the bin direction and can land inside `[0, nbins)` for a
+    // physically wrong gate. ODIM_H5 guarantees `rscale > 0`, but a
+    // defensive guard here is cheap and keeps a corrupted file from
+    // ever surfacing fabricated values.
+    if !sweep.rscale.is_finite() || sweep.rscale <= 0.0 {
+        return None;
+    }
     let moment = sweep.moments.iter().find(|m| m.quantity == *quantity)?;
     let bin = ((slant_range_m - sweep.rstart) / sweep.rscale).floor() as i64;
     if bin < 0 || bin >= sweep.nbins as i64 {
@@ -2192,6 +2202,32 @@ mod tests {
             (h - 1_020.0).abs() < 10.0,
             "el=1 r=50km: h={h} should be ~1020"
         );
+    }
+
+    /// `sample_polar_slant` returns `None` for malformed sweep geometry
+    /// (`rscale` zero, negative, or non-finite) rather than fabricating
+    /// a bin-0 sample. ODIM_H5 guarantees `rscale > 0`, but a corrupted
+    /// file would otherwise produce a `NaN as i64 == 0` cast and report
+    /// the first bin's value at every requested range.
+    #[test]
+    fn sample_polar_slant_rejects_malformed_rscale() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let mut vol = synthetic_volume(site_lon, site_lat);
+        let azimuth = 90.0;
+        let elangle = 0.5;
+        let range_m = 10_000.0;
+
+        // Baseline: well-formed sweep returns a finite sample.
+        let v = sample_polar_slant(&vol, "DBZH", range_m, azimuth, elangle);
+        assert!(v.is_some(), "well-formed sweep must sample");
+
+        for bad in [0.0_f64, -1_000.0, f64::NAN, f64::INFINITY] {
+            vol.sweeps[0].rscale = bad;
+            assert!(
+                sample_polar_slant(&vol, "DBZH", range_m, azimuth, elangle).is_none(),
+                "rscale={bad} must yield None, not fabricated data"
+            );
+        }
     }
 
     /// Build a synthetic single-site, single-sweep, single-moment
