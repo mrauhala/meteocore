@@ -1605,6 +1605,33 @@ fn sample_polar_slant(
     if sweep.nrays == 0 || sweep.nbins == 0 {
         return None;
     }
+    // Reject targets outside the sweep envelope. Without this,
+    // `nearest_sweep` silently substitutes the lowest sweep's value
+    // for surface cells whose 4/3-Earth-inverted elevation drops below
+    // the horizon (h=0 beyond ~1 km from the radar produces a small
+    // negative angle), and analogously the highest sweep for cells
+    // above the radar's coverage cone — fabricating data far from the
+    // true sample point. The tolerance (~half a typical beam width) is
+    // looser than a beam width so cells slightly outside the surveyed
+    // angle still snap to the nearest sweep instead of dropping out.
+    //
+    // Computed from this volume's sweeps every call so a heterogeneous
+    // network gets per-site envelopes correctly. Cheap (≤ ~20 sweeps).
+    const SWEEP_TOL_DEG: f64 = 1.0;
+    let (min_el, max_el) = volume
+        .sweeps
+        .iter()
+        .map(|s| s.elangle)
+        .filter(|v| v.is_finite())
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+            (lo.min(v), hi.max(v))
+        });
+    if !elangle_deg.is_finite()
+        || elangle_deg < min_el - SWEEP_TOL_DEG
+        || elangle_deg > max_el + SWEEP_TOL_DEG
+    {
+        return None;
+    }
     // A malformed sweep with `rscale <= 0` would silently mis-sample:
     // `rscale = 0` makes the divisor zero (a NaN cast to `i64` becomes
     // 0, sampling the first bin with wrong-range data); `rscale < 0`
@@ -2228,6 +2255,40 @@ mod tests {
                 "rscale={bad} must yield None, not fabricated data"
             );
         }
+    }
+
+    /// `sample_polar_slant` returns `None` for elevation targets outside
+    /// the sweep envelope (above the highest beam or well below the
+    /// lowest). This guards against the silent surface-row substitution
+    /// the 4/3-Earth inversion otherwise causes: at h=0 far from the
+    /// radar, the inverted target el goes slightly negative; without
+    /// this guard `nearest_sweep` still picks the lowest sweep and
+    /// fabricates "ground" reflectivity from a beam aimed well above.
+    /// Found by claude-review on PR #275.
+    #[test]
+    fn sample_polar_slant_rejects_out_of_envelope_elevation() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let vol = synthetic_volume(site_lon, site_lat);
+        // Synthetic fixture has one sweep at 0.5°. Tolerance is 1°, so
+        // targets in [-0.5°, 1.5°] are accepted; everything outside ⇒ None.
+        let azimuth = 90.0;
+        let range_m = 10_000.0;
+
+        // Inside the window — sampled.
+        assert!(sample_polar_slant(&vol, "DBZH", range_m, azimuth, 0.5).is_some());
+        assert!(sample_polar_slant(&vol, "DBZH", range_m, azimuth, 1.4).is_some());
+        assert!(sample_polar_slant(&vol, "DBZH", range_m, azimuth, -0.4).is_some());
+
+        // Just outside the window — None.
+        assert!(sample_polar_slant(&vol, "DBZH", range_m, azimuth, 1.6).is_none());
+        assert!(sample_polar_slant(&vol, "DBZH", range_m, azimuth, -0.6).is_none());
+
+        // Far outside — None (the 90° overhead case that bit the
+        // h=large cells at the radar location).
+        assert!(sample_polar_slant(&vol, "DBZH", range_m, azimuth, 90.0).is_none());
+
+        // Non-finite el — None.
+        assert!(sample_polar_slant(&vol, "DBZH", range_m, azimuth, f64::NAN).is_none());
     }
 
     /// Build a synthetic single-site, single-sweep, single-moment

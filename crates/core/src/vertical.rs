@@ -78,8 +78,17 @@ impl VerticalKind {
         match self {
             // EPSG:5714 = "MSL height", the closest match for altimetric height.
             VerticalKind::Height => "http://www.opengis.net/def/crs/EPSG/0/5714",
-            // EPSG:5798 = "WMO standard atmospheric pressure" — pressure altitude.
-            VerticalKind::Pressure => "http://www.opengis.net/def/crs/EPSG/0/5798",
+            // EPSG has no standard URI for an atmospheric pressure CRS
+            // (an earlier draft of this code referenced EPSG:5798, which
+            // is actually "EGM96 height" — wrong kind entirely; flagged
+            // by claude-review on PR #275). Emit an inline WKT2 instead.
+            VerticalKind::Pressure => {
+                "VERTCRS[\"Atmospheric pressure\",\
+                 VDATUM[\"Mean sea level\"],\
+                 CS[vertical,1],\
+                 AXIS[\"Pressure (hPa)\",down],\
+                 UNIT[\"hPa\",100]]"
+            }
             VerticalKind::ElevationAngle => {
                 "VERTCRS[\"Elevation angle\",\
                  VDATUM[\"Antenna horizon\"],\

@@ -166,6 +166,20 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
     let mut collection_paths = json!({});
     for config in state.collections.values() {
         let id = &config.id;
+        // Per-collection supported-query-types so the OpenAPI spec only
+        // advertises endpoints the engine actually implements. The
+        // `data_queries` block in `build_collection_metadata` already
+        // gates on this; without the same gate here the two discovery
+        // surfaces disagree (an OGC CITE crawl following /api would hit
+        // the default `InvalidParameter → 400` arm on an unsupported
+        // engine, while /collections/{id} omits the link entirely).
+        // The legacy /position and /area entries below stay unconditional
+        // for back-compat; trajectory ships gated from day one.
+        let supported: std::collections::HashSet<String> = state
+            .engines
+            .get(id)
+            .map(|e| e.supported_query_types().into_iter().collect())
+            .unwrap_or_default();
 
         // Collection detail
         let detail_path = format!("/edr/collections/{id}");
@@ -314,36 +328,41 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             }
         });
 
-        // Trajectory query (vertical cross-section). Engines that don't
-        // support it return an `InvalidParameter` 400 — same precedent
-        // as the unconditional `/area` and `/position` entries above.
-        let trajectory_path = format!("/edr/collections/{id}/trajectory");
-        collection_paths[&trajectory_path] = json!({
-            "get": {
-                "summary": format!("Trajectory cross-section for {}", config.title),
-                "operationId": format!("getTrajectory_{id}"),
-                "tags": [id],
-                "parameters": [
-                    {"$ref": "#/components/parameters/coords-linestring"},
-                    {"$ref": "#/components/parameters/datetime"},
-                    {"$ref": "#/components/parameters/parameter-name"},
-                    {"$ref": "#/components/parameters/z-trajectory"}
-                ],
-                "responses": {
-                    "200": {
-                        "description": "Coverage data — CoverageJSON Section domain",
-                        "content": {
-                            "application/prs.coverage+json": {
-                                "schema": {"$ref": "#/components/schemas/coverageJSON"}
+        // Trajectory query (vertical cross-section). Only advertised
+        // for engines that report `trajectory` in
+        // `supported_query_types` — keeps the OpenAPI spec consistent
+        // with `data_queries` in the collection metadata. Engines
+        // without the capability return `InvalidParameter → 400` from
+        // the default trait method if a client still calls the path.
+        if supported.contains("trajectory") {
+            let trajectory_path = format!("/edr/collections/{id}/trajectory");
+            collection_paths[&trajectory_path] = json!({
+                "get": {
+                    "summary": format!("Trajectory cross-section for {}", config.title),
+                    "operationId": format!("getTrajectory_{id}"),
+                    "tags": [id],
+                    "parameters": [
+                        {"$ref": "#/components/parameters/coords-linestring"},
+                        {"$ref": "#/components/parameters/datetime"},
+                        {"$ref": "#/components/parameters/parameter-name"},
+                        {"$ref": "#/components/parameters/z-trajectory"}
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Coverage data — CoverageJSON Section domain",
+                            "content": {
+                                "application/prs.coverage+json": {
+                                    "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                                }
                             }
-                        }
-                    },
-                    "400": {"description": "Bad request"},
-                    "404": {"description": "Not found"},
-                    "500": {"description": "Server error"}
+                        },
+                        "400": {"description": "Bad request"},
+                        "404": {"description": "Not found"},
+                        "500": {"description": "Server error"}
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     let mut paths = json!({

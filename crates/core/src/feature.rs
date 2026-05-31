@@ -376,8 +376,15 @@ pub fn parse_linestring_coords(coords: &str) -> Result<Vec<(f64, f64)>, DataServ
 
     // Reject Z/M variants explicitly so the error message points at the
     // dimensional mismatch rather than failing as "not a number".
+    //
+    // Compare bytes (not `&str` slices) — axum percent-decodes query
+    // params into UTF-8, so a payload like `coords=LINESTRING%C3%A9(...)`
+    // would arrive with a multibyte char straddling byte index 11 and a
+    // `&str` slice at that index would panic (`byte index … is not a
+    // char boundary`), crashing the handler with an unhandled 500.
     for variant in ["LINESTRINGZM", "LINESTRINGZ", "LINESTRINGM"] {
-        if trimmed.len() >= variant.len() && trimmed[..variant.len()].eq_ignore_ascii_case(variant)
+        if trimmed.len() >= variant.len()
+            && trimmed.as_bytes()[..variant.len()].eq_ignore_ascii_case(variant.as_bytes())
         {
             return Err(DataServerError::InvalidParameter(format!(
                 "{variant} is not supported — pass a plain 2-D LINESTRING(lon lat, lon lat, …)"
@@ -424,6 +431,21 @@ pub fn parse_linestring_coords(coords: &str) -> Result<Vec<(f64, f64)>, DataServ
             "LINESTRING must have at least two nodes — use POINT(...) for a single location".into(),
         ));
     }
+    // A LINESTRING whose nodes are all the same point produces a
+    // zero-length path. Downstream `resample_path` would return two
+    // identical composite tuples, and the rendered CoverageJSON `Section`
+    // domain would carry duplicate `[t,x,y]` values — semantically
+    // meaningless and prone to surprise clients. Reject early so the
+    // caller can fix the request rather than receive a degenerate
+    // coverage. (A LINESTRING with *some* repeated vertices and a
+    // non-zero total length is still accepted.)
+    let (lon0, lat0) = nodes[0];
+    if nodes.iter().all(|&(lon, lat)| lon == lon0 && lat == lat0) {
+        return Err(DataServerError::InvalidParameter(
+            "LINESTRING nodes must not all be identical — use POINT(...) for a single location"
+                .into(),
+        ));
+    }
 
     Ok(nodes)
 }
@@ -435,9 +457,17 @@ fn strip_wkt_prefix<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
     if s.len() < keyword.len() + 2 {
         return None;
     }
-    if !s[..keyword.len()].eq_ignore_ascii_case(keyword) {
+    // Byte-level compare so a multibyte char straddling `keyword.len()`
+    // doesn't panic (see the matching note in `parse_linestring_coords`).
+    // `s.get(..keyword.len())` would also work; bytes are clearer here.
+    if !s.as_bytes()[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes()) {
         return None;
     }
+    // `keyword.len()` is the same byte count as
+    // `s.as_bytes()[..keyword.len()]`, and the case-insensitive ASCII
+    // match above proves those bytes are ASCII (a UTF-8 leading byte
+    // never matches an ASCII keyword byte), so this str slice is on a
+    // char boundary by construction.
     let after = s[keyword.len()..].trim_start();
     after
         .strip_prefix('(')
@@ -801,5 +831,33 @@ mod tests {
         assert!(parse_linestring_coords("POINT(10 50)").is_err());
         assert!(parse_linestring_coords("LINESTRING(200 50, 11 51)").is_err());
         assert!(parse_linestring_coords("LINESTRING(NaN 50, 11 51)").is_err());
+    }
+
+    /// A multibyte UTF-8 character straddling the prefix length byte must
+    /// not panic. Caught by claude-review on PR #275 — `&str[..N]` is
+    /// byte-indexed, so a `LINESTRINGé(...)` input would crash the
+    /// handler with `byte index … is not a char boundary`.
+    #[test]
+    fn parse_linestring_handles_multibyte_prefix_collision() {
+        // `é` is 2 bytes, landing at byte index 10 — exactly where the
+        // length check would slice a `LINESTRINGZ` prefix.
+        let res = parse_linestring_coords("LINESTRINGé(10 50, 11 51)");
+        assert!(res.is_err(), "non-LINESTRING prefix must error, not panic");
+        // And the prefix check itself must not crash on this input.
+        assert!(parse_linestring_coords("LINESTRING\u{1F600}(0 0, 1 1)").is_err());
+    }
+
+    /// `LINESTRING(24 60, 24 60)` is a zero-length path — every along-path
+    /// node maps to the same `(t, lon, lat)` tuple, producing a degenerate
+    /// `Section` coverage. Reject early so the caller knows.
+    #[test]
+    fn parse_linestring_rejects_all_identical_nodes() {
+        let err = parse_linestring_coords("LINESTRING(24 60, 24 60)").unwrap_err();
+        assert!(format!("{err:?}").contains("identical"));
+        // Three identical nodes — same outcome.
+        assert!(parse_linestring_coords("LINESTRING(1 2, 1 2, 1 2)").is_err());
+        // A LINESTRING with *some* duplicates but a non-zero length is
+        // accepted — the resample step handles the geometry fine.
+        assert!(parse_linestring_coords("LINESTRING(1 2, 1 2, 2 3)").is_ok());
     }
 }
