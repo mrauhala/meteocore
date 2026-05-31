@@ -372,6 +372,15 @@ pub fn parse_point_coords(coords: &str) -> Result<(f64, f64), DataServerError> {
 /// follow-up. At least two distinct nodes are required (a single node is
 /// not a path; the position query covers that case).
 pub fn parse_linestring_coords(coords: &str) -> Result<Vec<(f64, f64)>, DataServerError> {
+    // Bound the input before any parsing so a 10 MB payload can't
+    // allocate one `(f64, f64)` per comma before `TRAJECTORY_MAX_NODES`
+    // (engine-odim) ever clamps the resampled path. Same limit as
+    // `parse_area_coords`. Flagged by claude-review on PR #275.
+    if coords.len() > MAX_WKT_LENGTH {
+        return Err(DataServerError::InvalidParameter(format!(
+            "LINESTRING geometry exceeds maximum length of {MAX_WKT_LENGTH} bytes"
+        )));
+    }
     let trimmed = coords.trim();
 
     // Reject Z/M variants explicitly so the error message points at the
@@ -850,6 +859,25 @@ mod tests {
     /// `LINESTRING(24 60, 24 60)` is a zero-length path — every along-path
     /// node maps to the same `(t, lon, lat)` tuple, producing a degenerate
     /// `Section` coverage. Reject early so the caller knows.
+    /// A LINESTRING payload longer than `MAX_WKT_LENGTH` is rejected
+    /// without allocating one `(f64, f64)` per comma. Mirrors
+    /// `parse_rejects_too_long` for polygons; caught by claude-review.
+    #[test]
+    fn parse_linestring_rejects_too_long_payload() {
+        // ~30 KB of valid LINESTRING content. Length-cap fires before
+        // any per-node parsing — i.e. this completes instantly.
+        let mut s = String::from("LINESTRING(");
+        for i in 0..5_000 {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("0 0");
+        }
+        s.push(')');
+        assert!(s.len() > MAX_WKT_LENGTH);
+        assert!(parse_linestring_coords(&s).is_err());
+    }
+
     #[test]
     fn parse_linestring_rejects_all_identical_nodes() {
         let err = parse_linestring_coords("LINESTRING(24 60, 24 60)").unwrap_err();

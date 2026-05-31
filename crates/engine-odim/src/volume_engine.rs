@@ -1570,12 +1570,22 @@ fn resolve_heights(z: Option<&[f64]>, top_default: f64) -> Vec<f64> {
     }
     match z {
         None | Some(&[]) => regular(0.0, top_default.max(TRAJECTORY_DEFAULT_Z_STEP_M)),
+        // Negative values are rejected upstream in `query_trajectory`,
+        // so each arm here can take its input verbatim. `.max(0.0)`
+        // kept on the single-value arm as belt-and-braces (the kind
+        // could one day be called from a non-trajectory path).
         Some([h]) => vec![h.max(0.0)],
         Some([a, b]) => regular(*a, *b),
         Some(levels) => {
+            // Dedup tolerance is 1 mm rather than `f64::EPSILON`:
+            // metre-scale heights produced by floating-point arithmetic
+            // can differ by sub-millimetre noise, which `EPSILON`
+            // (~2.2e-16) would not collapse. 1 mm is sub-resolution for
+            // every meteorological vertical axis here. Flagged by
+            // claude-review on PR #275.
             let mut v: Vec<f64> = levels.iter().copied().filter(|x| x.is_finite()).collect();
             v.sort_by(f64::total_cmp);
-            v.dedup_by(|a, b| (*a - *b).abs() < f64::EPSILON);
+            v.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
             if v.len() > TRAJECTORY_MAX_Z_LEVELS {
                 v.truncate(TRAJECTORY_MAX_Z_LEVELS);
             }
@@ -1584,11 +1594,42 @@ fn resolve_heights(z: Option<&[f64]>, top_default: f64) -> Vec<f64> {
     }
 }
 
+/// Tolerance (degrees) for the sweep-envelope guard in
+/// `sample_polar_slant`. ~Half a typical beam width — wide enough that
+/// cells slightly outside the surveyed angle still snap to the nearest
+/// sweep, narrow enough that surface cells far from the radar (whose
+/// 4/3-Earth-inverted el drops below the horizon) and over-cone cells
+/// fall out as `None` instead of fabricating data from the closest
+/// sweep.
+const SWEEP_ENVELOPE_TOL_DEG: f64 = 1.0;
+
+/// Cached `(min_elangle, max_elangle)` over a volume's finite sweep
+/// angles — passed into the per-cell sampler so the envelope check
+/// stays O(1) on the hot path. `None` when the volume has no finite
+/// sweep angles (a malformed file).
+fn sweep_envelope(volume: &PolarVolume) -> Option<(f64, f64)> {
+    let (lo, hi) = volume
+        .sweeps
+        .iter()
+        .map(|s| s.elangle)
+        .filter(|v| v.is_finite())
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+            (lo.min(v), hi.max(v))
+        });
+    lo.is_finite().then_some((lo, hi))
+}
+
 /// Sample one moment of a polar volume at *slant-range, azimuth* — the
 /// cross-section variant of `sample_sweep_moment`. Picks the sweep
 /// nearest `elangle_deg`, then maps `slant_range` to a range bin and
 /// `azimuth_deg` to an azimuth ray. `None` when the point is outside
 /// the sweep's range or the bin is nodata/undetect.
+///
+/// `envelope` is the volume's `(min_el, max_el)` precomputed by the
+/// caller — required, not recomputed per call. With up to
+/// `nodes × z_levels × quantities ≈ 5e5` calls per volume and ~20
+/// sweeps each, an in-function fold would burn ~10 M iterations per
+/// request on a serving worker, breaking the CLAUDE.md hot-path rule.
 ///
 /// Distinct from `sample_sweep_moment` so the existing ground-range
 /// interim (used by position/area/Map paths) is untouched: the slant
@@ -1596,6 +1637,7 @@ fn resolve_heights(z: Option<&[f64]>, top_default: f64) -> Vec<f64> {
 /// not from a ground-range fixup.
 fn sample_polar_slant(
     volume: &PolarVolume,
+    envelope: (f64, f64),
     quantity: &str,
     slant_range_m: f64,
     azimuth_deg: f64,
@@ -1605,30 +1647,12 @@ fn sample_polar_slant(
     if sweep.nrays == 0 || sweep.nbins == 0 {
         return None;
     }
-    // Reject targets outside the sweep envelope. Without this,
-    // `nearest_sweep` silently substitutes the lowest sweep's value
-    // for surface cells whose 4/3-Earth-inverted elevation drops below
-    // the horizon (h=0 beyond ~1 km from the radar produces a small
-    // negative angle), and analogously the highest sweep for cells
-    // above the radar's coverage cone — fabricating data far from the
-    // true sample point. The tolerance (~half a typical beam width) is
-    // looser than a beam width so cells slightly outside the surveyed
-    // angle still snap to the nearest sweep instead of dropping out.
-    //
-    // Computed from this volume's sweeps every call so a heterogeneous
-    // network gets per-site envelopes correctly. Cheap (≤ ~20 sweeps).
-    const SWEEP_TOL_DEG: f64 = 1.0;
-    let (min_el, max_el) = volume
-        .sweeps
-        .iter()
-        .map(|s| s.elangle)
-        .filter(|v| v.is_finite())
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
-            (lo.min(v), hi.max(v))
-        });
+    // Reject targets outside the sweep envelope (see the constant's doc
+    // for the rationale). Pre-computed envelope keeps this O(1) per cell.
+    let (min_el, max_el) = envelope;
     if !elangle_deg.is_finite()
-        || elangle_deg < min_el - SWEEP_TOL_DEG
-        || elangle_deg > max_el + SWEEP_TOL_DEG
+        || elangle_deg < min_el - SWEEP_ENVELOPE_TOL_DEG
+        || elangle_deg > max_el + SWEEP_ENVELOPE_TOL_DEG
     {
         return None;
     }
@@ -1661,7 +1685,11 @@ fn sample_polar_slant(
 /// Heuristic "top of radar coverage" used when `z` is unspecified. The
 /// height of the highest sweep at 200 km slant range, under the
 /// 4/3-Earth model — gives a meaningful ceiling for the default z axis
-/// without hard-coding an altitude.
+/// without hard-coding an altitude. Clamped to `[2 km, 25 km]` so a
+/// vertically pointing or 90°-pointing research radar does not blow
+/// the default axis up past the troposphere (flagged by claude-review
+/// on PR #275 — `TRAJECTORY_MAX_Z_LEVELS = 100` would otherwise produce
+/// km-spaced default levels for top-el ≈ 90°).
 fn coverage_top_default(volume: &PolarVolume) -> f64 {
     let top_el = volume
         .sweeps
@@ -1669,12 +1697,13 @@ fn coverage_top_default(volume: &PolarVolume) -> f64 {
         .map(|s| s.elangle)
         .filter(|v| v.is_finite())
         .fold(f64::NEG_INFINITY, f64::max);
-    if top_el.is_finite() {
+    let raw = if top_el.is_finite() {
         let (_, h) = slant_to_ground_height(200_000.0, top_el);
-        h.max(2_000.0)
+        h
     } else {
         15_000.0
-    }
+    };
+    raw.clamp(2_000.0, 25_000.0)
 }
 
 /// Build one `Section` coverage: the volume's polar field resampled on
@@ -1690,6 +1719,10 @@ fn volume_section(
     if path.len() < 2 || heights_m.is_empty() || quantities.is_empty() {
         return None;
     }
+    // Pre-compute the sweep envelope once per volume — `sample_polar_slant`
+    // would otherwise refold over every sweep on every cell. A volume with
+    // no finite sweep angles cannot be sampled at all.
+    let envelope = sweep_envelope(&entry.volume)?;
     let site = &entry.volume.site;
     let t = entry.volume.time;
     let nodes: Vec<(DateTime<Utc>, f64, f64)> =
@@ -1712,7 +1745,14 @@ fn volume_section(
         for &(d, bearing) in &geom {
             for &h in heights_m {
                 let (r, el) = ground_height_to_slant(d, h);
-                values.push(sample_polar_slant(&entry.volume, quantity, r, bearing, el));
+                values.push(sample_polar_slant(
+                    &entry.volume,
+                    envelope,
+                    quantity,
+                    r,
+                    bearing,
+                    el,
+                ));
             }
         }
         ranges.insert(
@@ -2031,6 +2071,18 @@ impl EdrEngine for PolarVolumeEngine {
                 "LINESTRING must trace a non-degenerate path".into(),
             ));
         }
+        // Reject negative `z` values up-front. `resolve_heights` would
+        // otherwise clamp them silently (single-value arm) or pass them
+        // through (3+ arm), advertising a "Height above antenna"
+        // (direction: up) axis with negative values that are physically
+        // impossible. A 400 surfaces the mistake to the caller rather
+        // than burying it in an all-None response row. Found by
+        // claude-review on PR #275.
+        if z.is_some_and(|levels| levels.iter().any(|&h| h < 0.0)) {
+            return Err(DataServerError::InvalidParameter(
+                "trajectory `z` values must be ≥ 0 (metres above antenna)".into(),
+            ));
+        }
 
         let catalog = self.catalog.load();
         // Path centroid (mean lon/lat) — good enough for picking which
@@ -2240,18 +2292,19 @@ mod tests {
     fn sample_polar_slant_rejects_malformed_rscale() {
         let (site_lon, site_lat) = (25.0, 60.0);
         let mut vol = synthetic_volume(site_lon, site_lat);
+        let env = sweep_envelope(&vol).expect("synthetic volume has finite sweep");
         let azimuth = 90.0;
         let elangle = 0.5;
         let range_m = 10_000.0;
 
         // Baseline: well-formed sweep returns a finite sample.
-        let v = sample_polar_slant(&vol, "DBZH", range_m, azimuth, elangle);
+        let v = sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, elangle);
         assert!(v.is_some(), "well-formed sweep must sample");
 
         for bad in [0.0_f64, -1_000.0, f64::NAN, f64::INFINITY] {
             vol.sweeps[0].rscale = bad;
             assert!(
-                sample_polar_slant(&vol, "DBZH", range_m, azimuth, elangle).is_none(),
+                sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, elangle).is_none(),
                 "rscale={bad} must yield None, not fabricated data"
             );
         }
@@ -2269,26 +2322,62 @@ mod tests {
     fn sample_polar_slant_rejects_out_of_envelope_elevation() {
         let (site_lon, site_lat) = (25.0, 60.0);
         let vol = synthetic_volume(site_lon, site_lat);
+        let env = sweep_envelope(&vol).unwrap();
         // Synthetic fixture has one sweep at 0.5°. Tolerance is 1°, so
         // targets in [-0.5°, 1.5°] are accepted; everything outside ⇒ None.
         let azimuth = 90.0;
         let range_m = 10_000.0;
 
         // Inside the window — sampled.
-        assert!(sample_polar_slant(&vol, "DBZH", range_m, azimuth, 0.5).is_some());
-        assert!(sample_polar_slant(&vol, "DBZH", range_m, azimuth, 1.4).is_some());
-        assert!(sample_polar_slant(&vol, "DBZH", range_m, azimuth, -0.4).is_some());
+        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, 0.5).is_some());
+        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, 1.4).is_some());
+        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, -0.4).is_some());
 
         // Just outside the window — None.
-        assert!(sample_polar_slant(&vol, "DBZH", range_m, azimuth, 1.6).is_none());
-        assert!(sample_polar_slant(&vol, "DBZH", range_m, azimuth, -0.6).is_none());
+        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, 1.6).is_none());
+        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, -0.6).is_none());
 
         // Far outside — None (the 90° overhead case that bit the
         // h=large cells at the radar location).
-        assert!(sample_polar_slant(&vol, "DBZH", range_m, azimuth, 90.0).is_none());
+        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, 90.0).is_none());
 
         // Non-finite el — None.
-        assert!(sample_polar_slant(&vol, "DBZH", range_m, azimuth, f64::NAN).is_none());
+        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, f64::NAN).is_none());
+    }
+
+    /// `coverage_top_default` is clamped to 25 km even for a research
+    /// volume whose highest sweep is near 90° — without the cap, the
+    /// 4/3-Earth height at 200 km slant range for a 90° beam is 200 km,
+    /// and `resolve_heights` would emit 100 levels spaced 2 km apart.
+    /// Found by claude-review on PR #275.
+    #[test]
+    fn coverage_top_default_caps_at_25km() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let mut vol = synthetic_volume(site_lon, site_lat);
+        // Replace the single 0.5° sweep with a vertically-pointing one.
+        vol.sweeps[0].elangle = 89.5;
+        let top = coverage_top_default(&vol);
+        assert!(
+            top <= 25_000.0 + 1.0,
+            "expected ceiling clamp at 25 km, got {top}"
+        );
+        assert!(top >= 2_000.0, "floor still respected, got {top}");
+    }
+
+    /// `resolve_heights` collapses near-duplicate explicit levels at a
+    /// millimetre tolerance, not at `f64::EPSILON`. Two levels differing
+    /// by sub-mm noise from float arithmetic must not survive as
+    /// separate axis points.
+    #[test]
+    fn resolve_heights_dedups_at_millimetre_tolerance() {
+        // 1 mm apart — would NOT dedup at `EPSILON`, but does at 1e-3.
+        let levels = [1_000.0_f64, 1_000.000_001, 2_000.0];
+        let out = resolve_heights(Some(&levels), 15_000.0);
+        assert_eq!(out.len(), 2, "1 mm-apart levels must collapse, got {out:?}");
+        // 1 cm apart — still distinct.
+        let levels = [1_000.0_f64, 1_000.01, 2_000.0];
+        let out = resolve_heights(Some(&levels), 15_000.0);
+        assert_eq!(out.len(), 3, "1 cm-apart levels stay distinct, got {out:?}");
     }
 
     /// Build a synthetic single-site, single-sweep, single-moment

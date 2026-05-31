@@ -96,9 +96,14 @@ impl VerticalKind {
             // (an earlier draft of this code referenced EPSG:5798, which
             // is actually "EGM96 height" — wrong kind entirely; flagged
             // by claude-review on PR #275). Emit an inline WKT2 instead.
+            // VDATUM is "Atmosphere" rather than "Mean sea level" — MSL
+            // is an altimetric gravity-surface datum, semantically wrong
+            // for a pressure axis. "Atmosphere" matches how NWP vertical
+            // CRS definitions describe atmospheric levels (GRIB2 §3.0).
+            // Flagged by claude-review on PR #275.
             VerticalKind::Pressure => {
                 "VERTCRS[\"Atmospheric pressure\",\
-                 VDATUM[\"Mean sea level\"],\
+                 VDATUM[\"Atmosphere\"],\
                  CS[vertical,1],\
                  AXIS[\"Pressure (hPa)\",down],\
                  UNIT[\"hPa\",100]]"
