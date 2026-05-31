@@ -14,13 +14,13 @@ use ds_core::edr_engine::EdrEngine;
 
 use ds_core::error::DataServerError;
 use ds_core::model::CoverageResponse;
-use ds_render::render_chart;
+use ds_render::{render_chart, render_heatmap};
 
 use crate::params::{
     parse_edr_format, parse_z, plot_dimensions, split_position_coords, AreaQueryParams, EdrFormat,
     LocationQueryParams, PositionQueryParams, TrajectoryQueryParams,
 };
-use crate::plot_convert::coverage_response_to_panels;
+use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{coverage_response_to_json, locations_to_geojson, LocationsContext};
 
 type HandlerError = (StatusCode, Json<serde_json::Value>);
@@ -345,14 +345,24 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         {"$ref": "#/components/parameters/coords-linestring"},
                         {"$ref": "#/components/parameters/datetime"},
                         {"$ref": "#/components/parameters/parameter-name"},
-                        {"$ref": "#/components/parameters/z-trajectory"}
+                        {"$ref": "#/components/parameters/z-trajectory"},
+                        {
+                            "name": "f",
+                            "in": "query",
+                            "description": "Output format: CoverageJSON (default) or PNG (a colour-mapped distance×height cross-section heatmap).",
+                            "required": false,
+                            "schema": {"type": "string", "enum": ["CoverageJSON", "PNG"]}
+                        }
                     ],
                     "responses": {
                         "200": {
-                            "description": "Coverage data — CoverageJSON Section domain",
+                            "description": "Coverage data — CoverageJSON Section domain or PNG heatmap",
                             "content": {
                                 "application/prs.coverage+json": {
                                     "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                                },
+                                "image/png": {
+                                    "schema": {"type": "string", "format": "binary"}
                                 }
                             }
                         },
@@ -805,7 +815,7 @@ pub async fn trajectory_query(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
-    let (engine, _config) = lookup_collection(&state, &id)?;
+    let (engine, config) = lookup_collection(&state, &id)?;
 
     // An engine that doesn't advertise `trajectory` has no cross-section
     // capability. Return 404 (the resource doesn't exist for this
@@ -829,12 +839,7 @@ pub async fn trajectory_query(
         ));
     }
 
-    // A Section is a 2-D cross-section — not a single plot.
-    if parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))? == EdrFormat::Png {
-        return Err(bad_request(&DataServerError::InvalidParameter(
-            "PNG output is not available for trajectory queries".into(),
-        )));
-    }
+    let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
 
     let datetime = params
         .datetime
@@ -892,11 +897,29 @@ pub async fn trajectory_query(
             }
         })?;
 
-    let body = serde_json::to_string(&coverage_response_to_json(&result)).unwrap();
-    Ok((
-        [(header::CONTENT_TYPE, "application/prs.coverage+json")],
-        body,
-    ))
+    match format {
+        EdrFormat::CoverageJson => {
+            let body = serde_json::to_string(&coverage_response_to_json(&result)).unwrap();
+            Ok((
+                [(header::CONTENT_TYPE, "application/prs.coverage+json")],
+                body,
+            )
+                .into_response())
+        }
+        EdrFormat::Png => {
+            // Render the cross-section as a colour-mapped heatmap using
+            // the collection's WMS colormap (or a data-scaled viridis
+            // fallback).
+            let (heatmaps, colormap) = section_response_to_heatmaps(&result, config.wms.as_ref())
+                .map_err(|e| bad_request(&e))?;
+            let (w, h) = plot_dimensions(params.width, params.height);
+            let png = render_heatmap(&heatmaps, colormap.as_ref(), w, h).map_err(|e| {
+                tracing::error!("Trajectory PNG render error: {e}");
+                server_error()
+            })?;
+            Ok(([(header::CONTENT_TYPE, "image/png")], png).into_response())
+        }
+    }
 }
 
 fn build_collection_metadata(
@@ -999,7 +1022,7 @@ fn build_collection_metadata(
             ),
             "trajectory" => (
                 format!("{base_url}/edr/collections/{}/trajectory", config.id),
-                json!(["CoverageJSON"]),
+                json!(["CoverageJSON", "PNG"]),
             ),
             _ => continue,
         };

@@ -82,10 +82,12 @@ pub struct TrajectoryQueryParams {
     #[serde(rename = "parameter-name")]
     pub parameter_name: Option<String>,
     pub z: Option<String>,
-    /// Output format. Trajectory queries return a `Section` domain —
-    /// a 2-D cross-section, not a single plot — so `f=PNG` is rejected
-    /// (same precedent as `area_query`).
+    /// Output format: `CoverageJSON` (default) or `PNG` — a colour-mapped
+    /// cross-section heatmap (distance × height).
     pub f: Option<String>,
+    /// PNG image dimensions (ignored for CoverageJSON).
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// Parse the EDR `z` query parameter — a comma-separated list of numeric
