@@ -813,7 +813,7 @@ fn build_collection_metadata(
         let (endpoint, output_formats) = match qt.as_str() {
             "locations" => (
                 format!("{base_url}/edr/collections/{}/locations", config.id),
-                json!(["CoverageJSON", "GeoJSON", "PNG"]),
+                json!(["CoverageJSON", "PNG"]),
             ),
             "position" => (
                 format!("{base_url}/edr/collections/{}/position", config.id),
@@ -857,6 +857,6 @@ fn build_collection_metadata(
         "data_queries": data_queries,
         "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
         "parameter_names": parameter_names,
-        "output_formats": ["CoverageJSON", "GeoJSON", "PNG"]
+        "output_formats": ["CoverageJSON", "PNG"]
     })
 }
