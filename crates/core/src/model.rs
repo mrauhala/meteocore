@@ -43,6 +43,15 @@ pub enum DomainDescription {
         t: Option<DateTime<Utc>>,
         z: VerticalCoord,
     },
+    /// A vertical cross-section along a path: the CoverageJSON `Section`
+    /// domain. `nodes` carries one `(time, longitude, latitude)` tuple
+    /// per along-path output column and is serialised as the mandatory
+    /// composite axis with `coordinates: ["t", "x", "y"]`; `z` carries
+    /// the vertical levels. The ndarray range shape is `[N_nodes, N_z]`.
+    Section {
+        nodes: Vec<(DateTime<Utc>, f64, f64)>,
+        z: VerticalCoord,
+    },
 }
 
 #[derive(Debug, Clone)]

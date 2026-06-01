@@ -192,6 +192,39 @@ fn coverage_with_all_nulls_validates() {
     validate(&json, &schema);
 }
 
+/// A non-finite `Some(NaN)` / `Some(inf)` measurement must serialise to
+/// JSON `null`, not `0` — a fabricated zero would be indistinguishable
+/// from a genuine reading. Regression for the claude-review finding on
+/// PR #275.
+#[test]
+fn coverage_with_non_finite_values_encodes_null_not_zero() {
+    let schema = load_schema();
+    let times = vec![make_time(0), make_time(1), make_time(2)];
+    let result = make_query_result(
+        times,
+        vec![(
+            "temperature",
+            "°C",
+            vec![Some(f64::NAN), Some(f64::INFINITY), Some(-1.5)],
+        )],
+    );
+    let json = query_result_to_coverage_json(&result);
+    let values = &json["ranges"]["temperature"]["values"];
+    assert!(
+        values[0].is_null(),
+        "NaN must encode as null, got {}",
+        values[0]
+    );
+    assert!(
+        values[1].is_null(),
+        "inf must encode as null, got {}",
+        values[1]
+    );
+    assert_eq!(values[2], serde_json::json!(-1.5));
+    // Still schema-valid (CoverageJSON allows null in numeric ranges).
+    validate(&json, &schema);
+}
+
 #[test]
 fn coverage_required_fields_present() {
     let schema = load_schema();
@@ -695,5 +728,65 @@ fn grid_with_z_validates() {
     let json = query_result_to_coverage_json(&result);
     assert_eq!(json["domain"]["domainType"], "Grid");
     assert!(json["domain"]["axes"]["z"]["values"].is_array());
+    validate(&json, &schema);
+}
+
+// --- Section domain (#198 — radar cross-section / trajectory) ---
+
+#[test]
+fn section_coverage_validates_against_schema() {
+    let schema = load_schema();
+    let t = make_time(12);
+    let nodes = vec![
+        (t, 24.0, 60.0),
+        (t, 24.5, 60.25),
+        (t, 25.0, 60.5),
+        (t, 25.5, 60.75),
+    ];
+    let heights = vec![0.0, 500.0, 1000.0, 2000.0, 5000.0];
+    let mut parameters = HashMap::new();
+    parameters.insert(
+        "DBZH".to_string(),
+        ParameterDescription {
+            label: "Reflectivity".to_string(),
+            unit: "dBZ".to_string(),
+            observed_property: "DBZH".to_string(),
+        },
+    );
+    let mut ranges = HashMap::new();
+    let values: Vec<Option<f64>> = (0..nodes.len() * heights.len())
+        .map(|i| if i % 3 == 0 { None } else { Some(i as f64) })
+        .collect();
+    ranges.insert(
+        "DBZH".to_string(),
+        NdArray {
+            shape: vec![nodes.len(), heights.len()],
+            axis_names: vec!["composite".to_string(), "z".to_string()],
+            values,
+        },
+    );
+
+    let result = QueryResult {
+        domain: DomainDescription::Section {
+            nodes,
+            z: VerticalCoord {
+                kind: VerticalKind::HeightAboveAntenna,
+                values: heights,
+            },
+        },
+        parameters,
+        ranges,
+    };
+
+    let json = query_result_to_coverage_json(&result);
+    assert_eq!(json["domain"]["domainType"], "Section");
+    let composite = &json["domain"]["axes"]["composite"];
+    assert_eq!(composite["dataType"], "tuple");
+    assert_eq!(composite["coordinates"], serde_json::json!(["t", "x", "y"]));
+    assert!(composite["values"].is_array());
+    let first = &composite["values"][0];
+    assert_eq!(first.as_array().unwrap().len(), 3);
+    assert!(json["domain"]["axes"]["z"]["values"].is_array());
+
     validate(&json, &schema);
 }

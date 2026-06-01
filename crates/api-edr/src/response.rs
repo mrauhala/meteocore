@@ -104,7 +104,13 @@ fn build_ndarray(ndarray: &ds_core::model::NdArray) -> Value {
         .values
         .iter()
         .map(|v| match v {
-            Some(f) => Value::Number(Number::from_f64(*f).unwrap_or(Number::from(0))),
+            // `Number::from_f64` returns `None` for NaN / ±inf (JSON has
+            // no representation), so a non-finite measurement must encode
+            // as `null` — not `0`, which would be indistinguishable from a
+            // genuine zero reading. Flagged by claude-review on PR #275.
+            Some(f) => Number::from_f64(*f)
+                .map(Value::Number)
+                .unwrap_or(Value::Null),
             None => Value::Null,
         })
         .collect();
@@ -152,6 +158,7 @@ fn domain_type_name(domain: &DomainDescription) -> &'static str {
         DomainDescription::PointSeries { .. } => "PointSeries",
         DomainDescription::Grid { .. } => "Grid",
         DomainDescription::VerticalProfile { .. } => "VerticalProfile",
+        DomainDescription::Section { .. } => "Section",
     }
 }
 
@@ -270,6 +277,32 @@ fn build_domain(desc: &DomainDescription) -> Value {
                 "domainType": "VerticalProfile",
                 "axes": axes,
                 "referencing": referencing
+            })
+        }
+        DomainDescription::Section { nodes, z } => {
+            // Each composite-axis entry is a 3-tuple `[t, x, y]`, exactly
+            // matching the CoverageJSON 1.0 `Section` schema (the only
+            // tuple shape it accepts).
+            let tuples: Vec<Value> = nodes
+                .iter()
+                .map(|(t, lon, lat)| json!([t.to_rfc3339(), lon, lat]))
+                .collect();
+            let mut axes = Map::new();
+            axes.insert(
+                "composite".into(),
+                json!({
+                    "dataType": "tuple",
+                    "coordinates": ["t", "x", "y"],
+                    "values": tuples,
+                }),
+            );
+            axes.insert("z".into(), json!({ "values": z.values }));
+            let referencing = vec![spatial_ref(), temporal_ref(), vertical_ref(z)];
+            json!({
+                "type": "Domain",
+                "domainType": "Section",
+                "axes": axes,
+                "referencing": referencing,
             })
         }
     }

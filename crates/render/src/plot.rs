@@ -13,6 +13,7 @@ use chrono::DateTime;
 
 use ds_core::error::DataServerError;
 
+use crate::colormap::ColorMap;
 use crate::encode_png;
 
 /// One labelled line within a panel. `points` are `(x, y)` in data
@@ -43,6 +44,33 @@ pub struct Panel {
     /// When true x values are epoch seconds and ticks are formatted as time.
     pub x_is_time: bool,
     pub series: Vec<Series>,
+}
+
+/// A 2-D colour-mapped field for [`render_heatmap`] — the EDR `Section`
+/// (radar cross-section) plot. `values` is row-major over the along-path
+/// axis then the vertical axis: `values[node * z_len + level]`, matching
+/// the CoverageJSON `Section` ndarray shape `[n_nodes, n_z]`. A `None`
+/// cell renders with the colormap's nodata colour.
+#[derive(Debug, Clone)]
+pub struct Heatmap {
+    /// Centred title (the parameter label).
+    pub title: String,
+    /// Horizontal-axis caption (e.g. "Distance (km)").
+    pub x_label: String,
+    /// Vertical-axis caption (e.g. "Height above antenna (m)").
+    pub y_label: String,
+    /// Caption for the colour bar (the value unit, e.g. "dBZ").
+    pub value_label: String,
+    /// Monotonic along-path coordinate per column (length `x_len`).
+    pub x_values: Vec<f64>,
+    /// Monotonic vertical coordinate per row (length `z_len`), ascending.
+    pub y_values: Vec<f64>,
+    /// Row-major `[node][level]` cell values; length `x_values.len() *
+    /// y_values.len()`.
+    pub values: Vec<Option<f64>>,
+    /// Colour-bar lower / upper bounds (the colormap's value range).
+    pub value_min: f64,
+    pub value_max: f64,
 }
 
 const BLACK: [u8; 3] = [0x20, 0x20, 0x20];
@@ -190,6 +218,225 @@ pub fn render_chart(panels: &[Panel], width: u32, height: u32) -> Result<Vec<u8>
     }
 
     encode_png(&cv.buf, width, height)
+}
+
+/// Render one or more [`Heatmap`]s (stacked vertically) to PNG bytes —
+/// the EDR cross-section (`Section`) plot. Each heatmap is colour-mapped
+/// with `colormap`; the value range for the colour bar comes from each
+/// heatmap's `value_min`/`value_max`.
+pub fn render_heatmap(
+    heatmaps: &[Heatmap],
+    colormap: &dyn ColorMap,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, DataServerError> {
+    if heatmaps.is_empty() {
+        return Err(DataServerError::Render("no heatmaps to plot".into()));
+    }
+    let width = width.clamp(160, 2000);
+    let height = height.clamp(120, 2000);
+
+    // Each stacked panel needs room for its top/bottom margins plus a few
+    // plot rows; below that `draw_heatmap_panel` would silently skip
+    // drawing and return an all-white PNG. Fail loudly with an actionable
+    // message instead (raise `height` or filter to one parameter).
+    const MIN_PANEL_PX: u32 = 64;
+    let n = heatmaps.len() as u32;
+    if height < n * MIN_PANEL_PX {
+        return Err(DataServerError::Render(format!(
+            "image height {height}px is too small for {n} stacked panel(s) \
+             (need ≥ {}px); raise `height` or filter to one parameter with \
+             `parameter-name`",
+            n * MIN_PANEL_PX
+        )));
+    }
+    let mut cv = Canvas::new(width, height);
+
+    let n = n as i32;
+    let panel_h = cv.h / n;
+    for (i, hm) in heatmaps.iter().enumerate() {
+        let top = i as i32 * panel_h;
+        draw_heatmap_panel(&mut cv, hm, colormap, top, panel_h);
+    }
+    encode_png(&cv.buf, width, height)
+}
+
+/// Composite an RGBA colormap sample over the white canvas background and
+/// return the opaque RGB to store. Nodata (alpha 0) becomes white.
+fn over_white(c: [u8; 4]) -> [u8; 3] {
+    let a = c[3] as u32;
+    if a == 255 {
+        return [c[0], c[1], c[2]];
+    }
+    let blend = |ch: u8| -> u8 { ((ch as u32 * a + 255 * (255 - a)) / 255) as u8 };
+    [blend(c[0]), blend(c[1]), blend(c[2])]
+}
+
+fn draw_heatmap_panel(
+    cv: &mut Canvas,
+    hm: &Heatmap,
+    colormap: &dyn ColorMap,
+    top: i32,
+    panel_h: i32,
+) {
+    // Margins: extra room on the right for the colour bar.
+    let m_left = 58;
+    let m_right = 64;
+    let m_top = 26;
+    let m_bottom = 30;
+
+    let x0 = m_left;
+    let x1 = cv.w - m_right;
+    let y0 = top + m_top;
+    let y1 = top + panel_h - m_bottom;
+    if x1 <= x0 + 4 || y1 <= y0 + 4 {
+        return;
+    }
+
+    // Centred title.
+    let title = hm.title.to_ascii_uppercase();
+    let tw = text_width(&title, 2);
+    cv.text((cv.w - tw) / 2, top + 6, &title, BLACK, 2);
+
+    let nx = hm.x_values.len();
+    let nz = hm.y_values.len();
+    if nx == 0 || nz == 0 || hm.values.len() != nx * nz {
+        cv.rect(x0, y0, x1, y1, FRAME);
+        let msg = "NO DATA";
+        let w = text_width(msg, 2);
+        cv.text((x0 + x1) / 2 - w / 2, (y0 + y1) / 2 - 7, msg, FRAME, 2);
+        draw_heatmap_captions(cv, hm, x0, x1, y1, top);
+        return;
+    }
+
+    let (ymin, ymax) = (hm.y_values[0], hm.y_values[nz - 1]);
+
+    // Fill the plot area. Each output pixel maps to a (node, level) cell:
+    // the column is index-linear in node, the row is *value-linear* in the
+    // vertical coordinate — the pixel's height value is found, then its
+    // nearest level by value. Value-linear matches the y-tick placement
+    // below (`py`), so labels line up even when the z levels are not
+    // uniformly spaced (a caller passing irregular `y_values`).
+    let pw = x1 - x0;
+    let ph = y1 - y0;
+    let nearest_level = |h: f64| -> usize {
+        // y_values is ascending; pick the index minimising |value − h|.
+        let mut best = 0usize;
+        let mut best_d = f64::INFINITY;
+        for (i, &yv) in hm.y_values.iter().enumerate() {
+            let d = (yv - h).abs();
+            if d < best_d {
+                best_d = d;
+                best = i;
+            }
+        }
+        best
+    };
+    let span = (ymax - ymin).max(f64::EPSILON);
+    for sy in 0..ph {
+        // Screen y grows downward; the top row is the max height value.
+        let frac_y = (sy as f64 + 0.5) / ph as f64;
+        let h = ymax - frac_y * span;
+        let level = nearest_level(h);
+        for sx in 0..pw {
+            let frac_x = (sx as f64 + 0.5) / pw as f64;
+            let node = ((frac_x * nx as f64) as usize).min(nx - 1);
+            let v = hm.values[node * nz + level];
+            let rgb = over_white(colormap.color(v));
+            cv.put(x0 + sx, y0 + sy, rgb);
+        }
+    }
+    cv.rect(x0, y0, x1, y1, FRAME);
+
+    // Y ticks (height) — value grows up, so the top is the max.
+    let py = |y: f64| -> i32 {
+        let frac = (y - ymin) / (ymax - ymin).max(f64::EPSILON);
+        y1 - (frac * (y1 - y0) as f64).round() as i32
+    };
+    for t in nice_ticks(ymin, ymax, 5) {
+        if t < ymin || t > ymax {
+            continue;
+        }
+        let yy = py(t);
+        cv.hline(x0 - 3, x0, yy, FRAME);
+        let label = format_value(t);
+        let lw = text_width(&label, 1);
+        cv.text(x0 - 6 - lw, yy - 3, &label, BLACK, 1);
+    }
+
+    // X ticks (distance).
+    let (xmin, xmax) = (hm.x_values[0], hm.x_values[nx - 1]);
+    let px = |x: f64| -> i32 {
+        let frac = (x - xmin) / (xmax - xmin).max(f64::EPSILON);
+        x0 + (frac * (x1 - x0) as f64).round() as i32
+    };
+    for t in nice_ticks(xmin, xmax, 5) {
+        if t < xmin || t > xmax {
+            continue;
+        }
+        let xx = px(t);
+        cv.vline(xx, y1, y1 + 3, FRAME);
+        let label = format_value(t);
+        let lw = text_width(&label, 1);
+        cv.text(xx - lw / 2, y1 + 6, &label, BLACK, 1);
+    }
+
+    draw_colorbar(cv, hm, colormap, x1, y0, y1);
+    draw_heatmap_captions(cv, hm, x0, x1, y1, top);
+}
+
+/// Vertical colour bar just right of the plot frame, with min/mid/max
+/// value ticks.
+fn draw_colorbar(
+    cv: &mut Canvas,
+    hm: &Heatmap,
+    colormap: &dyn ColorMap,
+    x1: i32,
+    y0: i32,
+    y1: i32,
+) {
+    let bar_x = x1 + 10;
+    let bar_w = 12;
+    let h = y1 - y0;
+    if h <= 1 {
+        return;
+    }
+    for sy in 0..h {
+        // Top = max value.
+        let frac = 1.0 - (sy as f64 + 0.5) / h as f64;
+        let v = hm.value_min + frac * (hm.value_max - hm.value_min);
+        let rgb = over_white(colormap.color(Some(v)));
+        for bx in 0..bar_w {
+            cv.put(bar_x + bx, y0 + sy, rgb);
+        }
+    }
+    cv.rect(bar_x, y0, bar_x + bar_w, y1, FRAME);
+
+    // Three labels: max (top), mid, min (bottom).
+    let label_at = |cv: &mut Canvas, frac: f64, v: f64| {
+        let yy = y1 - (frac * h as f64).round() as i32;
+        let label = format_value(v);
+        cv.hline(bar_x + bar_w, bar_x + bar_w + 3, yy, FRAME);
+        cv.text(bar_x + bar_w + 5, yy - 3, &label, BLACK, 1);
+    };
+    let mid = (hm.value_min + hm.value_max) / 2.0;
+    label_at(cv, 1.0, hm.value_max);
+    label_at(cv, 0.5, mid);
+    label_at(cv, 0.0, hm.value_min);
+
+    // Colour-bar caption (the unit) just above the bar.
+    if !hm.value_label.is_empty() {
+        let cap = hm.value_label.to_ascii_uppercase();
+        cv.text(bar_x, y0 - 9, &cap, BLACK, 1);
+    }
+}
+
+fn draw_heatmap_captions(cv: &mut Canvas, hm: &Heatmap, x0: i32, x1: i32, y1: i32, top: i32) {
+    let y_cap = hm.y_label.to_ascii_uppercase();
+    cv.text(4, top + 16, &y_cap, BLACK, 1);
+    let x_cap = hm.x_label.to_ascii_uppercase();
+    let w = text_width(&x_cap, 1);
+    cv.text((x0 + x1) / 2 - w / 2, y1 + 16, &x_cap, BLACK, 1);
 }
 
 fn draw_panel(cv: &mut Canvas, panel: &Panel, top: i32, panel_h: i32) {
@@ -686,6 +933,149 @@ mod tests {
             .timestamp() as f64;
         assert_eq!(format_time(ts, false), "13:45");
         assert_eq!(format_time(ts, true), "05-15 13:45");
+    }
+
+    fn sample_heatmap() -> Heatmap {
+        // 4 nodes × 3 levels, row-major [node][level].
+        let values = vec![
+            Some(10.0),
+            Some(20.0),
+            Some(30.0), // node 0
+            Some(15.0),
+            None,
+            Some(35.0), // node 1 (one nodata cell)
+            Some(5.0),
+            Some(25.0),
+            Some(40.0), // node 2
+            Some(0.0),
+            Some(12.0),
+            Some(28.0), // node 3
+        ];
+        Heatmap {
+            title: "DBZH".into(),
+            x_label: "Distance (km)".into(),
+            y_label: "Height (m)".into(),
+            value_label: "dBZ".into(),
+            x_values: vec![0.0, 10.0, 20.0, 30.0],
+            y_values: vec![0.0, 1000.0, 2000.0],
+            values,
+            value_min: 0.0,
+            value_max: 40.0,
+        }
+    }
+
+    #[test]
+    fn heatmap_renders_valid_png_of_requested_size() {
+        let cmap = crate::colormap::LutColorMap::from_builtin(
+            crate::colormap::BuiltinColormap::Viridis,
+            0.0,
+            40.0,
+        );
+        let png = render_heatmap(&[sample_heatmap()], &cmap, 800, 400).unwrap();
+        assert_eq!(decode_dims(&png), (800, 400));
+    }
+
+    #[test]
+    fn heatmap_render_is_deterministic() {
+        let cmap = crate::colormap::LutColorMap::from_builtin(
+            crate::colormap::BuiltinColormap::RadarDbz,
+            -32.0,
+            95.0,
+        );
+        let a = render_heatmap(&[sample_heatmap()], &cmap, 400, 300).unwrap();
+        let b = render_heatmap(&[sample_heatmap()], &cmap, 400, 300).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn heatmap_empty_is_error() {
+        let cmap = crate::colormap::LutColorMap::from_builtin(
+            crate::colormap::BuiltinColormap::Viridis,
+            0.0,
+            1.0,
+        );
+        assert!(render_heatmap(&[], &cmap, 100, 100).is_err());
+    }
+
+    #[test]
+    fn heatmap_mismatched_values_renders_no_data() {
+        // values length != nx*nz → "NO DATA" panel, but still a valid PNG.
+        let cmap = crate::colormap::LutColorMap::from_builtin(
+            crate::colormap::BuiltinColormap::Viridis,
+            0.0,
+            1.0,
+        );
+        let bad = Heatmap {
+            title: "T".into(),
+            x_label: "x".into(),
+            y_label: "y".into(),
+            value_label: "u".into(),
+            x_values: vec![0.0, 1.0],
+            y_values: vec![0.0, 1.0],
+            values: vec![Some(1.0)], // should be 4
+            value_min: 0.0,
+            value_max: 1.0,
+        };
+        let png = render_heatmap(&[bad], &cmap, 300, 200).unwrap();
+        assert_eq!(decode_dims(&png), (300, 200));
+    }
+
+    #[test]
+    fn over_white_blends_transparent_to_white() {
+        assert_eq!(over_white([0, 0, 0, 0]), [255, 255, 255]);
+        assert_eq!(over_white([10, 20, 30, 255]), [10, 20, 30]);
+        // 50% black over white ≈ mid grey.
+        let g = over_white([0, 0, 0, 128]);
+        assert!(g[0] > 120 && g[0] < 135);
+    }
+
+    #[test]
+    fn heatmap_too_small_for_panel_count_errors() {
+        let cmap = crate::colormap::LutColorMap::from_builtin(
+            crate::colormap::BuiltinColormap::Viridis,
+            0.0,
+            1.0,
+        );
+        // 3 panels in a 120px-tall image → 40px each, below the drawable
+        // minimum: a clear error, not a silent all-white PNG.
+        let three = vec![sample_heatmap(), sample_heatmap(), sample_heatmap()];
+        assert!(render_heatmap(&three, &cmap, 600, 120).is_err());
+        // The same three panels in a tall-enough image render fine.
+        assert!(render_heatmap(&three, &cmap, 600, 600).is_ok());
+    }
+
+    #[test]
+    fn heatmap_handles_non_uniform_z_levels() {
+        // Strongly non-uniform z levels (0, 100, 9000 m). Value-linear
+        // cell-fill + tick placement must agree, and the result is a
+        // valid PNG of the requested size. Before the fix the bottom two
+        // bands (0 and 100 m) each occupied a third of the height while
+        // ticks were placed by value — labels floated off their bands.
+        let cmap = crate::colormap::LutColorMap::from_builtin(
+            crate::colormap::BuiltinColormap::Viridis,
+            0.0,
+            30.0,
+        );
+        let hm = Heatmap {
+            title: "DBZH".into(),
+            x_label: "Distance (km)".into(),
+            y_label: "Height (m)".into(),
+            value_label: "dBZ".into(),
+            x_values: vec![0.0, 10.0, 20.0],
+            y_values: vec![0.0, 100.0, 9000.0],
+            values: vec![
+                Some(5.0),
+                Some(10.0),
+                Some(15.0),
+                Some(20.0),
+                Some(25.0),
+                Some(30.0),
+            ],
+            value_min: 0.0,
+            value_max: 30.0,
+        };
+        let png = render_heatmap(&[hm], &cmap, 600, 400).unwrap();
+        assert_eq!(decode_dims(&png), (600, 400));
     }
 
     #[test]

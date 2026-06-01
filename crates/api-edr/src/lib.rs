@@ -23,5 +23,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/collections/{id}/position", get(handlers::position_query))
         .route("/collections/{id}/area", get(handlers::area_query))
+        .route(
+            "/collections/{id}/trajectory",
+            get(handlers::trajectory_query),
+        )
         .with_state(state)
 }

@@ -9,7 +9,7 @@ pub use colormap::{
 };
 pub use encode::{encode_jpeg, encode_png, encode_webp};
 pub use metatile::{render_metatiled, MetaTile, MetaTileStats, TileKeyPrefix, TilePixelCache};
-pub use plot::{render_chart, Panel, Series};
+pub use plot::{render_chart, render_heatmap, Heatmap, Panel, Series};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

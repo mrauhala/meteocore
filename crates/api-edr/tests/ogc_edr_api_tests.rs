@@ -412,6 +412,90 @@ mod collections {
         }
     }
 
+    /// `/collections` validates against the OGC EDR 1.1 bundled OpenAPI
+    /// schema for `GET /collections` 200 `application/json`. The
+    /// `extent.vertical` block in particular requires `vrs` and typed
+    /// strings for `interval` / `values` — this test guards against the
+    /// regressions that broke a real radar collection. A dedicated
+    /// vertical-aware mock fires that branch without disturbing the
+    /// `no-vertical` invariant the rest of the suite relies on.
+    #[tokio::test]
+    async fn listing_validates_against_ogc_edr_schema() {
+        // Reuse MockEngine for everything except `get_vertical_extent`
+        // by wrapping it — that way every other handler invariant
+        // (locations, parameters, etc.) is exercised identically.
+        struct VerticalMockEngine(MockEngine);
+        impl EdrEngine for VerticalMockEngine {
+            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+                self.0.get_locations()
+            }
+            fn query_location(
+                &self,
+                location_id: &str,
+                dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                params: Option<&[String]>,
+                z: Option<&[f64]>,
+            ) -> Result<CoverageResponse, DataServerError> {
+                self.0.query_location(location_id, dt, params, z)
+            }
+            fn get_parameters(&self) -> Vec<String> {
+                self.0.get_parameters()
+            }
+            fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+                self.0.get_temporal_extent()
+            }
+            fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+                self.0.get_spatial_extent()
+            }
+            fn get_vertical_extent(&self) -> Option<ds_core::vertical::VerticalDimension> {
+                Some(ds_core::vertical::VerticalDimension::new(
+                    ds_core::vertical::VerticalKind::Pressure,
+                    vec![1000.0, 850.0, 700.0, 500.0, 250.0],
+                ))
+            }
+            fn supported_query_types(&self) -> Vec<String> {
+                self.0.supported_query_types()
+            }
+        }
+
+        let engine: Arc<dyn EdrEngine> = Arc::new(VerticalMockEngine(MockEngine));
+        let router = api_edr::router(make_edr_state(engine));
+        let req = Request::builder()
+            .uri("/collections")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        let schema_str = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../schemas/ogcapi-edr-1.1-bundled.json"
+        ))
+        .expect("read bundled OGC EDR schema");
+        let bundle: Value = serde_json::from_str(&schema_str).expect("parse schema");
+        let collections_schema = &bundle["paths"]["/collections"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"];
+        assert!(
+            !collections_schema.is_null(),
+            "Schema path /collections.get.responses.200 must resolve in the bundled spec"
+        );
+
+        let validator =
+            jsonschema::Validator::new(collections_schema).expect("compile collections schema");
+        let errors: Vec<String> = validator
+            .iter_errors(&json)
+            .map(|e| format!("- {} (at {})", e, e.instance_path))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "OGC EDR /collections schema violations:\n{}\n\nResponse:\n{}",
+            errors.join("\n"),
+            serde_json::to_string_pretty(&json).unwrap()
+        );
+    }
+
     // -- Single collection detail --
 
     #[tokio::test]
@@ -1090,12 +1174,134 @@ mod unimplemented_queries {
     }
 
     #[tokio::test]
-    #[ignore = "trajectory query not yet implemented"]
-    async fn trajectory_query() {
-        // GET /collections/{id}/trajectory?coords=LINESTRING(24 60,25 61)
-        let (status, _) =
-            get("/collections/weather/trajectory?coords=LINESTRING(24 60,25 61)").await;
-        assert_eq!(status, StatusCode::OK);
+    async fn trajectory_query_unsupported_engine_returns_404() {
+        // `MockEngine` does not advertise `trajectory` in
+        // `supported_query_types`, so the route must answer 404 (the
+        // capability is absent for this collection) rather than 400.
+        let (status, json) =
+            get("/collections/weather/trajectory?coords=LINESTRING(24%2060,25%2061)").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["code"], "NotFound");
+    }
+
+    /// A trajectory-capable engine routes a real `Section` through the
+    /// Axum handler: 200 + CoverageJSON by default, 200 + `image/png` for
+    /// `f=PNG`. Guards the handler's content-type and PNG dispatch, which
+    /// the 404-only test above can't reach.
+    #[tokio::test]
+    async fn trajectory_query_returns_section_and_png() {
+        use ds_core::model::{NdArray, VerticalCoord};
+        use ds_core::vertical::VerticalKind;
+
+        struct TrajectoryMock;
+        impl EdrEngine for TrajectoryMock {
+            fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+                Ok(vec![])
+            }
+            fn query_location(
+                &self,
+                _id: &str,
+                _dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                _p: Option<&[String]>,
+                _z: Option<&[f64]>,
+            ) -> Result<CoverageResponse, DataServerError> {
+                Err(DataServerError::LocationNotFound("n/a".into()))
+            }
+            fn get_parameters(&self) -> Vec<String> {
+                vec!["DBZH".into()]
+            }
+            fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+                None
+            }
+            fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+                Some([24.0, 60.0, 25.0, 61.0])
+            }
+            fn supported_query_types(&self) -> Vec<String> {
+                vec!["trajectory".into()]
+            }
+            fn query_trajectory(
+                &self,
+                _coords: &str,
+                _dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
+                _p: Option<&[String]>,
+                _z: Option<&[f64]>,
+            ) -> Result<CoverageResponse, DataServerError> {
+                let t = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+                let nodes = vec![(t, 24.0, 60.0), (t, 24.5, 60.5), (t, 25.0, 61.0)];
+                let mut parameters = HashMap::new();
+                parameters.insert(
+                    "DBZH".to_string(),
+                    ParameterDescription {
+                        label: "Reflectivity".into(),
+                        unit: "dBZ".into(),
+                        observed_property: "DBZH".into(),
+                    },
+                );
+                let mut ranges = HashMap::new();
+                ranges.insert(
+                    "DBZH".to_string(),
+                    NdArray {
+                        shape: vec![3, 2],
+                        axis_names: vec!["composite".into(), "z".into()],
+                        values: vec![
+                            Some(10.0),
+                            Some(20.0),
+                            None,
+                            Some(15.0),
+                            Some(5.0),
+                            Some(25.0),
+                        ],
+                    },
+                );
+                Ok(CoverageResponse::Single(QueryResult {
+                    domain: DomainDescription::Section {
+                        nodes,
+                        z: VerticalCoord {
+                            kind: VerticalKind::HeightAboveAntenna,
+                            values: vec![0.0, 1000.0],
+                        },
+                    },
+                    parameters,
+                    ranges,
+                }))
+            }
+        }
+
+        let engine: Arc<dyn EdrEngine> = Arc::new(TrajectoryMock);
+        let router = api_edr::router(make_edr_state(engine));
+
+        // Default → CoverageJSON Section.
+        let req = Request::builder()
+            .uri("/collections/weather/trajectory?coords=LINESTRING(24%2060,25%2061)")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/prs.coverage+json")
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["domain"]["domainType"], "Section");
+
+        // f=PNG → image/png with a valid PNG signature.
+        let req = Request::builder()
+            .uri("/collections/weather/trajectory?coords=LINESTRING(24%2060,25%2061)&f=PNG")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("image/png")
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[0..8], b"\x89PNG\r\n\x1a\n", "PNG signature");
     }
 
     #[tokio::test]

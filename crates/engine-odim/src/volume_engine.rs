@@ -55,7 +55,7 @@ use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
-use ds_core::feature::{parse_area_coords, parse_point_coords};
+use ds_core::feature::{parse_area_coords, parse_linestring_coords, parse_point_coords};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
@@ -120,6 +120,96 @@ pub fn ground_distance_bearing(lon0: f64, lat0: f64, lon1: f64, lat1: f64) -> (f
     let bearing = y.atan2(x).to_degrees().rem_euclid(360.0);
 
     (distance, bearing)
+}
+
+/// Forward great-circle destination point: starting at `(lon0, lat0)`
+/// (degrees), travel `distance_m` along bearing `bearing_deg` and return
+/// the destination `(lon, lat)` (degrees). Used for path resampling
+/// along a LINESTRING segment.
+pub fn destination_point(lon0: f64, lat0: f64, distance_m: f64, bearing_deg: f64) -> (f64, f64) {
+    let ang = distance_m / EARTH_RADIUS_M;
+    let lat0_r = lat0.to_radians();
+    let lon0_r = lon0.to_radians();
+    let brg = bearing_deg.to_radians();
+    let sin_lat = lat0_r.sin() * ang.cos() + lat0_r.cos() * ang.sin() * brg.cos();
+    let lat = sin_lat.asin();
+    let y = brg.sin() * ang.sin() * lat0_r.cos();
+    let x = ang.cos() - lat0_r.sin() * sin_lat;
+    // Normalise longitude into (−180, 180]: a path starting near ±180°
+    // can otherwise return a lon outside that range, which would leak
+    // into the CoverageJSON `Section` nodes verbatim.
+    let lon = lon0_r + y.atan2(x);
+    let lon_deg = (lon.to_degrees() + 540.0).rem_euclid(360.0) - 180.0;
+    (lon_deg, lat.to_degrees())
+}
+
+// ---------------------------------------------------------------------------
+// 4/3-Earth beam geometry (cross-section path)
+// ---------------------------------------------------------------------------
+//
+// The standard radar-meteorology "effective Earth" model: treat the
+// atmosphere's average refractivity gradient as if the Earth's radius
+// were 4/3 of its true value, then trace beams as straight lines through
+// that fictitious sphere. Forward and inverse maps come from Doviak &
+// Zrnić (1993), §2.2.3 — used by the cross-section sampler to translate
+// between the polar sweep coordinate (slant range, elevation angle) and
+// the human-meaningful display coordinate (ground distance from radar,
+// height above antenna).
+//
+// This is *only* used by the new `query_trajectory` cross-section path.
+// The legacy `sample_sweep_moment` (used by position/area queries) and
+// `polar_sample` (used by Map/WMS) stay on their ground-range interim —
+// migrating those is a separate ticket.
+
+/// 4/3 of the mean Earth radius, in metres — the effective radius used
+/// to model standard atmospheric refraction.
+pub(crate) const FOUR_THIRDS_EARTH_M: f64 = 4.0 / 3.0 * EARTH_RADIUS_M;
+
+/// Forward map: `(slant_range_m, elevation_angle_deg)` → `(ground_distance_m,
+/// height_above_antenna_m)` under the 4/3-Earth model.
+///
+/// `h = sqrt(r² + R'² + 2·r·R'·sin(el)) − R'`
+/// `s = R' · atan(r·cos(el) / (r·sin(el) + R'))`
+///
+/// where `R' = 4/3 · R_earth`. `r` is slant range in metres, `el` is in
+/// degrees.
+pub(crate) fn slant_to_ground_height(slant_range_m: f64, elangle_deg: f64) -> (f64, f64) {
+    let r = slant_range_m;
+    let el = elangle_deg.to_radians();
+    let rp = FOUR_THIRDS_EARTH_M;
+    let h = (r * r + rp * rp + 2.0 * r * rp * el.sin()).sqrt() - rp;
+    let s = rp * (r * el.cos() / (r * el.sin() + rp)).atan();
+    (s, h)
+}
+
+/// Inverse: `(ground_distance_m, height_above_antenna_m)` →
+/// `(slant_range_m, elevation_angle_deg)`. Closed-form companion to
+/// [`slant_to_ground_height`]; the algebra is in Doviak & Zrnić (1993)
+/// §2.2.3 / Rinehart (2004) §3.5.
+///
+/// Given target point `(s, h)` on the effective-Earth sphere, parametrise
+/// the antenna at radius `R'` and the target at radius `R' + h` separated
+/// by the central angle `θ = s / R'`. Then by the law of cosines:
+///
+/// `r² = R'² + (R'+h)² − 2·R'·(R'+h)·cos(θ)`
+///
+/// and the elevation angle measured from the local horizontal at the
+/// antenna is:
+///
+/// `el = atan2((R'+h)·cos(θ) − R', (R'+h)·sin(θ))`
+pub(crate) fn ground_height_to_slant(
+    ground_distance_m: f64,
+    height_above_antenna_m: f64,
+) -> (f64, f64) {
+    let s = ground_distance_m;
+    let h = height_above_antenna_m;
+    let rp = FOUR_THIRDS_EARTH_M;
+    let rh = rp + h;
+    let theta = s / rp;
+    let (sin_th, cos_th) = theta.sin_cos();
+    let r = (rp * rp + rh * rh - 2.0 * rp * rh * cos_th).sqrt().max(0.0);
+    let el = (rh * cos_th - rp).atan2(rh * sin_th);
+    (r, el.to_degrees())
 }
 
 // ---------------------------------------------------------------------------
@@ -1387,6 +1477,324 @@ fn level_series(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Trajectory cross-section (`Section` domain)
+// ---------------------------------------------------------------------------
+
+/// Cross-section sampling parameters.
+const TRAJECTORY_NODE_SPACING_M: f64 = 500.0;
+/// Hard cap on along-path nodes — protects against a 1000-km path
+/// allocating ~2000 columns × hundreds of z levels.
+const TRAJECTORY_MAX_NODES: usize = 1024;
+/// Default vertical step (metres) when `z` is absent.
+const TRAJECTORY_DEFAULT_Z_STEP_M: f64 = 250.0;
+/// Hard cap on z levels.
+const TRAJECTORY_MAX_Z_LEVELS: usize = 100;
+
+/// Resample a polyline `vertices` (WGS84 `(lon, lat)`) into evenly-spaced
+/// nodes along the great-circle path, ~`TRAJECTORY_NODE_SPACING_M` apart,
+/// with the endpoints preserved and a `TRAJECTORY_MAX_NODES` cap.
+///
+/// Returns an empty vec only when the polyline has < 2 vertices — the
+/// caller has already validated that via `parse_linestring_coords`.
+fn resample_path(vertices: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    if vertices.len() < 2 {
+        return Vec::new();
+    }
+    // Per-segment ground length + bearing — cheap (one haversine call per
+    // segment), cached so the sampling loop does not pay it per node.
+    let mut seg_len = Vec::with_capacity(vertices.len() - 1);
+    let mut seg_brg = Vec::with_capacity(vertices.len() - 1);
+    let mut total = 0.0_f64;
+    for w in vertices.windows(2) {
+        let (lon0, lat0) = w[0];
+        let (lon1, lat1) = w[1];
+        let (d, b) = ground_distance_bearing(lon0, lat0, lon1, lat1);
+        seg_len.push(d);
+        seg_brg.push(b);
+        total += d;
+    }
+    if total <= 0.0 {
+        // Degenerate polyline (all vertices coincide). `parse_linestring_coords`
+        // already rejects an all-identical LINESTRING with a 400, so this is
+        // only reachable via a direct call — return a single node so the
+        // caller's `path.len() < 2` guard turns it into an error rather than
+        // emitting a Section with two identical (and schema-invalid)
+        // composite-axis nodes.
+        return vec![vertices[0]];
+    }
+    let n =
+        ((total / TRAJECTORY_NODE_SPACING_M).ceil() as usize + 1).clamp(2, TRAJECTORY_MAX_NODES);
+    let step = total / (n - 1) as f64;
+
+    let mut out = Vec::with_capacity(n);
+    out.push(vertices[0]);
+    // Walk the path: track cumulative distance into the current segment.
+    let mut seg = 0usize;
+    let mut into = 0.0_f64;
+    for i in 1..(n - 1) {
+        let target = i as f64 * step;
+        // Advance through segments until `target` falls inside the
+        // current one. `total > 0` and `target < total` guarantees
+        // termination without overflow.
+        while seg + 1 < seg_len.len() && into + seg_len[seg] < target {
+            into += seg_len[seg];
+            seg += 1;
+        }
+        let remaining = target - into;
+        let (start_lon, start_lat) = vertices[seg];
+        out.push(destination_point(
+            start_lon,
+            start_lat,
+            remaining,
+            seg_brg[seg],
+        ));
+    }
+    out.push(*vertices.last().unwrap());
+    out
+}
+
+/// The elevation-angle window `[lo, hi]` (degrees) for a cross-section.
+///
+/// `z` carries the requested elevation angles (resolved by the API layer
+/// against the collection's advertised extent — an interval `0.3/15`
+/// arrives as the angles in range). `None`/empty selects the volume's
+/// full sweep span. The window is clamped to the volume's actual sweep
+/// range so a heterogeneous fleet (a site missing an advertised angle)
+/// degrades to nodata rather than fabricating data.
+///
+/// Errors:
+/// - `Engine` when the volume has no finite sweeps (a malformed file).
+/// - `InvalidParameter` when an explicit `z` list falls **entirely**
+///   outside the surveyed range, e.g. `z=40,50` on a 0.5–25° radar — the
+///   clamp would otherwise invert to `(40, 25)` and silently produce an
+///   all-nodata Section. (The interval form is already rejected earlier
+///   by `resolve_z_levels`; this guards the comma-list form, which the
+///   API layer passes through unvalidated.)
+fn angle_window(z: Option<&[f64]>, volume: &PolarVolume) -> Result<(f64, f64), DataServerError> {
+    let (smin, smax) = sweep_envelope(volume)
+        .ok_or_else(|| DataServerError::Engine("PVOL volume has no finite sweep angles".into()))?;
+    let Some(zs) = z.filter(|s| !s.is_empty()) else {
+        return Ok((smin, smax));
+    };
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for &v in zs.iter().filter(|v| v.is_finite()) {
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    if !lo.is_finite() {
+        return Ok((smin, smax));
+    }
+    // Clamp into the site's surveyed range. An inverted clamp means the
+    // whole request sits beyond the surveyed angles — surface that rather
+    // than returning a silently empty Section.
+    let (clo, chi) = (lo.max(smin), hi.min(smax));
+    if clo > chi {
+        return Err(DataServerError::InvalidParameter(format!(
+            "requested elevation angle(s) {lo}–{hi}° are outside this radar's \
+             surveyed range {smin}–{smax}°"
+        )));
+    }
+    Ok((clo, chi))
+}
+
+/// Build the cross-section height axis (metres above antenna): a regular
+/// `0..top` grid where `top` is the height of the `hi_angle` beam at the
+/// path's farthest ground distance, clamped to `[step, 25 km]` and capped
+/// at `TRAJECTORY_MAX_Z_LEVELS`. Selecting a lower top elevation angle (a
+/// narrower `z`) therefore zooms the vertical axis onto that band.
+fn height_axis(hi_angle_deg: f64, max_ground_dist_m: f64) -> Vec<f64> {
+    // `slant_to_ground_height` wants a slant range, so convert the path's
+    // farthest *ground* distance to slant via `ground / cos(el)` (exact
+    // for a flat beam, and the dominant term at radar elevation angles).
+    // Using the ground distance directly would under-size the ceiling by
+    // ~cos(el) — ~3.5 % (≈ 420 m on a 100 km path) at 15°, clipping
+    // real coverage near the top of the beam.
+    let el = hi_angle_deg.max(0.0);
+    let cos_el = el.to_radians().cos().max(1e-3);
+    let r = (max_ground_dist_m / cos_el).max(1_000.0);
+    let (_, h) = slant_to_ground_height(r, el);
+    let top = h.clamp(TRAJECTORY_DEFAULT_Z_STEP_M, 25_000.0);
+    let n =
+        ((top / TRAJECTORY_DEFAULT_Z_STEP_M).ceil() as usize + 1).clamp(2, TRAJECTORY_MAX_Z_LEVELS);
+    let step = top / (n - 1) as f64;
+    (0..n).map(|i| i as f64 * step).collect()
+}
+
+/// Tolerance (degrees) for the sweep-envelope guard in
+/// `sample_polar_slant`. ~Half a typical beam width — wide enough that
+/// cells slightly outside the surveyed angle still snap to the nearest
+/// sweep, narrow enough that surface cells far from the radar (whose
+/// 4/3-Earth-inverted el drops below the horizon) and over-cone cells
+/// fall out as `None` instead of fabricating data from the closest
+/// sweep.
+const SWEEP_ENVELOPE_TOL_DEG: f64 = 1.0;
+
+/// Cached `(min_elangle, max_elangle)` over a volume's finite sweep
+/// angles — passed into the per-cell sampler so the envelope check
+/// stays O(1) on the hot path. `None` when the volume has no finite
+/// sweep angles (a malformed file).
+fn sweep_envelope(volume: &PolarVolume) -> Option<(f64, f64)> {
+    let (lo, hi) = volume
+        .sweeps
+        .iter()
+        .map(|s| s.elangle)
+        .filter(|v| v.is_finite())
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+            (lo.min(v), hi.max(v))
+        });
+    lo.is_finite().then_some((lo, hi))
+}
+
+/// Sample one moment of a polar volume at *slant-range, azimuth* — the
+/// cross-section variant of `sample_sweep_moment`. Picks the sweep
+/// nearest `elangle_deg`, then maps `slant_range` to a range bin and
+/// `azimuth_deg` to an azimuth ray. `None` when the point is outside
+/// the sweep's range or the bin is nodata/undetect.
+///
+/// `envelope` is the volume's `(min_el, max_el)` precomputed by the
+/// caller — required, not recomputed per call. With up to
+/// `nodes × z_levels × quantities ≈ 5e5` calls per volume and ~20
+/// sweeps each, an in-function fold would burn ~10 M iterations per
+/// request on a serving worker, breaking the CLAUDE.md hot-path rule.
+///
+/// Distinct from `sample_sweep_moment` so the existing ground-range
+/// interim (used by position/area/Map paths) is untouched: the slant
+/// range here comes from the 4/3-Earth inversion in `volume_section`,
+/// not from a ground-range fixup.
+fn sample_polar_slant(
+    volume: &PolarVolume,
+    envelope: (f64, f64),
+    quantity: &str,
+    slant_range_m: f64,
+    azimuth_deg: f64,
+    elangle_deg: f64,
+) -> Option<f64> {
+    let sweep = nearest_sweep(volume, elangle_deg)?;
+    if sweep.nrays == 0 || sweep.nbins == 0 {
+        return None;
+    }
+    // Reject targets outside the sweep envelope (see the constant's doc
+    // for the rationale). Pre-computed envelope keeps this O(1) per cell.
+    let (min_el, max_el) = envelope;
+    if !elangle_deg.is_finite()
+        || elangle_deg < min_el - SWEEP_ENVELOPE_TOL_DEG
+        || elangle_deg > max_el + SWEEP_ENVELOPE_TOL_DEG
+    {
+        return None;
+    }
+    // A malformed sweep with `rscale <= 0` would silently mis-sample:
+    // `rscale = 0` makes the divisor zero (a NaN cast to `i64` becomes
+    // 0, sampling the first bin with wrong-range data); `rscale < 0`
+    // flips the bin direction and can land inside `[0, nbins)` for a
+    // physically wrong gate. ODIM_H5 guarantees `rscale > 0`, but a
+    // defensive guard here is cheap and keeps a corrupted file from
+    // ever surfacing fabricated values.
+    if !sweep.rscale.is_finite() || sweep.rscale <= 0.0 {
+        return None;
+    }
+    let moment = sweep.moments.iter().find(|m| m.quantity == *quantity)?;
+    let bin = ((slant_range_m - sweep.rstart) / sweep.rscale).floor() as i64;
+    if bin < 0 || bin >= sweep.nbins as i64 {
+        return None;
+    }
+    let ray = (azimuth_deg / (360.0 / sweep.nrays as f64)).floor() as usize % sweep.nrays;
+    moment.data.sample(
+        ray,
+        bin as usize,
+        moment.gain,
+        moment.offset,
+        moment.nodata,
+        Some(moment.undetect),
+    )
+}
+
+/// Build one `Section` coverage: the volume's polar field resampled on
+/// `(along-path-distance, height-above-antenna)` and exposed via the
+/// CoverageJSON composite axis `[t, lon, lat]` plus a numeric `z` axis
+/// in metres. `window` is the caller's selected elevation-angle band
+/// `[lo, hi]` (from `z`) — cells whose 4/3-Earth-inverted beam angle
+/// falls outside it become nodata.
+///
+/// The guard actually applied is `window ∩ this volume's own sweep
+/// envelope`: a multi-timestep request derives `window` once from the
+/// newest volume, but an older entry whose scan strategy reached a
+/// lower ceiling must not have a cell that inverts to (say) 20° matched
+/// to its 10° top sweep — intersecting per entry keeps each timestep
+/// honest about the angles it actually surveyed.
+fn volume_section(
+    entry: &VolumeEntry,
+    path: &[(f64, f64)],
+    heights_m: &[f64],
+    quantities: &[String],
+    window: (f64, f64),
+) -> Option<QueryResult> {
+    if path.len() < 2 || heights_m.is_empty() || quantities.is_empty() {
+        return None;
+    }
+    // Per-entry effective envelope: the selected window clamped to this
+    // volume's surveyed sweep range. A volume with no finite sweeps is
+    // skipped; one that doesn't cover the window yields all-nodata cells
+    // (an inverted envelope rejects every beam angle).
+    let entry_env = sweep_envelope(&entry.volume)?;
+    let envelope = (window.0.max(entry_env.0), window.1.min(entry_env.1));
+    let site = &entry.volume.site;
+    let t = entry.volume.time;
+    let nodes: Vec<(DateTime<Utc>, f64, f64)> =
+        path.iter().map(|&(lon, lat)| (t, lon, lat)).collect();
+
+    // Per-node geometry from the radar antenna — computed once and shared
+    // across every quantity and every z level.
+    let geom: Vec<(f64, f64)> = path
+        .iter()
+        .map(|&(lon, lat)| ground_distance_bearing(site.lon, site.lat, lon, lat))
+        .collect();
+
+    let mut ranges = HashMap::new();
+    let mut param_descs = HashMap::new();
+    let nz = heights_m.len();
+    let nn = nodes.len();
+
+    for quantity in quantities {
+        let mut values: Vec<Option<f64>> = Vec::with_capacity(nn * nz);
+        for &(d, bearing) in &geom {
+            for &h in heights_m {
+                let (r, el) = ground_height_to_slant(d, h);
+                values.push(sample_polar_slant(
+                    &entry.volume,
+                    envelope,
+                    quantity,
+                    r,
+                    bearing,
+                    el,
+                ));
+            }
+        }
+        ranges.insert(
+            quantity.clone(),
+            NdArray {
+                shape: vec![nn, nz],
+                axis_names: vec!["composite".to_string(), "z".to_string()],
+                values,
+            },
+        );
+        param_descs.insert(quantity.clone(), quantity_description(quantity));
+    }
+
+    Some(QueryResult {
+        domain: DomainDescription::Section {
+            nodes,
+            z: VerticalCoord {
+                kind: VerticalKind::HeightAboveAntenna,
+                values: heights_m.to_vec(),
+            },
+        },
+        parameters: param_descs,
+        ranges,
+    })
+}
+
 /// Build the EDR coverages for one radar site at WGS84 `(lon, lat)`.
 ///
 /// `(lon, lat)` is both the coverage's domain point and the sample
@@ -1568,6 +1976,7 @@ impl EdrEngine for PolarVolumeEngine {
             "locations".to_string(),
             "position".to_string(),
             "area".to_string(),
+            "trajectory".to_string(),
         ]
     }
 
@@ -1654,6 +2063,115 @@ impl EdrEngine for PolarVolumeEngine {
         }
         Ok(CoverageResponse::Collection(coverages))
     }
+
+    /// Trajectory query — a vertical cross-section along a WKT
+    /// `LINESTRING`. Returns a `Section` coverage per timestep: the
+    /// composite axis carries one `(t, lon, lat)` triple per along-path
+    /// node; the `z` axis is **height above the antenna in metres**
+    /// (derived via the 4/3-Earth beam geometry).
+    ///
+    /// `z` *selects elevation angles* — it matches the collection's
+    /// advertised vertical extent (sweep angles in degrees), resolved by
+    /// the API layer so an interval `z=0.3/15` arrives as the angles in
+    /// range. The selected `[min, max]` angle window bounds which sweeps
+    /// contribute and sizes the derived height axis; cells whose beam
+    /// angle falls outside the window are nodata. `None` uses every sweep.
+    ///
+    /// **Single radar per cross-section**: the site nearest the path
+    /// centroid is picked, and the whole Section is sampled against
+    /// that one volume. Path nodes outside that radar's coverage simply
+    /// receive nodata. Multi-radar stitching is a deliberate follow-up.
+    fn query_trajectory(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        z: Option<&[f64]>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let vertices = parse_linestring_coords(coords)?;
+        let path = resample_path(&vertices);
+        if path.len() < 2 {
+            return Err(DataServerError::InvalidParameter(
+                "LINESTRING must trace a non-degenerate path".into(),
+            ));
+        }
+
+        let catalog = self.catalog.load();
+        // Pick the radar nearest the path's *middle node* (not an
+        // arithmetic-mean centroid) to choose which site owns the line.
+        // A real on-path point is antimeridian-safe — averaging the
+        // longitudes of e.g. 178° and −178° gives 0°, which would pick a
+        // European radar for a Pacific path. The midpoint node is a true
+        // resampled `(lon, lat)` on the great-circle path. (v1: single
+        // radar per cross-section, no multi-radar stitching.)
+        let (cx, cy) = path[path.len() / 2];
+        let nod = nearest_site(&catalog, cx, cy)
+            .ok_or_else(|| {
+                DataServerError::LocationNotFound("PVOL catalog has no radar sites".into())
+            })?
+            .to_string();
+        let volumes = catalog.by_site.get(&nod).ok_or_else(|| {
+            DataServerError::Engine("internal: nearest_site returned a missing by_site key".into())
+        })?;
+
+        // Time filter — same logic as site_coverages.
+        let selected: Vec<&VolumeEntry> = match datetime {
+            Some((start, end)) => volumes
+                .iter()
+                .filter(|e| e.volume.time >= start && e.volume.time <= end)
+                .collect(),
+            None => volumes.iter().collect(),
+        };
+        if selected.is_empty() {
+            return Err(DataServerError::LocationNotFound(
+                "No PVOL data available for the requested time range".into(),
+            ));
+        }
+
+        let quantities = resolve_quantities(&selected, parameters)?;
+
+        // `z` carries the requested elevation angles (resolved by the API
+        // layer against the advertised extent). Derive the angle window
+        // and the matching height axis from the most recent volume. An
+        // out-of-range `z` list surfaces as `InvalidParameter` (400)
+        // rather than a silently empty Section.
+        let ref_volume = &selected.last().unwrap().volume;
+        let window = angle_window(z, ref_volume)?;
+        // The path's farthest ground distance from the radar sizes the
+        // height-axis ceiling for the selected top angle.
+        let max_ground_dist = path
+            .iter()
+            .map(|&(lon, lat)| {
+                ground_distance_bearing(ref_volume.site.lon, ref_volume.site.lat, lon, lat).0
+            })
+            .fold(0.0_f64, f64::max);
+        let heights = height_axis(window.1, max_ground_dist);
+        if heights.is_empty() {
+            return Err(DataServerError::InvalidParameter(
+                "trajectory `z` resolved to an empty axis".into(),
+            ));
+        }
+
+        let coverages: Vec<QueryResult> = selected
+            .iter()
+            .filter_map(|e| volume_section(e, &path, &heights, &quantities, window))
+            .collect();
+        if coverages.is_empty() {
+            return Err(DataServerError::LocationNotFound(
+                "No PVOL volumes produced a section for the requested path".into(),
+            ));
+        }
+        if coverages.len() == 1 {
+            // Single timestep — emit one Coverage rather than a one-item
+            // collection, matching the `query_location` precedent for
+            // pinned-level requests.
+            Ok(CoverageResponse::Single(
+                coverages.into_iter().next().unwrap(),
+            ))
+        } else {
+            Ok(CoverageResponse::Collection(coverages))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1705,6 +2223,288 @@ mod tests {
     fn distance_zero_at_site() {
         let (d, _az) = ground_distance_bearing(25.0, 60.0, 25.0, 60.0);
         assert!(d < 1e-6, "distance at site ≈ 0, got {d}");
+    }
+
+    /// `destination_point` plus `ground_distance_bearing` are inverses
+    /// up to spherical-trig round-off — moving 50 km along bearing 45°
+    /// from a starting point gives back distance 50 km and bearing 45°.
+    #[test]
+    fn destination_point_roundtrips_via_distance_bearing() {
+        let (lon0, lat0) = (25.0, 60.0);
+        let (lon1, lat1) = destination_point(lon0, lat0, 50_000.0, 45.0);
+        let (d, az) = ground_distance_bearing(lon0, lat0, lon1, lat1);
+        assert!((d - 50_000.0).abs() < 1.0, "round-trip distance, got {d}");
+        assert!((az - 45.0).abs() < 1e-3, "round-trip bearing, got {az}");
+    }
+
+    /// Crossing the antimeridian eastbound keeps the longitude in
+    /// (−180, 180]: starting at 179.9° and travelling east must wrap to a
+    /// small negative longitude, not 180.x°, so the value is valid in a
+    /// CoverageJSON node.
+    #[test]
+    fn destination_point_normalises_longitude_across_antimeridian() {
+        let (lon, _lat) = destination_point(179.9, 0.0, 50_000.0, 90.0);
+        assert!(
+            (-180.0..=180.0).contains(&lon),
+            "lon must be normalised into (−180, 180], got {lon}"
+        );
+        assert!(
+            lon < 0.0,
+            "eastbound past 180° wraps to negative, got {lon}"
+        );
+    }
+
+    /// 4/3-Earth forward + inverse are mutual inverses to sub-metre /
+    /// sub-mdeg residuals over the radar-relevant envelope
+    /// (≤ 250 km range, 0°–30° elevation, up to 20 km height). This is
+    /// the round-trip check; the next test pins absolute values against
+    /// a Doviak reference.
+    #[test]
+    fn four_thirds_earth_roundtrips() {
+        for &r in &[1_000.0_f64, 50_000.0, 100_000.0, 200_000.0, 250_000.0] {
+            for &el in &[0.5_f64, 1.5, 5.0, 15.0, 30.0] {
+                let (s, h) = slant_to_ground_height(r, el);
+                let (r2, el2) = ground_height_to_slant(s, h);
+                assert!(
+                    (r - r2).abs() < 0.5,
+                    "slant round-trip residual @ r={r} el={el}: r2={r2}"
+                );
+                assert!(
+                    (el - el2).abs() < 1e-6,
+                    "elangle round-trip residual @ r={r} el={el}: el2={el2}"
+                );
+            }
+        }
+    }
+
+    /// Absolute pins (not round-trip) against the 4/3-Earth model: at
+    /// elevation 0° the beam grazes the surface, so a 100 km slant
+    /// range gives ground distance ≈ 99.95 km and height ≈ 587 m
+    /// (R'/(2R'+r) curvature drop). At elevation 90° the beam goes
+    /// straight up: ground distance ≈ 0, height ≈ r. Both follow from
+    /// the formula given in `slant_to_ground_height`.
+    #[test]
+    fn four_thirds_earth_absolute_reference() {
+        // Zero elevation, 100 km range: height = √(r² + R'²) − R'
+        //                              = √(1e10 + R'²) − R' ≈ 587 m
+        let (s, h) = slant_to_ground_height(100_000.0, 0.0);
+        let expected_h =
+            (100_000.0_f64.powi(2) + FOUR_THIRDS_EARTH_M.powi(2)).sqrt() - FOUR_THIRDS_EARTH_M;
+        assert!(
+            (h - expected_h).abs() < 0.01,
+            "el=0 r=100km: h={h}, expected {expected_h}"
+        );
+        // Ground distance for el=0 ≈ R' · atan(r/R') ≈ r at radar range.
+        // The drop from r is the curvature correction (~50 m at 100 km).
+        assert!((s - 99_950.0).abs() < 60.0, "el=0 r=100km: s={s}");
+
+        // 90° elevation: everything points straight up.
+        let (s, h) = slant_to_ground_height(50_000.0, 90.0);
+        assert!(s.abs() < 1e-3, "el=90 r=50km: s={s} should be ~0");
+        assert!(
+            (h - 50_000.0).abs() < 1.0,
+            "el=90 r=50km: h={h} should be ~50000"
+        );
+
+        // 1° elevation, 50 km range. Under 4/3-Earth, h ≈ 1020 m
+        // (≈ r·sin(el) ≈ 873 m plus the ~147 m curvature drop). The
+        // ground distance is r·cos(el) less ~10 m of curvature
+        // correction — `s ≈ 49982.6 m` — looser tolerance than the
+        // straight-line approximation would suggest.
+        let (s, h) = slant_to_ground_height(50_000.0, 1.0);
+        assert!(
+            (s - 49_983.0).abs() < 5.0,
+            "el=1 r=50km: s={s} should be ~49983"
+        );
+        assert!(
+            (h - 1_020.0).abs() < 10.0,
+            "el=1 r=50km: h={h} should be ~1020"
+        );
+    }
+
+    /// `sample_polar_slant` returns `None` for malformed sweep geometry
+    /// (`rscale` zero, negative, or non-finite) rather than fabricating
+    /// a bin-0 sample. ODIM_H5 guarantees `rscale > 0`, but a corrupted
+    /// file would otherwise produce a `NaN as i64 == 0` cast and report
+    /// the first bin's value at every requested range.
+    #[test]
+    fn sample_polar_slant_rejects_malformed_rscale() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let mut vol = synthetic_volume(site_lon, site_lat);
+        let env = sweep_envelope(&vol).expect("synthetic volume has finite sweep");
+        let azimuth = 90.0;
+        let elangle = 0.5;
+        let range_m = 10_000.0;
+
+        // Baseline: well-formed sweep returns a finite sample.
+        let v = sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, elangle);
+        assert!(v.is_some(), "well-formed sweep must sample");
+
+        for bad in [0.0_f64, -1_000.0, f64::NAN, f64::INFINITY] {
+            vol.sweeps[0].rscale = bad;
+            assert!(
+                sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, elangle).is_none(),
+                "rscale={bad} must yield None, not fabricated data"
+            );
+        }
+    }
+
+    /// `sample_polar_slant` returns `None` for elevation targets outside
+    /// the sweep envelope (above the highest beam or well below the
+    /// lowest). This guards against the silent surface-row substitution
+    /// the 4/3-Earth inversion otherwise causes: at h=0 far from the
+    /// radar, the inverted target el goes slightly negative; without
+    /// this guard `nearest_sweep` still picks the lowest sweep and
+    /// fabricates "ground" reflectivity from a beam aimed well above.
+    /// Found by claude-review on PR #275.
+    #[test]
+    fn sample_polar_slant_rejects_out_of_envelope_elevation() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let vol = synthetic_volume(site_lon, site_lat);
+        let env = sweep_envelope(&vol).unwrap();
+        // Synthetic fixture has one sweep at 0.5°. Tolerance is 1°, so
+        // targets in [-0.5°, 1.5°] are accepted; everything outside ⇒ None.
+        let azimuth = 90.0;
+        let range_m = 10_000.0;
+
+        // Inside the window — sampled.
+        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, 0.5).is_some());
+        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, 1.4).is_some());
+        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, -0.4).is_some());
+
+        // Just outside the window — None.
+        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, 1.6).is_none());
+        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, -0.6).is_none());
+
+        // Far outside — None (the 90° overhead case that bit the
+        // h=large cells at the radar location).
+        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, 90.0).is_none());
+
+        // Non-finite el — None.
+        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, f64::NAN).is_none());
+    }
+
+    /// `angle_window` selects the requested elevation-angle span, clamped
+    /// to the volume's actual sweep range; `None` selects the full span;
+    /// a request entirely above the top sweep is a 400, not silent nodata.
+    #[test]
+    fn angle_window_selects_and_clamps() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let mut vol = synthetic_volume(site_lon, site_lat);
+        // Give it a fan of sweeps 0.5°..15°.
+        let base = vol.sweeps[0].clone();
+        vol.sweeps = [0.5, 1.5, 5.0, 9.0, 15.0]
+            .iter()
+            .map(|&el| {
+                let mut s = base.clone();
+                s.elangle = el;
+                s
+            })
+            .collect();
+
+        // No z → full sweep span.
+        assert_eq!(angle_window(None, &vol).unwrap(), (0.5, 15.0));
+        // A sub-range → exactly that window.
+        assert_eq!(
+            angle_window(Some(&[1.5, 5.0, 9.0]), &vol).unwrap(),
+            (1.5, 9.0)
+        );
+        // A request straddling the top sweep clamps to the surveyed range.
+        assert_eq!(angle_window(Some(&[5.0, 45.0]), &vol).unwrap(), (5.0, 15.0));
+        // A discrete list entirely above the top sweep would invert the
+        // clamp to (40, 15) → would silently produce an all-nodata
+        // Section. It must be a clear `InvalidParameter` instead.
+        match angle_window(Some(&[40.0, 50.0]), &vol) {
+            Err(DataServerError::InvalidParameter(_)) => {}
+            other => panic!("expected InvalidParameter for out-of-range z, got {other:?}"),
+        }
+    }
+
+    /// `height_axis` builds a monotonic 0..top grid whose ceiling tracks
+    /// the selected top angle and is clamped to ≤ 25 km.
+    #[test]
+    fn height_axis_tracks_top_angle_and_caps() {
+        // A 2° beam at 30 km ground distance reaches ~1 km up.
+        let low = height_axis(2.0, 30_000.0);
+        assert!(low.first() == Some(&0.0), "axis starts at 0");
+        assert!(low.windows(2).all(|w| w[1] > w[0]), "monotonic ascending");
+        assert!(*low.last().unwrap() <= 25_000.0);
+        // A higher top angle reaches higher (taller axis ceiling).
+        let high = height_axis(15.0, 30_000.0);
+        assert!(*high.last().unwrap() > *low.last().unwrap());
+        // The slant correction (ground/cos el) makes the 15° ceiling a
+        // touch higher than using the ground distance as slant directly —
+        // a few hundred metres on a 30 km path — so real coverage near the
+        // top of the beam isn't clipped. (Both are well under the 25 km
+        // cap at 30 km, so the correction is observable here.)
+        let (_, h_ground_as_slant) = slant_to_ground_height(30_000.0, 15.0);
+        assert!(*high.last().unwrap() <= 25_000.0, "below the cap at 30 km");
+        assert!(
+            *high.last().unwrap() > h_ground_as_slant,
+            "cos-corrected ceiling {} must exceed the ground-as-slant value {}",
+            high.last().unwrap(),
+            h_ground_as_slant
+        );
+        // A near-vertical beam at long range is capped at 25 km, not
+        // hundreds of km.
+        let capped = height_axis(89.0, 200_000.0);
+        assert!(*capped.last().unwrap() <= 25_000.0 + 1.0);
+        assert!(capped.len() <= 100, "level count capped");
+    }
+
+    /// A zero-length polyline (all vertices coincident) resamples to a
+    /// *single* node, so `query_trajectory`'s `path.len() < 2` guard turns
+    /// it into a 400 rather than a Section with duplicate composite nodes.
+    /// (`parse_linestring_coords` rejects this upstream too; this guards a
+    /// direct call.)
+    #[test]
+    fn resample_path_degenerate_returns_single_node() {
+        let coincident = vec![(25.0, 60.0), (25.0, 60.0)];
+        assert_eq!(resample_path(&coincident).len(), 1);
+        // A real path still resamples to ≥2 nodes.
+        let real = vec![(25.0, 60.0), (25.5, 60.5)];
+        assert!(resample_path(&real).len() >= 2);
+    }
+
+    /// `volume_section` clamps the caller's angle window to *this volume's*
+    /// surveyed sweep range. A window wider than the volume's sweeps (as
+    /// happens when the window is derived from a newer, deeper scan) must
+    /// not fabricate data: a cell that inverts to an elevation the volume
+    /// never scanned stays nodata rather than snapping to its top sweep.
+    #[test]
+    fn volume_section_clamps_window_to_per_volume_sweeps() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        // The synthetic volume has a single 0.5° sweep.
+        let vol = synthetic_volume(site_lon, site_lat);
+        let e = entry(vol, "v0");
+
+        // A node ~10 km due east: at height 0 the beam grazes the surface
+        // (el ≈ 0°, inside the 0.5° sweep envelope ±1°); at 1500 m it
+        // climbs to el ≈ 8–9° — inside the *window* (0.5–25°) but outside
+        // this volume's actual range, so it must be nodata.
+        let dlon_10km = 10_000.0 / (EARTH_RADIUS_M * site_lat.to_radians().cos()) * 180.0
+            / std::f64::consts::PI;
+        let path = vec![(site_lon, site_lat), (site_lon + dlon_10km, site_lat)];
+        let heights = vec![0.0, 1500.0];
+        let window = (0.5, 25.0); // wider than the volume's 0.5° sweep
+
+        let qr = volume_section(&e, &path, &heights, &["DBZH".to_string()], window)
+            .expect("section produced");
+        let nd = qr.ranges.get("DBZH").expect("DBZH range");
+        // Layout is row-major [node][height]; the far node is index 1, so
+        // its first cell starts at `heights.len()`.
+        let nz = heights.len();
+        let far_surface = nd.values[nz]; // (10 km, 0 m)
+        let far_high = nd.values[nz + 1]; // (10 km, 1500 m)
+        assert!(
+            far_surface.is_some(),
+            "the surface cell grazes the 0.5° sweep and must sample"
+        );
+        assert!(
+            far_high.is_none(),
+            "a cell at ~8° must stay nodata — the volume never scanned that \
+             angle, even though it's inside the requested window"
+        );
     }
 
     /// Build a synthetic single-site, single-sweep, single-moment

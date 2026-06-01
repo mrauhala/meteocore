@@ -14,13 +14,13 @@ use ds_core::edr_engine::EdrEngine;
 
 use ds_core::error::DataServerError;
 use ds_core::model::CoverageResponse;
-use ds_render::render_chart;
+use ds_render::{render_chart, render_heatmap};
 
 use crate::params::{
-    parse_edr_format, parse_z, plot_dimensions, split_position_coords, AreaQueryParams, EdrFormat,
-    LocationQueryParams, PositionQueryParams,
+    parse_edr_format, parse_z, plot_dimensions, resolve_z_levels, split_position_coords,
+    AreaQueryParams, EdrFormat, LocationQueryParams, PositionQueryParams, TrajectoryQueryParams,
 };
-use crate::plot_convert::coverage_response_to_panels;
+use crate::plot_convert::{coverage_response_to_panels, section_response_to_heatmaps};
 use crate::response::{coverage_response_to_json, locations_to_geojson, LocationsContext};
 
 type HandlerError = (StatusCode, Json<serde_json::Value>);
@@ -100,14 +100,23 @@ fn lookup_collection<'a>(
     Ok((engine, config))
 }
 
-/// Reject a `z` selector against a collection with no vertical dimension.
-/// Collections that have one let the engine resolve `z`; collections that
-/// don't return HTTP 400 rather than silently ignoring the parameter.
-fn reject_z_without_vertical(
+/// Parse and resolve the request `z` parameter into the concrete level
+/// list an engine samples.
+///
+/// - Absent / blank → `None` (whole vertical extent).
+/// - A `z` against a collection with no vertical dimension → 400 (rather
+///   than silently ignored).
+/// - An interval (`z=min/max`) is expanded against the collection's
+///   advertised levels; a list passes through for the engine to snap.
+fn resolve_request_z(
     engine: &Arc<dyn EdrEngine>,
-    z: &Option<Vec<f64>>,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if z.is_some() && engine.get_vertical_extent().is_none() {
+    z: Option<&str>,
+) -> Result<Option<Vec<f64>>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(sel) = parse_z(z).map_err(|e| bad_request(&e))? else {
+        return Ok(None);
+    };
+    let extent = engine.get_vertical_extent();
+    if extent.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -117,7 +126,8 @@ fn reject_z_without_vertical(
             })),
         ));
     }
-    Ok(())
+    let levels = resolve_z_levels(&sel, extent.as_ref()).map_err(|e| bad_request(&e))?;
+    Ok(Some(levels))
 }
 
 pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
@@ -166,6 +176,20 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
     let mut collection_paths = json!({});
     for config in state.collections.values() {
         let id = &config.id;
+        // Per-collection supported-query-types so the OpenAPI spec only
+        // advertises endpoints the engine actually implements. The
+        // `data_queries` block in `build_collection_metadata` already
+        // gates on this; without the same gate here the two discovery
+        // surfaces disagree (an OGC CITE crawl following /api would hit
+        // the default `InvalidParameter → 400` arm on an unsupported
+        // engine, while /collections/{id} omits the link entirely).
+        // The legacy /position and /area entries below stay unconditional
+        // for back-compat; trajectory ships gated from day one.
+        let supported: std::collections::HashSet<String> = state
+            .engines
+            .get(id)
+            .map(|e| e.supported_query_types().into_iter().collect())
+            .unwrap_or_default();
 
         // Collection detail
         let detail_path = format!("/edr/collections/{id}");
@@ -313,6 +337,53 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 }
             }
         });
+
+        // Trajectory query (vertical cross-section). Only advertised
+        // for engines that report `trajectory` in
+        // `supported_query_types` — keeps the OpenAPI spec consistent
+        // with `data_queries` in the collection metadata. A client that
+        // calls the path on a non-trajectory engine gets a 404 from the
+        // handler's capability guard (the resource doesn't exist for
+        // that collection).
+        if supported.contains("trajectory") {
+            let trajectory_path = format!("/edr/collections/{id}/trajectory");
+            collection_paths[&trajectory_path] = json!({
+                "get": {
+                    "summary": format!("Trajectory cross-section for {}", config.title),
+                    "operationId": format!("getTrajectory_{id}"),
+                    "tags": [id],
+                    "parameters": [
+                        {"$ref": "#/components/parameters/coords-linestring"},
+                        {"$ref": "#/components/parameters/datetime"},
+                        {"$ref": "#/components/parameters/parameter-name"},
+                        {"$ref": "#/components/parameters/z-trajectory"},
+                        {
+                            "name": "f",
+                            "in": "query",
+                            "description": "Output format: CoverageJSON (default) or PNG (a colour-mapped distance×height cross-section heatmap).",
+                            "required": false,
+                            "schema": {"type": "string", "enum": ["CoverageJSON", "PNG"]}
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Coverage data — CoverageJSON Section domain or PNG heatmap",
+                            "content": {
+                                "application/prs.coverage+json": {
+                                    "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                                },
+                                "image/png": {
+                                    "schema": {"type": "string", "format": "binary"}
+                                }
+                            }
+                        },
+                        "400": {"description": "Bad request"},
+                        "404": {"description": "Not found"},
+                        "500": {"description": "Server error"}
+                    }
+                }
+            });
+        }
     }
 
     let mut paths = json!({
@@ -397,6 +468,20 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "required": true,
                     "schema": {"type": "string"},
                     "description": "WKT POLYGON geometry, e.g. POLYGON((24 60, 26 60, 26 61, 24 61, 24 60))"
+                },
+                "coords-linestring": {
+                    "name": "coords",
+                    "in": "query",
+                    "required": true,
+                    "schema": {"type": "string"},
+                    "description": "WKT LINESTRING geometry (lon lat, lon lat, …). LINESTRINGZ/M variants are not accepted — per-node z and time will arrive in a follow-up."
+                },
+                "z-trajectory": {
+                    "name": "z",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "description": "Elevation-angle selection for the cross-section, matching the collection's advertised vertical extent (sweep angles in degrees). Forms: z=5 (one sweep), z=0.5,1.5,5 (a list), or z=0.3/15 (a min/max interval → every advertised angle in range). The selected angle window bounds which sweeps build the RHI; the rendered z axis is derived height above the antenna (metres). Absent → all sweeps."
                 }
             },
             "schemas": {
@@ -533,13 +618,7 @@ pub async fn location_query(
         .as_deref()
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
-    let z = parse_z(params.z.as_deref()).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-        )
-    })?;
-    reject_z_without_vertical(engine, &z)?;
+    let z = resolve_request_z(engine, params.z.as_deref())?;
 
     let result = engine
         .query_location(&loc_id, datetime, param_names.as_deref(), z.as_deref())
@@ -590,13 +669,7 @@ pub async fn position_query(
         .as_deref()
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
-    let z = parse_z(params.z.as_deref()).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-        )
-    })?;
-    reject_z_without_vertical(engine, &z)?;
+    let z = resolve_request_z(engine, params.z.as_deref())?;
 
     // Split coords into one or more POINT(lon lat) strings. A single POINT is
     // passed through to the engine as-is; MULTIPOINT is fanned out into one
@@ -692,13 +765,7 @@ pub async fn area_query(
         .as_deref()
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
-    let z = parse_z(params.z.as_deref()).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-        )
-    })?;
-    reject_z_without_vertical(engine, &z)?;
+    let z = resolve_request_z(engine, params.z.as_deref())?;
 
     let result = engine
         .query_area(
@@ -728,11 +795,142 @@ pub async fn area_query(
             }
         })?;
 
-    let body = serde_json::to_string(&coverage_response_to_json(&result)).unwrap();
+    let body = serde_json::to_string(&coverage_response_to_json(&result)).map_err(|e| {
+        tracing::error!("Area CoverageJSON serialise error: {e}");
+        server_error()
+    })?;
     Ok((
         [(header::CONTENT_TYPE, "application/prs.coverage+json")],
         body,
     ))
+}
+
+pub async fn trajectory_query(
+    Path(id): Path<String>,
+    Query(params): Query<TrajectoryQueryParams>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let state = state.load_full();
+    let (engine, config) = lookup_collection(&state, &id)?;
+
+    // An engine that doesn't advertise `trajectory` has no cross-section
+    // capability. Return 404 (the resource doesn't exist for this
+    // collection) rather than letting the default trait method answer
+    // 400 (which wrongly implies the *request* was malformed). Keeps the
+    // live route consistent with the `api_definition` OpenAPI gating and
+    // the `data_queries` collection metadata. Flagged by claude-review.
+    if !engine
+        .supported_query_types()
+        .iter()
+        .any(|q| q == "trajectory")
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "code": "NotFound",
+                "description": format!(
+                    "Collection '{id}' does not support trajectory (cross-section) queries"
+                )
+            })),
+        ));
+    }
+
+    let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
+
+    let datetime = params
+        .datetime
+        .as_deref()
+        .map(parse_datetime_interval)
+        .transpose()
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+            )
+        })?;
+
+    let param_names: Option<Vec<String>> = params
+        .parameter_name
+        .as_deref()
+        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
+
+    // Trajectory `z` selects elevation angles from the collection's
+    // advertised vertical extent (the cross-section is built from those
+    // sweeps); an interval `z=0.3/15` expands to the angles in range.
+    let z = resolve_request_z(engine, params.z.as_deref())?;
+
+    // The cross-section sampler is the heaviest EDR path — up to
+    // nodes × z-levels × quantities × timesteps `sample_polar_slant`
+    // iterations (millions, seconds of CPU). Run it on the blocking pool
+    // so it doesn't park a request-serving worker and head-of-line-block
+    // other requests. Safe here: the trajectory path reads an in-memory
+    // `ArcSwap` catalog snapshot and never touches `DataStore` (whose
+    // `block_in_place` would panic on a `spawn_blocking` thread). The
+    // general "wrap every EdrEngine query" work is tracked in #178.
+    let engine = engine.clone();
+    let coords = params.coords.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        engine.query_trajectory(&coords, datetime, param_names.as_deref(), z.as_deref())
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!("Trajectory query task join error: {e}");
+        server_error()
+    })?
+    .map_err(|e| match &e {
+        ds_core::error::DataServerError::InvalidParameter(_)
+        | ds_core::error::DataServerError::InvalidBbox(_)
+        | ds_core::error::DataServerError::InvalidDatetime(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+        ),
+        ds_core::error::DataServerError::LocationNotFound(_)
+        | ds_core::error::DataServerError::CollectionNotFound(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "code": "NotFound", "description": e.to_string() })),
+        ),
+        _ => {
+            tracing::error!("Trajectory query error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "code": "ServerError", "description": "Internal server error" })),
+            )
+        }
+    })?;
+
+    match format {
+        EdrFormat::CoverageJson => {
+            let body = serde_json::to_string(&coverage_response_to_json(&result)).map_err(|e| {
+                tracing::error!("Trajectory CoverageJSON serialise error: {e}");
+                server_error()
+            })?;
+            Ok((
+                [(header::CONTENT_TYPE, "application/prs.coverage+json")],
+                body,
+            )
+                .into_response())
+        }
+        EdrFormat::Png => {
+            // Render the cross-section as a colour-mapped heatmap using
+            // the collection's WMS colormap (or a data-scaled viridis
+            // fallback).
+            // A failure here is an internal inconsistency (the engine
+            // already returned a Section for this trajectory query), not
+            // a client mistake — log it and return a generic 500 rather
+            // than leaking the internal message in a 400.
+            let (heatmaps, colormap) = section_response_to_heatmaps(&result, config.wms.as_ref())
+                .map_err(|e| {
+                tracing::error!("Trajectory PNG section conversion error: {e}");
+                server_error()
+            })?;
+            let (w, h) = plot_dimensions(params.width, params.height);
+            let png = render_heatmap(&heatmaps, colormap.as_ref(), w, h).map_err(|e| {
+                tracing::error!("Trajectory PNG render error: {e}");
+                server_error()
+            })?;
+            Ok(([(header::CONTENT_TYPE, "image/png")], png).into_response())
+        }
+    }
 }
 
 fn build_collection_metadata(
@@ -772,15 +970,26 @@ fn build_collection_metadata(
     }
 
     // Vertical extent — advertise the available levels so a client knows
-    // what `z` values it may request. `vrs` is intentionally omitted:
-    // vertical coordinate kinds like radar elevation angle have no
-    // standard OGC vertical-CRS URI, and `vrs` is optional in OGC EDR.
+    // what `z` values it may request.
+    //
+    // OGC EDR 1.1 requires `interval` items, `values` items, and `vrs`
+    // — and `interval`/`values` are typed as STRINGS in the schema
+    // (lines 670–676 of `schemas/ogcapi-edr-1.1-bundled.json`), not
+    // numbers. Floats round-trip through `Display` so a client can
+    // parse them back when needed. `vrs` is taken from the kind's
+    // built-in WKT/URI so a radar collection still validates against
+    // the EDR schema.
     if let Some(vertical) = engine.get_vertical_extent() {
         let mut vertical_obj = serde_json::Map::new();
         if let Some((lo, hi)) = vertical.extent() {
-            vertical_obj.insert("interval".to_string(), json!([[lo, hi]]));
+            vertical_obj.insert(
+                "interval".to_string(),
+                json!([[lo.to_string(), hi.to_string()]]),
+            );
         }
-        vertical_obj.insert("values".to_string(), json!(vertical.levels));
+        let values: Vec<String> = vertical.levels.iter().map(|v| v.to_string()).collect();
+        vertical_obj.insert("values".to_string(), json!(values));
+        vertical_obj.insert("vrs".to_string(), json!(vertical.kind.vrs()));
         extent.insert("vertical".to_string(), json!(vertical_obj));
     }
 
@@ -821,6 +1030,10 @@ fn build_collection_metadata(
             "area" => (
                 format!("{base_url}/edr/collections/{}/area", config.id),
                 json!(["CoverageJSON"]),
+            ),
+            "trajectory" => (
+                format!("{base_url}/edr/collections/{}/trajectory", config.id),
+                json!(["CoverageJSON", "PNG"]),
             ),
             _ => continue,
         };
