@@ -970,20 +970,25 @@ impl PolarVolumeEngine {
 
     /// Re-scan the source and atomically swap the catalog.
     ///
-    /// The scan — directory walk or S3 `list` + multi-MB `get`s plus
-    /// HDF5 parsing — is blocking, so it runs on `spawn_blocking` rather
-    /// than stalling a Tokio worker. Mirrors `OdimEngine::poll_once`.
+    /// The scan — directory walk or S3 `list` + multi-MB `get`s plus HDF5
+    /// parsing — is blocking, and runs **directly on the background poll
+    /// runtime worker**, NOT via `spawn_blocking`. For a `Source::Remote`,
+    /// `scan_source` reaches into `ds-storage`, whose `block_in_place`
+    /// **panics** on a `spawn_blocking` pool thread but is valid on a
+    /// multi-thread-runtime worker (`poll_runtime()` is `new_multi_thread`).
+    /// Wrapping in `spawn_blocking` would silently fail every S3 refresh
+    /// (the `JoinError` is caught, but the catalog never updates — new
+    /// volumes are dropped until an admin reload). Mirrors the GRIB /
+    /// GeoTIFF / QueryData poll loops, which also call their blocking scan
+    /// directly on the poll runtime.
     async fn poll_once(&self) {
-        let collection_id = self.collection_id.clone();
-        let source = self.source.clone();
-        let cache = Arc::clone(&self.parse_cache);
-        let max_files = self.max_files;
-        let scan_result = tokio::task::spawn_blocking(move || {
-            scan_source(&collection_id, &source, &cache, max_files)
-        })
-        .await;
-        match scan_result {
-            Ok(Ok(catalog)) => {
+        match scan_source(
+            &self.collection_id,
+            &self.source,
+            &self.parse_cache,
+            self.max_files,
+        ) {
+            Ok(catalog) => {
                 let prev = self.catalog.load();
                 // Aggregate signals across sites for change detection: site
                 // count, newest volume time, and total volume count.
@@ -1010,14 +1015,8 @@ impl PolarVolumeEngine {
                 }
                 self.catalog.store(Arc::new(catalog));
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 tracing::warn!("[{}] PVOL catalog refresh failed: {e}", self.collection_id);
-            }
-            Err(join_err) => {
-                tracing::error!(
-                    "[{}] PVOL catalog refresh task panicked: {join_err}",
-                    self.collection_id
-                );
             }
         }
     }
@@ -2012,6 +2011,16 @@ fn finalize_single_site(
                 )
             });
     }
+    // Every selected volume produced no plottable coverage (e.g. a
+    // corrupted batch where every sweep's elevation angle is non-finite).
+    // An empty `CoverageCollection` is invalid CoverageJSON and would
+    // serve HTTP 200 for what is really "no data" — surface a 404 instead,
+    // matching the CLAUDE.md "no data in window → LocationNotFound" rule.
+    if covs.is_empty() {
+        return Err(DataServerError::LocationNotFound(
+            "no PVOL data for this site in the requested time window".into(),
+        ));
+    }
     Ok(CoverageResponse::Collection(covs))
 }
 
@@ -2020,24 +2029,31 @@ fn finalize_single_site(
 // ---------------------------------------------------------------------------
 
 impl PolarVolumeEngine {
-    /// NOD codes of every radar site currently in the catalog, sorted.
+    /// `(nod, label)` for every radar site with usable metadata, sorted by
+    /// `nod`, from **one** catalog snapshot.
     ///
     /// The loader calls this after construction (one synchronous scan has
-    /// already run) to expand this one source config into N per-site OGC
-    /// collections — one [`site_view`](Self::site_view) each. The set is a
-    /// snapshot: sites appearing or disappearing between polls are only
-    /// reflected on the next admin reload, which re-runs the expansion.
-    pub fn site_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.catalog.load().by_site.keys().cloned().collect();
-        ids.sort();
-        ids
-    }
-
-    /// Human place name (ODIM `/what` PLC) for site `nod`, if the catalog
-    /// holds one — used to title the per-site collection. `None` when the
-    /// site is unknown or carries no place name.
-    pub fn site_label(&self, nod: &str) -> Option<String> {
-        self.catalog.load().by_site_meta.get(nod)?.plc.clone()
+    /// already run) to expand this source config into N per-site OGC
+    /// collections — one [`site_view`](Self::site_view) per entry. `label`
+    /// is the site's place name (ODIM `/what` PLC) or its `nod` when none.
+    ///
+    /// Enumerates `by_site_meta`, **not** `by_site`: a site whose latest
+    /// volume has no usable lowest sweep is absent from `by_site_meta`, so
+    /// registering it would yield a collection with no parameters/extent
+    /// (every WMS GetMap then 400s). Returning `(nod, label)` from a single
+    /// snapshot also keeps the registered id and title consistent even if a
+    /// background poll swaps the catalog mid-registration. Snapshot — sites
+    /// appearing or disappearing between polls surface on the next admin
+    /// reload, which re-runs the expansion.
+    pub fn sites(&self) -> Vec<(String, String)> {
+        let catalog = self.catalog.load();
+        let mut sites: Vec<(String, String)> = catalog
+            .by_site_meta
+            .iter()
+            .map(|(nod, meta)| (nod.clone(), meta.plc.clone().unwrap_or_else(|| nod.clone())))
+            .collect();
+        sites.sort_by(|a, b| a.0.cmp(&b.0));
+        sites
     }
 
     /// Build a [`PolarVolumeSiteView`] scoped to radar `nod`, sharing this
@@ -2317,6 +2333,15 @@ impl EdrEngine for PolarVolumeSiteView {
             parameters,
             levels.as_deref(),
         )?;
+        // Guard against an empty collection (every volume produced no
+        // plottable coverage) — an empty `CoverageCollection` is invalid
+        // CoverageJSON and should be a 404, not HTTP 200. Mirrors the
+        // network engine's dropped `query_area` is-empty check.
+        if covs.is_empty() {
+            return Err(DataServerError::LocationNotFound(
+                "no PVOL data for this site in the requested time window".into(),
+            ));
+        }
         Ok(CoverageResponse::Collection(covs))
     }
 
@@ -3489,5 +3514,79 @@ mod tests {
             ),
             Err(DataServerError::LocationNotFound(_))
         ));
+    }
+
+    /// A site whose latest volume has no usable lowest sweep is kept in
+    /// `by_site` but excluded from `by_site_meta` — so `sites()` (which the
+    /// loader enumerates) never registers a parameter-less, broken
+    /// collection for it. Regression guard for the `site_ids`-over-`by_site`
+    /// bug.
+    #[test]
+    fn derive_catalog_excludes_sweepless_site_from_meta() {
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "good".to_string(),
+            vec![entry(synthetic_volume(25.0, 60.0), "g")],
+        );
+        // A site whose latest volume carries no sweeps — no derivable metadata.
+        let mut sweepless = synthetic_volume(26.0, 60.0);
+        sweepless.sweeps.clear();
+        by_site.insert("bad".to_string(), vec![entry(sweepless, "b")]);
+
+        let cache = Mutex::new(HashMap::new());
+        let catalog = derive_catalog(by_site, &cache, None);
+
+        // Both survive in `by_site` (non-empty volume lists)...
+        assert!(catalog.by_site.contains_key("good"));
+        assert!(catalog.by_site.contains_key("bad"));
+        // ...but only the one with a usable lowest sweep has metadata.
+        assert!(catalog.by_site_meta.contains_key("good"));
+        assert!(
+            !catalog.by_site_meta.contains_key("bad"),
+            "a sweepless site must be absent from by_site_meta so it is never registered"
+        );
+
+        // `sites()` (via an engine over this catalog) returns only `good`.
+        let view = PolarVolumeSiteView {
+            catalog: Arc::new(ArcSwap::from_pointee(catalog)),
+            nod: "good".into(),
+            collection_id: "test".into(),
+        };
+        // The view for `good` advertises its quantity; metadata is present.
+        assert!(!MapEngine::raster_info(&view).parameters.is_empty());
+    }
+
+    /// When every selected volume yields no plottable coverage (a sweep
+    /// whose elevation angle is non-finite ⇒ `volume_profile` returns
+    /// `None`), an EDR point query returns `LocationNotFound` (404), not an
+    /// empty `CoverageCollection` served as HTTP 200. Regression guard for
+    /// the dropped is-empty check.
+    #[test]
+    fn site_view_empty_coverage_is_location_not_found() {
+        let mut nan_vol = synthetic_volume(25.0, 60.0);
+        nan_vol.sweeps[0].elangle = f64::NAN;
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert("nanv".to_string(), vec![entry(nan_vol, "n")]);
+        let view = site_view_for(by_site, "nanv");
+
+        // No `z`: the only sweep has a non-finite angle, so the profile is
+        // empty and the collection would be empty → must be a 404.
+        // (`CoverageResponse` is not `Debug`, so assert on the variant.)
+        assert!(
+            matches!(
+                EdrEngine::query_position(&view, "POINT(25.0 60.0)", None, None, None),
+                Err(DataServerError::LocationNotFound(_))
+            ),
+            "an all-empty point coverage must be LocationNotFound, not HTTP 200"
+        );
+
+        // Same for an area query whose polygon contains the antenna.
+        assert!(
+            matches!(
+                EdrEngine::query_area(&view, "24.0,59.0,26.0,61.0", None, None, None),
+                Err(DataServerError::LocationNotFound(_))
+            ),
+            "an all-empty area coverage must be LocationNotFound"
+        );
     }
 }

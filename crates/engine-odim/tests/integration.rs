@@ -565,9 +565,9 @@ fn pvol_engine_remote_scan_discovers_fmi_volume() {
 
     // The `fivih` site must surface — view it under model B.
     assert!(
-        engine.site_ids().iter().any(|n| n == "fivih"),
+        engine.sites().iter().any(|(n, _)| n == "fivih"),
         "remote scan must discover the `fivih` site, got {:?}",
-        engine.site_ids()
+        engine.sites()
     );
     let view = engine.site_view("fivih", "fivih-remote-test-fivih");
 

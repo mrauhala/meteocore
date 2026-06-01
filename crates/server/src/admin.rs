@@ -1184,8 +1184,12 @@ pub fn load_collections(
                 // set is the catalog snapshot taken by `new`'s synchronous
                 // scan; sites that appear later surface on the next reload
                 // (which re-runs this expansion).
-                let site_ids = engine.site_ids();
-                if site_ids.is_empty() {
+                // `(nod, label)` from one snapshot — enumerates only sites
+                // with usable metadata, so no empty/broken collection is
+                // registered, and the id+title stay consistent if a poll
+                // swaps the catalog mid-registration.
+                let sites = engine.sites();
+                if sites.is_empty() {
                     tracing::warn!(
                         "Collection '{}': PVOL source has no radar sites yet — no per-site \
                          collections registered. Reload once volume files arrive.",
@@ -1200,9 +1204,8 @@ pub fn load_collections(
                         error: Some("no radar sites discovered yet".into()),
                     });
                 }
-                for nod in &site_ids {
+                for (nod, label) in &sites {
                     let site_id = format!("{}-{}", collection.id, nod);
-                    let label = engine.site_label(nod).unwrap_or_else(|| nod.clone());
                     let view = Arc::new(engine.site_view(nod, &site_id));
 
                     // Per-site collection config: inherit the base
