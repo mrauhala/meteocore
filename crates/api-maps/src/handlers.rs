@@ -972,8 +972,23 @@ async fn render_map(
             (cached, "EMPTY", "image/png")
         }
         Err(e) => {
-            tracing::warn!("Maps render error for collection '{}': {e}", collection_id);
-            return Err(MapsError::Internal(format!("Render failed: {e}")));
+            use ds_core::error::DataServerError as DSE;
+            // A client mistake (e.g. a multi-parameter PVOL collection
+            // rendered without a `<site>:<quantity>` parameter, or a bad
+            // bbox/datetime) is a 400 with the engine's helpful message —
+            // not a 500 that hides it behind "Internal server error".
+            return Err(match e {
+                DSE::InvalidParameter(_) | DSE::InvalidBbox(_) | DSE::InvalidDatetime(_) => {
+                    MapsError::BadRequest(e.to_string())
+                }
+                DSE::CollectionNotFound(_) | DSE::LocationNotFound(_) => {
+                    MapsError::NotFound(e.to_string())
+                }
+                _ => {
+                    tracing::warn!("Maps render error for collection '{}': {e}", collection_id);
+                    MapsError::Internal(format!("Render failed: {e}"))
+                }
+            });
         }
     };
 

@@ -75,12 +75,93 @@ impl MapEngine for MockMapEngine {
     }
 }
 
+/// A `MapEngine` whose `get_raster_tile` always returns `InvalidParameter`
+/// — mirrors a multi-parameter PVOL collection rendered without a
+/// `<site>:<quantity>` selection. Used to verify the handler classifies a
+/// client mistake as 400, not 500.
+struct InvalidParamEngine;
+
+impl MapEngine for InvalidParamEngine {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        _width: u32,
+        _height: u32,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+    ) -> Result<RasterTile, DataServerError> {
+        Err(DataServerError::InvalidParameter(
+            "collection requires a `<site>:<quantity>` parameter (e.g. `fivih:DBZH`)".into(),
+        ))
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        MockMapEngine::make_info()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 fn build_router() -> axum::Router {
     build_router_with_apis(vec!["maps".to_string()])
+}
+
+/// Build a Maps router backed by a caller-supplied engine (otherwise
+/// identical to `build_router`), for exercising engine error paths.
+fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
+    let mut engines = HashMap::new();
+    let mut collections = HashMap::new();
+    let mut styles_map = HashMap::new();
+    engines.insert("radar".to_string(), engine);
+    collections.insert(
+        "radar".to_string(),
+        CollectionConfig {
+            id: "radar".to_string(),
+            title: "Test Radar".to_string(),
+            description: "Test radar data".to_string(),
+            data_path: None,
+            apis: vec!["maps".to_string()],
+            engine_type: "odim-volume".to_string(),
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            odim: None,
+            postgis: None,
+            preview: None,
+        },
+    );
+    let cmap = Arc::new(LutColorMap::from_builtin(
+        BuiltinColormap::Viridis,
+        0.0,
+        1.0,
+    ));
+    let mut layer_styles = HashMap::new();
+    layer_styles.insert(
+        "default".to_string(),
+        StyleInfo {
+            name: "default".to_string(),
+            title: "Default".to_string(),
+            colormap: cmap,
+            min: 0.0,
+            max: 1.0,
+            parameter: None,
+        },
+    );
+    styles_map.insert("radar".to_string(), layer_styles);
+    let state = Arc::new(ArcSwap::from_pointee(MapsState {
+        engines,
+        collections,
+        styles: styles_map,
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        base_url: String::new(),
+    }));
+    api_maps::router(state)
 }
 
 fn build_router_with_apis(apis: Vec<String>) -> axum::Router {
@@ -592,6 +673,30 @@ mod get_map {
     async fn unknown_collection_returns_404() {
         let (status, _) = get("/collections/nonexistent/map?bbox=10,55,30,70").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// An engine `InvalidParameter` from `get_raster_tile` (e.g. a
+    /// multi-parameter PVOL collection rendered without a
+    /// `<site>:<quantity>` selection) is a **400 with the engine's
+    /// message**, not a 500 that hides it. Regression for the reported
+    /// "internal server error" on a parameterless PVOL maps request.
+    #[tokio::test]
+    async fn render_invalid_parameter_is_400_with_message() {
+        let app = build_router_with_engine(Arc::new(InvalidParamEngine));
+        let (status, json) = get_on(
+            app,
+            "/collections/radar/map?bbox=10,55,30,70&width=64&height=48",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["code"], "BadRequest");
+        assert!(
+            json["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("parameter"),
+            "the helpful engine message must reach the client, got {json}"
+        );
     }
 
     #[tokio::test]

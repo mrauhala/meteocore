@@ -1269,8 +1269,22 @@ async fn render_tile(
     .map_err(|e| TilesError::Internal(format!("Render task failed: {e}")))?;
 
     let maybe_bytes = render_result.map_err(|e| {
-        tracing::warn!("Tiles render error for collection '{}': {e}", collection_id);
-        TilesError::Internal(format!("Render failed: {e}"))
+        use ds_core::error::DataServerError as DSE;
+        // A client mistake (multi-parameter collection rendered without a
+        // parameter, bad bbox/datetime) is a 400 with the engine's message,
+        // not a 500 that hides it.
+        match e {
+            DSE::InvalidParameter(_) | DSE::InvalidBbox(_) | DSE::InvalidDatetime(_) => {
+                TilesError::BadRequest(e.to_string())
+            }
+            DSE::CollectionNotFound(_) | DSE::LocationNotFound(_) => {
+                TilesError::NotFound(e.to_string())
+            }
+            _ => {
+                tracing::warn!("Tiles render error for collection '{}': {e}", collection_id);
+                TilesError::Internal(format!("Render failed: {e}"))
+            }
+        }
     })?;
 
     // Empty tiles return the pre-generated transparent PNG without caching;
