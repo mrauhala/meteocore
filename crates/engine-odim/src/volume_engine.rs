@@ -762,10 +762,21 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
     let sweep0 = latest.volume.sweeps.first()?;
     let site = &latest.volume.site;
 
-    // Map/WMS + EDR quantity set, from the lowest sweep — matching the
-    // global derivation, but bare (no `<nod>:` prefix). Title is just the
-    // quantity: the per-site collection already carries the place name.
-    let mut quantities: Vec<String> = sweep0.moments.iter().map(|m| m.quantity.clone()).collect();
+    // Map/WMS + EDR quantity set: the **union** of every sweep's moments
+    // (bare, no `<nod>:` prefix). Title is just the quantity — the per-site
+    // collection already carries the place name. The union (not just the
+    // lowest sweep) is deliberate: a moment that only appears on higher
+    // sweeps (split-cut scan strategies) is still queryable by EDR
+    // (`resolve_quantities` unions across sweeps) and renderable by WMS
+    // (`polar_sample` searches every sweep that carries the quantity), so
+    // the advertised list must include it — otherwise EDR and WMS would
+    // report contradictory parameter sets for the same collection.
+    let mut quantities: Vec<String> = latest
+        .volume
+        .sweeps
+        .iter()
+        .flat_map(|s| s.moments.iter().map(|m| m.quantity.clone()))
+        .collect();
     quantities.sort();
     quantities.dedup();
     let parameters: Vec<(String, String)> =
@@ -1218,29 +1229,39 @@ fn polar_sample(
     output_crs: &OutputCrs,
     z: Option<f64>,
 ) -> Result<RasterTile, DataServerError> {
-    // M1 sorts `sweeps` ascending by elangle, so `first()` is the lowest.
-    let sweep = match z {
-        Some(target) => nearest_sweep(volume, target),
-        None => volume.sweeps.first(),
-    }
-    .ok_or_else(|| {
-        DataServerError::Engine(format!(
-            "PVOL site `{}` has no elevation sweeps",
+    // Pick the sweep that actually carries `quantity`: nearest to `z` (or
+    // the lowest when `z` is absent) *among the sweeps that contain the
+    // moment*. A blind lowest/nearest pick would 400 on a quantity that is
+    // only present on higher sweeps (split-cut scan strategies), even
+    // though it is advertised (the parameter list unions across sweeps).
+    // `sweeps` is sorted ascending by elangle (M1), so the first matching
+    // candidate is the lowest sweep that has the quantity.
+    let mut candidates = volume
+        .sweeps
+        .iter()
+        .filter(|s| s.moments.iter().any(|m| m.quantity == quantity))
+        .peekable();
+    if candidates.peek().is_none() {
+        return Err(DataServerError::InvalidParameter(format!(
+            "quantity `{quantity}` is not present in any sweep of PVOL site `{}`",
             volume.site.nod.as_deref().unwrap_or("?")
-        ))
-    })?;
+        )));
+    }
+    let sweep = match z {
+        Some(target) => candidates.min_by(|a, b| {
+            (a.elangle - target)
+                .abs()
+                .total_cmp(&(b.elangle - target).abs())
+        }),
+        None => candidates.next(),
+    }
+    .expect("non-empty candidate set checked above");
 
     let moment = sweep
         .moments
         .iter()
         .find(|m| m.quantity == quantity)
-        .ok_or_else(|| {
-            DataServerError::InvalidParameter(format!(
-                "quantity `{quantity}` is not present in the lowest sweep of \
-                 PVOL site `{}`",
-                volume.site.nod.as_deref().unwrap_or("?")
-            ))
-        })?;
+        .expect("candidate sweep contains the quantity");
 
     let (site_lon, site_lat) = (volume.site.lon, volume.site.lat);
     if sweep.nrays == 0 || sweep.nbins == 0 {
@@ -2056,6 +2077,13 @@ impl PolarVolumeEngine {
         sites
     }
 
+    /// The base collection id of this source (the `{base}` in each per-site
+    /// `{base}-{nod}` collection id). Used by `/health` to key per-site
+    /// temporal extents.
+    pub fn collection_id(&self) -> &str {
+        &self.collection_id
+    }
+
     /// Build a [`PolarVolumeSiteView`] scoped to radar `nod`, sharing this
     /// engine's live catalog (`ArcSwap`) so the view tracks poll-loop
     /// updates without re-parsing. `collection_id` is the per-site OGC
@@ -2333,16 +2361,11 @@ impl EdrEngine for PolarVolumeSiteView {
             parameters,
             levels.as_deref(),
         )?;
-        // Guard against an empty collection (every volume produced no
-        // plottable coverage) — an empty `CoverageCollection` is invalid
-        // CoverageJSON and should be a 404, not HTTP 200. Mirrors the
-        // network engine's dropped `query_area` is-empty check.
-        if covs.is_empty() {
-            return Err(DataServerError::LocationNotFound(
-                "no PVOL data for this site in the requested time window".into(),
-            ));
-        }
-        Ok(CoverageResponse::Collection(covs))
+        // Same shaping as position/location: a single-`z` request collapses
+        // to a bare `Coverage`, every other shape is a `Collection`, and an
+        // all-empty result is `LocationNotFound` (404) rather than an empty
+        // collection served as HTTP 200.
+        finalize_single_site(covs, &levels)
     }
 
     /// Trajectory cross-section along a WKT `LINESTRING`, always against
@@ -3588,5 +3611,81 @@ mod tests {
             ),
             "an all-empty area coverage must be LocationNotFound"
         );
+    }
+
+    /// A per-site `area` query collapses to a bare `Coverage` for a single
+    /// `z` level (matching position/location), and stays a `Collection`
+    /// otherwise.
+    #[test]
+    fn site_view_area_single_z_collapses_to_single() {
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![entry(synthetic_volume(25.0, 60.0), "v")],
+        );
+        let view = site_view_for(by_site, "fivih");
+
+        // Single elevation angle (the fixture's only sweep) → one Coverage.
+        assert!(
+            matches!(
+                EdrEngine::query_area(&view, "24.0,59.0,26.0,61.0", None, None, Some(&[0.5])),
+                Ok(CoverageResponse::Single(_))
+            ),
+            "a single-z area query must collapse to a bare Coverage"
+        );
+        // No z → a Collection (one VerticalProfile per timestep).
+        assert!(matches!(
+            EdrEngine::query_area(&view, "24.0,59.0,26.0,61.0", None, None, None),
+            Ok(CoverageResponse::Collection(_))
+        ));
+    }
+
+    /// A quantity present only on a higher-elevation sweep (a split-cut
+    /// strategy) is still advertised in the parameter list **and** renders
+    /// without a 400 — the advertised list unions across sweeps and
+    /// `polar_sample` searches every sweep that carries the quantity.
+    #[test]
+    fn site_view_advertises_and_renders_higher_sweep_only_quantity() {
+        // sweep0 @0.5° carries DBZH; add a 1.5° sweep carrying VRADH only.
+        let mut vol = synthetic_volume(25.0, 60.0);
+        let mut sweep1 = vol.sweeps[0].clone();
+        sweep1.elangle = 1.5;
+        sweep1.moments[0].quantity = "VRADH".to_string();
+        vol.sweeps.push(sweep1);
+
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert("fivih".to_string(), vec![entry(vol, "v")]);
+        let view = site_view_for(by_site, "fivih");
+
+        // Both quantities are advertised (union across sweeps).
+        let params = EdrEngine::get_parameters(&view);
+        assert!(
+            params.contains(&"DBZH".to_string()) && params.contains(&"VRADH".to_string()),
+            "lowest- and higher-sweep quantities must both be advertised, got {params:?}"
+        );
+        let info = MapEngine::raster_info(&view);
+        let names: Vec<&str> = info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"VRADH"),
+            "WMS layer list must include VRADH"
+        );
+
+        // VRADH (only on the 1.5° sweep) renders at default `z` instead of
+        // 400ing because the lowest sweep lacks it.
+        let dlon =
+            50_000.0 / (EARTH_RADIUS_M * 60f64.to_radians().cos()) * 180.0 / std::f64::consts::PI;
+        let bbox = [25.0, 59.999, 25.0 + dlon, 60.001];
+        let tile = MapEngine::get_raster_tile(
+            &view,
+            bbox,
+            16,
+            4,
+            None,
+            &OutputCrs::Wgs84,
+            Some("VRADH"),
+            None,
+        )
+        .expect("a higher-sweep-only quantity must render, not 400");
+        assert_eq!(tile.values.len(), 16 * 4);
     }
 }

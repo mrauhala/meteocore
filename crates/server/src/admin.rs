@@ -1190,19 +1190,19 @@ pub fn load_collections(
                 // swaps the catalog mid-registration.
                 let sites = engine.sites();
                 if sites.is_empty() {
+                    // Register nothing and add NO health entry: a `Degraded`
+                    // placeholder here would count toward the reload guard's
+                    // "loaded" tally (`status != Failed`), letting a
+                    // transient empty scan (S3 hiccup) replace a working
+                    // registry with zero per-site collections. With no
+                    // entry, an empty source contributes 0 — so if it is the
+                    // only collection the guard correctly keeps the old
+                    // state. The WARN keeps the misconfiguration visible.
                     tracing::warn!(
                         "Collection '{}': PVOL source has no radar sites yet — no per-site \
                          collections registered. Reload once volume files arrive.",
                         collection.id
                     );
-                    // Keep the source visible in `/health` even with no
-                    // data, so an empty-bucket misconfiguration isn't silent.
-                    health.push(CollectionHealth {
-                        id: collection.id.clone(),
-                        engine_type: "odim-volume".into(),
-                        status: CollectionStatus::Degraded,
-                        error: Some("no radar sites discovered yet".into()),
-                    });
                 }
                 for (nod, label) in &sites {
                     let site_id = format!("{}-{}", collection.id, nod);
@@ -2113,6 +2113,26 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             let id = engine.collection_id().to_string();
             if let Some(temporal) = build_temporal(engine.as_ref()) {
                 temporal_info.insert(id, temporal);
+            }
+        }
+    }
+    {
+        // PVOL sources expand into one per-site collection each
+        // (`{base}-{nod}`); the engine is keyed by `{base}` and does not
+        // implement `EdrEngine`, so build each site's temporal extent from
+        // its `PolarVolumeSiteView` and key it by the per-site id to match
+        // the `{base}-{nod}` health entries.
+        let engines = state
+            .odim_volume_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        for engine in engines.iter() {
+            for (nod, _label) in engine.sites() {
+                let id = format!("{}-{}", engine.collection_id(), nod);
+                let view = engine.site_view(&nod, &id);
+                if let Some(temporal) = build_temporal(&view) {
+                    temporal_info.insert(id, temporal);
+                }
             }
         }
     }
