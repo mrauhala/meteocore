@@ -563,9 +563,10 @@ mod get_tile {
 
     /// An engine `InvalidParameter` from `get_raster_tile` (e.g. a
     /// multi-parameter PVOL collection tiled without a `<site>:<quantity>`
-    /// selection) is a 400, not a 500.
+    /// selection) is a 400 **with the engine's message in the body**, not
+    /// a 500 — parity with the maps regression test.
     #[tokio::test]
-    async fn render_invalid_parameter_is_400() {
+    async fn render_invalid_parameter_is_400_with_message() {
         let app = build_router_with_engine(Arc::new(InvalidParamEngine));
         let req = Request::builder()
             .uri("/collections/radar/tiles/WebMercatorQuad/0/0/0")
@@ -573,6 +574,16 @@ mod get_tile {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "BadRequest");
+        assert!(
+            json["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("parameter"),
+            "the helpful engine message must reach the client, got {json}"
+        );
     }
 
     #[tokio::test]
