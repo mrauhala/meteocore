@@ -722,11 +722,19 @@ fn build_catalog(
 }
 
 /// Whether `nod` is safe to embed verbatim in a URL-routed collection id
-/// (`{base}-{nod}`) and a WMS `LAYERS` token: non-empty and ASCII
-/// alphanumeric plus `-`/`_`. ODIM NODs are pure ASCII alphanumeric, so
-/// this passes every well-formed code and rejects routing-breaking input.
+/// (`{base}-{nod}`) and a WMS `LAYERS` token: ASCII alphanumeric plus
+/// interior `-`/`_`, with an **alphanumeric first and last char** so a
+/// degenerate code like `"-"` can't yield a double-hyphen id (`"{base}--"`)
+/// or a trailing-separator layer name. ODIM NODs are pure ASCII
+/// alphanumeric, so this passes every well-formed code.
 fn is_url_safe_nod(nod: &str) -> bool {
-    !nod.is_empty()
+    let mut chars = nod.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let last = nod.chars().next_back().unwrap_or(first);
+    first.is_ascii_alphanumeric()
+        && last.is_ascii_alphanumeric()
         && nod
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -784,12 +792,11 @@ fn derive_catalog(
 
 /// Derive one site's [`SiteMeta`] from its time-sorted volume list.
 ///
-/// Returns `None` only for a site whose most-recent volume has no usable
-/// lowest sweep (an entirely malformed file) — such a site is dropped
-/// from `by_site_meta` and its view reports empty metadata.
+/// Returns `None` for a site whose most-recent volume has no sweeps or no
+/// moment datasets (an entirely malformed file) — such a site is dropped
+/// from `by_site_meta` and is never registered as a collection.
 fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
     let latest = list.last()?;
-    let sweep0 = latest.volume.sweeps.first()?;
     let site = &latest.volume.site;
 
     // Map/WMS + EDR quantity set: the **union** of every sweep's moments
@@ -825,9 +832,22 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
     let parameters: Vec<(String, String)> =
         quantities.iter().map(|q| (q.clone(), q.clone())).collect();
 
-    // Coverage radius from the lowest sweep's range gate geometry.
-    let radius_m = sweep0.nbins as f64 * sweep0.rscale + sweep0.rstart;
-    let coverage_radius_m = (radius_m.is_finite() && radius_m > 0.0).then_some(radius_m);
+    // Coverage radius = the **maximum** range-gate reach across all sweeps
+    // (skipping sweeps with a malformed `rscale`). Quantities are unioned
+    // across sweeps, so a moment may live only on a longer-range higher
+    // sweep; using the lowest sweep's radius alone would wrongly reject an
+    // in-range query for such a quantity. `None` only when *no* sweep has
+    // usable geometry. `spatial_extent` derives from the same radius so the
+    // advertised extent covers the union of sweep ranges.
+    let coverage_radius_m = latest
+        .volume
+        .sweeps
+        .iter()
+        .filter_map(|s| {
+            let r = s.nbins as f64 * s.rscale + s.rstart;
+            (s.rscale.is_finite() && s.rscale > 0.0 && r.is_finite() && r > 0.0).then_some(r)
+        })
+        .max_by(f64::total_cmp);
     let spatial_extent = coverage_radius_m.map(|r| site_coverage_bbox(site.lon, site.lat, r));
 
     let mut times: Vec<DateTime<Utc>> = list.iter().map(|e| e.volume.time).collect();
@@ -2385,16 +2405,21 @@ impl EdrEngine for PolarVolumeSiteView {
         // Reject a point clearly outside the radar's coverage circle with a
         // 404 rather than returning HTTP 200 all-null values — which is
         // indistinguishable from "in range, clear sky". The per-site
-        // collection's advertised spatial extent *is* this coverage circle,
-        // so a point beyond it is outside the collection's domain. (A point
-        // inside coverage with no echo still correctly returns 200 nulls.)
-        if let Some(radius_m) = meta.coverage_radius_m {
-            let (dist, _) = ground_distance_bearing(meta.lon, meta.lat, lon, lat);
-            if dist > radius_m {
-                return Err(DataServerError::LocationNotFound(
-                    "requested point is outside this radar's coverage area".into(),
-                ));
-            }
+        // collection's advertised spatial extent *is* this coverage circle
+        // (the max range across all sweeps), so a point beyond it is outside
+        // the collection's domain. A point inside coverage with no echo
+        // still correctly returns 200 nulls. **Fail closed**: a site with no
+        // usable range geometry (`coverage_radius_m == None`, every sweep
+        // has a malformed `rscale`) can only ever produce all-null samples,
+        // so a position query there is a 404, not a misleading 200.
+        let radius_m = meta.coverage_radius_m.ok_or_else(|| {
+            DataServerError::LocationNotFound("this radar site has no usable range geometry".into())
+        })?;
+        let (dist, _) = ground_distance_bearing(meta.lon, meta.lat, lon, lat);
+        if dist > radius_m {
+            return Err(DataServerError::LocationNotFound(
+                "requested point is outside this radar's coverage area".into(),
+            ));
         }
         let volumes = catalog.by_site.get(&self.nod).ok_or_else(|| {
             DataServerError::LocationNotFound(format!(
@@ -3687,7 +3712,11 @@ mod tests {
         for ok in ["fivih", "fianj", "se1", "uk-abc_2"] {
             assert!(is_url_safe_nod(ok), "{ok} should be accepted");
         }
-        for bad in ["", "fi/bad", "fi?x", "fi#x", "fi bad", "fiäö", "a.b"] {
+        // Routing-breakers, plus degenerate boundary separators that would
+        // yield a double-hyphen id (`{base}--`) or a trailing-separator layer.
+        for bad in [
+            "", "fi/bad", "fi?x", "fi#x", "fi bad", "fiäö", "a.b", "-", "_", "-a", "a-", "_x", "x_",
+        ] {
             assert!(!is_url_safe_nod(bad), "{bad:?} should be rejected");
         }
     }
@@ -3867,6 +3896,55 @@ mod tests {
         // ...and a direct query_location returns 404, not InvalidParameter.
         assert!(matches!(
             EdrEngine::query_location(&view, "fivih", None, None, None),
+            Err(DataServerError::LocationNotFound(_))
+        ));
+    }
+
+    /// The coverage radius is the **max** across sweeps: a point beyond the
+    /// lowest sweep's range but within a longer-range higher sweep is in
+    /// coverage (not 404), since a quantity may live only on that sweep.
+    #[test]
+    fn site_view_coverage_radius_uses_max_sweep_range() {
+        let mut vol = synthetic_volume(25.0, 60.0);
+        vol.sweeps[0].nbins = 50; // sweep0 ≈ 50 km
+        let mut sweep1 = vol.sweeps[0].clone();
+        sweep1.elangle = 3.0;
+        sweep1.nbins = 120; // sweep1 ≈ 120 km
+        vol.sweeps.push(sweep1);
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert("fivih".to_string(), vec![entry(vol, "v")]);
+        let view = site_view_for(by_site, "fivih");
+
+        // ~70 km north: beyond sweep0's 50 km but within sweep1's 120 km.
+        let dlat_70 = 70_000.0 / EARTH_RADIUS_M * 180.0 / std::f64::consts::PI;
+        let near = format!("POINT(25.0 {})", 60.0 + dlat_70);
+        assert!(
+            EdrEngine::query_position(&view, &near, None, None, None).is_ok(),
+            "a point within the longest sweep's range must not be rejected"
+        );
+        // ~200 km: beyond every sweep → 404.
+        let dlat_200 = 200_000.0 / EARTH_RADIUS_M * 180.0 / std::f64::consts::PI;
+        let far = format!("POINT(25.0 {})", 60.0 + dlat_200);
+        assert!(matches!(
+            EdrEngine::query_position(&view, &far, None, None, None),
+            Err(DataServerError::LocationNotFound(_))
+        ));
+    }
+
+    /// A site whose only sweep has a malformed `rscale` (no usable range
+    /// geometry, `coverage_radius_m == None`) fails closed: a position query
+    /// is a 404, not a misleading HTTP 200 all-null.
+    #[test]
+    fn site_view_query_position_malformed_rscale_is_404() {
+        let mut vol = synthetic_volume(25.0, 60.0);
+        vol.sweeps[0].rscale = 0.0;
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert("fivih".to_string(), vec![entry(vol, "v")]);
+        let view = site_view_for(by_site, "fivih");
+
+        // Even at the antenna itself — no usable geometry → fail closed.
+        assert!(matches!(
+            EdrEngine::query_position(&view, "POINT(25.0 60.0)", None, None, None),
             Err(DataServerError::LocationNotFound(_))
         ));
     }

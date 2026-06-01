@@ -1910,38 +1910,11 @@ pub async fn reload_handler(
 
     let base_url = config.server.base_url();
 
-    // Shut down old poll loops
-    {
-        let old_geotiff = state
-            .geotiff_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        for engine in old_geotiff.iter() {
-            engine.shutdown();
-        }
-        let old_querydata = state
-            .querydata_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        for engine in old_querydata.iter() {
-            engine.shutdown();
-        }
-        let old_grib = state.grib_engines.read().unwrap_or_else(|e| e.into_inner());
-        for engine in old_grib.iter() {
-            engine.shutdown();
-        }
-        let old_odim = state.odim_engines.read().unwrap_or_else(|e| e.into_inner());
-        for engine in old_odim.iter() {
-            engine.shutdown();
-        }
-        let old_odim_volume = state
-            .odim_volume_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        for engine in old_odim_volume.iter() {
-            engine.shutdown();
-        }
-    }
+    // NOTE: old poll loops are shut down *after* the reload guard below, not
+    // here. If the guard rejects the reload (no `Ready` collection), the old
+    // engines and their poll loops must stay alive — otherwise a rejected
+    // reload would freeze the live registry with dead loops and no new ones
+    // spawned (the guard returns before the spawn block).
 
     let result = load_collections(
         &config.collections,
@@ -1972,9 +1945,12 @@ pub async fn reload_handler(
         .count();
 
     if ready == 0 && !config.collections.is_empty() {
-        // Restore old GeoTIFF engines (they were shut down)
-        // This is a best-effort recovery — the old engines' poll loops won't restart,
-        // but cached data is still servable.
+        // Reject the reload and keep the live state. The old engines were
+        // NOT shut down (that happens below, only on accept), so their poll
+        // loops keep running and recover on their own — e.g. a transiently
+        // unreachable PostGIS DB, or an odim-volume source that momentarily
+        // scanned zero sites. The newly-built engines in `result` are simply
+        // dropped (their poll loops were never spawned).
         tracing::error!(
             "Reload produced 0 working collections from {} configured. Keeping old state.",
             config.collections.len()
@@ -1986,6 +1962,51 @@ pub async fn reload_handler(
                 "configured": config.collections.len()
             })),
         ));
+    }
+
+    // Reload accepted — now shut down the old poll loops (the new ones are
+    // spawned just below, then state is swapped atomically).
+    {
+        for engine in state
+            .geotiff_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            engine.shutdown();
+        }
+        for engine in state
+            .querydata_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            engine.shutdown();
+        }
+        for engine in state
+            .grib_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            engine.shutdown();
+        }
+        for engine in state
+            .odim_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            engine.shutdown();
+        }
+        for engine in state
+            .odim_volume_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            engine.shutdown();
+        }
     }
 
     // Spawn poll loops for new engines on the dedicated background runtime
