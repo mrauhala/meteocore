@@ -1124,6 +1124,14 @@ fn sample_sweep_moment_bilinear(
     if sweep.nrays == 0 || sweep.nbins == 0 {
         return None;
     }
+    // Same defensive `rscale` guard as `sample_polar_slant`: a malformed
+    // `rscale = 0` makes `bin_f` NaN, and a negative `rscale` with
+    // `dist < rstart` yields a positive `bin_f` that can land in range and
+    // sample the wrong gate. ODIM_H5 guarantees `rscale > 0`; this keeps a
+    // corrupted file from surfacing fabricated values.
+    if !sweep.rscale.is_finite() || sweep.rscale <= 0.0 {
+        return None;
+    }
     let (dist, az) = ground_distance_bearing(site_lon, site_lat, lon, lat);
 
     // Fractional bin (ground-range interim). Bin `i` starts at
@@ -2808,6 +2816,43 @@ mod tests {
             "bilinear interpolates to ≈ 10.5, got {bilinear}"
         );
         assert_eq!(nearest, 10.0, "nearest floors to bin 10");
+    }
+
+    /// The bilinear sampler carries the same malformed-`rscale` guard as
+    /// `sample_polar_slant`: a zero / negative / non-finite `rscale`
+    /// yields `None`, not a sample from the wrong (or NaN) range gate.
+    #[test]
+    fn sample_sweep_moment_bilinear_rejects_malformed_rscale() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let mut vol = synthetic_volume(site_lon, site_lat);
+        let dlon = 10_000.0 / (EARTH_RADIUS_M * site_lat.to_radians().cos()) * 180.0
+            / std::f64::consts::PI;
+        let (lon, lat) = (site_lon + dlon, site_lat);
+        // Baseline: well-formed sweep samples.
+        assert!(sample_sweep_moment_bilinear(
+            &vol.sweeps[0],
+            &vol.sweeps[0].moments[0],
+            site_lon,
+            site_lat,
+            lon,
+            lat
+        )
+        .is_some());
+        for bad in [0.0_f64, -1_000.0, f64::NAN, f64::INFINITY] {
+            vol.sweeps[0].rscale = bad;
+            assert!(
+                sample_sweep_moment_bilinear(
+                    &vol.sweeps[0],
+                    &vol.sweeps[0].moments[0],
+                    site_lon,
+                    site_lat,
+                    lon,
+                    lat
+                )
+                .is_none(),
+                "rscale={bad} must yield None"
+            );
+        }
     }
 
     /// An absent quantity is an `InvalidParameter` error, not a panic.
