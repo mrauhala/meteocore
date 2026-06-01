@@ -1024,6 +1024,16 @@ fn sample_sweep_moment(
     if sweep.nrays == 0 || sweep.nbins == 0 {
         return None;
     }
+    // Same malformed-`rscale` guard as `sample_polar_slant` /
+    // `sample_sweep_moment_bilinear`: a `rscale = 0` / NaN makes the bin
+    // `NaN`, and `NaN as i64 == 0` (saturating cast) would pass the bounds
+    // check and return bin 0 for every requested point — silent fabricated
+    // data on every EDR position/area/profile query against a corrupted
+    // file. A negative `rscale` with `dist < rstart` likewise lands in
+    // range and samples the wrong gate.
+    if !sweep.rscale.is_finite() || sweep.rscale <= 0.0 {
+        return None;
+    }
     let (dist, az) = ground_distance_bearing(site_lon, site_lat, lon, lat);
 
     // Range bin. Ground-range interim — a slant-range / 4⁄3-Earth
@@ -2853,6 +2863,109 @@ mod tests {
                 "rscale={bad} must yield None"
             );
         }
+    }
+
+    /// The nearest-neighbour EDR sampler carries the malformed-`rscale`
+    /// guard too: `rscale = 0`/NaN must not slip a `NaN as i64 == 0` cast
+    /// past the bounds check and return bin-0 data for every point.
+    #[test]
+    fn sample_sweep_moment_rejects_malformed_rscale() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let mut vol = synthetic_volume(site_lon, site_lat);
+        let dlon = 10_000.0 / (EARTH_RADIUS_M * site_lat.to_radians().cos()) * 180.0
+            / std::f64::consts::PI;
+        let (lon, lat) = (site_lon + dlon, site_lat);
+        assert!(sample_sweep_moment(
+            &vol.sweeps[0],
+            &vol.sweeps[0].moments[0],
+            site_lon,
+            site_lat,
+            lon,
+            lat
+        )
+        .is_some());
+        for bad in [0.0_f64, -1_000.0, f64::NAN, f64::INFINITY] {
+            vol.sweeps[0].rscale = bad;
+            assert!(
+                sample_sweep_moment(
+                    &vol.sweeps[0],
+                    &vol.sweeps[0].moments[0],
+                    site_lon,
+                    site_lat,
+                    lon,
+                    lat
+                )
+                .is_none(),
+                "rscale={bad} must yield None"
+            );
+        }
+    }
+
+    /// End-to-end ray-blending guard (#186). The fixture's value depends
+    /// only on the *ray* (`raw[ray][bin] = ray`), so nearest-neighbour
+    /// sampling can only return integer ray indices — the bilinear render
+    /// blends adjacent rays into fractional values. A regression of
+    /// `polar_sample` back to `sample_sweep_moment` would make every
+    /// output pixel integer-valued; this catches that.
+    #[test]
+    fn polar_sample_blends_across_rays_end_to_end() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let (nrays, nbins) = (360usize, 100usize);
+        let mut data = Array2::<u16>::zeros((nrays, nbins));
+        for r in 0..nrays {
+            for b in 0..nbins {
+                data[(r, b)] = r as u16; // value = ray index, constant across bins
+            }
+        }
+        let moment = PolarMoment {
+            quantity: "DBZH".to_string(),
+            gain: 1.0,
+            offset: 0.0,
+            nodata: 65_535.0,
+            undetect: 65_534.0,
+            data: RawPixels::U16(data),
+        };
+        let sweep = Sweep {
+            elangle: 0.5,
+            nbins,
+            nrays,
+            rscale: 1_000.0,
+            rstart: 0.0,
+            a1gate: 0,
+            moments: vec![moment],
+        };
+        let vol = PolarVolume {
+            site: RadarSite {
+                lon: site_lon,
+                lat: site_lat,
+                height: 100.0,
+                nod: Some("test".to_string()),
+                plc: None,
+                wmo: None,
+            },
+            time: Utc::now(),
+            object: "PVOL".to_string(),
+            sweeps: vec![sweep],
+        };
+        // A box NE of the site spanning many azimuths within range.
+        let bbox = [
+            site_lon + 0.02,
+            site_lat + 0.02,
+            site_lon + 0.25,
+            site_lat + 0.25,
+        ];
+        let tile = polar_sample(&vol, "DBZH", bbox, 24, 24, &OutputCrs::Wgs84, None).unwrap();
+        // Value varies only by ray, so any fractional pixel proves the
+        // render blended across rays — impossible for nearest-neighbour.
+        let fractional = tile
+            .values
+            .iter()
+            .flatten()
+            .any(|v| (v - v.round()).abs() > 1e-6);
+        assert!(
+            fractional,
+            "bilinear render must blend adjacent rays into fractional values"
+        );
     }
 
     /// An absent quantity is an `InvalidParameter` error, not a panic.
