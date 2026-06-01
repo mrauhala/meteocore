@@ -410,20 +410,18 @@ fn edr_query_area_masks_outside_polygon() {
 // PolarVolumeEngine — ODIM polar-volume (PVOL) MapEngine
 // ---------------------------------------------------------------------------
 
-/// End-to-end render against the real FMI Anjalankoski polar volume
-/// (`testdata/radar-fmi-pvol/202605150000_fianj_PVOL.h5`).
+/// End-to-end render against the real FMI Vihti polar volume
+/// (`testdata/radar-fmi-pvol/202605191050_fivih_PVOL.h5`).
 ///
 /// The 15 MB fixture is **not committed to git**, so this test skips
 /// gracefully when it is absent — CI stays green; a local checkout
 /// with the fixture exercises the full PVOL render pipeline.
 #[test]
-fn pvol_engine_renders_fmi_anjalankoski_volume() {
+fn pvol_engine_renders_fmi_vihti_volume() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../testdata/radar-fmi-pvol/202605150000_fianj_PVOL.h5");
+        .join("../../testdata/radar-fmi-pvol/202605191050_fivih_PVOL.h5");
     if !fixture.exists() {
-        eprintln!(
-            "skipping pvol_engine_renders_fmi_anjalankoski_volume: fixture absent at {fixture:?}"
-        );
+        eprintln!("skipping pvol_engine_renders_fmi_vihti_volume: fixture absent at {fixture:?}");
         return;
     }
 
@@ -453,45 +451,48 @@ fn pvol_engine_renders_fmi_anjalankoski_volume() {
         time_window: None,
     };
 
-    let engine = engine_odim::PolarVolumeEngine::new("fianj-pvol-test", Some(data_dir), &config)
+    let engine = engine_odim::PolarVolumeEngine::new("fivih-pvol-test", Some(data_dir), &config)
         .expect("PolarVolumeEngine::new over the PVOL directory");
 
-    let info = engine.raster_info();
+    // Model B: the source expands into per-site collections. Take the
+    // Vihti site view and render through it.
+    let view = engine.site_view("fivih", "fivih-pvol-test-fivih");
+
+    let info = view.raster_info();
     assert_eq!(info.native_crs, "CRS:84");
-    assert!(!info.times.is_empty(), "PVOL catalog must have a timestep");
+    assert!(!info.times.is_empty(), "PVOL site must have a timestep");
     assert!(
         info.spatial_extent.is_some(),
-        "PVOL catalog must report a coverage bbox"
+        "PVOL site must report a coverage bbox"
     );
 
-    // The FMI Anjalankoski volume's lowest sweep exposes TH (and DBZH).
-    // At least one `fianj:<quantity>` parameter must surface.
-    let fianj_params: Vec<&str> = info
-        .parameters
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .filter(|n| n.starts_with("fianj:"))
-        .collect();
+    // The FMI Vihti lowest sweep exposes TH (and DBZH). Under
+    // model B the parameters are **bare quantities** — no `fivih:` prefix.
+    let params: Vec<&str> = info.parameters.iter().map(|(n, _)| n.as_str()).collect();
     assert!(
-        !fianj_params.is_empty(),
-        "expected fianj:<quantity> parameters, got {:?}",
+        !params.is_empty(),
+        "expected bare-quantity parameters, got {:?}",
         info.parameters
     );
-    // Prefer TH if present (every FMI lowest sweep carries it), else
-    // any available fianj quantity.
-    let render_param = if fianj_params.contains(&"fianj:TH") {
-        "fianj:TH".to_string()
-    } else if fianj_params.contains(&"fianj:DBZH") {
-        "fianj:DBZH".to_string()
+    assert!(
+        params.iter().all(|n| !n.contains(':')),
+        "per-site parameters must be bare quantities, got {params:?}"
+    );
+    // Prefer TH if present (every FMI lowest sweep carries it), else any.
+    let render_param = if params.contains(&"TH") {
+        "TH"
+    } else if params.contains(&"DBZH") {
+        "DBZH"
     } else {
-        fianj_params[0].to_string()
-    };
+        params[0]
+    }
+    .to_string();
 
-    // Render a tile over the radar's coverage bbox. Anjalankoski sits
-    // near 27.11°E, 60.90°N; a ~2° box centred there is well inside
-    // the ~250 km sweep, so a real volume must produce some echoes.
-    let bbox = [26.0, 60.0, 28.2, 61.8];
-    let tile = engine
+    // Render a tile over the radar's coverage bbox. Vihti sits near
+    // 24.50°E, 60.56°N; a ~2° box centred there is well inside the
+    // ~250 km sweep, so a real volume must produce some echoes.
+    let bbox = [23.4, 59.6, 25.6, 61.5];
+    let tile = view
         .get_raster_tile(
             bbox,
             128,
@@ -501,7 +502,7 @@ fn pvol_engine_renders_fmi_anjalankoski_volume() {
             Some(&render_param),
             None,
         )
-        .expect("PVOL get_raster_tile over the coverage bbox");
+        .expect("PVOL site get_raster_tile over the coverage bbox");
 
     assert_eq!(tile.width, 128);
     assert_eq!(tile.height, 128);
@@ -521,13 +522,13 @@ fn pvol_engine_renders_fmi_anjalankoski_volume() {
 /// real remote code path — the same trick PR #182 used for the COMP
 /// engine.
 ///
-/// Asserts the Anjalankoski (`fianj`) volume is discovered with its
+/// Asserts the Vihti (`fivih`) volume is discovered with its
 /// 13 elevation sweeps. The 15 MB fixture is **not committed to git**,
 /// so the test skips gracefully when it is absent.
 #[test]
 fn pvol_engine_remote_scan_discovers_fmi_volume() {
     let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/radar-fmi-pvol");
-    let fixture = fixture_dir.join("202605150000_fianj_PVOL.h5");
+    let fixture = fixture_dir.join("202605191050_fivih_PVOL.h5");
     if !fixture.exists() {
         eprintln!("skipping pvol_engine_remote_scan_discovers_fmi_volume: fixture absent");
         return;
@@ -544,24 +545,33 @@ fn pvol_engine_remote_scan_discovers_fmi_volume() {
     )
     .expect("build a DataStore over the fixture directory");
 
-    // The FMI Anjalankoski polar volume carries 13 elevation sweeps —
+    // The FMI Vihti polar volume is a multi-sweep elevation stack
+    // (9 distinct angles, 0.3°–9°, with low-elevation split cuts) —
     // assert that directly from the parsed fixture so the remote-scan
     // path below is verified against a known volume shape.
     let bytes = std::fs::read(&fixture).expect("read PVOL fixture bytes");
     let volume = engine_odim::pvol::read_polar_volume(&bytes).expect("parse PVOL fixture");
-    assert_eq!(volume.site.nod.as_deref(), Some("fianj"));
-    assert_eq!(
-        volume.sweeps.len(),
-        13,
-        "FMI Anjalankoski volume has 13 elevation sweeps"
+    assert_eq!(volume.site.nod.as_deref(), Some("fivih"));
+    assert!(
+        volume.sweeps.len() >= 9,
+        "FMI Vihti volume has ≥9 elevation sweeps, got {}",
+        volume.sweeps.len()
     );
 
     // Empty prefix scans the store root, where the fixture lives.
     let engine =
-        engine_odim::PolarVolumeEngine::new_remote_for_test("fianj-remote-test", store, "")
+        engine_odim::PolarVolumeEngine::new_remote_for_test("fivih-remote-test", store, "")
             .expect("PolarVolumeEngine remote scan over the fixture directory");
 
-    let info = engine.raster_info();
+    // The `fivih` site must surface — view it under model B.
+    assert!(
+        engine.site_ids().iter().any(|n| n == "fivih"),
+        "remote scan must discover the `fivih` site, got {:?}",
+        engine.site_ids()
+    );
+    let view = engine.site_view("fivih", "fivih-remote-test-fivih");
+
+    let info = view.raster_info();
     assert_eq!(info.native_crs, "CRS:84");
     assert!(
         !info.times.is_empty(),
@@ -572,32 +582,26 @@ fn pvol_engine_remote_scan_discovers_fmi_volume() {
         "remote scan must report a coverage bbox"
     );
 
-    // The `fianj` site must surface with `fianj:<quantity>` parameters.
-    let fianj_params: Vec<&str> = info
-        .parameters
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .filter(|n| n.starts_with("fianj:"))
-        .collect();
+    // Parameters are bare quantities (no `fivih:` prefix).
+    let params: Vec<&str> = info.parameters.iter().map(|(n, _)| n.as_str()).collect();
     assert!(
-        !fianj_params.is_empty(),
-        "remote scan must discover fianj:<quantity> parameters, got {:?}",
+        !params.is_empty() && params.iter().all(|n| !n.contains(':')),
+        "remote scan must discover bare-quantity parameters, got {:?}",
         info.parameters
     );
 
-    // The FMI Anjalankoski polar volume has 13 elevation sweeps — a
-    // render over its coverage bbox proves the streamed-then-parsed
-    // volume is intact end-to-end.
-    let render_param = fianj_params
+    // A render over the radar's coverage bbox proves the
+    // streamed-then-parsed volume is intact end-to-end.
+    let render_param = params
         .iter()
-        .find(|n| **n == "fianj:TH")
-        .or_else(|| fianj_params.iter().find(|n| **n == "fianj:DBZH"))
+        .find(|n| **n == "TH")
+        .or_else(|| params.iter().find(|n| **n == "DBZH"))
         .copied()
-        .unwrap_or(fianj_params[0])
+        .unwrap_or(params[0])
         .to_string();
-    let tile = engine
+    let tile = view
         .get_raster_tile(
-            [26.0, 60.0, 28.2, 61.8],
+            [23.4, 59.6, 25.6, 61.5],
             64,
             64,
             None,
@@ -618,7 +622,7 @@ fn pvol_engine_remote_scan_discovers_fmi_volume() {
 #[test]
 fn pvol_engine_rejects_missing_parameter() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../testdata/radar-fmi-pvol/202605150000_fianj_PVOL.h5");
+        .join("../../testdata/radar-fmi-pvol/202605191050_fivih_PVOL.h5");
     if !fixture.exists() {
         eprintln!("skipping pvol_engine_rejects_missing_parameter: fixture absent");
         return;
@@ -641,11 +645,12 @@ fn pvol_engine_rejects_missing_parameter() {
         time_window: None,
     };
     let engine =
-        engine_odim::PolarVolumeEngine::new("fianj-pvol-test", Some(data_dir), &config).unwrap();
+        engine_odim::PolarVolumeEngine::new("fivih-pvol-test", Some(data_dir), &config).unwrap();
+    let view = engine.site_view("fivih", "fivih-pvol-test-fivih");
 
     // `RasterTile` has no `Debug`, so match rather than `unwrap_err`.
-    match engine.get_raster_tile(
-        [26.0, 60.0, 28.0, 62.0],
+    match view.get_raster_tile(
+        [23.4, 59.6, 25.6, 61.5],
         8,
         8,
         None,
@@ -663,12 +668,15 @@ fn pvol_engine_rejects_missing_parameter() {
 // PolarVolumeEngine — EdrEngine (M3a: sites as locations + position queries)
 // ---------------------------------------------------------------------------
 
-/// Build a PVOL engine over the local `radar-fmi-pvol` fixture
-/// directory, or `None` when the (uncommitted, 15 MB) fixture is
-/// absent — so these tests skip gracefully in CI.
-fn pvol_fixture_engine() -> Option<engine_odim::PolarVolumeEngine> {
+/// Build the per-site `PolarVolumeSiteView` for the Vihti (`fivih`)
+/// radar over the local `radar-fmi-pvol` fixture directory, or `None` when
+/// the (uncommitted, 15 MB) fixture is absent — so these tests skip
+/// gracefully in CI. Under model B each radar site is its own collection,
+/// served by such a view; the owning engine may be dropped because the
+/// view holds an `Arc` of the shared catalog.
+fn pvol_fixture_view() -> Option<engine_odim::PolarVolumeSiteView> {
     let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/radar-fmi-pvol");
-    if !fixture_dir.join("202605150000_fianj_PVOL.h5").exists() {
+    if !fixture_dir.join("202605191050_fivih_PVOL.h5").exists() {
         return None;
     }
     let config = OdimConfig {
@@ -687,53 +695,52 @@ fn pvol_fixture_engine() -> Option<engine_odim::PolarVolumeEngine> {
         prefix_pattern: None,
         time_window: None,
     };
-    Some(
-        engine_odim::PolarVolumeEngine::new(
-            "fianj-edr-test",
-            Some(fixture_dir.to_str().expect("utf8 fixture dir")),
-            &config,
-        )
-        .expect("PolarVolumeEngine::new over the PVOL fixture directory"),
+    let engine = engine_odim::PolarVolumeEngine::new(
+        "fivih-edr-test",
+        Some(fixture_dir.to_str().expect("utf8 fixture dir")),
+        &config,
     )
+    .expect("PolarVolumeEngine::new over the PVOL fixture directory");
+    Some(engine.site_view("fivih", "fivih-edr-test-fivih"))
 }
 
 /// `get_locations` exposes each radar site as an EDR location keyed by
 /// its ODIM NOD code, with the antenna position as the point geometry.
 #[test]
 fn pvol_edr_get_locations_lists_sites() {
-    let Some(engine) = pvol_fixture_engine() else {
+    let Some(view) = pvol_fixture_view() else {
         eprintln!("skipping pvol_edr_get_locations_lists_sites: fixture absent");
         return;
     };
-    let locations = EdrEngine::get_locations(&engine).expect("get_locations");
+    let locations = EdrEngine::get_locations(&view).expect("get_locations");
     assert!(
         !locations.is_empty(),
         "the PVOL fixture must surface at least one radar site"
     );
-    let fianj = locations
+    let fivih = locations
         .iter()
-        .find(|l| l.id == "fianj")
-        .expect("Anjalankoski site keyed by NOD code `fianj`");
-    // Anjalankoski sits near 27.1°E, 60.9°N.
+        .find(|l| l.id == "fivih")
+        .expect("Vihti site keyed by NOD code `fivih`");
+    // Vihti sits near 24.50°E, 60.56°N.
     assert!(
-        (26.0..28.5).contains(&fianj.longitude) && (60.0..61.8).contains(&fianj.latitude),
-        "fianj antenna near 27.1E/60.9N, got {},{}",
-        fianj.longitude,
-        fianj.latitude
+        (23.5..25.5).contains(&fivih.longitude) && (60.0..61.0).contains(&fivih.latitude),
+        "fivih antenna near 24.50E/60.56N, got {},{}",
+        fivih.longitude,
+        fivih.latitude
     );
-    assert!(!fianj.label.is_empty(), "a location carries a label");
+    assert!(!fivih.label.is_empty(), "a location carries a label");
 }
 
 /// A position query with no `z` returns a `CoverageCollection` of
 /// `VerticalProfile`s — one per timestep — sampling every sweep.
 #[test]
 fn pvol_edr_query_position_returns_vertical_profiles() {
-    let Some(engine) = pvol_fixture_engine() else {
+    let Some(view) = pvol_fixture_view() else {
         eprintln!("skipping pvol_edr_query_position_returns_vertical_profiles: fixture absent");
         return;
     };
-    // ~30 km north of Anjalankoski — inside the lowest sweep.
-    let response = EdrEngine::query_position(&engine, "POINT(27.1 61.2)", None, None, None)
+    // ~30 km north of Vihti — inside the lowest sweep.
+    let response = EdrEngine::query_position(&view, "POINT(24.5 60.85)", None, None, None)
         .expect("position query inside radar coverage");
     let coverages = match response {
         CoverageResponse::Collection(c) => c,
@@ -743,7 +750,7 @@ fn pvol_edr_query_position_returns_vertical_profiles() {
     for qr in &coverages {
         match &qr.domain {
             DomainDescription::VerticalProfile { x, y, z, .. } => {
-                assert!((*x - 27.1).abs() < 1e-9 && (*y - 61.2).abs() < 1e-9);
+                assert!((*x - 24.5).abs() < 1e-9 && (*y - 60.85).abs() < 1e-9);
                 assert!(!z.values.is_empty(), "a profile spans the sweep angles");
                 for arr in qr.ranges.values() {
                     assert_eq!(arr.shape, vec![z.values.len()]);
@@ -763,14 +770,14 @@ fn pvol_edr_query_position_returns_vertical_profiles() {
 /// `PointSeries` (a `Single` coverage).
 #[test]
 fn pvol_edr_query_position_with_z_returns_point_series() {
-    let Some(engine) = pvol_fixture_engine() else {
+    let Some(view) = pvol_fixture_view() else {
         eprintln!("skipping pvol_edr_query_position_with_z_returns_point_series: fixture absent");
         return;
     };
-    let vertical = EdrEngine::get_vertical_extent(&engine).expect("PVOL has a vertical extent");
+    let vertical = EdrEngine::get_vertical_extent(&view).expect("PVOL has a vertical extent");
     let level = vertical.levels[0];
     let response =
-        EdrEngine::query_position(&engine, "POINT(27.1 61.2)", None, None, Some(&[level]))
+        EdrEngine::query_position(&view, "POINT(24.5 60.85)", None, None, Some(&[level]))
             .expect("z-pinned position query");
     let result = match response {
         CoverageResponse::Single(qr) => qr,
@@ -788,12 +795,12 @@ fn pvol_edr_query_position_with_z_returns_point_series() {
 /// an unknown id is `LocationNotFound` (HTTP 404), not a panic.
 #[test]
 fn pvol_edr_query_location_by_nod() {
-    let Some(engine) = pvol_fixture_engine() else {
+    let Some(view) = pvol_fixture_view() else {
         eprintln!("skipping pvol_edr_query_location_by_nod: fixture absent");
         return;
     };
-    let response = EdrEngine::query_location(&engine, "fianj", None, None, None)
-        .expect("query_location for the fianj site");
+    let response = EdrEngine::query_location(&view, "fivih", None, None, None)
+        .expect("query_location for the fivih site");
     let coverages = match response {
         CoverageResponse::Collection(c) => c,
         CoverageResponse::Single(_) => panic!("a no-z site query must return a Collection"),
@@ -806,7 +813,7 @@ fn pvol_edr_query_location_by_nod() {
         ));
     }
 
-    match EdrEngine::query_location(&engine, "nosuchsite", None, None, None) {
+    match EdrEngine::query_location(&view, "nosuchsite", None, None, None) {
         Err(ds_core::error::DataServerError::LocationNotFound(_)) => {}
         other => panic!("unknown location id must be LocationNotFound, got {other:?}"),
     }
@@ -816,18 +823,18 @@ fn pvol_edr_query_location_by_nod() {
 /// polygon far from any radar is `LocationNotFound`.
 #[test]
 fn pvol_edr_query_area_collects_sites() {
-    let Some(engine) = pvol_fixture_engine() else {
+    let Some(view) = pvol_fixture_view() else {
         eprintln!("skipping pvol_edr_query_area_collects_sites: fixture absent");
         return;
     };
-    // A bbox enclosing Anjalankoski (27.1E, 60.9N).
-    let result = EdrEngine::query_area(&engine, "25.0,59.0,29.0,62.5", None, None, None)
-        .expect("area query enclosing the fianj site");
+    // A bbox enclosing Vihti (24.50E, 60.56N).
+    let result = EdrEngine::query_area(&view, "23.0,59.0,26.0,62.0", None, None, None)
+        .expect("area query enclosing the fivih site");
     match result {
         CoverageResponse::Collection(coverages) => {
             assert!(
                 !coverages.is_empty(),
-                "the polygon encloses fianj, so the collection is non-empty"
+                "the polygon encloses fivih, so the collection is non-empty"
             );
             for qr in &coverages {
                 assert!(matches!(
@@ -842,7 +849,7 @@ fn pvol_edr_query_area_collects_sites() {
     }
 
     // A polygon far from any FMI radar matches nothing.
-    match EdrEngine::query_area(&engine, "0.0,0.0,1.0,1.0", None, None, None) {
+    match EdrEngine::query_area(&view, "0.0,0.0,1.0,1.0", None, None, None) {
         Err(ds_core::error::DataServerError::LocationNotFound(_)) => {}
         other => panic!("an empty area must be LocationNotFound, got {other:?}"),
     }
@@ -859,17 +866,17 @@ fn pvol_edr_query_area_collects_sites() {
 /// must sample a finite value.
 #[test]
 fn pvol_edr_query_trajectory_returns_section() {
-    let Some(engine) = pvol_fixture_engine() else {
+    let Some(view) = pvol_fixture_view() else {
         eprintln!("skipping pvol_edr_query_trajectory_returns_section: fixture absent");
         return;
     };
-    // A ~50 km north-bound leg starting south-west of Anjalankoski
-    // (~27.1°E, 60.9°N), so the path crosses the radar's lowest sweep
-    // coverage along its length. `z` here selects the 0.5°–5° elevation
-    // angle band (the cross-section's vertical axis is derived height).
-    let coords = "LINESTRING(27.1 60.6, 27.1 61.1)";
+    // A ~65 km north-bound leg through Vihti (~24.50°E, 60.56°N), so the
+    // path crosses the radar's lowest sweep coverage along its length.
+    // `z` here selects the 0.5°–5° elevation angle band (the
+    // cross-section's vertical axis is derived height).
+    let coords = "LINESTRING(24.5 60.3, 24.5 60.9)";
     let response = EdrEngine::query_trajectory(
-        &engine,
+        &view,
         coords,
         None,
         Some(&["DBZH".to_string()]),
@@ -907,13 +914,14 @@ fn pvol_edr_query_trajectory_returns_section() {
     );
 }
 
-/// A trajectory whose path lies entirely outside any radar's coverage
-/// still yields a Section, but every cell is nodata. Far-out paths
-/// fall back to the catalog's `nearest_site` and produce a Section
-/// shaped against that site's z extent.
+/// A trajectory whose path lies entirely outside this site's coverage
+/// still yields a Section, but every cell is nodata: a per-site view
+/// always samples its own radar (no nearest-site pick), so a far-out path
+/// produces a Section shaped against this site's z extent with all-None
+/// cells.
 #[test]
 fn pvol_edr_query_trajectory_out_of_coverage_yields_empty_cells() {
-    let Some(engine) = pvol_fixture_engine() else {
+    let Some(view) = pvol_fixture_view() else {
         eprintln!(
             "skipping pvol_edr_query_trajectory_out_of_coverage_yields_empty_cells: fixture absent"
         );
@@ -923,7 +931,7 @@ fn pvol_edr_query_trajectory_out_of_coverage_yields_empty_cells() {
     // range. `z` selects a low elevation-angle band.
     let coords = "LINESTRING(-150 -30, -150 -29)";
     match EdrEngine::query_trajectory(
-        &engine,
+        &view,
         coords,
         None,
         Some(&["DBZH".to_string()]),
@@ -952,7 +960,7 @@ fn pvol_edr_query_trajectory_out_of_coverage_yields_empty_cells() {
 /// API layer can map to HTTP 400.
 #[test]
 fn pvol_edr_query_trajectory_rejects_malformed_linestring() {
-    let Some(engine) = pvol_fixture_engine() else {
+    let Some(view) = pvol_fixture_view() else {
         eprintln!(
             "skipping pvol_edr_query_trajectory_rejects_malformed_linestring: fixture absent"
         );
@@ -964,7 +972,7 @@ fn pvol_edr_query_trajectory_rejects_malformed_linestring() {
         "LINESTRINGZ(27.1 60.9 0, 27.1 61.1 100)",
         "LINESTRING(NaN 60.9, 27.1 61.1)",
     ] {
-        match EdrEngine::query_trajectory(&engine, bad, None, None, None) {
+        match EdrEngine::query_trajectory(&view, bad, None, None, None) {
             Err(ds_core::error::DataServerError::InvalidParameter(_)) => {}
             other => panic!("expected InvalidParameter for `{bad}`, got {other:?}"),
         }

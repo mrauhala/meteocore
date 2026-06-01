@@ -1176,80 +1176,118 @@ pub fn load_collections(
 
                 odim_volume_engines.push(engine.clone());
 
-                if collection.apis.contains(&"edr".to_string()) {
-                    edr_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+                // Model B: one PVOL source expands into N per-site OGC
+                // collections — one per radar `nod`, parameter = bare
+                // quantity. The owning engine keeps the single scan, parse
+                // cache, and poll loop; each site gets a cheap
+                // `PolarVolumeSiteView` over the shared catalog. The site
+                // set is the catalog snapshot taken by `new`'s synchronous
+                // scan; sites that appear later surface on the next reload
+                // (which re-runs this expansion).
+                let site_ids = engine.site_ids();
+                if site_ids.is_empty() {
+                    tracing::warn!(
+                        "Collection '{}': PVOL source has no radar sites yet — no per-site \
+                         collections registered. Reload once volume files arrive.",
+                        collection.id
                     );
-                    edr_collections.insert(collection.id.clone(), collection.clone());
-                    info!("Collection '{}': wired to EDR API", collection.id);
+                    // Keep the source visible in `/health` even with no
+                    // data, so an empty-bucket misconfiguration isn't silent.
+                    health.push(CollectionHealth {
+                        id: collection.id.clone(),
+                        engine_type: "odim-volume".into(),
+                        status: CollectionStatus::Degraded,
+                        error: Some("no radar sites discovered yet".into()),
+                    });
                 }
+                for nod in &site_ids {
+                    let site_id = format!("{}-{}", collection.id, nod);
+                    let label = engine.site_label(nod).unwrap_or_else(|| nod.clone());
+                    let view = Arc::new(engine.site_view(nod, &site_id));
 
-                // PVOL is multi-parameter (one layer per <site>:<quantity>).
-                let raster_params =
-                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+                    // Per-site collection config: inherit the base
+                    // (`apis`, `[wms]` styling, …) and override identity.
+                    let mut site_cfg = collection.clone();
+                    site_cfg.id = site_id.clone();
+                    site_cfg.title = format!("{} — {label}", collection.title);
+                    site_cfg.description =
+                        format!("{} (radar site {label} / {nod})", collection.description);
 
-                if collection.apis.contains(&"wms".to_string()) {
-                    map_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
-                    map_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    map_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut map_styles,
-                            &bundle_index,
+                    if collection.apis.contains(&"edr".to_string()) {
+                        edr_engines.insert(
+                            site_id.clone(),
+                            view.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
                         );
+                        edr_collections.insert(site_id.clone(), site_cfg.clone());
                     }
-                    info!("Collection '{}': wired to WMS API", collection.id);
-                }
-                if collection.apis.contains(&"maps".to_string()) {
-                    maps_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
-                    maps_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    maps_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut maps_styles,
-                            &bundle_index,
-                        );
-                    }
-                    info!("Collection '{}': wired to Maps API", collection.id);
-                }
-                if collection.apis.contains(&"tiles".to_string()) {
-                    tiles_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
-                    tiles_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    tiles_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut tiles_styles,
-                            &bundle_index,
-                        );
-                    }
-                    info!("Collection '{}': wired to Tiles API", collection.id);
-                }
 
-                health.push(CollectionHealth {
-                    id: collection.id.clone(),
-                    engine_type: "odim-volume".into(),
-                    status: CollectionStatus::Ready,
-                    error: None,
-                });
+                    // Per-site, multi-parameter: one layer per bare quantity.
+                    let raster_params =
+                        ds_core::map_engine::MapEngine::raster_info(view.as_ref()).parameters;
+
+                    if collection.apis.contains(&"wms".to_string()) {
+                        map_engines.insert(
+                            site_id.clone(),
+                            view.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                        );
+                        map_collections.insert(site_id.clone(), site_cfg.clone());
+                        let styles = build_styles(&site_cfg, &bundle_index);
+                        map_styles.insert(site_id.clone(), styles);
+                        if !raster_params.is_empty() {
+                            register_parameter_layer_styles(
+                                &site_cfg,
+                                &raster_params,
+                                &mut map_styles,
+                                &bundle_index,
+                            );
+                        }
+                    }
+                    if collection.apis.contains(&"maps".to_string()) {
+                        maps_engines.insert(
+                            site_id.clone(),
+                            view.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                        );
+                        maps_collections.insert(site_id.clone(), site_cfg.clone());
+                        let styles = build_styles(&site_cfg, &bundle_index);
+                        maps_styles.insert(site_id.clone(), styles);
+                        if !raster_params.is_empty() {
+                            register_parameter_layer_styles(
+                                &site_cfg,
+                                &raster_params,
+                                &mut maps_styles,
+                                &bundle_index,
+                            );
+                        }
+                    }
+                    if collection.apis.contains(&"tiles".to_string()) {
+                        tiles_engines.insert(
+                            site_id.clone(),
+                            view.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                        );
+                        tiles_collections.insert(site_id.clone(), site_cfg.clone());
+                        let styles = build_styles(&site_cfg, &bundle_index);
+                        tiles_styles.insert(site_id.clone(), styles);
+                        if !raster_params.is_empty() {
+                            register_parameter_layer_styles(
+                                &site_cfg,
+                                &raster_params,
+                                &mut tiles_styles,
+                                &bundle_index,
+                            );
+                        }
+                    }
+
+                    info!(
+                        "Collection '{}': wired per-site radar collection '{site_id}' ({label})",
+                        collection.id
+                    );
+                    health.push(CollectionHealth {
+                        id: site_id,
+                        engine_type: "odim-volume".into(),
+                        status: CollectionStatus::Ready,
+                        error: None,
+                    });
+                }
             }
             "postgis" => {
                 let postgis_cfg = match collection.postgis.as_ref() {
