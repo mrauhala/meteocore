@@ -76,6 +76,33 @@ impl MapEngine for MockMapEngine {
     }
 }
 
+/// A `MapEngine` whose `get_raster_tile` always returns `InvalidParameter`
+/// — mirrors a multi-parameter PVOL collection tiled without a
+/// `<site>:<quantity>` selection. Used to verify the handler returns 400,
+/// not 500.
+struct InvalidParamEngine;
+
+impl MapEngine for InvalidParamEngine {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        _width: u32,
+        _height: u32,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+    ) -> Result<RasterTile, DataServerError> {
+        Err(DataServerError::InvalidParameter(
+            "collection requires a `<site>:<quantity>` parameter (e.g. `fivih:DBZH`)".into(),
+        ))
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        MockMapEngine::make_info()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -140,6 +167,63 @@ fn build_router() -> axum::Router {
     );
     styles_map.insert("radar".to_string(), layer_styles);
 
+    let state = Arc::new(ArcSwap::from_pointee(TilesState {
+        map_engines: engines,
+        collections,
+        styles: styles_map,
+        feature_engines: HashMap::new(),
+        feature_collections: HashMap::new(),
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        vector_tile_cache: Arc::new(VectorTileCache::new(16)),
+        base_url: String::new(),
+    }));
+    api_tiles::router(state)
+}
+
+/// A Tiles router backed by a caller-supplied engine, for exercising
+/// engine error paths.
+fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
+    let mut engines = HashMap::new();
+    let mut collections = HashMap::new();
+    let mut styles_map = HashMap::new();
+    engines.insert("radar".to_string(), engine);
+    collections.insert(
+        "radar".to_string(),
+        CollectionConfig {
+            id: "radar".to_string(),
+            title: "Test Radar".to_string(),
+            description: "Test radar data".to_string(),
+            data_path: None,
+            apis: vec!["tiles".to_string()],
+            engine_type: "odim-volume".to_string(),
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            odim: None,
+            postgis: None,
+            preview: None,
+        },
+    );
+    let cmap = Arc::new(LutColorMap::from_builtin(
+        BuiltinColormap::Viridis,
+        0.0,
+        1.0,
+    ));
+    let mut layer_styles = HashMap::new();
+    layer_styles.insert(
+        "default".to_string(),
+        StyleInfo {
+            name: "default".to_string(),
+            title: "Default".to_string(),
+            colormap: cmap,
+            min: 0.0,
+            max: 1.0,
+            parameter: None,
+        },
+    );
+    styles_map.insert("radar".to_string(), layer_styles);
     let state = Arc::new(ArcSwap::from_pointee(TilesState {
         map_engines: engines,
         collections,
@@ -475,6 +559,31 @@ mod get_tile {
         let (status, _, _) =
             get_raw("/collections/radar/tiles/WebMercatorQuad/0/0/0?elevation=0.5").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// An engine `InvalidParameter` from `get_raster_tile` (e.g. a
+    /// multi-parameter PVOL collection tiled without a `<site>:<quantity>`
+    /// selection) is a 400 **with the engine's message in the body**, not
+    /// a 500 — parity with the maps regression test.
+    #[tokio::test]
+    async fn render_invalid_parameter_is_400_with_message() {
+        let app = build_router_with_engine(Arc::new(InvalidParamEngine));
+        let req = Request::builder()
+            .uri("/collections/radar/tiles/WebMercatorQuad/0/0/0")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "BadRequest");
+        assert!(
+            json["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("parameter"),
+            "the helpful engine message must reach the client, got {json}"
+        );
     }
 
     #[tokio::test]
