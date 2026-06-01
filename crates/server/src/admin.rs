@@ -1190,19 +1190,27 @@ pub fn load_collections(
                 // swaps the catalog mid-registration.
                 let sites = engine.sites();
                 if sites.is_empty() {
-                    // Register nothing and add NO health entry: a `Degraded`
-                    // placeholder here would count toward the reload guard's
-                    // "loaded" tally (`status != Failed`), letting a
-                    // transient empty scan (S3 hiccup) replace a working
-                    // registry with zero per-site collections. With no
-                    // entry, an empty source contributes 0 — so if it is the
-                    // only collection the guard correctly keeps the old
-                    // state. The WARN keeps the misconfiguration visible.
+                    // No sites yet (empty/not-yet-populated source). Register
+                    // nothing but DO push a `Degraded` health entry so the
+                    // server still boots and waits for the first poll —
+                    // matching the geotiff/querydata/grib "no data yet"
+                    // convention. The startup guard (main.rs) counts
+                    // `status != Failed`, so without this entry an all-empty
+                    // PVOL deployment would `exit(1)` on boot. The *reload*
+                    // guard counts `status == Ready` instead, so this
+                    // placeholder does NOT let a transient empty scan replace
+                    // a working registry — see `reload_handler`.
                     tracing::warn!(
                         "Collection '{}': PVOL source has no radar sites yet — no per-site \
                          collections registered. Reload once volume files arrive.",
                         collection.id
                     );
+                    health.push(CollectionHealth {
+                        id: collection.id.clone(),
+                        engine_type: "odim-volume".into(),
+                        status: CollectionStatus::Degraded,
+                        error: Some("no radar sites found yet (waiting for .h5 files)".into()),
+                    });
                 }
                 for (nod, label) in &sites {
                     let site_id = format!("{}-{}", collection.id, nod);
@@ -1948,7 +1956,22 @@ pub async fn reload_handler(
         .filter(|h| h.status != CollectionStatus::Failed)
         .count();
 
-    if loaded == 0 && !config.collections.is_empty() {
+    // Reload protection counts *fully working* (`Ready`) collections, not
+    // just non-`Failed` ones. A `Degraded` placeholder — e.g. an
+    // odim-volume source that transiently scanned zero sites, or a postgis
+    // collection whose DB is momentarily down — wires no servable routes,
+    // so it must not satisfy the guard and let an empty/degraded reload
+    // replace a working live registry. (Startup in `main.rs` deliberately
+    // uses the looser `!= Failed`: at boot there is no live state to
+    // protect, so the server should start degraded and wait for the first
+    // poll rather than refuse to boot.)
+    let ready = result
+        .health
+        .iter()
+        .filter(|h| h.status == CollectionStatus::Ready)
+        .count();
+
+    if ready == 0 && !config.collections.is_empty() {
         // Restore old GeoTIFF engines (they were shut down)
         // This is a best-effort recovery — the old engines' poll loops won't restart,
         // but cached data is still servable.

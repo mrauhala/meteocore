@@ -353,6 +353,10 @@ struct SiteMeta {
     times: Vec<DateTime<Utc>>,
     /// This site's circular coverage bbox `[w, s, e, n]` (WGS84).
     spatial_extent: Option<[f64; 4]>,
+    /// This site's maximum ground-range coverage radius (metres) — the
+    /// lowest sweep's `nbins·rscale + rstart`. `None` for a malformed
+    /// `rscale`. Used to reject position queries clearly outside coverage.
+    coverage_radius_m: Option<f64>,
     /// This site's sweep elevation angles (degrees).
     vertical: Option<VerticalDimension>,
 }
@@ -823,8 +827,8 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
 
     // Coverage radius from the lowest sweep's range gate geometry.
     let radius_m = sweep0.nbins as f64 * sweep0.rscale + sweep0.rstart;
-    let spatial_extent = (radius_m.is_finite() && radius_m > 0.0)
-        .then(|| site_coverage_bbox(site.lon, site.lat, radius_m));
+    let coverage_radius_m = (radius_m.is_finite() && radius_m > 0.0).then_some(radius_m);
+    let spatial_extent = coverage_radius_m.map(|r| site_coverage_bbox(site.lon, site.lat, r));
 
     let mut times: Vec<DateTime<Utc>> = list.iter().map(|e| e.volume.time).collect();
     times.sort_unstable();
@@ -852,6 +856,7 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         quantities,
         times,
         spatial_extent,
+        coverage_radius_m,
         vertical,
     })
 }
@@ -1364,24 +1369,27 @@ fn quantity_description(quantity: &str) -> ParameterDescription {
 }
 
 /// Resolve the quantity set for a PVOL site query: the union of every
-/// sweep's moments in the most recent selected volume — a profile
-/// samples all sweeps, and a quantity may be present only on higher
-/// elevations (e.g. dual-PRF `VRADH`/`WRADH`) — intersected with the
-/// optional `parameters` filter.
+/// sweep's moments across **all** selected volumes — a profile samples all
+/// sweeps, a quantity may be present only on higher elevations (e.g.
+/// dual-PRF `VRADH`/`WRADH`), and a quantity may drop out of the newest
+/// scan (firmware change / reduced strategy) while earlier volumes in the
+/// window still carry it — intersected with the optional `parameters`
+/// filter. `volume_profile`/`level_series` map a missing moment in any one
+/// timestep to `None`, so unioning here never fabricates data; it only
+/// keeps a quantity queryable for the timesteps that actually have it.
 fn resolve_quantities(
     selected: &[&VolumeEntry],
     parameters: Option<&[String]>,
 ) -> Result<Vec<String>, DataServerError> {
     let mut available: Vec<String> = selected
-        .last()
-        .map(|e| {
+        .iter()
+        .flat_map(|e| {
             e.volume
                 .sweeps
                 .iter()
                 .flat_map(|s| s.moments.iter().map(|m| m.quantity.clone()))
-                .collect()
         })
-        .unwrap_or_default();
+        .collect();
     available.sort();
     available.dedup();
     let quantities: Vec<String> = match parameters {
@@ -2280,6 +2288,16 @@ impl EdrEngine for PolarVolumeSiteView {
             return Err(DataServerError::LocationNotFound(location_id.to_string()));
         }
         let catalog = self.catalog.load();
+        // Gate on `by_site_meta`, exactly as `get_locations` does: a site
+        // whose latest volume has no usable moment data is dropped from
+        // `by_site_meta` (but not `by_site`), so without this guard
+        // `query_location` would fall through to `resolve_quantities` and
+        // return a 400 for a location that `get_locations` reports as
+        // absent. Both must agree on a clean 404.
+        let meta = catalog
+            .by_site_meta
+            .get(&self.nod)
+            .ok_or_else(|| DataServerError::LocationNotFound(self.nod.clone()))?;
         let volumes = catalog
             .by_site
             .get(&self.nod)
@@ -2289,11 +2307,7 @@ impl EdrEngine for PolarVolumeSiteView {
             .ok_or_else(|| DataServerError::LocationNotFound(self.nod.clone()))?
             .volume
             .site;
-        let canonical = catalog
-            .by_site_meta
-            .get(&self.nod)
-            .and_then(|m| m.vertical.as_ref())
-            .map(|v| v.levels.as_slice());
+        let canonical = meta.vertical.as_ref().map(|v| v.levels.as_slice());
         site_point_query(
             volumes, site.lon, site.lat, datetime, parameters, z, canonical,
         )
@@ -2362,17 +2376,33 @@ impl EdrEngine for PolarVolumeSiteView {
     ) -> Result<CoverageResponse, DataServerError> {
         let (lat, lon) = parse_point_coords(coords)?;
         let catalog = self.catalog.load();
+        let meta = catalog.by_site_meta.get(&self.nod).ok_or_else(|| {
+            DataServerError::LocationNotFound(format!(
+                "[{}] radar site `{}` has no current metadata",
+                self.collection_id, self.nod
+            ))
+        })?;
+        // Reject a point clearly outside the radar's coverage circle with a
+        // 404 rather than returning HTTP 200 all-null values — which is
+        // indistinguishable from "in range, clear sky". The per-site
+        // collection's advertised spatial extent *is* this coverage circle,
+        // so a point beyond it is outside the collection's domain. (A point
+        // inside coverage with no echo still correctly returns 200 nulls.)
+        if let Some(radius_m) = meta.coverage_radius_m {
+            let (dist, _) = ground_distance_bearing(meta.lon, meta.lat, lon, lat);
+            if dist > radius_m {
+                return Err(DataServerError::LocationNotFound(
+                    "requested point is outside this radar's coverage area".into(),
+                ));
+            }
+        }
         let volumes = catalog.by_site.get(&self.nod).ok_or_else(|| {
             DataServerError::LocationNotFound(format!(
                 "[{}] radar site `{}` has no current volumes",
                 self.collection_id, self.nod
             ))
         })?;
-        let canonical = catalog
-            .by_site_meta
-            .get(&self.nod)
-            .and_then(|m| m.vertical.as_ref())
-            .map(|v| v.levels.as_slice());
+        let canonical = meta.vertical.as_ref().map(|v| v.levels.as_slice());
         site_point_query(volumes, lon, lat, datetime, parameters, z, canonical)
     }
 
@@ -3770,5 +3800,74 @@ mod tests {
         )
         .expect("a higher-sweep-only quantity must render, not 400");
         assert_eq!(tile.values.len(), 16 * 4);
+    }
+
+    /// `resolve_quantities` unions moments across **all** selected volumes,
+    /// so a quantity that drops out of the newest scan is still queryable
+    /// for the earlier timesteps that carry it.
+    #[test]
+    fn resolve_quantities_unions_across_volumes() {
+        // Older volume carries DBZH + VRADH; newer carries DBZH only.
+        let mut older = synthetic_volume(25.0, 60.0);
+        let mut vradh = older.sweeps[0].moments[0].clone();
+        vradh.quantity = "VRADH".to_string();
+        older.sweeps[0].moments.push(vradh);
+        let newer = synthetic_volume(25.0, 60.0); // DBZH only
+
+        let owned = [entry(older, "a"), entry(newer, "b")];
+        let selected: Vec<&VolumeEntry> = owned.iter().collect();
+
+        // VRADH is absent from the newest volume but present in the union.
+        let q = resolve_quantities(&selected, Some(&["VRADH".to_string()]))
+            .expect("VRADH is available in the window's union");
+        assert_eq!(q, vec!["VRADH".to_string()]);
+    }
+
+    /// A position query for a point clearly outside the radar's coverage
+    /// circle is `LocationNotFound` (404), not HTTP 200 all-null.
+    #[test]
+    fn site_view_query_position_outside_coverage_is_404() {
+        // synthetic_volume: 100 bins × 1 km ⇒ ~100 km coverage radius.
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![entry(synthetic_volume(25.0, 60.0), "v")],
+        );
+        let view = site_view_for(by_site, "fivih");
+
+        // ~5° east at 60°N ≈ 280 km — well beyond the 100 km radius.
+        assert!(
+            matches!(
+                EdrEngine::query_position(&view, "POINT(30.0 60.0)", None, None, None),
+                Err(DataServerError::LocationNotFound(_))
+            ),
+            "a point outside the coverage radius must be 404"
+        );
+        // ~11 km north — inside coverage, resolves to a coverage.
+        assert!(
+            EdrEngine::query_position(&view, "POINT(25.0 60.1)", None, None, None).is_ok(),
+            "a point within coverage must succeed"
+        );
+    }
+
+    /// `query_location` agrees with `get_locations`: a site dropped from
+    /// `by_site_meta` (sweeps but no moments) is a 404, not a 400.
+    #[test]
+    fn site_view_query_location_moment_less_site_is_404() {
+        let mut momentless = synthetic_volume(25.0, 60.0);
+        momentless.sweeps[0].moments.clear();
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert("fivih".to_string(), vec![entry(momentless, "m")]);
+        let view = site_view_for(by_site, "fivih");
+
+        // The site is invisible to discovery...
+        assert!(EdrEngine::get_locations(&view)
+            .expect("locations")
+            .is_empty());
+        // ...and a direct query_location returns 404, not InvalidParameter.
+        assert!(matches!(
+            EdrEngine::query_location(&view, "fivih", None, None, None),
+            Err(DataServerError::LocationNotFound(_))
+        ));
     }
 }

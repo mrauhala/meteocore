@@ -732,6 +732,24 @@ fn pvol_edr_get_locations_lists_sites() {
 }
 
 /// A position query with no `z` returns a `CoverageCollection` of
+/// A position query for a point far outside the real radar's coverage
+/// (Kansas vs a Finnish radar) is `LocationNotFound` (404), not HTTP 200
+/// all-null — exercises the coverage-radius guard on real data.
+#[test]
+fn pvol_edr_position_outside_coverage_is_404() {
+    let Some(view) = pvol_fixture_view() else {
+        eprintln!("skipping pvol_edr_position_outside_coverage_is_404: fixture absent");
+        return;
+    };
+    assert!(
+        matches!(
+            EdrEngine::query_position(&view, "POINT(-100 40)", None, None, None),
+            Err(ds_core::error::DataServerError::LocationNotFound(_))
+        ),
+        "a point ~7000 km from the radar must be outside coverage (404)"
+    );
+}
+
 /// `VerticalProfile`s — one per timestep — sampling every sweep.
 #[test]
 fn pvol_edr_query_position_returns_vertical_profiles() {
