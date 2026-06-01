@@ -1049,6 +1049,98 @@ fn sample_sweep_moment(
     )
 }
 
+/// Bilinearly read one moment at a *fractional* `(ray, bin)` position —
+/// the shared core of the anti-spoke sampler. Blends the four
+/// surrounding cells in the moment's stored physical units, wrapping the
+/// azimuth axis at the 0°/360° ray seam (ray `nrays` ≡ ray 0) and
+/// dropping any `nodata`/`undetect` or out-of-range neighbour while
+/// renormalising the weights over the cells that remain — so a masked
+/// cell never darkens valid output and valid data never bleeds more
+/// than one cell into a gap. `None` when every contributing neighbour
+/// is masked or out of range.
+///
+/// Interpolation is in the stored units (e.g. dBZ): the standard
+/// cosmetic choice for a display product. It slightly under-weights
+/// peaks versus a linear-reflectivity average, but avoids per-moment
+/// unit-aware conversion for what is a smoothing pass.
+fn bilinear_cell(
+    moment: &PolarMoment,
+    nrays: usize,
+    nbins: usize,
+    ray_f: f64,
+    bin_f: f64,
+) -> Option<f64> {
+    let b0 = bin_f.floor() as i64;
+    let r0 = ray_f.floor() as i64;
+    let bf = bin_f - b0 as f64;
+    let rf = ray_f - r0 as f64;
+
+    let mut sum = 0.0;
+    let mut wsum = 0.0;
+    for (dr, wr) in [(0i64, 1.0 - rf), (1, rf)] {
+        if wr <= 0.0 {
+            continue;
+        }
+        // Azimuth wraps at the seam; `rem_euclid` keeps `nrays-1 → 0`.
+        let ray = (r0 + dr).rem_euclid(nrays as i64) as usize;
+        for (db, wb) in [(0i64, 1.0 - bf), (1, bf)] {
+            let w = wr * wb;
+            if w <= 0.0 {
+                continue;
+            }
+            let bin = b0 + db;
+            if bin < 0 || bin >= nbins as i64 {
+                continue; // range edge — drop this neighbour
+            }
+            if let Some(v) = moment.data.sample(
+                ray,
+                bin as usize,
+                moment.gain,
+                moment.offset,
+                moment.nodata,
+                Some(moment.undetect),
+            ) {
+                sum += v * w;
+                wsum += w;
+            }
+        }
+    }
+    (wsum > 0.0).then(|| sum / wsum)
+}
+
+/// Bilinear (anti-spoke) variant of [`sample_sweep_moment`] used by the
+/// Cartesian render. Nearest-neighbour azimuth sampling leaves visible
+/// radial spokes far from the radar, where adjacent output pixels
+/// straddle a ray boundary (#186); blending between the straddling rays
+/// closes them. Same **ground-range interim** as [`sample_sweep_moment`].
+fn sample_sweep_moment_bilinear(
+    sweep: &Sweep,
+    moment: &PolarMoment,
+    site_lon: f64,
+    site_lat: f64,
+    lon: f64,
+    lat: f64,
+) -> Option<f64> {
+    if sweep.nrays == 0 || sweep.nbins == 0 {
+        return None;
+    }
+    let (dist, az) = ground_distance_bearing(site_lon, site_lat, lon, lat);
+
+    // Fractional bin (ground-range interim). Bin `i` starts at
+    // `rstart + i*rscale`, matching the nearest-neighbour `floor` mapping;
+    // the fractional part blends toward the next bin.
+    let bin_f = (dist - sweep.rstart) / sweep.rscale;
+    if bin_f < 0.0 || bin_f >= sweep.nbins as f64 {
+        return None;
+    }
+    // Fractional ray. ODIM rays are stored north-first, clockwise (the
+    // `a1gate` acquisition offset must NOT shift the stored index); ray
+    // `i` starts at azimuth `i * 360/nrays`.
+    let ray_f = az / (360.0 / sweep.nrays as f64);
+
+    bilinear_cell(moment, sweep.nrays, sweep.nbins, ray_f, bin_f)
+}
+
 /// The sweep whose elevation angle is nearest `target` degrees. `None`
 /// only when the volume has no sweeps.
 fn nearest_sweep(volume: &PolarVolume, target: f64) -> Option<&Sweep> {
@@ -1069,12 +1161,15 @@ fn nearest_sweep(volume: &PolarVolume, target: f64) -> Option<&Sweep> {
 ///
 /// 1. computes ground distance + azimuth from the site via
 ///    [`ground_distance_bearing`];
-/// 2. maps distance to a range bin (ground range — see below);
-/// 3. maps azimuth to a stored ray index;
-/// 4. samples the raw moment array and applies gain/offset/nodata.
+/// 2. maps distance to a fractional range bin (ground range — see below);
+/// 3. maps azimuth to a fractional ray index;
+/// 4. **bilinearly** samples the four surrounding moment cells
+///    ([`sample_sweep_moment_bilinear`]), blending across rays to close
+///    the radial spoke gaps that nearest-neighbour sampling leaves far
+///    from the radar (#186).
 ///
 /// **Ground-range interim.** The sweep range axis is treated as ground
-/// range: `bin = floor((d - rstart) / rscale)`. A proper slant-range /
+/// range: `bin = (d - rstart) / rscale`. A proper slant-range /
 /// 4⁄3-Earth ground-range correction is deferred — for the lowest
 /// elevation sweep this M2 interim, the near-horizon geometry keeps the
 /// slant-vs-ground discrepancy small.
@@ -1146,7 +1241,7 @@ fn polar_sample(
                 continue;
             }
 
-            values.push(sample_sweep_moment(
+            values.push(sample_sweep_moment_bilinear(
                 sweep, moment, site_lon, site_lat, lon, lat,
             ));
         }
@@ -2610,6 +2705,109 @@ mod tests {
             tile.values.iter().all(Option::is_none),
             "pixels past max range must be None"
         );
+    }
+
+    /// Build a single moment whose raw `[ray, bin]` value is `set(ray, bin)`.
+    fn moment_with(nrays: usize, nbins: usize, set: impl Fn(usize, usize) -> u16) -> PolarMoment {
+        let mut data = Array2::<u16>::zeros((nrays, nbins));
+        for r in 0..nrays {
+            for b in 0..nbins {
+                data[(r, b)] = set(r, b);
+            }
+        }
+        PolarMoment {
+            quantity: "DBZH".to_string(),
+            gain: 1.0,
+            offset: 0.0,
+            nodata: 65_535.0,
+            undetect: 65_534.0,
+            data: RawPixels::U16(data),
+        }
+    }
+
+    /// Bilinear blends across the two straddling rays (the anti-spoke
+    /// fix, #186): a point halfway between ray 0 (20) and ray 1 (40) at
+    /// bin 10 samples the mean, 30 — not one ray's value.
+    #[test]
+    fn bilinear_cell_blends_adjacent_rays() {
+        let m = moment_with(360, 20, |r, b| match (r, b) {
+            (0, 10) => 20,
+            (1, 10) => 40,
+            _ => 0,
+        });
+        let v = bilinear_cell(&m, 360, 20, 0.5, 10.0).unwrap();
+        assert!((v - 30.0).abs() < 1e-9, "ray blend (20+40)/2, got {v}");
+    }
+
+    /// The azimuth axis wraps at the 0°/360° seam: ray 359 and ray 0
+    /// blend for a point just inside the last ray.
+    #[test]
+    fn bilinear_cell_wraps_azimuth_seam() {
+        let m = moment_with(360, 20, |r, b| match (r, b) {
+            (359, 10) => 10,
+            (0, 10) => 30,
+            _ => 0,
+        });
+        let v = bilinear_cell(&m, 360, 20, 359.5, 10.0).unwrap();
+        assert!((v - 20.0).abs() < 1e-9, "seam blend (10+30)/2, got {v}");
+    }
+
+    /// A `nodata`/`undetect` neighbour is dropped and the weights are
+    /// renormalised over the valid cells — so a masked ray never darkens
+    /// valid output (a 50/50 blend with a masked cell returns the valid
+    /// value, not half of it).
+    #[test]
+    fn bilinear_cell_renormalises_over_masked_neighbours() {
+        let m = moment_with(360, 20, |r, b| match (r, b) {
+            (0, 10) => 20,
+            (1, 10) => 65_535, // nodata
+            _ => 0,
+        });
+        let v = bilinear_cell(&m, 360, 20, 0.5, 10.0).unwrap();
+        assert!(
+            (v - 20.0).abs() < 1e-9,
+            "masked neighbour renormalised away, got {v}"
+        );
+    }
+
+    /// Every contributing neighbour masked → `None` (transparent).
+    #[test]
+    fn bilinear_cell_all_masked_is_none() {
+        let m = moment_with(360, 20, |_, b| if b == 10 { 65_535 } else { 0 });
+        assert!(bilinear_cell(&m, 360, 20, 0.5, 10.0).is_none());
+    }
+
+    /// A range-edge neighbour (`bin + 1 == nbins`) is dropped, not read
+    /// out of bounds; the in-range cell still samples.
+    #[test]
+    fn bilinear_cell_drops_range_edge_neighbour() {
+        let m = moment_with(360, 20, |_, b| if b == 19 { 42 } else { 0 });
+        let v = bilinear_cell(&m, 360, 20, 5.0, 19.5).unwrap();
+        assert!((v - 42.0).abs() < 1e-9, "edge neighbour dropped, got {v}");
+    }
+
+    /// End-to-end: the bilinear sampler returns a *fractional* bin value
+    /// where the nearest-neighbour sampler floors — confirming the
+    /// interpolation is wired into the render path.
+    #[test]
+    fn sample_sweep_moment_bilinear_vs_nearest() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let vol = synthetic_volume(site_lon, site_lat); // raw[ray][bin]=bin, 1 km bins
+        let sweep = &vol.sweeps[0];
+        let moment = &sweep.moments[0];
+        // ~10.5 km due east → fractional bin ≈ 10.5.
+        let dlon = 10_500.0 / (EARTH_RADIUS_M * site_lat.to_radians().cos()) * 180.0
+            / std::f64::consts::PI;
+        let (lon, lat) = (site_lon + dlon, site_lat);
+        let bilinear = sample_sweep_moment_bilinear(sweep, moment, site_lon, site_lat, lon, lat)
+            .expect("bilinear sample");
+        let nearest =
+            sample_sweep_moment(sweep, moment, site_lon, site_lat, lon, lat).expect("nn sample");
+        assert!(
+            (bilinear - 10.5).abs() < 0.1,
+            "bilinear interpolates to ≈ 10.5, got {bilinear}"
+        );
+        assert_eq!(nearest, 10.0, "nearest floors to bin 10");
     }
 
     /// An absent quantity is an `InvalidParameter` error, not a panic.
