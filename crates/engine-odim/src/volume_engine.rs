@@ -693,6 +693,21 @@ fn build_catalog(
             continue;
         };
 
+        // The NOD becomes part of a URL-routed collection id (`{base}-{nod}`)
+        // and a WMS `LAYERS` token, so reject anything that isn't a clean
+        // path segment. ODIM NODs are spec'd as 5 ASCII-alphanumeric chars
+        // (2-letter country + 3-letter station), so this only fires on a
+        // malformed/adversarial file — a NOD with `/` would make the
+        // collection permanently unreachable (Axum stops `{id}` at the first
+        // `/`), and `?`/`#`/space/non-ASCII would corrupt routing or the IRI.
+        if !is_url_safe_nod(&nod) {
+            tracing::warn!(
+                "[{collection_id}] skipping PVOL file `{id}`: NOD `{nod}` contains \
+                 characters invalid in a URL path segment (expected ASCII alphanumeric)"
+            );
+            continue;
+        }
+
         by_site
             .entry(nod)
             .or_default()
@@ -700,6 +715,17 @@ fn build_catalog(
     }
 
     by_site
+}
+
+/// Whether `nod` is safe to embed verbatim in a URL-routed collection id
+/// (`{base}-{nod}`) and a WMS `LAYERS` token: non-empty and ASCII
+/// alphanumeric plus `-`/`_`. ODIM NODs are pure ASCII alphanumeric, so
+/// this passes every well-formed code and rejects routing-breaking input.
+fn is_url_safe_nod(nod: &str) -> bool {
+    !nod.is_empty()
+        && nod
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Finalise the grouped volume map into a [`Catalog`]: sort and cap each
@@ -779,6 +805,19 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         .collect();
     quantities.sort();
     quantities.dedup();
+    // A volume with sweep structs but no moment datasets in any of them
+    // (a malformed file) yields no quantities. Exclude such a site rather
+    // than register a zero-parameter collection whose default WMS layer is
+    // broken and whose every render 400s — `sweeps.first()?` above only
+    // guards the no-sweeps case, not the no-moments case.
+    if quantities.is_empty() {
+        let nod = site.nod.as_deref().unwrap_or("?");
+        tracing::warn!(
+            "PVOL site `{nod}`: latest volume has sweeps but no moment data — \
+             excluding from registered sites"
+        );
+        return None;
+    }
     let parameters: Vec<(String, String)> =
         quantities.iter().map(|q| (q.clone(), q.clone())).collect();
 
@@ -2082,6 +2121,22 @@ impl PolarVolumeEngine {
     /// temporal extents.
     pub fn collection_id(&self) -> &str {
         &self.collection_id
+    }
+
+    /// Per-site `(nod, volume times)` from **one** catalog snapshot, sorted
+    /// by `nod`. Lets `/health` build each site's temporal extent without
+    /// allocating a `PolarVolumeSiteView` per site (one `ArcSwap` load for
+    /// the whole network, not one per site) — keeping the per-request
+    /// accessor O(1)-from-a-snapshot per the CLAUDE.md hot-path rule.
+    pub fn site_times(&self) -> Vec<(String, Vec<DateTime<Utc>>)> {
+        let catalog = self.catalog.load();
+        let mut out: Vec<(String, Vec<DateTime<Utc>>)> = catalog
+            .by_site_meta
+            .iter()
+            .map(|(nod, meta)| (nod.clone(), meta.times.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// Build a [`PolarVolumeSiteView`] scoped to radar `nod`, sharing this
@@ -3577,6 +3632,34 @@ mod tests {
         };
         // The view for `good` advertises its quantity; metadata is present.
         assert!(!MapEngine::raster_info(&view).parameters.is_empty());
+    }
+
+    /// A volume with sweep structs but no moment datasets has no derivable
+    /// metadata, so the site is excluded (never registered as a
+    /// zero-parameter collection). `sweeps.first()?` only guards the
+    /// no-sweeps case.
+    #[test]
+    fn derive_site_meta_excludes_moment_less_site() {
+        let mut momentless = synthetic_volume(25.0, 60.0);
+        momentless.sweeps[0].moments.clear();
+        let list = vec![entry(momentless, "m")];
+        assert!(
+            derive_site_meta(&list).is_none(),
+            "a site whose sweeps carry no moments must yield no SiteMeta"
+        );
+    }
+
+    /// `is_url_safe_nod` accepts well-formed ODIM codes and rejects any NOD
+    /// that would break URL routing if used in a `{base}-{nod}` collection
+    /// id.
+    #[test]
+    fn is_url_safe_nod_accepts_codes_rejects_routing_breakers() {
+        for ok in ["fivih", "fianj", "se1", "uk-abc_2"] {
+            assert!(is_url_safe_nod(ok), "{ok} should be accepted");
+        }
+        for bad in ["", "fi/bad", "fi?x", "fi#x", "fi bad", "fiäö", "a.b"] {
+            assert!(!is_url_safe_nod(bad), "{bad:?} should be rejected");
+        }
     }
 
     /// When every selected volume yields no plottable coverage (a sweep

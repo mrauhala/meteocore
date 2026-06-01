@@ -2062,6 +2062,21 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
     let mut data_ages: HashMap<String, i64> = HashMap::new();
     let mut temporal_info: HashMap<String, serde_json::Value> = HashMap::new();
 
+    // Helper: build temporal extent { interval, values? } from a sorted
+    // (first..last) timestamp list.
+    fn temporal_from_times(times: &[chrono::DateTime<chrono::Utc>]) -> Option<serde_json::Value> {
+        let first = times.first()?;
+        let last = times.last()?;
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "interval".to_string(),
+            json!([[first.to_rfc3339(), last.to_rfc3339()]]),
+        );
+        let values: Vec<String> = times.iter().map(|t| t.to_rfc3339()).collect();
+        obj.insert("values".to_string(), json!(values));
+        Some(json!(obj))
+    }
+
     // Helper: build temporal extent from any EdrEngine
     fn build_temporal(engine: &dyn ds_core::edr_engine::EdrEngine) -> Option<serde_json::Value> {
         let (start, end) = engine.get_temporal_extent()?;
@@ -2119,19 +2134,19 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
     {
         // PVOL sources expand into one per-site collection each
         // (`{base}-{nod}`); the engine is keyed by `{base}` and does not
-        // implement `EdrEngine`, so build each site's temporal extent from
-        // its `PolarVolumeSiteView` and key it by the per-site id to match
-        // the `{base}-{nod}` health entries.
+        // implement `EdrEngine`. `site_times()` returns every site's
+        // timestamps from one catalog snapshot, so the temporal extents are
+        // built without allocating a view per site (O(1)-from-a-snapshot per
+        // request). Key each by the `{base}-{nod}` id to match the health
+        // entries.
         let engines = state
             .odim_volume_engines
             .read()
             .unwrap_or_else(|e| e.into_inner());
         for engine in engines.iter() {
-            for (nod, _label) in engine.sites() {
-                let id = format!("{}-{}", engine.collection_id(), nod);
-                let view = engine.site_view(&nod, &id);
-                if let Some(temporal) = build_temporal(&view) {
-                    temporal_info.insert(id, temporal);
+            for (nod, times) in engine.site_times() {
+                if let Some(temporal) = temporal_from_times(&times) {
+                    temporal_info.insert(format!("{}-{}", engine.collection_id(), nod), temporal);
                 }
             }
         }
