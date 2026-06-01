@@ -979,9 +979,20 @@ async fn render_map(
             // not a 500 that hides it behind "Internal server error".
             return Err(match e {
                 DSE::InvalidParameter(_) | DSE::InvalidBbox(_) | DSE::InvalidDatetime(_) => {
+                    // 4xx-class: traced at DEBUG (not WARN) so a misconfigured
+                    // client is still diagnosable server-side without inflating
+                    // the warn stream with routine bad requests.
+                    tracing::debug!(
+                        "Maps render bad-request for collection '{}': {e}",
+                        collection_id
+                    );
                     MapsError::BadRequest(e.to_string())
                 }
                 DSE::CollectionNotFound(_) | DSE::LocationNotFound(_) => {
+                    tracing::debug!(
+                        "Maps render not-found for collection '{}': {e}",
+                        collection_id
+                    );
                     MapsError::NotFound(e.to_string())
                 }
                 _ => {
