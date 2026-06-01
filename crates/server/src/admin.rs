@@ -1214,6 +1214,33 @@ pub fn load_collections(
                 }
                 for (nod, label) in &sites {
                     let site_id = format!("{}-{}", collection.id, nod);
+
+                    // Defence-in-depth against a derived-id collision. NODs
+                    // are alphanumeric (so two odim-volume sources can't
+                    // derive the same id), but an *inline* `[[collections]]`
+                    // entry could be named `{base}-{nod}` by hand. Skip with
+                    // an error rather than silently overwriting a registry
+                    // entry. NOTE: per-quantity WMS/Maps styles are
+                    // snapshotted from `raster_info()` at load — if a poll
+                    // later brings in a *new* moment for a site, its layer
+                    // falls back to the collection default colormap until the
+                    // next `POST /admin/collections/reload` (same load-time
+                    // snapshot as GeoTIFF/QueryData; PVOL moment sets are
+                    // firmware-dependent, so a reload is required when they
+                    // change).
+                    if edr_collections.contains_key(&site_id)
+                        || map_collections.contains_key(&site_id)
+                        || maps_collections.contains_key(&site_id)
+                        || tiles_collections.contains_key(&site_id)
+                    {
+                        tracing::error!(
+                            "Collection '{}': per-site id '{site_id}' collides with an \
+                             already-registered collection — skipping this site",
+                            collection.id
+                        );
+                        continue;
+                    }
+
                     let view = Arc::new(engine.site_view(nod, &site_id));
 
                     // Per-site collection config: inherit the base
@@ -1916,7 +1943,7 @@ pub async fn reload_handler(
     // reload would freeze the live registry with dead loops and no new ones
     // spawned (the guard returns before the spawn block).
 
-    let result = load_collections(
+    let mut result = load_collections(
         &config.collections,
         &config.style_bundles,
         &base_url,
@@ -1962,6 +1989,47 @@ pub async fn reload_handler(
                 "configured": config.collections.len()
             })),
         ));
+    }
+
+    // Surface a vanished per-site radar in `/health`. A site that was
+    // `Ready` in the live registry but is absent from the new scan (its
+    // files aged out of the time window, or the radar went offline) would
+    // otherwise just disappear from `/collections` with no `/health` trace.
+    // Push a `Degraded` entry so monitoring can see it — but only when the
+    // site's base source is still configured (a fully-removed source is a
+    // config change, not a data gap). Degraded, so it doesn't affect the
+    // `ready` guard above.
+    {
+        let old_health = state.health.read().unwrap_or_else(|e| e.into_inner());
+        let new_ids: std::collections::HashSet<&str> =
+            result.health.iter().map(|h| h.id.as_str()).collect();
+        let new_bases: Vec<String> = result
+            .odim_volume_engines
+            .iter()
+            .map(|e| e.collection_id().to_string())
+            .collect();
+        let vanished: Vec<String> = old_health
+            .iter()
+            .filter(|h| h.engine_type == "odim-volume" && h.status == CollectionStatus::Ready)
+            .filter(|h| !new_ids.contains(h.id.as_str()))
+            .filter(|h| {
+                new_bases.iter().any(|b| {
+                    h.id.strip_prefix(b.as_str())
+                        .is_some_and(|r| r.starts_with('-'))
+                })
+            })
+            .map(|h| h.id.clone())
+            .collect();
+        drop(old_health);
+        for id in vanished {
+            tracing::warn!("Reload: radar site collection '{id}' is no longer present in the scan");
+            result.health.push(CollectionHealth {
+                id,
+                engine_type: "odim-volume".into(),
+                status: CollectionStatus::Degraded,
+                error: Some("site no longer present in the latest scan".into()),
+            });
+        }
     }
 
     // Reload accepted — now shut down the old poll loops (the new ones are

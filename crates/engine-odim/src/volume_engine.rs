@@ -722,22 +722,14 @@ fn build_catalog(
 }
 
 /// Whether `nod` is safe to embed verbatim in a URL-routed collection id
-/// (`{base}-{nod}`) and a WMS `LAYERS` token: ASCII alphanumeric plus
-/// interior `-`/`_`, with an **alphanumeric first and last char** so a
-/// degenerate code like `"-"` can't yield a double-hyphen id (`"{base}--"`)
-/// or a trailing-separator layer name. ODIM NODs are pure ASCII
-/// alphanumeric, so this passes every well-formed code.
+/// (`{base}-{nod}`) and a WMS `LAYERS` token: non-empty and **purely ASCII
+/// alphanumeric**. ODIM NODs are exactly that (5 chars, e.g. `fivih`), so
+/// this passes every well-formed code. Forbidding the `-` separator inside
+/// a nod also makes the per-site id `{base}-{nod}` unambiguous — two
+/// different sources can never derive the same id (`radar-a` + `b-fivih`
+/// vs `radar-a-b` + `fivih` would otherwise both yield `radar-a-b-fivih`).
 fn is_url_safe_nod(nod: &str) -> bool {
-    let mut chars = nod.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    let last = nod.chars().next_back().unwrap_or(first);
-    first.is_ascii_alphanumeric()
-        && last.is_ascii_alphanumeric()
-        && nod
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    !nod.is_empty() && nod.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 /// Finalise the grouped volume map into a [`Catalog`]: sort and cap each
@@ -2490,6 +2482,16 @@ impl EdrEngine for PolarVolumeSiteView {
     ) -> Result<CoverageResponse, DataServerError> {
         let path = resample_section_path(coords)?;
         let catalog = self.catalog.load();
+        // Gate on `by_site_meta` first, like `query_location`/`query_position`/
+        // `query_area`: a site absent from `by_site_meta` (sweeps with no
+        // moment datasets) is a 404, not a 400 fall-through via
+        // `resolve_quantities`.
+        if !catalog.by_site_meta.contains_key(&self.nod) {
+            return Err(DataServerError::LocationNotFound(format!(
+                "[{}] radar site `{}` has no current volumes",
+                self.collection_id, self.nod
+            )));
+        }
         let volumes = catalog.by_site.get(&self.nod).ok_or_else(|| {
             DataServerError::LocationNotFound(format!(
                 "[{}] radar site `{}` has no current volumes",
@@ -3709,13 +3711,14 @@ mod tests {
     /// id.
     #[test]
     fn is_url_safe_nod_accepts_codes_rejects_routing_breakers() {
-        for ok in ["fivih", "fianj", "se1", "uk-abc_2"] {
+        for ok in ["fivih", "fianj", "se1", "ukabc2"] {
             assert!(is_url_safe_nod(ok), "{ok} should be accepted");
         }
-        // Routing-breakers, plus degenerate boundary separators that would
-        // yield a double-hyphen id (`{base}--`) or a trailing-separator layer.
+        // Routing-breakers, degenerate boundary separators, and any nod with
+        // a `-`/`_` (which could make `{base}-{nod}` collide across sources).
         for bad in [
-            "", "fi/bad", "fi?x", "fi#x", "fi bad", "fiäö", "a.b", "-", "_", "-a", "a-", "_x", "x_",
+            "", "fi/bad", "fi?x", "fi#x", "fi bad", "fiäö", "a.b", "-", "_", "-a", "a-", "_x",
+            "x_", "b-fivih", "uk-abc_2",
         ] {
             assert!(!is_url_safe_nod(bad), "{bad:?} should be rejected");
         }
@@ -3896,6 +3899,17 @@ mod tests {
         // ...and a direct query_location returns 404, not InvalidParameter.
         assert!(matches!(
             EdrEngine::query_location(&view, "fivih", None, None, None),
+            Err(DataServerError::LocationNotFound(_))
+        ));
+        // ...and so does query_trajectory (same by_site_meta gate).
+        assert!(matches!(
+            EdrEngine::query_trajectory(
+                &view,
+                "LINESTRING(24.5 60.3, 24.5 60.9)",
+                None,
+                None,
+                None
+            ),
             Err(DataServerError::LocationNotFound(_))
         ));
     }
