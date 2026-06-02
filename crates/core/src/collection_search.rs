@@ -192,6 +192,19 @@ fn parse_bbox(s: &str) -> Result<[f64; 4], SearchError> {
     if bbox[1] > bbox[3] {
         return Err(SearchError::new("bbox: south must be <= north"));
     }
+    // CRS84 range. Out-of-range coordinates would otherwise pass through and
+    // silently match nothing (HTTP 200, numberMatched 0) instead of a 400.
+    if bbox[1] < -90.0 || bbox[3] > 90.0 {
+        return Err(SearchError::new(
+            "bbox: latitude values must be within [-90, 90]",
+        ));
+    }
+    // Anti-meridian (west > east) is allowed, but both must be in range.
+    if !(-180.0..=180.0).contains(&bbox[0]) || !(-180.0..=180.0).contains(&bbox[2]) {
+        return Err(SearchError::new(
+            "bbox: longitude values must be within [-180, 180]",
+        ));
+    }
     Ok(bbox)
 }
 
@@ -217,10 +230,12 @@ pub fn search(items: &[CollectionMatch], p: &SearchParams) -> SearchResult {
         page,
         has_next: end < number_matched,
         next_offset: p.offset.saturating_add(p.limit),
-        // Only offer `prev` from a page at or before the data: an out-of-range
-        // `offset` (> number_matched) must not chain to further empty `prev`
-        // pages that never reach data.
-        has_prev: p.offset > 0 && p.offset <= number_matched,
+        // Offer `prev` only from a non-empty result page (`offset < number_matched`,
+        // matching the page-population guard above). An out-of-range or
+        // exactly-off-the-end `offset` yields an empty page with no `prev`,
+        // since `prev` implies a preceding result page. A `next` link never
+        // produces `offset == number_matched`, so normal paging is unaffected.
+        has_prev: p.offset > 0 && p.offset < number_matched,
         prev_offset: p.offset.saturating_sub(p.limit),
     }
 }
@@ -275,9 +290,14 @@ fn lon_overlaps(qw: f64, qe: f64, cw: f64, ce: f64) -> bool {
 fn q_matches(terms: &[String], title: &str, description: &str, keywords: &[String]) -> bool {
     terms.iter().any(|term| {
         if term.chars().any(char::is_whitespace) {
-            // Phrase: case-insensitive substring across the combined text.
-            let hay = format!("{title} {description} {}", keywords.join(" ")).to_lowercase();
-            hay.contains(term.as_str())
+            // Phrase: case-insensitive substring within a *single* field, so the
+            // boundary between two fields can't form a phantom match (e.g. title
+            // "Finnish Weather" + keyword "Helsinki" must not match "weather
+            // helsinki"). Each keyword is checked individually for the same reason.
+            let t = term.as_str();
+            title.to_lowercase().contains(t)
+                || description.to_lowercase().contains(t)
+                || keywords.iter().any(|k| k.to_lowercase().contains(t))
         } else {
             word_match(title, term)
                 || word_match(description, term)
@@ -459,6 +479,34 @@ mod tests {
         // south > north is always invalid (longitude inversion stays allowed).
         assert!(parse_search_params(Some("0,70,30,60"), None, None, None, None, None).is_err());
         assert!(parse_search_params(Some("170,50,-170,60"), None, None, None, None, None).is_ok());
+        // out-of-range latitude / longitude rejected.
+        assert!(parse_search_params(Some("0,200,10,300"), None, None, None, None, None).is_err());
+        assert!(parse_search_params(Some("200,0,300,10"), None, None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn phrase_q_does_not_match_across_fields() {
+        let kw = vec!["Helsinki".to_string(), "radar".to_string()];
+        let items = [cm("Finnish Weather", "", &kw, None, None)];
+        // "weather helsinki" spans the title→keyword boundary — must NOT match.
+        let across =
+            parse_search_params(None, None, None, Some("weather helsinki"), None, None).unwrap();
+        assert_eq!(search(&items, &across).number_matched, 0);
+        // a phrase within a single field still matches.
+        let within =
+            parse_search_params(None, None, None, Some("finnish weather"), None, None).unwrap();
+        assert_eq!(search(&items, &within).number_matched, 1);
+    }
+
+    #[test]
+    fn no_prev_exactly_off_the_end() {
+        let kw: Vec<String> = vec![];
+        let items: Vec<CollectionMatch> = (0..4).map(|_| cm("a", "", &kw, None, None)).collect();
+        // offset == number_matched: empty page, no prev (prev implies a result page).
+        let p = parse_search_params(None, None, None, None, Some("2"), Some("4")).unwrap();
+        let r = search(&items, &p);
+        assert!(r.page.is_empty());
+        assert!(!r.has_prev);
     }
 
     #[test]
