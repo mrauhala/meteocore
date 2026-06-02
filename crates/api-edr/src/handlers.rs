@@ -518,6 +518,13 @@ pub async fn conformance() -> impl IntoResponse {
             "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
             "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page",
             "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/oas30",
+            // OGC API - Common - Part 2: Geospatial Data (20-024). Our
+            // /collections + /collections/{id} already satisfy the Collections
+            // and JSON classes structurally; declaring them makes that
+            // discoverable. The HTML class (.../conf/html) is intentionally
+            // omitted — there is no HTML representation of /collections.
+            "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/collections",
+            "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/json",
             "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/core",
             "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/collections",
             "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/json",
