@@ -361,6 +361,22 @@ fn source_label(source: &Source) -> String {
     }
 }
 
+/// Globally-unique [`PIXEL_CACHE`] id for a volume file. A `Local` id is
+/// already an absolute path (unique); a remote object key is unique only
+/// *within its bucket*, so a remote id is qualified with `endpoint`+`bucket`.
+/// Without this, two S3-backed PVOL sources with the same key layout but
+/// different buckets collide in the process-global cache and silently serve
+/// each other's pixels (PR #290 review). The bare `file_id` is still used as
+/// the object path for the fetch itself.
+fn pixel_cache_id<'a>(source: &Source, file_id: &'a str) -> std::borrow::Cow<'a, str> {
+    match source {
+        Source::Local { .. } => std::borrow::Cow::Borrowed(file_id),
+        Source::Remote {
+            endpoint, bucket, ..
+        } => std::borrow::Cow::Owned(format!("{endpoint}\u{1f}{bucket}\u{1f}{file_id}")),
+    }
+}
+
 /// Capture the current runtime handle for the lazy pixel fetch. Call ONLY
 /// from a `spawn_blocking` context (`get_raster_tile` / `query_trajectory`),
 /// where `handle.block_on` is valid and `block_in_place` would panic; the
@@ -433,27 +449,39 @@ impl Pixels<'_> {
         nrays: usize,
         nbins: usize,
     ) -> Option<Arc<RawPixels>> {
-        if let Some(p) = PIXEL_CACHE.get(file_id, &moment.dataset_path) {
+        // Source-qualified key so two S3 sources can't collide in the global
+        // cache (PR #290 review); the bare `file_id` stays the fetch path.
+        let cache_id = pixel_cache_id(self.source, file_id);
+        if let Some(p) = PIXEL_CACHE.get(&cache_id, &moment.dataset_path) {
             return Some(p);
         }
-        let bytes = fetch_file_bytes(self.source, file_id, self.handle)
-            .map_err(|e| {
-                PIXEL_READ_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!("PVOL lazy pixel read failed: {e}");
-            })
-            .ok()?;
-        let raw = read_moment_pixels(&bytes, &moment.dataset_path, nrays, nbins)
-            .map_err(|e| {
-                PIXEL_READ_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!(
-                    "PVOL pixel decode `{}` in `{file_id}`: {e}",
-                    moment.dataset_path
-                );
-            })
-            .ok()?;
-        let arc = Arc::new(raw);
-        PIXEL_CACHE.insert(file_id, &moment.dataset_path, arc.clone());
-        Some(arc)
+        // A previously-failed read degrades straight to nodata without
+        // re-fetching — a per-cell sampler loop (e.g. `volume_section`) must
+        // not storm the store, nor re-inflate the failure metric, on one bad
+        // moment (PR #290 review).
+        if PIXEL_CACHE.is_known_bad(&cache_id, &moment.dataset_path) {
+            return None;
+        }
+        let decoded = fetch_file_bytes(self.source, file_id, self.handle).and_then(|bytes| {
+            read_moment_pixels(&bytes, &moment.dataset_path, nrays, nbins)
+                .map_err(|e| format!("decode `{}`: {e}", moment.dataset_path))
+        });
+        match decoded {
+            Ok(raw) => {
+                let arc = Arc::new(raw);
+                PIXEL_CACHE.insert(&cache_id, &moment.dataset_path, arc.clone());
+                Some(arc)
+            }
+            Err(e) => {
+                // Count + log once per key; subsequent cells short-circuit on
+                // `is_known_bad` above.
+                if PIXEL_CACHE.mark_bad(&cache_id, &moment.dataset_path) {
+                    PIXEL_READ_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!("PVOL lazy pixel read failed for `{file_id}`: {e}");
+                }
+                None
+            }
+        }
     }
 }
 
@@ -3234,6 +3262,68 @@ mod tests {
             "test-volume-unique-{}.h5",
             NEXT.fetch_add(1, Ordering::Relaxed)
         )
+    }
+
+    /// An in-memory-backed `Source::Remote` for tests that only need its
+    /// `endpoint`/`bucket` (e.g. [`pixel_cache_id`]); the store is never read.
+    fn dummy_remote(bucket: &str) -> Source {
+        Source::Remote {
+            store: ds_storage::DataStore::new(std::sync::Arc::new(
+                ds_storage::object_store::memory::InMemory::new(),
+            )),
+            endpoint: "https://s3.example.com".to_string(),
+            bucket: bucket.to_string(),
+            prefix_pattern: "%Y/".to_string(),
+            time_window: None,
+        }
+    }
+
+    #[test]
+    fn pixel_cache_id_local_is_bare_path() {
+        let local = Source::Local {
+            data_dir: PathBuf::from("/x"),
+        };
+        // A local id is already an absolute path — used verbatim.
+        assert_eq!(
+            pixel_cache_id(&local, "/abs/file.h5").as_ref(),
+            "/abs/file.h5"
+        );
+    }
+
+    #[test]
+    fn pixel_cache_id_qualifies_remote_by_bucket() {
+        let a = dummy_remote("bucket-a");
+        let b = dummy_remote("bucket-b");
+        let key = "2026/06/02/0000_fivih_PVOL.h5";
+        // Same object key in two different buckets must NOT collide in the
+        // process-global cache (PR #290 review, finding 1).
+        assert_ne!(pixel_cache_id(&a, key), pixel_cache_id(&b, key));
+        // Stable for the same source + key.
+        assert_eq!(pixel_cache_id(&a, key), pixel_cache_id(&a, key));
+    }
+
+    #[test]
+    fn moment_failure_marks_known_bad_and_returns_none() {
+        // An unseeded id over the `/nonexistent` Local source → the fetch
+        // fails. The failure must be negatively cached so a per-cell loop
+        // short-circuits instead of re-fetching (PR #290 review, finding 4).
+        let file_id = unique_file_id();
+        let mom = PolarMoment {
+            quantity: "DBZH".to_string(),
+            gain: 1.0,
+            offset: 0.0,
+            nodata: 65_535.0,
+            undetect: 65_534.0,
+            dataset_path: SYNTHETIC_DS.to_string(),
+        };
+        let pix = test_pixels();
+        assert!(pix.moment(&file_id, &mom, 360, 100).is_none());
+        assert!(
+            pixel_cache().is_known_bad(&file_id, &mom.dataset_path),
+            "a failed read must be negatively cached"
+        );
+        // Repeat returns None via the negative-cache short-circuit.
+        assert!(pix.moment(&file_id, &mom, 360, 100).is_none());
     }
 
     /// A dummy file source for the lazy-pixel context; never actually read,

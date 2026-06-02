@@ -29,9 +29,22 @@ impl quick_cache::Weighter<PixelKey, Arc<RawPixels>> for PixelWeighter {
     }
 }
 
+/// Count cap on the negative (known-bad) cache. Bounds the memory a burst of
+/// distinct failing keys can pin; entries age out by LRU so a transient
+/// failure is retried once evicted.
+const NEGATIVE_CAPACITY_ITEMS: usize = 4096;
+
 /// Thread-safe, byte-bounded LRU of decoded moment arrays.
 pub struct PixelCache {
     inner: Cache<PixelKey, Arc<RawPixels>, PixelWeighter>,
+    /// Count-bounded LRU of keys whose pixel read/decode failed. A per-cell
+    /// sampler loop (e.g. `volume_section`, thousands of cells) would otherwise
+    /// re-fetch and re-count a failed moment on every cell, since a failure
+    /// caches nothing — one transient S3 error inflated `pvol_pixel_read_
+    /// failures_total` by thousands and hammered the store (PR #290 review).
+    /// Recording the failure here makes the retry a single no-op lookup and
+    /// the metric increment happen once.
+    negative: Cache<PixelKey, ()>,
     capacity_bytes: u64,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -47,6 +60,7 @@ impl PixelCache {
         let estimated_items = ((capacity_bytes / (256 * 1024)).max(16)) as usize;
         PixelCache {
             inner: Cache::with_weighter(estimated_items, capacity_bytes.max(1), PixelWeighter),
+            negative: Cache::new(NEGATIVE_CAPACITY_ITEMS),
             capacity_bytes,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -80,6 +94,34 @@ impl PixelCache {
         self.inner.insert(key, pixels);
     }
 
+    /// Whether `(file_id, dataset_path)` recently failed to read/decode and
+    /// should be treated as nodata without re-fetching. Always `false` when
+    /// the cache is disabled (diagnostic mode re-reads every sample).
+    pub fn is_known_bad(&self, file_id: &str, dataset_path: &str) -> bool {
+        if self.capacity_bytes == 0 {
+            return false;
+        }
+        let key: PixelKey = (Arc::from(file_id), Arc::from(dataset_path));
+        self.negative.get(&key).is_some()
+    }
+
+    /// Record a failed read for `(file_id, dataset_path)`. Returns `true` when
+    /// this key was not already known-bad — the caller increments the failure
+    /// metric only then, so one logical failure counts once instead of once
+    /// per cell. When the cache is disabled there is no dedup store, so it
+    /// returns `true` every time (matching the re-read-everything mode).
+    pub fn mark_bad(&self, file_id: &str, dataset_path: &str) -> bool {
+        if self.capacity_bytes == 0 {
+            return true;
+        }
+        let key: PixelKey = (Arc::from(file_id), Arc::from(dataset_path));
+        if self.negative.get(&key).is_some() {
+            return false;
+        }
+        self.negative.insert(key, ());
+        true
+    }
+
     /// Current resident weight (bytes) — for metrics.
     pub fn weight(&self) -> u64 {
         self.inner.weight()
@@ -96,5 +138,34 @@ impl PixelCache {
             self.hits.load(Ordering::Relaxed),
             self.misses.load(Ordering::Relaxed),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negative_cache_dedups_failures() {
+        let c = PixelCache::new(64);
+        assert!(!c.is_known_bad("file-a", "/d"));
+        // First failure for a key is "new" (caller counts it once); the key is
+        // then known-bad and a repeat mark is a no-op.
+        assert!(c.mark_bad("file-a", "/d"), "first mark is new");
+        assert!(c.is_known_bad("file-a", "/d"));
+        assert!(!c.mark_bad("file-a", "/d"), "repeat mark must not recount");
+        // A different key (or dataset) is tracked independently.
+        assert!(c.mark_bad("file-b", "/d"));
+        assert!(c.mark_bad("file-a", "/other"));
+    }
+
+    #[test]
+    fn disabled_cache_never_negative_caches() {
+        // Capacity 0 = diagnostic re-read-everything mode: no dedup store, so
+        // mark_bad always reports "new" and is_known_bad never reports bad.
+        let c = PixelCache::new(0);
+        assert!(c.mark_bad("x", "/d"));
+        assert!(c.mark_bad("x", "/d"));
+        assert!(!c.is_known_bad("x", "/d"));
     }
 }
