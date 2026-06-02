@@ -388,9 +388,10 @@ pub async fn collections(
     let base = &state.base_url;
 
     // (id, title, description, bbox, metadata) per collection. Features carry
-    // no temporal extent today, so a `datetime` filter excludes them (per the
-    // Part 4 draft: a collection with no temporal extent doesn't match a
-    // datetime query); tuple element types are inferred.
+    // no temporal extent today (`time: None`), so per OGC API – Common – Part 4
+    // §7.14.3 ("unknown extent ≡ unbounded") they *match* any `datetime`
+    // filter rather than being excluded — see `collection_search::matches`.
+    // Tuple element types are inferred.
     let mut rows: Vec<_> = state
         .collections
         .values()

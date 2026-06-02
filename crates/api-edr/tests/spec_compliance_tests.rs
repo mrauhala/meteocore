@@ -263,22 +263,24 @@ async fn finding_04_landing_page_has_service_desc_link() {
 // ===========================================================================
 // FINDING 5: Collections endpoint ignores bbox query parameter
 // ===========================================================================
-// Spec: GET /collections supports optional query parameters: bbox, datetime, f
-// Implementation: collections() handler takes no query parameters at all.
-// Impact: Clients filtering collections by spatial/temporal extent get no filtering.
-// Fix: Add optional bbox/datetime/f query params to collections handler,
-//   filter the collection list accordingly.
+// Spec: GET /collections supports optional query parameters: bbox, datetime, q.
+// RESOLVED by OGC API – Common – Part 4 (Searchable Collections): /collections
+//   now filters by bbox/datetime/q. (The `f` content-negotiation param is
+//   separate — see FINDING 6.)
 
 #[tokio::test]
-async fn finding_05_collections_ignores_bbox_param() {
-    // Passing bbox should not cause an error (it should be accepted gracefully).
-    // Currently the param is simply ignored.
-    let (status, _json) = get_json("/collections?bbox=20,60,30,70").await;
+async fn finding_05_collections_bbox_filtering() {
+    // The mock collection's spatial extent is [19, 59, 32, 71].
+    // An intersecting bbox keeps it; a disjoint bbox filters it out.
+    let (status, hit) = get_json("/collections?bbox=20,60,30,70").await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        status,
-        StatusCode::OK,
-        "bbox param should be accepted (even if not yet filtering)"
+        hit["numberMatched"], 1,
+        "intersecting bbox must keep the collection"
     );
+
+    let (_, miss) = get_json("/collections?bbox=-50,-50,-40,-40").await;
+    assert_eq!(miss["numberMatched"], 0, "disjoint bbox must filter it out");
 }
 
 // ===========================================================================
