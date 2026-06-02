@@ -1176,7 +1176,7 @@ pub fn load_collections(
 
                 odim_volume_engines.push(engine.clone());
 
-                // Model B: one PVOL source expands into N per-site OGC
+                // One PVOL source expands into N per-site OGC
                 // collections — one per radar `nod`, parameter = bare
                 // quantity. The owning engine keeps the single scan, parse
                 // cache, and poll loop; each site gets a cheap

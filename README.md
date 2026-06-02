@@ -23,7 +23,7 @@ Each engine implements one or more of the core traits.
 | `engine-geojson` | `FeatureEngine` | GeoJSON FeatureCollection files (WGS84 only) |
 | `engine-geotiff` | `EdrEngine` + `MapEngine` | Cloud-Optimized GeoTIFF (local dir, S3, or STAC catalog) |
 | `engine-grib` | `EdrEngine` + `MapEngine` | GRIB2 NWP data via JSON/wgrib2 index sidecars (ECMWF IFS, NOAA GFS) |
-| `engine-odim` | `MapEngine` (EDR coming) | ODIM_H5 weather-radar composites (FMI / DMI / SMHI / OPERA); pure-Rust HDF5 |
+| `engine-odim` | `EdrEngine` + `MapEngine` | ODIM_H5 weather radar — 2-D composites (FMI / DMI / SMHI / OPERA) and native polar volumes (`odim-volume`, one collection per radar site); pure-Rust HDF5 |
 | `engine-querydata` | `EdrEngine` + `MapEngine` | FMI QueryData (`.sqd`) binary files, memory-mapped |
 | `engine-postgis` | `EdrEngine` + `FeatureEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible) |
 
@@ -240,7 +240,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `description` | yes | — | Collection description |
 | `data_path` | yes* | — | Path to data file (CSV, GeoJSON) or directory (GeoTIFF) |
 | `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, `"maps"`, `"tiles"`, `"wms"` |
-| `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, `"querydata"`, `"postgis"` |
+| `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, `"odim"` (radar composite), `"odim-volume"` (radar polar volumes), `"querydata"`, `"postgis"` |
 | `wms` | no | — | WMS rendering config. Required when `apis` contains `"wms"`. |
 
 ### Per-File Collection Configs
@@ -617,6 +617,82 @@ colormap = "viridis"
 min = 950.0
 max = 1050.0
 ```
+
+### ODIM Radar (HDF5)
+
+Native weather-radar data in the ODIM_H5 format, read with a pure-Rust HDF5 parser (no `libhdf5` dependency). Two engine types share the reader:
+
+#### `odim` — 2-D composites
+
+One pre-projected reflectivity composite per timestep (FMI / DMI / SMHI / OPERA). Single parameter per collection. Source is a local directory or S3 (`endpoint` + `bucket` + `prefix_pattern`). Implements `EdrEngine` (position, area) and `MapEngine` (WMS / Maps / Tiles).
+
+```toml
+[[collections]]
+id = "radar-opera"
+title = "OPERA Radar Composite"
+description = "European radar reflectivity composite"
+engine_type = "odim"
+apis = ["edr", "wms", "maps", "tiles"]
+data_path = "testdata/radar-opera"     # local directory (a top-level CollectionConfig field)
+
+[collections.odim]
+filename_template = "OPERA@%Y%m%dT%H%M@0@ACRR.h5"
+parameter = "reflectivity"             # required for COMP collections
+unit = "dBZ"                           # required for COMP collections
+# ...or stream from S3 instead of data_path (set inside [collections.odim]):
+# endpoint = "https://s3.example.com"
+# bucket = "radar"
+# prefix_pattern = "%Y/%m/%d/"
+poll_interval_secs = 300
+
+[collections.wms]
+colormap = "radar_dbz"
+```
+
+#### `odim-volume` — native polar volumes (PVOL), one collection per radar site
+
+A single `odim-volume` source scans a directory / S3 prefix of `.h5` **polar volumes** spanning a whole radar *network*, then **auto-expands into one OGC collection per radar site** (ODIM `nod`), with id `{base_id}-{nod}` (e.g. `radar-fi-volume-fivih`). There is no network-level aggregate collection — each radar is its own collection.
+
+- **Parameters are the bare ODIM quantities** — `DBZH`, `TH`, `VRADH`, `ZDR`, `RHOHV`, `KDP`, … The site *is* the collection (its single EDR location, its spatial/vertical extent), so the `nod` is not part of the parameter name.
+- **Per-quantity WMS colormaps** via `[[wms.parameters]]` (with the bare quantity as `name`) on the source config — every per-site collection inherits them, so reflectivity, velocity, and dual-pol moments each get a fitting palette instead of one stretched over all of them.
+- **Vertical dimension = elevation angle.** EDR `z` (and WMS `ELEVATION`) selects the sweep.
+- **EDR** supports `position`, `locations` (the radar site), `area`, and **`trajectory`** — vertical cross-sections (RHI-like `Section` coverages, with `z` = height above the antenna via the 4/3-Earth beam model). `MapEngine` renders each quantity to WMS / Maps / Tiles.
+- New radar sites that appear in the source surface as new collections on the next `POST /admin/collections/reload`.
+
+```toml
+[[collections]]
+id = "radar-fi-volume"
+title = "FMI radar polar volumes"
+description = "Finnish radar polar volumes (ODIM_H5 PVOL) — one collection per site"
+engine_type = "odim-volume"
+apis = ["edr", "wms", "maps", "tiles"]
+data_path = "testdata/radar-fmi-pvol"     # or S3: endpoint + bucket + prefix_pattern
+
+[collections.odim]
+poll_interval_secs = 300
+
+[collections.wms]
+colormap = "radar_dbz"          # fallback for any unlisted quantity
+
+# Per-quantity palettes (name = bare quantity); inherited by every site.
+[[collections.wms.parameters]]
+name = "DBZH"
+colormap = "radar_dbz"
+
+[[collections.wms.parameters]]
+name = "VRADH"                   # Doppler velocity — diverging palette
+min = -48.0
+max = 48.0
+# color_stops = [...]            # blue → white → red about zero
+
+[[collections.wms.parameters]]
+name = "RHOHV"                   # correlation coefficient 0..1
+colormap = "viridis"
+min = 0.0
+max = 1.0
+```
+
+A bare `LAYERS=radar-fi-volume-fivih` WMS request (or a Maps/Tiles request with no `parameter-name`) renders the site's primary quantity; use `LAYERS=radar-fi-volume-fivih/DBZH` to pick a specific moment. The layer is the full per-site collection id (`{base_id}-{nod}`) — replace `radar-fi-volume` with your source `id` and `fivih` with the radar's ODIM `nod`.
 
 ### QueryData
 

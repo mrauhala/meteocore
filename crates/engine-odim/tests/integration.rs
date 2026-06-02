@@ -454,8 +454,8 @@ fn pvol_engine_renders_fmi_vihti_volume() {
     let engine = engine_odim::PolarVolumeEngine::new("fivih-pvol-test", Some(data_dir), &config)
         .expect("PolarVolumeEngine::new over the PVOL directory");
 
-    // Model B: the source expands into per-site collections. Take the
-    // Vihti site view and render through it.
+    // The source expands into per-site collections. Take the Vihti
+    // site view and render through it.
     let view = engine.site_view("fivih", "fivih-pvol-test-fivih");
 
     let info = view.raster_info();
@@ -466,8 +466,8 @@ fn pvol_engine_renders_fmi_vihti_volume() {
         "PVOL site must report a coverage bbox"
     );
 
-    // The FMI Vihti lowest sweep exposes TH (and DBZH). Under
-    // model B the parameters are **bare quantities** — no `fivih:` prefix.
+    // The FMI Vihti lowest sweep exposes TH (and DBZH); the
+    // parameters are **bare quantities** — no `fivih:` prefix.
     let params: Vec<&str> = info.parameters.iter().map(|(n, _)| n.as_str()).collect();
     assert!(
         !params.is_empty(),
@@ -563,7 +563,7 @@ fn pvol_engine_remote_scan_discovers_fmi_volume() {
         engine_odim::PolarVolumeEngine::new_remote_for_test("fivih-remote-test", store, "")
             .expect("PolarVolumeEngine remote scan over the fixture directory");
 
-    // The `fivih` site must surface — view it under model B.
+    // The `fivih` site must surface — view it as a per-site collection.
     assert!(
         engine.sites().iter().any(|(n, _)| n == "fivih"),
         "remote scan must discover the `fivih` site, got {:?}",
@@ -671,7 +671,7 @@ fn pvol_bare_render_defaults_to_primary_quantity() {
 /// Build the per-site `PolarVolumeSiteView` for the Vihti (`fivih`)
 /// radar over the local `radar-fmi-pvol` fixture directory, or `None` when
 /// the (uncommitted, 15 MB) fixture is absent — so these tests skip
-/// gracefully in CI. Under model B each radar site is its own collection,
+/// gracefully in CI. Each radar site is its own collection,
 /// served by such a view; the owning engine may be dropped because the
 /// view holds an `Arc` of the shared catalog.
 fn pvol_fixture_view() -> Option<engine_odim::PolarVolumeSiteView> {
