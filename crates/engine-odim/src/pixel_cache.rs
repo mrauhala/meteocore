@@ -67,22 +67,28 @@ impl PixelCache {
         }
     }
 
-    /// Look up a cached array. Counts a hit/miss for `/metrics`.
+    /// Look up a cached array, counting a hit for `/metrics`. A miss is **not**
+    /// counted here: the loader records a genuine miss via [`Self::record_miss`]
+    /// only after ruling out a negative-cache (known-bad) short-circuit, so a
+    /// bad-key skip doesn't inflate `pvol_pixel_cache_misses_total` (PR #290
+    /// review r4). Keeping `is_known_bad` *after* this on the loader's hot path
+    /// means a good-key access stays a single lookup.
     pub fn get(&self, file_id: &str, dataset_path: &str) -> Option<Arc<RawPixels>> {
         if self.capacity_bytes == 0 {
             return None;
         }
         let key: PixelKey = (Arc::from(file_id), Arc::from(dataset_path));
-        match self.inner.get(&key) {
-            Some(v) => {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                Some(v)
-            }
-            None => {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                None
-            }
+        let hit = self.inner.get(&key);
+        if hit.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
         }
+        hit
+    }
+
+    /// Count one genuine positive-cache miss — i.e. a key that is neither
+    /// cached nor known-bad, so the loader is about to fetch + decode it.
+    pub fn record_miss(&self) {
+        self.misses.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Insert a freshly-decoded array. No-op when disabled.
@@ -172,6 +178,18 @@ mod tests {
             "repeat deduped even with the positive cache off"
         );
         assert!(c.is_known_bad("x", "/d"));
+    }
+
+    #[test]
+    fn miss_counted_only_by_record_miss_not_by_get() {
+        // A `get` that misses must NOT bump the miss counter — a known-bad skip
+        // would otherwise count as a phantom positive-cache miss (PR #290 r4).
+        let c = PixelCache::new(64);
+        let (h0, m0) = c.stats();
+        assert!(c.get("absent", "/d").is_none());
+        assert_eq!(c.stats(), (h0, m0), "get() miss must not be counted");
+        c.record_miss();
+        assert_eq!(c.stats(), (h0, m0 + 1), "record_miss() counts the miss");
     }
 
     #[test]

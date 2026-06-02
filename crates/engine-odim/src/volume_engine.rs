@@ -462,6 +462,9 @@ impl Pixels<'_> {
         if PIXEL_CACHE.is_known_bad(&cache_id, &moment.dataset_path) {
             return None;
         }
+        // Genuine positive-cache miss (not a known-bad skip) — count it here so
+        // the miss metric reflects real fetches, then fetch + decode.
+        PIXEL_CACHE.record_miss();
         // NOTE: this fetches + parses the *whole* `.h5` to extract one dataset
         // (the reader has no slice API), so a file with Q cold moments is
         // downloaded Q times. Batch-decoding all moments on the first miss is
