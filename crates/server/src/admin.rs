@@ -2147,15 +2147,18 @@ pub async fn reload_handler(
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.postgis_engines;
 
+    let degraded = loaded.saturating_sub(ready);
     info!(
-        "Reload complete: {}/{} collections loaded",
-        loaded,
+        "Reload complete: {ready} ready ({degraded} degraded) of {} configured",
         config.collections.len()
     );
 
     Ok(Json(json!({
         "status": "ok",
-        "loaded": loaded,
+        // `ready` = fully-working collections; `degraded` wire no servable
+        // routes (e.g. an empty odim-volume source) but aren't failures.
+        "ready": ready,
+        "degraded": degraded,
         "configured": config.collections.len(),
         "collections": result.health
     })))

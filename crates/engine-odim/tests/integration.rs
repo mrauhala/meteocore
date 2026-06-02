@@ -617,14 +617,15 @@ fn pvol_engine_remote_scan_discovers_fmi_volume() {
     );
 }
 
-/// A `get_raster_tile` call with no `parameter` (or an unparseable
-/// one) on a PVOL collection is a clean error, not a panic.
+/// A `get_raster_tile` call with no `parameter` defaults to the site's
+/// primary (first) quantity — a bare `LAYERS={site}` WMS / Maps request
+/// renders the primary moment rather than erroring.
 #[test]
-fn pvol_engine_rejects_missing_parameter() {
+fn pvol_bare_render_defaults_to_primary_quantity() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../testdata/radar-fmi-pvol/202605191050_fivih_PVOL.h5");
     if !fixture.exists() {
-        eprintln!("skipping pvol_engine_rejects_missing_parameter: fixture absent");
+        eprintln!("skipping pvol_bare_render_defaults_to_primary_quantity: fixture absent");
         return;
     }
     let data_dir = fixture.parent().unwrap().to_str().unwrap();
@@ -648,20 +649,19 @@ fn pvol_engine_rejects_missing_parameter() {
         engine_odim::PolarVolumeEngine::new("fivih-pvol-test", Some(data_dir), &config).unwrap();
     let view = engine.site_view("fivih", "fivih-pvol-test-fivih");
 
-    // `RasterTile` has no `Debug`, so match rather than `unwrap_err`.
-    match view.get_raster_tile(
-        [23.4, 59.6, 25.6, 61.5],
-        8,
-        8,
-        None,
-        &OutputCrs::Wgs84,
-        None,
-        None,
-    ) {
-        Err(ds_core::error::DataServerError::InvalidParameter(_)) => {}
-        Err(other) => panic!("missing parameter must be InvalidParameter, got {other:?}"),
-        Ok(_) => panic!("missing parameter on a PVOL collection must error"),
-    }
+    // No parameter named → render the primary quantity (Ok), not a 400.
+    let tile = view
+        .get_raster_tile(
+            [23.4, 59.6, 25.6, 61.5],
+            8,
+            8,
+            None,
+            &OutputCrs::Wgs84,
+            None,
+            None,
+        )
+        .expect("a bare (no-parameter) render must default to the primary quantity");
+    assert_eq!(tile.values.len(), 8 * 8);
 }
 
 // ---------------------------------------------------------------------------

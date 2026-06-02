@@ -1940,7 +1940,20 @@ fn site_coverages(
             let times: Vec<DateTime<Utc>> = selected.iter().map(|e| e.volume.time).collect();
             Ok(lvls
                 .iter()
-                .map(|&lvl| level_series(&selected, lon, lat, lvl, &quantities, &times))
+                // Drop a level whose series is all-null across every quantity
+                // and timestep (the requested point is out of range, or the
+                // nearest sweep carries no data) — otherwise an all-null
+                // `PointSeries` would serve HTTP 200, indistinguishable from
+                // clear sky. With every level dropped, `finalize_single_site`
+                // turns the empty result into a 404.
+                .filter_map(|&lvl| {
+                    let qr = level_series(&selected, lon, lat, lvl, &quantities, &times);
+                    let all_null = qr
+                        .ranges
+                        .values()
+                        .all(|a| a.values.iter().all(Option::is_none));
+                    (!all_null).then_some(qr)
+                })
                 .collect())
         }
     }
@@ -2076,30 +2089,20 @@ fn finalize_single_site(
     covs: Vec<QueryResult>,
     levels: &Option<Vec<f64>>,
 ) -> Result<CoverageResponse, DataServerError> {
-    if matches!(levels, Some(l) if l.len() == 1) {
-        // `site_coverages` builds exactly one coverage per requested
-        // level, so a single-level request yields exactly one. A missing
-        // coverage would be an internal invariant violation — surface it
-        // as a logged 500, not an opaque `spawn_blocking` panic.
-        return covs
-            .into_iter()
-            .next()
-            .map(CoverageResponse::Single)
-            .ok_or_else(|| {
-                DataServerError::Engine(
-                    "internal: single-level query produced no coverage (invariant violated)".into(),
-                )
-            });
-    }
-    // Every selected volume produced no plottable coverage (e.g. a
-    // corrupted batch where every sweep's elevation angle is non-finite).
-    // An empty `CoverageCollection` is invalid CoverageJSON and would
-    // serve HTTP 200 for what is really "no data" — surface a 404 instead,
-    // matching the CLAUDE.md "no data in window → LocationNotFound" rule.
+    // No plottable coverage — every profile/level was dropped because it
+    // sampled no data (out of range, or all-null). An empty
+    // `CoverageCollection` is invalid CoverageJSON and would serve HTTP 200
+    // for what is really "no data", so surface a 404, matching the CLAUDE.md
+    // "no data in window → LocationNotFound" rule. Checked first so it
+    // covers both the single-level and multi-coverage shapes.
     if covs.is_empty() {
         return Err(DataServerError::LocationNotFound(
             "no PVOL data for this site in the requested time window".into(),
         ));
+    }
+    if matches!(levels, Some(l) if l.len() == 1) {
+        // A single pinned level yields exactly one (non-null) coverage.
+        return Ok(CoverageResponse::Single(covs.into_iter().next().unwrap()));
     }
     Ok(CoverageResponse::Collection(covs))
 }
@@ -2206,17 +2209,29 @@ impl MapEngine for PolarVolumeSiteView {
         parameter: Option<&str>,
         z: Option<f64>,
     ) -> Result<RasterTile, DataServerError> {
-        // A per-site PVOL collection is still multi-parameter — one layer
-        // per radar quantity — but the layer name is now the bare quantity
-        // (no `<site>:` prefix): the site *is* the collection.
-        let quantity = parameter.ok_or_else(|| {
-            DataServerError::InvalidParameter(format!(
-                "[{}] PVOL collection requires a quantity parameter (e.g. `DBZH`)",
-                self.collection_id
-            ))
-        })?;
-
         let catalog = self.catalog.load();
+        // A per-site PVOL collection is still multi-parameter — one layer per
+        // radar quantity (the bare quantity, no `<site>:` prefix). When no
+        // quantity is named (a bare `LAYERS={site}` WMS request, or a Maps /
+        // Tiles request with no `?parameter-name=`), default to the site's
+        // primary (first advertised) quantity — the same as
+        // `raster_info().parameter` — instead of erroring, matching the GRIB
+        // engine's default-parameter behaviour.
+        let quantity = match parameter {
+            Some(q) => q,
+            None => catalog
+                .by_site_meta
+                .get(&self.nod)
+                .and_then(|m| m.quantities.first())
+                .map(|s| s.as_str())
+                .ok_or_else(|| {
+                    DataServerError::InvalidParameter(format!(
+                        "[{}] PVOL collection has no quantities to render",
+                        self.collection_id
+                    ))
+                })?,
+        };
+
         let site_volumes = catalog.by_site.get(&self.nod).ok_or_else(|| {
             // The site aged out of the catalog since this view was
             // registered (source change / `max_files`). A reload would
@@ -2270,21 +2285,21 @@ impl MapEngine for PolarVolumeSiteView {
 
 impl EdrEngine for PolarVolumeSiteView {
     /// Exactly one EDR location — this radar site — `id` is the NOD code
-    /// and the point geometry is the antenna position.
+    /// and the point geometry is the antenna position. A 404 (not an empty
+    /// list) when the site has dropped from `by_site_meta`, so the locations
+    /// list and `query_location` agree on the same data condition.
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
         let catalog = self.catalog.load();
-        Ok(catalog
+        let m = catalog
             .by_site_meta
             .get(&self.nod)
-            .map(|m| {
-                vec![Location {
-                    id: self.nod.clone(),
-                    label: m.plc.clone().unwrap_or_else(|| self.nod.clone()),
-                    latitude: m.lat,
-                    longitude: m.lon,
-                }]
-            })
-            .unwrap_or_default())
+            .ok_or_else(|| DataServerError::LocationNotFound(self.nod.clone()))?;
+        Ok(vec![Location {
+            id: self.nod.clone(),
+            label: m.plc.clone().unwrap_or_else(|| self.nod.clone()),
+            latitude: m.lat,
+            longitude: m.lon,
+        }])
     }
 
     /// Query this radar site by NOD code. The only valid `location_id` is
@@ -3626,12 +3641,13 @@ mod tests {
             "a render over the radar's own coverage samples some echoes"
         );
 
-        // Missing parameter is a clean 400. (`RasterTile` is not `Debug`,
-        // so assert on the variant rather than `unwrap_err`.)
-        assert!(matches!(
-            MapEngine::get_raster_tile(&view, bbox, 4, 4, None, &OutputCrs::Wgs84, None, None),
-            Err(DataServerError::InvalidParameter(_))
-        ));
+        // No parameter named → render the site's primary (first) quantity,
+        // not a 400, so a bare `LAYERS={site}` WMS / Maps request works.
+        assert!(
+            MapEngine::get_raster_tile(&view, bbox, 32, 4, None, &OutputCrs::Wgs84, None, None)
+                .is_ok(),
+            "a bare (no-parameter) render must default to the primary quantity"
+        );
 
         // A view over a site absent from the catalog reports no data, not
         // a 500.
@@ -3892,10 +3908,12 @@ mod tests {
         by_site.insert("fivih".to_string(), vec![entry(momentless, "m")]);
         let view = site_view_for(by_site, "fivih");
 
-        // The site is invisible to discovery...
-        assert!(EdrEngine::get_locations(&view)
-            .expect("locations")
-            .is_empty());
+        // The site is invisible to discovery — get_locations 404s, matching
+        // query_location (not an empty 200 list).
+        assert!(matches!(
+            EdrEngine::get_locations(&view),
+            Err(DataServerError::LocationNotFound(_))
+        ));
         // ...and a direct query_location returns 404, not InvalidParameter.
         assert!(matches!(
             EdrEngine::query_location(&view, "fivih", None, None, None),
@@ -3909,6 +3927,35 @@ mod tests {
                 None,
                 None,
                 None
+            ),
+            Err(DataServerError::LocationNotFound(_))
+        ));
+    }
+
+    /// A z-pinned query whose level series is all-null (the nearest sweep
+    /// carries no data for the requested quantity) is a 404, not an HTTP 200
+    /// all-null `PointSeries`.
+    #[test]
+    fn site_view_z_level_all_null_is_404() {
+        // sweep0 @0.5° has DBZH; an added 15° sweep has VRADH only.
+        let mut vol = synthetic_volume(25.0, 60.0);
+        let mut hi = vol.sweeps[0].clone();
+        hi.elangle = 15.0;
+        hi.moments[0].quantity = "VRADH".to_string();
+        vol.sweeps.push(hi);
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert("fivih".to_string(), vec![entry(vol, "v")]);
+        let view = site_view_for(by_site, "fivih");
+
+        // DBZH pinned to z=15°: the 15° sweep carries no DBZH → all-null →
+        // 404. (~11 km north keeps the point well inside coverage.)
+        assert!(matches!(
+            EdrEngine::query_position(
+                &view,
+                "POINT(25.0 60.1)",
+                None,
+                Some(&["DBZH".to_string()]),
+                Some(&[15.0]),
             ),
             Err(DataServerError::LocationNotFound(_))
         ));
