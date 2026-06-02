@@ -153,10 +153,15 @@ fn build_collection_metadata(
     // preserved and de-duplicated.
     let mut crs_uris: Vec<&'static str> = Vec::new();
     for tms_id in SUPPORTED_TILE_MATRIX_SETS {
-        if let Some(def) = tilematrixset::get_tile_matrix_set(tms_id) {
-            if !crs_uris.contains(&def.crs) {
-                crs_uris.push(def.crs);
-            }
+        // `expect` rather than `if let`: SUPPORTED_TILE_MATRIX_SETS and
+        // `get_tile_matrix_set` are separate constructs, so a TMS added to the
+        // list without a matching definition must fail loudly (in tests) rather
+        // than silently shorten `crs` — an empty `crs` fails Part 2 schema
+        // validation (review on #298).
+        let def = tilematrixset::get_tile_matrix_set(tms_id)
+            .expect("SUPPORTED_TILE_MATRIX_SETS entry has no matching TileMatrixSet definition");
+        if !crs_uris.contains(&def.crs) {
+            crs_uris.push(def.crs);
         }
     }
 

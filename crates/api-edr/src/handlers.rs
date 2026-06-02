@@ -1067,10 +1067,12 @@ fn build_collection_metadata(
         "id": config.id,
         "title": config.title,
         "description": config.description,
-        // OGC API – Common – Part 2 `itemType`. EDR collections expose
-        // coverage data, so "coverage" is the appropriate value (#296). Maps
-        // and raster tiles omit it — map items have no registered value.
-        "itemType": "coverage",
+        // No `itemType`: OGC API – Common – Part 2 registers only "feature"
+        // and "record", and the field describes a /collections/{id}/items
+        // sub-resource — which EDR has no equivalent of (data is reached via
+        // /position, /area, /trajectory, …). EDR collections are also not all
+        // coverage data (CSV/PostGIS serve discrete observations), so no single
+        // itemType applies. Omitted rather than mislabelled (review on #298).
         "links": [
             {
                 "href": format!("{base_url}/edr/collections/{}", config.id),
