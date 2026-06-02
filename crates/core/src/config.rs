@@ -353,8 +353,9 @@ pub struct OdimConfig {
     /// Parameter name advertised to clients (e.g. `"reflectivity"`).
     /// Required for single-parameter `engine_type = "odim"` (COMP)
     /// collections. Unused — and may be omitted — by the multi-parameter
-    /// `engine_type = "odim-volume"` (PVOL) engine, which derives one
-    /// parameter per `<site>:<quantity>` pair from the volume files.
+    /// `engine_type = "odim-volume"` (PVOL) engine, which auto-expands into
+    /// one collection per radar site whose parameters are the bare ODIM
+    /// quantities (`DBZH`, `VRADH`, …) read from the volume files.
     pub parameter: Option<String>,
     /// Unit of measurement (e.g. `"dBZ"`). Pure metadata: the engine
     /// does not convert between units. Required for `engine_type = "odim"`;

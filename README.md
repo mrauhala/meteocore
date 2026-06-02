@@ -633,12 +633,14 @@ title = "OPERA Radar Composite"
 description = "European radar reflectivity composite"
 engine_type = "odim"
 apis = ["edr", "wms", "maps", "tiles"]
+data_path = "testdata/radar-opera"     # local directory (a top-level CollectionConfig field)
 
 [collections.odim]
 filename_template = "OPERA@%Y%m%dT%H%M@0@ACRR.h5"
-# Local directory:
-data_path = "testdata/radar-opera"
-# ...or S3: endpoint = "..."  bucket = "..."  prefix_pattern = "%Y/%m/%d/"
+parameter = "reflectivity"             # required for COMP collections
+unit = "dBZ"                           # required for COMP collections
+# ...or stream from S3 instead of data_path (set inside [collections.odim]):
+# endpoint = "https://s3.example.com"  bucket = "radar"  prefix_pattern = "%Y/%m/%d/"
 poll_interval_secs = 300
 
 [collections.wms]
@@ -688,7 +690,7 @@ min = 0.0
 max = 1.0
 ```
 
-A bare `LAYERS={site}` WMS request (or a Maps/Tiles request with no `parameter-name`) renders the site's primary quantity; name `{site}/DBZH` to pick a specific moment.
+A bare `LAYERS=radar-fi-volume-fivih` WMS request (or a Maps/Tiles request with no `parameter-name`) renders the site's primary quantity; use `LAYERS=radar-fi-volume-fivih/DBZH` to pick a specific moment. The layer is the full per-site collection id (`{base_id}-{nod}`) — replace `radar-fi-volume` with your source `id` and `fivih` with the radar's ODIM `nod`.
 
 ### QueryData
 
