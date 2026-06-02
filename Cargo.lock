@@ -891,6 +891,7 @@ dependencies = [
  "ds-storage",
  "hdf5-reader",
  "ndarray",
+ "quick_cache",
  "regex",
  "serde",
  "tempfile",

@@ -51,6 +51,13 @@ pub struct RadarSite {
 }
 
 /// A single radar moment (quantity) within one elevation sweep.
+///
+/// **Metadata only** — the bulky pixel array is *not* held here. A scan
+/// parses every moment's scaling/identity attributes (cheap) but defers
+/// the `/datasetN/dataM/data` array, which is read lazily on demand via
+/// [`read_moment_pixels`] (keyed by [`Self::dataset_path`]) and cached by
+/// the engine. This keeps a parsed [`PolarVolume`] at KB scale so a whole
+/// radar network's catalog fits in memory; see issue #289.
 #[derive(Debug, Clone)]
 pub struct PolarMoment {
     /// ODIM quantity name, e.g. `"DBZH"`, `"VRADH"`, `"ZDR"`.
@@ -63,8 +70,10 @@ pub struct PolarMoment {
     pub nodata: f64,
     /// Raw value indicating "no echo detected".
     pub undetect: f64,
-    /// Raw data array, indexed `[ray, bin]` — shape `(nrays, nbins)`.
-    pub data: RawPixels,
+    /// HDF5 path of this moment's raw data array
+    /// (`/datasetN/dataM/data`), for the lazy pixel read. The array is
+    /// shape `(nrays, nbins)`, indexed `[ray, bin]`.
+    pub dataset_path: String,
 }
 
 /// One elevation sweep of a polar volume: all moments measured at a
@@ -370,7 +379,24 @@ fn read_moment(
     let nodata = read_scaling("nodata", None)?;
     let undetect = read_scaling("undetect", None)?;
 
-    let data = read_moment_array(file, &format!("{data_path}/data"), nrays, nbins)?;
+    // Validate the data array exists and matches the sweep's declared
+    // `(nrays, nbins)` at scan time — cheap (a shape/metadata check, not a
+    // decode), so a malformed file is rejected up front rather than only on
+    // first render. The array bytes are read lazily via `read_moment_pixels`.
+    let dataset_path = format!("{data_path}/data");
+    let ds = file
+        .dataset(&dataset_path)
+        .map_err(|_| ReadError::MissingGroup(dataset_path.clone()))?;
+    let shape = ds.shape();
+    if shape.len() != 2 {
+        return Err(ReadError::UnsupportedRank(shape.len()));
+    }
+    if shape[0] as usize != nrays || shape[1] as usize != nbins {
+        return Err(ReadError::DatasetRead(format!(
+            "{dataset_path}: array shape {:?} doesn't match sweep metadata {nrays}x{nbins}",
+            (shape[0], shape[1])
+        )));
+    }
 
     Ok(PolarMoment {
         quantity,
@@ -378,8 +404,25 @@ fn read_moment(
         offset,
         nodata,
         undetect,
-        data,
+        dataset_path,
     })
+}
+
+/// Read one moment's raw pixel array on demand from the volume's bytes.
+///
+/// The lazy companion to [`read_polar_volume`]: re-parse the HDF5 file
+/// (cheap — structure only) and decode just the single
+/// `/datasetN/dataM/data` dataset named by [`PolarMoment::dataset_path`].
+/// `nrays`/`nbins` come from the owning sweep. Used by the engine's
+/// bounded pixel cache so the full sweep stack is never resident.
+pub fn read_moment_pixels(
+    bytes: &[u8],
+    dataset_path: &str,
+    nrays: usize,
+    nbins: usize,
+) -> Result<RawPixels, ReadError> {
+    let file = Hdf5File::from_bytes(bytes).map_err(|e| ReadError::OpenFailed(e.to_string()))?;
+    read_moment_array(&file, dataset_path, nrays, nbins)
 }
 
 /// Combine ODIM's split `/what/date` (`YYYYMMDD`) and `/what/time`
@@ -518,13 +561,15 @@ mod tests {
             "sweep[0] should expose ZDR, got {quantities:?}"
         );
 
-        // Each moment's array shape matches its own sweep's grid —
-        // read_polar_volume validates this internally, so assert it
-        // holds across every sweep/moment pair.
+        // Pixel arrays are read lazily — verify `read_moment_pixels` decodes
+        // each moment's `/datasetN/dataM/data` at the declared
+        // `(nrays, nbins)` for every sweep/moment pair.
         for sweep in &vol.sweeps {
             for m in &sweep.moments {
+                let px = read_moment_pixels(&bytes, &m.dataset_path, sweep.nrays, sweep.nbins)
+                    .unwrap_or_else(|e| panic!("read pixels for {}: {e}", m.quantity));
                 assert_eq!(
-                    m.data.shape(),
+                    px.shape(),
                     (sweep.nrays, sweep.nbins),
                     "moment {} array shape vs sweep grid",
                     m.quantity

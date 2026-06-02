@@ -70,7 +70,36 @@ use ds_storage::discovery::{expand_prefix_for_dates, expand_prefix_pattern, Time
 
 use crate::catalog::MAX_REMOTE_FILE_SIZE;
 use crate::engine::EngineError;
-use crate::pvol::{read_polar_volume, PolarMoment, PolarVolume, Sweep};
+use crate::pixel_cache::PixelCache;
+use crate::pvol::{read_moment_pixels, read_polar_volume, PolarMoment, PolarVolume, Sweep};
+use crate::reader::RawPixels;
+
+/// Default lazy-pixel cache size (MB) when `MC_PVOL_PIXEL_CACHE_MB` is
+/// unset. One shared budget bounds resident decoded pixels across every
+/// PVOL collection, so the engine scales to a full radar network without
+/// holding every sweep stack in RAM (#289).
+const DEFAULT_PIXEL_CACHE_MB: u64 = 1024;
+
+/// Read the configured lazy-pixel cache size from the environment, or the
+/// default. `0` disables caching (every sample re-reads — diagnostic only).
+fn pixel_cache_mb() -> u64 {
+    std::env::var("MC_PVOL_PIXEL_CACHE_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PIXEL_CACHE_MB)
+}
+
+/// Process-global decoded-pixel LRU, shared by every PVOL collection so a
+/// single byte-budget bounds resident pixels across the whole radar
+/// network. Sized once from the environment on first use (#289).
+static PIXEL_CACHE: std::sync::LazyLock<PixelCache> =
+    std::sync::LazyLock::new(|| PixelCache::new(pixel_cache_mb()));
+
+/// Accessor for the global pixel cache, for tests to seed/inspect it.
+#[cfg(test)]
+pub(crate) fn pixel_cache() -> &'static PixelCache {
+    &PIXEL_CACHE
+}
 
 /// Days of date-partitioned prefixes to scan when an S3 source has no
 /// `time_window`. Two days covers the just-after-midnight case where
@@ -308,6 +337,66 @@ fn source_label(source: &Source) -> String {
             prefix_pattern,
             ..
         } => format!("s3 {endpoint}/{bucket}/{prefix_pattern}"),
+    }
+}
+
+/// Re-fetch one volume file's raw bytes by its [`FileId`] — a local path
+/// read or an S3 `get`. Used by the lazy pixel reader on a cache miss.
+fn fetch_file_bytes(source: &Source, file_id: &str) -> Result<Vec<u8>, String> {
+    match source {
+        Source::Local { .. } => {
+            std::fs::read(file_id).map_err(|e| format!("read `{file_id}`: {e}"))
+        }
+        Source::Remote { store, .. } => {
+            use ds_storage::object_store::path::Path as ObjectPath;
+            let object = ObjectPath::from(file_id);
+            store
+                .get(&object)
+                .map(|b| b.to_vec())
+                .map_err(|e| format!("get `{file_id}`: {e}"))
+        }
+    }
+}
+
+/// Lazy-pixel access context threaded through the samplers: just the file
+/// source, used to re-fetch a volume's bytes on a [`PIXEL_CACHE`] miss.
+/// The catalog holds only metadata, so a moment's `RawPixels` is fetched
+/// here on first use and cached in the global LRU (#289).
+#[derive(Clone, Copy)]
+struct Pixels<'a> {
+    source: &'a Source,
+}
+
+impl Pixels<'_> {
+    /// Fetch a moment's decoded pixel array — cache hit, or read the one
+    /// `/datasetN/dataM/data` dataset from the (re-fetched) file bytes and
+    /// cache it. `None` on any I/O / decode error (the caller treats a
+    /// missing array as nodata, so a single corrupt file degrades to
+    /// transparent rather than failing the whole request).
+    fn moment(
+        &self,
+        file_id: &str,
+        moment: &PolarMoment,
+        nrays: usize,
+        nbins: usize,
+    ) -> Option<Arc<RawPixels>> {
+        if let Some(p) = PIXEL_CACHE.get(file_id, &moment.dataset_path) {
+            return Some(p);
+        }
+        let bytes = fetch_file_bytes(self.source, file_id)
+            .map_err(|e| tracing::warn!("PVOL lazy pixel read failed: {e}"))
+            .ok()?;
+        let raw = read_moment_pixels(&bytes, &moment.dataset_path, nrays, nbins)
+            .map_err(|e| {
+                tracing::warn!(
+                    "PVOL pixel decode `{}` in `{file_id}`: {e}",
+                    moment.dataset_path
+                )
+            })
+            .ok()?;
+        let arc = Arc::new(raw);
+        PIXEL_CACHE.insert(file_id, &moment.dataset_path, arc.clone());
+        Some(arc)
     }
 }
 
@@ -885,22 +974,22 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
 pub struct PolarVolumeEngine {
     collection_id: String,
     /// Local directory or S3/HTTP object store, re-scanned by the poll loop.
-    source: Source,
+    /// Behind an `Arc` so per-site views can hold it cheaply for lazy pixel
+    /// re-fetches.
+    source: Arc<Source>,
     /// Per-site cap on retained volumes (`OdimConfig.max_files`) — keeps
     /// an archive source from loading every file into the catalog.
     max_files: Option<usize>,
     /// Lock-free catalog snapshot for `raster_info()` + `get_raster_tile`.
     catalog: Arc<ArcSwap<Catalog>>,
-    /// Multi-entry parse cache keyed by file identity (local path
-    /// string or S3 object key — see [`FileId`]). A PVOL network of
-    /// ~10 sites at 5-min cadence keeps tens of volumes resident; HDF5
-    /// parsing (and, for S3, the multi-MB download) dominates, so
-    /// caching every parsed volume keeps both the poll loop and hot
-    /// tile requests cheap. The key is a `String`, not a `PathBuf`,
-    /// because S3 object keys are not filesystem paths.
+    /// Parse cache of **metadata-only** [`PolarVolume`]s keyed by file
+    /// identity (local path string or S3 object key — see [`FileId`]) so a
+    /// poll doesn't re-parse unchanged files' structure. Tiny now that
+    /// pixel arrays are excluded (#289): a whole network's catalog fits in
+    /// memory. Behind an `Arc` so a scan can be moved off `self`.
     ///
-    /// Behind an `Arc` so a `poll_once` scan can be moved onto a
-    /// `spawn_blocking` task without borrowing `self`.
+    /// (Decoded pixel arrays live in the process-global [`pixel_cache`] LRU,
+    /// not here — one byte-budget for the whole radar network.)
     parse_cache: Arc<Mutex<HashMap<FileId, Arc<PolarVolume>>>>,
     poll_interval: Duration,
     shutdown: AtomicBool,
@@ -938,7 +1027,7 @@ impl PolarVolumeEngine {
             );
         }
 
-        let source = build_source(collection_id, data_path, config)?;
+        let source = Arc::new(build_source(collection_id, data_path, config)?);
 
         let parse_cache = Arc::new(Mutex::new(HashMap::new()));
         let catalog = scan_source(collection_id, &source, &parse_cache, config.max_files)?;
@@ -1006,13 +1095,13 @@ impl PolarVolumeEngine {
         store: ds_storage::DataStore,
         prefix_pattern: &str,
     ) -> Result<Self, EngineError> {
-        let source = Source::Remote {
+        let source = Arc::new(Source::Remote {
             store,
             endpoint: "test://local".to_string(),
             bucket: "test".to_string(),
             prefix_pattern: prefix_pattern.to_string(),
             time_window: None,
-        };
+        });
         let parse_cache = Arc::new(Mutex::new(HashMap::new()));
         let catalog = scan_source(collection_id, &source, &parse_cache, None)?;
         Ok(Self {
@@ -1098,6 +1187,7 @@ impl PolarVolumeEngine {
 fn sample_sweep_moment(
     sweep: &Sweep,
     moment: &PolarMoment,
+    pixels: &RawPixels,
     site_lon: f64,
     site_lat: f64,
     lon: f64,
@@ -1131,7 +1221,7 @@ fn sample_sweep_moment(
     let ray = (az / (360.0 / sweep.nrays as f64)).floor() as usize % sweep.nrays;
 
     // `RawPixels` is indexed [ray, bin].
-    moment.data.sample(
+    pixels.sample(
         ray,
         bin as usize,
         moment.gain,
@@ -1156,6 +1246,7 @@ fn sample_sweep_moment(
 /// peaks versus a linear-reflectivity average, but avoids per-moment
 /// unit-aware conversion for what is a smoothing pass.
 fn bilinear_cell(
+    pixels: &RawPixels,
     moment: &PolarMoment,
     nrays: usize,
     nbins: usize,
@@ -1184,7 +1275,7 @@ fn bilinear_cell(
             if bin < 0 || bin >= nbins as i64 {
                 continue; // range edge — drop this neighbour
             }
-            if let Some(v) = moment.data.sample(
+            if let Some(v) = pixels.sample(
                 ray,
                 bin as usize,
                 moment.gain,
@@ -1208,6 +1299,7 @@ fn bilinear_cell(
 fn sample_sweep_moment_bilinear(
     sweep: &Sweep,
     moment: &PolarMoment,
+    pixels: &RawPixels,
     site_lon: f64,
     site_lat: f64,
     lon: f64,
@@ -1238,7 +1330,7 @@ fn sample_sweep_moment_bilinear(
     // `i` starts at azimuth `i * 360/nrays`.
     let ray_f = az / (360.0 / sweep.nrays as f64);
 
-    bilinear_cell(moment, sweep.nrays, sweep.nbins, ray_f, bin_f)
+    bilinear_cell(pixels, moment, sweep.nrays, sweep.nbins, ray_f, bin_f)
 }
 
 /// The sweep whose elevation angle is nearest `target` degrees. `None`
@@ -1276,8 +1368,11 @@ fn nearest_sweep(volume: &PolarVolume, target: f64) -> Option<&Sweep> {
 ///
 /// `z` selects the elevation sweep: `Some(angle)` renders the sweep
 /// nearest that angle, `None` renders the lowest sweep.
+#[allow(clippy::too_many_arguments)]
 fn polar_sample(
     volume: &PolarVolume,
+    file_id: &str,
+    pix: Pixels,
     quantity: &str,
     bbox: [f64; 4],
     width: u32,
@@ -1326,6 +1421,19 @@ fn polar_sample(
         ));
     }
 
+    // Lazily fetch this one moment's pixel array (cache hit, or read the
+    // single dataset from the re-fetched file bytes) — once, before the
+    // per-pixel loop. A read failure yields an all-transparent tile rather
+    // than a 500: the file may have rotated out from under us, and the next
+    // poll/request recovers.
+    let Some(pixels) = pix.moment(file_id, moment, sweep.nrays, sweep.nbins) else {
+        return Ok(RasterTile {
+            width,
+            height,
+            values: vec![None; (width as usize) * (height as usize)],
+        });
+    };
+
     // Polar sampling is inherently per-pixel (each output pixel resolves to a
     // ground distance + bearing from the site), so unlike the gridded engines
     // this loop maps each pixel's WGS84 lon/lat with the shared
@@ -1352,7 +1460,7 @@ fn polar_sample(
             }
 
             values.push(sample_sweep_moment_bilinear(
-                sweep, moment, site_lon, site_lat, lon, lat,
+                sweep, moment, &pixels, site_lon, site_lat, lon, lat,
             ));
         }
     }
@@ -1441,6 +1549,7 @@ fn snap_levels(requested: &[f64], canonical: &[f64]) -> Vec<f64> {
 /// `z` axis.
 fn volume_profile(
     entry: &VolumeEntry,
+    pix: Pixels,
     lon: f64,
     lat: f64,
     quantities: &[String],
@@ -1495,7 +1604,8 @@ fn volume_profile(
                     })
                     .and_then(|sweep| {
                         let moment = sweep.moments.iter().find(|m| m.quantity == *quantity)?;
-                        sample_sweep_moment(sweep, moment, site_lon, site_lat, lon, lat)
+                        let pixels = pix.moment(&entry.id, moment, sweep.nrays, sweep.nbins)?;
+                        sample_sweep_moment(sweep, moment, &pixels, site_lon, site_lat, lon, lat)
                     })
             })
             .collect();
@@ -1529,6 +1639,7 @@ fn volume_profile(
 /// sweep nearest `level` in each selected volume, sampled at `(lon, lat)`.
 fn level_series(
     selected: &[&VolumeEntry],
+    pix: Pixels,
     lon: f64,
     lat: f64,
     level: f64,
@@ -1543,9 +1654,11 @@ fn level_series(
             .map(|e| {
                 let sweep = nearest_sweep(&e.volume, level)?;
                 let moment = sweep.moments.iter().find(|m| &m.quantity == quantity)?;
+                let pixels = pix.moment(&e.id, moment, sweep.nrays, sweep.nbins)?;
                 sample_sweep_moment(
                     sweep,
                     moment,
+                    &pixels,
                     e.volume.site.lon,
                     e.volume.site.lat,
                     lon,
@@ -1765,8 +1878,11 @@ fn sweep_envelope(volume: &PolarVolume) -> Option<(f64, f64)> {
 /// interim (used by position/area/Map paths) is untouched: the slant
 /// range here comes from the 4/3-Earth inversion in `volume_section`,
 /// not from a ground-range fixup.
+#[allow(clippy::too_many_arguments)]
 fn sample_polar_slant(
     volume: &PolarVolume,
+    file_id: &str,
+    pix: Pixels,
     envelope: (f64, f64),
     quantity: &str,
     slant_range_m: f64,
@@ -1802,7 +1918,8 @@ fn sample_polar_slant(
         return None;
     }
     let ray = (azimuth_deg / (360.0 / sweep.nrays as f64)).floor() as usize % sweep.nrays;
-    moment.data.sample(
+    let pixels = pix.moment(file_id, moment, sweep.nrays, sweep.nbins)?;
+    pixels.sample(
         ray,
         bin as usize,
         moment.gain,
@@ -1827,6 +1944,7 @@ fn sample_polar_slant(
 /// honest about the angles it actually surveyed.
 fn volume_section(
     entry: &VolumeEntry,
+    pix: Pixels,
     path: &[(f64, f64)],
     heights_m: &[f64],
     quantities: &[String],
@@ -1865,6 +1983,8 @@ fn volume_section(
                 let (r, el) = ground_height_to_slant(d, h);
                 values.push(sample_polar_slant(
                     &entry.volume,
+                    &entry.id,
+                    pix,
                     envelope,
                     quantity,
                     r,
@@ -1908,6 +2028,7 @@ fn volume_section(
 /// `PointSeries` per requested level (a time series at that sweep).
 fn site_coverages(
     volumes: &[VolumeEntry],
+    pix: Pixels,
     lon: f64,
     lat: f64,
     datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -1934,7 +2055,7 @@ fn site_coverages(
             .iter()
             // `filter_map` drops volumes that produced no plottable profile
             // (every elangle non-finite — `volume_profile` returns `None`).
-            .filter_map(|e| volume_profile(e, lon, lat, &quantities))
+            .filter_map(|e| volume_profile(e, pix, lon, lat, &quantities))
             .collect()),
         Some(lvls) => {
             let times: Vec<DateTime<Utc>> = selected.iter().map(|e| e.volume.time).collect();
@@ -1947,7 +2068,7 @@ fn site_coverages(
                 // clear sky. With every level dropped, `finalize_single_site`
                 // turns the empty result into a 404.
                 .filter_map(|&lvl| {
-                    let qr = level_series(&selected, lon, lat, lvl, &quantities, &times);
+                    let qr = level_series(&selected, pix, lon, lat, lvl, &quantities, &times);
                     let all_null = qr
                         .ranges
                         .values()
@@ -1985,8 +2106,10 @@ fn resolve_levels(
 /// selector against the site's `canonical` sweep angles, build the
 /// coverages, and wrap them per [`finalize_single_site`]. Shared by the
 /// network engine (after it picks a site) and each per-site view.
+#[allow(clippy::too_many_arguments)]
 fn site_point_query(
     volumes: &[VolumeEntry],
+    pix: Pixels,
     lon: f64,
     lat: f64,
     datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -1995,7 +2118,15 @@ fn site_point_query(
     canonical: Option<&[f64]>,
 ) -> Result<CoverageResponse, DataServerError> {
     let levels = resolve_levels(canonical, z)?;
-    let covs = site_coverages(volumes, lon, lat, datetime, parameters, levels.as_deref())?;
+    let covs = site_coverages(
+        volumes,
+        pix,
+        lon,
+        lat,
+        datetime,
+        parameters,
+        levels.as_deref(),
+    )?;
     finalize_single_site(covs, &levels)
 }
 
@@ -2021,6 +2152,7 @@ fn resample_section_path(coords: &str) -> Result<Vec<(f64, f64)>, DataServerErro
 /// engine (after it picks the nearest site) and each per-site view.
 fn site_trajectory(
     volumes: &[VolumeEntry],
+    pix: Pixels,
     path: &[(f64, f64)],
     datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
     parameters: Option<&[String]>,
@@ -2065,7 +2197,7 @@ fn site_trajectory(
 
     let coverages: Vec<QueryResult> = selected
         .iter()
-        .filter_map(|e| volume_section(e, path, &heights, &quantities, window))
+        .filter_map(|e| volume_section(e, pix, path, &heights, &quantities, window))
         .collect();
     if coverages.is_empty() {
         return Err(DataServerError::LocationNotFound(
@@ -2169,6 +2301,7 @@ impl PolarVolumeEngine {
     pub fn site_view(&self, nod: &str, collection_id: &str) -> PolarVolumeSiteView {
         PolarVolumeSiteView {
             catalog: self.catalog.clone(),
+            source: self.source.clone(),
             nod: nod.to_string(),
             collection_id: collection_id.to_string(),
         }
@@ -2192,6 +2325,9 @@ impl PolarVolumeEngine {
 pub struct PolarVolumeSiteView {
     /// Live catalog shared with the owning [`PolarVolumeEngine`].
     catalog: Arc<ArcSwap<Catalog>>,
+    /// The owning engine's file source, shared so the view can lazily
+    /// re-fetch a volume's bytes to decode a moment's pixels on demand.
+    source: Arc<Source>,
     /// ODIM NOD code this view is scoped to.
     nod: String,
     /// Per-site OGC collection id (`{base}-{nod}`), for error messages.
@@ -2256,7 +2392,20 @@ impl MapEngine for PolarVolumeSiteView {
             ))
         })?;
 
-        polar_sample(&entry.volume, quantity, bbox, width, height, output_crs, z)
+        let pix = Pixels {
+            source: &self.source,
+        };
+        polar_sample(
+            &entry.volume,
+            &entry.id,
+            pix,
+            quantity,
+            bbox,
+            width,
+            height,
+            output_crs,
+            z,
+        )
     }
 
     fn raster_info(&self) -> RasterInfo {
@@ -2335,8 +2484,11 @@ impl EdrEngine for PolarVolumeSiteView {
             .volume
             .site;
         let canonical = meta.vertical.as_ref().map(|v| v.levels.as_slice());
+        let pix = Pixels {
+            source: &self.source,
+        };
         site_point_query(
-            volumes, site.lon, site.lat, datetime, parameters, z, canonical,
+            volumes, pix, site.lon, site.lat, datetime, parameters, z, canonical,
         )
     }
 
@@ -2435,7 +2587,10 @@ impl EdrEngine for PolarVolumeSiteView {
             ))
         })?;
         let canonical = meta.vertical.as_ref().map(|v| v.levels.as_slice());
-        site_point_query(volumes, lon, lat, datetime, parameters, z, canonical)
+        let pix = Pixels {
+            source: &self.source,
+        };
+        site_point_query(volumes, pix, lon, lat, datetime, parameters, z, canonical)
     }
 
     /// Area query — a `CoverageCollection` of this site's coverages, but
@@ -2470,8 +2625,12 @@ impl EdrEngine for PolarVolumeSiteView {
         })?;
         let canonical = meta.vertical.as_ref().map(|v| v.levels.as_slice());
         let levels = resolve_levels(canonical, z)?;
+        let pix = Pixels {
+            source: &self.source,
+        };
         let covs = site_coverages(
             volumes,
+            pix,
             meta.lon,
             meta.lat,
             datetime,
@@ -2518,7 +2677,10 @@ impl EdrEngine for PolarVolumeSiteView {
                 self.collection_id, self.nod
             ))
         })?;
-        site_trajectory(volumes, &path, datetime, parameters, z)
+        let pix = Pixels {
+            source: &self.source,
+        };
+        site_trajectory(volumes, pix, &path, datetime, parameters, z)
     }
 }
 
@@ -2679,19 +2841,39 @@ mod tests {
     fn sample_polar_slant_rejects_malformed_rscale() {
         let (site_lon, site_lat) = (25.0, 60.0);
         let mut vol = synthetic_volume(site_lon, site_lat);
+        seed_synthetic(TEST_FILE);
         let env = sweep_envelope(&vol).expect("synthetic volume has finite sweep");
         let azimuth = 90.0;
         let elangle = 0.5;
         let range_m = 10_000.0;
 
         // Baseline: well-formed sweep returns a finite sample.
-        let v = sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, elangle);
+        let v = sample_polar_slant(
+            &vol,
+            TEST_FILE,
+            test_pixels(),
+            env,
+            "DBZH",
+            range_m,
+            azimuth,
+            elangle,
+        );
         assert!(v.is_some(), "well-formed sweep must sample");
 
         for bad in [0.0_f64, -1_000.0, f64::NAN, f64::INFINITY] {
             vol.sweeps[0].rscale = bad;
             assert!(
-                sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, elangle).is_none(),
+                sample_polar_slant(
+                    &vol,
+                    TEST_FILE,
+                    test_pixels(),
+                    env,
+                    "DBZH",
+                    range_m,
+                    azimuth,
+                    elangle
+                )
+                .is_none(),
                 "rscale={bad} must yield None, not fabricated data"
             );
         }
@@ -2709,6 +2891,7 @@ mod tests {
     fn sample_polar_slant_rejects_out_of_envelope_elevation() {
         let (site_lon, site_lat) = (25.0, 60.0);
         let vol = synthetic_volume(site_lon, site_lat);
+        seed_synthetic(TEST_FILE);
         let env = sweep_envelope(&vol).unwrap();
         // Synthetic fixture has one sweep at 0.5°. Tolerance is 1°, so
         // targets in [-0.5°, 1.5°] are accepted; everything outside ⇒ None.
@@ -2716,20 +2899,90 @@ mod tests {
         let range_m = 10_000.0;
 
         // Inside the window — sampled.
-        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, 0.5).is_some());
-        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, 1.4).is_some());
-        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, -0.4).is_some());
+        assert!(sample_polar_slant(
+            &vol,
+            TEST_FILE,
+            test_pixels(),
+            env,
+            "DBZH",
+            range_m,
+            azimuth,
+            0.5
+        )
+        .is_some());
+        assert!(sample_polar_slant(
+            &vol,
+            TEST_FILE,
+            test_pixels(),
+            env,
+            "DBZH",
+            range_m,
+            azimuth,
+            1.4
+        )
+        .is_some());
+        assert!(sample_polar_slant(
+            &vol,
+            TEST_FILE,
+            test_pixels(),
+            env,
+            "DBZH",
+            range_m,
+            azimuth,
+            -0.4
+        )
+        .is_some());
 
         // Just outside the window — None.
-        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, 1.6).is_none());
-        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, -0.6).is_none());
+        assert!(sample_polar_slant(
+            &vol,
+            TEST_FILE,
+            test_pixels(),
+            env,
+            "DBZH",
+            range_m,
+            azimuth,
+            1.6
+        )
+        .is_none());
+        assert!(sample_polar_slant(
+            &vol,
+            TEST_FILE,
+            test_pixels(),
+            env,
+            "DBZH",
+            range_m,
+            azimuth,
+            -0.6
+        )
+        .is_none());
 
         // Far outside — None (the 90° overhead case that bit the
         // h=large cells at the radar location).
-        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, 90.0).is_none());
+        assert!(sample_polar_slant(
+            &vol,
+            TEST_FILE,
+            test_pixels(),
+            env,
+            "DBZH",
+            range_m,
+            azimuth,
+            90.0
+        )
+        .is_none());
 
         // Non-finite el — None.
-        assert!(sample_polar_slant(&vol, env, "DBZH", range_m, azimuth, f64::NAN).is_none());
+        assert!(sample_polar_slant(
+            &vol,
+            TEST_FILE,
+            test_pixels(),
+            env,
+            "DBZH",
+            range_m,
+            azimuth,
+            f64::NAN
+        )
+        .is_none());
     }
 
     /// `angle_window` selects the requested elevation-angle span, clamped
@@ -2836,8 +3089,15 @@ mod tests {
         let heights = vec![0.0, 1500.0];
         let window = (0.5, 25.0); // wider than the volume's 0.5° sweep
 
-        let qr = volume_section(&e, &path, &heights, &["DBZH".to_string()], window)
-            .expect("section produced");
+        let qr = volume_section(
+            &e,
+            test_pixels(),
+            &path,
+            &heights,
+            &["DBZH".to_string()],
+            window,
+        )
+        .expect("section produced");
         let nd = qr.ranges.get("DBZH").expect("DBZH range");
         // Layout is row-major [node][height]; the far node is index 1, so
         // its first cell starts at `heights.len()`.
@@ -2858,16 +3118,49 @@ mod tests {
     /// Build a synthetic single-site, single-sweep, single-moment
     /// volume whose raw value at `[ray, bin]` encodes the bin index,
     /// so a rendered pixel's sampled value reveals which bin it hit.
-    fn synthetic_volume(lon: f64, lat: f64) -> PolarVolume {
-        let nrays = 360usize;
-        let nbins = 100usize;
-        // raw[ray][bin] = bin  → physical = bin*1.0 + 0.0 = bin.
+    /// The synthetic pixel array used by every test moment: `raw[ray][bin]
+    /// = bin` (360×100 u16), so `physical = bin*1.0 + 0.0 = bin`.
+    fn synthetic_raw() -> RawPixels {
+        let (nrays, nbins) = (360usize, 100usize);
         let mut data = Array2::<u16>::zeros((nrays, nbins));
         for ray in 0..nrays {
             for bin in 0..nbins {
                 data[(ray, bin)] = bin as u16;
             }
         }
+        RawPixels::U16(data)
+    }
+
+    /// Dataset path every synthetic moment advertises (one sweep, one moment).
+    const SYNTHETIC_DS: &str = "/dataset1/data1/data";
+
+    /// A file id for tests that render/sample a bare `synthetic_volume`
+    /// (not wrapped via [`entry`]). Pre-seed it with [`seed_synthetic`].
+    const TEST_FILE: &str = "test-volume.h5";
+
+    /// A dummy file source for the lazy-pixel context; never actually read,
+    /// because tests pre-seed the cache (see [`seed_synthetic`]).
+    static TEST_SOURCE: std::sync::LazyLock<Source> = std::sync::LazyLock::new(|| Source::Local {
+        data_dir: PathBuf::from("/nonexistent-test-pvol"),
+    });
+
+    /// A `Pixels` context over the dummy source — pairs with [`seed_synthetic`].
+    fn test_pixels() -> Pixels<'static> {
+        Pixels {
+            source: &TEST_SOURCE,
+        }
+    }
+
+    /// Seed the global pixel cache with the synthetic array under `file_id`
+    /// so the lazy fetch hits the cache (no file I/O). Call before any
+    /// sampler that resolves pixels for a volume with this `file_id`.
+    fn seed_synthetic(file_id: &str) {
+        pixel_cache().insert(file_id, SYNTHETIC_DS, std::sync::Arc::new(synthetic_raw()));
+    }
+
+    fn synthetic_volume(lon: f64, lat: f64) -> PolarVolume {
+        let nrays = 360usize;
+        let nbins = 100usize;
         let moment = PolarMoment {
             quantity: "DBZH".to_string(),
             gain: 1.0,
@@ -2875,7 +3168,7 @@ mod tests {
             // 65535 is an unused raw value — nothing masks.
             nodata: 65_535.0,
             undetect: 65_534.0,
-            data: RawPixels::U16(data),
+            dataset_path: SYNTHETIC_DS.to_string(),
         };
         let sweep = Sweep {
             elangle: 0.5,
@@ -2909,6 +3202,7 @@ mod tests {
     fn polar_sample_maps_distance_to_bin() {
         let (site_lon, site_lat) = (25.0, 60.0);
         let vol = synthetic_volume(site_lon, site_lat);
+        seed_synthetic(TEST_FILE);
 
         // A box from the site eastward ~50 km. With 1 km bins the
         // sampled value at each pixel equals its ground-distance / 1000.
@@ -2920,7 +3214,18 @@ mod tests {
             site_lon + dlon_50km,
             site_lat + 0.001,
         ];
-        let tile = polar_sample(&vol, "DBZH", bbox, 50, 1, &OutputCrs::Wgs84, None).unwrap();
+        let tile = polar_sample(
+            &vol,
+            TEST_FILE,
+            test_pixels(),
+            "DBZH",
+            bbox,
+            50,
+            1,
+            &OutputCrs::Wgs84,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(tile.values.len(), 50);
         // Leftmost pixel ≈ at the site → bin 0.
@@ -2943,6 +3248,7 @@ mod tests {
     fn polar_sample_beyond_range_is_none() {
         let (site_lon, site_lat) = (25.0, 60.0);
         let vol = synthetic_volume(site_lon, site_lat); // 100 bins × 1 km = 100 km
+        seed_synthetic(TEST_FILE);
 
         // 300 km east — well past the 100 km sweep.
         let dlon = 300_000.0 / (EARTH_RADIUS_M * site_lat.to_radians().cos()) * 180.0
@@ -2953,29 +3259,46 @@ mod tests {
             site_lon + dlon + 0.01,
             site_lat + 0.001,
         ];
-        let tile = polar_sample(&vol, "DBZH", bbox, 4, 1, &OutputCrs::Wgs84, None).unwrap();
+        let tile = polar_sample(
+            &vol,
+            TEST_FILE,
+            test_pixels(),
+            "DBZH",
+            bbox,
+            4,
+            1,
+            &OutputCrs::Wgs84,
+            None,
+        )
+        .unwrap();
         assert!(
             tile.values.iter().all(Option::is_none),
             "pixels past max range must be None"
         );
     }
 
-    /// Build a single moment whose raw `[ray, bin]` value is `set(ray, bin)`.
-    fn moment_with(nrays: usize, nbins: usize, set: impl Fn(usize, usize) -> u16) -> PolarMoment {
+    /// Build a single moment (metadata) plus its raw `[ray, bin]` pixel
+    /// array, where each cell is `set(ray, bin)`.
+    fn moment_with(
+        nrays: usize,
+        nbins: usize,
+        set: impl Fn(usize, usize) -> u16,
+    ) -> (PolarMoment, RawPixels) {
         let mut data = Array2::<u16>::zeros((nrays, nbins));
         for r in 0..nrays {
             for b in 0..nbins {
                 data[(r, b)] = set(r, b);
             }
         }
-        PolarMoment {
+        let moment = PolarMoment {
             quantity: "DBZH".to_string(),
             gain: 1.0,
             offset: 0.0,
             nodata: 65_535.0,
             undetect: 65_534.0,
-            data: RawPixels::U16(data),
-        }
+            dataset_path: SYNTHETIC_DS.to_string(),
+        };
+        (moment, RawPixels::U16(data))
     }
 
     /// Bilinear blends across the two straddling rays (the anti-spoke
@@ -2983,12 +3306,12 @@ mod tests {
     /// bin 10 samples the mean, 30 — not one ray's value.
     #[test]
     fn bilinear_cell_blends_adjacent_rays() {
-        let m = moment_with(360, 20, |r, b| match (r, b) {
+        let (m, px) = moment_with(360, 20, |r, b| match (r, b) {
             (0, 10) => 20,
             (1, 10) => 40,
             _ => 0,
         });
-        let v = bilinear_cell(&m, 360, 20, 0.5, 10.0).unwrap();
+        let v = bilinear_cell(&px, &m, 360, 20, 0.5, 10.0).unwrap();
         assert!((v - 30.0).abs() < 1e-9, "ray blend (20+40)/2, got {v}");
     }
 
@@ -2996,12 +3319,12 @@ mod tests {
     /// blend for a point just inside the last ray.
     #[test]
     fn bilinear_cell_wraps_azimuth_seam() {
-        let m = moment_with(360, 20, |r, b| match (r, b) {
+        let (m, px) = moment_with(360, 20, |r, b| match (r, b) {
             (359, 10) => 10,
             (0, 10) => 30,
             _ => 0,
         });
-        let v = bilinear_cell(&m, 360, 20, 359.5, 10.0).unwrap();
+        let v = bilinear_cell(&px, &m, 360, 20, 359.5, 10.0).unwrap();
         assert!((v - 20.0).abs() < 1e-9, "seam blend (10+30)/2, got {v}");
     }
 
@@ -3011,12 +3334,12 @@ mod tests {
     /// value, not half of it).
     #[test]
     fn bilinear_cell_renormalises_over_masked_neighbours() {
-        let m = moment_with(360, 20, |r, b| match (r, b) {
+        let (m, px) = moment_with(360, 20, |r, b| match (r, b) {
             (0, 10) => 20,
             (1, 10) => 65_535, // nodata
             _ => 0,
         });
-        let v = bilinear_cell(&m, 360, 20, 0.5, 10.0).unwrap();
+        let v = bilinear_cell(&px, &m, 360, 20, 0.5, 10.0).unwrap();
         assert!(
             (v - 20.0).abs() < 1e-9,
             "masked neighbour renormalised away, got {v}"
@@ -3026,16 +3349,16 @@ mod tests {
     /// Every contributing neighbour masked → `None` (transparent).
     #[test]
     fn bilinear_cell_all_masked_is_none() {
-        let m = moment_with(360, 20, |_, b| if b == 10 { 65_535 } else { 0 });
-        assert!(bilinear_cell(&m, 360, 20, 0.5, 10.0).is_none());
+        let (m, px) = moment_with(360, 20, |_, b| if b == 10 { 65_535 } else { 0 });
+        assert!(bilinear_cell(&px, &m, 360, 20, 0.5, 10.0).is_none());
     }
 
     /// A range-edge neighbour (`bin + 1 == nbins`) is dropped, not read
     /// out of bounds; the in-range cell still samples.
     #[test]
     fn bilinear_cell_drops_range_edge_neighbour() {
-        let m = moment_with(360, 20, |_, b| if b == 19 { 42 } else { 0 });
-        let v = bilinear_cell(&m, 360, 20, 5.0, 19.5).unwrap();
+        let (m, px) = moment_with(360, 20, |_, b| if b == 19 { 42 } else { 0 });
+        let v = bilinear_cell(&px, &m, 360, 20, 5.0, 19.5).unwrap();
         assert!((v - 42.0).abs() < 1e-9, "edge neighbour dropped, got {v}");
     }
 
@@ -3052,10 +3375,26 @@ mod tests {
         let dlon = 10_500.0 / (EARTH_RADIUS_M * site_lat.to_radians().cos()) * 180.0
             / std::f64::consts::PI;
         let (lon, lat) = (site_lon + dlon, site_lat);
-        let bilinear = sample_sweep_moment_bilinear(sweep, moment, site_lon, site_lat, lon, lat)
-            .expect("bilinear sample");
-        let nearest =
-            sample_sweep_moment(sweep, moment, site_lon, site_lat, lon, lat).expect("nn sample");
+        let bilinear = sample_sweep_moment_bilinear(
+            sweep,
+            moment,
+            &synthetic_raw(),
+            site_lon,
+            site_lat,
+            lon,
+            lat,
+        )
+        .expect("bilinear sample");
+        let nearest = sample_sweep_moment(
+            sweep,
+            moment,
+            &synthetic_raw(),
+            site_lon,
+            site_lat,
+            lon,
+            lat,
+        )
+        .expect("nn sample");
         assert!(
             (bilinear - 10.5).abs() < 0.1,
             "bilinear interpolates to ≈ 10.5, got {bilinear}"
@@ -3077,6 +3416,7 @@ mod tests {
         assert!(sample_sweep_moment_bilinear(
             &vol.sweeps[0],
             &vol.sweeps[0].moments[0],
+            &synthetic_raw(),
             site_lon,
             site_lat,
             lon,
@@ -3089,6 +3429,7 @@ mod tests {
                 sample_sweep_moment_bilinear(
                     &vol.sweeps[0],
                     &vol.sweeps[0].moments[0],
+                    &synthetic_raw(),
                     site_lon,
                     site_lat,
                     lon,
@@ -3113,6 +3454,7 @@ mod tests {
         assert!(sample_sweep_moment(
             &vol.sweeps[0],
             &vol.sweeps[0].moments[0],
+            &synthetic_raw(),
             site_lon,
             site_lat,
             lon,
@@ -3125,6 +3467,7 @@ mod tests {
                 sample_sweep_moment(
                     &vol.sweeps[0],
                     &vol.sweeps[0].moments[0],
+                    &synthetic_raw(),
                     site_lon,
                     site_lat,
                     lon,
@@ -3152,13 +3495,21 @@ mod tests {
                 data[(r, b)] = r as u16; // value = ray index, constant across bins
             }
         }
+        // This test uses a custom pixel array (value = ray index), so seed
+        // the cache with *this* array under TEST_FILE rather than the
+        // standard `synthetic_raw()`.
+        pixel_cache().insert(
+            TEST_FILE,
+            SYNTHETIC_DS,
+            std::sync::Arc::new(RawPixels::U16(data)),
+        );
         let moment = PolarMoment {
             quantity: "DBZH".to_string(),
             gain: 1.0,
             offset: 0.0,
             nodata: 65_535.0,
             undetect: 65_534.0,
-            data: RawPixels::U16(data),
+            dataset_path: SYNTHETIC_DS.to_string(),
         };
         let sweep = Sweep {
             elangle: 0.5,
@@ -3189,7 +3540,18 @@ mod tests {
             site_lon + 0.25,
             site_lat + 0.25,
         ];
-        let tile = polar_sample(&vol, "DBZH", bbox, 24, 24, &OutputCrs::Wgs84, None).unwrap();
+        let tile = polar_sample(
+            &vol,
+            TEST_FILE,
+            test_pixels(),
+            "DBZH",
+            bbox,
+            24,
+            24,
+            &OutputCrs::Wgs84,
+            None,
+        )
+        .unwrap();
         // Value varies only by ray, so any fractional pixel proves the
         // render blended across rays — impossible for nearest-neighbour.
         let fractional = tile
@@ -3207,9 +3569,12 @@ mod tests {
     #[test]
     fn polar_sample_unknown_quantity_errors() {
         let vol = synthetic_volume(25.0, 60.0);
+        seed_synthetic(TEST_FILE);
         // `RasterTile` has no `Debug`, so match rather than `unwrap_err`.
         match polar_sample(
             &vol,
+            TEST_FILE,
+            test_pixels(),
             "VRADH",
             [24.0, 59.0, 26.0, 61.0],
             4,
@@ -3355,8 +3720,11 @@ mod tests {
 
     // --- EdrEngine helpers -------------------------------------------------
 
-    /// Wrap a synthetic volume in a `VolumeEntry` for catalog tests.
+    /// Wrap a synthetic volume in a `VolumeEntry` for catalog tests, and
+    /// seed the lazy-pixel cache for it so samplers over this entry resolve
+    /// the synthetic array without touching the (nonexistent) source.
     fn entry(volume: PolarVolume, id: &str) -> VolumeEntry {
+        seed_synthetic(id);
         VolumeEntry {
             id: id.to_string(),
             volume: Arc::new(volume),
@@ -3375,6 +3743,7 @@ mod tests {
             / std::f64::consts::PI;
         let covs = site_coverages(
             &volumes,
+            test_pixels(),
             site_lon + dlon,
             site_lat,
             None,
@@ -3407,7 +3776,16 @@ mod tests {
     fn site_coverages_no_z_yields_vertical_profile() {
         let (site_lon, site_lat) = (25.0, 60.0);
         let volumes = vec![entry(synthetic_volume(site_lon, site_lat), "v0")];
-        let covs = site_coverages(&volumes, site_lon, site_lat, None, None, None).unwrap();
+        let covs = site_coverages(
+            &volumes,
+            test_pixels(),
+            site_lon,
+            site_lat,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(covs.len(), 1);
         match &covs[0].domain {
             DomainDescription::VerticalProfile { z, .. } => {
@@ -3449,6 +3827,7 @@ mod tests {
         // range, querying both quantities at once.
         let profile = volume_profile(
             &entry(vol, "v0"),
+            test_pixels(),
             site_lon + 0.05,
             site_lat,
             &["DBZH".to_string(), "VRADH".to_string()],
@@ -3499,8 +3878,14 @@ mod tests {
         nan_sweep.elangle = f64::NAN;
         vol.sweeps.push(nan_sweep);
 
-        let profile = volume_profile(&entry(vol, "v0"), site_lon, site_lat, &["DBZH".to_string()])
-            .expect("one finite sweep remains, so a coverage is produced");
+        let profile = volume_profile(
+            &entry(vol, "v0"),
+            test_pixels(),
+            site_lon,
+            site_lat,
+            &["DBZH".to_string()],
+        )
+        .expect("one finite sweep remains, so a coverage is produced");
         match &profile.domain {
             DomainDescription::VerticalProfile { z, .. } => {
                 assert!(
@@ -3525,7 +3910,13 @@ mod tests {
         for s in &mut vol.sweeps {
             s.elangle = f64::NAN;
         }
-        let result = volume_profile(&entry(vol, "v0"), site_lon, site_lat, &["DBZH".to_string()]);
+        let result = volume_profile(
+            &entry(vol, "v0"),
+            test_pixels(),
+            site_lon,
+            site_lat,
+            &["DBZH".to_string()],
+        );
         assert!(result.is_none(), "expected None, got {result:?}");
     }
 
@@ -3536,7 +3927,15 @@ mod tests {
         let past = DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        match site_coverages(&volumes, 25.0, 60.0, Some((past, past)), None, None) {
+        match site_coverages(
+            &volumes,
+            test_pixels(),
+            25.0,
+            60.0,
+            Some((past, past)),
+            None,
+            None,
+        ) {
             Err(DataServerError::LocationNotFound(_)) => {}
             other => panic!("expected LocationNotFound, got {other:?}"),
         }
@@ -3547,7 +3946,15 @@ mod tests {
     fn site_coverages_unknown_parameter_errors() {
         let volumes = vec![entry(synthetic_volume(25.0, 60.0), "v0")];
         let filter = ["NONESUCH".to_string()];
-        match site_coverages(&volumes, 25.0, 60.0, None, Some(&filter), None) {
+        match site_coverages(
+            &volumes,
+            test_pixels(),
+            25.0,
+            60.0,
+            None,
+            Some(&filter),
+            None,
+        ) {
             Err(DataServerError::InvalidParameter(_)) => {}
             other => panic!("expected InvalidParameter, got {other:?}"),
         }
@@ -3561,6 +3968,9 @@ mod tests {
         let catalog = derive_catalog(by_site, &cache, None);
         PolarVolumeSiteView {
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
+            source: Arc::new(Source::Local {
+                data_dir: PathBuf::from("/nonexistent-test-pvol"),
+            }),
             nod: nod.to_string(),
             collection_id: format!("test-{nod}"),
         }
@@ -3705,6 +4115,9 @@ mod tests {
         // `sites()` (via an engine over this catalog) returns only `good`.
         let view = PolarVolumeSiteView {
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
+            source: Arc::new(Source::Local {
+                data_dir: PathBuf::from("/nonexistent-test-pvol"),
+            }),
             nod: "good".into(),
             collection_id: "test".into(),
         };
