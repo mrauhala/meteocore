@@ -420,7 +420,6 @@ pub async fn collections(
         .map(|r| CollectionMatch {
             title: &r.1,
             description: &r.2,
-            keywords: &[],
             bbox: r.3,
             time: None,
         })

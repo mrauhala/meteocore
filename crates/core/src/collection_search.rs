@@ -53,7 +53,6 @@ impl SearchError {
 pub struct CollectionMatch<'a> {
     pub title: &'a str,
     pub description: &'a str,
-    pub keywords: &'a [String],
     /// CRS84 bbox `[west, south, east, north]`, if the collection has one.
     pub bbox: Option<[f64; 4]>,
     /// Temporal interval `(start, end)`, if the collection has one.
@@ -260,7 +259,7 @@ fn matches(it: &CollectionMatch, p: &SearchParams) -> bool {
             Some(_) => return false,
         }
     }
-    if !p.q.is_empty() && !q_matches(&p.q, it.title, it.description, it.keywords) {
+    if !p.q.is_empty() && !q_matches(&p.q, it.title, it.description) {
         return false;
     }
     true
@@ -285,23 +284,23 @@ fn lon_overlaps(qw: f64, qe: f64, cw: f64, ce: f64) -> bool {
 }
 
 /// Whole-word (or, for terms containing whitespace, phrase) match of any `q`
-/// term against the collection's title, description, or keywords. Terms are
-/// pre-lowercased; comparison is Unicode-case-insensitive (Finnish ä/ö etc.).
-fn q_matches(terms: &[String], title: &str, description: &str, keywords: &[String]) -> bool {
+/// term against the collection's title or description. Terms are pre-lowercased;
+/// comparison is Unicode-case-insensitive (Finnish ä/ö etc.).
+///
+/// Keyword search is intentionally not included: `CollectionConfig` has no
+/// `keywords` field yet (tracked as a follow-up), so matching only the fields
+/// that actually exist avoids carrying dead code.
+fn q_matches(terms: &[String], title: &str, description: &str) -> bool {
     terms.iter().any(|term| {
         if term.chars().any(char::is_whitespace) {
             // Phrase: case-insensitive substring within a *single* field, so the
             // boundary between two fields can't form a phantom match (e.g. title
-            // "Finnish Weather" + keyword "Helsinki" must not match "weather
-            // helsinki"). Each keyword is checked individually for the same reason.
+            // "Finnish Weather" + description "Helsinki …" must not match
+            // "weather helsinki").
             let t = term.as_str();
-            title.to_lowercase().contains(t)
-                || description.to_lowercase().contains(t)
-                || keywords.iter().any(|k| k.to_lowercase().contains(t))
+            title.to_lowercase().contains(t) || description.to_lowercase().contains(t)
         } else {
-            word_match(title, term)
-                || word_match(description, term)
-                || keywords.iter().any(|k| word_match(k, term))
+            word_match(title, term) || word_match(description, term)
         }
     })
 }
@@ -428,14 +427,12 @@ mod tests {
     fn cm<'a>(
         title: &'a str,
         description: &'a str,
-        keywords: &'a [String],
         bbox: Option<[f64; 4]>,
         time: Option<(DateTime<Utc>, DateTime<Utc>)>,
     ) -> CollectionMatch<'a> {
         CollectionMatch {
             title,
             description,
-            keywords,
             bbox,
             time,
         }
@@ -486,9 +483,8 @@ mod tests {
 
     #[test]
     fn phrase_q_does_not_match_across_fields() {
-        let kw = vec!["Helsinki".to_string(), "radar".to_string()];
-        let items = [cm("Finnish Weather", "", &kw, None, None)];
-        // "weather helsinki" spans the title→keyword boundary — must NOT match.
+        let items = [cm("Finnish Weather", "Helsinki radar", None, None)];
+        // "weather helsinki" spans the title→description boundary — must NOT match.
         let across =
             parse_search_params(None, None, None, Some("weather helsinki"), None, None).unwrap();
         assert_eq!(search(&items, &across).number_matched, 0);
@@ -500,8 +496,7 @@ mod tests {
 
     #[test]
     fn no_prev_exactly_off_the_end() {
-        let kw: Vec<String> = vec![];
-        let items: Vec<CollectionMatch> = (0..4).map(|_| cm("a", "", &kw, None, None)).collect();
+        let items: Vec<CollectionMatch> = (0..4).map(|_| cm("a", "", None, None)).collect();
         // offset == number_matched: empty page, no prev (prev implies a result page).
         let p = parse_search_params(None, None, None, None, Some("2"), Some("4")).unwrap();
         let r = search(&items, &p);
@@ -543,11 +538,10 @@ mod tests {
 
     #[test]
     fn bbox_filter_includes_and_excludes() {
-        let kw: Vec<String> = vec![];
-        let inside = cm("a", "", &kw, Some([20.0, 60.0, 25.0, 65.0]), None);
-        let outside = cm("b", "", &kw, Some([-10.0, -10.0, -5.0, -5.0]), None);
+        let inside = cm("a", "", Some([20.0, 60.0, 25.0, 65.0]), None);
+        let outside = cm("b", "", Some([-10.0, -10.0, -5.0, -5.0]), None);
         // "unknown extent ≡ unbounded": a collection with no bbox matches.
-        let no_bbox = cm("c", "", &kw, None, None);
+        let no_bbox = cm("c", "", None, None);
         let items = [inside, outside, no_bbox];
         let p = parse_search_params(Some("0,50,30,70"), None, None, None, None, None).unwrap();
         let r = search(&items, &p);
@@ -558,10 +552,9 @@ mod tests {
 
     #[test]
     fn unknown_extent_is_unbounded() {
-        let kw: Vec<String> = vec![];
         // No spatial and no temporal extent → matches both bbox and datetime
         // filters (OGC API – Common – Part 4 §7.14.2 / §7.14.3).
-        let items = [cm("a", "", &kw, None, None)];
+        let items = [cm("a", "", None, None)];
         let bbox = parse_search_params(Some("0,0,1,1"), None, None, None, None, None).unwrap();
         assert_eq!(search(&items, &bbox).number_matched, 1);
         let dt = parse_search_params(None, None, Some("2026-06-02T00:00:00Z"), None, None, None)
@@ -571,8 +564,7 @@ mod tests {
 
     #[test]
     fn prev_suppressed_when_offset_out_of_range() {
-        let kw: Vec<String> = vec![];
-        let items: Vec<CollectionMatch> = (0..3).map(|_| cm("a", "", &kw, None, None)).collect();
+        let items: Vec<CollectionMatch> = (0..3).map(|_| cm("a", "", None, None)).collect();
         // offset far beyond the 3 matches: empty page, and no `prev` chain.
         let p = parse_search_params(None, None, None, None, Some("2"), Some("5000")).unwrap();
         let r = search(&items, &p);
@@ -590,11 +582,9 @@ mod tests {
 
     #[test]
     fn datetime_overlap_filter() {
-        let kw: Vec<String> = vec![];
         let c = cm(
             "a",
             "",
-            &kw,
             None,
             Some((t("2026-06-01T00:00:00Z"), t("2026-06-03T00:00:00Z"))),
         );
@@ -608,9 +598,8 @@ mod tests {
     }
 
     #[test]
-    fn q_whole_word_and_keywords_and_unicode() {
-        let kw = vec!["sää".to_string(), "tutka".to_string()];
-        let c = cm("Helsinki Radar", "Reflectivity composite", &kw, None, None);
+    fn q_whole_word_and_unicode() {
+        let c = cm("Helsinki Radar", "Reflectivity composite sää", None, None);
         let items = [c];
         // whole word, case-insensitive
         assert_eq!(
@@ -621,7 +610,7 @@ mod tests {
             .number_matched,
             1
         );
-        // keyword match, Unicode case-insensitive (SÄÄ -> sää)
+        // whole word in description, Unicode case-insensitive (SÄÄ -> sää)
         assert_eq!(
             search(
                 &items,
@@ -652,8 +641,7 @@ mod tests {
 
     #[test]
     fn pagination_cursors() {
-        let kw: Vec<String> = vec![];
-        let items: Vec<CollectionMatch> = (0..5).map(|_| cm("a", "", &kw, None, None)).collect();
+        let items: Vec<CollectionMatch> = (0..5).map(|_| cm("a", "", None, None)).collect();
         let p = parse_search_params(None, None, None, None, Some("2"), Some("2")).unwrap();
         let r = search(&items, &p);
         assert_eq!(r.number_matched, 5);
