@@ -361,6 +361,7 @@ impl SearchQueryParams {
             self.q.as_deref(),
             limit_str.as_deref(),
             offset,
+            self.f.as_deref(),
         )
     }
 }
@@ -376,6 +377,7 @@ pub fn page_query_string(
     q: Option<&str>,
     limit: Option<&str>,
     offset: usize,
+    f: Option<&str>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut push = |key: &str, val: Option<&str>| {
@@ -390,6 +392,13 @@ pub fn page_query_string(
     push("limit", limit);
     if offset > 0 {
         parts.push(format!("offset={offset}"));
+    }
+    // Preserve the requested format across pagination links so an HTML
+    // `/collections` page's next/prev links stay HTML (don't revert to JSON).
+    // Pushed directly (not via the `push` closure) so the closure's mutable
+    // borrow of `parts` ends before the direct `offset` push above.
+    if let Some(v) = f.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(format!("f={}", encode_qval(v)));
     }
     if parts.is_empty() {
         String::new()
@@ -663,18 +672,32 @@ mod tests {
             Some("radar"),
             Some("10"),
             10,
+            None,
         );
         assert_eq!(
             qs,
             "?bbox=20,60,30,70&datetime=2026-06-02T00:00:00Z&q=radar&limit=10&offset=10"
         );
         // No params, offset 0 → empty (backward compatible self link).
-        assert_eq!(page_query_string(None, None, None, None, None, 0), "");
+        assert_eq!(page_query_string(None, None, None, None, None, 0, None), "");
         // Spaces get percent-encoded.
         assert_eq!(
-            page_query_string(None, None, None, Some("heavy rain"), None, 0),
+            page_query_string(None, None, None, Some("heavy rain"), None, 0, None),
             "?q=heavy%20rain"
         );
+    }
+
+    #[test]
+    fn query_string_preserves_format_across_pagination() {
+        // An HTML /collections page's next/prev links must keep ?f=html.
+        let sp = SearchQueryParams {
+            f: Some("html".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(sp.query_string(DEFAULT_LIMIT, 20), "?offset=20&f=html");
+        // No format requested → links omit f.
+        let none = SearchQueryParams::default();
+        assert_eq!(none.query_string(DEFAULT_LIMIT, 20), "?offset=20");
     }
 
     #[test]

@@ -88,6 +88,14 @@ fn negotiate(f: Option<&str>, headers: &HeaderMap) -> Result<ds_core::html::Want
     ds_core::html::negotiate(f, accept).map_err(|e| bad_request_msg(&e.to_string()))
 }
 
+/// Tag a content-negotiated response with `Vary: Accept` so shared caches
+/// don't serve the JSON body to a client that asked for HTML (or vice versa).
+fn with_vary(mut resp: Response) -> Response {
+    resp.headers_mut()
+        .insert(header::VARY, axum::http::HeaderValue::from_static("accept"));
+    resp
+}
+
 /// Shared state for the EDR API: a registry of collection engines + metadata.
 #[derive(Clone)]
 pub struct EdrState {
@@ -188,7 +196,7 @@ pub async fn landing_page(
             "Collections",
         ),
     ];
-    Ok(match wanted {
+    Ok(with_vary(match wanted {
         Wanted::Json => {
             let json_links: Vec<_> = links
                 .iter()
@@ -204,7 +212,7 @@ pub async fn landing_page(
                 .collect();
             Html(ds_core::html::landing_html(title, description, &views)).into_response()
         }
-    })
+    }))
 }
 
 /// OpenAPI `parameters` array for the OGC API – Common – Part 4 searchable
@@ -597,10 +605,10 @@ pub async fn conformance(
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/json",
         "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/covjson",
     ];
-    Ok(match wanted {
+    Ok(with_vary(match wanted {
         Wanted::Json => Json(json!({ "conformsTo": classes })).into_response(),
         Wanted::Html => Html(ds_core::html::conformance_html(&classes)).into_response(),
-    })
+    }))
 }
 
 pub async fn collections(
@@ -661,7 +669,7 @@ pub async fn collections(
         )
     };
 
-    Ok(match wanted {
+    Ok(with_vary(match wanted {
         Wanted::Json => {
             let collections: Vec<serde_json::Value> =
                 result.page.iter().map(|&i| rows[i].5.clone()).collect();
@@ -721,7 +729,7 @@ pub async fn collections(
             }
             Html(ds_core::html::collections_html("Collections", &cards, &nav)).into_response()
         }
-    })
+    }))
 }
 
 pub async fn collection(
@@ -735,7 +743,7 @@ pub async fn collection(
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
     let base = &state.base_url;
-    Ok(match wanted {
+    Ok(with_vary(match wanted {
         Wanted::Json => {
             Json(build_collection_metadata(engine.as_ref(), config, base)).into_response()
         }
@@ -760,7 +768,7 @@ pub async fn collection(
             ];
             Html(ds_core::html::collection_html(&card, &links)).into_response()
         }
-    })
+    }))
 }
 
 pub async fn locations(

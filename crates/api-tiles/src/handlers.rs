@@ -106,6 +106,16 @@ fn negotiate(f: Option<&str>, headers: &HeaderMap) -> Result<ds_core::html::Want
     ds_core::html::negotiate(f, accept).map_err(|e| TilesError::BadRequest(e.to_string()))
 }
 
+/// Tag a content-negotiated response with `Vary: Accept` so shared caches
+/// don't serve the JSON body to a client that asked for HTML (or vice versa).
+fn with_vary(mut resp: Response) -> Response {
+    resp.headers_mut().insert(
+        axum::http::header::VARY,
+        axum::http::HeaderValue::from_static("accept"),
+    );
+    resp
+}
+
 fn build_collection_metadata(
     config: &CollectionConfig,
     raster_info: Option<&ds_core::map_engine::RasterInfo>,
@@ -313,7 +323,7 @@ pub async fn landing_page(
             "Tile matrix sets",
         ),
     ];
-    Ok(match wanted {
+    Ok(with_vary(match wanted {
         Wanted::Json => {
             let json_links: Vec<_> = links
                 .iter()
@@ -329,7 +339,7 @@ pub async fn landing_page(
                 .collect();
             Html(ds_core::html::landing_html(title, description, &views)).into_response()
         }
-    })
+    }))
 }
 
 /// OpenAPI `parameters` array for the OGC API – Common – Part 4 searchable
@@ -619,10 +629,10 @@ pub async fn conformance(
         "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/jpeg",
         "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/mvt",
     ];
-    Ok(match wanted {
+    Ok(with_vary(match wanted {
         Wanted::Json => Json(json!({ "conformsTo": classes })).into_response(),
         Wanted::Html => Html(ds_core::html::conformance_html(&classes)).into_response(),
-    })
+    }))
 }
 
 /// GET /tiles/tileMatrixSets — List supported tile matrix sets
@@ -742,7 +752,7 @@ pub async fn collections(
         )
     };
 
-    Ok(match wanted {
+    Ok(with_vary(match wanted {
         Wanted::Json => {
             let colls: Vec<serde_json::Value> =
                 result.page.iter().map(|&i| rows[i].5.clone()).collect();
@@ -804,7 +814,7 @@ pub async fn collections(
             }
             Html(ds_core::html::collections_html("Collections", &cards, &nav)).into_response()
         }
-    })
+    }))
 }
 
 /// GET /tiles/collections/{id} — Collection detail
@@ -833,7 +843,7 @@ pub async fn collection(
         )));
     }
     let base = &state.base_url;
-    Ok(match wanted {
+    Ok(with_vary(match wanted {
         Wanted::Json => {
             let styles = state.styles.get(&id);
             Json(build_collection_metadata(
@@ -866,7 +876,7 @@ pub async fn collection(
             ];
             Html(ds_core::html::collection_html(&card, &links)).into_response()
         }
-    })
+    }))
 }
 
 /// GET /tiles/collections/{id}/tiles — List tilesets for a collection

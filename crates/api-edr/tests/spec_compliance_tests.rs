@@ -1130,4 +1130,25 @@ mod content_negotiation {
         let (status, _, _) = get_raw("/collections?f=xml", None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
+
+    /// Negotiated responses carry `Vary: Accept` so shared caches don't serve
+    /// the wrong representation.
+    #[tokio::test]
+    async fn negotiated_responses_set_vary_accept() {
+        for uri in ["/collections", "/collections?f=html", "/conformance", "/"] {
+            let resp = app()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let vary = resp
+                .headers()
+                .get("vary")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert!(
+                vary.to_ascii_lowercase().contains("accept"),
+                "{uri}: missing Vary: Accept (got {vary:?})"
+            );
+        }
+    }
 }

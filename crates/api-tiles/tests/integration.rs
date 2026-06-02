@@ -1826,4 +1826,39 @@ mod content_negotiation {
         let (status, _, _) = get_raw("/collections?f=xml").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn accept_header_selects_html() {
+        let app = build_router();
+        let req = Request::builder()
+            .uri("/collections")
+            .header("accept", "text/html")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("text/html"), "content-type was {ct}");
+    }
+
+    /// Negotiated responses carry `Vary: Accept` so shared caches don't serve
+    /// the wrong representation.
+    #[tokio::test]
+    async fn negotiated_responses_set_vary_accept() {
+        for uri in ["/collections", "/collections?f=html", "/conformance", "/"] {
+            let (_, headers, _) = get_raw(uri).await;
+            let vary = headers
+                .get("vary")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert!(
+                vary.to_ascii_lowercase().contains("accept"),
+                "{uri}: missing Vary: Accept (got {vary:?})"
+            );
+        }
+    }
 }
