@@ -362,6 +362,33 @@ mod conformance {
             .iter()
             .any(|c| c.as_str().unwrap().contains("conf/tilematrixset")));
     }
+
+    #[tokio::test]
+    async fn declares_ogcapi_common_part1_and_part2() {
+        // OGC API - Common Part 1 (Core) + Part 2 (Collections, JSON) — the
+        // landing page / conformance / collections resources satisfy them, so
+        // they are advertised for discovery (#291).
+        let (_, json) = get("/conformance").await;
+        let classes = json["conformsTo"].as_array().unwrap();
+        let has = |needle: &str| classes.iter().any(|c| c.as_str().unwrap().contains(needle));
+        assert!(has("ogcapi-common-1/1.0/conf/core"), "Common Part 1 Core");
+        assert!(
+            has("ogcapi-common-2/1.0/conf/collections"),
+            "Common Part 2 Collections"
+        );
+        assert!(has("ogcapi-common-2/1.0/conf/json"), "Common Part 2 JSON");
+    }
+
+    #[tokio::test]
+    async fn omits_common_html_class() {
+        // No HTML representation of /collections — declaring the HTML class
+        // would be a false conformance claim (#291).
+        let (_, json) = get("/conformance").await;
+        let classes = json["conformsTo"].as_array().unwrap();
+        assert!(!classes
+            .iter()
+            .any(|c| c.as_str().unwrap().contains("common-2/1.0/conf/html")));
+    }
 }
 
 // ---------------------------------------------------------------------------

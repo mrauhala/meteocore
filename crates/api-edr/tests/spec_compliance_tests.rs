@@ -713,6 +713,30 @@ async fn finding_18_conformance_has_ogc_common_classes() {
     );
 }
 
+// OGC API - Common - Part 2: Geospatial Data (20-024). #291: /collections +
+// /collections/{id} satisfy the Collections + JSON classes structurally, so
+// they are advertised for discovery. The HTML class is intentionally omitted.
+#[tokio::test]
+async fn declares_ogcapi_common_part2_classes() {
+    let (_status, json) = get_json("/conformance").await;
+    let conforms_to = json["conformsTo"].as_array().unwrap();
+    let uris: Vec<&str> = conforms_to.iter().filter_map(|v| v.as_str()).collect();
+    let has = |needle: &str| uris.iter().any(|u| u.contains(needle));
+
+    assert!(
+        has("ogcapi-common-2/1.0/conf/collections"),
+        "must declare OGC API Common Part 2 Collections class"
+    );
+    assert!(
+        has("ogcapi-common-2/1.0/conf/json"),
+        "must declare OGC API Common Part 2 JSON class"
+    );
+    assert!(
+        !has("ogcapi-common-2/1.0/conf/html"),
+        "must NOT declare the HTML class (no HTML /collections representation)"
+    );
+}
+
 // ===========================================================================
 // FINDING 19: No support for HTTP 308 redirect responses
 // ===========================================================================

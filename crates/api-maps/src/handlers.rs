@@ -615,6 +615,15 @@ pub async fn api_docs(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn conformance() -> impl IntoResponse {
     Json(json!({
         "conformsTo": [
+            // OGC API - Common - Part 1: Core (landing page, /conformance,
+            // /api) and Part 2: Geospatial Data (/collections + /collections/
+            // {id}, JSON). Both are satisfied structurally; the HTML class
+            // (.../common-2/.../conf/html) is omitted — no HTML /collections.
+            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
+            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page",
+            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/oas30",
+            "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/collections",
+            "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/json",
             "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/core",
             "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/collection-map",
             "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/styled-map",
