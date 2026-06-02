@@ -1583,3 +1583,163 @@ mod extent_edge_cases {
         assert!((lon_res - 0.01).abs() < 1e-9);
     }
 }
+
+// ---------------------------------------------------------------------------
+// OGC API - Common - Part 4: Searchable Collections (?bbox/datetime/q/limit)
+// ---------------------------------------------------------------------------
+
+mod searchable {
+    use super::*;
+
+    /// Build a Maps router with two collections so pagination links can be
+    /// exercised end-to-end. Both are backed by the same mock engine
+    /// (bbox [10,55,30,70], times 2024-01-01T00..01Z, title "Test Radar").
+    fn build_router_two() -> axum::Router {
+        let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+        let mut collections = HashMap::new();
+        for id in ["radar-a", "radar-b"] {
+            engines.insert(id.to_string(), Arc::new(MockMapEngine::new()));
+            collections.insert(
+                id.to_string(),
+                CollectionConfig {
+                    id: id.to_string(),
+                    title: "Test Radar".to_string(),
+                    description: "Test radar data".to_string(),
+                    data_path: None,
+                    apis: vec!["maps".to_string()],
+                    engine_type: "geotiff".to_string(),
+                    geotiff: None,
+                    querydata: None,
+                    wms: None,
+                    grib: None,
+                    odim: None,
+                    postgis: None,
+                    preview: None,
+                },
+            );
+        }
+        let state = Arc::new(ArcSwap::from_pointee(MapsState {
+            engines,
+            collections,
+            styles: HashMap::new(),
+            render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            rendered_cache: Arc::new(RenderedCache::new(16)),
+            base_url: String::new(),
+        }));
+        api_maps::router(state)
+    }
+
+    #[tokio::test]
+    async fn conformance_declares_searchable_collections() {
+        let (_, json) = get("/conformance").await;
+        let classes = json["conformsTo"].as_array().unwrap();
+        assert!(classes.iter().any(|c| c
+            .as_str()
+            .unwrap()
+            .contains("common-4/1.0/conf/searchable-collections")));
+    }
+
+    #[tokio::test]
+    async fn unfiltered_has_match_counts() {
+        let (status, json) = get("/collections").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["numberMatched"], 1);
+        assert_eq!(json["numberReturned"], 1);
+        assert_eq!(json["collections"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn q_matches_title_word() {
+        let (_, json) = get("/collections?q=radar").await;
+        assert_eq!(json["numberMatched"], 1);
+    }
+
+    #[tokio::test]
+    async fn q_no_match_excludes() {
+        let (_, json) = get("/collections?q=zzznotaword").await;
+        assert_eq!(json["numberMatched"], 0);
+        assert_eq!(json["numberReturned"], 0);
+        assert!(json["collections"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bbox_intersecting_includes() {
+        let (_, json) = get("/collections?bbox=0,50,15,60").await;
+        assert_eq!(json["numberMatched"], 1);
+    }
+
+    #[tokio::test]
+    async fn bbox_disjoint_excludes() {
+        let (_, json) = get("/collections?bbox=-50,-50,-40,-40").await;
+        assert_eq!(json["numberMatched"], 0);
+    }
+
+    #[tokio::test]
+    async fn datetime_within_extent_includes() {
+        let (_, json) = get("/collections?datetime=2024-01-01T00:30:00Z").await;
+        assert_eq!(json["numberMatched"], 1);
+    }
+
+    #[tokio::test]
+    async fn datetime_outside_extent_excludes() {
+        let (_, json) = get("/collections?datetime=2025-06-01T00:00:00Z").await;
+        assert_eq!(json["numberMatched"], 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_limit_is_400() {
+        let (status, _) = get("/collections?limit=0").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn invalid_bbox_is_400() {
+        let (status, _) = get("/collections?bbox=1,2,3").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn non_crs84_bbox_crs_is_400() {
+        let (status, _) = get("/collections?bbox=0,0,1,1&bbox-crs=EPSG:3857").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn pagination_first_page_has_next_not_prev() {
+        let app = build_router_two();
+        let (_, json) = get_on(app, "/collections?limit=1").await;
+        assert_eq!(json["numberMatched"], 2);
+        assert_eq!(json["numberReturned"], 1);
+        let links = json["links"].as_array().unwrap();
+        let next = links
+            .iter()
+            .find(|l| l["rel"] == "next")
+            .expect("next link");
+        assert!(next["href"].as_str().unwrap().contains("offset=1"));
+        assert!(!links.iter().any(|l| l["rel"] == "prev"));
+    }
+
+    #[tokio::test]
+    async fn pagination_second_page_has_prev_not_next() {
+        let app = build_router_two();
+        let (_, json) = get_on(app, "/collections?limit=1&offset=1").await;
+        assert_eq!(json["numberReturned"], 1);
+        let links = json["links"].as_array().unwrap();
+        assert!(links.iter().any(|l| l["rel"] == "prev"));
+        assert!(!links.iter().any(|l| l["rel"] == "next"));
+    }
+
+    #[tokio::test]
+    async fn self_link_preserves_query() {
+        let app = build_router_two();
+        let (_, json) = get_on(app, "/collections?q=radar&limit=1").await;
+        let links = json["links"].as_array().unwrap();
+        let self_link = links
+            .iter()
+            .find(|l| l["rel"] == "self")
+            .expect("self link");
+        let href = self_link["href"].as_str().unwrap();
+        assert!(href.contains("q=radar"));
+        assert!(href.contains("limit=1"));
+    }
+}

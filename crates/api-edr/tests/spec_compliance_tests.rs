@@ -263,22 +263,24 @@ async fn finding_04_landing_page_has_service_desc_link() {
 // ===========================================================================
 // FINDING 5: Collections endpoint ignores bbox query parameter
 // ===========================================================================
-// Spec: GET /collections supports optional query parameters: bbox, datetime, f
-// Implementation: collections() handler takes no query parameters at all.
-// Impact: Clients filtering collections by spatial/temporal extent get no filtering.
-// Fix: Add optional bbox/datetime/f query params to collections handler,
-//   filter the collection list accordingly.
+// Spec: GET /collections supports optional query parameters: bbox, datetime, q.
+// RESOLVED by OGC API – Common – Part 4 (Searchable Collections): /collections
+//   now filters by bbox/datetime/q. (The `f` content-negotiation param is
+//   separate — see FINDING 6.)
 
 #[tokio::test]
-async fn finding_05_collections_ignores_bbox_param() {
-    // Passing bbox should not cause an error (it should be accepted gracefully).
-    // Currently the param is simply ignored.
-    let (status, _json) = get_json("/collections?bbox=20,60,30,70").await;
+async fn finding_05_collections_bbox_filtering() {
+    // The mock collection's spatial extent is [19, 59, 32, 71].
+    // An intersecting bbox keeps it; a disjoint bbox filters it out.
+    let (status, hit) = get_json("/collections?bbox=20,60,30,70").await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        status,
-        StatusCode::OK,
-        "bbox param should be accepted (even if not yet filtering)"
+        hit["numberMatched"], 1,
+        "intersecting bbox must keep the collection"
     );
+
+    let (_, miss) = get_json("/collections?bbox=-50,-50,-40,-40").await;
+    assert_eq!(miss["numberMatched"], 0, "disjoint bbox must filter it out");
 }
 
 // ===========================================================================
@@ -672,20 +674,19 @@ async fn data_queries_default_output_format_set_for_all_query_types() {
 // ===========================================================================
 // Spec: GET /collections response SHOULD include numberMatched and
 //   numberReturned for pagination support.
-// Implementation: Only returns "collections" and "links".
-// Fix: Add "numberMatched" and "numberReturned" fields.
+// RESOLVED by OGC API - Common - Part 4 (Searchable Collections): /collections
+//   now returns both count fields alongside self/next/prev pagination links.
 
 #[tokio::test]
-async fn finding_17_collections_missing_count_fields() {
+async fn finding_17_collections_have_count_fields() {
     let (_status, json) = get_json("/collections").await;
-    // SPEC GAP: No pagination info
     assert!(
-        json.get("numberMatched").is_none(),
-        "Documenting: numberMatched not present"
+        json.get("numberMatched").and_then(Value::as_u64).is_some(),
+        "numberMatched must be present (Common Part 4)"
     );
     assert!(
-        json.get("numberReturned").is_none(),
-        "Documenting: numberReturned not present"
+        json.get("numberReturned").and_then(Value::as_u64).is_some(),
+        "numberReturned must be present (Common Part 4)"
     );
 }
 
@@ -1018,3 +1019,47 @@ async fn finding_30c_404_location_not_found() {
 // 28. Landing page structure is valid
 // 29. Collections response structure is valid
 // 30. Error responses work for 400/404 cases
+
+// ===========================================================================
+// OGC API - Common - Part 4: Searchable Collections — handler wiring smoke
+// ===========================================================================
+
+mod part4_searchable {
+    use super::*;
+
+    #[tokio::test]
+    async fn conformance_declares_searchable_collections() {
+        let (_, json) = get_json("/conformance").await;
+        let classes = json["conformsTo"].as_array().unwrap();
+        assert!(classes.iter().any(|c| c
+            .as_str()
+            .unwrap()
+            .contains("common-4/1.0/conf/searchable-collections")));
+    }
+
+    #[tokio::test]
+    async fn collections_has_match_counts() {
+        let (status, json) = get_json("/collections").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["numberMatched"].is_number());
+        assert!(json["numberReturned"].is_number());
+        assert!(json["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["rel"] == "self"));
+    }
+
+    #[tokio::test]
+    async fn invalid_limit_is_400() {
+        let (status, _) = get_json("/collections?limit=0").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn q_no_match_returns_empty() {
+        let (_, json) = get_json("/collections?q=zzznotaword").await;
+        assert_eq!(json["numberReturned"], 0);
+        assert!(json["collections"].as_array().unwrap().is_empty());
+    }
+}

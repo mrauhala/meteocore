@@ -302,6 +302,25 @@ pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+/// OpenAPI `parameters` array for the OGC API – Common – Part 4 searchable
+/// `/collections` query parameters.
+fn searchable_collections_parameters() -> serde_json::Value {
+    json!([
+        {"name": "bbox", "in": "query", "required": false, "schema": {"type": "string"},
+         "description": "Filter to collections intersecting this CRS84 bbox: 4 (or 6) comma-separated numbers west,south,east,north."},
+        {"name": "bbox-crs", "in": "query", "required": false, "schema": {"type": "string"},
+         "description": "CRS of the bbox values. Only CRS84 is supported."},
+        {"name": "datetime", "in": "query", "required": false, "schema": {"type": "string"},
+         "description": "Filter to collections whose temporal extent intersects this RFC 3339 instant or interval (start/end, ../end, start/..)."},
+        {"name": "q", "in": "query", "required": false, "schema": {"type": "string"},
+         "description": "Free-text search (comma-separated terms, OR) over collection title and description."},
+        {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 1000},
+         "description": "Maximum number of collections per page (default 1000)."},
+        {"name": "offset", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0},
+         "description": "Number of matching collections to skip (pagination cursor)."}
+    ])
+}
+
 /// GET /tiles/api — OpenAPI 3.0.3 definition
 pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
     let state = state.load_full();
@@ -441,6 +460,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             "get": {
                 "summary": "List tile-enabled collections",
                 "operationId": "getCollections",
+                "parameters": searchable_collections_parameters(),
                 "responses": { "200": {"description": "List of collections"} }
             }
         },
@@ -548,6 +568,10 @@ pub async fn conformance() -> impl IntoResponse {
             "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/oas30",
             "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/collections",
             "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/json",
+            // OGC API - Common - Part 4 (Discovery within many collections,
+            // draft 25-046): /collections supports bbox/bbox-crs/datetime/q/
+            // limit filtering + offset pagination.
+            "http://www.opengis.net/spec/ogcapi-common-4/1.0/conf/searchable-collections",
             "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/core",
             "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tileset",
             "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tilesets-list",
@@ -605,14 +629,24 @@ pub async fn tile_matrix_set(Path(tms_id): Path<String>) -> Result<impl IntoResp
 }
 
 /// GET /tiles/collections — List tile-enabled collections
-pub async fn collections(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn collections(
+    State(state): State<AppState>,
+    Query(sp): Query<ds_core::collection_search::SearchQueryParams>,
+) -> Result<Json<serde_json::Value>, TilesError> {
+    use ds_core::collection_search::{search, CollectionMatch};
+
+    let params = sp
+        .parse()
+        .map_err(|e| TilesError::BadRequest(e.to_string()))?;
     let state = state.load_full();
     let base = &state.base_url;
-    // Surface every tile-enabled collection, regardless of which engine
-    // backs it — a vector-only collection that lives in `feature_collections`
-    // would otherwise be invisible at the discovery endpoint.
+
+    // Surface every tile-enabled collection, regardless of which engine backs
+    // it — a vector-only collection that lives in `feature_collections` would
+    // otherwise be invisible. Rows are (id, title, description, bbox, time,
+    // metadata); tuple element types are inferred (no extra chrono import).
     let mut seen = std::collections::HashSet::new();
-    let mut colls: Vec<serde_json::Value> = Vec::new();
+    let mut rows: Vec<_> = Vec::new();
     for config in state
         .collections
         .values()
@@ -627,30 +661,64 @@ pub async fn collections(State(state): State<AppState>) -> impl IntoResponse {
             .get(&config.id)
             .and_then(|e| e.spatial_extent());
         let styles = state.styles.get(&config.id);
-        colls.push(build_collection_metadata(
-            config,
-            raster_info.as_ref(),
-            feature_extent,
-            styles,
-            base,
+        let value =
+            build_collection_metadata(config, raster_info.as_ref(), feature_extent, styles, base);
+        let bbox = raster_info
+            .as_ref()
+            .and_then(|i| i.spatial_extent)
+            .or(feature_extent);
+        let time = raster_info
+            .as_ref()
+            .and_then(|i| i.times.first().copied().zip(i.times.last().copied()));
+        rows.push((
+            config.id.clone(),
+            config.title.clone(),
+            config.description.clone(),
+            bbox,
+            time,
+            value,
         ));
     }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
 
-    colls.sort_by(|a, b| {
-        a["id"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(b["id"].as_str().unwrap_or(""))
-    });
+    let matches: Vec<CollectionMatch> = rows
+        .iter()
+        .map(|r| CollectionMatch {
+            title: &r.1,
+            description: &r.2,
+            bbox: r.3,
+            time: r.4,
+        })
+        .collect();
+    let result = search(&matches, &params);
+    let colls: Vec<serde_json::Value> = result.page.iter().map(|&i| rows[i].5.clone()).collect();
+    let number_returned = colls.len();
 
-    Json(json!({
-        "collections": colls,
-        "links": [{
-            "href": format!("{base}/tiles/collections"),
-            "rel": "self",
+    let link = |rel: &str, offset: usize, title: Option<&str>| {
+        let mut o = json!({
+            "href": format!("{base}/tiles/collections{}", sp.query_string(params.limit, offset)),
+            "rel": rel,
             "type": "application/json"
-        }]
-    }))
+        });
+        if let Some(t) = title {
+            o["title"] = json!(t);
+        }
+        o
+    };
+    let mut links = vec![link("self", params.offset, None)];
+    if result.has_next {
+        links.push(link("next", result.next_offset, Some("Next page")));
+    }
+    if result.has_prev {
+        links.push(link("prev", result.prev_offset, Some("Previous page")));
+    }
+
+    Ok(Json(json!({
+        "collections": colls,
+        "numberMatched": result.number_matched,
+        "numberReturned": number_returned,
+        "links": links
+    })))
 }
 
 /// GET /tiles/collections/{id} — Collection detail
