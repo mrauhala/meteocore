@@ -86,6 +86,28 @@ impl DataStore {
         Ok(result)
     }
 
+    /// Like [`Self::get`], but drives the fetch on an explicitly-provided
+    /// runtime `Handle` (`handle.block_on`) instead of `block_in_place`. Use
+    /// from a `spawn_blocking` pool thread — where `block_in_place` *panics*
+    /// (e.g. the PVOL lazy pixel reader on a render / trajectory request that
+    /// runs inside `spawn_blocking`). Must NOT be called from within a running
+    /// future on a request worker (an async execution context — `handle.block_on`
+    /// panics there); use [`Self::get`] for that.
+    #[allow(clippy::needless_question_mark)]
+    pub fn get_on(
+        &self,
+        path: &ObjectPath,
+        handle: &tokio::runtime::Handle,
+    ) -> Result<Bytes, DataServerError> {
+        let result = self.block_on_with(Some(handle), async {
+            let result = self.inner.get(path).await?;
+            Ok(result.bytes().await?)
+        })?;
+        self.bytes_read
+            .fetch_add(result.len() as u64, Ordering::Relaxed);
+        Ok(result)
+    }
+
     /// Return total bytes read from this store since creation.
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read.load(Ordering::Relaxed)

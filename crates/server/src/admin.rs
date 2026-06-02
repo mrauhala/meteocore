@@ -201,6 +201,54 @@ static RENDERED_CACHE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
     gauge
 });
 
+// PVOL lazy pixel cache (#289 / PR #290) — global byte-bounded LRU of decoded
+// radar moment arrays, shared across every per-site PVOL collection. The
+// failures counter surfaces the otherwise-silent degradation when a moment's
+// pixels can't be read/decoded at render time (was a hard catalog rejection
+// before lazy loading).
+static PVOL_PIXEL_CACHE_HITS: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new("pvol_pixel_cache_hits_total", "PVOL pixel cache hits").unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static PVOL_PIXEL_CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter =
+        IntCounter::new("pvol_pixel_cache_misses_total", "PVOL pixel cache misses").unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static PVOL_PIXEL_CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "pvol_pixel_cache_bytes",
+        "Bytes currently held in the PVOL pixel cache",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static PVOL_PIXEL_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "pvol_pixel_cache_capacity_bytes",
+        "Configured PVOL pixel cache capacity in bytes",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static PVOL_PIXEL_READ_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "pvol_pixel_read_failures_total",
+        "PVOL lazy pixel reads that failed (I/O or decode) and degraded to nodata",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
 // Meta-tile pixel cache (#202) — global, decoded-RGBA tiles for the Web
 // Mercator WMS meta-tiling path. Distinct from the per-collection GeoTIFF
 // compressed-byte tile cache (`tile_cache_*`).
@@ -327,6 +375,9 @@ struct CacheCounterState {
     grid: HashMap<String, (u64, u64)>,
     rendered: (u64, u64),
     metatile: (u64, u64),
+    /// PVOL pixel cache `(hits, misses, read_failures)` — global cache, never
+    /// replaced on reload, so always monotonic.
+    pvol_pixel: (u64, u64, u64),
 }
 
 static RENDER_SEMAPHORE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -2385,6 +2436,32 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     METATILE_CACHE_BYTES.set(wms.tile_cache.weight() as i64);
     METATILE_CACHE_CAPACITY_BYTES.set(wms.tile_cache.capacity() as i64);
     METATILE_CACHE_ENTRIES.set(wms.tile_cache.len() as i64);
+
+    // PVOL lazy pixel cache: process-global (never replaced on reload), so the
+    // cumulative counters are monotonic. Only emit when PVOL collections are
+    // loaded, so non-radar deployments don't carry empty `pvol_*` series.
+    let has_pvol = state
+        .odim_volume_engines
+        .read()
+        .map(|e| !e.is_empty())
+        .unwrap_or(false);
+    if has_pvol {
+        let (p_hits, p_misses, p_bytes, p_cap, p_fail) = engine_odim::pixel_cache_metrics();
+        let (last_ph, last_pm, last_pf) = counter_state.pvol_pixel;
+        // Defensive rebaseline (the global cache never resets in practice).
+        if p_hits < last_ph || p_misses < last_pm || p_fail < last_pf {
+            PVOL_PIXEL_CACHE_HITS.inc_by(0);
+            PVOL_PIXEL_CACHE_MISSES.inc_by(0);
+            PVOL_PIXEL_READ_FAILURES.inc_by(0);
+        } else {
+            PVOL_PIXEL_CACHE_HITS.inc_by(p_hits - last_ph);
+            PVOL_PIXEL_CACHE_MISSES.inc_by(p_misses - last_pm);
+            PVOL_PIXEL_READ_FAILURES.inc_by(p_fail - last_pf);
+        }
+        counter_state.pvol_pixel = (p_hits, p_misses, p_fail);
+        PVOL_PIXEL_CACHE_BYTES.set(p_bytes as i64);
+        PVOL_PIXEL_CACHE_CAPACITY_BYTES.set(p_cap as i64);
+    }
 
     // Tile cache: per-collection
     if let Ok(engines) = state.geotiff_engines.read() {

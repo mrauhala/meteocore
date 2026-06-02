@@ -101,6 +101,27 @@ pub(crate) fn pixel_cache() -> &'static PixelCache {
     &PIXEL_CACHE
 }
 
+/// Cumulative count of lazy pixel reads that failed (remote/local I/O or
+/// HDF5 decode) and so degraded to a transparent / nodata sample instead of
+/// real data. Before lazy loading a decode failure was a hard catalog
+/// rejection at scan time; now the failure is per-request and otherwise
+/// silent, so this counter (surfaced as `pvol_pixel_read_failures_total` in
+/// `/metrics`) makes the degradation observable (PR #290 review).
+static PIXEL_READ_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the process-global PVOL pixel cache for `/metrics`:
+/// `(hits, misses, resident_bytes, capacity_bytes, read_failures)`.
+pub fn pixel_cache_metrics() -> (u64, u64, u64, u64, u64) {
+    let (hits, misses) = PIXEL_CACHE.stats();
+    (
+        hits,
+        misses,
+        PIXEL_CACHE.weight(),
+        PIXEL_CACHE.capacity(),
+        PIXEL_READ_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Days of date-partitioned prefixes to scan when an S3 source has no
 /// `time_window`. Two days covers the just-after-midnight case where
 /// the recent tail still straddles yesterday's partition. Mirrors
@@ -340,9 +361,30 @@ fn source_label(source: &Source) -> String {
     }
 }
 
+/// Capture the current runtime handle for the lazy pixel fetch. Call ONLY
+/// from a `spawn_blocking` context (`get_raster_tile` / `query_trajectory`),
+/// where `handle.block_on` is valid and `block_in_place` would panic; the
+/// request-worker query paths pass `None` instead. Uses `try_current` (not
+/// `current`) so unit tests that invoke the trait methods outside any runtime
+/// — always with a `Local` source that ignores the handle — don't panic.
+fn blocking_pixel_handle() -> Option<tokio::runtime::Handle> {
+    tokio::runtime::Handle::try_current().ok()
+}
+
 /// Re-fetch one volume file's raw bytes by its [`FileId`] — a local path
 /// read or an S3 `get`. Used by the lazy pixel reader on a cache miss.
-fn fetch_file_bytes(source: &Source, file_id: &str) -> Result<Vec<u8>, String> {
+///
+/// `handle` picks the async→sync bridge for a remote fetch by the caller's
+/// runtime context (see [`Pixels::handle`]): `Some(handle)` drives the fetch
+/// via `handle.block_on` (valid on a `spawn_blocking` pool thread, where
+/// `block_in_place` *panics*); `None` uses the plain [`DataStore::get`],
+/// whose `block_in_place` is valid on a request-worker thread. A local read
+/// never touches a runtime, so the handle is irrelevant there.
+fn fetch_file_bytes(
+    source: &Source,
+    file_id: &str,
+    handle: Option<&tokio::runtime::Handle>,
+) -> Result<Vec<u8>, String> {
     match source {
         Source::Local { .. } => {
             std::fs::read(file_id).map_err(|e| format!("read `{file_id}`: {e}"))
@@ -350,8 +392,11 @@ fn fetch_file_bytes(source: &Source, file_id: &str) -> Result<Vec<u8>, String> {
         Source::Remote { store, .. } => {
             use ds_storage::object_store::path::Path as ObjectPath;
             let object = ObjectPath::from(file_id);
-            store
-                .get(&object)
+            let bytes = match handle {
+                Some(h) => store.get_on(&object, h),
+                None => store.get(&object),
+            };
+            bytes
                 .map(|b| b.to_vec())
                 .map_err(|e| format!("get `{file_id}`: {e}"))
         }
@@ -365,6 +410,14 @@ fn fetch_file_bytes(source: &Source, file_id: &str) -> Result<Vec<u8>, String> {
 #[derive(Clone, Copy)]
 struct Pixels<'a> {
     source: &'a Source,
+    /// Runtime context for a remote (S3) pixel fetch on a cache miss:
+    /// `Some(handle)` when the caller runs inside `spawn_blocking`
+    /// (`get_raster_tile` / `query_trajectory`) — the fetch then uses
+    /// `handle.block_on` because `block_in_place` panics on a `spawn_blocking`
+    /// pool thread. `None` on a request worker (EDR position / area /
+    /// locations), where the fetch must use `block_in_place` via the plain
+    /// `DataStore::get`. Irrelevant for a `Local` source.
+    handle: Option<&'a tokio::runtime::Handle>,
 }
 
 impl Pixels<'_> {
@@ -383,15 +436,19 @@ impl Pixels<'_> {
         if let Some(p) = PIXEL_CACHE.get(file_id, &moment.dataset_path) {
             return Some(p);
         }
-        let bytes = fetch_file_bytes(self.source, file_id)
-            .map_err(|e| tracing::warn!("PVOL lazy pixel read failed: {e}"))
+        let bytes = fetch_file_bytes(self.source, file_id, self.handle)
+            .map_err(|e| {
+                PIXEL_READ_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!("PVOL lazy pixel read failed: {e}");
+            })
             .ok()?;
         let raw = read_moment_pixels(&bytes, &moment.dataset_path, nrays, nbins)
             .map_err(|e| {
+                PIXEL_READ_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::warn!(
                     "PVOL pixel decode `{}` in `{file_id}`: {e}",
                     moment.dataset_path
-                )
+                );
             })
             .ok()?;
         let arc = Arc::new(raw);
@@ -2392,8 +2449,13 @@ impl MapEngine for PolarVolumeSiteView {
             ))
         })?;
 
+        // Runs inside `spawn_blocking` (api-{wms,maps,tiles} dispatch
+        // `get_raster_tile` there) — drive any S3 pixel fetch on the runtime
+        // handle, since `block_in_place` panics on a `spawn_blocking` thread.
+        let handle = blocking_pixel_handle();
         let pix = Pixels {
             source: &self.source,
+            handle: handle.as_ref(),
         };
         polar_sample(
             &entry.volume,
@@ -2484,8 +2546,13 @@ impl EdrEngine for PolarVolumeSiteView {
             .volume
             .site;
         let canonical = meta.vertical.as_ref().map(|v| v.levels.as_slice());
+        // EDR `query_location` runs directly on the request worker (the
+        // generic api-edr handler does not `spawn_blocking`), so any S3 pixel
+        // fetch must use `block_in_place` (the plain `DataStore::get`) — pass
+        // `None`. `handle.block_on` would panic in this async context.
         let pix = Pixels {
             source: &self.source,
+            handle: None,
         };
         site_point_query(
             volumes, pix, site.lon, site.lat, datetime, parameters, z, canonical,
@@ -2587,8 +2654,11 @@ impl EdrEngine for PolarVolumeSiteView {
             ))
         })?;
         let canonical = meta.vertical.as_ref().map(|v| v.levels.as_slice());
+        // Request-worker path (no `spawn_blocking`) — `None` selects the
+        // `block_in_place` fetch; see `query_location`.
         let pix = Pixels {
             source: &self.source,
+            handle: None,
         };
         site_point_query(volumes, pix, lon, lat, datetime, parameters, z, canonical)
     }
@@ -2625,8 +2695,11 @@ impl EdrEngine for PolarVolumeSiteView {
         })?;
         let canonical = meta.vertical.as_ref().map(|v| v.levels.as_slice());
         let levels = resolve_levels(canonical, z)?;
+        // Request-worker path (no `spawn_blocking`) — `None` selects the
+        // `block_in_place` fetch; see `query_location`.
         let pix = Pixels {
             source: &self.source,
+            handle: None,
         };
         let covs = site_coverages(
             volumes,
@@ -2677,8 +2750,13 @@ impl EdrEngine for PolarVolumeSiteView {
                 self.collection_id, self.nod
             ))
         })?;
+        // Runs inside `spawn_blocking` (api-edr dispatches `query_trajectory`
+        // there) — drive any S3 pixel fetch on the runtime handle, since
+        // `block_in_place` panics on a `spawn_blocking` thread.
+        let handle = blocking_pixel_handle();
         let pix = Pixels {
             source: &self.source,
+            handle: handle.as_ref(),
         };
         site_trajectory(volumes, pix, &path, datetime, parameters, z)
     }
@@ -3136,7 +3214,27 @@ mod tests {
 
     /// A file id for tests that render/sample a bare `synthetic_volume`
     /// (not wrapped via [`entry`]). Pre-seed it with [`seed_synthetic`].
+    ///
+    /// Safe to share across the parallel test run **only** because every
+    /// seeder writes the identical deterministic [`synthetic_raw`] array under
+    /// it — overwrites are no-ops. A test that needs a *different* pixel array
+    /// MUST mint its own key with [`unique_file_id`]; reusing `TEST_FILE` for
+    /// divergent data flakes nondeterministically against the global cache
+    /// (PR #290 review).
     const TEST_FILE: &str = "test-volume.h5";
+
+    /// Mint a process-unique file id so a test's custom pixel array occupies a
+    /// distinct [`PIXEL_CACHE`] key — the cache is a global LRU shared across
+    /// the parallel test run, so divergent arrays under one key clobber each
+    /// other (PR #290 review).
+    fn unique_file_id() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "test-volume-unique-{}.h5",
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
 
     /// A dummy file source for the lazy-pixel context; never actually read,
     /// because tests pre-seed the cache (see [`seed_synthetic`]).
@@ -3145,9 +3243,12 @@ mod tests {
     });
 
     /// A `Pixels` context over the dummy source — pairs with [`seed_synthetic`].
+    /// `handle: None` so the remote-fetch path (never hit, since the source is
+    /// `Local` and the cache is pre-seeded) would take the worker bridge.
     fn test_pixels() -> Pixels<'static> {
         Pixels {
             source: &TEST_SOURCE,
+            handle: None,
         }
     }
 
@@ -3495,11 +3596,13 @@ mod tests {
                 data[(r, b)] = r as u16; // value = ray index, constant across bins
             }
         }
-        // This test uses a custom pixel array (value = ray index), so seed
-        // the cache with *this* array under TEST_FILE rather than the
-        // standard `synthetic_raw()`.
+        // This test uses a custom pixel array (value = ray index), divergent
+        // from the standard `synthetic_raw()`. It MUST live under a unique key
+        // so it neither clobbers nor is clobbered by the default-seed tests
+        // sharing the global cache (PR #290 review).
+        let file_id = unique_file_id();
         pixel_cache().insert(
-            TEST_FILE,
+            &file_id,
             SYNTHETIC_DS,
             std::sync::Arc::new(RawPixels::U16(data)),
         );
@@ -3542,7 +3645,7 @@ mod tests {
         ];
         let tile = polar_sample(
             &vol,
-            TEST_FILE,
+            &file_id,
             test_pixels(),
             "DBZH",
             bbox,
