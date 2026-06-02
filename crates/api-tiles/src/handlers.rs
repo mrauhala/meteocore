@@ -145,11 +145,27 @@ fn build_collection_metadata(
         "vector"
     };
 
+    // OGC API – Common – Part 2 `crs` array (#296), for parity with the Maps
+    // collection object. Unlike Maps — which can reproject to any supported
+    // output CRS — tiles are delivered only in their TileMatrixSet's CRS, so
+    // we advertise exactly the CRSs of the supported TileMatrixSets
+    // (EPSG:3857 for WebMercatorQuad, CRS84 for WorldCRS84Quad), order-
+    // preserved and de-duplicated.
+    let mut crs_uris: Vec<&'static str> = Vec::new();
+    for tms_id in SUPPORTED_TILE_MATRIX_SETS {
+        if let Some(def) = tilematrixset::get_tile_matrix_set(tms_id) {
+            if !crs_uris.contains(&def.crs) {
+                crs_uris.push(def.crs);
+            }
+        }
+    }
+
     let mut metadata = json!({
         "id": config.id,
         "title": config.title,
         "description": config.description,
         "dataType": data_type,
+        "crs": crs_uris,
         "tileMatrixSetLinks": tms_links,
         "styles": style_list,
         "links": [
@@ -167,6 +183,13 @@ fn build_collection_metadata(
             }
         ]
     });
+
+    // OGC API – Common – Part 2 `itemType`. Only the vector case has a
+    // registered value ("feature"); map (raster) tiles have no registered
+    // itemType, so it is omitted rather than invented (#296).
+    if raster_info.is_none() {
+        metadata["itemType"] = json!("feature");
+    }
 
     // Advertise `storageCrs` for raster collections when the native CRS has a
     // stable OGC URI (mirrors api-maps). Omitted for vector collections and

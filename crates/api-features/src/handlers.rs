@@ -106,6 +106,18 @@ pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn conformance() -> impl IntoResponse {
     Json(json!({
         "conformsTo": [
+            // OGC API – Common – Part 1: Core and Part 2: Geospatial Data. The
+            // Features landing page, /conformance, /api, and
+            // /collections{,/{id}} satisfy these structurally — the same
+            // declaration #292 added for Maps and Tiles. Declaring Part 2 is
+            // also the prerequisite for Common Part 4 "searchable collections".
+            // The HTML class (.../conf/html) is omitted — there is no HTML
+            // representation of /collections yet.
+            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
+            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page",
+            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/oas30",
+            "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/collections",
+            "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/json",
             "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
             "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas30",
             "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson"
