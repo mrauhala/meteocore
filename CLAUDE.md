@@ -169,7 +169,7 @@ radar elevation angle. WMS exposes it as the `ELEVATION` dimension; Maps/Tiles a
 | QueryData | `EdrEngine` + `MapEngine` | EDR (position only), WMS, Maps, Tiles |
 | PostGIS | `EdrEngine` + `FeatureEngine` | EDR (position, locations, area), Features |
 
-## ODIM PVOL Engine Notes (per-site collections — model B)
+## ODIM PVOL Engine Notes (per-site collections)
 
 - **One source → N collections.** A single `engine_type = "odim-volume"` config scans a directory / S3 prefix of `.h5` polar volumes spanning a whole radar *network*, then expands into **one OGC collection per radar site** (ODIM `nod`), with id `{base_id}-{nod}` (e.g. `radar-fi-volume-local-h5-fivih`). There is **no** network-level aggregate collection.
 - **The engine owns the source; views serve the API.** `PolarVolumeEngine` (in `engine-odim/src/volume_engine.rs`) does the scan, parse cache, and poll loop and is registered only on the background poll runtime. Each site is served by a cheap `PolarVolumeSiteView` over the engine's shared `Arc<ArcSwap<Catalog>>` — so all views see poll refreshes for free. The engine itself does **not** implement `EdrEngine`/`MapEngine`.

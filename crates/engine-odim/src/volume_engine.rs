@@ -6,7 +6,7 @@
 //! coordinates — and resamples them into Cartesian raster tiles on the
 //! fly.
 //!
-//! ## Collection model (model B — per-site collections)
+//! ## Collection model (per-site collections)
 //!
 //! A PVOL **source** is a local directory of `.h5` polar-volume files (or
 //! an S3/HTTP prefix) spanning multiple radar **sites** and multiple
@@ -344,7 +344,7 @@ struct SiteMeta {
     /// Human place name (ODIM `/what` PLC), if present.
     plc: Option<String>,
     /// Map/WMS layer list — `(bare_quantity, title)` from this site's
-    /// lowest sweep. **No `<nod>:` prefix**: under model B the site *is*
+    /// lowest sweep. **No `<nod>:` prefix**: the site *is*
     /// the collection, so the parameter is the bare quantity.
     parameters: Vec<(String, String)>,
     /// Bare EDR quantities (lowest sweep), sorted distinct.
@@ -364,7 +364,7 @@ struct SiteMeta {
 /// The engine's catalog: per-site time-sorted volume lists, plus the
 /// per-site derived metadata each [`PolarVolumeSiteView`] answers from.
 ///
-/// Under model B there is no network-level collection — each radar site is
+/// There is no network-level collection — each radar site is
 /// its own collection — so the catalog carries only the per-site index and
 /// no union/aggregate metadata.
 struct Catalog {
@@ -734,7 +734,7 @@ fn is_url_safe_nod(nod: &str) -> bool {
 
 /// Finalise the grouped volume map into a [`Catalog`]: sort and cap each
 /// site's list, evict stale parse-cache entries, and derive per-site
-/// metadata. Under model B there is no aggregate/union metadata — each
+/// metadata. There is no aggregate/union metadata — each
 /// radar site is its own collection, served by a [`PolarVolumeSiteView`].
 ///
 /// `max_files` caps each site to its most-recent N volumes — an archive
@@ -768,7 +768,7 @@ fn derive_catalog(
         guard.retain(|k, _| kept.contains(k));
     }
 
-    // Per-site metadata snapshots (model B): one `SiteMeta` per site so
+    // Per-site metadata snapshots: one `SiteMeta` per site so
     // each `PolarVolumeSiteView` answers capability queries scoped to its
     // own radar without re-deriving from sweeps per request.
     let by_site_meta: HashMap<String, SiteMeta> = by_site
@@ -2108,7 +2108,7 @@ fn finalize_single_site(
 }
 
 // ---------------------------------------------------------------------------
-// Per-site collections (model B)
+// Per-site collections
 // ---------------------------------------------------------------------------
 
 impl PolarVolumeEngine {
@@ -2175,7 +2175,7 @@ impl PolarVolumeEngine {
     }
 }
 
-/// A single radar site exposed as its own OGC collection (model B).
+/// A single radar site exposed as its own OGC collection.
 ///
 /// Where [`PolarVolumeEngine`] owns the source scan, parse cache, and poll
 /// loop for a whole radar *network*, a `PolarVolumeSiteView` is a thin,
@@ -2185,8 +2185,8 @@ impl PolarVolumeEngine {
 /// temporal extents. Many views share one engine's `Arc<ArcSwap<Catalog>>`,
 /// so they all see poll-loop refreshes for free.
 ///
-/// The site is not a sub-resource of a network collection: under model B
-/// there is no network-level collection at all — each radar is registered
+/// The site is not a sub-resource of a network collection: there is no
+/// network-level collection at all — each radar is registered
 /// independently. The parse cache, poll loop, and shutdown all live on the
 /// owning engine.
 pub struct PolarVolumeSiteView {
@@ -3566,7 +3566,7 @@ mod tests {
         }
     }
 
-    /// Model B: a per-site view advertises **bare** quantities (no
+    /// A per-site view advertises **bare** quantities (no
     /// `<nod>:` prefix), a single EDR location (the antenna), and the
     /// site's own coverage extent — even when the catalog holds other
     /// sites.
