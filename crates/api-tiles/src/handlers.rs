@@ -189,12 +189,13 @@ fn build_collection_metadata(
         ]
     });
 
-    // OGC API – Common – Part 2 `itemType`. Only the vector case has a
-    // registered value ("feature"); map (raster) tiles have no registered
-    // itemType, so it is omitted rather than invented (#296).
-    if raster_info.is_none() {
-        metadata["itemType"] = json!("feature");
-    }
+    // No `itemType`: OGC API – Common – Part 2 §7.13 defines it as describing
+    // the items reachable at /collections/{id}/items, but the Tiles router has
+    // no /items route — tiles are fetched at /tiles/…. Emitting it (even
+    // "feature" for vector collections) would be an over-claim a validator
+    // probing /items would catch. A collection that is *also* a Features
+    // collection advertises itemType on its /features representation, where an
+    // /items resource actually exists (review on #298).
 
     // Advertise `storageCrs` for raster collections when the native CRS has a
     // stable OGC URI (mirrors api-maps). Omitted for vector collections and
