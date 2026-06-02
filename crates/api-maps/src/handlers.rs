@@ -625,7 +625,13 @@ pub async fn collections(
         .collections
         .values()
         .filter_map(|config| {
-            let engine = state.engines.get(&config.id)?;
+            let Some(engine) = state.engines.get(&config.id) else {
+                tracing::warn!(
+                    collection = %config.id,
+                    "collection has no registered map engine; omitting from /collections"
+                );
+                return None;
+            };
             let info = engine.raster_info();
             let styles = state.styles.get(&config.id);
             let value = build_collection_metadata(config, &info, styles, base);

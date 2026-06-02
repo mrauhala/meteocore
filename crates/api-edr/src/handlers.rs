@@ -580,7 +580,15 @@ pub async fn collections(
         .collections
         .values()
         .filter_map(|config| {
-            let engine = state.engines.get(&config.id)?;
+            let Some(engine) = state.engines.get(&config.id) else {
+                // A registered collection with no engine (e.g. a partial
+                // reload) would otherwise vanish from /collections silently.
+                tracing::warn!(
+                    collection = %config.id,
+                    "collection has no registered EDR engine; omitting from /collections"
+                );
+                return None;
+            };
             let value = build_collection_metadata(engine.as_ref(), config, base);
             Some((
                 config.id.clone(),

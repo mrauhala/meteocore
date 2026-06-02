@@ -396,7 +396,13 @@ pub async fn collections(
         .collections
         .values()
         .filter_map(|config| {
-            let engine = state.engines.get(&config.id)?;
+            let Some(engine) = state.engines.get(&config.id) else {
+                tracing::warn!(
+                    collection = %config.id,
+                    "collection has no registered feature engine; omitting from /collections"
+                );
+                return None;
+            };
             let value = build_collection_metadata(engine.as_ref(), config, base);
             Some((
                 config.id.clone(),

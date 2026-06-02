@@ -116,10 +116,16 @@ pub fn parse_search_params(
     };
 
     let datetime = match datetime.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) => Some(
-            parse_datetime_interval(s)
-                .map_err(|e| SearchError::new(format!("Invalid datetime: {e}")))?,
-        ),
+        Some(s) => {
+            let (start, end) = parse_datetime_interval(s)
+                .map_err(|e| SearchError::new(format!("Invalid datetime: {e}")))?;
+            // An inverted interval (end before start) would silently exclude
+            // every overlapping collection; reject it as a 400.
+            if start > end {
+                return Err(SearchError::new("datetime: start must be <= end"));
+            }
+            Some((start, end))
+        }
         None => None,
     };
 
@@ -168,13 +174,25 @@ fn parse_bbox(s: &str) -> Result<[f64; 4], SearchError> {
     let nums: Result<Vec<f64>, _> = s.split(',').map(|p| p.trim().parse::<f64>()).collect();
     let nums =
         nums.map_err(|_| SearchError::new("bbox must be a comma-separated list of numbers"))?;
-    match nums.len() {
-        // 2D: minx,miny,maxx,maxy
-        4 => Ok([nums[0], nums[1], nums[2], nums[3]]),
-        // 3D: minx,miny,minz,maxx,maxy,maxz — drop the vertical axis.
-        6 => Ok([nums[0], nums[1], nums[3], nums[4]]),
-        _ => Err(SearchError::new("bbox must have 4 or 6 numbers")),
+    // `f64::parse` accepts "NaN"/"Inf"/"-Inf"; those would slip past the
+    // intersection test (NaN compares false → silent empty result) and must be
+    // rejected as a 400.
+    if nums.iter().any(|n| !n.is_finite()) {
+        return Err(SearchError::new("bbox values must be finite numbers"));
     }
+    let bbox = match nums.len() {
+        // 2D: west,south,east,north
+        4 => [nums[0], nums[1], nums[2], nums[3]],
+        // 3D: west,south,minz,east,north,maxz — drop the vertical axis.
+        6 => [nums[0], nums[1], nums[3], nums[4]],
+        _ => return Err(SearchError::new("bbox must have 4 or 6 numbers")),
+    };
+    // Latitude must not be inverted (south <= north). Longitude inversion is
+    // legitimate — `west > east` represents an anti-meridian-crossing bbox.
+    if bbox[1] > bbox[3] {
+        return Err(SearchError::new("bbox: south must be <= north"));
+    }
+    Ok(bbox)
 }
 
 /// Filter `items` by the parameters and apply `offset`/`limit` pagination.
@@ -431,6 +449,29 @@ mod tests {
             parse_search_params(Some("0,0,1,1"), Some("EPSG:3857"), None, None, None, None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn parse_rejects_nonfinite_and_inverted_bbox() {
+        // NaN / Inf must not slip through as a silent empty result.
+        assert!(parse_search_params(Some("NaN,60,30,70"), None, None, None, None, None).is_err());
+        assert!(parse_search_params(Some("0,60,Inf,70"), None, None, None, None, None).is_err());
+        // south > north is always invalid (longitude inversion stays allowed).
+        assert!(parse_search_params(Some("0,70,30,60"), None, None, None, None, None).is_err());
+        assert!(parse_search_params(Some("170,50,-170,60"), None, None, None, None, None).is_ok());
+    }
+
+    #[test]
+    fn parse_rejects_inverted_datetime() {
+        assert!(parse_search_params(
+            None,
+            None,
+            Some("2024-12-01T00:00:00Z/2024-01-01T00:00:00Z"),
+            None,
+            None,
+            None
+        )
+        .is_err());
     }
 
     #[test]
