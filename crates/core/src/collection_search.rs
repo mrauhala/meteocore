@@ -1,0 +1,557 @@
+//! OGC API – Common – Part 4 ("Discovery within many collections", draft
+//! [25-046]) — the **Searchable Collections** requirements class.
+//!
+//! Filtering and pagination for the `/collections` resource: `bbox` /
+//! `bbox-crs`, `datetime`, `q`, and `limit` + `offset`. The logic lives here
+//! (not in the API crates) so EDR, Maps, Tiles, and Features share one
+//! implementation — ds-core never builds `serde_json::Value`, so the crates
+//! call [`parse_search_params`] + [`search`] and assemble the JSON response
+//! themselves (and build `next`/`prev` link hrefs with [`page_query_string`]).
+//!
+//! Only CRS84 is supported for `bbox` / `bbox-crs` (every collection bbox is
+//! advertised in CRS84). Sortable / Filterable (CQL2) / Hierarchical classes
+//! are intentionally not implemented.
+//!
+//! [25-046]: https://docs.ogc.org/DRAFTS/25-046.html
+
+use crate::datetime::parse_datetime_interval;
+use chrono::{DateTime, Utc};
+
+/// Server default page size when `limit` is absent. Sized so realistic
+/// catalogs (including a full OPERA radar network) come back in one page and
+/// existing single-page clients see no behaviour change.
+pub const DEFAULT_LIMIT: usize = 1000;
+/// Maximum honoured `limit`. A larger requested value is clamped to this (per
+/// the draft, an over-large `limit` is not an error).
+pub const MAX_LIMIT: usize = 1000;
+
+/// `bbox-crs` values accepted as CRS84 (URI, CURIE, and short forms).
+const ACCEPTED_BBOX_CRS: &[&str] = &[
+    "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
+    "https://www.opengis.net/def/crs/OGC/1.3/CRS84",
+    "[OGC:CRS84]",
+    "OGC:CRS84",
+    "CRS84",
+    "CRS:84",
+];
+
+/// A bad `/collections` query parameter. The API crates map this to HTTP 400.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{0}")]
+pub struct SearchError(pub String);
+
+impl SearchError {
+    fn new(msg: impl Into<String>) -> Self {
+        SearchError(msg.into())
+    }
+}
+
+/// The searchable facets of one collection. Borrows from the caller's config /
+/// engine snapshot; build one per collection in the same order as the response
+/// list, then pass the slice to [`search`].
+#[derive(Debug, Clone)]
+pub struct CollectionMatch<'a> {
+    pub title: &'a str,
+    pub description: &'a str,
+    pub keywords: &'a [String],
+    /// CRS84 bbox `[west, south, east, north]`, if the collection has one.
+    pub bbox: Option<[f64; 4]>,
+    /// Temporal interval `(start, end)`, if the collection has one.
+    pub time: Option<(DateTime<Utc>, DateTime<Utc>)>,
+}
+
+/// Validated, parsed search parameters.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchParams {
+    /// CRS84 query bbox `[west, south, east, north]`.
+    pub bbox: Option<[f64; 4]>,
+    /// Query interval `(start, end)`.
+    pub datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// Lower-cased, non-empty free-text terms (OR semantics). Empty = no `q`.
+    pub q: Vec<String>,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+/// The outcome of a [`search`]: the total match count and the indices of the
+/// items on the requested page, plus pagination cursors.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchResult {
+    /// Total collections matching the filters (before pagination).
+    pub number_matched: usize,
+    /// Indices into the `items` slice for this page, in input order.
+    pub page: Vec<usize>,
+    pub has_next: bool,
+    pub next_offset: usize,
+    pub has_prev: bool,
+    pub prev_offset: usize,
+}
+
+/// Parse and validate the raw `/collections` query parameters. Returns
+/// [`SearchError`] (→ HTTP 400) for malformed input.
+pub fn parse_search_params(
+    bbox: Option<&str>,
+    bbox_crs: Option<&str>,
+    datetime: Option<&str>,
+    q: Option<&str>,
+    limit: Option<&str>,
+    offset: Option<&str>,
+) -> Result<SearchParams, SearchError> {
+    // bbox-crs is only meaningful with a bbox, but validate it whenever present.
+    if let Some(crs) = bbox_crs.map(str::trim).filter(|s| !s.is_empty()) {
+        if !ACCEPTED_BBOX_CRS
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(crs))
+        {
+            return Err(SearchError::new(
+                "Only CRS84 is supported for bbox-crs (e.g. \
+                 http://www.opengis.net/def/crs/OGC/1.3/CRS84)",
+            ));
+        }
+    }
+
+    let bbox = match bbox.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => Some(parse_bbox(s)?),
+        None => None,
+    };
+
+    let datetime = match datetime.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => Some(
+            parse_datetime_interval(s)
+                .map_err(|e| SearchError::new(format!("Invalid datetime: {e}")))?,
+        ),
+        None => None,
+    };
+
+    let q = match q.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s
+            .split(',')
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let limit = match limit.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => {
+            let n: usize = s.parse().map_err(|_| {
+                SearchError::new(format!("Invalid limit: '{s}' is not a positive integer"))
+            })?;
+            if n < 1 {
+                return Err(SearchError::new("limit must be >= 1"));
+            }
+            n.min(MAX_LIMIT)
+        }
+        None => DEFAULT_LIMIT,
+    };
+
+    let offset = match offset.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s.parse().map_err(|_| {
+            SearchError::new(format!(
+                "Invalid offset: '{s}' is not a non-negative integer"
+            ))
+        })?,
+        None => 0,
+    };
+
+    Ok(SearchParams {
+        bbox,
+        datetime,
+        q,
+        limit,
+        offset,
+    })
+}
+
+/// Parse a `bbox` query value: 4 numbers (2D) or 6 (3D, vertical axis dropped).
+fn parse_bbox(s: &str) -> Result<[f64; 4], SearchError> {
+    let nums: Result<Vec<f64>, _> = s.split(',').map(|p| p.trim().parse::<f64>()).collect();
+    let nums =
+        nums.map_err(|_| SearchError::new("bbox must be a comma-separated list of numbers"))?;
+    match nums.len() {
+        // 2D: minx,miny,maxx,maxy
+        4 => Ok([nums[0], nums[1], nums[2], nums[3]]),
+        // 3D: minx,miny,minz,maxx,maxy,maxz — drop the vertical axis.
+        6 => Ok([nums[0], nums[1], nums[3], nums[4]]),
+        _ => Err(SearchError::new("bbox must have 4 or 6 numbers")),
+    }
+}
+
+/// Filter `items` by the parameters and apply `offset`/`limit` pagination.
+pub fn search(items: &[CollectionMatch], p: &SearchParams) -> SearchResult {
+    let matched: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| matches(it, p))
+        .map(|(i, _)| i)
+        .collect();
+
+    let number_matched = matched.len();
+    let end = p.offset.saturating_add(p.limit).min(number_matched);
+    let page: Vec<usize> = if p.offset < number_matched {
+        matched[p.offset..end].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    SearchResult {
+        number_matched,
+        page,
+        has_next: end < number_matched,
+        next_offset: p.offset.saturating_add(p.limit),
+        has_prev: p.offset > 0,
+        prev_offset: p.offset.saturating_sub(p.limit),
+    }
+}
+
+fn matches(it: &CollectionMatch, p: &SearchParams) -> bool {
+    if let Some(qbox) = p.bbox {
+        match it.bbox {
+            Some(cbox) if bbox_intersects(qbox, cbox) => {}
+            _ => return false,
+        }
+    }
+    if let Some((qs, qe)) = p.datetime {
+        match it.time {
+            Some((cs, ce)) if qs <= ce && cs <= qe => {}
+            _ => return false,
+        }
+    }
+    if !p.q.is_empty() && !q_matches(&p.q, it.title, it.description, it.keywords) {
+        return false;
+    }
+    true
+}
+
+/// CRS84 bbox intersection, anti-meridian aware.
+fn bbox_intersects(q: [f64; 4], c: [f64; 4]) -> bool {
+    // Latitude (no wrap).
+    let lat = q[1] <= c[3] && c[1] <= q[3];
+    lat && lon_overlaps(q[0], q[2], c[0], c[2])
+}
+
+/// Longitude overlap where a box with `west > east` wraps the anti-meridian.
+fn lon_overlaps(qw: f64, qe: f64, cw: f64, ce: f64) -> bool {
+    match (qw > qe, cw > ce) {
+        (false, false) => qw <= ce && cw <= qe,
+        // Exactly one wraps: it covers [w, 180] ∪ [-180, e].
+        (true, false) | (false, true) => qw <= ce || cw <= qe,
+        // Both wrap: each spans the anti-meridian, so they always overlap.
+        (true, true) => true,
+    }
+}
+
+/// Whole-word (or, for terms containing whitespace, phrase) match of any `q`
+/// term against the collection's title, description, or keywords. Terms are
+/// pre-lowercased; comparison is Unicode-case-insensitive (Finnish ä/ö etc.).
+fn q_matches(terms: &[String], title: &str, description: &str, keywords: &[String]) -> bool {
+    terms.iter().any(|term| {
+        if term.chars().any(char::is_whitespace) {
+            // Phrase: case-insensitive substring across the combined text.
+            let hay = format!("{title} {description} {}", keywords.join(" ")).to_lowercase();
+            hay.contains(term.as_str())
+        } else {
+            word_match(title, term)
+                || word_match(description, term)
+                || keywords.iter().any(|k| word_match(k, term))
+        }
+    })
+}
+
+/// True if `term` (already lower-cased) equals a whole word of `text`. Words
+/// are maximal runs of alphanumeric characters (Unicode-aware).
+fn word_match(text: &str, term: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .any(|w| w.to_lowercase() == term)
+}
+
+/// Raw `/collections` query parameters, deserialized by the API crates'
+/// handlers (`Query<SearchQueryParams>`). Defined here so all four surfaces
+/// share one extractor; [`parse`](Self::parse) validates it into
+/// [`SearchParams`] and [`query_string`](Self::query_string) rebuilds a
+/// link href for the same request at a different offset.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct SearchQueryParams {
+    pub bbox: Option<String>,
+    #[serde(rename = "bbox-crs")]
+    pub bbox_crs: Option<String>,
+    pub datetime: Option<String>,
+    pub q: Option<String>,
+    pub limit: Option<String>,
+    pub offset: Option<String>,
+}
+
+impl SearchQueryParams {
+    /// Validate into [`SearchParams`] (→ HTTP 400 on bad input).
+    pub fn parse(&self) -> Result<SearchParams, SearchError> {
+        parse_search_params(
+            self.bbox.as_deref(),
+            self.bbox_crs.as_deref(),
+            self.datetime.as_deref(),
+            self.q.as_deref(),
+            self.limit.as_deref(),
+            self.offset.as_deref(),
+        )
+    }
+
+    /// The query string (leading `?`, or empty) for this request at `offset`,
+    /// for building `self`/`next`/`prev` link hrefs.
+    pub fn query_string(&self, offset: usize) -> String {
+        page_query_string(
+            self.bbox.as_deref(),
+            self.bbox_crs.as_deref(),
+            self.datetime.as_deref(),
+            self.q.as_deref(),
+            self.limit.as_deref(),
+            offset,
+        )
+    }
+}
+
+/// Reconstruct the `/collections` query string (leading `?`, or empty) for a
+/// `self`/`next`/`prev` link: the original raw filter values plus the given
+/// `offset` (omitted when 0). Percent-encodes values; keeps `,` `:` `/`
+/// readable (all valid in a query component per RFC 3986).
+pub fn page_query_string(
+    bbox: Option<&str>,
+    bbox_crs: Option<&str>,
+    datetime: Option<&str>,
+    q: Option<&str>,
+    limit: Option<&str>,
+    offset: usize,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut push = |key: &str, val: Option<&str>| {
+        if let Some(v) = val.map(str::trim).filter(|s| !s.is_empty()) {
+            parts.push(format!("{key}={}", encode_qval(v)));
+        }
+    };
+    push("bbox", bbox);
+    push("bbox-crs", bbox_crs);
+    push("datetime", datetime);
+    push("q", q);
+    push("limit", limit);
+    if offset > 0 {
+        parts.push(format!("offset={offset}"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", parts.join("&"))
+    }
+}
+
+/// Percent-encode a query-parameter value, leaving unreserved characters and
+/// the query-safe sub-delims `,` `:` `/` intact for readability.
+fn encode_qval(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b','
+            | b':'
+            | b'/' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn cm<'a>(
+        title: &'a str,
+        description: &'a str,
+        keywords: &'a [String],
+        bbox: Option<[f64; 4]>,
+        time: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    ) -> CollectionMatch<'a> {
+        CollectionMatch {
+            title,
+            description,
+            keywords,
+            bbox,
+            time,
+        }
+    }
+
+    #[test]
+    fn parse_defaults() {
+        let p = parse_search_params(None, None, None, None, None, None).unwrap();
+        assert_eq!(p.limit, DEFAULT_LIMIT);
+        assert_eq!(p.offset, 0);
+        assert!(p.bbox.is_none() && p.datetime.is_none() && p.q.is_empty());
+    }
+
+    #[test]
+    fn parse_bbox_4_and_6() {
+        let p = parse_search_params(Some("20,60,30,70"), None, None, None, None, None).unwrap();
+        assert_eq!(p.bbox, Some([20.0, 60.0, 30.0, 70.0]));
+        // 6-number form drops the vertical axis.
+        let p6 =
+            parse_search_params(Some("20,60,0,30,70,5000"), None, None, None, None, None).unwrap();
+        assert_eq!(p6.bbox, Some([20.0, 60.0, 30.0, 70.0]));
+    }
+
+    #[test]
+    fn parse_rejects_bad_bbox_and_limit_and_crs() {
+        assert!(parse_search_params(Some("1,2,3"), None, None, None, None, None).is_err());
+        assert!(parse_search_params(Some("a,b,c,d"), None, None, None, None, None).is_err());
+        assert!(parse_search_params(None, None, None, None, Some("0"), None).is_err());
+        assert!(parse_search_params(None, None, None, None, Some("-3"), None).is_err());
+        assert!(
+            parse_search_params(Some("0,0,1,1"), Some("EPSG:3857"), None, None, None, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_accepts_crs84_bbox_crs_forms() {
+        for crs in [
+            "CRS84",
+            "OGC:CRS84",
+            "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
+        ] {
+            assert!(
+                parse_search_params(Some("0,0,1,1"), Some(crs), None, None, None, None).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn limit_clamped_to_max() {
+        let p = parse_search_params(None, None, None, None, Some("99999"), None).unwrap();
+        assert_eq!(p.limit, MAX_LIMIT);
+    }
+
+    #[test]
+    fn bbox_filter_includes_and_excludes() {
+        let kw: Vec<String> = vec![];
+        let inside = cm("a", "", &kw, Some([20.0, 60.0, 25.0, 65.0]), None);
+        let outside = cm("b", "", &kw, Some([-10.0, -10.0, -5.0, -5.0]), None);
+        let no_bbox = cm("c", "", &kw, None, None);
+        let items = [inside, outside, no_bbox];
+        let p = parse_search_params(Some("0,50,30,70"), None, None, None, None, None).unwrap();
+        let r = search(&items, &p);
+        assert_eq!(r.page, vec![0]); // only the intersecting one; no-bbox excluded
+        assert_eq!(r.number_matched, 1);
+    }
+
+    #[test]
+    fn antimeridian_bbox_overlaps() {
+        // Query wraps the anti-meridian: [170, -170] covers 170..180 and -180..-170.
+        assert!(lon_overlaps(170.0, -170.0, 175.0, 178.0));
+        assert!(lon_overlaps(170.0, -170.0, -179.0, -171.0));
+        assert!(!lon_overlaps(170.0, -170.0, 0.0, 10.0));
+    }
+
+    #[test]
+    fn datetime_overlap_filter() {
+        let kw: Vec<String> = vec![];
+        let c = cm(
+            "a",
+            "",
+            &kw,
+            None,
+            Some((t("2026-06-01T00:00:00Z"), t("2026-06-03T00:00:00Z"))),
+        );
+        let items = [c];
+        let hit = parse_search_params(None, None, Some("2026-06-02T12:00:00Z"), None, None, None)
+            .unwrap();
+        assert_eq!(search(&items, &hit).number_matched, 1);
+        let miss = parse_search_params(None, None, Some("2026-07-01T00:00:00Z"), None, None, None)
+            .unwrap();
+        assert_eq!(search(&items, &miss).number_matched, 0);
+    }
+
+    #[test]
+    fn q_whole_word_and_keywords_and_unicode() {
+        let kw = vec!["sää".to_string(), "tutka".to_string()];
+        let c = cm("Helsinki Radar", "Reflectivity composite", &kw, None, None);
+        let items = [c];
+        // whole word, case-insensitive
+        assert_eq!(
+            search(
+                &items,
+                &parse_search_params(None, None, None, Some("radar"), None, None).unwrap()
+            )
+            .number_matched,
+            1
+        );
+        // keyword match, Unicode case-insensitive (SÄÄ -> sää)
+        assert_eq!(
+            search(
+                &items,
+                &parse_search_params(None, None, None, Some("SÄÄ"), None, None).unwrap()
+            )
+            .number_matched,
+            1
+        );
+        // partial word does NOT match whole-word term
+        assert_eq!(
+            search(
+                &items,
+                &parse_search_params(None, None, None, Some("rada"), None, None).unwrap()
+            )
+            .number_matched,
+            0
+        );
+        // phrase (whitespace) → substring
+        assert_eq!(
+            search(
+                &items,
+                &parse_search_params(None, None, None, Some("helsinki radar"), None, None).unwrap()
+            )
+            .number_matched,
+            1
+        );
+    }
+
+    #[test]
+    fn pagination_cursors() {
+        let kw: Vec<String> = vec![];
+        let items: Vec<CollectionMatch> = (0..5).map(|_| cm("a", "", &kw, None, None)).collect();
+        let p = parse_search_params(None, None, None, None, Some("2"), Some("2")).unwrap();
+        let r = search(&items, &p);
+        assert_eq!(r.number_matched, 5);
+        assert_eq!(r.page, vec![2, 3]);
+        assert!(r.has_next && r.next_offset == 4);
+        assert!(r.has_prev && r.prev_offset == 0);
+    }
+
+    #[test]
+    fn query_string_roundtrip() {
+        let qs = page_query_string(
+            Some("20,60,30,70"),
+            None,
+            Some("2026-06-02T00:00:00Z"),
+            Some("radar"),
+            Some("10"),
+            10,
+        );
+        assert_eq!(
+            qs,
+            "?bbox=20,60,30,70&datetime=2026-06-02T00:00:00Z&q=radar&limit=10&offset=10"
+        );
+        // No params, offset 0 → empty (backward compatible self link).
+        assert_eq!(page_query_string(None, None, None, None, None, 0), "");
+        // Spaces get percent-encoded.
+        assert_eq!(
+            page_query_string(None, None, None, Some("heavy rain"), None, 0),
+            "?q=heavy%20rain"
+        );
+    }
+}

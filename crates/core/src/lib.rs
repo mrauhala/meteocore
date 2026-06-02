@@ -1,3 +1,4 @@
+pub mod collection_search;
 pub mod config;
 pub mod datetime;
 pub mod edr_engine;

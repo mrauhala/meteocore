@@ -757,3 +757,35 @@ mod errors {
         assert!(json["code"].is_string());
     }
 }
+
+// ---------------------------------------------------------------------------
+// OGC API - Common - Part 4: Searchable Collections — handler wiring smoke
+// ---------------------------------------------------------------------------
+
+mod part4_searchable {
+    use super::*;
+
+    #[tokio::test]
+    async fn conformance_declares_searchable_collections() {
+        let (_, json) = get("/conformance").await;
+        let classes = json["conformsTo"].as_array().unwrap();
+        assert!(classes.iter().any(|c| c
+            .as_str()
+            .unwrap()
+            .contains("common-4/1.0/conf/searchable-collections")));
+    }
+
+    #[tokio::test]
+    async fn collections_has_match_counts() {
+        let (status, json) = get("/collections").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["numberMatched"].is_number());
+        assert!(json["numberReturned"].is_number());
+    }
+
+    #[tokio::test]
+    async fn invalid_bbox_is_400() {
+        let (status, _) = get("/collections?bbox=1,2,3").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+}

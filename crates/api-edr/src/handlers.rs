@@ -171,6 +171,26 @@ pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+/// OpenAPI `parameters` array for the OGC API – Common – Part 4 searchable
+/// `/collections` query parameters. Documented per the CLAUDE.md rule and
+/// Part 4 §5.5.
+fn searchable_collections_parameters() -> serde_json::Value {
+    json!([
+        {"name": "bbox", "in": "query", "required": false, "schema": {"type": "string"},
+         "description": "Filter to collections intersecting this CRS84 bbox: 4 (or 6) comma-separated numbers west,south,east,north."},
+        {"name": "bbox-crs", "in": "query", "required": false, "schema": {"type": "string"},
+         "description": "CRS of the bbox values. Only CRS84 is supported."},
+        {"name": "datetime", "in": "query", "required": false, "schema": {"type": "string"},
+         "description": "Filter to collections whose temporal extent intersects this RFC 3339 instant or interval (start/end, ../end, start/..)."},
+        {"name": "q", "in": "query", "required": false, "schema": {"type": "string"},
+         "description": "Free-text search (comma-separated terms, OR) over collection title and description."},
+        {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 1000},
+         "description": "Maximum number of collections per page (default 1000)."},
+        {"name": "offset", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0},
+         "description": "Number of matching collections to skip (pagination cursor)."}
+    ])
+}
+
 pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
     let state = state.load_full();
     let mut collection_paths = json!({});
@@ -409,6 +429,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             "get": {
                 "summary": "List collections",
                 "operationId": "getCollections",
+                "parameters": searchable_collections_parameters(),
                 "responses": {
                     "200": {"description": "List of EDR collections"}
                 }
@@ -525,6 +546,11 @@ pub async fn conformance() -> impl IntoResponse {
             // omitted — there is no HTML representation of /collections.
             "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/collections",
             "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/json",
+            // OGC API - Common - Part 4 (Discovery within many collections,
+            // draft 25-046): /collections supports bbox/bbox-crs/datetime/q/
+            // limit filtering + offset pagination (numberMatched/Returned +
+            // next/prev links). Sortable/Filterable/Hierarchical not declared.
+            "http://www.opengis.net/spec/ogcapi-common-4/1.0/conf/searchable-collections",
             "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/core",
             "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/collections",
             "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/json",
@@ -533,31 +559,81 @@ pub async fn conformance() -> impl IntoResponse {
     }))
 }
 
-pub async fn collections(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn collections(
+    State(state): State<AppState>,
+    Query(sp): Query<ds_core::collection_search::SearchQueryParams>,
+) -> Result<Json<serde_json::Value>, HandlerError> {
+    use ds_core::collection_search::{search, CollectionMatch};
+
+    let params = sp.parse().map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+        )
+    })?;
     let state = state.load_full();
     let base = &state.base_url;
-    let collections: Vec<serde_json::Value> = state
+
+    // (id, title, description, bbox, time, metadata) per collection. Tuple
+    // element types are inferred, so no extra chrono import is needed.
+    let mut rows: Vec<_> = state
         .collections
         .values()
-        .map(|config| {
-            build_collection_metadata(
-                state.engines.get(&config.id).unwrap().as_ref(),
-                config,
-                base,
-            )
+        .filter_map(|config| {
+            let engine = state.engines.get(&config.id)?;
+            let value = build_collection_metadata(engine.as_ref(), config, base);
+            Some((
+                config.id.clone(),
+                config.title.clone(),
+                config.description.clone(),
+                engine.get_spatial_extent(),
+                engine.get_temporal_extent(),
+                value,
+            ))
         })
         .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
 
-    Json(json!({
+    let matches: Vec<CollectionMatch> = rows
+        .iter()
+        .map(|r| CollectionMatch {
+            title: &r.1,
+            description: &r.2,
+            keywords: &[],
+            bbox: r.3,
+            time: r.4,
+        })
+        .collect();
+    let result = search(&matches, &params);
+    let collections: Vec<serde_json::Value> =
+        result.page.iter().map(|&i| rows[i].5.clone()).collect();
+    let number_returned = collections.len();
+
+    let link = |rel: &str, offset: usize, title: Option<&str>| {
+        let mut o = json!({
+            "href": format!("{base}/edr/collections{}", sp.query_string(offset)),
+            "rel": rel,
+            "type": "application/json"
+        });
+        if let Some(t) = title {
+            o["title"] = json!(t);
+        }
+        o
+    };
+    let mut links = vec![link("self", params.offset, None)];
+    if result.has_next {
+        links.push(link("next", result.next_offset, Some("Next page")));
+    }
+    if result.has_prev {
+        links.push(link("prev", result.prev_offset, Some("Previous page")));
+    }
+
+    Ok(Json(json!({
         "collections": collections,
-        "links": [
-            {
-                "href": format!("{}/edr/collections", state.base_url),
-                "rel": "self",
-                "type": "application/json"
-            }
-        ]
-    }))
+        "numberMatched": result.number_matched,
+        "numberReturned": number_returned,
+        "links": links
+    })))
 }
 
 pub async fn collection(
