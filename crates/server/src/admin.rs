@@ -2438,26 +2438,24 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     METATILE_CACHE_ENTRIES.set(wms.tile_cache.len() as i64);
 
     // PVOL lazy pixel cache: process-global (never replaced on reload), so the
-    // cumulative counters are monotonic. Only emit when PVOL collections are
-    // loaded, so non-radar deployments don't carry empty `pvol_*` series.
-    let has_pvol = state
+    // cumulative counters are strictly monotonic — a per-counter
+    // `saturating_sub` delta is correct without the rebaseline branch the
+    // replaceable rendered/metatile caches above need (and `saturating_sub`
+    // can't underflow if a counter ever does appear backward). Only emit when
+    // PVOL collections are loaded, so non-radar deployments don't carry empty
+    // `pvol_*` series. Recover from a poisoned lock (`into_inner`) — a panic
+    // elsewhere must not silently suppress the failure metric.
+    let has_pvol = !state
         .odim_volume_engines
         .read()
-        .map(|e| !e.is_empty())
-        .unwrap_or(false);
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty();
     if has_pvol {
         let (p_hits, p_misses, p_bytes, p_cap, p_fail) = engine_odim::pixel_cache_metrics();
         let (last_ph, last_pm, last_pf) = counter_state.pvol_pixel;
-        // Defensive rebaseline (the global cache never resets in practice).
-        if p_hits < last_ph || p_misses < last_pm || p_fail < last_pf {
-            PVOL_PIXEL_CACHE_HITS.inc_by(0);
-            PVOL_PIXEL_CACHE_MISSES.inc_by(0);
-            PVOL_PIXEL_READ_FAILURES.inc_by(0);
-        } else {
-            PVOL_PIXEL_CACHE_HITS.inc_by(p_hits - last_ph);
-            PVOL_PIXEL_CACHE_MISSES.inc_by(p_misses - last_pm);
-            PVOL_PIXEL_READ_FAILURES.inc_by(p_fail - last_pf);
-        }
+        PVOL_PIXEL_CACHE_HITS.inc_by(p_hits.saturating_sub(last_ph));
+        PVOL_PIXEL_CACHE_MISSES.inc_by(p_misses.saturating_sub(last_pm));
+        PVOL_PIXEL_READ_FAILURES.inc_by(p_fail.saturating_sub(last_pf));
         counter_state.pvol_pixel = (p_hits, p_misses, p_fail);
         PVOL_PIXEL_CACHE_BYTES.set(p_bytes as i64);
         PVOL_PIXEL_CACHE_CAPACITY_BYTES.set(p_cap as i64);
