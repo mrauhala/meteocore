@@ -171,6 +171,18 @@ impl RawPixels {
         }
         Some(raw * gain + offset)
     }
+
+    /// Approximate heap footprint of the backing array, in bytes — element
+    /// count times element size. Byte-weights the engine's lazy-pixel LRU.
+    pub fn size_bytes(&self) -> usize {
+        let (h, w) = self.shape();
+        let elem = match self {
+            RawPixels::U8(_) => 1,
+            RawPixels::U16(_) => 2,
+            RawPixels::F64(_) => 8,
+        };
+        h * w * elem
+    }
 }
 
 /// A parsed ODIM composite ready for sampling. Carries the raw

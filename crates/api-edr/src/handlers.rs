@@ -870,10 +870,13 @@ pub async fn trajectory_query(
     // nodes × z-levels × quantities × timesteps `sample_polar_slant`
     // iterations (millions, seconds of CPU). Run it on the blocking pool
     // so it doesn't park a request-serving worker and head-of-line-block
-    // other requests. Safe here: the trajectory path reads an in-memory
-    // `ArcSwap` catalog snapshot and never touches `DataStore` (whose
-    // `block_in_place` would panic on a `spawn_blocking` thread). The
-    // general "wrap every EdrEngine query" work is tracked in #178.
+    // other requests. spawn_blocking is also *required* for correctness under
+    // lazy pixel loading: an S3 cache miss now fetches via `DataStore::get_on`
+    // (`handle.block_on`), the valid bridge on a `spawn_blocking` pool thread —
+    // the plain `DataStore::get` uses `block_in_place`, which *panics* on a
+    // spawn_blocking thread (it is only valid on a multi-thread runtime worker).
+    // The still-direct position/area/locations queries keep `DataStore::get`
+    // precisely because they run on a worker; offloading them is tracked in #178.
     let engine = engine.clone();
     let coords = params.coords.clone();
     let result = tokio::task::spawn_blocking(move || {
