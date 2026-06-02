@@ -199,22 +199,32 @@ pub fn search(items: &[CollectionMatch], p: &SearchParams) -> SearchResult {
         page,
         has_next: end < number_matched,
         next_offset: p.offset.saturating_add(p.limit),
-        has_prev: p.offset > 0,
+        // Only offer `prev` from a page at or before the data: an out-of-range
+        // `offset` (> number_matched) must not chain to further empty `prev`
+        // pages that never reach data.
+        has_prev: p.offset > 0 && p.offset <= number_matched,
         prev_offset: p.offset.saturating_sub(p.limit),
     }
 }
 
 fn matches(it: &CollectionMatch, p: &SearchParams) -> bool {
+    // "Unknown extent ≡ unbounded" (OGC API – Common – Part 4 §7.14.2/§7.14.3):
+    // a collection that declares no spatial/temporal extent matches any
+    // bbox/datetime filter, rather than being excluded — otherwise cold-start
+    // engines (bbox/time still None) and extent-less collections silently
+    // vanish from filtered /collections responses.
     if let Some(qbox) = p.bbox {
         match it.bbox {
             Some(cbox) if bbox_intersects(qbox, cbox) => {}
-            _ => return false,
+            None => {}
+            Some(_) => return false,
         }
     }
     if let Some((qs, qe)) = p.datetime {
         match it.time {
             Some((cs, ce)) if qs <= ce && cs <= qe => {}
-            _ => return false,
+            None => {}
+            Some(_) => return false,
         }
     }
     if !p.q.is_empty() && !q_matches(&p.q, it.title, it.description, it.keywords) {
@@ -296,14 +306,19 @@ impl SearchQueryParams {
     }
 
     /// The query string (leading `?`, or empty) for this request at `offset`,
-    /// for building `self`/`next`/`prev` link hrefs.
-    pub fn query_string(&self, offset: usize) -> String {
+    /// for building `self`/`next`/`prev` link hrefs. `limit` is the *resolved*
+    /// (clamped) value — when the client supplied a `limit`, links reflect the
+    /// honoured value, not the raw request (a `limit=9999` clamped to 1000 must
+    /// not leak `9999` into links). When the client supplied none, links omit
+    /// `limit` so default-page URLs stay clean.
+    pub fn query_string(&self, limit: usize, offset: usize) -> String {
+        let limit_str = self.limit.as_ref().map(|_| limit.to_string());
         page_query_string(
             self.bbox.as_deref(),
             self.bbox_crs.as_deref(),
             self.datetime.as_deref(),
             self.q.as_deref(),
-            self.limit.as_deref(),
+            limit_str.as_deref(),
             offset,
         )
     }
@@ -442,12 +457,38 @@ mod tests {
         let kw: Vec<String> = vec![];
         let inside = cm("a", "", &kw, Some([20.0, 60.0, 25.0, 65.0]), None);
         let outside = cm("b", "", &kw, Some([-10.0, -10.0, -5.0, -5.0]), None);
+        // "unknown extent ≡ unbounded": a collection with no bbox matches.
         let no_bbox = cm("c", "", &kw, None, None);
         let items = [inside, outside, no_bbox];
         let p = parse_search_params(Some("0,50,30,70"), None, None, None, None, None).unwrap();
         let r = search(&items, &p);
-        assert_eq!(r.page, vec![0]); // only the intersecting one; no-bbox excluded
-        assert_eq!(r.number_matched, 1);
+        // intersecting (0) + unbounded no-bbox (2); the disjoint one (1) is out.
+        assert_eq!(r.page, vec![0, 2]);
+        assert_eq!(r.number_matched, 2);
+    }
+
+    #[test]
+    fn unknown_extent_is_unbounded() {
+        let kw: Vec<String> = vec![];
+        // No spatial and no temporal extent → matches both bbox and datetime
+        // filters (OGC API – Common – Part 4 §7.14.2 / §7.14.3).
+        let items = [cm("a", "", &kw, None, None)];
+        let bbox = parse_search_params(Some("0,0,1,1"), None, None, None, None, None).unwrap();
+        assert_eq!(search(&items, &bbox).number_matched, 1);
+        let dt = parse_search_params(None, None, Some("2026-06-02T00:00:00Z"), None, None, None)
+            .unwrap();
+        assert_eq!(search(&items, &dt).number_matched, 1);
+    }
+
+    #[test]
+    fn prev_suppressed_when_offset_out_of_range() {
+        let kw: Vec<String> = vec![];
+        let items: Vec<CollectionMatch> = (0..3).map(|_| cm("a", "", &kw, None, None)).collect();
+        // offset far beyond the 3 matches: empty page, and no `prev` chain.
+        let p = parse_search_params(None, None, None, None, Some("2"), Some("5000")).unwrap();
+        let r = search(&items, &p);
+        assert!(r.page.is_empty());
+        assert!(!r.has_prev, "out-of-range offset must not offer prev");
     }
 
     #[test]
@@ -553,5 +594,21 @@ mod tests {
             page_query_string(None, None, None, Some("heavy rain"), None, 0),
             "?q=heavy%20rain"
         );
+    }
+
+    #[test]
+    fn query_string_reflects_clamped_limit() {
+        // Client asked for an over-large limit; links must carry the resolved
+        // (clamped) value, not the raw request.
+        let sp = SearchQueryParams {
+            limit: Some("99999".to_string()),
+            ..Default::default()
+        };
+        let resolved = sp.parse().unwrap().limit; // == MAX_LIMIT
+        assert_eq!(resolved, MAX_LIMIT);
+        assert_eq!(sp.query_string(resolved, 0), format!("?limit={MAX_LIMIT}"));
+        // Client supplied no limit → links omit it (clean default-page URL).
+        let none = SearchQueryParams::default();
+        assert_eq!(none.query_string(DEFAULT_LIMIT, 0), "");
     }
 }

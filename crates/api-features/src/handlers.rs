@@ -425,7 +425,7 @@ pub async fn collections(
 
     let link = |rel: &str, offset: usize, title: Option<&str>| {
         let mut o = json!({
-            "href": format!("{base}/features/collections{}", sp.query_string(offset)),
+            "href": format!("{base}/features/collections{}", sp.query_string(params.limit, offset)),
             "rel": rel,
             "type": "application/json"
         });
