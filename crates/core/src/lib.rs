@@ -7,6 +7,7 @@ pub mod feature_engine;
 pub mod geo;
 pub mod map_engine;
 pub mod model;
+pub mod ogc_extent;
 pub mod openapi;
 pub mod resample;
 pub mod vertical;
