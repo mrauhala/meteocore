@@ -498,14 +498,14 @@ fn build_collection_metadata(
         "numberItems": total
     });
 
-    // Add spatial extent if available
+    // Add spatial extent if available. A Features collection contributes only
+    // a bbox (no grid/temporal/vertical), but it shares the one extent builder
+    // in `ds_core::ogc_extent` so the `/features` shape can't drift from
+    // `/maps` and `/tiles` (issue #263).
     if let Some(bbox) = engine.spatial_extent() {
-        metadata["extent"] = json!({
-            "spatial": {
-                "bbox": [bbox],
-                "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
-            }
-        });
+        if let Some(extent) = ds_core::ogc_extent::build_extent(Some(bbox), None, "", &[], None) {
+            metadata["extent"] = serde_json::to_value(extent).expect("Extent serializes to JSON");
+        }
     }
 
     metadata

@@ -181,81 +181,18 @@ fn build_collection_metadata(
 /// Build the OGC API Common Part 2 `extent` object (spatial, temporal,
 /// vertical) including the `grid` resolution descriptors. Returns `None` when
 /// the collection advertises no spatial, temporal, or vertical extent.
+///
+/// The assembly lives in `ds_core::ogc_extent` so Maps, Tiles, and Features
+/// share one definition (issue #263).
 fn build_extent(info: &ds_core::map_engine::RasterInfo) -> Option<serde_json::Value> {
-    let mut extent = serde_json::Map::new();
-
-    if let Some(bbox) = info.spatial_extent {
-        let mut spatial = json!({
-            "bbox": [bbox],
-            "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"
-        });
-        // Per-axis grid resolution in CRS84 degrees, derived from the native
-        // cell counts and the WGS84 bbox. Only for geographic (lon/lat) grids:
-        // for projected sources the cells aren't degree-regular, so a single
-        // CRS84-degree resolution would imply a regularity that doesn't hold.
-        // `crs84_bbox_spans` keeps the spans positive across the anti-meridian.
-        // Check the CRS first (cheap), then compute spans — mirrors api-tiles.
-        if let Some([nx, ny]) = info.grid_size {
-            if nx > 0 && ny > 0 && ds_core::geo::is_crs84_grid(&info.native_crs) {
-                let (lon_span, lat_span) = ds_core::geo::crs84_bbox_spans(bbox);
-                // Skip a degenerate (zero-span) bbox too: 0.0/nx would emit
-                // "resolution": 0.0, which is invalid per OGC API Common Part 2.
-                if lon_span > 0.0 && lat_span > 0.0 {
-                    spatial["grid"] = json!([
-                        { "cellsCount": nx, "resolution": lon_span / nx as f64 },
-                        { "cellsCount": ny, "resolution": lat_span / ny as f64 }
-                    ]);
-                }
-            }
-        }
-        extent.insert("spatial".to_string(), spatial);
-    }
-
-    if !info.times.is_empty() {
-        let start = info.times.first().map(|t| t.to_rfc3339());
-        let end = info.times.last().map(|t| t.to_rfc3339());
-        if let (Some(start), Some(end)) = (start, end) {
-            let mut temporal = json!({
-                "interval": [[start, end]],
-                "trs": "http://www.opengis.net/def/uom/ISO-8601/0/Gregorian"
-            });
-            // Shared descriptor from ds-core so Maps and Tiles can't drift.
-            if let Some(grid) = ds_core::datetime::temporal_grid(&info.times) {
-                temporal["grid"] =
-                    serde_json::to_value(grid).expect("TemporalGrid serializes to JSON");
-            }
-            extent.insert("temporal".to_string(), temporal);
-        }
-    }
-
-    // Vertical — keep `interval` + `values` (back-compat) and additively add
-    // the OGC API Common Part 2 form (`unit` + `grid.coordinates`). `vrs` is
-    // omitted: the only kind in use (radar elevation angle) has no standard
-    // OGC vertical-CRS URI.
-    if let Some(vertical) = &info.vertical {
-        // Only emit the vertical extent when there are levels: OGC API Common
-        // Part 2 requires `interval` to be a non-null array when the extent
-        // object is present, so an empty `VerticalDimension` is omitted rather
-        // than emitting `"interval": null`.
-        if let Some((lo, hi)) = vertical.extent() {
-            let levels = &vertical.levels;
-            extent.insert(
-                "vertical".to_string(),
-                json!({
-                    "interval": [[lo, hi]],
-                    "values": levels,
-                    "unit": vertical.unit(),
-                    "grid": { "coordinates": levels }
-                }),
-            );
-        }
-    }
-
-    if extent.is_empty() {
-        None
-    } else {
-        Some(serde_json::Value::Object(extent))
-    }
+    let extent = ds_core::ogc_extent::build_extent(
+        info.spatial_extent,
+        info.grid_size,
+        &info.native_crs,
+        &info.times,
+        info.vertical.as_ref(),
+    )?;
+    Some(serde_json::to_value(extent).expect("Extent serializes to JSON"))
 }
 
 // ---------------------------------------------------------------------------
