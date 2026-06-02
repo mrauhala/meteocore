@@ -215,11 +215,18 @@ pub async fn landing_page(
     }))
 }
 
+/// OpenAPI `f` (output-format) query parameter, shared by the content-negotiated
+/// metadata endpoints (landing, conformance, collections, collection detail).
+fn format_parameter() -> serde_json::Value {
+    json!({"name": "f", "in": "query", "required": false, "schema": {"type": "string", "enum": ["json", "html"]},
+           "description": "Output format. 'json' (default) or 'html'; overrides the Accept header."})
+}
+
 /// OpenAPI `parameters` array for the OGC API – Common – Part 4 searchable
-/// `/collections` query parameters. Documented per the CLAUDE.md rule and
-/// Part 4 §5.5.
+/// `/collections` query parameters (plus the shared `f` format selector).
+/// Documented per the CLAUDE.md rule and Part 4 §5.5.
 fn searchable_collections_parameters() -> serde_json::Value {
-    json!([
+    let mut params = json!([
         {"name": "bbox", "in": "query", "required": false, "schema": {"type": "string"},
          "description": "Filter to collections intersecting this CRS84 bbox: 4 (or 6) comma-separated numbers west,south,east,north."},
         {"name": "bbox-crs", "in": "query", "required": false, "schema": {"type": "string"},
@@ -231,10 +238,13 @@ fn searchable_collections_parameters() -> serde_json::Value {
         {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 1000},
          "description": "Maximum number of collections per page (default 1000)."},
         {"name": "offset", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0},
-         "description": "Number of matching collections to skip (pagination cursor)."},
-        {"name": "f", "in": "query", "required": false, "schema": {"type": "string", "enum": ["json", "html"]},
-         "description": "Output format. 'json' (default) or 'html'; overrides the Accept header."}
-    ])
+         "description": "Number of matching collections to skip (pagination cursor)."}
+    ]);
+    params
+        .as_array_mut()
+        .expect("searchable params is a JSON array")
+        .push(format_parameter());
+    params
 }
 
 pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
@@ -264,6 +274,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 "summary": format!("Get {} collection metadata", config.title),
                 "operationId": format!("getCollection_{id}"),
                 "tags": [id],
+                "parameters": [format_parameter()],
                 "responses": {
                     "200": {"description": "Collection metadata"},
                     "404": {"description": "Collection not found"}
@@ -457,6 +468,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             "get": {
                 "summary": "Landing page",
                 "operationId": "getLandingPage",
+                "parameters": [format_parameter()],
                 "responses": {
                     "200": {"description": "Landing page"}
                 }
@@ -466,6 +478,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             "get": {
                 "summary": "Conformance classes",
                 "operationId": "getConformance",
+                "parameters": [format_parameter()],
                 "responses": {
                     "200": {"description": "Conformance classes"}
                 }

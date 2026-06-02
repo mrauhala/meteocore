@@ -45,13 +45,16 @@ pub struct FormatParams {
 }
 
 /// Resolve the requested representation. `?f=` wins over the `Accept` header;
-/// `f=json|html` (case-insensitive); an unknown `f` is a 400. With no `f`, an
-/// `Accept` containing `text/html` selects HTML; everything else (including a
-/// missing header, `application/json`, `*/*`) defaults to **JSON** — so the
-/// existing JSON-only behaviour is unchanged unless a client opts in.
+/// `f=json|html` (case-insensitive); an unknown `f` is a 400. With no `f`, HTML
+/// is served only when `Accept` lists `text/html` with a non-zero q-value;
+/// everything else (missing header, `application/json`, `*/*`, or an explicit
+/// `text/html;q=0` opt-out) defaults to **JSON** — so the JSON-only behaviour
+/// is unchanged unless a client explicitly asks for HTML.
 ///
-/// `Accept` is matched by simple substring; q-value weighting is not applied
-/// (a deliberate v1 simplification — a client wanting JSON can send `?f=json`).
+/// Only an explicit `text/html` range is honoured (not `*/*`), so API clients
+/// that send `Accept: */*` (e.g. curl) keep getting JSON. Full cross-type
+/// q-value preference ordering is not implemented (a client wanting a specific
+/// format can always send `?f=`).
 pub fn negotiate(f: Option<&str>, accept: Option<&str>) -> Result<Wanted, NegotiationError> {
     if let Some(f) = f.map(str::trim).filter(|s| !s.is_empty()) {
         return match f.to_ascii_lowercase().as_str() {
@@ -62,10 +65,32 @@ pub fn negotiate(f: Option<&str>, accept: Option<&str>) -> Result<Wanted, Negoti
             ))),
         };
     }
-    if accept.is_some_and(|a| a.contains("text/html")) {
+    if accept.is_some_and(accept_allows_html) {
         return Ok(Wanted::Html);
     }
     Ok(Wanted::Json)
+}
+
+/// True if the `Accept` header lists a `text/html` media range that isn't
+/// disabled with `q=0`. `*/*` does not count — API clients sending `Accept: */*`
+/// stay on the JSON default.
+fn accept_allows_html(accept: &str) -> bool {
+    accept.split(',').any(|entry| {
+        let mut parts = entry.split(';').map(str::trim);
+        if !parts
+            .next()
+            .is_some_and(|m| m.eq_ignore_ascii_case("text/html"))
+        {
+            return false;
+        }
+        // Honour an explicit `q=0` (any zero form) as an opt-out.
+        for p in parts {
+            if let Some(q) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+                return q.trim().parse::<f32>().map(|v| v > 0.0).unwrap_or(true);
+            }
+        }
+        true
+    })
 }
 
 /// A hyperlink rendered in an HTML page (owned so callers build it inline).
@@ -230,6 +255,30 @@ mod tests {
         );
         assert_eq!(negotiate(None, None).unwrap(), Wanted::Json);
         assert_eq!(negotiate(Some(""), None).unwrap(), Wanted::Json);
+    }
+
+    #[test]
+    fn negotiate_accept_honours_q_values() {
+        // Explicit opt-out: text/html;q=0 must NOT select HTML.
+        assert_eq!(
+            negotiate(None, Some("text/html;q=0, application/json")).unwrap(),
+            Wanted::Json
+        );
+        assert_eq!(
+            negotiate(None, Some("text/html; q=0.0")).unwrap(),
+            Wanted::Json
+        );
+        // Non-zero q (or no q) selects HTML.
+        assert_eq!(
+            negotiate(None, Some("text/html;q=0.9")).unwrap(),
+            Wanted::Html
+        );
+        assert_eq!(
+            negotiate(None, Some("application/json, text/html;q=0.8")).unwrap(),
+            Wanted::Html
+        );
+        // `*/*` is not an explicit text/html range → JSON (curl-style clients).
+        assert_eq!(negotiate(None, Some("*/*")).unwrap(), Wanted::Json);
     }
 
     #[test]
