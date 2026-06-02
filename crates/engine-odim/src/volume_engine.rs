@@ -2478,11 +2478,16 @@ impl EdrEngine for PolarVolumeSiteView {
             parameters,
             levels.as_deref(),
         )?;
-        // Same shaping as position/location: a single-`z` request collapses
-        // to a bare `Coverage`, every other shape is a `Collection`, and an
-        // all-empty result is `LocationNotFound` (404) rather than an empty
-        // collection served as HTTP 200.
-        finalize_single_site(covs, &levels)
+        // An `area` query ALWAYS returns a `CoverageCollection` per OGC EDR —
+        // unlike position/location it does NOT collapse a single-`z` result
+        // to a bare `Coverage`. An all-empty result is `LocationNotFound`
+        // (404), not an empty collection served as HTTP 200.
+        if covs.is_empty() {
+            return Err(DataServerError::LocationNotFound(
+                "no PVOL data for this site in the requested time window".into(),
+            ));
+        }
+        Ok(CoverageResponse::Collection(covs))
     }
 
     /// Trajectory cross-section along a WKT `LINESTRING`, always against
@@ -3774,11 +3779,11 @@ mod tests {
         );
     }
 
-    /// A per-site `area` query collapses to a bare `Coverage` for a single
-    /// `z` level (matching position/location), and stays a `Collection`
-    /// otherwise.
+    /// A per-site `area` query ALWAYS returns a `CoverageCollection` per OGC
+    /// EDR — even for a single `z` level it does not collapse to a bare
+    /// `Coverage` (unlike position/location).
     #[test]
-    fn site_view_area_single_z_collapses_to_single() {
+    fn site_view_area_always_returns_collection() {
         let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
         by_site.insert(
             "fivih".to_string(),
@@ -3786,15 +3791,15 @@ mod tests {
         );
         let view = site_view_for(by_site, "fivih");
 
-        // Single elevation angle (the fixture's only sweep) → one Coverage.
+        // Single elevation angle → still a CoverageCollection.
         assert!(
             matches!(
                 EdrEngine::query_area(&view, "24.0,59.0,26.0,61.0", None, None, Some(&[0.5])),
-                Ok(CoverageResponse::Single(_))
+                Ok(CoverageResponse::Collection(_))
             ),
-            "a single-z area query must collapse to a bare Coverage"
+            "a single-z area query must stay a CoverageCollection"
         );
-        // No z → a Collection (one VerticalProfile per timestep).
+        // No z → also a Collection (one VerticalProfile per timestep).
         assert!(matches!(
             EdrEngine::query_area(&view, "24.0,59.0,26.0,61.0", None, None, None),
             Ok(CoverageResponse::Collection(_))

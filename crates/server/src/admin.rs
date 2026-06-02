@@ -1238,6 +1238,14 @@ pub fn load_collections(
                              already-registered collection — skipping this site",
                             collection.id
                         );
+                        health.push(CollectionHealth {
+                            id: site_id,
+                            engine_type: "odim-volume".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some(
+                                "derived id collides with an already-registered collection".into(),
+                            ),
+                        });
                         continue;
                     }
 
@@ -1950,12 +1958,6 @@ pub async fn reload_handler(
         config.server.metatile_cache_mb,
     );
 
-    let loaded = result
-        .health
-        .iter()
-        .filter(|h| h.status != CollectionStatus::Failed)
-        .count();
-
     // Reload protection counts *fully working* (`Ready`) collections, not
     // just non-`Failed` ones. A `Degraded` placeholder — e.g. an
     // odim-volume source that transiently scanned zero sites, or a postgis
@@ -2013,9 +2015,18 @@ pub async fn reload_handler(
             .filter(|h| h.engine_type == "odim-volume" && h.status == CollectionStatus::Ready)
             .filter(|h| !new_ids.contains(h.id.as_str()))
             .filter(|h| {
+                // `{base}-{nod}` where `nod` is plain alphanumeric (no `-`).
+                // Require the suffix after the base to be exactly `-{nod}`,
+                // not merely to start with `-`, so a still-present base
+                // `radar` doesn't claim a vanished site from a removed
+                // `radar-fi` source: `radar-fi-x`.strip_prefix(`radar`) =
+                // `-fi-x`, whose nod part `fi-x` is not alphanumeric.
                 new_bases.iter().any(|b| {
-                    h.id.strip_prefix(b.as_str())
-                        .is_some_and(|r| r.starts_with('-'))
+                    h.id.strip_prefix(b.as_str()).is_some_and(|r| {
+                        r.strip_prefix('-').is_some_and(|nod| {
+                            !nod.is_empty() && nod.bytes().all(|c| c.is_ascii_alphanumeric())
+                        })
+                    })
                 })
             })
             .map(|h| h.id.clone())
@@ -2147,7 +2158,19 @@ pub async fn reload_handler(
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.postgis_engines;
 
-    let degraded = loaded.saturating_sub(ready);
+    // Recount from the final `result.health` — the vanished-site block above
+    // appends `Degraded` entries after the guard's `ready` was computed, so
+    // count here to keep the response in sync with the `collections` array.
+    let ready = result
+        .health
+        .iter()
+        .filter(|h| h.status == CollectionStatus::Ready)
+        .count();
+    let degraded = result
+        .health
+        .iter()
+        .filter(|h| h.status == CollectionStatus::Degraded)
+        .count();
     info!(
         "Reload complete: {ready} ready ({degraded} degraded) of {} configured",
         config.collections.len()
