@@ -23,7 +23,7 @@ Each engine implements one or more of the core traits.
 | `engine-geojson` | `FeatureEngine` | GeoJSON FeatureCollection files (WGS84 only) |
 | `engine-geotiff` | `EdrEngine` + `MapEngine` | Cloud-Optimized GeoTIFF (local dir, S3, or STAC catalog) |
 | `engine-grib` | `EdrEngine` + `MapEngine` | GRIB2 NWP data via JSON/wgrib2 index sidecars (ECMWF IFS, NOAA GFS) |
-| `engine-odim` | `MapEngine` (EDR coming) | ODIM_H5 weather-radar composites (FMI / DMI / SMHI / OPERA); pure-Rust HDF5 |
+| `engine-odim` | `EdrEngine` + `MapEngine` | ODIM_H5 weather radar — 2-D composites (FMI / DMI / SMHI / OPERA) and native polar volumes (`odim-volume`, one collection per radar site); pure-Rust HDF5 |
 | `engine-querydata` | `EdrEngine` + `MapEngine` | FMI QueryData (`.sqd`) binary files, memory-mapped |
 | `engine-postgis` | `EdrEngine` + `FeatureEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible) |
 
