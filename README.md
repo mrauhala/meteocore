@@ -640,7 +640,9 @@ filename_template = "OPERA@%Y%m%dT%H%M@0@ACRR.h5"
 parameter = "reflectivity"             # required for COMP collections
 unit = "dBZ"                           # required for COMP collections
 # ...or stream from S3 instead of data_path (set inside [collections.odim]):
-# endpoint = "https://s3.example.com"  bucket = "radar"  prefix_pattern = "%Y/%m/%d/"
+# endpoint = "https://s3.example.com"
+# bucket = "radar"
+# prefix_pattern = "%Y/%m/%d/"
 poll_interval_secs = 300
 
 [collections.wms]
