@@ -51,10 +51,10 @@ pub struct FormatParams {
 /// `text/html;q=0` opt-out) defaults to **JSON** — so the JSON-only behaviour
 /// is unchanged unless a client explicitly asks for HTML.
 ///
-/// Only an explicit `text/html` range is honoured (not `*/*`), so API clients
-/// that send `Accept: */*` (e.g. curl) keep getting JSON. Full cross-type
-/// q-value preference ordering is not implemented (a client wanting a specific
-/// format can always send `?f=`).
+/// A `text/html` or `text/*` range is honoured (per RFC 9110 §12.5.1), but not
+/// `*/*` — so API clients that send `Accept: */*` (e.g. curl) keep getting JSON.
+/// Full cross-type q-value preference ordering is not implemented (a client
+/// wanting a specific format can always send `?f=`).
 pub fn negotiate(f: Option<&str>, accept: Option<&str>) -> Result<Wanted, NegotiationError> {
     if let Some(f) = f.map(str::trim).filter(|s| !s.is_empty()) {
         return match f.to_ascii_lowercase().as_str() {
@@ -71,16 +71,15 @@ pub fn negotiate(f: Option<&str>, accept: Option<&str>) -> Result<Wanted, Negoti
     Ok(Wanted::Json)
 }
 
-/// True if the `Accept` header lists a `text/html` media range that isn't
-/// disabled with `q=0`. `*/*` does not count — API clients sending `Accept: */*`
-/// stay on the JSON default.
+/// True if the `Accept` header lists a `text/html` (or `text/*`) media range
+/// that isn't disabled with `q=0`. `*/*` does not count — API clients sending
+/// `Accept: */*` stay on the JSON default.
 fn accept_allows_html(accept: &str) -> bool {
     accept.split(',').any(|entry| {
         let mut parts = entry.split(';').map(str::trim);
-        if !parts
-            .next()
-            .is_some_and(|m| m.eq_ignore_ascii_case("text/html"))
-        {
+        if !parts.next().is_some_and(|m| {
+            m.eq_ignore_ascii_case("text/html") || m.eq_ignore_ascii_case("text/*")
+        }) {
             return false;
         }
         // Honour an explicit `q=0` (any zero form) as an opt-out.
@@ -127,6 +126,10 @@ code{background:#f2f2f2;padding:.1em .3em;border-radius:3px;font-size:.9em}\
 ul{padding-left:1.1rem}li{margin:.25rem 0}.rel{color:#777;font-size:.85em}\
 .desc{color:#444}.nav{font-size:.9em}";
 
+/// Wrap `body` in the page skeleton. **`body` must already be HTML-escaped** —
+/// only `title` is escaped here. All builders in this module construct `body`
+/// from `escape()`d pieces; a caller that interpolates raw user-derived text
+/// into `body` would introduce stored XSS.
 fn page(title: &str, body: &str) -> String {
     format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
@@ -279,6 +282,9 @@ mod tests {
         );
         // `*/*` is not an explicit text/html range → JSON (curl-style clients).
         assert_eq!(negotiate(None, Some("*/*")).unwrap(), Wanted::Json);
+        // `text/*` matches text/html (RFC 9110 §12.5.1); `text/*;q=0` opts out.
+        assert_eq!(negotiate(None, Some("text/*")).unwrap(), Wanted::Html);
+        assert_eq!(negotiate(None, Some("text/*;q=0")).unwrap(), Wanted::Json);
     }
 
     #[test]
