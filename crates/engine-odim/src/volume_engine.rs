@@ -462,6 +462,11 @@ impl Pixels<'_> {
         if PIXEL_CACHE.is_known_bad(&cache_id, &moment.dataset_path) {
             return None;
         }
+        // NOTE: this fetches + parses the *whole* `.h5` to extract one dataset
+        // (the reader has no slice API), so a file with Q cold moments is
+        // downloaded Q times. Batch-decoding all moments on the first miss is
+        // tracked in #293 — an S3-transfer optimisation; local re-reads hit the
+        // page cache.
         let decoded = fetch_file_bytes(self.source, file_id, self.handle).and_then(|bytes| {
             read_moment_pixels(&bytes, &moment.dataset_path, nrays, nbins)
                 .map_err(|e| format!("decode `{}`: {e}", moment.dataset_path))

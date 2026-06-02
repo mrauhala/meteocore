@@ -95,31 +95,31 @@ impl PixelCache {
     }
 
     /// Whether `(file_id, dataset_path)` recently failed to read/decode and
-    /// should be treated as nodata without re-fetching. Always `false` when
-    /// the cache is disabled (diagnostic mode re-reads every sample).
+    /// should be treated as nodata without re-fetching. The negative cache is
+    /// independent of the byte capacity, so this stays effective even in the
+    /// disabled (`capacity_mb == 0`) diagnostic mode — otherwise a failing
+    /// moment would re-storm the store / re-flood logs there (PR #290 review).
     pub fn is_known_bad(&self, file_id: &str, dataset_path: &str) -> bool {
-        if self.capacity_bytes == 0 {
-            return false;
-        }
         let key: PixelKey = (Arc::from(file_id), Arc::from(dataset_path));
         self.negative.get(&key).is_some()
     }
 
     /// Record a failed read for `(file_id, dataset_path)`. Returns `true` when
-    /// this key was not already known-bad — the caller increments the failure
-    /// metric only then, so one logical failure counts once instead of once
-    /// per cell. When the cache is disabled there is no dedup store, so it
-    /// returns `true` every time (matching the re-read-everything mode).
+    /// this call was the first to record the key — the caller increments the
+    /// failure metric only then, so one logical failure counts once instead of
+    /// once per cell. The check-and-insert is atomic via the cache's
+    /// placeholder guard (`get_or_insert_with` runs the closure only for the
+    /// winning caller), so concurrent failures of the same key still count once
+    /// (no get/insert TOCTOU race — PR #290 review).
     pub fn mark_bad(&self, file_id: &str, dataset_path: &str) -> bool {
-        if self.capacity_bytes == 0 {
-            return true;
-        }
         let key: PixelKey = (Arc::from(file_id), Arc::from(dataset_path));
-        if self.negative.get(&key).is_some() {
-            return false;
-        }
-        self.negative.insert(key, ());
-        true
+        let mut newly = false;
+        let _: Result<(), std::convert::Infallible> =
+            self.negative.get_or_insert_with(&key, || {
+                newly = true;
+                Ok(())
+            });
+        newly
     }
 
     /// Current resident weight (bytes) — for metrics.
@@ -160,12 +160,28 @@ mod tests {
     }
 
     #[test]
-    fn disabled_cache_never_negative_caches() {
-        // Capacity 0 = diagnostic re-read-everything mode: no dedup store, so
-        // mark_bad always reports "new" and is_known_bad never reports bad.
+    fn negative_cache_stays_active_when_positive_disabled() {
+        // Capacity 0 disables the *positive* pixel cache (every successful
+        // sample re-reads), but the negative cache must stay active so a
+        // failing moment isn't re-fetched / re-logged per cell in diagnostic
+        // mode (PR #290 review r3).
         let c = PixelCache::new(0);
-        assert!(c.mark_bad("x", "/d"));
-        assert!(c.mark_bad("x", "/d"));
-        assert!(!c.is_known_bad("x", "/d"));
+        assert!(c.mark_bad("x", "/d"), "first failure is new");
+        assert!(
+            !c.mark_bad("x", "/d"),
+            "repeat deduped even with the positive cache off"
+        );
+        assert!(c.is_known_bad("x", "/d"));
+    }
+
+    #[test]
+    fn mark_bad_counts_once_under_repeated_calls() {
+        // The winning caller gets "new"; every later call for the same key is
+        // a dedup (no double-count of the failure metric).
+        let c = PixelCache::new(64);
+        assert!(c.mark_bad("k", "/d"));
+        for _ in 0..100 {
+            assert!(!c.mark_bad("k", "/d"));
+        }
     }
 }
