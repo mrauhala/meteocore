@@ -165,9 +165,17 @@ radar elevation angle. WMS exposes it as the `ELEVATION` dimension; Maps/Tiles a
 | GeoTIFF | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | GRIB | `EdrEngine` + `MapEngine` | EDR, WMS, Maps, Tiles |
 | ODIM COMP | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
-| ODIM PVOL | `EdrEngine` + `MapEngine` | EDR (position, locations, area), WMS, Maps, Tiles |
+| ODIM PVOL | `EdrEngine` + `MapEngine` | EDR (position, locations, area, trajectory), WMS, Maps, Tiles |
 | QueryData | `EdrEngine` + `MapEngine` | EDR (position only), WMS, Maps, Tiles |
 | PostGIS | `EdrEngine` + `FeatureEngine` | EDR (position, locations, area), Features |
+
+## ODIM PVOL Engine Notes (per-site collections — model B)
+
+- **One source → N collections.** A single `engine_type = "odim-volume"` config scans a directory / S3 prefix of `.h5` polar volumes spanning a whole radar *network*, then expands into **one OGC collection per radar site** (ODIM `nod`), with id `{base_id}-{nod}` (e.g. `radar-fi-volume-local-h5-fivih`). There is **no** network-level aggregate collection.
+- **The engine owns the source; views serve the API.** `PolarVolumeEngine` (in `engine-odim/src/volume_engine.rs`) does the scan, parse cache, and poll loop and is registered only on the background poll runtime. Each site is served by a cheap `PolarVolumeSiteView` over the engine's shared `Arc<ArcSwap<Catalog>>` — so all views see poll refreshes for free. The engine itself does **not** implement `EdrEngine`/`MapEngine`.
+- **Parameter = bare quantity.** A site collection's parameters are the bare ODIM quantities (`DBZH`, `VRADH`, `ZDR`, `RHOHV`, …) — **never** `<nod>:<quantity>`. The site is the collection (its single EDR location, its spatial/vertical extent), so it has no place in the parameter name. This also lets WMS styling key off the quantity: set per-quantity colormaps with `[[wms.parameters]]` (name = bare quantity) on the source config and every site inherits them.
+- **Auto-split happens in `server/src/admin.rs`** (`load_collections`, the `"odim-volume"` arm): build the engine once, enumerate `engine.site_ids()`, and register one view per site (cloning the base `CollectionConfig` with a per-site id/title). Site discovery is a scan snapshot — sites added later surface on the next `POST /admin/collections/reload`.
+- **Cross-sections.** `query_trajectory` returns a CoverageJSON `Section` (composite `[t,x,y]` axis + numeric `z` = height above antenna, via the 4/3-Earth beam model). `z` selects the elevation-angle band. Vertical axis is elevation angle (`VerticalKind::ElevationAngle`).
 
 ## GeoTIFF Engine Notes
 

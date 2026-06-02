@@ -6,21 +6,23 @@
 //! coordinates — and resamples them into Cartesian raster tiles on the
 //! fly.
 //!
-//! ## Layer model
+//! ## Collection model (model B — per-site collections)
 //!
-//! A PVOL collection covers a radar **network**: a local directory of
-//! `.h5` polar-volume files spanning multiple sites and multiple
-//! acquisition times. Each radar **site** is a layer group; each radar
-//! **quantity** (`DBZH`, `TH`, `VRADH`, `ZDR`, …) is a sub-layer —
-//! exactly like a multi-parameter GRIB collection. The advertised
-//! parameter name is `<nod>:<quantity>` (e.g. `fianj:DBZH`).
+//! A PVOL **source** is a local directory of `.h5` polar-volume files (or
+//! an S3/HTTP prefix) spanning multiple radar **sites** and multiple
+//! acquisition times. [`PolarVolumeEngine`] owns one source: it scans,
+//! parses, caches, and polls — but it is *not* itself an OGC collection.
 //!
-//! The `:` separator is deliberate. WMS layer names are
-//! `collection-id/parameter` and the api-wms handler splits on the
-//! *first* `/`, so the parameter token must not itself contain `/`.
-//! `:` is safe in a WMS `LAYERS=` value and in a Maps/Tiles
-//! `?parameter-name=` query parameter, and reads naturally as a
-//! site-scoped quantity.
+//! Instead, the loader expands one source into **N per-site collections**
+//! (one per ODIM `nod`), each served by a cheap [`PolarVolumeSiteView`]
+//! over the engine's shared catalog. A site collection's parameters are
+//! **bare quantities** (`DBZH`, `TH`, `VRADH`, `ZDR`, …) — the site is the
+//! collection (its EDR location, its spatial/vertical extent), so it has
+//! no business in the parameter name. This matches EDR (where the
+//! parameter list is the quantity, never `<nod>:<quantity>`) and lets WMS
+//! styling key off the bare quantity. WMS layer names are
+//! `collection-id/parameter`; with a bare-quantity parameter the token
+//! never contains the api-wms-significant `/`.
 //!
 //! ## Interim scope (Milestone 2)
 //!
@@ -75,11 +77,6 @@ use crate::pvol::{read_polar_volume, PolarMoment, PolarVolume, Sweep};
 /// the recent tail still straddles yesterday's partition. Mirrors
 /// `OdimEngine`'s constant of the same name.
 const DEFAULT_SCAN_DAYS: u32 = 2;
-
-/// Separator between the ODIM node id and the radar quantity in an
-/// advertised parameter name (`fianj:DBZH`). See the module docs for
-/// why `:` and not `/`.
-pub const SITE_QUANTITY_SEP: char = ':';
 
 /// Mean Earth radius (metres) used by the geodesic helper. A sphere is
 /// the right model here: radar ground range is itself a spherical
@@ -331,29 +328,54 @@ struct VolumeEntry {
     volume: Arc<PolarVolume>,
 }
 
+/// Per-site derived metadata, computed once per scan in [`derive_catalog`].
+///
+/// A [`PolarVolumeSiteView`]'s capability accessors (`raster_info`,
+/// `get_parameters`, extents) read from this snapshot so they stay O(1)
+/// from an `ArcSwap` load (CLAUDE.md hot-path rule) instead of re-deriving
+/// from sweeps on every request. Mirrors the union fields on [`Catalog`]
+/// but scoped to one radar `nod`.
+#[derive(Clone)]
+struct SiteMeta {
+    /// Antenna longitude (WGS84).
+    lon: f64,
+    /// Antenna latitude (WGS84).
+    lat: f64,
+    /// Human place name (ODIM `/what` PLC), if present.
+    plc: Option<String>,
+    /// Map/WMS layer list — `(bare_quantity, title)` from this site's
+    /// lowest sweep. **No `<nod>:` prefix**: under model B the site *is*
+    /// the collection, so the parameter is the bare quantity.
+    parameters: Vec<(String, String)>,
+    /// Bare EDR quantities (lowest sweep), sorted distinct.
+    quantities: Vec<String>,
+    /// This site's distinct volume times, ascending.
+    times: Vec<DateTime<Utc>>,
+    /// This site's circular coverage bbox `[w, s, e, n]` (WGS84).
+    spatial_extent: Option<[f64; 4]>,
+    /// This site's maximum ground-range coverage radius (metres) — the
+    /// lowest sweep's `nbins·rscale + rstart`. `None` for a malformed
+    /// `rscale`. Used to reject position queries clearly outside coverage.
+    coverage_radius_m: Option<f64>,
+    /// This site's sweep elevation angles (degrees).
+    vertical: Option<VerticalDimension>,
+}
+
 /// The engine's catalog: per-site time-sorted volume lists, plus the
-/// derived metadata `raster_info()` answers from.
+/// per-site derived metadata each [`PolarVolumeSiteView`] answers from.
+///
+/// Under model B there is no network-level collection — each radar site is
+/// its own collection — so the catalog carries only the per-site index and
+/// no union/aggregate metadata.
 struct Catalog {
     /// Volumes grouped by `site.nod`, each list sorted by `time`
     /// ascending.
     by_site: HashMap<String, Vec<VolumeEntry>>,
-    /// `(parameter_name, title)` pairs — one per `<nod>:<quantity>`
-    /// from each site's lowest sweep. Sorted for stable output. This is
-    /// the Map/WMS layer list (site-scoped).
-    parameters: Vec<(String, String)>,
-    /// Distinct ODIM quantity names across every site's lowest sweep,
-    /// sorted — the EDR parameter list. Unlike `parameters` these carry
-    /// no `<site>:` prefix: in EDR the site is the *location* and the
-    /// quantity is the *parameter*.
-    quantities: Vec<String>,
-    /// All distinct volume times across every site, sorted ascending.
-    times: Vec<DateTime<Utc>>,
-    /// Union of per-site coverage bboxes `[w, s, e, n]` in WGS84.
-    spatial_extent: Option<[f64; 4]>,
-    /// The collection's vertical axis — elevation angle (degrees), the
-    /// union of every site's sweep angles. `None` until the catalog has
-    /// at least one volume.
-    vertical: Option<VerticalDimension>,
+    /// Per-site derived metadata keyed by `nod` — the snapshot each
+    /// [`PolarVolumeSiteView`] answers capability queries from. Keys
+    /// match `by_site` (a site with no derivable metadata, e.g. every
+    /// sweep malformed, is simply absent here).
+    by_site_meta: HashMap<String, SiteMeta>,
 }
 
 /// Round an elevation angle to 0.1° so near-identical sweep angles from
@@ -675,6 +697,21 @@ fn build_catalog(
             continue;
         };
 
+        // The NOD becomes part of a URL-routed collection id (`{base}-{nod}`)
+        // and a WMS `LAYERS` token, so reject anything that isn't a clean
+        // path segment. ODIM NODs are spec'd as 5 ASCII-alphanumeric chars
+        // (2-letter country + 3-letter station), so this only fires on a
+        // malformed/adversarial file — a NOD with `/` would make the
+        // collection permanently unreachable (Axum stops `{id}` at the first
+        // `/`), and `?`/`#`/space/non-ASCII would corrupt routing or the IRI.
+        if !is_url_safe_nod(&nod) {
+            tracing::warn!(
+                "[{collection_id}] skipping PVOL file `{id}`: NOD `{nod}` contains \
+                 characters invalid in a URL path segment (expected ASCII alphanumeric)"
+            );
+            continue;
+        }
+
         by_site
             .entry(nod)
             .or_default()
@@ -684,9 +721,21 @@ fn build_catalog(
     by_site
 }
 
-/// Finalise the grouped volume map into a [`Catalog`]: sort and cap
-/// each site's list, evict stale parse-cache entries, and derive the
-/// parameter list, temporal extent, and spatial extent.
+/// Whether `nod` is safe to embed verbatim in a URL-routed collection id
+/// (`{base}-{nod}`) and a WMS `LAYERS` token: non-empty and **purely ASCII
+/// alphanumeric**. ODIM NODs are exactly that (5 chars, e.g. `fivih`), so
+/// this passes every well-formed code. Forbidding the `-` separator inside
+/// a nod also makes the per-site id `{base}-{nod}` unambiguous — two
+/// different sources can never derive the same id (`radar-a` + `b-fivih`
+/// vs `radar-a-b` + `fivih` would otherwise both yield `radar-a-b-fivih`).
+fn is_url_safe_nod(nod: &str) -> bool {
+    !nod.is_empty() && nod.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Finalise the grouped volume map into a [`Catalog`]: sort and cap each
+/// site's list, evict stale parse-cache entries, and derive per-site
+/// metadata. Under model B there is no aggregate/union metadata — each
+/// radar site is its own collection, served by a [`PolarVolumeSiteView`].
 ///
 /// `max_files` caps each site to its most-recent N volumes — an archive
 /// directory (or a wide S3 `time_window`) must not load and cache every
@@ -719,84 +768,109 @@ fn derive_catalog(
         guard.retain(|k, _| kept.contains(k));
     }
 
-    // Derive parameters (Map layers) and quantities (EDR parameters)
-    // from each site's lowest sweep.
-    let mut parameters: Vec<(String, String)> = Vec::new();
-    let mut quantities: Vec<String> = Vec::new();
-    for (nod, list) in &by_site {
-        // Use the most recent volume's lowest sweep for the quantity
-        // list — quantity sets are stable across a site's volumes.
-        let Some(latest) = list.last() else { continue };
-        let Some(sweep0) = latest.volume.sweeps.first() else {
-            continue;
-        };
-        let plc = latest.volume.site.plc.as_deref();
-        for moment in &sweep0.moments {
-            let name = format!("{nod}{SITE_QUANTITY_SEP}{}", moment.quantity);
-            let title = match plc {
-                Some(place) => format!("{place} — {}", moment.quantity),
-                None => name.clone(),
-            };
-            parameters.push((name, title));
-            quantities.push(moment.quantity.clone());
-        }
+    // Per-site metadata snapshots (model B): one `SiteMeta` per site so
+    // each `PolarVolumeSiteView` answers capability queries scoped to its
+    // own radar without re-deriving from sweeps per request.
+    let by_site_meta: HashMap<String, SiteMeta> = by_site
+        .iter()
+        .filter_map(|(nod, list)| Some((nod.clone(), derive_site_meta(list)?)))
+        .collect();
+
+    Catalog {
+        by_site,
+        by_site_meta,
     }
-    parameters.sort_by(|a, b| a.0.cmp(&b.0));
-    // A producer shipping a sweep with a duplicate quantity name would
-    // otherwise advertise the same `<nod>:<quantity>` layer twice.
-    parameters.dedup_by(|a, b| a.0 == b.0);
-    // Quantities recur across sites — collapse to the distinct set.
+}
+
+/// Derive one site's [`SiteMeta`] from its time-sorted volume list.
+///
+/// Returns `None` for a site whose most-recent volume has no sweeps or no
+/// moment datasets (an entirely malformed file) — such a site is dropped
+/// from `by_site_meta` and is never registered as a collection.
+fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
+    let latest = list.last()?;
+    let site = &latest.volume.site;
+
+    // Map/WMS + EDR quantity set: the **union** of every sweep's moments
+    // (bare, no `<nod>:` prefix). Title is just the quantity — the per-site
+    // collection already carries the place name. The union (not just the
+    // lowest sweep) is deliberate: a moment that only appears on higher
+    // sweeps (split-cut scan strategies) is still queryable by EDR
+    // (`resolve_quantities` unions across sweeps) and renderable by WMS
+    // (`polar_sample` searches every sweep that carries the quantity), so
+    // the advertised list must include it — otherwise EDR and WMS would
+    // report contradictory parameter sets for the same collection.
+    let mut quantities: Vec<String> = latest
+        .volume
+        .sweeps
+        .iter()
+        .flat_map(|s| s.moments.iter().map(|m| m.quantity.clone()))
+        .collect();
     quantities.sort();
     quantities.dedup();
+    // A volume with sweep structs but no moment datasets in any of them
+    // (a malformed file) yields no quantities. Exclude such a site rather
+    // than register a zero-parameter collection whose default WMS layer is
+    // broken and whose every render 400s — `sweeps.first()?` above only
+    // guards the no-sweeps case, not the no-moments case.
+    if quantities.is_empty() {
+        let nod = site.nod.as_deref().unwrap_or("?");
+        tracing::warn!(
+            "PVOL site `{nod}`: latest volume has sweeps but no moment data — \
+             excluding from registered sites"
+        );
+        return None;
+    }
+    let parameters: Vec<(String, String)> =
+        quantities.iter().map(|q| (q.clone(), q.clone())).collect();
 
-    // Distinct, sorted volume times across all sites.
-    let mut times: Vec<DateTime<Utc>> = by_site
-        .values()
-        .flat_map(|l| l.iter().map(|e| e.volume.time))
-        .collect();
+    // Coverage radius = the **maximum** range-gate reach across all sweeps
+    // (skipping sweeps with a malformed `rscale`). Quantities are unioned
+    // across sweeps, so a moment may live only on a longer-range higher
+    // sweep; using the lowest sweep's radius alone would wrongly reject an
+    // in-range query for such a quantity. `None` only when *no* sweep has
+    // usable geometry. `spatial_extent` derives from the same radius so the
+    // advertised extent covers the union of sweep ranges.
+    let coverage_radius_m = latest
+        .volume
+        .sweeps
+        .iter()
+        .filter_map(|s| {
+            let r = s.nbins as f64 * s.rscale + s.rstart;
+            (s.rscale.is_finite() && s.rscale > 0.0 && r.is_finite() && r > 0.0).then_some(r)
+        })
+        .max_by(f64::total_cmp);
+    let spatial_extent = coverage_radius_m.map(|r| site_coverage_bbox(site.lon, site.lat, r));
+
+    let mut times: Vec<DateTime<Utc>> = list.iter().map(|e| e.volume.time).collect();
     times.sort_unstable();
     times.dedup();
 
-    // Union of per-site coverage bboxes.
-    let mut spatial_extent: Option<[f64; 4]> = None;
-    for list in by_site.values() {
-        let Some(latest) = list.last() else { continue };
-        let Some(sweep0) = latest.volume.sweeps.first() else {
-            continue;
-        };
-        let site = &latest.volume.site;
-        let radius_m = sweep0.nbins as f64 * sweep0.rscale + sweep0.rstart;
-        let bb = site_coverage_bbox(site.lon, site.lat, radius_m);
-        spatial_extent = Some(match spatial_extent {
-            None => bb,
-            Some([w, s, e, n]) => [w.min(bb[0]), s.min(bb[1]), e.max(bb[2]), n.max(bb[3])],
-        });
-    }
-
-    // Vertical axis: the union of every site's sweep elevation angles
-    // (from each site's most-recent volume), rounded and sorted ascending.
-    let mut levels: Vec<f64> = by_site
-        .values()
-        .filter_map(|list| list.last())
-        .flat_map(|e| e.volume.sweeps.iter().map(|s| round_elevation(s.elangle)))
+    // Elevation-angle axis from the most-recent volume's sweeps, rounded
+    // and deduped — see the matching union derivation above.
+    let mut levels: Vec<f64> = latest
+        .volume
+        .sweeps
+        .iter()
+        .map(|s| round_elevation(s.elangle))
         .collect();
-    // Drop non-finite angles before the extent — see the matching filter in
-    // `volume_profile`. `round_elevation` normalises -0.0 → +0.0, so plain
-    // `dedup` after `sort_by(total_cmp)` collapses every duplicate.
     levels.retain(|v| v.is_finite());
     levels.sort_by(f64::total_cmp);
     levels.dedup();
     let vertical =
         (!levels.is_empty()).then(|| VerticalDimension::new(VerticalKind::ElevationAngle, levels));
 
-    Catalog {
-        by_site,
+    Some(SiteMeta {
+        lon: site.lon,
+        lat: site.lat,
+        plc: site.plc.clone(),
         parameters,
         quantities,
         times,
         spatial_extent,
+        coverage_radius_m,
         vertical,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -876,10 +950,9 @@ impl PolarVolumeEngine {
             );
         } else {
             tracing::info!(
-                "[{collection_id}] PVOL catalog: {} site(s), {} parameter(s), {} time(s)",
+                "[{collection_id}] PVOL catalog: {} site(s), {} volume(s)",
                 catalog.by_site.len(),
-                catalog.parameters.len(),
-                catalog.times.len()
+                catalog.by_site.values().map(|l| l.len()).sum::<usize>(),
             );
         }
 
@@ -964,44 +1037,53 @@ impl PolarVolumeEngine {
 
     /// Re-scan the source and atomically swap the catalog.
     ///
-    /// The scan — directory walk or S3 `list` + multi-MB `get`s plus
-    /// HDF5 parsing — is blocking, so it runs on `spawn_blocking` rather
-    /// than stalling a Tokio worker. Mirrors `OdimEngine::poll_once`.
+    /// The scan — directory walk or S3 `list` + multi-MB `get`s plus HDF5
+    /// parsing — is blocking, and runs **directly on the background poll
+    /// runtime worker**, NOT via `spawn_blocking`. For a `Source::Remote`,
+    /// `scan_source` reaches into `ds-storage`, whose `block_in_place`
+    /// **panics** on a `spawn_blocking` pool thread but is valid on a
+    /// multi-thread-runtime worker (`poll_runtime()` is `new_multi_thread`).
+    /// Wrapping in `spawn_blocking` would silently fail every S3 refresh
+    /// (the `JoinError` is caught, but the catalog never updates — new
+    /// volumes are dropped until an admin reload). Mirrors the GRIB /
+    /// GeoTIFF / QueryData poll loops, which also call their blocking scan
+    /// directly on the poll runtime.
     async fn poll_once(&self) {
-        let collection_id = self.collection_id.clone();
-        let source = self.source.clone();
-        let cache = Arc::clone(&self.parse_cache);
-        let max_files = self.max_files;
-        let scan_result = tokio::task::spawn_blocking(move || {
-            scan_source(&collection_id, &source, &cache, max_files)
-        })
-        .await;
-        match scan_result {
-            Ok(Ok(catalog)) => {
+        match scan_source(
+            &self.collection_id,
+            &self.source,
+            &self.parse_cache,
+            self.max_files,
+        ) {
+            Ok(catalog) => {
                 let prev = self.catalog.load();
+                // Aggregate signals across sites for change detection: site
+                // count, newest volume time, and total volume count.
+                let latest = |c: &Catalog| {
+                    c.by_site_meta
+                        .values()
+                        .filter_map(|m| m.times.last().copied())
+                        .max()
+                };
+                let total_volumes =
+                    |c: &Catalog| c.by_site.values().map(|l| l.len()).sum::<usize>();
                 let changed = prev.by_site.len() != catalog.by_site.len()
-                    || prev.times.last() != catalog.times.last()
-                    || prev.parameters.len() != catalog.parameters.len();
+                    || latest(&prev) != latest(&catalog)
+                    || total_volumes(&prev) != total_volumes(&catalog);
                 if changed {
                     tracing::info!(
-                        "[{}] PVOL catalog refreshed: {} → {} site(s), {} → {} time(s)",
+                        "[{}] PVOL catalog refreshed: {} → {} site(s), {} → {} volume(s)",
                         self.collection_id,
                         prev.by_site.len(),
                         catalog.by_site.len(),
-                        prev.times.len(),
-                        catalog.times.len(),
+                        total_volumes(&prev),
+                        total_volumes(&catalog),
                     );
                 }
                 self.catalog.store(Arc::new(catalog));
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 tracing::warn!("[{}] PVOL catalog refresh failed: {e}", self.collection_id);
-            }
-            Err(join_err) => {
-                tracing::error!(
-                    "[{}] PVOL catalog refresh task panicked: {join_err}",
-                    self.collection_id
-                );
             }
         }
     }
@@ -1203,29 +1285,39 @@ fn polar_sample(
     output_crs: &OutputCrs,
     z: Option<f64>,
 ) -> Result<RasterTile, DataServerError> {
-    // M1 sorts `sweeps` ascending by elangle, so `first()` is the lowest.
-    let sweep = match z {
-        Some(target) => nearest_sweep(volume, target),
-        None => volume.sweeps.first(),
-    }
-    .ok_or_else(|| {
-        DataServerError::Engine(format!(
-            "PVOL site `{}` has no elevation sweeps",
+    // Pick the sweep that actually carries `quantity`: nearest to `z` (or
+    // the lowest when `z` is absent) *among the sweeps that contain the
+    // moment*. A blind lowest/nearest pick would 400 on a quantity that is
+    // only present on higher sweeps (split-cut scan strategies), even
+    // though it is advertised (the parameter list unions across sweeps).
+    // `sweeps` is sorted ascending by elangle (M1), so the first matching
+    // candidate is the lowest sweep that has the quantity.
+    let mut candidates = volume
+        .sweeps
+        .iter()
+        .filter(|s| s.moments.iter().any(|m| m.quantity == quantity))
+        .peekable();
+    if candidates.peek().is_none() {
+        return Err(DataServerError::InvalidParameter(format!(
+            "quantity `{quantity}` is not present in any sweep of PVOL site `{}`",
             volume.site.nod.as_deref().unwrap_or("?")
-        ))
-    })?;
+        )));
+    }
+    let sweep = match z {
+        Some(target) => candidates.min_by(|a, b| {
+            (a.elangle - target)
+                .abs()
+                .total_cmp(&(b.elangle - target).abs())
+        }),
+        None => candidates.next(),
+    }
+    .expect("non-empty candidate set checked above");
 
     let moment = sweep
         .moments
         .iter()
         .find(|m| m.quantity == quantity)
-        .ok_or_else(|| {
-            DataServerError::InvalidParameter(format!(
-                "quantity `{quantity}` is not present in the lowest sweep of \
-                 PVOL site `{}`",
-                volume.site.nod.as_deref().unwrap_or("?")
-            ))
-        })?;
+        .expect("candidate sweep contains the quantity");
 
     let (site_lon, site_lat) = (volume.site.lon, volume.site.lat);
     if sweep.nrays == 0 || sweep.nbins == 0 {
@@ -1272,99 +1364,8 @@ fn polar_sample(
     })
 }
 
-/// Split an advertised `<nod>:<quantity>` parameter name into its
-/// `(site, quantity)` parts. Returns `None` when the separator is
-/// absent or either side is empty.
-fn parse_parameter(parameter: &str) -> Option<(&str, &str)> {
-    let (site, quantity) = parameter.split_once(SITE_QUANTITY_SEP)?;
-    if site.is_empty() || quantity.is_empty() {
-        return None;
-    }
-    Some((site, quantity))
-}
-
-impl MapEngine for PolarVolumeEngine {
-    fn get_raster_tile(
-        &self,
-        bbox: [f64; 4],
-        width: u32,
-        height: u32,
-        time: Option<DateTime<Utc>>,
-        output_crs: &OutputCrs,
-        parameter: Option<&str>,
-        z: Option<f64>,
-    ) -> Result<RasterTile, DataServerError> {
-        // A PVOL collection is inherently multi-parameter — the caller
-        // must name a `<nod>:<quantity>` layer.
-        let parameter = parameter.ok_or_else(|| {
-            DataServerError::InvalidParameter(format!(
-                "[{}] PVOL collection requires a `<site>{SITE_QUANTITY_SEP}<quantity>` \
-                 parameter (e.g. `fianj{SITE_QUANTITY_SEP}DBZH`)",
-                self.collection_id
-            ))
-        })?;
-        let (site, quantity) = parse_parameter(parameter).ok_or_else(|| {
-            DataServerError::InvalidParameter(format!(
-                "[{}] unparseable PVOL parameter `{parameter}` — expected \
-                 `<site>{SITE_QUANTITY_SEP}<quantity>`",
-                self.collection_id
-            ))
-        })?;
-
-        let catalog = self.catalog.load();
-        let site_volumes = catalog.by_site.get(site).ok_or_else(|| {
-            DataServerError::InvalidParameter(format!(
-                "[{}] unknown PVOL site `{site}`",
-                self.collection_id
-            ))
-        })?;
-
-        // Select the volume nearest `time` (latest if `None`) — mirrors
-        // `OdimEngine::select_entry`.
-        let entry = match time {
-            Some(target) => site_volumes
-                .iter()
-                .min_by_key(|e| (e.volume.time - target).num_seconds().abs()),
-            None => site_volumes.last(),
-        }
-        .ok_or_else(|| {
-            DataServerError::Engine(format!(
-                "[{}] PVOL site `{site}` has no volumes",
-                self.collection_id
-            ))
-        })?;
-
-        polar_sample(&entry.volume, quantity, bbox, width, height, output_crs, z)
-    }
-
-    fn raster_info(&self) -> RasterInfo {
-        let catalog = self.catalog.load();
-        let parameters = catalog.parameters.clone();
-        let parameter = parameters
-            .first()
-            .map(|(name, _)| name.clone())
-            .unwrap_or_default();
-
-        RasterInfo {
-            native_crs: "CRS:84".to_string(),
-            spatial_extent: catalog.spatial_extent,
-            times: catalog.times.clone(),
-            parameter,
-            // PVOL quantities span multiple physical units (dBZ, m/s,
-            // dB, …); the per-layer unit is not a single collection
-            // constant, so leave it blank.
-            unit: String::new(),
-            parameters,
-            vertical: catalog.vertical.clone(),
-            // Polar volume — no regular CRS84 cell grid, so the spatial grid
-            // resolution is not meaningful here.
-            grid_size: None,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
-// EdrEngine
+// Per-site EDR/Map helpers (shared by PolarVolumeSiteView)
 // ---------------------------------------------------------------------------
 
 /// `ParameterDescription` for an ODIM quantity. ODIM moment groups
@@ -1379,40 +1380,28 @@ fn quantity_description(quantity: &str) -> ParameterDescription {
     }
 }
 
-/// NOD code of the radar site nearest to `(lon, lat)` by ground
-/// distance. `None` only when the catalog holds no sites.
-fn nearest_site(catalog: &Catalog, lon: f64, lat: f64) -> Option<&str> {
-    catalog
-        .by_site
-        .iter()
-        .filter_map(|(nod, list)| {
-            let site = &list.last()?.volume.site;
-            let (dist, _) = ground_distance_bearing(site.lon, site.lat, lon, lat);
-            Some((nod.as_str(), dist))
-        })
-        .min_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(nod, _)| nod)
-}
-
 /// Resolve the quantity set for a PVOL site query: the union of every
-/// sweep's moments in the most recent selected volume — a profile
-/// samples all sweeps, and a quantity may be present only on higher
-/// elevations (e.g. dual-PRF `VRADH`/`WRADH`) — intersected with the
-/// optional `parameters` filter.
+/// sweep's moments across **all** selected volumes — a profile samples all
+/// sweeps, a quantity may be present only on higher elevations (e.g.
+/// dual-PRF `VRADH`/`WRADH`), and a quantity may drop out of the newest
+/// scan (firmware change / reduced strategy) while earlier volumes in the
+/// window still carry it — intersected with the optional `parameters`
+/// filter. `volume_profile`/`level_series` map a missing moment in any one
+/// timestep to `None`, so unioning here never fabricates data; it only
+/// keeps a quantity queryable for the timesteps that actually have it.
 fn resolve_quantities(
     selected: &[&VolumeEntry],
     parameters: Option<&[String]>,
 ) -> Result<Vec<String>, DataServerError> {
     let mut available: Vec<String> = selected
-        .last()
-        .map(|e| {
+        .iter()
+        .flat_map(|e| {
             e.volume
                 .sweeps
                 .iter()
                 .flat_map(|s| s.moments.iter().map(|m| m.quantity.clone()))
-                .collect()
         })
-        .unwrap_or_default();
+        .collect();
     available.sort();
     available.dedup();
     let quantities: Vec<String> = match parameters {
@@ -1951,32 +1940,147 @@ fn site_coverages(
             let times: Vec<DateTime<Utc>> = selected.iter().map(|e| e.volume.time).collect();
             Ok(lvls
                 .iter()
-                .map(|&lvl| level_series(&selected, lon, lat, lvl, &quantities, &times))
+                // Drop a level whose series is all-null across every quantity
+                // and timestep (the requested point is out of range, or the
+                // nearest sweep carries no data) — otherwise an all-null
+                // `PointSeries` would serve HTTP 200, indistinguishable from
+                // clear sky. With every level dropped, `finalize_single_site`
+                // turns the empty result into a 404.
+                .filter_map(|&lvl| {
+                    let qr = level_series(&selected, lon, lat, lvl, &quantities, &times);
+                    let all_null = qr
+                        .ranges
+                        .values()
+                        .all(|a| a.values.iter().all(Option::is_none));
+                    (!all_null).then_some(qr)
+                })
                 .collect())
         }
     }
 }
 
-/// Resolve a requested EDR `z` selector against the catalog's vertical
-/// axis. `None` (or an empty selector) means "every level — a profile".
+/// Resolve a requested EDR `z` selector against a `canonical` set of
+/// advertised sweep angles. `None` (or an empty selector) means "every
+/// level — a profile". `canonical` is the collection's (or site's)
+/// advertised vertical axis; `None` there means the collection exposes no
+/// sweeps to select with `z` (a 400).
 fn resolve_levels(
-    catalog: &Catalog,
+    canonical: Option<&[f64]>,
     z: Option<&[f64]>,
 ) -> Result<Option<Vec<f64>>, DataServerError> {
     let Some(zs) = z.filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
-    let canonical = catalog
-        .vertical
-        .as_ref()
-        .map(|v| v.levels.as_slice())
-        .ok_or_else(|| {
-            DataServerError::InvalidParameter(
-                "this PVOL collection has no elevation sweeps to select with `z`".into(),
-            )
-        })?;
+    let canonical = canonical.ok_or_else(|| {
+        DataServerError::InvalidParameter(
+            "this PVOL collection has no elevation sweeps to select with `z`".into(),
+        )
+    })?;
     let snapped = snap_levels(zs, canonical);
     Ok((!snapped.is_empty()).then_some(snapped))
+}
+
+/// Run a point-style EDR query (position / single-site location) against
+/// one site's `volumes`, sampling at WGS84 `(lon, lat)`: resolve the `z`
+/// selector against the site's `canonical` sweep angles, build the
+/// coverages, and wrap them per [`finalize_single_site`]. Shared by the
+/// network engine (after it picks a site) and each per-site view.
+fn site_point_query(
+    volumes: &[VolumeEntry],
+    lon: f64,
+    lat: f64,
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    parameters: Option<&[String]>,
+    z: Option<&[f64]>,
+    canonical: Option<&[f64]>,
+) -> Result<CoverageResponse, DataServerError> {
+    let levels = resolve_levels(canonical, z)?;
+    let covs = site_coverages(volumes, lon, lat, datetime, parameters, levels.as_deref())?;
+    finalize_single_site(covs, &levels)
+}
+
+/// Parse + resample a WKT `LINESTRING` into the evenly-spaced node path a
+/// cross-section samples, rejecting a degenerate (< 2-node) path. Shared
+/// by the network engine's and the per-site view's `query_trajectory`.
+fn resample_section_path(coords: &str) -> Result<Vec<(f64, f64)>, DataServerError> {
+    let vertices = parse_linestring_coords(coords)?;
+    let path = resample_path(&vertices);
+    if path.len() < 2 {
+        return Err(DataServerError::InvalidParameter(
+            "LINESTRING must trace a non-degenerate path".into(),
+        ));
+    }
+    Ok(path)
+}
+
+/// Build the trajectory cross-section coverage(s) for one site's
+/// `volumes` along an already-resampled `path`. Time-filters the volumes,
+/// resolves quantities + the `z` angle window, sizes the height axis from
+/// the path's farthest reach, and emits one `Section` per timestep
+/// (`Single` for one step, `Collection` otherwise). Shared by the network
+/// engine (after it picks the nearest site) and each per-site view.
+fn site_trajectory(
+    volumes: &[VolumeEntry],
+    path: &[(f64, f64)],
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    parameters: Option<&[String]>,
+    z: Option<&[f64]>,
+) -> Result<CoverageResponse, DataServerError> {
+    let selected: Vec<&VolumeEntry> = match datetime {
+        Some((start, end)) => volumes
+            .iter()
+            .filter(|e| e.volume.time >= start && e.volume.time <= end)
+            .collect(),
+        None => volumes.iter().collect(),
+    };
+    if selected.is_empty() {
+        return Err(DataServerError::LocationNotFound(
+            "No PVOL data available for the requested time range".into(),
+        ));
+    }
+
+    let quantities = resolve_quantities(&selected, parameters)?;
+
+    // `z` carries the requested elevation angles (resolved by the API
+    // layer against the advertised extent). Derive the angle window and
+    // the matching height axis from the most recent volume. An
+    // out-of-range `z` list surfaces as `InvalidParameter` (400) rather
+    // than a silently empty Section.
+    let ref_volume = &selected.last().unwrap().volume;
+    let window = angle_window(z, ref_volume)?;
+    // The path's farthest ground distance from the radar sizes the
+    // height-axis ceiling for the selected top angle.
+    let max_ground_dist = path
+        .iter()
+        .map(|&(lon, lat)| {
+            ground_distance_bearing(ref_volume.site.lon, ref_volume.site.lat, lon, lat).0
+        })
+        .fold(0.0_f64, f64::max);
+    let heights = height_axis(window.1, max_ground_dist);
+    if heights.is_empty() {
+        return Err(DataServerError::InvalidParameter(
+            "trajectory `z` resolved to an empty axis".into(),
+        ));
+    }
+
+    let coverages: Vec<QueryResult> = selected
+        .iter()
+        .filter_map(|e| volume_section(e, path, &heights, &quantities, window))
+        .collect();
+    if coverages.is_empty() {
+        return Err(DataServerError::LocationNotFound(
+            "No PVOL volumes produced a section for the requested path".into(),
+        ));
+    }
+    if coverages.len() == 1 {
+        // Single timestep — emit one Coverage rather than a one-item
+        // collection, matching the `query_location` precedent.
+        Ok(CoverageResponse::Single(
+            coverages.into_iter().next().unwrap(),
+        ))
+    } else {
+        Ok(CoverageResponse::Collection(coverages))
+    }
 }
 
 /// Wrap one site's coverages: a request pinned to exactly one level is a
@@ -1985,49 +2089,221 @@ fn finalize_single_site(
     covs: Vec<QueryResult>,
     levels: &Option<Vec<f64>>,
 ) -> Result<CoverageResponse, DataServerError> {
+    // No plottable coverage — every profile/level was dropped because it
+    // sampled no data (out of range, or all-null). An empty
+    // `CoverageCollection` is invalid CoverageJSON and would serve HTTP 200
+    // for what is really "no data", so surface a 404, matching the CLAUDE.md
+    // "no data in window → LocationNotFound" rule. Checked first so it
+    // covers both the single-level and multi-coverage shapes.
+    if covs.is_empty() {
+        return Err(DataServerError::LocationNotFound(
+            "no PVOL data for this site in the requested time window".into(),
+        ));
+    }
     if matches!(levels, Some(l) if l.len() == 1) {
-        // `site_coverages` builds exactly one coverage per requested
-        // level, so a single-level request yields exactly one. A missing
-        // coverage would be an internal invariant violation — surface it
-        // as a logged 500, not an opaque `spawn_blocking` panic.
-        return covs
-            .into_iter()
-            .next()
-            .map(CoverageResponse::Single)
-            .ok_or_else(|| {
-                DataServerError::Engine(
-                    "internal: single-level query produced no coverage (invariant violated)".into(),
-                )
-            });
+        // A single pinned level yields exactly one (non-null) coverage.
+        return Ok(CoverageResponse::Single(covs.into_iter().next().unwrap()));
     }
     Ok(CoverageResponse::Collection(covs))
 }
 
-impl EdrEngine for PolarVolumeEngine {
-    /// One EDR location per radar site — `id` is the ODIM NOD code and
-    /// the point geometry is the antenna position.
-    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+// ---------------------------------------------------------------------------
+// Per-site collections (model B)
+// ---------------------------------------------------------------------------
+
+impl PolarVolumeEngine {
+    /// `(nod, label)` for every radar site with usable metadata, sorted by
+    /// `nod`, from **one** catalog snapshot.
+    ///
+    /// The loader calls this after construction (one synchronous scan has
+    /// already run) to expand this source config into N per-site OGC
+    /// collections — one [`site_view`](Self::site_view) per entry. `label`
+    /// is the site's place name (ODIM `/what` PLC) or its `nod` when none.
+    ///
+    /// Enumerates `by_site_meta`, **not** `by_site`: a site whose latest
+    /// volume has no usable lowest sweep is absent from `by_site_meta`, so
+    /// registering it would yield a collection with no parameters/extent
+    /// (every WMS GetMap then 400s). Returning `(nod, label)` from a single
+    /// snapshot also keeps the registered id and title consistent even if a
+    /// background poll swaps the catalog mid-registration. Snapshot — sites
+    /// appearing or disappearing between polls surface on the next admin
+    /// reload, which re-runs the expansion.
+    pub fn sites(&self) -> Vec<(String, String)> {
         let catalog = self.catalog.load();
-        let mut locations: Vec<Location> = catalog
-            .by_site
+        let mut sites: Vec<(String, String)> = catalog
+            .by_site_meta
             .iter()
-            .filter_map(|(nod, list)| {
-                let site = &list.last()?.volume.site;
-                Some(Location {
-                    id: nod.clone(),
-                    label: site.plc.clone().unwrap_or_else(|| nod.clone()),
-                    latitude: site.lat,
-                    longitude: site.lon,
-                })
-            })
+            .map(|(nod, meta)| (nod.clone(), meta.plc.clone().unwrap_or_else(|| nod.clone())))
             .collect();
-        locations.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(locations)
+        sites.sort_by(|a, b| a.0.cmp(&b.0));
+        sites
     }
 
-    /// Query one radar site by NOD code. With no `z` the result is a
-    /// `CoverageCollection` of `VerticalProfile`s (one per timestep);
-    /// with `z` it is a `PointSeries` per selected elevation sweep.
+    /// The base collection id of this source (the `{base}` in each per-site
+    /// `{base}-{nod}` collection id). Used by `/health` to key per-site
+    /// temporal extents.
+    pub fn collection_id(&self) -> &str {
+        &self.collection_id
+    }
+
+    /// Per-site `(nod, volume times)` from **one** catalog snapshot, sorted
+    /// by `nod`. Lets `/health` build each site's temporal extent without
+    /// allocating a `PolarVolumeSiteView` per site (one `ArcSwap` load for
+    /// the whole network, not one per site) — keeping the per-request
+    /// accessor O(1)-from-a-snapshot per the CLAUDE.md hot-path rule.
+    pub fn site_times(&self) -> Vec<(String, Vec<DateTime<Utc>>)> {
+        let catalog = self.catalog.load();
+        let mut out: Vec<(String, Vec<DateTime<Utc>>)> = catalog
+            .by_site_meta
+            .iter()
+            .map(|(nod, meta)| (nod.clone(), meta.times.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Build a [`PolarVolumeSiteView`] scoped to radar `nod`, sharing this
+    /// engine's live catalog (`ArcSwap`) so the view tracks poll-loop
+    /// updates without re-parsing. `collection_id` is the per-site OGC
+    /// collection id (`{base}-{nod}`) used in the view's error messages.
+    pub fn site_view(&self, nod: &str, collection_id: &str) -> PolarVolumeSiteView {
+        PolarVolumeSiteView {
+            catalog: self.catalog.clone(),
+            nod: nod.to_string(),
+            collection_id: collection_id.to_string(),
+        }
+    }
+}
+
+/// A single radar site exposed as its own OGC collection (model B).
+///
+/// Where [`PolarVolumeEngine`] owns the source scan, parse cache, and poll
+/// loop for a whole radar *network*, a `PolarVolumeSiteView` is a thin,
+/// cheap handle scoped to one site `nod`: its `MapEngine`/`EdrEngine`
+/// surface advertises **bare quantity** parameters (`DBZH`, `VRADH`, …),
+/// a single location (the antenna), and the one site's spatial/vertical/
+/// temporal extents. Many views share one engine's `Arc<ArcSwap<Catalog>>`,
+/// so they all see poll-loop refreshes for free.
+///
+/// The site is not a sub-resource of a network collection: under model B
+/// there is no network-level collection at all — each radar is registered
+/// independently. The parse cache, poll loop, and shutdown all live on the
+/// owning engine.
+pub struct PolarVolumeSiteView {
+    /// Live catalog shared with the owning [`PolarVolumeEngine`].
+    catalog: Arc<ArcSwap<Catalog>>,
+    /// ODIM NOD code this view is scoped to.
+    nod: String,
+    /// Per-site OGC collection id (`{base}-{nod}`), for error messages.
+    collection_id: String,
+}
+
+impl MapEngine for PolarVolumeSiteView {
+    fn get_raster_tile(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<DateTime<Utc>>,
+        output_crs: &OutputCrs,
+        parameter: Option<&str>,
+        z: Option<f64>,
+    ) -> Result<RasterTile, DataServerError> {
+        let catalog = self.catalog.load();
+        // A per-site PVOL collection is still multi-parameter — one layer per
+        // radar quantity (the bare quantity, no `<site>:` prefix). When no
+        // quantity is named (a bare `LAYERS={site}` WMS request, or a Maps /
+        // Tiles request with no `?parameter-name=`), default to the site's
+        // primary (first advertised) quantity — the same as
+        // `raster_info().parameter` — instead of erroring, matching the GRIB
+        // engine's default-parameter behaviour.
+        let quantity = match parameter {
+            Some(q) => q,
+            None => catalog
+                .by_site_meta
+                .get(&self.nod)
+                .and_then(|m| m.quantities.first())
+                .map(|s| s.as_str())
+                .ok_or_else(|| {
+                    DataServerError::InvalidParameter(format!(
+                        "[{}] PVOL collection has no quantities to render",
+                        self.collection_id
+                    ))
+                })?,
+        };
+
+        let site_volumes = catalog.by_site.get(&self.nod).ok_or_else(|| {
+            // The site aged out of the catalog since this view was
+            // registered (source change / `max_files`). A reload would
+            // drop the collection; until then report no data, not a 500.
+            DataServerError::LocationNotFound(format!(
+                "[{}] radar site `{}` has no current volumes",
+                self.collection_id, self.nod
+            ))
+        })?;
+
+        // Select the volume nearest `time` (latest if `None`).
+        let entry = match time {
+            Some(target) => site_volumes
+                .iter()
+                .min_by_key(|e| (e.volume.time - target).num_seconds().abs()),
+            None => site_volumes.last(),
+        }
+        .ok_or_else(|| {
+            DataServerError::LocationNotFound(format!(
+                "[{}] radar site `{}` has no volumes",
+                self.collection_id, self.nod
+            ))
+        })?;
+
+        polar_sample(&entry.volume, quantity, bbox, width, height, output_crs, z)
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        let catalog = self.catalog.load();
+        let meta = catalog.by_site_meta.get(&self.nod);
+        let parameters = meta.map(|m| m.parameters.clone()).unwrap_or_default();
+        let parameter = parameters
+            .first()
+            .map(|(name, _)| name.clone())
+            .unwrap_or_default();
+
+        RasterInfo {
+            native_crs: "CRS:84".to_string(),
+            spatial_extent: meta.and_then(|m| m.spatial_extent),
+            times: meta.map(|m| m.times.clone()).unwrap_or_default(),
+            parameter,
+            // PVOL quantities span multiple physical units; the per-layer
+            // unit is not a single collection constant — leave it blank.
+            unit: String::new(),
+            parameters,
+            vertical: meta.and_then(|m| m.vertical.clone()),
+            grid_size: None,
+        }
+    }
+}
+
+impl EdrEngine for PolarVolumeSiteView {
+    /// Exactly one EDR location — this radar site — `id` is the NOD code
+    /// and the point geometry is the antenna position. A 404 (not an empty
+    /// list) when the site has dropped from `by_site_meta`, so the locations
+    /// list and `query_location` agree on the same data condition.
+    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        let catalog = self.catalog.load();
+        let m = catalog
+            .by_site_meta
+            .get(&self.nod)
+            .ok_or_else(|| DataServerError::LocationNotFound(self.nod.clone()))?;
+        Ok(vec![Location {
+            id: self.nod.clone(),
+            label: m.plc.clone().unwrap_or_else(|| self.nod.clone()),
+            latitude: m.lat,
+            longitude: m.lon,
+        }])
+    }
+
+    /// Query this radar site by NOD code. The only valid `location_id` is
+    /// the view's own `nod`; any other is `LocationNotFound`.
     fn query_location(
         &self,
         location_id: &str,
@@ -2035,53 +2311,76 @@ impl EdrEngine for PolarVolumeEngine {
         parameters: Option<&[String]>,
         z: Option<&[f64]>,
     ) -> Result<CoverageResponse, DataServerError> {
+        if location_id != self.nod {
+            return Err(DataServerError::LocationNotFound(location_id.to_string()));
+        }
         let catalog = self.catalog.load();
+        // Gate on `by_site_meta`, exactly as `get_locations` does: a site
+        // whose latest volume has no usable moment data is dropped from
+        // `by_site_meta` (but not `by_site`), so without this guard
+        // `query_location` would fall through to `resolve_quantities` and
+        // return a 400 for a location that `get_locations` reports as
+        // absent. Both must agree on a clean 404.
+        let meta = catalog
+            .by_site_meta
+            .get(&self.nod)
+            .ok_or_else(|| DataServerError::LocationNotFound(self.nod.clone()))?;
         let volumes = catalog
             .by_site
-            .get(location_id)
-            .ok_or_else(|| DataServerError::LocationNotFound(location_id.to_string()))?;
-        // The location *is* the radar site, so the coverage point is
-        // the antenna itself.
+            .get(&self.nod)
+            .ok_or_else(|| DataServerError::LocationNotFound(self.nod.clone()))?;
         let site = &volumes
             .last()
-            .ok_or_else(|| DataServerError::LocationNotFound(location_id.to_string()))?
+            .ok_or_else(|| DataServerError::LocationNotFound(self.nod.clone()))?
             .volume
             .site;
-        let levels = resolve_levels(&catalog, z)?;
-        let covs = site_coverages(
-            volumes,
-            site.lon,
-            site.lat,
-            datetime,
-            parameters,
-            levels.as_deref(),
-        )?;
-        finalize_single_site(covs, &levels)
+        let canonical = meta.vertical.as_ref().map(|v| v.levels.as_slice());
+        site_point_query(
+            volumes, site.lon, site.lat, datetime, parameters, z, canonical,
+        )
     }
 
     fn get_parameters(&self) -> Vec<String> {
-        self.catalog.load().quantities.clone()
+        self.catalog
+            .load()
+            .by_site_meta
+            .get(&self.nod)
+            .map(|m| m.quantities.clone())
+            .unwrap_or_default()
     }
 
     fn get_vertical_extent(&self) -> Option<VerticalDimension> {
-        self.catalog.load().vertical.clone()
+        self.catalog
+            .load()
+            .by_site_meta
+            .get(&self.nod)
+            .and_then(|m| m.vertical.clone())
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
         let catalog = self.catalog.load();
-        Some((*catalog.times.first()?, *catalog.times.last()?))
+        let m = catalog.by_site_meta.get(&self.nod)?;
+        Some((*m.times.first()?, *m.times.last()?))
     }
 
-    /// PVOL volumes arrive at discrete (typically 5-min) steps, so
-    /// advertise the exact timestamps rather than just the interval —
-    /// same rationale as the COMP engine.
+    /// Advertise the exact volume timestamps — same rationale as the
+    /// network engine and the COMP engine.
     fn get_available_times(&self) -> Option<Vec<DateTime<Utc>>> {
-        let times = self.catalog.load().times.clone();
+        let catalog = self.catalog.load();
+        let times = catalog
+            .by_site_meta
+            .get(&self.nod)
+            .map(|m| m.times.clone())
+            .unwrap_or_default();
         (!times.is_empty()).then_some(times)
     }
 
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
-        self.catalog.load().spatial_extent
+        self.catalog
+            .load()
+            .by_site_meta
+            .get(&self.nod)
+            .and_then(|m| m.spatial_extent)
     }
 
     fn supported_query_types(&self) -> Vec<String> {
@@ -2093,8 +2392,8 @@ impl EdrEngine for PolarVolumeEngine {
         ]
     }
 
-    /// Position query against the radar site nearest the requested
-    /// point — same `z`-driven shape as [`query_location`].
+    /// Position query — same `z`-driven shape as [`query_location`](Self::query_location),
+    /// but always against this one site (no nearest-radar pick).
     fn query_position(
         &self,
         coords: &str,
@@ -2104,23 +2403,45 @@ impl EdrEngine for PolarVolumeEngine {
     ) -> Result<CoverageResponse, DataServerError> {
         let (lat, lon) = parse_point_coords(coords)?;
         let catalog = self.catalog.load();
-        let nod = nearest_site(&catalog, lon, lat).ok_or_else(|| {
-            DataServerError::LocationNotFound("PVOL catalog has no radar sites".into())
+        let meta = catalog.by_site_meta.get(&self.nod).ok_or_else(|| {
+            DataServerError::LocationNotFound(format!(
+                "[{}] radar site `{}` has no current metadata",
+                self.collection_id, self.nod
+            ))
         })?;
-        // `nearest_site` returns a key it read from `by_site`, so the
-        // lookup cannot miss — but a graceful error beats a panicking
-        // request thread should a refactor ever break that invariant.
-        let volumes = catalog.by_site.get(nod).ok_or_else(|| {
-            DataServerError::Engine("internal: nearest_site returned a missing by_site key".into())
+        // Reject a point clearly outside the radar's coverage circle with a
+        // 404 rather than returning HTTP 200 all-null values — which is
+        // indistinguishable from "in range, clear sky". The per-site
+        // collection's advertised spatial extent *is* this coverage circle
+        // (the max range across all sweeps), so a point beyond it is outside
+        // the collection's domain. A point inside coverage with no echo
+        // still correctly returns 200 nulls. **Fail closed**: a site with no
+        // usable range geometry (`coverage_radius_m == None`, every sweep
+        // has a malformed `rscale`) can only ever produce all-null samples,
+        // so a position query there is a 404, not a misleading 200.
+        let radius_m = meta.coverage_radius_m.ok_or_else(|| {
+            DataServerError::LocationNotFound("this radar site has no usable range geometry".into())
         })?;
-        let levels = resolve_levels(&catalog, z)?;
-        let covs = site_coverages(volumes, lon, lat, datetime, parameters, levels.as_deref())?;
-        finalize_single_site(covs, &levels)
+        let (dist, _) = ground_distance_bearing(meta.lon, meta.lat, lon, lat);
+        if dist > radius_m {
+            return Err(DataServerError::LocationNotFound(
+                "requested point is outside this radar's coverage area".into(),
+            ));
+        }
+        let volumes = catalog.by_site.get(&self.nod).ok_or_else(|| {
+            DataServerError::LocationNotFound(format!(
+                "[{}] radar site `{}` has no current volumes",
+                self.collection_id, self.nod
+            ))
+        })?;
+        let canonical = meta.vertical.as_ref().map(|v| v.levels.as_slice());
+        site_point_query(volumes, lon, lat, datetime, parameters, z, canonical)
     }
 
-    /// Area query — a `CoverageCollection` flattening every in-polygon
-    /// radar site's coverages (a `VerticalProfile` per timestep with no
-    /// `z`, a `PointSeries` per level with `z`).
+    /// Area query — a `CoverageCollection` of this site's coverages, but
+    /// only when the antenna falls inside the requested polygon (a per-site
+    /// collection holds exactly one radar). Sampled at the antenna itself,
+    /// matching the network engine's in-polygon-site semantics.
     fn query_area(
         &self,
         coords: &str,
@@ -2130,70 +2451,48 @@ impl EdrEngine for PolarVolumeEngine {
     ) -> Result<CoverageResponse, DataServerError> {
         let polygon = parse_area_coords(coords)?;
         let catalog = self.catalog.load();
-        let levels = resolve_levels(&catalog, z)?;
-
-        // Stable, sorted iteration so the collection order is
-        // deterministic across requests.
-        let mut nods: Vec<&String> = catalog.by_site.keys().collect();
-        nods.sort();
-
-        let mut coverages = Vec::new();
-        for nod in nods {
-            let volumes = &catalog.by_site[nod];
-            let Some(site) = volumes.last().map(|e| &e.volume.site) else {
-                continue;
-            };
-            if !polygon.contains(site.lon, site.lat) {
-                continue;
-            }
-            match site_coverages(
-                volumes,
-                site.lon,
-                site.lat,
-                datetime,
-                parameters,
-                levels.as_deref(),
-            ) {
-                Ok(covs) => coverages.extend(covs),
-                // A site inside the polygon is skipped — not fatal to
-                // the whole area query — when it has no data in the
-                // requested window (`LocationNotFound`) or none of the
-                // requested quantities (`InvalidParameter`): a
-                // heterogeneous network mixes single- and dual-pol
-                // radars, so a `ZDR` filter legitimately misses some
-                // sites while matching others.
-                Err(
-                    DataServerError::LocationNotFound(_) | DataServerError::InvalidParameter(_),
-                ) => continue,
-                Err(e) => return Err(e),
-            }
-        }
-
-        if coverages.is_empty() {
+        let meta = catalog.by_site_meta.get(&self.nod).ok_or_else(|| {
+            DataServerError::LocationNotFound(format!(
+                "[{}] radar site `{}` has no current volumes",
+                self.collection_id, self.nod
+            ))
+        })?;
+        if !polygon.contains(meta.lon, meta.lat) {
             return Err(DataServerError::LocationNotFound(
-                "No radar sites with data found within the requested area".into(),
+                "the radar site is not within the requested area".into(),
             ));
         }
-        Ok(CoverageResponse::Collection(coverages))
+        let volumes = catalog.by_site.get(&self.nod).ok_or_else(|| {
+            DataServerError::LocationNotFound(format!(
+                "[{}] radar site `{}` has no current volumes",
+                self.collection_id, self.nod
+            ))
+        })?;
+        let canonical = meta.vertical.as_ref().map(|v| v.levels.as_slice());
+        let levels = resolve_levels(canonical, z)?;
+        let covs = site_coverages(
+            volumes,
+            meta.lon,
+            meta.lat,
+            datetime,
+            parameters,
+            levels.as_deref(),
+        )?;
+        // An `area` query ALWAYS returns a `CoverageCollection` per OGC EDR —
+        // unlike position/location it does NOT collapse a single-`z` result
+        // to a bare `Coverage`. An all-empty result is `LocationNotFound`
+        // (404), not an empty collection served as HTTP 200.
+        if covs.is_empty() {
+            return Err(DataServerError::LocationNotFound(
+                "no PVOL data for this site in the requested time window".into(),
+            ));
+        }
+        Ok(CoverageResponse::Collection(covs))
     }
 
-    /// Trajectory query — a vertical cross-section along a WKT
-    /// `LINESTRING`. Returns a `Section` coverage per timestep: the
-    /// composite axis carries one `(t, lon, lat)` triple per along-path
-    /// node; the `z` axis is **height above the antenna in metres**
-    /// (derived via the 4/3-Earth beam geometry).
-    ///
-    /// `z` *selects elevation angles* — it matches the collection's
-    /// advertised vertical extent (sweep angles in degrees), resolved by
-    /// the API layer so an interval `z=0.3/15` arrives as the angles in
-    /// range. The selected `[min, max]` angle window bounds which sweeps
-    /// contribute and sizes the derived height axis; cells whose beam
-    /// angle falls outside the window are nodata. `None` uses every sweep.
-    ///
-    /// **Single radar per cross-section**: the site nearest the path
-    /// centroid is picked, and the whole Section is sampled against
-    /// that one volume. Path nodes outside that radar's coverage simply
-    /// receive nodata. Multi-radar stitching is a deliberate follow-up.
+    /// Trajectory cross-section along a WKT `LINESTRING`, always against
+    /// this one site (no nearest-radar pick). Same `Section` output shape
+    /// as the network engine's [`query_trajectory`](PolarVolumeEngine).
     fn query_trajectory(
         &self,
         coords: &str,
@@ -2201,89 +2500,25 @@ impl EdrEngine for PolarVolumeEngine {
         parameters: Option<&[String]>,
         z: Option<&[f64]>,
     ) -> Result<CoverageResponse, DataServerError> {
-        let vertices = parse_linestring_coords(coords)?;
-        let path = resample_path(&vertices);
-        if path.len() < 2 {
-            return Err(DataServerError::InvalidParameter(
-                "LINESTRING must trace a non-degenerate path".into(),
-            ));
-        }
-
+        let path = resample_section_path(coords)?;
         let catalog = self.catalog.load();
-        // Pick the radar nearest the path's *middle node* (not an
-        // arithmetic-mean centroid) to choose which site owns the line.
-        // A real on-path point is antimeridian-safe — averaging the
-        // longitudes of e.g. 178° and −178° gives 0°, which would pick a
-        // European radar for a Pacific path. The midpoint node is a true
-        // resampled `(lon, lat)` on the great-circle path. (v1: single
-        // radar per cross-section, no multi-radar stitching.)
-        let (cx, cy) = path[path.len() / 2];
-        let nod = nearest_site(&catalog, cx, cy)
-            .ok_or_else(|| {
-                DataServerError::LocationNotFound("PVOL catalog has no radar sites".into())
-            })?
-            .to_string();
-        let volumes = catalog.by_site.get(&nod).ok_or_else(|| {
-            DataServerError::Engine("internal: nearest_site returned a missing by_site key".into())
-        })?;
-
-        // Time filter — same logic as site_coverages.
-        let selected: Vec<&VolumeEntry> = match datetime {
-            Some((start, end)) => volumes
-                .iter()
-                .filter(|e| e.volume.time >= start && e.volume.time <= end)
-                .collect(),
-            None => volumes.iter().collect(),
-        };
-        if selected.is_empty() {
-            return Err(DataServerError::LocationNotFound(
-                "No PVOL data available for the requested time range".into(),
-            ));
+        // Gate on `by_site_meta` first, like `query_location`/`query_position`/
+        // `query_area`: a site absent from `by_site_meta` (sweeps with no
+        // moment datasets) is a 404, not a 400 fall-through via
+        // `resolve_quantities`.
+        if !catalog.by_site_meta.contains_key(&self.nod) {
+            return Err(DataServerError::LocationNotFound(format!(
+                "[{}] radar site `{}` has no current volumes",
+                self.collection_id, self.nod
+            )));
         }
-
-        let quantities = resolve_quantities(&selected, parameters)?;
-
-        // `z` carries the requested elevation angles (resolved by the API
-        // layer against the advertised extent). Derive the angle window
-        // and the matching height axis from the most recent volume. An
-        // out-of-range `z` list surfaces as `InvalidParameter` (400)
-        // rather than a silently empty Section.
-        let ref_volume = &selected.last().unwrap().volume;
-        let window = angle_window(z, ref_volume)?;
-        // The path's farthest ground distance from the radar sizes the
-        // height-axis ceiling for the selected top angle.
-        let max_ground_dist = path
-            .iter()
-            .map(|&(lon, lat)| {
-                ground_distance_bearing(ref_volume.site.lon, ref_volume.site.lat, lon, lat).0
-            })
-            .fold(0.0_f64, f64::max);
-        let heights = height_axis(window.1, max_ground_dist);
-        if heights.is_empty() {
-            return Err(DataServerError::InvalidParameter(
-                "trajectory `z` resolved to an empty axis".into(),
-            ));
-        }
-
-        let coverages: Vec<QueryResult> = selected
-            .iter()
-            .filter_map(|e| volume_section(e, &path, &heights, &quantities, window))
-            .collect();
-        if coverages.is_empty() {
-            return Err(DataServerError::LocationNotFound(
-                "No PVOL volumes produced a section for the requested path".into(),
-            ));
-        }
-        if coverages.len() == 1 {
-            // Single timestep — emit one Coverage rather than a one-item
-            // collection, matching the `query_location` precedent for
-            // pinned-level requests.
-            Ok(CoverageResponse::Single(
-                coverages.into_iter().next().unwrap(),
+        let volumes = catalog.by_site.get(&self.nod).ok_or_else(|| {
+            DataServerError::LocationNotFound(format!(
+                "[{}] radar site `{}` has no current volumes",
+                self.collection_id, self.nod
             ))
-        } else {
-            Ok(CoverageResponse::Collection(coverages))
-        }
+        })?;
+        site_trajectory(volumes, &path, datetime, parameters, z)
     }
 }
 
@@ -2988,16 +3223,6 @@ mod tests {
         }
     }
 
-    /// `parse_parameter` round-trips a `<nod>:<quantity>` name and
-    /// rejects malformed inputs.
-    #[test]
-    fn parse_parameter_splits_and_rejects() {
-        assert_eq!(parse_parameter("fianj:DBZH"), Some(("fianj", "DBZH")));
-        assert_eq!(parse_parameter("nodbzh"), None);
-        assert_eq!(parse_parameter(":DBZH"), None);
-        assert_eq!(parse_parameter("fianj:"), None);
-    }
-
     /// `site_coverage_bbox` brackets the centre and widens with radius.
     #[test]
     fn site_coverage_bbox_brackets_centre() {
@@ -3328,41 +3553,465 @@ mod tests {
         }
     }
 
-    /// `nearest_site` picks the site with the smallest ground distance.
-    #[test]
-    fn nearest_site_picks_closest() {
-        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
-        by_site.insert(
-            "west".to_string(),
-            vec![entry(synthetic_volume(20.0, 60.0), "w")],
-        );
-        by_site.insert(
-            "east".to_string(),
-            vec![entry(synthetic_volume(30.0, 60.0), "e")],
-        );
-        let catalog = Catalog {
-            by_site,
-            parameters: vec![],
-            quantities: vec![],
-            times: vec![],
-            spatial_extent: None,
-            vertical: None,
-        };
-        assert_eq!(nearest_site(&catalog, 29.0, 60.0), Some("east"));
-        assert_eq!(nearest_site(&catalog, 21.0, 60.0), Some("west"));
+    /// Build a [`PolarVolumeSiteView`] over a synthetic catalog scoped to
+    /// `nod` — mirrors what `PolarVolumeEngine::site_view` produces, but
+    /// without a real source scan.
+    fn site_view_for(by_site: HashMap<String, Vec<VolumeEntry>>, nod: &str) -> PolarVolumeSiteView {
+        let cache = Mutex::new(HashMap::new());
+        let catalog = derive_catalog(by_site, &cache, None);
+        PolarVolumeSiteView {
+            catalog: Arc::new(ArcSwap::from_pointee(catalog)),
+            nod: nod.to_string(),
+            collection_id: format!("test-{nod}"),
+        }
     }
 
-    /// An empty catalog has no nearest site.
+    /// Model B: a per-site view advertises **bare** quantities (no
+    /// `<nod>:` prefix), a single EDR location (the antenna), and the
+    /// site's own coverage extent — even when the catalog holds other
+    /// sites.
     #[test]
-    fn nearest_site_empty_catalog_is_none() {
-        let catalog = Catalog {
-            by_site: HashMap::new(),
-            parameters: vec![],
-            quantities: vec![],
-            times: vec![],
-            spatial_extent: None,
-            vertical: None,
+    fn site_view_advertises_bare_quantities_and_single_location() {
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![entry(synthetic_volume(25.0, 60.0), "v")],
+        );
+        by_site.insert(
+            "fianj".to_string(),
+            vec![entry(synthetic_volume(27.0, 60.9), "a")],
+        );
+        let view = site_view_for(by_site, "fivih");
+
+        // Map/WMS parameters are the bare quantity — no `fivih:` prefix.
+        let info = MapEngine::raster_info(&view);
+        let names: Vec<&str> = info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["DBZH"],
+            "per-site layer must be the bare quantity, got {names:?}"
+        );
+        assert!(
+            info.spatial_extent.is_some(),
+            "a per-site view reports its own coverage bbox"
+        );
+        assert!(
+            info.vertical.is_some(),
+            "a per-site view reports its own elevation axis"
+        );
+
+        // EDR parameter list is bare too.
+        assert_eq!(
+            EdrEngine::get_parameters(&view),
+            vec!["DBZH".to_string()],
+            "EDR parameter list is the bare quantity"
+        );
+
+        // Exactly one EDR location — this radar.
+        let locs = EdrEngine::get_locations(&view).expect("locations");
+        assert_eq!(locs.len(), 1, "a per-site collection has one location");
+        assert_eq!(locs[0].id, "fivih");
+        assert_eq!(locs[0].label, "Test Site");
+    }
+
+    /// The per-site view renders with a bare-quantity parameter, and
+    /// errors cleanly (not a panic) on a missing parameter or a site that
+    /// has no current volumes.
+    #[test]
+    fn site_view_get_raster_tile_uses_bare_quantity() {
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![entry(synthetic_volume(25.0, 60.0), "v")],
+        );
+        let view = site_view_for(by_site, "fivih");
+
+        let dlon =
+            50_000.0 / (EARTH_RADIUS_M * 60f64.to_radians().cos()) * 180.0 / std::f64::consts::PI;
+        let bbox = [25.0, 59.999, 25.0 + dlon, 60.001];
+        let tile = MapEngine::get_raster_tile(
+            &view,
+            bbox,
+            32,
+            4,
+            None,
+            &OutputCrs::Wgs84,
+            Some("DBZH"),
+            None,
+        )
+        .expect("render with a bare quantity");
+        assert_eq!(tile.values.len(), 32 * 4);
+        assert!(
+            tile.values.iter().any(Option::is_some),
+            "a render over the radar's own coverage samples some echoes"
+        );
+
+        // No parameter named → render the site's primary (first) quantity,
+        // not a 400, so a bare `LAYERS={site}` WMS / Maps request works.
+        assert!(
+            MapEngine::get_raster_tile(&view, bbox, 32, 4, None, &OutputCrs::Wgs84, None, None)
+                .is_ok(),
+            "a bare (no-parameter) render must default to the primary quantity"
+        );
+
+        // A view over a site absent from the catalog reports no data, not
+        // a 500.
+        let ghost = site_view_for(HashMap::new(), "ghost");
+        assert!(matches!(
+            MapEngine::get_raster_tile(
+                &ghost,
+                bbox,
+                4,
+                4,
+                None,
+                &OutputCrs::Wgs84,
+                Some("DBZH"),
+                None,
+            ),
+            Err(DataServerError::LocationNotFound(_))
+        ));
+    }
+
+    /// A site whose latest volume has no usable lowest sweep is kept in
+    /// `by_site` but excluded from `by_site_meta` — so `sites()` (which the
+    /// loader enumerates) never registers a parameter-less, broken
+    /// collection for it. Regression guard for the `site_ids`-over-`by_site`
+    /// bug.
+    #[test]
+    fn derive_catalog_excludes_sweepless_site_from_meta() {
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "good".to_string(),
+            vec![entry(synthetic_volume(25.0, 60.0), "g")],
+        );
+        // A site whose latest volume carries no sweeps — no derivable metadata.
+        let mut sweepless = synthetic_volume(26.0, 60.0);
+        sweepless.sweeps.clear();
+        by_site.insert("bad".to_string(), vec![entry(sweepless, "b")]);
+
+        let cache = Mutex::new(HashMap::new());
+        let catalog = derive_catalog(by_site, &cache, None);
+
+        // Both survive in `by_site` (non-empty volume lists)...
+        assert!(catalog.by_site.contains_key("good"));
+        assert!(catalog.by_site.contains_key("bad"));
+        // ...but only the one with a usable lowest sweep has metadata.
+        assert!(catalog.by_site_meta.contains_key("good"));
+        assert!(
+            !catalog.by_site_meta.contains_key("bad"),
+            "a sweepless site must be absent from by_site_meta so it is never registered"
+        );
+
+        // `sites()` (via an engine over this catalog) returns only `good`.
+        let view = PolarVolumeSiteView {
+            catalog: Arc::new(ArcSwap::from_pointee(catalog)),
+            nod: "good".into(),
+            collection_id: "test".into(),
         };
-        assert_eq!(nearest_site(&catalog, 25.0, 60.0), None);
+        // The view for `good` advertises its quantity; metadata is present.
+        assert!(!MapEngine::raster_info(&view).parameters.is_empty());
+    }
+
+    /// A volume with sweep structs but no moment datasets has no derivable
+    /// metadata, so the site is excluded (never registered as a
+    /// zero-parameter collection). `sweeps.first()?` only guards the
+    /// no-sweeps case.
+    #[test]
+    fn derive_site_meta_excludes_moment_less_site() {
+        let mut momentless = synthetic_volume(25.0, 60.0);
+        momentless.sweeps[0].moments.clear();
+        let list = vec![entry(momentless, "m")];
+        assert!(
+            derive_site_meta(&list).is_none(),
+            "a site whose sweeps carry no moments must yield no SiteMeta"
+        );
+    }
+
+    /// `is_url_safe_nod` accepts well-formed ODIM codes and rejects any NOD
+    /// that would break URL routing if used in a `{base}-{nod}` collection
+    /// id.
+    #[test]
+    fn is_url_safe_nod_accepts_codes_rejects_routing_breakers() {
+        for ok in ["fivih", "fianj", "se1", "ukabc2"] {
+            assert!(is_url_safe_nod(ok), "{ok} should be accepted");
+        }
+        // Routing-breakers, degenerate boundary separators, and any nod with
+        // a `-`/`_` (which could make `{base}-{nod}` collide across sources).
+        for bad in [
+            "", "fi/bad", "fi?x", "fi#x", "fi bad", "fiäö", "a.b", "-", "_", "-a", "a-", "_x",
+            "x_", "b-fivih", "uk-abc_2",
+        ] {
+            assert!(!is_url_safe_nod(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    /// When every selected volume yields no plottable coverage (a sweep
+    /// whose elevation angle is non-finite ⇒ `volume_profile` returns
+    /// `None`), an EDR point query returns `LocationNotFound` (404), not an
+    /// empty `CoverageCollection` served as HTTP 200. Regression guard for
+    /// the dropped is-empty check.
+    #[test]
+    fn site_view_empty_coverage_is_location_not_found() {
+        let mut nan_vol = synthetic_volume(25.0, 60.0);
+        nan_vol.sweeps[0].elangle = f64::NAN;
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert("nanv".to_string(), vec![entry(nan_vol, "n")]);
+        let view = site_view_for(by_site, "nanv");
+
+        // No `z`: the only sweep has a non-finite angle, so the profile is
+        // empty and the collection would be empty → must be a 404.
+        // (`CoverageResponse` is not `Debug`, so assert on the variant.)
+        assert!(
+            matches!(
+                EdrEngine::query_position(&view, "POINT(25.0 60.0)", None, None, None),
+                Err(DataServerError::LocationNotFound(_))
+            ),
+            "an all-empty point coverage must be LocationNotFound, not HTTP 200"
+        );
+
+        // Same for an area query whose polygon contains the antenna.
+        assert!(
+            matches!(
+                EdrEngine::query_area(&view, "24.0,59.0,26.0,61.0", None, None, None),
+                Err(DataServerError::LocationNotFound(_))
+            ),
+            "an all-empty area coverage must be LocationNotFound"
+        );
+    }
+
+    /// A per-site `area` query ALWAYS returns a `CoverageCollection` per OGC
+    /// EDR — even for a single `z` level it does not collapse to a bare
+    /// `Coverage` (unlike position/location).
+    #[test]
+    fn site_view_area_always_returns_collection() {
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![entry(synthetic_volume(25.0, 60.0), "v")],
+        );
+        let view = site_view_for(by_site, "fivih");
+
+        // Single elevation angle → still a CoverageCollection.
+        assert!(
+            matches!(
+                EdrEngine::query_area(&view, "24.0,59.0,26.0,61.0", None, None, Some(&[0.5])),
+                Ok(CoverageResponse::Collection(_))
+            ),
+            "a single-z area query must stay a CoverageCollection"
+        );
+        // No z → also a Collection (one VerticalProfile per timestep).
+        assert!(matches!(
+            EdrEngine::query_area(&view, "24.0,59.0,26.0,61.0", None, None, None),
+            Ok(CoverageResponse::Collection(_))
+        ));
+    }
+
+    /// A quantity present only on a higher-elevation sweep (a split-cut
+    /// strategy) is still advertised in the parameter list **and** renders
+    /// without a 400 — the advertised list unions across sweeps and
+    /// `polar_sample` searches every sweep that carries the quantity.
+    #[test]
+    fn site_view_advertises_and_renders_higher_sweep_only_quantity() {
+        // sweep0 @0.5° carries DBZH; add a 1.5° sweep carrying VRADH only.
+        let mut vol = synthetic_volume(25.0, 60.0);
+        let mut sweep1 = vol.sweeps[0].clone();
+        sweep1.elangle = 1.5;
+        sweep1.moments[0].quantity = "VRADH".to_string();
+        vol.sweeps.push(sweep1);
+
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert("fivih".to_string(), vec![entry(vol, "v")]);
+        let view = site_view_for(by_site, "fivih");
+
+        // Both quantities are advertised (union across sweeps).
+        let params = EdrEngine::get_parameters(&view);
+        assert!(
+            params.contains(&"DBZH".to_string()) && params.contains(&"VRADH".to_string()),
+            "lowest- and higher-sweep quantities must both be advertised, got {params:?}"
+        );
+        let info = MapEngine::raster_info(&view);
+        let names: Vec<&str> = info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"VRADH"),
+            "WMS layer list must include VRADH"
+        );
+
+        // VRADH (only on the 1.5° sweep) renders at default `z` instead of
+        // 400ing because the lowest sweep lacks it.
+        let dlon =
+            50_000.0 / (EARTH_RADIUS_M * 60f64.to_radians().cos()) * 180.0 / std::f64::consts::PI;
+        let bbox = [25.0, 59.999, 25.0 + dlon, 60.001];
+        let tile = MapEngine::get_raster_tile(
+            &view,
+            bbox,
+            16,
+            4,
+            None,
+            &OutputCrs::Wgs84,
+            Some("VRADH"),
+            None,
+        )
+        .expect("a higher-sweep-only quantity must render, not 400");
+        assert_eq!(tile.values.len(), 16 * 4);
+    }
+
+    /// `resolve_quantities` unions moments across **all** selected volumes,
+    /// so a quantity that drops out of the newest scan is still queryable
+    /// for the earlier timesteps that carry it.
+    #[test]
+    fn resolve_quantities_unions_across_volumes() {
+        // Older volume carries DBZH + VRADH; newer carries DBZH only.
+        let mut older = synthetic_volume(25.0, 60.0);
+        let mut vradh = older.sweeps[0].moments[0].clone();
+        vradh.quantity = "VRADH".to_string();
+        older.sweeps[0].moments.push(vradh);
+        let newer = synthetic_volume(25.0, 60.0); // DBZH only
+
+        let owned = [entry(older, "a"), entry(newer, "b")];
+        let selected: Vec<&VolumeEntry> = owned.iter().collect();
+
+        // VRADH is absent from the newest volume but present in the union.
+        let q = resolve_quantities(&selected, Some(&["VRADH".to_string()]))
+            .expect("VRADH is available in the window's union");
+        assert_eq!(q, vec!["VRADH".to_string()]);
+    }
+
+    /// A position query for a point clearly outside the radar's coverage
+    /// circle is `LocationNotFound` (404), not HTTP 200 all-null.
+    #[test]
+    fn site_view_query_position_outside_coverage_is_404() {
+        // synthetic_volume: 100 bins × 1 km ⇒ ~100 km coverage radius.
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![entry(synthetic_volume(25.0, 60.0), "v")],
+        );
+        let view = site_view_for(by_site, "fivih");
+
+        // ~5° east at 60°N ≈ 280 km — well beyond the 100 km radius.
+        assert!(
+            matches!(
+                EdrEngine::query_position(&view, "POINT(30.0 60.0)", None, None, None),
+                Err(DataServerError::LocationNotFound(_))
+            ),
+            "a point outside the coverage radius must be 404"
+        );
+        // ~11 km north — inside coverage, resolves to a coverage.
+        assert!(
+            EdrEngine::query_position(&view, "POINT(25.0 60.1)", None, None, None).is_ok(),
+            "a point within coverage must succeed"
+        );
+    }
+
+    /// `query_location` agrees with `get_locations`: a site dropped from
+    /// `by_site_meta` (sweeps but no moments) is a 404, not a 400.
+    #[test]
+    fn site_view_query_location_moment_less_site_is_404() {
+        let mut momentless = synthetic_volume(25.0, 60.0);
+        momentless.sweeps[0].moments.clear();
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert("fivih".to_string(), vec![entry(momentless, "m")]);
+        let view = site_view_for(by_site, "fivih");
+
+        // The site is invisible to discovery — get_locations 404s, matching
+        // query_location (not an empty 200 list).
+        assert!(matches!(
+            EdrEngine::get_locations(&view),
+            Err(DataServerError::LocationNotFound(_))
+        ));
+        // ...and a direct query_location returns 404, not InvalidParameter.
+        assert!(matches!(
+            EdrEngine::query_location(&view, "fivih", None, None, None),
+            Err(DataServerError::LocationNotFound(_))
+        ));
+        // ...and so does query_trajectory (same by_site_meta gate).
+        assert!(matches!(
+            EdrEngine::query_trajectory(
+                &view,
+                "LINESTRING(24.5 60.3, 24.5 60.9)",
+                None,
+                None,
+                None
+            ),
+            Err(DataServerError::LocationNotFound(_))
+        ));
+    }
+
+    /// A z-pinned query whose level series is all-null (the nearest sweep
+    /// carries no data for the requested quantity) is a 404, not an HTTP 200
+    /// all-null `PointSeries`.
+    #[test]
+    fn site_view_z_level_all_null_is_404() {
+        // sweep0 @0.5° has DBZH; an added 15° sweep has VRADH only.
+        let mut vol = synthetic_volume(25.0, 60.0);
+        let mut hi = vol.sweeps[0].clone();
+        hi.elangle = 15.0;
+        hi.moments[0].quantity = "VRADH".to_string();
+        vol.sweeps.push(hi);
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert("fivih".to_string(), vec![entry(vol, "v")]);
+        let view = site_view_for(by_site, "fivih");
+
+        // DBZH pinned to z=15°: the 15° sweep carries no DBZH → all-null →
+        // 404. (~11 km north keeps the point well inside coverage.)
+        assert!(matches!(
+            EdrEngine::query_position(
+                &view,
+                "POINT(25.0 60.1)",
+                None,
+                Some(&["DBZH".to_string()]),
+                Some(&[15.0]),
+            ),
+            Err(DataServerError::LocationNotFound(_))
+        ));
+    }
+
+    /// The coverage radius is the **max** across sweeps: a point beyond the
+    /// lowest sweep's range but within a longer-range higher sweep is in
+    /// coverage (not 404), since a quantity may live only on that sweep.
+    #[test]
+    fn site_view_coverage_radius_uses_max_sweep_range() {
+        let mut vol = synthetic_volume(25.0, 60.0);
+        vol.sweeps[0].nbins = 50; // sweep0 ≈ 50 km
+        let mut sweep1 = vol.sweeps[0].clone();
+        sweep1.elangle = 3.0;
+        sweep1.nbins = 120; // sweep1 ≈ 120 km
+        vol.sweeps.push(sweep1);
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert("fivih".to_string(), vec![entry(vol, "v")]);
+        let view = site_view_for(by_site, "fivih");
+
+        // ~70 km north: beyond sweep0's 50 km but within sweep1's 120 km.
+        let dlat_70 = 70_000.0 / EARTH_RADIUS_M * 180.0 / std::f64::consts::PI;
+        let near = format!("POINT(25.0 {})", 60.0 + dlat_70);
+        assert!(
+            EdrEngine::query_position(&view, &near, None, None, None).is_ok(),
+            "a point within the longest sweep's range must not be rejected"
+        );
+        // ~200 km: beyond every sweep → 404.
+        let dlat_200 = 200_000.0 / EARTH_RADIUS_M * 180.0 / std::f64::consts::PI;
+        let far = format!("POINT(25.0 {})", 60.0 + dlat_200);
+        assert!(matches!(
+            EdrEngine::query_position(&view, &far, None, None, None),
+            Err(DataServerError::LocationNotFound(_))
+        ));
+    }
+
+    /// A site whose only sweep has a malformed `rscale` (no usable range
+    /// geometry, `coverage_radius_m == None`) fails closed: a position query
+    /// is a 404, not a misleading HTTP 200 all-null.
+    #[test]
+    fn site_view_query_position_malformed_rscale_is_404() {
+        let mut vol = synthetic_volume(25.0, 60.0);
+        vol.sweeps[0].rscale = 0.0;
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert("fivih".to_string(), vec![entry(vol, "v")]);
+        let view = site_view_for(by_site, "fivih");
+
+        // Even at the antenna itself — no usable geometry → fail closed.
+        assert!(matches!(
+            EdrEngine::query_position(&view, "POINT(25.0 60.0)", None, None, None),
+            Err(DataServerError::LocationNotFound(_))
+        ));
     }
 }

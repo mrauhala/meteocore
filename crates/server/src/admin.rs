@@ -1176,80 +1176,164 @@ pub fn load_collections(
 
                 odim_volume_engines.push(engine.clone());
 
-                if collection.apis.contains(&"edr".to_string()) {
-                    edr_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+                // Model B: one PVOL source expands into N per-site OGC
+                // collections — one per radar `nod`, parameter = bare
+                // quantity. The owning engine keeps the single scan, parse
+                // cache, and poll loop; each site gets a cheap
+                // `PolarVolumeSiteView` over the shared catalog. The site
+                // set is the catalog snapshot taken by `new`'s synchronous
+                // scan; sites that appear later surface on the next reload
+                // (which re-runs this expansion).
+                // `(nod, label)` from one snapshot — enumerates only sites
+                // with usable metadata, so no empty/broken collection is
+                // registered, and the id+title stay consistent if a poll
+                // swaps the catalog mid-registration.
+                let sites = engine.sites();
+                if sites.is_empty() {
+                    // No sites yet (empty/not-yet-populated source). Register
+                    // nothing but DO push a `Degraded` health entry so the
+                    // server still boots and waits for the first poll —
+                    // matching the geotiff/querydata/grib "no data yet"
+                    // convention. The startup guard (main.rs) counts
+                    // `status != Failed`, so without this entry an all-empty
+                    // PVOL deployment would `exit(1)` on boot. The *reload*
+                    // guard counts `status == Ready` instead, so this
+                    // placeholder does NOT let a transient empty scan replace
+                    // a working registry — see `reload_handler`.
+                    tracing::warn!(
+                        "Collection '{}': PVOL source has no radar sites yet — no per-site \
+                         collections registered. Reload once volume files arrive.",
+                        collection.id
                     );
-                    edr_collections.insert(collection.id.clone(), collection.clone());
-                    info!("Collection '{}': wired to EDR API", collection.id);
+                    health.push(CollectionHealth {
+                        id: collection.id.clone(),
+                        engine_type: "odim-volume".into(),
+                        status: CollectionStatus::Degraded,
+                        error: Some("no radar sites found yet (waiting for .h5 files)".into()),
+                    });
                 }
+                for (nod, label) in &sites {
+                    let site_id = format!("{}-{}", collection.id, nod);
 
-                // PVOL is multi-parameter (one layer per <site>:<quantity>).
-                let raster_params =
-                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+                    // Defence-in-depth against a derived-id collision. NODs
+                    // are alphanumeric (so two odim-volume sources can't
+                    // derive the same id), but an *inline* `[[collections]]`
+                    // entry could be named `{base}-{nod}` by hand. Skip with
+                    // an error rather than silently overwriting a registry
+                    // entry. NOTE: per-quantity WMS/Maps styles are
+                    // snapshotted from `raster_info()` at load — if a poll
+                    // later brings in a *new* moment for a site, its layer
+                    // falls back to the collection default colormap until the
+                    // next `POST /admin/collections/reload` (same load-time
+                    // snapshot as GeoTIFF/QueryData; PVOL moment sets are
+                    // firmware-dependent, so a reload is required when they
+                    // change).
+                    if edr_collections.contains_key(&site_id)
+                        || map_collections.contains_key(&site_id)
+                        || maps_collections.contains_key(&site_id)
+                        || tiles_collections.contains_key(&site_id)
+                    {
+                        tracing::error!(
+                            "Collection '{}': per-site id '{site_id}' collides with an \
+                             already-registered collection — skipping this site",
+                            collection.id
+                        );
+                        health.push(CollectionHealth {
+                            id: site_id,
+                            engine_type: "odim-volume".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some(
+                                "derived id collides with an already-registered collection".into(),
+                            ),
+                        });
+                        continue;
+                    }
 
-                if collection.apis.contains(&"wms".to_string()) {
-                    map_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
-                    map_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    map_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut map_styles,
-                            &bundle_index,
-                        );
-                    }
-                    info!("Collection '{}': wired to WMS API", collection.id);
-                }
-                if collection.apis.contains(&"maps".to_string()) {
-                    maps_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
-                    maps_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    maps_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut maps_styles,
-                            &bundle_index,
-                        );
-                    }
-                    info!("Collection '{}': wired to Maps API", collection.id);
-                }
-                if collection.apis.contains(&"tiles".to_string()) {
-                    tiles_engines.insert(
-                        collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
-                    );
-                    tiles_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    tiles_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut tiles_styles,
-                            &bundle_index,
-                        );
-                    }
-                    info!("Collection '{}': wired to Tiles API", collection.id);
-                }
+                    let view = Arc::new(engine.site_view(nod, &site_id));
 
-                health.push(CollectionHealth {
-                    id: collection.id.clone(),
-                    engine_type: "odim-volume".into(),
-                    status: CollectionStatus::Ready,
-                    error: None,
-                });
+                    // Per-site collection config: inherit the base
+                    // (`apis`, `[wms]` styling, …) and override identity.
+                    let mut site_cfg = collection.clone();
+                    site_cfg.id = site_id.clone();
+                    site_cfg.title = format!("{} — {label}", collection.title);
+                    site_cfg.description =
+                        format!("{} (radar site {label} / {nod})", collection.description);
+
+                    if collection.apis.contains(&"edr".to_string()) {
+                        edr_engines.insert(
+                            site_id.clone(),
+                            view.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+                        );
+                        edr_collections.insert(site_id.clone(), site_cfg.clone());
+                    }
+
+                    // Per-site, multi-parameter: one layer per bare quantity.
+                    let raster_params =
+                        ds_core::map_engine::MapEngine::raster_info(view.as_ref()).parameters;
+
+                    if collection.apis.contains(&"wms".to_string()) {
+                        map_engines.insert(
+                            site_id.clone(),
+                            view.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                        );
+                        map_collections.insert(site_id.clone(), site_cfg.clone());
+                        let styles = build_styles(&site_cfg, &bundle_index);
+                        map_styles.insert(site_id.clone(), styles);
+                        if !raster_params.is_empty() {
+                            register_parameter_layer_styles(
+                                &site_cfg,
+                                &raster_params,
+                                &mut map_styles,
+                                &bundle_index,
+                            );
+                        }
+                    }
+                    if collection.apis.contains(&"maps".to_string()) {
+                        maps_engines.insert(
+                            site_id.clone(),
+                            view.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                        );
+                        maps_collections.insert(site_id.clone(), site_cfg.clone());
+                        let styles = build_styles(&site_cfg, &bundle_index);
+                        maps_styles.insert(site_id.clone(), styles);
+                        if !raster_params.is_empty() {
+                            register_parameter_layer_styles(
+                                &site_cfg,
+                                &raster_params,
+                                &mut maps_styles,
+                                &bundle_index,
+                            );
+                        }
+                    }
+                    if collection.apis.contains(&"tiles".to_string()) {
+                        tiles_engines.insert(
+                            site_id.clone(),
+                            view.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                        );
+                        tiles_collections.insert(site_id.clone(), site_cfg.clone());
+                        let styles = build_styles(&site_cfg, &bundle_index);
+                        tiles_styles.insert(site_id.clone(), styles);
+                        if !raster_params.is_empty() {
+                            register_parameter_layer_styles(
+                                &site_cfg,
+                                &raster_params,
+                                &mut tiles_styles,
+                                &bundle_index,
+                            );
+                        }
+                    }
+
+                    info!(
+                        "Collection '{}': wired per-site radar collection '{site_id}' ({label})",
+                        collection.id
+                    );
+                    health.push(CollectionHealth {
+                        id: site_id,
+                        engine_type: "odim-volume".into(),
+                        status: CollectionStatus::Ready,
+                        error: None,
+                    });
+                }
             }
             "postgis" => {
                 let postgis_cfg = match collection.postgis.as_ref() {
@@ -1861,56 +1945,41 @@ pub async fn reload_handler(
 
     let base_url = config.server.base_url();
 
-    // Shut down old poll loops
-    {
-        let old_geotiff = state
-            .geotiff_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        for engine in old_geotiff.iter() {
-            engine.shutdown();
-        }
-        let old_querydata = state
-            .querydata_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        for engine in old_querydata.iter() {
-            engine.shutdown();
-        }
-        let old_grib = state.grib_engines.read().unwrap_or_else(|e| e.into_inner());
-        for engine in old_grib.iter() {
-            engine.shutdown();
-        }
-        let old_odim = state.odim_engines.read().unwrap_or_else(|e| e.into_inner());
-        for engine in old_odim.iter() {
-            engine.shutdown();
-        }
-        let old_odim_volume = state
-            .odim_volume_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        for engine in old_odim_volume.iter() {
-            engine.shutdown();
-        }
-    }
+    // NOTE: old poll loops are shut down *after* the reload guard below, not
+    // here. If the guard rejects the reload (no `Ready` collection), the old
+    // engines and their poll loops must stay alive — otherwise a rejected
+    // reload would freeze the live registry with dead loops and no new ones
+    // spawned (the guard returns before the spawn block).
 
-    let result = load_collections(
+    let mut result = load_collections(
         &config.collections,
         &config.style_bundles,
         &base_url,
         config.server.metatile_cache_mb,
     );
 
-    let loaded = result
+    // Reload protection counts *fully working* (`Ready`) collections, not
+    // just non-`Failed` ones. A `Degraded` placeholder — e.g. an
+    // odim-volume source that transiently scanned zero sites, or a postgis
+    // collection whose DB is momentarily down — wires no servable routes,
+    // so it must not satisfy the guard and let an empty/degraded reload
+    // replace a working live registry. (Startup in `main.rs` deliberately
+    // uses the looser `!= Failed`: at boot there is no live state to
+    // protect, so the server should start degraded and wait for the first
+    // poll rather than refuse to boot.)
+    let ready = result
         .health
         .iter()
-        .filter(|h| h.status != CollectionStatus::Failed)
+        .filter(|h| h.status == CollectionStatus::Ready)
         .count();
 
-    if loaded == 0 && !config.collections.is_empty() {
-        // Restore old GeoTIFF engines (they were shut down)
-        // This is a best-effort recovery — the old engines' poll loops won't restart,
-        // but cached data is still servable.
+    if ready == 0 && !config.collections.is_empty() {
+        // Reject the reload and keep the live state. The old engines were
+        // NOT shut down (that happens below, only on accept), so their poll
+        // loops keep running and recover on their own — e.g. a transiently
+        // unreachable PostGIS DB, or an odim-volume source that momentarily
+        // scanned zero sites. The newly-built engines in `result` are simply
+        // dropped (their poll loops were never spawned).
         tracing::error!(
             "Reload produced 0 working collections from {} configured. Keeping old state.",
             config.collections.len()
@@ -1922,6 +1991,101 @@ pub async fn reload_handler(
                 "configured": config.collections.len()
             })),
         ));
+    }
+
+    // Surface a vanished per-site radar in `/health`. A site that was
+    // `Ready` in the live registry but is absent from the new scan (its
+    // files aged out of the time window, or the radar went offline) would
+    // otherwise just disappear from `/collections` with no `/health` trace.
+    // Push a `Degraded` entry so monitoring can see it — but only when the
+    // site's base source is still configured (a fully-removed source is a
+    // config change, not a data gap). Degraded, so it doesn't affect the
+    // `ready` guard above.
+    {
+        let old_health = state.health.read().unwrap_or_else(|e| e.into_inner());
+        let new_ids: std::collections::HashSet<&str> =
+            result.health.iter().map(|h| h.id.as_str()).collect();
+        let new_bases: Vec<String> = result
+            .odim_volume_engines
+            .iter()
+            .map(|e| e.collection_id().to_string())
+            .collect();
+        let vanished: Vec<String> = old_health
+            .iter()
+            .filter(|h| h.engine_type == "odim-volume" && h.status == CollectionStatus::Ready)
+            .filter(|h| !new_ids.contains(h.id.as_str()))
+            .filter(|h| {
+                // `{base}-{nod}` where `nod` is plain alphanumeric (no `-`).
+                // Require the suffix after the base to be exactly `-{nod}`,
+                // not merely to start with `-`, so a still-present base
+                // `radar` doesn't claim a vanished site from a removed
+                // `radar-fi` source: `radar-fi-x`.strip_prefix(`radar`) =
+                // `-fi-x`, whose nod part `fi-x` is not alphanumeric.
+                new_bases.iter().any(|b| {
+                    h.id.strip_prefix(b.as_str()).is_some_and(|r| {
+                        r.strip_prefix('-').is_some_and(|nod| {
+                            !nod.is_empty() && nod.bytes().all(|c| c.is_ascii_alphanumeric())
+                        })
+                    })
+                })
+            })
+            .map(|h| h.id.clone())
+            .collect();
+        drop(old_health);
+        for id in vanished {
+            tracing::warn!("Reload: radar site collection '{id}' is no longer present in the scan");
+            result.health.push(CollectionHealth {
+                id,
+                engine_type: "odim-volume".into(),
+                status: CollectionStatus::Degraded,
+                error: Some("site no longer present in the latest scan".into()),
+            });
+        }
+    }
+
+    // Reload accepted — now shut down the old poll loops (the new ones are
+    // spawned just below, then state is swapped atomically).
+    {
+        for engine in state
+            .geotiff_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            engine.shutdown();
+        }
+        for engine in state
+            .querydata_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            engine.shutdown();
+        }
+        for engine in state
+            .grib_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            engine.shutdown();
+        }
+        for engine in state
+            .odim_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            engine.shutdown();
+        }
+        for engine in state
+            .odim_volume_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            engine.shutdown();
+        }
     }
 
     // Spawn poll loops for new engines on the dedicated background runtime
@@ -1994,15 +2158,30 @@ pub async fn reload_handler(
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.postgis_engines;
 
+    // Recount from the final `result.health` — the vanished-site block above
+    // appends `Degraded` entries after the guard's `ready` was computed, so
+    // count here to keep the response in sync with the `collections` array.
+    let ready = result
+        .health
+        .iter()
+        .filter(|h| h.status == CollectionStatus::Ready)
+        .count();
+    let degraded = result
+        .health
+        .iter()
+        .filter(|h| h.status == CollectionStatus::Degraded)
+        .count();
     info!(
-        "Reload complete: {}/{} collections loaded",
-        loaded,
+        "Reload complete: {ready} ready ({degraded} degraded) of {} configured",
         config.collections.len()
     );
 
     Ok(Json(json!({
         "status": "ok",
-        "loaded": loaded,
+        // `ready` = fully-working collections; `degraded` wire no servable
+        // routes (e.g. an empty odim-volume source) but aren't failures.
+        "ready": ready,
+        "degraded": degraded,
         "configured": config.collections.len(),
         "collections": result.health
     })))
@@ -2020,6 +2199,21 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
     // Uses EDR-style temporal extent format: { interval, values? }
     let mut data_ages: HashMap<String, i64> = HashMap::new();
     let mut temporal_info: HashMap<String, serde_json::Value> = HashMap::new();
+
+    // Helper: build temporal extent { interval, values? } from a sorted
+    // (first..last) timestamp list.
+    fn temporal_from_times(times: &[chrono::DateTime<chrono::Utc>]) -> Option<serde_json::Value> {
+        let first = times.first()?;
+        let last = times.last()?;
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "interval".to_string(),
+            json!([[first.to_rfc3339(), last.to_rfc3339()]]),
+        );
+        let values: Vec<String> = times.iter().map(|t| t.to_rfc3339()).collect();
+        obj.insert("values".to_string(), json!(values));
+        Some(json!(obj))
+    }
 
     // Helper: build temporal extent from any EdrEngine
     fn build_temporal(engine: &dyn ds_core::edr_engine::EdrEngine) -> Option<serde_json::Value> {
@@ -2072,6 +2266,26 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             let id = engine.collection_id().to_string();
             if let Some(temporal) = build_temporal(engine.as_ref()) {
                 temporal_info.insert(id, temporal);
+            }
+        }
+    }
+    {
+        // PVOL sources expand into one per-site collection each
+        // (`{base}-{nod}`); the engine is keyed by `{base}` and does not
+        // implement `EdrEngine`. `site_times()` returns every site's
+        // timestamps from one catalog snapshot, so the temporal extents are
+        // built without allocating a view per site (O(1)-from-a-snapshot per
+        // request). Key each by the `{base}-{nod}` id to match the health
+        // entries.
+        let engines = state
+            .odim_volume_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        for engine in engines.iter() {
+            for (nod, times) in engine.site_times() {
+                if let Some(temporal) = temporal_from_times(&times) {
+                    temporal_info.insert(format!("{}-{}", engine.collection_id(), nod), temporal);
+                }
             }
         }
     }

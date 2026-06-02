@@ -6,22 +6,26 @@
 # `s3://fmi-opendata-radar-volume-hdf5/YYYY/MM/DD/<site>/` with
 # filenames `YYYYMMDDHHMM_<site>_PVOL.h5`.
 #
-# The odim-volume engine renders the lowest elevation sweep of each
-# site as a Cartesian raster; the WMS layer tree is one group per radar
-# site with the dual-pol moments as quantity sub-layers (TH, DBZH,
-# VRADH, ZDR, RHOHV...). Parameter names are `<site>:<quantity>`, e.g.
-# `fivih:DBZH`. On the EDR API each radar site is a location (id = ODIM
-# NOD code) and each quantity is a parameter.
+# Under the per-site collection model this one source expands into
+# **one OGC collection per radar site** (id =
+# `radar-fi-volume-s3-h5-<nod>`, e.g. `…-fivih`), each rendering that
+# site's lowest elevation sweep as a Cartesian raster. Within a site
+# collection the WMS layers are the **bare quantities** (TH, DBZH,
+# VRADH, ZDR, RHOHV...) — no `<site>:` prefix. On the EDR API each site
+# collection has one location (id = ODIM NOD code) and the quantities
+# are its parameters.
 #
 # `prefix_pattern` covers the whole date partition (`%Y/%m/%d/`), so the
-# scan picks up every FMI radar site, not just one. `time_window`
+# scan picks up every FMI radar site, not just one — i.e. every site
+# becomes its own collection. The set of collections is discovered from
+# the scan; a new site appears after the next admin reload. `time_window`
 # bounds both the date-partitioned prefixes listed and the volume
 # timestamps kept — with ~12 sites at 5-min cadence a wide window pulls
 # a lot of multi-MB volumes, so it is deliberately short.
 
 id = "radar-fi-volume-s3-h5"
 title = "FMI — radar polar volumes (S3, ODIM_H5)"
-description = "Finnish radar polar volumes (ODIM_H5 PVOL) streamed from FMI's open-data S3 bucket — every FMI radar site, all elevation sweeps and dual-polarisation moments."
+description = "Finnish radar polar volumes (ODIM_H5 PVOL) streamed from FMI's open-data S3 bucket — every FMI radar site, all elevation sweeps and dual-polarisation moments. One collection per radar site."
 engine_type = "odim-volume"
 apis = ["edr", "wms", "maps", "tiles"]
 
@@ -33,4 +37,59 @@ time_window = "-PT1H"
 poll_interval_secs = 300
 
 [wms]
+# Collection-level fallback; per-quantity colormaps follow (the bare
+# quantity name now matches, so velocity / dual-pol moments each get a
+# fitting palette instead of the dBZ palette stretched over all of them).
 colormap = "radar_dbz"
+
+[[wms.parameters]]
+name = "TH"
+colormap = "radar_dbz"
+[[wms.parameters]]
+name = "DBZH"
+colormap = "radar_dbz"
+
+# Doppler radial velocity — m/s, diverging blue→white→red about zero.
+[[wms.parameters]]
+name = "VRADH"
+min = -48.0
+max = 48.0
+[[wms.parameters.color_stops]]
+value = -48.0
+color = "#1a1aff"
+[[wms.parameters.color_stops]]
+value = -24.0
+color = "#66ccff"
+[[wms.parameters.color_stops]]
+value = 0.0
+color = "#f5f5f5"
+[[wms.parameters.color_stops]]
+value = 24.0
+color = "#ff8c66"
+[[wms.parameters.color_stops]]
+value = 48.0
+color = "#cc0000"
+
+[[wms.parameters]]
+name = "WRADH"
+colormap = "viridis"
+min = 0.0
+max = 10.0
+
+[[wms.parameters]]
+name = "ZDR"
+colormap = "viridis"
+min = -2.0
+max = 6.0
+
+[[wms.parameters]]
+name = "RHOHV"
+colormap = "viridis"
+min = 0.0
+max = 1.0
+
+[[wms.parameters]]
+name = "KDP"
+colormap = "viridis"
+min = -1.0
+max = 6.0

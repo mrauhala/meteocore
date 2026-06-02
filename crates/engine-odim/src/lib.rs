@@ -27,4 +27,4 @@ pub mod reader;
 pub mod volume_engine;
 
 pub use engine::{EngineError, OdimEngine};
-pub use volume_engine::PolarVolumeEngine;
+pub use volume_engine::{PolarVolumeEngine, PolarVolumeSiteView};
