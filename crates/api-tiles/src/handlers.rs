@@ -145,11 +145,47 @@ fn build_collection_metadata(
         "vector"
     };
 
+    // `storageCrs`: native CRS of a raster source when it has a stable OGC URI
+    // (omitted for vector collections and for projected grids with no canonical
+    // URI). Resolved up-front because OGC API – Common – Part 2 §7.13.3 requires
+    // it to be a member of `crs[]` below.
+    let storage_crs = raster_info.and_then(|i| ds_core::geo::native_crs_uri(&i.native_crs));
+
+    // OGC API – Common – Part 2 `crs` array (#296), for parity with Maps.
+    // Tiles are delivered in their TileMatrixSet's CRS (EPSG:3857 for
+    // WebMercatorQuad, CRS84 for WorldCRS84Quad), plus the native `storageCrs`
+    // when present — §7.13.3 mandates `storageCrs ∈ crs[]`, and a projected
+    // raster (EPSG:3067/3035) would otherwise violate it. CRS84 is listed first
+    // for consistency with Maps and Features.
+    const CRS84_URI: &str = "http://www.opengis.net/def/crs/OGC/1.3/CRS84";
+    let mut crs_uris: Vec<&'static str> = Vec::new();
+    for tms_id in SUPPORTED_TILE_MATRIX_SETS {
+        // `if let` (not `expect`): this runs in the request-serving path and
+        // there is no CatchPanicLayer, so a panic would drop the connection.
+        // Divergence between SUPPORTED_TILE_MATRIX_SETS and `get_tile_matrix_set`
+        // is instead caught in CI by `tilematrixset::tests::
+        // every_supported_tms_resolves`, so `crs[]` is never silently shortened
+        // in practice (review on #298).
+        if let Some(def) = tilematrixset::get_tile_matrix_set(tms_id) {
+            if !crs_uris.contains(&def.crs) {
+                crs_uris.push(def.crs);
+            }
+        }
+    }
+    if let Some(sc) = storage_crs {
+        if !crs_uris.contains(&sc) {
+            crs_uris.push(sc);
+        }
+    }
+    // CRS84 first (stable sort keeps the rest in order).
+    crs_uris.sort_by_key(|c| *c != CRS84_URI);
+
     let mut metadata = json!({
         "id": config.id,
         "title": config.title,
         "description": config.description,
         "dataType": data_type,
+        "crs": crs_uris,
         "tileMatrixSetLinks": tms_links,
         "styles": style_list,
         "links": [
@@ -168,12 +204,16 @@ fn build_collection_metadata(
         ]
     });
 
-    // Advertise `storageCrs` for raster collections when the native CRS has a
-    // stable OGC URI (mirrors api-maps). Omitted for vector collections and
-    // for projected grids with no canonical URI.
-    if let Some(storage_crs) = raster_info.and_then(|i| ds_core::geo::native_crs_uri(&i.native_crs))
-    {
-        metadata["storageCrs"] = json!(storage_crs);
+    // No `itemType`: OGC API – Common – Part 2 §7.13 defines it as describing
+    // the items reachable at /collections/{id}/items, but the Tiles router has
+    // no /items route — tiles are fetched at /tiles/…. Emitting it (even
+    // "feature" for vector collections) would be an over-claim a validator
+    // probing /items would catch. A collection that is *also* a Features
+    // collection advertises itemType on its /features representation, where an
+    // /items resource actually exists (review on #298).
+
+    if let Some(sc) = storage_crs {
+        metadata["storageCrs"] = json!(sc);
     }
 
     if let Some(extent) = build_extent(raster_info, feature_extent) {

@@ -328,6 +328,21 @@ fn crs84_extent_to_tile_range(
 mod tests {
     use super::*;
 
+    /// Every id in `SUPPORTED_TILE_MATRIX_SETS` must resolve via
+    /// `get_tile_matrix_set`. This is the CI guard that lets the
+    /// `build_collection_metadata` `crs[]` builder use `if let Some` (no panic
+    /// in the request path) without silently shortening `crs[]` if the two
+    /// constructs ever diverge (review on #298).
+    #[test]
+    fn every_supported_tms_resolves() {
+        for id in SUPPORTED_TILE_MATRIX_SETS {
+            assert!(
+                get_tile_matrix_set(id).is_some(),
+                "SUPPORTED_TILE_MATRIX_SETS entry {id:?} has no TileMatrixSetDef"
+            );
+        }
+    }
+
     #[test]
     fn test_web_mercator_z0_single_tile() {
         let bbox = web_mercator_tile_bbox(0, 0, 0).unwrap();

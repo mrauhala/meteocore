@@ -106,6 +106,18 @@ pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn conformance() -> impl IntoResponse {
     Json(json!({
         "conformsTo": [
+            // OGC API – Common – Part 1: Core and Part 2: Geospatial Data. The
+            // Features landing page, /conformance, /api, and
+            // /collections{,/{id}} satisfy these structurally — the same
+            // declaration #292 added for Maps and Tiles. Declaring Part 2 is
+            // also the prerequisite for Common Part 4 "searchable collections".
+            // The HTML class (.../conf/html) is omitted — there is no HTML
+            // representation of /collections yet.
+            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
+            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page",
+            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/oas30",
+            "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/collections",
+            "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/json",
             "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
             "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas30",
             "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson"
@@ -118,8 +130,28 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
     let mut collection_paths = json!({});
     for config in state.collections.values() {
         let id = &config.id;
+        let detail_path = format!("/features/collections/{id}");
         let items_path = format!("/features/collections/{id}/items");
         let item_path = format!("/features/collections/{id}/items/{{featureId}}");
+
+        // Collection detail. OGC API – Common – Part 2 `conf/json` requires the
+        // API definition to describe every collection resource, including
+        // GET /collections/{id} — Maps and Tiles already do; Features was the
+        // odd one out (review on #298).
+        collection_paths[&detail_path] = json!({
+            "get": {
+                "summary": format!("Get {} collection metadata", config.title),
+                "operationId": format!("getCollection_{id}"),
+                "tags": [id],
+                "responses": {
+                    "200": {
+                        "description": "Collection metadata",
+                        "content": {"application/json": {}}
+                    },
+                    "404": {"description": "Collection not found"}
+                }
+            }
+        });
 
         collection_paths[&items_path] = json!({
             "get": {
