@@ -130,8 +130,28 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
     let mut collection_paths = json!({});
     for config in state.collections.values() {
         let id = &config.id;
+        let detail_path = format!("/features/collections/{id}");
         let items_path = format!("/features/collections/{id}/items");
         let item_path = format!("/features/collections/{id}/items/{{featureId}}");
+
+        // Collection detail. OGC API – Common – Part 2 `conf/json` requires the
+        // API definition to describe every collection resource, including
+        // GET /collections/{id} — Maps and Tiles already do; Features was the
+        // odd one out (review on #298).
+        collection_paths[&detail_path] = json!({
+            "get": {
+                "summary": format!("Get {} collection metadata", config.title),
+                "operationId": format!("getCollection_{id}"),
+                "tags": [id],
+                "responses": {
+                    "200": {
+                        "description": "Collection metadata",
+                        "content": {"application/json": {}}
+                    },
+                    "404": {"description": "Collection not found"}
+                }
+            }
+        });
 
         collection_paths[&items_path] = json!({
             "get": {
