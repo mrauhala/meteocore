@@ -1799,7 +1799,13 @@ mod content_negotiation {
     /// the wrong representation.
     #[tokio::test]
     async fn negotiated_responses_set_vary_accept() {
-        for uri in ["/collections", "/collections?f=html", "/conformance", "/"] {
+        for uri in [
+            "/collections",
+            "/collections?f=html",
+            "/collections/radar",
+            "/conformance",
+            "/",
+        ] {
             let (_, headers, _) = get_raw(uri).await;
             let vary = headers
                 .get("vary")

@@ -1135,7 +1135,13 @@ mod content_negotiation {
     /// the wrong representation.
     #[tokio::test]
     async fn negotiated_responses_set_vary_accept() {
-        for uri in ["/collections", "/collections?f=html", "/conformance", "/"] {
+        for uri in [
+            "/collections",
+            "/collections?f=html",
+            "/collections/weather",
+            "/conformance",
+            "/",
+        ] {
             let resp = app()
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
                 .await

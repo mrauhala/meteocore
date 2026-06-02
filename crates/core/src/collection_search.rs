@@ -395,8 +395,9 @@ pub fn page_query_string(
     }
     // Preserve the requested format across pagination links so an HTML
     // `/collections` page's next/prev links stay HTML (don't revert to JSON).
-    // Pushed directly (not via the `push` closure) so the closure's mutable
-    // borrow of `parts` ends before the direct `offset` push above.
+    // Pushed directly rather than via the `push` closure: the closure borrows
+    // `parts` mutably, and re-invoking it here (after the direct `offset` push)
+    // would overlap that borrow — so `f` is appended inline instead.
     if let Some(v) = f.map(str::trim).filter(|s| !s.is_empty()) {
         parts.push(format!("f={}", encode_qval(v)));
     }
