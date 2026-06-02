@@ -288,11 +288,9 @@ async fn finding_05_collections_bbox_filtering() {
 // ===========================================================================
 // Spec: All endpoints should support `f` query parameter for content
 //   negotiation (e.g., f=json, f=html).
-// Implementation: No endpoint accepts or processes the `f` parameter.
-// Impact: Clients requesting specific output format via query param get
-//   no format negotiation.
-// Fix: Add `f` parameter support to all handlers, or at minimum accept
-//   and ignore it without returning an error.
+// RESOLVED (#296): the metadata endpoints (landing, /conformance, /collections,
+//   /collections/{id}) now negotiate `?f=json|html` + the Accept header and
+//   serve an HTML representation. See the `content_negotiation` tests below.
 
 #[tokio::test]
 async fn finding_06_landing_page_accepts_f_param() {
@@ -714,9 +712,9 @@ async fn finding_18_conformance_has_ogc_common_classes() {
     );
 }
 
-// OGC API - Common - Part 2: Geospatial Data (20-024). #291: /collections +
-// /collections/{id} satisfy the Collections + JSON classes structurally, so
-// they are advertised for discovery. The HTML class is intentionally omitted.
+// OGC API - Common - Part 2: Geospatial Data (20-024). /collections +
+// /collections/{id} satisfy the Collections + JSON classes; the HTML class is
+// now also declared (HTML representation served via ?f=html / Accept, #296).
 #[tokio::test]
 async fn declares_ogcapi_common_part2_classes() {
     let (_status, json) = get_json("/conformance").await;
@@ -733,8 +731,8 @@ async fn declares_ogcapi_common_part2_classes() {
         "must declare OGC API Common Part 2 JSON class"
     );
     assert!(
-        !has("ogcapi-common-2/1.0/conf/html"),
-        "must NOT declare the HTML class (no HTML /collections representation)"
+        has("ogcapi-common-2/1.0/conf/html"),
+        "must declare the HTML class (HTML representation served via ?f=html)"
     );
 }
 
@@ -1061,5 +1059,75 @@ mod part4_searchable {
         let (_, json) = get_json("/collections?q=zzznotaword").await;
         assert_eq!(json["numberReturned"], 0);
         assert!(json["collections"].as_array().unwrap().is_empty());
+    }
+}
+
+// ===========================================================================
+// Content negotiation — ?f=json|html + Accept (OGC API Common Part 2 conf/html)
+// ===========================================================================
+
+mod content_negotiation {
+    use super::*;
+
+    /// Raw request returning (status, content-type, body string).
+    async fn get_raw(uri: &str, accept: Option<&str>) -> (StatusCode, String, String) {
+        let mut builder = Request::builder().uri(uri);
+        if let Some(a) = accept {
+            builder = builder.header("accept", a);
+        }
+        let resp = app()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, ct, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test]
+    async fn f_html_serves_html_on_all_metadata_endpoints() {
+        for uri in [
+            "/?f=html",
+            "/conformance?f=html",
+            "/collections?f=html",
+            "/collections/weather?f=html",
+        ] {
+            let (status, ct, body) = get_raw(uri, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert!(ct.starts_with("text/html"), "{uri}: content-type was {ct}");
+            assert!(body.contains("<!DOCTYPE html>"), "{uri}: not HTML");
+        }
+    }
+
+    #[tokio::test]
+    async fn f_json_serves_json() {
+        let (status, ct, _) = get_raw("/collections?f=json", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.starts_with("application/json"), "content-type was {ct}");
+    }
+
+    #[tokio::test]
+    async fn accept_header_selects_html() {
+        let (status, ct, _) = get_raw("/collections", Some("text/html")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.starts_with("text/html"), "content-type was {ct}");
+    }
+
+    #[tokio::test]
+    async fn no_accept_defaults_to_json() {
+        let (_status, ct, _) = get_raw("/collections", None).await;
+        assert!(ct.starts_with("application/json"), "content-type was {ct}");
+    }
+
+    #[tokio::test]
+    async fn unknown_f_is_400() {
+        let (status, _, _) = get_raw("/collections?f=xml", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

@@ -789,3 +789,47 @@ mod part4_searchable {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Content negotiation — ?f=json|html (OGC API Common Part 2 conf/html, #296)
+// ---------------------------------------------------------------------------
+mod content_negotiation {
+    use super::*;
+
+    async fn get_raw(uri: &str) -> (StatusCode, String, String) {
+        let resp = build_router()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, ct, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test]
+    async fn f_html_serves_html() {
+        let (status, ct, body) = get_raw("/collections?f=html").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.starts_with("text/html"), "content-type was {ct}");
+        assert!(body.contains("<!DOCTYPE html>"));
+    }
+
+    #[tokio::test]
+    async fn collection_detail_serves_html() {
+        let (status, ct, _) = get_raw("/collections/cities?f=html").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.starts_with("text/html"), "content-type was {ct}");
+    }
+
+    #[tokio::test]
+    async fn unknown_f_is_400() {
+        let (status, _, _) = get_raw("/collections?f=xml").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+}

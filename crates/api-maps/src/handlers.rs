@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
@@ -67,6 +67,14 @@ fn cache_control_value(has_explicit_time: bool) -> &'static str {
     } else {
         "public, max-age=60, must-revalidate"
     }
+}
+
+/// Resolve the requested representation from `?f=` + the `Accept` header.
+fn negotiate(f: Option<&str>, headers: &HeaderMap) -> Result<ds_core::html::Wanted, MapsError> {
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok());
+    ds_core::html::negotiate(f, accept).map_err(|e| MapsError::BadRequest(e.to_string()))
 }
 
 fn build_collection_metadata(
@@ -200,45 +208,67 @@ fn build_extent(info: &ds_core::map_engine::RasterInfo) -> Option<serde_json::Va
 // ---------------------------------------------------------------------------
 
 /// GET /maps/ — Landing page
-pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn landing_page(
+    State(state): State<AppState>,
+    Query(fp): Query<ds_core::html::FormatParams>,
+    headers: HeaderMap,
+) -> Result<Response, MapsError> {
+    use ds_core::html::{LinkView, Wanted};
+    let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let base = &state.base_url;
-    Json(json!({
-        "title": "MeteoCore - Maps",
-        "description": "Metocean Data Server — OGC API Maps",
-        "links": [
-            {
-                "href": format!("{base}/maps/"),
-                "rel": "self",
-                "type": "application/json",
-                "title": "This document"
-            },
-            {
-                "href": format!("{base}/maps/api"),
-                "rel": "service-desc",
-                "type": "application/vnd.oai.openapi+json;version=3.0",
-                "title": "API definition"
-            },
-            {
-                "href": format!("{base}/maps/api/docs"),
-                "rel": "service-doc",
-                "type": "text/html",
-                "title": "API documentation"
-            },
-            {
-                "href": format!("{base}/maps/conformance"),
-                "rel": "conformance",
-                "type": "application/json",
-                "title": "Conformance classes"
-            },
-            {
-                "href": format!("{base}/maps/collections"),
-                "rel": "data",
-                "type": "application/json",
-                "title": "Collections"
-            }
-        ]
-    }))
+    let title = "MeteoCore - Maps";
+    let description = "Metocean Data Server — OGC API Maps";
+    // (href, rel, type, title) — one source for both representations.
+    let links = [
+        (
+            format!("{base}/maps/"),
+            "self",
+            "application/json",
+            "This document",
+        ),
+        (
+            format!("{base}/maps/api"),
+            "service-desc",
+            "application/vnd.oai.openapi+json;version=3.0",
+            "API definition",
+        ),
+        (
+            format!("{base}/maps/api/docs"),
+            "service-doc",
+            "text/html",
+            "API documentation",
+        ),
+        (
+            format!("{base}/maps/conformance"),
+            "conformance",
+            "application/json",
+            "Conformance classes",
+        ),
+        (
+            format!("{base}/maps/collections"),
+            "data",
+            "application/json",
+            "Collections",
+        ),
+    ];
+    Ok(match wanted {
+        Wanted::Json => {
+            let json_links: Vec<_> = links
+                .iter()
+                .map(|(h, r, t, ti)| json!({ "href": h, "rel": r, "type": t, "title": ti }))
+                .collect();
+            Json(json!({ "title": title, "description": description, "links": json_links }))
+                .into_response()
+        }
+        Wanted::Html => {
+            let views: Vec<LinkView> = links
+                .iter()
+                .map(|(h, r, _, ti)| LinkView::new(h.clone(), *r, Some(ti)))
+                .collect();
+            Html(ds_core::html::landing_html(title, description, &views)).into_response()
+        }
+    })
 }
 
 /// OpenAPI `parameters` array for the OGC API – Common – Part 4 searchable
@@ -256,7 +286,9 @@ fn searchable_collections_parameters() -> serde_json::Value {
         {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 1000},
          "description": "Maximum number of collections per page (default 1000)."},
         {"name": "offset", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0},
-         "description": "Number of matching collections to skip (pagination cursor)."}
+         "description": "Number of matching collections to skip (pagination cursor)."},
+        {"name": "f", "in": "query", "required": false, "schema": {"type": "string", "enum": ["json", "html"]},
+         "description": "Output format. 'json' (default) or 'html'; overrides the Accept header."}
     ])
 }
 
@@ -569,50 +601,62 @@ pub async fn api_docs(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// GET /maps/conformance
-pub async fn conformance() -> impl IntoResponse {
-    Json(json!({
-        "conformsTo": [
-            // OGC API - Common - Part 1: Core (landing page, /conformance,
-            // /api) and Part 2: Geospatial Data (/collections + /collections/
-            // {id}, JSON). Both are satisfied structurally; the HTML class
-            // (.../common-2/.../conf/html) is omitted — no HTML /collections.
-            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
-            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page",
-            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/oas30",
-            "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/collections",
-            "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/json",
-            // OGC API - Common - Part 4 (Discovery within many collections,
-            // draft 25-046): /collections supports bbox/bbox-crs/datetime/q/
-            // limit filtering + offset pagination.
-            "http://www.opengis.net/spec/ogcapi-common-4/1.0/conf/searchable-collections",
-            "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/core",
-            "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/collection-map",
-            "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/styled-map",
-            "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/spatial-subsetting",
-            "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/scaling",
-            "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/datetime",
-            "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/crs",
-            "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/png",
-            "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg"
-            // NOTE: the OGC API Maps "Map Tilesets" class
-            // (.../conf/tilesets) is intentionally NOT declared. Its abstract
-            // tests require maps-native /collections/{id}/map/tiles endpoints,
-            // which we don't implement — raster tiles are served by the
-            // standalone OGC API Tiles service and merely *discovered* from a
-            // maps collection via the `tilesets-map` link relation. Declaring
-            // the class without the endpoints would be a false conformance
-            // claim.
-        ]
-    }))
+pub async fn conformance(
+    Query(fp): Query<ds_core::html::FormatParams>,
+    headers: HeaderMap,
+) -> Result<Response, MapsError> {
+    use ds_core::html::Wanted;
+    let wanted = negotiate(fp.f.as_deref(), &headers)?;
+    let classes = [
+        // OGC API - Common - Part 1: Core (landing page, /conformance,
+        // /api) and Part 2: Geospatial Data (/collections + /collections/
+        // {id}, JSON). Both are satisfied structurally; the HTML class
+        // (.../common-2/.../conf/html) is now declared — the HTML
+        // representation is served via `?f=html` / Accept.
+        "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
+        "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page",
+        "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/oas30",
+        "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/collections",
+        "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/json",
+        "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/html",
+        // OGC API - Common - Part 4 (Discovery within many collections,
+        // draft 25-046): /collections supports bbox/bbox-crs/datetime/q/
+        // limit filtering + offset pagination.
+        "http://www.opengis.net/spec/ogcapi-common-4/1.0/conf/searchable-collections",
+        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/core",
+        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/collection-map",
+        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/styled-map",
+        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/spatial-subsetting",
+        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/scaling",
+        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/datetime",
+        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/crs",
+        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/png",
+        "http://www.opengis.net/spec/ogcapi-maps-1/1.0/conf/jpeg",
+        // NOTE: the OGC API Maps "Map Tilesets" class
+        // (.../conf/tilesets) is intentionally NOT declared. Its abstract
+        // tests require maps-native /collections/{id}/map/tiles endpoints,
+        // which we don't implement — raster tiles are served by the
+        // standalone OGC API Tiles service and merely *discovered* from a
+        // maps collection via the `tilesets-map` link relation. Declaring
+        // the class without the endpoints would be a false conformance
+        // claim.
+    ];
+    Ok(match wanted {
+        Wanted::Json => Json(json!({ "conformsTo": classes })).into_response(),
+        Wanted::Html => Html(ds_core::html::conformance_html(&classes)).into_response(),
+    })
 }
 
 /// GET /maps/collections
 pub async fn collections(
     State(state): State<AppState>,
     Query(sp): Query<ds_core::collection_search::SearchQueryParams>,
-) -> Result<Json<serde_json::Value>, MapsError> {
+    headers: HeaderMap,
+) -> Result<Response, MapsError> {
     use ds_core::collection_search::{search, CollectionMatch};
+    use ds_core::html::Wanted;
 
+    let wanted = negotiate(sp.f.as_deref(), &headers)?;
     let params = sp
         .parse()
         .map_err(|e| MapsError::BadRequest(e.to_string()))?;
@@ -658,51 +702,118 @@ pub async fn collections(
         })
         .collect();
     let result = search(&matches, &params);
-    let colls: Vec<serde_json::Value> = result.page.iter().map(|&i| rows[i].5.clone()).collect();
-    let number_returned = colls.len();
-
-    let link = |rel: &str, offset: usize, title: Option<&str>| {
-        let mut o = json!({
-            "href": format!("{base}/maps/collections{}", sp.query_string(params.limit, offset)),
-            "rel": rel,
-            "type": "application/json"
-        });
-        if let Some(t) = title {
-            o["title"] = json!(t);
-        }
-        o
+    let href = |offset| {
+        format!(
+            "{base}/maps/collections{}",
+            sp.query_string(params.limit, offset)
+        )
     };
-    let mut links = vec![link("self", params.offset, None)];
-    if result.has_next {
-        links.push(link("next", result.next_offset, Some("Next page")));
-    }
-    if result.has_prev {
-        links.push(link("prev", result.prev_offset, Some("Previous page")));
-    }
 
-    Ok(Json(json!({
-        "collections": colls,
-        "numberMatched": result.number_matched,
-        "numberReturned": number_returned,
-        "links": links
-    })))
+    Ok(match wanted {
+        Wanted::Json => {
+            let colls: Vec<serde_json::Value> =
+                result.page.iter().map(|&i| rows[i].5.clone()).collect();
+            let number_returned = colls.len();
+
+            let link = |rel: &str, offset: usize, title: Option<&str>| {
+                let mut o = json!({ "href": href(offset), "rel": rel, "type": "application/json" });
+                if let Some(t) = title {
+                    o["title"] = json!(t);
+                }
+                o
+            };
+            let mut links = vec![link("self", params.offset, None)];
+            if result.has_next {
+                links.push(link("next", result.next_offset, Some("Next page")));
+            }
+            if result.has_prev {
+                links.push(link("prev", result.prev_offset, Some("Previous page")));
+            }
+
+            Json(json!({
+                "collections": colls,
+                "numberMatched": result.number_matched,
+                "numberReturned": number_returned,
+                "links": links
+            }))
+            .into_response()
+        }
+        Wanted::Html => {
+            use ds_core::html::{CollectionCard, LinkView};
+            let cards: Vec<CollectionCard> = result
+                .page
+                .iter()
+                .map(|&i| CollectionCard {
+                    id: rows[i].0.clone(),
+                    title: rows[i].1.clone(),
+                    description: rows[i].2.clone(),
+                    self_href: format!("{base}/maps/collections/{}", rows[i].0),
+                })
+                .collect();
+            let mut nav = vec![LinkView::new(
+                href(params.offset),
+                "self",
+                Some("This page"),
+            )];
+            if result.has_next {
+                nav.push(LinkView::new(
+                    href(result.next_offset),
+                    "next",
+                    Some("Next page"),
+                ));
+            }
+            if result.has_prev {
+                nav.push(LinkView::new(
+                    href(result.prev_offset),
+                    "prev",
+                    Some("Previous page"),
+                ));
+            }
+            Html(ds_core::html::collections_html("Collections", &cards, &nav)).into_response()
+        }
+    })
 }
 
 /// GET /maps/collections/{id}
 pub async fn collection(
     Path(id): Path<String>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, MapsError> {
+    Query(fp): Query<ds_core::html::FormatParams>,
+    headers: HeaderMap,
+) -> Result<Response, MapsError> {
+    use ds_core::html::{CollectionCard, LinkView, Wanted};
+    let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let (engine, config) = lookup_engine(&state, &id)?;
-    let info = engine.raster_info();
-    let styles = state.styles.get(&id);
-    Ok(Json(build_collection_metadata(
-        config,
-        &info,
-        styles,
-        &state.base_url,
-    )))
+    let base = &state.base_url;
+    Ok(match wanted {
+        Wanted::Json => {
+            let info = engine.raster_info();
+            let styles = state.styles.get(&id);
+            Json(build_collection_metadata(config, &info, styles, base)).into_response()
+        }
+        Wanted::Html => {
+            let card = CollectionCard {
+                id: config.id.clone(),
+                title: config.title.clone(),
+                description: config.description.clone(),
+                self_href: format!("{base}/maps/collections/{}", config.id),
+            };
+            let links = [
+                LinkView::new(
+                    format!("{base}/maps/collections/{}?f=json", config.id),
+                    "alternate",
+                    Some("JSON"),
+                ),
+                LinkView::new(
+                    format!("{base}/maps/collections"),
+                    "collection",
+                    Some("All collections"),
+                ),
+            ];
+            Html(ds_core::html::collection_html(&card, &links)).into_response()
+        }
+    })
 }
 
 /// GET /maps/collections/{id}/styles

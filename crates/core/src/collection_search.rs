@@ -327,6 +327,10 @@ pub struct SearchQueryParams {
     pub q: Option<String>,
     pub limit: Option<String>,
     pub offset: Option<String>,
+    /// Output-format selector (`json`/`html`) for content negotiation. Not a
+    /// search facet — captured here only so the `/collections` handler can read
+    /// it without a second, conflicting `Query` extractor. See `ds_core::html`.
+    pub f: Option<String>,
 }
 
 impl SearchQueryParams {

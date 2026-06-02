@@ -418,12 +418,12 @@ mod conformance {
     }
 
     #[tokio::test]
-    async fn omits_common_html_class() {
-        // No HTML representation of /collections — declaring the HTML class
-        // would be a false conformance claim (#291).
+    async fn declares_common_html_class() {
+        // HTML representation of the metadata endpoints is now served via
+        // `?f=html` / Accept, so the Common Part 2 HTML class is declared (#296).
         let (_, json) = get("/conformance").await;
         let classes = json["conformsTo"].as_array().unwrap();
-        assert!(!classes
+        assert!(classes
             .iter()
             .any(|c| c.as_str().unwrap().contains("common-2/1.0/conf/html")));
     }
@@ -1741,5 +1741,39 @@ mod searchable {
         let href = self_link["href"].as_str().unwrap();
         assert!(href.contains("q=radar"));
         assert!(href.contains("limit=1"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Content negotiation — ?f=json|html (OGC API Common Part 2 conf/html, #296)
+// ---------------------------------------------------------------------------
+mod content_negotiation {
+    use super::*;
+
+    #[tokio::test]
+    async fn f_html_serves_html() {
+        let (status, headers, body) = get_raw("/collections?f=html").await;
+        assert_eq!(status, StatusCode::OK);
+        let ct = headers.get("content-type").unwrap().to_str().unwrap();
+        assert!(ct.starts_with("text/html"), "content-type was {ct}");
+        assert!(String::from_utf8_lossy(&body).contains("<!DOCTYPE html>"));
+    }
+
+    #[tokio::test]
+    async fn collection_detail_serves_html() {
+        let (status, headers, _) = get_raw("/collections/radar?f=html").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+    }
+
+    #[tokio::test]
+    async fn unknown_f_is_400() {
+        let (status, _, _) = get_raw("/collections?f=xml").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }
