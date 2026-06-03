@@ -58,6 +58,7 @@ impl MapEngine for EmptyMockMapEngine {
             parameters: vec![],
             vertical: None,
             grid_size: None,
+            layer_subtitle: None,
         }
     }
 }
@@ -208,6 +209,7 @@ impl MapEngine for FailingMockMapEngine {
             parameters: vec![],
             vertical: None,
             grid_size: None,
+            layer_subtitle: None,
         }
     }
 }
@@ -349,6 +351,7 @@ impl MapEngine for PopulatedMockMapEngine {
             parameters: vec![],
             vertical: None,
             grid_size: None,
+            layer_subtitle: None,
         }
     }
 }
@@ -693,6 +696,7 @@ impl MapEngine for CountingMockMapEngine {
             parameters: vec![],
             vertical: None,
             grid_size: None,
+            layer_subtitle: None,
         }
     }
 }
@@ -866,5 +870,112 @@ async fn zero_metatile_cache_disables_meta_tiling() {
         calls.load(std::sync::atomic::Ordering::Relaxed),
         1,
         "kill switch must fall back to a single direct render"
+    );
+}
+
+/// Multi-parameter mock standing in for a PVOL radar-site collection: two
+/// bare-quantity parameters with human labels, and a `layer_subtitle` carrying
+/// the site place name. Drives the flat-client disambiguation in
+/// `get_capabilities_xml` (parent layer per collection, one child per param).
+struct SiteMockMapEngine;
+
+impl MapEngine for SiteMockMapEngine {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+    ) -> Result<RasterTile, DataServerError> {
+        let pixel_count = (width * height) as usize;
+        Ok(RasterTile {
+            width,
+            height,
+            values: vec![None; pixel_count],
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            native_crs: "CRS:84".into(),
+            spatial_extent: Some([20.0, 58.0, 28.0, 62.0]),
+            times: vec![chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)],
+            parameter: "DBZH".into(),
+            unit: String::new(),
+            parameters: vec![
+                ("DBZH".into(), "DBZH — Reflectivity (horizontal)".into()),
+                (
+                    "VRADH".into(),
+                    "VRADH — Radial velocity (horizontal)".into(),
+                ),
+            ],
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: Some("Vihti".into()),
+        }
+    }
+}
+
+fn site_collection_config(id: &str) -> CollectionConfig {
+    CollectionConfig {
+        id: id.to_string(),
+        title: format!("Finnish radar volumes — Vihti ({id})"),
+        description: "PVOL radar site".into(),
+        data_path: None,
+        apis: vec!["wms".to_string()],
+        engine_type: "odim-volume".to_string(),
+        geotiff: None,
+        querydata: None,
+        wms: None,
+        grib: None,
+        odim: None,
+        postgis: None,
+        preview: None,
+    }
+}
+
+/// A multi-parameter (PVOL site) collection emits, per WMS spec, a
+/// non-requestable parent layer plus one requestable child layer per
+/// parameter. The child `<Name>` stays `{id}/{quantity}` (the requestable
+/// token), while the child `<Title>` is prefixed with the site place name from
+/// `layer_subtitle` so a WMS client that ignores the parent tree can still tell
+/// the sites apart. Without the prefix every site's child is titled identically.
+#[test]
+fn child_layer_titles_are_site_prefixed_for_flat_clients() {
+    let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+    let mut collections = HashMap::new();
+    engines.insert("radar-fivih".to_string(), Arc::new(SiteMockMapEngine));
+    collections.insert(
+        "radar-fivih".to_string(),
+        site_collection_config("radar-fivih"),
+    );
+
+    let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
+    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
+
+    // Requestable child <Name> is unchanged (id/quantity).
+    assert!(
+        xml.contains("<Name>radar-fivih/DBZH</Name>"),
+        "child layer Name must stay the requestable id/quantity token; got:\n{xml}"
+    );
+    // Child <Title> is site-prefixed + human-readable.
+    assert!(
+        xml.contains("<Title>Vihti — DBZH — Reflectivity (horizontal)</Title>"),
+        "child layer Title must be prefixed with the site name; got:\n{xml}"
+    );
+    assert!(
+        xml.contains("<Title>Vihti — VRADH — Radial velocity (horizontal)</Title>"),
+        "second child layer Title must also be site-prefixed; got:\n{xml}"
+    );
+    // The bare quantity must NOT appear as a standalone title (the bug being fixed).
+    assert!(
+        !xml.contains("<Title>DBZH</Title>"),
+        "child Title must not be the bare quantity (ambiguous across sites); got:\n{xml}"
     );
 }

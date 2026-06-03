@@ -72,6 +72,7 @@ use crate::catalog::MAX_REMOTE_FILE_SIZE;
 use crate::engine::EngineError;
 use crate::pixel_cache::PixelCache;
 use crate::pvol::{read_moment_pixels, read_polar_volume, PolarMoment, PolarVolume, Sweep};
+use crate::quantities;
 use crate::reader::RawPixels;
 
 /// Default lazy-pixel cache size (MB) when `MC_PVOL_PIXEL_CACHE_MB` is
@@ -1186,8 +1187,13 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         );
         return None;
     }
-    let parameters: Vec<(String, String)> =
-        quantities.iter().map(|q| (q.clone(), q.clone())).collect();
+    // Title is the human-readable label from the ODIM quantity dictionary
+    // (acronym + name); the tuple key stays the bare quantity so the
+    // parameter id / WMS `<Name>` token is unchanged.
+    let parameters: Vec<(String, String)> = quantities
+        .iter()
+        .map(|q| (q.clone(), quantities::quantity_label(q)))
+        .collect();
 
     // Coverage radius = the **maximum** range-gate reach across all sweeps
     // (skipping sweeps with a malformed `rscale`). Quantities are unioned
@@ -1768,14 +1774,16 @@ fn polar_sample(
 // Per-site EDR/Map helpers (shared by PolarVolumeSiteView)
 // ---------------------------------------------------------------------------
 
-/// `ParameterDescription` for an ODIM quantity. ODIM moment groups
-/// carry no unit attribute and quantities span several physical units,
-/// so the unit is left blank (matching `raster_info`); the label
-/// mirrors the `EdrEngine` default-description convention.
+/// `ParameterDescription` for an ODIM quantity. ODIM moment groups carry no
+/// unit attribute, but the bare quantity code canonically determines the
+/// physical unit (after `gain`/`offset`), so both the human-readable label and
+/// the unit come from the ODIM quantity dictionary ([`crate::quantities`]).
+/// The `observed_property` stays the bare code. Unknown codes fall back to the
+/// bare string with an empty unit.
 fn quantity_description(quantity: &str) -> ParameterDescription {
     ParameterDescription {
-        label: quantity.replace('_', " "),
-        unit: String::new(),
+        label: quantities::quantity_label(quantity),
+        unit: quantities::quantity_unit(quantity).to_string(),
         observed_property: quantity.to_string(),
     }
 }
@@ -2725,6 +2733,10 @@ impl MapEngine for PolarVolumeSiteView {
             parameters,
             vertical: meta.and_then(|m| m.vertical.clone()),
             grid_size: None,
+            // Site place name (ODIM `/what` PLC, falling back to NOD) — same
+            // value `get_locations` uses — so WMS can prefix each child
+            // layer's title and flat clients can tell the sites apart.
+            layer_subtitle: meta.map(|m| m.plc.clone().unwrap_or_else(|| self.nod.clone())),
         }
     }
 }

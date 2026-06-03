@@ -1236,6 +1236,7 @@ impl MapEngine for GribEngine {
             // catalog metadata doesn't carry them, so leave the spatial grid
             // unadvertised for now (tracked as a follow-up).
             grid_size: None,
+            layer_subtitle: None,
         }
     }
 }
