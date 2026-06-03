@@ -128,6 +128,37 @@ pub fn pixel_cache_metrics() -> (u64, u64, u64, u64, u64) {
 /// `OdimEngine`'s constant of the same name.
 const DEFAULT_SCAN_DAYS: u32 = 2;
 
+/// How much of a remote source a scan downloads + parses.
+///
+/// PVOL metadata (site, sweep geometry, parameters) lives *inside* each
+/// HDF5 file, so — unlike the COMP engine, which catalogs from filenames
+/// and downloads only a seed — building the catalog means fetching and
+/// parsing every volume. Over a whole-network S3 bucket with a multi-hour
+/// `time_window` that is hundreds of multi-MB files, which made the
+/// startup scan in [`PolarVolumeEngine::new`] take minutes before the HTTP
+/// listener could bind.
+///
+/// [`ScanDepth::Bootstrap`] fixes that: the construction scan fetches only
+/// the **newest volume per site** — enough to discover every active radar
+/// and seed its metadata (which [`derive_site_meta`] derives from the
+/// *latest* volume per site anyway) — and the background [`poll_loop`]
+/// (already non-blocking, on the dedicated poll runtime) fills the full
+/// `time_window` history on its first tick.
+///
+/// "Newest per site" (not "the latest N timestamp slots") is deliberate:
+/// producer uploads are staggered, so the freshest slots are the *least*
+/// complete — sampling them under-discovers radars whose newest upload
+/// lags. Grouping by [`stream_key`] (the filename with its timestamp
+/// masked) and keeping the latest per group fetches one file per radar —
+/// the theoretical minimum — and can't miss an active site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ScanDepth {
+    /// Newest volume per site only — fast startup; used by `new`.
+    Bootstrap,
+    /// Every in-window volume — used by the background poll.
+    Full,
+}
+
 /// Mean Earth radius (metres) used by the geodesic helper. A sphere is
 /// the right model here: radar ground range is itself a spherical
 /// approximation, and the per-pixel error of WGS84-vs-sphere at radar
@@ -595,16 +626,39 @@ fn site_coverage_bbox(lon: f64, lat: f64, radius_m: f64) -> [f64; 4] {
     ]
 }
 
-/// One file the scan should ingest: a stable identity plus a thunk
-/// that fetches its raw bytes on a cache miss. Decouples enumeration
-/// (local `read_dir` vs S3 `list`) from the shared parse/cache/group
-/// logic in [`build_catalog`].
-struct PendingFile<'a> {
-    /// Cache-key identity — local path string or S3 object key.
+/// One file the scan should ingest: a stable identity plus where its
+/// bytes live. Decouples enumeration (local `read_dir` vs S3 `list`)
+/// from the shared parse/cache/group logic in [`build_catalog`], and —
+/// unlike an opaque fetch thunk — lets `build_catalog` batch the remote
+/// files into one bounded-concurrent download.
+struct PendingFile {
+    /// Cache-key identity — local path string or S3/HTTP object key.
     id: FileId,
-    /// Fetch the raw HDF5 bytes. Only called on a cache miss.
-    fetch: Box<dyn FnOnce() -> Result<Vec<u8>, String> + 'a>,
+    /// Where to fetch the raw HDF5 bytes on a cache miss.
+    spec: FetchSpec,
 }
+
+/// Where a [`PendingFile`]'s bytes come from.
+enum FetchSpec {
+    /// A local filesystem path, read with `std::fs::read`.
+    Local(PathBuf),
+    /// An object `key` within `store` (S3/HTTP), fetched via the store.
+    /// Carrying the (cheap `Arc`-clone) `store` makes the file
+    /// self-describing so [`build_catalog`] can collect every remote file
+    /// and download them concurrently.
+    Remote {
+        store: ds_storage::DataStore,
+        key: String,
+    },
+}
+
+/// Max concurrent volume downloads in [`build_catalog`]'s remote fetch.
+/// Bounds in-flight S3 requests (and therefore peak memory to
+/// ~`FETCH_CONCURRENCY × volume size`, a few hundred MB) while turning
+/// the previously-sequential per-file download — the dominant cost of a
+/// scan — into a parallel one. Volume fetches are network-bound, not
+/// CPU-bound, so this can exceed the core count.
+const FETCH_CONCURRENCY: usize = 12;
 
 /// Scan `source` for `.h5` polar-volume files and build the catalog,
 /// reusing already-parsed volumes from `cache` (keyed by file identity)
@@ -616,8 +670,13 @@ fn scan_source(
     source: &Source,
     cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
     max_files: Option<usize>,
+    depth: ScanDepth,
 ) -> Result<Catalog, EngineError> {
     match source {
+        // A local directory is small and cheap to enumerate; the
+        // bootstrap bound only matters for remote (S3/HTTP) sources where
+        // each file is a multi-MB network fetch, so local always scans in
+        // full regardless of `depth`.
         Source::Local { data_dir } => {
             let pending = enumerate_local(collection_id, data_dir)?;
             let by_site = build_catalog(collection_id, pending, cache);
@@ -630,7 +689,7 @@ fn scan_source(
             ..
         } => {
             let (pending, time_filter) =
-                enumerate_remote(collection_id, store, prefix_pattern, time_window)?;
+                enumerate_remote(collection_id, store, prefix_pattern, time_window, depth)?;
             let mut by_site = build_catalog(collection_id, pending, cache);
             // A `time_window` also bounds the timestamps kept: the
             // object listing can include volumes just outside the
@@ -646,10 +705,10 @@ fn scan_source(
 }
 
 /// Enumerate `.h5` files directly in a local directory. Non-recursive.
-fn enumerate_local<'a>(
+fn enumerate_local(
     collection_id: &str,
-    data_dir: &'a std::path::Path,
-) -> Result<Vec<PendingFile<'a>>, EngineError> {
+    data_dir: &std::path::Path,
+) -> Result<Vec<PendingFile>, EngineError> {
     let read_dir = std::fs::read_dir(data_dir).map_err(|e| {
         EngineError::Storage(DataServerError::Engine(format!(
             "[{collection_id}] failed to read PVOL directory `{}`: {e}",
@@ -670,7 +729,7 @@ fn enumerate_local<'a>(
         let id = path.display().to_string();
         pending.push(PendingFile {
             id,
-            fetch: Box::new(move || std::fs::read(&path).map_err(|e| format!("read failed: {e}"))),
+            spec: FetchSpec::Local(path),
         });
     }
     Ok(pending)
@@ -710,21 +769,62 @@ fn parse_key_timestamp(key: &str) -> Option<DateTime<Utc>> {
     None
 }
 
+/// A per-site/per-product grouping key for a remote object: the object's
+/// basename with its acquisition-timestamp digit-run masked to `#`, so
+/// every timestep of the same stream collapses to one key.
+///
+/// `202605150000_fivih_PVOL.h5` → `#_fivih_PVOL.h5`,
+/// `dkste_202512150405.vol.h5` → `dkste_#.vol.h5`. Uses the same
+/// first-run-of-≥12-digits rule as [`parse_key_timestamp`], so the masked
+/// run is exactly the timestamp. A basename with no such run is its own
+/// stream (returned unchanged), which keeps it from being dropped during
+/// the bootstrap newest-per-stream reduction.
+fn stream_key(key: &str) -> String {
+    let basename = key.rsplit('/').next().unwrap_or(key);
+    let bytes = basename.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i - start >= 12 {
+                let mut s = String::with_capacity(basename.len() - (i - start) + 1);
+                s.push_str(&basename[..start]);
+                s.push('#');
+                s.push_str(&basename[i..]);
+                return s;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    basename.to_string()
+}
+
 /// Enumerate `.h5` objects under an S3/HTTP store's date-expanded
 /// prefixes. Returns the pending-file list plus the optional
 /// `(start, end)` time filter the window implies.
+///
+/// In [`ScanDepth::Bootstrap`] only the newest object per [`stream_key`]
+/// (≈ one volume per radar) is returned, so a construction-time scan
+/// downloads the minimum needed to discover and seed every site instead
+/// of the whole window — the rest is filled by the background poll, which
+/// scans in [`ScanDepth::Full`].
 ///
 /// A prefix that fails to `list` (e.g. a date partition that doesn't
 /// exist yet) is logged and skipped. If *every* prefix fails the call
 /// errors rather than silently returning an empty catalog. Mirrors
 /// `catalog::scan_remote`'s error tolerance.
 #[allow(clippy::type_complexity)]
-fn enumerate_remote<'a>(
+fn enumerate_remote(
     collection_id: &str,
-    store: &'a ds_storage::DataStore,
+    store: &ds_storage::DataStore,
     prefix_pattern: &str,
     time_window: &Option<TimeWindow>,
-) -> Result<(Vec<PendingFile<'a>>, Option<TimeRange>), EngineError> {
+    depth: ScanDepth,
+) -> Result<(Vec<PendingFile>, Option<TimeRange>), EngineError> {
     use ds_storage::object_store::path::Path as ObjectPath;
 
     let now = Utc::now();
@@ -739,7 +839,11 @@ fn enumerate_remote<'a>(
         ),
     };
 
-    let mut pending: Vec<PendingFile<'a>> = Vec::new();
+    // First pass: list each prefix and collect surviving `(key, timestamp)`
+    // candidates. The bootstrap slot filter needs to see every candidate's
+    // timestamp before it can pick the most-recent slots, so building the
+    // fetch closures is deferred to the second pass below.
+    let mut candidates: Vec<(String, Option<DateTime<Utc>>)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
     for prefix in &prefixes {
@@ -755,6 +859,7 @@ fn enumerate_remote<'a>(
             if !key.to_ascii_lowercase().ends_with(".h5") {
                 continue;
             }
+            let ts = parse_key_timestamp(&key);
             // Drop out-of-window objects *before* fetching. A per-day
             // prefix lists a whole day (~288 files at 5-min cadence);
             // without this pre-filter every one would be downloaded and
@@ -762,11 +867,9 @@ fn enumerate_remote<'a>(
             // afterwards — gigabytes of needless transfer. A key whose
             // name carries no parseable timestamp falls through and is
             // caught by the post-parse window filter instead.
-            if let Some((start, end)) = time_filter {
-                if let Some(ts) = parse_key_timestamp(&key) {
-                    if ts < start || ts > end {
-                        continue;
-                    }
+            if let (Some((start, end)), Some(ts)) = (time_filter, ts) {
+                if ts < start || ts > end {
+                    continue;
                 }
             }
             if obj.size as u64 > MAX_REMOTE_FILE_SIZE {
@@ -776,33 +879,49 @@ fn enumerate_remote<'a>(
                 );
                 continue;
             }
-            let store_clone = store.clone();
-            let key_for_fetch = key.clone();
-            pending.push(PendingFile {
-                id: key,
-                fetch: Box::new(move || {
-                    let object = ObjectPath::from(key_for_fetch.as_str());
-                    // Re-check size before `get`: `list` already
-                    // filtered by size; this `head` closes the
-                    // grow-between-list-and-get gap. Mirrors the COMP
-                    // engine's `fetch_bytes` head-before-get.
-                    let meta = store_clone
-                        .head(&object)
-                        .map_err(|e| format!("head failed: {e}"))?;
-                    if meta.size as u64 > MAX_REMOTE_FILE_SIZE {
-                        return Err(format!(
-                            "object is {} bytes — exceeds the {MAX_REMOTE_FILE_SIZE}-byte limit",
-                            meta.size
-                        ));
-                    }
-                    store_clone
-                        .get(&object)
-                        .map(|b| b.to_vec())
-                        .map_err(|e| format!("get failed: {e}"))
-                }),
-            });
+            candidates.push((key, ts));
         }
     }
+
+    // Bootstrap: keep only the newest file per site — grouped by
+    // `stream_key` (the basename with its timestamp masked), keeping the
+    // greatest-timestamp entry in each group. This discovers every active
+    // radar from its latest volume while downloading the theoretical
+    // minimum (one file per site), and — unlike taking the latest N
+    // slots — can't miss a radar whose newest upload lags the freshest
+    // slot. `Option<DateTime>` orders `None < Some`, so a timestamp-less
+    // key only wins its group if no dated key shares the stream.
+    if depth == ScanDepth::Bootstrap {
+        let mut latest: HashMap<String, usize> = HashMap::new();
+        for (i, (key, ts)) in candidates.iter().enumerate() {
+            latest
+                .entry(stream_key(key))
+                .and_modify(|best| {
+                    if *ts > candidates[*best].1 {
+                        *best = i;
+                    }
+                })
+                .or_insert(i);
+        }
+        let mut keep: Vec<usize> = latest.into_values().collect();
+        keep.sort_unstable();
+        candidates = keep.into_iter().map(|i| candidates[i].clone()).collect();
+    }
+
+    // Second pass: turn each retained candidate into a remote fetch spec.
+    // The actual download — with the size re-check that closes the
+    // grow-between-list-and-get gap — happens concurrently in
+    // `build_catalog` via `DataStore::get_many(.., Some(MAX_REMOTE_FILE_SIZE))`.
+    let pending: Vec<PendingFile> = candidates
+        .into_iter()
+        .map(|(key, _)| PendingFile {
+            id: key.clone(),
+            spec: FetchSpec::Remote {
+                store: store.clone(),
+                key,
+            },
+        })
+        .collect();
 
     if pending.is_empty() && !errors.is_empty() {
         return Err(EngineError::Storage(DataServerError::Engine(format!(
@@ -830,77 +949,136 @@ fn enumerate_remote<'a>(
 /// [`derive_catalog`].
 fn build_catalog(
     collection_id: &str,
-    pending: Vec<PendingFile<'_>>,
+    pending: Vec<PendingFile>,
     cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
 ) -> HashMap<String, Vec<VolumeEntry>> {
+    use ds_storage::object_store::path::Path as ObjectPath;
+
     let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+    // Remote files needing a fetch, gathered for one bounded-concurrent
+    // download pass. Each carries its store (a cheap `Arc` clone; all share
+    // the source's store) so a future mixed-source scan would still work.
+    let mut remote_fetch: Vec<(FileId, ds_storage::DataStore, ObjectPath)> = Vec::new();
 
-    for file in pending {
-        let PendingFile { id, fetch } = file;
-
-        // Cache hit — reuse the parsed volume.
+    for PendingFile { id, spec } in pending {
+        // Cache hit — reuse the parsed volume, no fetch.
         let cached = {
             let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
             guard.get(&id).cloned()
         };
-        let volume = match cached {
-            Some(v) => v,
-            None => {
-                let bytes = match fetch() {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!("[{collection_id}] skipping PVOL file `{id}`: {e}");
-                        continue;
-                    }
-                };
-                match read_polar_volume(&bytes) {
-                    Ok(v) => {
-                        let v = Arc::new(v);
-                        cache
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(id.clone(), v.clone());
-                        v
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "[{collection_id}] skipping PVOL file `{id}`: parse failed: {e}"
-                        );
-                        continue;
-                    }
-                }
-            }
-        };
-
-        let Some(nod) = volume.site.nod.clone() else {
-            tracing::warn!(
-                "[{collection_id}] skipping PVOL file `{id}`: no NOD identifier in /what/source"
-            );
-            continue;
-        };
-
-        // The NOD becomes part of a URL-routed collection id (`{base}-{nod}`)
-        // and a WMS `LAYERS` token, so reject anything that isn't a clean
-        // path segment. ODIM NODs are spec'd as 5 ASCII-alphanumeric chars
-        // (2-letter country + 3-letter station), so this only fires on a
-        // malformed/adversarial file — a NOD with `/` would make the
-        // collection permanently unreachable (Axum stops `{id}` at the first
-        // `/`), and `?`/`#`/space/non-ASCII would corrupt routing or the IRI.
-        if !is_url_safe_nod(&nod) {
-            tracing::warn!(
-                "[{collection_id}] skipping PVOL file `{id}`: NOD `{nod}` contains \
-                 characters invalid in a URL path segment (expected ASCII alphanumeric)"
-            );
+        if let Some(v) = cached {
+            insert_volume(collection_id, &mut by_site, id, v);
             continue;
         }
+        match spec {
+            // Local reads are cheap; do them inline.
+            FetchSpec::Local(path) => match std::fs::read(&path) {
+                Ok(bytes) => {
+                    if let Some(v) = parse_and_cache(collection_id, &id, &bytes, cache) {
+                        insert_volume(collection_id, &mut by_site, id, v);
+                    }
+                }
+                Err(e) => tracing::warn!("[{collection_id}] skipping PVOL file `{id}`: {e}"),
+            },
+            // Defer remote reads to the concurrent batch below.
+            FetchSpec::Remote { store, key } => {
+                remote_fetch.push((id, store, ObjectPath::from(key.as_str())));
+            }
+        }
+    }
 
-        by_site
-            .entry(nod)
-            .or_default()
-            .push(VolumeEntry { id, volume });
+    // Download the remote misses concurrently, in `FETCH_CONCURRENCY`-sized
+    // chunks so peak memory stays ~one chunk of raw volumes (each chunk's
+    // bytes are parsed into compact `PolarVolume`s and dropped before the
+    // next). This parallelises the dominant scan cost — the per-file S3
+    // download — turning a sequential ~N×RTT stall into ~N/concurrency.
+    for chunk in remote_fetch.chunks(FETCH_CONCURRENCY) {
+        let store = chunk[0].1.clone();
+        let paths: Vec<ObjectPath> = chunk.iter().map(|(_, _, p)| p.clone()).collect();
+        let results = match store.get_many(&paths, FETCH_CONCURRENCY, Some(MAX_REMOTE_FILE_SIZE)) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("[{collection_id}] PVOL batch fetch failed: {e}");
+                continue;
+            }
+        };
+        for ((id, _, _), res) in chunk.iter().zip(results) {
+            match res {
+                Ok(bytes) => {
+                    if let Some(v) = parse_and_cache(collection_id, id, &bytes, cache) {
+                        insert_volume(collection_id, &mut by_site, id.clone(), v);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[{collection_id}] skipping PVOL file `{id}`: {e}")
+                }
+            }
+        }
     }
 
     by_site
+}
+
+/// Parse `bytes` into a `PolarVolume`, insert into the shared parse cache
+/// keyed by `id`, and return the shared handle. A parse failure is logged
+/// and yields `None` (the file is skipped, not fatal to the scan).
+fn parse_and_cache(
+    collection_id: &str,
+    id: &str,
+    bytes: &[u8],
+    cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
+) -> Option<Arc<PolarVolume>> {
+    match read_polar_volume(bytes) {
+        Ok(v) => {
+            let v = Arc::new(v);
+            cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id.to_string(), v.clone());
+            Some(v)
+        }
+        Err(e) => {
+            tracing::warn!("[{collection_id}] skipping PVOL file `{id}`: parse failed: {e}");
+            None
+        }
+    }
+}
+
+/// Group one parsed volume under its radar `nod`, applying the
+/// URL-safety guard. A volume with no NOD, or a NOD that isn't a clean
+/// URL path segment, is logged and dropped (never registered).
+fn insert_volume(
+    collection_id: &str,
+    by_site: &mut HashMap<String, Vec<VolumeEntry>>,
+    id: FileId,
+    volume: Arc<PolarVolume>,
+) {
+    let Some(nod) = volume.site.nod.clone() else {
+        tracing::warn!(
+            "[{collection_id}] skipping PVOL file `{id}`: no NOD identifier in /what/source"
+        );
+        return;
+    };
+
+    // The NOD becomes part of a URL-routed collection id (`{base}-{nod}`)
+    // and a WMS `LAYERS` token, so reject anything that isn't a clean
+    // path segment. ODIM NODs are spec'd as 5 ASCII-alphanumeric chars
+    // (2-letter country + 3-letter station), so this only fires on a
+    // malformed/adversarial file — a NOD with `/` would make the
+    // collection permanently unreachable (Axum stops `{id}` at the first
+    // `/`), and `?`/`#`/space/non-ASCII would corrupt routing or the IRI.
+    if !is_url_safe_nod(&nod) {
+        tracing::warn!(
+            "[{collection_id}] skipping PVOL file `{id}`: NOD `{nod}` contains \
+             characters invalid in a URL path segment (expected ASCII alphanumeric)"
+        );
+        return;
+    }
+
+    by_site
+        .entry(nod)
+        .or_default()
+        .push(VolumeEntry { id, volume });
 }
 
 /// Whether `nod` is safe to embed verbatim in a URL-routed collection id
@@ -1123,7 +1301,17 @@ impl PolarVolumeEngine {
         let source = Arc::new(build_source(collection_id, data_path, config)?);
 
         let parse_cache = Arc::new(Mutex::new(HashMap::new()));
-        let catalog = scan_source(collection_id, &source, &parse_cache, config.max_files)?;
+        // Bootstrap scan: parse only the most-recent slots so a whole-network
+        // S3 source doesn't download hundreds of multi-MB volumes before the
+        // server can bind. The background poll fills the full `time_window`
+        // history on its first tick (see `ScanDepth`).
+        let catalog = scan_source(
+            collection_id,
+            &source,
+            &parse_cache,
+            config.max_files,
+            ScanDepth::Bootstrap,
+        )?;
         if catalog.by_site.is_empty() {
             tracing::warn!(
                 "[{collection_id}] no PVOL `.h5` files found at `{}` yet — \
@@ -1132,7 +1320,8 @@ impl PolarVolumeEngine {
             );
         } else {
             tracing::info!(
-                "[{collection_id}] PVOL catalog: {} site(s), {} volume(s)",
+                "[{collection_id}] PVOL bootstrap catalog: {} site(s), {} volume(s) \
+                 (newest volume per site; full history fills on the first poll)",
                 catalog.by_site.len(),
                 catalog.by_site.values().map(|l| l.len()).sum::<usize>(),
             );
@@ -1196,7 +1385,7 @@ impl PolarVolumeEngine {
             time_window: None,
         });
         let parse_cache = Arc::new(Mutex::new(HashMap::new()));
-        let catalog = scan_source(collection_id, &source, &parse_cache, None)?;
+        let catalog = scan_source(collection_id, &source, &parse_cache, None, ScanDepth::Full)?;
         Ok(Self {
             collection_id: collection_id.to_string(),
             source,
@@ -1231,11 +1420,16 @@ impl PolarVolumeEngine {
     /// GeoTIFF / QueryData poll loops, which also call their blocking scan
     /// directly on the poll runtime.
     async fn poll_once(&self) {
+        // Full scan: the poll runs on the background runtime, so downloading
+        // and parsing the whole `time_window` here is off the request path
+        // and off the startup path. This is what backfills the history the
+        // bootstrap scan in `new` deliberately skipped.
         match scan_source(
             &self.collection_id,
             &self.source,
             &self.parse_cache,
             self.max_files,
+            ScanDepth::Full,
         ) {
             Ok(catalog) => {
                 let prev = self.catalog.load();
@@ -3897,6 +4091,49 @@ mod tests {
             build_source("c", Some("/dir"), &bucket_only),
             Err(EngineError::IncompleteS3Config)
         ));
+    }
+
+    /// `ScanDepth::Bootstrap` returns the newest object per site (one
+    /// volume per radar), while `Full` returns every in-window file.
+    /// Drives the real remote enumeration over a `LocalFileSystem`-backed
+    /// `DataStore` (the offline-remote trick); `enumerate_remote` only
+    /// lists keys and parses filename timestamps — it does not open the
+    /// HDF5 — so plain placeholder files exercise the reduction without a
+    /// real fixture, and the test runs in CI.
+    ///
+    /// Crucially, `fikor`'s newest upload (00:05) *lags* `fivih`'s (00:10):
+    /// a "latest N slots" rule would miss `fikor`, but newest-per-site must
+    /// still discover it — the staggered-upload case from the live test.
+    #[test]
+    fn enumerate_remote_bootstrap_keeps_newest_volume_per_site() {
+        let dir = tempfile::tempdir().unwrap();
+        // fivih: 3 slots (newest 00:10). fikor: 2 slots (newest 00:05, lags).
+        for slot in ["202605150000", "202605150005", "202605150010"] {
+            std::fs::write(dir.path().join(format!("{slot}_fivih_PVOL.h5")), b"x").unwrap();
+        }
+        for slot in ["202605150000", "202605150005"] {
+            std::fs::write(dir.path().join(format!("{slot}_fikor_PVOL.h5")), b"x").unwrap();
+        }
+        let (store, _) =
+            ds_storage::build_store(dir.path().canonicalize().unwrap().to_str().unwrap()).unwrap();
+
+        // Full: every file. `time_window: None` so `Utc::now()`-relative
+        // filtering doesn't drop the (necessarily past-dated) fixtures.
+        let (full, _) = enumerate_remote("t", &store, "", &None, ScanDepth::Full).unwrap();
+        assert_eq!(full.len(), 5, "Full scan must enumerate every volume");
+
+        // Bootstrap: exactly one (the newest) per site.
+        let (boot, _) = enumerate_remote("t", &store, "", &None, ScanDepth::Bootstrap).unwrap();
+        let mut ids: Vec<&str> = boot.iter().map(|p| p.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![
+                "202605150005_fikor_PVOL.h5", // fikor's newest, even though it lags
+                "202605150010_fivih_PVOL.h5", // fivih's newest
+            ],
+            "Bootstrap keeps exactly the newest volume per site"
+        );
     }
 
     /// The pre-fetch window filter hinges on reading a timestamp from

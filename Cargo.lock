@@ -796,6 +796,7 @@ dependencies = [
  "ds-core",
  "futures",
  "object_store",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

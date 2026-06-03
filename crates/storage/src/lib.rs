@@ -128,6 +128,90 @@ impl DataStore {
         self.block_on(async { Ok(self.inner.head(path).await?) })
     }
 
+    /// Fetch many objects concurrently, returning one result per input
+    /// path **in input order**. A per-object failure (missing, oversized,
+    /// network) is carried in that slot's `Err` and does not sink the
+    /// batch; the outer `Err` is reserved for a runtime-bridge failure.
+    ///
+    /// `concurrency` bounds in-flight requests (`buffer_unordered`), which
+    /// also bounds peak memory to ~`concurrency × object size` — so call
+    /// this with a bounded batch (a chunk), not thousands of paths at once.
+    /// When `max_bytes` is set, each object's size is checked with `head`
+    /// before `get`, so an object that grew past the cap isn't pulled into
+    /// memory.
+    ///
+    /// Drives the whole batch on ONE bridge call, so — like every other
+    /// [`DataStore`] method — it is safe at startup and on a multi-thread
+    /// runtime worker (`block_in_place`) but MUST NOT be wrapped in
+    /// `spawn_blocking` or called from a rayon worker.
+    #[allow(clippy::type_complexity)]
+    pub fn get_many(
+        &self,
+        paths: &[ObjectPath],
+        concurrency: usize,
+        max_bytes: Option<u64>,
+    ) -> Result<Vec<Result<Bytes, DataServerError>>, DataServerError> {
+        use futures::StreamExt;
+
+        let conc = concurrency.max(1);
+        let inner = &self.inner;
+        // Drive the batch with NO overall timeout — the 30s budget is
+        // applied PER object below. A whole-batch cap would fail the entire
+        // chunk once the combined transfer exceeds 30s (e.g. a dozen
+        // multi-MB volumes on a constrained link), losing every object
+        // instead of the one that actually stalled.
+        let ordered: Vec<(usize, Result<Bytes, DataServerError>)> =
+            self.block_on_untimed(async {
+                let mut results: Vec<(usize, Result<Bytes, DataServerError>)> =
+                    futures::stream::iter(paths.iter().enumerate().map(|(i, p)| async move {
+                        let fetch = async {
+                            if let Some(cap) = max_bytes {
+                                let meta = inner
+                                    .head(p)
+                                    .await
+                                    .map_err(|e| DataServerError::from(StorageError::from(e)))?;
+                                if meta.size as u64 > cap {
+                                    return Err(DataServerError::Storage(format!(
+                                        "object `{p}` is {} bytes — exceeds the {cap}-byte limit",
+                                        meta.size
+                                    )));
+                                }
+                            }
+                            let res = inner
+                                .get(p)
+                                .await
+                                .map_err(|e| DataServerError::from(StorageError::from(e)))?;
+                            let bytes = res
+                                .bytes()
+                                .await
+                                .map_err(|e| DataServerError::from(StorageError::from(e)))?;
+                            Ok::<Bytes, DataServerError>(bytes)
+                        };
+                        let r = match tokio::time::timeout(Self::REQUEST_TIMEOUT, fetch).await {
+                            Ok(r) => r,
+                            Err(_) => Err(DataServerError::Storage(format!(
+                                "fetch of `{p}` timed out after {}s",
+                                Self::REQUEST_TIMEOUT.as_secs()
+                            ))),
+                        };
+                        (i, r)
+                    }))
+                    .buffer_unordered(conc)
+                    .collect()
+                    .await;
+                results.sort_by_key(|(i, _)| *i);
+                results
+            })?;
+
+        let total: u64 = ordered
+            .iter()
+            .filter_map(|(_, r)| r.as_ref().ok())
+            .map(|b| b.len() as u64)
+            .sum();
+        self.bytes_read.fetch_add(total, Ordering::Relaxed);
+        Ok(ordered.into_iter().map(|(_, r)| r).collect())
+    }
+
     /// Default timeout for individual storage operations (30 seconds).
     const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -140,6 +224,29 @@ impl DataStore {
         F: std::future::Future<Output = Result<T, object_store::Error>>,
     {
         self.block_on_with(None, future)
+    }
+
+    /// Drive `future` to completion on the appropriate runtime — like
+    /// [`Self::block_on`] but with **no** overall 30s timeout and an
+    /// unconstrained output type. For batch helpers (e.g. [`Self::get_many`])
+    /// whose total wall-time legitimately exceeds a single request's budget
+    /// and which apply their own per-item timeouts; a batch-wide cap would
+    /// wrongly fail the whole batch. Same thread-context rules as
+    /// [`Self::block_on_with`] with `None`: valid on a runtime worker
+    /// (`block_in_place`) or off-runtime (temporary runtime), never on a
+    /// `spawn_blocking`/rayon thread.
+    fn block_on_untimed<F, T>(&self, future: F) -> Result<T, DataServerError>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
+            Err(_) => {
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| DataServerError::Storage(format!("Cannot create runtime: {e}")))?;
+                Ok(rt.block_on(future))
+            }
+        }
     }
 
     /// Core sync→async bridge. With an explicit `handle` (caller is on a
@@ -433,6 +540,45 @@ mod tests {
         // which `strip_scheme` must preserve verbatim.
         assert_eq!(strip_scheme("S3://Bucket/Key", "s3://"), Some("Bucket/Key"));
         assert_eq!(strip_scheme("/local", "s3://"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_many_returns_results_in_input_order_and_isolates_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.bin"), b"aaa").unwrap();
+        std::fs::write(dir.path().join("c.bin"), b"cccc").unwrap();
+        let (store, _) = build_store(dir.path().to_str().unwrap()).unwrap();
+
+        // Middle key is missing — its slot must be `Err`, the others `Ok`,
+        // and the order must match the input.
+        let paths = [
+            ObjectPath::from("a.bin"),
+            ObjectPath::from("missing.bin"),
+            ObjectPath::from("c.bin"),
+        ];
+        let res = store.get_many(&paths, 8, None).unwrap();
+        assert_eq!(res.len(), 3);
+        assert_eq!(res[0].as_ref().unwrap().as_ref(), b"aaa");
+        assert!(res[1].is_err(), "a missing object yields a per-item Err");
+        assert_eq!(res[2].as_ref().unwrap().as_ref(), b"cccc");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_many_max_bytes_rejects_oversized_object() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.bin"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.path().join("ok.bin"), vec![0u8; 8]).unwrap();
+        let (store, _) = build_store(dir.path().to_str().unwrap()).unwrap();
+
+        let res = store
+            .get_many(
+                &[ObjectPath::from("ok.bin"), ObjectPath::from("big.bin")],
+                4,
+                Some(10),
+            )
+            .unwrap();
+        assert!(res[0].is_ok(), "8-byte object is under the 10-byte cap");
+        assert!(res[1].is_err(), "100-byte object exceeds the cap → Err");
     }
 
     #[tokio::test(flavor = "multi_thread")]
