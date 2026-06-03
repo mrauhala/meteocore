@@ -2737,22 +2737,20 @@ impl FeatureEngine for PolarVolumeEngine {
 
         let number_matched = filtered.len();
         let offset = query.offset.min(number_matched);
-        let limit = if query.limit == 0 {
-            number_matched.saturating_sub(offset)
-        } else {
-            query.limit
-        };
-        // Saturating: `limit` may be an un-capped query param; `offset + limit`
-        // would otherwise wrap in release before the clamp.
-        let end = offset.saturating_add(limit).min(number_matched);
+        // Mirror `CsvEngine::get_features`: `limit` is taken verbatim (`0` ⇒ an
+        // empty page, not "all"), and `offset + limit` is saturating so an
+        // un-capped large `limit` can't wrap in release before the clamp. The
+        // API layer clamps `limit` to `[1, 1000]`, so `0` only arises from
+        // internal callers.
+        let end = offset.saturating_add(query.limit).min(number_matched);
         let features: Vec<Feature> = filtered[offset..end]
             .iter()
             .map(|(nod, m)| self.site_to_feature(nod, m))
             .collect();
 
         let number_returned = features.len();
-        let next_offset = if offset + number_returned < number_matched {
-            Some(offset + number_returned)
+        let next_offset = if end < number_matched {
+            Some(end)
         } else {
             None
         };
@@ -2812,11 +2810,14 @@ impl FeatureEngine for PolarVolumeEngine {
             h = fnv1a_update(h, &epoch.to_le_bytes());
             h = fnv1a_update(h, &(meta.times.len() as u64).to_le_bytes());
             // Sort defensively so the hash is order-independent — it must not
-            // rely on `derive_site_meta` happening to sort `quantities`.
+            // rely on `derive_site_meta` happening to sort `quantities`. A
+            // delimiter after each keeps variable-length codes from colliding
+            // across boundaries (`["AB","CD"]` vs `["ABCD"]`).
             let mut qs: Vec<&str> = meta.quantities.iter().map(String::as_str).collect();
             qs.sort_unstable();
             for q in qs {
                 h = fnv1a_update(h, q.as_bytes());
+                h = fnv1a_update(h, b"|");
             }
         }
         h
@@ -5292,6 +5293,25 @@ mod tests {
         .unwrap();
         assert_eq!(second.features[0].id, "fivih");
         assert_eq!(second.next_offset, None);
+    }
+
+    #[test]
+    fn limit_zero_returns_empty_page_not_all() {
+        // Convention parity with CsvEngine: limit 0 ⇒ zero items (number_matched
+        // still reflects the full set). The API layer clamps limit to >= 1, so
+        // 0 only reaches here from internal callers.
+        let engine = two_site_engine();
+        let page = FeatureEngine::get_features(
+            &engine,
+            &FeatureQuery {
+                limit: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(page.number_matched, 2);
+        assert_eq!(page.number_returned, 0);
+        assert!(page.features.is_empty());
     }
 
     #[test]

@@ -538,7 +538,7 @@ pub fn load_collections(
             "querydata" => &["edr", "wms", "maps", "tiles"],
             "grib" => &["edr", "wms", "maps", "tiles"],
             "odim" => &["edr", "wms", "maps", "tiles"],
-            "odim-volume" => &["edr", "wms", "maps", "tiles"],
+            "odim-volume" => &["edr", "wms", "maps", "tiles", "features"],
             "postgis" => &["edr", "features", "tiles"],
             _ => &[],
         };
@@ -1423,12 +1423,19 @@ pub fn load_collections(
                             collection.id,
                             sites.len()
                         );
-                        health.push(CollectionHealth {
-                            id: collection.id.clone(),
-                            engine_type: "odim-volume".into(),
-                            status: CollectionStatus::Ready,
-                            error: None,
-                        });
+                        // Only mark Ready when there are sites: the empty-source
+                        // case already pushed a `Degraded` entry for this id
+                        // above, so a second entry would contradict it. The
+                        // inventory is still registered (an empty
+                        // FeatureCollection is valid) and fills on the next poll.
+                        if !sites.is_empty() {
+                            health.push(CollectionHealth {
+                                id: collection.id.clone(),
+                                engine_type: "odim-volume".into(),
+                                status: CollectionStatus::Ready,
+                                error: None,
+                            });
+                        }
                     }
                 }
             }
