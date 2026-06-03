@@ -733,17 +733,17 @@ fn enumerate_local(
     Ok(pending)
 }
 
-/// Extract an acquisition timestamp from an object key by finding the
-/// first run of ≥ 12 consecutive ASCII digits in the basename and
-/// parsing its leading 12 as `%Y%m%d%H%M` (UTC).
+/// Byte range of the acquisition timestamp in `basename`: the first run
+/// of ≥ 12 consecutive ASCII digits, returned as `(start, end)`.
 ///
 /// Handles both source layouts — FMI `202605150000_fivih_PVOL.h5`
 /// (timestamp leads) and DMI `dkste_202512150405.vol.h5` (timestamp
-/// follows the station code). Returns `None` when no such digit run
-/// exists; the caller then keeps the file and relies on the
-/// post-parse `time_window` filter.
-fn parse_key_timestamp(key: &str) -> Option<DateTime<Utc>> {
-    let basename = key.rsplit('/').next().unwrap_or(key);
+/// follows the station code). The single source of truth for "where the
+/// timestamp is," shared by [`parse_key_timestamp`] (which parses it) and
+/// [`stream_key`] (which masks it) so the two can't silently diverge —
+/// the bootstrap newest-per-stream reduction relies on the masked run
+/// being exactly the parsed timestamp.
+fn timestamp_run(basename: &str) -> Option<(usize, usize)> {
     let bytes = basename.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -753,12 +753,7 @@ fn parse_key_timestamp(key: &str) -> Option<DateTime<Utc>> {
                 i += 1;
             }
             if i - start >= 12 {
-                return chrono::NaiveDateTime::parse_from_str(
-                    &basename[start..start + 12],
-                    "%Y%m%d%H%M",
-                )
-                .ok()
-                .map(|t| t.and_utc());
+                return Some((start, i));
             }
         } else {
             i += 1;
@@ -767,38 +762,38 @@ fn parse_key_timestamp(key: &str) -> Option<DateTime<Utc>> {
     None
 }
 
+/// Extract an acquisition timestamp from an object key by parsing the
+/// leading 12 digits of its [`timestamp_run`] as `%Y%m%d%H%M` (UTC).
+/// Returns `None` when the basename has no such run; the caller then
+/// keeps the file and relies on the post-parse `time_window` filter.
+fn parse_key_timestamp(key: &str) -> Option<DateTime<Utc>> {
+    let basename = key.rsplit('/').next().unwrap_or(key);
+    let (start, _) = timestamp_run(basename)?;
+    chrono::NaiveDateTime::parse_from_str(&basename[start..start + 12], "%Y%m%d%H%M")
+        .ok()
+        .map(|t| t.and_utc())
+}
+
 /// A per-site/per-product grouping key for a remote object: the object's
-/// basename with its acquisition-timestamp digit-run masked to `#`, so
-/// every timestep of the same stream collapses to one key.
+/// basename with its acquisition-timestamp [`timestamp_run`] masked to
+/// `#`, so every timestep of the same stream collapses to one key.
 ///
 /// `202605150000_fivih_PVOL.h5` → `#_fivih_PVOL.h5`,
-/// `dkste_202512150405.vol.h5` → `dkste_#.vol.h5`. Uses the same
-/// first-run-of-≥12-digits rule as [`parse_key_timestamp`], so the masked
-/// run is exactly the timestamp. A basename with no such run is its own
-/// stream (returned unchanged), which keeps it from being dropped during
-/// the bootstrap newest-per-stream reduction.
+/// `dkste_202512150405.vol.h5` → `dkste_#.vol.h5`. A basename with no
+/// timestamp run is its own stream (returned unchanged), which keeps it
+/// from being dropped during the bootstrap newest-per-stream reduction.
 fn stream_key(key: &str) -> String {
     let basename = key.rsplit('/').next().unwrap_or(key);
-    let bytes = basename.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() {
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i - start >= 12 {
-                let mut s = String::with_capacity(basename.len() - (i - start) + 1);
-                s.push_str(&basename[..start]);
-                s.push('#');
-                s.push_str(&basename[i..]);
-                return s;
-            }
-        } else {
-            i += 1;
+    match timestamp_run(basename) {
+        Some((start, end)) => {
+            let mut s = String::with_capacity(basename.len() - (end - start) + 1);
+            s.push_str(&basename[..start]);
+            s.push('#');
+            s.push_str(&basename[end..]);
+            s
         }
+        None => basename.to_string(),
     }
-    basename.to_string()
 }
 
 /// Enumerate `.h5` objects under an S3/HTTP store's date-expanded
@@ -997,10 +992,12 @@ fn build_catalog(
     };
 
     // Download the remote misses concurrently, in `FETCH_CONCURRENCY`-sized
-    // chunks so peak memory stays ~one chunk of raw volumes (each chunk's
-    // bytes are parsed into compact `PolarVolume`s and dropped before the
-    // next). This parallelises the dominant scan cost — the per-file S3
-    // download — turning a sequential ~N×RTT stall into ~N/concurrency.
+    // chunks. `get_many` returns a whole chunk's raw bytes together, so
+    // peak memory is ~one chunk of volumes resident at once; those are
+    // parsed into compact `PolarVolume`s and the chunk's bytes freed before
+    // the next chunk is fetched. This parallelises the dominant scan cost —
+    // the per-file S3 download — turning a sequential ~N×RTT stall into
+    // ~N/concurrency.
     for chunk in remote_fetch.chunks(FETCH_CONCURRENCY) {
         let paths: Vec<ObjectPath> = chunk.iter().map(|(_, p)| p.clone()).collect();
         let results = match store.get_many(&paths, FETCH_CONCURRENCY, Some(MAX_REMOTE_FILE_SIZE)) {
