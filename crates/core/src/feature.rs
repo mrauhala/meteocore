@@ -492,9 +492,13 @@ pub enum PropertyValue {
     Integer(i64),
     Bool(bool),
     Null,
-    /// An ordered list of values (e.g. a radar site's measured quantities or
-    /// sweep elevation angles). Serializes to a JSON array in Features output;
-    /// scalar-only sinks (the MVT tag encoder) flatten it to a joined string.
+    /// An ordered, **flat** list of scalar values (e.g. a radar site's measured
+    /// quantities or sweep elevation angles). Elements are expected to be
+    /// scalars — engines do not nest `List`s, and the Features JSON serializer
+    /// (which recurses) and the MVT tag encoder (which flattens to a joined
+    /// string) both rely on shallow, engine-constructed nesting rather than a
+    /// runtime depth guard. There is no path from untrusted input to a
+    /// `PropertyValue`, so depth is bounded by construction.
     List(Vec<PropertyValue>),
 }
 

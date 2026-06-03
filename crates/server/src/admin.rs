@@ -1408,6 +1408,7 @@ pub fn load_collections(
                         || map_collections.contains_key(&collection.id)
                         || maps_collections.contains_key(&collection.id)
                         || tiles_collections.contains_key(&collection.id)
+                        || tiles_feature_collections.contains_key(&collection.id)
                     {
                         tracing::error!(
                             "Collection '{}': base id already registered as another \
@@ -1419,7 +1420,8 @@ pub fn load_collections(
                             engine_type: "odim-volume".into(),
                             status: CollectionStatus::Failed,
                             error: Some(
-                                "base id collides with an already-registered Features collection"
+                                "base id collides with an already-registered collection \
+                                 (EDR, Map, Maps, Tiles, or Features)"
                                     .into(),
                             ),
                         });
