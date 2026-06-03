@@ -598,6 +598,18 @@ struct Catalog {
     /// match `by_site` (a site with no derivable metadata, e.g. every
     /// sweep malformed, is simply absent here).
     by_site_meta: HashMap<String, SiteMeta>,
+    /// `by_site_meta` keys pre-sorted at build time, so the network-inventory
+    /// `FeatureEngine` never sorts per request (CLAUDE.md hot-path rule).
+    sorted_nods: Vec<String>,
+    /// Antenna-point bounding box `[w,s,e,n]` over all sites — the Features
+    /// collection's spatial extent, precomputed so `spatial_extent()` is an
+    /// O(1) snapshot read. Bounds the Feature *points* (what `bbox` filters
+    /// on), not the wider radar coverage bboxes.
+    features_extent: Option<[f64; 4]>,
+    /// Precomputed `data_version` content hash of the site inventory — a pure
+    /// function of this snapshot, computed once at swap time instead of per
+    /// (future) vector-tile render.
+    feature_version: u64,
 }
 
 /// Round an elevation angle to 0.1° so near-identical sweep angles from
@@ -1150,9 +1162,19 @@ fn derive_catalog(
         .filter_map(|(nod, list)| Some((nod.clone(), derive_site_meta(list)?)))
         .collect();
 
+    // Precompute the network-inventory FeatureEngine's per-request answers once
+    // here (on the background poll runtime), so the request path is O(1) reads.
+    let mut sorted_nods: Vec<String> = by_site_meta.keys().cloned().collect();
+    sorted_nods.sort();
+    let features_extent = features_extent_of(&by_site_meta);
+    let feature_version = feature_version_of(&sorted_nods, &by_site_meta);
+
     Catalog {
         by_site,
         by_site_meta,
+        sorted_nods,
+        features_extent,
+        feature_version,
     }
 }
 
@@ -2713,14 +2735,92 @@ fn fnv1a_update(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
+/// Antenna-point bounding box `[w,s,e,n]` over all sites, or `None` when empty.
+/// Bounds the Feature *points* (what `get_features` filters `bbox` on), NOT the
+/// wider radar coverage bboxes — advertising the coverage bbox would let a
+/// conformant client query a bbox the extent claims to cover yet get zero
+/// results. Computed once at catalog-build time.
+fn features_extent_of(by_site_meta: &HashMap<String, SiteMeta>) -> Option<[f64; 4]> {
+    let mut acc: Option<[f64; 4]> = None;
+    for m in by_site_meta.values() {
+        let b = [m.lon, m.lat, m.lon, m.lat];
+        acc = Some(match acc {
+            None => b,
+            Some(a) => [
+                a[0].min(b[0]),
+                a[1].min(b[1]),
+                a[2].max(b[2]),
+                a[3].max(b[3]),
+            ],
+        });
+    }
+    acc
+}
+
+/// Opaque content hash of the whole site inventory — the FeatureEngine
+/// `data_version`. Changes iff any Feature's serialized content changes, so a
+/// poll refresh invalidates any (future) vector-tile ETag. Folds **every**
+/// property-bearing field, with a delimiter after each variable-length string
+/// (fixed-width numerics are self-delimiting). `nods` must be sorted for
+/// determinism. Computed once at catalog-build time, not per render.
+fn feature_version_of(nods: &[String], by_site_meta: &HashMap<String, SiteMeta>) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325_u64; // FNV-1a offset basis
+    for nod in nods {
+        let Some(meta) = by_site_meta.get(nod) else {
+            continue;
+        };
+        // Variable-length strings: delimit (US, 0x1f) so `nod||plc` can't alias.
+        for s in [
+            nod.as_str(),
+            meta.plc.as_deref().unwrap_or(""),
+            meta.wmo.as_deref().unwrap_or(""),
+        ] {
+            h = fnv1a_update(h, s.as_bytes());
+            h = fnv1a_update(h, b"\x1f");
+        }
+        // Fixed-width numerics (self-delimiting): geometry + corrigible metadata.
+        for f in [
+            meta.lon,
+            meta.lat,
+            meta.height_m,
+            meta.coverage_radius_m.unwrap_or(f64::NAN),
+        ] {
+            h = fnv1a_update(h, &f.to_bits().to_le_bytes());
+        }
+        let epoch = meta.times.last().map(|t| t.timestamp()).unwrap_or(0);
+        h = fnv1a_update(h, &epoch.to_le_bytes());
+        h = fnv1a_update(h, &(meta.times.len() as u64).to_le_bytes());
+        // Quantities are sorted at construction; sort here too so the hash never
+        // relies on that. Delimit to avoid cross-boundary collisions.
+        let mut qs: Vec<&str> = meta.quantities.iter().map(String::as_str).collect();
+        qs.sort_unstable();
+        for q in qs {
+            h = fnv1a_update(h, q.as_bytes());
+            h = fnv1a_update(h, b"|");
+        }
+        // Sweep elevation angles (length-prefixed; fixed-width entries).
+        let levels = meta
+            .vertical
+            .as_ref()
+            .map(|v| v.levels.as_slice())
+            .unwrap_or(&[]);
+        h = fnv1a_update(h, &(levels.len() as u64).to_le_bytes());
+        for a in levels {
+            h = fnv1a_update(h, &a.to_bits().to_le_bytes());
+        }
+    }
+    h
+}
+
 impl FeatureEngine for PolarVolumeEngine {
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         let catalog = self.catalog.load();
-        // Stable order (by NOD) so paging is deterministic across requests.
-        let mut sites: Vec<(&String, &SiteMeta)> = catalog.by_site_meta.iter().collect();
-        sites.sort_by(|a, b| a.0.cmp(b.0));
-        let filtered: Vec<(&String, &SiteMeta)> = sites
-            .into_iter()
+        // `sorted_nods` is pre-sorted at catalog-build time, so paging is
+        // deterministic with no per-request sort — just look up, filter, page.
+        let filtered: Vec<(&String, &SiteMeta)> = catalog
+            .sorted_nods
+            .iter()
+            .filter_map(|nod| catalog.by_site_meta.get(nod).map(|m| (nod, m)))
             .filter(|(_, m)| {
                 query
                     .bbox
@@ -2777,61 +2877,13 @@ impl FeatureEngine for PolarVolumeEngine {
     }
 
     fn spatial_extent(&self) -> Option<[f64; 4]> {
-        let catalog = self.catalog.load();
-        let mut acc: Option<[f64; 4]> = None;
-        for m in catalog.by_site_meta.values() {
-            // The Feature geometry is the antenna *point*, and `get_features`
-            // filters `bbox` on that point — so the collection extent must
-            // bound the antenna points, NOT the (much wider) radar coverage
-            // bbox. Advertising the coverage bbox would let a conformant client
-            // query a bbox the extent claims to cover yet get zero results.
-            let b = [m.lon, m.lat, m.lon, m.lat];
-            acc = Some(match acc {
-                None => b,
-                Some(a) => [
-                    a[0].min(b[0]),
-                    a[1].min(b[1]),
-                    a[2].max(b[2]),
-                    a[3].max(b[3]),
-                ],
-            });
-        }
-        acc
+        // O(1) snapshot read — precomputed in `derive_catalog`.
+        self.catalog.load().features_extent
     }
 
     fn data_version(&self) -> u64 {
-        // Self-contained content hash: changes iff the site set, their latest
-        // volume time / count, or measured quantities change — so a poll
-        // refresh invalidates any (future) vector-tile ETag without threading a
-        // generation counter through the catalog swap. Sorted for determinism.
-        let catalog = self.catalog.load();
-        let mut sites: Vec<(&String, &SiteMeta)> = catalog.by_site_meta.iter().collect();
-        sites.sort_by(|a, b| a.0.cmp(b.0));
-        let mut h = 0xcbf2_9ce4_8422_2325_u64; // FNV-1a offset basis
-        for (nod, meta) in sites {
-            h = fnv1a_update(h, nod.as_bytes());
-            // Corrigible string metadata that feeds Feature properties (`name`,
-            // `wmo`): a re-published volume that fixes a wrong PLC/WMO changes
-            // the feature content even if the nominal time is unchanged.
-            h = fnv1a_update(h, meta.plc.as_deref().unwrap_or("").as_bytes());
-            h = fnv1a_update(h, b"|");
-            h = fnv1a_update(h, meta.wmo.as_deref().unwrap_or("").as_bytes());
-            h = fnv1a_update(h, b"|");
-            let epoch = meta.times.last().map(|t| t.timestamp()).unwrap_or(0);
-            h = fnv1a_update(h, &epoch.to_le_bytes());
-            h = fnv1a_update(h, &(meta.times.len() as u64).to_le_bytes());
-            // Sort defensively so the hash is order-independent — it must not
-            // rely on `derive_site_meta` happening to sort `quantities`. A
-            // delimiter after each keeps variable-length codes from colliding
-            // across boundaries (`["AB","CD"]` vs `["ABCD"]`).
-            let mut qs: Vec<&str> = meta.quantities.iter().map(String::as_str).collect();
-            qs.sort_unstable();
-            for q in qs {
-                h = fnv1a_update(h, q.as_bytes());
-                h = fnv1a_update(h, b"|");
-            }
-        }
-        h
+        // O(1) snapshot read — precomputed in `derive_catalog`.
+        self.catalog.load().feature_version
     }
 }
 
@@ -5346,6 +5398,52 @@ mod tests {
         assert_ne!(
             FeatureEngine::data_version(&one),
             FeatureEngine::data_version(&two)
+        );
+    }
+
+    /// The content hash reflects metadata-only corrections (PLC, antenna
+    /// height) that feed Feature properties — not just the site set / time.
+    #[test]
+    fn feature_version_reflects_metadata_corrections() {
+        fn meta_with(plc: Option<&str>, height_m: f64) -> SiteMeta {
+            SiteMeta {
+                lon: 24.5,
+                lat: 60.3,
+                plc: plc.map(String::from),
+                wmo: None,
+                height_m,
+                parameters: vec![],
+                quantities: vec!["DBZH".to_string()],
+                times: vec![],
+                spatial_extent: None,
+                coverage_radius_m: None,
+                vertical: None,
+            }
+        }
+        let nods = vec!["fivih".to_string()];
+        let base: HashMap<String, SiteMeta> =
+            [("fivih".to_string(), meta_with(Some("Vihti"), 100.0))]
+                .into_iter()
+                .collect();
+        let v0 = feature_version_of(&nods, &base);
+        assert_eq!(v0, feature_version_of(&nods, &base), "deterministic");
+
+        let plc_fixed: HashMap<String, SiteMeta> = [(
+            "fivih".to_string(),
+            meta_with(Some("Vihti (corrected)"), 100.0),
+        )]
+        .into_iter()
+        .collect();
+        assert_ne!(v0, feature_version_of(&nods, &plc_fixed), "PLC change");
+
+        let height_fixed: HashMap<String, SiteMeta> =
+            [("fivih".to_string(), meta_with(Some("Vihti"), 101.0))]
+                .into_iter()
+                .collect();
+        assert_ne!(
+            v0,
+            feature_version_of(&nods, &height_fixed),
+            "height change"
         );
     }
 }

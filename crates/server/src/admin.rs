@@ -1397,9 +1397,20 @@ pub fn load_collections(
                 // name); the per-site EDR/WMS/etc. collections use `{base}-{nod}`,
                 // so the base id is free of those registries.
                 if collection.apis.contains(&"features".to_string()) {
-                    if feature_collections.contains_key(&collection.id) {
+                    // Defence-in-depth: the base id must not already name a
+                    // collection in ANY registry (e.g. a hand-written inline
+                    // collection, or a `{base}-{nod}` per-site id derived from
+                    // another odim-volume source). Mirrors the per-site guard
+                    // above so the same id can't mean different things across
+                    // the EDR / Map / Features services.
+                    if feature_collections.contains_key(&collection.id)
+                        || edr_collections.contains_key(&collection.id)
+                        || map_collections.contains_key(&collection.id)
+                        || maps_collections.contains_key(&collection.id)
+                        || tiles_collections.contains_key(&collection.id)
+                    {
                         tracing::error!(
-                            "Collection '{}': base id already registered as a Features \
+                            "Collection '{}': base id already registered as another \
                              collection — skipping radar-site inventory",
                             collection.id
                         );
