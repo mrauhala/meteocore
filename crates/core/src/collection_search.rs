@@ -364,6 +364,24 @@ impl SearchQueryParams {
             self.f.as_deref(),
         )
     }
+
+    /// Like [`query_string`](Self::query_string) but forces the `f` (format)
+    /// selector instead of echoing the request's own. Used to build a
+    /// `rel="alternate"` link from one representation to the other while
+    /// preserving every search/pagination parameter (bbox, datetime, q,
+    /// limit, offset).
+    pub fn query_string_with_format(&self, limit: usize, offset: usize, f: &str) -> String {
+        let limit_str = self.limit.as_ref().map(|_| limit.to_string());
+        page_query_string(
+            self.bbox.as_deref(),
+            self.bbox_crs.as_deref(),
+            self.datetime.as_deref(),
+            self.q.as_deref(),
+            limit_str.as_deref(),
+            offset,
+            Some(f),
+        )
+    }
 }
 
 /// Reconstruct the `/collections` query string (leading `?`, or empty) for a
@@ -694,6 +712,22 @@ mod tests {
         // No format requested → links omit f.
         let none = SearchQueryParams::default();
         assert_eq!(none.query_string(DEFAULT_LIMIT, 20), "?offset=20");
+    }
+
+    #[test]
+    fn query_string_with_format_overrides_and_preserves_filters() {
+        // The alternate (?f=json) link forces the format but keeps every
+        // search/pagination param — even when the request itself was f=html.
+        let sp = SearchQueryParams {
+            q: Some("radar".to_string()),
+            limit: Some("10".to_string()),
+            f: Some("html".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            sp.query_string_with_format(10, 20, "json"),
+            "?q=radar&limit=10&f=json&offset=20"
+        );
     }
 
     #[test]

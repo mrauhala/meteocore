@@ -847,6 +847,17 @@ pub async fn collections(
                     Some("Previous page"),
                 ));
             }
+            // rel="alternate" to the JSON representation, preserving the current
+            // bbox/datetime/q/limit/offset filters (parity with the other HTML
+            // metadata pages).
+            nav.push(LinkView::new(
+                format!(
+                    "{base}/tiles/collections{}",
+                    sp.query_string_with_format(params.limit, params.offset, "json")
+                ),
+                "alternate",
+                Some("This page as JSON"),
+            ));
             Html(ds_core::html::collections_html("Collections", &cards, &nav)).into_response()
         }
     }))
