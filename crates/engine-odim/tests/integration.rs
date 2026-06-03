@@ -996,3 +996,100 @@ fn pvol_edr_query_trajectory_rejects_malformed_linestring() {
         }
     }
 }
+
+/// #286 — the COMP engine over a *remote* `DataStore`.
+///
+/// `object_store`'s `LocalFileSystem` exposes the same `list`/`get`
+/// surface an HTTP(S) `HttpStore` (or S3) does, so building one over a
+/// tempdir holding the committed DMI fixture drives the exact remote
+/// `scan_remote` → seed → render path that an `http(s)://` `data_path`
+/// takes — without standing up a WebDAV server. (`build_source`'s URL
+/// routing is unit-tested separately in `engine.rs`; this asserts the
+/// resulting remote source scans, reports extents, and renders.)
+#[test]
+fn comp_engine_remote_scan_discovers_and_renders_dmi_fixture() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/odim-dmi-fixture.h5")
+        .canonicalize()
+        .expect("fixture path canonicalises");
+    // Two timesteps so the catalog scan/sort/seed path is non-trivial.
+    for name in [
+        "dk.com.202601201125.500_max.h5",
+        "dk.com.202601201130.500_max.h5",
+    ] {
+        std::fs::copy(&src, dir.path().join(name)).expect("copy fixture");
+    }
+
+    // A `DataStore` over the fixture directory — the same trick the PVOL
+    // remote test and the catalog unit tests use to exercise the remote
+    // backend offline. `_base` (the store-relative prefix) is empty here.
+    let (store, _base) = ds_storage::build_store(
+        dir.path()
+            .canonicalize()
+            .expect("tempdir canonicalises")
+            .to_str()
+            .expect("utf8 tempdir path"),
+    )
+    .expect("build a DataStore over the fixture directory");
+
+    let config = OdimConfig {
+        filename_template: Some("dk.com.%Y%m%d%H%M.500_max.h5".into()),
+        filename_pattern: None,
+        timestamp_format: None,
+        parameter: Some("reflectivity".into()),
+        unit: Some("dBZ".into()),
+        nodata: None,
+        gain: None,
+        offset: None,
+        poll_interval_secs: 30,
+        max_files: None,
+        endpoint: None,
+        bucket: None,
+        prefix_pattern: None,
+        time_window: None,
+    };
+
+    // Empty prefix scans the store root, where the fixtures live.
+    let engine = engine_odim::OdimEngine::new_remote_for_test(
+        "dmi-remote-test",
+        store,
+        "",
+        "reflectivity",
+        "dBZ",
+        &config,
+    )
+    .expect("OdimEngine remote scan over the fixture directory");
+
+    // Metadata is populated from the remotely-fetched seed composite.
+    let info = engine.raster_info();
+    assert!(
+        info.native_crs.to_lowercase().contains("stere"),
+        "remote scan must report the DMI stereographic CRS, got `{}`",
+        info.native_crs
+    );
+    assert_eq!(
+        info.times.len(),
+        2,
+        "both remote timesteps must be cataloged"
+    );
+    assert!(
+        info.spatial_extent.is_some(),
+        "remote scan must report a spatial extent"
+    );
+
+    // A render proves the streamed-then-parsed composite is intact: the
+    // bytes came through `DataStore::get`, not a local `std::fs::read`.
+    let tile = engine
+        .get_raster_tile(
+            [9.5, 55.0, 12.5, 57.0], // over Jylland / Sjælland
+            64,
+            64,
+            None,
+            &OutputCrs::Wgs84,
+            None,
+            None,
+        )
+        .expect("render of the remotely-scanned composite succeeds");
+    assert_eq!(tile.values.len(), 64 * 64);
+}

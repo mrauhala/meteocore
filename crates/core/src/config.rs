@@ -383,18 +383,22 @@ pub struct OdimConfig {
     pub max_files: Option<usize>,
 
     /// S3-compatible endpoint URL (e.g. `https://s3.waw3-1.cloudferro.com`).
-    /// When `endpoint` + `bucket` are set the engine reads from S3;
-    /// otherwise it scans the collection's local `data_path`.
+    /// When `endpoint` + `bucket` are set the engine reads from S3.
+    /// Otherwise the source is the collection's `data_path`: an
+    /// `http(s)://` URL selects an HTTP(S) object store (COMP only — the
+    /// directory must be WebDAV/`PROPFIND`-listable; a plain Apache/nginx
+    /// autoindex is not), and any other value is a local directory.
     pub endpoint: Option<String>,
     /// S3 bucket name. Required when `endpoint` is set.
     pub bucket: Option<String>,
     /// Object key prefix, optionally carrying strftime templates
     /// (e.g. `%Y/%m/%d/OPERA/COMP/`). Expanded per UTC date on every
-    /// poll so the scan stays current across day boundaries.
+    /// poll so the scan stays current across day boundaries. For an
+    /// `http(s)://` `data_path` (COMP) it is appended under the URL path.
     pub prefix_pattern: Option<String>,
     /// ISO 8601 duration bounding which timesteps to keep, relative to
     /// now (e.g. `-PT12H` for the last 12 hours). Drives both prefix
-    /// date expansion and timestamp filtering for S3 sources. When
+    /// date expansion and timestamp filtering for S3/HTTP sources. When
     /// unset, the scan falls back to a fixed recent-days window.
     pub time_window: Option<String>,
 }

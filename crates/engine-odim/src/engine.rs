@@ -57,20 +57,42 @@ const DEFAULT_SCAN_DAYS: u32 = 2;
 enum Source {
     /// A local filesystem directory, scanned with `read_dir`.
     Local { data_dir: PathBuf },
-    /// An S3/HTTP object store. `prefix_pattern` may carry strftime
-    /// codes (e.g. `%Y/%m/%d/OPERA/COMP/`); it is expanded per UTC
-    /// date on every scan so the listing stays current across day
-    /// boundaries. `time_window`, when set, bounds both the dates
-    /// expanded and the timestamps kept. `endpoint` / `bucket` are
-    /// retained purely for diagnostics (the `store` already targets
-    /// them) so log and error messages can name the store.
+    /// An S3 or HTTP(S) object store. `prefix_pattern` may carry
+    /// strftime codes (e.g. `%Y/%m/%d/OPERA/COMP/`); it is expanded
+    /// per UTC date on every scan so the listing stays current across
+    /// day boundaries. `time_window`, when set, bounds both the dates
+    /// expanded and the timestamps kept. `origin` is retained purely
+    /// for diagnostics (the `store` already targets it) so log and
+    /// error messages can name the store.
     Remote {
         store: ds_storage::DataStore,
-        endpoint: String,
-        bucket: String,
+        origin: RemoteOrigin,
         prefix_pattern: String,
         time_window: Option<TimeWindow>,
     },
+}
+
+/// Diagnostic descriptor for a [`Source::Remote`] store — names the
+/// backend in logs and error messages. The `store` does the real work;
+/// this only carries enough to identify *which* store an operator is
+/// looking at.
+#[derive(Clone)]
+enum RemoteOrigin {
+    /// An S3 bucket reached via `endpoint` + `bucket`.
+    S3 { endpoint: String, bucket: String },
+    /// A plain HTTP(S) directory reached via an `http(s)://` `data_path`.
+    Http { base_url: String },
+}
+
+/// Optional per-file scaling overrides (`physical = raw * gain + offset`,
+/// plus a nodata sentinel). Each takes precedence over the value read
+/// from the composite. Grouped so the engine constructors don't carry
+/// three loose `Option<f64>` arguments.
+#[derive(Clone, Copy, Default)]
+struct Overrides {
+    gain: Option<f64>,
+    offset: Option<f64>,
+    nodata: Option<f64>,
 }
 
 /// Scan `source` for ODIM files, returning catalog entries sorted by
@@ -204,8 +226,8 @@ pub enum EngineError {
     #[error("filename pattern build failed: {0}")]
     BadPattern(#[from] crate::catalog::CatalogError),
     #[error(
-        "ODIM collection has no source — set a local `data_path` or an S3 \
-         `endpoint` + `bucket`"
+        "ODIM collection has no source — set a local `data_path`, an \
+         `http(s)://` `data_path`, or an S3 `endpoint` + `bucket`"
     )]
     NoSource,
     #[error(
@@ -244,24 +266,15 @@ pub enum EngineError {
 impl OdimEngine {
     /// Build an engine by scanning its configured source for files
     /// matching the filename pattern. The source is a local directory
-    /// (`data_path`) or an S3 bucket (`endpoint`/`bucket`/`prefix_pattern`).
-    /// Loads the most recent file synchronously to populate metadata;
-    /// raises [`EngineError`] when the source yields no files.
+    /// (`data_path`), an S3 bucket (`endpoint`/`bucket`/`prefix_pattern`),
+    /// or an HTTP(S) directory (`http(s)://` `data_path`). Loads the most
+    /// recent file synchronously to populate metadata; raises
+    /// [`EngineError`] when the source yields no files.
     pub fn new(
         collection_id: &str,
         data_path: Option<&str>,
         config: &ds_core::config::OdimConfig,
     ) -> Result<Self, EngineError> {
-        // `time_window` only constrains S3 prefix expansion + timestamp
-        // filtering. A local `data_path` source ignores it — warn so a
-        // misplaced setting doesn't silently do nothing.
-        if config.time_window.is_some() && config.endpoint.is_none() {
-            tracing::warn!(
-                "[{collection_id}] `time_window` is set but has no effect on a \
-                 local `data_path` ODIM source — it only applies to S3 sources"
-            );
-        }
-
         // COMP is single-parameter — `parameter`/`unit` are mandatory.
         // (The shared `OdimConfig` makes both `Option` so the
         // multi-parameter `odim-volume` engine can omit them.)
@@ -277,7 +290,50 @@ impl OdimEngine {
         let matcher = build_matcher(config)?;
         let source = build_source(collection_id, data_path, config)?;
 
-        let catalog = scan_source(&source, &matcher, config.max_files)?;
+        // `time_window` only constrains a *remote* (S3/HTTP) source's
+        // prefix expansion + timestamp filtering. A local `data_path`
+        // source ignores it — warn so a misplaced setting doesn't
+        // silently do nothing. (An `http(s)://` `data_path` resolves to
+        // `Source::Remote`, so it is correctly exempt.)
+        if config.time_window.is_some() && matches!(source, Source::Local { .. }) {
+            tracing::warn!(
+                "[{collection_id}] `time_window` is set but has no effect on a \
+                 local `data_path` ODIM source — it only applies to S3/HTTP sources"
+            );
+        }
+
+        Self::assemble(
+            collection_id,
+            parameter,
+            unit,
+            Overrides {
+                gain: config.gain,
+                offset: config.offset,
+                nodata: config.nodata,
+            },
+            source,
+            matcher,
+            config.max_files,
+            config.poll_interval_secs,
+        )
+    }
+
+    /// Scan `source`, pre-load the most recent file to seed metadata,
+    /// and assemble the engine. Shared by [`OdimEngine::new`] and the
+    /// test-only remote constructor — everything past source resolution
+    /// is identical regardless of how the source was obtained.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        collection_id: &str,
+        parameter: String,
+        unit: String,
+        overrides: Overrides,
+        source: Source,
+        matcher: FilenameMatcher,
+        max_files: Option<usize>,
+        poll_interval_secs: u64,
+    ) -> Result<Self, EngineError> {
+        let catalog = scan_source(&source, &matcher, max_files)?;
         if catalog.is_empty() {
             return Err(EngineError::NoFiles {
                 location: source_label(&source),
@@ -308,9 +364,9 @@ impl OdimEngine {
             collection_id: collection_id.to_string(),
             parameter,
             unit,
-            gain_override: config.gain,
-            offset_override: config.offset,
-            nodata_override: config.nodata,
+            gain_override: overrides.gain,
+            offset_override: overrides.offset,
+            nodata_override: overrides.nodata,
             seed_native_crs,
             seed_spatial_extent,
             seed_xsize,
@@ -318,11 +374,49 @@ impl OdimEngine {
             cached: Mutex::new(Some((seed_location.id(), composite))),
             source,
             matcher,
-            max_files: config.max_files,
-            poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
+            max_files,
+            poll_interval: Duration::from_secs(poll_interval_secs.max(1)),
             shutdown: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
         })
+    }
+
+    /// Build an engine over a pre-constructed remote [`ds_storage::DataStore`]
+    /// — the `LocalFileSystem`-as-remote test trick (PR #182) used to drive
+    /// the S3/HTTP `scan_remote` → render path without a live endpoint.
+    /// `prefix` is the (already date-expanded or flat) key prefix to list.
+    #[doc(hidden)]
+    pub fn new_remote_for_test(
+        collection_id: &str,
+        store: ds_storage::DataStore,
+        prefix: &str,
+        parameter: &str,
+        unit: &str,
+        config: &ds_core::config::OdimConfig,
+    ) -> Result<Self, EngineError> {
+        let matcher = build_matcher(config)?;
+        let source = Source::Remote {
+            store,
+            origin: RemoteOrigin::Http {
+                base_url: "test://remote".to_string(),
+            },
+            prefix_pattern: prefix.to_string(),
+            time_window: None,
+        };
+        Self::assemble(
+            collection_id,
+            parameter.to_string(),
+            unit.to_string(),
+            Overrides {
+                gain: config.gain,
+                offset: config.offset,
+                nodata: config.nodata,
+            },
+            source,
+            matcher,
+            config.max_files,
+            config.poll_interval_secs,
+        )
     }
 
     /// Run the source poll loop. Exits when [`OdimEngine::shutdown`]
@@ -574,10 +668,16 @@ fn build_matcher(config: &ds_core::config::OdimConfig) -> Result<FilenameMatcher
     Err(EngineError::NoFilenamePattern)
 }
 
-/// Resolve the engine's [`Source`] from config. `endpoint` + `bucket`
-/// select an S3 source; their absence falls back to the local
-/// `data_path`. Setting exactly one of `endpoint` / `bucket` is a
-/// configuration error rather than a silent fallback.
+/// Resolve the engine's [`Source`] from config:
+///
+/// - `endpoint` + `bucket` → an **S3** source (date-partitioned via
+///   `prefix_pattern`). Setting exactly one is a configuration error.
+/// - an `http(s)://` `data_path` → an **HTTP(S)** object store, built
+///   with [`ds_storage::build_store`] (the same dispatch the GeoTIFF
+///   engine uses, so an `amazonaws.com`/`cloudferro.com` URL still
+///   resolves to S3). The URL path becomes the base prefix; any
+///   `prefix_pattern` is appended under it for date partitioning.
+/// - a plain `data_path` → a **local** directory.
 fn build_source(
     collection_id: &str,
     data_path: Option<&str>,
@@ -604,34 +704,98 @@ fn build_source(
             );
             Ok(Source::Remote {
                 store,
-                endpoint: endpoint.to_string(),
-                bucket: bucket.to_string(),
+                origin: RemoteOrigin::S3 {
+                    endpoint: endpoint.to_string(),
+                    bucket: bucket.to_string(),
+                },
                 prefix_pattern,
                 time_window,
             })
         }
         (None, None) => {
             let data_path = data_path.ok_or(EngineError::NoSource)?;
-            Ok(Source::Local {
-                data_dir: PathBuf::from(data_path),
-            })
+            if data_path.starts_with("http://") || data_path.starts_with("https://") {
+                // HTTP(S) object-store source, mirroring engine-geotiff:
+                // `build_store` dispatches the URL (plain HTTP → WebDAV-
+                // listable `HttpStore`; amazonaws/cloudferro → S3). The
+                // returned base path is the directory the catalog lists;
+                // any `prefix_pattern` is appended for date partitioning.
+                //
+                // NOTE: object_store's `HttpStore` lists via WebDAV
+                // `PROPFIND`, so a plain Apache/nginx autoindex (e.g. DWD
+                // opendata) is *not* discoverable here — that needs the
+                // template-based probe tracked in #287.
+                let (store, base) = ds_storage::build_store(data_path)?;
+                let prefix_pattern =
+                    combine_http_prefix(base.as_ref(), config.prefix_pattern.as_deref());
+                let time_window = match &config.time_window {
+                    Some(s) => Some(TimeWindow::parse(s)?),
+                    None => None,
+                };
+                tracing::info!(
+                    "[{}] ODIM HTTP source: url={data_path} prefix='{prefix_pattern}'",
+                    collection_id
+                );
+                Ok(Source::Remote {
+                    store,
+                    origin: RemoteOrigin::Http {
+                        base_url: data_path.to_string(),
+                    },
+                    prefix_pattern,
+                    time_window,
+                })
+            } else {
+                Ok(Source::Local {
+                    data_dir: PathBuf::from(data_path),
+                })
+            }
         }
         _ => Err(EngineError::IncompleteS3Config),
     }
 }
 
+/// Join an HTTP store's base path (the URL path from
+/// [`ds_storage::build_store`]) with an optional `prefix_pattern`.
+///
+/// The base is a literal directory (no strftime codes); the pattern,
+/// when present, is appended so its `%Y/%m/%d/…` codes still expand
+/// per UTC date during the scan. An empty/absent pattern leaves the
+/// base alone; an empty base (URL pointing at the store root) yields
+/// the pattern by itself.
+fn combine_http_prefix(base_path: &str, prefix_pattern: Option<&str>) -> String {
+    let base = base_path.trim_matches('/');
+    // `trim()` first so a whitespace-only pattern counts as absent, then
+    // strip surrounding slashes so the join produces exactly one
+    // separator and no trailing slash (a lone `/` pattern → empty → base).
+    let pattern = prefix_pattern
+        .map(|p| p.trim().trim_matches('/'))
+        .filter(|p| !p.is_empty());
+    match pattern {
+        Some(pattern) if base.is_empty() => pattern.to_string(),
+        Some(pattern) => format!("{base}/{pattern}"),
+        None => base.to_string(),
+    }
+}
+
 /// Human-readable description of a [`Source`] for error messages —
-/// names the local directory, or the S3 endpoint/bucket/prefix, so an
-/// operator reading a log entry knows exactly which store to check.
+/// names the local directory, the S3 endpoint/bucket/prefix, or the
+/// HTTP base URL/prefix, so an operator reading a log entry knows
+/// exactly which store to check.
 fn source_label(source: &Source) -> String {
     match source {
         Source::Local { data_dir } => data_dir.display().to_string(),
         Source::Remote {
-            endpoint,
-            bucket,
+            origin,
             prefix_pattern,
             ..
-        } => format!("s3 {endpoint}/{bucket}/{prefix_pattern}"),
+        } => match origin {
+            RemoteOrigin::S3 { endpoint, bucket } => {
+                format!("s3 {endpoint}/{bucket}/{prefix_pattern}")
+            }
+            RemoteOrigin::Http { base_url } => {
+                format!("http {base_url} (prefix '{prefix_pattern}')")
+            }
+        },
     }
 }
 
@@ -793,6 +957,128 @@ mod tests {
         // None of the generic projected labels resolve to a storageCrs URI.
         assert!(ds_core::geo::native_crs_uri("stere").is_none());
         assert!(ds_core::geo::native_crs_uri("rotated_ll").is_none());
+    }
+
+    /// Minimal `OdimConfig` for `build_source` routing tests — only the
+    /// fields the source resolver reads are meaningful; the rest are
+    /// zero/`None`.
+    fn config_with(
+        endpoint: Option<&str>,
+        bucket: Option<&str>,
+        prefix_pattern: Option<&str>,
+        time_window: Option<&str>,
+    ) -> ds_core::config::OdimConfig {
+        ds_core::config::OdimConfig {
+            filename_template: Some("%Y%m%dT%H%M_radar.h5".into()),
+            filename_pattern: None,
+            timestamp_format: None,
+            parameter: Some("reflectivity".into()),
+            unit: Some("dBZ".into()),
+            nodata: None,
+            gain: None,
+            offset: None,
+            poll_interval_secs: 30,
+            max_files: None,
+            endpoint: endpoint.map(str::to_string),
+            bucket: bucket.map(str::to_string),
+            prefix_pattern: prefix_pattern.map(str::to_string),
+            time_window: time_window.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn combine_http_prefix_joins_base_and_pattern() {
+        // URL path only (DWD-style flat directory) — no date pattern.
+        assert_eq!(
+            combine_http_prefix("weather/radar/composite/hx", None),
+            "weather/radar/composite/hx"
+        );
+        // Base + date pattern: the strftime codes survive for per-date
+        // expansion during the scan.
+        assert_eq!(
+            combine_http_prefix("radar", Some("%Y/%m/%d/COMP/")),
+            "radar/%Y/%m/%d/COMP"
+        );
+        // Surrounding slashes on either side collapse to a single join.
+        assert_eq!(
+            combine_http_prefix("/radar/", Some("/%Y/%m/%d/")),
+            "radar/%Y/%m/%d"
+        );
+        // Store-root URL (empty path) with a pattern yields the pattern alone.
+        assert_eq!(combine_http_prefix("", Some("%Y/%m/%d/")), "%Y/%m/%d");
+        // Store-root URL with no pattern is the empty (root) prefix.
+        assert_eq!(combine_http_prefix("", None), "");
+        // A whitespace-only / empty pattern is treated as absent.
+        assert_eq!(combine_http_prefix("radar", Some("")), "radar");
+    }
+
+    /// An `http(s)://` `data_path` (no `endpoint`/`bucket`) resolves to a
+    /// remote HTTP source, not a local directory — the core of #286.
+    /// Building the store is lazy (no network), so this runs offline.
+    #[test]
+    fn build_source_routes_http_data_path_to_remote() {
+        let config = config_with(None, None, None, None);
+        let source = build_source(
+            "http-test",
+            Some("https://opendata.example.org/weather/radar/composite/hx/"),
+            &config,
+        )
+        .expect("http data_path builds a remote source");
+
+        match &source {
+            Source::Remote {
+                origin,
+                prefix_pattern,
+                ..
+            } => {
+                assert!(
+                    matches!(origin, RemoteOrigin::Http { .. }),
+                    "http data_path must select an HTTP origin"
+                );
+                // The URL path becomes the (flat) list prefix.
+                assert_eq!(prefix_pattern, "weather/radar/composite/hx");
+            }
+            Source::Local { .. } => panic!("http data_path must not be a Local source"),
+        }
+
+        // The label names the HTTP URL, not an S3 bucket.
+        let label = source_label(&source);
+        assert!(
+            label.starts_with("http https://opendata.example.org/"),
+            "source_label should name the HTTP base URL, got `{label}`"
+        );
+    }
+
+    /// A `prefix_pattern` alongside an HTTP `data_path` is appended under
+    /// the URL path so date partitioning still works on a listable store.
+    #[test]
+    fn build_source_http_appends_prefix_pattern() {
+        let config = config_with(None, None, Some("%Y/%m/%d/"), Some("-PT2H"));
+        let source = build_source("http-test", Some("https://host.example/radar/"), &config)
+            .expect("http data_path with prefix_pattern builds a remote source");
+        match source {
+            Source::Remote {
+                prefix_pattern,
+                time_window,
+                ..
+            } => {
+                assert_eq!(prefix_pattern, "radar/%Y/%m/%d");
+                assert!(
+                    time_window.is_some(),
+                    "time_window must apply to an HTTP source"
+                );
+            }
+            Source::Local { .. } => panic!("expected a remote HTTP source"),
+        }
+    }
+
+    /// A plain (non-URL) `data_path` is still a local directory source.
+    #[test]
+    fn build_source_routes_plain_data_path_to_local() {
+        let config = config_with(None, None, None, None);
+        let source =
+            build_source("local-test", Some("/var/lib/radar"), &config).expect("local source");
+        assert!(matches!(source, Source::Local { .. }));
     }
 
     /// `shutdown()` called before `poll_loop()` ever starts must
