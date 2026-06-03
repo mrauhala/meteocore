@@ -29,3 +29,23 @@ exclude = ["fuzz"]
 # fails the release-PR with `value at path package.version is not tagged`.
 # Until that's fixed upstream, leaving versions inline lets release-please
 # walk the workspace members and bump each one to the same value.
+
+# Dev/test build-speed tuning. The dominant cost of `cargo test` here is not
+# test execution (every binary finishes in <0.5s) but linking — writing and
+# relocating full DWARF debug info across ~440 dependency crates and 17
+# workspace members on every relink. The default dev profile uses `debug = 2`
+# (full debuginfo); a one-line change cost ~14s to rebuild a test binary, of
+# which only ~2.5s was actual compilation.
+#
+# - Workspace crates keep `line-tables-only`: panics/backtraces still resolve to
+#   file:line, but the heavy variable/type DWARF is dropped.
+# - Dependencies get no debuginfo at all (`package."*"`): you never step into
+#   them, and their debug sections are the bulk of the link-time cost.
+#
+# This also speeds up CI (which builds the same dev/test profile). opt-level and
+# codegen-units are left at their fast-compile defaults (0 / 256).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
