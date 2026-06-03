@@ -212,6 +212,60 @@ impl DataStore {
         Ok(ordered.into_iter().map(|(_, r)| r).collect())
     }
 
+    /// Probe many object keys concurrently with `head`, returning one
+    /// result per input path **in input order**. A **missing** object
+    /// (`NotFound` / HTTP 404) maps to `Ok(None)` — "absent", not an
+    /// error — so a caller probing candidate keys can keep the ones that
+    /// exist; any other failure (timeout, 403, network) is the slot's
+    /// `Err`. The outer `Err` is reserved for a runtime-bridge failure.
+    ///
+    /// This is the listing-free discovery primitive for HTTP stores that
+    /// don't support `list` (a plain Apache/nginx autoindex answers a
+    /// direct `HEAD` but not WebDAV `PROPFIND`). Same concurrency,
+    /// per-object 30s timeout, and thread-context rules as
+    /// [`Self::get_many`].
+    #[allow(clippy::type_complexity)]
+    pub fn head_many(
+        &self,
+        paths: &[ObjectPath],
+        concurrency: usize,
+    ) -> Result<Vec<Result<Option<ObjectMeta>, DataServerError>>, DataServerError> {
+        use futures::StreamExt;
+
+        let conc = concurrency.max(1);
+        let inner = &self.inner;
+        let ordered: Vec<(usize, Result<Option<ObjectMeta>, DataServerError>)> = self
+            .block_on_untimed(async {
+                let mut results: Vec<(usize, Result<Option<ObjectMeta>, DataServerError>)> =
+                    futures::stream::iter(paths.iter().enumerate().map(|(i, p)| async move {
+                        let probe = async {
+                            match inner.head(p).await {
+                                Ok(meta) => Ok(Some(meta)),
+                                // A 404 is the expected answer for a candidate
+                                // key that doesn't exist — not a failure.
+                                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                                Err(e) => Err(DataServerError::from(StorageError::from(e))),
+                            }
+                        };
+                        let r = match tokio::time::timeout(Self::REQUEST_TIMEOUT, probe).await {
+                            Ok(r) => r,
+                            Err(_) => Err(DataServerError::Storage(format!(
+                                "head of `{p}` timed out after {}s",
+                                Self::REQUEST_TIMEOUT.as_secs()
+                            ))),
+                        };
+                        (i, r)
+                    }))
+                    .buffer_unordered(conc)
+                    .collect()
+                    .await;
+                results.sort_by_key(|(i, _)| *i);
+                results
+            })?;
+
+        Ok(ordered.into_iter().map(|(_, r)| r).collect())
+    }
+
     /// Default timeout for individual storage operations (30 seconds).
     const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -561,6 +615,30 @@ mod tests {
         assert_eq!(res[0].as_ref().unwrap().as_ref(), b"aaa");
         assert!(res[1].is_err(), "a missing object yields a per-item Err");
         assert_eq!(res[2].as_ref().unwrap().as_ref(), b"cccc");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn head_many_reports_presence_in_input_order() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.bin"), b"aaa").unwrap();
+        std::fs::write(dir.path().join("c.bin"), b"cccc").unwrap();
+        let (store, _) = build_store(dir.path().to_str().unwrap()).unwrap();
+
+        // Middle key is absent — a missing object is `Ok(None)`, not an Err.
+        let paths = [
+            ObjectPath::from("a.bin"),
+            ObjectPath::from("missing.bin"),
+            ObjectPath::from("c.bin"),
+        ];
+        let res = store.head_many(&paths, 8).unwrap();
+        assert_eq!(res.len(), 3);
+        assert_eq!(res[0].as_ref().unwrap().as_ref().unwrap().size, 3);
+        assert!(
+            matches!(res[1], Ok(None)),
+            "a missing object is Ok(None), got {:?}",
+            res[1]
+        );
+        assert_eq!(res[2].as_ref().unwrap().as_ref().unwrap().size, 4);
     }
 
     #[tokio::test(flavor = "multi_thread")]
