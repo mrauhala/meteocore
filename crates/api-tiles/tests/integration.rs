@@ -45,6 +45,7 @@ impl MockMapEngine {
             vertical: None,
             // bbox [10,55,30,70] over 2000x1500 cells => 0.01° per cell.
             grid_size: Some([2000, 1500]),
+            layer_subtitle: None,
         }
     }
 }
@@ -1104,6 +1105,7 @@ impl MapEngine for MultiParamMockEngine {
             ],
             vertical: None,
             grid_size: None,
+            layer_subtitle: None,
         }
     }
 }
@@ -1708,6 +1710,7 @@ mod temporal_grid_jitter {
                 parameters: vec![],
                 vertical: None,
                 grid_size: None,
+                layer_subtitle: None,
             }
         }
     }

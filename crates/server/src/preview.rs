@@ -853,6 +853,7 @@ mod tests {
                 parameters: self.parameters.clone(),
                 vertical: None,
                 grid_size: None,
+                layer_subtitle: None,
             }
         }
     }
@@ -1876,6 +1877,7 @@ mod tests {
                     ],
                     vertical: None,
                     grid_size: None,
+                    layer_subtitle: None,
                 }
             }
         }

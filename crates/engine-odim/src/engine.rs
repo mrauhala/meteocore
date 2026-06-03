@@ -1198,6 +1198,7 @@ impl MapEngine for OdimEngine {
             parameters: vec![],
             vertical: None, // 2-D composite, no vertical dimension
             grid_size: Some([self.seed_xsize, self.seed_ysize]),
+            layer_subtitle: None,
         }
     }
 }

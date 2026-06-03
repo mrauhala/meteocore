@@ -25,6 +25,7 @@ pub mod engine;
 pub mod pixel_cache;
 pub mod proj;
 pub mod pvol;
+pub mod quantities;
 pub mod reader;
 pub mod volume_engine;
 

@@ -56,6 +56,7 @@ impl MapEngine for MockMapEngine {
             parameters: vec![],
             vertical: None,
             grid_size: None,
+            layer_subtitle: None,
         }
     }
 }

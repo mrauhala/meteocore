@@ -429,6 +429,7 @@ impl MapEngine for QueryDataEngine {
             parameters,
             vertical: None,
             grid_size: Some([gt.width, gt.height]),
+            layer_subtitle: None,
         }
     }
 }

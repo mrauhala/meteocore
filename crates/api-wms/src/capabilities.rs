@@ -143,9 +143,17 @@ fn write_parent_layer(
     // CRS, bbox, time on parent — inherited by children
     write_layer_metadata(writer, info);
 
-    // Child layers — one per parameter
+    // Child layers — one per parameter. When the collection carries a
+    // `layer_subtitle` (e.g. a radar site place name), prepend it to the child
+    // Title so WMS clients that render a flat layer list (ignoring this parent
+    // tree) can still tell sibling collections apart — otherwise every site's
+    // child layer is titled identically (just the parameter).
     for (short_name, title) in &info.parameters {
         let child_layer_name = format!("{id}/{short_name}");
+        let child_title = match &info.layer_subtitle {
+            Some(subtitle) => format!("{subtitle} — {title}"),
+            None => title.clone(),
+        };
         write_layer(
             writer,
             &child_layer_name,
@@ -153,7 +161,7 @@ fn write_parent_layer(
             info,
             layer_styles,
             base_url,
-            Some(title),
+            Some(&child_title),
         );
     }
 

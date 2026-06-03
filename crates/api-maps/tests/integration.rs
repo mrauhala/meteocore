@@ -44,6 +44,7 @@ impl MockMapEngine {
             vertical: None,
             // bbox [10,55,30,70] over 2000x1500 cells => 0.01° per cell.
             grid_size: Some([2000, 1500]),
+            layer_subtitle: None,
         }
     }
 }
@@ -1164,6 +1165,7 @@ impl MapEngine for MultiParamMockEngine {
             ],
             vertical: None,
             grid_size: None,
+            layer_subtitle: None,
         }
     }
 }
@@ -1327,6 +1329,7 @@ mod vertical_extent {
                     vec![0.5, 1.5, 5.0],
                 )),
                 grid_size: None,
+                layer_subtitle: None,
             }
         }
     }
@@ -1387,6 +1390,7 @@ mod vertical_extent {
                 parameters: vec![],
                 vertical: Some(VerticalDimension::new(VerticalKind::ElevationAngle, vec![])),
                 grid_size: None,
+                layer_subtitle: None,
             }
         }
     }
@@ -1446,6 +1450,7 @@ mod extent_edge_cases {
                 parameters: vec![],
                 vertical: None,
                 grid_size: Some([2000, 1500]),
+                layer_subtitle: None,
             }
         }
     }
@@ -1493,6 +1498,7 @@ mod extent_edge_cases {
                 parameters: vec![],
                 vertical: None,
                 grid_size: None,
+                layer_subtitle: None,
             }
         }
     }
@@ -1566,6 +1572,7 @@ mod extent_edge_cases {
                 parameters: vec![],
                 vertical: None,
                 grid_size: Some([2000, 1000]),
+                layer_subtitle: None,
             }
         }
     }

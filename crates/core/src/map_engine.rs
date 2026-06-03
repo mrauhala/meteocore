@@ -133,6 +133,12 @@ pub struct RasterInfo {
     /// grid (e.g. polar radar volumes) or when the cell counts are not cheaply
     /// available without decoding data.
     pub grid_size: Option<[u32; 2]>,
+    /// Optional short label distinguishing this layer from sibling layers that
+    /// share a parent grouping (e.g. a radar site place name like "Vihti").
+    /// WMS prepends it to child-layer titles so flat clients that ignore the
+    /// parent-layer tree can still tell siblings apart. `None` for standalone
+    /// collections.
+    pub layer_subtitle: Option<String>,
 }
 
 /// Trait for serving raster data as map images.

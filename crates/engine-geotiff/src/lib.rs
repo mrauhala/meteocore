@@ -1549,6 +1549,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             parameters: vec![], // single-parameter engine
             vertical: None,     // single-layer raster, no vertical dimension
             grid_size,
+            layer_subtitle: None,
         }
     }
 }
