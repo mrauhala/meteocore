@@ -2791,12 +2791,14 @@ fn feature_version_of(nods: &[String], by_site_meta: &HashMap<String, SiteMeta>)
         h = fnv1a_update(h, &epoch.to_le_bytes());
         h = fnv1a_update(h, &(meta.times.len() as u64).to_le_bytes());
         // Quantities are sorted at construction; sort here too so the hash never
-        // relies on that. Delimit to avoid cross-boundary collisions.
+        // relies on that. Delimit with the same `\x1f` used for the other
+        // variable-length fields (impossible in an `[A-Z0-9]+` ODIM code) to
+        // avoid cross-boundary collisions.
         let mut qs: Vec<&str> = meta.quantities.iter().map(String::as_str).collect();
         qs.sort_unstable();
         for q in qs {
             h = fnv1a_update(h, q.as_bytes());
-            h = fnv1a_update(h, b"|");
+            h = fnv1a_update(h, b"\x1f");
         }
         // Sweep elevation angles (length-prefixed; fixed-width entries).
         let levels = meta
