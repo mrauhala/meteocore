@@ -335,10 +335,17 @@ pub async fn landing_page(
                 .into_response()
         }
         Wanted::Html => {
-            let views: Vec<LinkView> = links
+            let mut views: Vec<LinkView> = links
                 .iter()
                 .map(|(h, r, _, ti)| LinkView::new(h.clone(), *r, Some(ti)))
                 .collect();
+            // rel="alternate" to the JSON representation (parity with the
+            // collection-detail HTML page).
+            views.push(LinkView::new(
+                format!("{base}/tiles/?f=json"),
+                "alternate",
+                Some("This document as JSON"),
+            ));
             Html(ds_core::html::landing_html(title, description, &views)).into_response()
         }
     }))
@@ -614,11 +621,14 @@ pub async fn api_docs(State(state): State<AppState>) -> impl IntoResponse {
 
 /// GET /tiles/conformance
 pub async fn conformance(
+    State(state): State<AppState>,
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, TilesError> {
-    use ds_core::html::Wanted;
+    use ds_core::html::{LinkView, Wanted};
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
+    let state = state.load_full();
+    let base = &state.base_url;
     let classes = [
         // OGC API - Common - Part 1: Core (landing page, /conformance,
         // /api) and Part 2: Geospatial Data (/collections + /collections/
@@ -646,7 +656,17 @@ pub async fn conformance(
     ];
     Ok(with_vary(match wanted {
         Wanted::Json => Json(json!({ "conformsTo": classes })).into_response(),
-        Wanted::Html => Html(ds_core::html::conformance_html(&classes)).into_response(),
+        Wanted::Html => {
+            let nav = [
+                LinkView::new(format!("{base}/tiles/"), "up", Some("Landing page")),
+                LinkView::new(
+                    format!("{base}/tiles/conformance?f=json"),
+                    "alternate",
+                    Some("This document as JSON"),
+                ),
+            ];
+            Html(ds_core::html::conformance_html(&classes, &nav)).into_response()
+        }
     }))
 }
 

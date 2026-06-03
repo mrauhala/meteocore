@@ -208,10 +208,18 @@ pub async fn landing_page(
                 .into_response()
         }
         Wanted::Html => {
-            let views: Vec<LinkView> = links
+            let mut views: Vec<LinkView> = links
                 .iter()
                 .map(|(h, r, _, ti)| LinkView::new(h.clone(), *r, Some(ti)))
                 .collect();
+            // rel="alternate" to the JSON representation (parity with the
+            // collection-detail HTML page), so the HTML landing page links to
+            // its machine-readable twin.
+            views.push(LinkView::new(
+                format!("{base}/edr/?f=json"),
+                "alternate",
+                Some("This document as JSON"),
+            ));
             Html(ds_core::html::landing_html(title, description, &views)).into_response()
         }
     }))
@@ -595,11 +603,14 @@ pub async fn api_docs(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 pub async fn conformance(
+    State(state): State<AppState>,
     Query(fp): Query<ds_core::html::FormatParams>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
-    use ds_core::html::Wanted;
+    use ds_core::html::{LinkView, Wanted};
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
+    let state = state.load_full();
+    let base = &state.base_url;
     let classes = [
         "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
         "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page",
@@ -622,7 +633,17 @@ pub async fn conformance(
     ];
     Ok(with_vary(match wanted {
         Wanted::Json => Json(json!({ "conformsTo": classes })).into_response(),
-        Wanted::Html => Html(ds_core::html::conformance_html(&classes)).into_response(),
+        Wanted::Html => {
+            let nav = [
+                LinkView::new(format!("{base}/edr/"), "up", Some("Landing page")),
+                LinkView::new(
+                    format!("{base}/edr/conformance?f=json"),
+                    "alternate",
+                    Some("This document as JSON"),
+                ),
+            ];
+            Html(ds_core::html::conformance_html(&classes, &nav)).into_response()
+        }
     }))
 }
 

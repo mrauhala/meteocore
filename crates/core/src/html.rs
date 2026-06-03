@@ -184,9 +184,13 @@ pub fn landing_html(title: &str, description: &str, links: &[LinkView]) -> Strin
     page(title, &body)
 }
 
-/// Conformance declaration (`GET /{api}/conformance`).
-pub fn conformance_html(classes: &[&str]) -> String {
-    let mut body = String::from("<h1>Conformance classes</h1>\n<ul>\n");
+/// Conformance declaration (`GET /{api}/conformance`). `nav` carries links back
+/// to the landing page and a `rel="alternate"` pointer to the JSON
+/// representation, so the HTML page is not a navigation dead-end.
+pub fn conformance_html(classes: &[&str], nav: &[LinkView]) -> String {
+    let mut body = String::from("<h1>Conformance classes</h1>\n");
+    body.push_str(&render_links(nav, "nav"));
+    body.push_str("<ul>\n");
     for c in classes {
         body.push_str(&format!("<li><code>{}</code></li>\n", escape(c)));
     }
@@ -352,7 +356,10 @@ mod tests {
         )];
         let l = landing_html("MeteoCore - EDR", "desc", &links);
         assert!(l.contains("MeteoCore - EDR") && l.contains("/edr/collections"));
-        let c = conformance_html(&["http://example/conf/core"]);
+        let nav = [LinkView::new("/edr/", "up", Some("Landing page"))];
+        let c = conformance_html(&["http://example/conf/core"], &nav);
         assert!(c.contains("http://example/conf/core"));
+        // Not a dead-end: the nav link back to the landing page is rendered.
+        assert!(c.contains("/edr/") && c.contains("Landing page"));
     }
 }
