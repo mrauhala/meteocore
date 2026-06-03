@@ -43,6 +43,8 @@ fn dmi_engine() -> (engine_odim::OdimEngine, tempfile::TempDir) {
         bucket: None,
         prefix_pattern: None,
         time_window: None,
+        discovery: None,
+        cadence_secs: None,
     };
 
     let engine = engine_odim::OdimEngine::new(
@@ -351,6 +353,8 @@ fn edr_query_area_rejects_too_many_timesteps() {
         bucket: None,
         prefix_pattern: None,
         time_window: None,
+        discovery: None,
+        cadence_secs: None,
     };
     let engine = engine_odim::OdimEngine::new(
         "dmi-cap-test",
@@ -449,6 +453,8 @@ fn pvol_engine_renders_fmi_vihti_volume() {
         bucket: None,
         prefix_pattern: None,
         time_window: None,
+        discovery: None,
+        cadence_secs: None,
     };
 
     let engine = engine_odim::PolarVolumeEngine::new("fivih-pvol-test", Some(data_dir), &config)
@@ -644,6 +650,8 @@ fn pvol_bare_render_defaults_to_primary_quantity() {
         bucket: None,
         prefix_pattern: None,
         time_window: None,
+        discovery: None,
+        cadence_secs: None,
     };
     let engine =
         engine_odim::PolarVolumeEngine::new("fivih-pvol-test", Some(data_dir), &config).unwrap();
@@ -694,6 +702,8 @@ fn pvol_fixture_view() -> Option<engine_odim::PolarVolumeSiteView> {
         bucket: None,
         prefix_pattern: None,
         time_window: None,
+        discovery: None,
+        cadence_secs: None,
     };
     let engine = engine_odim::PolarVolumeEngine::new(
         "fivih-edr-test",
@@ -1048,6 +1058,8 @@ fn comp_engine_remote_scan_discovers_and_renders_dmi_fixture() {
         bucket: None,
         prefix_pattern: None,
         time_window: None,
+        discovery: None,
+        cadence_secs: None,
     };
 
     // Empty prefix scans the store root, where the fixtures live.
@@ -1092,4 +1104,74 @@ fn comp_engine_remote_scan_discovers_and_renders_dmi_fixture() {
         )
         .expect("render of the remotely-scanned composite succeeds");
     assert_eq!(tile.values.len(), 64 * 64);
+}
+
+/// #287 — template (listing-free) HTTP discovery.
+///
+/// `object_store`'s `LocalFileSystem` answers `head` per object exactly
+/// like an HTTP `HEAD` (and returns `NotFound` for a missing key), so a
+/// `DataStore` over a tempdir drives the real `head_many` probe path
+/// offline. The probe builds candidate filenames from the strftime
+/// template for timestamps walked back from an **injected** `now`, so the
+/// set of discovered files is deterministic. We lay down files for some
+/// slots and leave a gap, and assert the probe finds exactly the present
+/// ones — never listing the directory.
+#[test]
+fn comp_template_discovery_probes_present_slots_only() {
+    use chrono::{TimeZone, Utc};
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let template = "composite_hx_%Y%m%d_%H%M-hd5";
+    // Aligned reference clock; 5-minute cadence.
+    let now = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
+    let cadence_secs = 300;
+
+    // Present: now, now-5m, now-10m, now-20m. Absent: now-15m (a gap), and
+    // the older slots the -PT30M window still probes (now-25m, now-30m).
+    for back_min in [0i64, 5, 10, 20] {
+        let t = now - chrono::Duration::minutes(back_min);
+        let name = t.format(template).to_string();
+        std::fs::write(dir.path().join(name), b"x").expect("write candidate");
+    }
+    // A decoy with no parseable slot must never be probed/added.
+    std::fs::write(dir.path().join("composite_hx_LATEST-hd5"), b"x").unwrap();
+
+    let (store, _base) = ds_storage::build_store(
+        dir.path()
+            .canonicalize()
+            .expect("tempdir canonicalises")
+            .to_str()
+            .expect("utf8 tempdir path"),
+    )
+    .expect("DataStore over the tempdir");
+
+    // Empty base prefix → probe the store root, where the files live.
+    let catalog = engine_odim::OdimEngine::discover_template_for_test(
+        now,
+        store,
+        "",
+        template,
+        cadence_secs,
+        Some("-PT30M"),
+        None,
+    )
+    .expect("template probe succeeds");
+
+    // Exactly the four present dated slots, ascending; the 11:45 gap and the
+    // empty 11:30/11:35 slots are excluded, and `LATEST` is never probed.
+    let times: Vec<String> = catalog.iter().map(|e| e.time.to_rfc3339()).collect();
+    assert_eq!(
+        times,
+        [
+            "2026-06-03T11:40:00+00:00",
+            "2026-06-03T11:50:00+00:00",
+            "2026-06-03T11:55:00+00:00",
+            "2026-06-03T12:00:00+00:00",
+        ],
+        "probe must discover exactly the present dated slots"
+    );
+    // Keys are the template-rendered names under the (empty) base prefix.
+    assert!(catalog
+        .iter()
+        .all(|e| e.location.id().starts_with("composite_hx_")));
 }

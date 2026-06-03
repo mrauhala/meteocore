@@ -401,6 +401,19 @@ pub struct OdimConfig {
     /// date expansion and timestamp filtering for S3/HTTP sources. When
     /// unset, the scan falls back to a fixed recent-days window.
     pub time_window: Option<String>,
+    /// Discovery mode for an `http(s)://` `data_path` source (COMP only;
+    /// ignored for local and S3 sources):
+    /// - `"list"` (default) — enumerate the directory with WebDAV
+    ///   `PROPFIND`. Works for listable HTTP stores (#286).
+    /// - `"template"` — don't list; instead build candidate filenames
+    ///   from `filename_template` + `cadence_secs` walking back from now,
+    ///   and probe them with `HEAD`. For non-listable autoindex servers
+    ///   such as DWD opendata (#287). Requires `filename_template`.
+    pub discovery: Option<String>,
+    /// Probe cadence in seconds for `discovery = "template"` — the spacing
+    /// of candidate timestamps (e.g. `300` for a 5-minute radar feed).
+    /// Required in template mode; ignored otherwise.
+    pub cadence_secs: Option<u64>,
 }
 
 fn default_grib_poll_interval() -> u64 {

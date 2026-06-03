@@ -70,7 +70,32 @@ enum Source {
         prefix_pattern: String,
         time_window: Option<TimeWindow>,
     },
+    /// A non-listable HTTP(S) directory discovered by **template probe**
+    /// (#287): instead of `list`, candidate filenames are built from
+    /// `template` (the strftime `filename_template`) for timestamps walked
+    /// back from now over `cadence`, and each is `HEAD`-probed. For
+    /// autoindex servers (DWD opendata) where `list` (WebDAV `PROPFIND`)
+    /// returns nothing. `time_window` bounds how far back to walk;
+    /// `base_url` is diagnostics only.
+    TemplateHttp {
+        store: ds_storage::DataStore,
+        base_url: String,
+        base_prefix: String,
+        template: String,
+        cadence: Duration,
+        time_window: Option<TimeWindow>,
+    },
 }
+
+/// Hard cap on candidate timestamps probed per template scan — a backstop
+/// against an unbounded walk when neither `time_window` nor `max_files`
+/// bounds it. 288 = 24 h at a 5-minute cadence. The probes are concurrent
+/// `HEAD`s (cheap), so this is generous; `time_window`/`max_files` clamp it
+/// far lower in practice (DWD `-PT2H` @ 300 s → 25 probes).
+const HARD_MAX_PROBES: usize = 288;
+
+/// Max concurrent `HEAD` probes in a template scan.
+const PROBE_CONCURRENCY: usize = 16;
 
 /// Diagnostic descriptor for a [`Source::Remote`] store — names the
 /// backend in logs and error messages. The `store` does the real work;
@@ -130,6 +155,119 @@ fn scan_source(
                 max_files,
             )?)
         }
+        Source::TemplateHttp {
+            store,
+            base_prefix,
+            template,
+            cadence,
+            time_window,
+            ..
+        } => Ok(discover_template_at(
+            Utc::now(),
+            store,
+            base_prefix,
+            template,
+            *cadence,
+            time_window.as_ref(),
+            max_files,
+        )?),
+    }
+}
+
+/// Discover ODIM files on a non-listable HTTP source by **probing**
+/// candidate filenames instead of listing the directory.
+///
+/// Builds one candidate per timestamp from `now` walked back by `cadence`
+/// — `N = min(window/cadence, max_files, HARD_MAX_PROBES)` steps — renders
+/// each filename with `time.format(template)` (the strftime inverse of the
+/// catalog matcher), joins it under `base_prefix`, and `HEAD`-probes them
+/// all concurrently. Existing objects become [`CatalogEntry`] values whose
+/// timestamp is the one we generated (no parsing needed); the bytes are
+/// fetched lazily on render via [`fetch_bytes`]. Sorted ascending, deduped
+/// by timestamp.
+///
+/// `now` is a parameter (not `Utc::now()` inside) so the probe is
+/// deterministically testable against a controlled clock.
+fn discover_template_at(
+    now: DateTime<Utc>,
+    store: &ds_storage::DataStore,
+    base_prefix: &str,
+    template: &str,
+    cadence: Duration,
+    time_window: Option<&TimeWindow>,
+    max_files: Option<usize>,
+) -> Result<Vec<CatalogEntry>, EngineError> {
+    use ds_storage::object_store::path::Path as ObjectPath;
+
+    let cadence_secs = (cadence.as_secs().max(1)) as i64;
+
+    // How many timestamp slots back to probe.
+    let window_steps = match time_window {
+        Some(tw) => {
+            let (start, end) = tw.to_range(now);
+            // +1 so the walk includes `now`'s own (aligned) slot.
+            ((end - start).num_seconds().abs() / cadence_secs) as usize + 1
+        }
+        None => HARD_MAX_PROBES,
+    };
+    let bounded = window_steps
+        .min(max_files.unwrap_or(usize::MAX))
+        .min(HARD_MAX_PROBES);
+    let n = bounded.max(1);
+
+    // Align `now` down to the cadence grid (epoch-aligned), then walk back.
+    let now_ts = now.timestamp();
+    let aligned = now_ts - now_ts.rem_euclid(cadence_secs);
+    let stamps: Vec<DateTime<Utc>> = (0..n)
+        .filter_map(|i| DateTime::<Utc>::from_timestamp(aligned - (i as i64) * cadence_secs, 0))
+        .collect();
+
+    // Render candidate filenames via the strftime template, join under the
+    // base prefix, and probe their existence concurrently.
+    let keys: Vec<String> = stamps
+        .iter()
+        .map(|t| join_prefix(base_prefix, &t.format(template).to_string()))
+        .collect();
+    let paths: Vec<ObjectPath> = keys.iter().map(|k| ObjectPath::from(k.as_str())).collect();
+
+    let probed = store.head_many(&paths, PROBE_CONCURRENCY)?;
+
+    let mut entries: Vec<CatalogEntry> = Vec::new();
+    for ((time, key), result) in stamps.iter().zip(keys.iter()).zip(probed.iter()) {
+        match result {
+            Ok(Some(meta)) => {
+                if meta.size as u64 > crate::catalog::MAX_REMOTE_FILE_SIZE {
+                    tracing::warn!(
+                        "[odim-template] skipping oversized object `{key}` ({} bytes)",
+                        meta.size
+                    );
+                    continue;
+                }
+                entries.push(CatalogEntry {
+                    time: *time,
+                    location: Location::Remote {
+                        store: store.clone(),
+                        key: key.clone(),
+                    },
+                });
+            }
+            Ok(None) => {} // absent — expected for most candidate slots
+            Err(e) => tracing::warn!("[odim-template] HEAD `{key}` failed: {e}"),
+        }
+    }
+
+    entries.sort_by_key(|e| e.time);
+    entries.dedup_by(|a, b| a.time == b.time);
+    Ok(entries)
+}
+
+/// Join a base prefix and a filename with exactly one `/` (and none when
+/// the base is empty — an `http(s)://host/` URL pointing at the root).
+fn join_prefix(base_prefix: &str, filename: &str) -> String {
+    if base_prefix.is_empty() {
+        filename.to_string()
+    } else {
+        format!("{}/{}", base_prefix.trim_end_matches('/'), filename)
     }
 }
 
@@ -261,6 +399,25 @@ pub enum EngineError {
          `unit` (only `engine_type = \"odim-volume\"` may omit them)"
     )]
     MissingCompField { field: &'static str },
+    #[error(
+        "ODIM `discovery = \"{value}\"` is not a known mode — use `\"list\"` \
+         (default, WebDAV PROPFIND) or `\"template\"` (HEAD-probe candidate \
+         filenames for non-listable autoindex servers)"
+    )]
+    UnknownDiscovery { value: String },
+    #[error(
+        "ODIM `discovery = \"template\"` requires `filename_template` — the \
+         `filename_pattern` + `timestamp_format` form can't be inverted to a \
+         candidate filename to probe"
+    )]
+    TemplateNeedsFilenameTemplate,
+    #[error(
+        "ODIM `discovery = \"template\"` requires `cadence_secs` > 0 — the \
+         spacing of candidate timestamps to probe (e.g. 300 for a 5-min feed)"
+    )]
+    TemplateNeedsCadence,
+    #[error("ODIM `discovery = \"template\"` only applies to an `http(s)://` `data_path` source")]
+    TemplateNeedsHttp,
 }
 
 impl OdimEngine {
@@ -419,15 +576,51 @@ impl OdimEngine {
         )
     }
 
+    /// Drive the #287 template-discovery probe against a controlled clock —
+    /// the seam the integration suite uses to test the listing-free HTTP
+    /// discovery deterministically (over a `LocalFileSystem`-backed
+    /// `DataStore`, whose `head` returns `NotFound` for absent candidates).
+    /// `time_window` is an ISO 8601 duration string (e.g. `"-PT1H"`).
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn discover_template_for_test(
+        now: DateTime<Utc>,
+        store: ds_storage::DataStore,
+        base_prefix: &str,
+        template: &str,
+        cadence_secs: u64,
+        time_window: Option<&str>,
+        max_files: Option<usize>,
+    ) -> Result<Vec<CatalogEntry>, EngineError> {
+        let tw = match time_window {
+            Some(s) => Some(TimeWindow::parse(s)?),
+            None => None,
+        };
+        discover_template_at(
+            now,
+            &store,
+            base_prefix,
+            template,
+            Duration::from_secs(cadence_secs),
+            tw.as_ref(),
+            max_files,
+        )
+    }
+
     /// Run the source poll loop. Exits when [`OdimEngine::shutdown`]
     /// is called. Each tick re-scans the source, atomically swaps the
     /// catalog `ArcSwap` if the file set changed, and logs at INFO
     /// when new files appear so operators can confirm the polling is
     /// alive.
     ///
-    /// The scan runs on `tokio::task::spawn_blocking` so neither a
-    /// slow filesystem (network mount, large directory) nor a slow S3
-    /// `list` stalls a Tokio worker thread for its duration.
+    /// The scan runs **directly on the background poll runtime worker**,
+    /// NOT via `spawn_blocking`: a remote scan reaches `ds-storage`, whose
+    /// `block_in_place` is valid on a multi-thread-runtime worker but
+    /// *panics* on a `spawn_blocking` pool thread. Wrapping it in
+    /// `spawn_blocking` silently fails every remote (S3 / HTTP / template)
+    /// refresh — the `JoinError` is caught, but the catalog never updates.
+    /// Mirrors the GRIB / GeoTIFF / QueryData / PVOL poll loops, which also
+    /// call their blocking scan directly on the poll runtime.
     ///
     /// Errors from the scan (source temporarily unavailable, S3
     /// timeout) are logged at WARN and otherwise ignored — the
@@ -450,7 +643,7 @@ impl OdimEngine {
                     // returning, and we don't want to do extra I/O on
                     // the way out.
                     if !self.shutdown.load(Ordering::Acquire) {
-                        self.poll_once().await;
+                        self.poll_once();
                     }
                 }
                 _ = self.shutdown_notify.notified() => {
@@ -476,27 +669,17 @@ impl OdimEngine {
         }
     }
 
-    async fn poll_once(&self) {
-        let source = self.source.clone();
-        let matcher = self.matcher.clone();
-        let max_files = self.max_files;
-        let scan_result =
-            tokio::task::spawn_blocking(move || scan_source(&source, &matcher, max_files)).await;
-        let scan = match scan_result {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
+    fn poll_once(&self) {
+        // Direct (not `spawn_blocking`) so a remote scan's `ds-storage`
+        // `block_in_place` runs on the multi-thread poll-runtime worker —
+        // valid there, panics on a `spawn_blocking` thread. See `poll_loop`.
+        let scan = match scan_source(&self.source, &self.matcher, self.max_files) {
+            Ok(s) => s,
+            Err(e) => {
                 tracing::warn!(
                     "[{}] ODIM catalog refresh failed: {}",
                     self.collection_id,
                     e
-                );
-                return;
-            }
-            Err(join_err) => {
-                tracing::error!(
-                    "[{}] ODIM catalog refresh task panicked: {}",
-                    self.collection_id,
-                    join_err
                 );
                 return;
             }
@@ -676,13 +859,21 @@ fn build_matcher(config: &ds_core::config::OdimConfig) -> Result<FilenameMatcher
 ///   with [`ds_storage::build_store`] (the same dispatch the GeoTIFF
 ///   engine uses, so an `amazonaws.com`/`cloudferro.com` URL still
 ///   resolves to S3). The URL path becomes the base prefix; any
-///   `prefix_pattern` is appended under it for date partitioning.
+///   `prefix_pattern` is appended under it. `discovery = "template"`
+///   switches it to the listing-free [`Source::TemplateHttp`] probe
+///   (#287, for non-listable autoindex servers); otherwise it lists.
 /// - a plain `data_path` → a **local** directory.
 fn build_source(
     collection_id: &str,
     data_path: Option<&str>,
     config: &ds_core::config::OdimConfig,
 ) -> Result<Source, EngineError> {
+    // Validate `discovery` up front (catches an unknown value for any
+    // source type); template mode is only valid on HTTP, rejected here for S3.
+    if discovery_mode(config)? == DiscoveryMode::Template && config.endpoint.is_some() {
+        return Err(EngineError::TemplateNeedsHttp);
+    }
+
     match (config.endpoint.as_deref(), config.bucket.as_deref()) {
         (Some(endpoint), Some(bucket)) => {
             // A missing `prefix_pattern` is almost always a config
@@ -714,38 +905,72 @@ fn build_source(
         }
         (None, None) => {
             let data_path = data_path.ok_or(EngineError::NoSource)?;
-            if ds_storage::has_scheme(data_path, "http://")
-                || ds_storage::has_scheme(data_path, "https://")
-            {
-                // HTTP(S) object-store source, mirroring engine-geotiff:
-                // `build_store` dispatches the URL (plain HTTP → WebDAV-
-                // listable `HttpStore`; amazonaws/cloudferro → S3). The
-                // returned base path is the directory the catalog lists;
-                // any `prefix_pattern` is appended for date partitioning.
-                //
-                // NOTE: object_store's `HttpStore` lists via WebDAV
-                // `PROPFIND`, so a plain Apache/nginx autoindex (e.g. DWD
-                // opendata) is *not* discoverable here — that needs the
-                // template-based probe tracked in #287.
+            let is_http = ds_storage::has_scheme(data_path, "http://")
+                || ds_storage::has_scheme(data_path, "https://");
+
+            // `discovery = "template"` only makes sense for an HTTP source —
+            // reject it on a local `data_path` so a misconfig fails loudly.
+            if discovery_mode(config)? == DiscoveryMode::Template && !is_http {
+                return Err(EngineError::TemplateNeedsHttp);
+            }
+
+            if is_http {
+                // `build_store` dispatches the URL (plain HTTP → `HttpStore`;
+                // amazonaws/cloudferro → S3). The returned base path is the
+                // directory; any `prefix_pattern` is appended under it.
                 let (store, base) = ds_storage::build_store(data_path)?;
-                let prefix_pattern =
+                let base_prefix =
                     combine_http_prefix(base.as_ref(), config.prefix_pattern.as_deref());
                 let time_window = match &config.time_window {
                     Some(s) => Some(TimeWindow::parse(s)?),
                     None => None,
                 };
-                tracing::info!(
-                    "[{}] ODIM HTTP source: url={data_path} prefix='{prefix_pattern}'",
-                    collection_id
-                );
-                Ok(Source::Remote {
-                    store,
-                    origin: RemoteOrigin::Http {
-                        base_url: data_path.to_string(),
-                    },
-                    prefix_pattern,
-                    time_window,
-                })
+
+                match discovery_mode(config)? {
+                    // Template probe — for non-listable autoindex servers
+                    // (DWD opendata): no `list`, HEAD candidate filenames
+                    // built from `filename_template` + `cadence_secs`.
+                    DiscoveryMode::Template => {
+                        let template = config
+                            .filename_template
+                            .clone()
+                            .ok_or(EngineError::TemplateNeedsFilenameTemplate)?;
+                        let cadence_secs = config
+                            .cadence_secs
+                            .filter(|c| *c > 0)
+                            .ok_or(EngineError::TemplateNeedsCadence)?;
+                        tracing::info!(
+                            "[{}] ODIM HTTP template source: url={data_path} prefix='{base_prefix}' \
+                             cadence={cadence_secs}s",
+                            collection_id
+                        );
+                        Ok(Source::TemplateHttp {
+                            store,
+                            base_url: data_path.to_string(),
+                            base_prefix,
+                            template,
+                            cadence: Duration::from_secs(cadence_secs),
+                            time_window,
+                        })
+                    }
+                    // List mode (default) — WebDAV `PROPFIND`. NOTE: a plain
+                    // Apache/nginx autoindex is *not* listable; use
+                    // `discovery = "template"` for those.
+                    DiscoveryMode::List => {
+                        tracing::info!(
+                            "[{}] ODIM HTTP source: url={data_path} prefix='{base_prefix}'",
+                            collection_id
+                        );
+                        Ok(Source::Remote {
+                            store,
+                            origin: RemoteOrigin::Http {
+                                base_url: data_path.to_string(),
+                            },
+                            prefix_pattern: base_prefix,
+                            time_window,
+                        })
+                    }
+                }
             } else {
                 Ok(Source::Local {
                     data_dir: PathBuf::from(data_path),
@@ -753,6 +978,25 @@ fn build_source(
             }
         }
         _ => Err(EngineError::IncompleteS3Config),
+    }
+}
+
+/// Parsed `[odim].discovery` mode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiscoveryMode {
+    List,
+    Template,
+}
+
+/// Resolve the discovery mode from config: absent / `"list"` → list,
+/// `"template"` → template, anything else → an explicit error.
+fn discovery_mode(config: &ds_core::config::OdimConfig) -> Result<DiscoveryMode, EngineError> {
+    match config.discovery.as_deref() {
+        None | Some("list") => Ok(DiscoveryMode::List),
+        Some("template") => Ok(DiscoveryMode::Template),
+        Some(other) => Err(EngineError::UnknownDiscovery {
+            value: other.to_string(),
+        }),
     }
 }
 
@@ -798,6 +1042,11 @@ fn source_label(source: &Source) -> String {
                 format!("http {base_url} (prefix '{prefix_pattern}')")
             }
         },
+        Source::TemplateHttp {
+            base_url,
+            base_prefix,
+            ..
+        } => format!("http {base_url} (template-probe, prefix '{base_prefix}')"),
     }
 }
 
@@ -985,6 +1234,8 @@ mod tests {
             bucket: bucket.map(str::to_string),
             prefix_pattern: prefix_pattern.map(str::to_string),
             time_window: time_window.map(str::to_string),
+            discovery: None,
+            cadence_secs: None,
         }
     }
 
@@ -1040,7 +1291,7 @@ mod tests {
                 // The URL path becomes the (flat) list prefix.
                 assert_eq!(prefix_pattern, "weather/radar/composite/hx");
             }
-            Source::Local { .. } => panic!("http data_path must not be a Local source"),
+            _ => panic!("http data_path (list mode) must be a Source::Remote"),
         }
 
         // The label names the HTTP URL, not an S3 bucket.
@@ -1085,8 +1336,100 @@ mod tests {
                     "time_window must apply to an HTTP source"
                 );
             }
-            Source::Local { .. } => panic!("expected a remote HTTP source"),
+            _ => panic!("expected a remote HTTP source"),
         }
+    }
+
+    /// `discovery = "template"` on an `http(s)://` source with a
+    /// `filename_template` + `cadence_secs` builds a `TemplateHttp` source
+    /// (the #287 listing-free probe), carrying the URL path as the base
+    /// prefix and the template + cadence verbatim.
+    #[test]
+    fn build_source_template_mode_builds_template_http() {
+        let mut config = config_with(None, None, None, Some("-PT2H"));
+        config.filename_template = Some("composite_hx_%Y%m%d_%H%M-hd5".into());
+        config.discovery = Some("template".into());
+        config.cadence_secs = Some(300);
+
+        let source = build_source(
+            "dwd",
+            Some("https://opendata.dwd.de/weather/radar/composite/hx/"),
+            &config,
+        )
+        .expect("template-mode http source builds");
+        match &source {
+            Source::TemplateHttp {
+                base_prefix,
+                template,
+                cadence,
+                time_window,
+                ..
+            } => {
+                assert_eq!(base_prefix, "weather/radar/composite/hx");
+                assert_eq!(template, "composite_hx_%Y%m%d_%H%M-hd5");
+                assert_eq!(*cadence, Duration::from_secs(300));
+                assert!(time_window.is_some());
+            }
+            _ => panic!("discovery=template must build a TemplateHttp source"),
+        }
+        // The label flags the listing-free probe mode.
+        assert!(
+            source_label(&source).contains("template-probe"),
+            "source_label should mark template-probe mode, got `{}`",
+            source_label(&source)
+        );
+    }
+
+    /// Template mode requires `cadence_secs` (> 0) and `filename_template`,
+    /// only applies to HTTP, and rejects an unknown `discovery` value.
+    #[test]
+    fn build_source_template_mode_validation() {
+        let http = "https://h.example/radar/";
+
+        // Missing cadence.
+        let mut c = config_with(None, None, None, None);
+        c.filename_template = Some("c_%Y%m%d_%H%M.h5".into());
+        c.discovery = Some("template".into());
+        assert!(matches!(
+            build_source("t", Some(http), &c),
+            Err(EngineError::TemplateNeedsCadence)
+        ));
+        // cadence = 0 is also rejected.
+        c.cadence_secs = Some(0);
+        assert!(matches!(
+            build_source("t", Some(http), &c),
+            Err(EngineError::TemplateNeedsCadence)
+        ));
+
+        // Template form required — the `filename_pattern` form can't be inverted.
+        let mut c = config_with(None, None, None, None);
+        c.filename_template = None;
+        c.filename_pattern = Some(r"^c-(?P<timestamp>\d{12})\.h5$".into());
+        c.timestamp_format = Some("%Y%m%d%H%M".into());
+        c.discovery = Some("template".into());
+        c.cadence_secs = Some(300);
+        assert!(matches!(
+            build_source("t", Some(http), &c),
+            Err(EngineError::TemplateNeedsFilenameTemplate)
+        ));
+
+        // Template mode only applies to HTTP — rejected on a local data_path.
+        let mut c = config_with(None, None, None, None);
+        c.filename_template = Some("c_%Y%m%d_%H%M.h5".into());
+        c.discovery = Some("template".into());
+        c.cadence_secs = Some(300);
+        assert!(matches!(
+            build_source("t", Some("/var/lib/radar"), &c),
+            Err(EngineError::TemplateNeedsHttp)
+        ));
+
+        // Unknown discovery value is an explicit error.
+        let mut c = config_with(None, None, None, None);
+        c.discovery = Some("bogus".into());
+        assert!(matches!(
+            build_source("t", Some(http), &c),
+            Err(EngineError::UnknownDiscovery { value }) if value == "bogus"
+        ));
     }
 
     /// A plain (non-URL) `data_path` is still a local directory source.

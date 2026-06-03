@@ -4019,6 +4019,8 @@ mod tests {
             bucket: None,
             prefix_pattern: None,
             time_window: None,
+            discovery: None,
+            cadence_secs: None,
         }
     }
 
