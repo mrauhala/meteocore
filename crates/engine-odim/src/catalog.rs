@@ -300,14 +300,14 @@ pub fn scan_remote(
 
     if entries.is_empty() && !errors.is_empty() {
         return Err(DataServerError::Engine(format!(
-            "all {} ODIM S3 prefix scan(s) failed: {}",
+            "all {} ODIM remote prefix scan(s) failed: {}",
             errors.len(),
             errors.join("; ")
         )));
     }
     if !errors.is_empty() {
         warn!(
-            "[catalog] {} ODIM S3 prefix scan(s) failed (kept {} entries from the rest): {}",
+            "[catalog] {} ODIM remote prefix scan(s) failed (kept {} entries from the rest): {}",
             errors.len(),
             entries.len(),
             errors.join("; ")
