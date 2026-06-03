@@ -642,14 +642,12 @@ struct PendingFile {
 enum FetchSpec {
     /// A local filesystem path, read with `std::fs::read`.
     Local(PathBuf),
-    /// An object `key` within `store` (S3/HTTP), fetched via the store.
-    /// Carrying the (cheap `Arc`-clone) `store` makes the file
-    /// self-describing so [`build_catalog`] can collect every remote file
-    /// and download them concurrently.
-    Remote {
-        store: ds_storage::DataStore,
-        key: String,
-    },
+    /// An object `key` within the scan's single source store (S3/HTTP).
+    /// The store isn't carried per-file: a scan has exactly one
+    /// [`Source`], so [`build_catalog`] receives that one store and uses
+    /// it for every remote key — letting it batch them into one
+    /// bounded-concurrent download.
+    Remote { key: String },
 }
 
 /// Max concurrent volume downloads in [`build_catalog`]'s remote fetch.
@@ -679,7 +677,7 @@ fn scan_source(
         // full regardless of `depth`.
         Source::Local { data_dir } => {
             let pending = enumerate_local(collection_id, data_dir)?;
-            let by_site = build_catalog(collection_id, pending, cache);
+            let by_site = build_catalog(collection_id, pending, None, cache);
             Ok(derive_catalog(by_site, cache, max_files))
         }
         Source::Remote {
@@ -690,7 +688,7 @@ fn scan_source(
         } => {
             let (pending, time_filter) =
                 enumerate_remote(collection_id, store, prefix_pattern, time_window, depth)?;
-            let mut by_site = build_catalog(collection_id, pending, cache);
+            let mut by_site = build_catalog(collection_id, pending, Some(store), cache);
             // A `time_window` also bounds the timestamps kept: the
             // object listing can include volumes just outside the
             // window (the prefix is a whole UTC day).
@@ -916,10 +914,7 @@ fn enumerate_remote(
         .into_iter()
         .map(|(key, _)| PendingFile {
             id: key.clone(),
-            spec: FetchSpec::Remote {
-                store: store.clone(),
-                key,
-            },
+            spec: FetchSpec::Remote { key },
         })
         .collect();
 
@@ -950,15 +945,15 @@ fn enumerate_remote(
 fn build_catalog(
     collection_id: &str,
     pending: Vec<PendingFile>,
+    store: Option<&ds_storage::DataStore>,
     cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
 ) -> HashMap<String, Vec<VolumeEntry>> {
     use ds_storage::object_store::path::Path as ObjectPath;
 
     let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
-    // Remote files needing a fetch, gathered for one bounded-concurrent
-    // download pass. Each carries its store (a cheap `Arc` clone; all share
-    // the source's store) so a future mixed-source scan would still work.
-    let mut remote_fetch: Vec<(FileId, ds_storage::DataStore, ObjectPath)> = Vec::new();
+    // Remote keys needing a fetch, gathered for one bounded-concurrent
+    // download pass against the scan's single source `store`.
+    let mut remote_fetch: Vec<(FileId, ObjectPath)> = Vec::new();
 
     for PendingFile { id, spec } in pending {
         // Cache hit — reuse the parsed volume, no fetch.
@@ -981,11 +976,25 @@ fn build_catalog(
                 Err(e) => tracing::warn!("[{collection_id}] skipping PVOL file `{id}`: {e}"),
             },
             // Defer remote reads to the concurrent batch below.
-            FetchSpec::Remote { store, key } => {
-                remote_fetch.push((id, store, ObjectPath::from(key.as_str())));
+            FetchSpec::Remote { key } => {
+                remote_fetch.push((id, ObjectPath::from(key.as_str())));
             }
         }
     }
+
+    // A `Remote` spec can only come from a `Source::Remote` scan, which
+    // always passes its store — so this is unreachable in practice; guard
+    // rather than `expect` so a future refactor degrades to a warning, not
+    // a panic.
+    let Some(store) = store else {
+        if !remote_fetch.is_empty() {
+            tracing::warn!(
+                "[{collection_id}] {} remote PVOL file(s) enumerated without a store — skipped",
+                remote_fetch.len()
+            );
+        }
+        return by_site;
+    };
 
     // Download the remote misses concurrently, in `FETCH_CONCURRENCY`-sized
     // chunks so peak memory stays ~one chunk of raw volumes (each chunk's
@@ -993,8 +1002,7 @@ fn build_catalog(
     // next). This parallelises the dominant scan cost — the per-file S3
     // download — turning a sequential ~N×RTT stall into ~N/concurrency.
     for chunk in remote_fetch.chunks(FETCH_CONCURRENCY) {
-        let store = chunk[0].1.clone();
-        let paths: Vec<ObjectPath> = chunk.iter().map(|(_, _, p)| p.clone()).collect();
+        let paths: Vec<ObjectPath> = chunk.iter().map(|(_, p)| p.clone()).collect();
         let results = match store.get_many(&paths, FETCH_CONCURRENCY, Some(MAX_REMOTE_FILE_SIZE)) {
             Ok(r) => r,
             Err(e) => {
@@ -1002,7 +1010,7 @@ fn build_catalog(
                 continue;
             }
         };
-        for ((id, _, _), res) in chunk.iter().zip(results) {
+        for ((id, _), res) in chunk.iter().zip(results) {
             match res {
                 Ok(bytes) => {
                     if let Some(v) = parse_and_cache(collection_id, id, &bytes, cache) {
