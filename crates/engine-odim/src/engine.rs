@@ -127,6 +127,11 @@ fn scan_source(
     source: &Source,
     matcher: &FilenameMatcher,
     max_files: Option<usize>,
+    // The current catalog, used only by the template-probe source to skip
+    // re-probing already-known slots. Empty at construction; the poll
+    // passes the live catalog. List-based sources ignore it (one `list`
+    // call already returns the whole set cheaply).
+    known: &[CatalogEntry],
 ) -> Result<Vec<CatalogEntry>, EngineError> {
     match source {
         Source::Local { data_dir } => Ok(scan_local_directory(data_dir, matcher, max_files)?),
@@ -170,6 +175,7 @@ fn scan_source(
             *cadence,
             time_window.as_ref(),
             max_files,
+            known,
         )?),
     }
 }
@@ -178,16 +184,25 @@ fn scan_source(
 /// candidate filenames instead of listing the directory.
 ///
 /// Builds one candidate per timestamp from `now` walked back by `cadence`
-/// — `N = min(window/cadence, max_files, HARD_MAX_PROBES)` steps — renders
-/// each filename with `time.format(template)` (the strftime inverse of the
-/// catalog matcher), joins it under `base_prefix`, and `HEAD`-probes them
-/// all concurrently. Existing objects become [`CatalogEntry`] values whose
-/// timestamp is the one we generated (no parsing needed); the bytes are
-/// fetched lazily on render via [`fetch_bytes`]. Sorted ascending, deduped
-/// by timestamp.
+/// — `N = min(window/cadence, max_files, HARD_MAX_PROBES)` steps — and
+/// renders each filename with `time.format(template)` (the strftime
+/// inverse of the catalog matcher) joined under `base_prefix`.
+///
+/// **Incremental.** A candidate already present in `known` (the current
+/// catalog) is carried forward unchanged — radar files are immutable once
+/// published, so re-`HEAD`-ing them is pure overhead. Only the candidates
+/// *not* in `known` are `HEAD`-probed (concurrently): the freshly-arrived
+/// newest slot, plus any still-missing slots (a gap or a late upload),
+/// which keep being retried until they arrive or age out of the window.
+/// So the first scan probes the whole window, but each subsequent poll
+/// probes only ~one slot. Survivors (carried + newly-found) become
+/// [`CatalogEntry`] values whose timestamp is the one we generated (no
+/// parsing); bytes are fetched lazily on render via [`fetch_bytes`].
+/// Sorted ascending, deduped by timestamp.
 ///
 /// `now` is a parameter (not `Utc::now()` inside) so the probe is
 /// deterministically testable against a controlled clock.
+#[allow(clippy::too_many_arguments)]
 fn discover_template_at(
     now: DateTime<Utc>,
     store: &ds_storage::DataStore,
@@ -196,8 +211,10 @@ fn discover_template_at(
     cadence: Duration,
     time_window: Option<&TimeWindow>,
     max_files: Option<usize>,
+    known: &[CatalogEntry],
 ) -> Result<Vec<CatalogEntry>, EngineError> {
     use ds_storage::object_store::path::Path as ObjectPath;
+    use std::collections::HashMap;
 
     let cadence_secs = (cadence.as_secs().max(1)) as i64;
 
@@ -222,18 +239,35 @@ fn discover_template_at(
         .filter_map(|i| DateTime::<Utc>::from_timestamp(aligned - (i as i64) * cadence_secs, 0))
         .collect();
 
-    // Render candidate filenames via the strftime template, join under the
-    // base prefix, and probe their existence concurrently.
-    let keys: Vec<String> = stamps
+    // Carry forward already-known in-window entries (no re-probe); collect
+    // the rest as the slots to actually HEAD.
+    let known_by_time: HashMap<DateTime<Utc>, &CatalogEntry> =
+        known.iter().map(|e| (e.time, e)).collect();
+    let mut entries: Vec<CatalogEntry> = Vec::new();
+    let mut probe_stamps: Vec<DateTime<Utc>> = Vec::new();
+    for stamp in &stamps {
+        match known_by_time.get(stamp) {
+            Some(entry) => entries.push((*entry).clone()),
+            None => probe_stamps.push(*stamp),
+        }
+    }
+
+    // Render + probe only the unknown candidates' filenames concurrently.
+    let probe_keys: Vec<String> = probe_stamps
         .iter()
         .map(|t| join_prefix(base_prefix, &t.format(template).to_string()))
         .collect();
-    let paths: Vec<ObjectPath> = keys.iter().map(|k| ObjectPath::from(k.as_str())).collect();
-
+    let paths: Vec<ObjectPath> = probe_keys
+        .iter()
+        .map(|k| ObjectPath::from(k.as_str()))
+        .collect();
     let probed = store.head_many(&paths, PROBE_CONCURRENCY)?;
 
-    let mut entries: Vec<CatalogEntry> = Vec::new();
-    for ((time, key), result) in stamps.iter().zip(keys.iter()).zip(probed.iter()) {
+    for ((time, key), result) in probe_stamps
+        .iter()
+        .zip(probe_keys.iter())
+        .zip(probed.iter())
+    {
         match result {
             Ok(Some(meta)) => {
                 if meta.size as u64 > crate::catalog::MAX_REMOTE_FILE_SIZE {
@@ -490,7 +524,9 @@ impl OdimEngine {
         max_files: Option<usize>,
         poll_interval_secs: u64,
     ) -> Result<Self, EngineError> {
-        let catalog = scan_source(&source, &matcher, max_files)?;
+        // Construction: no prior catalog, so the template probe scans the
+        // whole window (`known` is empty).
+        let catalog = scan_source(&source, &matcher, max_files, &[])?;
         if catalog.is_empty() {
             return Err(EngineError::NoFiles {
                 location: source_label(&source),
@@ -591,6 +627,7 @@ impl OdimEngine {
         cadence_secs: u64,
         time_window: Option<&str>,
         max_files: Option<usize>,
+        known: &[CatalogEntry],
     ) -> Result<Vec<CatalogEntry>, EngineError> {
         let tw = match time_window {
             Some(s) => Some(TimeWindow::parse(s)?),
@@ -604,6 +641,7 @@ impl OdimEngine {
             Duration::from_secs(cadence_secs),
             tw.as_ref(),
             max_files,
+            known,
         )
     }
 
@@ -670,10 +708,15 @@ impl OdimEngine {
     }
 
     fn poll_once(&self) {
+        // Snapshot the current catalog *before* scanning so the template
+        // probe can carry forward already-known slots and HEAD only the new
+        // ones (list-based sources ignore it). Held across the scan — a
+        // cheap `ArcSwap` guard on the background poll path.
+        let prev = self.catalog.load_full();
         // Direct (not `spawn_blocking`) so a remote scan's `ds-storage`
         // `block_in_place` runs on the multi-thread poll-runtime worker —
         // valid there, panics on a `spawn_blocking` thread. See `poll_loop`.
-        let scan = match scan_source(&self.source, &self.matcher, self.max_files) {
+        let scan = match scan_source(&self.source, &self.matcher, self.max_files, &prev) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -688,7 +731,6 @@ impl OdimEngine {
         // timestamp. Producing-side renames are rare; this is cheap
         // and accurate for the append-only / rolling-window case ODIM
         // producers actually use.
-        let prev = self.catalog.load();
         let prev_count = prev.len();
         let prev_latest = prev.last().map(|e| e.time);
         let new_latest = scan.last().map(|e| e.time);

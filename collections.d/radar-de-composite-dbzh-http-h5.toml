@@ -1,0 +1,48 @@
+# DWD Germany radar composite HX (ODIM_H5 v2.3) — HTTP source, template discovery.
+#
+# Streams `composite_hx_YYYYMMDD_HHMM-hd5` composites directly from DWD open
+# data over plain HTTP — no local mirror, no S3. DWD serves the directory as
+# an Apache autoindex (HTML), which `object_store`'s HttpStore can't list (it
+# lists via WebDAV PROPFIND, which autoindex doesn't support). So this uses
+# `discovery = "template"` (#287): candidate filenames are built from
+# `filename_template` + `cadence_secs` walked back from now over `time_window`
+# and probed directly with HEAD — no listing required.
+#
+#   https://opendata.dwd.de/weather/radar/composite/hx/
+#
+# 4400×4800 grid at 250m/px over Germany + neighbours, polar stereographic
+# (lat_0=90, lat_ts=60, lon_0=10 — same family as FMI/OPERA composites). DBZH
+# quantity, u16 pixels (gain=0.00293, offset=-64 → -64..+128 dBZ; nodata=65535,
+# undetect=0). A new composite lands every 5 minutes; DWD keeps a rolling ~48h
+# archive.
+#
+# The first scan probes the whole `time_window` (~25 HEADs for -PT2H); the
+# probe is incremental, so each poll thereafter only HEADs the new slot(s)
+# — already-known slots are carried forward, not re-probed. So a wider
+# `time_window` (up to 24h = the 288-candidate cap) costs more only at boot.
+#
+# NOTE: DWD's URLs carry no file extension, so the template ends in `-hd5` —
+# unlike the local twin `radar-de-composite-dbzh-local-h5`, which appends `.h5`
+# to the saved sample files.
+
+id = "radar-de-composite-dbzh-http-h5"
+title = "DWD — radar reflectivity composite (HTTP, ODIM_H5)"
+description = "German radar reflectivity (DBZH) composite (HX product) from DWD open data, streamed over HTTP via listing-free template discovery. Polar stereographic projection."
+engine_type = "odim"
+apis = ["edr", "wms", "maps", "tiles"]
+data_path = "https://opendata.dwd.de/weather/radar/composite/hx/"
+
+[odim]
+filename_template = "composite_hx_%Y%m%d_%H%M-hd5"
+parameter = "reflectivity"
+unit = "dBZ"
+# Listing-free discovery for DWD's non-listable autoindex (#287).
+discovery = "template"
+# 5-minute composite cadence — the spacing of probed candidate timestamps.
+cadence_secs = 300
+# Keep the last 2h in the catalog (25 HEAD probes/poll); DWD retains ~48h.
+time_window = "-PT2H"
+poll_interval_secs = 300
+
+[wms]
+colormap = "radar_dbz"

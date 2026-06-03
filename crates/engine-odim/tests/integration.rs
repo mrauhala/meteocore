@@ -1154,6 +1154,7 @@ fn comp_template_discovery_probes_present_slots_only() {
         cadence_secs,
         Some("-PT30M"),
         None,
+        &[], // cold scan — no prior catalog
     )
     .expect("template probe succeeds");
 
@@ -1174,4 +1175,76 @@ fn comp_template_discovery_probes_present_slots_only() {
     assert!(catalog
         .iter()
         .all(|e| e.location.id().starts_with("composite_hx_")));
+}
+
+/// #287 — incremental polling: a slot already in `known` is carried
+/// forward WITHOUT being re-probed (radar files are immutable), so only
+/// genuinely-new slots cost a `HEAD`.
+///
+/// Proven by making the known slots' files **absent from disk**: if the
+/// probe re-`HEAD`-ed them they'd 404 and drop out; their survival proves
+/// they were carried forward, not re-probed. Meanwhile a new slot that
+/// *does* exist on disk is discovered.
+#[test]
+fn comp_template_discovery_carries_forward_known_without_reprobe() {
+    use chrono::{TimeZone, Utc};
+    use engine_odim::catalog::{CatalogEntry, Location};
+
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let template = "composite_hx_%Y%m%d_%H%M-hd5";
+    let now = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
+
+    // On disk: ONLY the freshest slot (now). The two older slots are NOT
+    // written — they exist only in `known`.
+    let now_name = now.format(template).to_string();
+    std::fs::write(dir.path().join(&now_name), b"x").unwrap();
+
+    let (store, _base) = ds_storage::build_store(
+        dir.path()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .expect("utf8 path"),
+    )
+    .unwrap();
+
+    // `known` carries the two older slots (11:55, 11:50) whose files are absent.
+    let known: Vec<CatalogEntry> = [5i64, 10]
+        .iter()
+        .map(|&back| {
+            let t = now - chrono::Duration::minutes(back);
+            CatalogEntry {
+                time: t,
+                location: Location::Remote {
+                    store: store.clone(),
+                    key: t.format(template).to_string(),
+                },
+            }
+        })
+        .collect();
+
+    let catalog = engine_odim::OdimEngine::discover_template_for_test(
+        now,
+        store,
+        "",
+        template,
+        300,
+        Some("-PT30M"),
+        None,
+        &known,
+    )
+    .expect("incremental probe succeeds");
+
+    // All three present: the two carried-forward (file-less) known slots and
+    // the one freshly-probed slot — proving known slots were NOT re-HEADed.
+    let times: Vec<String> = catalog.iter().map(|e| e.time.to_rfc3339()).collect();
+    assert_eq!(
+        times,
+        [
+            "2026-06-03T11:50:00+00:00", // carried forward (no file on disk)
+            "2026-06-03T11:55:00+00:00", // carried forward (no file on disk)
+            "2026-06-03T12:00:00+00:00", // freshly discovered by HEAD
+        ],
+        "known slots must be carried forward without re-probing"
+    );
 }
