@@ -144,7 +144,11 @@ fn add_tag(feature: &mut mvt::Feature, key: &str, value: &PropertyValue) {
                 .filter_map(scalar_tag_string)
                 .collect::<Vec<_>>()
                 .join(",");
-            feature.add_tag_string(key, &joined);
+            // An empty / all-null list contributes no scalar value — drop the
+            // tag entirely, matching how `Null` is handled (no empty-string tag).
+            if !joined.is_empty() {
+                feature.add_tag_string(key, &joined);
+            }
         }
     }
 }
@@ -657,6 +661,27 @@ mod tests {
         // string stored in plaintext within the protobuf.
         assert!(slice_contains(&bytes, b"quantities"));
         assert!(slice_contains(&bytes, b"DBZH,VRADH"));
+    }
+
+    #[test]
+    fn encode_point_drops_all_null_list_tag() {
+        // A list with no scalar items flattens to "" — the tag must be dropped
+        // entirely (like a bare Null), not written as an empty-string value.
+        let f = feature(
+            "1",
+            Geometry::Point { x: 0.0, y: 0.0 },
+            &[
+                ("empty", PropertyValue::List(vec![PropertyValue::Null])),
+                ("name", PropertyValue::String("origin".into())),
+            ],
+        );
+        let opts = TileEncodeOptions::new("points", TmsKind::WebMercatorQuad);
+        let bytes = encode_tile(&[f], web_mercator_tile_z0(), &opts).unwrap();
+        assert!(slice_contains(&bytes, b"name"), "scalar tag still present");
+        assert!(
+            !slice_contains(&bytes, b"empty"),
+            "an all-null list tag must be dropped"
+        );
     }
 
     #[test]

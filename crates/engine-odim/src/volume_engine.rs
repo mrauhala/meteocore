@@ -2742,7 +2742,9 @@ impl FeatureEngine for PolarVolumeEngine {
         } else {
             query.limit
         };
-        let end = (offset + limit).min(number_matched);
+        // Saturating: `limit` may be an un-capped query param; `offset + limit`
+        // would otherwise wrap in release before the clamp.
+        let end = offset.saturating_add(limit).min(number_matched);
         let features: Vec<Feature> = filtered[offset..end]
             .iter()
             .map(|(nod, m)| self.site_to_feature(nod, m))
@@ -2809,7 +2811,11 @@ impl FeatureEngine for PolarVolumeEngine {
             let epoch = meta.times.last().map(|t| t.timestamp()).unwrap_or(0);
             h = fnv1a_update(h, &epoch.to_le_bytes());
             h = fnv1a_update(h, &(meta.times.len() as u64).to_le_bytes());
-            for q in &meta.quantities {
+            // Sort defensively so the hash is order-independent — it must not
+            // rely on `derive_site_meta` happening to sort `quantities`.
+            let mut qs: Vec<&str> = meta.quantities.iter().map(String::as_str).collect();
+            qs.sort_unstable();
+            for q in qs {
                 h = fnv1a_update(h, q.as_bytes());
             }
         }
