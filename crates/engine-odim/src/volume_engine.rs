@@ -2780,8 +2780,12 @@ impl FeatureEngine for PolarVolumeEngine {
         let catalog = self.catalog.load();
         let mut acc: Option<[f64; 4]> = None;
         for m in catalog.by_site_meta.values() {
-            // Prefer the site's coverage bbox; fall back to its antenna point.
-            let b = m.spatial_extent.unwrap_or([m.lon, m.lat, m.lon, m.lat]);
+            // The Feature geometry is the antenna *point*, and `get_features`
+            // filters `bbox` on that point — so the collection extent must
+            // bound the antenna points, NOT the (much wider) radar coverage
+            // bbox. Advertising the coverage bbox would let a conformant client
+            // query a bbox the extent claims to cover yet get zero results.
+            let b = [m.lon, m.lat, m.lon, m.lat];
             acc = Some(match acc {
                 None => b,
                 Some(a) => [
@@ -2806,6 +2810,13 @@ impl FeatureEngine for PolarVolumeEngine {
         let mut h = 0xcbf2_9ce4_8422_2325_u64; // FNV-1a offset basis
         for (nod, meta) in sites {
             h = fnv1a_update(h, nod.as_bytes());
+            // Corrigible string metadata that feeds Feature properties (`name`,
+            // `wmo`): a re-published volume that fixes a wrong PLC/WMO changes
+            // the feature content even if the nominal time is unchanged.
+            h = fnv1a_update(h, meta.plc.as_deref().unwrap_or("").as_bytes());
+            h = fnv1a_update(h, b"|");
+            h = fnv1a_update(h, meta.wmo.as_deref().unwrap_or("").as_bytes());
+            h = fnv1a_update(h, b"|");
             let epoch = meta.times.last().map(|t| t.timestamp()).unwrap_or(0);
             h = fnv1a_update(h, &epoch.to_le_bytes());
             h = fnv1a_update(h, &(meta.times.len() as u64).to_le_bytes());
@@ -5204,10 +5215,13 @@ mod tests {
         let engine = two_site_engine();
         assert_eq!(FeatureEngine::feature_count(&engine), 2);
         let ext = FeatureEngine::spatial_extent(&engine).expect("extent");
-        // Union must enclose both antenna longitudes (21.0 and 24.5).
-        assert!(
-            ext[0] <= 21.0 && ext[2] >= 24.5,
-            "extent {ext:?} must span both sites"
+        // Tight to the antenna *points* — NOT the (~100 km wide) coverage bbox
+        // these synthetic sites also carry — so the extent matches what `bbox`
+        // filters on. fikor (21.0, 60.0) and fivih (24.5, 60.3).
+        assert_eq!(
+            ext,
+            [21.0, 60.0, 24.5, 60.3],
+            "extent must bound antenna points only, got {ext:?}"
         );
     }
 
