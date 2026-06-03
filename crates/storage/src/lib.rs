@@ -194,20 +194,42 @@ impl std::fmt::Debug for DataStore {
     }
 }
 
+/// Case-insensitively test whether `path` begins with a URL `scheme`
+/// prefix (e.g. `"http://"`, `"s3://"`).
+///
+/// Per RFC 3986 §3.1 URL schemes are case-insensitive (`HTTP://` and
+/// `http://` are the same scheme), but the remainder of a URL is not —
+/// so only the prefix is folded. The comparison is byte-wise so a
+/// non-ASCII `path` can't trip a UTF-8 boundary panic.
+pub fn has_scheme(path: &str, scheme: &str) -> bool {
+    let scheme = scheme.as_bytes();
+    let bytes = path.as_bytes();
+    bytes.len() >= scheme.len() && bytes[..scheme.len()].eq_ignore_ascii_case(scheme)
+}
+
+/// Case-insensitively strip a URL `scheme` prefix, returning the
+/// remainder, or `None` when `path` doesn't start with `scheme`.
+/// `scheme` is ASCII, so the matched prefix length is a valid UTF-8
+/// boundary to slice at.
+fn strip_scheme<'a>(path: &'a str, scheme: &str) -> Option<&'a str> {
+    has_scheme(path, scheme).then(|| &path[scheme.len()..])
+}
+
 /// Build a `DataStore` from a data path string.
 ///
-/// Auto-detects the backend from the path prefix:
+/// Auto-detects the backend from the path prefix (schemes are matched
+/// case-insensitively, per [`has_scheme`]):
 /// - `s3://bucket/prefix/` → Amazon S3 (credentials from AWS standard chain)
 /// - `https://...` or `http://...` → HTTP object store
 /// - Anything else → Local filesystem
 ///
 /// Returns the store and the base path within that store.
 pub fn build_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServerError> {
-    if data_path.starts_with("s3://") {
+    if has_scheme(data_path, "s3://") {
         build_s3_store(data_path)
     } else if is_s3_http_url(data_path) {
         build_s3_from_http_url(data_path)
-    } else if data_path.starts_with("http://") || data_path.starts_with("https://") {
+    } else if has_scheme(data_path, "http://") || has_scheme(data_path, "https://") {
         build_http_store(data_path)
     } else {
         build_local_store(data_path)
@@ -226,7 +248,7 @@ pub fn build_s3_store_from_parts(
     endpoint: &str,
     bucket: &str,
 ) -> Result<DataStore, DataServerError> {
-    let allow_http = endpoint.starts_with("http://");
+    let allow_http = has_scheme(endpoint, "http://");
 
     let store = object_store::aws::AmazonS3Builder::new()
         .with_bucket_name(bucket)
@@ -264,9 +286,8 @@ fn build_local_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataSer
 }
 
 fn build_s3_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServerError> {
-    // Parse s3://bucket/prefix/path/
-    let without_scheme = data_path
-        .strip_prefix("s3://")
+    // Parse s3://bucket/prefix/path/ (scheme matched case-insensitively).
+    let without_scheme = strip_scheme(data_path, "s3://")
         .ok_or_else(|| DataServerError::Storage("Expected s3:// prefix".into()))?;
 
     let (bucket, prefix) = match without_scheme.find('/') {
@@ -389,6 +410,30 @@ fn build_http_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServ
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn has_scheme_is_case_insensitive_on_the_prefix_only() {
+        // Scheme matches regardless of case (RFC 3986 §3.1).
+        for url in [
+            "http://example.com/x",
+            "HTTP://example.com/x",
+            "HtTp://example.com/x",
+        ] {
+            assert!(has_scheme(url, "http://"), "{url} should match http://");
+        }
+        assert!(has_scheme("S3://bucket/key", "s3://"));
+        assert!(has_scheme("HTTPS://h/p", "https://"));
+
+        // Non-matches: different scheme, no scheme, or shorter than the prefix.
+        assert!(!has_scheme("ftp://h/p", "http://"));
+        assert!(!has_scheme("/local/path", "http://"));
+        assert!(!has_scheme("htt", "http://"));
+        assert!(!has_scheme("", "s3://"));
+        // The fold applies to the scheme only — the path keeps its case,
+        // which `strip_scheme` must preserve verbatim.
+        assert_eq!(strip_scheme("S3://Bucket/Key", "s3://"), Some("Bucket/Key"));
+        assert_eq!(strip_scheme("/local", "s3://"), None);
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn local_store_list() {

@@ -714,7 +714,9 @@ fn build_source(
         }
         (None, None) => {
             let data_path = data_path.ok_or(EngineError::NoSource)?;
-            if data_path.starts_with("http://") || data_path.starts_with("https://") {
+            if ds_storage::has_scheme(data_path, "http://")
+                || ds_storage::has_scheme(data_path, "https://")
+            {
                 // HTTP(S) object-store source, mirroring engine-geotiff:
                 // `build_store` dispatches the URL (plain HTTP → WebDAV-
                 // listable `HttpStore`; amazonaws/cloudferro → S3). The
@@ -1046,6 +1048,21 @@ mod tests {
         assert!(
             label.starts_with("http https://opendata.example.org/"),
             "source_label should name the HTTP base URL, got `{label}`"
+        );
+    }
+
+    /// URL schemes are case-insensitive (RFC 3986) — an uppercase
+    /// `HTTPS://` `data_path` must still route to a remote source, not
+    /// fall through to a `Source::Local` that errors as a missing
+    /// directory.
+    #[test]
+    fn build_source_http_scheme_is_case_insensitive() {
+        let config = config_with(None, None, None, None);
+        let source = build_source("http-test", Some("HTTPS://host.example/radar/"), &config)
+            .expect("uppercase https data_path builds a remote source");
+        assert!(
+            matches!(source, Source::Remote { .. }),
+            "an HTTPS:// data_path must select a remote source"
         );
     }
 
