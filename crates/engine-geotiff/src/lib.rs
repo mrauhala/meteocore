@@ -277,9 +277,9 @@ impl GeoTiffEngine {
                 display,
             )
         } else if let Some(data_path) = data_path {
-            let is_remote = data_path.starts_with("s3://")
-                || data_path.starts_with("http://")
-                || data_path.starts_with("https://");
+            let is_remote = ds_storage::has_scheme(data_path, "s3://")
+                || ds_storage::has_scheme(data_path, "http://")
+                || ds_storage::has_scheme(data_path, "https://");
 
             if is_remote {
                 let (store, prefix) = ds_storage::build_store(data_path)?;
