@@ -390,16 +390,11 @@ pub fn page_query_string(
     push("datetime", datetime);
     push("q", q);
     push("limit", limit);
-    if offset > 0 {
-        parts.push(format!("offset={offset}"));
-    }
     // Preserve the requested format across pagination links so an HTML
     // `/collections` page's next/prev links stay HTML (don't revert to JSON).
-    // Pushed directly rather than via the `push` closure: the closure borrows
-    // `parts` mutably, and re-invoking it here (after the direct `offset` push)
-    // would overlap that borrow — so `f` is appended inline instead.
-    if let Some(v) = f.map(str::trim).filter(|s| !s.is_empty()) {
-        parts.push(format!("f={}", encode_qval(v)));
+    push("f", f);
+    if offset > 0 {
+        parts.push(format!("offset={offset}"));
     }
     if parts.is_empty() {
         String::new()
@@ -695,7 +690,7 @@ mod tests {
             f: Some("html".to_string()),
             ..Default::default()
         };
-        assert_eq!(sp.query_string(DEFAULT_LIMIT, 20), "?offset=20&f=html");
+        assert_eq!(sp.query_string(DEFAULT_LIMIT, 20), "?f=html&offset=20");
         // No format requested → links omit f.
         let none = SearchQueryParams::default();
         assert_eq!(none.query_string(DEFAULT_LIMIT, 20), "?offset=20");

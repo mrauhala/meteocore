@@ -75,7 +75,10 @@ pub fn negotiate(f: Option<&str>, accept: Option<&str>) -> Result<Wanted, Negoti
 /// q-value for `text/html` is taken from the **most specific** matching range —
 /// an exact `text/html` overrides the `text/*` wildcard (RFC 9110 §12.5.1), so
 /// `text/html;q=0, text/*` correctly yields JSON. `*/*` is ignored entirely, so
-/// API clients sending `Accept: */*` (e.g. curl) stay on the JSON default.
+/// API clients sending `Accept: */*` (e.g. curl) stay on the JSON default. A
+/// malformed q-value (e.g. `q=abc`) is treated as `0` — not acceptable — so a
+/// garbled header falls back to the safe JSON default rather than being read as
+/// maximally preferred.
 fn accept_allows_html(accept: &str) -> bool {
     let mut exact: Option<f32> = None; // q of an explicit `text/html` range
     let mut wildcard: Option<f32> = None; // q of a `text/*` range
@@ -90,7 +93,7 @@ fn accept_allows_html(accept: &str) -> bool {
         let mut q = 1.0_f32; // absent q defaults to 1.0
         for p in parts {
             if let Some(v) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
-                q = v.trim().parse::<f32>().unwrap_or(1.0);
+                q = v.trim().parse::<f32>().unwrap_or(0.0);
             }
         }
         if is_exact {
@@ -153,7 +156,7 @@ fn render_links(links: &[LinkView], class: &str) -> String {
     if links.is_empty() {
         return String::new();
     }
-    let mut s = format!("<ul class=\"{class}\">\n");
+    let mut s = format!("<ul class=\"{}\">\n", escape(class));
     for l in links {
         let label = l
             .title
@@ -303,6 +306,18 @@ mod tests {
         assert_eq!(
             negotiate(None, Some("text/html, text/*;q=0")).unwrap(),
             Wanted::Html
+        );
+        // A malformed q-value must NOT be read as maximally preferred — it falls
+        // back to the safe JSON default (regression: was `unwrap_or(1.0)`).
+        assert_eq!(
+            negotiate(None, Some("text/html;q=abc")).unwrap(),
+            Wanted::Json
+        );
+        // Malformed exact still loses to a healthy wildcard? No — most-specific
+        // wins, so the garbled exact (q=0) overrides text/* and yields JSON.
+        assert_eq!(
+            negotiate(None, Some("text/html;q=nope, text/*")).unwrap(),
+            Wanted::Json
         );
     }
 
