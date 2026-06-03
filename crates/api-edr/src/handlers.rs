@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
@@ -74,6 +74,30 @@ fn server_error() -> HandlerError {
     )
 }
 
+/// A 400 from a plain message (used for `?f=` content negotiation errors).
+fn bad_request_msg(msg: &str) -> HandlerError {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "code": "BadRequest", "description": msg })),
+    )
+}
+
+/// Resolve the requested representation from `?f=` + the `Accept` header.
+fn negotiate(f: Option<&str>, headers: &HeaderMap) -> Result<ds_core::html::Wanted, HandlerError> {
+    let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
+    ds_core::html::negotiate(f, accept).map_err(|e| bad_request_msg(&e.to_string()))
+}
+
+/// Tag a content-negotiated response with `Vary: Accept` so shared caches
+/// don't serve the JSON body to a client that asked for HTML (or vice versa).
+/// Uses `append` (not `insert`) so it never clobbers a `Vary` an upstream layer
+/// may have set (e.g. compression's `Vary: Accept-Encoding`).
+fn with_vary(mut resp: Response) -> Response {
+    resp.headers_mut()
+        .append(header::VARY, axum::http::HeaderValue::from_static("accept"));
+    resp
+}
+
 /// Shared state for the EDR API: a registry of collection engines + metadata.
 #[derive(Clone)]
 pub struct EdrState {
@@ -130,52 +154,89 @@ fn resolve_request_z(
     Ok(Some(levels))
 }
 
-pub async fn landing_page(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn landing_page(
+    State(state): State<AppState>,
+    Query(fp): Query<ds_core::html::FormatParams>,
+    headers: HeaderMap,
+) -> Result<Response, HandlerError> {
+    use ds_core::html::{LinkView, Wanted};
+    let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let base = &state.base_url;
-    Json(json!({
-        "title": "MeteoCore - EDR",
-        "description": "Metocean Data Server — OGC API EDR",
-        "links": [
-            {
-                "href": format!("{base}/edr/"),
-                "rel": "self",
-                "type": "application/json",
-                "title": "This document"
-            },
-            {
-                "href": format!("{base}/edr/api"),
-                "rel": "service-desc",
-                "type": "application/vnd.oai.openapi+json;version=3.0",
-                "title": "API definition"
-            },
-            {
-                "href": format!("{base}/edr/api/docs"),
-                "rel": "service-doc",
-                "type": "text/html",
-                "title": "API documentation"
-            },
-            {
-                "href": format!("{base}/edr/conformance"),
-                "rel": "conformance",
-                "type": "application/json",
-                "title": "Conformance classes"
-            },
-            {
-                "href": format!("{base}/edr/collections"),
-                "rel": "data",
-                "type": "application/json",
-                "title": "Collections"
-            }
-        ]
+    let title = "MeteoCore - EDR";
+    let description = "Metocean Data Server — OGC API EDR";
+    // (href, rel, type, title) — one source for both representations.
+    let links = [
+        (
+            format!("{base}/edr/"),
+            "self",
+            "application/json",
+            "This document",
+        ),
+        (
+            format!("{base}/edr/api"),
+            "service-desc",
+            "application/vnd.oai.openapi+json;version=3.0",
+            "API definition",
+        ),
+        (
+            format!("{base}/edr/api/docs"),
+            "service-doc",
+            "text/html",
+            "API documentation",
+        ),
+        (
+            format!("{base}/edr/conformance"),
+            "conformance",
+            "application/json",
+            "Conformance classes",
+        ),
+        (
+            format!("{base}/edr/collections"),
+            "data",
+            "application/json",
+            "Collections",
+        ),
+    ];
+    Ok(with_vary(match wanted {
+        Wanted::Json => {
+            let json_links: Vec<_> = links
+                .iter()
+                .map(|(h, r, t, ti)| json!({ "href": h, "rel": r, "type": t, "title": ti }))
+                .collect();
+            Json(json!({ "title": title, "description": description, "links": json_links }))
+                .into_response()
+        }
+        Wanted::Html => {
+            let mut views: Vec<LinkView> = links
+                .iter()
+                .map(|(h, r, _, ti)| LinkView::new(h.clone(), *r, Some(ti)))
+                .collect();
+            // rel="alternate" to the JSON representation (parity with the
+            // collection-detail HTML page), so the HTML landing page links to
+            // its machine-readable twin.
+            views.push(LinkView::new(
+                format!("{base}/edr/?f=json"),
+                "alternate",
+                Some("This document as JSON"),
+            ));
+            Html(ds_core::html::landing_html(title, description, &views)).into_response()
+        }
     }))
 }
 
+/// OpenAPI `f` (output-format) query parameter, shared by the content-negotiated
+/// metadata endpoints (landing, conformance, collections, collection detail).
+fn format_parameter() -> serde_json::Value {
+    json!({"name": "f", "in": "query", "required": false, "schema": {"type": "string", "enum": ["json", "html"]},
+           "description": "Output format. 'json' (default) or 'html'; overrides the Accept header."})
+}
+
 /// OpenAPI `parameters` array for the OGC API – Common – Part 4 searchable
-/// `/collections` query parameters. Documented per the CLAUDE.md rule and
-/// Part 4 §5.5.
+/// `/collections` query parameters (plus the shared `f` format selector).
+/// Documented per the CLAUDE.md rule and Part 4 §5.5.
 fn searchable_collections_parameters() -> serde_json::Value {
-    json!([
+    let mut params = json!([
         {"name": "bbox", "in": "query", "required": false, "schema": {"type": "string"},
          "description": "Filter to collections intersecting this CRS84 bbox: 4 (or 6) comma-separated numbers west,south,east,north."},
         {"name": "bbox-crs", "in": "query", "required": false, "schema": {"type": "string"},
@@ -188,7 +249,12 @@ fn searchable_collections_parameters() -> serde_json::Value {
          "description": "Maximum number of collections per page (default 1000)."},
         {"name": "offset", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0},
          "description": "Number of matching collections to skip (pagination cursor)."}
-    ])
+    ]);
+    params
+        .as_array_mut()
+        .expect("searchable params is a JSON array")
+        .push(format_parameter());
+    params
 }
 
 pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
@@ -218,6 +284,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 "summary": format!("Get {} collection metadata", config.title),
                 "operationId": format!("getCollection_{id}"),
                 "tags": [id],
+                "parameters": [format_parameter()],
                 "responses": {
                     "200": {"description": "Collection metadata"},
                     "404": {"description": "Collection not found"}
@@ -411,6 +478,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             "get": {
                 "summary": "Landing page",
                 "operationId": "getLandingPage",
+                "parameters": [format_parameter()],
                 "responses": {
                     "200": {"description": "Landing page"}
                 }
@@ -420,6 +488,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             "get": {
                 "summary": "Conformance classes",
                 "operationId": "getConformance",
+                "parameters": [format_parameter()],
                 "responses": {
                     "200": {"description": "Conformance classes"}
                 }
@@ -533,44 +602,61 @@ pub async fn api_docs(State(state): State<AppState>) -> impl IntoResponse {
     ))
 }
 
-pub async fn conformance() -> impl IntoResponse {
-    Json(json!({
-        "conformsTo": [
-            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
-            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page",
-            "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/oas30",
-            // OGC API - Common - Part 2: Geospatial Data (20-024). Our
-            // /collections + /collections/{id} already satisfy the Collections
-            // and JSON classes structurally; declaring them makes that
-            // discoverable. The HTML class (.../conf/html) is intentionally
-            // omitted — there is no HTML representation of /collections.
-            "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/collections",
-            "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/json",
-            // OGC API - Common - Part 4 (Discovery within many collections,
-            // draft 25-046): /collections supports bbox/bbox-crs/datetime/q/
-            // limit filtering + offset pagination (numberMatched/Returned +
-            // next/prev links). Sortable/Filterable/Hierarchical not declared.
-            "http://www.opengis.net/spec/ogcapi-common-4/1.0/conf/searchable-collections",
-            "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/core",
-            "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/collections",
-            "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/json",
-            "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/covjson"
-        ]
+pub async fn conformance(
+    State(state): State<AppState>,
+    Query(fp): Query<ds_core::html::FormatParams>,
+    headers: HeaderMap,
+) -> Result<Response, HandlerError> {
+    use ds_core::html::{LinkView, Wanted};
+    let wanted = negotiate(fp.f.as_deref(), &headers)?;
+    let state = state.load_full();
+    let base = &state.base_url;
+    let classes = [
+        "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
+        "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page",
+        "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/oas30",
+        // OGC API - Common - Part 2: Geospatial Data (20-024). /collections +
+        // /collections/{id} satisfy the Collections, JSON, and (now) HTML
+        // classes — the HTML representation is served via `?f=html` / Accept.
+        "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/collections",
+        "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/json",
+        "http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/html",
+        // OGC API - Common - Part 4 (Discovery within many collections,
+        // draft 25-046): /collections supports bbox/bbox-crs/datetime/q/
+        // limit filtering + offset pagination (numberMatched/Returned +
+        // next/prev links). Sortable/Filterable/Hierarchical not declared.
+        "http://www.opengis.net/spec/ogcapi-common-4/1.0/conf/searchable-collections",
+        "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/core",
+        "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/collections",
+        "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/json",
+        "http://www.opengis.net/spec/ogcapi-edr-1/1.1/conf/covjson",
+    ];
+    Ok(with_vary(match wanted {
+        Wanted::Json => Json(json!({ "conformsTo": classes })).into_response(),
+        Wanted::Html => {
+            let nav = [
+                LinkView::new(format!("{base}/edr/"), "up", Some("Landing page")),
+                LinkView::new(
+                    format!("{base}/edr/conformance?f=json"),
+                    "alternate",
+                    Some("This document as JSON"),
+                ),
+            ];
+            Html(ds_core::html::conformance_html(&classes, &nav)).into_response()
+        }
     }))
 }
 
 pub async fn collections(
     State(state): State<AppState>,
     Query(sp): Query<ds_core::collection_search::SearchQueryParams>,
-) -> Result<Json<serde_json::Value>, HandlerError> {
+    headers: HeaderMap,
+) -> Result<Response, HandlerError> {
     use ds_core::collection_search::{search, CollectionMatch};
+    use ds_core::html::Wanted;
 
-    let params = sp.parse().map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "code": "BadRequest", "description": e.to_string() })),
-        )
-    })?;
+    let wanted = negotiate(sp.f.as_deref(), &headers)?;
+    let params = sp.parse().map_err(|e| bad_request_msg(&e.to_string()))?;
     let state = state.load_full();
     let base = &state.base_url;
 
@@ -612,48 +698,124 @@ pub async fn collections(
         })
         .collect();
     let result = search(&matches, &params);
-    let collections: Vec<serde_json::Value> =
-        result.page.iter().map(|&i| rows[i].5.clone()).collect();
-    let number_returned = collections.len();
-
-    let link = |rel: &str, offset: usize, title: Option<&str>| {
-        let mut o = json!({
-            "href": format!("{base}/edr/collections{}", sp.query_string(params.limit, offset)),
-            "rel": rel,
-            "type": "application/json"
-        });
-        if let Some(t) = title {
-            o["title"] = json!(t);
-        }
-        o
+    let href = |offset| {
+        format!(
+            "{base}/edr/collections{}",
+            sp.query_string(params.limit, offset)
+        )
     };
-    let mut links = vec![link("self", params.offset, None)];
-    if result.has_next {
-        links.push(link("next", result.next_offset, Some("Next page")));
-    }
-    if result.has_prev {
-        links.push(link("prev", result.prev_offset, Some("Previous page")));
-    }
 
-    Ok(Json(json!({
-        "collections": collections,
-        "numberMatched": result.number_matched,
-        "numberReturned": number_returned,
-        "links": links
-    })))
+    Ok(with_vary(match wanted {
+        Wanted::Json => {
+            let collections: Vec<serde_json::Value> =
+                result.page.iter().map(|&i| rows[i].5.clone()).collect();
+            let number_returned = collections.len();
+            let link = |rel: &str, offset: usize, title: Option<&str>| {
+                let mut o = json!({ "href": href(offset), "rel": rel, "type": "application/json" });
+                if let Some(t) = title {
+                    o["title"] = json!(t);
+                }
+                o
+            };
+            let mut links = vec![link("self", params.offset, None)];
+            if result.has_next {
+                links.push(link("next", result.next_offset, Some("Next page")));
+            }
+            if result.has_prev {
+                links.push(link("prev", result.prev_offset, Some("Previous page")));
+            }
+            Json(json!({
+                "collections": collections,
+                "numberMatched": result.number_matched,
+                "numberReturned": number_returned,
+                "links": links
+            }))
+            .into_response()
+        }
+        Wanted::Html => {
+            use ds_core::html::{CollectionCard, LinkView};
+            let cards: Vec<CollectionCard> = result
+                .page
+                .iter()
+                .map(|&i| CollectionCard {
+                    id: rows[i].0.clone(),
+                    title: rows[i].1.clone(),
+                    description: rows[i].2.clone(),
+                    self_href: format!("{base}/edr/collections/{}", rows[i].0),
+                })
+                .collect();
+            let mut nav = vec![LinkView::new(
+                href(params.offset),
+                "self",
+                Some("This page"),
+            )];
+            if result.has_next {
+                nav.push(LinkView::new(
+                    href(result.next_offset),
+                    "next",
+                    Some("Next page"),
+                ));
+            }
+            if result.has_prev {
+                nav.push(LinkView::new(
+                    href(result.prev_offset),
+                    "prev",
+                    Some("Previous page"),
+                ));
+            }
+            // rel="alternate" to the JSON representation, preserving the current
+            // bbox/datetime/q/limit/offset filters (parity with the other HTML
+            // metadata pages).
+            nav.push(LinkView::new(
+                format!(
+                    "{base}/edr/collections{}",
+                    sp.query_string_with_format(params.limit, params.offset, "json")
+                ),
+                "alternate",
+                Some("This page as JSON"),
+            ));
+            Html(ds_core::html::collections_html("Collections", &cards, &nav)).into_response()
+        }
+    }))
 }
 
 pub async fn collection(
     Path(id): Path<String>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    Query(fp): Query<ds_core::html::FormatParams>,
+    headers: HeaderMap,
+) -> Result<Response, HandlerError> {
+    use ds_core::html::{CollectionCard, LinkView, Wanted};
+    let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
-    Ok(Json(build_collection_metadata(
-        engine.as_ref(),
-        config,
-        &state.base_url,
-    )))
+    let base = &state.base_url;
+    Ok(with_vary(match wanted {
+        Wanted::Json => {
+            Json(build_collection_metadata(engine.as_ref(), config, base)).into_response()
+        }
+        Wanted::Html => {
+            let card = CollectionCard {
+                id: config.id.clone(),
+                title: config.title.clone(),
+                description: config.description.clone(),
+                self_href: format!("{base}/edr/collections/{}", config.id),
+            };
+            let links = [
+                LinkView::new(
+                    format!("{base}/edr/collections/{}?f=json", config.id),
+                    "alternate",
+                    Some("JSON"),
+                ),
+                LinkView::new(
+                    format!("{base}/edr/collections"),
+                    "collection",
+                    Some("All collections"),
+                ),
+            ];
+            Html(ds_core::html::collection_html(&card, &links)).into_response()
+        }
+    }))
 }
 
 pub async fn locations(

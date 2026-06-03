@@ -789,3 +789,85 @@ mod part4_searchable {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Content negotiation — ?f=json|html (OGC API Common Part 2 conf/html, #296)
+// ---------------------------------------------------------------------------
+mod content_negotiation {
+    use super::*;
+
+    async fn get_raw(uri: &str, accept: Option<&str>) -> (StatusCode, String, String) {
+        let mut builder = Request::builder().uri(uri);
+        if let Some(a) = accept {
+            builder = builder.header("accept", a);
+        }
+        let resp = build_router()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, ct, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test]
+    async fn f_html_serves_html() {
+        let (status, ct, body) = get_raw("/collections?f=html", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.starts_with("text/html"), "content-type was {ct}");
+        assert!(body.contains("<!DOCTYPE html>"));
+    }
+
+    #[tokio::test]
+    async fn collection_detail_serves_html() {
+        let (status, ct, _) = get_raw("/collections/cities?f=html", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.starts_with("text/html"), "content-type was {ct}");
+    }
+
+    #[tokio::test]
+    async fn unknown_f_is_400() {
+        let (status, _, _) = get_raw("/collections?f=xml", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn accept_header_selects_html() {
+        let (status, ct, _) = get_raw("/collections", Some("text/html")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.starts_with("text/html"), "content-type was {ct}");
+    }
+
+    /// Negotiated responses carry `Vary: Accept` so shared caches don't serve
+    /// the wrong representation.
+    #[tokio::test]
+    async fn negotiated_responses_set_vary_accept() {
+        for uri in [
+            "/collections",
+            "/collections?f=html",
+            "/collections/cities",
+            "/conformance",
+            "/",
+        ] {
+            let resp = build_router()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let vary = resp
+                .headers()
+                .get("vary")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert!(
+                vary.to_ascii_lowercase().contains("accept"),
+                "{uri}: missing Vary: Accept (got {vary:?})"
+            );
+        }
+    }
+}

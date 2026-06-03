@@ -380,12 +380,12 @@ mod conformance {
     }
 
     #[tokio::test]
-    async fn omits_common_html_class() {
-        // No HTML representation of /collections — declaring the HTML class
-        // would be a false conformance claim (#291).
+    async fn declares_common_html_class() {
+        // HTML representation of the metadata endpoints is now served via
+        // `?f=html` / Accept, so the Common Part 2 HTML class is declared (#296).
         let (_, json) = get("/conformance").await;
         let classes = json["conformsTo"].as_array().unwrap();
-        assert!(!classes
+        assert!(classes
             .iter()
             .any(|c| c.as_str().unwrap().contains("common-2/1.0/conf/html")));
     }
@@ -1791,5 +1791,80 @@ mod part4_searchable {
     async fn invalid_limit_is_400() {
         let (status, _) = get("/collections?limit=-1").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Content negotiation — ?f=json|html (OGC API Common Part 2 conf/html, #296)
+// ---------------------------------------------------------------------------
+mod content_negotiation {
+    use super::*;
+
+    #[tokio::test]
+    async fn f_html_serves_html() {
+        let (status, headers, body) = get_raw("/collections?f=html").await;
+        assert_eq!(status, StatusCode::OK);
+        let ct = headers.get("content-type").unwrap().to_str().unwrap();
+        assert!(ct.starts_with("text/html"), "content-type was {ct}");
+        assert!(String::from_utf8_lossy(&body).contains("<!DOCTYPE html>"));
+    }
+
+    #[tokio::test]
+    async fn collection_detail_serves_html() {
+        let (status, headers, _) = get_raw("/collections/radar?f=html").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+    }
+
+    #[tokio::test]
+    async fn unknown_f_is_400() {
+        let (status, _, _) = get_raw("/collections?f=xml").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn accept_header_selects_html() {
+        let app = build_router();
+        let req = Request::builder()
+            .uri("/collections")
+            .header("accept", "text/html")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("text/html"), "content-type was {ct}");
+    }
+
+    /// Negotiated responses carry `Vary: Accept` so shared caches don't serve
+    /// the wrong representation.
+    #[tokio::test]
+    async fn negotiated_responses_set_vary_accept() {
+        for uri in [
+            "/collections",
+            "/collections?f=html",
+            "/collections/radar",
+            "/conformance",
+            "/",
+        ] {
+            let (_, headers, _) = get_raw(uri).await;
+            let vary = headers
+                .get("vary")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            assert!(
+                vary.to_ascii_lowercase().contains("accept"),
+                "{uri}: missing Vary: Accept (got {vary:?})"
+            );
+        }
     }
 }

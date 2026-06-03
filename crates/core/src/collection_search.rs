@@ -327,6 +327,10 @@ pub struct SearchQueryParams {
     pub q: Option<String>,
     pub limit: Option<String>,
     pub offset: Option<String>,
+    /// Output-format selector (`json`/`html`) for content negotiation. Not a
+    /// search facet — captured here only so the `/collections` handler can read
+    /// it without a second, conflicting `Query` extractor. See `ds_core::html`.
+    pub f: Option<String>,
 }
 
 impl SearchQueryParams {
@@ -357,6 +361,25 @@ impl SearchQueryParams {
             self.q.as_deref(),
             limit_str.as_deref(),
             offset,
+            self.f.as_deref(),
+        )
+    }
+
+    /// Like [`query_string`](Self::query_string) but forces the `f` (format)
+    /// selector instead of echoing the request's own. Used to build a
+    /// `rel="alternate"` link from one representation to the other while
+    /// preserving every search/pagination parameter (bbox, datetime, q,
+    /// limit, offset).
+    pub fn query_string_with_format(&self, limit: usize, offset: usize, f: &str) -> String {
+        let limit_str = self.limit.as_ref().map(|_| limit.to_string());
+        page_query_string(
+            self.bbox.as_deref(),
+            self.bbox_crs.as_deref(),
+            self.datetime.as_deref(),
+            self.q.as_deref(),
+            limit_str.as_deref(),
+            offset,
+            Some(f),
         )
     }
 }
@@ -372,6 +395,7 @@ pub fn page_query_string(
     q: Option<&str>,
     limit: Option<&str>,
     offset: usize,
+    f: Option<&str>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut push = |key: &str, val: Option<&str>| {
@@ -384,6 +408,9 @@ pub fn page_query_string(
     push("datetime", datetime);
     push("q", q);
     push("limit", limit);
+    // Preserve the requested format across pagination links so an HTML
+    // `/collections` page's next/prev links stay HTML (don't revert to JSON).
+    push("f", f);
     if offset > 0 {
         parts.push(format!("offset={offset}"));
     }
@@ -659,17 +686,47 @@ mod tests {
             Some("radar"),
             Some("10"),
             10,
+            None,
         );
         assert_eq!(
             qs,
             "?bbox=20,60,30,70&datetime=2026-06-02T00:00:00Z&q=radar&limit=10&offset=10"
         );
         // No params, offset 0 → empty (backward compatible self link).
-        assert_eq!(page_query_string(None, None, None, None, None, 0), "");
+        assert_eq!(page_query_string(None, None, None, None, None, 0, None), "");
         // Spaces get percent-encoded.
         assert_eq!(
-            page_query_string(None, None, None, Some("heavy rain"), None, 0),
+            page_query_string(None, None, None, Some("heavy rain"), None, 0, None),
             "?q=heavy%20rain"
+        );
+    }
+
+    #[test]
+    fn query_string_preserves_format_across_pagination() {
+        // An HTML /collections page's next/prev links must keep ?f=html.
+        let sp = SearchQueryParams {
+            f: Some("html".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(sp.query_string(DEFAULT_LIMIT, 20), "?f=html&offset=20");
+        // No format requested → links omit f.
+        let none = SearchQueryParams::default();
+        assert_eq!(none.query_string(DEFAULT_LIMIT, 20), "?offset=20");
+    }
+
+    #[test]
+    fn query_string_with_format_overrides_and_preserves_filters() {
+        // The alternate (?f=json) link forces the format but keeps every
+        // search/pagination param — even when the request itself was f=html.
+        let sp = SearchQueryParams {
+            q: Some("radar".to_string()),
+            limit: Some("10".to_string()),
+            f: Some("html".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            sp.query_string_with_format(10, 20, "json"),
+            "?q=radar&limit=10&f=json&offset=20"
         );
     }
 
