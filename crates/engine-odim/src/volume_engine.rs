@@ -2827,6 +2827,12 @@ impl FeatureEngine for PolarVolumeEngine {
                     .as_ref()
                     .is_none_or(|b: &Bbox| b.contains(m.lon, m.lat))
             })
+            // `datetime` keeps sites with a volume within the interval (issue
+            // #285's chosen semantics). `m.times` spans only the retained
+            // catalog window (`time_window` / `max_files`), so an interval
+            // entirely before that horizon matches no site and yields an empty
+            // FeatureCollection — the OGC-conformant "no data in window" result
+            // (an empty 200, not a 400), not a bug.
             .filter(|(_, m)| {
                 query
                     .datetime

@@ -1410,21 +1410,19 @@ pub fn load_collections(
                         || tiles_collections.contains_key(&collection.id)
                         || tiles_feature_collections.contains_key(&collection.id)
                     {
+                        // Log only — no health entry. The id already belongs to
+                        // whatever registered it first (which pushed its own
+                        // entry), so a second, contradictory `Failed` entry for
+                        // the same id would corrupt `/health` and trip "any
+                        // Failed" alerts. Only the network-level Features
+                        // inventory is skipped; the per-site EDR/WMS/Maps/Tiles
+                        // collections registered above are unaffected.
                         tracing::error!(
-                            "Collection '{}': base id already registered as another \
-                             collection — skipping radar-site inventory",
+                            "Collection '{}': base id already registered as another collection \
+                             — skipping only the radar-site Features inventory; the per-site \
+                             collections are unaffected",
                             collection.id
                         );
-                        health.push(CollectionHealth {
-                            id: collection.id.clone(),
-                            engine_type: "odim-volume".into(),
-                            status: CollectionStatus::Failed,
-                            error: Some(
-                                "base id collides with an already-registered collection \
-                                 (EDR, Map, Maps, Tiles, or Features)"
-                                    .into(),
-                            ),
-                        });
                     } else {
                         feature_engines.insert(
                             collection.id.clone(),
