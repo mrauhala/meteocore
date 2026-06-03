@@ -492,6 +492,10 @@ pub enum PropertyValue {
     Integer(i64),
     Bool(bool),
     Null,
+    /// An ordered list of values (e.g. a radar site's measured quantities or
+    /// sweep elevation angles). Serializes to a JSON array in Features output;
+    /// scalar-only sinks (the MVT tag encoder) flatten it to a joined string.
+    List(Vec<PropertyValue>),
 }
 
 /// A single feature with geometry and properties.

@@ -1385,6 +1385,52 @@ pub fn load_collections(
                         error: None,
                     });
                 }
+
+                // Network site inventory as an OGC API - Features collection
+                // under the (model-B-freed) base id: the owning engine — not
+                // the per-site views — implements `FeatureEngine`, projecting
+                // its shared `by_site_meta` into one Point Feature per site.
+                // Registered whenever `apis` includes "features", regardless of
+                // site count (an empty inventory is a valid empty
+                // FeatureCollection, unlike EDR's empty PointSeries). The base
+                // config supplies the collection title/description (the network
+                // name); the per-site EDR/WMS/etc. collections use `{base}-{nod}`,
+                // so the base id is free of those registries.
+                if collection.apis.contains(&"features".to_string()) {
+                    if feature_collections.contains_key(&collection.id) {
+                        tracing::error!(
+                            "Collection '{}': base id already registered as a Features \
+                             collection — skipping radar-site inventory",
+                            collection.id
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "odim-volume".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some(
+                                "base id collides with an already-registered Features collection"
+                                    .into(),
+                            ),
+                        });
+                    } else {
+                        feature_engines.insert(
+                            collection.id.clone(),
+                            engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
+                        );
+                        feature_collections.insert(collection.id.clone(), collection.clone());
+                        info!(
+                            "Collection '{}': wired radar-site inventory Features collection ({} site(s))",
+                            collection.id,
+                            sites.len()
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "odim-volume".into(),
+                            status: CollectionStatus::Ready,
+                            error: None,
+                        });
+                    }
+                }
             }
             "postgis" => {
                 let postgis_cfg = match collection.postgis.as_ref() {
