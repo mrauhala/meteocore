@@ -71,25 +71,35 @@ pub fn negotiate(f: Option<&str>, accept: Option<&str>) -> Result<Wanted, Negoti
     Ok(Wanted::Json)
 }
 
-/// True if the `Accept` header lists a `text/html` (or `text/*`) media range
-/// that isn't disabled with `q=0`. `*/*` does not count — API clients sending
-/// `Accept: */*` stay on the JSON default.
+/// True if the `Accept` header makes `text/html` acceptable. The effective
+/// q-value for `text/html` is taken from the **most specific** matching range —
+/// an exact `text/html` overrides the `text/*` wildcard (RFC 9110 §12.5.1), so
+/// `text/html;q=0, text/*` correctly yields JSON. `*/*` is ignored entirely, so
+/// API clients sending `Accept: */*` (e.g. curl) stay on the JSON default.
 fn accept_allows_html(accept: &str) -> bool {
-    accept.split(',').any(|entry| {
+    let mut exact: Option<f32> = None; // q of an explicit `text/html` range
+    let mut wildcard: Option<f32> = None; // q of a `text/*` range
+    for entry in accept.split(',') {
         let mut parts = entry.split(';').map(str::trim);
-        if !parts.next().is_some_and(|m| {
-            m.eq_ignore_ascii_case("text/html") || m.eq_ignore_ascii_case("text/*")
-        }) {
-            return false;
+        let media = parts.next().unwrap_or("");
+        let is_exact = media.eq_ignore_ascii_case("text/html");
+        let is_wild = media.eq_ignore_ascii_case("text/*");
+        if !is_exact && !is_wild {
+            continue;
         }
-        // Honour an explicit `q=0` (any zero form) as an opt-out.
+        let mut q = 1.0_f32; // absent q defaults to 1.0
         for p in parts {
-            if let Some(q) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
-                return q.trim().parse::<f32>().map(|v| v > 0.0).unwrap_or(true);
+            if let Some(v) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+                q = v.trim().parse::<f32>().unwrap_or(1.0);
             }
         }
-        true
-    })
+        if is_exact {
+            exact = Some(q);
+        } else {
+            wildcard = Some(q);
+        }
+    }
+    exact.or(wildcard).is_some_and(|q| q > 0.0)
 }
 
 /// A hyperlink rendered in an HTML page (owned so callers build it inline).
@@ -285,6 +295,15 @@ mod tests {
         // `text/*` matches text/html (RFC 9110 §12.5.1); `text/*;q=0` opts out.
         assert_eq!(negotiate(None, Some("text/*")).unwrap(), Wanted::Html);
         assert_eq!(negotiate(None, Some("text/*;q=0")).unwrap(), Wanted::Json);
+        // Most-specific wins: an exact text/html;q=0 overrides the text/* wildcard.
+        assert_eq!(
+            negotiate(None, Some("text/html;q=0, text/*")).unwrap(),
+            Wanted::Json
+        );
+        assert_eq!(
+            negotiate(None, Some("text/html, text/*;q=0")).unwrap(),
+            Wanted::Html
+        );
     }
 
     #[test]

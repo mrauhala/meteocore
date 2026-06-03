@@ -90,9 +90,11 @@ fn negotiate(f: Option<&str>, headers: &HeaderMap) -> Result<ds_core::html::Want
 
 /// Tag a content-negotiated response with `Vary: Accept` so shared caches
 /// don't serve the JSON body to a client that asked for HTML (or vice versa).
+/// Uses `append` (not `insert`) so it never clobbers a `Vary` an upstream layer
+/// may have set (e.g. compression's `Vary: Accept-Encoding`).
 fn with_vary(mut resp: Response) -> Response {
     resp.headers_mut()
-        .insert(header::VARY, axum::http::HeaderValue::from_static("accept"));
+        .append(header::VARY, axum::http::HeaderValue::from_static("accept"));
     resp
 }
 
