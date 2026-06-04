@@ -190,39 +190,22 @@ impl GeoTiffEngine {
     }
 
     /// Rebuild the cached [`RasterInfo`] from the current catalog and publish it.
-    /// Call after every catalog swap (#211). Runs the (possibly metadata-loading)
-    /// derivation — invoke at startup or on the poll runtime, never per request.
+    /// Call after every catalog swap (#211). [`build_raster_info`](Self::build_raster_info)
+    /// only *reads* already-loaded metadata (no I/O), so this is cheap and safe
+    /// from any context — including the request path (`store_stac_catalog`,
+    /// `do_load_metadata`), where it must never trigger `DataStore`/`block_in_place`.
     fn refresh_raster_info(&self) {
         self.raster_info.store(Arc::new(self.build_raster_info()));
     }
 
-    /// Derive [`RasterInfo`] from the current catalog. `times` come from the
-    /// entry keys (fixed at scan); CRS/grid come from entry metadata, lazily
-    /// loaded here for CRS detection if no entry is loaded yet (a no-op for
-    /// local files, whose metadata is parsed during the scan).
+    /// Derive [`RasterInfo`] from the current catalog — a pure read of what's
+    /// already loaded, with **no** metadata fetch. `times` come from the entry
+    /// keys (fixed at scan); `native_crs`/`grid_size` from currently-loaded entry
+    /// metadata. Local entries are `Loaded` at scan (CRS correct from
+    /// construction); STAC entries are stubs until first render, so `native_crs`
+    /// is the `CRS:84` placeholder until `do_load_metadata` loads one and calls
+    /// [`refresh_raster_info`](Self::refresh_raster_info).
     fn build_raster_info(&self) -> ds_core::map_engine::RasterInfo {
-        {
-            let catalog = self.catalog.load();
-            let has_loaded = catalog.entries.values().any(|e| e.is_loaded());
-            if !has_loaded {
-                // No loaded entries — try each until one succeeds.
-                let timestamps: Vec<DateTime<Utc>> = catalog.entries.keys().copied().collect();
-                drop(catalog);
-                for ts in &timestamps {
-                    match self.ensure_metadata(ts) {
-                        Ok(()) => break,
-                        Err(e) => {
-                            tracing::warn!(
-                                "[{}] Failed to load metadata for CRS detection: {}",
-                                self.collection_id,
-                                e
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
         let catalog = self.catalog.load();
         let crs_name = catalog
             .entries
@@ -767,6 +750,11 @@ impl GeoTiffEngine {
         }
         new_catalog.recompute_extents();
         self.catalog.store(Arc::new(new_catalog));
+        // A STAC stub just gained metadata (CRS/grid/extent) — refresh the
+        // cached snapshot so `raster_info()` reflects it immediately rather than
+        // waiting for the next poll. Cheap + I/O-free (the metadata is already
+        // loaded), so it's safe here even on the render path (#211 review).
+        self.refresh_raster_info();
 
         Ok(())
     }
