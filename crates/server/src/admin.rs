@@ -2041,25 +2041,41 @@ pub async fn reload_handler(
         )
     })?;
 
-    match do_reload(&state) {
-        Ok(outcome) => Ok(Json(json!({
+    // Run the (blocking) reload on the background runtime so it never parks a
+    // request-serving worker — same as the collections_dir watcher. Use
+    // `spawn` (an async task on a poll-runtime worker), NOT `spawn_blocking`:
+    // engine construction calls `ds-storage`'s `block_in_place`, which panics
+    // on a spawn_blocking pool thread but is valid on a multi-thread worker.
+    let state2 = state.clone();
+    let outcome = crate::poll_runtime()
+        .spawn(async move { do_reload(&state2) })
+        .await;
+    match outcome {
+        Ok(Ok(o)) => Ok(Json(json!({
             "status": "ok",
-            "ready": outcome.ready,
-            "degraded": outcome.degraded,
-            "configured": outcome.configured,
-            "collections": outcome.health,
+            "ready": o.ready,
+            "degraded": o.degraded,
+            "configured": o.configured,
+            "collections": o.health,
         }))),
-        Err(ReloadError::ConfigRead(e)) => Err((
+        Ok(Err(ReloadError::ConfigRead(e))) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("Failed to read config: {e}") })),
         )),
-        Err(ReloadError::NoReadyCollections { configured }) => Err((
+        Ok(Err(ReloadError::NoReadyCollections { configured })) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
                 "error": "Reload produced 0 working collections, keeping old state",
                 "configured": configured
             })),
         )),
+        Err(e) => {
+            tracing::error!("Reload task failed to join: {e}");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Reload task failed" })),
+            ))
+        }
     }
 }
 

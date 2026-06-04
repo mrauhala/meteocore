@@ -50,6 +50,12 @@ pub fn spawn_collections_watcher(
         dir.display(),
         debounce.as_millis()
     );
+    if debounce.is_zero() {
+        warn!(
+            "watch_debounce_ms = 0: event coalescing is disabled — a reload fires \
+             per raw filesystem event (an editor save can trigger several)"
+        );
+    }
 
     crate::poll_runtime().spawn(async move {
         // Hold the watcher (and thus its event thread + the sender) alive for
