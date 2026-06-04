@@ -13,6 +13,8 @@ use std::path::Path;
 
 use ds_core::config::OdimConfig;
 use ds_core::edr_engine::EdrEngine;
+use ds_core::feature::{Bbox, FeatureQuery, Geometry, PropertyValue};
+use ds_core::feature_engine::FeatureEngine;
 use ds_core::map_engine::{MapEngine, OutputCrs};
 use ds_core::model::{CoverageResponse, DomainDescription};
 
@@ -518,6 +520,114 @@ fn pvol_engine_renders_fmi_vihti_volume() {
         non_none > 0,
         "a render over the radar's own coverage bbox must sample some \
          non-None values (parameter {render_param})"
+    );
+}
+
+/// End-to-end `FeatureEngine` surface on the real FMI Vihti volume: the
+/// owning `PolarVolumeEngine` exposes its sites as a Features collection (one
+/// Point Feature per site). Skips when the uncommitted 15 MB fixture is absent.
+#[test]
+fn pvol_engine_exposes_sites_as_features() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/radar-fmi-pvol/202605191050_fivih_PVOL.h5");
+    if !fixture.exists() {
+        eprintln!("skipping pvol_engine_exposes_sites_as_features: fixture absent at {fixture:?}");
+        return;
+    }
+    let data_dir = fixture
+        .parent()
+        .expect("fixture has a parent directory")
+        .to_str()
+        .expect("utf8 fixture dir");
+
+    let config = OdimConfig {
+        filename_template: None,
+        filename_pattern: None,
+        timestamp_format: None,
+        parameter: None,
+        unit: None,
+        nodata: None,
+        gain: None,
+        offset: None,
+        poll_interval_secs: 30,
+        max_files: None,
+        endpoint: None,
+        bucket: None,
+        prefix_pattern: None,
+        time_window: None,
+        discovery: None,
+        cadence_secs: None,
+    };
+
+    let engine =
+        engine_odim::PolarVolumeEngine::new("radar-fi-volume-local-h5", Some(data_dir), &config)
+            .expect("PolarVolumeEngine::new over the PVOL directory");
+
+    // Inventory page: one Point Feature per site; fivih (Vihti) must be present.
+    let page = FeatureEngine::get_features(&engine, &FeatureQuery::default()).unwrap();
+    assert!(page.number_matched >= 1, "at least the Vihti site");
+    assert_eq!(page.number_returned, page.features.len());
+    assert_eq!(
+        FeatureEngine::feature_count(&engine),
+        page.number_matched,
+        "feature_count agrees with the unpaged match count"
+    );
+    assert!(
+        FeatureEngine::spatial_extent(&engine).is_some(),
+        "inventory has a spatial extent"
+    );
+
+    let fivih = FeatureEngine::get_feature(&engine, "fivih").expect("fivih site feature");
+    assert_eq!(fivih.id, "fivih");
+    match fivih.geometry.as_ref() {
+        Geometry::Point { x, y } => {
+            assert!(
+                (23.0..26.0).contains(x) && (59.0..62.0).contains(y),
+                "Vihti antenna sits near 24.5E/60.5N, got {x},{y}"
+            );
+        }
+        other => panic!("expected Point geometry, got {other:?}"),
+    }
+    // `quantities` is a non-empty List of *bare* quantity codes (no `nod:`).
+    match fivih.properties.get("quantities") {
+        Some(PropertyValue::List(items)) => {
+            assert!(!items.is_empty(), "site advertises measured quantities");
+            assert!(
+                items
+                    .iter()
+                    .all(|q| matches!(q, PropertyValue::String(s) if !s.contains(':'))),
+                "quantities must be bare codes, got {items:?}"
+            );
+        }
+        other => panic!("quantities must be a List, got {other:?}"),
+    }
+    // `collection` points at the per-site EDR/WMS collection id.
+    assert_eq!(
+        fivih.properties.get("collection"),
+        Some(&PropertyValue::String(
+            "radar-fi-volume-local-h5-fivih".into()
+        ))
+    );
+
+    // Unknown site → FeatureNotFound (→ 404 at the API layer).
+    assert!(matches!(
+        FeatureEngine::get_feature(&engine, "nope"),
+        Err(ds_core::error::DataServerError::FeatureNotFound(_))
+    ));
+
+    // A bbox over Vihti's antenna keeps fivih in the result.
+    let bbox = Bbox::new(23.4, 59.6, 25.6, 61.5).unwrap();
+    let in_box = FeatureEngine::get_features(
+        &engine,
+        &FeatureQuery {
+            bbox: Some(bbox),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        in_box.features.iter().any(|f| f.id == "fivih"),
+        "fivih antenna falls inside the query bbox"
     );
 }
 

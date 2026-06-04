@@ -8,6 +8,9 @@ fn property_value_to_json(v: &PropertyValue) -> Value {
         PropertyValue::Integer(i) => json!(i),
         PropertyValue::Bool(b) => json!(b),
         PropertyValue::Null => Value::Null,
+        PropertyValue::List(items) => {
+            Value::Array(items.iter().map(property_value_to_json).collect())
+        }
     }
 }
 
@@ -136,6 +139,13 @@ mod tests {
         properties.insert("temp".into(), PropertyValue::Float(-2.5));
         properties.insert("active".into(), PropertyValue::Bool(true));
         properties.insert("missing".into(), PropertyValue::Null);
+        properties.insert(
+            "quantities".into(),
+            PropertyValue::List(vec![
+                PropertyValue::String("DBZH".into()),
+                PropertyValue::String("VRADH".into()),
+            ]),
+        );
 
         Feature {
             id: "Helsinki".into(),
@@ -161,6 +171,8 @@ mod tests {
         assert_eq!(json["properties"]["temp"], -2.5);
         assert_eq!(json["properties"]["active"], true);
         assert!(json["properties"]["missing"].is_null());
+        // List → JSON array
+        assert_eq!(json["properties"]["quantities"], json!(["DBZH", "VRADH"]));
     }
 
     #[test]

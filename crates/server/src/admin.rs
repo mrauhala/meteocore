@@ -538,7 +538,7 @@ pub fn load_collections(
             "querydata" => &["edr", "wms", "maps", "tiles"],
             "grib" => &["edr", "wms", "maps", "tiles"],
             "odim" => &["edr", "wms", "maps", "tiles"],
-            "odim-volume" => &["edr", "wms", "maps", "tiles"],
+            "odim-volume" => &["edr", "wms", "maps", "tiles", "features"],
             "postgis" => &["edr", "features", "tiles"],
             _ => &[],
         };
@@ -1384,6 +1384,70 @@ pub fn load_collections(
                         status: CollectionStatus::Ready,
                         error: None,
                     });
+                }
+
+                // Network site inventory as an OGC API - Features collection
+                // under the (model-B-freed) base id: the owning engine — not
+                // the per-site views — implements `FeatureEngine`, projecting
+                // its shared `by_site_meta` into one Point Feature per site.
+                // Registered whenever `apis` includes "features", regardless of
+                // site count (an empty inventory is a valid empty
+                // FeatureCollection, unlike EDR's empty PointSeries). The base
+                // config supplies the collection title/description (the network
+                // name); the per-site EDR/WMS/etc. collections use `{base}-{nod}`,
+                // so the base id is free of those registries.
+                if collection.apis.contains(&"features".to_string()) {
+                    // Defence-in-depth: the base id must not already name a
+                    // collection in ANY registry (e.g. a hand-written inline
+                    // collection, or a `{base}-{nod}` per-site id derived from
+                    // another odim-volume source). Mirrors the per-site guard
+                    // above so the same id can't mean different things across
+                    // the EDR / Map / Features services.
+                    if feature_collections.contains_key(&collection.id)
+                        || edr_collections.contains_key(&collection.id)
+                        || map_collections.contains_key(&collection.id)
+                        || maps_collections.contains_key(&collection.id)
+                        || tiles_collections.contains_key(&collection.id)
+                        || tiles_feature_collections.contains_key(&collection.id)
+                    {
+                        // Log only — no health entry. The id already belongs to
+                        // whatever registered it first (which pushed its own
+                        // entry), so a second, contradictory `Failed` entry for
+                        // the same id would corrupt `/health` and trip "any
+                        // Failed" alerts. Only the network-level Features
+                        // inventory is skipped; the per-site EDR/WMS/Maps/Tiles
+                        // collections registered above are unaffected.
+                        tracing::error!(
+                            "Collection '{}': base id already registered as another collection \
+                             — skipping only the radar-site Features inventory; the per-site \
+                             collections are unaffected",
+                            collection.id
+                        );
+                    } else {
+                        feature_engines.insert(
+                            collection.id.clone(),
+                            engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
+                        );
+                        feature_collections.insert(collection.id.clone(), collection.clone());
+                        info!(
+                            "Collection '{}': wired radar-site inventory Features collection ({} site(s))",
+                            collection.id,
+                            sites.len()
+                        );
+                        // Only mark Ready when there are sites: the empty-source
+                        // case already pushed a `Degraded` entry for this id
+                        // above, so a second entry would contradict it. The
+                        // inventory is still registered (an empty
+                        // FeatureCollection is valid) and fills on the next poll.
+                        if !sites.is_empty() {
+                            health.push(CollectionHealth {
+                                id: collection.id.clone(),
+                                engine_type: "odim-volume".into(),
+                                status: CollectionStatus::Ready,
+                                error: None,
+                            });
+                        }
+                    }
                 }
             }
             "postgis" => {

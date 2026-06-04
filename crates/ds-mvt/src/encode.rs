@@ -136,6 +136,33 @@ fn add_tag(feature: &mut mvt::Feature, key: &str, value: &PropertyValue) {
         // MVT has no null tag type. Dropping a null-valued tag matches what
         // every other tile-producing stack does (PostGIS ST_AsMVT, tippecanoe).
         PropertyValue::Null => {}
+        // MVT tag values are scalar — flatten a list to a comma-joined string
+        // (nested lists / nulls contribute nothing).
+        PropertyValue::List(items) => {
+            let joined = items
+                .iter()
+                .filter_map(scalar_tag_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            // An empty / all-null list contributes no scalar value — drop the
+            // tag entirely, matching how `Null` is handled (no empty-string tag).
+            if !joined.is_empty() {
+                feature.add_tag_string(key, &joined);
+            }
+        }
+    }
+}
+
+/// Render a scalar `PropertyValue` as a string for the MVT list-flattening
+/// path. Returns `None` for `Null` and nested `List`s (which have no scalar
+/// representation), so they're skipped in the joined output.
+fn scalar_tag_string(v: &PropertyValue) -> Option<String> {
+    match v {
+        PropertyValue::String(s) => Some(s.clone()),
+        PropertyValue::Float(f) => Some(f.to_string()),
+        PropertyValue::Integer(i) => Some(i.to_string()),
+        PropertyValue::Bool(b) => Some(b.to_string()),
+        PropertyValue::Null | PropertyValue::List(_) => None,
     }
 }
 
@@ -613,6 +640,62 @@ mod tests {
         assert!(slice_contains(&bytes, b"points"));
         assert!(slice_contains(&bytes, b"name"));
         assert!(slice_contains(&bytes, b"origin"));
+    }
+
+    #[test]
+    fn encode_point_flattens_list_property_to_joined_string() {
+        let f = feature(
+            "1",
+            Geometry::Point { x: 0.0, y: 0.0 },
+            &[(
+                "quantities",
+                PropertyValue::List(vec![
+                    PropertyValue::String("DBZH".into()),
+                    PropertyValue::String("VRADH".into()),
+                ]),
+            )],
+        );
+        let opts = TileEncodeOptions::new("points", TmsKind::WebMercatorQuad);
+        let bytes = encode_tile(&[f], web_mercator_tile_z0(), &opts).unwrap();
+        // MVT tag values are scalar, so the list is flattened to a comma-joined
+        // string stored in plaintext within the protobuf.
+        assert!(slice_contains(&bytes, b"quantities"));
+        assert!(slice_contains(&bytes, b"DBZH,VRADH"));
+    }
+
+    #[test]
+    fn encode_point_drops_all_null_list_tag() {
+        // A list with no scalar items flattens to "" — the tag must be dropped
+        // entirely (like a bare Null), not written as an empty-string value.
+        let f = feature(
+            "1",
+            Geometry::Point { x: 0.0, y: 0.0 },
+            &[
+                ("empty", PropertyValue::List(vec![PropertyValue::Null])),
+                ("name", PropertyValue::String("origin".into())),
+            ],
+        );
+        let opts = TileEncodeOptions::new("points", TmsKind::WebMercatorQuad);
+        let bytes = encode_tile(&[f], web_mercator_tile_z0(), &opts).unwrap();
+        assert!(slice_contains(&bytes, b"name"), "scalar tag still present");
+        assert!(
+            !slice_contains(&bytes, b"empty"),
+            "an all-null list tag must be dropped"
+        );
+    }
+
+    #[test]
+    fn scalar_tag_string_skips_null_and_nested_lists() {
+        assert_eq!(
+            scalar_tag_string(&PropertyValue::String("x".into())),
+            Some("x".into())
+        );
+        assert_eq!(
+            scalar_tag_string(&PropertyValue::Integer(3)),
+            Some("3".into())
+        );
+        assert_eq!(scalar_tag_string(&PropertyValue::Null), None);
+        assert_eq!(scalar_tag_string(&PropertyValue::List(vec![])), None);
     }
 
     #[test]

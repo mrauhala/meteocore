@@ -57,7 +57,11 @@ use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
-use ds_core::feature::{parse_area_coords, parse_linestring_coords, parse_point_coords};
+use ds_core::feature::{
+    parse_area_coords, parse_linestring_coords, parse_point_coords, Bbox, DatetimeInterval,
+    Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue,
+};
+use ds_core::feature_engine::FeatureEngine;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
@@ -557,6 +561,10 @@ struct SiteMeta {
     lat: f64,
     /// Human place name (ODIM `/what` PLC), if present.
     plc: Option<String>,
+    /// WMO station number (ODIM `/what/source` WMO token), if present.
+    wmo: Option<String>,
+    /// Antenna height above mean sea level (metres).
+    height_m: f64,
     /// Map/WMS layer list — `(bare_quantity, title)` from this site's
     /// lowest sweep. **No `<nod>:` prefix**: the site *is*
     /// the collection, so the parameter is the bare quantity.
@@ -590,6 +598,18 @@ struct Catalog {
     /// match `by_site` (a site with no derivable metadata, e.g. every
     /// sweep malformed, is simply absent here).
     by_site_meta: HashMap<String, SiteMeta>,
+    /// `by_site_meta` keys pre-sorted at build time, so the network-inventory
+    /// `FeatureEngine` never sorts per request (CLAUDE.md hot-path rule).
+    sorted_nods: Vec<String>,
+    /// Antenna-point bounding box `[w,s,e,n]` over all sites — the Features
+    /// collection's spatial extent, precomputed so `spatial_extent()` is an
+    /// O(1) snapshot read. Bounds the Feature *points* (what `bbox` filters
+    /// on), not the wider radar coverage bboxes.
+    features_extent: Option<[f64; 4]>,
+    /// Precomputed `data_version` content hash of the site inventory — a pure
+    /// function of this snapshot, computed once at swap time instead of per
+    /// (future) vector-tile render.
+    feature_version: u64,
 }
 
 /// Round an elevation angle to 0.1° so near-identical sweep angles from
@@ -1142,9 +1162,19 @@ fn derive_catalog(
         .filter_map(|(nod, list)| Some((nod.clone(), derive_site_meta(list)?)))
         .collect();
 
+    // Precompute the network-inventory FeatureEngine's per-request answers once
+    // here (on the background poll runtime), so the request path is O(1) reads.
+    let mut sorted_nods: Vec<String> = by_site_meta.keys().cloned().collect();
+    sorted_nods.sort();
+    let features_extent = features_extent_of(&by_site_meta);
+    let feature_version = feature_version_of(&sorted_nods, &by_site_meta);
+
     Catalog {
         by_site,
         by_site_meta,
+        sorted_nods,
+        features_extent,
+        feature_version,
     }
 }
 
@@ -1235,6 +1265,8 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         lon: site.lon,
         lat: site.lat,
         plc: site.plc.clone(),
+        wmo: site.wmo.clone(),
+        height_m: site.height,
         parameters,
         quantities,
         times,
@@ -2605,6 +2637,261 @@ impl PolarVolumeEngine {
             nod: nod.to_string(),
             collection_id: collection_id.to_string(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FeatureEngine: network site inventory
+// ---------------------------------------------------------------------------
+//
+// Model B freed the network-level (base) id; this serves it as an OGC API -
+// Features collection — one Point Feature per radar site, projected from the
+// engine's shared `by_site_meta` snapshot. The per-site EDR/Map *views* serve
+// per-site data; the owning *engine* serves the network inventory. Mirrors the
+// PostGIS station-as-Feature pattern (`engine-postgis/src/feature.rs`).
+
+impl PolarVolumeEngine {
+    /// Project one site's [`SiteMeta`] into an OGC Feature. `id` = ODIM NOD;
+    /// geometry = the antenna point (WGS84); properties carry the site's
+    /// identity, geometry, measured quantities, sweep angles, coverage, and the
+    /// per-site collection id so a client can jump to its EDR/WMS layers.
+    fn site_to_feature(&self, nod: &str, meta: &SiteMeta) -> Feature {
+        let opt_str = |o: &Option<String>| {
+            o.clone()
+                .map(PropertyValue::String)
+                .unwrap_or(PropertyValue::Null)
+        };
+        let mut props: HashMap<String, PropertyValue> = HashMap::new();
+        props.insert("nod".into(), PropertyValue::String(nod.to_string()));
+        props.insert("name".into(), opt_str(&meta.plc));
+        props.insert("wmo".into(), opt_str(&meta.wmo));
+        props.insert("longitude".into(), PropertyValue::Float(meta.lon));
+        props.insert("latitude".into(), PropertyValue::Float(meta.lat));
+        props.insert(
+            "antenna_height_m".into(),
+            PropertyValue::Float(meta.height_m),
+        );
+        props.insert(
+            "quantities".into(),
+            PropertyValue::List(
+                meta.quantities
+                    .iter()
+                    .cloned()
+                    .map(PropertyValue::String)
+                    .collect(),
+            ),
+        );
+        let angles = meta
+            .vertical
+            .as_ref()
+            .map(|v| v.levels.iter().copied().map(PropertyValue::Float).collect())
+            .unwrap_or_default();
+        props.insert("elevation_angles".into(), PropertyValue::List(angles));
+        props.insert(
+            "coverage_radius_m".into(),
+            meta.coverage_radius_m
+                .map(PropertyValue::Float)
+                .unwrap_or(PropertyValue::Null),
+        );
+        props.insert(
+            "latest_volume_time".into(),
+            meta.times
+                .last()
+                .map(|t| PropertyValue::String(t.to_rfc3339()))
+                .unwrap_or(PropertyValue::Null),
+        );
+        props.insert(
+            "volume_count".into(),
+            PropertyValue::Integer(meta.times.len() as i64),
+        );
+        props.insert(
+            "collection".into(),
+            PropertyValue::String(format!("{}-{}", self.collection_id, nod)),
+        );
+        Feature {
+            id: nod.to_string(),
+            geometry: Arc::new(Geometry::Point {
+                x: meta.lon,
+                y: meta.lat,
+            }),
+            properties: Arc::new(props),
+        }
+    }
+}
+
+/// True if any of `times` falls within `interval` (open bounds = unbounded).
+fn any_time_in_interval(times: &[DateTime<Utc>], interval: &DatetimeInterval) -> bool {
+    times
+        .iter()
+        .any(|t| interval.start.is_none_or(|s| *t >= s) && interval.end.is_none_or(|e| *t <= e))
+}
+
+/// FNV-1a fold of `bytes` into the running hash `h`.
+fn fnv1a_update(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Antenna-point bounding box `[w,s,e,n]` over all sites, or `None` when empty.
+/// Bounds the Feature *points* (what `get_features` filters `bbox` on), NOT the
+/// wider radar coverage bboxes — advertising the coverage bbox would let a
+/// conformant client query a bbox the extent claims to cover yet get zero
+/// results. Computed once at catalog-build time.
+fn features_extent_of(by_site_meta: &HashMap<String, SiteMeta>) -> Option<[f64; 4]> {
+    let mut acc: Option<[f64; 4]> = None;
+    for m in by_site_meta.values() {
+        let b = [m.lon, m.lat, m.lon, m.lat];
+        acc = Some(match acc {
+            None => b,
+            Some(a) => [
+                a[0].min(b[0]),
+                a[1].min(b[1]),
+                a[2].max(b[2]),
+                a[3].max(b[3]),
+            ],
+        });
+    }
+    acc
+}
+
+/// Opaque content hash of the whole site inventory — the FeatureEngine
+/// `data_version`. Changes iff any Feature's serialized content changes, so a
+/// poll refresh invalidates any (future) vector-tile ETag. Folds **every**
+/// property-bearing field, with a delimiter after each variable-length string
+/// (fixed-width numerics are self-delimiting). `nods` must be sorted for
+/// determinism. Computed once at catalog-build time, not per render.
+fn feature_version_of(nods: &[String], by_site_meta: &HashMap<String, SiteMeta>) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325_u64; // FNV-1a offset basis
+    for nod in nods {
+        let Some(meta) = by_site_meta.get(nod) else {
+            continue;
+        };
+        // Variable-length strings: delimit (US, 0x1f) so `nod||plc` can't alias.
+        for s in [
+            nod.as_str(),
+            meta.plc.as_deref().unwrap_or(""),
+            meta.wmo.as_deref().unwrap_or(""),
+        ] {
+            h = fnv1a_update(h, s.as_bytes());
+            h = fnv1a_update(h, b"\x1f");
+        }
+        // Fixed-width numerics (self-delimiting): geometry + corrigible metadata.
+        for f in [
+            meta.lon,
+            meta.lat,
+            meta.height_m,
+            meta.coverage_radius_m.unwrap_or(f64::NAN),
+        ] {
+            h = fnv1a_update(h, &f.to_bits().to_le_bytes());
+        }
+        let epoch = meta.times.last().map(|t| t.timestamp()).unwrap_or(0);
+        h = fnv1a_update(h, &epoch.to_le_bytes());
+        h = fnv1a_update(h, &(meta.times.len() as u64).to_le_bytes());
+        // Quantities are sorted at construction; sort here too so the hash never
+        // relies on that. Delimit with the same `\x1f` used for the other
+        // variable-length fields (impossible in an `[A-Z0-9]+` ODIM code) to
+        // avoid cross-boundary collisions.
+        let mut qs: Vec<&str> = meta.quantities.iter().map(String::as_str).collect();
+        qs.sort_unstable();
+        for q in qs {
+            h = fnv1a_update(h, q.as_bytes());
+            h = fnv1a_update(h, b"\x1f");
+        }
+        // Sweep elevation angles (length-prefixed; fixed-width entries).
+        let levels = meta
+            .vertical
+            .as_ref()
+            .map(|v| v.levels.as_slice())
+            .unwrap_or(&[]);
+        h = fnv1a_update(h, &(levels.len() as u64).to_le_bytes());
+        for a in levels {
+            h = fnv1a_update(h, &a.to_bits().to_le_bytes());
+        }
+    }
+    h
+}
+
+impl FeatureEngine for PolarVolumeEngine {
+    fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+        let catalog = self.catalog.load();
+        // `sorted_nods` is pre-sorted at catalog-build time, so paging is
+        // deterministic with no per-request sort — just look up, filter, page.
+        let filtered: Vec<(&String, &SiteMeta)> = catalog
+            .sorted_nods
+            .iter()
+            .filter_map(|nod| catalog.by_site_meta.get(nod).map(|m| (nod, m)))
+            .filter(|(_, m)| {
+                query
+                    .bbox
+                    .as_ref()
+                    .is_none_or(|b: &Bbox| b.contains(m.lon, m.lat))
+            })
+            // `datetime` keeps sites with a volume within the interval (issue
+            // #285's chosen semantics). `m.times` spans only the retained
+            // catalog window (`time_window` / `max_files`), so an interval
+            // entirely before that horizon matches no site and yields an empty
+            // FeatureCollection — the OGC-conformant "no data in window" result
+            // (an empty 200, not a 400), not a bug.
+            .filter(|(_, m)| {
+                query
+                    .datetime
+                    .as_ref()
+                    .is_none_or(|dt| any_time_in_interval(&m.times, dt))
+            })
+            .collect();
+
+        let number_matched = filtered.len();
+        let offset = query.offset.min(number_matched);
+        // Mirror `CsvEngine::get_features`: `limit` is taken verbatim (`0` ⇒ an
+        // empty page, not "all"), and `offset + limit` is saturating so an
+        // un-capped large `limit` can't wrap in release before the clamp. The
+        // API layer clamps `limit` to `[1, 1000]`, so `0` only arises from
+        // internal callers.
+        let end = offset.saturating_add(query.limit).min(number_matched);
+        let features: Vec<Feature> = filtered[offset..end]
+            .iter()
+            .map(|(nod, m)| self.site_to_feature(nod, m))
+            .collect();
+
+        let number_returned = features.len();
+        let next_offset = if end < number_matched {
+            Some(end)
+        } else {
+            None
+        };
+
+        Ok(FeaturePage {
+            features,
+            number_matched,
+            number_returned,
+            next_offset,
+        })
+    }
+
+    fn get_feature(&self, feature_id: &str) -> Result<Feature, DataServerError> {
+        let catalog = self.catalog.load();
+        let meta = catalog
+            .by_site_meta
+            .get(feature_id)
+            .ok_or_else(|| DataServerError::FeatureNotFound(feature_id.to_string()))?;
+        Ok(self.site_to_feature(feature_id, meta))
+    }
+
+    fn feature_count(&self) -> usize {
+        self.catalog.load().by_site_meta.len()
+    }
+
+    fn spatial_extent(&self) -> Option<[f64; 4]> {
+        // O(1) snapshot read — precomputed in `derive_catalog`.
+        self.catalog.load().features_extent
+    }
+
+    fn data_version(&self) -> u64 {
+        // O(1) snapshot read — precomputed in `derive_catalog`.
+        self.catalog.load().feature_version
     }
 }
 
@@ -4883,5 +5170,288 @@ mod tests {
             EdrEngine::query_position(&view, "POINT(25.0 60.0)", None, None, None),
             Err(DataServerError::LocationNotFound(_))
         ));
+    }
+
+    // -- FeatureEngine: network site inventory ------------------------------
+
+    /// Build a `PolarVolumeEngine` over a synthetic catalog for FeatureEngine
+    /// tests — the engine-level analog of `site_view_for`.
+    fn engine_for(
+        by_site: HashMap<String, Vec<VolumeEntry>>,
+        collection_id: &str,
+    ) -> PolarVolumeEngine {
+        let cache = Mutex::new(HashMap::new());
+        let catalog = derive_catalog(by_site, &cache, None);
+        PolarVolumeEngine {
+            collection_id: collection_id.to_string(),
+            source: Arc::new(Source::Local {
+                data_dir: PathBuf::from("/nonexistent-test-pvol"),
+            }),
+            max_files: None,
+            catalog: Arc::new(ArcSwap::from_pointee(catalog)),
+            parse_cache: Arc::new(Mutex::new(HashMap::new())),
+            poll_interval: Duration::from_secs(30),
+            shutdown: AtomicBool::new(false),
+            shutdown_notify: Notify::new(),
+        }
+    }
+
+    /// Two sites at distinct antenna positions, keyed by NOD.
+    fn two_site_engine() -> PolarVolumeEngine {
+        let mut by_site = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![entry(synthetic_volume(24.5, 60.3), "v0")],
+        );
+        by_site.insert(
+            "fikor".to_string(),
+            vec![entry(synthetic_volume(21.0, 60.0), "v0")],
+        );
+        engine_for(by_site, "radar-fi-volume-local-h5")
+    }
+
+    #[test]
+    fn features_list_sites_sorted_with_properties() {
+        let engine = two_site_engine();
+        let page = FeatureEngine::get_features(&engine, &FeatureQuery::default()).unwrap();
+        assert_eq!(page.number_matched, 2);
+        assert_eq!(page.number_returned, 2);
+        // Stable NOD-sorted order: fikor before fivih.
+        let ids: Vec<&str> = page.features.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, vec!["fikor", "fivih"]);
+
+        let vih = page.features.iter().find(|f| f.id == "fivih").unwrap();
+        match vih.geometry.as_ref() {
+            Geometry::Point { x, y } => {
+                assert_eq!((*x, *y), (24.5, 60.3));
+            }
+            _ => panic!("expected Point"),
+        }
+        let p = &vih.properties;
+        assert_eq!(p.get("nod"), Some(&PropertyValue::String("fivih".into())));
+        assert_eq!(
+            p.get("name"),
+            Some(&PropertyValue::String("Test Site".into()))
+        );
+        assert_eq!(p.get("wmo"), Some(&PropertyValue::Null));
+        assert_eq!(
+            p.get("antenna_height_m"),
+            Some(&PropertyValue::Float(100.0))
+        );
+        assert_eq!(
+            p.get("quantities"),
+            Some(&PropertyValue::List(vec![PropertyValue::String(
+                "DBZH".into()
+            )]))
+        );
+        assert_eq!(
+            p.get("elevation_angles"),
+            Some(&PropertyValue::List(vec![PropertyValue::Float(0.5)]))
+        );
+        assert_eq!(p.get("volume_count"), Some(&PropertyValue::Integer(1)));
+        assert_eq!(
+            p.get("collection"),
+            Some(&PropertyValue::String(
+                "radar-fi-volume-local-h5-fivih".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn get_feature_hit_and_miss() {
+        let engine = two_site_engine();
+        assert_eq!(
+            FeatureEngine::get_feature(&engine, "fivih").unwrap().id,
+            "fivih"
+        );
+        assert!(matches!(
+            FeatureEngine::get_feature(&engine, "nope"),
+            Err(DataServerError::FeatureNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn feature_count_and_spatial_extent_cover_all_sites() {
+        let engine = two_site_engine();
+        assert_eq!(FeatureEngine::feature_count(&engine), 2);
+        let ext = FeatureEngine::spatial_extent(&engine).expect("extent");
+        // Tight to the antenna *points* — NOT the (~100 km wide) coverage bbox
+        // these synthetic sites also carry — so the extent matches what `bbox`
+        // filters on. fikor (21.0, 60.0) and fivih (24.5, 60.3).
+        assert_eq!(
+            ext,
+            [21.0, 60.0, 24.5, 60.3],
+            "extent must bound antenna points only, got {ext:?}"
+        );
+    }
+
+    #[test]
+    fn bbox_filters_by_antenna_position() {
+        let engine = two_site_engine();
+        // A tight box around fivih (24.5, 60.3) excludes fikor (21.0, 60.0).
+        let bbox = Bbox::new(24.0, 60.0, 25.0, 60.5).unwrap();
+        let page = FeatureEngine::get_features(
+            &engine,
+            &FeatureQuery {
+                bbox: Some(bbox),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(page.number_matched, 1);
+        assert_eq!(page.features[0].id, "fivih");
+    }
+
+    #[test]
+    fn datetime_filters_by_data_in_window() {
+        let engine = two_site_engine();
+        let past = DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let near_future = DateTime::parse_from_rfc3339("2999-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // Volumes are stamped Utc::now(), so a wide window includes both sites…
+        let wide = FeatureEngine::get_features(
+            &engine,
+            &FeatureQuery {
+                datetime: Some(DatetimeInterval {
+                    start: Some(past),
+                    end: Some(near_future),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(wide.number_matched, 2);
+        // …and a purely historical window includes neither.
+        let old = FeatureEngine::get_features(
+            &engine,
+            &FeatureQuery {
+                datetime: Some(DatetimeInterval {
+                    start: None,
+                    end: Some(past),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(old.number_matched, 0);
+    }
+
+    #[test]
+    fn pagination_limit_offset_and_next() {
+        let engine = two_site_engine();
+        let first = FeatureEngine::get_features(
+            &engine,
+            &FeatureQuery {
+                limit: 1,
+                offset: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(first.number_matched, 2);
+        assert_eq!(first.number_returned, 1);
+        assert_eq!(first.features[0].id, "fikor");
+        assert_eq!(first.next_offset, Some(1));
+
+        let second = FeatureEngine::get_features(
+            &engine,
+            &FeatureQuery {
+                limit: 1,
+                offset: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(second.features[0].id, "fivih");
+        assert_eq!(second.next_offset, None);
+    }
+
+    #[test]
+    fn limit_zero_returns_empty_page_not_all() {
+        // Convention parity with CsvEngine: limit 0 ⇒ zero items (number_matched
+        // still reflects the full set). The API layer clamps limit to >= 1, so
+        // 0 only reaches here from internal callers.
+        let engine = two_site_engine();
+        let page = FeatureEngine::get_features(
+            &engine,
+            &FeatureQuery {
+                limit: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(page.number_matched, 2);
+        assert_eq!(page.number_returned, 0);
+        assert!(page.features.is_empty());
+    }
+
+    #[test]
+    fn data_version_is_deterministic_and_inventory_sensitive() {
+        let two = two_site_engine();
+        // Deterministic for a fixed snapshot.
+        assert_eq!(
+            FeatureEngine::data_version(&two),
+            FeatureEngine::data_version(&two)
+        );
+        // A different site set hashes differently.
+        let mut one_site = HashMap::new();
+        one_site.insert(
+            "fivih".to_string(),
+            vec![entry(synthetic_volume(24.5, 60.3), "v0")],
+        );
+        let one = engine_for(one_site, "radar-fi-volume-local-h5");
+        assert_ne!(
+            FeatureEngine::data_version(&one),
+            FeatureEngine::data_version(&two)
+        );
+    }
+
+    /// The content hash reflects metadata-only corrections (PLC, antenna
+    /// height) that feed Feature properties — not just the site set / time.
+    #[test]
+    fn feature_version_reflects_metadata_corrections() {
+        fn meta_with(plc: Option<&str>, height_m: f64) -> SiteMeta {
+            SiteMeta {
+                lon: 24.5,
+                lat: 60.3,
+                plc: plc.map(String::from),
+                wmo: None,
+                height_m,
+                parameters: vec![],
+                quantities: vec!["DBZH".to_string()],
+                times: vec![],
+                spatial_extent: None,
+                coverage_radius_m: None,
+                vertical: None,
+            }
+        }
+        let nods = vec!["fivih".to_string()];
+        let base: HashMap<String, SiteMeta> =
+            [("fivih".to_string(), meta_with(Some("Vihti"), 100.0))]
+                .into_iter()
+                .collect();
+        let v0 = feature_version_of(&nods, &base);
+        assert_eq!(v0, feature_version_of(&nods, &base), "deterministic");
+
+        let plc_fixed: HashMap<String, SiteMeta> = [(
+            "fivih".to_string(),
+            meta_with(Some("Vihti (corrected)"), 100.0),
+        )]
+        .into_iter()
+        .collect();
+        assert_ne!(v0, feature_version_of(&nods, &plc_fixed), "PLC change");
+
+        let height_fixed: HashMap<String, SiteMeta> =
+            [("fivih".to_string(), meta_with(Some("Vihti"), 101.0))]
+                .into_iter()
+                .collect();
+        assert_ne!(
+            v0,
+            feature_version_of(&nods, &height_fixed),
+            "height change"
+        );
     }
 }
