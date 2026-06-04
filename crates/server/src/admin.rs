@@ -2041,18 +2041,80 @@ pub async fn reload_handler(
         )
     })?;
 
+    // Run the (blocking) reload on the background runtime so it never parks a
+    // request-serving worker — same as the collections_dir watcher. Use
+    // `spawn` (an async task on a poll-runtime worker), NOT `spawn_blocking`:
+    // engine construction calls `ds-storage`'s `block_in_place`, which panics
+    // on a spawn_blocking pool thread but is valid on a multi-thread worker.
+    let state2 = state.clone();
+    let outcome = crate::poll_runtime()
+        .spawn(async move { do_reload(&state2) })
+        .await;
+    match outcome {
+        Ok(Ok(o)) => Ok(Json(json!({
+            "status": "ok",
+            "ready": o.ready,
+            "degraded": o.degraded,
+            "configured": o.configured,
+            "collections": o.health,
+        }))),
+        Ok(Err(ReloadError::ConfigRead(e))) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Failed to read config: {e}") })),
+        )),
+        Ok(Err(ReloadError::NoReadyCollections { configured })) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "Reload produced 0 working collections, keeping old state",
+                "configured": configured
+            })),
+        )),
+        Err(e) => {
+            tracing::error!("Reload task failed to join: {e}");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Reload task failed" })),
+            ))
+        }
+    }
+}
+
+/// Outcome of a successful reload — counts + final health for the response/log.
+pub(crate) struct ReloadOutcome {
+    pub ready: usize,
+    pub degraded: usize,
+    pub configured: usize,
+    pub health: Vec<CollectionHealth>,
+}
+
+/// Why a reload was rejected — the live registry is left untouched in both cases.
+pub(crate) enum ReloadError {
+    /// Re-reading / parsing the config failed (e.g. a malformed collection file).
+    ConfigRead(String),
+    /// The new config produced zero `Ready` collections; the old state is kept.
+    NoReadyCollections { configured: usize },
+}
+
+/// Re-read the config from `state.config_path`, rebuild every engine, and
+/// atomically swap them into the live registries — the shared core behind both
+/// `POST /admin/collections/reload` and the `collections_dir` watcher.
+///
+/// The caller serializes reloads via `state.reload_lock` (the HTTP handler
+/// `try_lock`s → 409 on contention; the watcher `lock().await`s). On `Err` the
+/// live state is untouched: old engines and their poll loops keep running, and
+/// the freshly-built (rejected) engines are dropped with their loops never
+/// spawned. The (blocking) load runs synchronously — call it off the
+/// request-serving runtime (the watcher uses `poll_runtime()`).
+pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError> {
     info!(
-        "Reload requested, re-reading config from {}",
+        "Reloading collections, re-reading config from {}",
         state.config_path
     );
 
     let (config, config_warnings) = ds_core::config::ServerConfig::from_file(&state.config_path)
         .map_err(|e| {
             tracing::error!("Reload failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Failed to read config: {e}") })),
-            )
+            ReloadError::ConfigRead(format!("{e}"))
         })?;
     for warning in &config_warnings {
         tracing::warn!("{warning}");
@@ -2099,13 +2161,9 @@ pub async fn reload_handler(
             "Reload produced 0 working collections from {} configured. Keeping old state.",
             config.collections.len()
         );
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": "Reload produced 0 working collections, keeping old state",
-                "configured": config.collections.len()
-            })),
-        ));
+        return Err(ReloadError::NoReadyCollections {
+            configured: config.collections.len(),
+        });
     }
 
     // Surface a vanished per-site radar in `/health`. A site that was
@@ -2291,15 +2349,14 @@ pub async fn reload_handler(
         config.collections.len()
     );
 
-    Ok(Json(json!({
-        "status": "ok",
-        // `ready` = fully-working collections; `degraded` wire no servable
-        // routes (e.g. an empty odim-volume source) but aren't failures.
-        "ready": ready,
-        "degraded": degraded,
-        "configured": config.collections.len(),
-        "collections": result.health
-    })))
+    // `ready` = fully-working collections; `degraded` wire no servable routes
+    // (e.g. an empty odim-volume source) but aren't failures.
+    Ok(ReloadOutcome {
+        ready,
+        degraded,
+        configured: config.collections.len(),
+        health: result.health,
+    })
 }
 
 /// GET /health — per-collection health status with data staleness info.

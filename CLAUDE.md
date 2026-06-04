@@ -235,6 +235,8 @@ host = "0.0.0.0"
 port = 8000
 # base_url = "https://api.example.com"  # optional, for absolute links behind a proxy
 # collections_dir = "collections.d"     # optional, directory of per-collection .toml files
+# watch_collections_dir = true          # optional, auto-reload on collections_dir changes (default false)
+# watch_debounce_ms = 500               # optional, coalesce-window for the watcher (default 500)
 
 # Optional shared WMS style bundles. MUST live in top-level config.toml —
 # a [[style_bundles]] block inside a collections_dir file is silently
@@ -321,7 +323,8 @@ colormap = "radar_dbz"
 - The `id` field is required inside each file (not derived from filename). A warning is logged if the filename stem differs from the `id`.
 - The directory must exist if `collections_dir` is set (missing directory = hard error). An empty directory is valid but logs a warning.
 - Non-recursive: only files directly in the directory, no subdirectory traversal.
-- Hot-reload (`POST /admin/collections/reload`) picks up added, removed, and changed files automatically.
+- Hot-reload (`POST /admin/collections/reload`) picks up added, removed, and changed files automatically. With `[server] watch_collections_dir = true` (default off), a filesystem watcher (`notify`) triggers the **same** reload automatically on add/edit/remove — debounced (`watch_debounce_ms`, default 500), running on the background `poll_runtime`, and keeping the live registry if the new config is invalid/empty. The shared core is `admin::do_reload`.
+  - **Trust model:** the watcher's reload is authorized by *filesystem write access to `collections_dir`*, NOT the HTTP `ADMIN_TOKEN` that gates `POST /admin/collections/reload` — they are different control planes (local FS vs network). Anyone who can write a collection file already controls what the server serves. When the watcher is enabled and `ADMIN_TOKEN` is set, a startup WARN makes the asymmetry explicit; keep `collections_dir` writable only by trusted principals (avoid shared/NFS mounts for it).
 - A single invalid file rejects the entire config (no partial loads).
 - `[[style_bundles]]` blocks are NOT allowed in per-collection files — only in `config.toml`. Referencing a bundle from a per-collection `[wms]` is fine; defining one here is rejected with an explicit error.
 - A `style_bundle` cannot coexist with `[[wms.parameters]]` on the same collection — inline per-parameter *defaults* are rejected at config load when a bundle is attached.
@@ -329,7 +332,7 @@ colormap = "radar_dbz"
 
 ## Admin & Operations
 
-- **Reload**: `POST /admin/collections/reload` — re-reads config, atomically swaps engines.
+- **Reload**: `POST /admin/collections/reload` — re-reads config, atomically swaps engines. Shared core `admin::do_reload` is also driven by the optional `collections_dir` watcher (`[server] watch_collections_dir`).
 - **Health**: `GET /health` — per-collection status (ready/degraded/failed). HTTP 503 only when all failed.
 - **Metrics**: `GET /metrics` — Prometheus format. Path labels use route patterns (not raw URLs) to avoid cardinality explosion.
 - **State**: API state wrapped in `ArcSwap` for lock-free reads. Render semaphore (2× CPU cores, min 8) shared across Maps/Tiles/WMS. Engine loading in `server/src/admin.rs`.

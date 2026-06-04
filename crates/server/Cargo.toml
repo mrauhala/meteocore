@@ -23,6 +23,7 @@ arc-swap = "1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 http-body = "1"
+notify = "8"
 rust-embed = { version = "8", features = ["include-exclude"] }
 prometheus = "0.13"
 serde = { version = "1", features = ["derive"] }
@@ -36,5 +37,6 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
+tempfile = "3"
 toml = "0.8"
 tower = { version = "0.5", features = ["util"] }

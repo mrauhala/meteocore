@@ -1,5 +1,6 @@
 mod admin;
 mod preview;
+mod watcher;
 
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -294,6 +295,37 @@ async fn main() {
         info!("Admin endpoint authentication disabled (no ADMIN_TOKEN set)");
     }
 
+    // Resolve the collections_dir to watch (issue #318) before `config_path` is
+    // moved into `server_state` below. `from_file` already canonicalized and
+    // validated the dir at config load, so it exists here.
+    let watch_dir: Option<std::path::PathBuf> = if config.server.watch_collections_dir {
+        match config.server.collections_dir.as_deref() {
+            Some(dir) => {
+                let parent = std::path::Path::new(&config_path)
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                match parent.join(dir).canonicalize() {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        tracing::warn!(
+                            "watch_collections_dir: cannot resolve collections_dir '{dir}': {e} \
+                             — auto-reload disabled"
+                        );
+                        None
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "watch_collections_dir is set but collections_dir is not — nothing to watch"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let server_state: AdminState = Arc::new(ServerState {
         edr: edr_swap.clone(),
         features: features_swap.clone(),
@@ -311,6 +343,27 @@ async fn main() {
         reload_lock: tokio::sync::Mutex::new(()),
         admin_token,
     });
+
+    // Start the collections_dir watcher (issue #318) if enabled. Best-effort:
+    // a watcher init failure logs and the server runs without auto-reload.
+    if let Some(dir) = watch_dir {
+        // Trust-model note: watch-triggered reloads are gated by write access to
+        // `collections_dir` (a local-filesystem control plane), NOT the HTTP
+        // `ADMIN_TOKEN` that gates `POST /admin/collections/reload`. Make the
+        // asymmetry explicit when both are in play (e.g. a shared/NFS dir).
+        if server_state.admin_token.is_some() {
+            tracing::warn!(
+                "collections_dir watcher is enabled and an admin token is set: \
+                 filesystem-triggered reloads do NOT require the token — they are \
+                 authorized by write access to collections_dir. Ensure only trusted \
+                 principals can write there."
+            );
+        }
+        let debounce = std::time::Duration::from_millis(config.server.watch_debounce_ms);
+        if let Err(e) = watcher::spawn_collections_watcher(server_state.clone(), dir, debounce) {
+            tracing::warn!("Failed to start collections_dir watcher: {e}");
+        }
+    }
 
     let root_state = server_state.clone();
 

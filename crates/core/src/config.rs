@@ -34,6 +34,17 @@ pub struct ServerSettings {
     /// render), reversible via config reload.
     #[serde(default = "default_metatile_cache_mb")]
     pub metatile_cache_mb: u64,
+    /// Watch `collections_dir` for changes and auto-reload (add/remove/update
+    /// collections) when `.toml` files are added, edited, or removed — no manual
+    /// `POST /admin/collections/reload` needed. Opt-in; default `false`. Has no
+    /// effect unless `collections_dir` is also set.
+    #[serde(default)]
+    pub watch_collections_dir: bool,
+    /// Debounce window (milliseconds) for the `collections_dir` watcher: rapid
+    /// or multi-event file changes (an editor's write-then-rename) within this
+    /// window coalesce into a single reload. Default: 500.
+    #[serde(default = "default_watch_debounce_ms")]
+    pub watch_debounce_ms: u64,
 }
 
 impl ServerSettings {
@@ -172,6 +183,10 @@ fn default_rendered_cache_mb() -> u64 {
 
 fn default_metatile_cache_mb() -> u64 {
     1024
+}
+
+fn default_watch_debounce_ms() -> u64 {
+    500
 }
 
 /// Shared WMS style set: one default + zero or more named extras.
@@ -1391,6 +1406,52 @@ description = "A test"
         assert_eq!(config.collections.len(), 1);
         assert_eq!(config.collections[0].id, "test");
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn watch_collections_dir_defaults_off_with_500ms_debounce() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(
+            tmp.path(),
+            "config.toml",
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "test"
+title = "Test"
+description = "A test"
+"#,
+        );
+        let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert!(!config.server.watch_collections_dir);
+        assert_eq!(config.server.watch_debounce_ms, 500);
+    }
+
+    #[test]
+    fn watch_collections_dir_parses_explicit_values() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(
+            tmp.path(),
+            "config.toml",
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+watch_collections_dir = true
+watch_debounce_ms = 250
+
+[[collections]]
+id = "test"
+title = "Test"
+description = "A test"
+"#,
+        );
+        let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert!(config.server.watch_collections_dir);
+        assert_eq!(config.server.watch_debounce_ms, 250);
     }
 
     #[test]
