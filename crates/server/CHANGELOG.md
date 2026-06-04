@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.6.0](https://github.com/mrauhala/meteocore/compare/v0.5.1...v0.6.0) (2026-06-04)
+
+
+### Features
+
+* **api:** align OGC API Maps/Tiles collection metadata with the spec ([#261](https://github.com/mrauhala/meteocore/issues/261)) ([579773f](https://github.com/mrauhala/meteocore/commit/579773f546b9153f1e7410abb20e88554e9be52d))
+* **engine-odim:** human-readable PVOL labels + site-prefixed WMS layer titles ([#315](https://github.com/mrauhala/meteocore/issues/315)) ([1c4cfee](https://github.com/mrauhala/meteocore/commit/1c4cfee74cb09c2cb35ad13a8b18db08524d1432))
+* **engine-odim:** per-site PVOL collections (model B); param = bare quantity ([#282](https://github.com/mrauhala/meteocore/issues/282)) ([55c4b4f](https://github.com/mrauhala/meteocore/commit/55c4b4f5b4d89ae11be39bbeaa015b5d2fa0740c))
+* **engine-odim:** radar sites as an OGC API - Features collection ([#285](https://github.com/mrauhala/meteocore/issues/285)) ([#316](https://github.com/mrauhala/meteocore/issues/316)) ([8c9a2ad](https://github.com/mrauhala/meteocore/commit/8c9a2adf2b143fd5ab913ecfc3bc53e52d9618e0))
+* **server:** watch collections_dir and auto-reload on changes ([#318](https://github.com/mrauhala/meteocore/issues/318)) ([#319](https://github.com/mrauhala/meteocore/issues/319)) ([fd946aa](https://github.com/mrauhala/meteocore/commit/fd946aa7e9ee8f597027cc1f1f0c7227e1685397))
+
+
+### Bug Fixes
+
+* **server:** add WMS latency histogram buckets between 1s and 5s ([#230](https://github.com/mrauhala/meteocore/issues/230)) ([f750a2e](https://github.com/mrauhala/meteocore/commit/f750a2e8e100de17b181733c7060ff3c808af0f3))
+
+
+### Performance Improvements
+
+* **engine-odim:** lazy PVOL pixel loading — bounded RAM, non-blocking scan ([#290](https://github.com/mrauhala/meteocore/issues/290)) ([dce9cb3](https://github.com/mrauhala/meteocore/commit/dce9cb33b23dce0cde33def67be291631a240a2a))
+* **render,api-wms:** internal meta-tiling for Web Mercator WMS GetMap ([#202](https://github.com/mrauhala/meteocore/issues/202)) ([#235](https://github.com/mrauhala/meteocore/issues/235)) ([aee7d5b](https://github.com/mrauhala/meteocore/commit/aee7d5b52ac2b57c2fa5ce165ccdc0d5bf48cc98))
+* **server:** wire IntegerLutColorMap into the WMS/Maps/Tiles colorize path ([#250](https://github.com/mrauhala/meteocore/issues/250)) ([ff0d459](https://github.com/mrauhala/meteocore/commit/ff0d459121d51f894291d98a52e6effae4d42628))
+
 ## [0.5.1](https://github.com/mrauhala/meteocore/compare/v0.5.0...v0.5.1) (2026-05-24)
 
 
