@@ -142,6 +142,12 @@ impl LicenseConfig {
     /// The license URL to advertise: the explicit `url` if set, else an
     /// `spdx.org` URL synthesized from `title` when it is a plausible SPDX id,
     /// else `None` (the caller emits a license link only when this is `Some`).
+    ///
+    /// Note: a deprecated `+`-suffix id (e.g. `GPL-2.0+`) is accepted by the
+    /// shape check and synthesizes `https://spdx.org/licenses/GPL-2.0+.html`,
+    /// which `spdx.org` serves only via a redirect to the canonical
+    /// `-or-later` page. For a canonical `href`, set an explicit `url` or use
+    /// the non-deprecated id (e.g. `GPL-2.0-or-later`).
     pub fn resolved_url(&self) -> Option<String> {
         if let Some(url) = &self.url {
             return Some(url.clone());
