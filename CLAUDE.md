@@ -260,9 +260,10 @@ engine_type = "csv"             # defaults to "csv"
 # Optional discovery metadata, surfaced across all APIs (see below).
 keywords = ["weather", "observations", "Finland"]
 [collections.license]
-title = "CC-BY 4.0"            # required; an SPDX id (e.g. "CC-BY-4.0") works too
-url = "https://creativecommons.org/licenses/by/4.0/"  # optional; auto-synthesized
-                                                      # from spdx.org for an SPDX id
+title = "CC-BY-4.0"   # required; an SPDX id (no spaces). With no `url` below,
+                      # the link auto-resolves to
+                      # https://spdx.org/licenses/CC-BY-4.0.html
+# url = "https://creativecommons.org/licenses/by/4.0/"   # optional explicit override
 
 [[collections]]
 id = "radar"
