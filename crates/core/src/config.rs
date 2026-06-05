@@ -84,6 +84,14 @@ where
     Ok(String::deserialize(d)?.trim().to_string())
 }
 
+/// Like [`de_trimmed_string`] but for an optional string (e.g. a license `url`).
+fn de_trimmed_opt_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(d)?.map(|s| s.trim().to_string()))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CollectionConfig {
     pub id: String,
@@ -138,10 +146,11 @@ pub struct LicenseConfig {
     #[serde(deserialize_with = "de_trimmed_string")]
     pub title: String,
     /// Explicit URL to the license text. When absent, [`resolved_url`] falls
-    /// back to an `spdx.org` URL if `title` looks like an SPDX id.
+    /// back to an `spdx.org` URL if `title` looks like an SPDX id. Trimmed at
+    /// load (like `title`) so the raw field is always clean.
     ///
     /// [`resolved_url`]: Self::resolved_url
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
     pub url: Option<String>,
 }
 
@@ -157,9 +166,8 @@ impl LicenseConfig {
     /// the non-deprecated id (e.g. `GPL-2.0-or-later`).
     pub fn resolved_url(&self) -> Option<String> {
         if let Some(url) = &self.url {
-            // Trim so a stray space in the TOML value can't leak into an
-            // href/xlink:href (mirrors `de_trimmed_keywords`).
-            return Some(url.trim().to_string());
+            // Already trimmed at load by `de_trimmed_opt_string`.
+            return Some(url.clone());
         }
         // SPDX ids are short tokens of [A-Za-z0-9.+-] (e.g. "CC-BY-4.0",
         // "Apache-2.0"). Only synthesize for that shape so a free-text title
@@ -1403,9 +1411,7 @@ impl ServerConfig {
                     )));
                 }
                 if let Some(url) = &license.url {
-                    // Trim before the scheme check so it matches what
-                    // `resolved_url()` actually emits (which trims too).
-                    let url = url.trim();
+                    // `url` is trimmed at load by `de_trimmed_opt_string`.
                     if !(url.starts_with("http://") || url.starts_with("https://")) {
                         return Err(crate::error::DataServerError::Config(format!(
                             "Collection '{id}': [collections.license] 'url' must be an http(s) URL"
@@ -1574,11 +1580,11 @@ url = "https://creativecommons.org/licenses/by/4.0/"
 
     #[test]
     fn license_url_is_trimmed() {
-        // A stray space in the TOML value must not leak into the emitted href.
-        let lic = LicenseConfig {
-            title: "X".into(),
-            url: Some("  https://example.com/lic  ".into()),
-        };
+        // A stray space in the TOML value must not leak into the stored field
+        // or the emitted href — trimming happens at load (de_trimmed_opt_string).
+        let lic: LicenseConfig =
+            toml::from_str("title = \"X\"\nurl = \"  https://example.com/lic  \"").unwrap();
+        assert_eq!(lic.url.as_deref(), Some("https://example.com/lic"));
         assert_eq!(
             lic.resolved_url().as_deref(),
             Some("https://example.com/lic")

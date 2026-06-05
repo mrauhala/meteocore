@@ -1323,7 +1323,7 @@ fn build_collection_metadata(
         "title": config.title
     })];
     if let Some((title, url)) = config.license.as_ref().and_then(|l| l.card_link()) {
-        links.push(json!({ "href": url, "rel": "license", "type": "text/html", "title": title }));
+        links.push(json!({ "href": url, "rel": "license", "title": title }));
     }
 
     let mut metadata = json!({
