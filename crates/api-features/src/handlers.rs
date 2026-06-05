@@ -501,7 +501,7 @@ pub async fn collections(
                 engine.spatial_extent(),
                 value,
                 config.keywords.clone(),
-                config.license.as_ref().and_then(|l| l.card_link()),
+                config.license.as_ref().map(|l| l.card_label()),
             ))
         })
         .collect();
@@ -625,7 +625,7 @@ pub async fn collection(
                 description: config.description.clone(),
                 self_href: format!("{base}/features/collections/{}", config.id),
                 keywords: config.keywords.clone(),
-                license: config.license.as_ref().and_then(|l| l.card_link()),
+                license: config.license.as_ref().map(|l| l.card_label()),
             };
             let links = [
                 LinkView::new(

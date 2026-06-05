@@ -133,8 +133,9 @@ pub struct CollectionCard {
     pub self_href: String,
     /// Configured keywords (may be empty), rendered as chips.
     pub keywords: Vec<String>,
-    /// Optional license as `(title, href)`, rendered as a link.
-    pub license: Option<(String, String)>,
+    /// Optional license as `(title, href?)`: rendered as a link when an href is
+    /// present, else as the plain name (a free-text license with no URL).
+    pub license: Option<(String, Option<String>)>,
 }
 
 const STYLE: &str = "body{font-family:system-ui,sans-serif;max-width:60rem;margin:2rem auto;\
@@ -172,14 +173,18 @@ fn render_keywords(keywords: &[String]) -> String {
     s
 }
 
-/// Render the license as a labelled link. `None` → empty string.
-fn render_license(license: &Option<(String, String)>) -> String {
+/// Render the license: a labelled link when an href is present, else the plain
+/// name (a free-text license with no resolvable URL). `None` → empty string.
+fn render_license(license: &Option<(String, Option<String>)>) -> String {
     match license {
-        Some((title, href)) => format!(
+        Some((title, Some(href))) => format!(
             "<p class=\"license\">License: <a href=\"{}\">{}</a></p>\n",
             escape(href),
             escape(title)
         ),
+        Some((title, None)) => {
+            format!("<p class=\"license\">License: {}</p>\n", escape(title))
+        }
         None => String::new(),
     }
 }
@@ -373,7 +378,7 @@ mod tests {
             description: "x & y".into(),
             self_href: "/maps/collections/radar".into(),
             keywords: vec!["weather".into(), "ra<d>ar".into()],
-            license: Some(("CC-BY 4.0".into(), "https://example/lic".into())),
+            license: Some(("CC-BY 4.0".into(), Some("https://example/lic".into()))),
         }];
         let html = collections_html("Collections", &cards, &[]);
         assert!(html.starts_with("<!DOCTYPE html>"));
@@ -390,6 +395,24 @@ mod tests {
         let detail = collection_html(&cards[0], &[]);
         assert!(detail.contains("class=\"kw\">weather</span>"));
         assert!(detail.contains("https://example/lic") && detail.contains("CC-BY 4.0"));
+    }
+
+    #[test]
+    fn license_without_url_renders_as_plain_name() {
+        // A free-text license (no resolvable URL) must still show its name on the
+        // HTML page — as plain text, not an <a> — matching the WMS <Attribution>.
+        let card = CollectionCard {
+            id: "c".into(),
+            title: "C".into(),
+            description: String::new(),
+            self_href: "/maps/collections/c".into(),
+            keywords: vec![],
+            license: Some(("All rights reserved".into(), None)),
+        };
+        let html = collection_html(&card, &[]);
+        assert!(html.contains("License: All rights reserved"));
+        // No anchor for a license without an href.
+        assert!(!html.contains("License: <a"));
     }
 
     #[test]

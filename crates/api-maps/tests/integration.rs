@@ -312,10 +312,10 @@ async fn fetch_collection_json(engine: Arc<dyn MapEngine>, id: &str, apis: Vec<S
 }
 
 /// Fetch a collection's JSON with explicit keywords + license configured.
-async fn fetch_collection_json_with(
+fn router_with(
     keywords: Vec<String>,
     license: Option<ds_core::config::LicenseConfig>,
-) -> Value {
+) -> axum::Router {
     let id = "radar";
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
@@ -351,8 +351,27 @@ async fn fetch_collection_json_with(
         rendered_cache: Arc::new(RenderedCache::new(16)),
         base_url: String::new(),
     }));
-    let (_, json) = get_on(api_maps::router(state), &format!("/collections/{id}")).await;
+    api_maps::router(state)
+}
+
+async fn fetch_collection_json_with(
+    keywords: Vec<String>,
+    license: Option<ds_core::config::LicenseConfig>,
+) -> Value {
+    let (_, json) = get_on(router_with(keywords, license), "/collections/radar").await;
     json
+}
+
+/// Fetch the HTML collection-detail page as a raw string.
+async fn fetch_collection_html_with(license: Option<ds_core::config::LicenseConfig>) -> String {
+    let app = router_with(Vec::new(), license);
+    let req = Request::builder()
+        .uri("/collections/radar?f=html")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(body.to_vec()).unwrap()
 }
 
 mod metadata_extras {
@@ -362,6 +381,27 @@ mod metadata_extras {
     async fn keywords_appear_in_collection_json() {
         let json = fetch_collection_json_with(vec!["radar".into(), "weather".into()], None).await;
         assert_eq!(json["keywords"], serde_json::json!(["radar", "weather"]));
+    }
+
+    #[tokio::test]
+    async fn freetext_license_shows_name_in_html_but_no_json_link() {
+        // A free-text license (no resolvable URL) must surface its name on the
+        // HTML page (as plain text, no <a>) yet produce no JSON `rel="license"`
+        // link — the cross-output behavior the docs promise (review on PR #324).
+        let lic = ds_core::config::LicenseConfig {
+            title: "All rights reserved".into(),
+            url: None,
+        };
+        let html = fetch_collection_html_with(Some(lic.clone())).await;
+        assert!(html.contains("License: All rights reserved"));
+        assert!(!html.contains("License: <a"));
+
+        let json = fetch_collection_json_with(Vec::new(), Some(lic)).await;
+        assert!(json["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|l| l["rel"] != "license"));
     }
 
     #[tokio::test]

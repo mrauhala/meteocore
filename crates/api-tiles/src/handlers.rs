@@ -776,7 +776,7 @@ pub async fn collections(
             time,
             value,
             config.keywords.clone(),
-            config.license.as_ref().and_then(|l| l.card_link()),
+            config.license.as_ref().map(|l| l.card_label()),
         ));
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
@@ -922,7 +922,7 @@ pub async fn collection(
                 description: config.description.clone(),
                 self_href: format!("{base}/tiles/collections/{}", config.id),
                 keywords: config.keywords.clone(),
-                license: config.license.as_ref().and_then(|l| l.card_link()),
+                license: config.license.as_ref().map(|l| l.card_label()),
             };
             let links = [
                 LinkView::new(

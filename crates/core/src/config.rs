@@ -167,11 +167,19 @@ impl LicenseConfig {
         }
     }
 
-    /// `(title, href)` for an HTML license link, or `None` when no URL is
-    /// resolvable (an `<a href>` needs a target). Shared by the API crates'
-    /// HTML collection cards.
+    /// `(title, href)` for a license **link**, or `None` when no URL is
+    /// resolvable (a link object / `<a href>` needs a target). Used for the
+    /// JSON `rel="license"` link, which cannot exist without an `href`.
     pub fn card_link(&self) -> Option<(String, String)> {
         self.resolved_url().map(|url| (self.title.clone(), url))
+    }
+
+    /// `(title, href?)` for **display** contexts (HTML cards) that show the
+    /// license name even when no URL resolves. Unlike [`card_link`](Self::card_link)
+    /// this always yields the title; the href is `None` for a free-text license
+    /// with no explicit `url` (rendered as plain text rather than a link).
+    pub fn card_label(&self) -> (String, Option<String>) {
+        (self.title.clone(), self.resolved_url())
     }
 }
 
@@ -1551,15 +1559,18 @@ url = "https://creativecommons.org/licenses/by/4.0/"
     }
 
     #[test]
-    fn license_freetext_without_url_has_no_link() {
+    fn license_freetext_without_url_has_no_link_but_keeps_label() {
         // A free-text name (spaces) is not a plausible SPDX id, so no URL is
-        // synthesized and the JSON/HTML link is omitted.
+        // synthesized: the JSON `rel="license"` link is omitted (card_link →
+        // None), but the display label keeps the name (card_label → (name, None))
+        // so HTML/WMS can still show it.
         let lic = LicenseConfig {
             title: "All rights reserved".into(),
             url: None,
         };
         assert_eq!(lic.resolved_url(), None);
         assert_eq!(lic.card_link(), None);
+        assert_eq!(lic.card_label(), ("All rights reserved".to_string(), None));
     }
 
     fn collection_with(extra: &str) -> ServerConfig {
