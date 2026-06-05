@@ -212,3 +212,32 @@ fn partially_overlapping_bbox_is_partially_filled() {
         "the off-raster side should be nodata"
     );
 }
+
+/// #211: `raster_info()` is served from a snapshot rebuilt at each catalog
+/// swap, so it is populated (CRS, grid, timestamps) at construction — the
+/// first request needs no per-call CRS scan / timestamp-Vec build / metadata
+/// fetch — and is stable across calls.
+#[test]
+fn raster_info_is_cached_and_populated_at_construction() {
+    let engine = tm35fin_engine();
+
+    let info = engine.raster_info();
+    assert!(
+        !info.times.is_empty(),
+        "times populated from the committed fixture at construction"
+    );
+    assert_ne!(
+        info.native_crs, "CRS:84",
+        "CRS comes from metadata loaded during the scan, not the cold-start default"
+    );
+    assert!(
+        info.grid_size.is_some(),
+        "grid size read from the (already-loaded) metadata"
+    );
+
+    // Cached snapshot: a second call returns identical data.
+    let info2 = engine.raster_info();
+    assert_eq!(info.times, info2.times);
+    assert_eq!(info.native_crs, info2.native_crs);
+    assert_eq!(info.grid_size, info2.grid_size);
+}

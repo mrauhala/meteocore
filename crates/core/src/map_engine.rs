@@ -109,6 +109,7 @@ impl RasterTile {
 }
 
 /// Metadata about a map-capable raster collection.
+#[derive(Debug, Clone)]
 pub struct RasterInfo {
     /// Native CRS identifier (e.g., "EPSG:3067").
     pub native_crs: String,

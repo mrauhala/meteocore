@@ -80,6 +80,12 @@ enum StoreMode {
 pub struct GeoTiffEngine {
     collection_id: String,
     catalog: ArcSwap<Catalog>,
+    /// `RasterInfo` snapshot, rebuilt once per catalog swap (`refresh_raster_info`)
+    /// so the per-request `raster_info()` is an O(1) `ArcSwap` read + cheap clone
+    /// instead of re-deriving CRS/grid/timestamps — and, for STAC, never a
+    /// metadata fetch — on every Maps/Tiles call (#211). The expensive
+    /// derivation runs at startup and on the background poll runtime.
+    raster_info: ArcSwap<ds_core::map_engine::RasterInfo>,
     tile_cache: cache::TileCache,
     store_mode: StoreMode,
     filename_pattern: Regex,
@@ -180,6 +186,57 @@ impl GeoTiffEngine {
             catalog.trim_to_latest(max);
         }
         self.catalog.store(Arc::new(catalog));
+        self.refresh_raster_info();
+    }
+
+    /// Rebuild the cached [`RasterInfo`] from the current catalog and publish it.
+    /// Call after every catalog swap (#211). [`build_raster_info`](Self::build_raster_info)
+    /// only *reads* already-loaded metadata (no I/O), so this is cheap and safe
+    /// from any context — including the request path (`store_stac_catalog`,
+    /// `do_load_metadata`), where it must never trigger `DataStore`/`block_in_place`.
+    fn refresh_raster_info(&self) {
+        self.raster_info.store(Arc::new(self.build_raster_info()));
+    }
+
+    /// Derive [`RasterInfo`] from the current catalog — a pure read of what's
+    /// already loaded, with **no** metadata fetch. `times` come from the entry
+    /// keys (fixed at scan); `native_crs`/`grid_size` from currently-loaded entry
+    /// metadata. Local entries are `Loaded` at scan (CRS correct from
+    /// construction); STAC entries are stubs until first render, so `native_crs`
+    /// is the `CRS:84` placeholder until `do_load_metadata` loads one and calls
+    /// [`refresh_raster_info`](Self::refresh_raster_info). The STAC cold-start
+    /// `CRS:84` window (GetCapabilities / `/collections` before the first
+    /// render) is tracked as a known limitation in #322.
+    fn build_raster_info(&self) -> ds_core::map_engine::RasterInfo {
+        let catalog = self.catalog.load();
+        let crs_name = catalog
+            .entries
+            .values()
+            .find_map(|entry| entry.metadata().map(|m| crs_label(&m.geo_transform.crs)))
+            // No metadata could be read; the engine works internally in
+            // lon-first geographic coordinates, so default to CRS:84.
+            .unwrap_or_else(|| "CRS:84".to_string());
+
+        let times: Vec<DateTime<Utc>> = catalog.entries.keys().cloned().collect();
+
+        // Native full-resolution grid dimensions, taken from the first loaded
+        // entry (all entries in a collection share the same grid).
+        let grid_size = catalog
+            .entries
+            .values()
+            .find_map(|entry| entry.metadata().map(|m| [m.width, m.height]));
+
+        ds_core::map_engine::RasterInfo {
+            native_crs: crs_name,
+            spatial_extent: catalog.spatial_extent,
+            times,
+            parameter: self.parameter.clone(),
+            unit: self.unit.clone(),
+            parameters: vec![], // single-parameter engine
+            vertical: None,     // single-layer raster, no vertical dimension
+            grid_size,
+            layer_subtitle: None,
+        }
     }
 
     /// How long ago the catalog was last successfully updated.
@@ -334,6 +391,18 @@ impl GeoTiffEngine {
         let engine = GeoTiffEngine {
             collection_id: collection_id.to_string(),
             catalog: ArcSwap::from_pointee(Catalog::empty()),
+            // Placeholder until the initial scan populates it (refreshed below).
+            raster_info: ArcSwap::from_pointee(ds_core::map_engine::RasterInfo {
+                native_crs: "CRS:84".to_string(),
+                spatial_extent: None,
+                times: vec![],
+                parameter: config.parameter.clone(),
+                unit: config.unit.clone(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: None,
+                layer_subtitle: None,
+            }),
             tile_cache,
             store_mode,
             filename_pattern,
@@ -410,6 +479,11 @@ impl GeoTiffEngine {
                 );
             }
         }
+
+        // Populate the cached RasterInfo from the freshly-scanned catalog so the
+        // first request is already O(1) (and any CRS metadata-load happens here
+        // at startup, not on a request worker).
+        engine.refresh_raster_info();
 
         Ok(engine)
     }
@@ -678,6 +752,11 @@ impl GeoTiffEngine {
         }
         new_catalog.recompute_extents();
         self.catalog.store(Arc::new(new_catalog));
+        // A STAC stub just gained metadata (CRS/grid/extent) — refresh the
+        // cached snapshot so `raster_info()` reflects it immediately rather than
+        // waiting for the next poll. Cheap + I/O-free (the metadata is already
+        // loaded), so it's safe here even on the render path (#211 review).
+        self.refresh_raster_info();
 
         Ok(())
     }
@@ -893,6 +972,8 @@ impl GeoTiffEngine {
 
                 self.consecutive_poll_failures.store(0, Ordering::Relaxed);
                 self.catalog.store(Arc::new(new_catalog));
+                // Rebuild the cached RasterInfo off the request path (#211).
+                self.refresh_raster_info();
                 // Track successful catalog update time
                 *self
                     .catalog_updated_at
@@ -1499,58 +1580,10 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
     }
 
     fn raster_info(&self) -> ds_core::map_engine::RasterInfo {
-        // Try to load at least one entry's metadata for CRS detection
-        {
-            let catalog = self.catalog.load();
-            let has_loaded = catalog.entries.values().any(|e| e.is_loaded());
-            if !has_loaded {
-                // No loaded entries — try each until one succeeds
-                let timestamps: Vec<DateTime<Utc>> = catalog.entries.keys().copied().collect();
-                drop(catalog);
-                for ts in &timestamps {
-                    match self.ensure_metadata(ts) {
-                        Ok(()) => break,
-                        Err(e) => {
-                            tracing::warn!(
-                                "[{}] Failed to load metadata for CRS detection: {}",
-                                self.collection_id,
-                                e
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        let catalog = self.catalog.load();
-        let crs_name = catalog
-            .entries
-            .values()
-            .find_map(|entry| entry.metadata().map(|m| crs_label(&m.geo_transform.crs)))
-            // No metadata could be read; the engine works internally in
-            // lon-first geographic coordinates, so default to CRS:84.
-            .unwrap_or_else(|| "CRS:84".to_string());
-
-        let times: Vec<DateTime<Utc>> = catalog.entries.keys().cloned().collect();
-
-        // Native full-resolution grid dimensions, taken from the first loaded
-        // entry (all entries in a collection share the same grid).
-        let grid_size = catalog
-            .entries
-            .values()
-            .find_map(|entry| entry.metadata().map(|m| [m.width, m.height]));
-
-        ds_core::map_engine::RasterInfo {
-            native_crs: crs_name,
-            spatial_extent: catalog.spatial_extent,
-            times,
-            parameter: self.parameter.clone(),
-            unit: self.unit.clone(),
-            parameters: vec![], // single-parameter engine
-            vertical: None,     // single-layer raster, no vertical dimension
-            grid_size,
-            layer_subtitle: None,
-        }
+        // O(1): clone the snapshot rebuilt at the last catalog swap
+        // (`refresh_raster_info`). No per-request CRS scan, timestamp Vec
+        // allocation, or STAC metadata fetch on the request path (#211).
+        (*self.raster_info.load_full()).clone()
     }
 }
 
@@ -1977,6 +2010,101 @@ mod tests {
     fn crs_label_wgs84_is_crs84_not_epsg4326() {
         // Internal data is lon-first; EPSG:4326 would imply lat-first.
         assert_eq!(crs_label(&ds_core::geo::Crs::Wgs84), "CRS:84");
+    }
+
+    fn tm35fin_test_config() -> ds_core::config::GeoTiffConfig {
+        ds_core::config::GeoTiffConfig {
+            filename_template: Some("radar_tm35_%Y%m%dT%H%MZ.tif".to_string()),
+            filename_pattern: None,
+            timestamp_format: None,
+            parameter: "reflectivity".to_string(),
+            unit: "dBZ".to_string(),
+            poll_interval_secs: 3600,
+            tile_cache_mb: 16,
+            band: 1,
+            max_files: None,
+            nodata: None,
+            scale: None,
+            offset: None,
+            exclude_patterns: vec![],
+            endpoint: None,
+            bucket: None,
+            prefix_pattern: None,
+            time_window: None,
+            scan_days: None,
+            stac_url: None,
+            stac_asset_key: "data".to_string(),
+            stac_asset_allowlist: None,
+        }
+    }
+
+    /// #211 review: guards the STAC cold-start behaviour change. A stub-backed
+    /// catalog (STAC, pre-render) must report `CRS:84` / no grid — with **no**
+    /// metadata fetch (`build_raster_info` is pure) — while `times` still derive
+    /// from the entry keys; once an entry is `Loaded` (as `do_load_metadata`
+    /// does) and the snapshot is refreshed, the real CRS/grid reappear. Built
+    /// over the committed local fixture so a real loaded entry is available.
+    #[test]
+    fn raster_info_stub_reports_crs84_then_real_crs_after_load() {
+        use ds_core::map_engine::MapEngine;
+        let config = tm35fin_test_config();
+        let engine = GeoTiffEngine::new(
+            "radar-tm35fin",
+            Some("../../testdata/radar-tm35fin"),
+            &config,
+        )
+        .expect("engine builds from the committed TM35FIN fixture");
+
+        // Local entries are Loaded at scan → real projected CRS from construction.
+        assert_ne!(engine.raster_info().native_crs, "CRS:84");
+
+        // Borrow a real loaded entry to reuse for the transition half.
+        let (loaded_ts, loaded_entry) = {
+            let cat = engine.catalog.load();
+            let (ts, e) = cat.entries.iter().next().expect("fixture has an entry");
+            (*ts, e.clone())
+        };
+
+        // Cold-start: a stub-only catalog reports the placeholder CRS, no grid,
+        // and no fetch — but `times` come from the keys.
+        let stub_ts = loaded_ts + chrono::Duration::minutes(5);
+        let mut stub_catalog = crate::catalog::Catalog::empty();
+        stub_catalog.entries.insert(
+            stub_ts,
+            crate::catalog::FileEntry::stac_stub(
+                std::path::PathBuf::from("stub.tif"),
+                0,
+                crate::catalog::StacStub {
+                    bbox: None,
+                    asset_url: "https://example.com/stub.tif".to_string(),
+                },
+            ),
+        );
+        engine.catalog.store(Arc::new(stub_catalog));
+        engine.refresh_raster_info();
+        let stub_info = engine.raster_info();
+        assert_eq!(
+            stub_info.native_crs, "CRS:84",
+            "stub entries report the placeholder CRS without a metadata fetch"
+        );
+        assert!(stub_info.grid_size.is_none());
+        assert_eq!(
+            stub_info.times,
+            vec![stub_ts],
+            "times derive from entry keys even for stubs"
+        );
+
+        // Transition: a Loaded entry + refresh restores the real CRS/grid.
+        let mut loaded_catalog = crate::catalog::Catalog::empty();
+        loaded_catalog.entries.insert(loaded_ts, loaded_entry);
+        engine.catalog.store(Arc::new(loaded_catalog));
+        engine.refresh_raster_info();
+        let reloaded = engine.raster_info();
+        assert_ne!(
+            reloaded.native_crs, "CRS:84",
+            "a Loaded entry yields the real CRS after refresh (do_load_metadata path)"
+        );
+        assert!(reloaded.grid_size.is_some());
     }
 
     #[test]
