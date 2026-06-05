@@ -244,7 +244,7 @@ fn searchable_collections_parameters() -> serde_json::Value {
         {"name": "datetime", "in": "query", "required": false, "schema": {"type": "string"},
          "description": "Filter to collections whose temporal extent intersects this RFC 3339 instant or interval (start/end, ../end, start/..)."},
         {"name": "q", "in": "query", "required": false, "schema": {"type": "string"},
-         "description": "Free-text search (comma-separated terms, OR) over collection title and description."},
+         "description": "Free-text search (comma-separated terms, OR) over collection title, description, and keywords."},
         {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 1000},
          "description": "Maximum number of collections per page (default 1000)."},
         {"name": "offset", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0},
@@ -660,8 +660,9 @@ pub async fn collections(
     let state = state.load_full();
     let base = &state.base_url;
 
-    // (id, title, description, bbox, time, metadata) per collection. Tuple
-    // element types are inferred, so no extra chrono import is needed.
+    // (id, title, description, bbox, time, metadata, keywords, license) per
+    // collection. Tuple element types are inferred, so no extra chrono import is
+    // needed. keywords/license feed `?q=` search and the HTML cards.
     let mut rows: Vec<_> = state
         .collections
         .values()
@@ -683,6 +684,8 @@ pub async fn collections(
                 engine.get_spatial_extent(),
                 engine.get_temporal_extent(),
                 value,
+                config.keywords.clone(),
+                config.license.as_ref().and_then(|l| l.card_link()),
             ))
         })
         .collect();
@@ -693,6 +696,7 @@ pub async fn collections(
         .map(|r| CollectionMatch {
             title: &r.1,
             description: &r.2,
+            keywords: &r.6,
             bbox: r.3,
             time: r.4,
         })
@@ -742,6 +746,8 @@ pub async fn collections(
                     title: rows[i].1.clone(),
                     description: rows[i].2.clone(),
                     self_href: format!("{base}/edr/collections/{}", rows[i].0),
+                    keywords: rows[i].6.clone(),
+                    license: rows[i].7.clone(),
                 })
                 .collect();
             let mut nav = vec![LinkView::new(
@@ -800,6 +806,8 @@ pub async fn collection(
                 title: config.title.clone(),
                 description: config.description.clone(),
                 self_href: format!("{base}/edr/collections/{}", config.id),
+                keywords: config.keywords.clone(),
+                license: config.license.as_ref().and_then(|l| l.card_link()),
             };
             let links = [
                 LinkView::new(
@@ -1188,6 +1196,20 @@ pub async fn trajectory_query(
     }
 }
 
+/// An OGC `rel="license"` link for the collection, or `None` when the config has
+/// no license (or the license has no resolvable URL — a link object requires an
+/// `href`). Shared shape across all JSON APIs.
+fn license_link(config: &CollectionConfig) -> Option<serde_json::Value> {
+    let license = config.license.as_ref()?;
+    let href = license.resolved_url()?;
+    Some(json!({
+        "href": href,
+        "rel": "license",
+        "type": "text/html",
+        "title": license.title(),
+    }))
+}
+
 fn build_collection_metadata(
     engine: &dyn EdrEngine,
     config: &CollectionConfig,
@@ -1308,7 +1330,17 @@ fn build_collection_metadata(
         );
     }
 
-    json!({
+    let mut links = vec![json!({
+        "href": format!("{base_url}/edr/collections/{}", config.id),
+        "rel": "self",
+        "type": "application/json",
+        "title": config.title
+    })];
+    if let Some(link) = license_link(config) {
+        links.push(link);
+    }
+
+    let mut metadata = json!({
         "id": config.id,
         "title": config.title,
         "description": config.description,
@@ -1318,18 +1350,16 @@ fn build_collection_metadata(
         // /position, /area, /trajectory, …). EDR collections are also not all
         // coverage data (CSV/PostGIS serve discrete observations), so no single
         // itemType applies. Omitted rather than mislabelled (review on #298).
-        "links": [
-            {
-                "href": format!("{base_url}/edr/collections/{}", config.id),
-                "rel": "self",
-                "type": "application/json",
-                "title": config.title
-            }
-        ],
+        "links": links,
         "extent": extent,
         "data_queries": data_queries,
         "crs": ["http://www.opengis.net/def/crs/OGC/1.3/CRS84"],
         "parameter_names": parameter_names,
         "output_formats": ["CoverageJSON", "PNG"]
-    })
+    });
+    // OGC API – Common – Part 2 `keywords`: emit only when non-empty.
+    if !config.keywords.is_empty() {
+        metadata["keywords"] = json!(config.keywords);
+    }
+    metadata
 }

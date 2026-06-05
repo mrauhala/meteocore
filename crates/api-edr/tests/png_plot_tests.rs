@@ -157,6 +157,8 @@ fn router_with(engine: Arc<dyn EdrEngine>) -> axum::Router {
             data_path: None,
             apis: vec!["edr".to_string()],
             engine_type: "csv".to_string(),
+            keywords: Vec::new(),
+            license: None,
             geotiff: None,
             querydata: None,
             wms: None,

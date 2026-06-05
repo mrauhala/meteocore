@@ -118,6 +118,20 @@ fn with_vary(mut resp: Response) -> Response {
     resp
 }
 
+/// An OGC `rel="license"` link for the collection, or `None` when the config has
+/// no license (or the license has no resolvable URL — a link object requires an
+/// `href`). Shared shape across all JSON APIs.
+fn license_link(config: &CollectionConfig) -> Option<serde_json::Value> {
+    let license = config.license.as_ref()?;
+    let href = license.resolved_url()?;
+    Some(json!({
+        "href": href,
+        "rel": "license",
+        "type": "text/html",
+        "title": license.title(),
+    }))
+}
+
 fn build_collection_metadata(
     config: &CollectionConfig,
     raster_info: Option<&ds_core::map_engine::RasterInfo>,
@@ -200,6 +214,24 @@ fn build_collection_metadata(
     // CRS84 first (stable sort keeps the rest in order).
     crs_uris.sort_by_key(|c| *c != CRS84_URI);
 
+    let mut links = vec![
+        json!({
+            "href": format!("{base_url}/tiles/collections/{}", config.id),
+            "rel": "self",
+            "type": "application/json",
+            "title": config.title
+        }),
+        json!({
+            "href": format!("{base_url}/tiles/collections/{}/tiles", config.id),
+            "rel": "tiles",
+            "type": "application/json",
+            "title": "Tilesets"
+        }),
+    ];
+    if let Some(link) = license_link(config) {
+        links.push(link);
+    }
+
     let mut metadata = json!({
         "id": config.id,
         "title": config.title,
@@ -208,21 +240,12 @@ fn build_collection_metadata(
         "crs": crs_uris,
         "tileMatrixSetLinks": tms_links,
         "styles": style_list,
-        "links": [
-            {
-                "href": format!("{base_url}/tiles/collections/{}", config.id),
-                "rel": "self",
-                "type": "application/json",
-                "title": config.title
-            },
-            {
-                "href": format!("{base_url}/tiles/collections/{}/tiles", config.id),
-                "rel": "tiles",
-                "type": "application/json",
-                "title": "Tilesets"
-            }
-        ]
+        "links": links
     });
+    // OGC API – Common – Part 2 `keywords`: emit only when non-empty.
+    if !config.keywords.is_empty() {
+        metadata["keywords"] = json!(config.keywords);
+    }
 
     // No `itemType`: OGC API – Common – Part 2 §7.13 defines it as describing
     // the items reachable at /collections/{id}/items, but the Tiles router has
@@ -369,7 +392,7 @@ fn searchable_collections_parameters() -> serde_json::Value {
         {"name": "datetime", "in": "query", "required": false, "schema": {"type": "string"},
          "description": "Filter to collections whose temporal extent intersects this RFC 3339 instant or interval (start/end, ../end, start/..)."},
         {"name": "q", "in": "query", "required": false, "schema": {"type": "string"},
-         "description": "Free-text search (comma-separated terms, OR) over collection title and description."},
+         "description": "Free-text search (comma-separated terms, OR) over collection title, description, and keywords."},
         {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 1000},
          "description": "Maximum number of collections per page (default 1000)."},
         {"name": "offset", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0},
@@ -766,6 +789,8 @@ pub async fn collections(
             bbox,
             time,
             value,
+            config.keywords.clone(),
+            config.license.as_ref().and_then(|l| l.card_link()),
         ));
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
@@ -775,6 +800,7 @@ pub async fn collections(
         .map(|r| CollectionMatch {
             title: &r.1,
             description: &r.2,
+            keywords: &r.6,
             bbox: r.3,
             time: r.4,
         })
@@ -826,6 +852,8 @@ pub async fn collections(
                     title: rows[i].1.clone(),
                     description: rows[i].2.clone(),
                     self_href: format!("{base}/tiles/collections/{}", rows[i].0),
+                    keywords: rows[i].6.clone(),
+                    license: rows[i].7.clone(),
                 })
                 .collect();
             let mut nav = vec![LinkView::new(
@@ -907,6 +935,8 @@ pub async fn collection(
                 title: config.title.clone(),
                 description: config.description.clone(),
                 self_href: format!("{base}/tiles/collections/{}", config.id),
+                keywords: config.keywords.clone(),
+                license: config.license.as_ref().and_then(|l| l.card_link()),
             };
             let links = [
                 LinkView::new(

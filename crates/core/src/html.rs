@@ -131,13 +131,20 @@ pub struct CollectionCard {
     pub description: String,
     /// Link to this collection's own metadata resource.
     pub self_href: String,
+    /// Configured keywords (may be empty), rendered as chips.
+    pub keywords: Vec<String>,
+    /// Optional license as `(title, href)`, rendered as a link.
+    pub license: Option<(String, String)>,
 }
 
 const STYLE: &str = "body{font-family:system-ui,sans-serif;max-width:60rem;margin:2rem auto;\
 padding:0 1rem;line-height:1.5;color:#1a1a1a}h1{font-size:1.5rem}a{color:#0b66c3}\
 code{background:#f2f2f2;padding:.1em .3em;border-radius:3px;font-size:.9em}\
 ul{padding-left:1.1rem}li{margin:.25rem 0}.rel{color:#777;font-size:.85em}\
-.desc{color:#444}.nav{font-size:.9em}";
+.desc{color:#444}.nav{font-size:.9em}\
+.kws{margin:.3em 0}.kw{display:inline-block;background:#eef;border-radius:3px;\
+padding:.05em .4em;margin:.1em .25em .1em 0;font-size:.8em;color:#334}\
+.license{color:#555;font-size:.9em}";
 
 /// Wrap `body` in the page skeleton. **`body` must already be HTML-escaped** —
 /// only `title` is escaped here. All builders in this module construct `body`
@@ -150,6 +157,31 @@ fn page(title: &str, body: &str) -> String {
 <title>{}</title>\n<style>{STYLE}</style>\n</head>\n<body>\n{body}</body>\n</html>\n",
         escape(title)
     )
+}
+
+/// Render keywords as a row of chips. Empty input → empty string.
+fn render_keywords(keywords: &[String]) -> String {
+    if keywords.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("<div class=\"kws\">");
+    for k in keywords {
+        s.push_str(&format!("<span class=\"kw\">{}</span>", escape(k)));
+    }
+    s.push_str("</div>\n");
+    s
+}
+
+/// Render the license as a labelled link. `None` → empty string.
+fn render_license(license: &Option<(String, String)>) -> String {
+    match license {
+        Some((title, href)) => format!(
+            "<p class=\"license\">License: <a href=\"{}\">{}</a></p>\n",
+            escape(href),
+            escape(title)
+        ),
+        None => String::new(),
+    }
 }
 
 fn render_links(links: &[LinkView], class: &str) -> String {
@@ -217,6 +249,7 @@ pub fn collections_html(title: &str, cards: &[CollectionCard], nav: &[LinkView])
                 escape(&c.description)
             ));
         }
+        body.push_str(&render_keywords(&c.keywords));
         body.push_str("</li>\n");
     }
     body.push_str("</ul>\n");
@@ -241,6 +274,8 @@ pub fn collection_html(card: &CollectionCard, links: &[LinkView]) -> String {
             escape(&card.description)
         ));
     }
+    body.push_str(&render_keywords(&card.keywords));
+    body.push_str(&render_license(&card.license));
     body.push_str(&render_links(links, "links"));
     page(title, &body)
 }
@@ -337,6 +372,8 @@ mod tests {
             title: "A <b>Radar</b>".into(),
             description: "x & y".into(),
             self_href: "/maps/collections/radar".into(),
+            keywords: vec!["weather".into(), "ra<d>ar".into()],
+            license: Some(("CC-BY 4.0".into(), "https://example/lic".into())),
         }];
         let html = collections_html("Collections", &cards, &[]);
         assert!(html.starts_with("<!DOCTYPE html>"));
@@ -345,6 +382,14 @@ mod tests {
         assert!(html.contains("/maps/collections/radar"));
         // raw unescaped title must not leak
         assert!(!html.contains("<b>Radar</b>"));
+        // keyword chips render and are escaped
+        assert!(html.contains("class=\"kw\">weather</span>"));
+        assert!(html.contains("ra&lt;d&gt;ar"));
+
+        // detail page renders keywords + the license link
+        let detail = collection_html(&cards[0], &[]);
+        assert!(detail.contains("class=\"kw\">weather</span>"));
+        assert!(detail.contains("https://example/lic") && detail.contains("CC-BY 4.0"));
     }
 
     #[test]

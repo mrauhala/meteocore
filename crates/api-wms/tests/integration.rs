@@ -81,6 +81,8 @@ fn build_empty_router() -> axum::Router {
             data_path: None,
             apis: vec!["wms".to_string()],
             engine_type: "geotiff".to_string(),
+            keywords: Vec::new(),
+            license: None,
             geotiff: None,
             querydata: None,
             wms: None,
@@ -231,6 +233,8 @@ fn build_failing_router() -> axum::Router {
             data_path: None,
             apis: vec!["wms".to_string()],
             engine_type: "geotiff".to_string(),
+            keywords: Vec::new(),
+            license: None,
             geotiff: None,
             querydata: None,
             wms: None,
@@ -372,6 +376,8 @@ fn build_populated_router() -> axum::Router {
             data_path: None,
             apis: vec!["wms".to_string()],
             engine_type: "geotiff".to_string(),
+            keywords: Vec::new(),
+            license: None,
             geotiff: None,
             querydata: None,
             wms: None,
@@ -730,6 +736,8 @@ fn build_counting_router(
             data_path: None,
             apis: vec!["wms".to_string()],
             engine_type: "geotiff".to_string(),
+            keywords: Vec::new(),
+            license: None,
             geotiff: None,
             querydata: None,
             wms: None,
@@ -929,6 +937,8 @@ fn site_collection_config(id: &str) -> CollectionConfig {
         data_path: None,
         apis: vec!["wms".to_string()],
         engine_type: "odim-volume".to_string(),
+        keywords: Vec::new(),
+        license: None,
         geotiff: None,
         querydata: None,
         wms: None,
@@ -977,5 +987,51 @@ fn child_layer_titles_are_site_prefixed_for_flat_clients() {
     assert!(
         !xml.contains("<Title>DBZH</Title>"),
         "child Title must not be the bare quantity (ambiguous across sites); got:\n{xml}"
+    );
+}
+
+/// Per-collection keywords surface as a `<KeywordList>` and the license as an
+/// `<Attribution>` in the capabilities XML (on the parent layer of a
+/// multi-param collection). Element order follows the WMS 1.3.0 schema.
+#[test]
+fn capabilities_emit_keywords_and_attribution() {
+    let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+    let mut collections = HashMap::new();
+    engines.insert("radar-fivih".to_string(), Arc::new(SiteMockMapEngine));
+    let mut config = site_collection_config("radar-fivih");
+    config.keywords = vec!["radar".into(), "precipitation".into()];
+    config.license = Some(ds_core::config::LicenseConfig {
+        title: "CC-BY 4.0".into(),
+        url: Some("https://example/lic".into()),
+    });
+    collections.insert("radar-fivih".to_string(), config);
+
+    let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
+    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
+
+    assert!(
+        xml.contains(
+            "<KeywordList><Keyword>radar</Keyword><Keyword>precipitation</Keyword></KeywordList>"
+        ),
+        "KeywordList must list the configured keywords; got:\n{xml}"
+    );
+    assert!(
+        xml.contains("<Attribution><Title>CC-BY 4.0</Title>")
+            && xml.contains("xlink:href=\"https://example/lic\""),
+        "Attribution must carry the license title + URL; got:\n{xml}"
+    );
+    // WMS 1.3.0 order: Abstract → KeywordList → (CRS/bbox), and
+    // Dimension → Attribution. Use EX_GeographicBoundingBox as the lower
+    // boundary since a root <CRS> appears earlier in the document.
+    let kw = xml.find("<KeywordList>").unwrap();
+    assert!(
+        xml.find("<Abstract>").unwrap() < kw
+            && kw < xml.find("<EX_GeographicBoundingBox>").unwrap(),
+        "KeywordList must sit between Abstract and the bounding box; got:\n{xml}"
+    );
+    assert!(
+        xml.find("<Dimension").unwrap() < xml.find("<Attribution>").unwrap(),
+        "Attribution must follow the Dimension elements; got:\n{xml}"
     );
 }

@@ -67,6 +67,16 @@ pub struct CollectionConfig {
     pub id: String,
     pub title: String,
     pub description: String,
+    /// Free-text keywords for discovery. Surfaced in the OGC API – Common
+    /// collection description (`"keywords"`), the WMS `<KeywordList>`, the HTML
+    /// collection cards, and matched by `/collections?q=`. Empty by default.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// License for this collection's data. Surfaced as a `rel="license"` link in
+    /// the JSON APIs, a `<Attribution>` element in WMS, and a link in the HTML
+    /// cards. Absent by default.
+    #[serde(default)]
+    pub license: Option<LicenseConfig>,
     /// Path or URL to the data source. Required for csv/geojson engines.
     /// Optional for geotiff when endpoint+bucket are specified in [geotiff].
     #[serde(default)]
@@ -89,6 +99,61 @@ pub struct CollectionConfig {
     pub postgis: Option<PostgisConfig>,
     /// Preview-SPA-specific tuning (e.g. bound the time slider). Optional.
     pub preview: Option<PreviewConfig>,
+}
+
+/// License metadata for a collection's data.
+///
+/// Rendered as an OGC `rel="license"` link in the JSON APIs (href =
+/// [`resolved_url`](Self::resolved_url), title = `title`) and a WMS
+/// `<Attribution>` element. `title` is required (the human-readable name, e.g.
+/// `"CC-BY 4.0"`, or an SPDX id like `"CC-BY-4.0"`); `url` is optional and, when
+/// omitted, is synthesized from `title` if it parses as an SPDX identifier.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct LicenseConfig {
+    /// Human-readable license name or SPDX identifier (the link title).
+    pub title: String,
+    /// Explicit URL to the license text. When absent, [`resolved_url`] falls
+    /// back to an `spdx.org` URL if `title` looks like an SPDX id.
+    ///
+    /// [`resolved_url`]: Self::resolved_url
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+impl LicenseConfig {
+    /// The link title (the human-readable license name).
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// The license URL to advertise: the explicit `url` if set, else an
+    /// `spdx.org` URL synthesized from `title` when it is a plausible SPDX id,
+    /// else `None` (the caller emits a license link only when this is `Some`).
+    pub fn resolved_url(&self) -> Option<String> {
+        if let Some(url) = &self.url {
+            return Some(url.clone());
+        }
+        // SPDX ids are short tokens of [A-Za-z0-9.+-] (e.g. "CC-BY-4.0",
+        // "Apache-2.0"). Only synthesize for that shape so a free-text title
+        // like "All rights reserved" doesn't produce a bogus link.
+        let t = self.title.trim();
+        if !t.is_empty()
+            && t.len() <= 64
+            && t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+        {
+            Some(format!("https://spdx.org/licenses/{t}.html"))
+        } else {
+            None
+        }
+    }
+
+    /// `(title, href)` for an HTML license link, or `None` when no URL is
+    /// resolvable (an `<a href>` needs a target). Shared by the API crates'
+    /// HTML collection cards.
+    pub fn card_link(&self) -> Option<(String, String)> {
+        self.resolved_url().map(|url| (self.title.clone(), url))
+    }
 }
 
 /// Preview-SPA tuning knobs. Only affects what `/preview/manifest.json`
@@ -1280,6 +1345,32 @@ impl ServerConfig {
                 ));
             }
 
+            // Keywords must be non-empty strings (empty entries produce blank
+            // `<Keyword/>` elements / dead `?q=` facets).
+            if collection.keywords.iter().any(|k| k.trim().is_empty()) {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': 'keywords' must not contain empty strings"
+                )));
+            }
+
+            // License, when present, needs a non-empty title and an http(s) url
+            // (the synthesized SPDX url is always http(s), so only an explicit
+            // url can be malformed here).
+            if let Some(license) = &collection.license {
+                if license.title.trim().is_empty() {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': [collections.license] 'title' must not be empty"
+                    )));
+                }
+                if let Some(url) = &license.url {
+                    if !(url.starts_with("http://") || url.starts_with("https://")) {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': [collections.license] 'url' must be an http(s) URL"
+                        )));
+                    }
+                }
+            }
+
             // GeoTIFF engine requires geotiff config section
             if collection.engine_type == "geotiff" && collection.geotiff.is_none() {
                 return Err(crate::error::DataServerError::Config(format!(
@@ -1386,6 +1477,101 @@ description = "Test collection"
         let path = dir.join(name);
         fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn keywords_and_license_parse_from_toml() {
+        let toml = r#"
+id = "radar"
+title = "Radar"
+description = "d"
+keywords = ["radar", "precipitation", "Finland"]
+
+[license]
+title = "CC-BY 4.0"
+url = "https://creativecommons.org/licenses/by/4.0/"
+"#;
+        let c: CollectionConfig = toml::from_str(toml).unwrap();
+        assert_eq!(c.keywords, ["radar", "precipitation", "Finland"]);
+        let lic = c.license.expect("license present");
+        assert_eq!(lic.title(), "CC-BY 4.0");
+        assert_eq!(
+            lic.resolved_url().as_deref(),
+            Some("https://creativecommons.org/licenses/by/4.0/")
+        );
+    }
+
+    #[test]
+    fn keywords_and_license_default_absent() {
+        let c: CollectionConfig =
+            toml::from_str("id=\"x\"\ntitle=\"t\"\ndescription=\"d\"\n").unwrap();
+        assert!(c.keywords.is_empty());
+        assert!(c.license.is_none());
+    }
+
+    #[test]
+    fn license_url_synthesized_from_spdx_id() {
+        let lic = LicenseConfig {
+            title: "Apache-2.0".into(),
+            url: None,
+        };
+        assert_eq!(
+            lic.resolved_url().as_deref(),
+            Some("https://spdx.org/licenses/Apache-2.0.html")
+        );
+        assert_eq!(
+            lic.card_link(),
+            Some((
+                "Apache-2.0".to_string(),
+                "https://spdx.org/licenses/Apache-2.0.html".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn license_freetext_without_url_has_no_link() {
+        // A free-text name (spaces) is not a plausible SPDX id, so no URL is
+        // synthesized and the JSON/HTML link is omitted.
+        let lic = LicenseConfig {
+            title: "All rights reserved".into(),
+            url: None,
+        };
+        assert_eq!(lic.resolved_url(), None);
+        assert_eq!(lic.card_link(), None);
+    }
+
+    fn collection_with(extra: &str) -> ServerConfig {
+        let toml = format!(
+            "[server]\nhost=\"127.0.0.1\"\nport=8000\n\n\
+             [[collections]]\nid=\"c\"\ntitle=\"t\"\ndescription=\"d\"\n{extra}"
+        );
+        toml::from_str(&toml).unwrap()
+    }
+
+    #[test]
+    fn validate_rejects_empty_keyword() {
+        let cfg = collection_with("keywords = [\"ok\", \"  \"]\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_license_title() {
+        let cfg = collection_with("[collections.license]\ntitle = \"\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_non_http_license_url() {
+        let cfg = collection_with("[collections.license]\ntitle = \"X\"\nurl = \"ftp://x/y\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_valid_keywords_and_license() {
+        let cfg = collection_with(
+            "keywords = [\"radar\"]\n[collections.license]\ntitle = \"CC-BY-4.0\"\n",
+        );
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

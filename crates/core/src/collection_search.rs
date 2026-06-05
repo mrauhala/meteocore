@@ -53,6 +53,9 @@ impl SearchError {
 pub struct CollectionMatch<'a> {
     pub title: &'a str,
     pub description: &'a str,
+    /// The collection's configured keywords (may be empty). Matched by `q`
+    /// alongside title and description.
+    pub keywords: &'a [String],
     /// CRS84 bbox `[west, south, east, north]`, if the collection has one.
     pub bbox: Option<[f64; 4]>,
     /// Temporal interval `(start, end)`, if the collection has one.
@@ -259,7 +262,7 @@ fn matches(it: &CollectionMatch, p: &SearchParams) -> bool {
             Some(_) => return false,
         }
     }
-    if !p.q.is_empty() && !q_matches(&p.q, it.title, it.description) {
+    if !p.q.is_empty() && !q_matches(&p.q, it.title, it.description, it.keywords) {
         return false;
     }
     true
@@ -284,13 +287,14 @@ fn lon_overlaps(qw: f64, qe: f64, cw: f64, ce: f64) -> bool {
 }
 
 /// Whole-word (or, for terms containing whitespace, phrase) match of any `q`
-/// term against the collection's title or description. Terms are pre-lowercased;
-/// comparison is Unicode-case-insensitive (Finnish ä/ö etc.).
+/// term against the collection's title, description, or any keyword. Terms are
+/// pre-lowercased; comparison is Unicode-case-insensitive (Finnish ä/ö etc.).
 ///
-/// Keyword search is intentionally not included: `CollectionConfig` has no
-/// `keywords` field yet (tracked as a follow-up), so matching only the fields
-/// that actually exist avoids carrying dead code.
-fn q_matches(terms: &[String], title: &str, description: &str) -> bool {
+/// A keyword matches a non-phrase term either as a whole word *within* the
+/// keyword (so the keyword `"sea surface temperature"` is found by `q=surface`)
+/// or as the keyword in full; a phrase term matches a keyword as a substring,
+/// like the title/description fields.
+fn q_matches(terms: &[String], title: &str, description: &str, keywords: &[String]) -> bool {
     terms.iter().any(|term| {
         if term.chars().any(char::is_whitespace) {
             // Phrase: case-insensitive substring within a *single* field, so the
@@ -298,9 +302,13 @@ fn q_matches(terms: &[String], title: &str, description: &str) -> bool {
             // "Finnish Weather" + description "Helsinki …" must not match
             // "weather helsinki").
             let t = term.as_str();
-            title.to_lowercase().contains(t) || description.to_lowercase().contains(t)
+            title.to_lowercase().contains(t)
+                || description.to_lowercase().contains(t)
+                || keywords.iter().any(|k| k.to_lowercase().contains(t))
         } else {
-            word_match(title, term) || word_match(description, term)
+            word_match(title, term)
+                || word_match(description, term)
+                || keywords.iter().any(|k| word_match(k, term))
         }
     })
 }
@@ -460,8 +468,24 @@ mod tests {
         CollectionMatch {
             title,
             description,
+            keywords: &[],
             bbox,
             time,
+        }
+    }
+
+    /// Like [`cm`] but with keywords, for the `q`-over-keywords tests.
+    fn cm_kw<'a>(
+        title: &'a str,
+        description: &'a str,
+        keywords: &'a [String],
+    ) -> CollectionMatch<'a> {
+        CollectionMatch {
+            title,
+            description,
+            keywords,
+            bbox: None,
+            time: None,
         }
     }
 
@@ -664,6 +688,32 @@ mod tests {
             .number_matched,
             1
         );
+    }
+
+    #[test]
+    fn q_matches_keywords() {
+        let kws = [
+            "precipitation".to_string(),
+            "sea surface temperature".to_string(),
+        ];
+        let items = [cm_kw("Radar", "Composite", &kws)];
+        let n = |q: &str| {
+            search(
+                &items,
+                &parse_search_params(None, None, None, Some(q), None, None).unwrap(),
+            )
+            .number_matched
+        };
+        // whole keyword, case-insensitive
+        assert_eq!(n("Precipitation"), 1);
+        // whole word *within* a multi-word keyword
+        assert_eq!(n("surface"), 1);
+        // partial word does not match
+        assert_eq!(n("precip"), 0);
+        // phrase substring across a keyword
+        assert_eq!(n("surface temperature"), 1);
+        // term present in neither title/description nor keywords
+        assert_eq!(n("snow"), 0);
     }
 
     #[test]

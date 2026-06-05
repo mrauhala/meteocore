@@ -257,6 +257,12 @@ description = "Hourly weather observations"
 data_path = "testdata/weather.csv"
 apis = ["edr", "features"]     # defaults to ["edr"]
 engine_type = "csv"             # defaults to "csv"
+# Optional discovery metadata, surfaced across all APIs (see below).
+keywords = ["weather", "observations", "Finland"]
+[collections.license]
+title = "CC-BY 4.0"            # required; an SPDX id (e.g. "CC-BY-4.0") works too
+url = "https://creativecommons.org/licenses/by/4.0/"  # optional; auto-synthesized
+                                                      # from spdx.org for an SPDX id
 
 [[collections]]
 id = "radar"
@@ -289,6 +295,28 @@ time_window = "PT12H"
 ```
 
 See config struct definitions in each engine crate and `ds-core/src/config.rs` for all fields.
+
+### Collection Keywords & License
+
+Two optional per-collection discovery fields live directly on the collection (any
+engine), surfaced across **every** API from the shared `CollectionConfig`:
+
+- **`keywords`** — a flat array of non-empty strings. Emitted as the OGC API –
+  Common – Part 2 `"keywords"` array in the EDR/Features/Maps/Tiles collection
+  JSON, as a `<KeywordList>` in WMS `GetCapabilities` (on the collection's layer,
+  in WMS 1.3.0 schema order after `<Abstract>`), as chips on the HTML collection
+  pages, and matched by `/collections?q=` (whole-word or phrase, alongside title
+  and description).
+- **`[collections.license]`** — `title` (required; a human name or SPDX id) plus
+  an optional `url`. When `url` is omitted and `title` is a plausible SPDX id, the
+  URL is synthesized as `https://spdx.org/licenses/<id>.html`. Rendered as a
+  `rel="license"` link in the JSON APIs, a `<Attribution>` element in WMS (after
+  the `<Dimension>` elements), and a link on the HTML pages. A license with no
+  resolvable URL (free-text title, no `url`) still shows its name in WMS/HTML but
+  produces no JSON link (a link object requires an `href`).
+
+Both are validated at config load: empty keyword entries, an empty license
+`title`, and a non-`http(s)` license `url` are rejected.
 
 ### Per-File Collection Configs (`collections_dir`)
 
