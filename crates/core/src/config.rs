@@ -63,15 +63,22 @@ impl ServerSettings {
 }
 
 /// Deserialize a keyword list, trimming surrounding whitespace from each entry
-/// so a padded keyword (e.g. `" radar "`) can't render with visible spaces in
-/// HTML chips or a WMS `<Keyword>`. An all-whitespace entry trims to `""`, which
+/// and dropping exact duplicates (first occurrence wins, order preserved) so
+/// `["radar", "radar"]` can't produce doubled chips / `<Keyword>` elements / JSON
+/// entries. A padded keyword (e.g. `" radar "`) is trimmed first so the dedup is
+/// on the clean value; an all-whitespace entry trims to `""`, which
 /// `CollectionConfig::validate` then rejects as a vacuous keyword.
 fn de_trimmed_keywords<'de, D>(d: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let raw = Vec::<String>::deserialize(d)?;
-    Ok(raw.into_iter().map(|k| k.trim().to_string()).collect())
+    let mut seen = std::collections::HashSet::new();
+    Ok(raw
+        .into_iter()
+        .map(|k| k.trim().to_string())
+        .filter(|k| seen.insert(k.clone()))
+        .collect())
 }
 
 /// Deserialize a string, trimming surrounding whitespace — so a padded value
@@ -1534,14 +1541,15 @@ description = "Test collection"
 id = "radar"
 title = "Radar"
 description = "d"
-keywords = ["radar", "  precipitation  ", "Finland"]
+keywords = ["radar", "  precipitation  ", "Finland", "radar"]
 
 [license]
 title = "  CC-BY 4.0  "
 url = "https://creativecommons.org/licenses/by/4.0/"
 "#;
         let c: CollectionConfig = toml::from_str(toml).unwrap();
-        // Padded keywords and license title are trimmed at load.
+        // Keywords are trimmed and de-duplicated (the second "radar" is dropped);
+        // the license title is trimmed too.
         assert_eq!(c.keywords, ["radar", "precipitation", "Finland"]);
         let lic = c.license.expect("license present");
         assert_eq!(lic.title, "CC-BY 4.0");

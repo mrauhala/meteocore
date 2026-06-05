@@ -215,6 +215,8 @@ fn build_collection_metadata(
         }),
     ];
     if let Some((title, url)) = config.license.as_ref().and_then(|l| l.card_link()) {
+        // No `type`: an operator-supplied license URL may not be HTML, and OGC
+        // API Common §6.5.2 wants the link's real media type — omitting is valid.
         links.push(json!({ "href": url, "rel": "license", "title": title }));
     }
 
