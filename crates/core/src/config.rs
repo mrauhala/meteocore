@@ -74,6 +74,16 @@ where
     Ok(raw.into_iter().map(|k| k.trim().to_string()).collect())
 }
 
+/// Deserialize a string, trimming surrounding whitespace — so a padded value
+/// (e.g. a license `title = "  CC-BY 4.0  "`) can't render with visible spaces
+/// in the JSON link title, WMS `<Title>`, or HTML page.
+fn de_trimmed_string<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(String::deserialize(d)?.trim().to_string())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CollectionConfig {
     pub id: String,
@@ -124,6 +134,8 @@ pub struct CollectionConfig {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct LicenseConfig {
     /// Human-readable license name or SPDX identifier (the link title).
+    /// Trimmed at load so padding can't leak into the rendered title.
+    #[serde(deserialize_with = "de_trimmed_string")]
     pub title: String,
     /// Explicit URL to the license text. When absent, [`resolved_url`] falls
     /// back to an `spdx.org` URL if `title` looks like an SPDX id.
@@ -1383,7 +1395,9 @@ impl ServerConfig {
             // (the synthesized SPDX url is always http(s), so only an explicit
             // url can be malformed here).
             if let Some(license) = &collection.license {
-                if license.title.trim().is_empty() {
+                // Title is trimmed at load by `de_trimmed_string`, so an
+                // all-whitespace title arrives here as "" — `is_empty()` suffices.
+                if license.title.is_empty() {
                     return Err(crate::error::DataServerError::Config(format!(
                         "Collection '{id}': [collections.license] 'title' must not be empty"
                     )));
@@ -1517,11 +1531,11 @@ description = "d"
 keywords = ["radar", "  precipitation  ", "Finland"]
 
 [license]
-title = "CC-BY 4.0"
+title = "  CC-BY 4.0  "
 url = "https://creativecommons.org/licenses/by/4.0/"
 "#;
         let c: CollectionConfig = toml::from_str(toml).unwrap();
-        // Padded entries are trimmed at load.
+        // Padded keywords and license title are trimmed at load.
         assert_eq!(c.keywords, ["radar", "precipitation", "Finland"]);
         let lic = c.license.expect("license present");
         assert_eq!(lic.title, "CC-BY 4.0");
