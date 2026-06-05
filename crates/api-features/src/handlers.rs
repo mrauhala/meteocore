@@ -729,20 +729,6 @@ pub async fn item(
     )))
 }
 
-/// An OGC `rel="license"` link for the collection, or `None` when the config has
-/// no license (or the license has no resolvable URL — a link object requires an
-/// `href`). Shared shape across all JSON APIs.
-fn license_link(config: &CollectionConfig) -> Option<serde_json::Value> {
-    let license = config.license.as_ref()?;
-    let href = license.resolved_url()?;
-    Some(json!({
-        "href": href,
-        "rel": "license",
-        "type": "text/html",
-        "title": license.title(),
-    }))
-}
-
 fn build_collection_metadata(
     engine: &dyn FeatureEngine,
     config: &CollectionConfig,
@@ -782,8 +768,8 @@ fn build_collection_metadata(
         }));
     }
 
-    if let Some(link) = license_link(config) {
-        links.push(link);
+    if let Some((title, url)) = config.license.as_ref().and_then(|l| l.card_link()) {
+        links.push(json!({ "href": url, "rel": "license", "type": "text/html", "title": title }));
     }
 
     let mut metadata = json!({

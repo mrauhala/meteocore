@@ -62,6 +62,18 @@ impl ServerSettings {
     }
 }
 
+/// Deserialize a keyword list, trimming surrounding whitespace from each entry
+/// so a padded keyword (e.g. `" radar "`) can't render with visible spaces in
+/// HTML chips or a WMS `<Keyword>`. An all-whitespace entry trims to `""`, which
+/// `CollectionConfig::validate` then rejects as a vacuous keyword.
+fn de_trimmed_keywords<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<String>::deserialize(d)?;
+    Ok(raw.into_iter().map(|k| k.trim().to_string()).collect())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CollectionConfig {
     pub id: String,
@@ -70,7 +82,8 @@ pub struct CollectionConfig {
     /// Free-text keywords for discovery. Surfaced in the OGC API – Common
     /// collection description (`"keywords"`), the WMS `<KeywordList>`, the HTML
     /// collection cards, and matched by `/collections?q=`. Empty by default.
-    #[serde(default)]
+    /// Each entry is trimmed at load so padding can't leak into chips/`<Keyword>`.
+    #[serde(default, deserialize_with = "de_trimmed_keywords")]
     pub keywords: Vec<String>,
     /// License for this collection's data. Surfaced as a `rel="license"` link in
     /// the JSON APIs, a `<Attribution>` element in WMS, and a link in the HTML
@@ -1485,13 +1498,14 @@ description = "Test collection"
 id = "radar"
 title = "Radar"
 description = "d"
-keywords = ["radar", "precipitation", "Finland"]
+keywords = ["radar", "  precipitation  ", "Finland"]
 
 [license]
 title = "CC-BY 4.0"
 url = "https://creativecommons.org/licenses/by/4.0/"
 "#;
         let c: CollectionConfig = toml::from_str(toml).unwrap();
+        // Padded entries are trimmed at load.
         assert_eq!(c.keywords, ["radar", "precipitation", "Finland"]);
         let lic = c.license.expect("license present");
         assert_eq!(lic.title(), "CC-BY 4.0");
