@@ -255,6 +255,7 @@ pub fn collections_html(title: &str, cards: &[CollectionCard], nav: &[LinkView])
             ));
         }
         body.push_str(&render_keywords(&c.keywords));
+        body.push_str(&render_license(&c.license));
         body.push_str("</li>\n");
     }
     body.push_str("</ul>\n");
@@ -390,6 +391,8 @@ mod tests {
         // keyword chips render and are escaped
         assert!(html.contains("class=\"kw\">weather</span>"));
         assert!(html.contains("ra&lt;d&gt;ar"));
+        // license renders on the list page too (parity with the detail page)
+        assert!(html.contains("https://example/lic") && html.contains("CC-BY 4.0"));
 
         // detail page renders keywords + the license link
         let detail = collection_html(&cards[0], &[]);

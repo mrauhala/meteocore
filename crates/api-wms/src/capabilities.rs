@@ -114,7 +114,6 @@ fn write_dcp_type(writer: &mut Writer<Vec<u8>>, base_url: &str) {
 
     let wms_url = format!("{base_url}/wms?");
     let mut or = BytesStart::new("OnlineResource");
-    or.push_attribute(("xmlns:xlink", "http://www.w3.org/1999/xlink"));
     or.push_attribute(("xlink:type", "simple"));
     or.push_attribute(("xlink:href", wms_url.as_str()));
     let _ = writer.write_event(Event::Empty(or));
@@ -308,7 +307,6 @@ fn write_layer_styles(
                     style.name
                 );
                 let mut or = BytesStart::new("OnlineResource");
-                or.push_attribute(("xmlns:xlink", "http://www.w3.org/1999/xlink"));
                 or.push_attribute(("xlink:type", "simple"));
                 or.push_attribute(("xlink:href", legend_url.as_str()));
                 let _ = writer.write_event(Event::Empty(or));
@@ -355,10 +353,9 @@ fn write_attribution(writer: &mut Writer<Vec<u8>>, license: Option<&LicenseConfi
         return;
     };
     let _ = writer.write_event(Event::Start(BytesStart::new("Attribution")));
-    write_text_element(writer, "Title", license.title());
+    write_text_element(writer, "Title", &license.title);
     if let Some(url) = license.resolved_url() {
         let mut or = BytesStart::new("OnlineResource");
-        or.push_attribute(("xmlns:xlink", "http://www.w3.org/1999/xlink"));
         or.push_attribute(("xlink:type", "simple"));
         or.push_attribute(("xlink:href", url.as_str()));
         let _ = writer.write_event(Event::Empty(or));

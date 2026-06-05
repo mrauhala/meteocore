@@ -134,11 +134,6 @@ pub struct LicenseConfig {
 }
 
 impl LicenseConfig {
-    /// The link title (the human-readable license name).
-    pub fn title(&self) -> &str {
-        &self.title
-    }
-
     /// The license URL to advertise: the explicit `url` if set, else an
     /// `spdx.org` URL synthesized from `title` when it is a plausible SPDX id,
     /// else `None` (the caller emits a license link only when this is `Some`).
@@ -1529,7 +1524,7 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         // Padded entries are trimmed at load.
         assert_eq!(c.keywords, ["radar", "precipitation", "Finland"]);
         let lic = c.license.expect("license present");
-        assert_eq!(lic.title(), "CC-BY 4.0");
+        assert_eq!(lic.title, "CC-BY 4.0");
         assert_eq!(
             lic.resolved_url().as_deref(),
             Some("https://creativecommons.org/licenses/by/4.0/")
