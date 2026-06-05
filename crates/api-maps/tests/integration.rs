@@ -384,6 +384,25 @@ mod metadata_extras {
     }
 
     #[tokio::test]
+    async fn keyword_is_matched_by_q_search() {
+        // End-to-end: config.keywords -> rows tuple -> CollectionMatch.keywords.
+        // "thunderstorm" is in neither title nor description, so a match proves
+        // the keyword wiring (a wrong tuple index would silently return 0).
+        let (_, hit) = get_on(
+            router_with(vec!["thunderstorm".into()], None),
+            "/collections?q=thunderstorm",
+        )
+        .await;
+        assert_eq!(hit["numberMatched"].as_u64(), Some(1));
+        let (_, miss) = get_on(
+            router_with(vec!["thunderstorm".into()], None),
+            "/collections?q=zzznotaword",
+        )
+        .await;
+        assert_eq!(miss["numberMatched"].as_u64(), Some(0));
+    }
+
+    #[tokio::test]
     async fn freetext_license_shows_name_in_html_but_no_json_link() {
         // A free-text license (no resolvable URL) must surface its name on the
         // HTML page (as plain text, no <a>) yet produce no JSON `rel="license"`

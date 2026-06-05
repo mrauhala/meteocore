@@ -1949,6 +1949,22 @@ mod metadata_extras {
         serde_json::from_slice(&body).unwrap()
     }
 
+    async fn q_count(q: &str) -> u64 {
+        let app = state_with(vec!["thunderstorm".into()], None);
+        let req = Request::builder().uri(q).body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        json["numberMatched"].as_u64().unwrap()
+    }
+
+    #[tokio::test]
+    async fn keyword_is_matched_by_q_search() {
+        // End-to-end guard for config.keywords -> tuple -> CollectionMatch.
+        assert_eq!(q_count("/collections?q=thunderstorm").await, 1);
+        assert_eq!(q_count("/collections?q=zzznotaword").await, 0);
+    }
+
     #[tokio::test]
     async fn keywords_and_license_surface_in_json() {
         let lic = ds_core::config::LicenseConfig {

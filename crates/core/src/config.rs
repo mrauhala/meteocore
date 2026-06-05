@@ -150,7 +150,9 @@ impl LicenseConfig {
     /// the non-deprecated id (e.g. `GPL-2.0-or-later`).
     pub fn resolved_url(&self) -> Option<String> {
         if let Some(url) = &self.url {
-            return Some(url.clone());
+            // Trim so a stray space in the TOML value can't leak into an
+            // href/xlink:href (mirrors `de_trimmed_keywords`).
+            return Some(url.trim().to_string());
         }
         // SPDX ids are short tokens of [A-Za-z0-9.+-] (e.g. "CC-BY-4.0",
         // "Apache-2.0"). Only synthesize for that shape so a free-text title
@@ -1392,6 +1394,9 @@ impl ServerConfig {
                     )));
                 }
                 if let Some(url) = &license.url {
+                    // Trim before the scheme check so it matches what
+                    // `resolved_url()` actually emits (which trims too).
+                    let url = url.trim();
                     if !(url.starts_with("http://") || url.starts_with("https://")) {
                         return Err(crate::error::DataServerError::Config(format!(
                             "Collection '{id}': [collections.license] 'url' must be an http(s) URL"
@@ -1555,6 +1560,19 @@ url = "https://creativecommons.org/licenses/by/4.0/"
                 "Apache-2.0".to_string(),
                 "https://spdx.org/licenses/Apache-2.0.html".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn license_url_is_trimmed() {
+        // A stray space in the TOML value must not leak into the emitted href.
+        let lic = LicenseConfig {
+            title: "X".into(),
+            url: Some("  https://example.com/lic  ".into()),
+        };
+        assert_eq!(
+            lic.resolved_url().as_deref(),
+            Some("https://example.com/lic")
         );
     }
 
