@@ -966,6 +966,8 @@ mod tests {
             data_path: None,
             apis: apis.iter().map(|s| s.to_string()).collect(),
             engine_type: "mock".into(),
+            keywords: Vec::new(),
+            license: None,
             geotiff: None,
             querydata: None,
             wms: None,

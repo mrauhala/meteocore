@@ -62,11 +62,59 @@ impl ServerSettings {
     }
 }
 
+/// Deserialize a keyword list, trimming surrounding whitespace from each entry
+/// and dropping exact duplicates (first occurrence wins, order preserved) so
+/// `["radar", "radar"]` can't produce doubled chips / `<Keyword>` elements / JSON
+/// entries. A padded keyword (e.g. `" radar "`) is trimmed first so the dedup is
+/// on the clean value; an all-whitespace entry trims to `""`, which
+/// `CollectionConfig::validate` then rejects as a vacuous keyword.
+fn de_trimmed_keywords<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<String>::deserialize(d)?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(raw
+        .into_iter()
+        .map(|k| k.trim().to_string())
+        .filter(|k| seen.insert(k.clone()))
+        .collect())
+}
+
+/// Deserialize a string, trimming surrounding whitespace — so a padded value
+/// (e.g. a license `title = "  CC-BY 4.0  "`) can't render with visible spaces
+/// in the JSON link title, WMS `<Title>`, or HTML page.
+fn de_trimmed_string<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(String::deserialize(d)?.trim().to_string())
+}
+
+/// Like [`de_trimmed_string`] but for an optional string (e.g. a license `url`).
+fn de_trimmed_opt_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(d)?.map(|s| s.trim().to_string()))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CollectionConfig {
     pub id: String,
     pub title: String,
     pub description: String,
+    /// Free-text keywords for discovery. Surfaced in the OGC API – Common
+    /// collection description (`"keywords"`), the WMS `<KeywordList>`, the HTML
+    /// collection cards, and matched by `/collections?q=`. Empty by default.
+    /// Each entry is trimmed at load so padding can't leak into chips/`<Keyword>`.
+    #[serde(default, deserialize_with = "de_trimmed_keywords")]
+    pub keywords: Vec<String>,
+    /// License for this collection's data. Surfaced as a `rel="license"` link in
+    /// the JSON APIs, a `<Attribution>` element in WMS, and a link in the HTML
+    /// cards. Absent by default.
+    #[serde(default)]
+    pub license: Option<LicenseConfig>,
     /// Path or URL to the data source. Required for csv/geojson engines.
     /// Optional for geotiff when endpoint+bucket are specified in [geotiff].
     #[serde(default)]
@@ -89,6 +137,74 @@ pub struct CollectionConfig {
     pub postgis: Option<PostgisConfig>,
     /// Preview-SPA-specific tuning (e.g. bound the time slider). Optional.
     pub preview: Option<PreviewConfig>,
+}
+
+/// License metadata for a collection's data.
+///
+/// Rendered as an OGC `rel="license"` link in the JSON APIs (href =
+/// [`resolved_url`](Self::resolved_url), title = `title`) and a WMS
+/// `<Attribution>` element. `title` is required (the human-readable name, e.g.
+/// `"CC-BY 4.0"`, or an SPDX id like `"CC-BY-4.0"`); `url` is optional and, when
+/// omitted, is synthesized from `title` if it parses as an SPDX identifier.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct LicenseConfig {
+    /// Human-readable license name or SPDX identifier (the link title).
+    /// Trimmed at load so padding can't leak into the rendered title.
+    #[serde(deserialize_with = "de_trimmed_string")]
+    pub title: String,
+    /// Explicit URL to the license text. When absent, [`resolved_url`] falls
+    /// back to an `spdx.org` URL if `title` looks like an SPDX id. Trimmed at
+    /// load (like `title`) so the raw field is always clean.
+    ///
+    /// [`resolved_url`]: Self::resolved_url
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub url: Option<String>,
+}
+
+impl LicenseConfig {
+    /// The license URL to advertise: the explicit `url` if set, else an
+    /// `spdx.org` URL synthesized from `title` when it is a plausible SPDX id,
+    /// else `None` (the caller emits a license link only when this is `Some`).
+    ///
+    /// Note: a deprecated `+`-suffix id (e.g. `GPL-2.0+`) is accepted by the
+    /// shape check and synthesizes `https://spdx.org/licenses/GPL-2.0+.html`,
+    /// which `spdx.org` serves only via a redirect to the canonical
+    /// `-or-later` page. For a canonical `href`, set an explicit `url` or use
+    /// the non-deprecated id (e.g. `GPL-2.0-or-later`).
+    pub fn resolved_url(&self) -> Option<String> {
+        if let Some(url) = &self.url {
+            // Already trimmed at load by `de_trimmed_opt_string`.
+            return Some(url.clone());
+        }
+        // SPDX ids are short tokens of [A-Za-z0-9.+-] (e.g. "CC-BY-4.0",
+        // "Apache-2.0"). Only synthesize for that shape so a free-text title
+        // like "All rights reserved" doesn't produce a bogus link.
+        let t = self.title.trim();
+        if !t.is_empty()
+            && t.len() <= 64
+            && t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+        {
+            Some(format!("https://spdx.org/licenses/{t}.html"))
+        } else {
+            None
+        }
+    }
+
+    /// `(title, href)` for a license **link**, or `None` when no URL is
+    /// resolvable (a link object / `<a href>` needs a target). Used for the
+    /// JSON `rel="license"` link, which cannot exist without an `href`.
+    pub fn card_link(&self) -> Option<(String, String)> {
+        self.resolved_url().map(|url| (self.title.clone(), url))
+    }
+
+    /// `(title, href?)` for **display** contexts (HTML cards) that show the
+    /// license name even when no URL resolves. Unlike [`card_link`](Self::card_link)
+    /// this always yields the title; the href is `None` for a free-text license
+    /// with no explicit `url` (rendered as plain text rather than a link).
+    pub fn card_label(&self) -> (String, Option<String>) {
+        (self.title.clone(), self.resolved_url())
+    }
 }
 
 /// Preview-SPA tuning knobs. Only affects what `/preview/manifest.json`
@@ -1280,6 +1396,37 @@ impl ServerConfig {
                 ));
             }
 
+            // Keywords must be non-empty (empty entries produce blank
+            // `<Keyword/>` elements / dead `?q=` facets). Entries are already
+            // trimmed by `de_trimmed_keywords` at load, so an all-whitespace
+            // keyword arrives here as "" — a plain `is_empty()` check suffices.
+            if collection.keywords.iter().any(|k| k.is_empty()) {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': 'keywords' must not contain empty strings"
+                )));
+            }
+
+            // License, when present, needs a non-empty title and an http(s) url
+            // (the synthesized SPDX url is always http(s), so only an explicit
+            // url can be malformed here).
+            if let Some(license) = &collection.license {
+                // Title is trimmed at load by `de_trimmed_string`, so an
+                // all-whitespace title arrives here as "" — `is_empty()` suffices.
+                if license.title.is_empty() {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': [collections.license] 'title' must not be empty"
+                    )));
+                }
+                if let Some(url) = &license.url {
+                    // `url` is trimmed at load by `de_trimmed_opt_string`.
+                    if !(url.starts_with("http://") || url.starts_with("https://")) {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': [collections.license] 'url' must be an http(s) URL"
+                        )));
+                    }
+                }
+            }
+
             // GeoTIFF engine requires geotiff config section
             if collection.engine_type == "geotiff" && collection.geotiff.is_none() {
                 return Err(crate::error::DataServerError::Config(format!(
@@ -1386,6 +1533,119 @@ description = "Test collection"
         let path = dir.join(name);
         fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn keywords_and_license_parse_from_toml() {
+        let toml = r#"
+id = "radar"
+title = "Radar"
+description = "d"
+keywords = ["radar", "  precipitation  ", "Finland", "radar"]
+
+[license]
+title = "  CC-BY 4.0  "
+url = "https://creativecommons.org/licenses/by/4.0/"
+"#;
+        let c: CollectionConfig = toml::from_str(toml).unwrap();
+        // Keywords are trimmed and de-duplicated (the second "radar" is dropped);
+        // the license title is trimmed too.
+        assert_eq!(c.keywords, ["radar", "precipitation", "Finland"]);
+        let lic = c.license.expect("license present");
+        assert_eq!(lic.title, "CC-BY 4.0");
+        assert_eq!(
+            lic.resolved_url().as_deref(),
+            Some("https://creativecommons.org/licenses/by/4.0/")
+        );
+    }
+
+    #[test]
+    fn keywords_and_license_default_absent() {
+        let c: CollectionConfig =
+            toml::from_str("id=\"x\"\ntitle=\"t\"\ndescription=\"d\"\n").unwrap();
+        assert!(c.keywords.is_empty());
+        assert!(c.license.is_none());
+    }
+
+    #[test]
+    fn license_url_synthesized_from_spdx_id() {
+        let lic = LicenseConfig {
+            title: "Apache-2.0".into(),
+            url: None,
+        };
+        assert_eq!(
+            lic.resolved_url().as_deref(),
+            Some("https://spdx.org/licenses/Apache-2.0.html")
+        );
+        assert_eq!(
+            lic.card_link(),
+            Some((
+                "Apache-2.0".to_string(),
+                "https://spdx.org/licenses/Apache-2.0.html".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn license_url_is_trimmed() {
+        // A stray space in the TOML value must not leak into the stored field
+        // or the emitted href — trimming happens at load (de_trimmed_opt_string).
+        let lic: LicenseConfig =
+            toml::from_str("title = \"X\"\nurl = \"  https://example.com/lic  \"").unwrap();
+        assert_eq!(lic.url.as_deref(), Some("https://example.com/lic"));
+        assert_eq!(
+            lic.resolved_url().as_deref(),
+            Some("https://example.com/lic")
+        );
+    }
+
+    #[test]
+    fn license_freetext_without_url_has_no_link_but_keeps_label() {
+        // A free-text name (spaces) is not a plausible SPDX id, so no URL is
+        // synthesized: the JSON `rel="license"` link is omitted (card_link →
+        // None), but the display label keeps the name (card_label → (name, None))
+        // so HTML/WMS can still show it.
+        let lic = LicenseConfig {
+            title: "All rights reserved".into(),
+            url: None,
+        };
+        assert_eq!(lic.resolved_url(), None);
+        assert_eq!(lic.card_link(), None);
+        assert_eq!(lic.card_label(), ("All rights reserved".to_string(), None));
+    }
+
+    fn collection_with(extra: &str) -> ServerConfig {
+        let toml = format!(
+            "[server]\nhost=\"127.0.0.1\"\nport=8000\n\n\
+             [[collections]]\nid=\"c\"\ntitle=\"t\"\ndescription=\"d\"\n{extra}"
+        );
+        toml::from_str(&toml).unwrap()
+    }
+
+    #[test]
+    fn validate_rejects_empty_keyword() {
+        let cfg = collection_with("keywords = [\"ok\", \"  \"]\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_license_title() {
+        let cfg = collection_with("[collections.license]\ntitle = \"\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_non_http_license_url() {
+        let cfg = collection_with("[collections.license]\ntitle = \"X\"\nurl = \"ftp://x/y\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_valid_keywords_and_license() {
+        let cfg = collection_with(
+            "keywords = [\"radar\"]\n[collections.license]\ntitle = \"CC-BY-4.0\"\n",
+        );
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

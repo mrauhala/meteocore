@@ -81,6 +81,8 @@ fn build_empty_router() -> axum::Router {
             data_path: None,
             apis: vec!["wms".to_string()],
             engine_type: "geotiff".to_string(),
+            keywords: Vec::new(),
+            license: None,
             geotiff: None,
             querydata: None,
             wms: None,
@@ -231,6 +233,8 @@ fn build_failing_router() -> axum::Router {
             data_path: None,
             apis: vec!["wms".to_string()],
             engine_type: "geotiff".to_string(),
+            keywords: Vec::new(),
+            license: None,
             geotiff: None,
             querydata: None,
             wms: None,
@@ -372,6 +376,8 @@ fn build_populated_router() -> axum::Router {
             data_path: None,
             apis: vec!["wms".to_string()],
             engine_type: "geotiff".to_string(),
+            keywords: Vec::new(),
+            license: None,
             geotiff: None,
             querydata: None,
             wms: None,
@@ -730,6 +736,8 @@ fn build_counting_router(
             data_path: None,
             apis: vec!["wms".to_string()],
             engine_type: "geotiff".to_string(),
+            keywords: Vec::new(),
+            license: None,
             geotiff: None,
             querydata: None,
             wms: None,
@@ -929,6 +937,8 @@ fn site_collection_config(id: &str) -> CollectionConfig {
         data_path: None,
         apis: vec!["wms".to_string()],
         engine_type: "odim-volume".to_string(),
+        keywords: Vec::new(),
+        license: None,
         geotiff: None,
         querydata: None,
         wms: None,
@@ -977,5 +987,123 @@ fn child_layer_titles_are_site_prefixed_for_flat_clients() {
     assert!(
         !xml.contains("<Title>DBZH</Title>"),
         "child Title must not be the bare quantity (ambiguous across sites); got:\n{xml}"
+    );
+}
+
+/// Per-collection keywords surface as a `<KeywordList>` and the license as an
+/// `<Attribution>` in the capabilities XML (on the parent layer of a
+/// multi-param collection). Element order follows the WMS 1.3.0 schema.
+#[test]
+fn capabilities_emit_keywords_and_attribution() {
+    let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+    let mut collections = HashMap::new();
+    engines.insert("radar-fivih".to_string(), Arc::new(SiteMockMapEngine));
+    let mut config = site_collection_config("radar-fivih");
+    config.keywords = vec!["radar".into(), "precipitation".into()];
+    config.license = Some(ds_core::config::LicenseConfig {
+        title: "CC-BY 4.0".into(),
+        url: Some("https://example/lic".into()),
+    });
+    collections.insert("radar-fivih".to_string(), config);
+
+    let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
+    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
+
+    assert!(
+        xml.contains(
+            "<KeywordList><Keyword>radar</Keyword><Keyword>precipitation</Keyword></KeywordList>"
+        ),
+        "KeywordList must list the configured keywords; got:\n{xml}"
+    );
+    assert!(
+        xml.contains("<Attribution><Title>CC-BY 4.0</Title>")
+            && xml.contains("xlink:href=\"https://example/lic\""),
+        "Attribution must carry the license title + URL; got:\n{xml}"
+    );
+    // WMS 1.3.0 order: Abstract → KeywordList → (CRS/bbox), and
+    // Dimension → Attribution. Anchor on the *layer's own* Abstract content
+    // (not a bare `<Abstract>`, which also matches the service-level Abstract
+    // earlier in the document), and on EX_GeographicBoundingBox as the lower
+    // boundary (a root <CRS> appears earlier).
+    let layer_abstract = xml.find("<Abstract>PVOL radar site</Abstract>").unwrap();
+    let kw = xml.find("<KeywordList>").unwrap();
+    assert!(
+        layer_abstract < kw && kw < xml.find("<EX_GeographicBoundingBox>").unwrap(),
+        "KeywordList must sit between the layer Abstract and the bounding box; got:\n{xml}"
+    );
+    assert!(
+        xml.find("<Dimension").unwrap() < xml.find("<Attribution>").unwrap(),
+        "Attribution must follow the Dimension elements; got:\n{xml}"
+    );
+
+    // The per-element xmlns:xlink declarations were dropped in favour of one on
+    // the root; assert the root carries it so every xlink:href stays a defined
+    // namespace reference (a strict parser would otherwise reject the document).
+    let root_start = xml.find("<WMS_Capabilities").unwrap();
+    let root_end = root_start + xml[root_start..].find('>').unwrap();
+    assert!(
+        xml[root_start..root_end].contains("xmlns:xlink=\"http://www.w3.org/1999/xlink\""),
+        "root <WMS_Capabilities> must declare xmlns:xlink; got:\n{xml}"
+    );
+}
+
+/// The single-parameter `write_layer` branch (no parent layer) must also emit
+/// `<KeywordList>` after `<Abstract>` and `<Attribution>` after `<Dimension>`,
+/// in WMS 1.3.0 schema order — the multi-param test above only covers the
+/// parent-layer path.
+#[test]
+fn capabilities_single_param_layer_emits_keywords_and_attribution() {
+    let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+    let mut collections = HashMap::new();
+    // EmptyMockMapEngine reports zero parameters → the single-layer path.
+    engines.insert("solo".to_string(), Arc::new(EmptyMockMapEngine));
+    collections.insert(
+        "solo".to_string(),
+        CollectionConfig {
+            id: "solo".to_string(),
+            title: "Solo".to_string(),
+            description: "Single-param fixture".to_string(),
+            data_path: None,
+            apis: vec!["wms".to_string()],
+            engine_type: "geotiff".to_string(),
+            keywords: vec!["radar".into()],
+            license: Some(ds_core::config::LicenseConfig {
+                title: "CC-BY 4.0".into(),
+                url: Some("https://example/lic".into()),
+            }),
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            odim: None,
+            postgis: None,
+            preview: None,
+        },
+    );
+
+    let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
+    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
+
+    assert!(
+        xml.contains("<KeywordList><Keyword>radar</Keyword></KeywordList>"),
+        "single-param layer must emit its KeywordList; got:\n{xml}"
+    );
+    assert!(
+        xml.contains("<Attribution><Title>CC-BY 4.0</Title>"),
+        "single-param layer must emit its Attribution; got:\n{xml}"
+    );
+    let layer_abstract = xml
+        .find("<Abstract>Single-param fixture</Abstract>")
+        .unwrap();
+    let kw = xml.find("<KeywordList>").unwrap();
+    assert!(
+        layer_abstract < kw && kw < xml.find("<EX_GeographicBoundingBox>").unwrap(),
+        "KeywordList must sit between the layer Abstract and the bounding box; got:\n{xml}"
+    );
+    assert!(
+        xml.find("<Dimension").unwrap() < xml.find("<Attribution>").unwrap(),
+        "Attribution must follow the Dimension elements; got:\n{xml}"
     );
 }

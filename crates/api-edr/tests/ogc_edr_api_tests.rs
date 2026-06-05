@@ -190,6 +190,8 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
             data_path: None,
             apis: vec!["edr".to_string()],
             engine_type: "csv".to_string(),
+            keywords: Vec::new(),
+            license: None,
             geotiff: None,
             querydata: None,
             wms: None,
@@ -1340,5 +1342,109 @@ mod unimplemented_queries {
         );
         let crs = json["crs"].as_array().unwrap();
         assert!(!crs.is_empty());
+    }
+}
+
+/// Keywords + license surface in the EDR collection JSON (the code path is
+/// symmetric with Maps/Tiles/Features, but tested here so a regression in this
+/// crate's builder is caught — review on PR #324).
+mod metadata_extras {
+    use super::*;
+
+    fn state_with(
+        keywords: Vec<String>,
+        license: Option<ds_core::config::LicenseConfig>,
+    ) -> Arc<ArcSwap<EdrState>> {
+        let mut engines = HashMap::new();
+        let mut collections = HashMap::new();
+        engines.insert(
+            "weather".to_string(),
+            Arc::new(MockEngine) as Arc<dyn EdrEngine>,
+        );
+        collections.insert(
+            "weather".to_string(),
+            CollectionConfig {
+                id: "weather".to_string(),
+                title: "Finnish Weather Observations".to_string(),
+                description: "Test collection".to_string(),
+                data_path: None,
+                apis: vec!["edr".to_string()],
+                engine_type: "csv".to_string(),
+                keywords,
+                license,
+                geotiff: None,
+                querydata: None,
+                wms: None,
+                grib: None,
+                odim: None,
+                postgis: None,
+                preview: None,
+            },
+        );
+        Arc::new(ArcSwap::from_pointee(EdrState {
+            engines,
+            collections,
+            base_url: String::new(),
+        }))
+    }
+
+    async fn collection_json(
+        keywords: Vec<String>,
+        license: Option<ds_core::config::LicenseConfig>,
+    ) -> Value {
+        let app = api_edr::router(state_with(keywords, license));
+        let req = Request::builder()
+            .uri("/collections/weather")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn q_count(q: &str) -> u64 {
+        let app = api_edr::router(state_with(vec!["thunderstorm".into()], None));
+        let req = Request::builder().uri(q).body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        json["numberMatched"].as_u64().unwrap()
+    }
+
+    #[tokio::test]
+    async fn keyword_is_matched_by_q_search() {
+        // End-to-end guard for config.keywords -> tuple -> CollectionMatch
+        // ("thunderstorm" is in neither title nor description).
+        assert_eq!(q_count("/collections?q=thunderstorm").await, 1);
+        assert_eq!(q_count("/collections?q=zzznotaword").await, 0);
+    }
+
+    #[tokio::test]
+    async fn keywords_and_license_surface_in_json() {
+        let lic = ds_core::config::LicenseConfig {
+            title: "CC-BY-4.0".into(),
+            url: None,
+        };
+        let json = collection_json(vec!["radar".into(), "weather".into()], Some(lic)).await;
+        assert_eq!(json["keywords"], serde_json::json!(["radar", "weather"]));
+        let link = json["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["rel"] == "license")
+            .expect("a rel=license link");
+        assert_eq!(link["href"], "https://spdx.org/licenses/CC-BY-4.0.html");
+        assert_eq!(link["title"], "CC-BY-4.0");
+    }
+
+    #[tokio::test]
+    async fn no_keywords_or_license_when_unset() {
+        let json = collection_json(Vec::new(), None).await;
+        assert!(json.get("keywords").is_none());
+        assert!(json["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|l| l["rel"] != "license"));
     }
 }

@@ -140,6 +140,8 @@ fn build_router() -> axum::Router {
             data_path: None,
             apis: vec!["features".to_string()],
             engine_type: "mock".to_string(),
+            keywords: Vec::new(),
+            license: None,
             geotiff: None,
             querydata: None,
             wms: None,
@@ -433,6 +435,8 @@ mod vector_tile_discovery {
                 data_path: None,
                 apis: vec!["features".to_string(), "tiles".to_string()],
                 engine_type: "mock".to_string(),
+                keywords: Vec::new(),
+                license: None,
                 geotiff: None,
                 querydata: None,
                 wms: None,
@@ -869,5 +873,110 @@ mod content_negotiation {
                 "{uri}: missing Vary: Accept (got {vary:?})"
             );
         }
+    }
+}
+
+/// Keywords + license surface in the Features collection JSON (symmetric path,
+/// tested per-crate so a regression in this builder is caught — review on PR #324).
+mod metadata_extras {
+    use super::*;
+
+    fn state_with(
+        keywords: Vec<String>,
+        license: Option<ds_core::config::LicenseConfig>,
+    ) -> axum::Router {
+        let mut engines = HashMap::new();
+        let mut collections = HashMap::new();
+        engines.insert(
+            "cities".to_string(),
+            Arc::new(MockFeatureEngine::new()) as Arc<dyn FeatureEngine>,
+        );
+        collections.insert(
+            "cities".to_string(),
+            CollectionConfig {
+                id: "cities".to_string(),
+                title: "Finnish Cities".to_string(),
+                description: "City points for testing".to_string(),
+                data_path: None,
+                apis: vec!["features".to_string()],
+                engine_type: "mock".to_string(),
+                keywords,
+                license,
+                geotiff: None,
+                querydata: None,
+                wms: None,
+                grib: None,
+                odim: None,
+                postgis: None,
+                preview: None,
+            },
+        );
+        let state = Arc::new(ArcSwap::from_pointee(FeaturesState {
+            engines,
+            collections,
+            base_url: String::new(),
+        }));
+        api_features::router(state)
+    }
+
+    async fn collection_json(
+        keywords: Vec<String>,
+        license: Option<ds_core::config::LicenseConfig>,
+    ) -> Value {
+        let app = state_with(keywords, license);
+        let req = Request::builder()
+            .uri("/collections/cities")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn q_count(q: &str) -> u64 {
+        let app = state_with(vec!["thunderstorm".into()], None);
+        let req = Request::builder().uri(q).body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        json["numberMatched"].as_u64().unwrap()
+    }
+
+    #[tokio::test]
+    async fn keyword_is_matched_by_q_search() {
+        // End-to-end guard for config.keywords -> tuple -> CollectionMatch
+        // (Features drops the time slot, so keywords land at a different tuple
+        // index than the other APIs — worth its own check).
+        assert_eq!(q_count("/collections?q=thunderstorm").await, 1);
+        assert_eq!(q_count("/collections?q=zzznotaword").await, 0);
+    }
+
+    #[tokio::test]
+    async fn keywords_and_license_surface_in_json() {
+        let lic = ds_core::config::LicenseConfig {
+            title: "CC-BY-4.0".into(),
+            url: None,
+        };
+        let json = collection_json(vec!["cities".into(), "Finland".into()], Some(lic)).await;
+        assert_eq!(json["keywords"], serde_json::json!(["cities", "Finland"]));
+        let link = json["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["rel"] == "license")
+            .expect("a rel=license link");
+        assert_eq!(link["href"], "https://spdx.org/licenses/CC-BY-4.0.html");
+        assert_eq!(link["title"], "CC-BY-4.0");
+    }
+
+    #[tokio::test]
+    async fn no_keywords_or_license_when_unset() {
+        let json = collection_json(Vec::new(), None).await;
+        assert!(json.get("keywords").is_none());
+        assert!(json["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|l| l["rel"] != "license"));
     }
 }

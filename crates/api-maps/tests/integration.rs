@@ -127,6 +127,8 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
             data_path: None,
             apis: vec!["maps".to_string()],
             engine_type: "odim-volume".to_string(),
+            keywords: Vec::new(),
+            license: None,
             geotiff: None,
             querydata: None,
             wms: None,
@@ -181,6 +183,8 @@ fn build_router_with_apis(apis: Vec<String>) -> axum::Router {
             data_path: None,
             apis,
             engine_type: "geotiff".to_string(),
+            keywords: Vec::new(),
+            license: None,
             geotiff: None,
             querydata: None,
             wms: None,
@@ -284,6 +288,8 @@ async fn fetch_collection_json(engine: Arc<dyn MapEngine>, id: &str, apis: Vec<S
             data_path: None,
             apis,
             engine_type: "geotiff".to_string(),
+            keywords: Vec::new(),
+            license: None,
             geotiff: None,
             querydata: None,
             wms: None,
@@ -303,6 +309,168 @@ async fn fetch_collection_json(engine: Arc<dyn MapEngine>, id: &str, apis: Vec<S
     }));
     let (_, json) = get_on(api_maps::router(state), &format!("/collections/{id}")).await;
     json
+}
+
+/// Fetch a collection's JSON with explicit keywords + license configured.
+fn router_with(
+    keywords: Vec<String>,
+    license: Option<ds_core::config::LicenseConfig>,
+) -> axum::Router {
+    let id = "radar";
+    let mut engines = HashMap::new();
+    let mut collections = HashMap::new();
+    engines.insert(
+        id.to_string(),
+        Arc::new(MockMapEngine::new()) as Arc<dyn MapEngine>,
+    );
+    collections.insert(
+        id.to_string(),
+        CollectionConfig {
+            id: id.to_string(),
+            title: "Test".to_string(),
+            description: "Test".to_string(),
+            data_path: None,
+            apis: vec!["maps".to_string()],
+            engine_type: "geotiff".to_string(),
+            keywords,
+            license,
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            odim: None,
+            postgis: None,
+            preview: None,
+        },
+    );
+    let state = Arc::new(ArcSwap::from_pointee(MapsState {
+        engines,
+        collections,
+        styles: HashMap::new(),
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        base_url: String::new(),
+    }));
+    api_maps::router(state)
+}
+
+async fn fetch_collection_json_with(
+    keywords: Vec<String>,
+    license: Option<ds_core::config::LicenseConfig>,
+) -> Value {
+    let (_, json) = get_on(router_with(keywords, license), "/collections/radar").await;
+    json
+}
+
+/// Fetch the HTML collection-detail page as a raw string.
+async fn fetch_collection_html_with(license: Option<ds_core::config::LicenseConfig>) -> String {
+    let app = router_with(Vec::new(), license);
+    let req = Request::builder()
+        .uri("/collections/radar?f=html")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(body.to_vec()).unwrap()
+}
+
+mod metadata_extras {
+    use super::*;
+
+    #[tokio::test]
+    async fn keywords_appear_in_collection_json() {
+        let json = fetch_collection_json_with(vec!["radar".into(), "weather".into()], None).await;
+        assert_eq!(json["keywords"], serde_json::json!(["radar", "weather"]));
+    }
+
+    #[tokio::test]
+    async fn keyword_is_matched_by_q_search() {
+        // End-to-end: config.keywords -> rows tuple -> CollectionMatch.keywords.
+        // "thunderstorm" is in neither title nor description, so a match proves
+        // the keyword wiring (a wrong tuple index would silently return 0).
+        let (_, hit) = get_on(
+            router_with(vec!["thunderstorm".into()], None),
+            "/collections?q=thunderstorm",
+        )
+        .await;
+        assert_eq!(hit["numberMatched"].as_u64(), Some(1));
+        let (_, miss) = get_on(
+            router_with(vec!["thunderstorm".into()], None),
+            "/collections?q=zzznotaword",
+        )
+        .await;
+        assert_eq!(miss["numberMatched"].as_u64(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn freetext_license_shows_name_in_html_but_no_json_link() {
+        // A free-text license (no resolvable URL) must surface its name on the
+        // HTML page (as plain text, no <a>) yet produce no JSON `rel="license"`
+        // link — the cross-output behavior the docs promise (review on PR #324).
+        let lic = ds_core::config::LicenseConfig {
+            title: "All rights reserved".into(),
+            url: None,
+        };
+        let html = fetch_collection_html_with(Some(lic.clone())).await;
+        assert!(html.contains("License: All rights reserved"));
+        assert!(!html.contains("License: <a"));
+
+        let json = fetch_collection_json_with(Vec::new(), Some(lic)).await;
+        assert!(json["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|l| l["rel"] != "license"));
+    }
+
+    #[tokio::test]
+    async fn no_keywords_field_when_empty() {
+        let json = fetch_collection_json_with(Vec::new(), None).await;
+        assert!(json.get("keywords").is_none());
+    }
+
+    #[tokio::test]
+    async fn license_link_uses_explicit_url() {
+        let lic = ds_core::config::LicenseConfig {
+            title: "CC-BY 4.0".into(),
+            url: Some("https://example/lic".into()),
+        };
+        let json = fetch_collection_json_with(Vec::new(), Some(lic)).await;
+        let link = json["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["rel"] == "license")
+            .expect("a rel=license link");
+        assert_eq!(link["href"], "https://example/lic");
+        assert_eq!(link["title"], "CC-BY 4.0");
+    }
+
+    #[tokio::test]
+    async fn license_link_synthesizes_spdx_url() {
+        let lic = ds_core::config::LicenseConfig {
+            title: "Apache-2.0".into(),
+            url: None,
+        };
+        let json = fetch_collection_json_with(Vec::new(), Some(lic)).await;
+        let link = json["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["rel"] == "license")
+            .expect("a rel=license link");
+        assert_eq!(link["href"], "https://spdx.org/licenses/Apache-2.0.html");
+    }
+
+    #[tokio::test]
+    async fn no_license_link_without_license() {
+        let json = fetch_collection_json_with(Vec::new(), None).await;
+        assert!(json["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|l| l["rel"] != "license"));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,6 +1243,8 @@ fn build_empty_router() -> axum::Router {
             data_path: None,
             apis: vec!["maps".to_string()],
             engine_type: "geotiff".to_string(),
+            keywords: Vec::new(),
+            license: None,
             geotiff: None,
             querydata: None,
             wms: None,
@@ -1186,6 +1356,8 @@ fn build_multi_param_router() -> axum::Router {
             data_path: None,
             apis: vec!["maps".to_string()],
             engine_type: "grib".to_string(),
+            keywords: Vec::new(),
+            license: None,
             geotiff: None,
             querydata: None,
             wms: None,
@@ -1615,6 +1787,8 @@ mod searchable {
                     data_path: None,
                     apis: vec!["maps".to_string()],
                     engine_type: "geotiff".to_string(),
+                    keywords: Vec::new(),
+                    license: None,
                     geotiff: None,
                     querydata: None,
                     wms: None,

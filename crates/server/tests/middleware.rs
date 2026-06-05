@@ -73,6 +73,8 @@ fn make_collection(id: &str) -> CollectionConfig {
         data_path: None,
         apis: vec!["wms".to_string()],
         engine_type: "geotiff".to_string(),
+        keywords: Vec::new(),
+        license: None,
         geotiff: None,
         querydata: None,
         wms: None,

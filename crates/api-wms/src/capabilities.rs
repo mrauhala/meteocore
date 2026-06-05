@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ds_core::config::CollectionConfig;
+use ds_core::config::{CollectionConfig, LicenseConfig};
 use ds_core::map_engine::{MapEngine, RasterInfo};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
@@ -114,7 +114,6 @@ fn write_dcp_type(writer: &mut Writer<Vec<u8>>, base_url: &str) {
 
     let wms_url = format!("{base_url}/wms?");
     let mut or = BytesStart::new("OnlineResource");
-    or.push_attribute(("xmlns:xlink", "http://www.w3.org/1999/xlink"));
     or.push_attribute(("xlink:type", "simple"));
     or.push_attribute(("xlink:href", wms_url.as_str()));
     let _ = writer.write_event(Event::Empty(or));
@@ -139,9 +138,13 @@ fn write_parent_layer(
     // Parent has no Name element — makes it non-requestable per WMS spec
     write_text_element(writer, "Title", &config.title);
     write_text_element(writer, "Abstract", &config.description);
+    write_keyword_list(writer, &config.keywords);
 
     // CRS, bbox, time on parent — inherited by children
     write_layer_metadata(writer, info);
+
+    // Attribution (license) after Dimension, before nested child Layers.
+    write_attribution(writer, config.license.as_ref());
 
     // Child layers — one per parameter. When the collection carries a
     // `layer_subtitle` (e.g. a radar site place name), prepend it to the child
@@ -192,12 +195,17 @@ fn write_layer(
     } else {
         write_text_element(writer, "Title", &config.title);
         write_text_element(writer, "Abstract", &config.description);
+        // Keywords belong on the collection's own layer; child layers of a
+        // multi-param parent inherit none (the parent carries them).
+        write_keyword_list(writer, &config.keywords);
     }
 
     // For top-level (non-nested) layers, write full metadata.
     // For nested child layers, parent already has CRS/bbox/time.
     if param_title.is_none() {
         write_layer_metadata(writer, info);
+        // Attribution (license) after Dimension, before Style.
+        write_attribution(writer, config.license.as_ref());
     }
 
     // Styles
@@ -299,7 +307,6 @@ fn write_layer_styles(
                     style.name
                 );
                 let mut or = BytesStart::new("OnlineResource");
-                or.push_attribute(("xmlns:xlink", "http://www.w3.org/1999/xlink"));
                 or.push_attribute(("xlink:type", "simple"));
                 or.push_attribute(("xlink:href", legend_url.as_str()));
                 let _ = writer.write_event(Event::Empty(or));
@@ -321,4 +328,37 @@ fn write_text_element(writer: &mut Writer<Vec<u8>>, tag: &str, text: &str) {
     let _ = writer.write_event(Event::Start(BytesStart::new(tag)));
     let _ = writer.write_event(Event::Text(BytesText::new(text)));
     let _ = writer.write_event(Event::End(BytesEnd::new(tag)));
+}
+
+/// Write a `<KeywordList>` for the collection's configured keywords (nothing when
+/// empty). Per the WMS 1.3.0 schema this belongs after `<Abstract>` and before
+/// `<CRS>` in a `<Layer>`.
+fn write_keyword_list(writer: &mut Writer<Vec<u8>>, keywords: &[String]) {
+    if keywords.is_empty() {
+        return;
+    }
+    let _ = writer.write_event(Event::Start(BytesStart::new("KeywordList")));
+    for kw in keywords {
+        write_text_element(writer, "Keyword", kw);
+    }
+    let _ = writer.write_event(Event::End(BytesEnd::new("KeywordList")));
+}
+
+/// Write an `<Attribution>` carrying the collection's license (nothing when the
+/// collection has no license). Per the WMS 1.3.0 schema this belongs after the
+/// `<Dimension>` elements and before `<Style>` in a `<Layer>`. The license name
+/// is the `<Title>`; a resolvable URL becomes the `<OnlineResource>`.
+fn write_attribution(writer: &mut Writer<Vec<u8>>, license: Option<&LicenseConfig>) {
+    let Some(license) = license else {
+        return;
+    };
+    let _ = writer.write_event(Event::Start(BytesStart::new("Attribution")));
+    write_text_element(writer, "Title", &license.title);
+    if let Some(url) = license.resolved_url() {
+        let mut or = BytesStart::new("OnlineResource");
+        or.push_attribute(("xlink:type", "simple"));
+        or.push_attribute(("xlink:href", url.as_str()));
+        let _ = writer.write_event(Event::Empty(or));
+    }
+    let _ = writer.write_event(Event::End(BytesEnd::new("Attribution")));
 }
