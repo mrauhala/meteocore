@@ -1364,9 +1364,11 @@ impl ServerConfig {
                 ));
             }
 
-            // Keywords must be non-empty strings (empty entries produce blank
-            // `<Keyword/>` elements / dead `?q=` facets).
-            if collection.keywords.iter().any(|k| k.trim().is_empty()) {
+            // Keywords must be non-empty (empty entries produce blank
+            // `<Keyword/>` elements / dead `?q=` facets). Entries are already
+            // trimmed by `de_trimmed_keywords` at load, so an all-whitespace
+            // keyword arrives here as "" — a plain `is_empty()` check suffices.
+            if collection.keywords.iter().any(|k| k.is_empty()) {
                 return Err(crate::error::DataServerError::Config(format!(
                     "Collection '{id}': 'keywords' must not contain empty strings"
                 )));

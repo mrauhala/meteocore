@@ -1022,13 +1022,15 @@ fn capabilities_emit_keywords_and_attribution() {
         "Attribution must carry the license title + URL; got:\n{xml}"
     );
     // WMS 1.3.0 order: Abstract → KeywordList → (CRS/bbox), and
-    // Dimension → Attribution. Use EX_GeographicBoundingBox as the lower
-    // boundary since a root <CRS> appears earlier in the document.
+    // Dimension → Attribution. Anchor on the *layer's own* Abstract content
+    // (not a bare `<Abstract>`, which also matches the service-level Abstract
+    // earlier in the document), and on EX_GeographicBoundingBox as the lower
+    // boundary (a root <CRS> appears earlier).
+    let layer_abstract = xml.find("<Abstract>PVOL radar site</Abstract>").unwrap();
     let kw = xml.find("<KeywordList>").unwrap();
     assert!(
-        xml.find("<Abstract>").unwrap() < kw
-            && kw < xml.find("<EX_GeographicBoundingBox>").unwrap(),
-        "KeywordList must sit between Abstract and the bounding box; got:\n{xml}"
+        layer_abstract < kw && kw < xml.find("<EX_GeographicBoundingBox>").unwrap(),
+        "KeywordList must sit between the layer Abstract and the bounding box; got:\n{xml}"
     );
     assert!(
         xml.find("<Dimension").unwrap() < xml.find("<Attribution>").unwrap(),
