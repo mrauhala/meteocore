@@ -91,16 +91,29 @@ const SCAN_DAYS: u32 = 2;
 /// of the path-keyed `known_indexes` dedup, not addressed here.)
 const SETTLED_REVALIDATE_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// How [`GribEngine::scan_once`] enumerates index files.
+enum ScanMode {
+    /// Remote S3/HTTP: expand `prefix_pattern` over recent dates × run hours
+    /// (the "now"-relative NWP layout).
+    Remote { prefix_pattern: String },
+    /// Local directory (or a fixed-prefix remote `data_path`): list a single
+    /// literal prefix — no date/run-hour templating, since local fixtures are
+    /// static. `prefix` is the literal sub-prefix under the store root (`""` =
+    /// root).
+    Local { prefix: String },
+}
+
 /// Engine for serving GRIB2 NWP forecast data.
 ///
-/// Discovers GRIB files via index sidecar files on S3/HTTP, fetches individual
-/// parameters via byte-range reads, and serves them through EDR and Maps APIs.
+/// Discovers GRIB files via index sidecar files on S3/HTTP/local, fetches
+/// individual parameters via byte-range reads, and serves them through EDR and
+/// Maps APIs.
 pub struct GribEngine {
     collection_id: String,
     config: GribConfig,
     catalog: ArcSwap<Catalog>,
     store: ds_storage::DataStore,
-    prefix_pattern: String,
+    scan_mode: ScanMode,
     grid_cache: Option<GridCache>,
     /// Shutdown signal for the poll loop.
     shutdown_tx: watch::Sender<bool>,
@@ -157,25 +170,46 @@ impl GribEngine {
 
     /// Create a new GRIB engine from config.
     pub fn new(collection_id: &str, config: &GribConfig) -> Result<Self, DataServerError> {
-        // Validate config
-        let endpoint = config.endpoint.as_deref().ok_or_else(|| {
-            DataServerError::Config(format!(
-                "Collection '{collection_id}': GRIB engine requires 'endpoint'"
-            ))
-        })?;
-        let bucket = config.bucket.as_deref().ok_or_else(|| {
-            DataServerError::Config(format!(
-                "Collection '{collection_id}': GRIB engine requires 'bucket'"
-            ))
-        })?;
-
-        // Build data store. Construct URL from endpoint+bucket for S3 region detection.
-        let store_url = format!("{endpoint}/{bucket}/");
-        let (store, _prefix) = ds_storage::build_store(&store_url).map_err(|e| {
-            DataServerError::Config(format!(
-                "Collection '{collection_id}': failed to build store: {e}"
-            ))
-        })?;
+        // Data source: local `data_path` (a directory, or a fixed-prefix remote
+        // URL) vs S3 `endpoint`+`bucket`. Mutual exclusivity is enforced at
+        // config load (`GribConfig` validation); re-check the presence here so
+        // the engine has a clear error if constructed directly.
+        let (store, scan_mode) = if let Some(data_path) = config.data_path.as_deref() {
+            let (store, _prefix) = ds_storage::build_store(data_path).map_err(|e| {
+                DataServerError::Config(format!(
+                    "Collection '{collection_id}': failed to build store for data_path \
+                     '{data_path}': {e}"
+                ))
+            })?;
+            // `prefix_pattern` is a literal sub-prefix here (no strftime); the
+            // local store is rooted at `data_path`, so the default "" lists it.
+            let prefix = config.prefix_pattern.clone().unwrap_or_default();
+            (store, ScanMode::Local { prefix })
+        } else {
+            let endpoint = config.endpoint.as_deref().ok_or_else(|| {
+                DataServerError::Config(format!(
+                    "Collection '{collection_id}': GRIB engine requires 'data_path' or 'endpoint'"
+                ))
+            })?;
+            let bucket = config.bucket.as_deref().ok_or_else(|| {
+                DataServerError::Config(format!(
+                    "Collection '{collection_id}': GRIB engine requires 'bucket'"
+                ))
+            })?;
+            let prefix_pattern = config.prefix_pattern.clone().ok_or_else(|| {
+                DataServerError::Config(format!(
+                    "Collection '{collection_id}': remote GRIB engine requires 'prefix_pattern'"
+                ))
+            })?;
+            // Construct URL from endpoint+bucket for S3 region detection.
+            let store_url = format!("{endpoint}/{bucket}/");
+            let (store, _prefix) = ds_storage::build_store(&store_url).map_err(|e| {
+                DataServerError::Config(format!(
+                    "Collection '{collection_id}': failed to build store: {e}"
+                ))
+            })?;
+            (store, ScanMode::Remote { prefix_pattern })
+        };
 
         let grid_cache = GridCache::new(config.grid_cache_mb);
 
@@ -193,7 +227,7 @@ impl GribEngine {
             config: config.clone(),
             catalog: ArcSwap::new(Arc::new(Catalog::new())),
             store,
-            prefix_pattern: config.prefix_pattern.clone(),
+            scan_mode,
             grid_cache,
             shutdown_tx,
             param_filter: config.parameters.clone(),
@@ -259,8 +293,15 @@ impl GribEngine {
             .as_deref()
             .unwrap_or(DEFAULT_RUN_HOURS);
 
-        // Generate all prefixes to scan, newest-first (skipping future runs).
-        let prefixes = build_scan_prefixes(&self.prefix_pattern, now, run_hours);
+        // Generate all prefixes to scan. Remote: expand over recent dates × run
+        // hours, newest-first (skipping future runs). Local: a single literal
+        // prefix (static data — no date/run templating).
+        let prefixes = match &self.scan_mode {
+            ScanMode::Remote { prefix_pattern } => {
+                build_scan_prefixes(prefix_pattern, now, run_hours)
+            }
+            ScanMode::Local { prefix } => vec![(now, prefix.clone())],
+        };
 
         // Optional filename substring filter. Applied in addition to the
         // index suffix match so that, for example, a GFS atmos directory

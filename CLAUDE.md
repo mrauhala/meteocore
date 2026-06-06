@@ -190,7 +190,8 @@ radar elevation angle. WMS exposes it as the `ELEVATION` dimension; Maps/Tiles a
 
 ## GRIB Engine Notes
 
-- Discovers data via index sidecar files on S3/HTTP, fetches messages via byte-range reads.
+- Discovers data via index sidecar files on S3/HTTP **or a local directory**, fetches messages via byte-range reads.
+- **Data source (mutually exclusive):** remote `endpoint`+`bucket`+`prefix_pattern` (S3, with strftime/run-hour date templating), or local `data_path` (a directory of `.grib2` + index sidecars; also accepts an `s3://`/`http(s)://` fixed-prefix URL). For `data_path`, `prefix_pattern` is optional and used as a literal sub-prefix (no date templating) since local fixtures are static — index/data files must share a basename (`X.index` ↔ `X.grib2`). Config load enforces the mutual exclusivity.
 - Supports two index formats via `index_format` config: `"ecmwf-json"` (default, JSON-lines as shipped by ECMWF open data) and `"wgrib2"` (colon-separated text as shipped by NOAA GFS).
 - Only regular lat/lon grids (Template 0). Multi-parameter collections (unlike GeoTIFF).
 - **Unit conversion is driven by the WMO `(discipline, category, parameter_number)` triple read out of every decoded message**, not by hardcoded short-name tables. Source units come from WMO Code Table 4.2 (see `crates/engine-grib/src/units.rs`) plus per-center overlays for local parameter numbers 192-254. Display conversions are mechanical: K→°C, Pa→hPa, kg m⁻²→mm, m² s⁻²→gpm, proportion→%. Colormap ranges use display units.
