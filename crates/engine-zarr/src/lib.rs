@@ -30,20 +30,26 @@ use tokio::sync::watch;
 use ds_core::config::ZarrConfig;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
+use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
 };
+use ds_core::resample::ProjectionGrid;
 
 use catalog::Catalog;
 use store::DsStore;
 
-/// Engine for serving Zarr arrays over EDR.
+/// Engine for serving Zarr arrays over EDR and the Map/Tiles/WMS APIs.
 pub struct ZarrEngine {
     collection_id: String,
     /// `ds-storage`-backed store (local / S3 / HTTP), shared by query and poll.
     store: Arc<DsStore>,
     /// Parsed snapshot, swapped atomically by the poll loop.
     catalog: ArcSwap<Catalog>,
+    /// Map capabilities snapshot, rebuilt on every catalog swap so
+    /// `raster_info()` (called per tile request to validate the parameter) is
+    /// O(1) from a snapshot rather than recomputed per call (CLAUDE.md #211).
+    meta: ArcSwap<RasterInfo>,
     /// Variable filter from config (`None` = expose all).
     param_filter: Option<Vec<String>>,
     poll_interval: Duration,
@@ -61,11 +67,13 @@ impl ZarrEngine {
 
         log_loaded(collection_id, &catalog);
 
+        let meta = build_raster_info(&catalog);
         let (shutdown_tx, _) = watch::channel(());
         Ok(Self {
             collection_id: collection_id.to_string(),
             store,
             catalog: ArcSwap::from_pointee(catalog),
+            meta: ArcSwap::from_pointee(meta),
             param_filter,
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
             shutdown_tx,
@@ -116,6 +124,8 @@ impl ZarrEngine {
                 {
                     log_loaded(&self.collection_id, &new_catalog);
                 }
+                // Rebuild the capabilities snapshot, then swap both.
+                self.meta.store(Arc::new(build_raster_info(&new_catalog)));
                 self.catalog.store(Arc::new(new_catalog));
             }
             Err(e) => {
@@ -318,6 +328,134 @@ fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<DsStore, Data
         prefix.as_ref().to_string(),
         config.cache_mb,
     ))
+}
+
+impl MapEngine for ZarrEngine {
+    fn get_raster_tile(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<DateTime<Utc>>,
+        output_crs: &OutputCrs,
+        parameter: Option<&str>,
+        _z: Option<f64>, // Zarr collections expose no vertical dimension yet
+    ) -> Result<RasterTile, DataServerError> {
+        let cat = self.catalog.load();
+        let var = match parameter {
+            Some(p) => cat.vars.iter().find(|v| v.name.eq_ignore_ascii_case(p)),
+            None => cat.vars.first(),
+        }
+        .ok_or_else(|| {
+            DataServerError::InvalidParameter(
+                parameter
+                    .map(|p| format!("Unknown parameter '{p}'"))
+                    .unwrap_or_else(|| "No parameters available".into()),
+            )
+        })?;
+
+        let time_idx = nearest_time_idx(&cat.times, time)
+            .ok_or_else(|| DataServerError::Engine("No Zarr data available".into()))?;
+
+        let n = (width as usize) * (height as usize);
+        let Some(window) = cat.read_window(var, time_idx, bbox)? else {
+            // bbox entirely outside the grid → fully transparent tile.
+            return Ok(RasterTile {
+                width,
+                height,
+                values: vec![None; n],
+            });
+        };
+
+        let mut values = Vec::with_capacity(n);
+        match output_crs {
+            OutputCrs::Projected { .. } => {
+                // Projected output runs `Crs::inverse` per node — expensive — so
+                // compose the output→source pixel map on a coarse
+                // `ProjectionGrid` and interpolate it, rather than projecting per
+                // output pixel (CLAUDE.md "never project per output pixel").
+                let grid = ProjectionGrid::build_2d(
+                    width,
+                    height,
+                    window.ncols() as u32,
+                    window.nrows() as u32,
+                    |fx, fy| output_crs.project_node(bbox, fx, fy),
+                    |lon, lat| window.frac_px(lon, lat),
+                );
+                for oy in 0..height {
+                    for ox in 0..width {
+                        let (col_f, row_f) = grid.sample(ox, oy);
+                        values.push(window.bilinear_at(col_f, row_f));
+                    }
+                }
+            }
+            OutputCrs::Wgs84 | OutputCrs::WebMercator => {
+                // `project_node` is cheap here (no inverse projection), so sample
+                // per pixel directly for full accuracy.
+                for row in 0..height {
+                    let fy = (row as f64 + 0.5) / height as f64;
+                    for col in 0..width {
+                        let fx = (col as f64 + 0.5) / width as f64;
+                        let (lon, lat) = output_crs.project_node(bbox, fx, fy);
+                        values.push(window.sample(lon, lat));
+                    }
+                }
+            }
+        }
+
+        Ok(RasterTile {
+            width,
+            height,
+            values,
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        (*self.meta.load_full()).clone()
+    }
+}
+
+/// Build the map-capabilities snapshot from a catalog. Cached and rebuilt on
+/// catalog swap so `raster_info()` doesn't recompute per request.
+fn build_raster_info(cat: &Catalog) -> RasterInfo {
+    let parameters: Vec<(String, String)> = cat
+        .vars
+        .iter()
+        .map(|v| (v.name.clone(), v.label.clone()))
+        .collect();
+    let (parameter, unit) = cat
+        .vars
+        .first()
+        .map(|v| (v.name.clone(), v.units.clone()))
+        .unwrap_or_default();
+    RasterInfo {
+        // Lon-first geographic grid → CRS:84 (not lat-first EPSG:4326), matching
+        // the other gridded engines' storageCrs.
+        native_crs: "CRS:84".to_string(),
+        spatial_extent: Some(cat.extent),
+        times: cat.times.clone(),
+        parameter,
+        unit,
+        parameters,
+        vertical: None,
+        grid_size: Some(cat.grid_size()),
+        layer_subtitle: None,
+    }
+}
+
+/// Index of the time step nearest `time` (latest when `time` is `None`).
+fn nearest_time_idx(times: &[DateTime<Utc>], time: Option<DateTime<Utc>>) -> Option<usize> {
+    if times.is_empty() {
+        return None;
+    }
+    match time {
+        None => Some(times.len() - 1),
+        Some(t) => times
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, dt)| (dt.signed_duration_since(t)).num_seconds().abs())
+            .map(|(i, _)| i),
+    }
 }
 
 fn log_loaded(collection_id: &str, cat: &Catalog) {

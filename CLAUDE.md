@@ -167,7 +167,7 @@ radar elevation angle. WMS exposes it as the `ELEVATION` dimension; Maps/Tiles a
 | ODIM COMP | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | ODIM PVOL | `EdrEngine` + `MapEngine` (per-site views) + `FeatureEngine` (network engine) | EDR (position, locations, area, trajectory), WMS, Maps, Tiles, Features (site inventory) |
 | QueryData | `EdrEngine` + `MapEngine` | EDR (position only), WMS, Maps, Tiles |
-| Zarr | `EdrEngine` | EDR (position only), local + S3/HTTP |
+| Zarr | `EdrEngine` + `MapEngine` | EDR (position), WMS, Maps, Tiles; local + S3/HTTP |
 | PostGIS | `EdrEngine` + `FeatureEngine` | EDR (position, locations, area), Features |
 
 ## ODIM PVOL Engine Notes (per-site collections)
@@ -215,15 +215,23 @@ radar elevation angle. WMS exposes it as the `ELEVATION` dimension; Maps/Tiles a
 ## Zarr Engine Notes
 
 Cloud-native multidimensional arrays (Zarr V2/V3) with CF-conventions metadata,
-tracked in #125. **The crate is phased; Phases 1-2 ship today.**
+tracked in #125. **The crate is phased; Phases 1-3 ship today.**
 
-- **Phases 1-2 (done):** local **and** remote (S3/HTTP) stores, WGS84/geographic
+- **Phases 1-3 (done):** local **and** remote (S3/HTTP) stores, WGS84/geographic
   lat-lon grid, multi-variable EDR **position** queries with bilinear
-  interpolation, CF time decoding, CF packing
-  (`scale_factor`/`add_offset`/`_FillValue`/`missing_value` + the array's own
-  Zarr fill), byte-range chunk reads with an LRU cache, and a startup WARN for
-  pathological chunk shapes. **Not yet:** Map/Tiles/WMS rendering (Phase 3),
-  per-item-CRS STAC mode (Phase 4), kerchunk (Phase 5).
+  interpolation, **WMS/Maps/Tiles rendering** (one layer per variable), CF time
+  decoding, CF packing (`scale_factor`/`add_offset`/`_FillValue`/`missing_value`
+  + the array's own Zarr fill), byte-range chunk reads with an LRU cache, and a
+  startup WARN for pathological chunk shapes. **Not yet:** per-item-CRS STAC
+  mode (Phase 4), kerchunk (Phase 5).
+- **Rendering (Phase 3):** `MapEngine::get_raster_tile` reads a 2-D spatial
+  *window* of the variable covering the request bbox (`Catalog::read_window`,
+  +1 cell margin) into memory, then samples per output pixel — per-pixel for
+  `Wgs84`/`WebMercator` (cheap `project_node`), via a coarse `ProjectionGrid`
+  for `Projected` output (never project per pixel; #203). `raster_info()` is
+  served from a cached `ArcSwap<RasterInfo>` rebuilt on each catalog swap
+  (#211). Window sampling uses `cf::locate`, so it handles ascending/descending
+  and irregular axes; the window read inherits `concurrent_target(1)`.
 - **The Zarr format + codec pipeline is handled by the `zarrs` crate** (features:
   blosc/zstd/gzip/crc32c/sharding/transpose + `filesystem`+`ndarray`). Codecs are
   transparent to this engine — it only adds CF semantics, the OGC domain mapping,
@@ -242,10 +250,10 @@ tracked in #125. **The crate is phased; Phases 1-2 ship today.**
   *panics*. `catalog::single_threaded_opts()` pins retrieval to the calling
   (request/poll) thread via `CodecOptions::with_concurrent_target(1)`, so storage
   reads never land on rayon. Every `retrieve_*` MUST go through it.
-- **Engine = EDR-only (through Phase 2).** The `engine_type → supported_apis`
-  allowlist in `admin.rs` lists `"zarr" => &["edr"]`, so a zarr collection that
-  requests `wms`/`maps`/`tiles` is rejected at load (widen the allowlist +
-  implement `MapEngine` in Phase 3).
+- **APIs:** the `engine_type → supported_apis` allowlist in `admin.rs` lists
+  `"zarr" => &["edr", "wms", "maps", "tiles"]`. WMS/Maps/Tiles need a `[wms]`
+  colormap (or a `style_bundle`) like the other raster engines; each variable
+  becomes its own layer via `register_parameter_layer_styles`.
 - **Catalog model:** `catalog::build` opens the root group, lists child arrays,
   treats 1-D arrays named after their dim as CF coordinate variables, classifies
   each dim via `cf::classify_axis` (coord-var `standard_name`/`units` first, name

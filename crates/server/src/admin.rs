@@ -540,8 +540,7 @@ pub fn load_collections(
             "geotiff" => &["edr", "wms", "maps", "tiles"],
             "querydata" => &["edr", "wms", "maps", "tiles"],
             "grib" => &["edr", "wms", "maps", "tiles"],
-            // Phase 1 (#125): EDR position queries only. Map/Tiles/WMS in Phase 3.
-            "zarr" => &["edr"],
+            "zarr" => &["edr", "wms", "maps", "tiles"],
             "odim" => &["edr", "wms", "maps", "tiles"],
             "odim-volume" => &["edr", "wms", "maps", "tiles", "features"],
             "postgis" => &["edr", "features", "tiles"],
@@ -1131,9 +1130,66 @@ pub fn load_collections(
                     edr_collections.insert(collection.id.clone(), collection.clone());
                     info!("Collection '{}': wired to EDR API", collection.id);
                 }
-                // Phase 1 serves EDR position queries only; Map/Tiles/WMS
-                // rendering is deferred to Phase 3 (#125). The engine/API
-                // allowlist above rejects a zarr collection that requests them.
+
+                // Per-parameter-layer styles (one WMS/Maps/Tiles layer per Zarr
+                // variable).
+                let raster_params =
+                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+
+                if collection.apis.contains(&"wms".to_string()) {
+                    map_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    map_collections.insert(collection.id.clone(), collection.clone());
+                    let styles = build_styles(collection, &bundle_index);
+                    map_styles.insert(collection.id.clone(), styles);
+                    if !raster_params.is_empty() {
+                        register_parameter_layer_styles(
+                            collection,
+                            &raster_params,
+                            &mut map_styles,
+                            &bundle_index,
+                        );
+                    }
+                    info!("Collection '{}': wired to WMS API", collection.id);
+                }
+                if collection.apis.contains(&"maps".to_string()) {
+                    maps_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    maps_collections.insert(collection.id.clone(), collection.clone());
+                    let styles = build_styles(collection, &bundle_index);
+                    maps_styles.insert(collection.id.clone(), styles);
+                    if !raster_params.is_empty() {
+                        register_parameter_layer_styles(
+                            collection,
+                            &raster_params,
+                            &mut maps_styles,
+                            &bundle_index,
+                        );
+                    }
+                    info!("Collection '{}': wired to Maps API", collection.id);
+                }
+                if collection.apis.contains(&"tiles".to_string()) {
+                    tiles_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    tiles_collections.insert(collection.id.clone(), collection.clone());
+                    let styles = build_styles(collection, &bundle_index);
+                    tiles_styles.insert(collection.id.clone(), styles);
+                    if !raster_params.is_empty() {
+                        register_parameter_layer_styles(
+                            collection,
+                            &raster_params,
+                            &mut tiles_styles,
+                            &bundle_index,
+                        );
+                    }
+                    info!("Collection '{}': wired to Tiles API", collection.id);
+                }
 
                 let has_data = temporal_extent.is_some();
                 health.push(CollectionHealth {

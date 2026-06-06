@@ -90,6 +90,73 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// Native grid cell counts `[nx, ny]` (lon columns, lat rows).
+    pub fn grid_size(&self) -> [u32; 2] {
+        [self.lons.len() as u32, self.lats.len() as u32]
+    }
+
+    /// Read a 2-D spatial slab of `var` at `time_idx` covering the WGS84 render
+    /// `bbox` (`[west, south, east, north]`), expanded by one cell so edge
+    /// pixels can interpolate. Returns `None` when the bbox lies entirely off
+    /// the grid. Used by the Map/Tiles/WMS render path.
+    pub fn read_window(
+        &self,
+        var: &Variable,
+        time_idx: usize,
+        bbox: [f64; 4],
+    ) -> Result<Option<Window>, DataServerError> {
+        let [west, south, east, north] = bbox;
+        let (Some((i0, i1)), Some((j0, j1))) = (
+            axis_window(&self.lons, west, east),
+            axis_window(&self.lats, south, north),
+        ) else {
+            return Ok(None); // bbox entirely outside the grid
+        };
+
+        let mut ranges: Vec<Range<u64>> = Vec::with_capacity(var.ndim);
+        for a in 0..var.ndim {
+            if Some(a) == var.time_axis {
+                ranges.push(time_idx as u64..time_idx as u64 + 1);
+            } else if a == var.lat_axis {
+                ranges.push(j0 as u64..(j1 as u64) + 1);
+            } else if a == var.lon_axis {
+                ranges.push(i0 as u64..(i1 as u64) + 1);
+            } else {
+                ranges.push(0..1);
+            }
+        }
+        let subset = ArraySubset::new_with_ranges(&ranges);
+        let raw = retrieve_raw_f64(&var.array, &subset)?;
+        let conv: Vec<Option<f64>> = raw.iter().map(|&r| var.convert(r)).collect();
+        let lens: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
+
+        let nrow = j1 - j0 + 1;
+        let ncol = i1 - i0 + 1;
+        let mut data = vec![None; nrow * ncol];
+        for r in 0..nrow {
+            for c in 0..ncol {
+                let mut off = 0usize;
+                for (a, &len) in lens.iter().enumerate() {
+                    let idx = if a == var.lat_axis {
+                        r
+                    } else if a == var.lon_axis {
+                        c
+                    } else {
+                        0 // time + any pinned dims
+                    };
+                    off = off * len + idx;
+                }
+                data[r * ncol + c] = conv[off];
+            }
+        }
+
+        Ok(Some(Window {
+            data,
+            lons: self.lons[i0..=i1].to_vec(),
+            lats: self.lats[j0..=j1].to_vec(),
+        }))
+    }
+
     /// Sample a variable's value at `(lon, lat)` for each requested time index,
     /// using bilinear interpolation over the surrounding grid cells (nearest
     /// fallback where a neighbour is nodata). Reads a single small hyperslab
@@ -173,6 +240,77 @@ impl Catalog {
             out.push(bilinear(v00, v01, v10, v11, wx, wy));
         }
         Ok(out)
+    }
+}
+
+/// An in-memory spatial slab of one variable at one time, covering a render
+/// bbox, with the slab's own (windowed) coordinate axes. Row-major, row `r` ↔
+/// `lats[r]`, column `c` ↔ `lons[c]`.
+pub struct Window {
+    data: Vec<Option<f64>>,
+    lons: Vec<f64>,
+    lats: Vec<f64>,
+}
+
+impl Window {
+    pub fn ncols(&self) -> usize {
+        self.lons.len()
+    }
+
+    pub fn nrows(&self) -> usize {
+        self.lats.len()
+    }
+
+    /// Fractional window pixel `(col_f, row_f)` for a WGS84 `(lon, lat)`. An
+    /// off-window coordinate yields a non-finite component, which
+    /// [`Window::bilinear_at`] rejects.
+    pub fn frac_px(&self, lon: f64, lat: f64) -> (f64, f64) {
+        let fx = cf::locate(&self.lons, lon)
+            .map(|(lo, _, w)| lo as f64 + w)
+            .unwrap_or(f64::NAN);
+        let fy = cf::locate(&self.lats, lat)
+            .map(|(lo, _, w)| lo as f64 + w)
+            .unwrap_or(f64::NAN);
+        (fx, fy)
+    }
+
+    /// Bilinearly sample at a fractional window pixel; `None` off-window or where
+    /// every neighbour is nodata.
+    pub fn bilinear_at(&self, col_f: f64, row_f: f64) -> Option<f64> {
+        if !col_f.is_finite() || !row_f.is_finite() {
+            return None;
+        }
+        let (ncol, nrow) = (self.lons.len() as isize, self.lats.len() as isize);
+        if ncol == 0 || nrow == 0 {
+            return None;
+        }
+        let c0 = col_f.floor() as isize;
+        let r0 = row_f.floor() as isize;
+        if c0 < -1 || c0 >= ncol || r0 < -1 || r0 >= nrow {
+            return None;
+        }
+        let (wx, wy) = (col_f - c0 as f64, row_f - r0 as f64);
+        let at = |r: isize, c: isize| -> Option<f64> {
+            if r < 0 || c < 0 || r >= nrow || c >= ncol {
+                None
+            } else {
+                self.data[r as usize * self.lons.len() + c as usize]
+            }
+        };
+        bilinear(
+            at(r0, c0),
+            at(r0, c0 + 1),
+            at(r0 + 1, c0),
+            at(r0 + 1, c0 + 1),
+            wx,
+            wy,
+        )
+    }
+
+    /// Sample directly at a WGS84 `(lon, lat)`.
+    pub fn sample(&self, lon: f64, lat: f64) -> Option<f64> {
+        let (fx, fy) = self.frac_px(lon, lat);
+        self.bilinear_at(fx, fy)
     }
 }
 
@@ -566,6 +704,24 @@ fn warn_bad_chunking(
              query decodes the entire field for every timestep"
         );
     }
+}
+
+/// Index range `(lo, hi)` (inclusive) of the cells of a monotonic axis whose
+/// values fall within `[min, max]`, expanded by one cell each side so a render
+/// can interpolate at the window edge. `None` if no cell is in range (the bbox
+/// is entirely off this axis). Works for ascending or descending axes (it
+/// compares values, not order).
+fn axis_window(axis: &[f64], min: f64, max: f64) -> Option<(usize, usize)> {
+    let (mut lo, mut hi) = (None, None);
+    for (i, &v) in axis.iter().enumerate() {
+        if v >= min && v <= max {
+            lo.get_or_insert(i);
+            hi = Some(i);
+        }
+    }
+    let lo = lo?.saturating_sub(1);
+    let hi = (hi? + 1).min(axis.len() - 1);
+    Some((lo, hi))
 }
 
 /// Edge extent `(min, max)` of a centred coordinate axis, expanded by half a
