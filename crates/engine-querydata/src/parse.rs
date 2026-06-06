@@ -1006,25 +1006,26 @@ mod tests {
 
         let qd = QueryData::open(&path).unwrap();
 
-        // Verify parameters
-        assert_eq!(qd.params.len(), 10, "Expected 10 parameters");
+        // Verify parameters. The committed fixture is a qdcrop subset of the
+        // original (msl/2t/precip kept, in that order) — see testdata README.
+        assert_eq!(qd.params.len(), 3, "Expected 3 parameters");
         assert_eq!(qd.params[0].name, "Mean Sea Level Pressure (msl)");
         assert_eq!(qd.params[1].name, "2 Metre Temperature (2t)");
 
-        // Verify grid
-        assert_eq!(qd.grid.nx, 561);
-        assert_eq!(qd.grid.ny, 482);
+        // Verify grid (cropped Kenya box, decimated 2×)
+        assert_eq!(qd.grid.nx, 16);
+        assert_eq!(qd.grid.ny, 21);
         assert!(matches!(qd.grid.area.crs, Crs::Wgs84));
-        assert!((qd.grid.area.bottom_left.0 - (-40.0)).abs() < 0.01);
-        assert!((qd.grid.area.bottom_left.1 - (-60.25)).abs() < 0.01);
-        assert!((qd.grid.area.top_right.0 - 100.0).abs() < 0.01);
-        assert!((qd.grid.area.top_right.1 - 60.0).abs() < 0.01);
+        assert!((qd.grid.area.bottom_left.0 - 34.0).abs() < 0.01);
+        assert!((qd.grid.area.bottom_left.1 - 4.75).abs() < 0.01);
+        assert!((qd.grid.area.top_right.0 - 41.5).abs() < 0.01);
+        assert!((qd.grid.area.top_right.1 - (-5.25)).abs() < 0.01);
 
         // Verify levels
         assert_eq!(qd.levels.len(), 1, "Expected 1 level (surface)");
 
-        // Verify times
-        assert_eq!(qd.times.len(), 49, "Expected 49 time steps");
+        // Verify times (cropped to +0/+3/+6/+9h)
+        assert_eq!(qd.times.len(), 4, "Expected 4 time steps");
         assert_eq!(
             qd.times[0].format("%Y-%m-%dT%H:%M").to_string(),
             "2026-04-04T06:00"
@@ -1062,16 +1063,16 @@ mod tests {
 
         let qd = QueryData::open(&path).unwrap();
 
-        // Bottom-left corner should be near (-40, -60.25)
+        // First grid corner should be near the cropped box's (34, 4.75)
         let (lon, lat) = qd.grid_lonlat(0);
-        assert!((lon - (-40.0)).abs() < 0.5, "BL lon={lon}");
-        assert!((lat - (-60.25)).abs() < 0.5, "BL lat={lat}");
+        assert!((lon - 34.0).abs() < 0.5, "BL lon={lon}");
+        assert!((lat - 4.75).abs() < 0.5, "BL lat={lat}");
 
-        // Top-right corner should be near (100, 60)
+        // Opposite corner should be near (41.5, -5.25)
         let last_idx = qd.grid_size() - 1;
         let (lon, lat) = qd.grid_lonlat(last_idx);
-        assert!((lon - 100.0).abs() < 0.5, "TR lon={lon}");
-        assert!((lat - 60.0).abs() < 0.5, "TR lat={lat}");
+        assert!((lon - 41.5).abs() < 0.5, "TR lon={lon}");
+        assert!((lat - (-5.25)).abs() < 0.5, "TR lat={lat}");
     }
 
     #[test]

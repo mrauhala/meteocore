@@ -676,7 +676,7 @@ mod tests {
         let engine = QueryDataEngine::new(&test_dir(), "test", None, 30).unwrap();
         assert!(engine.has_data());
         let params = engine.get_parameters();
-        assert_eq!(params.len(), 10);
+        assert_eq!(params.len(), 3);
     }
 
     #[test]
@@ -686,10 +686,10 @@ mod tests {
         }
         let engine = QueryDataEngine::new(&test_dir(), "test", None, 30).unwrap();
         let bbox = engine.get_spatial_extent().unwrap();
-        assert!((bbox[0] - (-40.0)).abs() < 0.01);
-        assert!((bbox[1] - (-60.25)).abs() < 0.01);
-        assert!((bbox[2] - 100.0).abs() < 0.01);
-        assert!((bbox[3] - 60.0).abs() < 0.01);
+        assert!((bbox[0] - 34.0).abs() < 0.01);
+        assert!((bbox[1] - 4.75).abs() < 0.01);
+        assert!((bbox[2] - 41.5).abs() < 0.01);
+        assert!((bbox[3] - (-5.25)).abs() < 0.01);
     }
 
     #[test]
@@ -721,8 +721,8 @@ mod tests {
             CoverageResponse::Collection(_) => panic!("expected Single"),
         };
 
-        assert_eq!(result.parameters.len(), 10);
-        assert_eq!(result.ranges.len(), 10);
+        assert_eq!(result.parameters.len(), 3);
+        assert_eq!(result.ranges.len(), 3);
 
         let temp = result.ranges.get("2 Metre Temperature (2t)").unwrap();
         let has_values = temp.values.iter().any(|v| v.is_some());
@@ -828,7 +828,7 @@ mod tests {
         assert_eq!(info.parameter, "2 Metre Temperature (2t)");
         // Lon-first geographic grid -> CRS:84 (not lat-first EPSG:4326).
         assert_eq!(info.native_crs, "CRS:84");
-        assert_eq!(info.times.len(), 49);
+        assert_eq!(info.times.len(), 4);
         assert!(info.spatial_extent.is_some());
     }
 
