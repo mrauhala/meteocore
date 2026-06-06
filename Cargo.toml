@@ -9,6 +9,7 @@ members = [
     "crates/engine-querydata",
     "crates/engine-grib",
     "crates/engine-odim",
+    "crates/engine-zarr",
     "crates/storage",
     "crates/render",
     "crates/ds-mvt",

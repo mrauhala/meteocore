@@ -129,6 +129,8 @@ pub struct CollectionConfig {
     pub querydata: Option<QueryDataConfig>,
     /// GRIB-specific configuration. Required when engine_type = "grib".
     pub grib: Option<GribConfig>,
+    /// Zarr-specific configuration. Required when engine_type = "zarr".
+    pub zarr: Option<ZarrConfig>,
     /// ODIM_H5 radar-specific configuration. Required when engine_type = "odim".
     pub odim: Option<OdimConfig>,
     /// WMS map rendering configuration. Required when apis contains "wms".
@@ -607,6 +609,51 @@ pub struct GribConfig {
     /// etc. — all ending in `.idx`. Set `filename_contains = "pgrb2.0p25"`
     /// to keep only the 0.25-degree forecast files.
     pub filename_contains: Option<String>,
+}
+
+fn default_zarr_poll_interval() -> u64 {
+    300
+}
+
+fn default_zarr_cache_mb() -> u64 {
+    256
+}
+
+/// Configuration for the Zarr engine (`engine_type = "zarr"`).
+///
+/// Reads cloud-native multidimensional arrays (Zarr V2/V3) with CF-conventions
+/// metadata. Phase 1 supports a **local** store (`data_path`) only; the S3/HTTP
+/// (`endpoint` + `bucket` + `path`) backend is validated here but rejected at
+/// engine construction until Phase 2.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ZarrConfig {
+    /// Local path to the Zarr store root directory (the `.zarr` directory).
+    /// Mutually exclusive with the S3 `endpoint`/`bucket` source.
+    pub data_path: Option<String>,
+    /// S3-compatible endpoint URL, e.g. "https://s3.eu-central-1.amazonaws.com"
+    /// (Phase 2). Required together with `bucket`.
+    pub endpoint: Option<String>,
+    /// S3 bucket name (Phase 2). Required when `endpoint` is set.
+    pub bucket: Option<String>,
+    /// Path of the Zarr store within the bucket (S3 source), e.g.
+    /// "zarr/2026/01/data/air_temperature_at_2_metres.zarr". Required for the
+    /// remote source. For a local `data_path` it is an optional sub-path
+    /// appended to the directory.
+    pub path: Option<String>,
+    /// Zarr metadata version to read: `2` or `3`. Default: auto-detect
+    /// (try V3 metadata, fall back to V2).
+    pub zarr_version: Option<u8>,
+    /// Optional variable filter — only expose these variables as parameters.
+    /// Default: every data variable discovered in the store.
+    pub parameters: Option<Vec<String>>,
+    /// Poll interval in seconds. The store is re-read on this cadence so
+    /// appended time steps surface without a reload. Default: 300 (5 min).
+    #[serde(default = "default_zarr_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// Chunk LRU cache size in MB (used by the Phase 2 remote byte-range
+    /// reader). Default: 256.
+    #[serde(default = "default_zarr_cache_mb")]
+    pub cache_mb: u64,
 }
 
 /// Observation table configuration for engine-postgis.
@@ -1512,6 +1559,78 @@ impl ServerConfig {
                 }
             }
 
+            // Zarr engine requires zarr config section.
+            if collection.engine_type == "zarr" && collection.zarr.is_none() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': engine_type 'zarr' requires a [collections.zarr] config section"
+                )));
+            }
+            if collection.zarr.is_some() && collection.engine_type != "zarr" {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': [collections.zarr] is set but engine_type is '{}'",
+                    collection.engine_type
+                )));
+            }
+            if let Some(zarr) = &collection.zarr {
+                if zarr.poll_interval_secs == 0 {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': zarr poll_interval_secs must be > 0"
+                    )));
+                }
+
+                // Data source: exactly one of local `data_path` or S3
+                // `endpoint`+`bucket`. The remote source needs both S3 fields
+                // plus `path` (the store location within the bucket).
+                let has_local = zarr.data_path.is_some();
+                let has_any_remote = zarr.endpoint.is_some() || zarr.bucket.is_some();
+                if has_local && has_any_remote {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': zarr 'data_path' (local) is mutually exclusive \
+                         with 'endpoint'/'bucket' (S3)"
+                    )));
+                }
+                if !has_local && !has_any_remote {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': zarr requires either 'data_path' (local) or \
+                         'endpoint'+'bucket' (S3)"
+                    )));
+                }
+                if has_any_remote {
+                    if zarr.endpoint.is_none() || zarr.bucket.is_none() {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': remote zarr requires both 'endpoint' and 'bucket'"
+                        )));
+                    }
+                    if zarr.path.is_none() {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': remote zarr (endpoint+bucket) requires 'path'"
+                        )));
+                    }
+                }
+
+                if let Some(v) = zarr.zarr_version {
+                    if v != 2 && v != 3 {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': invalid zarr_version {v}, expected 2 or 3"
+                        )));
+                    }
+                }
+
+                // `path` is joined onto the source root; an absolute path or one
+                // with `..` would silently escape it (`PathBuf::join` discards
+                // the base on an absolute child), so reject those at load.
+                if let Some(p) = &zarr.path {
+                    if std::path::Path::new(p).is_absolute()
+                        || p.split(['/', '\\']).any(|c| c == "..")
+                    {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': zarr 'path' must be a relative path without \
+                             '..' components"
+                        )));
+                    }
+                }
+            }
+
             // PostGIS engine: requires [postgis] section + parameters + valid shape.
             if collection.engine_type == "postgis" {
                 let postgis = collection.postgis.as_ref().ok_or_else(|| {
@@ -1714,6 +1833,74 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         assert!(only_endpoint.validate().is_err());
         let only_bucket = grib_collection("bucket = \"b\"\nprefix_pattern = \"%Y/\"\n");
         assert!(only_bucket.validate().is_err());
+    }
+
+    fn zarr_collection(zarr_body: &str) -> ServerConfig {
+        collection_with(&format!(
+            "engine_type = \"zarr\"\n[collections.zarr]\n{zarr_body}"
+        ))
+    }
+
+    #[test]
+    fn zarr_local_data_path_validates() {
+        let cfg = zarr_collection("data_path = \"testdata/zarr-era5-t2m\"\nzarr_version = 3\n");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn zarr_remote_validates_with_path() {
+        let cfg =
+            zarr_collection("endpoint = \"https://s3\"\nbucket = \"b\"\npath = \"data.zarr\"\n");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn zarr_engine_requires_section() {
+        // engine_type = "zarr" with no [collections.zarr] section is rejected.
+        let cfg = collection_with("engine_type = \"zarr\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn zarr_section_requires_matching_engine_type() {
+        let cfg = collection_with("[collections.zarr]\ndata_path = \"x\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn zarr_rejects_data_path_with_s3() {
+        let cfg = zarr_collection("data_path = \"x\"\nendpoint = \"https://s3\"\nbucket = \"b\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn zarr_rejects_no_data_source() {
+        let cfg = zarr_collection("zarr_version = 3\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn zarr_remote_rejects_missing_path() {
+        let cfg = zarr_collection("endpoint = \"https://s3\"\nbucket = \"b\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn zarr_rejects_invalid_version() {
+        let cfg = zarr_collection("data_path = \"x\"\nzarr_version = 4\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn zarr_rejects_absolute_or_traversal_path() {
+        // An absolute `path` would make PathBuf::join discard `data_path`.
+        let abs = zarr_collection("data_path = \"x\"\npath = \"/etc/passwd\"\n");
+        assert!(abs.validate().is_err());
+        let dotdot = zarr_collection("data_path = \"x\"\npath = \"../escape.zarr\"\n");
+        assert!(dotdot.validate().is_err());
+        // A normal relative sub-path is fine.
+        let ok = zarr_collection("data_path = \"x\"\npath = \"sub/data.zarr\"\n");
+        assert!(ok.validate().is_ok());
     }
 
     #[test]

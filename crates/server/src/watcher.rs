@@ -170,6 +170,7 @@ mod tests {
             geotiff_engines: RwLock::new(result.geotiff_engines),
             querydata_engines: RwLock::new(result.querydata_engines),
             grib_engines: RwLock::new(result.grib_engines),
+            zarr_engines: RwLock::new(result.zarr_engines),
             odim_engines: RwLock::new(result.odim_engines),
             odim_volume_engines: RwLock::new(result.odim_volume_engines),
             postgis_engines: RwLock::new(result.postgis_engines),

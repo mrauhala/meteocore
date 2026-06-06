@@ -1,0 +1,59 @@
+{
+  "zarr_format": 3,
+  "node_type": "array",
+  "shape": [
+    4,
+    12,
+    16
+  ],
+  "data_type": "int16",
+  "chunk_grid": {
+    "name": "regular",
+    "configuration": {
+      "chunk_shape": [
+        4,
+        6,
+        8
+      ]
+    }
+  },
+  "chunk_key_encoding": {
+    "name": "default",
+    "configuration": {
+      "separator": "/"
+    }
+  },
+  "fill_value": -9999,
+  "codecs": [
+    {
+      "name": "bytes",
+      "configuration": {
+        "endian": "little"
+      }
+    },
+    {
+      "name": "gzip",
+      "configuration": {
+        "level": 5
+      }
+    }
+  ],
+  "attributes": {
+    "units": "K",
+    "standard_name": "air_temperature",
+    "long_name": "2 metre temperature (packed)",
+    "scale_factor": 0.01,
+    "add_offset": 273.15,
+    "_FillValue": -9999,
+    "_zarrs": {
+      "description": "This array was created with zarrs",
+      "repository": "https://github.com/zarrs/zarrs",
+      "version": "0.23.13"
+    }
+  },
+  "dimension_names": [
+    "time",
+    "lat",
+    "lon"
+  ]
+}

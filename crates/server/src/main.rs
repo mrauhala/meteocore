@@ -262,6 +262,12 @@ async fn main() {
             poller.poll_loop().await;
         });
     }
+    for engine in &result.zarr_engines {
+        let poller = engine.clone();
+        poll_runtime().spawn(async move {
+            poller.poll_loop().await;
+        });
+    }
     for engine in &result.odim_engines {
         let poller = engine.clone();
         poll_runtime().spawn(async move {
@@ -337,6 +343,7 @@ async fn main() {
         geotiff_engines: RwLock::new(result.geotiff_engines),
         querydata_engines: RwLock::new(result.querydata_engines),
         grib_engines: RwLock::new(result.grib_engines),
+        zarr_engines: RwLock::new(result.zarr_engines),
         odim_engines: RwLock::new(result.odim_engines),
         odim_volume_engines: RwLock::new(result.odim_volume_engines),
         postgis_engines: RwLock::new(result.postgis_engines),
@@ -458,6 +465,13 @@ async fn main() {
         .read()
         .unwrap_or_else(|e| e.into_inner());
     for engine in grib.iter() {
+        engine.shutdown();
+    }
+    let zarr = server_state
+        .zarr_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    for engine in zarr.iter() {
         engine.shutdown();
     }
     let odim = server_state
