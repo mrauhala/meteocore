@@ -8,6 +8,11 @@ the multi-GB originals weren't committed). `qdcrop` is part of the FMI
 The full originals are FMI open data and re-downloadable if a larger fixture is
 ever needed.
 
+> Note: `qdcrop -G` snaps the requested box to the nearest original grid cells,
+> so the committed fixture's bounds are slightly *inside* the `-G` arguments
+> (e.g. the Kenya `-G 34,-5,42,5` yields east 41.5°, south −5.25°). That's
+> expected — not a mismatched file.
+
 ## `ecmwf-kenya/` — WGS84 lat/lon surface fields
 
 Exercises the geographic (WGS84) parse + EDR/Maps path.

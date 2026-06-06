@@ -1062,16 +1062,17 @@ mod tests {
 
         let qd = QueryData::open(&path).unwrap();
 
-        // First grid corner should be near the cropped box's (34, 4.75)
+        // First grid corner (index 0) is near (34, 4.75) — note this fixture's
+        // index 0 is the *north*west corner (lat 4.75), not a "bottom-left".
         let (lon, lat) = qd.grid_lonlat(0);
-        assert!((lon - 34.0).abs() < 0.5, "BL lon={lon}");
-        assert!((lat - 4.75).abs() < 0.5, "BL lat={lat}");
+        assert!((lon - 34.0).abs() < 0.5, "corner0 lon={lon}");
+        assert!((lat - 4.75).abs() < 0.5, "corner0 lat={lat}");
 
-        // Opposite corner should be near (41.5, -5.25)
+        // Opposite corner (last index) is near (41.5, -5.25).
         let last_idx = qd.grid_size() - 1;
         let (lon, lat) = qd.grid_lonlat(last_idx);
-        assert!((lon - 41.5).abs() < 0.5, "TR lon={lon}");
-        assert!((lat - (-5.25)).abs() < 0.5, "TR lat={lat}");
+        assert!((lon - 41.5).abs() < 0.5, "cornerN lon={lon}");
+        assert!((lat - (-5.25)).abs() < 0.5, "cornerN lat={lat}");
     }
 
     #[test]
