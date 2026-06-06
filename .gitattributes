@@ -1,0 +1,7 @@
+# Binary test fixtures — never apply text/EOL normalization
+*.sqd binary
+*.h5 binary
+*.hdf binary
+*.tif binary
+*.tiff binary
+*.grib2 binary
