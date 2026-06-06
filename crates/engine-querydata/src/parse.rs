@@ -1146,7 +1146,10 @@ mod tests {
         ));
         assert!(qd.grid.nx > 0);
         assert!(qd.grid.ny > 0);
-        assert!(!qd.params.is_empty());
-        assert!(!qd.times.is_empty());
+        // Cropped fixture shape (see testdata/QUERYDATA_FIXTURES.md): 2 params,
+        // 3 timesteps — assert exactly so a regression in the LCC parse path
+        // can't pass with 0 params / 1 time.
+        assert_eq!(qd.params.len(), 2);
+        assert_eq!(qd.times.len(), 3);
     }
 }

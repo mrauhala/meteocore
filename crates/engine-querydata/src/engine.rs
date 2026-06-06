@@ -217,7 +217,17 @@ impl EdrEngine for QueryDataEngine {
         let data = self.load_data();
         let bl = data.grid.area.bottom_left;
         let tr = data.grid.area.top_right;
-        Some([bl.0, bl.1, tr.0, tr.1])
+        // Normalize to [west, south, east, north]. `bottom_left`/`top_right` are
+        // the grid's first/last corners as stored, which for a north-to-south
+        // (or cropped) grid can have bottom_left *north* of top_right — emitting
+        // those raw would produce an invalid south>north bbox to WMS
+        // `EX_GeographicBoundingBox`, EDR/Maps/Tiles extents.
+        Some([
+            bl.0.min(tr.0),
+            bl.1.min(tr.1),
+            bl.0.max(tr.0),
+            bl.1.max(tr.1),
+        ])
     }
 
     fn supported_query_types(&self) -> Vec<String> {
@@ -685,11 +695,14 @@ mod tests {
             return;
         }
         let engine = QueryDataEngine::new(&test_dir(), "test", None, 30).unwrap();
+        // [west, south, east, north] — normalized, so south < north even though
+        // this fixture's stored bottom_left lat (4.75) is north of top_right
+        // (-5.25). Guards the get_spatial_extent min/max normalization.
         let bbox = engine.get_spatial_extent().unwrap();
-        assert!((bbox[0] - 34.0).abs() < 0.01);
-        assert!((bbox[1] - 4.75).abs() < 0.01);
-        assert!((bbox[2] - 41.5).abs() < 0.01);
-        assert!((bbox[3] - (-5.25)).abs() < 0.01);
+        assert!((bbox[0] - 34.0).abs() < 0.01, "west {}", bbox[0]);
+        assert!((bbox[1] - (-5.25)).abs() < 0.01, "south {}", bbox[1]);
+        assert!((bbox[2] - 41.5).abs() < 0.01, "east {}", bbox[2]);
+        assert!((bbox[3] - 4.75).abs() < 0.01, "north {}", bbox[3]);
     }
 
     #[test]
