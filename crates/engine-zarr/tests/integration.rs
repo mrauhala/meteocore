@@ -160,13 +160,19 @@ fn datetime_filter_selects_single_step() {
 #[test]
 fn off_grid_position_is_nodata() {
     let e = engine();
-    let qr = single(
-        e.query_position("POINT(100.0 0.0)", None, Some(&["t2m".to_string()]), None)
-            .unwrap(),
-    );
-    let nd = qr.ranges.get("t2m").unwrap();
-    assert!(
-        nd.values.iter().all(|v| v.is_none()),
-        "out-of-grid → nodata"
-    );
+    let only_t2m = ["t2m".to_string()];
+    // Both axes out of range, only longitude out (lat in 48.5..60.5), and only
+    // latitude out — each must yield all-nodata (the sample path requires both
+    // axes to locate).
+    for coords in ["POINT(100.0 0.0)", "POINT(100.0 54.5)", "POINT(5.5 0.0)"] {
+        let qr = single(
+            e.query_position(coords, None, Some(&only_t2m), None)
+                .unwrap(),
+        );
+        let nd = qr.ranges.get("t2m").unwrap();
+        assert!(
+            nd.values.iter().all(|v| v.is_none()),
+            "{coords}: out-of-grid → nodata"
+        );
+    }
 }
