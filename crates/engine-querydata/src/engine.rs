@@ -716,7 +716,11 @@ mod tests {
         let bbox = engine.get_spatial_extent().unwrap();
         assert!(bbox[0] < bbox[2], "west {} < east {}", bbox[0], bbox[2]);
         assert!(bbox[1] < bbox[3], "south {} < north {}", bbox[1], bbox[3]);
+        // Pin all four to the cropped LCC corners (in degrees) — a parse
+        // regression returning projected metres would be ~10^5, not ~10-65.
+        assert!((bbox[0] - 9.04).abs() < 0.1, "west {}", bbox[0]);
         assert!((bbox[1] - 60.02).abs() < 0.1, "south {}", bbox[1]);
+        assert!((bbox[2] - 19.13).abs() < 0.1, "east {}", bbox[2]);
         assert!((bbox[3] - 64.96).abs() < 0.1, "north {}", bbox[3]);
     }
 

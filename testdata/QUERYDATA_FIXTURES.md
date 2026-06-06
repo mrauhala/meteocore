@@ -27,8 +27,10 @@ The **only** fixture exercising the projected (LCC) parse path
 (`parse_meps_lcc`). `qdcrop` preserves the source projection (no `-P`).
 
 ```bash
+# NOTE: no ':' in the output filename — a colon breaks `git checkout` on
+# Windows and the path on non-Linux filesystems.
 qdcrop -G 10,60,20,65 -d 2x2 -p Temperature,Pressure -T 0,6,3 \
-       <full_meps_northeurope_surface.sqd> 2026-04-05T18:00:00Z_meps_northeurope_surface.sqd
+       <full_meps_northeurope_surface.sqd> 20260405T180000Z_meps_northeurope_surface.sqd
 ```
 
 - 2.99 GB → ~277 KB
