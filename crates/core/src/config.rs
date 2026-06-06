@@ -561,12 +561,23 @@ fn default_grid_cache_mb() -> u64 {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GribConfig {
+    /// Local directory of `.grib2` + index sidecar files. Mutually exclusive
+    /// with `endpoint`/`bucket` (S3). When set, the engine lists this directory
+    /// directly for index files — `prefix_pattern`'s strftime/run-hour
+    /// templating does not apply (it is used, if present, as a literal
+    /// sub-prefix; default = the directory root). A remote URL
+    /// (`s3://`/`http(s)://`) is also accepted here as a fixed-prefix source.
+    pub data_path: Option<String>,
     /// S3-compatible endpoint URL, e.g. "https://s3.amazonaws.com"
     pub endpoint: Option<String>,
     /// S3 bucket name. Required when endpoint is set.
     pub bucket: Option<String>,
-    /// Prefix pattern with strftime templates, e.g. "%Y%m%d/00z/ifs/0p25/oper/"
-    pub prefix_pattern: String,
+    /// Prefix pattern with strftime templates, e.g. "%Y%m%d/00z/ifs/0p25/oper/".
+    /// Required for the remote (`endpoint`+`bucket`) source. Optional for a
+    /// local `data_path`, where it is used (if present) as a *literal*
+    /// sub-prefix under the directory — no strftime/date templating; default
+    /// "" = the directory root.
+    pub prefix_pattern: Option<String>,
     /// Suffix for index files. Default: ".index"
     pub index_suffix: Option<String>,
     /// Suffix for GRIB data files. Default: ".grib2"
@@ -1458,6 +1469,38 @@ impl ServerConfig {
                     )));
                 }
 
+                // Data source: exactly one of local `data_path` or S3
+                // `endpoint`+`bucket`. The remote source needs *both* S3 fields
+                // plus `prefix_pattern` (date/run templating); local needs none
+                // of those.
+                let has_local = grib.data_path.is_some();
+                let has_any_remote = grib.endpoint.is_some() || grib.bucket.is_some();
+                if has_local && has_any_remote {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': grib 'data_path' (local) is mutually exclusive \
+                         with 'endpoint'/'bucket' (S3)"
+                    )));
+                }
+                if !has_local && !has_any_remote {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': grib requires either 'data_path' (local) or \
+                         'endpoint'+'bucket' (S3)"
+                    )));
+                }
+                if has_any_remote {
+                    // Partial remote config (one of endpoint/bucket) is invalid.
+                    if grib.endpoint.is_none() || grib.bucket.is_none() {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': remote grib requires both 'endpoint' and 'bucket'"
+                        )));
+                    }
+                    if grib.prefix_pattern.is_none() {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': remote grib (endpoint+bucket) requires 'prefix_pattern'"
+                        )));
+                    }
+                }
+
                 // Validate index_format
                 if let Some(fmt) = grib.index_format.as_deref() {
                     if fmt != "ecmwf-json" && fmt != "wgrib2" {
@@ -1620,6 +1663,57 @@ url = "https://creativecommons.org/licenses/by/4.0/"
              [[collections]]\nid=\"c\"\ntitle=\"t\"\ndescription=\"d\"\n{extra}"
         );
         toml::from_str(&toml).unwrap()
+    }
+
+    fn grib_collection(grib_body: &str) -> ServerConfig {
+        collection_with(&format!(
+            "engine_type = \"grib\"\n[collections.grib]\n{grib_body}"
+        ))
+    }
+
+    #[test]
+    fn grib_local_data_path_validates() {
+        // Local source: data_path alone, no prefix_pattern needed.
+        let cfg = grib_collection("data_path = \"testdata/grib-local\"\n");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn grib_remote_validates_with_prefix_pattern() {
+        let cfg = grib_collection(
+            "endpoint = \"https://s3\"\nbucket = \"b\"\nprefix_pattern = \"%Y%m%d/\"\n",
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn grib_rejects_data_path_with_s3() {
+        // Mutual exclusivity: local + S3 in one config is an error.
+        let cfg = grib_collection("data_path = \"x\"\nendpoint = \"https://s3\"\nbucket = \"b\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn grib_rejects_no_data_source() {
+        let cfg = grib_collection("index_format = \"ecmwf-json\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn grib_remote_rejects_missing_prefix_pattern() {
+        let cfg = grib_collection("endpoint = \"https://s3\"\nbucket = \"b\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn grib_rejects_partial_remote() {
+        // endpoint without bucket (and vice versa) must be rejected at load,
+        // not silently slip past validate() to fail later in the engine.
+        let only_endpoint =
+            grib_collection("endpoint = \"https://s3\"\nprefix_pattern = \"%Y/\"\n");
+        assert!(only_endpoint.validate().is_err());
+        let only_bucket = grib_collection("bucket = \"b\"\nprefix_pattern = \"%Y/\"\n");
+        assert!(only_bucket.validate().is_err());
     }
 
     #[test]
