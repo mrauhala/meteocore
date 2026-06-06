@@ -445,6 +445,7 @@ pub struct ServerState {
     pub geotiff_engines: RwLock<Vec<Arc<engine_geotiff::GeoTiffEngine>>>,
     pub querydata_engines: RwLock<Vec<Arc<engine_querydata::QueryDataEngine>>>,
     pub grib_engines: RwLock<Vec<Arc<engine_grib::GribEngine>>>,
+    pub zarr_engines: RwLock<Vec<Arc<engine_zarr::ZarrEngine>>>,
     pub odim_engines: RwLock<Vec<Arc<engine_odim::OdimEngine>>>,
     pub odim_volume_engines: RwLock<Vec<Arc<engine_odim::PolarVolumeEngine>>>,
     pub postgis_engines: RwLock<Vec<Arc<engine_postgis::PostgisEngine>>>,
@@ -471,6 +472,7 @@ pub struct LoadResult {
     pub geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>>,
     pub querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>>,
     pub grib_engines: Vec<Arc<engine_grib::GribEngine>>,
+    pub zarr_engines: Vec<Arc<engine_zarr::ZarrEngine>>,
     pub odim_engines: Vec<Arc<engine_odim::OdimEngine>>,
     pub odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>>,
     pub postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>>,
@@ -511,6 +513,7 @@ pub fn load_collections(
     let mut geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>> = Vec::new();
     let mut querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>> = Vec::new();
     let mut grib_engines: Vec<Arc<engine_grib::GribEngine>> = Vec::new();
+    let mut zarr_engines: Vec<Arc<engine_zarr::ZarrEngine>> = Vec::new();
     let mut odim_engines: Vec<Arc<engine_odim::OdimEngine>> = Vec::new();
     let mut odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>> = Vec::new();
     let mut postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>> = Vec::new();
@@ -537,6 +540,8 @@ pub fn load_collections(
             "geotiff" => &["edr", "wms", "maps", "tiles"],
             "querydata" => &["edr", "wms", "maps", "tiles"],
             "grib" => &["edr", "wms", "maps", "tiles"],
+            // Phase 1 (#125): EDR position queries only. Map/Tiles/WMS in Phase 3.
+            "zarr" => &["edr"],
             "odim" => &["edr", "wms", "maps", "tiles"],
             "odim-volume" => &["edr", "wms", "maps", "tiles", "features"],
             "postgis" => &["edr", "features", "tiles"],
@@ -1068,6 +1073,82 @@ pub fn load_collections(
                         None
                     } else {
                         Some("no forecast data found yet (waiting for poll)".into())
+                    },
+                });
+            }
+            "zarr" => {
+                let zarr_config = match collection.zarr.as_ref() {
+                    Some(c) => c,
+                    None => {
+                        tracing::error!(
+                            "Collection '{}': engine_type 'zarr' but missing [collections.zarr] config, skipping",
+                            collection.id
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "zarr".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some("missing [collections.zarr] config".into()),
+                        });
+                        continue;
+                    }
+                };
+
+                let engine = match engine_zarr::ZarrEngine::new(&collection.id, zarr_config) {
+                    Ok(e) => Arc::new(e),
+                    Err(e) => {
+                        tracing::error!(
+                            "Collection '{}': failed to initialize Zarr engine: {}",
+                            collection.id,
+                            e
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "zarr".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some(format!("{e}")),
+                        });
+                        continue;
+                    }
+                };
+
+                if let Some((start, end)) =
+                    ds_core::edr_engine::EdrEngine::get_temporal_extent(engine.as_ref())
+                {
+                    info!(
+                        "Collection '{}': temporal extent {} to {}",
+                        collection.id, start, end
+                    );
+                }
+
+                zarr_engines.push(engine.clone());
+
+                if collection.apis.contains(&"edr".to_string()) {
+                    edr_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+                    );
+                    edr_collections.insert(collection.id.clone(), collection.clone());
+                    info!("Collection '{}': wired to EDR API", collection.id);
+                }
+                // Phase 1 serves EDR position queries only; Map/Tiles/WMS
+                // rendering is deferred to Phase 3 (#125). The engine/API
+                // allowlist above rejects a zarr collection that requests them.
+
+                let has_data =
+                    ds_core::edr_engine::EdrEngine::get_temporal_extent(engine.as_ref()).is_some();
+                health.push(CollectionHealth {
+                    id: collection.id.clone(),
+                    engine_type: "zarr".into(),
+                    status: if has_data {
+                        CollectionStatus::Ready
+                    } else {
+                        CollectionStatus::Degraded
+                    },
+                    error: if has_data {
+                        None
+                    } else {
+                        Some("no Zarr data found yet (waiting for poll)".into())
                     },
                 });
             }
@@ -1685,6 +1766,7 @@ pub fn load_collections(
         geotiff_engines,
         querydata_engines,
         grib_engines,
+        zarr_engines,
         odim_engines,
         odim_volume_engines,
         postgis_engines,
@@ -2244,6 +2326,14 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
             engine.shutdown();
         }
         for engine in state
+            .zarr_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            engine.shutdown();
+        }
+        for engine in state
             .odim_engines
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -2276,6 +2366,12 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         });
     }
     for engine in &result.grib_engines {
+        let poller = engine.clone();
+        crate::poll_runtime().spawn(async move {
+            poller.poll_loop().await;
+        });
+    }
+    for engine in &result.zarr_engines {
         let poller = engine.clone();
         crate::poll_runtime().spawn(async move {
             poller.poll_loop().await;
@@ -2318,6 +2414,10 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         .grib_engines
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.grib_engines;
+    *state
+        .zarr_engines
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = result.zarr_engines;
     *state
         .odim_engines
         .write()
@@ -2434,6 +2534,15 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
     }
     {
         let engines = state.grib_engines.read().unwrap_or_else(|e| e.into_inner());
+        for engine in engines.iter() {
+            let id = engine.collection_id().to_string();
+            if let Some(temporal) = build_temporal(engine.as_ref()) {
+                temporal_info.insert(id, temporal);
+            }
+        }
+    }
+    {
+        let engines = state.zarr_engines.read().unwrap_or_else(|e| e.into_inner());
         for engine in engines.iter() {
             let id = engine.collection_id().to_string();
             if let Some(temporal) = build_temporal(engine.as_ref()) {

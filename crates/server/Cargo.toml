@@ -10,6 +10,7 @@ engine-geojson = { path = "../engine-geojson" }
 engine-geotiff = { path = "../engine-geotiff" }
 engine-querydata = { path = "../engine-querydata" }
 engine-grib = { path = "../engine-grib" }
+engine-zarr = { path = "../engine-zarr" }
 engine-odim = { path = "../engine-odim" }
 engine-postgis = { path = "../engine-postgis" }
 api-edr = { path = "../api-edr" }
