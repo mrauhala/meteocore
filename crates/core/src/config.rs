@@ -1835,9 +1835,8 @@ url = "https://creativecommons.org/licenses/by/4.0/"
 
     #[test]
     fn zarr_remote_validates_with_path() {
-        let cfg = zarr_collection(
-            "endpoint = \"https://s3\"\nbucket = \"b\"\npath = \"data.zarr\"\n",
-        );
+        let cfg =
+            zarr_collection("endpoint = \"https://s3\"\nbucket = \"b\"\npath = \"data.zarr\"\n");
         assert!(cfg.validate().is_ok());
     }
 
