@@ -46,18 +46,25 @@ pub struct Variable {
 
 impl Variable {
     /// Convert a raw stored sample to a physical value, mapping fill sentinels
-    /// and NaN to `None`.
+    /// and non-finite values to `None`.
     fn convert(&self, raw: f64) -> Option<f64> {
-        if raw.is_nan() {
-            return None;
-        }
-        // `raw` is guaranteed non-NaN here, so a NaN `_FillValue` is already
-        // covered by the check above; a plain equality is enough.
-        if self.fill_values.contains(&raw) {
-            return None;
-        }
-        Some(raw * self.scale_factor + self.add_offset)
+        convert_sample(raw, self.scale_factor, self.add_offset, &self.fill_values)
     }
+}
+
+/// Map a raw sample to a physical value: NaN / ±infinity and fill sentinels
+/// become `None` (an infinite sample would otherwise scale to ±inf and break
+/// CoverageJSON serialisation); everything else gets CF `scale`/`offset`.
+fn convert_sample(raw: f64, scale: f64, offset: f64, fills: &[f64]) -> Option<f64> {
+    if !raw.is_finite() {
+        return None;
+    }
+    // `raw` is finite here, so a NaN/inf fill can't match it; a plain equality
+    // against the (finite) sentinels is enough.
+    if fills.contains(&raw) {
+        return None;
+    }
+    Some(raw * scale + offset)
 }
 
 /// A parsed Zarr store snapshot.
@@ -666,4 +673,26 @@ fn retrieve_raw_f64(
         )));
     };
     result.map_err(|e| DataServerError::Engine(format!("Zarr chunk read failed: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::convert_sample;
+
+    #[test]
+    fn convert_sample_scales_and_maps_nodata() {
+        // Plain scale/offset.
+        assert_eq!(convert_sample(5.0, 2.0, 1.0, &[]), Some(11.0));
+        // CF packing with a fill sentinel.
+        assert_eq!(
+            convert_sample(550.0, 0.01, 273.15, &[-9999.0]),
+            Some(278.65)
+        );
+        assert_eq!(convert_sample(-9999.0, 0.01, 273.15, &[-9999.0]), None);
+        // Non-finite samples are nodata (an inf would otherwise scale to inf
+        // and break CoverageJSON).
+        assert_eq!(convert_sample(f64::NAN, 1.0, 0.0, &[]), None);
+        assert_eq!(convert_sample(f64::INFINITY, 1.0, 0.0, &[]), None);
+        assert_eq!(convert_sample(f64::NEG_INFINITY, 1.0, 0.0, &[]), None);
+    }
 }
