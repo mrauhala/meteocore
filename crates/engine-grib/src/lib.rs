@@ -96,11 +96,12 @@ enum ScanMode {
     /// Remote S3/HTTP: expand `prefix_pattern` over recent dates × run hours
     /// (the "now"-relative NWP layout).
     Remote { prefix_pattern: String },
-    /// Local directory (or a fixed-prefix remote `data_path`): list a single
-    /// literal prefix — no date/run-hour templating, since local fixtures are
-    /// static. `prefix` is the literal sub-prefix under the store root (`""` =
-    /// root).
-    Local { prefix: String },
+    /// A fixed-prefix source (a local directory, or a remote `data_path` URL):
+    /// list a single literal prefix — no date/run-hour templating, since the
+    /// data is static. `prefix` is the literal sub-prefix under the store root
+    /// (`""` = root). Named for the *prefix* behavior, not the backend: the
+    /// store may be local or remote.
+    FixedPrefix { prefix: String },
 }
 
 /// Engine for serving GRIB2 NWP forecast data.
@@ -184,7 +185,7 @@ impl GribEngine {
             // `prefix_pattern` is a literal sub-prefix here (no strftime); the
             // local store is rooted at `data_path`, so the default "" lists it.
             let prefix = config.prefix_pattern.clone().unwrap_or_default();
-            (store, ScanMode::Local { prefix })
+            (store, ScanMode::FixedPrefix { prefix })
         } else {
             let endpoint = config.endpoint.as_deref().ok_or_else(|| {
                 DataServerError::Config(format!(
@@ -300,7 +301,7 @@ impl GribEngine {
             ScanMode::Remote { prefix_pattern } => {
                 build_scan_prefixes(prefix_pattern, now, run_hours)
             }
-            ScanMode::Local { prefix } => vec![(now, prefix.clone())],
+            ScanMode::FixedPrefix { prefix } => vec![(now, prefix.clone())],
         };
 
         // Optional filename substring filter. Applied in addition to the

@@ -1468,28 +1468,35 @@ impl ServerConfig {
                 }
 
                 // Data source: exactly one of local `data_path` or S3
-                // `endpoint`+`bucket`. The remote source additionally needs
-                // `prefix_pattern` (date/run templating); local does not.
-                let has_remote = grib.endpoint.is_some() || grib.bucket.is_some();
-                match (grib.data_path.is_some(), has_remote) {
-                    (true, true) => {
-                        return Err(crate::error::DataServerError::Config(format!(
-                            "Collection '{id}': grib 'data_path' (local) is mutually exclusive \
-                             with 'endpoint'/'bucket' (S3)"
-                        )));
-                    }
-                    (false, false) => {
-                        return Err(crate::error::DataServerError::Config(format!(
-                            "Collection '{id}': grib requires either 'data_path' (local) or \
-                             'endpoint'+'bucket' (S3)"
-                        )));
-                    }
-                    _ => {}
-                }
-                if grib.data_path.is_none() && grib.prefix_pattern.is_none() {
+                // `endpoint`+`bucket`. The remote source needs *both* S3 fields
+                // plus `prefix_pattern` (date/run templating); local needs none
+                // of those.
+                let has_local = grib.data_path.is_some();
+                let has_any_remote = grib.endpoint.is_some() || grib.bucket.is_some();
+                if has_local && has_any_remote {
                     return Err(crate::error::DataServerError::Config(format!(
-                        "Collection '{id}': remote grib (endpoint+bucket) requires 'prefix_pattern'"
+                        "Collection '{id}': grib 'data_path' (local) is mutually exclusive \
+                         with 'endpoint'/'bucket' (S3)"
                     )));
+                }
+                if !has_local && !has_any_remote {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': grib requires either 'data_path' (local) or \
+                         'endpoint'+'bucket' (S3)"
+                    )));
+                }
+                if has_any_remote {
+                    // Partial remote config (one of endpoint/bucket) is invalid.
+                    if grib.endpoint.is_none() || grib.bucket.is_none() {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': remote grib requires both 'endpoint' and 'bucket'"
+                        )));
+                    }
+                    if grib.prefix_pattern.is_none() {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': remote grib (endpoint+bucket) requires 'prefix_pattern'"
+                        )));
+                    }
                 }
 
                 // Validate index_format
@@ -1694,6 +1701,17 @@ url = "https://creativecommons.org/licenses/by/4.0/"
     fn grib_remote_rejects_missing_prefix_pattern() {
         let cfg = grib_collection("endpoint = \"https://s3\"\nbucket = \"b\"\n");
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn grib_rejects_partial_remote() {
+        // endpoint without bucket (and vice versa) must be rejected at load,
+        // not silently slip past validate() to fail later in the engine.
+        let only_endpoint =
+            grib_collection("endpoint = \"https://s3\"\nprefix_pattern = \"%Y/\"\n");
+        assert!(only_endpoint.validate().is_err());
+        let only_bucket = grib_collection("bucket = \"b\"\nprefix_pattern = \"%Y/\"\n");
+        assert!(only_bucket.validate().is_err());
     }
 
     #[test]
