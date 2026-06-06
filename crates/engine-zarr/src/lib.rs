@@ -44,12 +44,11 @@ pub struct ZarrEngine {
     collection_id: String,
     /// `ds-storage`-backed store (local / S3 / HTTP), shared by query and poll.
     store: Arc<DsStore>,
-    /// Parsed snapshot, swapped atomically by the poll loop.
+    /// Parsed snapshot (data + map-capabilities), swapped atomically by the
+    /// poll loop. `raster_info()` reads the catalog's cached `RasterInfo`, so it
+    /// is O(1) from a snapshot and always consistent with the served data
+    /// (CLAUDE.md #211).
     catalog: ArcSwap<Catalog>,
-    /// Map capabilities snapshot, rebuilt on every catalog swap so
-    /// `raster_info()` (called per tile request to validate the parameter) is
-    /// O(1) from a snapshot rather than recomputed per call (CLAUDE.md #211).
-    meta: ArcSwap<RasterInfo>,
     /// Variable filter from config (`None` = expose all).
     param_filter: Option<Vec<String>>,
     poll_interval: Duration,
@@ -67,13 +66,11 @@ impl ZarrEngine {
 
         log_loaded(collection_id, &catalog);
 
-        let meta = build_raster_info(&catalog);
         let (shutdown_tx, _) = watch::channel(());
         Ok(Self {
             collection_id: collection_id.to_string(),
             store,
             catalog: ArcSwap::from_pointee(catalog),
-            meta: ArcSwap::from_pointee(meta),
             param_filter,
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
             shutdown_tx,
@@ -124,8 +121,7 @@ impl ZarrEngine {
                 {
                     log_loaded(&self.collection_id, &new_catalog);
                 }
-                // Rebuild the capabilities snapshot, then swap both.
-                self.meta.store(Arc::new(build_raster_info(&new_catalog)));
+                // One atomic swap updates data + capabilities together.
                 self.catalog.store(Arc::new(new_catalog));
             }
             Err(e) => {
@@ -411,35 +407,7 @@ impl MapEngine for ZarrEngine {
     }
 
     fn raster_info(&self) -> RasterInfo {
-        (*self.meta.load_full()).clone()
-    }
-}
-
-/// Build the map-capabilities snapshot from a catalog. Cached and rebuilt on
-/// catalog swap so `raster_info()` doesn't recompute per request.
-fn build_raster_info(cat: &Catalog) -> RasterInfo {
-    let parameters: Vec<(String, String)> = cat
-        .vars
-        .iter()
-        .map(|v| (v.name.clone(), v.label.clone()))
-        .collect();
-    let (parameter, unit) = cat
-        .vars
-        .first()
-        .map(|v| (v.name.clone(), v.units.clone()))
-        .unwrap_or_default();
-    RasterInfo {
-        // Lon-first geographic grid → CRS:84 (not lat-first EPSG:4326), matching
-        // the other gridded engines' storageCrs.
-        native_crs: "CRS:84".to_string(),
-        spatial_extent: Some(cat.extent),
-        times: cat.times.clone(),
-        parameter,
-        unit,
-        parameters,
-        vertical: None,
-        grid_size: Some(cat.grid_size()),
-        layer_subtitle: None,
+        self.catalog.load().raster_info.clone()
     }
 }
 

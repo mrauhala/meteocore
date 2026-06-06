@@ -244,6 +244,28 @@ fn raster_tile_off_grid_is_transparent() {
 }
 
 #[test]
+fn raster_tile_between_cell_centres_still_renders() {
+    // A tile whose bbox falls entirely *between* grid cell centres (no centre
+    // inside it) must still interpolate from the bracketing cells, not render
+    // transparent. lon centres 0,1,2…; lat centres …55,54…; bbox in the gaps.
+    let tile = engine()
+        .get_raster_tile(
+            [4.3, 54.2, 4.7, 54.8],
+            4,
+            4,
+            None,
+            &OutputCrs::Wgs84,
+            Some("t2m"),
+            None,
+        )
+        .unwrap();
+    assert!(
+        tile.values.iter().any(|v| v.is_some()),
+        "between-centres tile must interpolate, not be transparent"
+    );
+}
+
+#[test]
 fn off_grid_position_is_nodata() {
     let e = engine();
     let only_t2m = ["t2m".to_string()];

@@ -14,6 +14,7 @@ use zarrs::array::{data_type, Array, ArraySubset, CodecOptions};
 use zarrs::group::Group;
 
 use ds_core::error::DataServerError;
+use ds_core::map_engine::RasterInfo;
 
 use crate::cf::{self, AxisRole};
 use crate::store::DsStore;
@@ -87,14 +88,13 @@ pub struct Catalog {
     lons: Vec<f64>,
     /// Spatial extent `[west, south, east, north]` in WGS84 degrees.
     pub extent: [f64; 4],
+    /// Map-capabilities snapshot, built once here so `raster_info()` is O(1) and
+    /// swaps **atomically** with the data (one `ArcSwap<Catalog>`), with no
+    /// window where the advertised metadata and the served data disagree.
+    pub raster_info: RasterInfo,
 }
 
 impl Catalog {
-    /// Native grid cell counts `[nx, ny]` (lon columns, lat rows).
-    pub fn grid_size(&self) -> [u32; 2] {
-        [self.lons.len() as u32, self.lats.len() as u32]
-    }
-
     /// Read a 2-D spatial slab of `var` at `time_idx` covering the WGS84 render
     /// `bbox` (`[west, south, east, north]`), expanded by one cell so edge
     /// pixels can interpolate. Returns `None` when the bbox lies entirely off
@@ -614,14 +614,54 @@ pub fn build(
 
     let (west, east) = axis_extent(&lons);
     let (south, north) = axis_extent(&lats);
+    let extent = [west, south, east, north];
+
+    let raster_info = build_raster_info(
+        &vars,
+        &times,
+        extent,
+        [lons.len() as u32, lats.len() as u32],
+    );
 
     Ok(Catalog {
         vars,
         times,
         lats,
         lons,
-        extent: [west, south, east, north],
+        extent,
+        raster_info,
     })
+}
+
+/// Build the map-capabilities snapshot (one layer per variable). Stored on the
+/// `Catalog` so `raster_info()` is O(1) and swaps atomically with the data.
+fn build_raster_info(
+    vars: &[Variable],
+    times: &[DateTime<Utc>],
+    extent: [f64; 4],
+    grid_size: [u32; 2],
+) -> RasterInfo {
+    let parameters: Vec<(String, String)> = vars
+        .iter()
+        .map(|v| (v.name.clone(), v.label.clone()))
+        .collect();
+    let (parameter, unit) = vars
+        .first()
+        .map(|v| (v.name.clone(), v.units.clone()))
+        .unwrap_or_default();
+    RasterInfo {
+        // Lon-first geographic grid → CRS:84 (not lat-first EPSG:4326), matching
+        // the other gridded engines' storageCrs.
+        native_crs: "CRS:84".to_string(),
+        spatial_extent: Some(extent),
+        times: times.to_vec(),
+        parameter,
+        unit,
+        parameters,
+        vertical: None,
+        grid_size: Some(grid_size),
+        layer_subtitle: None,
+    }
 }
 
 /// Classify a dimension by its coordinate variable's CF attributes (preferred)
@@ -706,21 +746,40 @@ fn warn_bad_chunking(
     }
 }
 
-/// Index range `(lo, hi)` (inclusive) of the cells of a monotonic axis whose
-/// values fall within `[min, max]`, expanded by one cell each side so a render
-/// can interpolate at the window edge. `None` if no cell is in range (the bbox
-/// is entirely off this axis). Works for ascending or descending axes (it
-/// compares values, not order).
+/// Index range `(lo, hi)` (inclusive) of the cells of a monotonic axis needed to
+/// render `[min, max]`: every cell whose half-cell footprint overlaps the
+/// interval, expanded by one cell each side so bilinear has its bracketing
+/// neighbours at the edge. `None` if the interval lies entirely off the axis.
+///
+/// Crucially this includes the *bracketing* cells even when no cell **centre**
+/// falls inside `[min, max]` — a zoomed-in tile sitting between two grid centres
+/// must still interpolate, not render transparent. Works for ascending or
+/// descending axes (it compares values, not index order).
 fn axis_window(axis: &[f64], min: f64, max: f64) -> Option<(usize, usize)> {
+    let n = axis.len();
+    if n == 0 {
+        return None;
+    }
+    if n == 1 {
+        // Single (collapsed) cell — `Window`/`locate` snap any target to it.
+        return Some((0, 0));
+    }
+    // Approximate half-cell width from the mean spacing (exact for regular
+    // axes, a reasonable footprint for irregular ones).
+    let span = (axis[n - 1] - axis[0]).abs();
+    let half = (span / (n - 1) as f64) / 2.0;
+
     let (mut lo, mut hi) = (None, None);
     for (i, &v) in axis.iter().enumerate() {
-        if v >= min && v <= max {
+        // Cell i covers roughly [v - half, v + half]; keep it if that overlaps
+        // the requested interval.
+        if v + half >= min && v - half <= max {
             lo.get_or_insert(i);
             hi = Some(i);
         }
     }
     let lo = lo?.saturating_sub(1);
-    let hi = (hi? + 1).min(axis.len() - 1);
+    let hi = (hi? + 1).min(n - 1);
     Some((lo, hi))
 }
 
