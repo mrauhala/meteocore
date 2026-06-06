@@ -680,9 +680,7 @@ mod tests {
 
     #[test]
     fn engine_from_directory() {
-        if !test_file_exists() {
-            return;
-        }
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
         let engine = QueryDataEngine::new(&test_dir(), "test", None, 30).unwrap();
         assert!(engine.has_data());
         let params = engine.get_parameters();
@@ -691,9 +689,7 @@ mod tests {
 
     #[test]
     fn engine_spatial_extent() {
-        if !test_file_exists() {
-            return;
-        }
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
         let engine = QueryDataEngine::new(&test_dir(), "test", None, 30).unwrap();
         // [west, south, east, north] — normalized, so south < north even though
         // this fixture's stored bottom_left lat (4.75) is north of top_right
@@ -706,10 +702,27 @@ mod tests {
     }
 
     #[test]
+    fn engine_spatial_extent_lcc() {
+        // Projected (LCC) fixture: confirms the get_spatial_extent min/max
+        // normalization holds for non-WGS84 grids too. FMI grids store
+        // north-to-south, so the raw bottom_left lat is north of top_right —
+        // the result must still be a valid [west, south, east, north].
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/meps");
+        assert!(
+            dir.exists() && find_latest_sqd(&dir).is_some(),
+            "meps fixture missing"
+        );
+        let engine = QueryDataEngine::new(&dir, "test", None, 30).unwrap();
+        let bbox = engine.get_spatial_extent().unwrap();
+        assert!(bbox[0] < bbox[2], "west {} < east {}", bbox[0], bbox[2]);
+        assert!(bbox[1] < bbox[3], "south {} < north {}", bbox[1], bbox[3]);
+        assert!((bbox[1] - 60.02).abs() < 0.1, "south {}", bbox[1]);
+        assert!((bbox[3] - 64.96).abs() < 0.1, "north {}", bbox[3]);
+    }
+
+    #[test]
     fn engine_temporal_extent() {
-        if !test_file_exists() {
-            return;
-        }
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
         let engine = QueryDataEngine::new(&test_dir(), "test", None, 30).unwrap();
         let (first, last) = engine.get_temporal_extent().unwrap();
         assert_eq!(
@@ -721,9 +734,7 @@ mod tests {
 
     #[test]
     fn engine_position_query() {
-        if !test_file_exists() {
-            return;
-        }
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
         let engine = QueryDataEngine::new(&test_dir(), "test", None, 30).unwrap();
 
         let response = engine
@@ -744,9 +755,7 @@ mod tests {
 
     #[test]
     fn engine_position_query_filtered_params() {
-        if !test_file_exists() {
-            return;
-        }
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
         let engine = QueryDataEngine::new(&test_dir(), "test", None, 30).unwrap();
 
         let params = vec!["2 Metre Temperature (2t)".to_string()];
@@ -764,9 +773,7 @@ mod tests {
 
     #[test]
     fn map_engine_raster_tile() {
-        if !test_file_exists() {
-            return;
-        }
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
         let engine =
             QueryDataEngine::new(&test_dir(), "test", Some("2 Metre Temperature (2t)"), 30)
                 .unwrap();
@@ -796,9 +803,7 @@ mod tests {
         // globally valid, so projecting the fixture's own region into EPSG:3067
         // metres and back must still place data and never leak NaN — even though
         // the fixture is nowhere near the TM35FIN zone.
-        if !test_file_exists() {
-            return;
-        }
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
         let engine =
             QueryDataEngine::new(&test_dir(), "test", Some("2 Metre Temperature (2t)"), 30)
                 .unwrap();
@@ -830,9 +835,7 @@ mod tests {
 
     #[test]
     fn map_engine_raster_info() {
-        if !test_file_exists() {
-            return;
-        }
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
         let engine =
             QueryDataEngine::new(&test_dir(), "test", Some("2 Metre Temperature (2t)"), 30)
                 .unwrap();
@@ -847,9 +850,7 @@ mod tests {
 
     #[test]
     fn find_latest_sqd_in_dir() {
-        if !test_file_exists() {
-            return;
-        }
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
         let latest = find_latest_sqd(&test_dir());
         assert!(latest.is_some());
         let name = latest.unwrap();

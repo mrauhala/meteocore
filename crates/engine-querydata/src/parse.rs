@@ -999,10 +999,11 @@ mod tests {
     #[test]
     fn parse_ecmwf_kenya() {
         let path = test_file();
-        if !path.exists() {
-            eprintln!("Test file not found, skipping: {}", path.display());
-            return;
-        }
+        assert!(
+            path.exists(),
+            "ecmwf-kenya fixture missing: {}",
+            path.display()
+        );
 
         let qd = QueryData::open(&path).unwrap();
 
@@ -1057,9 +1058,7 @@ mod tests {
     #[test]
     fn grid_lonlat_corners() {
         let path = test_file();
-        if !path.exists() {
-            return;
-        }
+        assert!(path.exists(), "ecmwf-kenya fixture missing");
 
         let qd = QueryData::open(&path).unwrap();
 
@@ -1078,9 +1077,7 @@ mod tests {
     #[test]
     fn param_lookup() {
         let path = test_file();
-        if !path.exists() {
-            return;
-        }
+        assert!(path.exists(), "ecmwf-kenya fixture missing");
 
         let qd = QueryData::open(&path).unwrap();
         // By numeric ID
@@ -1116,29 +1113,9 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "sqd"))
             .collect();
-        if files.is_empty() {
-            eprintln!("No MEPS test files found, skipping");
-            return;
-        }
+        assert!(!files.is_empty(), "meps fixture missing in {path:?}");
 
         let qd = QueryData::open(&files[0].path()).unwrap();
-
-        println!(
-            "MEPS: {} params, {}x{} grid, {} levels, {} times",
-            qd.params.len(),
-            qd.grid.nx,
-            qd.grid.ny,
-            qd.levels.len(),
-            qd.times.len()
-        );
-        for (i, p) in qd.params.iter().enumerate() {
-            println!("  param[{i}]: id={}, name={}", p.id, p.name);
-        }
-        println!("  CRS: {:?}", qd.grid.area.crs);
-        println!(
-            "  BL: {:?}, TR: {:?}",
-            qd.grid.area.bottom_left, qd.grid.area.top_right
-        );
 
         assert!(matches!(
             qd.grid.area.crs,
