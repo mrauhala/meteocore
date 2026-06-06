@@ -622,18 +622,19 @@ fn default_zarr_cache_mb() -> u64 {
 /// Configuration for the Zarr engine (`engine_type = "zarr"`).
 ///
 /// Reads cloud-native multidimensional arrays (Zarr V2/V3) with CF-conventions
-/// metadata. Phase 1 supports a **local** store (`data_path`) only; the S3/HTTP
-/// (`endpoint` + `bucket` + `path`) backend is validated here but rejected at
-/// engine construction until Phase 2.
+/// metadata from a **local** store (`data_path`) or a remote **S3/HTTP** store
+/// (`endpoint` + `bucket` + `path`, or an `s3://`/`http(s)://` URL in
+/// `data_path`). The grid must be geographic (WGS84 lat/lon).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ZarrConfig {
-    /// Local path to the Zarr store root directory (the `.zarr` directory).
-    /// Mutually exclusive with the S3 `endpoint`/`bucket` source.
+    /// Local path to the Zarr store root directory (the `.zarr` directory), or
+    /// an `s3://` / `http(s)://` URL. Mutually exclusive with the S3
+    /// `endpoint`/`bucket` source.
     pub data_path: Option<String>,
-    /// S3-compatible endpoint URL, e.g. "https://s3.eu-central-1.amazonaws.com"
-    /// (Phase 2). Required together with `bucket`.
+    /// S3-compatible endpoint URL, e.g. "https://s3.eu-central-1.amazonaws.com".
+    /// Required together with `bucket`.
     pub endpoint: Option<String>,
-    /// S3 bucket name (Phase 2). Required when `endpoint` is set.
+    /// S3 bucket name. Required when `endpoint` is set.
     pub bucket: Option<String>,
     /// Path of the Zarr store within the bucket (S3 source), e.g.
     /// "zarr/2026/01/data/air_temperature_at_2_metres.zarr". Required for the
@@ -650,8 +651,9 @@ pub struct ZarrConfig {
     /// appended time steps surface without a reload. Default: 300 (5 min).
     #[serde(default = "default_zarr_poll_interval")]
     pub poll_interval_secs: u64,
-    /// Chunk LRU cache size in MB (used by the Phase 2 remote byte-range
-    /// reader). Default: 256.
+    /// Chunk LRU cache size in MB. Caches full chunk-object bytes for the
+    /// byte-range reader (most useful for the remote S3/HTTP backends).
+    /// Default: 256.
     #[serde(default = "default_zarr_cache_mb")]
     pub cache_mb: u64,
 }

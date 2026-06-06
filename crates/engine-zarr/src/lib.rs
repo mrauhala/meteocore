@@ -1,29 +1,31 @@
 //! Zarr engine — reads cloud-native multidimensional arrays (Zarr V2/V3) with
 //! CF-conventions metadata and serves them over the EDR API.
 //!
-//! **Phase 1 scope** (issue #125): a local Zarr store (`data_path`), a
-//! WGS84/geographic lat-lon grid, multi-variable EDR *position* queries with
-//! bilinear interpolation, CF time-axis decoding, CF packing
-//! (`scale_factor`/`add_offset`/`_FillValue`), and a startup warning for
-//! pathological chunk shapes. The S3/HTTP backend (Phase 2) and Map/Tiles/WMS
-//! rendering (Phase 3) are not implemented yet.
+//! **Scope** (issue #125, Phases 1-2): a local **or** remote (S3/HTTP) Zarr
+//! store on a WGS84/geographic lat-lon grid, multi-variable EDR *position*
+//! queries with bilinear interpolation, CF time-axis decoding, CF packing
+//! (`scale_factor`/`add_offset`/`_FillValue`), byte-range chunk reads with an
+//! LRU cache, and a startup warning for pathological chunk shapes. Map/Tiles/WMS
+//! rendering (Phase 3) and projected/per-item-CRS sources (Phase 4) are not
+//! implemented yet.
 //!
 //! The Zarr format and codec pipeline (blosc/zstd/gzip/crc32c/sharding) are
-//! handled by the `zarrs` crate; this engine adds the CF semantics, the OGC
-//! domain mapping, and the poll-and-swap lifecycle shared by the other engines.
+//! handled by the `zarrs` crate; all I/O goes through the shared `ds-storage`
+//! object store via [`store::DsStore`]. This engine adds the CF semantics, the
+//! OGC domain mapping, and the poll-and-swap lifecycle shared by the other
+//! engines.
 
 mod catalog;
 mod cf;
+mod store;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use tokio::sync::watch;
-use zarrs::filesystem::FilesystemStore;
 
 use ds_core::config::ZarrConfig;
 use ds_core::edr_engine::EdrEngine;
@@ -33,12 +35,13 @@ use ds_core::model::{
 };
 
 use catalog::Catalog;
+use store::DsStore;
 
 /// Engine for serving Zarr arrays over EDR.
 pub struct ZarrEngine {
     collection_id: String,
-    /// Filesystem store rooted at the Zarr store directory.
-    store: Arc<FilesystemStore>,
+    /// `ds-storage`-backed store (local / S3 / HTTP), shared by query and poll.
+    store: Arc<DsStore>,
     /// Parsed snapshot, swapped atomically by the poll loop.
     catalog: ArcSwap<Catalog>,
     /// Variable filter from config (`None` = expose all).
@@ -48,35 +51,10 @@ pub struct ZarrEngine {
 }
 
 impl ZarrEngine {
-    /// Open a local Zarr store and build the initial catalog.
+    /// Open a Zarr store (local directory or remote S3/HTTP) and build the
+    /// initial catalog.
     pub fn new(collection_id: &str, config: &ZarrConfig) -> Result<Self, DataServerError> {
-        if config.endpoint.is_some() || config.bucket.is_some() {
-            return Err(DataServerError::Config(format!(
-                "Collection '{collection_id}': zarr S3/HTTP backend is not implemented yet \
-                 (Phase 2); use a local 'data_path'"
-            )));
-        }
-        let data_path = config.data_path.as_deref().ok_or_else(|| {
-            DataServerError::Config(format!(
-                "Collection '{collection_id}': zarr engine requires 'data_path'"
-            ))
-        })?;
-        let root: PathBuf = match &config.path {
-            Some(p) => PathBuf::from(data_path).join(p),
-            None => PathBuf::from(data_path),
-        };
-        if !root.exists() {
-            return Err(DataServerError::Config(format!(
-                "Collection '{collection_id}': zarr data_path '{}' does not exist",
-                root.display()
-            )));
-        }
-        let store = Arc::new(FilesystemStore::new(&root).map_err(|e| {
-            DataServerError::Config(format!(
-                "Collection '{collection_id}': failed to open Zarr store '{}': {e}",
-                root.display()
-            ))
-        })?);
+        let store = Arc::new(build_store(collection_id, config)?);
 
         let param_filter = config.parameters.clone();
         let catalog = catalog::build(store.clone(), collection_id, param_filter.as_deref())?;
@@ -292,6 +270,51 @@ impl EdrEngine for ZarrEngine {
             ranges,
         }))
     }
+}
+
+/// Build the `ds-storage`-backed store for a Zarr collection.
+///
+/// - Remote: `endpoint` + `bucket` (+ required `path`) → an S3 store rooted at
+///   `path` within the bucket.
+/// - Local: `data_path` (a directory, or an `s3://` / `http(s)://` URL),
+///   optionally suffixed by `path`. `ds_storage::build_store` picks the backend.
+fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<DsStore, DataServerError> {
+    if let (Some(endpoint), Some(bucket)) = (config.endpoint.as_deref(), config.bucket.as_deref()) {
+        let path = config.path.as_deref().unwrap_or_default(); // required for remote (config-validated)
+        let ds = ds_storage::build_s3_store_from_parts(endpoint, bucket).map_err(|e| {
+            DataServerError::Config(format!(
+                "Collection '{collection_id}': failed to open S3 Zarr store \
+                 (endpoint={endpoint}, bucket={bucket}): {e}"
+            ))
+        })?;
+        return Ok(DsStore::new(ds, path, config.cache_mb));
+    }
+
+    let data_path = config.data_path.as_deref().ok_or_else(|| {
+        DataServerError::Config(format!(
+            "Collection '{collection_id}': zarr engine requires 'data_path' or 'endpoint'+'bucket'"
+        ))
+    })?;
+    // Optional `path` is a relative sub-path under `data_path` (config-validated
+    // to contain no leading slash or `..`).
+    let location = match &config.path {
+        Some(p) => format!(
+            "{}/{}",
+            data_path.trim_end_matches('/'),
+            p.trim_matches('/')
+        ),
+        None => data_path.to_string(),
+    };
+    let (ds, prefix) = ds_storage::build_store(&location).map_err(|e| {
+        DataServerError::Config(format!(
+            "Collection '{collection_id}': failed to open Zarr store '{location}': {e}"
+        ))
+    })?;
+    Ok(DsStore::new(
+        ds,
+        prefix.as_ref().to_string(),
+        config.cache_mb,
+    ))
 }
 
 fn log_loaded(collection_id: &str, cat: &Catalog) {

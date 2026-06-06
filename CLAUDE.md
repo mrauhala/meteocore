@@ -167,7 +167,7 @@ radar elevation angle. WMS exposes it as the `ELEVATION` dimension; Maps/Tiles a
 | ODIM COMP | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | ODIM PVOL | `EdrEngine` + `MapEngine` (per-site views) + `FeatureEngine` (network engine) | EDR (position, locations, area, trajectory), WMS, Maps, Tiles, Features (site inventory) |
 | QueryData | `EdrEngine` + `MapEngine` | EDR (position only), WMS, Maps, Tiles |
-| Zarr | `EdrEngine` | EDR (position only) — Phase 1 |
+| Zarr | `EdrEngine` | EDR (position only), local + S3/HTTP |
 | PostGIS | `EdrEngine` + `FeatureEngine` | EDR (position, locations, area), Features |
 
 ## ODIM PVOL Engine Notes (per-site collections)
@@ -215,43 +215,57 @@ radar elevation angle. WMS exposes it as the `ELEVATION` dimension; Maps/Tiles a
 ## Zarr Engine Notes
 
 Cloud-native multidimensional arrays (Zarr V2/V3) with CF-conventions metadata,
-tracked in #125. **The crate is phased; Phase 1 is what ships today.**
+tracked in #125. **The crate is phased; Phases 1-2 ship today.**
 
-- **Phase 1 (done):** local store (`data_path`), WGS84/geographic lat-lon grid,
-  multi-variable EDR **position** queries with bilinear interpolation, CF time
-  decoding, CF packing (`scale_factor`/`add_offset`/`_FillValue`/`missing_value`),
-  and a startup WARN for pathological chunk shapes. **Not yet:** S3/HTTP backend
-  (Phase 2), Map/Tiles/WMS rendering (Phase 3), per-item-CRS STAC mode (Phase 4),
-  kerchunk (Phase 5).
-- **The Zarr format + codec pipeline is handled by the `zarrs` crate** (default
-  features: blosc/zstd/gzip/crc32c/sharding/transpose + `filesystem`+`ndarray`).
-  Codecs are transparent to this engine — it only adds CF semantics, the OGC
-  domain mapping, and the poll-and-swap lifecycle. blosc/zstd build from C via
+- **Phases 1-2 (done):** local **and** remote (S3/HTTP) stores, WGS84/geographic
+  lat-lon grid, multi-variable EDR **position** queries with bilinear
+  interpolation, CF time decoding, CF packing
+  (`scale_factor`/`add_offset`/`_FillValue`/`missing_value` + the array's own
+  Zarr fill), byte-range chunk reads with an LRU cache, and a startup WARN for
+  pathological chunk shapes. **Not yet:** Map/Tiles/WMS rendering (Phase 3),
+  per-item-CRS STAC mode (Phase 4), kerchunk (Phase 5).
+- **The Zarr format + codec pipeline is handled by the `zarrs` crate** (features:
+  blosc/zstd/gzip/crc32c/sharding/transpose + `filesystem`+`ndarray`). Codecs are
+  transparent to this engine — it only adds CF semantics, the OGC domain mapping,
+  the storage bridge, and the poll-and-swap lifecycle. blosc/zstd build from C via
   `cmake`+`cc` (same toolchain `libaec-sys` already needs for GRIB).
-- `zarrs` uses **rayon internally for codec decode** (CPU-bound, not I/O) — safe
-  with the Phase-1 `FilesystemStore`. The "no `ds-storage` from a rayon thread"
-  hazard only applies to the Phase-2 adapter; honor it there.
-- **Engine = EDR-only in Phase 1.** The `engine_type → supported_apis` allowlist
-  in `admin.rs` lists `"zarr" => &["edr"]`, so a zarr collection that requests
-  `wms`/`maps`/`tiles` is rejected at load with a clear error (widen the
-  allowlist + implement `MapEngine` in Phase 3).
+- **Storage = `ds-storage` for every backend.** `engine-zarr/src/store.rs`
+  `DsStore` implements zarrs `ReadableStorageTraits` + `ListableStorageTraits`
+  over `ds_storage::DataStore` (local / S3 / HTTP via `build_store` /
+  `build_s3_store_from_parts`), with a `quick_cache` LRU of full chunk-object
+  bytes (byte ranges are served by slicing the cached buffer). Group/child
+  discovery uses one-level delimiter listing (`DataStore::list_dir`), not a
+  recursive chunk-key walk.
+- **`concurrent_target(1)` is load-bearing, not tuning.** `zarrs` parallelises
+  multi-chunk retrieval with **rayon by default**, and would call the storage
+  layer from rayon workers — where `ds-storage`'s `block_in_place` bridge
+  *panics*. `catalog::single_threaded_opts()` pins retrieval to the calling
+  (request/poll) thread via `CodecOptions::with_concurrent_target(1)`, so storage
+  reads never land on rayon. Every `retrieve_*` MUST go through it.
+- **Engine = EDR-only (through Phase 2).** The `engine_type → supported_apis`
+  allowlist in `admin.rs` lists `"zarr" => &["edr"]`, so a zarr collection that
+  requests `wms`/`maps`/`tiles` is rejected at load (widen the allowlist +
+  implement `MapEngine` in Phase 3).
 - **Catalog model:** `catalog::build` opens the root group, lists child arrays,
   treats 1-D arrays named after their dim as CF coordinate variables, classifies
   each dim via `cf::classify_axis` (coord-var `standard_name`/`units` first, name
   heuristic second — projected metre axes resolve to `Other` so they're not
-  mistaken for degrees), and exposes the remaining geographic data variables as
-  parameters. A **time axis is required** in Phase 1 (PointSeries needs a `t`).
-- **Reads:** `retrieve_array_subset::<Vec<T>>` requires the exact dtype, so the
-  read path branches on `data_type()` (`*dt == data_type::float32()`, …) and
-  widens every supported int/float to `f64`. Fill sentinels are compared against
-  the **raw** (pre-scale) value, NaN maps to nodata.
+  mistaken for degrees), validates lat/lon axes are monotonic, and exposes the
+  remaining geographic data variables as parameters. A **time axis is required**
+  (PointSeries needs a `t`). Variables with an unsupported dtype are skipped at
+  build with a WARN.
+- **Reads:** `retrieve_array_subset_opt::<Vec<T>>` (single-threaded) requires the
+  exact dtype, so the read path branches on `data_type()` (`*dt ==
+  data_type::float32()`, …) and widens every supported int/float to `f64`. Fill
+  sentinels are compared against the **raw** (pre-scale) value; NaN/±inf map to
+  nodata.
 - **Bad-chunking WARN (#125):** `time=1, lat=full, lon=full` (each timestep one
   full-domain chunk) is pathological for point/time-series queries; the engine
   logs it at startup but still serves.
-- **Config:** `data_path` (local store dir; mutually exclusive with the Phase-2
-  `endpoint`+`bucket`+`path` S3 source), optional `path` sub-dir, `zarr_version`
-  (2/3, advisory — `zarrs` auto-detects), `parameters` filter, `poll_interval_secs`
-  (default 300), `cache_mb` (default 256, Phase-2 chunk LRU).
+- **Config:** `data_path` (local dir, or an `s3://`/`http(s)://` URL) **or**
+  `endpoint`+`bucket`+`path` (S3) — mutually exclusive; optional `path` sub-path,
+  `zarr_version` (2/3, advisory — `zarrs` auto-detects), `parameters` filter,
+  `poll_interval_secs` (default 300), `cache_mb` (default 256, chunk LRU).
 - **Fixture:** `testdata/zarr-era5-t2m` (committed), regenerated by
   `cargo run -p engine-zarr --example gen_fixture`. Field is linear in lat/lon so
   bilinear is exact and integration assertions are tight.

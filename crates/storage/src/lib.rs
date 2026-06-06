@@ -128,6 +128,57 @@ impl DataStore {
         self.block_on(async { Ok(self.inner.head(path).await?) })
     }
 
+    /// Like [`Self::get`], but a **missing** object (`NotFound` / HTTP 404)
+    /// maps to `Ok(None)` rather than an error. Zarr stores treat an absent key
+    /// (an unwritten chunk, an optional metadata file) as "use the fill value"
+    /// / "not present", so the engine needs this distinction.
+    pub fn get_opt(&self, path: &ObjectPath) -> Result<Option<Bytes>, DataServerError> {
+        let result = self.block_on(async {
+            match self.inner.get(path).await {
+                Ok(res) => Ok(Some(res.bytes().await?)),
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(e),
+            }
+        })?;
+        if let Some(b) = &result {
+            self.bytes_read.fetch_add(b.len() as u64, Ordering::Relaxed);
+        }
+        Ok(result)
+    }
+
+    /// Like [`Self::get_range`], but a missing object maps to `Ok(None)`.
+    pub fn get_range_opt(
+        &self,
+        path: &ObjectPath,
+        range: Range<usize>,
+    ) -> Result<Option<Bytes>, DataServerError> {
+        let result = self.block_on(async {
+            match self.inner.get_range(path, range).await {
+                Ok(b) => Ok(Some(b)),
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(e),
+            }
+        })?;
+        if let Some(b) = &result {
+            self.bytes_read.fetch_add(b.len() as u64, Ordering::Relaxed);
+        }
+        Ok(result)
+    }
+
+    /// One-level (delimiter) listing under `prefix`, returning `(objects,
+    /// common_prefixes)` — the immediate child objects and the immediate child
+    /// "directories". Used for Zarr group/child discovery, which only needs the
+    /// next path segment, not a recursive walk of every chunk key.
+    pub fn list_dir(
+        &self,
+        prefix: &ObjectPath,
+    ) -> Result<(Vec<ObjectMeta>, Vec<ObjectPath>), DataServerError> {
+        self.block_on(async {
+            let res = self.inner.list_with_delimiter(Some(prefix)).await?;
+            Ok((res.objects, res.common_prefixes))
+        })
+    }
+
     /// Fetch many objects concurrently, returning one result per input
     /// path **in input order**. A per-object failure (missing, oversized,
     /// network) is carried in that slot's `Err` and does not sink the
