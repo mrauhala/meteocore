@@ -1,0 +1,32 @@
+id = "zarr-era5-t2m-local"
+title = "ERA5-like 2 m Temperature (Zarr V3, local)"
+description = "Synthetic CF-conventions Zarr V3 store (2 m temperature) served from a local directory. A small, network-free demo of the Zarr engine — EDR position queries plus WMS/Maps/Tiles rendering."
+engine_type = "zarr"
+apis = ["edr", "wms", "maps", "tiles"]
+keywords = ["temperature", "reanalysis", "zarr"]
+
+[zarr]
+# Local Zarr store root (relative to the config's parent dir / working dir).
+# Regenerate with: cargo run -p engine-zarr --example gen_fixture
+data_path = "testdata/zarr-era5-t2m"
+zarr_version = 3
+poll_interval_secs = 300
+# Optional: expose only some variables. The fixture has `t2m` (float32) and
+# `t2m_packed` (int16, scale_factor/add_offset). Default = all.
+# parameters = ["t2m"]
+
+[wms]
+colormap = "temperature"
+
+# Per-variable layer styling (one WMS/Maps/Tiles layer per variable).
+[[wms.parameters]]
+name = "t2m"
+colormap = "temperature"
+min = 250.0
+max = 300.0
+
+[[wms.parameters]]
+name = "t2m_packed"
+colormap = "temperature"
+min = 250.0
+max = 300.0
