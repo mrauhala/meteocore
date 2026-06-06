@@ -573,8 +573,10 @@ pub struct GribConfig {
     /// S3 bucket name. Required when endpoint is set.
     pub bucket: Option<String>,
     /// Prefix pattern with strftime templates, e.g. "%Y%m%d/00z/ifs/0p25/oper/".
-    /// Required for the remote (`endpoint`+`bucket`) source; optional/ignored
-    /// for a local `data_path`.
+    /// Required for the remote (`endpoint`+`bucket`) source. Optional for a
+    /// local `data_path`, where it is used (if present) as a *literal*
+    /// sub-prefix under the directory — no strftime/date templating; default
+    /// "" = the directory root.
     pub prefix_pattern: Option<String>,
     /// Suffix for index files. Default: ".index"
     pub index_suffix: Option<String>,
