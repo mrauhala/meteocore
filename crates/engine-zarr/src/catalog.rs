@@ -293,6 +293,19 @@ pub fn build(
     })?;
     let lons = read_coord_f64(lon_arr)?;
 
+    // `locate` (and bilinear sampling) assume monotonic axes; a non-monotonic
+    // coordinate would yield silently wrong interpolation, so reject it here.
+    if !cf::is_monotonic(&lats) {
+        return Err(DataServerError::Engine(format!(
+            "latitude coordinate '{lat_dim}' is not monotonic"
+        )));
+    }
+    if !cf::is_monotonic(&lons) {
+        return Err(DataServerError::Engine(format!(
+            "longitude coordinate '{lon_dim}' is not monotonic"
+        )));
+    }
+
     let time_dim = time_dim.ok_or_else(|| {
         DataServerError::Engine(
             "collection has no time dimension; Phase 1 requires a CF time axis".into(),
@@ -400,6 +413,15 @@ pub fn build(
                     fill_values.extend(arr.iter().filter_map(|x| x.as_f64()));
                 }
                 _ => {}
+            }
+        }
+        // Also honour the array's own Zarr fill value — zarrs substitutes it for
+        // unwritten/out-of-bounds chunks, so an integer array carrying a
+        // non-NaN Zarr fill but no CF `_FillValue` would otherwise emit scaled
+        // garbage. NaN floats are already mapped to nodata in `convert`.
+        if let Some(fv) = fill_value_as_f64(&array) {
+            if fv.is_finite() && !fill_values.contains(&fv) {
+                fill_values.push(fv);
             }
         }
 
@@ -559,6 +581,43 @@ fn dtype_supported(dt: &zarrs::array::DataType) -> bool {
         || *dt == data_type::uint16()
         || *dt == data_type::uint32()
         || *dt == data_type::uint64()
+}
+
+/// Widen an array's Zarr-native fill value to `f64`, interpreting its raw
+/// native-endian bytes per the array's data type. Returns `None` for an
+/// unsupported dtype or a byte-length mismatch.
+fn fill_value_as_f64(array: &Array<Store>) -> Option<f64> {
+    let bytes = array.fill_value().as_ne_bytes();
+    let dt = array.data_type();
+    macro_rules! decode {
+        ($t:ty, $n:literal) => {{
+            let arr: [u8; $n] = bytes.try_into().ok()?;
+            Some(<$t>::from_ne_bytes(arr) as f64)
+        }};
+    }
+    if *dt == data_type::float32() {
+        decode!(f32, 4)
+    } else if *dt == data_type::float64() {
+        decode!(f64, 8)
+    } else if *dt == data_type::int8() {
+        decode!(i8, 1)
+    } else if *dt == data_type::int16() {
+        decode!(i16, 2)
+    } else if *dt == data_type::int32() {
+        decode!(i32, 4)
+    } else if *dt == data_type::int64() {
+        decode!(i64, 8)
+    } else if *dt == data_type::uint8() {
+        decode!(u8, 1)
+    } else if *dt == data_type::uint16() {
+        decode!(u16, 2)
+    } else if *dt == data_type::uint32() {
+        decode!(u32, 4)
+    } else if *dt == data_type::uint64() {
+        decode!(u64, 8)
+    } else {
+        None
+    }
 }
 
 /// Read an entire array as `Vec<f64>` (used for small coordinate arrays).

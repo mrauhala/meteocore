@@ -139,10 +139,17 @@ pub fn is_standard_calendar(calendar: Option<&str>) -> bool {
 pub fn decode_times(raw: &[f64], units: &str) -> Result<Vec<DateTime<Utc>>, String> {
     let (secs, epoch) =
         parse_time_units(units).ok_or_else(|| format!("unrecognised CF time units '{units}'"))?;
-    Ok(raw
-        .iter()
-        .map(|&v| epoch + Duration::milliseconds((v * secs * 1000.0).round() as i64))
-        .collect())
+    raw.iter()
+        .map(|&v| {
+            // A non-finite value (e.g. zarrs returning the Zarr fill for an
+            // unwritten time-axis chunk) would `round() as i64`-saturate to 0
+            // and silently produce the epoch — fail the build instead.
+            if !v.is_finite() {
+                return Err(format!("non-finite value in time axis: {v}"));
+            }
+            Ok(epoch + Duration::milliseconds((v * secs * 1000.0).round() as i64))
+        })
+        .collect()
 }
 
 /// Whether a variable's chunk shape is pathological for point / time-series
@@ -159,6 +166,23 @@ pub fn is_bad_timeseries_chunking(
     n_times: u64,
 ) -> bool {
     n_times > 1 && time_chunk <= 1 && lat_chunk >= ny && lon_chunk >= nx
+}
+
+/// Whether a 1-D axis is monotonic (non-strictly ascending or descending).
+/// [`locate`] assumes this; a non-monotonic coordinate axis would otherwise
+/// produce silently wrong bilinear interpolation, so callers validate up front.
+pub fn is_monotonic(vals: &[f64]) -> bool {
+    if vals.len() < 2 {
+        return true;
+    }
+    let ascending = vals[1] >= vals[0];
+    vals.windows(2).all(|w| {
+        if ascending {
+            w[1] >= w[0]
+        } else {
+            w[1] <= w[0]
+        }
+    })
 }
 
 /// Locate `target` within a monotonic (ascending or descending) 1-D
@@ -284,6 +308,20 @@ mod tests {
         let desc = [60.0, 59.0, 58.0, 57.0];
         assert_eq!(locate(&desc, 60.0), Some((0, 1, 0.0)));
         assert_eq!(locate(&desc, 57.0), Some((2, 3, 1.0)));
+    }
+
+    #[test]
+    fn decode_times_rejects_non_finite() {
+        assert!(decode_times(&[0.0, f64::NAN], "hours since 2026-01-01").is_err());
+        assert!(decode_times(&[0.0, 6.0], "hours since 2026-01-01").is_ok());
+    }
+
+    #[test]
+    fn is_monotonic_detects_both_directions() {
+        assert!(is_monotonic(&[1.0, 2.0, 3.0]));
+        assert!(is_monotonic(&[3.0, 2.0, 1.0]));
+        assert!(is_monotonic(&[5.0])); // trivially
+        assert!(!is_monotonic(&[1.0, 3.0, 2.0]));
     }
 
     #[test]
