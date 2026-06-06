@@ -1,0 +1,50 @@
+# Runnable example for the Zarr engine (Phase 1, issue #125).
+#
+# This points at the committed synthetic fixture in this directory, so it works
+# out of the box with no network access:
+#
+#   CONFIG_PATH=testdata/zarr-era5-t2m/test-config.toml cargo run -p server
+#
+# Then try (the fixture's field is 273.15 + 0.1*lat + 0.01*lon + 0.5*t):
+#
+#   curl 'http://127.0.0.1:8097/edr/collections/era5-t2m'
+#   curl 'http://127.0.0.1:8097/edr/collections/era5-t2m/position?coords=POINT(5.5%2054.5)'
+#
+# Regenerate the fixture with:
+#   cargo run -p engine-zarr --example gen_fixture
+
+[server]
+host = "127.0.0.1"
+port = 8097
+
+[[collections]]
+id = "era5-t2m"
+title = "ERA5-like 2 m Temperature (Zarr V3)"
+description = "Synthetic CF-conventions Zarr V3 store: 2 m temperature over a small lat/lon window, served from a local directory."
+engine_type = "zarr"
+apis = ["edr"] # Phase 1 = EDR position queries only; WMS/Maps/Tiles is Phase 3.
+keywords = ["temperature", "reanalysis", "zarr"]
+
+[collections.zarr]
+# Local Zarr store root (relative to the working directory).
+data_path = "testdata/zarr-era5-t2m"
+zarr_version = 3
+# Optional: expose only some variables. The fixture has `t2m` (float32) and
+# `t2m_packed` (int16 with scale_factor/add_offset). Default = all.
+# parameters = ["t2m"]
+poll_interval_secs = 300
+
+# ---------------------------------------------------------------------------
+# Real cloud data (NOT runnable on Phase 1 — kept here as a roadmap reference).
+#
+# HRRR-Zarr (s3://hrrrzarr/) needs TWO things this engine doesn't have yet:
+#   1. an S3/HTTP backend  -> Phase 2 (#125)
+#   2. projected-grid (Lambert Conformal) + 2-D lat/lon support -> Phase 4 (#125)
+# so HRRR specifically is not a Phase-2 target. The clean Phase-2 demo target is
+# a geographic (1-D lat/lon) Zarr such as ARCO-ERA5. The eventual shape will be:
+#
+# [collections.zarr]
+# endpoint = "https://s3.amazonaws.com"
+# bucket = "hrrrzarr"
+# path = "sfc/20210101/20210101_00z_anl.zarr/2m_above_ground/TMP"
+# ---------------------------------------------------------------------------
