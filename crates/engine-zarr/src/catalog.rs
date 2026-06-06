@@ -229,6 +229,10 @@ pub fn build(
                     coord_names.insert(name.clone());
                 }
                 None => {
+                    tracing::debug!(
+                        "collection '{collection_id}': 1-D array '{name}' has no dimension \
+                         names; treating it as a coordinate variable"
+                    );
                     coord_names.insert(name.clone());
                 }
                 _ => {}
@@ -343,6 +347,18 @@ pub fn build(
             );
             continue;
         };
+
+        // Skip variables whose data type the read path can't widen to f64 (e.g.
+        // float16/bfloat16, complex, raw bytes) at build time, with a clear
+        // warning — rather than listing the parameter and failing the query.
+        if !dtype_supported(array.data_type()) {
+            tracing::warn!(
+                "collection '{collection_id}': variable '{name}' has unsupported Zarr data \
+                 type {}; skipping",
+                array.data_type()
+            );
+            continue;
+        }
 
         let shape = array.shape();
         if shape[lat_axis] as usize != lats.len() || shape[lon_axis] as usize != lons.len() {
@@ -526,6 +542,23 @@ fn axis_extent(vals: &[f64]) -> (f64, f64) {
         0.0
     };
     (min - half, max + half)
+}
+
+/// Whether [`retrieve_raw_f64`] can widen this data type to `f64`. Keep the
+/// arms in sync with `retrieve_raw_f64`. Unsupported types (float16/bfloat16,
+/// complex, raw bytes, strings) are skipped at build time so a query never
+/// fails at read time with a confusing error.
+fn dtype_supported(dt: &zarrs::array::DataType) -> bool {
+    *dt == data_type::float32()
+        || *dt == data_type::float64()
+        || *dt == data_type::int8()
+        || *dt == data_type::int16()
+        || *dt == data_type::int32()
+        || *dt == data_type::int64()
+        || *dt == data_type::uint8()
+        || *dt == data_type::uint16()
+        || *dt == data_type::uint32()
+        || *dt == data_type::uint64()
 }
 
 /// Read an entire array as `Vec<f64>` (used for small coordinate arrays).

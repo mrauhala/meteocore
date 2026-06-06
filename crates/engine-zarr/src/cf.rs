@@ -176,20 +176,32 @@ pub fn locate(axis: &[f64], target: f64) -> Option<(usize, usize, f64)> {
     if n == 1 {
         return Some((0, 0, 0.0));
     }
-    for i in 0..n - 1 {
-        let a = axis[i];
-        let b = axis[i + 1];
-        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-        if target >= lo && target <= hi {
-            let w = if (b - a).abs() < f64::EPSILON {
-                0.0
-            } else {
-                (target - a) / (b - a)
-            };
-            return Some((i, i + 1, w));
-        }
+    // Monotonic axis (ascending or descending) → O(log n) bracket via binary
+    // search. Both endpoints are inclusive, matching a fence-post linear scan
+    // (a query exactly at the first or last coordinate is in-range).
+    let ascending = axis[n - 1] >= axis[0];
+    let (min, max) = if ascending {
+        (axis[0], axis[n - 1])
+    } else {
+        (axis[n - 1], axis[0])
+    };
+    if target < min || target > max {
+        return None;
     }
-    None
+    // `partition_point` returns the first index whose value is >= target
+    // (ascending) / <= target (descending). Clamp into a valid bracket: `pos`
+    // is 0 only when target == the first element and `n` only when target ==
+    // the last — both in range here, so the clamp picks the edge cell.
+    let pos = axis.partition_point(|&v| if ascending { v < target } else { v > target });
+    let j = pos.clamp(1, n - 1);
+    let i = j - 1;
+    let (a, b) = (axis[i], axis[j]);
+    let w = if (b - a).abs() < f64::EPSILON {
+        0.0
+    } else {
+        (target - a) / (b - a)
+    };
+    Some((i, j, w))
 }
 
 #[cfg(test)]
@@ -259,6 +271,19 @@ mod tests {
 
         assert!(locate(&asc, -1.0).is_none());
         assert!(locate(&asc, 9.0).is_none());
+    }
+
+    #[test]
+    fn locate_inclusive_endpoints() {
+        // Exact endpoints must stay in range (the subtle case a naive
+        // partition_point bracket gets wrong at the upper edge).
+        let asc = [0.0, 1.0, 2.0, 3.0];
+        assert_eq!(locate(&asc, 0.0), Some((0, 1, 0.0))); // first element, w=0
+        assert_eq!(locate(&asc, 3.0), Some((2, 3, 1.0))); // last element, w=1
+
+        let desc = [60.0, 59.0, 58.0, 57.0];
+        assert_eq!(locate(&desc, 60.0), Some((0, 1, 0.0)));
+        assert_eq!(locate(&desc, 57.0), Some((2, 3, 1.0)));
     }
 
     #[test]

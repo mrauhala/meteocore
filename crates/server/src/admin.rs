@@ -1112,9 +1112,9 @@ pub fn load_collections(
                     }
                 };
 
-                if let Some((start, end)) =
-                    ds_core::edr_engine::EdrEngine::get_temporal_extent(engine.as_ref())
-                {
+                let temporal_extent =
+                    ds_core::edr_engine::EdrEngine::get_temporal_extent(engine.as_ref());
+                if let Some((start, end)) = temporal_extent {
                     info!(
                         "Collection '{}': temporal extent {} to {}",
                         collection.id, start, end
@@ -1135,8 +1135,7 @@ pub fn load_collections(
                 // rendering is deferred to Phase 3 (#125). The engine/API
                 // allowlist above rejects a zarr collection that requests them.
 
-                let has_data =
-                    ds_core::edr_engine::EdrEngine::get_temporal_extent(engine.as_ref()).is_some();
+                let has_data = temporal_extent.is_some();
                 health.push(CollectionHealth {
                     id: collection.id.clone(),
                     engine_type: "zarr".into(),
