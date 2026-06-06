@@ -146,25 +146,6 @@ impl DataStore {
         Ok(result)
     }
 
-    /// Like [`Self::get_range`], but a missing object maps to `Ok(None)`.
-    pub fn get_range_opt(
-        &self,
-        path: &ObjectPath,
-        range: Range<usize>,
-    ) -> Result<Option<Bytes>, DataServerError> {
-        let result = self.block_on(async {
-            match self.inner.get_range(path, range).await {
-                Ok(b) => Ok(Some(b)),
-                Err(object_store::Error::NotFound { .. }) => Ok(None),
-                Err(e) => Err(e),
-            }
-        })?;
-        if let Some(b) = &result {
-            self.bytes_read.fetch_add(b.len() as u64, Ordering::Relaxed);
-        }
-        Ok(result)
-    }
-
     /// One-level (delimiter) listing under `prefix`, returning `(objects,
     /// common_prefixes)` — the immediate child objects and the immediate child
     /// "directories". Used for Zarr group/child discovery, which only needs the

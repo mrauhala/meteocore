@@ -159,6 +159,11 @@ impl ListableStorageTraits for DsStore {
         self.list_prefix(&root)
     }
 
+    // NOTE: recursive (no delimiter) — its contract is "every key under the
+    // prefix". The engine's child/array discovery goes through `list_dir`
+    // (one-level), so this is not on the open/read hot path; avoid calling it at
+    // the store root of a large remote store, where it would enumerate every
+    // chunk key.
     fn list_prefix(&self, prefix: &StorePrefix) -> Result<StoreKeys, StorageError> {
         let metas = self
             .store

@@ -280,7 +280,10 @@ impl EdrEngine for ZarrEngine {
 ///   optionally suffixed by `path`. `ds_storage::build_store` picks the backend.
 fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<DsStore, DataServerError> {
     if let (Some(endpoint), Some(bucket)) = (config.endpoint.as_deref(), config.bucket.as_deref()) {
-        let path = config.path.as_deref().unwrap_or_default(); // required for remote (config-validated)
+        // `path` is required for a remote source — enforced in
+        // `ServerConfig::validate` ("remote zarr (endpoint+bucket) requires
+        // 'path'"), so by here it is always present.
+        let path = config.path.as_deref().unwrap_or_default();
         let ds = ds_storage::build_s3_store_from_parts(endpoint, bucket).map_err(|e| {
             DataServerError::Config(format!(
                 "Collection '{collection_id}': failed to open S3 Zarr store \
