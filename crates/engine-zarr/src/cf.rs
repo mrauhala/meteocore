@@ -190,8 +190,13 @@ pub fn is_monotonic(vals: &[f64]) -> bool {
 /// `data[lo] * (1 - w) + data[hi] * w`, with `lo`/`hi` the bracketing indices
 /// and `w ∈ [0, 1]` the weight toward `hi`.
 ///
-/// Returns `None` when `target` lies outside the axis range. A single-element
-/// axis returns `(0, 0, 0.0)` (nearest).
+/// Returns `None` when `target` lies outside the axis range.
+///
+/// A single-element axis always returns `(0, 0, 0.0)`, snapping *any* in-bounds
+/// target to the sole cell regardless of distance. This is intentional: a
+/// collapsed/degenerate axis — e.g. a zonal- or meridional-mean field stored
+/// with a single lat or lon point — should return its one value for every
+/// position along that axis, not nodata.
 pub fn locate(axis: &[f64], target: f64) -> Option<(usize, usize, f64)> {
     let n = axis.len();
     if n == 0 || !target.is_finite() {
@@ -295,6 +300,18 @@ mod tests {
 
         assert!(locate(&asc, -1.0).is_none());
         assert!(locate(&asc, 9.0).is_none());
+    }
+
+    #[test]
+    fn locate_single_element_snaps_any_target() {
+        // A collapsed axis (one point — e.g. a zonal/meridional mean) returns
+        // its only cell for any target, near or far. Documented, intentional.
+        let one = [50.0];
+        assert_eq!(locate(&one, 50.0), Some((0, 0, 0.0)));
+        assert_eq!(locate(&one, -120.0), Some((0, 0, 0.0)));
+        assert_eq!(locate(&one, 9999.0), Some((0, 0, 0.0)));
+        // Non-finite is still rejected.
+        assert!(locate(&one, f64::NAN).is_none());
     }
 
     #[test]
