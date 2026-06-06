@@ -51,11 +51,9 @@ impl Variable {
         if raw.is_nan() {
             return None;
         }
-        if self
-            .fill_values
-            .iter()
-            .any(|f| raw == *f || (f.is_nan() && raw.is_nan()))
-        {
+        // `raw` is guaranteed non-NaN here, so a NaN `_FillValue` is already
+        // covered by the check above; a plain equality is enough.
+        if self.fill_values.contains(&raw) {
             return None;
         }
         Some(raw * self.scale_factor + self.add_offset)
@@ -80,7 +78,7 @@ impl Catalog {
     /// Sample a variable's value at `(lon, lat)` for each requested time index,
     /// using bilinear interpolation over the surrounding grid cells (nearest
     /// fallback where a neighbour is nodata). Reads a single small hyperslab
-    /// covering the 2×2 spatial neighbourhood across the full time axis.
+    /// covering the 2×2 spatial neighbourhood across the requested time span.
     pub fn sample_series(
         &self,
         var: &Variable,
@@ -95,13 +93,21 @@ impl Catalog {
         let (i0, i1, wx) = xb;
         let (j0, j1, wy) = yb;
 
-        // Build the read window: full time axis, the 2×2 spatial block, other
+        // Build the read window: only the contiguous span of requested time
+        // steps (not the whole axis — a single-step query on an 8760-step store
+        // must not decode every time chunk), the 2×2 spatial block, and other
         // dims pinned to index 0.
+        let (t_start, t_end) = match (
+            time_idx.iter().copied().min(),
+            time_idx.iter().copied().max(),
+        ) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return Ok(Vec::new()), // empty request (caller guards against this)
+        };
         let mut ranges: Vec<Range<u64>> = Vec::with_capacity(var.ndim);
-        let nt = self.times.len() as u64;
         for a in 0..var.ndim {
             if Some(a) == var.time_axis {
-                ranges.push(0..nt);
+                ranges.push(t_start as u64..(t_end as u64) + 1);
             } else if a == var.lat_axis {
                 ranges.push(j0 as u64..(j1 as u64) + 1);
             } else if a == var.lon_axis {
@@ -138,7 +144,13 @@ impl Catalog {
 
         let mut out = Vec::with_capacity(time_idx.len());
         for &ti in time_idx {
-            let t_local = if var.time_axis.is_some() { ti } else { 0 };
+            // `ti` indexes the global time axis; the read window starts at
+            // `t_start`, so shift into local coordinates.
+            let t_local = if var.time_axis.is_some() {
+                ti - t_start
+            } else {
+                0
+            };
             let v00 = sample_at(t_local, 0, 0);
             let v01 = sample_at(t_local, 0, ic1);
             let v10 = sample_at(t_local, jc1, 0);

@@ -1615,6 +1615,20 @@ impl ServerConfig {
                         )));
                     }
                 }
+
+                // `path` is joined onto the source root; an absolute path or one
+                // with `..` would silently escape it (`PathBuf::join` discards
+                // the base on an absolute child), so reject those at load.
+                if let Some(p) = &zarr.path {
+                    if std::path::Path::new(p).is_absolute()
+                        || p.split(['/', '\\']).any(|c| c == "..")
+                    {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': zarr 'path' must be a relative path without \
+                             '..' components"
+                        )));
+                    }
+                }
             }
 
             // PostGIS engine: requires [postgis] section + parameters + valid shape.
@@ -1875,6 +1889,18 @@ url = "https://creativecommons.org/licenses/by/4.0/"
     fn zarr_rejects_invalid_version() {
         let cfg = zarr_collection("data_path = \"x\"\nzarr_version = 4\n");
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn zarr_rejects_absolute_or_traversal_path() {
+        // An absolute `path` would make PathBuf::join discard `data_path`.
+        let abs = zarr_collection("data_path = \"x\"\npath = \"/etc/passwd\"\n");
+        assert!(abs.validate().is_err());
+        let dotdot = zarr_collection("data_path = \"x\"\npath = \"../escape.zarr\"\n");
+        assert!(dotdot.validate().is_err());
+        // A normal relative sub-path is fine.
+        let ok = zarr_collection("data_path = \"x\"\npath = \"sub/data.zarr\"\n");
+        assert!(ok.validate().is_ok());
     }
 
     #[test]
