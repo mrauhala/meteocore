@@ -10,17 +10,25 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use zarrs::array::{data_type, Array, ArraySubset};
-use zarrs::filesystem::FilesystemStore;
+use zarrs::array::{data_type, Array, ArraySubset, CodecOptions};
 use zarrs::group::Group;
 
 use ds_core::error::DataServerError;
 
 use crate::cf::{self, AxisRole};
+use crate::store::DsStore;
 
-/// The concrete store type used by the Phase-1 local backend. Phase 2 will
-/// generalise this to a trait object over `ds-storage`.
-type Store = FilesystemStore;
+/// The store type backing every Zarr collection: a `ds-storage` adapter that
+/// serves local, S3, and HTTP backends uniformly (#125 Phase 2).
+type Store = DsStore;
+
+/// Codec options that pin chunk retrieval to the **calling thread** by setting
+/// the concurrency target to 1. This is load-bearing: it stops zarrs from
+/// dispatching storage reads onto `rayon` workers, where ds-storage's
+/// `block_in_place` bridge would panic (see [`crate::store`]).
+fn single_threaded_opts() -> CodecOptions {
+    CodecOptions::default().with_concurrent_target(1)
+}
 
 /// A single exposed data variable (one EDR/Map parameter).
 pub struct Variable {
@@ -640,10 +648,11 @@ fn retrieve_raw_f64(
     subset: &ArraySubset,
 ) -> Result<Vec<f64>, DataServerError> {
     let dt = array.data_type();
+    let opts = single_threaded_opts();
     macro_rules! read_as {
         ($t:ty) => {
             array
-                .retrieve_array_subset::<Vec<$t>>(subset)
+                .retrieve_array_subset_opt::<Vec<$t>>(subset, &opts)
                 .map(|v| v.into_iter().map(|x| x as f64).collect::<Vec<f64>>())
         };
     }

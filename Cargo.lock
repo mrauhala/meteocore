@@ -1063,8 +1063,11 @@ name = "engine-zarr"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "bytes",
  "chrono",
  "ds-core",
+ "ds-storage",
+ "quick_cache",
  "serde",
  "serde_json",
  "tempfile",

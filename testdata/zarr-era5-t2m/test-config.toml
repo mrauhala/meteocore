@@ -35,16 +35,20 @@ zarr_version = 3
 poll_interval_secs = 300
 
 # ---------------------------------------------------------------------------
-# Real cloud data (NOT runnable on Phase 1 — kept here as a roadmap reference).
-#
-# HRRR-Zarr (s3://hrrrzarr/) needs TWO things this engine doesn't have yet:
-#   1. an S3/HTTP backend  -> Phase 2 (#125)
-#   2. projected-grid (Lambert Conformal) + 2-D lat/lon support -> Phase 4 (#125)
-# so HRRR specifically is not a Phase-2 target. The clean Phase-2 demo target is
-# a geographic (1-D lat/lon) Zarr such as ARCO-ERA5. The eventual shape will be:
+# Remote S3/HTTP backend (Phase 2, #125). A geographic (1-D lat/lon) Zarr on a
+# public bucket is now runnable — give endpoint+bucket+path:
 #
 # [collections.zarr]
-# endpoint = "https://s3.amazonaws.com"
-# bucket = "hrrrzarr"
-# path = "sfc/20210101/20210101_00z_anl.zarr/2m_above_ground/TMP"
+# endpoint = "https://s3.us-west-2.amazonaws.com"
+# bucket = "mur-sst"
+# path = "zarr-v1"
+# parameters = ["analysed_sst"]
+#
+# (MUR-SST also trips the bad-chunking startup WARN by design — time=1,
+# lat=full, lon=full — so a point time-series there decodes a full field per
+# step. It's the issue's negative-test dataset.)
+#
+# HRRR-Zarr (s3://hrrrzarr/) is still NOT supported: it's on a Lambert Conformal
+# projected grid with 2-D lat/lon (no 1-D geographic coordinate variables),
+# which needs the projected/per-item-CRS work in Phase 4.
 # ---------------------------------------------------------------------------
