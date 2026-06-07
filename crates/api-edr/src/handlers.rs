@@ -1304,14 +1304,18 @@ async fn run_area_query(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
-    let reference_time = resolve_instance(engine, instance_id.as_deref())?;
 
-    // An area result is gridded / multi-coverage, not a single line plot.
+    // Static request-level checks before engine/instance resolution, so the
+    // instance variant rejects the same way as the non-instance `area_query`
+    // (e.g. `…/instances/x/area?f=png` → 400 "PNG not available", not a 404 on
+    // the instance). An area result is gridded / multi-coverage, not a plot.
     if parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))? == EdrFormat::Png {
         return Err(bad_request(&DataServerError::InvalidParameter(
             "PNG output is not available for area queries".into(),
         )));
     }
+
+    let reference_time = resolve_instance(engine, instance_id.as_deref())?;
 
     let datetime = params
         .datetime

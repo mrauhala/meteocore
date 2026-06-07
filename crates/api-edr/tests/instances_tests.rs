@@ -261,8 +261,8 @@ async fn instances_list_has_both_runs() {
         .iter()
         .map(|c| c["id"].as_str().unwrap())
         .collect();
-    assert!(ids.contains(&"20260607T0000Z"), "ids: {ids:?}");
-    assert!(ids.contains(&"20260607T1200Z"), "ids: {ids:?}");
+    // Ascending by reference time, latest last (the build_instances contract).
+    assert_eq!(ids, ["20260607T0000Z", "20260607T1200Z"], "order: {ids:?}");
 }
 
 #[tokio::test]
