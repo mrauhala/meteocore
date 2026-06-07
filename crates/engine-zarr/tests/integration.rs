@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use chrono::{TimeZone, Utc};
 use ds_core::config::ZarrConfig;
 use ds_core::edr_engine::EdrEngine;
+use ds_core::map_engine::{MapEngine, OutputCrs};
 use ds_core::model::CoverageResponse;
 use engine_zarr::ZarrEngine;
 
@@ -155,6 +156,113 @@ fn datetime_filter_selects_single_step() {
     assert_eq!(nd.shape, vec![1]);
     let v = nd.values[0].unwrap();
     assert!((v - 279.155).abs() < 0.02, "value {v}");
+}
+
+#[test]
+fn raster_info_describes_the_grid() {
+    let info = engine().raster_info();
+    assert_eq!(info.native_crs, "CRS:84");
+    assert_eq!(info.times.len(), 4);
+    assert!(info.spatial_extent.is_some());
+    assert_eq!(info.grid_size, Some([16, 12])); // [nx lon, ny lat]
+    let names: Vec<&str> = info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"t2m") && names.contains(&"t2m_packed"));
+}
+
+#[test]
+fn raster_tile_wgs84_matches_linear_field() {
+    let e = engine();
+    // Full extent, 16x12 — pixel (col=8,row=6) centres on (lon=8.0, lat=54.0).
+    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let tile = e
+        .get_raster_tile(
+            [-0.5, 48.5, 15.5, 60.5],
+            16,
+            12,
+            Some(t0),
+            &OutputCrs::Wgs84,
+            Some("t2m"),
+            None,
+        )
+        .unwrap();
+    assert_eq!(tile.values.len(), 16 * 12);
+    assert!(tile.values.iter().flatten().all(|v| v.is_finite()));
+    let v = tile.values[6 * 16 + 8].expect("pixel (8,6) has data");
+    // 273.15 + 0.1*54 + 0.01*8 = 278.63 at t=0.
+    assert!((v - 278.63).abs() < 0.05, "pixel value {v}");
+}
+
+#[test]
+fn raster_tile_projected_via_build_2d_no_nan_leak() {
+    // Exercises the OutputCrs::Projected coarse-grid path. TM math is globally
+    // valid, so projecting the fixture's region into EPSG:3067 metres and back
+    // must place data and never leak NaN.
+    let e = engine();
+    let crs = ds_core::geo::projected_output_crs("EPSG:3067").unwrap();
+    let proj = ds_core::geo::projected_envelope(&crs, [1.0, 50.0, 14.0, 59.0]);
+    let read = ds_core::geo::wgs84_envelope(&crs, proj).expect("in-domain envelope");
+    let tile = e
+        .get_raster_tile(
+            read,
+            16,
+            16,
+            None,
+            &OutputCrs::Projected { crs, bbox: proj },
+            Some("t2m"),
+            None,
+        )
+        .unwrap();
+    assert_eq!(tile.values.len(), 16 * 16);
+    assert!(
+        tile.values.iter().flatten().all(|v| v.is_finite()),
+        "no NaN may leak through the projected path"
+    );
+    assert!(
+        tile.values.iter().filter(|v| v.is_some()).count() > 0,
+        "projected tile should have data"
+    );
+}
+
+#[test]
+fn raster_tile_off_grid_is_transparent() {
+    let tile = engine()
+        .get_raster_tile(
+            [100.0, 0.0, 110.0, 5.0],
+            8,
+            8,
+            None,
+            &OutputCrs::Wgs84,
+            Some("t2m"),
+            None,
+        )
+        .unwrap();
+    assert_eq!(tile.values.len(), 64);
+    assert!(
+        tile.values.iter().all(|v| v.is_none()),
+        "off-grid → transparent"
+    );
+}
+
+#[test]
+fn raster_tile_between_cell_centres_still_renders() {
+    // A tile whose bbox falls entirely *between* grid cell centres (no centre
+    // inside it) must still interpolate from the bracketing cells, not render
+    // transparent. lon centres 0,1,2…; lat centres …55,54…; bbox in the gaps.
+    let tile = engine()
+        .get_raster_tile(
+            [4.3, 54.2, 4.7, 54.8],
+            4,
+            4,
+            None,
+            &OutputCrs::Wgs84,
+            Some("t2m"),
+            None,
+        )
+        .unwrap();
+    assert!(
+        tile.values.iter().any(|v| v.is_some()),
+        "between-centres tile must interpolate, not be transparent"
+    );
 }
 
 #[test]

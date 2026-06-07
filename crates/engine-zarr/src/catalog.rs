@@ -14,6 +14,7 @@ use zarrs::array::{data_type, Array, ArraySubset, CodecOptions};
 use zarrs::group::Group;
 
 use ds_core::error::DataServerError;
+use ds_core::map_engine::RasterInfo;
 
 use crate::cf::{self, AxisRole};
 use crate::store::DsStore;
@@ -87,9 +88,75 @@ pub struct Catalog {
     lons: Vec<f64>,
     /// Spatial extent `[west, south, east, north]` in WGS84 degrees.
     pub extent: [f64; 4],
+    /// Map-capabilities snapshot, built once here so `raster_info()` is O(1) and
+    /// swaps **atomically** with the data (one `ArcSwap<Catalog>`), with no
+    /// window where the advertised metadata and the served data disagree.
+    pub raster_info: RasterInfo,
 }
 
 impl Catalog {
+    /// Read a 2-D spatial slab of `var` at `time_idx` covering the WGS84 render
+    /// `bbox` (`[west, south, east, north]`), expanded by one cell so edge
+    /// pixels can interpolate. Returns `None` when the bbox lies entirely off
+    /// the grid. Used by the Map/Tiles/WMS render path.
+    pub fn read_window(
+        &self,
+        var: &Variable,
+        time_idx: usize,
+        bbox: [f64; 4],
+    ) -> Result<Option<Window>, DataServerError> {
+        let [west, south, east, north] = bbox;
+        let (Some((i0, i1)), Some((j0, j1))) = (
+            axis_window(&self.lons, west, east),
+            axis_window(&self.lats, south, north),
+        ) else {
+            return Ok(None); // bbox entirely outside the grid
+        };
+
+        let mut ranges: Vec<Range<u64>> = Vec::with_capacity(var.ndim);
+        for a in 0..var.ndim {
+            if Some(a) == var.time_axis {
+                ranges.push(time_idx as u64..time_idx as u64 + 1);
+            } else if a == var.lat_axis {
+                ranges.push(j0 as u64..(j1 as u64) + 1);
+            } else if a == var.lon_axis {
+                ranges.push(i0 as u64..(i1 as u64) + 1);
+            } else {
+                ranges.push(0..1);
+            }
+        }
+        let subset = ArraySubset::new_with_ranges(&ranges);
+        let raw = retrieve_raw_f64(&var.array, &subset)?;
+        let conv: Vec<Option<f64>> = raw.iter().map(|&r| var.convert(r)).collect();
+        let lens: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
+
+        let nrow = j1 - j0 + 1;
+        let ncol = i1 - i0 + 1;
+        let mut data = vec![None; nrow * ncol];
+        for r in 0..nrow {
+            for c in 0..ncol {
+                let mut off = 0usize;
+                for (a, &len) in lens.iter().enumerate() {
+                    let idx = if a == var.lat_axis {
+                        r
+                    } else if a == var.lon_axis {
+                        c
+                    } else {
+                        0 // time + any pinned dims
+                    };
+                    off = off * len + idx;
+                }
+                data[r * ncol + c] = conv[off];
+            }
+        }
+
+        Ok(Some(Window {
+            data,
+            lons: self.lons[i0..=i1].to_vec(),
+            lats: self.lats[j0..=j1].to_vec(),
+        }))
+    }
+
     /// Sample a variable's value at `(lon, lat)` for each requested time index,
     /// using bilinear interpolation over the surrounding grid cells (nearest
     /// fallback where a neighbour is nodata). Reads a single small hyperslab
@@ -173,6 +240,77 @@ impl Catalog {
             out.push(bilinear(v00, v01, v10, v11, wx, wy));
         }
         Ok(out)
+    }
+}
+
+/// An in-memory spatial slab of one variable at one time, covering a render
+/// bbox, with the slab's own (windowed) coordinate axes. Row-major, row `r` ↔
+/// `lats[r]`, column `c` ↔ `lons[c]`.
+pub struct Window {
+    data: Vec<Option<f64>>,
+    lons: Vec<f64>,
+    lats: Vec<f64>,
+}
+
+impl Window {
+    pub fn ncols(&self) -> usize {
+        self.lons.len()
+    }
+
+    pub fn nrows(&self) -> usize {
+        self.lats.len()
+    }
+
+    /// Fractional window pixel `(col_f, row_f)` for a WGS84 `(lon, lat)`. An
+    /// off-window coordinate yields a non-finite component, which
+    /// [`Window::bilinear_at`] rejects.
+    pub fn frac_px(&self, lon: f64, lat: f64) -> (f64, f64) {
+        let fx = cf::locate(&self.lons, lon)
+            .map(|(lo, _, w)| lo as f64 + w)
+            .unwrap_or(f64::NAN);
+        let fy = cf::locate(&self.lats, lat)
+            .map(|(lo, _, w)| lo as f64 + w)
+            .unwrap_or(f64::NAN);
+        (fx, fy)
+    }
+
+    /// Bilinearly sample at a fractional window pixel; `None` off-window or where
+    /// every neighbour is nodata.
+    pub fn bilinear_at(&self, col_f: f64, row_f: f64) -> Option<f64> {
+        if !col_f.is_finite() || !row_f.is_finite() {
+            return None;
+        }
+        let (ncol, nrow) = (self.lons.len() as isize, self.lats.len() as isize);
+        if ncol == 0 || nrow == 0 {
+            return None;
+        }
+        let c0 = col_f.floor() as isize;
+        let r0 = row_f.floor() as isize;
+        if c0 < -1 || c0 >= ncol || r0 < -1 || r0 >= nrow {
+            return None;
+        }
+        let (wx, wy) = (col_f - c0 as f64, row_f - r0 as f64);
+        let at = |r: isize, c: isize| -> Option<f64> {
+            if r < 0 || c < 0 || r >= nrow || c >= ncol {
+                None
+            } else {
+                self.data[r as usize * self.lons.len() + c as usize]
+            }
+        };
+        bilinear(
+            at(r0, c0),
+            at(r0, c0 + 1),
+            at(r0 + 1, c0),
+            at(r0 + 1, c0 + 1),
+            wx,
+            wy,
+        )
+    }
+
+    /// Sample directly at a WGS84 `(lon, lat)`.
+    pub fn sample(&self, lon: f64, lat: f64) -> Option<f64> {
+        let (fx, fy) = self.frac_px(lon, lat);
+        self.bilinear_at(fx, fy)
     }
 }
 
@@ -476,14 +614,54 @@ pub fn build(
 
     let (west, east) = axis_extent(&lons);
     let (south, north) = axis_extent(&lats);
+    let extent = [west, south, east, north];
+
+    let raster_info = build_raster_info(
+        &vars,
+        &times,
+        extent,
+        [lons.len() as u32, lats.len() as u32],
+    );
 
     Ok(Catalog {
         vars,
         times,
         lats,
         lons,
-        extent: [west, south, east, north],
+        extent,
+        raster_info,
     })
+}
+
+/// Build the map-capabilities snapshot (one layer per variable). Stored on the
+/// `Catalog` so `raster_info()` is O(1) and swaps atomically with the data.
+fn build_raster_info(
+    vars: &[Variable],
+    times: &[DateTime<Utc>],
+    extent: [f64; 4],
+    grid_size: [u32; 2],
+) -> RasterInfo {
+    let parameters: Vec<(String, String)> = vars
+        .iter()
+        .map(|v| (v.name.clone(), v.label.clone()))
+        .collect();
+    let (parameter, unit) = vars
+        .first()
+        .map(|v| (v.name.clone(), v.units.clone()))
+        .unwrap_or_default();
+    RasterInfo {
+        // Lon-first geographic grid → CRS:84 (not lat-first EPSG:4326), matching
+        // the other gridded engines' storageCrs.
+        native_crs: "CRS:84".to_string(),
+        spatial_extent: Some(extent),
+        times: times.to_vec(),
+        parameter,
+        unit,
+        parameters,
+        vertical: None,
+        grid_size: Some(grid_size),
+        layer_subtitle: None,
+    }
 }
 
 /// Classify a dimension by its coordinate variable's CF attributes (preferred)
@@ -566,6 +744,43 @@ fn warn_bad_chunking(
              query decodes the entire field for every timestep"
         );
     }
+}
+
+/// Index range `(lo, hi)` (inclusive) of the cells of a monotonic axis needed to
+/// render `[min, max]`: every cell whose half-cell footprint overlaps the
+/// interval, expanded by one cell each side so bilinear has its bracketing
+/// neighbours at the edge. `None` if the interval lies entirely off the axis.
+///
+/// Crucially this includes the *bracketing* cells even when no cell **centre**
+/// falls inside `[min, max]` — a zoomed-in tile sitting between two grid centres
+/// must still interpolate, not render transparent. Works for ascending or
+/// descending axes (it compares values, not index order).
+fn axis_window(axis: &[f64], min: f64, max: f64) -> Option<(usize, usize)> {
+    let n = axis.len();
+    if n == 0 {
+        return None;
+    }
+    if n == 1 {
+        // Single (collapsed) cell — `Window`/`locate` snap any target to it.
+        return Some((0, 0));
+    }
+    // Approximate half-cell width from the mean spacing (exact for regular
+    // axes, a reasonable footprint for irregular ones).
+    let span = (axis[n - 1] - axis[0]).abs();
+    let half = (span / (n - 1) as f64) / 2.0;
+
+    let (mut lo, mut hi) = (None, None);
+    for (i, &v) in axis.iter().enumerate() {
+        // Cell i covers roughly [v - half, v + half]; keep it if that overlaps
+        // the requested interval.
+        if v + half >= min && v - half <= max {
+            lo.get_or_insert(i);
+            hi = Some(i);
+        }
+    }
+    let lo = lo?.saturating_sub(1);
+    let hi = (hi? + 1).min(n - 1);
+    Some((lo, hi))
 }
 
 /// Edge extent `(min, max)` of a centred coordinate axis, expanded by half a

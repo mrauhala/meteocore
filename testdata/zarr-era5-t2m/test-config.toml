@@ -1,4 +1,4 @@
-# Runnable example for the Zarr engine (Phase 1, issue #125).
+# Runnable example for the Zarr engine (#125).
 #
 # This points at the committed synthetic fixture in this directory, so it works
 # out of the box with no network access:
@@ -9,6 +9,8 @@
 #
 #   curl 'http://127.0.0.1:8097/edr/collections/era5-t2m'
 #   curl 'http://127.0.0.1:8097/edr/collections/era5-t2m/position?coords=POINT(5.5%2054.5)'
+#   # a rendered PNG map (Phase 3):
+#   curl 'http://127.0.0.1:8097/maps/collections/era5-t2m/map?bbox=-0.5,48.5,15.5,60.5&width=256&height=192&crs=CRS:84&parameter-name=t2m' -o map.png
 #
 # Regenerate the fixture with:
 #   cargo run -p engine-zarr --example gen_fixture
@@ -22,7 +24,7 @@ id = "era5-t2m"
 title = "ERA5-like 2 m Temperature (Zarr V3)"
 description = "Synthetic CF-conventions Zarr V3 store: 2 m temperature over a small lat/lon window, served from a local directory."
 engine_type = "zarr"
-apis = ["edr"] # Phase 1 = EDR position queries only; WMS/Maps/Tiles is Phase 3.
+apis = ["edr", "wms", "maps", "tiles"]
 keywords = ["temperature", "reanalysis", "zarr"]
 
 [collections.zarr]
@@ -33,6 +35,10 @@ zarr_version = 3
 # `t2m_packed` (int16 with scale_factor/add_offset). Default = all.
 # parameters = ["t2m"]
 poll_interval_secs = 300
+
+# WMS/Maps/Tiles rendering needs a colormap (one layer per variable).
+[collections.wms]
+colormap = "temperature"
 
 # ---------------------------------------------------------------------------
 # Remote S3/HTTP backend (Phase 2, #125). A geographic (1-D lat/lon) Zarr on a
