@@ -114,9 +114,11 @@ async fn build_storage(
         }
         // Use icechunk's `object_store`-based S3 backend (the same `object_store`
         // crate `ds-storage` uses) rather than `new_s3_storage` (the `aws-sdk-s3`
-        // backend) — avoids pulling the whole AWS SDK. `S3Credentials::Anonymous`
-        // is the single source of truth for no-signing (public datasets only;
-        // authenticated/private repos are a v1 non-goal, #335).
+        // backend) — avoids pulling the whole AWS SDK. No-signing is set on
+        // `opts` via `with_anonymous(true)` above (this backend keys off
+        // `S3Options.anonymous`); `S3Credentials::Anonymous` is passed for the
+        // credentials slot for consistency. Public datasets only;
+        // authenticated/private repos are a v1 non-goal (#335).
         icechunk::storage::new_s3_object_store_storage(
             opts,
             bucket.to_string(),

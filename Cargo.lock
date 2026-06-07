@@ -1890,7 +1890,7 @@ dependencies = [
 [[package]]
 name = "icechunk"
 version = "2.0.6"
-source = "git+https://github.com/mrauhala/icechunk.git?branch=fix%2Fvirtual-chunks-utf8-capture#41f6921e0229928f1a121924d4d5b7c002f6bf7a"
+source = "git+https://github.com/mrauhala/icechunk.git?rev=41f6921e0229928f1a121924d4d5b7c002f6bf7a#41f6921e0229928f1a121924d4d5b7c002f6bf7a"
 dependencies = [
  "async-compression",
  "async-recursion",
@@ -1928,7 +1928,7 @@ dependencies = [
 [[package]]
 name = "icechunk-arrow-object-store"
 version = "2.0.6"
-source = "git+https://github.com/mrauhala/icechunk.git?branch=fix%2Fvirtual-chunks-utf8-capture#41f6921e0229928f1a121924d4d5b7c002f6bf7a"
+source = "git+https://github.com/mrauhala/icechunk.git?rev=41f6921e0229928f1a121924d4d5b7c002f6bf7a#41f6921e0229928f1a121924d4d5b7c002f6bf7a"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1949,7 +1949,7 @@ dependencies = [
 [[package]]
 name = "icechunk-format"
 version = "2.0.6"
-source = "git+https://github.com/mrauhala/icechunk.git?branch=fix%2Fvirtual-chunks-utf8-capture#41f6921e0229928f1a121924d4d5b7c002f6bf7a"
+source = "git+https://github.com/mrauhala/icechunk.git?rev=41f6921e0229928f1a121924d4d5b7c002f6bf7a#41f6921e0229928f1a121924d4d5b7c002f6bf7a"
 dependencies = [
  "base32",
  "bytes",
@@ -1974,7 +1974,7 @@ dependencies = [
 [[package]]
 name = "icechunk-storage"
 version = "2.0.6"
-source = "git+https://github.com/mrauhala/icechunk.git?branch=fix%2Fvirtual-chunks-utf8-capture#41f6921e0229928f1a121924d4d5b7c002f6bf7a"
+source = "git+https://github.com/mrauhala/icechunk.git?rev=41f6921e0229928f1a121924d4d5b7c002f6bf7a#41f6921e0229928f1a121924d4d5b7c002f6bf7a"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1994,7 +1994,7 @@ dependencies = [
 [[package]]
 name = "icechunk-types"
 version = "2.0.6"
-source = "git+https://github.com/mrauhala/icechunk.git?branch=fix%2Fvirtual-chunks-utf8-capture#41f6921e0229928f1a121924d4d5b7c002f6bf7a"
+source = "git+https://github.com/mrauhala/icechunk.git?rev=41f6921e0229928f1a121924d4d5b7c002f6bf7a#41f6921e0229928f1a121924d4d5b7c002f6bf7a"
 dependencies = [
  "serde",
  "serde_with",
@@ -5599,7 +5599,7 @@ dependencies = [
 [[package]]
 name = "zarrs_icechunk"
 version = "0.5.0"
-source = "git+https://github.com/mrauhala/zarrs_icechunk.git?branch=feat%2Fforward-icechunk-backend-features#4ff7690420900a5f9b576eb492452ca9da77540b"
+source = "git+https://github.com/mrauhala/zarrs_icechunk.git?rev=4ff7690420900a5f9b576eb492452ca9da77540b#4ff7690420900a5f9b576eb492452ca9da77540b"
 dependencies = [
  "async-trait",
  "futures",

@@ -58,8 +58,10 @@ debug = false
 # `object_store` S3 backend and drop the `aws-sdk-s3` tree (~28 MB / ~300 crates)
 # the published crate pulls via icechunk's default features. Non-breaking
 # (default still enables every backend). Upstream: zarrs/zarrs_icechunk#13.
-zarrs_icechunk = { git = "https://github.com/mrauhala/zarrs_icechunk.git", branch = "feat/forward-icechunk-backend-features" }
+# Pinned to an immutable `rev` (not the branch) so a future `cargo update` can't
+# silently follow a moved branch tip.
+zarrs_icechunk = { git = "https://github.com/mrauhala/zarrs_icechunk.git", rev = "4ff7690420900a5f9b576eb492452ca9da77540b" }
 # One-line fix so icechunk's `object-store-s3` backend compiles without the `s3`
 # (aws-sdk) feature (a bare `?` on a FromUtf8Error only convertible under `s3`;
 # virtual_chunks.rs). Upstream: earth-mover/icechunk#2190.
-icechunk = { git = "https://github.com/mrauhala/icechunk.git", branch = "fix/virtual-chunks-utf8-capture" }
+icechunk = { git = "https://github.com/mrauhala/icechunk.git", rev = "41f6921e0229928f1a121924d4d5b7c002f6bf7a" }
