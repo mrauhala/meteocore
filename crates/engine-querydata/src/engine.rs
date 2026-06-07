@@ -566,6 +566,15 @@ fn list_sqd_files(dir: &Path) -> Vec<PathBuf> {
 ///
 /// `files` is the directory listing (ascending; see [`list_sqd_files`]) — the
 /// caller lists once and passes it in so poll never reads the directory twice.
+///
+/// The "most recent" window is taken by **filename sort**, which assumes the
+/// standard `…YYYYMMDDHHMM.sqd` naming where lexical order matches origin-time
+/// order. This keeps poll cheap — only the window's files are parsed (others are
+/// reused from `prev` by path) rather than parsing every file in the directory
+/// to read its origin time. A reissued run whose filename sorts out of origin
+/// order could thus be windowed wrong; that's an accepted limitation of the
+/// naming-convention assumption (the BTreeMap still keys by origin time, and a
+/// same-origin collision is logged below).
 fn build_runset(files: &[PathBuf], max_runs: usize, prev: &RunSet, collection_id: &str) -> RunSet {
     // Keep only the most recent `max_runs` files (the listing is ascending).
     let window = &files[files.len().saturating_sub(max_runs)..];

@@ -993,6 +993,14 @@ pub async fn instances(
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
     let base = &state.base_url;
+    // A non-forecast collection (no instances) returns 200 with an empty
+    // `instances` list rather than 404. This is the standard REST list
+    // convention and matches `/collections` (empty ⇒ 200 `{"collections":[]}`),
+    // while the *item* paths `/instances/{id}[/…]` 404 for such collections.
+    // OGC EDR 1.1 §8.2.3 ("only applies to resources that have temporal
+    // instances") permits a stricter 404 here; the lenient 200-empty is the
+    // deliberate, self-consistent choice (the resource is never advertised for
+    // non-forecast collections, so conformant clients don't reach it).
     let runs = engine.get_instances();
     // Each instance doc rebuilds the run-invariant bits (parameters, spatial
     // extent) via build_collection_metadata. That's a handful of redundant

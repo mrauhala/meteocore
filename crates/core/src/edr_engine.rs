@@ -36,6 +36,10 @@ pub trait EdrEngine: Send + Sync {
     /// times cloned). Any engine whose `get_instances` is non-trivial MUST
     /// override this.
     fn has_instances(&self) -> bool {
+        // NOTE: forecast engines MUST override this — the default clones
+        // `Vec<RunInfo>` (with every run's valid times), acceptable only for the
+        // non-forecast engines that take it (where `get_instances` is `Vec::new()`).
+        // Not enforceable at compile time; see the doc above.
         !self.get_instances().is_empty()
     }
 
