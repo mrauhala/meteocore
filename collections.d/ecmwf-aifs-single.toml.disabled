@@ -7,7 +7,7 @@
 #
 # To run it from collections.d:
 #   1. rename this file to drop `.disabled`
-#   2. cargo run -p server --features icechunk --collections=ecmwf-aifs-single
+#   2. cargo run -p server --features icechunk -- --collections=ecmwf-aifs-single
 #      (the `--collections` filter avoids loading the other, remote, collections)
 #
 # Verified live: serves EDR + WMS/Maps/Tiles. NOTE temperature_2m is in degrees

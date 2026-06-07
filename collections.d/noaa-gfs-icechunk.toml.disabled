@@ -3,7 +3,7 @@
 #
 # DISABLED by default (needs the icechunk feature + network). To run:
 #   1. rename to drop `.disabled`
-#   2. cargo run -p server --features icechunk --collections=noaa-gfs-icechunk
+#   2. cargo run -p server --features icechunk -- --collections=noaa-gfs-icechunk
 #
 # Distinct id from the GRIB `noaa-gfs.toml` example. Forecast: the engine serves
 # the LATEST run with valid time (= run + lead) as the time axis (#337 for run
