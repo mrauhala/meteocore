@@ -1,0 +1,37 @@
+# Example: ECMWF AIFS-single forecast as an Icechunk repository on public S3
+# (dynamical.org, https://registry.opendata.aws/dynamical-ecmwf-aifs-single/).
+#
+# DISABLED by default (`.toml.disabled` is ignored by the loader) because it:
+#   1. requires the server to be built with the `icechunk` feature
+#      (`cargo build -p server --features engine-zarr/icechunk` once wired), and
+#   2. fetches from the network (anonymous AWS S3, us-west-2).
+#
+# To try it: build with the icechunk feature, confirm the variable names with
+# `aws s3 ls --no-sign-request s3://dynamical-ecmwf-aifs-single/`, set the
+# `parameters` filter accordingly, and rename this file to drop `.disabled`.
+
+id = "ecmwf-aifs-single"
+title = "ECMWF AIFS-single forecast (Icechunk)"
+description = "ECMWF AIFS deterministic AI forecast, global regular lat/lon, as an Icechunk repository on public S3 (dynamical.org, CC-BY-4.0)."
+engine_type = "zarr"
+apis = ["edr", "wms", "maps", "tiles"]
+keywords = ["forecast", "AIFS", "ECMWF", "icechunk"]
+
+[collections.license]
+title = "CC-BY-4.0"
+
+[zarr]
+endpoint = "https://s3.us-west-2.amazonaws.com"
+bucket = "dynamical-ecmwf-aifs-single"
+path = "ecmwf-aifs-single-forecast/v0.1.0.icechunk"
+# Set a parameter filter for a focused demo, e.g.:
+# parameters = ["temperature_2m"]
+
+# Presence of this table selects the Icechunk backend. Default version = branch
+# `main` HEAD (new forecast cycles surface on /admin/collections/reload).
+[zarr.icechunk]
+branch = "main"
+region = "us-west-2"
+
+[wms]
+colormap = "temperature"

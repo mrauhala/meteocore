@@ -28,6 +28,7 @@ fn config(parameters: Option<Vec<String>>) -> ZarrConfig {
         parameters,
         poll_interval_secs: 300,
         cache_mb: 256,
+        icechunk: None,
     }
 }
 

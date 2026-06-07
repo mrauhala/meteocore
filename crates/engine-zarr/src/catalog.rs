@@ -17,11 +17,12 @@ use ds_core::error::DataServerError;
 use ds_core::map_engine::RasterInfo;
 
 use crate::cf::{self, AxisRole};
-use crate::store::DsStore;
+use crate::store::EngineStore;
 
-/// The store type backing every Zarr collection: a `ds-storage` adapter that
-/// serves local, S3, and HTTP backends uniformly (#125 Phase 2).
-type Store = DsStore;
+/// The store type backing every Zarr collection. A backend-agnostic wrapper so
+/// the catalog stays non-generic across the plain (`ds-storage`) and Icechunk
+/// backends (#125 Phase 2, #335).
+type Store = EngineStore;
 
 /// Codec options that pin chunk retrieval to the **calling thread** by setting
 /// the concurrency target to 1. This is load-bearing: it stops zarrs from
