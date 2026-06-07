@@ -3,7 +3,7 @@
 #
 # DISABLED by default (needs the icechunk feature + network). To run:
 #   1. rename to drop `.disabled`
-#   2. cargo run -p server --features icechunk --collections=dwd-icon-eu
+#   2. cargo run -p server --features icechunk -- --collections=dwd-icon-eu
 #
 # Regional (Europe), regular lat/lon — a good non-global-extent test. Forecast:
 # the engine serves the LATEST run with valid time (= run + lead) as the time

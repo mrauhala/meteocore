@@ -191,7 +191,8 @@ async fn write_coord_i64(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn probe_aifs_schema() {
     use icechunk::repository::VersionInfo;
-    let storage = icechunk::storage::new_s3_storage(
+    // object_store backend (not the aws-sdk `new_s3_storage`), matching the engine.
+    let storage = icechunk::storage::new_s3_object_store_storage(
         icechunk::storage::S3Options::default()
             .with_endpoint_url("https://s3.us-west-2.amazonaws.com")
             .with_anonymous(true)
@@ -201,6 +202,7 @@ async fn probe_aifs_schema() {
         Some("ecmwf-aifs-single-forecast/v0.1.0.icechunk".to_string()),
         Some(icechunk::storage::S3Credentials::Anonymous),
     )
+    .await
     .expect("s3 storage");
     let repo = Repository::open(None, storage, HashMap::new())
         .await

@@ -102,17 +102,28 @@ async fn build_storage(
             // Path-style by default (S3-compatible + AWS regional endpoints);
             // override per config for virtual-host-style.
             .with_force_path_style(ic.force_path_style.unwrap_or(true))
-            .with_allow_http(endpoint.starts_with("http://"));
+            .with_allow_http(endpoint.starts_with("http://"))
+            // The object_store S3 backend keys anonymous access off
+            // `S3Options.anonymous` (→ `skip_signature`), NOT the `credentials`
+            // arg below. Without this it falls through to the AWS credential
+            // chain (env → profile → EC2 IMDS) and hangs/fails off-EC2. Public
+            // datasets only (authenticated repos are a v1 non-goal, #335).
+            .with_anonymous(true);
         if let Some(region) = ic.region.as_deref() {
             opts = opts.with_region(region);
         }
-        // `S3Credentials::Anonymous` is the single source of truth for no-signing.
-        icechunk::storage::new_s3_storage(
+        // Use icechunk's `object_store`-based S3 backend (the same `object_store`
+        // crate `ds-storage` uses) rather than `new_s3_storage` (the `aws-sdk-s3`
+        // backend) — avoids pulling the whole AWS SDK. `S3Credentials::Anonymous`
+        // is the single source of truth for no-signing (public datasets only;
+        // authenticated/private repos are a v1 non-goal, #335).
+        icechunk::storage::new_s3_object_store_storage(
             opts,
             bucket.to_string(),
             prefix,
             Some(icechunk::storage::S3Credentials::Anonymous),
         )
+        .await
         .map_err(|e| cfg_err(format!("failed to build Icechunk S3 storage: {e}")))
     } else if let Some(data_path) = config.data_path.as_deref() {
         // The local backend is a real directory only. A URL in `data_path`

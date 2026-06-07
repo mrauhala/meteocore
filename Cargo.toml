@@ -50,3 +50,16 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
+
+# Interim patches (icechunk feature only) — both submitted upstream; drop each
+# once a release including it lands on crates.io, then bump the version.
+[patch.crates-io]
+# Forward icechunk's backend features so `engine-zarr` can select the lighter
+# `object_store` S3 backend and drop the `aws-sdk-s3` tree (~28 MB / ~300 crates)
+# the published crate pulls via icechunk's default features. Non-breaking
+# (default still enables every backend). Upstream: zarrs/zarrs_icechunk#13.
+zarrs_icechunk = { git = "https://github.com/mrauhala/zarrs_icechunk.git", branch = "feat/forward-icechunk-backend-features" }
+# One-line fix so icechunk's `object-store-s3` backend compiles without the `s3`
+# (aws-sdk) feature (a bare `?` on a FromUtf8Error only convertible under `s3`;
+# virtual_chunks.rs). Upstream: earth-mover/icechunk#2190.
+icechunk = { git = "https://github.com/mrauhala/icechunk.git", branch = "fix/virtual-chunks-utf8-capture" }

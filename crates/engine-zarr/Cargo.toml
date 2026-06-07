@@ -32,8 +32,18 @@ thiserror = "2"
 
 # Icechunk support (#335) — optional/feature-gated; heavy transactional engine.
 # `zarrs/async` is required for the async Icechunk store + the async→sync adapter.
-icechunk = { version = "2", optional = true }
-zarrs_icechunk = { version = "0.5", optional = true }
+# Select only the `object_store`-based S3 backend (+ local filesystem), NOT
+# icechunk's default `s3` backend which pulls the full `aws-sdk-s3` tree — we
+# reuse the same `object_store` crate `ds-storage` already links. Requires the
+# `zarrs_icechunk` `[patch]` in the workspace root (it forwards these features).
+icechunk = { version = "2", optional = true, default-features = false, features = [
+    "object-store-s3",
+    "object-store-fs",
+] }
+zarrs_icechunk = { version = "0.5", optional = true, default-features = false, features = [
+    "object-store-s3",
+    "object-store-fs",
+] }
 
 [features]
 icechunk = ["dep:icechunk", "dep:zarrs_icechunk", "zarrs/async"]
