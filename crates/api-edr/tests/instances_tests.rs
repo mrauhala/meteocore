@@ -340,6 +340,12 @@ async fn instance_query_on_non_forecast_collection_is_404() {
         StatusCode::NOT_FOUND,
         "instance query on a non-forecast collection must be 404, not 200"
     );
+    // Even an unparseable id is 404 here (no instance sub-resources at all) —
+    // consistent between the metadata and query paths.
+    assert_eq!(
+        get("/collections/obs/instances/not-a-time").await.0,
+        StatusCode::NOT_FOUND
+    );
     // The plain (no-instance) position query still works.
     assert_eq!(
         get("/collections/obs/position?coords=POINT(25%2060)")

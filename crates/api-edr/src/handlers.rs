@@ -994,6 +994,11 @@ pub async fn instances(
     let (engine, config) = lookup_collection(&state, &id)?;
     let base = &state.base_url;
     let runs = engine.get_instances();
+    // Each instance doc rebuilds the run-invariant bits (parameters, spatial
+    // extent) via build_collection_metadata. That's a handful of redundant
+    // clones (run count is bounded — a few to a few dozen) on a low-QPS
+    // discovery endpoint, not the `/collections`/`/api` hot paths #211 guards —
+    // kept simple over threading a precomputed-metadata variant through.
     let instances: Vec<serde_json::Value> = runs
         .iter()
         .map(|run| build_collection_metadata(engine.as_ref(), config, base, Some(run)))
@@ -1019,6 +1024,18 @@ pub async fn instance(
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
     let base = &state.base_url;
+    // A collection with no instances has no instance sub-resources at all, so
+    // any id (parseable or not) is 404 — consistent with the query path's
+    // `resolve_instance` guard, rather than 400 on an unparseable id.
+    if !engine.has_instances() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "code": "NotFound",
+                "description": "This collection has no model-run instances"
+            })),
+        ));
+    }
     let rt = ds_core::instances::parse_instance_id(&instance_id).ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
