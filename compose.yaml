@@ -57,7 +57,7 @@ services:
       - --storage.tsdb.retention.time=7d
       - --web.enable-lifecycle
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/var/prometheus
     ports:
       - "9090:9090"
@@ -70,7 +70,7 @@ services:
     container_name: meteocore-loki
     command: -config.file=/etc/loki/config.yml
     volumes:
-      - ./loki/config.yml:/etc/loki/config.yml:ro
+      - ./docker/loki/config.yml:/etc/loki/config.yml:ro
       - loki-data:/loki
     ports:
       - "3100:3100"
@@ -94,7 +94,7 @@ services:
       - --server.http.listen-addr=0.0.0.0:12345
       - /etc/alloy/config.alloy
     volumes:
-      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - ./docker/alloy/config.alloy:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
       - alloy-data:/var/lib/alloy/data
@@ -118,8 +118,8 @@ services:
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
     volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     ports:
       - "3000:3000"
