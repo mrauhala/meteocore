@@ -104,6 +104,7 @@ macro_rules! impl_common {
                 _dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
                 _p: Option<&[String]>,
                 _z: Option<&[f64]>,
+                _rt: Option<DateTime<Utc>>,
             ) -> Result<CoverageResponse, DataServerError> {
                 Ok(CoverageResponse::Single($result))
             }
@@ -125,6 +126,7 @@ macro_rules! impl_common {
                 _dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
                 _p: Option<&[String]>,
                 _z: Option<&[f64]>,
+                _rt: Option<DateTime<Utc>>,
             ) -> Result<CoverageResponse, DataServerError> {
                 Ok(CoverageResponse::Single($result))
             }
@@ -134,6 +136,7 @@ macro_rules! impl_common {
                 _dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
                 _p: Option<&[String]>,
                 _z: Option<&[f64]>,
+                _rt: Option<DateTime<Utc>>,
             ) -> Result<CoverageResponse, DataServerError> {
                 Ok(CoverageResponse::Single($result))
             }

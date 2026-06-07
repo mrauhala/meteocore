@@ -1139,6 +1139,7 @@ async fn render_map(
             &output_crs,
             render_parameter.as_deref(),
             render_z,
+            None,
         )?;
         // If every pixel is nodata, skip colorization + encoding entirely.
         if tile.is_empty() {

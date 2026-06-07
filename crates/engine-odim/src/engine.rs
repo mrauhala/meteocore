@@ -1093,6 +1093,7 @@ fn source_label(source: &Source) -> String {
 }
 
 impl MapEngine for OdimEngine {
+    #[allow(clippy::too_many_arguments)]
     fn get_raster_tile(
         &self,
         bbox: [f64; 4],
@@ -1102,6 +1103,7 @@ impl MapEngine for OdimEngine {
         output_crs: &OutputCrs,
         _parameter: Option<&str>,
         _z: Option<f64>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         let entry = self.select_entry(time).ok_or_else(|| {
             DataServerError::Engine(format!(
@@ -1199,6 +1201,7 @@ impl MapEngine for OdimEngine {
             vertical: None, // 2-D composite, no vertical dimension
             grid_size: Some([self.seed_xsize, self.seed_ysize]),
             layer_subtitle: None,
+            reference_times: Vec::new(),
         }
     }
 }

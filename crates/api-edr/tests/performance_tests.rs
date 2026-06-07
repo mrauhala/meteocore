@@ -82,6 +82,7 @@ impl EdrEngine for ScalableEngine {
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let idx: usize = location_id
             .strip_prefix("loc_")

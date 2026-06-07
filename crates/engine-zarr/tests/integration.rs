@@ -156,7 +156,10 @@ fn forecast_uses_latest_run_with_lead_as_time() {
 
     // A position query at (lon=10, lat=60) must read the LATEST run (init=1):
     // value = 1*1000 + lead_idx + 0.1*60 + 0.01*10 = 1006.1, 1007.1, 1008.1.
-    let qr = single(e.query_position("POINT(10 60)", None, None, None).unwrap());
+    let qr = single(
+        e.query_position("POINT(10 60)", None, None, None, None)
+            .unwrap(),
+    );
     let vals = &qr.ranges.get("temp").unwrap().values;
     assert_eq!(vals.len(), 3);
     assert!(
@@ -182,6 +185,7 @@ fn forecast_uses_latest_run_with_lead_as_time() {
             Some(first),
             &OutputCrs::Wgs84,
             Some("temp"),
+            None,
             None,
         )
         .unwrap();
@@ -263,7 +267,7 @@ fn supported_query_types_is_position() {
 fn position_query_bilinear_matches_linear_field() {
     let e = engine();
     let qr = single(
-        e.query_position("POINT(5.5 54.5)", None, None, None)
+        e.query_position("POINT(5.5 54.5)", None, None, None, None)
             .unwrap(),
     );
     assert_eq!(qr.parameters.len(), 2);
@@ -294,6 +298,7 @@ fn fill_value_maps_to_nodata() {
             None,
             Some(&["t2m_packed".to_string()]),
             None,
+            None,
         )
         .unwrap(),
     );
@@ -308,7 +313,7 @@ fn parameter_filter_restricts_variables() {
     let e = ZarrEngine::new("zarr-test", &config(Some(vec!["t2m".to_string()]))).unwrap();
     assert_eq!(e.get_parameters(), vec!["t2m".to_string()]);
     let qr = single(
-        e.query_position("POINT(5.5 54.5)", None, None, None)
+        e.query_position("POINT(5.5 54.5)", None, None, None, None)
             .unwrap(),
     );
     assert_eq!(qr.parameters.len(), 1);
@@ -324,6 +329,7 @@ fn datetime_filter_selects_single_step() {
             "POINT(5.5 54.5)",
             Some((t, t)),
             Some(&["t2m".to_string()]),
+            None,
             None,
         )
         .unwrap(),
@@ -359,6 +365,7 @@ fn raster_tile_wgs84_matches_linear_field() {
             &OutputCrs::Wgs84,
             Some("t2m"),
             None,
+            None,
         )
         .unwrap();
     assert_eq!(tile.values.len(), 16 * 12);
@@ -386,6 +393,7 @@ fn raster_tile_projected_via_build_2d_no_nan_leak() {
             &OutputCrs::Projected { crs, bbox: proj },
             Some("t2m"),
             None,
+            None,
         )
         .unwrap();
     assert_eq!(tile.values.len(), 16 * 16);
@@ -410,6 +418,7 @@ fn raster_tile_off_grid_is_transparent() {
             &OutputCrs::Wgs84,
             Some("t2m"),
             None,
+            None,
         )
         .unwrap();
     assert_eq!(tile.values.len(), 64);
@@ -433,6 +442,7 @@ fn raster_tile_between_cell_centres_still_renders() {
             &OutputCrs::Wgs84,
             Some("t2m"),
             None,
+            None,
         )
         .unwrap();
     assert!(
@@ -450,7 +460,7 @@ fn off_grid_position_is_nodata() {
     // axes to locate).
     for coords in ["POINT(100.0 0.0)", "POINT(100.0 54.5)", "POINT(5.5 0.0)"] {
         let qr = single(
-            e.query_position(coords, None, Some(&only_t2m), None)
+            e.query_position(coords, None, Some(&only_t2m), None, None)
                 .unwrap(),
         );
         let nd = qr.ranges.get("t2m").unwrap();

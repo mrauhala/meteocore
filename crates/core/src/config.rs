@@ -439,6 +439,10 @@ fn default_poll_interval() -> u64 {
     30
 }
 
+fn default_querydata_max_runs() -> usize {
+    4
+}
+
 fn default_exclude_patterns() -> Vec<String> {
     vec!["*.tmp".to_string(), "*.part".to_string()]
 }
@@ -459,6 +463,12 @@ pub struct QueryDataConfig {
     /// Directory poll interval in seconds. Default: 30.
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
+    /// How many recent model runs (`.sqd` files, keyed by origin/analysis time)
+    /// to retain and expose as OGC EDR instances / a WMS `reference_time`
+    /// dimension. The newest run is always the default for un-pinned queries.
+    /// Default: 4. Set to 1 to keep only the latest run (no model-run history).
+    #[serde(default = "default_querydata_max_runs")]
+    pub max_runs: usize,
 }
 
 /// Configuration for the ODIM_H5 weather-radar engine

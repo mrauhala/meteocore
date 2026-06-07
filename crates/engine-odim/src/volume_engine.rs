@@ -2922,6 +2922,7 @@ pub struct PolarVolumeSiteView {
 }
 
 impl MapEngine for PolarVolumeSiteView {
+    #[allow(clippy::too_many_arguments)]
     fn get_raster_tile(
         &self,
         bbox: [f64; 4],
@@ -2931,6 +2932,7 @@ impl MapEngine for PolarVolumeSiteView {
         output_crs: &OutputCrs,
         parameter: Option<&str>,
         z: Option<f64>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         let catalog = self.catalog.load();
         // A per-site PVOL collection is still multi-parameter — one layer per
@@ -3024,6 +3026,7 @@ impl MapEngine for PolarVolumeSiteView {
             // value `get_locations` uses — so WMS can prefix each child
             // layer's title and flat clients can tell the sites apart.
             layer_subtitle: meta.map(|m| m.plc.clone().unwrap_or_else(|| self.nod.clone())),
+            reference_times: Vec::new(),
         }
     }
 }
@@ -3055,6 +3058,7 @@ impl EdrEngine for PolarVolumeSiteView {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         if location_id != self.nod {
             return Err(DataServerError::LocationNotFound(location_id.to_string()));
@@ -3153,6 +3157,7 @@ impl EdrEngine for PolarVolumeSiteView {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let (lat, lon) = parse_point_coords(coords)?;
         let catalog = self.catalog.load();
@@ -3207,6 +3212,7 @@ impl EdrEngine for PolarVolumeSiteView {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let polygon = parse_area_coords(coords)?;
         let catalog = self.catalog.load();
@@ -3265,6 +3271,7 @@ impl EdrEngine for PolarVolumeSiteView {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let path = resample_section_path(coords)?;
         let catalog = self.catalog.load();
@@ -4792,6 +4799,7 @@ mod tests {
             &OutputCrs::Wgs84,
             Some("DBZH"),
             None,
+            None,
         )
         .expect("render with a bare quantity");
         assert_eq!(tile.values.len(), 32 * 4);
@@ -4803,8 +4811,18 @@ mod tests {
         // No parameter named → render the site's primary (first) quantity,
         // not a 400, so a bare `LAYERS={site}` WMS / Maps request works.
         assert!(
-            MapEngine::get_raster_tile(&view, bbox, 32, 4, None, &OutputCrs::Wgs84, None, None)
-                .is_ok(),
+            MapEngine::get_raster_tile(
+                &view,
+                bbox,
+                32,
+                4,
+                None,
+                &OutputCrs::Wgs84,
+                None,
+                None,
+                None
+            )
+            .is_ok(),
             "a bare (no-parameter) render must default to the primary quantity"
         );
 
@@ -4820,6 +4838,7 @@ mod tests {
                 None,
                 &OutputCrs::Wgs84,
                 Some("DBZH"),
+                None,
                 None,
             ),
             Err(DataServerError::LocationNotFound(_))
@@ -4920,7 +4939,7 @@ mod tests {
         // (`CoverageResponse` is not `Debug`, so assert on the variant.)
         assert!(
             matches!(
-                EdrEngine::query_position(&view, "POINT(25.0 60.0)", None, None, None),
+                EdrEngine::query_position(&view, "POINT(25.0 60.0)", None, None, None, None),
                 Err(DataServerError::LocationNotFound(_))
             ),
             "an all-empty point coverage must be LocationNotFound, not HTTP 200"
@@ -4929,7 +4948,7 @@ mod tests {
         // Same for an area query whose polygon contains the antenna.
         assert!(
             matches!(
-                EdrEngine::query_area(&view, "24.0,59.0,26.0,61.0", None, None, None),
+                EdrEngine::query_area(&view, "24.0,59.0,26.0,61.0", None, None, None, None),
                 Err(DataServerError::LocationNotFound(_))
             ),
             "an all-empty area coverage must be LocationNotFound"
@@ -4951,14 +4970,14 @@ mod tests {
         // Single elevation angle → still a CoverageCollection.
         assert!(
             matches!(
-                EdrEngine::query_area(&view, "24.0,59.0,26.0,61.0", None, None, Some(&[0.5])),
+                EdrEngine::query_area(&view, "24.0,59.0,26.0,61.0", None, None, Some(&[0.5]), None),
                 Ok(CoverageResponse::Collection(_))
             ),
             "a single-z area query must stay a CoverageCollection"
         );
         // No z → also a Collection (one VerticalProfile per timestep).
         assert!(matches!(
-            EdrEngine::query_area(&view, "24.0,59.0,26.0,61.0", None, None, None),
+            EdrEngine::query_area(&view, "24.0,59.0,26.0,61.0", None, None, None, None),
             Ok(CoverageResponse::Collection(_))
         ));
     }
@@ -5007,6 +5026,7 @@ mod tests {
             &OutputCrs::Wgs84,
             Some("VRADH"),
             None,
+            None,
         )
         .expect("a higher-sweep-only quantity must render, not 400");
         assert_eq!(tile.values.len(), 16 * 4);
@@ -5048,14 +5068,14 @@ mod tests {
         // ~5° east at 60°N ≈ 280 km — well beyond the 100 km radius.
         assert!(
             matches!(
-                EdrEngine::query_position(&view, "POINT(30.0 60.0)", None, None, None),
+                EdrEngine::query_position(&view, "POINT(30.0 60.0)", None, None, None, None),
                 Err(DataServerError::LocationNotFound(_))
             ),
             "a point outside the coverage radius must be 404"
         );
         // ~11 km north — inside coverage, resolves to a coverage.
         assert!(
-            EdrEngine::query_position(&view, "POINT(25.0 60.1)", None, None, None).is_ok(),
+            EdrEngine::query_position(&view, "POINT(25.0 60.1)", None, None, None, None).is_ok(),
             "a point within coverage must succeed"
         );
     }
@@ -5078,7 +5098,7 @@ mod tests {
         ));
         // ...and a direct query_location returns 404, not InvalidParameter.
         assert!(matches!(
-            EdrEngine::query_location(&view, "fivih", None, None, None),
+            EdrEngine::query_location(&view, "fivih", None, None, None, None),
             Err(DataServerError::LocationNotFound(_))
         ));
         // ...and so does query_trajectory (same by_site_meta gate).
@@ -5086,6 +5106,7 @@ mod tests {
             EdrEngine::query_trajectory(
                 &view,
                 "LINESTRING(24.5 60.3, 24.5 60.9)",
+                None,
                 None,
                 None,
                 None
@@ -5118,6 +5139,7 @@ mod tests {
                 None,
                 Some(&["DBZH".to_string()]),
                 Some(&[15.0]),
+                None,
             ),
             Err(DataServerError::LocationNotFound(_))
         ));
@@ -5142,14 +5164,14 @@ mod tests {
         let dlat_70 = 70_000.0 / EARTH_RADIUS_M * 180.0 / std::f64::consts::PI;
         let near = format!("POINT(25.0 {})", 60.0 + dlat_70);
         assert!(
-            EdrEngine::query_position(&view, &near, None, None, None).is_ok(),
+            EdrEngine::query_position(&view, &near, None, None, None, None).is_ok(),
             "a point within the longest sweep's range must not be rejected"
         );
         // ~200 km: beyond every sweep → 404.
         let dlat_200 = 200_000.0 / EARTH_RADIUS_M * 180.0 / std::f64::consts::PI;
         let far = format!("POINT(25.0 {})", 60.0 + dlat_200);
         assert!(matches!(
-            EdrEngine::query_position(&view, &far, None, None, None),
+            EdrEngine::query_position(&view, &far, None, None, None, None),
             Err(DataServerError::LocationNotFound(_))
         ));
     }
@@ -5167,7 +5189,7 @@ mod tests {
 
         // Even at the antenna itself — no usable geometry → fail closed.
         assert!(matches!(
-            EdrEngine::query_position(&view, "POINT(25.0 60.0)", None, None, None),
+            EdrEngine::query_position(&view, "POINT(25.0 60.0)", None, None, None, None),
             Err(DataServerError::LocationNotFound(_))
         ));
     }

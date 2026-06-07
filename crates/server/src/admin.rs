@@ -837,12 +837,14 @@ pub fn load_collections(
                 let qd_config = collection.querydata.as_ref();
                 let wms_param = qd_config.and_then(|c| c.wms_parameter.as_deref());
                 let poll_secs = qd_config.map_or(30, |c| c.poll_interval_secs);
+                let max_runs = qd_config.map_or(4, |c| c.max_runs);
 
                 let engine = match engine_querydata::QueryDataEngine::new(
                     std::path::Path::new(data_path),
                     &collection.id,
                     wms_param,
                     poll_secs,
+                    max_runs,
                 ) {
                     Ok(e) => Arc::new(e),
                     Err(e) => {

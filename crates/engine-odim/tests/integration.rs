@@ -124,6 +124,7 @@ fn get_raster_tile_over_denmark_renders() {
             &OutputCrs::Wgs84,
             None,
             None,
+            None,
         )
         .expect("render succeeds");
 
@@ -149,6 +150,7 @@ fn get_raster_tile_in_web_mercator_renders() {
             &OutputCrs::WebMercator,
             None,
             None,
+            None,
         )
         .expect("Mercator render succeeds");
 
@@ -172,7 +174,7 @@ fn get_raster_tile_full_extent_does_not_panic() {
     let bbox = info.spatial_extent.expect("fixture has spatial extent");
 
     let tile = engine
-        .get_raster_tile(bbox, 32, 32, None, &OutputCrs::Wgs84, None, None)
+        .get_raster_tile(bbox, 32, 32, None, &OutputCrs::Wgs84, None, None, None)
         .expect("full-extent render succeeds");
 
     assert_eq!(tile.values.len(), 32 * 32);
@@ -213,7 +215,9 @@ fn edr_metadata_is_consistent() {
     // ODIM has no station list — locations is empty, query_location
     // is unsupported.
     assert!(engine.get_locations().unwrap().is_empty());
-    assert!(engine.query_location("anything", None, None, None).is_err());
+    assert!(engine
+        .query_location("anything", None, None, None, None)
+        .is_err());
 }
 
 /// `query_position` over central Denmark returns a `PointSeries`
@@ -224,7 +228,7 @@ fn edr_metadata_is_consistent() {
 fn edr_query_position_returns_point_series() {
     let (engine, _guard) = dmi_engine();
     let response = engine
-        .query_position("POINT(10.5 56.0)", None, None, None)
+        .query_position("POINT(10.5 56.0)", None, None, None, None)
         .expect("position query succeeds");
     let result = match response {
         CoverageResponse::Single(qr) => qr,
@@ -254,7 +258,7 @@ fn edr_query_position_returns_point_series() {
 fn edr_query_position_off_grid_is_none() {
     let (engine, _guard) = dmi_engine();
     let response = engine
-        .query_position("POINT(-140.0 12.0)", None, None, None)
+        .query_position("POINT(-140.0 12.0)", None, None, None, None)
         .expect("off-grid position query still succeeds");
     let result = match response {
         CoverageResponse::Single(qr) => qr,
@@ -274,6 +278,7 @@ fn edr_query_position_rejects_unknown_parameter() {
             None,
             Some(&["temperature".to_string()]),
             None,
+            None,
         )
         .unwrap_err();
     assert!(format!("{err}").contains("Unknown parameter"));
@@ -286,7 +291,7 @@ fn edr_query_position_rejects_unknown_parameter() {
 fn edr_query_area_returns_grid() {
     let (engine, _guard) = dmi_engine();
     let result = engine
-        .query_area("9.0,55.0,12.0,57.5", None, None, None)
+        .query_area("9.0,55.0,12.0,57.5", None, None, None, None)
         .expect("area query succeeds");
 
     let coverage = match result {
@@ -367,7 +372,7 @@ fn edr_query_area_rejects_too_many_timesteps() {
 
     // No datetime filter → all 65 entries → over the cap → error.
     let err = engine
-        .query_area("9.0,55.0,12.0,57.5", None, None, None)
+        .query_area("9.0,55.0,12.0,57.5", None, None, None, None)
         .unwrap_err();
     assert!(
         format!("{err}").contains("maximum is 64"),
@@ -380,7 +385,7 @@ fn edr_query_area_rejects_too_many_timesteps() {
     let end = Utc.with_ymd_and_hms(2026, 5, 14, 0, 30, 0).unwrap();
     assert!(
         engine
-            .query_area("9.0,55.0,12.0,57.5", Some((start, end)), None, None)
+            .query_area("9.0,55.0,12.0,57.5", Some((start, end)), None, None, None)
             .is_ok(),
         "a 7-timestep window must stay under the cap"
     );
@@ -395,6 +400,7 @@ fn edr_query_area_masks_outside_polygon() {
     let result = engine
         .query_area(
             "POLYGON((9.0 55.0, 12.0 55.0, 9.0 57.0, 9.0 55.0))",
+            None,
             None,
             None,
             None,
@@ -508,6 +514,7 @@ fn pvol_engine_renders_fmi_vihti_volume() {
             None,
             &OutputCrs::Wgs84,
             Some(&render_param),
+            None,
             None,
         )
         .expect("PVOL site get_raster_tile over the coverage bbox");
@@ -724,6 +731,7 @@ fn pvol_engine_remote_scan_discovers_fmi_volume() {
             &OutputCrs::Wgs84,
             Some(&render_param),
             None,
+            None,
         )
         .expect("render of the remotely-scanned volume succeeds");
     assert_eq!(tile.values.len(), 64 * 64);
@@ -775,6 +783,7 @@ fn pvol_bare_render_defaults_to_primary_quantity() {
             8,
             None,
             &OutputCrs::Wgs84,
+            None,
             None,
             None,
         )
@@ -863,7 +872,7 @@ fn pvol_edr_position_outside_coverage_is_404() {
     };
     assert!(
         matches!(
-            EdrEngine::query_position(&view, "POINT(-100 40)", None, None, None),
+            EdrEngine::query_position(&view, "POINT(-100 40)", None, None, None, None),
             Err(ds_core::error::DataServerError::LocationNotFound(_))
         ),
         "a point ~7000 km from the radar must be outside coverage (404)"
@@ -878,7 +887,7 @@ fn pvol_edr_query_position_returns_vertical_profiles() {
         return;
     };
     // ~30 km north of Vihti — inside the lowest sweep.
-    let response = EdrEngine::query_position(&view, "POINT(24.5 60.85)", None, None, None)
+    let response = EdrEngine::query_position(&view, "POINT(24.5 60.85)", None, None, None, None)
         .expect("position query inside radar coverage");
     let coverages = match response {
         CoverageResponse::Collection(c) => c,
@@ -915,7 +924,7 @@ fn pvol_edr_query_position_with_z_returns_point_series() {
     let vertical = EdrEngine::get_vertical_extent(&view).expect("PVOL has a vertical extent");
     let level = vertical.levels[0];
     let response =
-        EdrEngine::query_position(&view, "POINT(24.5 60.85)", None, None, Some(&[level]))
+        EdrEngine::query_position(&view, "POINT(24.5 60.85)", None, None, Some(&[level]), None)
             .expect("z-pinned position query");
     let result = match response {
         CoverageResponse::Single(qr) => qr,
@@ -937,7 +946,7 @@ fn pvol_edr_query_location_by_nod() {
         eprintln!("skipping pvol_edr_query_location_by_nod: fixture absent");
         return;
     };
-    let response = EdrEngine::query_location(&view, "fivih", None, None, None)
+    let response = EdrEngine::query_location(&view, "fivih", None, None, None, None)
         .expect("query_location for the fivih site");
     let coverages = match response {
         CoverageResponse::Collection(c) => c,
@@ -951,7 +960,7 @@ fn pvol_edr_query_location_by_nod() {
         ));
     }
 
-    match EdrEngine::query_location(&view, "nosuchsite", None, None, None) {
+    match EdrEngine::query_location(&view, "nosuchsite", None, None, None, None) {
         Err(ds_core::error::DataServerError::LocationNotFound(_)) => {}
         other => panic!("unknown location id must be LocationNotFound, got {other:?}"),
     }
@@ -966,7 +975,7 @@ fn pvol_edr_query_area_collects_sites() {
         return;
     };
     // A bbox enclosing Vihti (24.50E, 60.56N).
-    let result = EdrEngine::query_area(&view, "23.0,59.0,26.0,62.0", None, None, None)
+    let result = EdrEngine::query_area(&view, "23.0,59.0,26.0,62.0", None, None, None, None)
         .expect("area query enclosing the fivih site");
     match result {
         CoverageResponse::Collection(coverages) => {
@@ -987,7 +996,7 @@ fn pvol_edr_query_area_collects_sites() {
     }
 
     // A polygon far from any FMI radar matches nothing.
-    match EdrEngine::query_area(&view, "0.0,0.0,1.0,1.0", None, None, None) {
+    match EdrEngine::query_area(&view, "0.0,0.0,1.0,1.0", None, None, None, None) {
         Err(ds_core::error::DataServerError::LocationNotFound(_)) => {}
         other => panic!("an empty area must be LocationNotFound, got {other:?}"),
     }
@@ -1019,6 +1028,7 @@ fn pvol_edr_query_trajectory_returns_section() {
         None,
         Some(&["DBZH".to_string()]),
         Some(&[0.5, 5.0]),
+        None,
     )
     .expect("trajectory query inside radar coverage");
     let qr = match &response {
@@ -1074,6 +1084,7 @@ fn pvol_edr_query_trajectory_out_of_coverage_yields_empty_cells() {
         None,
         Some(&["DBZH".to_string()]),
         Some(&[0.5, 3.0]),
+        None,
     ) {
         Ok(response) => {
             let qr = match response {
@@ -1110,7 +1121,7 @@ fn pvol_edr_query_trajectory_rejects_malformed_linestring() {
         "LINESTRINGZ(27.1 60.9 0, 27.1 61.1 100)",
         "LINESTRING(NaN 60.9, 27.1 61.1)",
     ] {
-        match EdrEngine::query_trajectory(&view, bad, None, None, None) {
+        match EdrEngine::query_trajectory(&view, bad, None, None, None, None) {
             Err(ds_core::error::DataServerError::InvalidParameter(_)) => {}
             other => panic!("expected InvalidParameter for `{bad}`, got {other:?}"),
         }
@@ -1209,6 +1220,7 @@ fn comp_engine_remote_scan_discovers_and_renders_dmi_fixture() {
             64,
             None,
             &OutputCrs::Wgs84,
+            None,
             None,
             None,
         )

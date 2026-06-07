@@ -124,6 +124,45 @@ fn lookup_collection<'a>(
     Ok((engine, config))
 }
 
+/// Resolve an optional `{instanceId}` path segment to a forecast model run.
+///
+/// `None` (the no-instance routes) ⇒ `Ok(None)` (the engine serves its latest
+/// run). `Some(id)` ⇒ parse the id to a reference time ([`instances::parse_instance_id`])
+/// and confirm the engine exposes that run (`get_instances`): an unparseable id
+/// is 400, an unknown run is 404. The validated reference time is then passed to
+/// the engine query methods.
+fn resolve_instance(
+    engine: &Arc<dyn EdrEngine>,
+    instance_id: Option<&str>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(iid) = instance_id else {
+        return Ok(None);
+    };
+    let rt = ds_core::instances::parse_instance_id(iid).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "BadRequest",
+                "description": format!("Invalid instance id '{iid}' (expected a reference time like 20260607T0600Z)")
+            })),
+        )
+    })?;
+    if !engine
+        .get_instances()
+        .iter()
+        .any(|r| r.reference_time == rt)
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "code": "NotFound",
+                "description": format!("Instance '{iid}' not found")
+            })),
+        ));
+    }
+    Ok(Some(rt))
+}
+
 /// Parse and resolve the request `z` parameter into the concrete level
 /// list an engine samples.
 ///
@@ -471,6 +510,117 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 }
             });
         }
+
+        // Instances (forecast model runs; #337). Only advertised for engines
+        // that expose runs, so the OpenAPI spec matches the `instances`
+        // data_query in the collection metadata.
+        let has_instances = state
+            .engines
+            .get(id)
+            .map(|e| !e.get_instances().is_empty())
+            .unwrap_or(false);
+        if has_instances {
+            let instance_id_param = json!({
+                "name": "instanceId",
+                "in": "path",
+                "required": true,
+                "description": "Forecast model run (reference time), e.g. 20260607T0600Z.",
+                "schema": {"type": "string"}
+            });
+            let instances_path = format!("/edr/collections/{id}/instances");
+            collection_paths[&instances_path] = json!({
+                "get": {
+                    "summary": format!("List model runs (instances) for {}", config.title),
+                    "operationId": format!("getInstances_{id}"),
+                    "tags": [id],
+                    "responses": {
+                        "200": {"description": "Available instances (model runs)"},
+                        "404": {"description": "Collection not found"}
+                    }
+                }
+            });
+            let instance_path = format!("/edr/collections/{id}/instances/{{instanceId}}");
+            collection_paths[&instance_path] = json!({
+                "get": {
+                    "summary": format!("Get one model run's metadata for {}", config.title),
+                    "operationId": format!("getInstance_{id}"),
+                    "tags": [id],
+                    "parameters": [instance_id_param.clone()],
+                    "responses": {
+                        "200": {"description": "Instance (model run) metadata"},
+                        "400": {"description": "Bad request"},
+                        "404": {"description": "Instance not found"}
+                    }
+                }
+            });
+            if supported.contains("position") {
+                let p = format!("/edr/collections/{id}/instances/{{instanceId}}/position");
+                collection_paths[&p] = json!({
+                    "get": {
+                        "summary": format!("Position query against a model run for {}", config.title),
+                        "operationId": format!("getInstancePosition_{id}"),
+                        "tags": [id],
+                        "parameters": [
+                            instance_id_param.clone(),
+                            {"$ref": "#/components/parameters/coords-point"},
+                            {"$ref": "#/components/parameters/datetime"},
+                            {"$ref": "#/components/parameters/parameter-name"},
+                            {"$ref": "#/components/parameters/z"},
+                            {
+                                "name": "f",
+                                "in": "query",
+                                "required": false,
+                                "schema": {"type": "string", "enum": ["CoverageJSON", "PNG"]}
+                            }
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "Coverage data",
+                                "content": {
+                                    "application/prs.coverage+json": {
+                                        "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                                    },
+                                    "image/png": {"schema": {"type": "string", "format": "binary"}}
+                                }
+                            },
+                            "400": {"description": "Bad request"},
+                            "404": {"description": "Not found"},
+                            "500": {"description": "Server error"}
+                        }
+                    }
+                });
+            }
+            if supported.contains("area") {
+                let p = format!("/edr/collections/{id}/instances/{{instanceId}}/area");
+                collection_paths[&p] = json!({
+                    "get": {
+                        "summary": format!("Area query against a model run for {}", config.title),
+                        "operationId": format!("getInstanceArea_{id}"),
+                        "tags": [id],
+                        "parameters": [
+                            instance_id_param.clone(),
+                            {"$ref": "#/components/parameters/coords-polygon"},
+                            {"$ref": "#/components/parameters/datetime"},
+                            {"$ref": "#/components/parameters/parameter-name"},
+                            {"$ref": "#/components/parameters/z"}
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "Coverage data",
+                                "content": {
+                                    "application/prs.coverage+json": {
+                                        "schema": {"$ref": "#/components/schemas/coverageJSON"}
+                                    }
+                                }
+                            },
+                            "400": {"description": "Bad request"},
+                            "404": {"description": "Not found"},
+                            "500": {"description": "Server error"}
+                        }
+                    }
+                });
+            }
+        }
     }
 
     let mut paths = json!({
@@ -676,7 +826,7 @@ pub async fn collections(
                 );
                 return None;
             };
-            let value = build_collection_metadata(engine.as_ref(), config, base);
+            let value = build_collection_metadata(engine.as_ref(), config, base, None);
             Some((
                 config.id.clone(),
                 config.title.clone(),
@@ -797,9 +947,13 @@ pub async fn collection(
     let (engine, config) = lookup_collection(&state, &id)?;
     let base = &state.base_url;
     Ok(with_vary(match wanted {
-        Wanted::Json => {
-            Json(build_collection_metadata(engine.as_ref(), config, base)).into_response()
-        }
+        Wanted::Json => Json(build_collection_metadata(
+            engine.as_ref(),
+            config,
+            base,
+            None,
+        ))
+        .into_response(),
         Wanted::Html => {
             let card = CollectionCard {
                 id: config.id.clone(),
@@ -824,6 +978,69 @@ pub async fn collection(
             Html(ds_core::html::collection_html(&card, &links)).into_response()
         }
     }))
+}
+
+/// `GET /collections/{id}/instances` — list the collection's forecast model runs
+/// as OGC API - EDR instances. Empty `collections` for non-forecast engines.
+pub async fn instances(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let state = state.load_full();
+    let (engine, config) = lookup_collection(&state, &id)?;
+    let base = &state.base_url;
+    let runs = engine.get_instances();
+    let collections: Vec<serde_json::Value> = runs
+        .iter()
+        .map(|run| build_collection_metadata(engine.as_ref(), config, base, Some(run)))
+        .collect();
+    Ok(Json(json!({
+        "links": [{
+            "href": format!("{base}/edr/collections/{}/instances", config.id),
+            "rel": "self",
+            "type": "application/json",
+            "title": format!("{} — instances", config.title)
+        }],
+        "collections": collections,
+    })))
+}
+
+/// `GET /collections/{id}/instances/{instanceId}` — one model run's metadata.
+pub async fn instance(
+    Path((id, instance_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let state = state.load_full();
+    let (engine, config) = lookup_collection(&state, &id)?;
+    let base = &state.base_url;
+    let rt = ds_core::instances::parse_instance_id(&instance_id).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "BadRequest",
+                "description": format!("Invalid instance id '{instance_id}' (expected a reference time like 20260607T0600Z)")
+            })),
+        )
+    })?;
+    let runs = engine.get_instances();
+    let run = runs
+        .iter()
+        .find(|r| r.reference_time == rt)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "code": "NotFound",
+                    "description": format!("Instance '{instance_id}' not found")
+                })),
+            )
+        })?;
+    Ok(Json(build_collection_metadata(
+        engine.as_ref(),
+        config,
+        base,
+        Some(run),
+    )))
 }
 
 pub async fn locations(
@@ -881,7 +1098,13 @@ pub async fn location_query(
     let z = resolve_request_z(engine, params.z.as_deref())?;
 
     let result = engine
-        .query_location(&loc_id, datetime, param_names.as_deref(), z.as_deref())
+        .query_location(
+            &loc_id,
+            datetime,
+            param_names.as_deref(),
+            z.as_deref(),
+            None,
+        )
         .map_err(|e| match &e {
             ds_core::error::DataServerError::LocationNotFound(_) => (
                 StatusCode::NOT_FOUND,
@@ -909,8 +1132,28 @@ pub async fn position_query(
     Query(params): Query<PositionQueryParams>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    run_position_query(id, None, params, state).await
+}
+
+/// `GET /collections/{id}/instances/{instanceId}/position` — position query
+/// against a specific forecast model run.
+pub async fn instance_position_query(
+    Path((id, instance_id)): Path<(String, String)>,
+    Query(params): Query<PositionQueryParams>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    run_position_query(id, Some(instance_id), params, state).await
+}
+
+async fn run_position_query(
+    id: String,
+    instance_id: Option<String>,
+    params: PositionQueryParams,
+    state: AppState,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
+    let reference_time = resolve_instance(engine, instance_id.as_deref())?;
 
     let datetime = params
         .datetime
@@ -967,7 +1210,13 @@ pub async fn position_query(
 
     if points.len() == 1 {
         let result = engine
-            .query_position(&points[0], datetime, param_names.as_deref(), z.as_deref())
+            .query_position(
+                &points[0],
+                datetime,
+                param_names.as_deref(),
+                z.as_deref(),
+                reference_time,
+            )
             .map_err(|e| map_engine_error(&e))?;
         return render_coverage_response(result, format, params.width, params.height);
     }
@@ -977,7 +1226,13 @@ pub async fn position_query(
     let mut coverages = Vec::with_capacity(points.len());
     for point in &points {
         let qr = engine
-            .query_position(point, datetime, param_names.as_deref(), z.as_deref())
+            .query_position(
+                point,
+                datetime,
+                param_names.as_deref(),
+                z.as_deref(),
+                reference_time,
+            )
             .map_err(|e| map_engine_error(&e))?;
         match qr {
             CoverageResponse::Single(q) => coverages.push(q),
@@ -998,8 +1253,28 @@ pub async fn area_query(
     Query(params): Query<AreaQueryParams>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    run_area_query(id, None, params, state).await
+}
+
+/// `GET /collections/{id}/instances/{instanceId}/area` — area query against a
+/// specific forecast model run.
+pub async fn instance_area_query(
+    Path((id, instance_id)): Path<(String, String)>,
+    Query(params): Query<AreaQueryParams>,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    run_area_query(id, Some(instance_id), params, state).await
+}
+
+async fn run_area_query(
+    id: String,
+    instance_id: Option<String>,
+    params: AreaQueryParams,
+    state: AppState,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
+    let reference_time = resolve_instance(engine, instance_id.as_deref())?;
 
     // An area result is gridded / multi-coverage, not a single line plot.
     if parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))? == EdrFormat::Png {
@@ -1033,6 +1308,7 @@ pub async fn area_query(
             datetime,
             param_names.as_deref(),
             z.as_deref(),
+            reference_time,
         )
         .map_err(|e| match &e {
             ds_core::error::DataServerError::InvalidParameter(_)
@@ -1133,7 +1409,13 @@ pub async fn trajectory_query(
     let engine = engine.clone();
     let coords = params.coords.clone();
     let result = tokio::task::spawn_blocking(move || {
-        engine.query_trajectory(&coords, datetime, param_names.as_deref(), z.as_deref())
+        engine.query_trajectory(
+            &coords,
+            datetime,
+            param_names.as_deref(),
+            z.as_deref(),
+            None,
+        )
     })
     .await
     .map_err(|e| {
@@ -1196,14 +1478,44 @@ pub async fn trajectory_query(
     }
 }
 
+/// Build a collection (or instance) metadata document.
+///
+/// `instance = None` ⇒ the collection itself (un-pinned; latest run for forecast
+/// engines). `instance = Some(run)` ⇒ that forecast model run as an OGC EDR
+/// *instance*: `id`, temporal extent and data-query hrefs are scoped to the run
+/// (`/collections/{id}/instances/{instanceId}/…`). See [`ds_core::instances`].
 fn build_collection_metadata(
     engine: &dyn EdrEngine,
     config: &CollectionConfig,
     base_url: &str,
+    instance: Option<&ds_core::instances::RunInfo>,
 ) -> serde_json::Value {
     let param_descs = engine.get_parameter_descriptions();
-    let temporal = engine.get_temporal_extent();
     let spatial = engine.get_spatial_extent();
+
+    let coll_id = &config.id;
+    // The self id and the base path every data-query href hangs off — scoped to
+    // the instance when one is given.
+    let (self_id, query_base) = match instance {
+        Some(run) => (
+            run.instance_id(),
+            format!(
+                "{base_url}/edr/collections/{coll_id}/instances/{}",
+                run.instance_id()
+            ),
+        ),
+        None => (
+            coll_id.clone(),
+            format!("{base_url}/edr/collections/{coll_id}"),
+        ),
+    };
+
+    // Temporal extent + advertised timesteps: the run's for an instance, the
+    // engine's (latest run) for the collection.
+    let temporal = match instance {
+        Some(run) => run.temporal_extent(),
+        None => engine.get_temporal_extent(),
+    };
 
     let mut extent = serde_json::Map::new();
     if let Some(bbox) = spatial {
@@ -1223,8 +1535,13 @@ fn build_collection_metadata(
             json!("http://www.opengis.net/def/uom/ISO-8601/0/Gregorian"),
         );
 
-        // Include individual timesteps if the engine provides them
-        if let Some(times) = engine.get_available_times() {
+        // Include individual timesteps if available (the run's valid times for
+        // an instance, the engine's for the collection).
+        let times = match instance {
+            Some(run) => (!run.valid_times.is_empty()).then(|| run.valid_times.clone()),
+            None => engine.get_available_times(),
+        };
+        if let Some(times) = times {
             let values: Vec<String> = times.iter().map(|t| t.to_rfc3339()).collect();
             temporal_obj.insert("values".to_string(), json!(values));
         }
@@ -1278,24 +1595,31 @@ fn build_collection_metadata(
         })
         .collect();
 
-    let query_types = engine.supported_query_types();
+    // Data queries hang off `query_base` (instance-scoped when applicable).
+    // Under an instance only the run-queryable types (position/area) get routes.
+    let query_types: Vec<String> = if instance.is_some() {
+        engine
+            .supported_query_types()
+            .into_iter()
+            .filter(|qt| qt == "position" || qt == "area")
+            .collect()
+    } else {
+        engine.supported_query_types()
+    };
     let mut data_queries = serde_json::Map::new();
     for qt in &query_types {
         let (endpoint, output_formats) = match qt.as_str() {
             "locations" => (
-                format!("{base_url}/edr/collections/{}/locations", config.id),
+                format!("{query_base}/locations"),
                 json!(["CoverageJSON", "PNG"]),
             ),
             "position" => (
-                format!("{base_url}/edr/collections/{}/position", config.id),
+                format!("{query_base}/position"),
                 json!(["CoverageJSON", "PNG"]),
             ),
-            "area" => (
-                format!("{base_url}/edr/collections/{}/area", config.id),
-                json!(["CoverageJSON"]),
-            ),
+            "area" => (format!("{query_base}/area"), json!(["CoverageJSON"])),
             "trajectory" => (
-                format!("{base_url}/edr/collections/{}/trajectory", config.id),
+                format!("{query_base}/trajectory"),
                 json!(["CoverageJSON", "PNG"]),
             ),
             _ => continue,
@@ -1315,13 +1639,40 @@ fn build_collection_metadata(
             }),
         );
     }
+    // Advertise the model runs (forecast reference times) as EDR instances on
+    // the collection itself (not on an instance document).
+    if instance.is_none() && !engine.get_instances().is_empty() {
+        data_queries.insert(
+            "instances".to_string(),
+            json!({
+                "link": {
+                    "href": format!("{base_url}/edr/collections/{coll_id}/instances"),
+                    "rel": "data",
+                    "variables": { "query_type": "instances" }
+                }
+            }),
+        );
+    }
 
+    let self_title = match instance {
+        Some(run) => format!("{} — run {}", config.title, run.reference_time.to_rfc3339()),
+        None => config.title.clone(),
+    };
     let mut links = vec![json!({
-        "href": format!("{base_url}/edr/collections/{}", config.id),
+        "href": query_base,
         "rel": "self",
         "type": "application/json",
-        "title": config.title
+        "title": self_title.clone()
     })];
+    if instance.is_some() {
+        // Link an instance document back to its parent collection.
+        links.push(json!({
+            "href": format!("{base_url}/edr/collections/{coll_id}"),
+            "rel": "collection",
+            "type": "application/json",
+            "title": config.title
+        }));
+    }
     if let Some((title, url)) = config.license.as_ref().and_then(|l| l.card_link()) {
         // No `type`: an operator-supplied license URL may not be HTML, and OGC
         // API Common §6.5.2 wants the link's real media type — omitting is valid.
@@ -1329,8 +1680,8 @@ fn build_collection_metadata(
     }
 
     let mut metadata = json!({
-        "id": config.id,
-        "title": config.title,
+        "id": self_id,
+        "title": self_title,
         "description": config.description,
         // No `itemType`: OGC API – Common – Part 2 registers only "feature"
         // and "record", and the field describes a /collections/{id}/items

@@ -156,6 +156,43 @@ radar elevation angle. WMS exposes it as the `ELEVATION` dimension; Maps/Tiles a
 `elevation` query parameter; EDR as the `z` query parameter. The API layer rejects a
 `z`/`elevation` against a collection with no vertical extent (HTTP 400).
 
+### Model runs / forecast reference time (EDR instances) — #337
+
+Forecast datasets have **two** time axes: the **model run** (forecast *reference
+time* / init / analysis time) and the **valid time** (run + lead). The shared
+machinery lives in **`ds_core::instances`** so every forecast engine selects runs,
+builds instance lists, and encodes instance ids **identically** (no per-engine
+duplication):
+
+- `RunInfo { reference_time, valid_times }` — one model run; `instance_id()` =
+  canonical compact stamp `%Y%m%dT%H%MZ`.
+- `format_instance_id` / `parse_instance_id` — the URL ↔ reference-time codec
+  (parse also accepts RFC 3339); the **API layer** owns the string form, engines
+  only see `Option<DateTime<Utc>>`.
+- `select_run(&BTreeMap<DateTime<Utc>, T>, Option<DateTime<Utc>>)` — `None` ⇒
+  latest, `Some(rt)` ⇒ that exact run (absent ⇒ `None` → 404). The one selection
+  rule everywhere.
+- `build_instances(&runs, |rt, run| valid_times)` — `Vec<RunInfo>` from a
+  reference-time-keyed run map.
+
+**Engine contract:** store runs in a `BTreeMap<DateTime<Utc>, _>` keyed by
+reference time; implement `EdrEngine::get_instances() -> Vec<RunInfo>` (default
+empty = non-forecast); honour the trailing `reference_time: Option<DateTime<Utc>>`
+on the query methods and `MapEngine::get_raster_tile` (`None` ⇒ latest); populate
+`RasterInfo.reference_times`. **GRIB** (catalog `runs` map) and **QueryData**
+(`max_runs` recent `.sqd` files, keyed by origin time) implement it; other engines
+accept-and-ignore. Zarr's forecast-reference/lead detection → instances is a
+follow-up (it currently pins the latest run internally; see [[project_zarr_engine]]).
+
+**API surface:** EDR exposes `GET /collections/{id}/instances`,
+`/instances/{instanceId}` (per-run metadata), and `/instances/{instanceId}/{position,area}`
+(query a specific run); the no-instance routes default to the latest run
+(unchanged). Collection metadata gains an `instances` data_query and the OpenAPI
+spec advertises the instance paths — both gated on `get_instances()` being
+non-empty. **WMS `reference_time` dimension + Maps/Tiles `reference_time` query
+parameter are a follow-up** (the engines already honour the selector in
+`get_raster_tile`; the API layer currently passes `None`).
+
 ## Engine Capabilities
 
 | Engine | Traits | APIs |
@@ -206,11 +243,17 @@ radar elevation angle. WMS exposes it as the `ELEVATION` dimension; Maps/Tiles a
 
 - FMI QueryData (.sqd) binary format. Memory-mapped file access via `memmap2`.
 - Multi-parameter: exposes all parameters from the file. `wms_parameter` config selects which to render.
-- Polls directory for latest `.sqd` file, atomically swaps via `ArcSwap`.
+- **Model runs (#337):** polls the directory and retains the most recent `max_runs`
+  `.sqd` files as model runs, keyed by each file's **origin (analysis) time**
+  (`RunSet: BTreeMap<DateTime<Utc>, _>`), atomically swapped via `ArcSwap`.
+  Already-loaded files are reused on poll (not re-parsed). Each run is an EDR
+  instance / `RasterInfo.reference_times` entry; the latest run is the default for
+  un-pinned queries. See the "Model runs" section above and [[project_querydata_engine_plan]].
 - Supports WGS84, Stereographic, and Rotated Lat-Lon grids.
 - EDR position queries use bilinear interpolation. Map rendering uses nearest-neighbor.
 - Missing value sentinel: 32700.0.
-- Config: `wms_parameter` (name/short name/ID), `poll_interval_secs` (default 30).
+- Config: `wms_parameter` (name/short name/ID), `poll_interval_secs` (default 30),
+  `max_runs` (default 4; recent runs retained — set 1 for latest-only/no history).
 
 ## Zarr Engine Notes
 

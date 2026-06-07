@@ -27,5 +27,19 @@ pub fn router(state: AppState) -> Router {
             "/collections/{id}/trajectory",
             get(handlers::trajectory_query),
         )
+        // OGC API - EDR instances (forecast model runs; #337).
+        .route("/collections/{id}/instances", get(handlers::instances))
+        .route(
+            "/collections/{id}/instances/{instance_id}",
+            get(handlers::instance),
+        )
+        .route(
+            "/collections/{id}/instances/{instance_id}/position",
+            get(handlers::instance_position_query),
+        )
+        .route(
+            "/collections/{id}/instances/{instance_id}/area",
+            get(handlers::instance_area_query),
+        )
         .with_state(state)
 }

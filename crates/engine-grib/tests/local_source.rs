@@ -68,6 +68,7 @@ fn grib_engine_serves_local_directory() {
             &OutputCrs::Wgs84,
             Some(&param),
             None,
+            None,
         )
         .expect("render a tile from the local grib");
     assert_eq!(tile.values.len(), 32 * 16);

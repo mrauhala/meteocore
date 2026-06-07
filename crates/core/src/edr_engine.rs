@@ -3,11 +3,24 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 use crate::error::DataServerError;
+use crate::instances::RunInfo;
 use crate::model::{CoverageResponse, Location, ParameterDescription};
 use crate::vertical::VerticalDimension;
 
 pub trait EdrEngine: Send + Sync {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError>;
+
+    /// The forecast model runs this engine exposes as OGC API - EDR
+    /// *instances*, ascending by reference time (latest last).
+    ///
+    /// Default: empty — the engine has no model-run concept and exposes only a
+    /// single time axis (observations, analyses, a single forecast). Forecast
+    /// engines (GRIB, QueryData, …) override this, building the list with
+    /// [`crate::instances::build_instances`]. When non-empty, the `reference_time`
+    /// argument on the query methods selects a run (`None` ⇒ the latest).
+    fn get_instances(&self) -> Vec<RunInfo> {
+        Vec::new()
+    }
 
     /// Execute a query for a named location.
     ///
@@ -15,12 +28,17 @@ pub trait EdrEngine: Send + Sync {
     /// `Some([v])` pins one level, `Some([v1, v2, …])` selects several.
     /// Engines with no vertical dimension ignore it (the API layer rejects
     /// a `z` against a collection that has no vertical extent).
+    ///
+    /// `reference_time` selects a forecast model run (see [`Self::get_instances`]):
+    /// `None` ⇒ the latest run (the default and only behaviour for non-forecast
+    /// engines, which ignore it).
     fn query_location(
         &self,
         location_id: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError>;
 
     fn get_parameters(&self) -> Vec<String>;
@@ -73,8 +91,9 @@ pub trait EdrEngine: Send + Sync {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
-        let _ = (coords, datetime, parameters, z);
+        let _ = (coords, datetime, parameters, z, reference_time);
         Err(DataServerError::InvalidParameter(
             "Area query not supported by this engine".into(),
         ))
@@ -88,8 +107,9 @@ pub trait EdrEngine: Send + Sync {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
-        let _ = (coords, datetime, parameters, z);
+        let _ = (coords, datetime, parameters, z, reference_time);
         Err(DataServerError::InvalidParameter(
             "Position query not supported by this engine".into(),
         ))
@@ -108,8 +128,9 @@ pub trait EdrEngine: Send + Sync {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
-        let _ = (coords, datetime, parameters, z);
+        let _ = (coords, datetime, parameters, z, reference_time);
         Err(DataServerError::InvalidParameter(
             "Trajectory query not supported by this engine".into(),
         ))

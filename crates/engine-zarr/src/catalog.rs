@@ -758,6 +758,7 @@ fn build_raster_info(
         native_crs: "CRS:84".to_string(),
         spatial_extent: Some(extent),
         times: times.to_vec(),
+        reference_times: Vec::new(),
         parameter,
         unit,
         parameters,

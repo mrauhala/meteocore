@@ -45,6 +45,7 @@ impl MockMapEngine {
             // bbox [10,55,30,70] over 2000x1500 cells => 0.01° per cell.
             grid_size: Some([2000, 1500]),
             layer_subtitle: None,
+            reference_times: Vec::new(),
         }
     }
 }
@@ -59,6 +60,7 @@ impl MapEngine for MockMapEngine {
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
         _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         let pixel_count = (width * height) as usize;
         let values: Vec<Option<f64>> = (0..pixel_count)
@@ -92,6 +94,7 @@ impl MapEngine for InvalidParamEngine {
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
         _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         Err(DataServerError::InvalidParameter(
             "collection requires a `<site>:<quantity>` parameter (e.g. `fivih:DBZH`)".into(),
@@ -1217,6 +1220,7 @@ impl MapEngine for EmptyMockMapEngine {
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
         _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         let pixel_count = (width * height) as usize;
         Ok(RasterTile {
@@ -1302,6 +1306,7 @@ impl MapEngine for MultiParamMockEngine {
         _output_crs: &ds_core::map_engine::OutputCrs,
         parameter: Option<&str>,
         _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<ds_core::map_engine::RasterTile, ds_core::error::DataServerError> {
         // Vary the pixel values by parameter so the `parameter` field on the
         // cache key actually changes the rendered bytes — the cross-parameter
@@ -1341,6 +1346,7 @@ impl MapEngine for MultiParamMockEngine {
             vertical: None,
             grid_size: None,
             layer_subtitle: None,
+            reference_times: Vec::new(),
         }
     }
 }
@@ -1486,6 +1492,7 @@ mod vertical_extent {
             _output_crs: &OutputCrs,
             _parameter: Option<&str>,
             _z: Option<f64>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<RasterTile, DataServerError> {
             Ok(RasterTile {
                 width,
@@ -1508,6 +1515,7 @@ mod vertical_extent {
                 )),
                 grid_size: None,
                 layer_subtitle: None,
+                reference_times: Vec::new(),
             }
         }
     }
@@ -1550,6 +1558,7 @@ mod vertical_extent {
             _output_crs: &OutputCrs,
             _parameter: Option<&str>,
             _z: Option<f64>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<RasterTile, DataServerError> {
             Ok(RasterTile {
                 width,
@@ -1569,6 +1578,7 @@ mod vertical_extent {
                 vertical: Some(VerticalDimension::new(VerticalKind::ElevationAngle, vec![])),
                 grid_size: None,
                 layer_subtitle: None,
+                reference_times: Vec::new(),
             }
         }
     }
@@ -1610,6 +1620,7 @@ mod extent_edge_cases {
             _output_crs: &OutputCrs,
             _parameter: Option<&str>,
             _z: Option<f64>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<RasterTile, DataServerError> {
             Ok(RasterTile {
                 width,
@@ -1629,6 +1640,7 @@ mod extent_edge_cases {
                 vertical: None,
                 grid_size: Some([2000, 1500]),
                 layer_subtitle: None,
+                reference_times: Vec::new(),
             }
         }
     }
@@ -1647,6 +1659,7 @@ mod extent_edge_cases {
             _output_crs: &OutputCrs,
             _parameter: Option<&str>,
             _z: Option<f64>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<RasterTile, DataServerError> {
             Ok(RasterTile {
                 width,
@@ -1677,6 +1690,7 @@ mod extent_edge_cases {
                 vertical: None,
                 grid_size: None,
                 layer_subtitle: None,
+                reference_times: Vec::new(),
             }
         }
     }
@@ -1731,6 +1745,7 @@ mod extent_edge_cases {
             _output_crs: &OutputCrs,
             _parameter: Option<&str>,
             _z: Option<f64>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
         ) -> Result<RasterTile, DataServerError> {
             Ok(RasterTile {
                 width,
@@ -1751,6 +1766,7 @@ mod extent_edge_cases {
                 vertical: None,
                 grid_size: Some([2000, 1000]),
                 layer_subtitle: None,
+                reference_times: Vec::new(),
             }
         }
     }

@@ -148,6 +148,7 @@ impl EdrEngine for PostgisEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let source_keys = resolve_source_keys(&self.config, parameters)?;
         let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
@@ -173,10 +174,11 @@ impl EdrEngine for PostgisEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let (lon, lat) = parse_coords(coords)?;
         let station_id = resolve_nearest_station(&self.pool, &self.config, lon, lat)?;
-        self.query_location(&station_id, datetime, parameters, z)
+        self.query_location(&station_id, datetime, parameters, z, reference_time)
     }
 
     fn query_area(
@@ -185,6 +187,7 @@ impl EdrEngine for PostgisEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let polygon_wkt = normalize_area_wkt(coords)?;
         let source_keys = resolve_source_keys(&self.config, parameters)?;

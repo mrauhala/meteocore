@@ -37,6 +37,7 @@ impl MapEngine for EmptyMockMapEngine {
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
         _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         let pixel_count = (width * height) as usize;
         Ok(RasterTile {
@@ -59,6 +60,7 @@ impl MapEngine for EmptyMockMapEngine {
             vertical: None,
             grid_size: None,
             layer_subtitle: None,
+            reference_times: Vec::new(),
         }
     }
 }
@@ -196,6 +198,7 @@ impl MapEngine for FailingMockMapEngine {
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
         _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         Err(DataServerError::Engine("intentional render failure".into()))
     }
@@ -213,6 +216,7 @@ impl MapEngine for FailingMockMapEngine {
             vertical: None,
             grid_size: None,
             layer_subtitle: None,
+            reference_times: Vec::new(),
         }
     }
 }
@@ -331,6 +335,7 @@ impl MapEngine for PopulatedMockMapEngine {
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
         _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         let pixel_count = (width * height) as usize;
         // Linear gradient — yields a non-uniform PNG so the test isn't
@@ -358,6 +363,7 @@ impl MapEngine for PopulatedMockMapEngine {
             vertical: None,
             grid_size: None,
             layer_subtitle: None,
+            reference_times: Vec::new(),
         }
     }
 }
@@ -681,6 +687,7 @@ impl MapEngine for CountingMockMapEngine {
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
         _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         self.calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -706,6 +713,7 @@ impl MapEngine for CountingMockMapEngine {
             vertical: None,
             grid_size: None,
             layer_subtitle: None,
+            reference_times: Vec::new(),
         }
     }
 }
@@ -901,6 +909,7 @@ impl MapEngine for SiteMockMapEngine {
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
         _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         let pixel_count = (width * height) as usize;
         Ok(RasterTile {
@@ -929,6 +938,7 @@ impl MapEngine for SiteMockMapEngine {
             vertical: None,
             grid_size: None,
             layer_subtitle: Some("Vihti".into()),
+            reference_times: Vec::new(),
         }
     }
 }

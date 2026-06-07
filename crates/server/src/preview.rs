@@ -789,6 +789,7 @@ mod tests {
             _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
             _parameters: Option<&[String]>,
             _z: Option<&[f64]>,
+            _reference_time: Option<DateTime<Utc>>,
         ) -> Result<CoverageResponse, DataServerError> {
             unimplemented!()
         }
@@ -831,6 +832,7 @@ mod tests {
     }
 
     impl MapEngine for RasterMock {
+        #[allow(clippy::too_many_arguments)]
         fn get_raster_tile(
             &self,
             _bbox: [f64; 4],
@@ -840,6 +842,7 @@ mod tests {
             _crs: &OutputCrs,
             _param: Option<&str>,
             _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
         ) -> Result<RasterTile, DataServerError> {
             unimplemented!()
         }
@@ -854,6 +857,7 @@ mod tests {
                 vertical: None,
                 grid_size: None,
                 layer_subtitle: None,
+                reference_times: Vec::new(),
             }
         }
     }
@@ -1246,6 +1250,7 @@ mod tests {
                 _: Option<(DateTime<Utc>, DateTime<Utc>)>,
                 _: Option<&[String]>,
                 _: Option<&[f64]>,
+                _: Option<DateTime<Utc>>,
             ) -> Result<CoverageResponse, DataServerError> {
                 unimplemented!()
             }
@@ -1319,6 +1324,7 @@ mod tests {
                 _: Option<(DateTime<Utc>, DateTime<Utc>)>,
                 _: Option<&[String]>,
                 _: Option<&[f64]>,
+                _: Option<DateTime<Utc>>,
             ) -> Result<CoverageResponse, DataServerError> {
                 unimplemented!()
             }
@@ -1612,6 +1618,7 @@ mod tests {
                 _: Option<(DateTime<Utc>, DateTime<Utc>)>,
                 _: Option<&[String]>,
                 _: Option<&[f64]>,
+                _: Option<DateTime<Utc>>,
             ) -> Result<CoverageResponse, DataServerError> {
                 unimplemented!()
             }
@@ -1713,6 +1720,7 @@ mod tests {
                 _: Option<(DateTime<Utc>, DateTime<Utc>)>,
                 _: Option<&[String]>,
                 _: Option<&[f64]>,
+                _: Option<DateTime<Utc>>,
             ) -> Result<CoverageResponse, DataServerError> {
                 unimplemented!()
             }
@@ -1810,6 +1818,7 @@ mod tests {
                 _: Option<(DateTime<Utc>, DateTime<Utc>)>,
                 _: Option<&[String]>,
                 _: Option<&[f64]>,
+                _: Option<DateTime<Utc>>,
             ) -> Result<CoverageResponse, DataServerError> {
                 unimplemented!()
             }
@@ -1855,6 +1864,7 @@ mod tests {
         /// MapEngine that only exposes 2 of the EDR's 3 parameters.
         struct PartialRaster;
         impl MapEngine for PartialRaster {
+            #[allow(clippy::too_many_arguments)]
             fn get_raster_tile(
                 &self,
                 _: [f64; 4],
@@ -1864,6 +1874,7 @@ mod tests {
                 _: &OutputCrs,
                 _: Option<&str>,
                 _: Option<f64>,
+                _: Option<DateTime<Utc>>,
             ) -> Result<RasterTile, DataServerError> {
                 unimplemented!()
             }
@@ -1882,6 +1893,7 @@ mod tests {
                     vertical: None,
                     grid_size: None,
                     layer_subtitle: None,
+                    reference_times: Vec::new(),
                 }
             }
         }

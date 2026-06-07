@@ -92,6 +92,7 @@ impl EdrEngine for MockEngine {
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         if location_id == "helsinki" || location_id == "tampere" {
             Ok(CoverageResponse::Single(Self::sample_query_result()))
@@ -125,6 +126,7 @@ impl EdrEngine for MockEngine {
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let polygon = ds_core::feature::parse_area_coords(coords)?;
         let mut coverages = Vec::new();
@@ -147,6 +149,7 @@ impl EdrEngine for MockEngine {
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         // Accept any well-formed POINT(lon lat). Parsing is handled here to
         // exercise the handler's MULTIPOINT fan-out (which normalizes each
@@ -438,8 +441,9 @@ mod collections {
                 dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
                 params: Option<&[String]>,
                 z: Option<&[f64]>,
+                rt: Option<DateTime<Utc>>,
             ) -> Result<CoverageResponse, DataServerError> {
-                self.0.query_location(location_id, dt, params, z)
+                self.0.query_location(location_id, dt, params, z, rt)
             }
             fn get_parameters(&self) -> Vec<String> {
                 self.0.get_parameters()
@@ -1207,6 +1211,7 @@ mod unimplemented_queries {
                 _dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
                 _p: Option<&[String]>,
                 _z: Option<&[f64]>,
+                _rt: Option<DateTime<Utc>>,
             ) -> Result<CoverageResponse, DataServerError> {
                 Err(DataServerError::LocationNotFound("n/a".into()))
             }
@@ -1228,6 +1233,7 @@ mod unimplemented_queries {
                 _dt: Option<(DateTime<Utc>, DateTime<Utc>)>,
                 _p: Option<&[String]>,
                 _z: Option<&[f64]>,
+                _rt: Option<DateTime<Utc>>,
             ) -> Result<CoverageResponse, DataServerError> {
                 let t = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
                 let nodes = vec![(t, 24.0, 60.0), (t, 24.5, 60.5), (t, 25.0, 61.0)];

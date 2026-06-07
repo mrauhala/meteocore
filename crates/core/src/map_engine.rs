@@ -140,6 +140,11 @@ pub struct RasterInfo {
     /// parent-layer tree can still tell siblings apart. `None` for standalone
     /// collections.
     pub layer_subtitle: Option<String>,
+    /// Available forecast model runs (reference times), ascending. Empty for
+    /// non-forecast collections. WMS surfaces these as a custom `reference_time`
+    /// dimension and `get_raster_tile`'s `reference_time` argument selects one
+    /// (`None` ⇒ latest); see [`crate::instances`].
+    pub reference_times: Vec<DateTime<Utc>>,
 }
 
 /// Trait for serving raster data as map images.
@@ -164,8 +169,13 @@ pub trait MapEngine: Send + Sync {
     /// pressure level). Engines with no vertical dimension ignore it; engines
     /// that have one resolve it against `raster_info().vertical`.
     ///
+    /// The optional `reference_time` selects a forecast model run against
+    /// `raster_info().reference_times` (`None` ⇒ the latest run, the default and
+    /// only behaviour for non-forecast engines, which ignore it). See
+    /// [`crate::instances`].
+    ///
     /// The engine handles CRS reprojection to source data internally.
-    #[allow(clippy::too_many_arguments)] // bbox/size/time/crs/parameter/z are all genuine selectors
+    #[allow(clippy::too_many_arguments)] // bbox/size/time/crs/parameter/z/reference_time are all genuine selectors
     fn get_raster_tile(
         &self,
         bbox: [f64; 4],
@@ -175,6 +185,7 @@ pub trait MapEngine: Send + Sync {
         output_crs: &OutputCrs,
         parameter: Option<&str>,
         z: Option<f64>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError>;
 
     /// Return metadata for capabilities documents.

@@ -451,6 +451,7 @@ impl EdrEngine for OdimEngine {
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         // An ODIM composite is a gridded field with no named
         // locations, so any location id is genuinely "not found" →
@@ -509,6 +510,7 @@ impl EdrEngine for OdimEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let (lat, lon) = parse_point_coords(coords)?;
         Ok(CoverageResponse::Single(
@@ -522,6 +524,7 @@ impl EdrEngine for OdimEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let polygon = parse_area_coords(coords)?;
         let result = self.query_polygon(&polygon, datetime, parameters)?;
