@@ -510,6 +510,13 @@ pub fn build(
         let units = str_attr(ref_arr, "units").ok_or_else(|| {
             DataServerError::Engine(format!("reference-time coordinate '{rd}' has no 'units'"))
         })?;
+        if !cf::is_standard_calendar(str_attr(ref_arr, "calendar").as_deref()) {
+            tracing::warn!(
+                "collection '{collection_id}': non-standard CF calendar '{}' on reference-time \
+                 axis '{rd}' approximated as proleptic Gregorian",
+                str_attr(ref_arr, "calendar").unwrap_or_default()
+            );
+        }
         let decoded =
             cf::decode_times(&read_coord_f64(ref_arr)?, &units).map_err(DataServerError::Engine)?;
         let (idx, t) = decoded
