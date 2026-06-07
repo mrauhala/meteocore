@@ -184,6 +184,38 @@ async fn write_coord_i64(
         .expect("coord chunks");
 }
 
+/// Live probe against the public ECMWF AIFS-single Icechunk repo on AWS S3.
+/// `#[ignore]`d — needs network; run manually with:
+///   cargo test -p engine-zarr --features icechunk --test icechunk -- --ignored --nocapture probe_aifs
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_aifs() {
+    let config = ZarrConfig {
+        data_path: None,
+        endpoint: Some("https://s3.us-west-2.amazonaws.com".into()),
+        bucket: Some("dynamical-ecmwf-aifs-single".into()),
+        path: Some("ecmwf-aifs-single-forecast/v0.1.0.icechunk".into()),
+        zarr_version: None,
+        parameters: None,
+        poll_interval_secs: 300,
+        cache_mb: 128,
+        icechunk: Some(IcechunkConfig {
+            branch: Some("main".into()),
+            tag: None,
+            snapshot: None,
+            region: Some("us-west-2".into()),
+        }),
+    };
+    match ZarrEngine::new("aifs", &config) {
+        Ok(engine) => {
+            eprintln!("AIFS parameters: {:?}", engine.get_parameters());
+            eprintln!("AIFS temporal:   {:?}", engine.get_temporal_extent());
+            eprintln!("AIFS spatial:    {:?}", engine.get_spatial_extent());
+        }
+        Err(e) => eprintln!("AIFS open failed: {e}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reads_local_icechunk_repo() {
     let dir = tempfile::tempdir().expect("tempdir");

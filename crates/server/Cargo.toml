@@ -3,6 +3,11 @@ name = "server"
 version = "0.6.0"
 edition = "2021"
 
+[features]
+# Read Icechunk repositories in the Zarr engine (#335). Off by default (heavy
+# dep tree); enable with `cargo run -p server --features icechunk`.
+icechunk = ["engine-zarr/icechunk"]
+
 [dependencies]
 ds-core = { path = "../core" }
 engine-csv = { path = "../engine-csv" }
