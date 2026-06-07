@@ -1,0 +1,48 @@
+# Example: ECMWF AIFS-single forecast as an Icechunk repository on public S3
+# (dynamical.org, https://registry.opendata.aws/dynamical-ecmwf-aifs-single/).
+#
+# DISABLED by default (`.toml.disabled` is ignored by the loader) because it:
+#   1. requires the server built with the icechunk feature, and
+#   2. fetches from the network (anonymous AWS S3, us-west-2).
+#
+# To run it from collections.d:
+#   1. rename this file to drop `.disabled`
+#   2. cargo run -p server --features icechunk --collections=ecmwf-aifs-single
+#      (the `--collections` filter avoids loading the other, remote, collections)
+#
+# Verified live: serves EDR + WMS/Maps/Tiles. NOTE temperature_2m is in degrees
+# Celsius (the engine returns stored values; it does not convert units), hence
+# the Celsius colormap range below.
+
+id = "ecmwf-aifs-single"
+title = "ECMWF AIFS-single forecast (Icechunk)"
+description = "ECMWF AIFS deterministic AI forecast, global 0.25° regular lat/lon, as an Icechunk repository on public S3 (dynamical.org, CC-BY-4.0)."
+engine_type = "zarr"
+apis = ["edr", "wms", "maps", "tiles"]
+keywords = ["forecast", "AIFS", "ECMWF", "icechunk"]
+
+[license]
+title = "CC-BY-4.0"
+
+[zarr]
+endpoint = "https://s3.us-west-2.amazonaws.com"
+bucket = "dynamical-ecmwf-aifs-single"
+path = "ecmwf-aifs-single-forecast/v0.1.0.icechunk"
+# Focused demo; the repo also has wind_u_10m/wind_v_10m,
+# pressure_reduced_to_mean_sea_level, precipitation_surface, and ~13 more.
+parameters = ["temperature_2m"]
+
+# Presence of this table selects the Icechunk backend. Default version = branch
+# `main` HEAD (new forecast cycles surface on /admin/collections/reload).
+[zarr.icechunk]
+branch = "main"
+region = "us-west-2"
+
+[wms]
+colormap = "temperature"
+
+[[wms.parameters]]
+name = "temperature_2m"
+colormap = "temperature"
+min = -30.0
+max = 40.0
