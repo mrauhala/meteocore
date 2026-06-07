@@ -15,12 +15,10 @@
 # June Helsinki query returned ~11.4, not ~284). The engine returns stored
 # values verbatim (no unit conversion), so the colormap range below is Celsius.
 #
-# CAVEAT (until model-run support, #337): AIFS has both `init_time` (model run)
-# and `lead_time` (forecast offset). The engine currently treats the run axis as
-# the time axis and serves lead 0 (~the analysis), so the temporal extent is the
-# sequence of model runs, NOT a lead-time forecast. Always pass a `datetime` (a
-# single instant) for position queries, or you get one value per run across the
-# whole archive.
+# This is a forecast (init_time = model run, lead_time = offset): the engine uses
+# the LATEST run and exposes valid time (= run + lead) as the time axis, so the
+# temporal extent is the latest run's ~15-day forecast. Selecting an older run
+# (EDR instances / WMS reference_time) is tracked in #337.
 
 [server]
 host = "127.0.0.1"

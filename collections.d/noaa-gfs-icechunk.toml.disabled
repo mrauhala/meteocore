@@ -1,0 +1,41 @@
+# Example: NOAA GFS forecast as an Icechunk repository on public S3
+# (dynamical.org, https://registry.opendata.aws/dynamical-noaa-gfs/).
+#
+# DISABLED by default (needs the icechunk feature + network). To run:
+#   1. rename to drop `.disabled`
+#   2. cargo run -p server --features icechunk --collections=noaa-gfs-icechunk
+#
+# Distinct id from the GRIB `noaa-gfs.toml` example. Forecast: the engine serves
+# the LATEST run with valid time (= run + lead) as the time axis (#337 for run
+# selection). temperature_2m is in degrees Celsius (no unit conversion).
+# Verified live via the probe_models test.
+
+id = "noaa-gfs-icechunk"
+title = "NOAA GFS forecast (Icechunk)"
+description = "NOAA GFS deterministic forecast, global 0.25° regular lat/lon, from an Icechunk repository on public S3 (dynamical.org, CC-BY-4.0)."
+engine_type = "zarr"
+apis = ["edr", "wms", "maps", "tiles"]
+keywords = ["forecast", "GFS", "NOAA", "icechunk"]
+
+[license]
+title = "CC-BY-4.0"
+
+[zarr]
+endpoint = "https://s3.us-west-2.amazonaws.com"
+bucket = "dynamical-noaa-gfs"
+path = "noaa-gfs-forecast/v0.2.7.icechunk"
+# Focused demo; the repo has ~21 params (temperature, winds, precipitation, …).
+parameters = ["temperature_2m"]
+
+[zarr.icechunk]
+branch = "main"
+region = "us-west-2"
+
+[wms]
+colormap = "temperature"
+
+[[wms.parameters]]
+name = "temperature_2m"
+colormap = "temperature"
+min = -30.0
+max = 40.0

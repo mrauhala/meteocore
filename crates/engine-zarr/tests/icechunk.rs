@@ -184,35 +184,119 @@ async fn write_coord_i64(
         .expect("coord chunks");
 }
 
-/// Live probe against the public ECMWF AIFS-single Icechunk repo on AWS S3.
-/// `#[ignore]`d — needs network; run manually with:
-///   cargo test -p engine-zarr --features icechunk --test icechunk -- --ignored --nocapture probe_aifs
+/// Live schema dump of the AIFS repo — prints each array's dims + key CF attrs
+/// so we can see the init_time/lead_time encoding. `#[ignore]`d (network).
+///   cargo test -p engine-zarr --features icechunk --test icechunk -- --ignored --nocapture probe_aifs_schema
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn probe_aifs() {
-    let config = ZarrConfig {
-        data_path: None,
-        endpoint: Some("https://s3.us-west-2.amazonaws.com".into()),
-        bucket: Some("dynamical-ecmwf-aifs-single".into()),
-        path: Some("ecmwf-aifs-single-forecast/v0.1.0.icechunk".into()),
-        zarr_version: None,
-        parameters: None,
-        poll_interval_secs: 300,
-        cache_mb: 128,
-        icechunk: Some(IcechunkConfig {
-            branch: Some("main".into()),
-            tag: None,
-            snapshot: None,
-            region: Some("us-west-2".into()),
-        }),
-    };
-    match ZarrEngine::new("aifs", &config) {
-        Ok(engine) => {
-            eprintln!("AIFS parameters: {:?}", engine.get_parameters());
-            eprintln!("AIFS temporal:   {:?}", engine.get_temporal_extent());
-            eprintln!("AIFS spatial:    {:?}", engine.get_spatial_extent());
+async fn probe_aifs_schema() {
+    use icechunk::repository::VersionInfo;
+    let storage = icechunk::storage::new_s3_storage(
+        icechunk::storage::S3Options::default()
+            .with_endpoint_url("https://s3.us-west-2.amazonaws.com")
+            .with_anonymous(true)
+            .with_force_path_style(true)
+            .with_region("us-west-2"),
+        "dynamical-ecmwf-aifs-single".to_string(),
+        Some("ecmwf-aifs-single-forecast/v0.1.0.icechunk".to_string()),
+        Some(icechunk::storage::S3Credentials::Anonymous),
+    )
+    .expect("s3 storage");
+    let repo = Repository::open(None, storage, HashMap::new())
+        .await
+        .expect("open repo");
+    let session = repo
+        .readonly_session(&VersionInfo::BranchTipRef("main".into()))
+        .await
+        .expect("session");
+    let store = Arc::new(AsyncIcechunkStore::new(session));
+    let group = zarrs::group::Group::async_open(store.clone(), "/")
+        .await
+        .expect("group");
+    for array in group.async_child_arrays().await.expect("child arrays") {
+        let dims = array.dimension_names().clone();
+        let units = array.attributes().get("units").cloned();
+        let std = array.attributes().get("standard_name").cloned();
+        eprintln!(
+            "{}  shape={:?}  dims={:?}  units={:?}  standard_name={:?}",
+            array.path(),
+            array.shape(),
+            dims,
+            units,
+            std
+        );
+    }
+}
+
+/// Live probe across the three dynamical.org Icechunk forecast datasets from
+/// #337 — confirms the forecast (latest-run + lead) handling works generically.
+/// `#[ignore]`d — needs network; run manually with:
+///   cargo test -p engine-zarr --features icechunk --test icechunk -- --ignored --nocapture probe_models
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_models() {
+    let models = [
+        (
+            "AIFS",
+            "dynamical-ecmwf-aifs-single",
+            "ecmwf-aifs-single-forecast/v0.1.0.icechunk",
+        ),
+        (
+            "GFS",
+            "dynamical-noaa-gfs",
+            "noaa-gfs-forecast/v0.2.7.icechunk",
+        ),
+        (
+            "ICON-EU",
+            "dynamical-dwd-icon-eu",
+            "dwd-icon-eu-forecast-5-day/v0.2.0.icechunk",
+        ),
+    ];
+    for (name, bucket, path) in models {
+        let config = ZarrConfig {
+            data_path: None,
+            endpoint: Some("https://s3.us-west-2.amazonaws.com".into()),
+            bucket: Some(bucket.into()),
+            path: Some(path.into()),
+            zarr_version: None,
+            parameters: None,
+            poll_interval_secs: 300,
+            cache_mb: 128,
+            icechunk: Some(IcechunkConfig {
+                branch: Some("main".into()),
+                tag: None,
+                snapshot: None,
+                region: Some("us-west-2".into()),
+            }),
+        };
+        match ZarrEngine::new(name, &config) {
+            Ok(engine) => {
+                let params = engine.get_parameters();
+                // Position query (Helsinki — inside all three domains) to exercise
+                // the chunk-read path; print the temperature_2m lead-0 value.
+                let t2m = match engine.query_position(
+                    "POINT(24.9 60.2)",
+                    None,
+                    Some(&["temperature_2m".to_string()]),
+                    None,
+                ) {
+                    Ok(CoverageResponse::Single(qr)) => qr
+                        .ranges
+                        .get("temperature_2m")
+                        .and_then(|r| r.values.first().copied())
+                        .flatten(),
+                    _ => None,
+                };
+                eprintln!(
+                    "[{name}] OK — {} params; temporal={:?}; spatial={:?}; t2m@Helsinki(lead0)={:?}",
+                    params.len(),
+                    engine.get_temporal_extent(),
+                    engine.get_spatial_extent(),
+                    t2m,
+                );
+            }
+            Err(e) => eprintln!("[{name}] FAILED: {e}"),
         }
-        Err(e) => eprintln!("AIFS open failed: {e}"),
     }
 }
 

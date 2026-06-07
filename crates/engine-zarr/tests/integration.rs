@@ -18,6 +18,159 @@ fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/zarr-era5-t2m")
 }
 
+/// Write a tiny **forecast** Zarr V3 store (dims `init_time, lead_time, lat,
+/// lon`, CF `forecast_reference_time` + `forecast_period`) to `dir`. Two runs;
+/// the data encodes the run index so a test can prove the *latest* run is used.
+/// `temp[init, lead, lat, lon] = init*1000 + lead_idx + 0.1*lat + 0.01*lon`.
+fn write_forecast_store(dir: &std::path::Path) {
+    use zarrs::array::{codec::GzipCodec, data_type, ArrayBuilder, ArraySubset};
+    use zarrs::filesystem::FilesystemStore;
+    use zarrs::group::GroupBuilder;
+
+    let obj = |v: serde_json::Value| v.as_object().unwrap().clone();
+    let store = std::sync::Arc::new(FilesystemStore::new(dir).unwrap());
+    GroupBuilder::new()
+        .build(store.clone(), "/")
+        .unwrap()
+        .store_metadata()
+        .unwrap();
+
+    // Two runs: 2026-01-01 00Z and 12Z (12Z is the latest), as "seconds since".
+    let run0 = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .unwrap()
+        .timestamp();
+    let run1 = Utc
+        .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+        .unwrap()
+        .timestamp();
+    let coord = |path: &str, vals: Vec<i64>, dim: &str, at: serde_json::Value| {
+        let a = ArrayBuilder::new(
+            vec![vals.len() as u64],
+            vec![vals.len() as u64],
+            data_type::int64(),
+            0i64,
+        )
+        .dimension_names(Some([dim]))
+        .attributes(obj(at))
+        .build(store.clone(), path)
+        .unwrap();
+        a.store_metadata().unwrap();
+        a.store_chunk(&[0], vals).unwrap();
+    };
+    coord(
+        "/init_time",
+        vec![run0, run1],
+        "init_time",
+        serde_json::json!({"units":"seconds since 1970-01-01","standard_name":"forecast_reference_time"}),
+    );
+    coord(
+        "/lead_time",
+        vec![0, 3600, 7200],
+        "lead_time",
+        serde_json::json!({"units":"seconds","standard_name":"forecast_period"}),
+    );
+    let lats = [60.0_f64, 59.0];
+    let lons = [10.0_f64, 11.0];
+    let fcoord = |path: &str, vals: &[f64], dim: &str, at: serde_json::Value| {
+        let a = ArrayBuilder::new(
+            vec![vals.len() as u64],
+            vec![vals.len() as u64],
+            data_type::float64(),
+            f64::NAN,
+        )
+        .dimension_names(Some([dim]))
+        .attributes(obj(at))
+        .build(store.clone(), path)
+        .unwrap();
+        a.store_metadata().unwrap();
+        a.store_chunk(&[0], vals.to_vec()).unwrap();
+    };
+    fcoord(
+        "/latitude",
+        &lats,
+        "latitude",
+        serde_json::json!({"units":"degrees_north","standard_name":"latitude"}),
+    );
+    fcoord(
+        "/longitude",
+        &lons,
+        "longitude",
+        serde_json::json!({"units":"degrees_east","standard_name":"longitude"}),
+    );
+
+    let mut temp = Vec::new();
+    for init in 0..2 {
+        for lead in 0..3 {
+            for &lat in &lats {
+                for &lon in &lons {
+                    temp.push((init as f64 * 1000.0 + lead as f64 + 0.1 * lat + 0.01 * lon) as f32);
+                }
+            }
+        }
+    }
+    let a = ArrayBuilder::new(
+        vec![2, 3, 2, 2],
+        vec![2, 3, 2, 2],
+        data_type::float32(),
+        f32::NAN,
+    )
+    .dimension_names(Some(["init_time", "lead_time", "latitude", "longitude"]))
+    .bytes_to_bytes_codecs(vec![std::sync::Arc::new(GzipCodec::new(5).unwrap())])
+    .attributes(obj(
+        serde_json::json!({"units":"K","long_name":"temperature"}),
+    ))
+    .build(store.clone(), "/temp")
+    .unwrap();
+    a.store_metadata().unwrap();
+    a.store_chunks(
+        &ArraySubset::new_with_shape(a.chunk_grid_shape().to_vec()),
+        temp,
+    )
+    .unwrap();
+}
+
+#[test]
+fn forecast_uses_latest_run_with_lead_as_time() {
+    let dir = tempfile::tempdir().unwrap();
+    write_forecast_store(dir.path());
+    let cfg = ZarrConfig {
+        data_path: Some(dir.path().to_string_lossy().into_owned()),
+        endpoint: None,
+        bucket: None,
+        path: None,
+        zarr_version: Some(3),
+        parameters: None,
+        poll_interval_secs: 300,
+        cache_mb: 16,
+        icechunk: None,
+    };
+    let e = ZarrEngine::new("fc", &cfg).expect("open forecast store");
+    assert_eq!(e.get_parameters(), vec!["temp".to_string()]);
+
+    // Temporal extent = the LATEST run (12Z) + leads [0h,1h,2h] → 12:00..14:00.
+    let (first, last) = e.get_temporal_extent().unwrap();
+    assert_eq!(first, Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap());
+    assert_eq!(last, Utc.with_ymd_and_hms(2026, 1, 1, 14, 0, 0).unwrap());
+    assert_eq!(e.get_available_times().unwrap().len(), 3);
+
+    // A position query at (lon=10, lat=60) must read the LATEST run (init=1):
+    // value = 1*1000 + lead_idx + 0.1*60 + 0.01*10 = 1006.1, 1007.1, 1008.1.
+    let qr = single(e.query_position("POINT(10 60)", None, None, None).unwrap());
+    let vals = &qr.ranges.get("temp").unwrap().values;
+    assert_eq!(vals.len(), 3);
+    assert!(
+        (vals[0].unwrap() - 1006.1).abs() < 0.05,
+        "lead0 {:?}",
+        vals[0]
+    );
+    assert!(
+        (vals[2].unwrap() - 1008.1).abs() < 0.05,
+        "lead2 {:?}",
+        vals[2]
+    );
+}
+
 fn config(parameters: Option<Vec<String>>) -> ZarrConfig {
     ZarrConfig {
         data_path: Some(fixture_dir().to_string_lossy().into_owned()),

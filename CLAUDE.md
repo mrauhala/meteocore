@@ -262,6 +262,13 @@ tracked in #125. **The crate is phased; Phases 1-3 ship today.**
   remaining geographic data variables as parameters. A **time axis is required**
   (PointSeries needs a `t`). Variables with an unsupported dtype are skipped at
   build with a WARN.
+- **Forecast (reference + lead) handling:** when a store has a CF
+  `forecast_reference_time` axis (model run) **and** a `forecast_period`/lead
+  axis (e.g. dynamical.org AIFS/GFS/ICON-EU), the engine uses the **latest run**
+  and exposes **valid time = run + lead** as the time axis, pinning the run axis
+  to the latest index — matching the GRIB "latest run + valid time" convention.
+  `cf::parse_duration_seconds` decodes the lead axis (units like `seconds`).
+  Model-run *selection* (EDR instances + WMS `reference_time`) is tracked in #337.
 - **Reads:** `retrieve_array_subset_opt::<Vec<T>>` (single-threaded) requires the
   exact dtype, so the read path branches on `data_type()` (`*dt ==
   data_type::float32()`, …) and widens every supported int/float to `f64`. Fill

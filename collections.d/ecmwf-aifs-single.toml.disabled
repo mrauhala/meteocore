@@ -14,9 +14,9 @@
 # Celsius (the engine returns stored values; it does not convert units), hence
 # the Celsius colormap range below.
 #
-# CAVEAT (until model-run support, #337): AIFS has init_time (model run) + lead
-# time; the engine currently uses the run axis as the time axis and serves lead
-# 0 (~analysis). The temporal extent is the sequence of runs, not a forecast.
+# Forecast: the engine uses the LATEST run and exposes valid time (= run + lead)
+# as the time axis. Selecting older runs (EDR instances / WMS reference_time) is
+# tracked in #337.
 
 id = "ecmwf-aifs-single"
 title = "ECMWF AIFS-single forecast (Icechunk)"
