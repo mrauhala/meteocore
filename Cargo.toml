@@ -53,6 +53,7 @@ debug = false
 
 # Interim patches (icechunk feature only) — both submitted upstream; drop each
 # once a release including it lands on crates.io, then bump the version.
+# Tracked for removal in #340.
 [patch.crates-io]
 # Forward icechunk's backend features so `engine-zarr` can select the lighter
 # `object_store` S3 backend and drop the `aws-sdk-s3` tree (~28 MB / ~300 crates)

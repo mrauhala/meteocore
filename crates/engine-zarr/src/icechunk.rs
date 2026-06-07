@@ -108,6 +108,9 @@ async fn build_storage(
             // arg below. Without this it falls through to the AWS credential
             // chain (env → profile → EC2 IMDS) and hangs/fails off-EC2. Public
             // datasets only (authenticated repos are a v1 non-goal, #335).
+            // TODO(#335): make this conditional if private-repo support is added —
+            // an unconditional `with_anonymous(true)` would silently suppress any
+            // configured credentials and connect unsigned.
             .with_anonymous(true);
         if let Some(region) = ic.region.as_deref() {
             opts = opts.with_region(region);
@@ -116,14 +119,17 @@ async fn build_storage(
         // crate `ds-storage` uses) rather than `new_s3_storage` (the `aws-sdk-s3`
         // backend) — avoids pulling the whole AWS SDK. No-signing is set on
         // `opts` via `with_anonymous(true)` above (this backend keys off
-        // `S3Options.anonymous`); `S3Credentials::Anonymous` is passed for the
-        // credentials slot for consistency. Public datasets only;
-        // authenticated/private repos are a v1 non-goal (#335).
+        // `S3Options.anonymous`); the `credentials` arg is ignored by this
+        // backend, so pass `None`. Public datasets only; authenticated/private
+        // repos are a v1 non-goal (#335).
         icechunk::storage::new_s3_object_store_storage(
             opts,
             bucket.to_string(),
             prefix,
-            Some(icechunk::storage::S3Credentials::Anonymous),
+            // Ignored by the object_store backend (anonymity is set above); `None`
+            // rather than a vestigial `Some(Anonymous)` to avoid implying it has
+            // an effect. See #335 if private-repo credentials are added.
+            None,
         )
         .await
         .map_err(|e| cfg_err(format!("failed to build Icechunk S3 storage: {e}")))
