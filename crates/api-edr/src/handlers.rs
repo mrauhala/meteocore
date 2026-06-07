@@ -127,20 +127,34 @@ fn lookup_collection<'a>(
 /// Resolve an optional `{instanceId}` path segment to a forecast model run.
 ///
 /// `None` (the no-instance routes) ⇒ `Ok(None)` (the engine serves its latest
-/// run). `Some(id)` ⇒ parse the id to a reference time
-/// ([`instances::parse_instance_id`]); an unparseable id is 400.
+/// run). `Some(id)` ⇒ a run query, which requires the collection to actually
+/// expose model runs: a collection whose engine has no instances returns **404**
+/// (otherwise a non-forecast engine — which ignores `reference_time` — would
+/// wrongly answer 200 with its latest data for any instance path). The id is
+/// then parsed to a reference time ([`instances::parse_instance_id`]); an
+/// unparseable id is 400.
 ///
-/// Existence is **not** checked here. The engine query returns
-/// [`DataServerError::ReferenceTimeNotFound`] (→ 404) for an absent run, so the
-/// status is correct without a validate-then-query race *and* without cloning
-/// the engine's `get_instances()` `Vec` (with every run's valid times) on the
-/// hot query path (CLAUDE.md #211).
+/// The collection-level check is the **O(1)** [`EdrEngine::has_instances`], not
+/// a `get_instances()` clone (CLAUDE.md #211). The *specific*-run existence is
+/// left to the engine query, which returns
+/// [`DataServerError::ReferenceTimeNotFound`] (→ 404) for an absent run — no
+/// validate-then-query race.
 fn resolve_instance(
+    engine: &Arc<dyn EdrEngine>,
     instance_id: Option<&str>,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, (StatusCode, Json<serde_json::Value>)> {
     let Some(iid) = instance_id else {
         return Ok(None);
     };
+    if !engine.has_instances() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "code": "NotFound",
+                "description": "This collection has no model-run instances"
+            })),
+        ));
+    }
     let rt = ds_core::instances::parse_instance_id(iid).ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
@@ -1143,7 +1157,7 @@ async fn run_position_query(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
-    let reference_time = resolve_instance(instance_id.as_deref())?;
+    let reference_time = resolve_instance(engine, instance_id.as_deref())?;
 
     let datetime = params
         .datetime
@@ -1265,7 +1279,7 @@ async fn run_area_query(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
-    let reference_time = resolve_instance(instance_id.as_deref())?;
+    let reference_time = resolve_instance(engine, instance_id.as_deref())?;
 
     // An area result is gridded / multi-coverage, not a single line plot.
     if parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))? == EdrFormat::Png {

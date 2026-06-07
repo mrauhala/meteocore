@@ -129,31 +129,104 @@ impl EdrEngine for ForecastMock {
     }
 }
 
+/// A non-forecast engine: no instances, and `query_position` IGNORES
+/// `reference_time` (returns latest data). Proves the API rejects instance
+/// queries on such a collection rather than silently serving 200.
+struct NonForecastMock;
+
+impl EdrEngine for NonForecastMock {
+    fn get_locations(&self) -> Result<Vec<Location>, DataServerError> {
+        Ok(vec![])
+    }
+    fn query_location(
+        &self,
+        _: &str,
+        _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _: Option<&[String]>,
+        _: Option<&[f64]>,
+        _: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Err(DataServerError::InvalidParameter("no locations".into()))
+    }
+    fn get_parameters(&self) -> Vec<String> {
+        vec!["temperature".to_string()]
+    }
+    fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        Some((dt(0), dt(2)))
+    }
+    fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+        Some([-180.0, -90.0, 180.0, 90.0])
+    }
+    fn supported_query_types(&self) -> Vec<String> {
+        vec!["position".to_string()]
+    }
+    fn query_position(
+        &self,
+        _coords: &str,
+        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>, // ignored — the engine has no runs
+    ) -> Result<CoverageResponse, DataServerError> {
+        let mut parameters = HashMap::new();
+        parameters.insert(
+            "temperature".to_string(),
+            ParameterDescription {
+                label: "temperature".to_string(),
+                unit: "degC".to_string(),
+                observed_property: "temperature".to_string(),
+            },
+        );
+        let mut ranges = HashMap::new();
+        ranges.insert(
+            "temperature".to_string(),
+            NdArray {
+                shape: vec![1],
+                axis_names: vec!["t".to_string()],
+                values: vec![Some(1.0)],
+            },
+        );
+        Ok(CoverageResponse::Single(QueryResult {
+            domain: DomainDescription::PointSeries {
+                x: 25.0,
+                y: 60.0,
+                t: vec![dt(0)],
+                z: None,
+            },
+            parameters,
+            ranges,
+        }))
+    }
+}
+
+fn config(id: &str, engine_type: &str) -> CollectionConfig {
+    CollectionConfig {
+        id: id.to_string(),
+        title: id.to_string(),
+        description: String::new(),
+        data_path: None,
+        apis: vec!["edr".to_string()],
+        engine_type: engine_type.to_string(),
+        keywords: Vec::new(),
+        license: None,
+        geotiff: None,
+        querydata: None,
+        wms: None,
+        grib: None,
+        zarr: None,
+        odim: None,
+        postgis: None,
+        preview: None,
+    }
+}
+
 fn state() -> api_edr::handlers::AppState {
     let mut engines: HashMap<String, Arc<dyn EdrEngine>> = HashMap::new();
     let mut collections = HashMap::new();
     engines.insert("fc".to_string(), Arc::new(ForecastMock));
-    collections.insert(
-        "fc".to_string(),
-        CollectionConfig {
-            id: "fc".to_string(),
-            title: "Forecast".to_string(),
-            description: "Mock forecast".to_string(),
-            data_path: None,
-            apis: vec!["edr".to_string()],
-            engine_type: "grib".to_string(),
-            keywords: Vec::new(),
-            license: None,
-            geotiff: None,
-            querydata: None,
-            wms: None,
-            grib: None,
-            zarr: None,
-            odim: None,
-            postgis: None,
-            preview: None,
-        },
-    );
+    collections.insert("fc".to_string(), config("fc", "grib"));
+    engines.insert("obs".to_string(), Arc::new(NonForecastMock));
+    collections.insert("obs".to_string(), config("obs", "geotiff"));
     Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
         collections,
@@ -243,6 +316,36 @@ async fn unknown_instance_is_404_bad_id_is_400() {
     assert_eq!(
         get("/collections/fc/instances/not-a-time").await.0,
         StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn instance_query_on_non_forecast_collection_is_404() {
+    // The `obs` collection has no instances; its engine ignores reference_time.
+    // An instance path must 404, not silently serve 200 with latest data.
+    assert_eq!(
+        get("/collections/obs/instances").await.1["instances"]
+            .as_array()
+            .map(|a| a.len()),
+        Some(0)
+    );
+    assert_eq!(
+        get("/collections/obs/instances/20260607T0000Z").await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        get("/collections/obs/instances/20260607T0000Z/position?coords=POINT(25%2060)")
+            .await
+            .0,
+        StatusCode::NOT_FOUND,
+        "instance query on a non-forecast collection must be 404, not 200"
+    );
+    // The plain (no-instance) position query still works.
+    assert_eq!(
+        get("/collections/obs/position?coords=POINT(25%2060)")
+            .await
+            .0,
+        StatusCode::OK
     );
 }
 
