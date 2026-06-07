@@ -56,13 +56,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # `cook` and `build` so the cooked dep cache matches the final build.
 ARG CARGO_FEATURES="icechunk"
 COPY --from=planner /build/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json -p server \
+# `--locked`: build strictly against the committed Cargo.lock (matches the
+# release build) — important now that the default feature set pulls rev-pinned
+# `[patch.crates-io]` git forks; no silent re-resolution in the shipped image.
+RUN cargo chef cook --release --locked --recipe-path recipe.json -p server \
         ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 
 # Now copy the actual workspace source and build. Only the changed
 # workspace member's crate needs to recompile; deps are already linked.
 COPY . .
-RUN cargo build --release -p server \
+RUN cargo build --release --locked -p server \
         ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 
 # Stage 2: Runtime
