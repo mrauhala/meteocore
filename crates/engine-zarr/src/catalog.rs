@@ -549,10 +549,19 @@ pub fn build(
             ))
         })?;
         let base = latest_ref_time.expect("forecast sets latest_ref_time");
+        // Guard non-finite leads: `NaN as i64` is 0, which would silently yield
+        // the run time (mirrors `cf::decode_times`'s finite check).
         read_coord_f64(primary_arr)?
             .iter()
-            .map(|&v| base + chrono::Duration::milliseconds((v * secs * 1000.0).round() as i64))
-            .collect::<Vec<_>>()
+            .map(|&v| {
+                if !v.is_finite() {
+                    return Err(DataServerError::Engine(format!(
+                        "non-finite value in lead axis '{primary_dim}': {v}"
+                    )));
+                }
+                Ok(base + chrono::Duration::milliseconds((v * secs * 1000.0).round() as i64))
+            })
+            .collect::<Result<Vec<_>, _>>()?
     } else {
         let units = str_attr(primary_arr, "units").ok_or_else(|| {
             DataServerError::Engine(format!("time coordinate '{primary_dim}' has no 'units'"))
