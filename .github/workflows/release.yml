@@ -218,7 +218,12 @@ jobs:
         # producing a release built against a drifted lockfile.
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo build --release --locked --target "${TARGET}" -p server
+        # `--features icechunk`: ship Icechunk Zarr support in release binaries
+        # (object_store S3 backend, ~+8 MB, no AWS SDK — #339). Reuses the
+        # object_store/rustls stack already in the base build, so it adds no new
+        # cross-compilation deps. Remove once the icechunk [patch] forks are
+        # dropped if a leaner default is preferred (#340).
+        run: cargo build --release --locked --target "${TARGET}" -p server --features icechunk
 
       - name: Package tarball
         # All inputs flow through `env:` so the shell never sees an

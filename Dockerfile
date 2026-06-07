@@ -48,13 +48,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # so it stays cache-valid until any Cargo.toml or Cargo.lock changes.
 # Source changes do *not* invalidate it. `type=gha,mode=max` on the
 # workflow's `cache-to` exports this layer.
+#
+# Cargo features compiled into the server. Defaults to `icechunk` (read
+# transactional/versioned Icechunk Zarr repos; ~+8 MB, object_store S3 backend —
+# no AWS SDK, #339). Build a leaner image without it via
+# `--build-arg CARGO_FEATURES=""`, or pass a custom set. Threaded through BOTH
+# `cook` and `build` so the cooked dep cache matches the final build.
+ARG CARGO_FEATURES="icechunk"
 COPY --from=planner /build/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json -p server
+RUN cargo chef cook --release --recipe-path recipe.json -p server \
+        ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 
 # Now copy the actual workspace source and build. Only the changed
 # workspace member's crate needs to recompile; deps are already linked.
 COPY . .
-RUN cargo build --release -p server
+RUN cargo build --release -p server \
+        ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
