@@ -1520,13 +1520,11 @@ fn build_collection_metadata(
     // The self id and the base path every data-query href hangs off — scoped to
     // the instance when one is given.
     let (self_id, query_base) = match instance {
-        Some(run) => (
-            run.instance_id(),
-            format!(
-                "{base_url}/edr/collections/{coll_id}/instances/{}",
-                run.instance_id()
-            ),
-        ),
+        Some(run) => {
+            let iid = run.instance_id();
+            let base = format!("{base_url}/edr/collections/{coll_id}/instances/{iid}");
+            (iid, base)
+        }
         None => (
             coll_id.clone(),
             format!("{base_url}/edr/collections/{coll_id}"),

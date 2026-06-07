@@ -130,17 +130,19 @@ impl QueryDataEngine {
             return; // no files (or unreadable dir) — keep current data
         }
 
-        // Successful directory read — update staleness tracker
+        let prev = self.runs.load();
+        let new_set = build_runset(&files, self.max_runs, &prev, &self.collection_id);
+        if new_set.runs.is_empty() {
+            return; // nothing loadable (e.g. all files corrupt) — keep old data
+                    // and do NOT stamp freshness; data_age keeps growing.
+        }
+
+        // We have a usable run set — stamp freshness (reflects loadable data, not
+        // merely a readable directory).
         *self
             .data_updated_at
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
-
-        let prev = self.runs.load();
-        let new_set = build_runset(&files, self.max_runs, &prev, &self.collection_id);
-        if new_set.runs.is_empty() {
-            return; // nothing loadable — keep old data
-        }
 
         // Swap only when the retained file set actually changed (add/remove).
         let prev_paths: BTreeSet<&Path> = prev.runs.values().map(|e| e.path.as_path()).collect();
