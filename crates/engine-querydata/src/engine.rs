@@ -78,7 +78,8 @@ impl QueryDataEngine {
         max_runs: usize,
     ) -> Result<Self, DataServerError> {
         let max_runs = max_runs.max(1);
-        let runset = load_runset(data_dir, max_runs, &RunSet::default(), collection_id);
+        let files = list_sqd_files(data_dir);
+        let runset = build_runset(&files, max_runs, &RunSet::default(), collection_id);
         if runset.runs.is_empty() {
             return Err(DataServerError::Engine(format!(
                 "[{collection_id}] No loadable .sqd files found in {}",
@@ -123,9 +124,10 @@ impl QueryDataEngine {
     }
 
     fn poll_once(&self) {
-        // No directory read at all → keep current data (don't touch staleness).
-        if list_sqd_files(&self.data_dir).is_empty() {
-            return;
+        // List the directory once; reuse for the staleness guard and the rebuild.
+        let files = list_sqd_files(&self.data_dir);
+        if files.is_empty() {
+            return; // no files (or unreadable dir) — keep current data
         }
 
         // Successful directory read — update staleness tracker
@@ -135,7 +137,7 @@ impl QueryDataEngine {
             .unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
 
         let prev = self.runs.load();
-        let new_set = load_runset(&self.data_dir, self.max_runs, &prev, &self.collection_id);
+        let new_set = build_runset(&files, self.max_runs, &prev, &self.collection_id);
         if new_set.runs.is_empty() {
             return; // nothing loadable — keep old data
         }
@@ -543,29 +545,32 @@ fn list_sqd_files(dir: &Path) -> Vec<PathBuf> {
 /// as model runs (keyed by origin time), reusing already-parsed entries from
 /// `prev` whose path is unchanged (so poll never re-parses a stable run).
 /// Unloadable files are logged and skipped.
-fn load_runset(dir: &Path, max_runs: usize, prev: &RunSet, collection_id: &str) -> RunSet {
-    let mut files = list_sqd_files(dir);
-    // Keep only the most recent `max_runs` files.
-    if files.len() > max_runs {
-        files.drain(0..files.len() - max_runs);
-    }
+///
+/// `files` is the directory listing (ascending; see [`list_sqd_files`]) — the
+/// caller lists once and passes it in so poll never reads the directory twice.
+fn build_runset(files: &[PathBuf], max_runs: usize, prev: &RunSet, collection_id: &str) -> RunSet {
+    // Keep only the most recent `max_runs` files (the listing is ascending).
+    let window = &files[files.len().saturating_sub(max_runs)..];
 
     let by_path: HashMap<&Path, &RunEntry> =
         prev.runs.values().map(|e| (e.path.as_path(), e)).collect();
 
     let mut runs: BTreeMap<DateTime<Utc>, RunEntry> = BTreeMap::new();
-    for path in files {
+    for path in window {
         let entry = if let Some(existing) = by_path.get(path.as_path()) {
             RunEntry {
                 data: existing.data.clone(),
-                path,
+                path: path.clone(),
             }
         } else {
-            match load_file(&path, collection_id) {
+            match load_file(path, collection_id) {
                 Ok(data) => {
                     let data = Arc::new(data);
-                    log_loaded(collection_id, &path, &data);
-                    RunEntry { data, path }
+                    log_loaded(collection_id, path, &data);
+                    RunEntry {
+                        data,
+                        path: path.clone(),
+                    }
                 }
                 Err(e) => {
                     // `e` already carries the `[collection_id]` prefix.
@@ -574,7 +579,16 @@ fn load_runset(dir: &Path, max_runs: usize, prev: &RunSet, collection_id: &str) 
                 }
             }
         };
-        runs.insert(entry.data.origin_time, entry);
+        // Two files decoding to the same origin time (e.g. a reissued run) would
+        // collide on the key; the later-sorted file wins. Surface the drop so it
+        // isn't silent.
+        if let Some(prev) = runs.insert(entry.data.origin_time, entry) {
+            tracing::warn!(
+                "[{collection_id}] two .sqd files share origin time {}; keeping the later one, dropping {}",
+                prev.data.origin_time,
+                prev.path.display()
+            );
+        }
     }
     RunSet { runs }
 }

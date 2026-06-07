@@ -131,6 +131,11 @@ fn lookup_collection<'a>(
 /// and confirm the engine exposes that run (`get_instances`): an unparseable id
 /// is 400, an unknown run is 404. The validated reference time is then passed to
 /// the engine query methods.
+///
+/// The existence check is **best-effort**: it reads a catalog snapshot, and a
+/// background poll could evict that run before the subsequent query reads its
+/// own snapshot. In that rare race the query just fails (the engine has no such
+/// run) — a benign 400 instead of 404 for a run that no longer exists.
 fn resolve_instance(
     engine: &Arc<dyn EdrEngine>,
     instance_id: Option<&str>,
