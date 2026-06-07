@@ -755,14 +755,15 @@ async fn declares_ogcapi_common_part2_classes() {
 // EDR 1.1 /collections/{id}/instances exposes forecast model runs as instances.
 // Implemented for forecast engines (GRIB/QueryData) via EdrEngine::get_instances;
 // non-forecast engines (this MockEngine) report no runs, so the endpoint returns
-// 200 with an empty `collections` list rather than 404.
+// 200 with an empty `instances` list rather than 404.
 
 #[tokio::test]
 async fn finding_20_instances_endpoint_present() {
     let (status, body) = get_json("/collections/weather/instances").await;
     assert_eq!(status, StatusCode::OK, "instances endpoint must exist");
+    // OGC EDR `instancesJSON` array field is `instances`.
     assert_eq!(
-        body["collections"].as_array().map(|a| a.len()),
+        body["instances"].as_array().map(|a| a.len()),
         Some(0),
         "a non-forecast collection has no model-run instances"
     );

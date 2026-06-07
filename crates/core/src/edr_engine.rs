@@ -28,7 +28,13 @@ pub trait EdrEngine: Send + Sync {
     /// *whether* a collection has instances to gate the instances links — they
     /// must not clone the whole [`Self::get_instances`] `Vec` (with every run's
     /// valid times) per request. Forecast engines override this with a cheap
-    /// "is the run map non-empty" check. Default mirrors `get_instances`.
+    /// "is the run map non-empty" check.
+    ///
+    /// The default delegates to `get_instances`, which is acceptable precisely
+    /// because the engines that take the default are the **non-forecast** ones —
+    /// their `get_instances` returns an empty `Vec` (a no-op allocation, no valid
+    /// times cloned). Any engine whose `get_instances` is non-trivial MUST
+    /// override this.
     fn has_instances(&self) -> bool {
         !self.get_instances().is_empty()
     }

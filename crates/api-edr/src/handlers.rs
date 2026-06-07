@@ -980,10 +980,12 @@ pub async fn instances(
     let (engine, config) = lookup_collection(&state, &id)?;
     let base = &state.base_url;
     let runs = engine.get_instances();
-    let collections: Vec<serde_json::Value> = runs
+    let instances: Vec<serde_json::Value> = runs
         .iter()
         .map(|run| build_collection_metadata(engine.as_ref(), config, base, Some(run)))
         .collect();
+    // OGC API - EDR 1.1 §8.2.3 `instancesJSON`: the array field is `instances`
+    // (each item a collection-shaped instance), not `collections`.
     Ok(Json(json!({
         "links": [{
             "href": format!("{base}/edr/collections/{}/instances", config.id),
@@ -991,7 +993,7 @@ pub async fn instances(
             "type": "application/json",
             "title": format!("{} — instances", config.title)
         }],
-        "collections": collections,
+        "instances": instances,
     })))
 }
 

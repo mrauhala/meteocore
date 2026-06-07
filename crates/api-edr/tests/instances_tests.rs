@@ -181,9 +181,10 @@ async fn get(uri: &str) -> (StatusCode, Value) {
 async fn instances_list_has_both_runs() {
     let (status, body) = get("/collections/fc/instances").await;
     assert_eq!(status, StatusCode::OK);
-    let collections = body["collections"].as_array().unwrap();
-    assert_eq!(collections.len(), 2);
-    let ids: Vec<&str> = collections
+    // OGC EDR `instancesJSON` array field is `instances`, not `collections`.
+    let instances = body["instances"].as_array().unwrap();
+    assert_eq!(instances.len(), 2);
+    let ids: Vec<&str> = instances
         .iter()
         .map(|c| c["id"].as_str().unwrap())
         .collect();
