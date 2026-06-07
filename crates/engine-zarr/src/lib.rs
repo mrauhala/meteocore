@@ -17,6 +17,8 @@
 
 mod catalog;
 mod cf;
+#[cfg(feature = "icechunk")]
+mod icechunk;
 mod store;
 
 use std::collections::HashMap;
@@ -37,13 +39,14 @@ use ds_core::model::{
 use ds_core::resample::ProjectionGrid;
 
 use catalog::Catalog;
-use store::DsStore;
+use store::{DsStore, EngineStore};
 
 /// Engine for serving Zarr arrays over EDR and the Map/Tiles/WMS APIs.
 pub struct ZarrEngine {
     collection_id: String,
-    /// `ds-storage`-backed store (local / S3 / HTTP), shared by query and poll.
-    store: Arc<DsStore>,
+    /// Backend store (plain `ds-storage` local/S3/HTTP, or Icechunk), shared by
+    /// query and poll.
+    store: Arc<EngineStore>,
     /// Parsed snapshot (data + map-capabilities), swapped atomically by the
     /// poll loop. `raster_info()` reads the catalog's cached `RasterInfo`, so it
     /// is O(1) from a snapshot and always consistent with the served data
@@ -284,7 +287,23 @@ impl EdrEngine for ZarrEngine {
 ///   `path` within the bucket.
 /// - Local: `data_path` (a directory, or an `s3://` / `http(s)://` URL),
 ///   optionally suffixed by `path`. `ds_storage::build_store` picks the backend.
-fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<DsStore, DataServerError> {
+fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<EngineStore, DataServerError> {
+    // Icechunk source (transactional/versioned repo) takes precedence when
+    // configured. Feature-gated; errors clearly if requested without the build.
+    if config.icechunk.is_some() {
+        #[cfg(feature = "icechunk")]
+        {
+            return icechunk::build_store(collection_id, config);
+        }
+        #[cfg(not(feature = "icechunk"))]
+        {
+            return Err(DataServerError::Config(format!(
+                "Collection '{collection_id}': [zarr.icechunk] is configured but this server was \
+                 built without the 'icechunk' feature"
+            )));
+        }
+    }
+
     if let (Some(endpoint), Some(bucket)) = (config.endpoint.as_deref(), config.bucket.as_deref()) {
         // `path` is required for a remote source — enforced in
         // `ServerConfig::validate` ("remote zarr (endpoint+bucket) requires
@@ -296,7 +315,7 @@ fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<DsStore, Data
                  (endpoint={endpoint}, bucket={bucket}): {e}"
             ))
         })?;
-        return Ok(DsStore::new(ds, path, config.cache_mb));
+        return Ok(EngineStore::new(DsStore::new(ds, path, config.cache_mb)));
     }
 
     let data_path = config.data_path.as_deref().ok_or_else(|| {
@@ -319,11 +338,11 @@ fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<DsStore, Data
             "Collection '{collection_id}': failed to open Zarr store '{location}': {e}"
         ))
     })?;
-    Ok(DsStore::new(
+    Ok(EngineStore::new(DsStore::new(
         ds,
         prefix.as_ref().to_string(),
         config.cache_mb,
-    ))
+    )))
 }
 
 impl MapEngine for ZarrEngine {

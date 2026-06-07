@@ -1,0 +1,60 @@
+# ENABLED, runnable example: ECMWF AIFS-single forecast as an Icechunk repo on
+# public AWS S3 (dynamical.org, CC-BY-4.0). Verified against the live dataset.
+#
+# Needs the icechunk feature AND network (anonymous AWS S3, us-west-2):
+#
+#   CONFIG_PATH=testdata/zarr-icechunk-aifs.config.toml \
+#     cargo run -p server --features icechunk
+#
+# Then:
+#   curl 'http://127.0.0.1:8094/edr/collections/ecmwf-aifs-single'
+#   curl 'http://127.0.0.1:8094/edr/collections/ecmwf-aifs-single/position?coords=POINT(24.9%2060.2)&parameter-name=temperature_2m&datetime=2026-06-07T00:00:00Z'
+#   curl 'http://127.0.0.1:8094/maps/collections/ecmwf-aifs-single/map?bbox=-30,30,40,75&width=512&height=384&crs=CRS:84&parameter-name=temperature_2m&datetime=2026-06-07T00:00:00Z' -o aifs.png
+#
+# Tip: this dataset's temperature_2m is in DEGREES CELSIUS (verified live — a
+# June Helsinki query returned ~11.4, not ~284). The engine returns stored
+# values verbatim (no unit conversion), so the colormap range below is Celsius.
+#
+# This is a forecast (init_time = model run, lead_time = offset): the engine uses
+# the LATEST run and exposes valid time (= run + lead) as the time axis, so the
+# temporal extent is the latest run's ~15-day forecast. Selecting an older run
+# (EDR instances / WMS reference_time) is tracked in #337.
+
+[server]
+host = "127.0.0.1"
+port = 8094
+
+[[collections]]
+id = "ecmwf-aifs-single"
+title = "ECMWF AIFS-single forecast (Icechunk)"
+description = "ECMWF AIFS deterministic AI forecast — global 0.25° regular lat/lon — read from an Icechunk repository on public S3 (dynamical.org)."
+engine_type = "zarr"
+apis = ["edr", "wms", "maps", "tiles"]
+keywords = ["forecast", "AIFS", "ECMWF", "icechunk"]
+
+[collections.license]
+title = "CC-BY-4.0"
+
+[collections.zarr]
+endpoint = "https://s3.us-west-2.amazonaws.com"
+bucket = "dynamical-ecmwf-aifs-single"
+path = "ecmwf-aifs-single-forecast/v0.1.0.icechunk"
+# Focused demo. The repo also has wind_u_10m/wind_v_10m,
+# pressure_reduced_to_mean_sea_level, precipitation_surface, and ~13 more.
+parameters = ["temperature_2m"]
+
+# Presence of this table selects the Icechunk backend. Default version is the
+# HEAD of branch `main`; new forecast cycles surface on
+# `POST /admin/collections/reload`.
+[collections.zarr.icechunk]
+branch = "main"
+region = "us-west-2"
+
+[collections.wms]
+colormap = "temperature"
+
+[[collections.wms.parameters]]
+name = "temperature_2m"
+colormap = "temperature"
+min = -30.0
+max = 40.0

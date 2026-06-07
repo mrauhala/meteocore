@@ -9,11 +9,16 @@ use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, TimeZone, Utc};
 /// The role a dimension plays in a CF-conventions data variable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AxisRole {
+    /// Valid time (a plain CF time axis).
     Time,
+    /// Forecast **reference time** (model run / init / analysis time).
+    Reference,
+    /// Forecast **lead** / period (a duration offset from the reference time).
+    Lead,
     Lat,
     Lon,
-    /// A dimension we don't geolocate in Phase 1 (vertical level, ensemble
-    /// member, projected x/y, …). Pinned to index 0 when sampling.
+    /// A dimension we don't geolocate (vertical level, ensemble member,
+    /// projected x/y, …). Pinned to index 0 when sampling.
     Other,
 }
 
@@ -27,7 +32,9 @@ pub enum AxisRole {
 pub fn classify_axis(dim_name: &str, standard_name: Option<&str>, units: Option<&str>) -> AxisRole {
     if let Some(sn) = standard_name {
         match sn.trim().to_ascii_lowercase().as_str() {
-            "time" | "forecast_reference_time" => return AxisRole::Time,
+            "time" => return AxisRole::Time,
+            "forecast_reference_time" => return AxisRole::Reference,
+            "forecast_period" => return AxisRole::Lead,
             "latitude" => return AxisRole::Lat,
             "longitude" => return AxisRole::Lon,
             // Projected / rotated / curvilinear axes are not geographic — keep
@@ -63,11 +70,31 @@ pub fn classify_axis(dim_name: &str, standard_name: Option<&str>, units: Option<
     // present, to avoid reading projected metres as degrees.
     match dim_name.trim().to_ascii_lowercase().as_str() {
         "time" | "t" | "valid_time" | "forecast_time" => AxisRole::Time,
+        "init_time" | "reference_time" | "forecast_reference_time" | "analysis_time" => {
+            AxisRole::Reference
+        }
+        "lead_time" | "forecast_period" | "step" | "prediction_timedelta" => AxisRole::Lead,
         "latitude" | "lat" | "nav_lat" => AxisRole::Lat,
         "longitude" | "lon" | "long" | "nav_lon" => AxisRole::Lon,
         "y" if units.is_none() => AxisRole::Lat,
         "x" if units.is_none() => AxisRole::Lon,
         _ => AxisRole::Other,
+    }
+}
+
+/// Parse a plain duration unit (no "since"), returning seconds-per-unit. Used to
+/// decode a forecast **lead** axis (e.g. `seconds`, `hours`). Returns `None` for
+/// anything that isn't a recognised duration unit.
+pub fn parse_duration_seconds(units: &str) -> Option<f64> {
+    match units.trim().to_ascii_lowercase().as_str() {
+        "nanoseconds" | "nanosecond" | "ns" => Some(1e-9),
+        "microseconds" | "microsecond" | "us" | "µs" => Some(1e-6),
+        "milliseconds" | "millisecond" | "ms" => Some(1e-3),
+        "seconds" | "second" | "secs" | "sec" | "s" => Some(1.0),
+        "minutes" | "minute" | "mins" | "min" => Some(60.0),
+        "hours" | "hour" | "hrs" | "hr" | "h" => Some(3600.0),
+        "days" | "day" | "d" => Some(86_400.0),
+        _ => None,
     }
 }
 
@@ -284,6 +311,43 @@ mod tests {
         // Bare x/y with no units fall back to lon/lat.
         assert_eq!(classify_axis("x", None, None), AxisRole::Lon);
         assert_eq!(classify_axis("y", None, None), AxisRole::Lat);
+    }
+
+    #[test]
+    fn classify_forecast_axes() {
+        assert_eq!(
+            classify_axis(
+                "init_time",
+                Some("forecast_reference_time"),
+                Some("seconds since 1970")
+            ),
+            AxisRole::Reference
+        );
+        assert_eq!(
+            classify_axis("lead_time", Some("forecast_period"), Some("seconds")),
+            AxisRole::Lead
+        );
+        // Plain valid time stays Time.
+        assert_eq!(
+            classify_axis("valid_time", Some("time"), Some("seconds since 1970")),
+            AxisRole::Time
+        );
+        // Name fallbacks (no standard_name).
+        assert_eq!(classify_axis("init_time", None, None), AxisRole::Reference);
+        assert_eq!(
+            classify_axis("lead_time", None, Some("hours")),
+            AxisRole::Lead
+        );
+    }
+
+    #[test]
+    fn duration_units() {
+        assert_eq!(parse_duration_seconds("seconds"), Some(1.0));
+        assert_eq!(parse_duration_seconds("hours"), Some(3600.0));
+        assert_eq!(parse_duration_seconds("days"), Some(86_400.0));
+        // A "<unit> since <ref>" string is a time origin, not a duration.
+        assert!(parse_duration_seconds("seconds since 1970-01-01").is_none());
+        assert!(parse_duration_seconds("degrees_north").is_none());
     }
 
     #[test]

@@ -17,11 +17,12 @@ use ds_core::error::DataServerError;
 use ds_core::map_engine::RasterInfo;
 
 use crate::cf::{self, AxisRole};
-use crate::store::DsStore;
+use crate::store::EngineStore;
 
-/// The store type backing every Zarr collection: a `ds-storage` adapter that
-/// serves local, S3, and HTTP backends uniformly (#125 Phase 2).
-type Store = DsStore;
+/// The store type backing every Zarr collection. A backend-agnostic wrapper so
+/// the catalog stays non-generic across the plain (`ds-storage`) and Icechunk
+/// backends (#125 Phase 2, #335).
+type Store = EngineStore;
 
 /// Codec options that pin chunk retrieval to the **calling thread** by setting
 /// the concurrency target to 1. This is load-bearing: it stops zarrs from
@@ -38,8 +39,14 @@ pub struct Variable {
     array: Array<Store>,
     pub units: String,
     pub label: String,
-    /// Axis index of the time dimension within this variable's dim order.
+    /// Axis index of the time dimension within this variable's dim order. For a
+    /// forecast (reference + lead), this is the **lead** axis.
     pub time_axis: Option<usize>,
+    /// For a forecast, the axis index of the **reference time** (model run),
+    /// pinned to [`ref_index`](Self::ref_index) (the latest run).
+    ref_axis: Option<usize>,
+    /// The reference-axis index to read (the latest run); 0 when not a forecast.
+    ref_index: u64,
     /// Axis index of the latitude dimension.
     lat_axis: usize,
     /// Axis index of the longitude dimension.
@@ -121,6 +128,8 @@ impl Catalog {
                 ranges.push(j0 as u64..(j1 as u64) + 1);
             } else if a == var.lon_axis {
                 ranges.push(i0 as u64..(i1 as u64) + 1);
+            } else if Some(a) == var.ref_axis {
+                ranges.push(var.ref_index..var.ref_index + 1);
             } else {
                 ranges.push(0..1);
             }
@@ -194,6 +203,8 @@ impl Catalog {
                 ranges.push(j0 as u64..(j1 as u64) + 1);
             } else if a == var.lon_axis {
                 ranges.push(i0 as u64..(i1 as u64) + 1);
+            } else if Some(a) == var.ref_axis {
+                ranges.push(var.ref_index..var.ref_index + 1);
             } else {
                 ranges.push(0..1);
             }
@@ -409,32 +420,43 @@ pub fn build(
         ));
     }
 
-    // Find the reference lat/lon/time dims from the first geographic variable.
-    let mut ref_dims: Option<(String, String, Option<String>)> = None;
+    // Find the lat/lon dims and the time-like dims (valid time, forecast
+    // reference/run, lead) from the first geographic variable.
+    #[allow(clippy::type_complexity)]
+    let mut found: Option<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = None;
     for name in &data_var_names {
         let a = &by_name[name];
         let Some(dims) = dim_names(a) else { continue };
-        let (mut lat, mut lon, mut time) = (None, None, None);
+        let (mut lat, mut lon, mut time, mut reference, mut lead) = (None, None, None, None, None);
         for dn in &dims {
             match role_of(&by_name, dn) {
                 AxisRole::Lat => lat = Some(dn.clone()),
                 AxisRole::Lon => lon = Some(dn.clone()),
                 AxisRole::Time => time = Some(dn.clone()),
+                AxisRole::Reference => reference = Some(dn.clone()),
+                AxisRole::Lead => lead = Some(dn.clone()),
                 AxisRole::Other => {}
             }
         }
         if let (Some(la), Some(lo)) = (lat, lon) {
-            ref_dims = Some((la, lo, time));
+            found = Some((la, lo, time, reference, lead));
             break;
         }
     }
-    let (lat_dim, lon_dim, time_dim) = ref_dims.ok_or_else(|| {
-        DataServerError::Engine(
-            "no geographic (latitude/longitude) data variable found; non-geographic Zarr \
-             is not supported in Phase 1"
-                .into(),
-        )
-    })?;
+    let (lat_dim, lon_dim, time_role_dim, ref_role_dim, lead_role_dim) =
+        found.ok_or_else(|| {
+            DataServerError::Engine(
+                "no geographic (latitude/longitude) data variable found; non-geographic Zarr \
+             is not supported"
+                    .into(),
+            )
+        })?;
 
     // Read the shared coordinate axes.
     let lat_arr = by_name.get(&lat_dim).ok_or_else(|| {
@@ -459,28 +481,101 @@ pub fn build(
         )));
     }
 
-    let time_dim = time_dim.ok_or_else(|| {
-        DataServerError::Engine(
-            "collection has no time dimension; Phase 1 requires a CF time axis".into(),
-        )
-    })?;
-    let time_arr = by_name.get(&time_dim).ok_or_else(|| {
-        DataServerError::Engine(format!("missing time coordinate variable '{time_dim}'"))
-    })?;
-    let time_units = str_attr(time_arr, "units").ok_or_else(|| {
-        DataServerError::Engine(format!(
-            "time coordinate '{time_dim}' has no 'units' attribute"
-        ))
-    })?;
-    if !cf::is_standard_calendar(str_attr(time_arr, "calendar").as_deref()) {
-        tracing::warn!(
-            "collection '{collection_id}': non-standard CF calendar '{}' approximated as \
-             proleptic Gregorian",
-            str_attr(time_arr, "calendar").unwrap_or_default()
+    // Pick the primary time axis (the one that varies → the engine's time
+    // dimension). A forecast (reference run + lead) uses the **latest run** and
+    // exposes valid = run + lead as the time axis, matching the GRIB convention;
+    // the reference axis is pinned to that latest run. Model-run *selection*
+    // (instances / WMS reference_time) is tracked separately in #337.
+    let forecast = ref_role_dim.is_some() && lead_role_dim.is_some();
+    let primary_dim = if forecast {
+        lead_role_dim.clone().unwrap()
+    } else if let Some(t) = &time_role_dim {
+        t.clone()
+    } else if let Some(r) = &ref_role_dim {
+        r.clone() // a bare sequence of runs (no lead axis)
+    } else {
+        return Err(DataServerError::Engine(
+            "collection has no time axis (need a CF time, or forecast reference+lead)".into(),
+        ));
+    };
+
+    // Resolve the latest run when a reference axis is pinned.
+    let mut ref_pin: Option<(String, usize)> = None;
+    let mut latest_ref_time: Option<DateTime<Utc>> = None;
+    if forecast {
+        let rd = ref_role_dim.as_ref().unwrap();
+        let ref_arr = by_name.get(rd).ok_or_else(|| {
+            DataServerError::Engine(format!("missing reference-time coordinate variable '{rd}'"))
+        })?;
+        let units = str_attr(ref_arr, "units").ok_or_else(|| {
+            DataServerError::Engine(format!("reference-time coordinate '{rd}' has no 'units'"))
+        })?;
+        if !cf::is_standard_calendar(str_attr(ref_arr, "calendar").as_deref()) {
+            tracing::warn!(
+                "collection '{collection_id}': non-standard CF calendar '{}' on reference-time \
+                 axis '{rd}' approximated as proleptic Gregorian",
+                str_attr(ref_arr, "calendar").unwrap_or_default()
+            );
+        }
+        let decoded =
+            cf::decode_times(&read_coord_f64(ref_arr)?, &units).map_err(DataServerError::Engine)?;
+        let (idx, t) = decoded
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, t)| **t)
+            .ok_or_else(|| {
+                DataServerError::Engine(format!("reference-time coordinate '{rd}' is empty"))
+            })?;
+        tracing::info!(
+            "collection '{collection_id}': forecast — latest run {t} (of {} runs); lead axis \
+             '{primary_dim}' is the time dimension",
+            decoded.len()
         );
+        latest_ref_time = Some(*t);
+        ref_pin = Some((rd.clone(), idx));
     }
-    let raw_times = read_coord_f64(time_arr)?;
-    let times = cf::decode_times(&raw_times, &time_units).map_err(DataServerError::Engine)?;
+
+    // Build the valid-time axis.
+    let primary_arr = by_name.get(&primary_dim).ok_or_else(|| {
+        DataServerError::Engine(format!("missing coordinate variable '{primary_dim}'"))
+    })?;
+    let times = if forecast {
+        let units = str_attr(primary_arr, "units").ok_or_else(|| {
+            DataServerError::Engine(format!("lead coordinate '{primary_dim}' has no 'units'"))
+        })?;
+        let secs = cf::parse_duration_seconds(&units).ok_or_else(|| {
+            DataServerError::Engine(format!(
+                "lead coordinate '{primary_dim}' has unrecognised duration units '{units}'"
+            ))
+        })?;
+        let base = latest_ref_time.expect("forecast sets latest_ref_time");
+        // Guard non-finite leads: `NaN as i64` is 0, which would silently yield
+        // the run time (mirrors `cf::decode_times`'s finite check).
+        read_coord_f64(primary_arr)?
+            .iter()
+            .map(|&v| {
+                if !v.is_finite() {
+                    return Err(DataServerError::Engine(format!(
+                        "non-finite value in lead axis '{primary_dim}': {v}"
+                    )));
+                }
+                Ok(base + chrono::Duration::milliseconds((v * secs * 1000.0).round() as i64))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let units = str_attr(primary_arr, "units").ok_or_else(|| {
+            DataServerError::Engine(format!("time coordinate '{primary_dim}' has no 'units'"))
+        })?;
+        if !cf::is_standard_calendar(str_attr(primary_arr, "calendar").as_deref()) {
+            tracing::warn!(
+                "collection '{collection_id}': non-standard CF calendar '{}' approximated as \
+                 proleptic Gregorian",
+                str_attr(primary_arr, "calendar").unwrap_or_default()
+            );
+        }
+        cf::decode_times(&read_coord_f64(primary_arr)?, &units).map_err(DataServerError::Engine)?
+    };
+    let time_dim = primary_dim;
 
     // Build the exposed variables.
     let mut vars = Vec::new();
@@ -512,6 +607,12 @@ pub fn build(
                 "collection '{collection_id}': variable '{name}' does not share the lat/lon grid; skipping"
             );
             continue;
+        };
+
+        // Forecast: pin this variable's reference (run) axis to the latest run.
+        let (ref_axis, ref_index) = match &ref_pin {
+            Some((rd, idx)) => (dims.iter().position(|d| d == rd), *idx as u64),
+            None => (None, 0),
         };
 
         // Skip variables whose data type the read path can't widen to f64 (e.g.
@@ -597,6 +698,8 @@ pub fn build(
             units,
             label,
             time_axis,
+            ref_axis,
+            ref_index,
             lat_axis,
             lon_axis,
             ndim,

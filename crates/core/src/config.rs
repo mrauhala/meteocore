@@ -656,6 +656,33 @@ pub struct ZarrConfig {
     /// Default: 256.
     #[serde(default = "default_zarr_cache_mb")]
     pub cache_mb: u64,
+    /// Read the source as an **Icechunk** repository (transactional/versioned
+    /// Zarr) rather than a plain Zarr store. Requires the server to be built
+    /// with the `icechunk` feature. The repo location reuses `data_path`
+    /// (local) or `endpoint`+`bucket`+`path` (S3); this table selects the
+    /// version to read. See issue #335.
+    pub icechunk: Option<IcechunkConfig>,
+}
+
+/// Icechunk version selector for `[collections.zarr.icechunk]`.
+///
+/// At most one of `branch` / `tag` / `snapshot` may be set; the default is the
+/// HEAD of branch `main`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IcechunkConfig {
+    /// Read the HEAD of this branch (default: `main`).
+    pub branch: Option<String>,
+    /// Read this tag.
+    pub tag: Option<String>,
+    /// Read this exact snapshot id (immutable).
+    pub snapshot: Option<String>,
+    /// S3 region for the repo's object store (e.g. "us-west-2"). Needed for
+    /// AWS; ignored for the local backend.
+    pub region: Option<String>,
+    /// S3 path-style addressing (`endpoint/bucket/key`). Default `true` (works
+    /// for S3-compatible endpoints and AWS regional endpoints); set `false` for
+    /// virtual-host style. Ignored for the local backend.
+    pub force_path_style: Option<bool>,
 }
 
 /// Observation table configuration for engine-postgis.
@@ -1631,6 +1658,31 @@ impl ServerConfig {
                         )));
                     }
                 }
+
+                // Icechunk: at most one version selector (branch/tag/snapshot).
+                if let Some(ic) = &zarr.icechunk {
+                    let selectors = [ic.branch.is_some(), ic.tag.is_some(), ic.snapshot.is_some()]
+                        .iter()
+                        .filter(|&&s| s)
+                        .count();
+                    if selectors > 1 {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': zarr icechunk takes at most one of \
+                             'branch'/'tag'/'snapshot'"
+                        )));
+                    }
+                    // An empty selector would pass the count check but fail
+                    // opaquely at runtime — reject it at load.
+                    if [&ic.branch, &ic.tag, &ic.snapshot]
+                        .iter()
+                        .any(|s| s.as_deref().is_some_and(str::is_empty))
+                    {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': zarr icechunk 'branch'/'tag'/'snapshot' must not \
+                             be empty"
+                        )));
+                    }
+                }
             }
 
             // PostGIS engine: requires [postgis] section + parameters + valid shape.
@@ -1890,6 +1942,32 @@ url = "https://creativecommons.org/licenses/by/4.0/"
     #[test]
     fn zarr_rejects_invalid_version() {
         let cfg = zarr_collection("data_path = \"x\"\nzarr_version = 4\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn zarr_icechunk_single_version_selector_ok() {
+        let cfg = zarr_collection(
+            "data_path = \"x\"\n[collections.zarr.icechunk]\nsnapshot = \"abc123\"\n",
+        );
+        assert!(cfg.validate().is_ok());
+        // Default (no selector) is also fine — implies branch main HEAD.
+        let cfg2 = zarr_collection("data_path = \"x\"\n[collections.zarr.icechunk]\n");
+        assert!(cfg2.validate().is_ok());
+    }
+
+    #[test]
+    fn zarr_icechunk_rejects_multiple_version_selectors() {
+        let cfg = zarr_collection(
+            "data_path = \"x\"\n[collections.zarr.icechunk]\nbranch = \"main\"\ntag = \"v1\"\n",
+        );
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn zarr_icechunk_rejects_empty_selector() {
+        let cfg =
+            zarr_collection("data_path = \"x\"\n[collections.zarr.icechunk]\nbranch = \"\"\n");
         assert!(cfg.validate().is_err());
     }
 

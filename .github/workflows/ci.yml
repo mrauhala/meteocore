@@ -66,6 +66,14 @@ jobs:
     - name: Run tests
       run: cargo test
 
+    # The Zarr engine's `icechunk` feature is off by default (heavy dep tree),
+    # so the default jobs above don't compile it. Guard it from bitrot: lint +
+    # run its network-free end-to-end test (#335).
+    - name: Clippy + test engine-zarr icechunk feature
+      run: |
+        cargo clippy -p engine-zarr --features icechunk --all-targets -- -D warnings
+        cargo test -p engine-zarr --features icechunk --test icechunk
+
   docker-check:
     name: Docker Build (PR)
     needs: check

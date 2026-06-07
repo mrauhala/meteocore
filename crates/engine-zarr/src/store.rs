@@ -218,6 +218,76 @@ impl ListableStorageTraits for DsStore {
     }
 }
 
+/// A backend-agnostic readable + listable store. The catalog and read paths
+/// work over this single concrete type, so `Catalog`/`ZarrEngine` stay
+/// non-generic, while the actual backend — plain [`DsStore`], or the Icechunk
+/// async→sync adapter under the `icechunk` feature — lives behind two upcast
+/// trait-object handles to the *same* store.
+///
+/// We hold separate `Readable` and `Listable` handles (not one
+/// `dyn ReadableListableStorageTraits`) because zarrs's `child_arrays` requires
+/// the storage type to satisfy `ReadableStorageTraits` **and**
+/// `ListableStorageTraits` as separate bounds, which a `dyn`-of-the-combined-
+/// supertrait does not provide.
+pub struct EngineStore {
+    readable: Arc<dyn ReadableStorageTraits>,
+    listable: Arc<dyn ListableStorageTraits>,
+}
+
+impl EngineStore {
+    /// Wrap any concrete readable+listable backend store.
+    pub fn new<S>(store: S) -> Self
+    where
+        S: ReadableStorageTraits + ListableStorageTraits + 'static,
+    {
+        let arc = Arc::new(store);
+        Self {
+            readable: arc.clone(),
+            listable: arc,
+        }
+    }
+}
+
+impl ReadableStorageTraits for EngineStore {
+    fn get(&self, key: &StoreKey) -> Result<MaybeBytes, StorageError> {
+        self.readable.get(key)
+    }
+
+    fn get_partial_many<'a>(
+        &'a self,
+        key: &StoreKey,
+        byte_ranges: ByteRangeIterator<'a>,
+    ) -> Result<MaybeBytesIterator<'a>, StorageError> {
+        self.readable.get_partial_many(key, byte_ranges)
+    }
+
+    fn size_key(&self, key: &StoreKey) -> Result<Option<u64>, StorageError> {
+        self.readable.size_key(key)
+    }
+
+    fn supports_get_partial(&self) -> bool {
+        self.readable.supports_get_partial()
+    }
+}
+
+impl ListableStorageTraits for EngineStore {
+    fn list(&self) -> Result<StoreKeys, StorageError> {
+        self.listable.list()
+    }
+
+    fn list_prefix(&self, prefix: &StorePrefix) -> Result<StoreKeys, StorageError> {
+        self.listable.list_prefix(prefix)
+    }
+
+    fn list_dir(&self, prefix: &StorePrefix) -> Result<StoreKeysPrefixes, StorageError> {
+        self.listable.list_dir(prefix)
+    }
+
+    fn size_prefix(&self, prefix: &StorePrefix) -> Result<u64, StorageError> {
+        self.listable.size_prefix(prefix)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
