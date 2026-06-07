@@ -15,6 +15,10 @@ RUN cargo install cargo-chef --locked --version 0.1.71
 # stable across source-only changes — the next stage's cache hits.
 FROM chef AS planner
 COPY . .
+# NB: `cargo chef prepare` (0.1.71) takes no `--features` — the recipe captures
+# the full manifest incl. the *optional* `icechunk` dep, so the builder's
+# `cook --features icechunk` pre-warms those crates from it. (Newer cargo-chef
+# adds `prepare --features`; not needed / not supported here.)
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 1c: builder
