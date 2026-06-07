@@ -15,6 +15,10 @@ RUN cargo install cargo-chef --locked --version 0.1.71
 # stable across source-only changes — the next stage's cache hits.
 FROM chef AS planner
 COPY . .
+# NB: `cargo chef prepare` (0.1.71) takes no `--features` — the recipe captures
+# the full manifest incl. the *optional* `icechunk` dep, so the builder's
+# `cook --features icechunk` pre-warms those crates from it. (Newer cargo-chef
+# adds `prepare --features`; not needed / not supported here.)
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 1c: builder
@@ -48,13 +52,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # so it stays cache-valid until any Cargo.toml or Cargo.lock changes.
 # Source changes do *not* invalidate it. `type=gha,mode=max` on the
 # workflow's `cache-to` exports this layer.
+#
+# Cargo features compiled into the server. Defaults to `icechunk` (read
+# transactional/versioned Icechunk Zarr repos; ~+8 MB, object_store S3 backend —
+# no AWS SDK, #339). Build a leaner image without it via
+# `--build-arg CARGO_FEATURES=""`, or pass a custom set. Threaded through BOTH
+# `cook` and `build` so the cooked dep cache matches the final build.
+ARG CARGO_FEATURES="icechunk"
 COPY --from=planner /build/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json -p server
+# `--locked`: build strictly against the committed Cargo.lock (matches the
+# release build) — important now that the default feature set pulls rev-pinned
+# `[patch.crates-io]` git forks; no silent re-resolution in the shipped image.
+RUN cargo chef cook --release --locked --recipe-path recipe.json -p server \
+        ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 
 # Now copy the actual workspace source and build. Only the changed
 # workspace member's crate needs to recompile; deps are already linked.
 COPY . .
-RUN cargo build --release -p server
+RUN cargo build --release --locked -p server \
+        ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
