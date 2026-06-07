@@ -36,6 +36,7 @@ impl EdrEngine for MockEngine {
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         if location_id != "helsinki" {
             return Err(DataServerError::LocationNotFound(location_id.to_string()));

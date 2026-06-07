@@ -280,6 +280,7 @@ async fn probe_models() {
                     None,
                     Some(&["temperature_2m".to_string()]),
                     None,
+                    None,
                 ) {
                     Ok(CoverageResponse::Single(qr)) => qr
                         .ranges
@@ -337,7 +338,7 @@ async fn reads_local_icechunk_repo() {
     // 278.97 at t=0, +0.5/step.
     let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
     let resp = engine
-        .query_position("POINT(2 58)", Some((t0, t0)), None, None)
+        .query_position("POINT(2 58)", Some((t0, t0)), None, None, None)
         .expect("position query");
     let qr = match resp {
         CoverageResponse::Single(qr) => qr,

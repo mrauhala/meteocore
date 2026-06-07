@@ -230,6 +230,7 @@ impl GeoTiffEngine {
             native_crs: crs_name,
             spatial_extent: catalog.spatial_extent,
             times,
+            reference_times: Vec::new(),
             parameter: self.parameter.clone(),
             unit: self.unit.clone(),
             parameters: vec![], // single-parameter engine
@@ -396,6 +397,7 @@ impl GeoTiffEngine {
                 native_crs: "CRS:84".to_string(),
                 spatial_extent: None,
                 times: vec![],
+                reference_times: Vec::new(),
                 parameter: config.parameter.clone(),
                 unit: config.unit.clone(),
                 parameters: vec![],
@@ -1340,6 +1342,7 @@ fn crs_label(crs: &ds_core::geo::Crs) -> String {
 }
 
 impl ds_core::map_engine::MapEngine for GeoTiffEngine {
+    #[allow(clippy::too_many_arguments)]
     fn get_raster_tile(
         &self,
         bbox: [f64; 4],
@@ -1349,6 +1352,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         output_crs: &ds_core::map_engine::OutputCrs,
         parameter: Option<&str>,
         z: Option<f64>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<ds_core::map_engine::RasterTile, DataServerError> {
         let _ = (parameter, z); // GeoTIFF engine serves a single 2-D band per collection
                                 // For STAC: ensure we have items around the requested time
@@ -1598,6 +1602,7 @@ impl EdrEngine for GeoTiffEngine {
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         Err(DataServerError::InvalidParameter(
             "GeoTIFF engine does not support named location queries. \
@@ -1612,6 +1617,7 @@ impl EdrEngine for GeoTiffEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let (lat, lon) = parse_coords(coords)?;
         Ok(CoverageResponse::Single(
@@ -1625,6 +1631,7 @@ impl EdrEngine for GeoTiffEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let polygon = ds_core::feature::parse_area_coords(coords)?;
 

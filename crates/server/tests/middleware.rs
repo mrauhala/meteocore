@@ -26,6 +26,7 @@ use ds_render::{BuiltinColormap, LutColorMap, RenderedCache, StyleInfo};
 struct MockMapEngine;
 
 impl MapEngine for MockMapEngine {
+    #[allow(clippy::too_many_arguments)]
     fn get_raster_tile(
         &self,
         _bbox: [f64; 4],
@@ -35,6 +36,7 @@ impl MapEngine for MockMapEngine {
         _output_crs: &OutputCrs,
         _parameter: Option<&str>,
         _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         let n = (width * height) as usize;
         Ok(RasterTile {
@@ -57,6 +59,7 @@ impl MapEngine for MockMapEngine {
             vertical: None,
             grid_size: None,
             layer_subtitle: None,
+            reference_times: Vec::new(),
         }
     }
 }

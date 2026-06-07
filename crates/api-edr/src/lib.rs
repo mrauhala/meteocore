@@ -27,5 +27,20 @@ pub fn router(state: AppState) -> Router {
             "/collections/{id}/trajectory",
             get(handlers::trajectory_query),
         )
+        // OGC API - EDR instances (forecast model runs; #337). The `{instanceId}`
+        // segment name matches the OpenAPI `api_definition()` path parameter.
+        .route("/collections/{id}/instances", get(handlers::instances))
+        .route(
+            "/collections/{id}/instances/{instanceId}",
+            get(handlers::instance),
+        )
+        .route(
+            "/collections/{id}/instances/{instanceId}/position",
+            get(handlers::instance_position_query),
+        )
+        .route(
+            "/collections/{id}/instances/{instanceId}/area",
+            get(handlers::instance_area_query),
+        )
         .with_state(state)
 }

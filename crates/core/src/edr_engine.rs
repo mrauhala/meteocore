@@ -3,11 +3,57 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 use crate::error::DataServerError;
+use crate::instances::RunInfo;
 use crate::model::{CoverageResponse, Location, ParameterDescription};
 use crate::vertical::VerticalDimension;
 
 pub trait EdrEngine: Send + Sync {
     fn get_locations(&self) -> Result<Vec<Location>, DataServerError>;
+
+    /// The forecast model runs this engine exposes as OGC API - EDR
+    /// *instances*, ascending by reference time (latest last).
+    ///
+    /// Default: empty — the engine has no model-run concept and exposes only a
+    /// single time axis (observations, analyses, a single forecast). Forecast
+    /// engines (GRIB, QueryData, …) override this, building the list with
+    /// [`crate::instances::build_instances`]. When non-empty, the `reference_time`
+    /// argument on the query methods selects a run (`None` ⇒ the latest).
+    fn get_instances(&self) -> Vec<RunInfo> {
+        Vec::new()
+    }
+
+    /// Whether this engine exposes any model runs, **O(1)** from a snapshot.
+    ///
+    /// Hot metadata paths (`/api`, `/collections/{id}`) only need to know
+    /// *whether* a collection has instances to gate the instances links — they
+    /// must not clone the whole [`Self::get_instances`] `Vec` (with every run's
+    /// valid times) per request. Forecast engines override this with a cheap
+    /// "is the run map non-empty" check.
+    ///
+    /// The default delegates to `get_instances`, which is acceptable precisely
+    /// because the engines that take the default are the **non-forecast** ones —
+    /// their `get_instances` returns an empty `Vec` (a no-op allocation, no valid
+    /// times cloned). Any engine whose `get_instances` is non-trivial MUST
+    /// override this.
+    fn has_instances(&self) -> bool {
+        // NOTE: forecast engines MUST override this — the default clones
+        // `Vec<RunInfo>` (with every run's valid times), acceptable only for the
+        // non-forecast engines that take it (where `get_instances` is `Vec::new()`).
+        // Not enforceable at compile time; see the doc above.
+        !self.get_instances().is_empty()
+    }
+
+    /// Look up a single model run by reference time, or `None` if absent.
+    ///
+    /// The instance-metadata endpoint needs exactly one run; the default
+    /// builds the full list and filters, but forecast engines override this to
+    /// build only the requested run's [`RunInfo`] (a direct catalog lookup),
+    /// avoiding the clone of every other run's valid times.
+    fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
+        self.get_instances()
+            .into_iter()
+            .find(|r| r.reference_time == reference_time)
+    }
 
     /// Execute a query for a named location.
     ///
@@ -15,12 +61,17 @@ pub trait EdrEngine: Send + Sync {
     /// `Some([v])` pins one level, `Some([v1, v2, …])` selects several.
     /// Engines with no vertical dimension ignore it (the API layer rejects
     /// a `z` against a collection that has no vertical extent).
+    ///
+    /// `reference_time` selects a forecast model run (see [`Self::get_instances`]):
+    /// `None` ⇒ the latest run (the default and only behaviour for non-forecast
+    /// engines, which ignore it).
     fn query_location(
         &self,
         location_id: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError>;
 
     fn get_parameters(&self) -> Vec<String>;
@@ -73,8 +124,9 @@ pub trait EdrEngine: Send + Sync {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
-        let _ = (coords, datetime, parameters, z);
+        let _ = (coords, datetime, parameters, z, reference_time);
         Err(DataServerError::InvalidParameter(
             "Area query not supported by this engine".into(),
         ))
@@ -88,8 +140,9 @@ pub trait EdrEngine: Send + Sync {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
-        let _ = (coords, datetime, parameters, z);
+        let _ = (coords, datetime, parameters, z, reference_time);
         Err(DataServerError::InvalidParameter(
             "Position query not supported by this engine".into(),
         ))
@@ -108,8 +161,9 @@ pub trait EdrEngine: Send + Sync {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
-        let _ = (coords, datetime, parameters, z);
+        let _ = (coords, datetime, parameters, z, reference_time);
         Err(DataServerError::InvalidParameter(
             "Trajectory query not supported by this engine".into(),
         ))

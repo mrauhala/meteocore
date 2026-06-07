@@ -294,6 +294,7 @@ pub async fn wms_handler(
                             &output_crs,
                             style_parameter.as_deref(),
                             elevation,
+                            None,
                         )?;
                         // If every pixel is nodata, skip colorization + encoding entirely.
                         if tile.is_empty() {
@@ -337,6 +338,7 @@ pub async fn wms_handler(
                                     &OutputCrs::WebMercator,
                                     style_parameter.as_deref(),
                                     elevation,
+                                    None,
                                 )
                             },
                         )?;

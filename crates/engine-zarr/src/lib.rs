@@ -148,6 +148,7 @@ impl EdrEngine for ZarrEngine {
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         Err(DataServerError::InvalidParameter(
             "Zarr engine does not support location queries (use a position query)".into(),
@@ -209,6 +210,7 @@ impl EdrEngine for ZarrEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let (lon, lat) = parse_coords(coords)?;
         let cat = self.catalog.load();
@@ -346,6 +348,7 @@ fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<EngineStore, 
 }
 
 impl MapEngine for ZarrEngine {
+    #[allow(clippy::too_many_arguments)]
     fn get_raster_tile(
         &self,
         bbox: [f64; 4],
@@ -355,6 +358,7 @@ impl MapEngine for ZarrEngine {
         output_crs: &OutputCrs,
         parameter: Option<&str>,
         _z: Option<f64>, // Zarr collections expose no vertical dimension yet
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         let cat = self.catalog.load();
         let var = match parameter {

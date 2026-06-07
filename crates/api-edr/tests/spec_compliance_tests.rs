@@ -54,6 +54,7 @@ impl EdrEngine for MockEngine {
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         if location_id != "station1" && location_id != "station2" {
             return Err(DataServerError::LocationNotFound(location_id.to_string()));
@@ -629,6 +630,7 @@ async fn data_queries_default_output_format_set_for_all_query_types() {
             _: Option<(DateTime<Utc>, DateTime<Utc>)>,
             _: Option<&[String]>,
             _: Option<&[f64]>,
+            _: Option<DateTime<Utc>>,
         ) -> Result<ds_core::model::CoverageResponse, DataServerError> {
             Err(DataServerError::LocationNotFound(location_id.into()))
         }
@@ -748,20 +750,22 @@ async fn declares_ogcapi_common_part2_classes() {
 // Impact: Minor - only needed for URL canonicalization.
 
 // ===========================================================================
-// FINDING 20: No "instances" endpoint
+// FINDING 20 (RESOLVED, #337): "instances" endpoint implemented
 // ===========================================================================
-// Spec: EDR 1.1 supports /collections/{id}/instances for temporal instances
-//   (e.g., different forecast runs).
-// Implementation: No instances endpoint exists.
-// Fix: If applicable, add /collections/{id}/instances endpoint.
+// EDR 1.1 /collections/{id}/instances exposes forecast model runs as instances.
+// Implemented for forecast engines (GRIB/QueryData) via EdrEngine::get_instances;
+// non-forecast engines (this MockEngine) report no runs, so the endpoint returns
+// 200 with an empty `instances` list rather than 404.
 
 #[tokio::test]
-async fn finding_20_instances_not_implemented() {
-    let (status, _) = get_json("/collections/weather/instances").await;
+async fn finding_20_instances_endpoint_present() {
+    let (status, body) = get_json("/collections/weather/instances").await;
+    assert_eq!(status, StatusCode::OK, "instances endpoint must exist");
+    // OGC EDR `instancesJSON` array field is `instances`.
     assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "Instances endpoint is not implemented"
+        body["instances"].as_array().map(|a| a.len()),
+        Some(0),
+        "a non-forecast collection has no model-run instances"
     );
 }
 

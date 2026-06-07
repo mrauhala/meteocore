@@ -26,7 +26,7 @@ fn bench_query_location(c: &mut Criterion) {
         b.iter(|| {
             black_box(
                 engine
-                    .query_location(black_box(loc_id), None, None, None)
+                    .query_location(black_box(loc_id), None, None, None, None)
                     .unwrap(),
             )
         })
@@ -37,7 +37,7 @@ fn bench_query_location(c: &mut Criterion) {
         b.iter(|| {
             black_box(
                 engine
-                    .query_location(black_box(loc_id), None, Some(&params), None)
+                    .query_location(black_box(loc_id), None, Some(&params), None, None)
                     .unwrap(),
             )
         })
@@ -69,7 +69,7 @@ fn bench_query_area(c: &mut Criterion) {
         b.iter(|| {
             black_box(
                 engine
-                    .query_area(black_box(coords), None, None, None)
+                    .query_area(black_box(coords), None, None, None, None)
                     .unwrap(),
             )
         })

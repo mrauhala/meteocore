@@ -164,6 +164,7 @@ impl EdrEngine for CsvEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         Ok(CoverageResponse::Single(self.location_series(
             location_id,
@@ -229,6 +230,7 @@ impl EdrEngine for CsvEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         const MAX_LOCATIONS: usize = 500;
 

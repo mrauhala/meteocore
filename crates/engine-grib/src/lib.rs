@@ -17,6 +17,7 @@ use tokio::sync::watch;
 use ds_core::config::GribConfig;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
+use ds_core::instances::{self, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::*;
 
@@ -813,37 +814,78 @@ impl GribEngine {
             .unwrap_or_else(|| ParamMetadata::placeholder(short_name))
     }
 
-    /// Find the best step file for a datetime query.
+    /// Find the best step file for a datetime query, optionally pinned to a
+    /// specific model run.
+    ///
+    /// `reference_time = Some(rt)` restricts the search to exactly that run
+    /// (an unknown run is an error → 404 at the API layer); `None` keeps the
+    /// existing "latest run, or the most recent run covering `datetime`"
+    /// behaviour. See [`instances::select_run`].
     fn resolve_time(
         &self,
+        reference_time: Option<DateTime<Utc>>,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
     ) -> Result<(u32, StepFile), DataServerError> {
         let catalog = self.catalog.load();
-
-        if catalog.runs.is_empty() {
-            return Err(DataServerError::Engine(
-                "No forecast data available".to_string(),
-            ));
-        }
-
-        let target = match datetime {
-            Some((start, _end)) => start,
+        // Run selection is shared with `query_position` (see `resolve_run`); this
+        // path additionally narrows to a single step.
+        let run = resolve_run(&catalog, reference_time, datetime)?;
+        match datetime {
+            Some((start, _end)) => run
+                .find_step_for_time(start)
+                .map(|(step, sf)| (step, sf.clone()))
+                .ok_or_else(|| {
+                    DataServerError::InvalidParameter(format!("No forecast step for time {start}"))
+                }),
             None => {
-                // Default to latest available time
-                let run = catalog.latest_run().unwrap();
-                let (&step, sf) = run.steps.iter().next_back().unwrap();
-                return Ok((step, sf.clone()));
+                let (&step, sf) = run.steps.iter().next_back().ok_or_else(|| {
+                    DataServerError::Engine("forecast run has no steps".to_string())
+                })?;
+                Ok((step, sf.clone()))
             }
-        };
+        }
+    }
+}
 
-        catalog
-            .find_for_time(target)
-            .map(|(step, sf)| (step, sf.clone()))
+/// Select the forecast run to serve, shared by `query_position` and
+/// `resolve_time` (the EDR and Maps paths) so run selection — and its
+/// error mapping — is identical everywhere.
+///
+/// `reference_time = Some(rt)` pins exactly that run (absent ⇒
+/// [`DataServerError::ReferenceTimeNotFound`] → 404); `None` falls back to the
+/// most recent run whose steps cover `datetime`, or the latest run. See
+/// [`instances::select_run`].
+fn resolve_run(
+    catalog: &Catalog,
+    reference_time: Option<DateTime<Utc>>,
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Result<&ForecastRun, DataServerError> {
+    if catalog.runs.is_empty() {
+        return Err(DataServerError::Engine(
+            "No forecast data available".to_string(),
+        ));
+    }
+    match reference_time {
+        Some(rt) => instances::select_run(&catalog.runs, Some(rt))
+            .map(|(_, r)| r)
             .ok_or_else(|| {
-                DataServerError::InvalidParameter(format!(
-                    "No forecast data available for time {target}"
+                DataServerError::ReferenceTimeNotFound(format!(
+                    "no forecast run for reference time {rt}"
                 ))
-            })
+            }),
+        None => match datetime {
+            Some((start, _)) => catalog
+                .runs
+                .values()
+                .rev()
+                .find(|r| r.find_step_for_time(start).is_some())
+                .ok_or_else(|| {
+                    DataServerError::InvalidParameter(format!(
+                        "No forecast run covers time {start}"
+                    ))
+                }),
+            None => Ok(catalog.latest_run().expect("runs is non-empty")),
+        },
     }
 }
 
@@ -857,12 +899,32 @@ impl EdrEngine for GribEngine {
         Ok(Vec::new())
     }
 
+    /// Each forecast run is an EDR instance (latest last). Valid times are
+    /// `reference_time + step` for every step retained in that run.
+    fn get_instances(&self) -> Vec<RunInfo> {
+        let catalog = self.catalog.load();
+        instances::build_instances(&catalog.runs, |_, run| run.valid_times())
+    }
+
+    fn has_instances(&self) -> bool {
+        !self.catalog.load().runs.is_empty()
+    }
+
+    fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
+        let catalog = self.catalog.load();
+        catalog.runs.get(&reference_time).map(|run| RunInfo {
+            reference_time,
+            valid_times: run.valid_times(),
+        })
+    }
+
     fn query_location(
         &self,
         _location_id: &str,
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         Err(DataServerError::InvalidParameter(
             "GRIB engine does not support location queries; use position or area instead"
@@ -924,33 +986,15 @@ impl EdrEngine for GribEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let (lon, lat) = parse_coords(coords)?;
         let catalog = self.catalog.load();
 
-        if catalog.runs.is_empty() {
-            return Err(DataServerError::Engine(
-                "No forecast data available".to_string(),
-            ));
-        }
-
-        // Find the best forecast run
-        let run = match datetime {
-            Some((start, _)) => {
-                // Find the run whose valid times include the requested time
-                catalog
-                    .runs
-                    .values()
-                    .rev()
-                    .find(|r| r.find_step_for_time(start).is_some())
-                    .ok_or_else(|| {
-                        DataServerError::InvalidParameter(format!(
-                            "No forecast run covers time {start}"
-                        ))
-                    })?
-            }
-            None => catalog.latest_run().unwrap(),
-        };
+        // Run selection (pinned instance, datetime-covering, or latest) is shared
+        // with `resolve_time` via `resolve_run`; this path then enumerates the
+        // run's steps into a time series.
+        let run = resolve_run(&catalog, reference_time, datetime)?;
 
         // Determine which forecast steps to include
         let steps_to_query: Vec<(u32, &StepFile)> = match datetime {
@@ -1067,9 +1111,10 @@ impl EdrEngine for GribEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let bbox = parse_bbox_from_wkt(coords)?;
-        let (_step, step_file) = self.resolve_time(datetime)?;
+        let (_step, step_file) = self.resolve_time(reference_time, datetime)?;
 
         // Default to first near-surface parameter
         let query_params: Vec<&str> = match parameters {
@@ -1181,6 +1226,7 @@ impl EdrEngine for GribEngine {
 // ---------------------------------------------------------------------------
 
 impl MapEngine for GribEngine {
+    #[allow(clippy::too_many_arguments)] // bbox/size/time/crs/parameter/z/reference_time are all genuine selectors
     fn get_raster_tile(
         &self,
         bbox: [f64; 4],
@@ -1190,10 +1236,11 @@ impl MapEngine for GribEngine {
         output_crs: &OutputCrs,
         parameter: Option<&str>,
         z: Option<f64>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         let _ = z; // GRIB collections expose no vertical dimension yet (#185)
         let datetime = time.map(|t| (t, t));
-        let (_step, step_file) = self.resolve_time(datetime)?;
+        let (_step, step_file) = self.resolve_time(reference_time, datetime)?;
 
         // Determine parameter to render
         let param_name = parameter.unwrap_or_else(|| {
@@ -1279,6 +1326,9 @@ impl MapEngine for GribEngine {
             // unadvertised for now (tracked as a follow-up).
             grid_size: None,
             layer_subtitle: None,
+            // Each retained forecast run is a selectable reference time (WMS
+            // `reference_time` dimension); ascending, latest last.
+            reference_times: catalog.runs.keys().copied().collect(),
         }
     }
 }

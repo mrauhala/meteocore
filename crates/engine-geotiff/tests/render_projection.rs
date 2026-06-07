@@ -66,7 +66,16 @@ fn renders_projected_geotiff_to_wgs84() {
     let engine = tm35fin_engine();
     let (w, h) = (256, 256);
     let tile = engine
-        .get_raster_tile(COVERED_BBOX, w, h, None, &OutputCrs::Wgs84, None, None)
+        .get_raster_tile(
+            COVERED_BBOX,
+            w,
+            h,
+            None,
+            &OutputCrs::Wgs84,
+            None,
+            None,
+            None,
+        )
         .expect("render should succeed");
 
     assert_eq!(tile.width, w);
@@ -98,10 +107,20 @@ fn web_mercator_and_wgs84_render_consistently() {
             &OutputCrs::WebMercator,
             None,
             None,
+            None,
         )
         .expect("render should succeed");
     let wgs = engine
-        .get_raster_tile(COVERED_BBOX, w, h, None, &OutputCrs::Wgs84, None, None)
+        .get_raster_tile(
+            COVERED_BBOX,
+            w,
+            h,
+            None,
+            &OutputCrs::Wgs84,
+            None,
+            None,
+            None,
+        )
         .expect("render should succeed");
 
     let (dm, dw) = (count_data(&merc) as f64, count_data(&wgs) as f64);
@@ -131,7 +150,7 @@ fn renders_projected_geotiff_to_epsg3067() {
     };
     let (w, h) = (256, 256);
     let tile = engine
-        .get_raster_tile(wgs84, w, h, None, &output_crs, None, None)
+        .get_raster_tile(wgs84, w, h, None, &output_crs, None, None, None)
         .expect("projected render should succeed");
 
     assert_eq!(tile.values.len() as u32, w * h);
@@ -146,7 +165,16 @@ fn renders_projected_geotiff_to_epsg3067() {
     // Sanity: the projected render covers a comparable amount of data to the
     // WGS84 render over the same geographic region.
     let wgs = engine
-        .get_raster_tile(COVERED_BBOX, w, h, None, &OutputCrs::Wgs84, None, None)
+        .get_raster_tile(
+            COVERED_BBOX,
+            w,
+            h,
+            None,
+            &OutputCrs::Wgs84,
+            None,
+            None,
+            None,
+        )
         .expect("wgs84 render should succeed");
     let (dp, dw) = (data as f64, count_data(&wgs) as f64);
     assert!(
@@ -161,7 +189,7 @@ fn bbox_outside_coverage_is_empty() {
     // Mid-Atlantic — nowhere near the TM35FIN raster.
     let bbox = [-50.0, 10.0, -40.0, 20.0];
     let tile = engine
-        .get_raster_tile(bbox, 64, 64, None, &OutputCrs::Wgs84, None, None)
+        .get_raster_tile(bbox, 64, 64, None, &OutputCrs::Wgs84, None, None, None)
         .expect("render should succeed even with no overlap");
     assert!(
         tile.is_empty(),
@@ -180,7 +208,7 @@ fn renders_via_overview_for_small_output() {
     let bbox = [8.0, 57.0, 42.0, 71.0];
     let (w, h) = (96, 96);
     let tile = engine
-        .get_raster_tile(bbox, w, h, None, &OutputCrs::Wgs84, None, None)
+        .get_raster_tile(bbox, w, h, None, &OutputCrs::Wgs84, None, None, None)
         .expect("overview render should succeed");
     assert_eq!(tile.values.len() as u32, w * h);
     // The whole-extent render of this echo-dense fixture always has data;
@@ -203,7 +231,7 @@ fn partially_overlapping_bbox_is_partially_filled() {
     let bbox = [20.0, 50.0, 32.0, 62.0];
     let (w, h) = (128, 128);
     let tile = engine
-        .get_raster_tile(bbox, w, h, None, &OutputCrs::Wgs84, None, None)
+        .get_raster_tile(bbox, w, h, None, &OutputCrs::Wgs84, None, None, None)
         .expect("render should succeed");
     let data = count_data(&tile);
     assert!(data > 0, "the on-raster side should have data");

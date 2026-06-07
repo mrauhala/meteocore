@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,6 +9,7 @@ use tokio::sync::watch;
 
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
+use ds_core::instances::{self, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
@@ -16,24 +17,48 @@ use ds_core::model::{
 
 use crate::parse::QueryData;
 
+/// One retained model run: a parsed `.sqd` file plus its source path (for
+/// change detection on poll). Keyed in [`RunSet`] by the file's origin time.
+struct RunEntry {
+    data: Arc<QueryData>,
+    path: PathBuf,
+}
+
+/// The retained model runs, keyed by origin (analysis / forecast reference)
+/// time, ascending — so `values().next_back()` is the latest run. Swapped
+/// atomically on poll. See [`ds_core::instances`].
+#[derive(Default)]
+struct RunSet {
+    runs: BTreeMap<DateTime<Utc>, RunEntry>,
+}
+
+impl RunSet {
+    /// The latest (most recent reference time) run, if any.
+    fn latest(&self) -> Option<&RunEntry> {
+        self.runs.values().next_back()
+    }
+}
+
 /// QueryData engine serving multi-parameter NWP/observation gridded data.
 ///
-/// Polls a directory for `.sqd` files. The latest file (by filename sort)
-/// is loaded and served. When a new file appears, it is atomically swapped
-/// in via `ArcSwap`.
+/// Polls a directory for `.sqd` files and retains the most recent `max_runs`
+/// as model runs (keyed by origin time), exposing each as an OGC EDR instance /
+/// WMS `reference_time` (#337). The newest run is the default for un-pinned
+/// queries. New/removed files are picked up on poll and the run set is swapped
+/// atomically via `ArcSwap`; already-loaded files are reused (not re-parsed).
 pub struct QueryDataEngine {
-    /// Current loaded data. Swapped atomically on poll.
-    data: ArcSwap<QueryData>,
+    /// Retained model runs. Swapped atomically on poll.
+    runs: ArcSwap<RunSet>,
     /// Directory to poll for .sqd files.
     data_dir: PathBuf,
-    /// Currently loaded filename (for change detection).
-    current_file: ArcSwap<Option<PathBuf>>,
     /// Parameter name to render for MapEngine (matched by name on each load).
     wms_parameter: Option<String>,
     /// Collection ID for logging.
     collection_id: String,
     /// Poll interval.
     poll_interval: Duration,
+    /// How many recent runs to retain (>= 1).
+    max_runs: usize,
     /// Shutdown signal.
     shutdown_tx: watch::Sender<()>,
     /// Tracks when data was last successfully loaded/updated.
@@ -50,27 +75,27 @@ impl QueryDataEngine {
         collection_id: &str,
         wms_parameter: Option<&str>,
         poll_interval_secs: u64,
+        max_runs: usize,
     ) -> Result<Self, DataServerError> {
-        let latest = find_latest_sqd(data_dir).ok_or_else(|| {
-            DataServerError::Engine(format!(
-                "[{collection_id}] No .sqd files found in {}",
+        let max_runs = max_runs.max(1);
+        let files = list_sqd_files(data_dir);
+        let runset = build_runset(&files, max_runs, &RunSet::default(), collection_id);
+        if runset.runs.is_empty() {
+            return Err(DataServerError::Engine(format!(
+                "[{collection_id}] No loadable .sqd files found in {}",
                 data_dir.display()
-            ))
-        })?;
-
-        let data = load_file(&latest, collection_id)?;
-
-        log_loaded(collection_id, &latest, &data);
+            )));
+        }
 
         let (shutdown_tx, _) = watch::channel(());
 
         Ok(Self {
-            data: ArcSwap::from_pointee(data),
+            runs: ArcSwap::from_pointee(runset),
             data_dir: data_dir.to_path_buf(),
-            current_file: ArcSwap::from_pointee(Some(latest)),
             wms_parameter: wms_parameter.map(String::from),
             collection_id: collection_id.to_string(),
             poll_interval: Duration::from_secs(poll_interval_secs.max(1)),
+            max_runs,
             shutdown_tx,
             data_updated_at: Mutex::new(Some(Utc::now())),
         })
@@ -99,43 +124,56 @@ impl QueryDataEngine {
     }
 
     fn poll_once(&self) {
-        let latest = match find_latest_sqd(&self.data_dir) {
-            Some(p) => p,
-            None => return, // no files — keep current data
-        };
+        // List the directory once; reuse for the staleness guard and the rebuild.
+        let files = list_sqd_files(&self.data_dir);
+        if files.is_empty() {
+            return; // no files (or unreadable dir) — keep current data
+        }
 
-        // Successful directory read — update staleness tracker
+        let prev = self.runs.load();
+        let new_set = build_runset(&files, self.max_runs, &prev, &self.collection_id);
+        if new_set.runs.is_empty() {
+            return; // nothing loadable (e.g. all files corrupt) — keep old data
+                    // and do NOT stamp freshness; data_age keeps growing.
+        }
+
+        // We have a usable run set — stamp freshness (reflects loadable data, not
+        // merely a readable directory).
         *self
             .data_updated_at
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(Utc::now());
 
-        // Check if file changed
-        let current = self.current_file.load();
-        if current.as_deref() == Some(&latest) {
-            return;
-        }
-
-        match load_file(&latest, &self.collection_id) {
-            Ok(new_data) => {
-                log_loaded(&self.collection_id, &latest, &new_data);
-                self.data.store(Arc::new(new_data));
-                self.current_file.store(Arc::new(Some(latest)));
-            }
-            Err(e) => {
-                tracing::error!(
-                    "[{}] Failed to load {}: {e}",
-                    self.collection_id,
-                    latest.display()
-                );
-                // Keep old data on failure
-            }
+        // Swap only when the retained file set actually changed (add/remove).
+        let prev_paths: BTreeSet<&Path> = prev.runs.values().map(|e| e.path.as_path()).collect();
+        let new_paths: BTreeSet<&Path> = new_set.runs.values().map(|e| e.path.as_path()).collect();
+        if prev_paths != new_paths {
+            self.runs.store(Arc::new(new_set));
         }
     }
 
-    /// Get a snapshot of the current data.
-    fn load_data(&self) -> arc_swap::Guard<Arc<QueryData>> {
-        self.data.load()
+    /// The data for a requested model run: `None` ⇒ the latest run; `Some(rt)` ⇒
+    /// the run with exactly that reference time (absent ⇒ error → 404). Shares
+    /// the selection rule with every forecast engine via [`instances::select_run`].
+    fn select_data(
+        &self,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<Arc<QueryData>, DataServerError> {
+        let set = self.runs.load();
+        instances::select_run(&set.runs, reference_time)
+            .map(|(_, e)| e.data.clone())
+            .ok_or_else(|| match reference_time {
+                Some(rt) => DataServerError::ReferenceTimeNotFound(format!(
+                    "no model run for reference time {rt}"
+                )),
+                None => DataServerError::Engine("No data available".into()),
+            })
+    }
+
+    /// A snapshot of the latest run's data (for run-agnostic metadata). The
+    /// engine always retains at least one run after construction.
+    fn latest_data(&self) -> Option<Arc<QueryData>> {
+        self.runs.load().latest().map(|e| e.data.clone())
     }
 
     /// Resolve the map parameter index for the current data snapshot.
@@ -149,7 +187,7 @@ impl QueryDataEngine {
 
     /// Check if this engine has data loaded.
     pub fn has_data(&self) -> bool {
-        !self.data.load().times.is_empty()
+        self.latest_data().is_some_and(|d| !d.times.is_empty())
     }
 
     /// The collection ID this engine serves.
@@ -172,12 +210,32 @@ impl EdrEngine for QueryDataEngine {
         Ok(vec![])
     }
 
+    /// Each retained `.sqd` file is a model run / EDR instance (latest last),
+    /// with its own valid times.
+    fn get_instances(&self) -> Vec<RunInfo> {
+        let set = self.runs.load();
+        instances::build_instances(&set.runs, |_, e| e.data.times.clone())
+    }
+
+    fn has_instances(&self) -> bool {
+        !self.runs.load().runs.is_empty()
+    }
+
+    fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
+        let set = self.runs.load();
+        set.runs.get(&reference_time).map(|e| RunInfo {
+            reference_time,
+            valid_times: e.data.times.clone(),
+        })
+    }
+
     fn query_location(
         &self,
         _location_id: &str,
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         _parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         Err(DataServerError::InvalidParameter(
             "QueryData engine does not support location queries (use position query)".into(),
@@ -185,12 +243,16 @@ impl EdrEngine for QueryDataEngine {
     }
 
     fn get_parameters(&self) -> Vec<String> {
-        let data = self.load_data();
+        let Some(data) = self.latest_data() else {
+            return Vec::new();
+        };
         data.params.iter().map(|p| p.name.clone()).collect()
     }
 
     fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        let data = self.load_data();
+        let Some(data) = self.latest_data() else {
+            return HashMap::new();
+        };
         data.params
             .iter()
             .map(|p| {
@@ -207,14 +269,14 @@ impl EdrEngine for QueryDataEngine {
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
-        let data = self.load_data();
+        let data = self.latest_data()?;
         let first = data.times.first()?;
         let last = data.times.last()?;
         Some((*first, *last))
     }
 
     fn get_spatial_extent(&self) -> Option<[f64; 4]> {
-        let data = self.load_data();
+        let data = self.latest_data()?;
         let bl = data.grid.area.bottom_left;
         let tr = data.grid.area.top_right;
         // Normalize to [west, south, east, north]. `bottom_left`/`top_right` are
@@ -240,9 +302,10 @@ impl EdrEngine for QueryDataEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         _z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let (lat, lon) = parse_coords(coords)?;
-        let data = self.load_data();
+        let data = self.select_data(reference_time)?;
 
         let time_indices = find_time_range(&data, datetime);
         if time_indices.is_empty() {
@@ -313,6 +376,7 @@ impl EdrEngine for QueryDataEngine {
 }
 
 impl MapEngine for QueryDataEngine {
+    #[allow(clippy::too_many_arguments)] // bbox/size/time/crs/parameter/z/reference_time are all genuine selectors
     fn get_raster_tile(
         &self,
         bbox: [f64; 4],
@@ -322,9 +386,10 @@ impl MapEngine for QueryDataEngine {
         output_crs: &OutputCrs,
         parameter: Option<&str>,
         z: Option<f64>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         let _ = z; // QueryData collections expose no vertical dimension yet (#185)
-        let data = self.load_data();
+        let data = self.select_data(reference_time)?;
         let param_idx = if let Some(param_name) = parameter {
             data.param_index_by_name(param_name)
                 .unwrap_or_else(|| self.resolve_map_param_idx(&data))
@@ -391,7 +456,29 @@ impl MapEngine for QueryDataEngine {
     }
 
     fn raster_info(&self) -> RasterInfo {
-        let data = self.load_data();
+        let set = self.runs.load();
+        // Every retained run is a selectable reference time (WMS dimension /
+        // EDR instance); ascending, latest last.
+        let reference_times: Vec<DateTime<Utc>> = set.runs.keys().copied().collect();
+        let data = match set.latest() {
+            Some(e) => e.data.clone(),
+            None => {
+                // No runs retained (shouldn't happen post-construction).
+                return RasterInfo {
+                    native_crs: "CRS:84".to_string(),
+                    spatial_extent: None,
+                    times: Vec::new(),
+                    parameter: String::new(),
+                    unit: String::new(),
+                    parameters: Vec::new(),
+                    vertical: None,
+                    grid_size: None,
+                    layer_subtitle: None,
+                    reference_times,
+                };
+            }
+        };
+        drop(set);
         let param_idx = self.resolve_map_param_idx(&data);
 
         let param_name = data
@@ -440,6 +527,7 @@ impl MapEngine for QueryDataEngine {
             vertical: None,
             grid_size: Some([gt.width, gt.height]),
             layer_subtitle: None,
+            reference_times,
         }
     }
 }
@@ -448,10 +536,18 @@ impl MapEngine for QueryDataEngine {
 // Free functions (operate on QueryData snapshots, not &self)
 // ============================================================================
 
-/// Find the latest .sqd file in a directory (by filename, lexicographic sort).
-fn find_latest_sqd(dir: &Path) -> Option<PathBuf> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
-        .ok()?
+/// List `.sqd` files in a directory, sorted ascending by filename (lexicographic
+/// ≈ chronological for the usual `…YYYYMMDDHHMM.sqd` naming, so the last entry is
+/// the latest run). Returns empty on a directory read error.
+fn list_sqd_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        // A read failure (e.g. a permissions regression) is indistinguishable
+        // from "empty" to callers — log it so a silent stale-data situation has
+        // a breadcrumb. Poll then keeps the current data.
+        tracing::warn!(dir = %dir.display(), "cannot read .sqd directory; keeping current data");
+        return Vec::new();
+    };
+    let mut entries: Vec<PathBuf> = rd
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| {
@@ -459,9 +555,69 @@ fn find_latest_sqd(dir: &Path) -> Option<PathBuf> {
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("sqd"))
         })
         .collect();
-
     entries.sort();
-    entries.pop() // last = lexicographically latest
+    entries
+}
+
+/// Build a [`RunSet`] from the directory: load the most recent `max_runs` files
+/// as model runs (keyed by origin time), reusing already-parsed entries from
+/// `prev` whose path is unchanged (so poll never re-parses a stable run).
+/// Unloadable files are logged and skipped.
+///
+/// `files` is the directory listing (ascending; see [`list_sqd_files`]) — the
+/// caller lists once and passes it in so poll never reads the directory twice.
+///
+/// The "most recent" window is taken by **filename sort**, which assumes the
+/// standard `…YYYYMMDDHHMM.sqd` naming where lexical order matches origin-time
+/// order. This keeps poll cheap — only the window's files are parsed (others are
+/// reused from `prev` by path) rather than parsing every file in the directory
+/// to read its origin time. A reissued run whose filename sorts out of origin
+/// order could thus be windowed wrong; that's an accepted limitation of the
+/// naming-convention assumption (the BTreeMap still keys by origin time, and a
+/// same-origin collision is logged below).
+fn build_runset(files: &[PathBuf], max_runs: usize, prev: &RunSet, collection_id: &str) -> RunSet {
+    // Keep only the most recent `max_runs` files (the listing is ascending).
+    let window = &files[files.len().saturating_sub(max_runs)..];
+
+    let by_path: HashMap<&Path, &RunEntry> =
+        prev.runs.values().map(|e| (e.path.as_path(), e)).collect();
+
+    let mut runs: BTreeMap<DateTime<Utc>, RunEntry> = BTreeMap::new();
+    for path in window {
+        let entry = if let Some(existing) = by_path.get(path.as_path()) {
+            RunEntry {
+                data: existing.data.clone(),
+                path: path.clone(),
+            }
+        } else {
+            match load_file(path, collection_id) {
+                Ok(data) => {
+                    let data = Arc::new(data);
+                    log_loaded(collection_id, path, &data);
+                    RunEntry {
+                        data,
+                        path: path.clone(),
+                    }
+                }
+                Err(e) => {
+                    // `e` already carries the `[collection_id]` prefix.
+                    tracing::error!("{e}");
+                    continue;
+                }
+            }
+        };
+        // Two files decoding to the same origin time (e.g. a reissued run) would
+        // collide on the key; the later-sorted file wins. Surface the drop so it
+        // isn't silent.
+        if let Some(prev) = runs.insert(entry.data.origin_time, entry) {
+            tracing::warn!(
+                "[{collection_id}] two .sqd files share origin time {}; keeping the later one, dropping {}",
+                prev.data.origin_time,
+                prev.path.display()
+            );
+        }
+    }
+    RunSet { runs }
 }
 
 fn load_file(path: &Path, collection_id: &str) -> Result<QueryData, DataServerError> {
@@ -675,13 +831,13 @@ mod tests {
     }
 
     fn test_file_exists() -> bool {
-        test_dir().exists() && find_latest_sqd(&test_dir()).is_some()
+        test_dir().exists() && !list_sqd_files(&test_dir()).is_empty()
     }
 
     #[test]
     fn engine_from_directory() {
         assert!(test_file_exists(), "ecmwf-kenya fixture missing");
-        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30).unwrap();
+        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30, 4).unwrap();
         assert!(engine.has_data());
         let params = engine.get_parameters();
         assert_eq!(params.len(), 3);
@@ -690,7 +846,7 @@ mod tests {
     #[test]
     fn engine_spatial_extent() {
         assert!(test_file_exists(), "ecmwf-kenya fixture missing");
-        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30).unwrap();
+        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30, 4).unwrap();
         // [west, south, east, north] — normalized, so south < north even though
         // this fixture's stored bottom_left lat (4.75) is north of top_right
         // (-5.25). Guards the get_spatial_extent min/max normalization.
@@ -709,10 +865,10 @@ mod tests {
         // the result must still be a valid [west, south, east, north].
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/meps");
         assert!(
-            dir.exists() && find_latest_sqd(&dir).is_some(),
+            dir.exists() && !list_sqd_files(&dir).is_empty(),
             "meps fixture missing"
         );
-        let engine = QueryDataEngine::new(&dir, "test", None, 30).unwrap();
+        let engine = QueryDataEngine::new(&dir, "test", None, 30, 4).unwrap();
         let bbox = engine.get_spatial_extent().unwrap();
         assert!(bbox[0] < bbox[2], "west {} < east {}", bbox[0], bbox[2]);
         assert!(bbox[1] < bbox[3], "south {} < north {}", bbox[1], bbox[3]);
@@ -727,7 +883,7 @@ mod tests {
     #[test]
     fn engine_temporal_extent() {
         assert!(test_file_exists(), "ecmwf-kenya fixture missing");
-        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30).unwrap();
+        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30, 4).unwrap();
         let (first, last) = engine.get_temporal_extent().unwrap();
         assert_eq!(
             first.format("%Y-%m-%dT%H:%M").to_string(),
@@ -739,10 +895,10 @@ mod tests {
     #[test]
     fn engine_position_query() {
         assert!(test_file_exists(), "ecmwf-kenya fixture missing");
-        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30).unwrap();
+        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30, 4).unwrap();
 
         let response = engine
-            .query_position("POINT(36.8 -1.3)", None, None, None)
+            .query_position("POINT(36.8 -1.3)", None, None, None, None)
             .unwrap();
         let result = match response {
             CoverageResponse::Single(qr) => qr,
@@ -760,11 +916,11 @@ mod tests {
     #[test]
     fn engine_position_query_filtered_params() {
         assert!(test_file_exists(), "ecmwf-kenya fixture missing");
-        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30).unwrap();
+        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30, 4).unwrap();
 
         let params = vec!["2 Metre Temperature (2t)".to_string()];
         let response = engine
-            .query_position("POINT(36.8 -1.3)", None, Some(&params), None)
+            .query_position("POINT(36.8 -1.3)", None, Some(&params), None, None)
             .unwrap();
         let result = match response {
             CoverageResponse::Single(qr) => qr,
@@ -779,7 +935,7 @@ mod tests {
     fn map_engine_raster_tile() {
         assert!(test_file_exists(), "ecmwf-kenya fixture missing");
         let engine =
-            QueryDataEngine::new(&test_dir(), "test", Some("2 Metre Temperature (2t)"), 30)
+            QueryDataEngine::new(&test_dir(), "test", Some("2 Metre Temperature (2t)"), 30, 4)
                 .unwrap();
 
         let tile = engine
@@ -789,6 +945,7 @@ mod tests {
                 16,
                 None,
                 &OutputCrs::Wgs84,
+                None,
                 None,
                 None,
             )
@@ -809,7 +966,7 @@ mod tests {
         // the fixture is nowhere near the TM35FIN zone.
         assert!(test_file_exists(), "ecmwf-kenya fixture missing");
         let engine =
-            QueryDataEngine::new(&test_dir(), "test", Some("2 Metre Temperature (2t)"), 30)
+            QueryDataEngine::new(&test_dir(), "test", Some("2 Metre Temperature (2t)"), 30, 4)
                 .unwrap();
         let crs = ds_core::geo::projected_output_crs("EPSG:3067").unwrap();
         let proj = ds_core::geo::projected_envelope(&crs, [33.0, -5.0, 42.0, 5.0]);
@@ -821,6 +978,7 @@ mod tests {
                 16,
                 None,
                 &OutputCrs::Projected { crs, bbox: proj },
+                None,
                 None,
                 None,
             )
@@ -841,7 +999,7 @@ mod tests {
     fn map_engine_raster_info() {
         assert!(test_file_exists(), "ecmwf-kenya fixture missing");
         let engine =
-            QueryDataEngine::new(&test_dir(), "test", Some("2 Metre Temperature (2t)"), 30)
+            QueryDataEngine::new(&test_dir(), "test", Some("2 Metre Temperature (2t)"), 30, 4)
                 .unwrap();
         let info = engine.raster_info();
 
@@ -853,11 +1011,43 @@ mod tests {
     }
 
     #[test]
-    fn find_latest_sqd_in_dir() {
+    fn list_sqd_files_in_dir() {
         assert!(test_file_exists(), "ecmwf-kenya fixture missing");
-        let latest = find_latest_sqd(&test_dir());
-        assert!(latest.is_some());
-        let name = latest.unwrap();
-        assert!(name.to_string_lossy().ends_with(".sqd"));
+        let files = list_sqd_files(&test_dir());
+        assert!(!files.is_empty());
+        let latest = files.last().unwrap();
+        assert!(latest.to_string_lossy().ends_with(".sqd"));
+    }
+
+    #[test]
+    fn instances_expose_runs_latest_default() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30, 4).unwrap();
+        let instances = engine.get_instances();
+        // The fixture dir has at least one .sqd → at least one run/instance.
+        assert!(!instances.is_empty());
+        // raster_info advertises the same runs as reference times.
+        assert_eq!(engine.raster_info().reference_times.len(), instances.len());
+        // An un-pinned position query (reference_time = None) serves the latest
+        // run; pinning the latest run's reference time returns the same series.
+        let latest_rt = instances.last().unwrap().reference_time;
+        let default = engine
+            .query_position("POINT(36.8 -1.3)", None, None, None, None)
+            .unwrap();
+        let pinned = engine
+            .query_position("POINT(36.8 -1.3)", None, None, None, Some(latest_rt))
+            .unwrap();
+        let (a, b) = match (default, pinned) {
+            (CoverageResponse::Single(a), CoverageResponse::Single(b)) => (a, b),
+            _ => panic!("expected Single coverages"),
+        };
+        assert_eq!(a.ranges.len(), b.ranges.len());
+        // A bogus reference time is rejected (→ 404 at the API layer).
+        let bogus = chrono::DateTime::parse_from_rfc3339("1990-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(engine
+            .query_position("POINT(36.8 -1.3)", None, None, None, Some(bogus))
+            .is_err());
     }
 }

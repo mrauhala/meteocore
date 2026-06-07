@@ -20,6 +20,12 @@ pub enum DataServerError {
     #[error("Feature not found: {0}")]
     FeatureNotFound(String),
 
+    /// A syntactically valid forecast model run (reference time / EDR instance)
+    /// that the engine does not have. Maps to HTTP 404 (the resource is absent),
+    /// not 400 (the request is well-formed). See `ds_core::instances`.
+    #[error("Reference time not found: {0}")]
+    ReferenceTimeNotFound(String),
+
     #[error("Invalid bbox: {0}")]
     InvalidBbox(String),
 
