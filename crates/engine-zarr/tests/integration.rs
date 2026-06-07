@@ -169,6 +169,28 @@ fn forecast_uses_latest_run_with_lead_as_time() {
         "lead2 {:?}",
         vals[2]
     );
+
+    // The MAP render path (`read_window`, used by WMS/Maps/Tiles) must pin to
+    // the same latest run. Render over the grid extent at the first valid time
+    // (latest run, lead 0); every pixel must come from init=1 (value ≥ 1000),
+    // never init=0 (~6).
+    let tile = e
+        .get_raster_tile(
+            [9.5, 58.5, 11.5, 60.5],
+            8,
+            8,
+            Some(first),
+            &OutputCrs::Wgs84,
+            Some("temp"),
+            None,
+        )
+        .unwrap();
+    let rendered: Vec<f64> = tile.values.iter().flatten().copied().collect();
+    assert!(!rendered.is_empty(), "render path produced no data");
+    assert!(
+        rendered.iter().all(|&v| v >= 1000.0),
+        "raster render must read the latest run (init=1), got {rendered:?}"
+    );
 }
 
 fn config(parameters: Option<Vec<String>>) -> ZarrConfig {
