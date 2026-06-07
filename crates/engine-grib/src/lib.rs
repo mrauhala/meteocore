@@ -837,8 +837,8 @@ impl GribEngine {
         // A pinned run constrains the step search to that single run.
         if let Some(rt) = reference_time {
             let (_, run) = instances::select_run(&catalog.runs, Some(rt)).ok_or_else(|| {
-                DataServerError::InvalidParameter(format!(
-                    "No forecast run for reference time {rt}"
+                DataServerError::ReferenceTimeNotFound(format!(
+                    "no forecast run for reference time {rt}"
                 ))
             })?;
             return match datetime {
@@ -895,6 +895,10 @@ impl EdrEngine for GribEngine {
     fn get_instances(&self) -> Vec<RunInfo> {
         let catalog = self.catalog.load();
         instances::build_instances(&catalog.runs, |_, run| run.valid_times())
+    }
+
+    fn has_instances(&self) -> bool {
+        !self.catalog.load().runs.is_empty()
     }
 
     fn query_location(
@@ -983,8 +987,8 @@ impl EdrEngine for GribEngine {
             Some(rt) => instances::select_run(&catalog.runs, Some(rt))
                 .map(|(_, r)| r)
                 .ok_or_else(|| {
-                    DataServerError::InvalidParameter(format!(
-                        "No forecast run for reference time {rt}"
+                    DataServerError::ReferenceTimeNotFound(format!(
+                        "no forecast run for reference time {rt}"
                     ))
                 })?,
             None => match datetime {

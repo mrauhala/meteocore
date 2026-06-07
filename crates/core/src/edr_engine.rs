@@ -22,6 +22,17 @@ pub trait EdrEngine: Send + Sync {
         Vec::new()
     }
 
+    /// Whether this engine exposes any model runs, **O(1)** from a snapshot.
+    ///
+    /// Hot metadata paths (`/api`, `/collections/{id}`) only need to know
+    /// *whether* a collection has instances to gate the instances links — they
+    /// must not clone the whole [`Self::get_instances`] `Vec` (with every run's
+    /// valid times) per request. Forecast engines override this with a cheap
+    /// "is the run map non-empty" check. Default mirrors `get_instances`.
+    fn has_instances(&self) -> bool {
+        !self.get_instances().is_empty()
+    }
+
     /// Execute a query for a named location.
     ///
     /// `z` selects vertical levels: `None` returns every level (a profile),

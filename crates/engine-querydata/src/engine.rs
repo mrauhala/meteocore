@@ -161,8 +161,8 @@ impl QueryDataEngine {
         instances::select_run(&set.runs, reference_time)
             .map(|(_, e)| e.data.clone())
             .ok_or_else(|| match reference_time {
-                Some(rt) => DataServerError::InvalidParameter(format!(
-                    "No model run for reference time {rt}"
+                Some(rt) => DataServerError::ReferenceTimeNotFound(format!(
+                    "no model run for reference time {rt}"
                 )),
                 None => DataServerError::Engine("No data available".into()),
             })
@@ -213,6 +213,10 @@ impl EdrEngine for QueryDataEngine {
     fn get_instances(&self) -> Vec<RunInfo> {
         let set = self.runs.load();
         instances::build_instances(&set.runs, |_, e| e.data.times.clone())
+    }
+
+    fn has_instances(&self) -> bool {
+        !self.runs.load().runs.is_empty()
     }
 
     fn query_location(

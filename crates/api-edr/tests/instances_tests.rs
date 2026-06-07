@@ -90,8 +90,12 @@ impl EdrEngine for ForecastMock {
         _z: Option<&[f64]>,
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
-        // None ⇒ latest run; encode the selected run's hour into every value.
+        // None ⇒ latest run; a pinned run that doesn't exist → 404 (mirrors the
+        // real engines, which return ReferenceTimeNotFound).
         let rt = reference_time.unwrap_or_else(|| dt(LATEST_RUN_HOUR));
+        if !Self::run_times().contains(&rt) {
+            return Err(DataServerError::ReferenceTimeNotFound(rt.to_rfc3339()));
+        }
         let marker = rt.hour() as f64;
         let times: Vec<DateTime<Utc>> = (0..3).map(|h| rt + chrono::Duration::hours(h)).collect();
         let mut parameters = HashMap::new();

@@ -127,17 +127,15 @@ fn lookup_collection<'a>(
 /// Resolve an optional `{instanceId}` path segment to a forecast model run.
 ///
 /// `None` (the no-instance routes) ⇒ `Ok(None)` (the engine serves its latest
-/// run). `Some(id)` ⇒ parse the id to a reference time ([`instances::parse_instance_id`])
-/// and confirm the engine exposes that run (`get_instances`): an unparseable id
-/// is 400, an unknown run is 404. The validated reference time is then passed to
-/// the engine query methods.
+/// run). `Some(id)` ⇒ parse the id to a reference time
+/// ([`instances::parse_instance_id`]); an unparseable id is 400.
 ///
-/// The existence check is **best-effort**: it reads a catalog snapshot, and a
-/// background poll could evict that run before the subsequent query reads its
-/// own snapshot. In that rare race the query just fails (the engine has no such
-/// run) — a benign 400 instead of 404 for a run that no longer exists.
+/// Existence is **not** checked here. The engine query returns
+/// [`DataServerError::ReferenceTimeNotFound`] (→ 404) for an absent run, so the
+/// status is correct without a validate-then-query race *and* without cloning
+/// the engine's `get_instances()` `Vec` (with every run's valid times) on the
+/// hot query path (CLAUDE.md #211).
 fn resolve_instance(
-    engine: &Arc<dyn EdrEngine>,
     instance_id: Option<&str>,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, (StatusCode, Json<serde_json::Value>)> {
     let Some(iid) = instance_id else {
@@ -152,19 +150,6 @@ fn resolve_instance(
             })),
         )
     })?;
-    if !engine
-        .get_instances()
-        .iter()
-        .any(|r| r.reference_time == rt)
-    {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "code": "NotFound",
-                "description": format!("Instance '{iid}' not found")
-            })),
-        ));
-    }
     Ok(Some(rt))
 }
 
@@ -522,7 +507,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
         let has_instances = state
             .engines
             .get(id)
-            .map(|e| !e.get_instances().is_empty())
+            .map(|e| e.has_instances())
             .unwrap_or(false);
         if has_instances {
             let instance_id_param = json!({
@@ -1158,7 +1143,7 @@ async fn run_position_query(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
-    let reference_time = resolve_instance(engine, instance_id.as_deref())?;
+    let reference_time = resolve_instance(instance_id.as_deref())?;
 
     let datetime = params
         .datetime
@@ -1198,7 +1183,8 @@ async fn run_position_query(
         ),
         ds_core::error::DataServerError::LocationNotFound(_)
         | ds_core::error::DataServerError::CollectionNotFound(_)
-        | ds_core::error::DataServerError::FeatureNotFound(_) => (
+        | ds_core::error::DataServerError::FeatureNotFound(_)
+        | ds_core::error::DataServerError::ReferenceTimeNotFound(_) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "code": "NotFound", "description": e.to_string() })),
         ),
@@ -1279,7 +1265,7 @@ async fn run_area_query(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
-    let reference_time = resolve_instance(engine, instance_id.as_deref())?;
+    let reference_time = resolve_instance(instance_id.as_deref())?;
 
     // An area result is gridded / multi-coverage, not a single line plot.
     if parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))? == EdrFormat::Png {
@@ -1323,7 +1309,8 @@ async fn run_area_query(
                 Json(json!({ "code": "BadRequest", "description": e.to_string() })),
             ),
             ds_core::error::DataServerError::LocationNotFound(_)
-            | ds_core::error::DataServerError::CollectionNotFound(_) => (
+            | ds_core::error::DataServerError::CollectionNotFound(_)
+            | ds_core::error::DataServerError::ReferenceTimeNotFound(_) => (
                 StatusCode::NOT_FOUND,
                 Json(json!({ "code": "NotFound", "description": e.to_string() })),
             ),
@@ -1646,7 +1633,7 @@ fn build_collection_metadata(
     }
     // Advertise the model runs (forecast reference times) as EDR instances on
     // the collection itself (not on an instance document).
-    if instance.is_none() && !engine.get_instances().is_empty() {
+    if instance.is_none() && engine.has_instances() {
         data_queries.insert(
             "instances".to_string(),
             json!({
