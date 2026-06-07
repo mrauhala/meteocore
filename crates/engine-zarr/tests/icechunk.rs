@@ -267,6 +267,7 @@ async fn probe_models() {
                 tag: None,
                 snapshot: None,
                 region: Some("us-west-2".into()),
+                force_path_style: None,
             }),
         };
         match ZarrEngine::new(name, &config) {
@@ -322,6 +323,7 @@ async fn reads_local_icechunk_repo() {
             tag: None,
             snapshot: None,
             region: None,
+            force_path_style: None,
         }),
     };
     let engine = ZarrEngine::new("ic-test", &config).expect("open icechunk repo");

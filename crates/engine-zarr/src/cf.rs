@@ -69,7 +69,7 @@ pub fn classify_axis(dim_name: &str, standard_name: Option<&str>, units: Option<
     // Name fallback. `x`/`y` are accepted as lon/lat only when no units are
     // present, to avoid reading projected metres as degrees.
     match dim_name.trim().to_ascii_lowercase().as_str() {
-        "time" | "t" | "valid_time" => AxisRole::Time,
+        "time" | "t" | "valid_time" | "forecast_time" => AxisRole::Time,
         "init_time" | "reference_time" | "forecast_reference_time" | "analysis_time" => {
             AxisRole::Reference
         }

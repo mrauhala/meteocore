@@ -679,6 +679,10 @@ pub struct IcechunkConfig {
     /// S3 region for the repo's object store (e.g. "us-west-2"). Needed for
     /// AWS; ignored for the local backend.
     pub region: Option<String>,
+    /// S3 path-style addressing (`endpoint/bucket/key`). Default `true` (works
+    /// for S3-compatible endpoints and AWS regional endpoints); set `false` for
+    /// virtual-host style. Ignored for the local backend.
+    pub force_path_style: Option<bool>,
 }
 
 /// Observation table configuration for engine-postgis.
@@ -1667,6 +1671,17 @@ impl ServerConfig {
                              'branch'/'tag'/'snapshot'"
                         )));
                     }
+                    // An empty selector would pass the count check but fail
+                    // opaquely at runtime — reject it at load.
+                    if [&ic.branch, &ic.tag, &ic.snapshot]
+                        .iter()
+                        .any(|s| s.as_deref().is_some_and(str::is_empty))
+                    {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': zarr icechunk 'branch'/'tag'/'snapshot' must not \
+                             be empty"
+                        )));
+                    }
                 }
             }
 
@@ -1946,6 +1961,13 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         let cfg = zarr_collection(
             "data_path = \"x\"\n[collections.zarr.icechunk]\nbranch = \"main\"\ntag = \"v1\"\n",
         );
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn zarr_icechunk_rejects_empty_selector() {
+        let cfg =
+            zarr_collection("data_path = \"x\"\n[collections.zarr.icechunk]\nbranch = \"\"\n");
         assert!(cfg.validate().is_err());
     }
 

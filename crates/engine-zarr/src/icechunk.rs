@@ -92,18 +92,21 @@ async fn build_storage(
     let ic = config.icechunk.as_ref().expect("icechunk config present");
 
     if let (Some(endpoint), Some(bucket)) = (config.endpoint.as_deref(), config.bucket.as_deref()) {
-        // Public/anonymous S3-compatible repo. `path` is the repo root within
-        // the bucket (required for remote — config-validated).
+        // S3-compatible repo. `path` is the repo root within the bucket
+        // (required for the remote source — config-validated). Access is
+        // **anonymous** (public datasets only); authenticated/private repos are
+        // a v1 non-goal (#335).
         let prefix = config.path.clone();
         let mut opts = icechunk::storage::S3Options::default()
             .with_endpoint_url(endpoint)
-            .with_anonymous(true)
-            // S3-compatible endpoints generally need path-style addressing.
-            .with_force_path_style(true)
+            // Path-style by default (S3-compatible + AWS regional endpoints);
+            // override per config for virtual-host-style.
+            .with_force_path_style(ic.force_path_style.unwrap_or(true))
             .with_allow_http(endpoint.starts_with("http://"));
         if let Some(region) = ic.region.as_deref() {
             opts = opts.with_region(region);
         }
+        // `S3Credentials::Anonymous` is the single source of truth for no-signing.
         icechunk::storage::new_s3_storage(
             opts,
             bucket.to_string(),
@@ -112,6 +115,15 @@ async fn build_storage(
         )
         .map_err(|e| cfg_err(format!("failed to build Icechunk S3 storage: {e}")))
     } else if let Some(data_path) = config.data_path.as_deref() {
+        // The local backend is a real directory only. A URL in `data_path`
+        // (which plain Zarr accepts) is not supported for Icechunk — use
+        // `endpoint`+`bucket` for S3.
+        if data_path.contains("://") {
+            return Err(cfg_err(format!(
+                "icechunk 'data_path' must be a local directory, not a URL ('{data_path}'); \
+                 use 'endpoint'+'bucket' for an S3 repo"
+            )));
+        }
         let root = match &config.path {
             Some(p) => format!(
                 "{}/{}",
