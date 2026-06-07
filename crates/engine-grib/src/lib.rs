@@ -827,56 +827,65 @@ impl GribEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
     ) -> Result<(u32, StepFile), DataServerError> {
         let catalog = self.catalog.load();
-
-        if catalog.runs.is_empty() {
-            return Err(DataServerError::Engine(
-                "No forecast data available".to_string(),
-            ));
+        // Run selection is shared with `query_position` (see `resolve_run`); this
+        // path additionally narrows to a single step.
+        let run = resolve_run(&catalog, reference_time, datetime)?;
+        match datetime {
+            Some((start, _end)) => run
+                .find_step_for_time(start)
+                .map(|(step, sf)| (step, sf.clone()))
+                .ok_or_else(|| {
+                    DataServerError::InvalidParameter(format!("No forecast step for time {start}"))
+                }),
+            None => {
+                let (&step, sf) = run.steps.iter().next_back().ok_or_else(|| {
+                    DataServerError::Engine("forecast run has no steps".to_string())
+                })?;
+                Ok((step, sf.clone()))
+            }
         }
+    }
+}
 
-        // A pinned run constrains the step search to that single run.
-        if let Some(rt) = reference_time {
-            let (_, run) = instances::select_run(&catalog.runs, Some(rt)).ok_or_else(|| {
+/// Select the forecast run to serve, shared by `query_position` and
+/// `resolve_time` (the EDR and Maps paths) so run selection — and its
+/// error mapping — is identical everywhere.
+///
+/// `reference_time = Some(rt)` pins exactly that run (absent ⇒
+/// [`DataServerError::ReferenceTimeNotFound`] → 404); `None` falls back to the
+/// most recent run whose steps cover `datetime`, or the latest run. See
+/// [`instances::select_run`].
+fn resolve_run(
+    catalog: &Catalog,
+    reference_time: Option<DateTime<Utc>>,
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Result<&ForecastRun, DataServerError> {
+    if catalog.runs.is_empty() {
+        return Err(DataServerError::Engine(
+            "No forecast data available".to_string(),
+        ));
+    }
+    match reference_time {
+        Some(rt) => instances::select_run(&catalog.runs, Some(rt))
+            .map(|(_, r)| r)
+            .ok_or_else(|| {
                 DataServerError::ReferenceTimeNotFound(format!(
                     "no forecast run for reference time {rt}"
                 ))
-            })?;
-            return match datetime {
-                Some((start, _end)) => run
-                    .find_step_for_time(start)
-                    .map(|(step, sf)| (step, sf.clone()))
-                    .ok_or_else(|| {
-                        DataServerError::InvalidParameter(format!(
-                            "Run {rt} has no forecast step for time {start}"
-                        ))
-                    }),
-                None => {
-                    let (&step, sf) = run.steps.iter().next_back().ok_or_else(|| {
-                        DataServerError::Engine(format!("Run {rt} has no forecast steps"))
-                    })?;
-                    Ok((step, sf.clone()))
-                }
-            };
-        }
-
-        let target = match datetime {
-            Some((start, _end)) => start,
-            None => {
-                // Default to latest available time
-                let run = catalog.latest_run().unwrap();
-                let (&step, sf) = run.steps.iter().next_back().unwrap();
-                return Ok((step, sf.clone()));
-            }
-        };
-
-        catalog
-            .find_for_time(target)
-            .map(|(step, sf)| (step, sf.clone()))
-            .ok_or_else(|| {
-                DataServerError::InvalidParameter(format!(
-                    "No forecast data available for time {target}"
-                ))
-            })
+            }),
+        None => match datetime {
+            Some((start, _)) => catalog
+                .runs
+                .values()
+                .rev()
+                .find(|r| r.find_step_for_time(start).is_some())
+                .ok_or_else(|| {
+                    DataServerError::InvalidParameter(format!(
+                        "No forecast run covers time {start}"
+                    ))
+                }),
+            None => Ok(catalog.latest_run().expect("runs is non-empty")),
+        },
     }
 }
 
@@ -899,6 +908,14 @@ impl EdrEngine for GribEngine {
 
     fn has_instances(&self) -> bool {
         !self.catalog.load().runs.is_empty()
+    }
+
+    fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
+        let catalog = self.catalog.load();
+        catalog.runs.get(&reference_time).map(|run| RunInfo {
+            reference_time,
+            valid_times: run.valid_times(),
+        })
     }
 
     fn query_location(
@@ -974,40 +991,10 @@ impl EdrEngine for GribEngine {
         let (lon, lat) = parse_coords(coords)?;
         let catalog = self.catalog.load();
 
-        if catalog.runs.is_empty() {
-            return Err(DataServerError::Engine(
-                "No forecast data available".to_string(),
-            ));
-        }
-
-        // Find the forecast run to serve. A pinned `reference_time` selects that
-        // exact run (the EDR instance); otherwise fall back to the most recent
-        // run covering `datetime`, or the latest run.
-        let run = match reference_time {
-            Some(rt) => instances::select_run(&catalog.runs, Some(rt))
-                .map(|(_, r)| r)
-                .ok_or_else(|| {
-                    DataServerError::ReferenceTimeNotFound(format!(
-                        "no forecast run for reference time {rt}"
-                    ))
-                })?,
-            None => match datetime {
-                Some((start, _)) => {
-                    // Find the run whose valid times include the requested time
-                    catalog
-                        .runs
-                        .values()
-                        .rev()
-                        .find(|r| r.find_step_for_time(start).is_some())
-                        .ok_or_else(|| {
-                            DataServerError::InvalidParameter(format!(
-                                "No forecast run covers time {start}"
-                            ))
-                        })?
-                }
-                None => catalog.latest_run().unwrap(),
-            },
-        };
+        // Run selection (pinned instance, datetime-covering, or latest) is shared
+        // with `resolve_time` via `resolve_run`; this path then enumerates the
+        // run's steps into a time series.
+        let run = resolve_run(&catalog, reference_time, datetime)?;
 
         // Determine which forecast steps to include
         let steps_to_query: Vec<(u32, &StepFile)> = match datetime {

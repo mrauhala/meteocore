@@ -39,6 +39,18 @@ pub trait EdrEngine: Send + Sync {
         !self.get_instances().is_empty()
     }
 
+    /// Look up a single model run by reference time, or `None` if absent.
+    ///
+    /// The instance-metadata endpoint needs exactly one run; the default
+    /// builds the full list and filters, but forecast engines override this to
+    /// build only the requested run's [`RunInfo`] (a direct catalog lookup),
+    /// avoiding the clone of every other run's valid times.
+    fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
+        self.get_instances()
+            .into_iter()
+            .find(|r| r.reference_time == reference_time)
+    }
+
     /// Execute a query for a named location.
     ///
     /// `z` selects vertical levels: `None` returns every level (a profile),

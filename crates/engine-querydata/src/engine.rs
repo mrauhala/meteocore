@@ -219,6 +219,14 @@ impl EdrEngine for QueryDataEngine {
         !self.runs.load().runs.is_empty()
     }
 
+    fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
+        let set = self.runs.load();
+        set.runs.get(&reference_time).map(|e| RunInfo {
+            reference_time,
+            valid_times: e.data.times.clone(),
+        })
+    }
+
     fn query_location(
         &self,
         _location_id: &str,
@@ -531,6 +539,10 @@ impl MapEngine for QueryDataEngine {
 /// the latest run). Returns empty on a directory read error.
 fn list_sqd_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
+        // A read failure (e.g. a permissions regression) is indistinguishable
+        // from "empty" to callers — log it so a silent stale-data situation has
+        // a breadcrumb. Poll then keeps the current data.
+        tracing::warn!(dir = %dir.display(), "cannot read .sqd directory; keeping current data");
         return Vec::new();
     };
     let mut entries: Vec<PathBuf> = rd

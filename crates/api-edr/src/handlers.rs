@@ -1014,24 +1014,22 @@ pub async fn instance(
             })),
         )
     })?;
-    let runs = engine.get_instances();
-    let run = runs
-        .iter()
-        .find(|r| r.reference_time == rt)
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({
-                    "code": "NotFound",
-                    "description": format!("Instance '{instance_id}' not found")
-                })),
-            )
-        })?;
+    // O(1) single-run lookup — avoids cloning every run's valid times just to
+    // find one (the engine builds only the requested run's RunInfo).
+    let run = engine.find_instance(rt).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "code": "NotFound",
+                "description": format!("Instance '{instance_id}' not found")
+            })),
+        )
+    })?;
     Ok(Json(build_collection_metadata(
         engine.as_ref(),
         config,
         base,
-        Some(run),
+        Some(&run),
     )))
 }
 
