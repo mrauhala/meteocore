@@ -3220,13 +3220,15 @@ const VOXEL_HEIGHT_CEILING_M: f64 = 20_000.0;
 /// uses, so cells outside the surveyed beam fan stay `NaN`. The angle axis is
 /// azimuth `0..2π` (the encoder maps to the cylinder convention); radius is
 /// ground range `0..max`, height `0..ceiling`.
+/// Returns the grid plus the count of sampled (finite) cells — counted during
+/// the fill so the caller needn't re-scan up to `MAX_VOXELS` cells.
 fn voxel_grid_from_volume(
     volume: &PolarVolume,
     file_id: &str,
     pix: Pixels,
     quantity: &str,
     dims: Option<[usize; 3]>,
-) -> Result<VoxelGrid, DataServerError> {
+) -> Result<(VoxelGrid, usize), DataServerError> {
     let dims = dims.unwrap_or(DEFAULT_VOXEL_DIMS);
     let [n_r, n_a, n_h] = dims;
     if n_r == 0 || n_a == 0 || n_h == 0 {
@@ -3248,11 +3250,13 @@ fn voxel_grid_from_volume(
         .ok_or_else(|| DataServerError::Engine("PVOL has no finite sweeps".into()))?;
 
     // Radial extent = max ground-range across sweeps (slant ≈ ground at low
-    // elevation; the cell→slant inversion handles the rest).
+    // elevation; the cell→slant inversion handles the rest). Guard `rstart`
+    // too (not just `rscale`): a NaN `rstart` would otherwise drop silently
+    // from `f64::max` and could under-compute the extent.
     let radius_max = volume
         .sweeps
         .iter()
-        .filter(|s| s.rscale.is_finite() && s.rscale > 0.0)
+        .filter(|s| s.rscale.is_finite() && s.rscale > 0.0 && s.rstart.is_finite())
         .map(|s| s.rstart + s.nbins as f64 * s.rscale)
         .fold(0.0_f64, f64::max);
     if !(radius_max.is_finite() && radius_max > 0.0) {
@@ -3264,6 +3268,7 @@ fn voxel_grid_from_volume(
     let site = &volume.site;
 
     let mut values = vec![f32::NAN; total];
+    let mut valid = 0usize; // counted here to avoid a second O(N) pass
     for i_r in 0..n_r {
         let ground = (i_r as f64 + 0.5) * radius_max / n_r as f64;
         for i_a in 0..n_a {
@@ -3283,12 +3288,13 @@ fn voxel_grid_from_volume(
                 ) {
                     // One source of truth for the axis order (in flux per #351).
                     values[VoxelGrid::index_of(dims, i_r, i_a, i_h)] = v as f32;
+                    valid += 1;
                 }
             }
         }
     }
 
-    Ok(VoxelGrid {
+    let grid = VoxelGrid {
         origin_lon: site.lon,
         origin_lat: site.lat,
         origin_height: site.height,
@@ -3299,7 +3305,8 @@ fn voxel_grid_from_volume(
         values,
         quantity: quantity.to_string(),
         unit: quantities::quantity_unit(quantity).to_string(),
-    })
+    };
+    Ok((grid, valid))
 }
 
 impl PolarVolumeSiteView {
@@ -3414,11 +3421,11 @@ impl VolumeEngine for PolarVolumeSiteView {
             source: &self.source,
             handle: handle.as_ref(),
         };
-        let grid = voxel_grid_from_volume(&entry.volume, &entry.id, pix, &quantity, dims)?;
+        let (grid, valid) = voxel_grid_from_volume(&entry.volume, &entry.id, pix, &quantity, dims)?;
 
         // No sampled cell (every cell outside the beam fan / nodata) ⇒ 404,
         // matching the other engines' "no data in window" convention.
-        if grid.valid_count() == 0 {
+        if valid == 0 {
             return Err(DataServerError::LocationNotFound(format!(
                 "[{}] no `{}` echoes in the selected volume of site `{}`",
                 self.collection_id, quantity, self.nod
