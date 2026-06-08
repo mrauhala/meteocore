@@ -73,6 +73,18 @@ pub fn encode_pnts(
     // build (the byte-length guards below would only catch this at ~4 GiB).
     let points_len = u32::try_from(count).map_err(|_| Tiles3dError::TooLarge("POINTS_LENGTH"))?;
 
+    // Front-load the body byte-budget check too: reject an oversized cloud
+    // *before* allocating the body (POSITION 12 B + RGB 3 B per point, + ≤7 B
+    // tail padding), so a caller bypassing the engine's MAX_POINTS cap can't
+    // force a multi-GB allocation that only errors afterward.
+    if count
+        .checked_mul(15)
+        .and_then(|n| n.checked_add(7))
+        .is_none_or(|n| u32::try_from(n).is_err())
+    {
+        return Err(Tiles3dError::TooLarge("featureTableBinary"));
+    }
+
     // Feature-table binary: POSITION (count * 3 * f32) then RGB (count * 3 * u8).
     let pos_bytes = count * 12;
     let rgb_off = pos_bytes;
