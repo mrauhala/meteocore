@@ -139,7 +139,7 @@ async function loadTileset() {
   if (min !== "") url += `&min_value=${encodeURIComponent(min)}`;
   try {
     const ts = await Cesium.Cesium3DTileset.fromUrl(url, { maximumScreenSpaceError: 1 });
-    if (token !== loadToken) return; // a newer load superseded this one
+    if (token !== loadToken) { ts.destroy(); return; } // superseded — free its GPU buffers
     current = ts;
     viewer.scene.primitives.add(ts);
     ts.style = new Cesium.Cesium3DTileStyle({ pointSize: 5.0 });
