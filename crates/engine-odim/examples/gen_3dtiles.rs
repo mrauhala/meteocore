@@ -223,7 +223,10 @@ fn main() {
     }
 
     let count = positions.len();
-    assert!(count > 0, "no cells >= {min_dbz} dBZ — nothing to write");
+    if count == 0 {
+        eprintln!("no cells >= {min_dbz} dBZ — nothing to write");
+        std::process::exit(1);
+    }
     eprintln!("points: {count}  (>= {min_dbz} dBZ)");
 
     fs::create_dir_all(&out_dir).expect("mkdir out_dir");
@@ -291,7 +294,17 @@ fn main() {
     );
     fs::write(out_dir.join("tileset.json"), tileset).expect("write tileset");
 
-    write_viewer(&out_dir, site.lon, site.lat, site.height);
+    // Self-describing HUD/title from the actual volume, not hardcoded.
+    let site_label = match (&site.plc, &site.nod) {
+        (Some(plc), Some(nod)) => format!("{plc} ({nod})"),
+        (Some(name), None) | (None, Some(name)) => name.clone(),
+        (None, None) => "radar".to_string(),
+    };
+    let hud = format!(
+        "{site_label} polar volume — {} · DBZH ≥ {min_dbz:.0} dBZ",
+        vol.time.format("%Y-%m-%d %H:%MZ")
+    );
+    write_viewer(&out_dir, site.lon, site.lat, site.height, &hud);
 
     eprintln!(
         "wrote {}/  (tileset.json, content.pnts, index.html)",
@@ -309,15 +322,20 @@ fn main() {
     );
 }
 
-fn write_viewer(out_dir: &std::path::Path, lon: f64, lat: f64, h: f64) {
+/// Write a self-contained CesiumJS viewer. `hud` describes the actual volume
+/// (site/time/threshold) so the page is correct for any input, not just fivih.
+fn write_viewer(out_dir: &std::path::Path, lon: f64, lat: f64, h: f64, hud: &str) {
+    // Camera sits ~90 km above the antenna's own elevation, south of it, so the
+    // framing tracks the site rather than assuming sea level.
+    let cam_alt = h + 90_000.0;
     let html = format!(
         r#"<!doctype html>
-<html><head><meta charset="utf-8"><title>fivih radar volume — 3D Tiles PoC</title>
+<html><head><meta charset="utf-8"><title>{hud} — 3D Tiles</title>
 <script src="https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/Cesium.js"></script>
 <link href="https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
 <style>html,body,#c{{width:100%;height:100%;margin:0;overflow:hidden}}
 #hud{{position:absolute;top:8px;left:8px;z-index:9;font:13px sans-serif;color:#fff;background:rgba(0,0,0,.55);padding:6px 9px;border-radius:5px}}</style></head>
-<body><div id="c"></div><div id="hud">fivih (Vihti) polar volume — 2026-05-19 10:50Z · DBZH ≥ 5 dBZ</div><script>
+<body><div id="c"></div><div id="hud">{hud}</div><script>
 // Token-free: CARTO Dark Matter basemap (dark backdrop makes the dBZ
 // colours pop), no Cesium Ion terrain/imagery.
 const viewer = new Cesium.Viewer("c", {{
@@ -337,7 +355,7 @@ Cesium.Cesium3DTileset.fromUrl("tileset.json", {{ maximumScreenSpaceError: 1 }})
   ts.style = new Cesium.Cesium3DTileStyle({{ pointSize: 5.0 }});
   // Frame the volume from the SW, elevated, to reveal vertical structure.
   viewer.camera.flyTo({{
-    destination: Cesium.Cartesian3.fromDegrees({lon}, {lat_s}, 90000),
+    destination: Cesium.Cartesian3.fromDegrees({lon}, {lat_s}, {cam_alt}),
     orientation: {{ heading: 0, pitch: Cesium.Math.toRadians(-30), roll: 0 }},
     duration: 0
   }});
@@ -345,9 +363,7 @@ Cesium.Cesium3DTileset.fromUrl("tileset.json", {{ maximumScreenSpaceError: 1 }})
 }}).catch(e => console.error("tileset error", e));
 </script></body></html>
 "#,
-        lon = lon,
         lat_s = lat - 0.9,
     );
-    let _ = h;
-    let _ = fs::write(out_dir.join("index.html"), html);
+    fs::write(out_dir.join("index.html"), html).expect("write index.html");
 }
