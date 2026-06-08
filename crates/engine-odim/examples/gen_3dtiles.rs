@@ -325,6 +325,16 @@ fn main() {
 /// Write a self-contained CesiumJS viewer. `hud` describes the actual volume
 /// (site/time/threshold) so the page is correct for any input, not just fivih.
 fn write_viewer(out_dir: &std::path::Path, lon: f64, lat: f64, h: f64, hud: &str) {
+    // `hud` carries HDF5-sourced site metadata (PLC/NOD) verbatim; escape it
+    // before it lands in the HTML <title>/<div> so a crafted .h5 can't inject
+    // markup/script into the generated viewer.
+    fn html_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    }
+    let hud = html_escape(hud);
     // Camera sits ~90 km above the antenna's own elevation, south of it, so the
     // framing tracks the site rather than assuming sea level.
     let cam_alt = h + 90_000.0;
