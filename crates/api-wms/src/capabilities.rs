@@ -273,6 +273,32 @@ fn write_layer_metadata(writer: &mut Writer<Vec<u8>>, info: &RasterInfo) {
             let _ = writer.write_event(Event::End(BytesEnd::new("Dimension")));
         }
     }
+
+    // Forecast reference-time (model run) dimension — advertised only for
+    // forecast collections that retain multiple runs. The standard `time`
+    // dimension stays the *valid* time axis; this custom `reference_time`
+    // dimension selects the run (the de-facto ncWMS/THREDDS convention,
+    // requested as `DIM_REFERENCE_TIME`). Default = latest run. No
+    // `nearestValue` — the run must match an advertised value exactly (the
+    // handler validates membership and the engine requires an exact match).
+    if !info.reference_times.is_empty() {
+        let mut dim = BytesStart::new("Dimension");
+        dim.push_attribute(("name", "reference_time"));
+        dim.push_attribute(("units", "ISO8601"));
+        if let Some(latest) = info.reference_times.last() {
+            dim.push_attribute(("default", latest.to_rfc3339().as_str()));
+        }
+        let _ = writer.write_event(Event::Start(dim));
+
+        let run_values: Vec<String> = info
+            .reference_times
+            .iter()
+            .map(|t| t.to_rfc3339())
+            .collect();
+        let _ = writer.write_event(Event::Text(BytesText::new(&run_values.join(","))));
+
+        let _ = writer.write_event(Event::End(BytesEnd::new("Dimension")));
+    }
 }
 
 /// Write style elements for a layer.

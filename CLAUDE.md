@@ -189,9 +189,19 @@ follow-up (it currently pins the latest run internally; see [[project_zarr_engin
 (query a specific run); the no-instance routes default to the latest run
 (unchanged). Collection metadata gains an `instances` data_query and the OpenAPI
 spec advertises the instance paths — both gated on `get_instances()` being
-non-empty. **WMS `reference_time` dimension + Maps/Tiles `reference_time` query
-parameter are a follow-up** (the engines already honour the selector in
-`get_raster_tile`; the API layer currently passes `None`).
+non-empty.
+
+**WMS `reference_time` dimension (done).** Forecast layers (non-empty
+`RasterInfo.reference_times`) advertise a custom `<Dimension name="reference_time">`
+in `GetCapabilities` alongside the standard `time` dimension (the valid-time axis),
+defaulting to the latest run. `GetMap` accepts `DIM_REFERENCE_TIME=<run>`
+(RFC 3339, or the compact instance-id stamp); the handler validates it against the
+advertised runs and returns `InvalidDimensionValue` (HTTP 400) for an unknown run
+or a non-forecast layer (no `nearestValue` — the engine requires an exact match).
+The run flows through `get_raster_tile` and into the rendered + meta-tile cache
+keys (`CacheKey.reference_time`, `TileKeyPrefix.reference_time`) so distinct runs
+don't collide. **Maps/Tiles `reference_time` query parameter is still a follow-up**
+(api-maps/api-tiles pass `reference_time: None` today).
 
 ## Engine Capabilities
 

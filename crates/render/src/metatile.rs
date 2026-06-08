@@ -119,6 +119,9 @@ pub struct TileKeyPrefix {
     pub time: Option<DateTime<Utc>>,
     /// Vertical level, pre-quantized via [`crate::quantize_z`].
     pub z: Option<i64>,
+    /// Forecast model run (reference time); `None` = the engine's latest run.
+    /// Keeps tiles for distinct runs from colliding in the meta-tile cache.
+    pub reference_time: Option<DateTime<Utc>>,
 }
 
 /// Cache key for one rendered+colorized meta-tile.
@@ -129,6 +132,7 @@ pub struct TileKey {
     style: String,
     time: Option<DateTime<Utc>>,
     z: Option<i64>,
+    reference_time: Option<DateTime<Utc>>,
     level: i32,
     col: i64,
     row: i64,
@@ -327,6 +331,7 @@ where
                 style: prefix.style.clone(),
                 time: prefix.time,
                 z: prefix.z,
+                reference_time: prefix.reference_time,
                 level,
                 col,
                 row,
@@ -585,6 +590,7 @@ mod tests {
             style: "default".into(),
             time: None,
             z: None,
+            reference_time: None,
         };
         // A modest viewport around Helsinki at ~zoom 6.
         let bbox = [20.0, 58.0, 30.0, 64.0];
@@ -650,6 +656,7 @@ mod tests {
             style: "default".into(),
             time: None,
             z: None,
+            reference_time: None,
         };
         let empty_tile = |_b: [f64; 4], w: u32, h: u32| {
             Ok(RasterTile {
@@ -681,6 +688,7 @@ mod tests {
             style: "default".into(),
             time: None,
             z: None,
+            reference_time: None,
         };
         // Whole-world bbox at a tiny resolution forces > MAX_TILES → fallback.
         let out = render_metatiled(
@@ -718,6 +726,7 @@ mod tests {
             style: "default".into(),
             time: None,
             z: None,
+            reference_time: None,
         };
         // ~1 µm/px viewport (tiny bbox, large image).
         let out = render_metatiled(
@@ -818,6 +827,7 @@ mod tests {
             style: "default".into(),
             time: None,
             z: None,
+            reference_time: None,
         };
 
         // --- X axis: value = mercator-X, constant down each column. ---

@@ -1123,3 +1123,389 @@ fn capabilities_single_param_layer_emits_keywords_and_attribution() {
         "Attribution must follow the Dimension elements; got:\n{xml}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Forecast `reference_time` dimension (#337 Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Records the `reference_time` argument of each `get_raster_tile` call, so a
+/// test can assert which model run the WMS handler asked the engine to render.
+type RunRecorder = Arc<std::sync::Mutex<Vec<Option<chrono::DateTime<chrono::Utc>>>>>;
+
+/// Two forecast model runs, ascending (latest last). Matches the canonical
+/// EDR/GRIB convention.
+fn forecast_runs() -> [chrono::DateTime<chrono::Utc>; 2] {
+    [
+        chrono::DateTime::parse_from_rfc3339("2026-06-07T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+        chrono::DateTime::parse_from_rfc3339("2026-06-07T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+    ]
+}
+
+/// Mock forecast engine that retains two model runs and records the
+/// `reference_time` it was asked to render, so tests can assert that the WMS
+/// `DIM_REFERENCE_TIME` selector reaches the engine (and that omitting it
+/// defaults to `None` ⇒ latest run).
+struct ForecastMockMapEngine {
+    calls: RunRecorder,
+}
+
+impl MapEngine for ForecastMockMapEngine {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+        reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        self.calls.lock().unwrap().push(reference_time);
+        let pixel_count = (width * height) as usize;
+        // Non-uniform so the response avoids the all-nodata fast path.
+        let values: Vec<Option<f64>> = (0..pixel_count)
+            .map(|i| Some(i as f64 / pixel_count as f64))
+            .collect();
+        Ok(RasterTile {
+            width,
+            height,
+            values,
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            native_crs: "EPSG:4326".into(),
+            spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
+            times: vec![chrono::DateTime::parse_from_rfc3339("2026-06-07T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)],
+            parameter: "2t".into(),
+            unit: "K".into(),
+            parameters: vec![],
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: forecast_runs().to_vec(),
+        }
+    }
+}
+
+/// Build a WMS router whose `ecmwf-fc` collection is a forecast engine with two
+/// runs. Returns the router and the call-recorder so tests can assert which run
+/// the engine was asked to render.
+fn build_forecast_router() -> (axum::Router, RunRecorder) {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let engine: Arc<dyn MapEngine> = Arc::new(ForecastMockMapEngine {
+        calls: calls.clone(),
+    });
+    let mut engines = HashMap::new();
+    let mut collections = HashMap::new();
+    let mut styles_map = HashMap::new();
+
+    engines.insert("ecmwf-fc".to_string(), engine);
+    collections.insert(
+        "ecmwf-fc".to_string(),
+        CollectionConfig {
+            id: "ecmwf-fc".to_string(),
+            title: "ECMWF Forecast".to_string(),
+            description: "Forecast fixture for #337 reference_time".into(),
+            data_path: None,
+            apis: vec!["wms".to_string()],
+            engine_type: "grib".to_string(),
+            keywords: Vec::new(),
+            license: None,
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            zarr: None,
+            odim: None,
+            postgis: None,
+            preview: None,
+        },
+    );
+
+    let cmap = Arc::new(LutColorMap::from_builtin(
+        BuiltinColormap::Viridis,
+        0.0,
+        1.0,
+    ));
+    let mut layer_styles = HashMap::new();
+    layer_styles.insert(
+        "default".to_string(),
+        StyleInfo {
+            name: "default".to_string(),
+            title: "Default".to_string(),
+            colormap: cmap,
+            min: 0.0,
+            max: 1.0,
+            parameter: None,
+        },
+    );
+    styles_map.insert("ecmwf-fc".to_string(), layer_styles);
+
+    let state = Arc::new(ArcSwap::from_pointee(WmsState {
+        engines,
+        collections,
+        styles: styles_map,
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
+        base_url: String::new(),
+    }));
+    (api_wms::router(state), calls)
+}
+
+const FC_GETMAP_URI: &str = "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=ecmwf-fc\
+                             &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64\
+                             &FORMAT=image/png";
+
+/// A forecast collection advertises a custom `reference_time` dimension (the
+/// model run) alongside the standard `time` dimension, defaulting to the latest
+/// run, with both runs in the value list — and it sits among the `<Dimension>`s
+/// (before any `<Attribution>`/`<Style>`).
+#[test]
+fn capabilities_emit_reference_time_dimension_for_forecast() {
+    let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+    let mut collections = HashMap::new();
+    engines.insert(
+        "ecmwf-fc".to_string(),
+        Arc::new(ForecastMockMapEngine {
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }),
+    );
+    collections.insert(
+        "ecmwf-fc".to_string(),
+        CollectionConfig {
+            id: "ecmwf-fc".to_string(),
+            title: "ECMWF Forecast".to_string(),
+            description: "Forecast fixture".into(),
+            data_path: None,
+            apis: vec!["wms".to_string()],
+            engine_type: "grib".to_string(),
+            keywords: Vec::new(),
+            license: None,
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            zarr: None,
+            odim: None,
+            postgis: None,
+            preview: None,
+        },
+    );
+
+    let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
+    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
+
+    // Both dimensions present: the valid-time axis and the run axis.
+    assert!(
+        xml.contains("<Dimension name=\"time\""),
+        "forecast layer must keep the standard time dimension; got:\n{xml}"
+    );
+    assert!(
+        xml.contains("<Dimension name=\"reference_time\" units=\"ISO8601\""),
+        "forecast layer must advertise a reference_time dimension; got:\n{xml}"
+    );
+    // Default is the latest run.
+    assert!(
+        xml.contains("default=\"2026-06-07T12:00:00+00:00\""),
+        "reference_time default must be the latest run; got:\n{xml}"
+    );
+    // Both runs listed as values.
+    assert!(
+        xml.contains("2026-06-07T00:00:00+00:00,2026-06-07T12:00:00+00:00</Dimension>"),
+        "reference_time must list both runs ascending; got:\n{xml}"
+    );
+    // No nearestValue on the run dimension (exact match required).
+    let rt_idx = xml.find("name=\"reference_time\"").unwrap();
+    let rt_end = rt_idx + xml[rt_idx..].find('>').unwrap();
+    assert!(
+        !xml[rt_idx..rt_end].contains("nearestValue"),
+        "reference_time dimension must not advertise nearestValue; got:\n{xml}"
+    );
+}
+
+/// A non-forecast layer (no `reference_times`) emits no `reference_time`
+/// dimension — the standard `time` dimension is the only one.
+#[test]
+fn capabilities_omit_reference_time_dimension_for_non_forecast() {
+    let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+    let mut collections = HashMap::new();
+    engines.insert("empty".to_string(), Arc::new(EmptyMockMapEngine));
+    collections.insert(
+        "empty".to_string(),
+        CollectionConfig {
+            id: "empty".to_string(),
+            title: "Empty".to_string(),
+            description: "Non-forecast".to_string(),
+            data_path: None,
+            apis: vec!["wms".to_string()],
+            engine_type: "geotiff".to_string(),
+            keywords: Vec::new(),
+            license: None,
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            zarr: None,
+            odim: None,
+            postgis: None,
+            preview: None,
+        },
+    );
+
+    let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
+    let xml = api_wms::capabilities::get_capabilities_xml(&engines, &collections, &styles, "");
+    let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
+    assert!(
+        !xml.contains("reference_time"),
+        "non-forecast layer must not advertise a reference_time dimension; got:\n{xml}"
+    );
+}
+
+/// `GetMap` with no `DIM_REFERENCE_TIME` defaults to the latest run — the
+/// engine is called with `reference_time = None`.
+#[tokio::test]
+async fn getmap_default_reference_time_is_none() {
+    let (app, calls) = build_forecast_router();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(FC_GETMAP_URI)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let recorded = calls.lock().unwrap().clone();
+    assert_eq!(
+        recorded,
+        vec![None],
+        "omitting DIM_REFERENCE_TIME must query the latest run (None)"
+    );
+}
+
+/// `GetMap` with a valid `DIM_REFERENCE_TIME` selects that run — the engine is
+/// called with the pinned reference time.
+#[tokio::test]
+async fn getmap_selects_pinned_reference_time() {
+    let (app, calls) = build_forecast_router();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "{FC_GETMAP_URI}&DIM_REFERENCE_TIME=2026-06-07T00:00:00Z"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let recorded = calls.lock().unwrap().clone();
+    assert_eq!(
+        recorded,
+        vec![Some(forecast_runs()[0])],
+        "DIM_REFERENCE_TIME must select the pinned run"
+    );
+}
+
+/// The compact EDR instance-id form (`20260607T0000Z`) is also accepted as a
+/// `DIM_REFERENCE_TIME` value, resolving to the same run.
+#[tokio::test]
+async fn getmap_accepts_compact_instance_id_reference_time() {
+    let (app, calls) = build_forecast_router();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("{FC_GETMAP_URI}&DIM_REFERENCE_TIME=20260607T0000Z"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let recorded = calls.lock().unwrap().clone();
+    assert_eq!(recorded, vec![Some(forecast_runs()[0])]);
+}
+
+/// A `DIM_REFERENCE_TIME` that doesn't match an advertised run is a 400
+/// `InvalidDimensionValue` ServiceException — not a rendered (red) tile.
+#[tokio::test]
+async fn getmap_unknown_reference_time_returns_400() {
+    let (app, calls) = build_forecast_router();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "{FC_GETMAP_URI}&DIM_REFERENCE_TIME=2000-01-01T00:00:00Z"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let xml = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        xml.contains("InvalidDimensionValue"),
+        "unknown run must yield InvalidDimensionValue; got:\n{xml}"
+    );
+    // The engine must not have been asked to render an invalid run.
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "engine must not be called for an invalid reference_time"
+    );
+}
+
+/// An unparseable `DIM_REFERENCE_TIME` is also a 400 `InvalidDimensionValue`.
+#[tokio::test]
+async fn getmap_unparseable_reference_time_returns_400() {
+    let (app, _calls) = build_forecast_router();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("{FC_GETMAP_URI}&DIM_REFERENCE_TIME=not-a-time"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `DIM_REFERENCE_TIME` against a non-forecast layer (no advertised runs) is a
+/// 400 `InvalidDimensionValue` — the dimension doesn't exist for that layer.
+#[tokio::test]
+async fn getmap_reference_time_against_non_forecast_layer_returns_400() {
+    let app = build_populated_router(); // "radar" has empty reference_times
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "{GETMAP_URI}&DIM_REFERENCE_TIME=2026-06-07T00:00:00Z"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let xml = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        xml.contains("InvalidDimensionValue"),
+        "reference_time on a non-forecast layer must be InvalidDimensionValue; got:\n{xml}"
+    );
+}

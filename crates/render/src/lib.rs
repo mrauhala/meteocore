@@ -86,6 +86,10 @@ pub struct CacheKey {
     /// Optional vertical level, quantized to millidegrees/milli-units so the
     /// key stays `Hash`/`Eq`. Use [`quantize_z`] to build it.
     pub z: Option<i64>,
+    /// Optional forecast model run (reference time). Distinct cache entries for
+    /// the same (layer, time, bbox, …) when a client pins a non-latest run via
+    /// the WMS `reference_time` dimension. `None` = the engine's latest run.
+    pub reference_time: Option<DateTime<Utc>>,
 }
 
 /// Quantize a vertical level for use in a [`CacheKey`] — millidegrees /
@@ -154,6 +158,19 @@ impl CacheKey {
             Some(z) => {
                 fnv1a_mix(&mut h, &[1u8]);
                 fnv1a_mix(&mut h, &z.to_le_bytes());
+            }
+            None => fnv1a_mix(&mut h, &[0u8]),
+        }
+        match self.reference_time {
+            Some(rt) => {
+                fnv1a_mix(&mut h, &[1u8]);
+                // Mirror the `time` mixing: nanos when in range, else a
+                // saturating millis fallback so the ETag stays deterministic
+                // for pathological dates rather than panicking.
+                let ts = rt
+                    .timestamp_nanos_opt()
+                    .unwrap_or_else(|| rt.timestamp_millis().saturating_mul(1_000_000));
+                fnv1a_mix(&mut h, &ts.to_le_bytes());
             }
             None => fnv1a_mix(&mut h, &[0u8]),
         }
@@ -534,6 +551,7 @@ mod tests {
             ),
             parameter: None,
             z: None,
+            reference_time: None,
         };
         let mut later = base.clone();
         later.time = Some(
@@ -557,6 +575,7 @@ mod tests {
             time: None,
             parameter: Some("2t".into()),
             z: None,
+            reference_time: None,
         };
         let mut other = base.clone();
         other.parameter = Some("10u".into());
@@ -564,6 +583,41 @@ mod tests {
 
         let mut absent = base.clone();
         absent.parameter = None;
+        assert_ne!(base.etag(), absent.etag());
+    }
+
+    #[test]
+    fn cache_key_etag_changes_when_reference_time_changes() {
+        // Two requests identical except for the forecast run (WMS
+        // `reference_time` dimension) must not collide in the rendered cache —
+        // different runs produce different pixels under the same valid TIME.
+        let base = CacheKey {
+            layer: "ecmwf-fc".into(),
+            style: "default".into(),
+            format: 0,
+            crs: "EPSG:3857".into(),
+            bbox: [0, 0, 1, 1],
+            width: 256,
+            height: 256,
+            time: None,
+            parameter: None,
+            z: None,
+            reference_time: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+        };
+        let mut other = base.clone();
+        other.reference_time = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        assert_ne!(base.etag(), other.etag());
+
+        let mut absent = base.clone();
+        absent.reference_time = None;
         assert_ne!(base.etag(), absent.etag());
     }
 
@@ -584,9 +638,10 @@ mod tests {
             time: None,
             parameter: None,
             z: None,
+            reference_time: None,
         };
-        // Pinned after introducing the `z` field (cache-bust event).
-        assert_eq!(key.etag(), "\"95776756a198bd3a\"");
+        // Pinned after introducing the `reference_time` field (cache-bust event).
+        assert_eq!(key.etag(), "\"92a1d2349689898e\"");
     }
 
     #[test]
