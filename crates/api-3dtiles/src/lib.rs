@@ -24,6 +24,7 @@ use axum::Router;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(handlers::landing_page))
+        .route("/viewer", get(handlers::get_viewer))
         .route("/collections", get(handlers::collections))
         .route("/collections/{id}", get(handlers::collection))
         .route("/collections/{id}/tileset.json", get(handlers::get_tileset))
