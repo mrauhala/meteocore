@@ -6,7 +6,10 @@
 <title>MeteoCore — 3D Tiles viewer</title>
 <!-- Subresource Integrity on the version-pinned CesiumJS entry point: a CDN
      compromise/MITM can't silently swap the bundle. (Cesium then loads workers/
-     WASM from the CDN without SRI — full mitigation would self-host CesiumJS.) -->
+     WASM from the CDN without SRI — full mitigation would self-host CesiumJS.)
+     MANDATORY when bumping the CesiumJS version below: recompute these two
+     sha384 hashes with `scripts/check-cesium-sri.sh` — a stale hash makes
+     browsers silently refuse to load CesiumJS (blank viewer for everyone). -->
 <script src="https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/Cesium.js"
         crossorigin="anonymous"
         integrity="sha384-5oazsHA45lZs9jgvxUv40qbMATfjwmtR/wQePfqDAeIDIhGmSK2V0gpRoCpZVBzJ"></script>
@@ -65,7 +68,15 @@ const sameOrigin = here.endsWith("/viewer")
 // Only accept an http(s) ?base override (reject javascript:/data:/etc.); it's
 // fetched + parsed by CesiumJS, so keep it to a plain absolute URL.
 const rawBase = params.get("base");
-const override = rawBase && /^https?:\/\//i.test(rawBase) ? rawBase.replace(/\/+$/, "") : null;
+let override = null;
+if (rawBase) {
+  try {
+    // new URL() normalises (resolves any `..`) and throws on malformed input;
+    // only accept an http(s) absolute URL (it's fetched + parsed by CesiumJS).
+    const u = new URL(rawBase);
+    if (u.protocol === "http:" || u.protocol === "https:") override = u.href.replace(/\/+$/, "");
+  } catch { /* ignore a malformed ?base override */ }
+}
 const BASE = override || sameOrigin || "https://meteocore.app.meteo.fi/3dtiles";
 
 const $coll = document.getElementById("coll");
