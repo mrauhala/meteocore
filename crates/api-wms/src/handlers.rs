@@ -191,6 +191,17 @@ pub async fn wms_handler(
             let content_type = params.format.content_type();
             let has_explicit_time = params.time.is_some();
 
+            // Normalise an explicit pin of the *current* latest run to `None`, so
+            // it shares cache entries (and the engine's latest-run path) with
+            // requests that omit the dimension — they render identical pixels.
+            // The common client flow is echoing the GetCapabilities `default=`
+            // (= the latest run), so without this those requests fragment the
+            // cache from the no-dimension ones. A pin of an *older* run stays
+            // explicit. (`info.reference_times` is ascending; latest is `.last()`.)
+            let reference_time = params
+                .reference_time
+                .filter(|&rt| info.reference_times.last().copied() != Some(rt));
+
             // Build cache key
             let cache_key = CacheKey {
                 layer: params.layer.clone(),
@@ -223,7 +234,7 @@ pub async fn wms_handler(
                 z: params.elevation.map(ds_render::quantize_z),
                 // The forecast run pinned via the `reference_time` dimension
                 // (None ⇒ latest), so runs don't collide in the rendered cache.
-                reference_time: params.reference_time,
+                reference_time,
             };
 
             let cache_control = cache_control_value(has_explicit_time);
@@ -291,7 +302,8 @@ pub async fn wms_handler(
             let output_crs = params.output_crs.clone();
             let format = params.format;
             let elevation = params.elevation;
-            let reference_time = params.reference_time;
+            // `reference_time` (normalised above) is `Copy`; it flows into both
+            // the direct and meta-tile render closures below.
             let z_q = elevation.map(ds_render::quantize_z);
             let layer = params.layer.clone();
             // Key meta-tiles on the *resolved* style name, not the raw STYLES

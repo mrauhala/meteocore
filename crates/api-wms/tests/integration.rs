@@ -1439,6 +1439,67 @@ async fn getmap_accepts_compact_instance_id_reference_time() {
     assert_eq!(recorded, vec![Some(forecast_runs()[0])]);
 }
 
+/// The Web Mercator (EPSG:3857) meta-tile render path propagates the pinned run
+/// in two independent places — `TileKeyPrefix.reference_time` and the
+/// `get_raster_tile` closure inside `render_metatiled` — neither of which the
+/// CRS:84 direct-path tests above exercise. Pin a non-latest run (so it isn't
+/// normalised to `None`) and assert every tile render saw it.
+#[tokio::test]
+async fn getmap_metatile_path_selects_pinned_reference_time() {
+    let (app, calls) = build_forecast_router();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(
+                    "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=ecmwf-fc\
+                     &STYLES=&CRS=EPSG:3857&BBOX=1113194,6982997,3339584,9100048\
+                     &WIDTH=256&HEIGHT=256&FORMAT=image/png\
+                     &DIM_REFERENCE_TIME=2026-06-07T00:00:00Z",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let recorded = calls.lock().unwrap().clone();
+    assert!(
+        !recorded.is_empty(),
+        "meta-tile path must call the engine at least once"
+    );
+    assert!(
+        recorded.iter().all(|rt| *rt == Some(forecast_runs()[0])),
+        "every meta-tile get_raster_tile must carry the pinned run; got {recorded:?}"
+    );
+}
+
+/// Explicitly pinning the *current latest* run is normalised to `None` so it
+/// shares cache entries (and the engine's latest-run path) with requests that
+/// omit the dimension — both render identical pixels. The engine therefore sees
+/// `None`, not `Some(latest)`.
+#[tokio::test]
+async fn getmap_explicit_latest_run_normalizes_to_none() {
+    let (app, calls) = build_forecast_router();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "{FC_GETMAP_URI}&DIM_REFERENCE_TIME=2026-06-07T12:00:00Z"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let recorded = calls.lock().unwrap().clone();
+    assert_eq!(
+        recorded,
+        vec![None],
+        "pinning the current latest run must collapse to None (cache unified with no-dimension)"
+    );
+}
+
 /// A `DIM_REFERENCE_TIME` that doesn't match an advertised run is a 400
 /// `InvalidDimensionValue` ServiceException — not a rendered (red) tile.
 #[tokio::test]
