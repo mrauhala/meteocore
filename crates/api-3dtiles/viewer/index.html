@@ -62,7 +62,11 @@ const here = location.pathname.replace(/\/+$/, "");
 const sameOrigin = here.endsWith("/viewer")
   ? location.origin + here.slice(0, -"/viewer".length)
   : null;
-const BASE = params.get("base") || sameOrigin || "https://meteocore.app.meteo.fi/3dtiles";
+// Only accept an http(s) ?base override (reject javascript:/data:/etc.); it's
+// fetched + parsed by CesiumJS, so keep it to a plain absolute URL.
+const rawBase = params.get("base");
+const override = rawBase && /^https?:\/\//i.test(rawBase) ? rawBase.replace(/\/+$/, "") : null;
+const BASE = override || sameOrigin || "https://meteocore.app.meteo.fi/3dtiles";
 
 const $coll = document.getElementById("coll");
 const $qty = document.getElementById("qty");
