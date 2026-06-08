@@ -142,7 +142,10 @@ pub fn encode_pnts(
 }
 
 /// Build the `tileset.json` for a point cloud. `content_uri` is the relative
-/// URI of the `.pnts` tile (e.g. `"content.pnts"`).
+/// URI of the `.pnts` tile (e.g. `"content.pnts"`). It is JSON-escaped by
+/// `serde_json`, so there is no injection risk, but callers **must** supply a
+/// server-controlled relative path — never user input or unvalidated config —
+/// since CesiumJS will fetch whatever URL it resolves to.
 ///
 /// The `region` bounding volume is geodetic, so no tile `transform` is needed
 /// (the `.pnts` `RTC_CENTER` already places points in ECEF). The top-level

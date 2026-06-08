@@ -14,6 +14,7 @@
 
 use crate::error::DataServerError;
 use chrono::{DateTime, Utc};
+use std::sync::Arc;
 
 /// One sample in a [`VolumePointCloud`]: an ECEF offset (metres) from the
 /// cloud's [`VolumePointCloud::rtc_center`], plus the physical value measured
@@ -93,5 +94,10 @@ pub trait VolumeEngine: Send + Sync {
     ) -> Result<VolumePointCloud, DataServerError>;
 
     /// Metadata for the volumetric collection (quantities, valid times).
-    fn volume_info(&self) -> VolumeInfo;
+    ///
+    /// Returns a shared snapshot so it stays **O(1) on a per-request path** (no
+    /// recompute, no `Vec` clone) — engines should serve a cached
+    /// `Arc<VolumeInfo>` rebuilt on data refresh, per the `RasterInfo` rule
+    /// (#211).
+    fn volume_info(&self) -> Arc<VolumeInfo>;
 }

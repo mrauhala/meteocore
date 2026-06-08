@@ -583,6 +583,10 @@ struct SiteMeta {
     coverage_radius_m: Option<f64>,
     /// This site's sweep elevation angles (degrees).
     vertical: Option<VerticalDimension>,
+    /// Pre-built 3D Tiles metadata snapshot, so `VolumeEngine::volume_info`
+    /// is an O(1) `Arc` clone on the request path (no per-call `Vec` clone),
+    /// per the `RasterInfo` rule (#211). Rebuilt on each catalog swap.
+    volume_info: Arc<VolumeInfo>,
 }
 
 /// The engine's catalog: per-site time-sorted volume lists, plus the
@@ -1263,6 +1267,20 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
     let vertical =
         (!levels.is_empty()).then(|| VerticalDimension::new(VerticalKind::ElevationAngle, levels));
 
+    // Pre-build the 3D Tiles metadata snapshot once per catalog rebuild so the
+    // per-request `volume_info()` is an O(1) Arc clone (#211).
+    let default_quantity = parameters
+        .first()
+        .map(|(id, _)| id.clone())
+        .unwrap_or_default();
+    let default_unit = quantities::quantity_unit(&default_quantity).to_string();
+    let volume_info = Arc::new(VolumeInfo {
+        quantities: parameters.clone(),
+        times: times.clone(),
+        default_quantity,
+        default_unit,
+    });
+
     Some(SiteMeta {
         lon: site.lon,
         lat: site.lat,
@@ -1275,6 +1293,7 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         spatial_extent,
         coverage_radius_m,
         vertical,
+        volume_info,
     })
 }
 
@@ -3082,6 +3101,7 @@ fn volume_point_cloud(
             || sweep.nbins == 0
             || !sweep.rscale.is_finite()
             || sweep.rscale <= 0.0
+            || !sweep.rstart.is_finite()
             || !sweep.elangle.is_finite()
         {
             continue;
@@ -3246,26 +3266,14 @@ impl VolumeEngine for PolarVolumeSiteView {
         Ok(cloud)
     }
 
-    fn volume_info(&self) -> VolumeInfo {
-        // NOTE: clones `parameters` + `times` per call, mirroring the sibling
-        // `raster_info()` above. Not yet on a per-request hot path (the 3D
-        // Tiles API is #349); when it is wired, cache a snapshot in an
-        // `ArcSwap` rebuilt on catalog swap for *both* accessors together,
-        // matching the #211 `RasterInfo` fix.
-        let catalog = self.catalog.load();
-        let meta = catalog.by_site_meta.get(&self.nod);
-        let quantities = meta.map(|m| m.parameters.clone()).unwrap_or_default();
-        let default_quantity = quantities
-            .first()
-            .map(|(id, _)| id.clone())
-            .unwrap_or_default();
-        let default_unit = quantities::quantity_unit(&default_quantity).to_string();
-        VolumeInfo {
-            quantities,
-            times: meta.map(|m| m.times.clone()).unwrap_or_default(),
-            default_quantity,
-            default_unit,
-        }
+    fn volume_info(&self) -> Arc<VolumeInfo> {
+        // O(1): clone the pre-built snapshot's `Arc`, not its `Vec`s (#211).
+        self.catalog
+            .load()
+            .by_site_meta
+            .get(&self.nod)
+            .map(|m| Arc::clone(&m.volume_info))
+            .unwrap_or_default()
     }
 }
 
@@ -5686,6 +5694,7 @@ mod tests {
                 spatial_extent: None,
                 coverage_radius_m: None,
                 vertical: None,
+                volume_info: Arc::default(),
             }
         }
         let nods = vec!["fivih".to_string()];
