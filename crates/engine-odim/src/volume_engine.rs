@@ -1268,11 +1268,11 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         (!levels.is_empty()).then(|| VerticalDimension::new(VerticalKind::ElevationAngle, levels));
 
     // Pre-build the 3D Tiles metadata snapshot once per catalog rebuild so the
-    // per-request `volume_info()` is an O(1) Arc clone (#211).
-    let default_quantity = parameters
-        .first()
-        .map(|(id, _)| id.clone())
-        .unwrap_or_default();
+    // per-request `volume_info()` is an O(1) Arc clone (#211). The default
+    // quantity is `quantities.first()` — the *same* source `read_point_cloud`
+    // and `get_raster_tile` default to, so the advertised default matches what
+    // an unqualified request actually renders.
+    let default_quantity = quantities.first().cloned().unwrap_or_default();
     let default_unit = quantities::quantity_unit(&default_quantity).to_string();
     let volume_info = Arc::new(VolumeInfo {
         quantities: parameters.clone(),
@@ -3195,15 +3195,16 @@ impl VolumeEngine for PolarVolumeSiteView {
     ) -> Result<VolumePointCloud, DataServerError> {
         let catalog = self.catalog.load();
 
-        // Default to the site's primary (first advertised) quantity, like
-        // `get_raster_tile`.
+        // Default to the same quantity `volume_info()` advertises (the cached
+        // `default_quantity`), so an unqualified request renders exactly what
+        // the metadata says is the default.
         let quantity = match quantity {
             Some(q) => q.to_string(),
             None => catalog
                 .by_site_meta
                 .get(&self.nod)
-                .and_then(|m| m.quantities.first())
-                .cloned()
+                .map(|m| m.volume_info.default_quantity.clone())
+                .filter(|q| !q.is_empty())
                 .ok_or_else(|| {
                     DataServerError::InvalidParameter(format!(
                         "[{}] PVOL collection has no quantities to render",
@@ -3268,6 +3269,9 @@ impl VolumeEngine for PolarVolumeSiteView {
 
     fn volume_info(&self) -> Arc<VolumeInfo> {
         // O(1): clone the pre-built snapshot's `Arc`, not its `Vec`s (#211).
+        // An unknown NOD (site dropped from the catalog since registration —
+        // a reload race) degrades to empty metadata, matching how the query
+        // methods report no data; no per-request log to avoid spam.
         self.catalog
             .load()
             .by_site_meta
