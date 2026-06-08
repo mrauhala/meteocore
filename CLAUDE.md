@@ -237,11 +237,18 @@ framework-free `ds-3dtiles` crate encodes it to a `.pnts` tile + `tileset.json`;
 (same rule as `MapEngine`→`ds-render`).
 
 - **Trait:** `VolumeEngine::read_point_cloud(quantity, time, min_value, reference_time)`
-  → `VolumePointCloud`, and `volume_info() -> Arc<VolumeInfo>` (O(1) cached
-  snapshot, #211 — carries quantities, times, default quantity, and a coverage
-  `region` for the tileset bounding volume without sampling). Implemented by
-  `PolarVolumeSiteView`; the cloud is bounded by `MAX_POINTS` (8M, truncate +
-  WARN). Unknown quantity ⇒ `InvalidParameter` (→ 400).
+  → `VolumePointCloud`; `read_voxel_grid(quantity, time, dims, reference_time)`
+  → `VoxelGrid` (a regular **cylindrical** grid — `radius`×`angle`×`height`,
+  `NaN`=nodata — the substrate for true voxels #351 and isosurfaces #357);
+  and `volume_info() -> Arc<VolumeInfo>` (O(1) cached snapshot, #211 — carries
+  quantities, times, default quantity, and a coverage `region` for the tileset
+  bounding volume without sampling). Implemented by `PolarVolumeSiteView` (which
+  shares `select_entry_and_quantity` across both samplers); the cloud is bounded
+  by `MAX_POINTS` (8M) and the grid by `MAX_VOXELS` (32M cells). Both resample
+  via the envelope-guarded `sample_polar_slant` (no fabricated data across the
+  cone of silence). Unknown quantity ⇒ `InvalidParameter` (→ 400). The
+  `EXT_primitive_voxels` glTF *encoding* of a `VoxelGrid` is a follow-up (#351) —
+  draft spec, render-verify against CesiumJS ≥1.127.
 - **Routes** (mounted at `/3dtiles`): `GET /collections/{id}/tileset.json`
   (`?quantity=&datetime=&min_value=`) and `GET /collections/{id}/content.pnts`
   (`?quantity=&datetime=&min_value=`), plus `/` · `/collections` ·

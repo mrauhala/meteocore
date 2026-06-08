@@ -57,6 +57,31 @@ impl VolumeEngine for MockVolume {
         })
     }
 
+    fn read_voxel_grid(
+        &self,
+        _quantity: Option<&str>,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        dims: Option<[usize; 3]>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<ds_core::volume::VoxelGrid, DataServerError> {
+        let dims = dims.unwrap_or([2, 4, 2]);
+        let total = dims[0] * dims[1] * dims[2];
+        let mut values = vec![f32::NAN; total];
+        values[0] = 30.0; // one sampled cell so valid_count() > 0
+        Ok(ds_core::volume::VoxelGrid {
+            origin_lon: 24.5,
+            origin_lat: 60.5,
+            origin_height: 100.0,
+            dims,
+            radius_range: [0.0, 250_000.0],
+            angle_range: [0.0, std::f64::consts::TAU],
+            height_range: [0.0, 20_000.0],
+            values,
+            quantity: "DBZH".into(),
+            unit: "dBZ".into(),
+        })
+    }
+
     fn volume_info(&self) -> Arc<VolumeInfo> {
         Arc::new(VolumeInfo {
             quantities: vec![("DBZH".into(), "Reflectivity".into())],

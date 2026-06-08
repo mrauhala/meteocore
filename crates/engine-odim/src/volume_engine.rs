@@ -69,7 +69,7 @@ use ds_core::model::{
     VerticalCoord,
 };
 use ds_core::vertical::{VerticalDimension, VerticalKind};
-use ds_core::volume::{VolumeEngine, VolumeInfo, VolumePoint, VolumePointCloud};
+use ds_core::volume::{VolumeEngine, VolumeInfo, VolumePoint, VolumePointCloud, VoxelGrid};
 use tokio::sync::Notify;
 
 use ds_storage::discovery::{expand_prefix_for_dates, expand_prefix_pattern, TimeWindow};
@@ -3204,30 +3204,118 @@ fn volume_point_cloud(
     }
 }
 
-impl VolumeEngine for PolarVolumeSiteView {
-    fn read_point_cloud(
+/// Default voxel grid resolution `[n_radius, n_angle, n_height]`: 1° azimuth
+/// bins (matching radar rays), ~2 km radial and ~420 m vertical cells over the
+/// ranges below. ~2.2M cells.
+const DEFAULT_VOXEL_DIMS: [usize; 3] = [128, 360, 48];
+/// Hard cap on requested voxel-grid cell count (memory + sample-loop bound).
+const MAX_VOXELS: usize = 32_000_000;
+/// Height ceiling (metres above antenna) for the voxel grid — above any echo.
+const VOXEL_HEIGHT_CEILING_M: f64 = 20_000.0;
+
+/// Resample one polar volume into a regular cylindrical [`VoxelGrid`]: for each
+/// `(radius, azimuth, height)` cell centre, invert to `(slant_range, elevation)`
+/// via the 4/3-Earth beam model and sample the volume — reusing the same
+/// `sample_polar_slant` (with its sweep-envelope guard) the cross-section path
+/// uses, so cells outside the surveyed beam fan stay `NaN`. The angle axis is
+/// azimuth `0..2π` (the encoder maps to the cylinder convention); radius is
+/// ground range `0..max`, height `0..ceiling`.
+fn voxel_grid_from_volume(
+    volume: &PolarVolume,
+    file_id: &str,
+    pix: Pixels,
+    quantity: &str,
+    dims: Option<[usize; 3]>,
+) -> Result<VoxelGrid, DataServerError> {
+    let dims = dims.unwrap_or(DEFAULT_VOXEL_DIMS);
+    let [n_r, n_a, n_h] = dims;
+    if n_r == 0 || n_a == 0 || n_h == 0 {
+        return Err(DataServerError::InvalidParameter(
+            "voxel grid dimensions must all be non-zero".into(),
+        ));
+    }
+    let total = n_r
+        .checked_mul(n_a)
+        .and_then(|x| x.checked_mul(n_h))
+        .filter(|&t| t <= MAX_VOXELS)
+        .ok_or_else(|| {
+            DataServerError::InvalidParameter(format!(
+                "voxel grid {n_r}×{n_a}×{n_h} exceeds the {MAX_VOXELS}-cell cap"
+            ))
+        })?;
+
+    let envelope = sweep_envelope(volume)
+        .ok_or_else(|| DataServerError::Engine("PVOL has no finite sweeps".into()))?;
+
+    // Radial extent = max ground-range across sweeps (slant ≈ ground at low
+    // elevation; the cell→slant inversion handles the rest).
+    let radius_max = volume
+        .sweeps
+        .iter()
+        .filter(|s| s.rscale.is_finite() && s.rscale > 0.0)
+        .map(|s| s.rstart + s.nbins as f64 * s.rscale)
+        .fold(0.0_f64, f64::max);
+    if !(radius_max.is_finite() && radius_max > 0.0) {
+        return Err(DataServerError::Engine(
+            "PVOL has no valid range geometry".into(),
+        ));
+    }
+    let ceiling = VOXEL_HEIGHT_CEILING_M;
+    let site = &volume.site;
+
+    let mut values = vec![f32::NAN; total];
+    for i_r in 0..n_r {
+        let ground = (i_r as f64 + 0.5) * radius_max / n_r as f64;
+        for i_a in 0..n_a {
+            let azimuth_deg = (i_a as f64 + 0.5) * 360.0 / n_a as f64;
+            for i_h in 0..n_h {
+                let height = (i_h as f64 + 0.5) * ceiling / n_h as f64;
+                let (slant, el) = ground_height_to_slant(ground, height);
+                if let Some(v) = sample_polar_slant(
+                    volume,
+                    file_id,
+                    pix,
+                    envelope,
+                    quantity,
+                    slant,
+                    azimuth_deg,
+                    el,
+                ) {
+                    values[(i_r * n_a + i_a) * n_h + i_h] = v as f32;
+                }
+            }
+        }
+    }
+
+    Ok(VoxelGrid {
+        origin_lon: site.lon,
+        origin_lat: site.lat,
+        origin_height: site.height,
+        dims,
+        radius_range: [0.0, radius_max],
+        angle_range: [0.0, std::f64::consts::TAU],
+        height_range: [0.0, ceiling],
+        values,
+        quantity: quantity.to_string(),
+        unit: quantities::quantity_unit(quantity).to_string(),
+    })
+}
+
+impl PolarVolumeSiteView {
+    /// Resolve the quantity (validate a named one ⇒ `InvalidParameter`/400;
+    /// `None` ⇒ the advertised default) and select the volume nearest `time`
+    /// (latest if `None`), with the antenna-finite guard. Shared by
+    /// `read_point_cloud` and `read_voxel_grid`.
+    fn select_entry_and_quantity<'c>(
         &self,
+        catalog: &'c Catalog,
         quantity: Option<&str>,
         time: Option<DateTime<Utc>>,
-        min_value: Option<f64>,
-        _reference_time: Option<DateTime<Utc>>,
-    ) -> Result<VolumePointCloud, DataServerError> {
-        let catalog = self.catalog.load();
-
-        // Default to the same quantity `volume_info()` advertises (the cached
-        // `default_quantity`), so an unqualified request renders exactly what
-        // the metadata says is the default.
+    ) -> Result<(&'c VolumeEntry, String), DataServerError> {
+        let meta = catalog.by_site_meta.get(&self.nod);
         let quantity = match quantity {
             Some(q) => {
-                // Reject an unknown quantity as InvalidParameter (→ 400), not a
-                // "no echoes" LocationNotFound (→ 404) — consistent with
-                // `get_raster_tile`/`polar_sample`, and so the #349 handler
-                // gets the right status for free.
-                let known = catalog
-                    .by_site_meta
-                    .get(&self.nod)
-                    .is_some_and(|m| m.quantities.iter().any(|x| x == q));
-                if !known {
+                if !meta.is_some_and(|m| m.quantities.iter().any(|x| x == q)) {
                     return Err(DataServerError::InvalidParameter(format!(
                         "[{}] unknown quantity `{q}` for radar site `{}`",
                         self.collection_id, self.nod
@@ -3235,9 +3323,7 @@ impl VolumeEngine for PolarVolumeSiteView {
                 }
                 q.to_string()
             }
-            None => catalog
-                .by_site_meta
-                .get(&self.nod)
+            None => meta
                 .map(|m| m.volume_info.default_quantity.clone())
                 .filter(|q| !q.is_empty())
                 .ok_or_else(|| {
@@ -3254,9 +3340,7 @@ impl VolumeEngine for PolarVolumeSiteView {
                 self.collection_id, self.nod
             ))
         })?;
-
-        // Select the volume nearest `time` (latest if `None`) — same rule as
-        // `get_raster_tile`.
+        // Nearest to `time` (latest if `None`) — same rule as `get_raster_tile`.
         let entry = match time {
             Some(target) => site_volumes
                 .iter()
@@ -3270,10 +3354,8 @@ impl VolumeEngine for PolarVolumeSiteView {
             ))
         })?;
 
-        // A corrupt file with non-finite antenna coordinates would poison the
-        // ECEF projection (`geodetic_to_ecef` → NaN center → every offset NaN).
-        // Reject up front with antenna context, rather than surfacing an opaque
-        // `NonFinite("point offset")` from the encoder.
+        // Non-finite antenna coordinates would poison the ECEF projection /
+        // voxel origin; reject up front with antenna context.
         let antenna = &entry.volume.site;
         if !(antenna.lon.is_finite() && antenna.lat.is_finite() && antenna.height.is_finite()) {
             return Err(DataServerError::Engine(format!(
@@ -3282,6 +3364,20 @@ impl VolumeEngine for PolarVolumeSiteView {
                 self.collection_id, self.nod, antenna.lon, antenna.lat, antenna.height
             )));
         }
+        Ok((entry, quantity))
+    }
+}
+
+impl VolumeEngine for PolarVolumeSiteView {
+    fn read_point_cloud(
+        &self,
+        quantity: Option<&str>,
+        time: Option<DateTime<Utc>>,
+        min_value: Option<f64>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<VolumePointCloud, DataServerError> {
+        let catalog = self.catalog.load();
+        let (entry, quantity) = self.select_entry_and_quantity(&catalog, quantity, time)?;
 
         let handle = blocking_pixel_handle();
         let pix = Pixels {
@@ -3300,6 +3396,34 @@ impl VolumeEngine for PolarVolumeSiteView {
             )));
         }
         Ok(cloud)
+    }
+
+    fn read_voxel_grid(
+        &self,
+        quantity: Option<&str>,
+        time: Option<DateTime<Utc>>,
+        dims: Option<[usize; 3]>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<VoxelGrid, DataServerError> {
+        let catalog = self.catalog.load();
+        let (entry, quantity) = self.select_entry_and_quantity(&catalog, quantity, time)?;
+
+        let handle = blocking_pixel_handle();
+        let pix = Pixels {
+            source: &self.source,
+            handle: handle.as_ref(),
+        };
+        let grid = voxel_grid_from_volume(&entry.volume, &entry.id, pix, &quantity, dims)?;
+
+        // No sampled cell (every cell outside the beam fan / nodata) ⇒ 404,
+        // matching the other engines' "no data in window" convention.
+        if grid.valid_count() == 0 {
+            return Err(DataServerError::LocationNotFound(format!(
+                "[{}] no `{}` echoes in the selected volume of site `{}`",
+                self.collection_id, quantity, self.nod
+            )));
+        }
+        Ok(grid)
     }
 
     fn volume_info(&self) -> Arc<VolumeInfo> {
