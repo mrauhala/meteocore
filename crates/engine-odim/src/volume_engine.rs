@@ -3061,7 +3061,11 @@ fn volume_point_cloud(
     let (mut min_h, mut max_h) = (f64::INFINITY, f64::NEG_INFINITY);
 
     for sweep in &volume.sweeps {
-        if sweep.nrays == 0 || sweep.nbins == 0 || !sweep.rscale.is_finite() || sweep.rscale <= 0.0
+        if sweep.nrays == 0
+            || sweep.nbins == 0
+            || !sweep.rscale.is_finite()
+            || sweep.rscale <= 0.0
+            || !sweep.elangle.is_finite()
         {
             continue;
         }

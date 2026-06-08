@@ -134,7 +134,11 @@ fn main() {
         "{site_label} ({nod}) polar volume — {time_str} · {} ≥ {min_dbz:.0} dBZ",
         cloud.quantity
     );
-    write_viewer(&out_dir, lon, lat, &hud);
+    // Frame relative to the site's elevation, not sea level: the region's min
+    // height ≈ the antenna altitude (lowest sweep near the radar). Matters for
+    // alpine sites; negligible for the Finnish fixture.
+    let base_alt = cloud.region[4];
+    write_viewer(&out_dir, lon, lat, base_alt, &hud);
 
     eprintln!(
         "wrote {}/  (tileset.json, content.pnts, index.html) — {:.1} MB pnts",
@@ -144,8 +148,9 @@ fn main() {
 }
 
 /// Write a self-contained, token-free CesiumJS viewer (CARTO Dark Matter
-/// basemap). `hud`/`lon`/`lat` describe the actual volume.
-fn write_viewer(out_dir: &Path, lon: f64, lat: f64, hud: &str) {
+/// basemap). `hud`/`lon`/`lat`/`base_alt` describe the actual volume;
+/// `base_alt` is the site's ground elevation (metres) the camera frames above.
+fn write_viewer(out_dir: &Path, lon: f64, lat: f64, base_alt: f64, hud: &str) {
     // `hud` carries HDF5-sourced site metadata (PLC/NOD) verbatim; escape it
     // before it lands in the HTML <title>/<div> so a crafted .h5 can't inject
     // markup/script into the generated viewer.
@@ -156,6 +161,7 @@ fn write_viewer(out_dir: &Path, lon: f64, lat: f64, hud: &str) {
             .replace('"', "&quot;")
     }
     let hud = html_escape(hud);
+    let cam_alt = base_alt + 90_000.0;
     let html = format!(
         r#"<!doctype html>
 <html><head><meta charset="utf-8"><title>{hud} — 3D Tiles</title>
@@ -183,7 +189,7 @@ Cesium.Cesium3DTileset.fromUrl("tileset.json", {{ maximumScreenSpaceError: 1 }})
   ts.style = new Cesium.Cesium3DTileStyle({{ pointSize: 5.0 }});
   // Frame the volume from the SW, elevated, to reveal vertical structure.
   viewer.camera.flyTo({{
-    destination: Cesium.Cartesian3.fromDegrees({lon}, {lat_s}, 90000),
+    destination: Cesium.Cartesian3.fromDegrees({lon}, {lat_s}, {cam_alt}),
     orientation: {{ heading: 0, pitch: Cesium.Math.toRadians(-30), roll: 0 }},
     duration: 0
   }});

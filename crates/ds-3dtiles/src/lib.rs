@@ -136,7 +136,7 @@ pub fn tileset_json(cloud: &VolumePointCloud, content_uri: &str) -> Result<Strin
     if cloud.region.iter().any(|v| !v.is_finite()) {
         return Err(Tiles3dError::NonFinite("region"));
     }
-    let region: Vec<f64> = cloud.region.to_vec();
+    // `[f64; 6]` serializes directly to a JSON array — no `Vec` needed.
     // `asset.version` is intentionally "1.1" even though `.pnts` is a 1.0
     // content type: CesiumJS keys its tileset loader off this version, and a
     // 1.1 tileset happily references legacy `.pnts` content. Do not "fix" this
@@ -145,7 +145,7 @@ pub fn tileset_json(cloud: &VolumePointCloud, content_uri: &str) -> Result<Strin
         "asset": { "version": "1.1" },
         "geometricError": TILESET_GEOMETRIC_ERROR,
         "root": {
-            "boundingVolume": { "region": region },
+            "boundingVolume": { "region": cloud.region },
             "geometricError": ROOT_GEOMETRIC_ERROR,
             "refine": "ADD",
             "content": { "uri": content_uri },
