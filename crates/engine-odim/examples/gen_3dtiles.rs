@@ -144,6 +144,16 @@ fn main() {
     };
     let vol = read_polar_volume(&bytes).expect("parse volume");
     let site = &vol.site;
+    // Non-finite antenna coordinates would poison both the ECEF projection
+    // (NaN positions) and the generated viewer (`f64::INFINITY` formats as the
+    // invalid-JS literal `inf`). Refuse a corrupt volume up front.
+    if !(site.lon.is_finite() && site.lat.is_finite() && site.height.is_finite()) {
+        eprintln!(
+            "non-finite antenna coordinates (lon={}, lat={}, h={}) — refusing to encode",
+            site.lon, site.lat, site.height
+        );
+        std::process::exit(1);
+    }
     eprintln!(
         "site {:?} ({:?})  lon={:.4} lat={:.4} h={:.0}m  sweeps={}  time={}",
         site.nod,
@@ -259,12 +269,17 @@ fn main() {
 
     let header_len = 28;
     let total = header_len + ft_json.len() + body.len();
+    // The pnts header fields are u32: fail loudly rather than silently
+    // truncate (a >4 GB tile would otherwise produce a corrupt file).
+    let total_u32 = u32::try_from(total).expect("pnts file exceeds 4 GB");
+    let ft_json_u32 = u32::try_from(ft_json.len()).expect("pnts feature-table JSON exceeds 4 GB");
+    let body_u32 = u32::try_from(body.len()).expect("pnts feature-table binary exceeds 4 GB");
     let mut pnts = Vec::with_capacity(total);
     pnts.extend_from_slice(b"pnts");
     pnts.extend_from_slice(&1u32.to_le_bytes()); // version
-    pnts.extend_from_slice(&(total as u32).to_le_bytes());
-    pnts.extend_from_slice(&(ft_json.len() as u32).to_le_bytes()); // FT JSON len
-    pnts.extend_from_slice(&(body.len() as u32).to_le_bytes()); // FT binary len
+    pnts.extend_from_slice(&total_u32.to_le_bytes());
+    pnts.extend_from_slice(&ft_json_u32.to_le_bytes()); // FT JSON len
+    pnts.extend_from_slice(&body_u32.to_le_bytes()); // FT binary len
     pnts.extend_from_slice(&0u32.to_le_bytes()); // batch table JSON len
     pnts.extend_from_slice(&0u32.to_le_bytes()); // batch table binary len
     pnts.extend_from_slice(&ft_json);
