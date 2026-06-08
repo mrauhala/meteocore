@@ -25,6 +25,7 @@ Each engine implements one or more of the core traits.
 | `engine-grib` | `EdrEngine` + `MapEngine` | GRIB2 NWP data via JSON/wgrib2 index sidecars (ECMWF IFS, NOAA GFS) |
 | `engine-odim` | `EdrEngine` + `MapEngine` | ODIM_H5 weather radar — 2-D composites (FMI / DMI / SMHI / OPERA) and native polar volumes (`odim-volume`, one collection per radar site); pure-Rust HDF5 |
 | `engine-querydata` | `EdrEngine` + `MapEngine` | FMI QueryData (`.sqd`) binary files, memory-mapped |
+| `engine-zarr` | `EdrEngine` + `MapEngine` | Zarr V2/V3 multidimensional arrays with CF metadata (local, S3, HTTP); optional Icechunk repositories |
 | `engine-postgis` | `EdrEngine` + `FeatureEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible) |
 
 ### OGC API Plugins
@@ -240,7 +241,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `description` | yes | — | Collection description |
 | `data_path` | yes* | — | Path to data file (CSV, GeoJSON) or directory (GeoTIFF) |
 | `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, `"maps"`, `"tiles"`, `"wms"` |
-| `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, `"odim"` (radar composite), `"odim-volume"` (radar polar volumes), `"querydata"`, `"postgis"` |
+| `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, `"odim"` (radar composite), `"odim-volume"` (radar polar volumes), `"querydata"`, `"zarr"`, `"postgis"` |
 | `wms` | no | — | WMS rendering config. Required when `apis` contains `"wms"`. |
 
 ### Per-File Collection Configs
@@ -738,6 +739,146 @@ colormap = "viridis"
 name = "2t"
 colormap = "temperature"
 ```
+
+### Zarr
+
+Cloud-native multidimensional arrays (Zarr V2/V3) with CF-conventions metadata. Implements `EdrEngine` (EDR position queries) and `MapEngine` (WMS/Maps/Tiles rendering) — one layer/parameter per data variable. The Zarr format and its codec pipeline (blosc/zstd/gzip/crc32c, sharding, transpose) are handled by the [`zarrs`](https://crates.io/crates/zarrs) crate; this engine adds CF semantics, the OGC domain mapping, the storage bridge, and the poll-and-swap lifecycle.
+
+**Key characteristics:**
+- **Multi-variable:** every geographic data variable in the store becomes a parameter (and a WMS/Maps/Tiles layer). Restrict with the `parameters` filter.
+- **CF-conventions decoding:** CF time axis, CF packing (`scale_factor`/`add_offset`/`_FillValue`/`missing_value` plus the array's own Zarr fill value). A time axis is **required** (EDR PointSeries needs a `t`).
+- **Storage:** local directory, S3 (`endpoint`+`bucket`+`path`), or HTTP — all via `ds-storage`, with byte-range chunk reads cached in an LRU keyed on full chunk objects (`cache_mb`).
+- **EDR position queries** use bilinear interpolation; ascending/descending and irregular axes are handled via CF axis location.
+- **Rendering** reads a 2-D spatial window covering the request bbox (+1 cell margin), then samples per output pixel (geographic/WebMercator) or via a coarse projection grid (projected output CRS — never per-pixel projection).
+- **Poll-and-swap:** the store is re-read on `poll_interval_secs` so appended time steps surface without a reload; `RasterInfo` is served from a cached snapshot.
+
+**Supported grids:** geographic (WGS84 lat/lon) only. Projected metre axes are detected and skipped (not mistaken for degrees). A startup WARN fires for pathological chunk shapes (e.g. `time=1, lat=full, lon=full` — one full-domain chunk per timestep is bad for point/time-series queries; the engine still serves).
+
+**Forecast (reference + lead) handling:** when a store has a CF `forecast_reference_time` axis (model run) **and** a `forecast_period`/lead axis (e.g. dynamical.org AIFS/GFS/ICON-EU), the engine uses the **latest run** and exposes valid time (= run + lead) as the time axis. Selecting older runs (EDR instances / WMS `reference_time`) is tracked in [#337](https://github.com/mrauhala/meteocore/issues/337).
+
+> **Note:** the engine returns stored values as-is — it does **not** convert units. For datasets where `temperature_2m` is already in °C (e.g. the dynamical.org forecasts), set the colormap range in °C.
+
+#### Data Source Modes
+
+| Mode | Config | Description |
+|------|--------|-------------|
+| Local directory | `data_path = "path/to/store.zarr"` | Local Zarr store root |
+| Local/remote URL | `data_path = "s3://…"` or `"http(s)://…"` | Store root as a URL |
+| S3 | `endpoint` + `bucket` + `path` | Store at `path` within the bucket |
+
+`data_path` and the `endpoint`/`bucket` source are mutually exclusive.
+
+#### Zarr Config Fields
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `data_path` | * | — | Local store root directory, or an `s3://` / `http(s)://` URL. Mutually exclusive with `endpoint`+`bucket`. |
+| `endpoint` | * | — | S3-compatible endpoint URL. Required with `bucket`. |
+| `bucket` | * | — | S3 bucket name. Required when `endpoint` is set. |
+| `path` | no | — | Store path within the bucket (S3); optional sub-path for a local `data_path`. |
+| `zarr_version` | no | auto | Metadata version `2` or `3` (advisory — `zarrs` auto-detects). |
+| `parameters` | no | all | Only expose these variables as parameters. |
+| `poll_interval_secs` | no | `300` | Store re-read cadence in seconds. |
+| `cache_mb` | no | `256` | Chunk LRU cache size in MB (most useful for S3/HTTP). |
+| `icechunk` | no | — | `[zarr.icechunk]` table → read an Icechunk repo instead of plain Zarr (see below). Requires the `icechunk` feature. |
+
+\* One of `data_path` **or** `endpoint`+`bucket` must be set.
+
+#### Zarr Config Example (local)
+
+```toml
+[[collections]]
+id = "zarr-era5-t2m-local"
+title = "ERA5-like 2 m Temperature (Zarr V3, local)"
+description = "Synthetic CF-conventions Zarr V3 store served from a local directory"
+engine_type = "zarr"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[collections.zarr]
+data_path = "testdata/zarr-era5-t2m"   # store root; or s3://… / http(s)://…
+zarr_version = 3
+poll_interval_secs = 300
+# parameters = ["t2m"]                  # optional — default is every variable
+
+[collections.wms]
+colormap = "temperature"
+
+# One WMS/Maps/Tiles layer per variable.
+[[collections.wms.parameters]]
+name = "t2m"
+colormap = "temperature"
+min = 250.0
+max = 300.0
+```
+
+A committed fixture lives at `testdata/zarr-era5-t2m`; regenerate it with `cargo run -p engine-zarr --example gen_fixture`.
+
+#### Icechunk
+
+[Icechunk](https://icechunk.io/) is a transactional, versioned storage format for Zarr (used by the dynamical.org AIFS/GFS/ICON-EU public datasets). Adding a `[collections.zarr.icechunk]` table makes the source an Icechunk repository instead of a plain Zarr store — its presence selects the backend.
+
+**Build requirement:** Icechunk support is **off by default** and gated behind the `icechunk` Cargo feature (it pulls in `icechunk` + `zarrs_icechunk`). Build with:
+
+```bash
+cargo build --release -p server --features icechunk
+cargo run -p server --features icechunk
+```
+
+If a config sets `[collections.zarr.icechunk]` but the binary was built without the feature, the engine errors clearly at load.
+
+**Details:**
+- The repo location reuses `data_path` (local) or `endpoint`+`bucket`+`path` (S3); the table selects the **version** to read.
+- The S3 backend uses Icechunk's `object_store` backend (not `aws-sdk-s3`), reusing the same crate `ds-storage` uses (keeps the icechunk feature's binary cost ~8 MB instead of ~28 MB).
+- **Public datasets only.** Anonymous S3 access is used; there is no credential configuration.
+- New snapshots on a branch are picked up on **reload** (`POST /admin/collections/reload`), not on poll.
+
+##### Icechunk Config Fields (`[collections.zarr.icechunk]`)
+
+At most one of `branch` / `tag` / `snapshot` may be set; the default is the HEAD of branch `main`.
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `branch` | no | `main` | Read the HEAD of this branch. |
+| `tag` | no | — | Read this tag. |
+| `snapshot` | no | — | Read this exact (immutable) snapshot id. |
+| `region` | no | — | S3 region for the repo's object store (needed for AWS; ignored for local). |
+| `force_path_style` | no | `true` | S3 path-style addressing. Set `false` for virtual-host style. |
+
+##### Icechunk Config Example (public S3)
+
+```toml
+[[collections]]
+id = "ecmwf-aifs-single"
+title = "ECMWF AIFS-single forecast (Icechunk)"
+description = "ECMWF AIFS deterministic AI forecast, global 0.25°, Icechunk on public S3 (dynamical.org)"
+engine_type = "zarr"
+apis = ["edr", "wms", "maps", "tiles"]
+
+[collections.license]
+title = "CC-BY-4.0"
+
+[collections.zarr]
+endpoint = "https://s3.us-west-2.amazonaws.com"
+bucket = "dynamical-ecmwf-aifs-single"
+path = "ecmwf-aifs-single-forecast/v0.1.0.icechunk"
+parameters = ["temperature_2m"]
+
+# Presence of this table selects the Icechunk backend.
+[collections.zarr.icechunk]
+branch = "main"
+region = "us-west-2"
+
+[collections.wms]
+colormap = "temperature"
+
+[[collections.wms.parameters]]
+name = "temperature_2m"
+colormap = "temperature"
+min = -30.0       # temperature_2m is already in °C — no unit conversion
+max = 40.0
+```
+
+Ready-to-use disabled examples ship in `collections.d/` (`ecmwf-aifs-single.toml.disabled`, `noaa-gfs-icechunk.toml.disabled`, `dwd-icon-eu.toml.disabled`) — rename to drop `.disabled` and run with `--features icechunk`.
 
 ### PostGIS observation data
 
@@ -1285,6 +1426,8 @@ CoverageJSON output is validated against the official [OGC CoverageJSON 1.0 sche
 - Tiles: WebMercatorQuad and WorldCRS84Quad only; fixed 256x256 raster tiles; MVT is supported via `?f=mvt` for `FeatureEngine`-backed collections
 - GRIB: regular lat/lon grids only, GRIB2 only, requires index sidecar files
 - QueryData: serves latest file only, no compressed files, EDR position only, level 0 only
+- Zarr: geographic (WGS84 lat/lon) grids only, EDR position only; forecast model-run selection pins the latest run (#337); STAC per-item-CRS and kerchunk modes not yet implemented
+- Zarr/Icechunk: requires the `icechunk` build feature, anonymous (public) S3 only, new snapshots picked up on reload (not poll)
 
 ## Tech Stack
 
@@ -1299,3 +1442,4 @@ CoverageJSON output is validated against the official [OGC CoverageJSON 1.0 sche
 - **png** for image encoding
 - **libaec-sys** for GRIB CCSDS/AEC decompression
 - **memmap2** for memory-mapped QueryData file access
+- **zarrs** for Zarr V2/V3 array reading and codecs (with optional **icechunk** for versioned repositories)
