@@ -290,6 +290,7 @@ async fn main() {
     let wms_swap = Arc::new(ArcSwap::from_pointee(result.wms_state));
     let maps_swap = Arc::new(ArcSwap::from_pointee(result.maps_state));
     let tiles_swap = Arc::new(ArcSwap::from_pointee(result.tiles_state));
+    let tiles_3d_swap = Arc::new(ArcSwap::from_pointee(result.tiles_3d_state));
 
     // Resolve admin token: ADMIN_TOKEN env var takes priority over config
     let admin_token = std::env::var("ADMIN_TOKEN")
@@ -338,6 +339,7 @@ async fn main() {
         wms: wms_swap.clone(),
         maps: maps_swap.clone(),
         tiles: tiles_swap.clone(),
+        tiles_3d: tiles_3d_swap.clone(),
         config_path,
         health: RwLock::new(result.health),
         geotiff_engines: RwLock::new(result.geotiff_engines),
@@ -382,7 +384,12 @@ async fn main() {
         .nest("/wms", api_wms::router(wms_swap.clone()))
         .nest("/maps", api_maps::router(maps_swap.clone()))
         .nest("/tiles", api_tiles::router(tiles_swap.clone()))
-        // Trailing-slash variants so /edr/, /features/, /maps/, and /tiles/ also work
+        .nest("/3dtiles", api_3dtiles::router(tiles_3d_swap.clone()))
+        // Trailing-slash variants so /edr/, /features/, /maps/, /tiles/, /3dtiles/ also work
+        .route(
+            "/3dtiles/",
+            get(api_3dtiles::handlers::landing_page).with_state(tiles_3d_swap),
+        )
         .route(
             "/edr/",
             get(api_edr::handlers::landing_page).with_state(edr_swap),
@@ -605,6 +612,12 @@ async fn root_landing_page(state: AdminState) -> impl IntoResponse {
                 "rel": "service-doc",
                 "type": "text/html",
                 "title": "Tiles API documentation"
+            },
+            {
+                "href": format!("{base}/3dtiles/"),
+                "rel": "child",
+                "type": "application/json",
+                "title": "3D Tiles API"
             },
             {
                 "href": format!("{base}/health"),

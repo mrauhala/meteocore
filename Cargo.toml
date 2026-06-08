@@ -19,6 +19,7 @@ members = [
     "crates/api-wms",
     "crates/api-maps",
     "crates/api-tiles",
+    "crates/api-3dtiles",
     "crates/server",
 ]
 exclude = ["fuzz"]

@@ -440,6 +440,7 @@ pub struct ServerState {
     pub wms: Arc<ArcSwap<WmsState>>,
     pub maps: Arc<ArcSwap<MapsState>>,
     pub tiles: Arc<ArcSwap<TilesState>>,
+    pub tiles_3d: Arc<ArcSwap<api_3dtiles::TilesState3d>>,
     pub config_path: String,
     pub health: RwLock<Vec<CollectionHealth>>,
     pub geotiff_engines: RwLock<Vec<Arc<engine_geotiff::GeoTiffEngine>>>,
@@ -468,6 +469,7 @@ pub struct LoadResult {
     pub wms_state: WmsState,
     pub maps_state: MapsState,
     pub tiles_state: TilesState,
+    pub tiles_3d_state: api_3dtiles::TilesState3d,
     pub health: Vec<CollectionHealth>,
     pub geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>>,
     pub querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>>,
@@ -510,6 +512,11 @@ pub fn load_collections(
         Arc<dyn ds_core::feature_engine::FeatureEngine>,
     > = HashMap::new();
     let mut tiles_feature_collections: HashMap<String, CollectionConfig> = HashMap::new();
+    // 3D Tiles sources: collections with `apis = [..., "3dtiles"]` whose engine
+    // implements `VolumeEngine`, keyed by collection id.
+    let mut volume_engines: HashMap<String, Arc<dyn ds_core::volume::VolumeEngine>> =
+        HashMap::new();
+    let mut volume_collections: HashMap<String, CollectionConfig> = HashMap::new();
     let mut geotiff_engines: Vec<Arc<engine_geotiff::GeoTiffEngine>> = Vec::new();
     let mut querydata_engines: Vec<Arc<engine_querydata::QueryDataEngine>> = Vec::new();
     let mut grib_engines: Vec<Arc<engine_grib::GribEngine>> = Vec::new();
@@ -542,7 +549,7 @@ pub fn load_collections(
             "grib" => &["edr", "wms", "maps", "tiles"],
             "zarr" => &["edr", "wms", "maps", "tiles"],
             "odim" => &["edr", "wms", "maps", "tiles"],
-            "odim-volume" => &["edr", "wms", "maps", "tiles", "features"],
+            "odim-volume" => &["edr", "wms", "maps", "tiles", "3dtiles", "features"],
             "postgis" => &["edr", "features", "tiles"],
             _ => &[],
         };
@@ -1511,6 +1518,13 @@ pub fn load_collections(
                             );
                         }
                     }
+                    if collection.apis.contains(&"3dtiles".to_string()) {
+                        volume_engines.insert(
+                            site_id.clone(),
+                            view.clone() as Arc<dyn ds_core::volume::VolumeEngine>,
+                        );
+                        volume_collections.insert(site_id.clone(), site_cfg.clone());
+                    }
 
                     info!(
                         "Collection '{}': wired per-site radar collection '{site_id}' ({label})",
@@ -1817,6 +1831,19 @@ pub fn load_collections(
             render_semaphore: render_semaphore.clone(),
             rendered_cache: rendered_cache.clone(),
             vector_tile_cache: vector_tile_cache.clone(),
+            base_url: base_url.to_string(),
+        },
+        tiles_3d_state: api_3dtiles::TilesState3d {
+            volume_engines,
+            collections: volume_collections,
+            // v1: one shared reflectivity ramp for all 3D-Tiles collections.
+            // Per-collection/per-quantity colormaps from config are a follow-up.
+            colormap: Arc::new(ds_render::LutColorMap::from_builtin(
+                ds_render::BuiltinColormap::RadarDbz,
+                -32.0,
+                95.0,
+            )),
+            render_semaphore: render_semaphore.clone(),
             base_url: base_url.to_string(),
         },
         health,
@@ -2453,6 +2480,7 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     state.wms.store(Arc::new(result.wms_state));
     state.maps.store(Arc::new(result.maps_state));
     state.tiles.store(Arc::new(result.tiles_state));
+    state.tiles_3d.store(Arc::new(result.tiles_3d_state));
 
     // Update health
     update_health_gauges(&result.health);

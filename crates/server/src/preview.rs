@@ -949,6 +949,17 @@ mod tests {
             wms: Arc::new(ArcSwap::from_pointee(wms)),
             maps: Arc::new(ArcSwap::from_pointee(maps)),
             tiles: Arc::new(ArcSwap::from_pointee(tiles)),
+            tiles_3d: Arc::new(ArcSwap::from_pointee(api_3dtiles::TilesState3d {
+                volume_engines: std::collections::HashMap::new(),
+                collections: std::collections::HashMap::new(),
+                colormap: Arc::new(ds_render::LutColorMap::from_builtin(
+                    ds_render::BuiltinColormap::RadarDbz,
+                    -32.0,
+                    95.0,
+                )),
+                render_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+                base_url: String::new(),
+            })),
             config_path: String::new(),
             health: RwLock::new(Vec::new()),
             geotiff_engines: RwLock::new(Vec::new()),

@@ -1274,11 +1274,30 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
     // an unqualified request actually renders.
     let default_quantity = quantities.first().cloned().unwrap_or_default();
     let default_unit = quantities::quantity_unit(&default_quantity).to_string();
+    // 3D Tiles coverage region: the WGS84 coverage bbox (→ radians) plus a
+    // generous vertical span (antenna height up to a 25 km ceiling — above any
+    // radar echo and the `volume_point_cloud` height range). It only needs to
+    // *contain* the sampled cloud, so a slight over-estimate is fine.
+    // Approximation: 3D Tiles heights are ellipsoidal but ODIM `site.height` is
+    // orthometric (above MSL); the geoid offset (~tens of m in Finland) is
+    // swamped by the 25 km ceiling, so this is harmless for culling — but the
+    // same approximation applies to the point altitudes in `volume_point_cloud`.
+    let region = spatial_extent.map(|[w, s, e, n]| {
+        [
+            w.to_radians(),
+            s.to_radians(),
+            e.to_radians(),
+            n.to_radians(),
+            site.height,
+            site.height + 25_000.0,
+        ]
+    });
     let volume_info = Arc::new(VolumeInfo {
         quantities: parameters.clone(),
         times: times.clone(),
         default_quantity,
         default_unit,
+        region,
     });
 
     Some(SiteMeta {

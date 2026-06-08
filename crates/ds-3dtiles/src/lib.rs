@@ -50,6 +50,11 @@ pub enum Tiles3dError {
     /// could traverse or redirect — defence-in-depth for a `pub` API.
     #[error("invalid content URI: {0:?}")]
     InvalidUri(String),
+    /// The geodetic `region` has inverted/degenerate bounds (`south > north`
+    /// or `min_h > max_h`) — valid JSON that CesiumJS silently refuses to load.
+    /// (`west > east` is *not* inverted — it's an antimeridian-crossing region.)
+    #[error("invalid region (inverted/degenerate bounds): {0:?}")]
+    InvalidRegion([f64; 6]),
 }
 
 /// Encode a point cloud as a 3D Tiles **`.pnts`** tile (the 3D Tiles 1.0 Point
@@ -160,6 +165,19 @@ pub fn encode_pnts(
 /// (the `.pnts` `RTC_CENTER` already places points in ECEF). The top-level
 /// `geometricError` is non-zero (load-bearing — see module docs).
 pub fn tileset_json(cloud: &VolumePointCloud, content_uri: &str) -> Result<String, Tiles3dError> {
+    tileset_json_for_region(cloud.region, content_uri)
+}
+
+/// Build the `tileset.json` from a geodetic bounding `region`
+/// (`[west, south, east, north, min_h, max_h]`, lon/lat radians + metres)
+/// directly — for the API layer, which has the collection's coverage region
+/// from `VolumeInfo` and need not sample the whole volume just to emit the
+/// tileset. The region must merely *contain* the content the `.pnts` will hold.
+/// Same `content_uri` validation and invariants as [`tileset_json`].
+pub fn tileset_json_for_region(
+    region: [f64; 6],
+    content_uri: &str,
+) -> Result<String, Tiles3dError> {
     if content_uri.is_empty()
         || content_uri.starts_with('/')
         || content_uri.contains("://")
@@ -167,8 +185,14 @@ pub fn tileset_json(cloud: &VolumePointCloud, content_uri: &str) -> Result<Strin
     {
         return Err(Tiles3dError::InvalidUri(content_uri.to_string()));
     }
-    if cloud.region.iter().any(|v| !v.is_finite()) {
+    if region.iter().any(|v| !v.is_finite()) {
         return Err(Tiles3dError::NonFinite("region"));
+    }
+    // Reject truly inverted/degenerate bounds (south > north, min_h > max_h) —
+    // valid JSON that CesiumJS silently refuses to load. Note `west > east` is
+    // NOT inverted: 3D Tiles 1.1 uses it for antimeridian-crossing regions.
+    if region[1] > region[3] || region[4] > region[5] {
+        return Err(Tiles3dError::InvalidRegion(region));
     }
     // `[f64; 6]` serializes directly to a JSON array — no `Vec` needed.
     // `asset.version` is intentionally "1.1" even though `.pnts` is a 1.0
@@ -179,7 +203,7 @@ pub fn tileset_json(cloud: &VolumePointCloud, content_uri: &str) -> Result<Strin
         "asset": { "version": "1.1" },
         "geometricError": TILESET_GEOMETRIC_ERROR,
         "root": {
-            "boundingVolume": { "region": cloud.region },
+            "boundingVolume": { "region": region },
             "geometricError": ROOT_GEOMETRIC_ERROR,
             "refine": "ADD",
             "content": { "uri": content_uri },
@@ -266,6 +290,25 @@ mod tests {
         let region = json["root"]["boundingVolume"]["region"].as_array().unwrap();
         assert_eq!(region.len(), 6);
         assert_eq!(region[0].as_f64().unwrap(), 0.42);
+    }
+
+    #[test]
+    fn inverted_region_is_rejected() {
+        // south > north is inverted.
+        let region = [0.42, 1.07, 0.44, 1.05, 100.0, 12_000.0];
+        assert!(matches!(
+            tileset_json_for_region(region, "content.pnts"),
+            Err(Tiles3dError::InvalidRegion(_))
+        ));
+        // min_h > max_h is inverted.
+        let region = [0.42, 1.05, 0.44, 1.07, 12_000.0, 100.0];
+        assert!(matches!(
+            tileset_json_for_region(region, "content.pnts"),
+            Err(Tiles3dError::InvalidRegion(_))
+        ));
+        // west > east is VALID — an antimeridian-crossing region (not inverted).
+        let region = [3.0, 1.05, -3.0, 1.07, 100.0, 12_000.0];
+        assert!(tileset_json_for_region(region, "content.pnts").is_ok());
     }
 
     #[test]
