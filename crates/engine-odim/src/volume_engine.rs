@@ -3177,6 +3177,19 @@ impl VolumeEngine for PolarVolumeSiteView {
             ))
         })?;
 
+        // A corrupt file with non-finite antenna coordinates would poison the
+        // ECEF projection (`geodetic_to_ecef` → NaN center → every offset NaN).
+        // Reject up front with antenna context, rather than surfacing an opaque
+        // `NonFinite("point offset")` from the encoder.
+        let antenna = &entry.volume.site;
+        if !(antenna.lon.is_finite() && antenna.lat.is_finite() && antenna.height.is_finite()) {
+            return Err(DataServerError::Engine(format!(
+                "[{}] radar site `{}` has non-finite antenna coordinates \
+                 (lon={}, lat={}, height={})",
+                self.collection_id, self.nod, antenna.lon, antenna.lat, antenna.height
+            )));
+        }
+
         let handle = blocking_pixel_handle();
         let pix = Pixels {
             source: &self.source,
@@ -3197,6 +3210,11 @@ impl VolumeEngine for PolarVolumeSiteView {
     }
 
     fn volume_info(&self) -> VolumeInfo {
+        // NOTE: clones `parameters` + `times` per call, mirroring the sibling
+        // `raster_info()` above. Not yet on a per-request hot path (the 3D
+        // Tiles API is #349); when it is wired, cache a snapshot in an
+        // `ArcSwap` rebuilt on catalog swap for *both* accessors together,
+        // matching the #211 `RasterInfo` fix.
         let catalog = self.catalog.load();
         let meta = catalog.by_site_meta.get(&self.nod);
         let quantities = meta.map(|m| m.parameters.clone()).unwrap_or_default();

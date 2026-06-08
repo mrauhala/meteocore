@@ -39,6 +39,11 @@ pub enum Tiles3dError {
     /// 4 GiB. Fail loudly instead of truncating to a corrupt file.
     #[error("pnts {0} exceeds u32 range (4 GiB)")]
     TooLarge(&'static str),
+    /// The point cloud is empty. The 3D Tiles 1.0 Point Cloud spec requires
+    /// `POINTS_LENGTH >= 1`; `VolumeEngine` maps "no data" to a 404 before
+    /// encoding, so an empty cloud reaching here is a caller bug.
+    #[error("cannot encode an empty point cloud (POINTS_LENGTH must be >= 1)")]
+    Empty,
 }
 
 /// Encode a point cloud as a 3D Tiles **`.pnts`** tile (the 3D Tiles 1.0 Point
@@ -47,6 +52,11 @@ pub enum Tiles3dError {
 ///
 /// `colormap` maps each point's physical value to RGB (alpha is ignored;
 /// `.pnts` `RGB` is opaque). Returns the complete tile bytes.
+///
+/// `cloud.points` must be non-empty — the 3D Tiles 1.0 Point Cloud format
+/// requires `POINTS_LENGTH >= 1`. An empty cloud is rejected with
+/// [`Tiles3dError::Empty`]; `VolumeEngine` callers already map "no data" to a
+/// 404 before reaching here.
 pub fn encode_pnts(
     cloud: &VolumePointCloud,
     colormap: &dyn ColorMap,
@@ -56,6 +66,9 @@ pub fn encode_pnts(
     }
 
     let count = cloud.points.len();
+    if count == 0 {
+        return Err(Tiles3dError::Empty);
+    }
 
     // Feature-table binary: POSITION (count * 3 * f32) then RGB (count * 3 * u8).
     let pos_bytes = count * 12;
@@ -124,6 +137,10 @@ pub fn tileset_json(cloud: &VolumePointCloud, content_uri: &str) -> Result<Strin
         return Err(Tiles3dError::NonFinite("region"));
     }
     let region: Vec<f64> = cloud.region.to_vec();
+    // `asset.version` is intentionally "1.1" even though `.pnts` is a 1.0
+    // content type: CesiumJS keys its tileset loader off this version, and a
+    // 1.1 tileset happily references legacy `.pnts` content. Do not "fix" this
+    // to "1.0" — it would change which loader path CesiumJS takes.
     let tileset = json!({
         "asset": { "version": "1.1" },
         "geometricError": TILESET_GEOMETRIC_ERROR,
@@ -235,15 +252,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_cloud_encodes_to_a_valid_empty_tile() {
+    fn empty_cloud_is_rejected() {
+        // The 3D Tiles 1.0 Point Cloud spec requires POINTS_LENGTH >= 1.
         let mut cloud = sample_cloud();
         cloud.points.clear();
-        let bytes = encode_pnts(&cloud, &dbz_map()).expect("encode empty");
-        assert_eq!(&bytes[0..4], b"pnts");
-        let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
-        assert_eq!(u32_at(8) as usize, bytes.len());
-        let ft: serde_json::Value =
-            serde_json::from_slice(&bytes[28..28 + u32_at(12) as usize]).unwrap();
-        assert_eq!(ft["POINTS_LENGTH"], 0);
+        assert!(matches!(
+            encode_pnts(&cloud, &dbz_map()),
+            Err(Tiles3dError::Empty)
+        ));
     }
 }
