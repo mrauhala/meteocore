@@ -27,7 +27,7 @@ fn main() {
     println!();
     println!(
         "{:>3}  {:>6}  {:>5}x{:>4}  {:>7}  {:>6}  {:>6}  {:>6}  {:>6}",
-        "sw", "elang", "rays", "bins", "valid%", "maxdBZ", ">20%", ">35%", ">50%"
+        "sw", "elang", "rays", "bins", "valid%", "maxdBZ", ">=20%", ">=35%", ">=50%"
     );
 
     // Volume-wide accumulators.
@@ -121,9 +121,10 @@ fn main() {
 
     println!();
     println!("VOLUME SUMMARY ({want}):");
-    if vtot == 0 {
-        // No readable sweeps: avoid -inf max and 0/0 = NaN coverage.
-        println!("  no readable {want}/TH sweeps");
+    if vvalid == 0 {
+        // No valid samples (no readable sweeps, or every cell nodata):
+        // vmax is still -inf and coverage would be 0/0 = NaN.
+        println!("  no valid {want}/TH samples ({vtot} cells, all nodata/undetect)");
         return;
     }
     println!("  max reflectivity : {vmax:.1} dBZ");
