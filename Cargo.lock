@@ -999,6 +999,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ds-3dtiles"
+version = "0.1.0"
+dependencies = [
+ "ds-core",
+ "ds-render",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ds-core"
 version = "0.1.0"
 dependencies = [
@@ -1141,7 +1151,9 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "chrono",
+ "ds-3dtiles",
  "ds-core",
+ "ds-render",
  "ds-storage",
  "hdf5-reader",
  "ndarray",

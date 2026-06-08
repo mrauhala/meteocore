@@ -530,6 +530,122 @@ fn pvol_engine_renders_fmi_vihti_volume() {
     );
 }
 
+/// `VolumeEngine` surface on the real FMI Vihti volume: sample the polar
+/// volume into a 3-D point cloud and encode it as a 3D Tiles `.pnts` tile +
+/// `tileset.json` via `ds-3dtiles`. Skips when the uncommitted fixture is
+/// absent (CI stays green).
+#[test]
+fn pvol_volume_engine_emits_point_cloud() {
+    use ds_core::volume::VolumeEngine;
+
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/radar-fmi-pvol/202605191050_fivih_PVOL.h5");
+    if !fixture.exists() {
+        eprintln!("skipping pvol_volume_engine_emits_point_cloud: fixture absent at {fixture:?}");
+        return;
+    }
+    let data_dir = fixture
+        .parent()
+        .expect("fixture has a parent directory")
+        .to_str()
+        .expect("utf8 fixture dir");
+
+    let config = OdimConfig {
+        filename_template: None,
+        filename_pattern: None,
+        timestamp_format: None,
+        parameter: None,
+        unit: None,
+        nodata: None,
+        gain: None,
+        offset: None,
+        poll_interval_secs: 30,
+        max_files: None,
+        endpoint: None,
+        bucket: None,
+        prefix_pattern: None,
+        time_window: None,
+        discovery: None,
+        cadence_secs: None,
+    };
+    let engine = engine_odim::PolarVolumeEngine::new("fivih-vol-test", Some(data_dir), &config)
+        .expect("PolarVolumeEngine::new over the PVOL directory");
+    let view = engine.site_view("fivih", "fivih-vol-test-fivih");
+
+    // Metadata surface.
+    let vinfo = view.volume_info();
+    assert!(
+        !vinfo.quantities.is_empty(),
+        "PVOL site must advertise quantities"
+    );
+    assert!(!vinfo.times.is_empty(), "PVOL site must have a valid time");
+    assert!(!vinfo.default_quantity.is_empty());
+
+    // Sample the full volume into a point cloud (default quantity, latest
+    // time, a 5 dBZ floor).
+    let cloud = view
+        .read_point_cloud(None, None, Some(5.0), None)
+        .expect("read_point_cloud over the real volume");
+    assert!(
+        !cloud.points.is_empty(),
+        "a real volume must yield echo points"
+    );
+
+    // RTC center is the antenna's ECEF position (geocentric radius ~6.36e6 m
+    // at 60.6°N); the per-point offsets are small and finite.
+    let rtc_mag =
+        (cloud.rtc_center[0].powi(2) + cloud.rtc_center[1].powi(2) + cloud.rtc_center[2].powi(2))
+            .sqrt();
+    assert!(
+        (6.0e6..6.6e6).contains(&rtc_mag),
+        "RTC center near Earth radius, got {rtc_mag}"
+    );
+    for p in &cloud.points {
+        assert!(p.offset.iter().all(|c| c.is_finite()), "finite offsets");
+        let d = (p.offset[0].powi(2) + p.offset[1].powi(2) + p.offset[2].powi(2)).sqrt();
+        assert!(d < 350_000.0, "point within sweep range, got {d} m");
+        assert!(p.value >= 5.0, "min_value floor honoured, got {}", p.value);
+    }
+
+    // Region is a sane geodetic box (radians/metres) around Vihti.
+    let [w, s, e, n, min_h, max_h] = cloud.region;
+    assert!(w < e && s < n, "region ordered: {:?}", cloud.region);
+    assert!(
+        (0.40..0.60).contains(&e),
+        "east edge near ~25-29°E, got {e}"
+    );
+    assert!(
+        (1.00..1.15).contains(&n),
+        "north edge near ~58-63°N, got {n}"
+    );
+    assert!(
+        min_h > 0.0 && min_h < max_h && max_h < 25_000.0,
+        "heights sane: {min_h}..{max_h}"
+    );
+
+    // Encode through ds-3dtiles: a valid .pnts tile + a tileset.json.
+    let cmap =
+        ds_render::LutColorMap::from_builtin(ds_render::BuiltinColormap::RadarDbz, -32.0, 95.0);
+    let pnts = ds_3dtiles::encode_pnts(&cloud, &cmap).expect("encode pnts");
+    assert_eq!(&pnts[0..4], b"pnts", "pnts magic");
+    let byte_len = u32::from_le_bytes(pnts[8..12].try_into().unwrap()) as usize;
+    assert_eq!(
+        byte_len,
+        pnts.len(),
+        "pnts byteLength matches actual length"
+    );
+
+    let tileset = ds_3dtiles::tileset_json(&cloud, "content.pnts").expect("tileset json");
+    assert!(
+        tileset.contains("\"content.pnts\""),
+        "tileset names content"
+    );
+    assert!(
+        tileset.contains("\"region\""),
+        "tileset has a region bounding volume"
+    );
+}
+
 /// End-to-end `FeatureEngine` surface on the real FMI Vihti volume: the
 /// owning `PolarVolumeEngine` exposes its sites as a Features collection (one
 /// Point Feature per site). Skips when the uncommitted 15 MB fixture is absent.

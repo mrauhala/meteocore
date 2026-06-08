@@ -14,3 +14,4 @@ pub mod ogc_extent;
 pub mod openapi;
 pub mod resample;
 pub mod vertical;
+pub mod volume;
