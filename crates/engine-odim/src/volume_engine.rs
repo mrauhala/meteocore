@@ -3056,12 +3056,22 @@ fn volume_point_cloud(
 
     // Hard memory bound: a pathologically dense volume must not allocate an
     // unbounded cloud once this is reachable from an HTTP handler (#349).
-    // 8M points × ~15 B ≈ 120 MB; real volumes are far smaller (the fivih demo
-    // is ~0.38M). On overflow we stop and warn rather than fail the request.
+    // `VolumePoint` is [f32; 3] + f64 = 24 B, so 8M points ≈ 192 MB; real
+    // volumes are far smaller (the fivih demo is ~0.38M). On overflow we stop
+    // and warn rather than fail the request.
     const MAX_POINTS: usize = 8_000_000;
     let mut truncated = false;
 
-    let mut points: Vec<VolumePoint> = Vec::new();
+    // Reserve the true upper bound (every cell of every sweep carrying the
+    // quantity), capped at MAX_POINTS, so the fill loop never reallocates.
+    let upper_bound = volume
+        .sweeps
+        .iter()
+        .filter(|s| s.moments.iter().any(|m| m.quantity == quantity))
+        .map(|s| s.nrays.saturating_mul(s.nbins))
+        .fold(0usize, usize::saturating_add)
+        .min(MAX_POINTS);
+    let mut points: Vec<VolumePoint> = Vec::with_capacity(upper_bound);
     // Geodetic region accumulators: lon/lat in radians, height in metres.
     let (mut west, mut east) = (f64::INFINITY, f64::NEG_INFINITY);
     let (mut south, mut north) = (f64::INFINITY, f64::NEG_INFINITY);

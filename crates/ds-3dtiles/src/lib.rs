@@ -69,6 +69,9 @@ pub fn encode_pnts(
     if count == 0 {
         return Err(Tiles3dError::Empty);
     }
+    // `POINTS_LENGTH` is a u32 in the feature table; reject before the body
+    // build (the byte-length guards below would only catch this at ~4 GiB).
+    let points_len = u32::try_from(count).map_err(|_| Tiles3dError::TooLarge("POINTS_LENGTH"))?;
 
     // Feature-table binary: POSITION (count * 3 * f32) then RGB (count * 3 * u8).
     let pos_bytes = count * 12;
@@ -95,7 +98,7 @@ pub fn encode_pnts(
     // would otherwise serialize a non-finite f64 as `null` silently.
     let [cx, cy, cz] = cloud.rtc_center;
     let ft = json!({
-        "POINTS_LENGTH": count,
+        "POINTS_LENGTH": points_len,
         "RTC_CENTER": [cx, cy, cz],
         "POSITION": { "byteOffset": 0 },
         "RGB": { "byteOffset": rgb_off },
