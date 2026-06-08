@@ -208,8 +208,27 @@ async fn datetime_offset_normalised_to_utc_z_in_content_uri() {
 
 #[tokio::test]
 async fn bad_datetime_is_400() {
-    let (status, _b, _h) = get("/collections/radar-fivih/content.pnts?datetime=notadate").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Both routes parse the datetime.
+    let (cs, _b, _h) = get("/collections/radar-fivih/content.pnts?datetime=notadate").await;
+    assert_eq!(cs, StatusCode::BAD_REQUEST, "content rejects bad datetime");
+    let (ts, _b, _h) = get("/collections/radar-fivih/tileset.json?datetime=notadate").await;
+    assert_eq!(ts, StatusCode::BAD_REQUEST, "tileset rejects bad datetime");
+}
+
+#[tokio::test]
+async fn if_none_match_wildcard_is_304() {
+    // RFC 7232 §3.2: `If-None-Match: *` matches any current representation.
+    let resp = router()
+        .oneshot(
+            Request::builder()
+                .uri("/collections/radar-fivih/content.pnts")
+                .header(axum::http::header::IF_NONE_MATCH, "*")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
 }
 
 #[tokio::test]

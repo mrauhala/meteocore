@@ -50,9 +50,9 @@ pub enum Tiles3dError {
     /// could traverse or redirect — defence-in-depth for a `pub` API.
     #[error("invalid content URI: {0:?}")]
     InvalidUri(String),
-    /// The geodetic `region` has inverted/degenerate bounds (`west > east`,
-    /// `south > north`, or `min_h > max_h`) — valid JSON that CesiumJS silently
-    /// refuses to load.
+    /// The geodetic `region` has inverted/degenerate bounds (`south > north`
+    /// or `min_h > max_h`) — valid JSON that CesiumJS silently refuses to load.
+    /// (`west > east` is *not* inverted — it's an antimeridian-crossing region.)
     #[error("invalid region (inverted/degenerate bounds): {0:?}")]
     InvalidRegion([f64; 6]),
 }
@@ -188,10 +188,10 @@ pub fn tileset_json_for_region(
     if region.iter().any(|v| !v.is_finite()) {
         return Err(Tiles3dError::NonFinite("region"));
     }
-    // Reject inverted/degenerate bounds: `[west, south, east, north, minH, maxH]`
-    // must be ordered. An inverted box serializes to valid JSON that CesiumJS
-    // silently refuses to load, so fail loudly at encode time instead.
-    if region[0] > region[2] || region[1] > region[3] || region[4] > region[5] {
+    // Reject truly inverted/degenerate bounds (south > north, min_h > max_h) —
+    // valid JSON that CesiumJS silently refuses to load. Note `west > east` is
+    // NOT inverted: 3D Tiles 1.1 uses it for antimeridian-crossing regions.
+    if region[1] > region[3] || region[4] > region[5] {
         return Err(Tiles3dError::InvalidRegion(region));
     }
     // `[f64; 6]` serializes directly to a JSON array — no `Vec` needed.
@@ -294,18 +294,21 @@ mod tests {
 
     #[test]
     fn inverted_region_is_rejected() {
-        // west > east — an inverted box CesiumJS would silently refuse.
-        let region = [0.44, 1.05, 0.42, 1.07, 100.0, 12_000.0];
+        // south > north is inverted.
+        let region = [0.42, 1.07, 0.44, 1.05, 100.0, 12_000.0];
         assert!(matches!(
             tileset_json_for_region(region, "content.pnts"),
             Err(Tiles3dError::InvalidRegion(_))
         ));
-        // min_h > max_h is also rejected.
+        // min_h > max_h is inverted.
         let region = [0.42, 1.05, 0.44, 1.07, 12_000.0, 100.0];
         assert!(matches!(
             tileset_json_for_region(region, "content.pnts"),
             Err(Tiles3dError::InvalidRegion(_))
         ));
+        // west > east is VALID — an antimeridian-crossing region (not inverted).
+        let region = [3.0, 1.05, -3.0, 1.07, 100.0, 12_000.0];
+        assert!(tileset_json_for_region(region, "content.pnts").is_ok());
     }
 
     #[test]
