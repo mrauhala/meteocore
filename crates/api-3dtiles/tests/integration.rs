@@ -194,6 +194,19 @@ async fn unknown_quantity_is_400() {
 }
 
 #[tokio::test]
+async fn datetime_offset_normalised_to_utc_z_in_content_uri() {
+    // A `+hh:mm` offset must be re-emitted as `…Z` so the client's URL parser
+    // doesn't decode the `+` as a space and 400 on the content fetch.
+    let (status, body, _h) =
+        get("/collections/radar-fivih/tileset.json?datetime=2024-01-01T12:00:00%2B05:30").await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let uri = v["root"]["content"]["uri"].as_str().unwrap();
+    assert!(!uri.contains('+'), "no raw + offset in content uri: {uri}");
+    assert!(uri.contains("datetime=2024-01-01T06:30:00Z"), "got {uri}");
+}
+
+#[tokio::test]
 async fn bad_datetime_is_400() {
     let (status, _b, _h) = get("/collections/radar-fivih/content.pnts?datetime=notadate").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);

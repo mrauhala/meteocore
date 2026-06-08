@@ -6,9 +6,7 @@
 //! - `GET /collections/{id}/content.pnts` — the point-cloud tile, sampled on a
 //!   blocking thread and encoded by `ds-3dtiles`.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -82,11 +80,16 @@ fn parse_datetime(s: &str) -> Result<DateTime<Utc>, Tiles3dError> {
         .map_err(|_| Tiles3dError::BadRequest(format!("invalid datetime: {s:?}")))
 }
 
-/// Weak content-derived ETag (quoted hex of a hash of the bytes).
+/// Weak content-derived ETag (quoted hex of a hash of the bytes). FNV-1a 64-bit
+/// — stable across Rust versions and instances (unlike `DefaultHasher`), so a
+/// toolchain upgrade or a mixed-version fleet doesn't silently invalidate ETags.
 fn etag_of(bytes: &[u8]) -> String {
-    let mut h = DefaultHasher::new();
-    bytes.hash(&mut h);
-    format!("\"{:016x}\"", h.finish())
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("\"{h:016x}\"")
 }
 
 // ---------------------------------------------------------------------------
@@ -120,20 +123,18 @@ pub async fn get_tileset(
             "collection '{id}' has no quantities"
         )));
     }
-    // Validate datetime if present (so the tileset never embeds a bad value).
-    if let Some(dt) = &params.datetime {
-        parse_datetime(dt)?;
-    }
-
     let region = info.region.ok_or_else(|| {
         Tiles3dError::NotFound(format!("collection '{id}' has no spatial coverage yet"))
     })?;
 
     // The `.pnts` content lives next to this tileset; carry the resolved
     // quantity (and pinned time, if any) so the content fetch is deterministic.
+    // Re-format the parsed time as UTC `…Z` — a raw `+hh:mm` offset would be
+    // decoded as a space by the client's URL parser and 400 on the fetch.
     let mut query = format!("quantity={quantity}");
-    if let Some(dt) = &params.datetime {
-        query.push_str(&format!("&datetime={dt}"));
+    if let Some(dt_str) = &params.datetime {
+        let dt = parse_datetime(dt_str)?;
+        query.push_str(&format!("&datetime={}", dt.format("%Y-%m-%dT%H:%M:%SZ")));
     }
     let content_uri = format!("content.pnts?{query}");
 
@@ -180,21 +181,27 @@ pub async fn get_content(
 
     let engine = engine.clone();
     let colormap = state.colormap.clone();
-    let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, Tiles3dError> {
-        let cloud = engine.read_point_cloud(quantity.as_deref(), time, min_value, None)?;
-        ds_3dtiles::encode_pnts(&cloud, colormap.as_ref())
-            .map_err(|e| Tiles3dError::Internal(format!("pnts encode failed: {e}")))
-    })
-    .await
-    .map_err(|e| Tiles3dError::Internal(format!("sample task failed: {e}")))??;
+    // Sample, encode, and hash all on the blocking thread (the ETag hash over a
+    // multi-MB tile is real CPU — keep it off the async worker too).
+    let (bytes, etag) =
+        tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
+            let cloud = engine.read_point_cloud(quantity.as_deref(), time, min_value, None)?;
+            let bytes = ds_3dtiles::encode_pnts(&cloud, colormap.as_ref())
+                .map_err(|e| Tiles3dError::Internal(format!("pnts encode failed: {e}")))?;
+            let etag = etag_of(&bytes);
+            Ok((bytes, etag))
+        })
+        .await
+        .map_err(|e| Tiles3dError::Internal(format!("sample task failed: {e}")))??;
 
     // Content-derived ETag → cheap 304s; the bytes are deterministic for a
-    // given (collection, quantity, time, min_value).
-    let etag = etag_of(&bytes);
-    let if_none_match = headers
+    // given (collection, quantity, time, min_value). RFC 7232 §3.2:
+    // `If-None-Match` may be `*` or a comma-separated list.
+    let not_modified = headers
         .get(header::IF_NONE_MATCH)
-        .and_then(|h| h.to_str().ok());
-    if if_none_match == Some(etag.as_str()) {
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|v| v == "*" || v.split(',').any(|t| t.trim() == etag));
+    if not_modified {
         return Ok((
             StatusCode::NOT_MODIFIED,
             [
