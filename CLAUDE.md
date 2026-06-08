@@ -339,16 +339,18 @@ tracked in #125. **The crate is phased; Phases 1-3 ship today.**
   tests; safe because retrieval is `concurrent_target(1)`).
   - **S3 backend = icechunk's `object_store` backend, NOT `aws-sdk-s3`.** The
     deps select `icechunk`/`zarrs_icechunk` with `default-features = false,
-    features = ["object-store-s3", "object-store-fs"]` (via two interim
-    `[patch.crates-io]` git forks; see root `Cargo.toml`), so the build reuses
+    features = ["object-store-s3", "object-store-fs"]`, so the build reuses
     the same `object_store` crate `ds-storage` uses instead of pulling the whole
     `aws-sdk-s3` tree — the icechunk feature's binary cost drops ~28 MB → ~8 MB.
+    `zarrs_icechunk`'s feature-forwarding fix shipped in 0.5.1, so it's a plain
+    crates.io dep now; **`icechunk` still needs one interim `[patch.crates-io]`**
+    (see root `Cargo.toml`) pinned to the upstream merge commit of
+    earth-mover/icechunk#2190 until a release > 2.0.6 carries it (#340).
     `build_storage` uses `new_s3_object_store_storage`; **anonymous access is set
     via `S3Options::with_anonymous(true)`** (the object_store backend keys
     skip-signing off `S3Options.anonymous`, *not* the `S3Credentials` arg —
     without it, it falls through to the AWS credential chain → EC2 IMDS and
-    hangs off-EC2). Public datasets only (#335). Drop the patches + bump versions
-    once zarrs/zarrs_icechunk#13 and earth-mover/icechunk#2190 release.
+    hangs off-EC2). Public datasets only (#335).
   - Icechunk still owns its own object storage, so this path does **not** go
     through `ds-storage`. New snapshots on a branch are picked up on **reload**,
     not poll (v1). Network-free e2e test generates a local repo: `cargo test -p

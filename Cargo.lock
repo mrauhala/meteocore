@@ -1890,7 +1890,7 @@ dependencies = [
 [[package]]
 name = "icechunk"
 version = "2.0.6"
-source = "git+https://github.com/mrauhala/icechunk.git?rev=41f6921e0229928f1a121924d4d5b7c002f6bf7a#41f6921e0229928f1a121924d4d5b7c002f6bf7a"
+source = "git+https://github.com/earth-mover/icechunk.git?rev=5f56b13605745ea06ec6558bcd8ed4a8f5805a3e#5f56b13605745ea06ec6558bcd8ed4a8f5805a3e"
 dependencies = [
  "async-compression",
  "async-recursion",
@@ -1928,7 +1928,7 @@ dependencies = [
 [[package]]
 name = "icechunk-arrow-object-store"
 version = "2.0.6"
-source = "git+https://github.com/mrauhala/icechunk.git?rev=41f6921e0229928f1a121924d4d5b7c002f6bf7a#41f6921e0229928f1a121924d4d5b7c002f6bf7a"
+source = "git+https://github.com/earth-mover/icechunk.git?rev=5f56b13605745ea06ec6558bcd8ed4a8f5805a3e#5f56b13605745ea06ec6558bcd8ed4a8f5805a3e"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1949,7 +1949,7 @@ dependencies = [
 [[package]]
 name = "icechunk-format"
 version = "2.0.6"
-source = "git+https://github.com/mrauhala/icechunk.git?rev=41f6921e0229928f1a121924d4d5b7c002f6bf7a#41f6921e0229928f1a121924d4d5b7c002f6bf7a"
+source = "git+https://github.com/earth-mover/icechunk.git?rev=5f56b13605745ea06ec6558bcd8ed4a8f5805a3e#5f56b13605745ea06ec6558bcd8ed4a8f5805a3e"
 dependencies = [
  "base32",
  "bytes",
@@ -1974,7 +1974,7 @@ dependencies = [
 [[package]]
 name = "icechunk-storage"
 version = "2.0.6"
-source = "git+https://github.com/mrauhala/icechunk.git?rev=41f6921e0229928f1a121924d4d5b7c002f6bf7a#41f6921e0229928f1a121924d4d5b7c002f6bf7a"
+source = "git+https://github.com/earth-mover/icechunk.git?rev=5f56b13605745ea06ec6558bcd8ed4a8f5805a3e#5f56b13605745ea06ec6558bcd8ed4a8f5805a3e"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1994,7 +1994,7 @@ dependencies = [
 [[package]]
 name = "icechunk-types"
 version = "2.0.6"
-source = "git+https://github.com/mrauhala/icechunk.git?rev=41f6921e0229928f1a121924d4d5b7c002f6bf7a#41f6921e0229928f1a121924d4d5b7c002f6bf7a"
+source = "git+https://github.com/earth-mover/icechunk.git?rev=5f56b13605745ea06ec6558bcd8ed4a8f5805a3e#5f56b13605745ea06ec6558bcd8ed4a8f5805a3e"
 dependencies = [
  "serde",
  "serde_with",
@@ -3228,7 +3228,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -3268,9 +3268,9 @@ dependencies = [
 
 [[package]]
 name = "quick_cache"
-version = "0.6.21"
+version = "0.6.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a70b1b8b47e31d0498ecbc3c5470bb931399a8bfed1fd79d1717a61ce7f96e3"
+checksum = "3a3db184a8b66cfe87f0263a1de147a6b554c864d1767c6f7fa4eb0e5497b565"
 dependencies = [
  "ahash",
  "equivalent",
@@ -3870,9 +3870,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.149"
+version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
+checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
  "indexmap 2.13.0",
  "itoa",
@@ -5598,8 +5598,9 @@ dependencies = [
 
 [[package]]
 name = "zarrs_icechunk"
-version = "0.5.0"
-source = "git+https://github.com/mrauhala/zarrs_icechunk.git?rev=4ff7690420900a5f9b576eb492452ca9da77540b#4ff7690420900a5f9b576eb492452ca9da77540b"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2737168a21a5d7afa973a92e6d3308da85dee10961fdcf936852e4ac347df4df"
 dependencies = [
  "async-trait",
  "futures",
