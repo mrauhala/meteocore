@@ -264,6 +264,14 @@ mod tests {
             tileset_json(&cloud, "content.pnts"),
             Err(Tiles3dError::NonFinite("region"))
         ));
+
+        // A non-finite point offset is caught in the encode loop.
+        let mut cloud = sample_cloud();
+        cloud.points[1].offset[2] = f32::NAN;
+        assert!(matches!(
+            encode_pnts(&cloud, &dbz_map()),
+            Err(Tiles3dError::NonFinite("point offset"))
+        ));
     }
 
     #[test]

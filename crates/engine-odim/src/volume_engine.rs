@@ -3145,8 +3145,12 @@ fn volume_point_cloud(
         );
     }
 
-    // Empty point set ⇒ zeroed region; the caller maps "no points" to a 404
-    // before this cloud is ever encoded, so the region is never used.
+    // The region bounds the *included* points — exactly the tile's content,
+    // which is what a 3D Tiles bounding volume must enclose. Correct for both
+    // the full and the truncated (MAX_POINTS) cases: dropped cells are not in
+    // the tile, so excluding them from the bounds is right, and a tighter
+    // bound is better for frustum culling. An empty set ⇒ zeroed region, but
+    // the caller maps "no points" to a 404 before encoding, so it's never used.
     let region = if points.is_empty() {
         [0.0; 6]
     } else {
