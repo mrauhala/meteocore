@@ -243,10 +243,14 @@ framework-free `ds-3dtiles` crate encodes it to a `.pnts` tile + `tileset.json`;
   `PolarVolumeSiteView`; the cloud is bounded by `MAX_POINTS` (8M, truncate +
   WARN). Unknown quantity ⇒ `InvalidParameter` (→ 400).
 - **Routes** (mounted at `/3dtiles`): `GET /collections/{id}/tileset.json`
-  (`?quantity=&datetime=`) and `GET /collections/{id}/content.pnts`
+  (`?quantity=&datetime=&min_value=`) and `GET /collections/{id}/content.pnts`
   (`?quantity=&datetime=&min_value=`), plus `/` · `/collections` ·
-  `/collections/{id}`. The tileset's `content.uri` embeds the resolved quantity
-  (+ pinned time) so the `.pnts` fetch is deterministic.
+  `/collections/{id}` · **`/viewer`** (a bundled CesiumJS page with a
+  collection + quantity picker, `include_str!`-baked from
+  `crates/api-3dtiles/viewer/index.html`; same-origin API base by default, so it
+  works on any deployment, with a `?base=` override). The tileset's
+  `content.uri` embeds the resolved quantity (+ pinned time + `min_value`) so
+  the `.pnts` fetch is deterministic.
 - **Concurrency:** `read_point_cloud` is sync (blocking HDF5 I/O + a long CPU
   loop), so the handler bounds it with the shared render semaphore and runs it
   via `spawn_blocking` — never inline on a request worker (the same pattern the

@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MeteoCore — 3D Tiles viewer</title>
+<script src="https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/Cesium.js"></script>
+<link href="https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+<style>
+  html, body, #cesium { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+  #cesium { position: absolute; inset: 0; }
+  #bar {
+    position: absolute; top: 0; left: 0; right: 0; z-index: 10;
+    display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
+    padding: 9px 14px; box-sizing: border-box;
+    background: rgba(10, 13, 20, 0.82); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    color: #e8eef6; font: 13px/1.3 system-ui, -apple-system, sans-serif;
+  }
+  #bar .brand { font-weight: 650; letter-spacing: .2px; margin-right: 4px; }
+  #bar .brand span { opacity: .55; font-weight: 400; }
+  #bar .field { display: flex; align-items: center; gap: 6px; }
+  #bar label { opacity: .6; }
+  #bar select, #bar input {
+    background: #161b25; color: #e8eef6; border: 1px solid #2a3340;
+    border-radius: 6px; padding: 5px 8px; font: 13px system-ui; max-width: 320px;
+  }
+  #bar input[type=number] { width: 58px; }
+  #status { margin-left: auto; opacity: .6; font-size: 12px; white-space: nowrap; }
+  #status.err { color: #ff8a8a; opacity: .95; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <div class="brand">MeteoCore <span>· 3D Tiles</span></div>
+  <div class="field"><label for="coll">Collection</label><select id="coll"></select></div>
+  <div class="field"><label for="qty">Quantity</label><select id="qty"></select></div>
+  <div class="field"><label for="min">min</label><input id="min" type="number" value="5" step="1"> dBZ</div>
+  <div id="status"></div>
+</div>
+<div id="cesium"></div>
+<script>
+"use strict";
+
+// API base: ?base=… override, else same-origin (when served at /3dtiles/viewer),
+// else the public deployment.
+const params = new URLSearchParams(location.search);
+const here = location.pathname.replace(/\/+$/, "");
+const sameOrigin = here.endsWith("/viewer")
+  ? location.origin + here.slice(0, -"/viewer".length)
+  : null;
+const BASE = params.get("base") || sameOrigin || "https://meteocore.app.meteo.fi/3dtiles";
+
+const $coll = document.getElementById("coll");
+const $qty = document.getElementById("qty");
+const $min = document.getElementById("min");
+const $status = document.getElementById("status");
+const setStatus = (msg, err) => { $status.textContent = msg; $status.className = err ? "err" : ""; };
+
+// Token-free CesiumJS: CARTO Dark Matter basemap, no Cesium Ion.
+const viewer = new Cesium.Viewer("cesium", {
+  baseLayer: new Cesium.ImageryLayer(new Cesium.UrlTemplateImageryProvider({
+    url: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+    subdomains: "abcd", maximumLevel: 19,
+    credit: "© OpenStreetMap contributors © CARTO",
+  })),
+  baseLayerPicker: false, timeline: false, animation: false, geocoder: false,
+  homeButton: false, sceneModePicker: false, navigationHelpButton: false, infoBox: false, selectionIndicator: false,
+});
+viewer.scene.backgroundColor = Cesium.Color.BLACK;
+viewer.scene.globe.depthTestAgainstTerrain = false;
+
+let current = null;       // active tileset
+let loadToken = 0;        // guards against out-of-order async loads
+
+async function loadCollections() {
+  setStatus("loading collections…");
+  try {
+    const data = await (await fetch(`${BASE}/collections`)).json();
+    const cols = data.collections || [];
+    $coll.innerHTML = "";
+    for (const c of cols) {
+      const o = document.createElement("option");
+      o.value = c.id; o.textContent = c.title || c.id;
+      $coll.appendChild(o);
+    }
+    if (!cols.length) { setStatus("no 3D-Tiles collections at " + BASE, true); return; }
+    await loadQuantities();
+  } catch (e) {
+    setStatus("can't reach " + BASE + " — " + e, true);
+  }
+}
+
+async function loadQuantities() {
+  const id = $coll.value;
+  if (!id) return;
+  try {
+    const data = await (await fetch(`${BASE}/collections/${encodeURIComponent(id)}`)).json();
+    const qs = data.quantities || [];
+    $qty.innerHTML = "";
+    for (const q of qs) {
+      const o = document.createElement("option");
+      o.value = q.id; o.textContent = q.label || q.id;
+      $qty.appendChild(o);
+    }
+    // Prefer a reflectivity quantity for the default view.
+    for (const pref of ["DBZH", "TH"]) {
+      const i = [...$qty.options].findIndex(o => o.value === pref);
+      if (i >= 0) { $qty.selectedIndex = i; break; }
+    }
+    await loadTileset();
+  } catch (e) {
+    setStatus("error loading quantities — " + e, true);
+  }
+}
+
+async function loadTileset() {
+  const id = $coll.value, q = $qty.value;
+  const min = $min.value.trim();
+  if (!id || !q) return;
+  const token = ++loadToken;
+  setStatus(`loading ${id} · ${q}…`);
+  if (current) { viewer.scene.primitives.remove(current); current = null; }
+
+  let url = `${BASE}/collections/${encodeURIComponent(id)}/tileset.json?quantity=${encodeURIComponent(q)}`;
+  if (min !== "") url += `&min_value=${encodeURIComponent(min)}`;
+  try {
+    const ts = await Cesium.Cesium3DTileset.fromUrl(url, { maximumScreenSpaceError: 1 });
+    if (token !== loadToken) return; // a newer load superseded this one
+    current = ts;
+    viewer.scene.primitives.add(ts);
+    ts.style = new Cesium.Cesium3DTileStyle({ pointSize: 5.0 });
+    await viewer.zoomTo(ts, new Cesium.HeadingPitchRange(
+      Cesium.Math.toRadians(210), Cesium.Math.toRadians(-28), 300000));
+    setStatus(`${id} · ${q}`);
+  } catch (e) {
+    if (token === loadToken) setStatus("no data for this selection", true);
+    console.error(e);
+  }
+}
+
+$coll.addEventListener("change", loadQuantities);
+$qty.addEventListener("change", loadTileset);
+$min.addEventListener("change", loadTileset);
+loadCollections();
+</script>
+</body>
+</html>

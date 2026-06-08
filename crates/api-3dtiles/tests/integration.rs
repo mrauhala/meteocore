@@ -232,6 +232,32 @@ async fn if_none_match_wildcard_is_304() {
 }
 
 #[tokio::test]
+async fn viewer_page_is_served() {
+    let (status, body, headers) = get("/viewer").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers[axum::http::header::CONTENT_TYPE]
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    let html = String::from_utf8(body).unwrap();
+    assert!(html.contains("Cesium"), "viewer loads CesiumJS");
+    assert!(
+        html.contains("/collections"),
+        "viewer calls the collections API"
+    );
+}
+
+#[tokio::test]
+async fn tileset_carries_min_value_into_content_uri() {
+    let (status, body, _h) =
+        get("/collections/radar-fivih/tileset.json?quantity=DBZH&min_value=5").await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let uri = v["root"]["content"]["uri"].as_str().unwrap();
+    assert_eq!(uri, "content.pnts?quantity=DBZH&min_value=5");
+}
+
+#[tokio::test]
 async fn collections_list_and_doc() {
     let (status, body, _h) = get("/collections").await;
     assert_eq!(status, StatusCode::OK);

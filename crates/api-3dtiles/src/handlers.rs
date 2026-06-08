@@ -64,6 +64,9 @@ pub struct TilesetParams {
     pub quantity: Option<String>,
     /// Valid time (RFC 3339). `None` → latest.
     pub datetime: Option<String>,
+    /// Drop points below this physical value (e.g. a dBZ floor); carried into
+    /// the tileset's `content.uri` so the `.pnts` fetch applies it.
+    pub min_value: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +114,16 @@ fn etag_of(bytes: &[u8]) -> String {
     format!("\"{h:016x}\"")
 }
 
+/// The bundled CesiumJS viewer page (collection + quantity picker), baked into
+/// the binary and served at `GET /3dtiles/viewer`.
+const VIEWER_HTML: &str = include_str!("../viewer/index.html");
+
+/// `GET /viewer` — interactive CesiumJS viewer. It calls this same API
+/// (same-origin by default), so it works on any deployment.
+pub async fn get_viewer() -> axum::response::Html<&'static str> {
+    axum::response::Html(VIEWER_HTML)
+}
+
 // ---------------------------------------------------------------------------
 // Tileset
 // ---------------------------------------------------------------------------
@@ -154,6 +167,10 @@ pub async fn get_tileset(
     if let Some(dt_str) = &params.datetime {
         let dt = parse_datetime(dt_str)?;
         query.push_str(&format!("&datetime={}", dt.format("%Y-%m-%dT%H:%M:%SZ")));
+    }
+    if let Some(min) = params.min_value {
+        // f64 Display is URL-safe for a dBZ-range value (digits, `.`, `-`).
+        query.push_str(&format!("&min_value={min}"));
     }
     let content_uri = format!("content.pnts?{query}");
 
@@ -259,6 +276,7 @@ pub async fn landing_page(State(state): State<AppState>) -> Json<serde_json::Val
         "links": [
             { "href": format!("{base}/3dtiles/"), "rel": "self", "type": "application/json", "title": "This document" },
             { "href": format!("{base}/3dtiles/collections"), "rel": "data", "type": "application/json", "title": "Collections" },
+            { "href": format!("{base}/3dtiles/viewer"), "rel": "alternate", "type": "text/html", "title": "Interactive 3D Tiles viewer" },
         ]
     }))
 }
