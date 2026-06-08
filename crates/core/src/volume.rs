@@ -83,7 +83,10 @@ pub struct VolumeInfo {
 /// The byte/axis-order conventions of the draft voxel glTF extensions (which
 /// reorder axes between `3DTILES_content_voxels` and `EXT_primitive_voxels`) are
 /// the *encoder's* concern; this domain type uses one natural order.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`: at the `MAX_VOXELS` cap the `values` buffer is ~128 MB, so
+/// copies must be deliberate (move it into the encoder).
+#[derive(Debug)]
 pub struct VoxelGrid {
     /// Cylinder-axis origin (the radar antenna): WGS84 lon/lat degrees, height m.
     pub origin_lon: f64,

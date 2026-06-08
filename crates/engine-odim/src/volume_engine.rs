@@ -3286,9 +3286,16 @@ fn voxel_grid_from_volume(
                     azimuth_deg,
                     el,
                 ) {
-                    // One source of truth for the axis order (in flux per #351).
-                    values[VoxelGrid::index_of(dims, i_r, i_a, i_h)] = v as f32;
-                    valid += 1;
+                    // Only finite samples count as data — a non-finite gain/
+                    // offset in a malformed file can yield `Some(NaN)`; writing
+                    // it would make `valid` (and the 404 guard) disagree with
+                    // the finite-only `valid_count()`.
+                    let fv = v as f32;
+                    if fv.is_finite() {
+                        // One source of truth for the axis order (in flux per #351).
+                        values[VoxelGrid::index_of(dims, i_r, i_a, i_h)] = fv;
+                        valid += 1;
+                    }
                 }
             }
         }
@@ -3314,6 +3321,10 @@ impl PolarVolumeSiteView {
     /// `None` ⇒ the advertised default) and select the volume nearest `time`
     /// (latest if `None`), with the antenna-finite guard. Shared by
     /// `read_point_cloud` and `read_voxel_grid`.
+    ///
+    /// `reference_time` is deliberately not a parameter: ODIM PVOL has no
+    /// model-run machinery (radar volumes aren't forecasts), so both callers
+    /// accept-and-ignore it — see the `ds_core::instances` engine contract.
     fn select_entry_and_quantity<'c>(
         &self,
         catalog: &'c Catalog,
