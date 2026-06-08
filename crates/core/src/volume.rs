@@ -63,6 +63,12 @@ pub struct VolumeInfo {
     pub default_quantity: String,
     /// Unit of the default quantity.
     pub default_unit: String,
+    /// Coverage bounding region `[west, south, east, north, min_h, max_h]`
+    /// (lon/lat **radians**, heights metres) — a region guaranteed to *contain*
+    /// the collection's content, for building the 3D Tiles `tileset.json`
+    /// bounding volume without sampling the full volume. `None` if the
+    /// collection has no known spatial extent yet.
+    pub region: Option<[f64; 6]>,
 }
 
 /// An engine that samples a collection's data into a volumetric point cloud

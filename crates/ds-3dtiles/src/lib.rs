@@ -160,6 +160,19 @@ pub fn encode_pnts(
 /// (the `.pnts` `RTC_CENTER` already places points in ECEF). The top-level
 /// `geometricError` is non-zero (load-bearing — see module docs).
 pub fn tileset_json(cloud: &VolumePointCloud, content_uri: &str) -> Result<String, Tiles3dError> {
+    tileset_json_for_region(cloud.region, content_uri)
+}
+
+/// Build the `tileset.json` from a geodetic bounding `region`
+/// (`[west, south, east, north, min_h, max_h]`, lon/lat radians + metres)
+/// directly — for the API layer, which has the collection's coverage region
+/// from `VolumeInfo` and need not sample the whole volume just to emit the
+/// tileset. The region must merely *contain* the content the `.pnts` will hold.
+/// Same `content_uri` validation and invariants as [`tileset_json`].
+pub fn tileset_json_for_region(
+    region: [f64; 6],
+    content_uri: &str,
+) -> Result<String, Tiles3dError> {
     if content_uri.is_empty()
         || content_uri.starts_with('/')
         || content_uri.contains("://")
@@ -167,7 +180,7 @@ pub fn tileset_json(cloud: &VolumePointCloud, content_uri: &str) -> Result<Strin
     {
         return Err(Tiles3dError::InvalidUri(content_uri.to_string()));
     }
-    if cloud.region.iter().any(|v| !v.is_finite()) {
+    if region.iter().any(|v| !v.is_finite()) {
         return Err(Tiles3dError::NonFinite("region"));
     }
     // `[f64; 6]` serializes directly to a JSON array — no `Vec` needed.
@@ -179,7 +192,7 @@ pub fn tileset_json(cloud: &VolumePointCloud, content_uri: &str) -> Result<Strin
         "asset": { "version": "1.1" },
         "geometricError": TILESET_GEOMETRIC_ERROR,
         "root": {
-            "boundingVolume": { "region": cloud.region },
+            "boundingVolume": { "region": region },
             "geometricError": ROOT_GEOMETRIC_ERROR,
             "refine": "ADD",
             "content": { "uri": content_uri },

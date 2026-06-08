@@ -165,6 +165,7 @@ mod tests {
             wms: Arc::new(ArcSwap::from_pointee(result.wms_state)),
             maps: Arc::new(ArcSwap::from_pointee(result.maps_state)),
             tiles: Arc::new(ArcSwap::from_pointee(result.tiles_state)),
+            tiles_3d: Arc::new(ArcSwap::from_pointee(result.tiles_3d_state)),
             config_path: config_path.to_str().unwrap().to_string(),
             health: RwLock::new(result.health),
             geotiff_engines: RwLock::new(result.geotiff_engines),

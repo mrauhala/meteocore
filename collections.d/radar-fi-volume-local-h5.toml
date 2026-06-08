@@ -21,7 +21,7 @@ id = "radar-fi-volume-local-h5"
 title = "FMI — radar polar volumes (local, ODIM_H5)"
 description = "Finnish radar polar volumes (ODIM_H5 PVOL) from local sample files — every elevation sweep and dual-polarisation moment. One collection per radar site."
 engine_type = "odim-volume"
-apis = ["edr", "wms", "maps", "tiles"]
+apis = ["edr", "wms", "maps", "tiles", "3dtiles"]
 data_path = "testdata/radar-fmi-pvol"
 
 [odim]

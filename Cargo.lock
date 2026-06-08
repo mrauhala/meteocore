@@ -65,6 +65,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "api-3dtiles"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "axum",
+ "bytes",
+ "chrono",
+ "ds-3dtiles",
+ "ds-core",
+ "ds-render",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "api-edr"
 version = "0.1.0"
 dependencies = [
@@ -3986,6 +4006,7 @@ dependencies = [
 name = "server"
 version = "0.6.0"
 dependencies = [
+ "api-3dtiles",
  "api-edr",
  "api-features",
  "api-maps",

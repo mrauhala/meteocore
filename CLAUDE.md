@@ -2,7 +2,7 @@
 
 ## What This Is
 
-Rust workspace implementing OGC API - EDR, OGC API - Features, OGC API - Maps, OGC API - Tiles, and OGC WMS 1.3.0 servers. Eighteen crates: `ds-core` (traits + types + shared utilities), `ds-storage` (S3/HTTP/local object store), `ds-render` (raster colorization + PNG encoding), `ds-mvt` (Mapbox Vector Tile encoder + LRU tile cache), `engine-csv` (CSV data engine), `engine-geojson` (GeoJSON data engine), `engine-geotiff` (GeoTIFF/COG data engine), `engine-grib` (GRIB2 NWP data engine), `engine-odim` (ODIM_H5 weather-radar engine), `engine-querydata` (FMI QueryData data engine), `engine-zarr` (Zarr V2/V3 multidimensional-array engine), `engine-postgis` (PostGIS/TimescaleDB observation data engine), `api-edr` (EDR HTTP layer), `api-features` (Features HTTP layer), `api-maps` (OGC API Maps HTTP layer), `api-tiles` (OGC API Tiles HTTP layer), `api-wms` (WMS 1.3.0 HTTP layer), `server` (binary).
+Rust workspace implementing OGC API - EDR, OGC API - Features, OGC API - Maps, OGC API - Tiles, OGC WMS 1.3.0, and OGC 3D Tiles servers. Twenty crates: `ds-core` (traits + types + shared utilities), `ds-storage` (S3/HTTP/local object store), `ds-render` (raster colorization + PNG encoding), `ds-mvt` (Mapbox Vector Tile encoder + LRU tile cache), `ds-3dtiles` (OGC 3D Tiles `.pnts`/`tileset.json` encoder), `engine-csv` (CSV data engine), `engine-geojson` (GeoJSON data engine), `engine-geotiff` (GeoTIFF/COG data engine), `engine-grib` (GRIB2 NWP data engine), `engine-odim` (ODIM_H5 weather-radar engine), `engine-querydata` (FMI QueryData data engine), `engine-zarr` (Zarr V2/V3 multidimensional-array engine), `engine-postgis` (PostGIS/TimescaleDB observation data engine), `api-edr` (EDR HTTP layer), `api-features` (Features HTTP layer), `api-maps` (OGC API Maps HTTP layer), `api-tiles` (OGC API Tiles HTTP layer), `api-wms` (WMS 1.3.0 HTTP layer), `api-3dtiles` (OGC 3D Tiles HTTP layer), `server` (binary).
 
 ## Build & Run
 
@@ -50,7 +50,7 @@ When completing work, close the relevant issue: `gh issue close <number>`.
 
 ## Architecture Rules
 
-- **Three core traits: `EdrEngine` (EDR), `FeatureEngine` (Features), and `MapEngine` (Maps/WMS/Tiles).** They are separate traits — not all engines need to support all APIs. Engines return domain types, never JSON/XML. Serialization belongs in the API crates.
+- **Four core traits: `EdrEngine` (EDR), `FeatureEngine` (Features), `MapEngine` (Maps/WMS/Tiles), and `VolumeEngine` (3D Tiles — volumetric point clouds).** They are separate traits — not all engines need to support all APIs. Engines return domain types, never JSON/XML. Serialization belongs in the API crates (`ds-3dtiles` is the framework-free byte encoder for the 3D Tiles path, mirroring `ds-render`/`ds-mvt`).
 - **ds-core has no framework dependencies.** Only chrono, serde, thiserror, toml. Keep it that way. Use `PropertyValue` enum instead of `serde_json::Value` for feature properties.
 - **CRS and GeoTransform live in ds-core** (`ds_core::geo`), shared by all engines.
 - **ds-render has no framework dependencies.** Only ds-core and `png`.
@@ -212,7 +212,7 @@ don't collide. **Maps/Tiles `reference_time` query parameter is still a follow-u
 | GeoTIFF | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | GRIB | `EdrEngine` + `MapEngine` | EDR, WMS, Maps, Tiles |
 | ODIM COMP | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
-| ODIM PVOL | `EdrEngine` + `MapEngine` (per-site views) + `FeatureEngine` (network engine) | EDR (position, locations, area, trajectory), WMS, Maps, Tiles, Features (site inventory) |
+| ODIM PVOL | `EdrEngine` + `MapEngine` + `VolumeEngine` (per-site views) + `FeatureEngine` (network engine) | EDR (position, locations, area, trajectory), WMS, Maps, Tiles, 3D Tiles, Features (site inventory) |
 | QueryData | `EdrEngine` + `MapEngine` | EDR (position only), WMS, Maps, Tiles |
 | Zarr | `EdrEngine` + `MapEngine` | EDR (position), WMS, Maps, Tiles; local + S3/HTTP |
 | PostGIS | `EdrEngine` + `FeatureEngine` | EDR (position, locations, area), Features |
@@ -226,6 +226,39 @@ don't collide. **Maps/Tiles `reference_time` query parameter is still a follow-u
 - **Labels come from the ODIM quantity dictionary.** The bare quantity stays the parameter *id* (URL short-name, WMS `<Name>`, CoverageJSON key), but the human-readable *label* and unit come from `engine-odim/src/quantities.rs` (acronym + name, e.g. `DBZH` → `"DBZH — Reflectivity (horizontal)"`, unit `dBZ`); unknown codes fall back to the bare string. WMS additionally prefixes each child layer's `<Title>` with the site place name (`RasterInfo.layer_subtitle`, ODIM `/what` PLC) so flat clients that ignore the parent-layer tree can tell the per-site layers apart.
 - **Auto-split happens in `server/src/admin.rs`** (`load_collections`, the `"odim-volume"` arm): build the engine once, enumerate `engine.sites()` (returns `(nod, label)` per site), and register one `PolarVolumeSiteView` per site (cloning the base `CollectionConfig` with a per-site id/title). Site discovery is a scan snapshot — sites added later surface on the next `POST /admin/collections/reload`.
 - **Cross-sections.** `query_trajectory` returns a CoverageJSON `Section` (composite `[t,x,y]` axis + numeric `z` = height above antenna, via the 4/3-Earth beam model). `z` selects the elevation-angle band. Vertical axis is elevation angle (`VerticalKind::ElevationAngle`).
+
+## OGC 3D Tiles (`api-3dtiles`, epic #346)
+
+Volumetric weather as OGC 3D Tiles — radar polar volumes today. The chain:
+`VolumeEngine` (in `ds-core`) returns a `VolumePointCloud` (one point per echo
+cell, placed at its true ECEF position via the 4/3-Earth beam model); the
+framework-free `ds-3dtiles` crate encodes it to a `.pnts` tile + `tileset.json`;
+`api-3dtiles` serves it over HTTP. Engines return the domain type, never bytes
+(same rule as `MapEngine`→`ds-render`).
+
+- **Trait:** `VolumeEngine::read_point_cloud(quantity, time, min_value, reference_time)`
+  → `VolumePointCloud`, and `volume_info() -> Arc<VolumeInfo>` (O(1) cached
+  snapshot, #211 — carries quantities, times, default quantity, and a coverage
+  `region` for the tileset bounding volume without sampling). Implemented by
+  `PolarVolumeSiteView`; the cloud is bounded by `MAX_POINTS` (8M, truncate +
+  WARN). Unknown quantity ⇒ `InvalidParameter` (→ 400).
+- **Routes** (mounted at `/3dtiles`): `GET /collections/{id}/tileset.json`
+  (`?quantity=&datetime=`) and `GET /collections/{id}/content.pnts`
+  (`?quantity=&datetime=&min_value=`), plus `/` · `/collections` ·
+  `/collections/{id}`. The tileset's `content.uri` embeds the resolved quantity
+  (+ pinned time) so the `.pnts` fetch is deterministic.
+- **Concurrency:** `read_point_cloud` is sync (blocking HDF5 I/O + a long CPU
+  loop), so the handler bounds it with the shared render semaphore and runs it
+  via `spawn_blocking` — never inline on a request worker (the same pattern the
+  raster APIs use for `get_raster_tile`).
+- **Caching:** content-derived ETag on `.pnts` (deterministic bytes ⇒ cheap
+  304s); `content_uri` is validated (no `..`/absolute/scheme) in `ds-3dtiles`.
+- **Config:** add `"3dtiles"` to a collection's `apis` (only `odim-volume`
+  supports it today). v1 uses one shared reflectivity colormap; per-collection /
+  per-quantity colormaps, time-dynamic tilesets (#350), and true cylindrical
+  voxels (#351) are follow-ups. **Encoder/CesiumJS gotchas** (load-bearing) live
+  in `ds-3dtiles`: tileset `geometricError > 0`, ECEF-native `.pnts` POSITION,
+  `.pnts` not glb-with-POINTS.
 
 ## GeoTIFF Engine Notes
 

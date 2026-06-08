@@ -23,6 +23,7 @@ api-features = { path = "../api-features" }
 api-wms = { path = "../api-wms" }
 api-maps = { path = "../api-maps" }
 api-tiles = { path = "../api-tiles" }
+api-3dtiles = { path = "../api-3dtiles" }
 ds-render = { path = "../render" }
 ds-mvt = { path = "../ds-mvt" }
 arc-swap = "1"
