@@ -3199,7 +3199,23 @@ impl VolumeEngine for PolarVolumeSiteView {
         // `default_quantity`), so an unqualified request renders exactly what
         // the metadata says is the default.
         let quantity = match quantity {
-            Some(q) => q.to_string(),
+            Some(q) => {
+                // Reject an unknown quantity as InvalidParameter (→ 400), not a
+                // "no echoes" LocationNotFound (→ 404) — consistent with
+                // `get_raster_tile`/`polar_sample`, and so the #349 handler
+                // gets the right status for free.
+                let known = catalog
+                    .by_site_meta
+                    .get(&self.nod)
+                    .is_some_and(|m| m.quantities.iter().any(|x| x == q));
+                if !known {
+                    return Err(DataServerError::InvalidParameter(format!(
+                        "[{}] unknown quantity `{q}` for radar site `{}`",
+                        self.collection_id, self.nod
+                    )));
+                }
+                q.to_string()
+            }
             None => catalog
                 .by_site_meta
                 .get(&self.nod)

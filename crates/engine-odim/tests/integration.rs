@@ -644,6 +644,16 @@ fn pvol_volume_engine_emits_point_cloud() {
         tileset.contains("\"region\""),
         "tileset has a region bounding volume"
     );
+
+    // An unknown quantity is a clear InvalidParameter (→ 400), not a
+    // "no echoes" LocationNotFound (→ 404).
+    assert!(
+        matches!(
+            view.read_point_cloud(Some("NOSUCHQ"), None, None, None),
+            Err(ds_core::error::DataServerError::InvalidParameter(_))
+        ),
+        "unknown quantity must be InvalidParameter"
+    );
 }
 
 /// End-to-end `FeatureEngine` surface on the real FMI Vihti volume: the

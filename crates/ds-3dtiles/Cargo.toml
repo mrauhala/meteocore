@@ -2,6 +2,9 @@
 name = "ds-3dtiles"
 version = "0.1.0"
 edition = "2021"
+# Uses `u*::is_multiple_of` (stable 1.87) and `Option::is_none_or` (1.82) — both
+# clippy-preferred idioms. Declared so an older toolchain fails clearly.
+rust-version = "1.87"
 
 [dependencies]
 ds-core = { path = "../core" }
