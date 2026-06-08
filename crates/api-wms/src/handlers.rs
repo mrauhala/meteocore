@@ -135,13 +135,17 @@ pub async fn wms_handler(
                 ))
             })?;
 
+            // One metadata snapshot for all parameter/dimension validation
+            // below. `raster_info()` clones its vecs, so take it once rather
+            // than once per check (parameter, ELEVATION, reference_time).
+            let info = engine.raster_info();
+
             // Validate `LAYERS=collection/parameter` against the engine's
             // advertised list (mirroring Maps + Tiles). Without this, an
             // unknown parameter would silently render whatever the engine
             // defaults to and cache that result under the invalid name —
             // ServiceException is the correct OGC response here.
             if let Some(pname) = layer_parameter.as_deref() {
-                let info = engine.raster_info();
                 if !info.parameters.is_empty()
                     && !info.parameters.iter().any(|(name, _)| name == pname)
                 {
@@ -157,15 +161,46 @@ pub async fn wms_handler(
             }
 
             // Reject an `ELEVATION` against a layer with no vertical axis.
-            if params.elevation.is_some() && engine.raster_info().vertical.is_none() {
+            if params.elevation.is_some() && info.vertical.is_none() {
                 return Err(WmsError::invalid_parameter(&format!(
                     "Layer '{collection_id}' has no ELEVATION dimension"
                 )));
             }
 
+            // Validate `DIM_REFERENCE_TIME` against the layer's advertised model
+            // runs. The engine requires an exact run match (`select_run` →
+            // `ReferenceTimeNotFound`, which the GetMap render path would turn
+            // into a red 200 tile); surfacing `InvalidDimensionValue` here is the
+            // correct WMS response — mirroring the parameter/ELEVATION checks.
+            if let Some(rt) = params.reference_time {
+                if info.reference_times.is_empty() {
+                    return Err(WmsError::InvalidDimensionValue(format!(
+                        "Layer '{collection_id}' has no reference_time dimension"
+                    )));
+                }
+                if !info.reference_times.contains(&rt) {
+                    return Err(WmsError::InvalidDimensionValue(format!(
+                        "reference_time '{}' is not an available model run for layer \
+                         '{collection_id}'",
+                        rt.to_rfc3339()
+                    )));
+                }
+            }
+
             let colormap = style_info.colormap.clone();
             let content_type = params.format.content_type();
             let has_explicit_time = params.time.is_some();
+
+            // Normalise an explicit pin of the *current* latest run to `None`, so
+            // it shares cache entries (and the engine's latest-run path) with
+            // requests that omit the dimension — they render identical pixels.
+            // The common client flow is echoing the GetCapabilities `default=`
+            // (= the latest run), so without this those requests fragment the
+            // cache from the no-dimension ones. A pin of an *older* run stays
+            // explicit. (`info.reference_times` is ascending; latest is `.last()`.)
+            let reference_time = params
+                .reference_time
+                .filter(|&rt| info.reference_times.last().copied() != Some(rt));
 
             // Build cache key
             let cache_key = CacheKey {
@@ -197,6 +232,9 @@ pub async fn wms_handler(
                     .clone()
                     .or_else(|| style_info.parameter.clone()),
                 z: params.elevation.map(ds_render::quantize_z),
+                // The forecast run pinned via the `reference_time` dimension
+                // (None ⇒ latest), so runs don't collide in the rendered cache.
+                reference_time,
             };
 
             let cache_control = cache_control_value(has_explicit_time);
@@ -264,6 +302,8 @@ pub async fn wms_handler(
             let output_crs = params.output_crs.clone();
             let format = params.format;
             let elevation = params.elevation;
+            // `reference_time` (normalised above) is `Copy`; it flows into both
+            // the direct and meta-tile render closures below.
             let z_q = elevation.map(ds_render::quantize_z);
             let layer = params.layer.clone();
             // Key meta-tiles on the *resolved* style name, not the raw STYLES
@@ -294,7 +334,7 @@ pub async fn wms_handler(
                             &output_crs,
                             style_parameter.as_deref(),
                             elevation,
-                            None,
+                            reference_time,
                         )?;
                         // If every pixel is nodata, skip colorization + encoding entirely.
                         if tile.is_empty() {
@@ -317,6 +357,7 @@ pub async fn wms_handler(
                             style,
                             time,
                             z: z_q,
+                            reference_time,
                         };
                         // `bbox` is in WGS84 degrees here — the params layer
                         // converts EPSG:3857 metres to degrees before this point;
@@ -338,7 +379,7 @@ pub async fn wms_handler(
                                     &OutputCrs::WebMercator,
                                     style_parameter.as_deref(),
                                     elevation,
-                                    None,
+                                    reference_time,
                                 )
                             },
                         )?;

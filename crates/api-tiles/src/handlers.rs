@@ -1430,6 +1430,9 @@ async fn render_tile(
         time,
         parameter: effective_parameter.clone(),
         z: validated.z.map(ds_render::quantize_z),
+        // Tiles `reference_time` query parameter is a follow-up (#337 Phase 4);
+        // the handler always queries the engine's latest run for now.
+        reference_time: None,
     };
 
     let cache_control = cache_control_value(has_explicit_time);

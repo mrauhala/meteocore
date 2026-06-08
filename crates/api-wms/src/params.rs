@@ -79,6 +79,12 @@ pub struct WmsQuery {
     pub time: Option<String>,
     #[serde(alias = "ELEVATION", alias = "Elevation")]
     pub elevation: Option<String>,
+    /// Forecast model run selector — the custom `reference_time` dimension
+    /// (de-facto ncWMS/THREDDS convention). Per WMS, a dimension `foo` is
+    /// requested via `DIM_FOO`; serde matches the lowercase field name itself,
+    /// these aliases add the upper/title-case variants real clients send.
+    #[serde(alias = "DIM_REFERENCE_TIME", alias = "Dim_Reference_Time")]
+    pub dim_reference_time: Option<String>,
 }
 
 /// Validated GetMap parameters.
@@ -98,6 +104,9 @@ pub struct GetMapParams {
     pub format: ds_render::ImageFormat,
     /// Vertical level from the WMS `ELEVATION` dimension, when supplied.
     pub elevation: Option<f64>,
+    /// Forecast model run from the custom `reference_time` dimension
+    /// (`DIM_REFERENCE_TIME`), when supplied. `None` ⇒ the engine's latest run.
+    pub reference_time: Option<DateTime<Utc>>,
 }
 
 impl WmsQuery {
@@ -231,6 +240,17 @@ impl WmsQuery {
             None => None,
         };
 
+        // DIM_REFERENCE_TIME — the forecast model run. A single value; the
+        // handler validates it against the layer's advertised runs (and rejects
+        // it for a non-forecast layer). Empty/whitespace ⇒ latest run (None).
+        let reference_time = self
+            .dim_reference_time
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(parse_reference_time)
+            .transpose()?;
+
         // STYLES — empty string or missing = "default"
         let style = self
             .styles
@@ -255,6 +275,7 @@ impl WmsQuery {
             output_crs,
             format: image_format,
             elevation,
+            reference_time,
         })
     }
 }
@@ -389,6 +410,23 @@ fn parse_time(s: &str) -> Result<DateTime<Utc>, WmsError> {
     Err(WmsError::InvalidDimensionValue(format!(
         "Cannot parse TIME '{s}' as ISO 8601"
     )))
+}
+
+/// Parse a `DIM_REFERENCE_TIME` value (the forecast model run / reference time).
+///
+/// Accepts the same ISO 8601 forms as `TIME` (the values GetCapabilities
+/// advertises for the `reference_time` dimension are RFC 3339) and, as a
+/// convenience, the compact EDR instance-id stamp (`20260607T0600Z`) so a
+/// client can echo either the WMS dimension value or an EDR instance id.
+fn parse_reference_time(s: &str) -> Result<DateTime<Utc>, WmsError> {
+    if let Ok(dt) = parse_time(s) {
+        return Ok(dt);
+    }
+    ds_core::instances::parse_instance_id(s).ok_or_else(|| {
+        WmsError::InvalidDimensionValue(format!(
+            "Cannot parse DIM_REFERENCE_TIME '{s}' as ISO 8601 or a run id"
+        ))
+    })
 }
 
 /// Supported CRS list for GetCapabilities.
