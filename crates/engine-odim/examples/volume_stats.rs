@@ -121,6 +121,11 @@ fn main() {
 
     println!();
     println!("VOLUME SUMMARY ({want}):");
+    if vtot == 0 {
+        // No readable sweeps: avoid -inf max and 0/0 = NaN coverage.
+        println!("  no readable {want}/TH sweeps");
+        return;
+    }
     println!("  max reflectivity : {vmax:.1} dBZ");
     println!(
         "  valid coverage   : {:.1}% of {vtot} cells",

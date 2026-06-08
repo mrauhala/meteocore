@@ -56,7 +56,7 @@ fn destination_point(lon0: f64, lat0: f64, dist: f64, bearing_deg: f64) -> (f64,
     let lat2 = (lat1.sin() * ad.cos() + lat1.cos() * ad.sin() * br.cos()).asin();
     let lon2 = lon1 + (br.sin() * ad.sin() * lat1.cos()).atan2(ad.cos() - lat1.sin() * lat2.sin());
     let mut lon = lon2.to_degrees();
-    lon = (lon + 540.0) % 360.0 - 180.0; // normalise to (-180, 180]
+    lon = (lon + 540.0) % 360.0 - 180.0; // normalise to [-180, 180)
     (lon, lat2.to_degrees())
 }
 
