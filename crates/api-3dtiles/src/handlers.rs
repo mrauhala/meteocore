@@ -97,9 +97,11 @@ fn parse_datetime(s: &str) -> Result<DateTime<Utc>, Tiles3dError> {
         .map_err(|_| Tiles3dError::BadRequest(format!("invalid datetime: {s:?}")))
 }
 
-/// Weak content-derived ETag (quoted hex of a hash of the bytes). FNV-1a 64-bit
-/// — stable across Rust versions and instances (unlike `DefaultHasher`), so a
-/// toolchain upgrade or a mixed-version fleet doesn't silently invalidate ETags.
+/// Strong content-derived ETag — quoted hex with no `W/` prefix (the bytes are
+/// exact, so byte-equal responses are equivalent per RFC 7232 §2.1). FNV-1a
+/// 64-bit — stable across Rust versions and instances (unlike `DefaultHasher`),
+/// so a toolchain upgrade or a mixed-version fleet doesn't silently invalidate
+/// ETags.
 fn etag_of(bytes: &[u8]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
@@ -211,9 +213,12 @@ pub async fn get_content(
         .await
         .map_err(|e| Tiles3dError::Internal(format!("sample task failed: {e}")))??;
 
-    // Content-derived ETag → cheap 304s; the bytes are deterministic for a
-    // given (collection, quantity, time, min_value). RFC 7232 §3.2:
-    // `If-None-Match` may be `*` or a comma-separated list.
+    // A 304 here saves the *network transfer* but not the recompute: the
+    // sample + encode + hash already ran above (the `If-None-Match` value can't
+    // be trusted to match without recomputing the content). Making 304s
+    // CPU-cheap needs an ETag cache keyed by (collection, quantity, time,
+    // min_value) + a data-version (latest data changes on poll) — a follow-up.
+    // RFC 7232 §3.2: `If-None-Match` may be `*` or a comma-separated list.
     let not_modified = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|h| h.to_str().ok())
