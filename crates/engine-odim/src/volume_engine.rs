@@ -3054,13 +3054,20 @@ fn volume_point_cloud(
     let site = &volume.site;
     let center = geodetic_to_ecef(site.lon, site.lat, site.height);
 
+    // Hard memory bound: a pathologically dense volume must not allocate an
+    // unbounded cloud once this is reachable from an HTTP handler (#349).
+    // 8M points × ~15 B ≈ 120 MB; real volumes are far smaller (the fivih demo
+    // is ~0.38M). On overflow we stop and warn rather than fail the request.
+    const MAX_POINTS: usize = 8_000_000;
+    let mut truncated = false;
+
     let mut points: Vec<VolumePoint> = Vec::new();
     // Geodetic region accumulators: lon/lat in radians, height in metres.
     let (mut west, mut east) = (f64::INFINITY, f64::NEG_INFINITY);
     let (mut south, mut north) = (f64::INFINITY, f64::NEG_INFINITY);
     let (mut min_h, mut max_h) = (f64::INFINITY, f64::NEG_INFINITY);
 
-    for sweep in &volume.sweeps {
+    'sweeps: for sweep in &volume.sweeps {
         if sweep.nrays == 0
             || sweep.nbins == 0
             || !sweep.rscale.is_finite()
@@ -3079,6 +3086,10 @@ fn volume_point_cloud(
         for ray in 0..sweep.nrays {
             let bearing = (ray as f64 + 0.5) * deg_per_ray;
             for bin in 0..sweep.nbins {
+                if points.len() >= MAX_POINTS {
+                    truncated = true;
+                    break 'sweeps;
+                }
                 let Some(v) = pixels.sample(
                     ray,
                     bin,
@@ -3114,6 +3125,14 @@ fn volume_point_cloud(
                 max_h = max_h.max(alt);
             }
         }
+    }
+
+    if truncated {
+        tracing::warn!(
+            "[PVOL] point cloud for site `{}` capped at {MAX_POINTS} points \
+             (dense volume); remaining cells dropped",
+            site.nod.as_deref().unwrap_or("?")
+        );
     }
 
     // Empty point set ⇒ zeroed region; the caller maps "no points" to a 404

@@ -74,7 +74,8 @@ pub trait VolumeEngine: Send + Sync {
     /// Sample the collection into a 3-D point cloud.
     ///
     /// - `quantity`: which parameter to sample (`None` → the default).
-    /// - `time`: valid time to select (`None` → latest).
+    /// - `time`: select the retained volume **nearest** this valid time
+    ///   (`None` → latest).
     /// - `min_value`: drop points whose physical value is below this (`None` →
     ///   keep every non-nodata sample). E.g. a dBZ floor to cut clutter.
     /// - `reference_time`: forecast model run (`None` → latest; ignored by
