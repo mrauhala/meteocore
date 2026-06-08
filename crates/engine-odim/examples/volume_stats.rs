@@ -34,6 +34,7 @@ fn main() {
     let mut vmax = f64::NEG_INFINITY;
     let mut vtot: u64 = 0;
     let mut vvalid: u64 = 0;
+    let mut v20: u64 = 0;
     let mut v35: u64 = 0;
     let mut v50: u64 = 0;
     // Approximate echo top: highest beam-center altitude with a >=35 dBZ cell.
@@ -115,6 +116,7 @@ fn main() {
         vmax = vmax.max(smax);
         vtot += total;
         vvalid += valid;
+        v20 += c20;
         v35 += c35;
         v50 += c50;
     }
@@ -132,6 +134,7 @@ fn main() {
         "  valid coverage   : {:.1}% of {vtot} cells",
         100.0 * vvalid as f64 / vtot as f64
     );
+    println!("  precip (>=20)    : {v20} cells");
     println!("  convective (>=35): {v35} cells");
     println!("  heavy core (>=50): {v50} cells");
     println!(
