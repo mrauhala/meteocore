@@ -135,13 +135,17 @@ pub async fn wms_handler(
                 ))
             })?;
 
+            // One metadata snapshot for all parameter/dimension validation
+            // below. `raster_info()` clones its vecs, so take it once rather
+            // than once per check (parameter, ELEVATION, reference_time).
+            let info = engine.raster_info();
+
             // Validate `LAYERS=collection/parameter` against the engine's
             // advertised list (mirroring Maps + Tiles). Without this, an
             // unknown parameter would silently render whatever the engine
             // defaults to and cache that result under the invalid name —
             // ServiceException is the correct OGC response here.
             if let Some(pname) = layer_parameter.as_deref() {
-                let info = engine.raster_info();
                 if !info.parameters.is_empty()
                     && !info.parameters.iter().any(|(name, _)| name == pname)
                 {
@@ -157,7 +161,7 @@ pub async fn wms_handler(
             }
 
             // Reject an `ELEVATION` against a layer with no vertical axis.
-            if params.elevation.is_some() && engine.raster_info().vertical.is_none() {
+            if params.elevation.is_some() && info.vertical.is_none() {
                 return Err(WmsError::invalid_parameter(&format!(
                     "Layer '{collection_id}' has no ELEVATION dimension"
                 )));
@@ -169,13 +173,12 @@ pub async fn wms_handler(
             // into a red 200 tile); surfacing `InvalidDimensionValue` here is the
             // correct WMS response — mirroring the parameter/ELEVATION checks.
             if let Some(rt) = params.reference_time {
-                let reference_times = engine.raster_info().reference_times;
-                if reference_times.is_empty() {
+                if info.reference_times.is_empty() {
                     return Err(WmsError::InvalidDimensionValue(format!(
                         "Layer '{collection_id}' has no reference_time dimension"
                     )));
                 }
-                if !reference_times.contains(&rt) {
+                if !info.reference_times.contains(&rt) {
                     return Err(WmsError::InvalidDimensionValue(format!(
                         "reference_time '{}' is not an available model run for layer \
                          '{collection_id}'",

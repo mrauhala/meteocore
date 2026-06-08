@@ -81,12 +81,9 @@ pub struct WmsQuery {
     pub elevation: Option<String>,
     /// Forecast model run selector — the custom `reference_time` dimension
     /// (de-facto ncWMS/THREDDS convention). Per WMS, a dimension `foo` is
-    /// requested via `DIM_FOO`; we accept the common case variants.
-    #[serde(
-        alias = "DIM_REFERENCE_TIME",
-        alias = "Dim_Reference_Time",
-        alias = "dim_reference_time"
-    )]
+    /// requested via `DIM_FOO`; serde matches the lowercase field name itself,
+    /// these aliases add the upper/title-case variants real clients send.
+    #[serde(alias = "DIM_REFERENCE_TIME", alias = "Dim_Reference_Time")]
     pub dim_reference_time: Option<String>,
 }
 
