@@ -44,6 +44,12 @@ pub enum Tiles3dError {
     /// encoding, so an empty cloud reaching here is a caller bug.
     #[error("cannot encode an empty point cloud (POINTS_LENGTH must be >= 1)")]
     Empty,
+    /// `content_uri` is not a safe server-relative path (empty, absolute,
+    /// scheme-qualified, or containing a `..` segment). CesiumJS fetches
+    /// whatever URL the tileset names, so the encoder rejects anything that
+    /// could traverse or redirect — defence-in-depth for a `pub` API.
+    #[error("invalid content URI: {0:?}")]
+    InvalidUri(String),
 }
 
 /// Encode a point cloud as a 3D Tiles **`.pnts`** tile (the 3D Tiles 1.0 Point
@@ -82,7 +88,9 @@ pub fn encode_pnts(
         .and_then(|n| n.checked_add(7))
         .is_none_or(|n| u32::try_from(n).is_err())
     {
-        return Err(Tiles3dError::TooLarge("featureTableBinary"));
+        // Distinct label from the post-build check below so the two guards are
+        // distinguishable in logs.
+        return Err(Tiles3dError::TooLarge("point data size"));
     }
 
     // Feature-table binary: POSITION (count * 3 * f32) then RGB (count * 3 * u8).
@@ -142,15 +150,23 @@ pub fn encode_pnts(
 }
 
 /// Build the `tileset.json` for a point cloud. `content_uri` is the relative
-/// URI of the `.pnts` tile (e.g. `"content.pnts"`). It is JSON-escaped by
-/// `serde_json`, so there is no injection risk, but callers **must** supply a
-/// server-controlled relative path — never user input or unvalidated config —
-/// since CesiumJS will fetch whatever URL it resolves to.
+/// URI of the `.pnts` tile (e.g. `"content.pnts"`). CesiumJS fetches whatever
+/// URL it resolves to, so the encoder **validates** it as a safe server-relative
+/// path — rejecting empty, absolute (`/…`), scheme-qualified (`…://…`), and
+/// `..`-traversing values with [`Tiles3dError::InvalidUri`] — rather than
+/// relying on the caller (defence-in-depth for a `pub` API).
 ///
 /// The `region` bounding volume is geodetic, so no tile `transform` is needed
 /// (the `.pnts` `RTC_CENTER` already places points in ECEF). The top-level
 /// `geometricError` is non-zero (load-bearing — see module docs).
 pub fn tileset_json(cloud: &VolumePointCloud, content_uri: &str) -> Result<String, Tiles3dError> {
+    if content_uri.is_empty()
+        || content_uri.starts_with('/')
+        || content_uri.contains("://")
+        || content_uri.split('/').any(|s| s == "..")
+    {
+        return Err(Tiles3dError::InvalidUri(content_uri.to_string()));
+    }
     if cloud.region.iter().any(|v| !v.is_finite()) {
         return Err(Tiles3dError::NonFinite("region"));
     }
@@ -275,6 +291,26 @@ mod tests {
             encode_pnts(&cloud, &dbz_map()),
             Err(Tiles3dError::NonFinite("point offset"))
         ));
+    }
+
+    #[test]
+    fn unsafe_content_uri_is_rejected() {
+        let cloud = sample_cloud();
+        for bad in [
+            "",
+            "/abs.pnts",
+            "http://evil/x.pnts",
+            "../../secret",
+            "a/../b.pnts",
+        ] {
+            assert!(
+                matches!(tileset_json(&cloud, bad), Err(Tiles3dError::InvalidUri(_))),
+                "expected InvalidUri for {bad:?}"
+            );
+        }
+        // A plain relative path is accepted.
+        assert!(tileset_json(&cloud, "content.pnts").is_ok());
+        assert!(tileset_json(&cloud, "tiles/0/content.pnts").is_ok());
     }
 
     #[test]

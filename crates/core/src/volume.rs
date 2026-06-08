@@ -76,7 +76,10 @@ pub trait VolumeEngine: Send + Sync {
     ///
     /// - `quantity`: which parameter to sample (`None` → the default).
     /// - `time`: select the retained volume **nearest** this valid time
-    ///   (`None` → latest).
+    ///   (`None` → latest). There is **no staleness cap** — the nearest
+    ///   retained volume is always returned regardless of age (matching the
+    ///   `MapEngine` raster path); a caller needing freshness must check the
+    ///   returned time, or the engine config must bound retention.
     /// - `min_value`: drop points whose physical value is below this (`None` →
     ///   keep every non-nodata sample). E.g. a dBZ floor to cut clutter.
     /// - `reference_time`: forecast model run (`None` → latest; ignored by
