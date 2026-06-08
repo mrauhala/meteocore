@@ -1263,7 +1263,7 @@ fn build_forecast_router() -> (axum::Router, RunRecorder) {
 }
 
 const FC_GETMAP_URI: &str = "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=ecmwf-fc\
-                             &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64\
+                             &STYLES=&CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64\
                              &FORMAT=image/png";
 
 /// A forecast collection advertises a custom `reference_time` dimension (the
