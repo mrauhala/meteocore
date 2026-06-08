@@ -169,7 +169,12 @@ pub async fn get_tileset(
         query.push_str(&format!("&datetime={}", dt.format("%Y-%m-%dT%H:%M:%SZ")));
     }
     if let Some(min) = params.min_value {
-        // f64 Display is URL-safe for a dBZ-range value (digits, `.`, `-`).
+        // `serde_urlencoded` parses "NaN"/"inf" as valid f64; a non-finite
+        // threshold filters every point → a silently-empty tile. Reject → 400.
+        if !min.is_finite() {
+            return Err(Tiles3dError::BadRequest("min_value must be finite".into()));
+        }
+        // f64 Display is URL-safe for a finite value (digits, `.`, `-`).
         query.push_str(&format!("&min_value={min}"));
     }
     let content_uri = format!("content.pnts?{query}");
@@ -204,6 +209,10 @@ pub async fn get_content(
     let time = params.datetime.as_deref().map(parse_datetime).transpose()?;
     let quantity = params.quantity.clone();
     let min_value = params.min_value;
+    // A non-finite threshold (parsed from "NaN"/"inf") would drop every point.
+    if min_value.is_some_and(|m| !m.is_finite()) {
+        return Err(Tiles3dError::BadRequest("min_value must be finite".into()));
+    }
 
     // Sample + encode off the request worker: `read_point_cloud` does blocking
     // HDF5 I/O and a long CPU loop (CLAUDE.md concurrency rules), so bound it

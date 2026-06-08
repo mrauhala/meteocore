@@ -248,6 +248,22 @@ async fn viewer_page_is_served() {
 }
 
 #[tokio::test]
+async fn non_finite_min_value_is_400() {
+    for v in ["NaN", "inf", "-inf"] {
+        let (ts, _b, _h) = get(&format!(
+            "/collections/radar-fivih/tileset.json?min_value={v}"
+        ))
+        .await;
+        assert_eq!(ts, StatusCode::BAD_REQUEST, "tileset rejects min_value={v}");
+        let (cs, _b, _h) = get(&format!(
+            "/collections/radar-fivih/content.pnts?min_value={v}"
+        ))
+        .await;
+        assert_eq!(cs, StatusCode::BAD_REQUEST, "content rejects min_value={v}");
+    }
+}
+
+#[tokio::test]
 async fn tileset_carries_min_value_into_content_uri() {
     let (status, body, _h) =
         get("/collections/radar-fivih/tileset.json?quantity=DBZH&min_value=5").await;

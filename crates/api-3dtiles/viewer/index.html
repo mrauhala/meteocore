@@ -4,8 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MeteoCore — 3D Tiles viewer</title>
-<script src="https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/Cesium.js"></script>
-<link href="https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+<!-- Subresource Integrity on the version-pinned CesiumJS entry point: a CDN
+     compromise/MITM can't silently swap the bundle. (Cesium then loads workers/
+     WASM from the CDN without SRI — full mitigation would self-host CesiumJS.) -->
+<script src="https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/Cesium.js"
+        crossorigin="anonymous"
+        integrity="sha384-5oazsHA45lZs9jgvxUv40qbMATfjwmtR/wQePfqDAeIDIhGmSK2V0gpRoCpZVBzJ"></script>
+<link href="https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/Widgets/widgets.css" rel="stylesheet"
+      crossorigin="anonymous"
+      integrity="sha384-ghEeMdcWWzRv/BPeUcX835vcKDGrxvROXisl/Btpv3GeekBUXTSPVcFJpI1Tcrgp">
 <style>
   html, body, #cesium { width: 100%; height: 100%; margin: 0; overflow: hidden; }
   #cesium { position: absolute; inset: 0; }
@@ -42,8 +49,14 @@
 <script>
 "use strict";
 
-// API base: ?base=… override, else same-origin (when served at /3dtiles/viewer),
-// else the public deployment.
+// API base, in priority order:
+//   1. ?base=…              explicit override (local dev / cross-origin)
+//   2. same origin          when served at /3dtiles/viewer (the normal path) —
+//                           so it works on any deployment with no config.
+//   3. the public instance  last resort, e.g. when this file is opened directly
+//                           from disk. Intentional (the page targets the public
+//                           API by default); note it's a third-party trust
+//                           boundary if this ever fires from a served page.
 const params = new URLSearchParams(location.search);
 const here = location.pathname.replace(/\/+$/, "");
 const sameOrigin = here.endsWith("/viewer")
