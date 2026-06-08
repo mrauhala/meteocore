@@ -20,3 +20,6 @@ thiserror = "2"
 [dev-dependencies]
 tempfile = "3"
 chrono = { version = "0.4", features = ["serde"] }
+# 3D Tiles encoding for the gen_3dtiles example + VolumeEngine integration test.
+ds-3dtiles = { path = "../ds-3dtiles" }
+ds-render = { path = "../render" }

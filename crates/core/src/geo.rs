@@ -5,6 +5,24 @@ const WGS84_A: f64 = 6_378_137.0; // semi-major axis (meters)
 const WGS84_F: f64 = 1.0 / 298.257223563; // flattening
 const WGS84_E2: f64 = 2.0 * WGS84_F - WGS84_F * WGS84_F; // eccentricity squared
 
+/// Convert WGS84 geodetic coordinates to Earth-Centered, Earth-Fixed (ECEF)
+/// metres (EPSG:4978). `lon_deg`/`lat_deg` are degrees, `h` is metres above
+/// the WGS84 ellipsoid. Used to place 3D content (e.g. OGC 3D Tiles volumes)
+/// at its true global position; the inverse is not needed here.
+pub fn geodetic_to_ecef(lon_deg: f64, lat_deg: f64, h: f64) -> [f64; 3] {
+    let lon = lon_deg.to_radians();
+    let lat = lat_deg.to_radians();
+    let (sin_lat, cos_lat) = lat.sin_cos();
+    let (sin_lon, cos_lon) = lon.sin_cos();
+    // Radius of curvature in the prime vertical.
+    let n = WGS84_A / (1.0 - WGS84_E2 * sin_lat * sin_lat).sqrt();
+    [
+        (n + h) * cos_lat * cos_lon,
+        (n + h) * cos_lat * sin_lon,
+        (n * (1.0 - WGS84_E2) + h) * sin_lat,
+    ]
+}
+
 /// Coordinate reference system.
 ///
 /// Stores projection parameters and provides forward/inverse transforms
@@ -1848,5 +1866,25 @@ mod tests {
         let (rlon, rlat) = crs.forward(24.0, 60.0);
         assert!((rlon - 24.0).abs() < 0.01, "rlon={rlon}");
         assert!((rlat - 60.0).abs() < 0.01, "rlat={rlat}");
+    }
+
+    #[test]
+    fn ecef_known_points() {
+        // (0,0,0): on the equator at the prime meridian, ECEF = (a, 0, 0).
+        let [x, y, z] = geodetic_to_ecef(0.0, 0.0, 0.0);
+        assert!((x - WGS84_A).abs() < 1e-3, "x={x}");
+        assert!(y.abs() < 1e-6 && z.abs() < 1e-6, "y={y} z={z}");
+
+        // North pole: x=y=0, z = polar radius b = a(1-f) (+height).
+        let b = WGS84_A * (1.0 - WGS84_F);
+        let [x, y, z] = geodetic_to_ecef(123.0, 90.0, 0.0);
+        assert!(x.abs() < 1e-6 && y.abs() < 1e-6, "x={x} y={y}");
+        assert!((z - b).abs() < 1e-3, "z={z} b={b}");
+
+        // 90°E on the equator: ECEF = (0, a, 0); height adds along the radial.
+        let [x, y, z] = geodetic_to_ecef(90.0, 0.0, 100.0);
+        assert!(x.abs() < 1e-6, "x={x}");
+        assert!((y - (WGS84_A + 100.0)).abs() < 1e-3, "y={y}");
+        assert!(z.abs() < 1e-6, "z={z}");
     }
 }

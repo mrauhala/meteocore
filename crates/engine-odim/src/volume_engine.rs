@@ -62,12 +62,14 @@ use ds_core::feature::{
     Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue,
 };
 use ds_core::feature_engine::FeatureEngine;
+use ds_core::geo::geodetic_to_ecef;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
     VerticalCoord,
 };
 use ds_core::vertical::{VerticalDimension, VerticalKind};
+use ds_core::volume::{VolumeEngine, VolumeInfo, VolumePoint, VolumePointCloud};
 use tokio::sync::Notify;
 
 use ds_storage::discovery::{expand_prefix_for_dates, expand_prefix_pattern, TimeWindow};
@@ -581,6 +583,10 @@ struct SiteMeta {
     coverage_radius_m: Option<f64>,
     /// This site's sweep elevation angles (degrees).
     vertical: Option<VerticalDimension>,
+    /// Pre-built 3D Tiles metadata snapshot, so `VolumeEngine::volume_info`
+    /// is an O(1) `Arc` clone on the request path (no per-call `Vec` clone),
+    /// per the `RasterInfo` rule (#211). Rebuilt on each catalog swap.
+    volume_info: Arc<VolumeInfo>,
 }
 
 /// The engine's catalog: per-site time-sorted volume lists, plus the
@@ -1261,6 +1267,20 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
     let vertical =
         (!levels.is_empty()).then(|| VerticalDimension::new(VerticalKind::ElevationAngle, levels));
 
+    // Pre-build the 3D Tiles metadata snapshot once per catalog rebuild so the
+    // per-request `volume_info()` is an O(1) Arc clone (#211). The default
+    // quantity is `quantities.first()` — the *same* source `read_point_cloud`
+    // and `get_raster_tile` default to, so the advertised default matches what
+    // an unqualified request actually renders.
+    let default_quantity = quantities.first().cloned().unwrap_or_default();
+    let default_unit = quantities::quantity_unit(&default_quantity).to_string();
+    let volume_info = Arc::new(VolumeInfo {
+        quantities: parameters.clone(),
+        times: times.clone(),
+        default_quantity,
+        default_unit,
+    });
+
     Some(SiteMeta {
         lon: site.lon,
         lat: site.lat,
@@ -1273,6 +1293,7 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         spatial_extent,
         coverage_radius_m,
         vertical,
+        volume_info,
     })
 }
 
@@ -3028,6 +3049,251 @@ impl MapEngine for PolarVolumeSiteView {
             layer_subtitle: meta.map(|m| m.plc.clone().unwrap_or_else(|| self.nod.clone())),
             reference_times: Vec::new(),
         }
+    }
+}
+
+/// Build a 3-D point cloud from one polar volume: every valid cell of every
+/// sweep that carries `quantity`, placed at its true ECEF position via the
+/// 4/3-Earth beam model (slant range → ground distance + height above the
+/// antenna), then offset from the antenna's ECEF position.
+///
+/// This is the cross-section sampler ([`volume_section`]) generalized from a
+/// 1-D path to the full `(sweep, ray, bin)` lattice. It uses real slant→ground
+/// geometry — unlike the 2-D [`polar_sample`], which renders with the
+/// ground-range interim. Azimuth is uniform `360/nrays` spacing (north-first,
+/// clockwise — matching the 2-D sampler); reading per-ray `how/startazA` for
+/// sector scans is a reader follow-up (#348).
+fn volume_point_cloud(
+    volume: &PolarVolume,
+    file_id: &str,
+    pix: Pixels,
+    quantity: &str,
+    min_value: Option<f64>,
+) -> VolumePointCloud {
+    let site = &volume.site;
+    let center = geodetic_to_ecef(site.lon, site.lat, site.height);
+
+    // Hard memory bound: a pathologically dense volume must not allocate an
+    // unbounded cloud once this is reachable from an HTTP handler (#349).
+    // `VolumePoint` is [f32; 3] + f64 = 24 B, so 8M points ≈ 192 MB; real
+    // volumes are far smaller (the fivih demo is ~0.38M). On overflow we stop
+    // and warn rather than fail the request.
+    const MAX_POINTS: usize = 8_000_000;
+    let mut truncated = false;
+
+    // Reserve the true upper bound (every cell of every sweep carrying the
+    // quantity), capped at MAX_POINTS, so the fill loop never reallocates.
+    let upper_bound = volume
+        .sweeps
+        .iter()
+        .filter(|s| s.moments.iter().any(|m| m.quantity == quantity))
+        .map(|s| s.nrays.saturating_mul(s.nbins))
+        .fold(0usize, usize::saturating_add)
+        .min(MAX_POINTS);
+    let mut points: Vec<VolumePoint> = Vec::with_capacity(upper_bound);
+    // Geodetic region accumulators: lon/lat in radians, height in metres.
+    let (mut west, mut east) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut south, mut north) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut min_h, mut max_h) = (f64::INFINITY, f64::NEG_INFINITY);
+
+    'sweeps: for sweep in &volume.sweeps {
+        if sweep.nrays == 0
+            || sweep.nbins == 0
+            || !sweep.rscale.is_finite()
+            || sweep.rscale <= 0.0
+            || !sweep.rstart.is_finite()
+            || !sweep.elangle.is_finite()
+        {
+            continue;
+        }
+        let Some(moment) = sweep.moments.iter().find(|m| m.quantity == quantity) else {
+            continue;
+        };
+        let Some(pixels) = pix.moment(file_id, moment, sweep.nrays, sweep.nbins) else {
+            continue;
+        };
+        let deg_per_ray = 360.0 / sweep.nrays as f64;
+        for ray in 0..sweep.nrays {
+            let bearing = (ray as f64 + 0.5) * deg_per_ray;
+            for bin in 0..sweep.nbins {
+                if points.len() >= MAX_POINTS {
+                    truncated = true;
+                    break 'sweeps;
+                }
+                let Some(v) = pixels.sample(
+                    ray,
+                    bin,
+                    moment.gain,
+                    moment.offset,
+                    moment.nodata,
+                    Some(moment.undetect),
+                ) else {
+                    continue;
+                };
+                if min_value.is_some_and(|min| v < min) {
+                    continue;
+                }
+                let r = sweep.rstart + (bin as f64 + 0.5) * sweep.rscale;
+                let (ground, h_above) = slant_to_ground_height(r, sweep.elangle);
+                let (lon, lat) = destination_point(site.lon, site.lat, ground, bearing);
+                let alt = site.height + h_above;
+                let ecef = geodetic_to_ecef(lon, lat, alt);
+                points.push(VolumePoint {
+                    offset: [
+                        (ecef[0] - center[0]) as f32,
+                        (ecef[1] - center[1]) as f32,
+                        (ecef[2] - center[2]) as f32,
+                    ],
+                    value: v,
+                });
+                let (lonr, latr) = (lon.to_radians(), lat.to_radians());
+                west = west.min(lonr);
+                east = east.max(lonr);
+                south = south.min(latr);
+                north = north.max(latr);
+                min_h = min_h.min(alt);
+                max_h = max_h.max(alt);
+            }
+        }
+    }
+
+    if truncated {
+        tracing::warn!(
+            "[PVOL] point cloud for site `{}` capped at {MAX_POINTS} points \
+             (dense volume); remaining cells dropped",
+            site.nod.as_deref().unwrap_or("?")
+        );
+    }
+
+    // The region bounds the *included* points — exactly the tile's content,
+    // which is what a 3D Tiles bounding volume must enclose. Correct for both
+    // the full and the truncated (MAX_POINTS) cases: dropped cells are not in
+    // the tile, so excluding them from the bounds is right, and a tighter
+    // bound is better for frustum culling. An empty set ⇒ zeroed region, but
+    // the caller maps "no points" to a 404 before encoding, so it's never used.
+    let region = if points.is_empty() {
+        [0.0; 6]
+    } else {
+        [west, south, east, north, min_h, max_h]
+    };
+    VolumePointCloud {
+        rtc_center: center,
+        region,
+        points,
+        quantity: quantity.to_string(),
+        unit: quantities::quantity_unit(quantity).to_string(),
+    }
+}
+
+impl VolumeEngine for PolarVolumeSiteView {
+    fn read_point_cloud(
+        &self,
+        quantity: Option<&str>,
+        time: Option<DateTime<Utc>>,
+        min_value: Option<f64>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<VolumePointCloud, DataServerError> {
+        let catalog = self.catalog.load();
+
+        // Default to the same quantity `volume_info()` advertises (the cached
+        // `default_quantity`), so an unqualified request renders exactly what
+        // the metadata says is the default.
+        let quantity = match quantity {
+            Some(q) => {
+                // Reject an unknown quantity as InvalidParameter (→ 400), not a
+                // "no echoes" LocationNotFound (→ 404) — consistent with
+                // `get_raster_tile`/`polar_sample`, and so the #349 handler
+                // gets the right status for free.
+                let known = catalog
+                    .by_site_meta
+                    .get(&self.nod)
+                    .is_some_and(|m| m.quantities.iter().any(|x| x == q));
+                if !known {
+                    return Err(DataServerError::InvalidParameter(format!(
+                        "[{}] unknown quantity `{q}` for radar site `{}`",
+                        self.collection_id, self.nod
+                    )));
+                }
+                q.to_string()
+            }
+            None => catalog
+                .by_site_meta
+                .get(&self.nod)
+                .map(|m| m.volume_info.default_quantity.clone())
+                .filter(|q| !q.is_empty())
+                .ok_or_else(|| {
+                    DataServerError::InvalidParameter(format!(
+                        "[{}] PVOL collection has no quantities to render",
+                        self.collection_id
+                    ))
+                })?,
+        };
+
+        let site_volumes = catalog.by_site.get(&self.nod).ok_or_else(|| {
+            DataServerError::LocationNotFound(format!(
+                "[{}] radar site `{}` has no current volumes",
+                self.collection_id, self.nod
+            ))
+        })?;
+
+        // Select the volume nearest `time` (latest if `None`) — same rule as
+        // `get_raster_tile`.
+        let entry = match time {
+            Some(target) => site_volumes
+                .iter()
+                .min_by_key(|e| (e.volume.time - target).num_seconds().abs()),
+            None => site_volumes.last(),
+        }
+        .ok_or_else(|| {
+            DataServerError::LocationNotFound(format!(
+                "[{}] radar site `{}` has no volumes",
+                self.collection_id, self.nod
+            ))
+        })?;
+
+        // A corrupt file with non-finite antenna coordinates would poison the
+        // ECEF projection (`geodetic_to_ecef` → NaN center → every offset NaN).
+        // Reject up front with antenna context, rather than surfacing an opaque
+        // `NonFinite("point offset")` from the encoder.
+        let antenna = &entry.volume.site;
+        if !(antenna.lon.is_finite() && antenna.lat.is_finite() && antenna.height.is_finite()) {
+            return Err(DataServerError::Engine(format!(
+                "[{}] radar site `{}` has non-finite antenna coordinates \
+                 (lon={}, lat={}, height={})",
+                self.collection_id, self.nod, antenna.lon, antenna.lat, antenna.height
+            )));
+        }
+
+        let handle = blocking_pixel_handle();
+        let pix = Pixels {
+            source: &self.source,
+            handle: handle.as_ref(),
+        };
+        let cloud = volume_point_cloud(&entry.volume, &entry.id, pix, &quantity, min_value);
+
+        // No echoes (every cell nodata, or below `min_value`) ⇒ 404, matching
+        // the other engines' "no data in window" convention, so the API layer
+        // never has to encode an empty tileset.
+        if cloud.points.is_empty() {
+            return Err(DataServerError::LocationNotFound(format!(
+                "[{}] no `{}` echoes in the selected volume of site `{}`",
+                self.collection_id, quantity, self.nod
+            )));
+        }
+        Ok(cloud)
+    }
+
+    fn volume_info(&self) -> Arc<VolumeInfo> {
+        // O(1): clone the pre-built snapshot's `Arc`, not its `Vec`s (#211).
+        // An unknown NOD (site dropped from the catalog since registration —
+        // a reload race) degrades to empty metadata, matching how the query
+        // methods report no data; no per-request log to avoid spam.
+        self.catalog
+            .load()
+            .by_site_meta
+            .get(&self.nod)
+            .map(|m| Arc::clone(&m.volume_info))
+            .unwrap_or_default()
     }
 }
 
@@ -5448,6 +5714,7 @@ mod tests {
                 spatial_extent: None,
                 coverage_radius_m: None,
                 vertical: None,
+                volume_info: Arc::default(),
             }
         }
         let nods = vec!["fivih".to_string()];
