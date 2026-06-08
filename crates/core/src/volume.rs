@@ -106,9 +106,22 @@ pub struct VoxelGrid {
 }
 
 impl VoxelGrid {
-    /// Flat index of cell `(i_r, i_a, i_h)` into [`Self::values`] (height fastest).
+    /// Flat index of cell `(i_r, i_a, i_h)` for a grid of `dims`
+    /// `[n_radius, n_angle, n_height]` — height fastest, then angle, then
+    /// radius. The single source of truth for the axis order (which producers
+    /// must match while the glTF voxel spec settles); usable before the grid
+    /// exists (the fill loop has no `self` yet).
+    pub fn index_of(dims: [usize; 3], i_r: usize, i_a: usize, i_h: usize) -> usize {
+        debug_assert!(
+            i_r < dims[0] && i_a < dims[1] && i_h < dims[2],
+            "voxel index ({i_r}, {i_a}, {i_h}) out of range for dims {dims:?}"
+        );
+        (i_r * dims[1] + i_a) * dims[2] + i_h
+    }
+
+    /// Flat index of cell `(i_r, i_a, i_h)` into [`Self::values`].
     pub fn index(&self, i_r: usize, i_a: usize, i_h: usize) -> usize {
-        (i_r * self.dims[1] + i_a) * self.dims[2] + i_h
+        Self::index_of(self.dims, i_r, i_a, i_h)
     }
 
     /// Count of cells with a **finite** sampled value (excludes `NaN` *and*

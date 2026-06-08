@@ -3281,7 +3281,8 @@ fn voxel_grid_from_volume(
                     azimuth_deg,
                     el,
                 ) {
-                    values[(i_r * n_a + i_a) * n_h + i_h] = v as f32;
+                    // One source of truth for the axis order (in flux per #351).
+                    values[VoxelGrid::index_of(dims, i_r, i_a, i_h)] = v as f32;
                 }
             }
         }
