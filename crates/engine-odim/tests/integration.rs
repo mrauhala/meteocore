@@ -724,10 +724,6 @@ fn pvol_volume_engine_voxel_grid() {
     for v in grid.values.iter().filter(|v| v.is_finite()) {
         assert!((-40.0..100.0).contains(v), "sane dBZ, got {v}");
     }
-    // The cell directly above the antenna (smallest radius, lowest height) is
-    // in the cone of silence → NaN.
-    let apex = grid.index(0, 0, 0);
-    let _ = apex; // index() sanity (value may or may not be NaN depending on geometry)
 }
 
 /// End-to-end `FeatureEngine` surface on the real FMI Vihti volume: the

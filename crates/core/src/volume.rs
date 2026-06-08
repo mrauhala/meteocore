@@ -111,7 +111,8 @@ impl VoxelGrid {
         (i_r * self.dims[1] + i_a) * self.dims[2] + i_h
     }
 
-    /// Count of non-`NaN` (sampled) cells — for diagnostics / emptiness checks.
+    /// Count of cells with a **finite** sampled value (excludes `NaN` *and*
+    /// `±∞`) — for diagnostics / emptiness checks.
     pub fn valid_count(&self) -> usize {
         self.values.iter().filter(|v| v.is_finite()).count()
     }
@@ -157,13 +158,21 @@ pub trait VolumeEngine: Send + Sync {
     /// Cells outside the surveyed beam fan are `NaN` (no fabricated data across
     /// the cone of silence). Returns [`DataServerError::LocationNotFound`] when
     /// the selection yields no sampled cell.
+    ///
+    /// **Optional capability:** unlike [`Self::read_point_cloud`] (the baseline
+    /// volumetric output), this defaults to an error, so an engine implements it
+    /// only if it supports the structured cylindrical grid (#351 / #357).
     fn read_voxel_grid(
         &self,
-        quantity: Option<&str>,
-        time: Option<DateTime<Utc>>,
-        dims: Option<[usize; 3]>,
-        reference_time: Option<DateTime<Utc>>,
-    ) -> Result<VoxelGrid, DataServerError>;
+        _quantity: Option<&str>,
+        _time: Option<DateTime<Utc>>,
+        _dims: Option<[usize; 3]>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<VoxelGrid, DataServerError> {
+        Err(DataServerError::Engine(
+            "voxel grid not supported by this engine".into(),
+        ))
+    }
 
     /// Metadata for the volumetric collection (quantities, valid times).
     ///
