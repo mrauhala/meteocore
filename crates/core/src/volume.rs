@@ -160,8 +160,12 @@ pub trait VolumeEngine: Send + Sync {
     /// the selection yields no sampled cell.
     ///
     /// **Optional capability:** unlike [`Self::read_point_cloud`] (the baseline
-    /// volumetric output), this defaults to an error, so an engine implements it
-    /// only if it supports the structured cylindrical grid (#351 / #357).
+    /// volumetric output), this defaults to "not available", so an engine
+    /// implements it only if it supports the structured cylindrical grid
+    /// (#351 / #357). The default is [`DataServerError::LocationNotFound`]
+    /// (→ 404) — a capability gap is "this resource doesn't exist for this
+    /// collection", not a server fault (matching the no-data-in-window
+    /// convention), so the future voxel route won't surface a misleading 500.
     fn read_voxel_grid(
         &self,
         _quantity: Option<&str>,
@@ -169,7 +173,7 @@ pub trait VolumeEngine: Send + Sync {
         _dims: Option<[usize; 3]>,
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<VoxelGrid, DataServerError> {
-        Err(DataServerError::Engine(
+        Err(DataServerError::LocationNotFound(
             "voxel grid not supported by this engine".into(),
         ))
     }
