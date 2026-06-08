@@ -74,6 +74,23 @@ pub struct ContentParams {
     pub min_value: Option<f64>,
 }
 
+/// Percent-encode a query-string value (RFC 3986 unreserved set passes
+/// through). The `VolumeEngine` trait places no charset constraint on quantity
+/// names, so a name containing `&`/`+`/`#`/`%`/… must not break the tileset's
+/// `content.uri` — the same class of bug as the `+hh:mm` datetime offset.
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 fn parse_datetime(s: &str) -> Result<DateTime<Utc>, Tiles3dError> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
@@ -131,7 +148,7 @@ pub async fn get_tileset(
     // quantity (and pinned time, if any) so the content fetch is deterministic.
     // Re-format the parsed time as UTC `…Z` — a raw `+hh:mm` offset would be
     // decoded as a space by the client's URL parser and 400 on the fetch.
-    let mut query = format!("quantity={quantity}");
+    let mut query = format!("quantity={}", pct_encode(&quantity));
     if let Some(dt_str) = &params.datetime {
         let dt = parse_datetime(dt_str)?;
         query.push_str(&format!("&datetime={}", dt.format("%Y-%m-%dT%H:%M:%SZ")));
@@ -291,4 +308,18 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
             { "href": format!("{base}/3dtiles/collections/{id}/tileset.json"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset" },
         ]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pct_encode;
+
+    #[test]
+    fn pct_encode_passes_unreserved_and_escapes_specials() {
+        assert_eq!(pct_encode("DBZH"), "DBZH");
+        assert_eq!(pct_encode("a-b_c.d~e"), "a-b_c.d~e");
+        // Chars that would break a query value are escaped.
+        assert_eq!(pct_encode("a&b+c#d%e"), "a%26b%2Bc%23d%25e");
+        assert_eq!(pct_encode("x y"), "x%20y");
+    }
 }

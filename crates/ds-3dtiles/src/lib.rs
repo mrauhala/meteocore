@@ -50,6 +50,11 @@ pub enum Tiles3dError {
     /// could traverse or redirect — defence-in-depth for a `pub` API.
     #[error("invalid content URI: {0:?}")]
     InvalidUri(String),
+    /// The geodetic `region` has inverted/degenerate bounds (`west > east`,
+    /// `south > north`, or `min_h > max_h`) — valid JSON that CesiumJS silently
+    /// refuses to load.
+    #[error("invalid region (inverted/degenerate bounds): {0:?}")]
+    InvalidRegion([f64; 6]),
 }
 
 /// Encode a point cloud as a 3D Tiles **`.pnts`** tile (the 3D Tiles 1.0 Point
@@ -183,6 +188,12 @@ pub fn tileset_json_for_region(
     if region.iter().any(|v| !v.is_finite()) {
         return Err(Tiles3dError::NonFinite("region"));
     }
+    // Reject inverted/degenerate bounds: `[west, south, east, north, minH, maxH]`
+    // must be ordered. An inverted box serializes to valid JSON that CesiumJS
+    // silently refuses to load, so fail loudly at encode time instead.
+    if region[0] > region[2] || region[1] > region[3] || region[4] > region[5] {
+        return Err(Tiles3dError::InvalidRegion(region));
+    }
     // `[f64; 6]` serializes directly to a JSON array — no `Vec` needed.
     // `asset.version` is intentionally "1.1" even though `.pnts` is a 1.0
     // content type: CesiumJS keys its tileset loader off this version, and a
@@ -279,6 +290,22 @@ mod tests {
         let region = json["root"]["boundingVolume"]["region"].as_array().unwrap();
         assert_eq!(region.len(), 6);
         assert_eq!(region[0].as_f64().unwrap(), 0.42);
+    }
+
+    #[test]
+    fn inverted_region_is_rejected() {
+        // west > east — an inverted box CesiumJS would silently refuse.
+        let region = [0.44, 1.05, 0.42, 1.07, 100.0, 12_000.0];
+        assert!(matches!(
+            tileset_json_for_region(region, "content.pnts"),
+            Err(Tiles3dError::InvalidRegion(_))
+        ));
+        // min_h > max_h is also rejected.
+        let region = [0.42, 1.05, 0.44, 1.07, 12_000.0, 100.0];
+        assert!(matches!(
+            tileset_json_for_region(region, "content.pnts"),
+            Err(Tiles3dError::InvalidRegion(_))
+        ));
     }
 
     #[test]

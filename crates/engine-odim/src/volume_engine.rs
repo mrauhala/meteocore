@@ -1278,6 +1278,10 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
     // generous vertical span (antenna height up to a 25 km ceiling — above any
     // radar echo and the `volume_point_cloud` height range). It only needs to
     // *contain* the sampled cloud, so a slight over-estimate is fine.
+    // Approximation: 3D Tiles heights are ellipsoidal but ODIM `site.height` is
+    // orthometric (above MSL); the geoid offset (~tens of m in Finland) is
+    // swamped by the 25 km ceiling, so this is harmless for culling — but the
+    // same approximation applies to the point altitudes in `volume_point_cloud`.
     let region = spatial_extent.map(|[w, s, e, n]| {
         [
             w.to_radians(),
