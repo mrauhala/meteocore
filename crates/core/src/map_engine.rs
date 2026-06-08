@@ -140,10 +140,13 @@ pub struct RasterInfo {
     /// parent-layer tree can still tell siblings apart. `None` for standalone
     /// collections.
     pub layer_subtitle: Option<String>,
-    /// Available forecast model runs (reference times), ascending. Empty for
-    /// non-forecast collections. WMS surfaces these as a custom `reference_time`
-    /// dimension and `get_raster_tile`'s `reference_time` argument selects one
-    /// (`None` ⇒ latest); see [`crate::instances`].
+    /// Available forecast model runs (reference times). **Contract: sorted
+    /// ascending, so the latest run is `.last()`** — engines build this from a
+    /// reference-time-keyed `BTreeMap`, and consumers depend on the ordering
+    /// (WMS advertises `.last()` as the `reference_time` dimension's `default`).
+    /// Empty for non-forecast collections. WMS surfaces these as a custom
+    /// `reference_time` dimension and `get_raster_tile`'s `reference_time`
+    /// argument selects one (`None` ⇒ latest); see [`crate::instances`].
     pub reference_times: Vec<DateTime<Utc>>,
 }
 
