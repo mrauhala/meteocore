@@ -42,7 +42,7 @@
   <div class="brand">MeteoCore <span>· 3D Tiles</span></div>
   <div class="field"><label for="coll">Collection</label><select id="coll"></select></div>
   <div class="field"><label for="qty">Quantity</label><select id="qty"></select></div>
-  <div class="field"><label for="min">min</label><input id="min" type="number" value="5" step="1"> dBZ</div>
+  <div class="field"><label for="min">min value</label><input id="min" type="number" value="5" step="1"></div>
   <div id="status"></div>
 </div>
 <div id="cesium"></div>
@@ -137,6 +137,10 @@ async function loadTileset() {
   if (!id || !q) return;
   const token = ++loadToken;
   setStatus(`loading ${id} · ${q}…`);
+  // `scene.primitives` has destroyPrimitives:true (default), so remove() also
+  // destroys the old tileset and frees its GPU buffers — no explicit destroy()
+  // (that would double-destroy and throw). The superseded-load path below DOES
+  // call destroy() because that tileset was never added to the collection.
   if (current) { viewer.scene.primitives.remove(current); current = null; }
 
   let url = `${BASE}/collections/${encodeURIComponent(id)}/tileset.json?quantity=${encodeURIComponent(q)}`;
