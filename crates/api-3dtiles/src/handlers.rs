@@ -20,7 +20,7 @@ use arc_swap::ArcSwap;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use ds_core::config::CollectionConfig;
 use ds_core::geo::geodetic_to_ecef;
 use ds_core::volume::VolumeEngine;
@@ -741,6 +741,20 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
                 .collect()
         })
         .unwrap_or_default();
+    // Available volume timestamps (RFC 3339 `…Z`) — the time axis a client scrubs
+    // for animation. Each value round-trips straight back as the `?datetime=` on
+    // tileset.json/content.*. `VolumeInfo.times` is already sorted ascending +
+    // deduped by the engine, so emit directly (no per-request sort — this is a
+    // metadata accessor, #211).
+    let times: Vec<String> = info
+        .as_ref()
+        .map(|i| {
+            i.times
+                .iter()
+                .map(|t| t.to_rfc3339_opts(SecondsFormat::Secs, true))
+                .collect()
+        })
+        .unwrap_or_default();
     // Every volume collection serves a point cloud; those whose engine can also
     // produce a voxel grid additionally serve the two glTF mesh products
     // (isosurface, echo-top). The viewer reads this to populate its toggle.
@@ -770,6 +784,7 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
         "title": title,
         "description": description,
         "quantities": quantities,
+        "times": times,
         "representations": representations,
         "legend": legend,
         "links": links,

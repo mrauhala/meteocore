@@ -55,6 +55,23 @@
   #legend .lticks { position: relative; width: 30px; margin-left: 5px; }
   #legend .tick { position: absolute; left: 0; transform: translateY(50%); white-space: nowrap; opacity: .85; }
   #legend .tick::before { content: "– "; opacity: .5; }
+  /* Time scrubber (shown only when the collection has >1 volume). */
+  #timebar {
+    position: absolute; left: 50%; transform: translateX(-50%); bottom: 22px; z-index: 10;
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 14px; border-radius: 9px; max-width: 70vw;
+    background: rgba(10, 13, 20, 0.82); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: #e8eef6; font: 12px system-ui, -apple-system, sans-serif;
+  }
+  #timebar[hidden] { display: none; }
+  #timebar button {
+    background: #1b2230; color: #e8eef6; border: 1px solid #2a3340; border-radius: 6px;
+    width: 30px; height: 26px; cursor: pointer; font-size: 13px; line-height: 1;
+  }
+  #timebar button:hover { background: #232c3c; }
+  #timebar input[type=range] { width: 320px; accent-color: #4a90d9; }
+  #timeLabel { min-width: 132px; opacity: .85; font-variant-numeric: tabular-nums; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -75,6 +92,11 @@
 <div id="legend" hidden>
   <div class="ltitle"></div>
   <div class="lwrap"><div class="lbar"></div><div class="lticks"></div></div>
+</div>
+<div id="timebar" hidden>
+  <button id="play" title="Play / pause">▶</button>
+  <input id="time" type="range" min="0" max="0" step="1" value="0">
+  <span id="timeLabel"></span>
 </div>
 <script>
 "use strict";
@@ -118,6 +140,10 @@ const $legend = document.getElementById("legend");
 const $legendTitle = $legend.querySelector(".ltitle");
 const $legendBar = $legend.querySelector(".lbar");
 const $legendTicks = $legend.querySelector(".lticks");
+const $timebar = document.getElementById("timebar");
+const $play = document.getElementById("play");
+const $time = document.getElementById("time");
+const $timeLabel = document.getElementById("timeLabel");
 const setStatus = (msg, err) => { $status.textContent = msg; $status.className = err ? "err" : ""; };
 
 // Each representation's label for the numeric field + its default value:
@@ -146,10 +172,26 @@ const viewer = new Cesium.Viewer("cesium", {
 viewer.scene.backgroundColor = Cesium.Color.BLACK;
 viewer.scene.globe.depthTestAgainstTerrain = false;
 
-let current = null;       // active tileset
-let loadToken = 0;        // guards against out-of-order async loads
-let currentRep = null;    // representation of the active tileset
-let pointsFetchFloor = null; // the min_value (dBZ) the active point cloud was fetched at
+// Time-dynamic playback: one preloaded tileset per available volume timestamp
+// (#350). All frames are built up front and kept hidden except the active one, so
+// scrubbing/playing just toggles `.show` — no per-frame network/reload stall. A
+// non-time-dynamic collection is just the degenerate 1-frame case.
+let frames = [];          // Cesium3DTileset per animated timestamp (parallel to `frameTimes`; null = failed)
+let times = [];           // full volume-time manifest (ISO Z) from the collection doc
+let frameTimes = [];      // the timestamps actually animated = most-recent MAX_FRAMES of `times`
+let frameIdx = 0;         // active index into `frameTimes`
+let playing = false;      // animation running?
+let playTimer = null;     // setInterval handle while playing
+const FRAME_MS = 600;     // per-frame dwell when playing
+// Safety cap on preloaded frames: a source with `max_files` unset (the default)
+// can retain hundreds of volumes (a day ≈ 288 at 5-min cadence), and preloading
+// all of them would mean hundreds of concurrent fetches + GPU-resident tilesets.
+// Animate the most-recent MAX_FRAMES; a true sliding window for longer runs is a
+// follow-up. Operators bound the source itself with `[odim] max_files`/`time_window`.
+const MAX_FRAMES = 48;
+let loadToken = 0;        // guards against out-of-order async (re)builds
+let currentRep = null;    // representation of the active frames
+let pointsFetchFloor = null; // the min_value (dBZ) the point-cloud frames were fetched at
 let legendData = null;    // colour-scale legend {title,unit,min,max,stops} from the collection doc
 
 async function loadCollections() {
@@ -181,6 +223,10 @@ async function loadCollectionMeta(reframe) {
     const data = await (await fetch(`${BASE}/collections/${encodeURIComponent(id)}`)).json();
     legendData = data.legend || null;
     buildLegend();
+    // The volume time axis (ascending). Default to the latest frame so the static
+    // initial view matches the no-`datetime` default (latest volume); play loops.
+    times = Array.isArray(data.times) ? data.times : [];
+    frameIdx = times.length ? times.length - 1 : 0;
     const qs = data.quantities || [];
     $qty.innerHTML = "";
     for (const q of qs) {
@@ -202,7 +248,7 @@ async function loadCollectionMeta(reframe) {
       $rep.appendChild(o);
     }
     syncNumField();
-    await loadTileset(reframe);
+    await loadFrames(reframe);
   } catch (e) {
     setStatus("error loading collection — " + e, true);
   }
@@ -244,19 +290,11 @@ function buildLegend() {
   }
 }
 
-async function loadTileset(reframe = false) {
-  const id = $coll.value, q = $qty.value;
-  const rep = $rep.value || "points";
+// The tileset.json URL for the active params at a given volume timestamp
+// (`time` = null → the server's latest-volume default, no `datetime`).
+function tilesetUrl(time) {
+  const id = $coll.value, q = $qty.value, rep = $rep.value || "points";
   const num = $num.value.trim();
-  if (!id || !q) return;
-  const token = ++loadToken;
-  setStatus(`loading ${id} · ${q} · ${rep}…`);
-  // `scene.primitives` has destroyPrimitives:true (default), so remove() also
-  // destroys the old tileset and frees its GPU buffers — no explicit destroy()
-  // (that would double-destroy and throw). The superseded-load path below DOES
-  // call destroy() because that tileset was never added to the collection.
-  if (current) { viewer.scene.primitives.remove(current); current = null; }
-
   let url = `${BASE}/collections/${encodeURIComponent(id)}/tileset.json?quantity=${encodeURIComponent(q)}`;
   if (rep === "isosurface" || rep === "echotop") {
     url += `&representation=${rep}`;
@@ -265,67 +303,156 @@ async function loadTileset(reframe = false) {
   } else if (num !== "") {
     url += `&min_value=${encodeURIComponent(num)}`;
   }
-  try {
-    const ts = await Cesium.Cesium3DTileset.fromUrl(url, { maximumScreenSpaceError: 1 });
-    if (token !== loadToken) { ts.destroy(); return; } // superseded — free its GPU buffers
-    current = ts;
-    currentRep = rep;
-    viewer.scene.primitives.add(ts);
-    if (rep === "points") {
-      // The server already dropped points below `num`; remember that floor so
-      // the slider can filter *up* from it client-side (see applyPointFilter).
-      pointsFetchFloor = num === "" ? -Infinity : parseFloat(num);
-      applyPointStyle(pointsFetchFloor);
-    }
-    // Frame from the south-west (camera faces NE, heading 45°) looking down at
-    // -28° — only on a reframe; otherwise leave the camera where the user put it.
-    if (reframe) {
-      await viewer.zoomTo(ts, new Cesium.HeadingPitchRange(
-        Cesium.Math.toRadians(45), Cesium.Math.toRadians(-28), 300000));
-    }
-    setStatus(`${id} · ${q} · ${rep}`);
-  } catch (e) {
-    if (token === loadToken) setStatus("no data for this selection", true);
-    console.error(e);
+  if (time) url += `&datetime=${encodeURIComponent(time)}`;
+  return url;
+}
+
+// Remove every frame tileset from the scene (destroying its GPU buffers — the
+// primitive collection's destroyPrimitives:true does the destroy on remove()).
+function clearFrames() {
+  for (const ts of frames) if (ts) viewer.scene.primitives.remove(ts);
+  frames = [];
+}
+
+// (Re)build the whole frame set for the current params: one preloaded, hidden
+// tileset per timestamp (or a single latest-volume frame when the collection has
+// no time axis). The active frame is revealed; on `reframe` the camera frames it.
+async function loadFrames(reframe = false) {
+  const id = $coll.value, q = $qty.value, rep = $rep.value || "points";
+  const num = $num.value.trim();
+  if (!id || !q) return;
+  const token = ++loadToken;
+  stopPlaying();
+  clearFrames();
+  currentRep = rep;
+  pointsFetchFloor = rep === "points" ? (num === "" ? -Infinity : parseFloat(num)) : null;
+
+  // Animate the most-recent MAX_FRAMES of the manifest ([null] = the single
+  // latest-volume frame when there's no time axis).
+  frameTimes = times.length ? times.slice(-MAX_FRAMES) : [null];
+  if (frameIdx >= frameTimes.length) frameIdx = frameTimes.length - 1;
+  if (frameIdx < 0) frameIdx = 0;
+  const capped = times.length > frameTimes.length ? ` (latest ${frameTimes.length} of ${times.length})` : "";
+  setStatus(`loading ${id} · ${q} · ${rep}${frameTimes.length > 1 ? ` · ${frameTimes.length} frames${capped}` : ""}…`);
+
+  // Preload all frames concurrently, each hidden. `preloadWhenHidden` is
+  // load-bearing: without it a hidden tileset doesn't fetch tiles, so the first
+  // reveal of each frame would stall — with it, every frame's content streams in
+  // the background and showing it is an instant visibility flip. (Bounded by the
+  // engine's retained-volume count; a sliding window would suit much longer
+  // sequences — a follow-up.) `fromUrl` rejects on a 4xx (e.g. no data).
+  const built = await Promise.all(frameTimes.map((t) =>
+    Cesium.Cesium3DTileset.fromUrl(tilesetUrl(t),
+      { maximumScreenSpaceError: 1, show: false, preloadWhenHidden: true })
+      .catch((e) => { console.error("frame", t, e); return null; })
+  ));
+  if (token !== loadToken) { for (const ts of built) if (ts) ts.destroy(); return; } // superseded
+
+  frames = built;
+  for (const ts of frames) if (ts) viewer.scene.primitives.add(ts);
+  if (rep === "points") applyPointStyle(pointsFetchFloor);
+  syncTimeBar();
+  showFrame(frameIdx);
+
+  if (reframe) {
+    const ts = frames[frameIdx];
+    if (ts) await viewer.zoomTo(ts, new Cesium.HeadingPitchRange(
+      Cesium.Math.toRadians(45), Cesium.Math.toRadians(-28), 300000));
+    if (token !== loadToken) return; // superseded during the zoomTo animation
+  }
+  if (!frames.some(Boolean)) setStatus("no data for this selection", true);
+  else updateStatus();
+}
+
+// Reveal frame `i` (wrapping), hide the rest — a pure visibility toggle, the
+// no-stall core of playback.
+function showFrame(i) {
+  if (!frames.length) return;
+  frameIdx = ((i % frames.length) + frames.length) % frames.length;
+  for (let j = 0; j < frames.length; j++) if (frames[j]) frames[j].show = (j === frameIdx);
+  $time.value = String(frameIdx);
+  updateTimeLabel();
+  updateStatus();
+  viewer.scene.requestRender();
+}
+
+// Point-cloud style applied to EVERY frame so the whole animation filters/sizes
+// consistently: drop points below `min` and scale each dot by its reflectivity
+// (the per-point `value` batch property). Both read `${value}` (a mesh ignores
+// both).
+function applyPointStyle(min) {
+  const cond = Number.isFinite(min) ? "${value} >= " + min : "true";
+  for (const ts of frames) {
+    if (!ts) continue;
+    ts.style = new Cesium.Cesium3DTileStyle({
+      show: cond,
+      // Steep ramp so weak vs strong reads clearly: ~1 px at 5 dBZ up to 16 px at
+      // 55 dBZ (slope 0.3). Weak clutter stays a speck; storm cores are fat dots.
+      pointSize: "clamp((${value} - 5.0) * 0.3 + 1.0, 1.0, 16.0)",
+    });
   }
 }
 
-// Point-cloud style: drop points below `min` and scale each dot by its
-// reflectivity (the per-point `value` batch property) — faint/small for weak
-// echo, big for strong. Both expressions read `${value}`, which is why the
-// `.pnts` carries it. (A mesh ignores both.)
-function applyPointStyle(min) {
-  if (!current) return;
-  const cond = Number.isFinite(min) ? "${value} >= " + min : "true";
-  current.style = new Cesium.Cesium3DTileStyle({
-    show: cond,
-    // Steep ramp so weak vs strong reads clearly: ~1 px at 5 dBZ up to 16 px at
-    // 55 dBZ (slope 0.3). Weak clutter stays a speck; storm cores are fat dots.
-    pointSize: "clamp((${value} - 5.0) * 0.3 + 1.0, 1.0, 16.0)",
-  });
-}
-
-// The `min dBZ` field for a point cloud filters CLIENT-SIDE (no re-fetch) by
-// restyling `show` — instant, since every point carries its value. We can only
-// hide points we already have, so dropping below the fetched floor re-fetches
-// the (larger) set; raising the threshold is always client-side.
-//   - `pointsClientFilter()` runs live on every `input` (fast, points-in-range).
-//   - `onNumCommit()` runs on `change` and re-fetches when needed: meshes, or a
-//     point cloud that needs values below its fetched floor.
+// The `min dBZ` field for a point cloud filters CLIENT-SIDE across all frames (no
+// re-fetch) by restyling `show` — instant, since every point carries its value.
+// We can only hide points we already have, so dropping below the fetched floor
+// re-fetches the (larger) set; raising the threshold is always client-side.
 function pointsClientFilter() {
-  if (($rep.value || "points") !== "points" || currentRep !== "points" || !current) return false;
+  if (($rep.value || "points") !== "points" || currentRep !== "points" || !frames.some(Boolean)) return false;
   const min = parseFloat($num.value);
   if (!Number.isFinite(min) || pointsFetchFloor === null || min < pointsFetchFloor) return false;
   applyPointStyle(min);
   viewer.scene.requestRender();
-  setStatus(`${$coll.value} · ${$qty.value} · points · ≥ ${min} dBZ`);
+  updateStatus(`≥ ${min} dBZ`);
   return true;
 }
 
 function onNumCommit() {
   // Points within the fetched range already restyled live → nothing to fetch.
   if (pointsClientFilter()) return;
-  loadTileset(false); // mesh threshold/resolution, or points needing more data
+  loadFrames(false); // mesh threshold/resolution, or points needing more data
+}
+
+// ── Time scrubber ──────────────────────────────────────────────────────────
+// Show the bar only for a genuine time axis (>1 volume); size the slider to the
+// frames and seek to the active one.
+function syncTimeBar() {
+  const n = frameTimes.length;
+  // Hide for a single frame, and also when every frame failed to load (the
+  // manifest had >1 time but nothing rendered) — no point showing a dead slider.
+  $timebar.hidden = n <= 1 || !frames.some(Boolean);
+  $time.max = String(Math.max(0, n - 1));
+  $time.value = String(frameIdx);
+  updateTimeLabel();
+}
+
+// Compact label for the active timestamp, e.g. `2026-05-15 00:05Z  (1/3)`
+// (`2026-05-15T00:05:00Z` → drop the `T` and the trailing `:00` seconds).
+function updateTimeLabel() {
+  const t = frameTimes[frameIdx];
+  if (!t) { $timeLabel.textContent = ""; return; }
+  const pretty = t.replace("T", " ").replace(/:\d{2}Z$/, "Z");
+  $timeLabel.textContent = `${pretty}  (${frameIdx + 1}/${frameTimes.length})`;
+}
+
+function updateStatus(extra) {
+  const base = `${$coll.value} · ${$qty.value} · ${$rep.value || "points"}`;
+  setStatus(extra ? `${base} · ${extra}` : base);
+}
+
+function startPlaying() {
+  // Need >1 frame AND at least one that actually loaded — otherwise play would
+  // loop forever showing nothing (every frame's fromUrl can fail → all null).
+  if (playing || frames.length <= 1 || !frames.some(Boolean)) return;
+  playing = true;
+  $play.textContent = "⏸";
+  playTimer = setInterval(() => showFrame(frameIdx + 1), FRAME_MS);
+}
+
+function stopPlaying() {
+  playing = false;
+  $play.textContent = "▶";
+  if (playTimer) { clearInterval(playTimer); playTimer = null; }
 }
 
 // Collection switch → reframe (new volume, possibly elsewhere). Every other
@@ -333,16 +460,20 @@ function onNumCommit() {
 // load-bearing: passing the handler bare would feed the DOM Event as `reframe`,
 // which is truthy and would reframe on every filter tweak.)
 $coll.addEventListener("change", () => loadCollectionMeta(true));
-$qty.addEventListener("change", () => loadTileset(false));
+$qty.addEventListener("change", () => loadFrames(false));
 // Switching representation relabels + re-defaults the numeric field, toggles the
-// Resolution selector, then reloads (camera preserved).
-$rep.addEventListener("change", () => { syncNumField(); loadTileset(false); });
-$res.addEventListener("change", () => loadTileset(false));
+// Resolution selector, then rebuilds the frames (camera preserved).
+$rep.addEventListener("change", () => { syncNumField(); loadFrames(false); });
+$res.addEventListener("change", () => loadFrames(false));
 // Live: a point cloud re-filters client-side as you drag the field. Commit
 // (`change`): re-fetch for meshes, or for points that need values below their
 // fetched floor.
 $num.addEventListener("input", pointsClientFilter);
 $num.addEventListener("change", onNumCommit);
+// Time scrubber: play/pause toggles the loop; dragging the slider seeks (and
+// pauses, so the frame you drag to stays put).
+$play.addEventListener("click", () => { playing ? stopPlaying() : startPlaying(); });
+$time.addEventListener("input", () => { stopPlaying(); showFrame(parseInt($time.value, 10) || 0); });
 loadCollections();
 </script>
 </body>
