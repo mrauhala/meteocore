@@ -144,12 +144,26 @@ pub fn encode_voxels_glb(grid: &VoxelGrid) -> Result<Vec<u8>, Tiles3dError> {
     assemble_glb(&gltf, bin)
 }
 
-/// Light separable 3-D smoothing of the (NaN-filled) grid in its native
-/// `[radius, angle, height]` index order — a `[0.25, 0.5, 0.25]` kernel along
-/// each axis. Merges the cellular radar field so a voxel render doesn't show one
-/// blob per cell. Angle wraps (full circle); radius/height clamp at the ends.
-/// Three passes ping-pong between two buffers.
+/// Separable 3-D smoothing of the (NaN-filled) grid in its native
+/// `[radius, angle, height]` index order — `PASSES` applications of a
+/// `[0.25, 0.5, 0.25]` kernel along each axis.
+///
+/// Radar echo is **cellular** (each native cell a local reflectivity maximum)
+/// and the voxel grid is coarse in height (~300 m layers), so a *single* pass
+/// still leaves the cell floors (height-layer boundaries) and walls
+/// (radial/angular boundaries) visible under GPU trilinear interpolation when
+/// the camera is close or inside the volume — trilinear is only C0, so every
+/// cell boundary is a faint crease whose visibility scales with the field's
+/// cell-to-cell contrast. Repeated passes widen the effective Gaussian
+/// (`sigma ≈ sqrt(PASSES/2)` cells), dropping that contrast until the field
+/// reads as a continuous volume. Angle wraps (full circle); radius/height clamp
+/// at the ends. Each axis sweep ping-pongs `src`↔`dst`, so the result is always
+/// in `src` regardless of the pass count.
 fn smooth_grid(vals: Vec<f32>, dims: [usize; 3]) -> Vec<f32> {
+    // 4 passes ⇒ sigma ≈ 1.4 cells (FWHM ≈ 3.3): dissolves the cell lattice —
+    // height floors and the fainter angular-sector walls — at close zoom without
+    // smearing storm cores into a flat haze.
+    const PASSES: usize = 4;
     let [n_r, n_a, n_h] = dims;
     let idx = |r: usize, a: usize, h: usize| VoxelGrid::index_of(dims, r, a, h);
     let blur = |lo: f32, mid: f32, hi: f32| 0.25 * lo + 0.5 * mid + 0.25 * hi;
@@ -157,39 +171,42 @@ fn smooth_grid(vals: Vec<f32>, dims: [usize; 3]) -> Vec<f32> {
     let mut src = vals;
     let mut dst = vec![0.0f32; src.len()];
 
-    // Height (clamp).
-    for r in 0..n_r {
+    for _ in 0..PASSES {
+        // Height (clamp).
+        for r in 0..n_r {
+            for a in 0..n_a {
+                for h in 0..n_h {
+                    let lo = src[idx(r, a, h.saturating_sub(1))];
+                    let hi = src[idx(r, a, (h + 1).min(n_h - 1))];
+                    dst[idx(r, a, h)] = blur(lo, src[idx(r, a, h)], hi);
+                }
+            }
+        }
+        std::mem::swap(&mut src, &mut dst);
+        // Angle (periodic).
+        for r in 0..n_r {
+            for h in 0..n_h {
+                for a in 0..n_a {
+                    let lo = src[idx(r, (a + n_a - 1) % n_a, h)];
+                    let hi = src[idx(r, (a + 1) % n_a, h)];
+                    dst[idx(r, a, h)] = blur(lo, src[idx(r, a, h)], hi);
+                }
+            }
+        }
+        std::mem::swap(&mut src, &mut dst);
+        // Radius (clamp).
         for a in 0..n_a {
             for h in 0..n_h {
-                let lo = src[idx(r, a, h.saturating_sub(1))];
-                let hi = src[idx(r, a, (h + 1).min(n_h - 1))];
-                dst[idx(r, a, h)] = blur(lo, src[idx(r, a, h)], hi);
+                for r in 0..n_r {
+                    let lo = src[idx(r.saturating_sub(1), a, h)];
+                    let hi = src[idx((r + 1).min(n_r - 1), a, h)];
+                    dst[idx(r, a, h)] = blur(lo, src[idx(r, a, h)], hi);
+                }
             }
         }
+        std::mem::swap(&mut src, &mut dst);
     }
-    std::mem::swap(&mut src, &mut dst);
-    // Angle (periodic).
-    for r in 0..n_r {
-        for h in 0..n_h {
-            for a in 0..n_a {
-                let lo = src[idx(r, (a + n_a - 1) % n_a, h)];
-                let hi = src[idx(r, (a + 1) % n_a, h)];
-                dst[idx(r, a, h)] = blur(lo, src[idx(r, a, h)], hi);
-            }
-        }
-    }
-    std::mem::swap(&mut src, &mut dst);
-    // Radius (clamp).
-    for a in 0..n_a {
-        for h in 0..n_h {
-            for r in 0..n_r {
-                let lo = src[idx(r.saturating_sub(1), a, h)];
-                let hi = src[idx((r + 1).min(n_r - 1), a, h)];
-                dst[idx(r, a, h)] = blur(lo, src[idx(r, a, h)], hi);
-            }
-        }
-    }
-    dst
+    src
 }
 
 /// The `EXT_structural_metadata` schema for one scalar voxel property named
