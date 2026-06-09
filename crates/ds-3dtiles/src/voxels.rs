@@ -53,7 +53,12 @@ pub fn encode_voxels_glb(grid: &VoxelGrid) -> Result<Vec<u8>, Tiles3dError> {
         return Err(Tiles3dError::Empty);
     }
     let count_u32 = u32::try_from(count).map_err(|_| Tiles3dError::TooLarge("voxel count"))?;
-    let byte_len = u32::try_from(count * 4).map_err(|_| Tiles3dError::TooLarge("voxel buffer"))?;
+    // Checked `* 4` (one f32/cell): caller may not honour MAX_VOXELS, so don't
+    // let the byte length wrap a `usize` before the `u32` bound catches it.
+    let byte_len = count
+        .checked_mul(4)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or(Tiles3dError::TooLarge("voxel buffer"))?;
 
     // Transpose our `[radius, angle, height]` grid (height-fastest) into the glТF
     // cylinder layout `[radius, height, angle]` (radius-fastest → height →
@@ -242,6 +247,10 @@ pub fn tileset_json_voxels(
                 }
             }
         },
+        // 0 is correct here (NOT the `> 0` rule the .pnts/mesh tilesets need):
+        // this is a single-tile implicit-tiling voxel set — there is no finer LOD
+        // to refine to, and CesiumJS's voxel traversal renders the leaf directly.
+        // (When octree LOD lands, the non-leaf levels get a positive error.)
         "geometricError": 0.0,
         "extensionsUsed": ["3DTILES_bounding_volume_cylinder", "3DTILES_content_voxels"],
         "extensionsRequired": ["3DTILES_bounding_volume_cylinder", "3DTILES_content_voxels"],

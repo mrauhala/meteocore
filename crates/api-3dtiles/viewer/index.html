@@ -418,6 +418,10 @@ async function loadVoxel(token) {
 // sentinel are transparent; stronger echo ramps blue→green→yellow→red→magenta
 // and grows more opaque.
 function voxelShader(quantity) {
+  // `quantity` is interpolated into GLSL source — guard the property name even
+  // though it comes from server metadata (ODIM quantities are A-Z0-9_). Sandboxed
+  // to our own GPU context, but cheap defence-in-depth.
+  if (!/^[A-Z][A-Z0-9_]*$/.test(quantity)) throw new Error("invalid quantity: " + quantity);
   return new Cesium.CustomShader({
     fragmentShaderText: [
       "void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {",

@@ -780,9 +780,15 @@ pub async fn get_voxel_subtree(
 ) -> Result<Response, Tiles3dError> {
     let state = state.load_full();
     let (engine, _config) = lookup(&state, &id)?;
-    if engine.volume_info().voxel_grid.is_none() {
+    // Same support/coverage gate (and status codes) as the tileset/content
+    // handlers, so the three voxel routes agree on whether a collection serves
+    // voxels: no voxel grid → 400, no coverage yet → 404.
+    let caps = engine.volume_info().voxel_grid.ok_or_else(|| {
+        Tiles3dError::BadRequest(format!("collection '{id}' does not support voxels"))
+    })?;
+    if !(caps.radius_m > 0.0 && caps.height_m > 0.0) {
         return Err(Tiles3dError::NotFound(format!(
-            "collection '{id}' has no voxels"
+            "collection '{id}' has no voxel coverage yet"
         )));
     }
     Ok((
