@@ -22,7 +22,7 @@
 //!   constant-availability subtree.
 
 use ds_core::geo::geodetic_to_ecef;
-use ds_core::volume::VoxelGrid;
+use ds_core::volume::{VoxelGrid, NO_ECHO_FLOOR_DBZ};
 use serde_json::json;
 
 use crate::Tiles3dError;
@@ -31,11 +31,6 @@ use crate::Tiles3dError;
 /// `0x80000000`, ellipsoid `0x80000001`; the high bit marks voxels, the low bits
 /// the shape. Read from the CesiumJS fixtures (not the draft README).
 const VOXEL_MODE_CYLINDER: u64 = 2_147_483_650;
-
-/// Finite sentinel written for `NaN`/nodata cells (the cone of silence / clear
-/// air the grid leaves unmeasured). Declared as the attribute's `noData`, so
-/// CesiumJS treats those cells as empty. Well outside any physical dBZ.
-const NODATA_SENTINEL: f32 = -9999.0;
 
 /// Encode a cylindrical [`VoxelGrid`] as an `EXT_primitive_voxels` glТF `.glb`
 /// (self-contained: the float data is embedded in the BIN chunk). The single
@@ -62,9 +57,17 @@ pub fn encode_voxels_glb(grid: &VoxelGrid) -> Result<Vec<u8>, Tiles3dError> {
 
     // Transpose our `[radius, angle, height]` grid (height-fastest) into the glТF
     // cylinder layout `[radius, height, angle]` (radius-fastest → height →
-    // angle-slowest). Track the finite value range for the transfer function;
-    // NaN/nodata → the sentinel.
+    // angle-slowest), and fill **unmeasured** (`NaN`: cone of silence, below the
+    // lowest beam, beyond range) cells with the no-echo floor — NOT an extreme
+    // nodata sentinel. CesiumJS *trilinearly interpolates* the metadata before
+    // the shader, so an extreme sentinel makes the echo→unmeasured transition
+    // razor-sharp and grid-aligned → flat **walls and floors** at the volume
+    // boundaries. Filling with the clear-air floor (which the transfer function
+    // makes transparent, like real clear air) keeps those transitions gentle.
+    // So no `noData` is declared — the whole cylinder is a dense field whose low
+    // end the transfer function fades out.
     let mut bin = Vec::with_capacity(count * 4);
+    let mut any_finite = false;
     let mut vmin = f32::INFINITY;
     let mut vmax = f32::NEG_INFINITY;
     for i_a in 0..n_a {
@@ -72,18 +75,19 @@ pub fn encode_voxels_glb(grid: &VoxelGrid) -> Result<Vec<u8>, Tiles3dError> {
             for i_r in 0..n_r {
                 let v = grid.values[grid.index(i_r, i_a, i_h)];
                 let f = if v.is_finite() {
-                    vmin = vmin.min(v);
-                    vmax = vmax.max(v);
+                    any_finite = true;
                     v
                 } else {
-                    NODATA_SENTINEL
+                    NO_ECHO_FLOOR_DBZ
                 };
+                vmin = vmin.min(f);
+                vmax = vmax.max(f);
                 bin.extend_from_slice(&f.to_le_bytes());
             }
         }
     }
-    if !vmin.is_finite() {
-        return Err(Tiles3dError::Empty); // every cell nodata
+    if !any_finite {
+        return Err(Tiles3dError::Empty); // every cell unmeasured — nothing to render
     }
 
     let q = grid.quantity.clone();
@@ -97,10 +101,10 @@ pub fn encode_voxels_glb(grid: &VoxelGrid) -> Result<Vec<u8>, Tiles3dError> {
                 "mode": VOXEL_MODE_CYLINDER,
                 "attributes": { "_VOXEL": 0 },
                 "extensions": {
-                    "EXT_primitive_voxels": {
-                        "dimensions": [n_r, n_h, n_a],
-                        "noData": { "_VOXEL": [NODATA_SENTINEL] }
-                    }
+                    // No `noData`: unmeasured cells carry the no-echo floor (a
+                    // real low dBZ the transfer function fades out), so the field
+                    // is dense and CesiumJS interpolates it without hard walls.
+                    "EXT_primitive_voxels": { "dimensions": [n_r, n_h, n_a] }
                 }
             }]
         }],
@@ -140,8 +144,7 @@ fn voxel_schema(quantity: &str) -> serde_json::Value {
                 "properties": {
                     quantity: {
                         "type": "SCALAR",
-                        "componentType": "FLOAT32",
-                        "noData": NODATA_SENTINEL
+                        "componentType": "FLOAT32"
                     }
                 }
             }
@@ -402,15 +405,30 @@ mod tests {
     }
 
     #[test]
-    fn nodata_becomes_sentinel_and_all_nodata_is_empty() {
+    fn unmeasured_becomes_floor_and_all_unmeasured_is_empty() {
         let mut g = grid(2, 2, 2);
         let idx = g.index(0, 0, 0);
         g.values[idx] = f32::NAN;
         let glb = encode_voxels_glb(&g).expect("encode");
-        let (_, bin) = parse_glb(&glb);
+        let (j, bin) = parse_glb(&glb);
         let f = |i: usize| f32::from_le_bytes(bin[i * 4..i * 4 + 4].try_into().unwrap());
-        assert_eq!(f(0), NODATA_SENTINEL, "NaN cell → sentinel");
+        // Unmeasured → the no-echo floor (a real low dBZ), NOT an extreme nodata
+        // sentinel — so CesiumJS's interpolation has no razor-sharp wall.
+        assert_eq!(f(0), NO_ECHO_FLOOR_DBZ, "NaN cell → no-echo floor");
+        // No `noData` is declared, on the primitive or the schema.
+        assert!(
+            j["meshes"][0]["primitives"][0]["extensions"]["EXT_primitive_voxels"]
+                .get("noData")
+                .is_none()
+        );
+        assert!(
+            j["extensions"]["EXT_structural_metadata"]["schema"]["classes"]["voxel"]["properties"]
+                ["DBZH"]
+                .get("noData")
+                .is_none()
+        );
 
+        // Every cell unmeasured → nothing real to render → Empty.
         let mut empty = grid(2, 2, 2);
         empty.values.iter_mut().for_each(|v| *v = f32::NAN);
         assert!(matches!(
