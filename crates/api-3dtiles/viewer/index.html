@@ -417,7 +417,9 @@ function onNumCommit() {
 // frames and seek to the active one.
 function syncTimeBar() {
   const n = frameTimes.length;
-  $timebar.hidden = n <= 1;
+  // Hide for a single frame, and also when every frame failed to load (the
+  // manifest had >1 time but nothing rendered) — no point showing a dead slider.
+  $timebar.hidden = n <= 1 || !frames.some(Boolean);
   $time.max = String(Math.max(0, n - 1));
   $time.value = String(frameIdx);
   updateTimeLabel();
@@ -438,7 +440,9 @@ function updateStatus(extra) {
 }
 
 function startPlaying() {
-  if (playing || frames.length <= 1) return;
+  // Need >1 frame AND at least one that actually loaded — otherwise play would
+  // loop forever showing nothing (every frame's fromUrl can fail → all null).
+  if (playing || frames.length <= 1 || !frames.some(Boolean)) return;
   playing = true;
   $play.textContent = "⏸";
   playTimer = setInterval(() => showFrame(frameIdx + 1), FRAME_MS);
