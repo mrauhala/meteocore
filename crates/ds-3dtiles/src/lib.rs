@@ -103,12 +103,15 @@ pub fn encode_pnts(
     let points_len = u32::try_from(count).map_err(|_| Tiles3dError::TooLarge("POINTS_LENGTH"))?;
 
     // Front-load the byte-budget check too: reject an oversized cloud *before*
-    // allocating (POSITION 12 B + RGB 3 B + batch-table value 4 B per point, +
-    // section padding), so a caller bypassing the engine's MAX_POINTS cap can't
-    // force a multi-GB allocation that only errors afterward.
+    // allocating (POSITION 12 B + RGB 3 B + batch-table value 4 B per point, plus
+    // the fixed overhead), so a caller bypassing the engine's MAX_POINTS cap can't
+    // force a multi-GB allocation that only errors afterward. The `+128` covers
+    // the fixed overhead conservatively (HEADER 28 + the two JSON blobs + ≤4
+    // section alignments); the authoritative guard is the `u32::try_from(total)`
+    // on the assembled size below, so this only needs to be in the ballpark.
     if count
         .checked_mul(19)
-        .and_then(|n| n.checked_add(64))
+        .and_then(|n| n.checked_add(128))
         .is_none_or(|n| u32::try_from(n).is_err())
     {
         // Distinct label from the post-build check below so the two guards are

@@ -418,10 +418,14 @@ pub async fn get_tileset(
             // `content.uri` is self-describing.
             let resolution = Resolution::parse(params.resolution.as_deref())?;
             query.push_str(&format!("&resolution={}", resolution.as_str()));
-            // The `content.glb` handler defaults to isosurface; tag echo-top.
-            if representation == Representation::EchoTop {
-                query.push_str("&representation=echotop");
-            }
+            // Tag the mesh product explicitly for *both* (not just echo-top), so
+            // the `content.uri` is unambiguous and doesn't depend on the
+            // content.glb handler's absent→isosurface default — a future default
+            // change there can't then silently repoint old isosurface tilesets.
+            query.push_str(match representation {
+                Representation::EchoTop => "&representation=echotop",
+                _ => "&representation=isosurface",
+            });
             let content_uri = format!("content.glb?{query}");
             ds_3dtiles::tileset_json_glb(region, &content_uri, rtc)
                 .map_err(|e| Tiles3dError::Internal(format!("tileset build failed: {e}")))?

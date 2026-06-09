@@ -548,9 +548,13 @@ async fn isosurface_tileset_has_transform_and_glb_content() {
     let t = v["root"]["transform"].as_array().unwrap();
     assert_eq!(t.len(), 16);
     // Content points at the .glb, carrying the resolved quantity + threshold +
-    // the (defaulted) resolution tier, so the content fetch is deterministic.
+    // the (defaulted) resolution tier + the explicit representation, so the
+    // content fetch is deterministic and unambiguous.
     let uri = v["root"]["content"]["uri"].as_str().unwrap();
-    assert_eq!(uri, "content.glb?quantity=DBZH&threshold=20&resolution=med");
+    assert_eq!(
+        uri,
+        "content.glb?quantity=DBZH&threshold=20&resolution=med&representation=isosurface"
+    );
     // The region bounding volume is still present (unaffected by the transform).
     assert_eq!(
         v["root"]["boundingVolume"]["region"]
