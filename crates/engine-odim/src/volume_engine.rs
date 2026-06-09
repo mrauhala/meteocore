@@ -1298,6 +1298,12 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         default_quantity,
         default_unit,
         region,
+        // PVOL site views implement `read_voxel_grid`, so the isosurface
+        // representation is available; the origin is the antenna (the point the
+        // voxel grid — and thus the isosurface mesh — is built relative to).
+        voxel_grid: Some(ds_core::volume::VoxelGridCaps {
+            origin: [site.lon, site.lat, site.height],
+        }),
     });
 
     Some(SiteMeta {

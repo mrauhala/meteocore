@@ -69,6 +69,24 @@ pub struct VolumeInfo {
     /// bounding volume without sampling the full volume. `None` if the
     /// collection has no known spatial extent yet.
     pub region: Option<[f64; 6]>,
+    /// Voxel-grid capability **and** the metadata it requires, coupled in one
+    /// `Option` so "supports but no origin" is unrepresentable. `Some` ⇒ the
+    /// engine implements [`VoxelGrid`] sampling (via
+    /// [`VolumeEngine::read_voxel_grid`]), so the **isosurface** 3D Tiles
+    /// representation is available alongside the `.pnts` point cloud; `None` ⇒
+    /// point-cloud only (the default `read_voxel_grid` is unsupported).
+    pub voxel_grid: Option<VoxelGridCaps>,
+}
+
+/// Voxel-grid capability metadata for a [`VolumeInfo`] — present iff the engine
+/// can produce a [`VoxelGrid`] (and thus an isosurface mesh).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VoxelGridCaps {
+    /// WGS84 `[lon_deg, lat_deg, height_m]` of the volume origin (the radar
+    /// antenna) — the point all isosurface-mesh positions are stored relative
+    /// to. Lets the 3D Tiles layer build the glTF tile `transform` (antenna
+    /// ECEF) **without** sampling the grid.
+    pub origin: [f64; 3],
 }
 
 /// A regular **cylindrical voxel grid** sampled from a volume — the structured

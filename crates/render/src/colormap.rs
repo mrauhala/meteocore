@@ -9,6 +9,14 @@ pub trait ColorMap: Send + Sync {
     fn nodata_color(&self) -> [u8; 4] {
         [0, 0, 0, 0]
     }
+
+    /// The continuous `(min, max)` value domain this colormap ramps over, if it
+    /// has one. Used e.g. as the "no-echo" floor when sealing a 3D Tiles
+    /// isosurface (the bottom of the reflectivity ramp). Defaults to `None`
+    /// (a categorical / domainless map).
+    fn domain(&self) -> Option<(f64, f64)> {
+        None
+    }
 }
 
 /// A color stop for defining gradient colormaps.
@@ -95,6 +103,10 @@ impl LutColorMap {
 impl ColorMap for LutColorMap {
     fn nodata_color(&self) -> [u8; 4] {
         self.nodata_color
+    }
+
+    fn domain(&self) -> Option<(f64, f64)> {
+        Some((self.min, self.max))
     }
 
     fn color(&self, value: Option<f64>) -> [u8; 4] {

@@ -21,6 +21,12 @@ use ds_core::volume::VolumePointCloud;
 use ds_render::ColorMap;
 use serde_json::json;
 
+/// Isosurface meshing of a [`ds_core::volume::VoxelGrid`] into glTF `.glb`
+/// triangle-mesh content (#357) — the verifiable, any-client 3-D path next to
+/// the `.pnts` point cloud.
+pub mod isosurface;
+pub use isosurface::{encode_isosurface_glb, tileset_json_glb};
+
 /// Top-level tileset geometric error. Must be > 0 (see module docs); the value
 /// only needs to exceed the root's so CesiumJS refines to the content.
 const TILESET_GEOMETRIC_ERROR: f64 = 1.0e5;
@@ -55,6 +61,13 @@ pub enum Tiles3dError {
     /// (`west > east` is *not* inverted — it's an antimeridian-crossing region.)
     #[error("invalid region (inverted/degenerate bounds): {0:?}")]
     InvalidRegion([f64; 6]),
+    /// The isosurface `background` (the value `NaN`/clear-air cells are sealed
+    /// to) is not strictly below the `threshold`. With `background >= threshold`,
+    /// unmeasured cells would be treated as *inside* the surface, inverting it
+    /// into something with no physical meaning. Rejected rather than silently
+    /// returning a bogus mesh.
+    #[error("isosurface background {background} must be < threshold {threshold}")]
+    BackgroundNotBelowThreshold { background: f64, threshold: f64 },
 }
 
 /// Encode a point cloud as a 3D Tiles **`.pnts`** tile (the 3D Tiles 1.0 Point
@@ -178,6 +191,18 @@ pub fn tileset_json_for_region(
     region: [f64; 6],
     content_uri: &str,
 ) -> Result<String, Tiles3dError> {
+    let tileset = tileset_value_for_region(region, content_uri)?;
+    Ok(serde_json::to_string_pretty(&tileset).expect("tileset serializes"))
+}
+
+/// Build the `tileset.json` as a [`serde_json::Value`] (the validation +
+/// construction shared by [`tileset_json_for_region`] and the glTF variant
+/// `isosurface::tileset_json_glb`, which injects a `transform` — so it builds
+/// on this `Value` directly instead of re-parsing a serialized string).
+pub(crate) fn tileset_value_for_region(
+    region: [f64; 6],
+    content_uri: &str,
+) -> Result<serde_json::Value, Tiles3dError> {
     if content_uri.is_empty()
         || content_uri.starts_with('/')
         || content_uri.contains("://")
@@ -199,7 +224,7 @@ pub fn tileset_json_for_region(
     // content type: CesiumJS keys its tileset loader off this version, and a
     // 1.1 tileset happily references legacy `.pnts` content. Do not "fix" this
     // to "1.0" — it would change which loader path CesiumJS takes.
-    let tileset = json!({
+    Ok(json!({
         "asset": { "version": "1.1" },
         "geometricError": TILESET_GEOMETRIC_ERROR,
         "root": {
@@ -208,8 +233,7 @@ pub fn tileset_json_for_region(
             "refine": "ADD",
             "content": { "uri": content_uri },
         }
-    });
-    Ok(serde_json::to_string_pretty(&tileset).expect("tileset serializes"))
+    }))
 }
 
 #[cfg(test)]

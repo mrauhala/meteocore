@@ -234,7 +234,9 @@ Volumetric weather as OGC 3D Tiles — radar polar volumes today. The chain:
 cell, placed at its true ECEF position via the 4/3-Earth beam model); the
 framework-free `ds-3dtiles` crate encodes it to a `.pnts` tile + `tileset.json`;
 `api-3dtiles` serves it over HTTP. Engines return the domain type, never bytes
-(same rule as `MapEngine`→`ds-render`).
+(same rule as `MapEngine`→`ds-render`). `ds-3dtiles` has two encoders: the
+`.pnts` point cloud, and (#357) an **isosurface** mesher that turns a `VoxelGrid`
+into a glTF `.glb` triangle mesh.
 
 - **Trait:** `VolumeEngine::read_point_cloud(quantity, time, min_value, reference_time)`
   → `VolumePointCloud`; `read_voxel_grid(quantity, time, dims, reference_time)`
@@ -249,21 +251,65 @@ framework-free `ds-3dtiles` crate encodes it to a `.pnts` tile + `tileset.json`;
   cone of silence). Unknown quantity ⇒ `InvalidParameter` (→ 400). The
   `EXT_primitive_voxels` glTF *encoding* of a `VoxelGrid` is a follow-up (#351) —
   draft spec, render-verify against CesiumJS ≥1.127.
+- **Isosurface meshing (#357, `ds-3dtiles/src/isosurface.rs`):**
+  `encode_isosurface_glb(grid, threshold, color)` extracts a constant-value
+  shell (e.g. "the 20 dBZ surface") from a `VoxelGrid` as a glTF 2.0 `.glb`
+  triangle mesh — a **plain glTF mesh that renders in any 3D Tiles 1.1 client**
+  (the verifiable alternative to the draft `EXT_primitive_voxels` voxel path).
+  Uses **marching tetrahedra**, not marching cubes: a tet is K4, so the surface
+  crosses exactly `|inside|·|outside|` edges and the topology is correct by
+  construction (no 256-case table to mis-transcribe — chosen because the output
+  isn't render-checkable at encode time). Cube → 6 tets (Kuhn split); any tet
+  touching a `NaN` corner is skipped (no surface across the cone of silence).
+  Surface vertices map fractional cell index → ground/azimuth/height (same
+  cell-centre convention as the engine sampler) → `destination_point` +
+  `geodetic_to_ecef` (both now in `ds_core::geo`), stored antenna-relative and
+  pre-flipped Z-up→Y-up because a runtime re-applies Y-up→Z-up to **glTF**
+  content (the flip the `.pnts` path skips — pnts isn't glTF). **`background`
+  sealing (load-bearing for radar):** the grid stores `NaN` for *both* clear-air
+  (`undetect`) and unmeasured (`nodata`/cone of silence) — `RawPixels::sample`
+  masks both identically (reader.rs). `encode_isosurface_glb(grid, threshold,
+  color, background)` with `background=Some(bg<threshold)` treats `NaN` as
+  no-echo so the surface **closes into solid blobs**; `None` skips `NaN`-touching
+  tets and the echo→clear-air boundary renders as open vertical *curtains*. The
+  demo seals with `Some(-32.0)` (the dBZ floor). Splitting `undetect` from
+  `nodata` in the engine sampler (so only the real cone of silence stays open) is
+  a follow-up. `tileset_json_glb`
+  carries the antenna ECEF as the tile **`transform`** (glTF content has no
+  embedded origin, unlike `.pnts` `RTC_CENTER`); the geodetic `region` is
+  unaffected by it. Demo: `cargo run -p engine-odim --example gen_isosurface`
+  (writes `.glb` + `tileset.json` + a token-free CesiumJS viewer). The mesh is
+  **render-verified live** (CesiumJS 1.124): the shell sits correctly over the
+  antenna, upright (so the Y-up→Z-up flip is right for direct 1.1 `.glb`
+  content), and sealing closes the curtains into solid blobs.
+- **Both representations are served from the API** (selected by
+  `?representation=points|isosurface` on `tileset.json`): `points` → `.pnts`
+  (region-only tileset, `RTC_CENTER` self-places), `isosurface` → `.glb` plus a
+  tile **`transform`** = the antenna ECEF. Capability + the origin it needs are
+  coupled in one field: `VolumeInfo.voxel_grid: Option<VoxelGridCaps { origin }>`
+  — `Some` ⇒ isosurface available and the origin is present (so the tileset is
+  built without sampling, and "supports but no origin" is unrepresentable, never
+  a 500). It drives the collection JSON's `representations` array → the viewer's
+  representation toggle. The isosurface floor (seal) = `ColorMap::domain()` min
+  (clamped `< threshold`); an over-large surface (threshold too low) → 400.
 - **Routes** (mounted at `/3dtiles`): `GET /collections/{id}/tileset.json`
-  (`?quantity=&datetime=&min_value=`) and `GET /collections/{id}/content.pnts`
-  (`?quantity=&datetime=&min_value=`), plus `/` · `/collections` ·
-  `/collections/{id}` · **`/viewer`** (a bundled CesiumJS page with a
-  collection + quantity picker, `include_str!`-baked from
-  `crates/api-3dtiles/viewer/index.html`; same-origin API base by default, so it
-  works on any deployment, with a `?base=` override). The tileset's
-  `content.uri` embeds the resolved quantity (+ pinned time + `min_value`) so
-  the `.pnts` fetch is deterministic.
-- **Concurrency:** `read_point_cloud` is sync (blocking HDF5 I/O + a long CPU
-  loop), so the handler bounds it with the shared render semaphore and runs it
-  via `spawn_blocking` — never inline on a request worker (the same pattern the
+  (`?representation=&quantity=&datetime=&min_value=&threshold=`),
+  `GET /collections/{id}/content.pnts` (`?quantity=&datetime=&min_value=`),
+  `GET /collections/{id}/content.glb` (`?quantity=&datetime=&threshold=`), plus
+  `/` · `/collections` · `/collections/{id}` · **`/viewer`** (a bundled CesiumJS
+  page with collection + quantity + **representation** pickers,
+  `include_str!`-baked from `crates/api-3dtiles/viewer/index.html`; same-origin
+  API base by default, with a `?base=` override). The tileset's `content.uri`
+  embeds the resolved quantity (+ pinned time + `min_value`/`threshold`) so the
+  content fetch is deterministic.
+- **Concurrency:** `read_point_cloud` / `read_voxel_grid` are sync (blocking
+  HDF5 I/O + a long CPU loop — marching tet for the latter), so both content
+  handlers bound them with the shared render semaphore and run via
+  `spawn_blocking` — never inline on a request worker (the same pattern the
   raster APIs use for `get_raster_tile`).
-- **Caching:** content-derived ETag on `.pnts` (deterministic bytes ⇒ cheap
-  304s); `content_uri` is validated (no `..`/absolute/scheme) in `ds-3dtiles`.
+- **Caching:** content-derived ETag on both `.pnts` and `.glb` (deterministic
+  bytes ⇒ cheap 304s, shared `binary_response` helper); `content_uri` is
+  validated (no `..`/absolute/scheme) in `ds-3dtiles`.
 - **Config:** add `"3dtiles"` to a collection's `apis` (only `odim-volume`
   supports it today). v1 uses one shared reflectivity colormap; per-collection /
   per-quantity colormaps, time-dynamic tilesets (#350), and true cylindrical
