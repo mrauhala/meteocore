@@ -182,7 +182,13 @@ impl MeshBuilder {
 
 /// Map a fractional cell index `(fr, fa, fh)` to a glTF-space position (metres),
 /// relative to `rtc` (the antenna ECEF) and pre-rotated Z-up→Y-up.
-fn index_to_gltf_pos(grid: &VoxelGrid, rtc: [f64; 3], fr: f64, fa: f64, fh: f64) -> [f32; 3] {
+pub(crate) fn index_to_gltf_pos(
+    grid: &VoxelGrid,
+    rtc: [f64; 3],
+    fr: f64,
+    fa: f64,
+    fh: f64,
+) -> [f32; 3] {
     let [n_r, n_a, n_h] = grid.dims;
     // Same cell-centre convention as the engine's sampler: sample i sits at
     // lo + (i + 0.5)(hi − lo)/n. Fractional i interpolates linearly between
