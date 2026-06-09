@@ -332,6 +332,23 @@ async fn collections_list_and_doc() {
         .map(|r| r.as_str().unwrap())
         .collect();
     assert_eq!(reps, vec!["points", "isosurface"]);
+    // …and a link-following client can discover the isosurface tileset too.
+    let hrefs: Vec<&str> = v["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|l| l["href"].as_str())
+        .collect();
+    assert!(
+        hrefs.iter().any(|h| h.ends_with("/tileset.json")),
+        "point-cloud tileset link present: {hrefs:?}"
+    );
+    assert!(
+        hrefs
+            .iter()
+            .any(|h| h.contains("tileset.json?representation=isosurface")),
+        "isosurface tileset link present: {hrefs:?}"
+    );
 }
 
 #[tokio::test]

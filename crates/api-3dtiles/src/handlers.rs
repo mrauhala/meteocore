@@ -408,6 +408,12 @@ pub async fn get_content_glb(
     // Colour the shell at the threshold; seal NaN (clear air / unmeasured) at
     // the colormap's floor so the surface closes into solid blobs. The floor
     // must be < threshold (clamp defensively against an odd colormap domain).
+    //
+    // v1 uses the single collection-level colormap regardless of quantity (the
+    // `.pnts` path has the same limitation), so for a non-reflectivity quantity
+    // (VRADH/ZDR/…) the dBZ floor is only "below any likely threshold", not
+    // physically the quantity's minimum — geometrically fine (the seal still
+    // closes), semantically approximate. Per-quantity colormaps (#350) fix it.
     let color = state.colormap.color(Some(threshold));
     let floor = state
         .colormap
@@ -512,9 +518,19 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
     // Every volume collection serves a point cloud; those whose engine can also
     // produce a voxel grid additionally serve an isosurface mesh. The viewer
     // reads this to populate its representation toggle.
+    let supports_iso = info.as_ref().is_some_and(|i| i.supports_voxel_grid);
     let mut representations = vec!["points"];
-    if info.as_ref().is_some_and(|i| i.supports_voxel_grid) {
+    if supports_iso {
         representations.push("isosurface");
+    }
+    // A link per representation so a link-following client (not just one that
+    // reads `representations` and builds URLs itself) can discover both.
+    let mut links = vec![
+        json!({ "href": format!("{base}/3dtiles/collections/{id}"), "rel": "self", "type": "application/json", "title": "This document" }),
+        json!({ "href": format!("{base}/3dtiles/collections/{id}/tileset.json"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (point cloud)" }),
+    ];
+    if supports_iso {
+        links.push(json!({ "href": format!("{base}/3dtiles/collections/{id}/tileset.json?representation=isosurface"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (isosurface mesh)" }));
     }
     json!({
         "id": id,
@@ -522,10 +538,7 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
         "description": description,
         "quantities": quantities,
         "representations": representations,
-        "links": [
-            { "href": format!("{base}/3dtiles/collections/{id}"), "rel": "self", "type": "application/json", "title": "This document" },
-            { "href": format!("{base}/3dtiles/collections/{id}/tileset.json"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (point cloud)" },
-        ]
+        "links": links,
     })
 }
 
