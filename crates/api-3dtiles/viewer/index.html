@@ -90,10 +90,12 @@ const setStatus = (msg, err) => { $status.textContent = msg; $status.className =
 
 // Each representation's label for the numeric field + its default value:
 // point clouds drop echoes below `min_value`; isosurfaces draw the shell AT
-// `threshold`. Both are a dBZ number, so one input serves both, relabelled.
+// `threshold`; echo-top columns rise to where reflectivity drops below
+// `threshold`. All a dBZ number, so one input serves them, relabelled.
 const REP_META = {
   points:     { label: "Point cloud", numLabel: "min dBZ",       numDefault: "5"  },
   isosurface: { label: "Isosurface",  numLabel: "threshold dBZ", numDefault: "20" },
+  echotop:    { label: "Echo top",    numLabel: "threshold dBZ", numDefault: "18" },
 };
 
 // Token-free CesiumJS: CARTO Dark Matter basemap, no Cesium Ion.
@@ -183,8 +185,8 @@ async function loadTileset() {
   if (current) { viewer.scene.primitives.remove(current); current = null; }
 
   let url = `${BASE}/collections/${encodeURIComponent(id)}/tileset.json?quantity=${encodeURIComponent(q)}`;
-  if (rep === "isosurface") {
-    url += `&representation=isosurface`;
+  if (rep === "isosurface" || rep === "echotop") {
+    url += `&representation=${rep}`;
     if (num !== "") url += `&threshold=${encodeURIComponent(num)}`;
   } else if (num !== "") {
     url += `&min_value=${encodeURIComponent(num)}`;
@@ -194,8 +196,14 @@ async function loadTileset() {
     if (token !== loadToken) { ts.destroy(); return; } // superseded — free its GPU buffers
     current = ts;
     viewer.scene.primitives.add(ts);
-    // pointSize styling only applies to the .pnts point cloud; a mesh ignores it.
-    if (rep === "points") ts.style = new Cesium.Cesium3DTileStyle({ pointSize: 5.0 });
+    // Point clouds: scale each dot by its reflectivity (the per-point `value`
+    // batch property) — faint/small for weak echo, big for strong. (A mesh
+    // ignores pointSize.)
+    if (rep === "points") {
+      ts.style = new Cesium.Cesium3DTileStyle({
+        pointSize: "clamp((${value} - 5.0) * 0.16 + 1.0, 1.0, 10.0)",
+      });
+    }
     await viewer.zoomTo(ts, new Cesium.HeadingPitchRange(
       Cesium.Math.toRadians(210), Cesium.Math.toRadians(-28), 300000));
     setStatus(`${id} · ${q} · ${rep}`);

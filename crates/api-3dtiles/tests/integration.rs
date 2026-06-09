@@ -367,14 +367,14 @@ async fn collections_list_and_doc() {
     assert_eq!(status, StatusCode::OK);
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["quantities"][0]["id"], "DBZH");
-    // The mock supports voxel grids, so both representations are advertised.
+    // The mock supports voxel grids, so all three representations are advertised.
     let reps: Vec<&str> = v["representations"]
         .as_array()
         .unwrap()
         .iter()
         .map(|r| r.as_str().unwrap())
         .collect();
-    assert_eq!(reps, vec!["points", "isosurface"]);
+    assert_eq!(reps, vec!["points", "isosurface", "echotop"]);
     // …and a link-following client can discover the isosurface tileset too.
     let hrefs: Vec<&str> = v["links"]
         .as_array()
@@ -452,6 +452,37 @@ async fn isosurface_on_unsupported_collection_is_400() {
         .map(|r| r.as_str().unwrap())
         .collect();
     assert_eq!(reps, vec!["points"]);
+}
+
+#[tokio::test]
+async fn echotop_tileset_and_content_is_valid_glb() {
+    // The tileset advertises echo-top glb content tagged with the representation,
+    // plus the antenna-ECEF transform (like the isosurface).
+    let (status, body, _h) =
+        get("/collections/radar-fivih/tileset.json?representation=echotop&quantity=DBZH").await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["root"]["transform"].as_array().unwrap().len(), 16);
+    let uri = v["root"]["content"]["uri"].as_str().unwrap();
+    assert!(uri.starts_with("content.glb?"), "glb content: {uri}");
+    assert!(
+        uri.contains("representation=echotop"),
+        "echotop-tagged: {uri}"
+    );
+
+    // The content itself is a valid glTF binary.
+    let (status, body, headers) =
+        get("/collections/radar-fivih/content.glb?representation=echotop&quantity=DBZH").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[0..4], b"glTF", "glb magic");
+    assert_eq!(
+        u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize,
+        body.len()
+    );
+    assert_eq!(
+        headers[axum::http::header::CONTENT_TYPE],
+        "model/gltf-binary"
+    );
 }
 
 #[tokio::test]

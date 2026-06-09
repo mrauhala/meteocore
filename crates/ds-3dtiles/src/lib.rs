@@ -102,13 +102,13 @@ pub fn encode_pnts(
     // build (the byte-length guards below would only catch this at ~4 GiB).
     let points_len = u32::try_from(count).map_err(|_| Tiles3dError::TooLarge("POINTS_LENGTH"))?;
 
-    // Front-load the body byte-budget check too: reject an oversized cloud
-    // *before* allocating the body (POSITION 12 B + RGB 3 B per point, + ≤7 B
-    // tail padding), so a caller bypassing the engine's MAX_POINTS cap can't
+    // Front-load the byte-budget check too: reject an oversized cloud *before*
+    // allocating (POSITION 12 B + RGB 3 B + batch-table value 4 B per point, +
+    // section padding), so a caller bypassing the engine's MAX_POINTS cap can't
     // force a multi-GB allocation that only errors afterward.
     if count
-        .checked_mul(15)
-        .and_then(|n| n.checked_add(7))
+        .checked_mul(19)
+        .and_then(|n| n.checked_add(64))
         .is_none_or(|n| u32::try_from(n).is_err())
     {
         // Distinct label from the post-build check below so the two guards are
@@ -151,13 +151,43 @@ pub fn encode_pnts(
         ft_json.push(b' ');
     }
 
+    // Batch table: one per-point `value` (the physical value, e.g. dBZ) so a
+    // client can style point size by it. No `BATCH_ID` in the feature table ⇒
+    // the batch table holds POINTS_LENGTH per-point properties (one per point).
+    let bt = json!({
+        "value": { "byteOffset": 0, "componentType": "FLOAT", "type": "SCALAR" },
+    });
+    let mut bt_json = serde_json::to_vec(&bt).expect("batch table serializes");
+    while !bt_json.len().is_multiple_of(8) {
+        bt_json.push(b' ');
+    }
+    let mut bt_bin = Vec::with_capacity(count * 4);
+    for p in &cloud.points {
+        // Points come from real (finite) echoes; guard anyway so a stray NaN
+        // can't reach the buffer as a non-finite property.
+        let v = if p.value.is_finite() {
+            p.value as f32
+        } else {
+            0.0
+        };
+        bt_bin.extend_from_slice(&v.to_le_bytes());
+    }
+    // The batch-table binary must also end on an 8-byte boundary.
+    while !bt_bin.len().is_multiple_of(8) {
+        bt_bin.push(0);
+    }
+
     const HEADER_LEN: usize = 28;
-    let total = HEADER_LEN + ft_json.len() + body.len();
+    let total = HEADER_LEN + ft_json.len() + body.len() + bt_json.len() + bt_bin.len();
     let total = u32::try_from(total).map_err(|_| Tiles3dError::TooLarge("byteLength"))?;
     let ft_json_len =
         u32::try_from(ft_json.len()).map_err(|_| Tiles3dError::TooLarge("featureTableJSON"))?;
     let body_len =
         u32::try_from(body.len()).map_err(|_| Tiles3dError::TooLarge("featureTableBinary"))?;
+    let bt_json_len =
+        u32::try_from(bt_json.len()).map_err(|_| Tiles3dError::TooLarge("batchTableJSON"))?;
+    let bt_bin_len =
+        u32::try_from(bt_bin.len()).map_err(|_| Tiles3dError::TooLarge("batchTableBinary"))?;
 
     let mut pnts = Vec::with_capacity(total as usize);
     pnts.extend_from_slice(b"pnts");
@@ -165,10 +195,12 @@ pub fn encode_pnts(
     pnts.extend_from_slice(&total.to_le_bytes());
     pnts.extend_from_slice(&ft_json_len.to_le_bytes());
     pnts.extend_from_slice(&body_len.to_le_bytes());
-    pnts.extend_from_slice(&0u32.to_le_bytes()); // batch-table JSON length
-    pnts.extend_from_slice(&0u32.to_le_bytes()); // batch-table binary length
+    pnts.extend_from_slice(&bt_json_len.to_le_bytes());
+    pnts.extend_from_slice(&bt_bin_len.to_le_bytes());
     pnts.extend_from_slice(&ft_json);
     pnts.extend_from_slice(&body);
+    pnts.extend_from_slice(&bt_json);
+    pnts.extend_from_slice(&bt_bin);
     Ok(pnts)
 }
 
@@ -289,12 +321,21 @@ mod tests {
         );
         let ft_json_len = u32_at(12) as usize;
         let ft_bin_len = u32_at(16) as usize;
-        assert_eq!(u32_at(20), 0, "no batch-table JSON");
-        assert_eq!(u32_at(24), 0, "no batch-table binary");
-        // Sections are 8-byte aligned, and the three lengths tile the file.
+        let bt_json_len = u32_at(20) as usize;
+        let bt_bin_len = u32_at(24) as usize;
+        // A per-point `value` batch table is present (for client point sizing):
+        // 3 f32 values = 12 B, padded to the next 8-byte boundary → 16 B.
+        assert!(bt_json_len > 0, "batch-table JSON present");
+        assert_eq!(bt_bin_len, 16, "3 f32 values (12 B) padded to 16");
+        // All four sections are 8-byte aligned and tile the file exactly.
         assert_eq!(ft_json_len % 8, 0);
         assert_eq!(ft_bin_len % 8, 0);
-        assert_eq!(28 + ft_json_len + ft_bin_len, bytes.len());
+        assert_eq!(bt_json_len % 8, 0);
+        assert_eq!(bt_bin_len % 8, 0);
+        assert_eq!(
+            28 + ft_json_len + ft_bin_len + bt_json_len + bt_bin_len,
+            bytes.len()
+        );
 
         // Feature-table JSON parses and carries the right point count + RTC.
         let ft: serde_json::Value =
@@ -303,6 +344,19 @@ mod tests {
         assert_eq!(ft["RTC_CENTER"][0], 3_000_000.0);
         // RGB starts after the 3 positions (3 * 12 = 36 bytes).
         assert_eq!(ft["RGB"]["byteOffset"], 36);
+
+        // Batch table declares the per-point `value` (FLOAT SCALAR), and its
+        // binary carries the three sample values (10, 45, 60).
+        let bt_start = 28 + ft_json_len + ft_bin_len;
+        let bt: serde_json::Value =
+            serde_json::from_slice(&bytes[bt_start..bt_start + bt_json_len])
+                .expect("BT JSON parses");
+        assert_eq!(bt["value"]["componentType"], "FLOAT");
+        let vbin = &bytes[bt_start + bt_json_len..bt_start + bt_json_len + bt_bin_len];
+        let v0 = f32::from_le_bytes(vbin[0..4].try_into().unwrap());
+        let v1 = f32::from_le_bytes(vbin[4..8].try_into().unwrap());
+        assert_eq!(v0, 10.0);
+        assert_eq!(v1, 45.0);
     }
 
     #[test]
