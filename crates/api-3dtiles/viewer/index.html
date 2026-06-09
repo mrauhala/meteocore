@@ -408,6 +408,9 @@ async function loadVoxel(token) {
       provider,
       customShader: voxelShader(q, legendData, voxelMin()),
     }));
+    // Finer ray-march than the default (1 sample/cell) so the trilinearly-
+    // interpolated field reads as a smooth volume, not a stack of cells.
+    voxelPrimitive.stepSizeMultiplier = 0.4;
     viewer.scene.requestRender();
     updateStatus(voxelMinLabel());
   } catch (e) {
@@ -453,10 +456,10 @@ function voxelShader(quantity, legend, min) {
     `}`,
     `void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material){`,
     `  float v=fsInput.metadata.${quantity};`,
-    `  if(v < ${min.toFixed(2)}){ material.alpha=0.0; return; }`, // min filter + nodata sentinel
     `  material.diffuse=voxRamp(v);`,
-    `  float a=clamp((v-(${lg.min.toFixed(2)}))/${span.toFixed(2)},0.0,1.0);`,
-    `  material.alpha=clamp(a*0.7,0.04,0.6);`, // denser echo = more opaque
+    // Density rises smoothly FROM 0 at the `min` threshold (no hard alpha step →
+    // no shell/"walls and floors" at the min isovalue), ~0.55 by +25 dBZ above it.
+    `  material.alpha=clamp((v-(${min.toFixed(2)}))*0.022,0.0,0.55);`,
     `}`,
   ].join("\n");
   return new Cesium.CustomShader({ fragmentShaderText: fs });
