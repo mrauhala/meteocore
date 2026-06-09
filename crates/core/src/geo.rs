@@ -23,6 +23,42 @@ pub fn geodetic_to_ecef(lon_deg: f64, lat_deg: f64, h: f64) -> [f64; 3] {
     ]
 }
 
+/// Mean Earth radius (metres) for spherical great-circle math — the value the
+/// radar beam model uses, so geometry derived here aligns with the volume
+/// engines (e.g. the cylindrical voxel grid → isosurface mapping).
+pub const EARTH_RADIUS_M: f64 = 6_371_000.0;
+
+/// Great-circle **destination point** on a sphere: starting at
+/// (`lon_deg`, `lat_deg`), travel `distance_m` along the initial compass
+/// `bearing_deg` (0° = north, increasing clockwise). Returns
+/// `(lon_deg, lat_deg)`, with longitude normalised into `(−180, 180]`.
+///
+/// Shared geodesy so every consumer that turns a (range, azimuth) polar sample
+/// into geographic coordinates — the radar volume engines, the 3D Tiles
+/// isosurface encoder — uses one formula (and the same [`EARTH_RADIUS_M`]).
+pub fn destination_point(
+    lon_deg: f64,
+    lat_deg: f64,
+    distance_m: f64,
+    bearing_deg: f64,
+) -> (f64, f64) {
+    let ang = distance_m / EARTH_RADIUS_M;
+    let lat0 = lat_deg.to_radians();
+    let lon0 = lon_deg.to_radians();
+    let brg = bearing_deg.to_radians();
+    let (sin_ang, cos_ang) = ang.sin_cos();
+    let (sin_lat0, cos_lat0) = lat0.sin_cos();
+    let sin_lat = sin_lat0 * cos_ang + cos_lat0 * sin_ang * brg.cos();
+    let lat = sin_lat.asin();
+    let y = brg.sin() * sin_ang * cos_lat0;
+    let x = cos_ang - sin_lat0 * sin_lat;
+    // Normalise longitude into (−180, 180]: a path starting near ±180° can
+    // otherwise return a lon outside that range.
+    let lon = (lon0 + y.atan2(x)).to_degrees();
+    let lon = (lon + 540.0).rem_euclid(360.0) - 180.0;
+    (lon, lat.to_degrees())
+}
+
 /// Coordinate reference system.
 ///
 /// Stores projection parameters and provides forward/inverse transforms
@@ -1256,6 +1292,31 @@ mod tests {
         for code in ["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:9999", ""] {
             assert!(projected_output_crs(code).is_none(), "{code} must be None");
         }
+    }
+
+    #[test]
+    fn destination_point_matches_analytic_references() {
+        // Pin against exact analytic cases (not a self-roundtrip): on a sphere,
+        // a meridian/equator path has a closed form independent of this code.
+        let ten_deg = EARTH_RADIUS_M * (10.0_f64).to_radians();
+        // Due north from the prime-meridian origin → straight up the meridian:
+        // lon unchanged, lat = arc angle.
+        let (lon, lat) = destination_point(0.0, 0.0, ten_deg, 0.0);
+        assert!(lon.abs() < 1e-9, "north keeps lon 0, got {lon}");
+        assert!(
+            (lat - 10.0).abs() < 1e-9,
+            "north 10° arc → lat 10, got {lat}"
+        );
+        // Due east along the equator → lat stays 0, lon = arc angle.
+        let (lon, lat) = destination_point(0.0, 0.0, ten_deg, 90.0);
+        assert!(lat.abs() < 1e-9, "east on equator keeps lat 0, got {lat}");
+        assert!(
+            (lon - 10.0).abs() < 1e-9,
+            "east 10° arc → lon 10, got {lon}"
+        );
+        // Eastbound across the antimeridian wraps into (−180, 180]: 179 + 10 → −171.
+        let (lon, _lat) = destination_point(179.0, 0.0, ten_deg, 90.0);
+        assert!((lon - (-171.0)).abs() < 1e-9, "wrapped past +180 → {lon}");
     }
 
     #[test]

@@ -234,7 +234,9 @@ Volumetric weather as OGC 3D Tiles — radar polar volumes today. The chain:
 cell, placed at its true ECEF position via the 4/3-Earth beam model); the
 framework-free `ds-3dtiles` crate encodes it to a `.pnts` tile + `tileset.json`;
 `api-3dtiles` serves it over HTTP. Engines return the domain type, never bytes
-(same rule as `MapEngine`→`ds-render`).
+(same rule as `MapEngine`→`ds-render`). `ds-3dtiles` has two encoders: the
+`.pnts` point cloud, and (#357) an **isosurface** mesher that turns a `VoxelGrid`
+into a glTF `.glb` triangle mesh.
 
 - **Trait:** `VolumeEngine::read_point_cloud(quantity, time, min_value, reference_time)`
   → `VolumePointCloud`; `read_voxel_grid(quantity, time, dims, reference_time)`
@@ -249,6 +251,29 @@ framework-free `ds-3dtiles` crate encodes it to a `.pnts` tile + `tileset.json`;
   cone of silence). Unknown quantity ⇒ `InvalidParameter` (→ 400). The
   `EXT_primitive_voxels` glTF *encoding* of a `VoxelGrid` is a follow-up (#351) —
   draft spec, render-verify against CesiumJS ≥1.127.
+- **Isosurface meshing (#357, `ds-3dtiles/src/isosurface.rs`):**
+  `encode_isosurface_glb(grid, threshold, color)` extracts a constant-value
+  shell (e.g. "the 20 dBZ surface") from a `VoxelGrid` as a glTF 2.0 `.glb`
+  triangle mesh — a **plain glTF mesh that renders in any 3D Tiles 1.1 client**
+  (the verifiable alternative to the draft `EXT_primitive_voxels` voxel path).
+  Uses **marching tetrahedra**, not marching cubes: a tet is K4, so the surface
+  crosses exactly `|inside|·|outside|` edges and the topology is correct by
+  construction (no 256-case table to mis-transcribe — chosen because the output
+  isn't render-checkable at encode time). Cube → 6 tets (Kuhn split); any tet
+  touching a `NaN` corner is skipped (no surface across the cone of silence).
+  Surface vertices map fractional cell index → ground/azimuth/height (same
+  cell-centre convention as the engine sampler) → `destination_point` +
+  `geodetic_to_ecef` (both now in `ds_core::geo`), stored antenna-relative and
+  pre-flipped Z-up→Y-up because a runtime re-applies Y-up→Z-up to **glTF**
+  content (the flip the `.pnts` path skips — pnts isn't glTF). `tileset_json_glb`
+  carries the antenna ECEF as the tile **`transform`** (glTF content has no
+  embedded origin, unlike `.pnts` `RTC_CENTER`); the geodetic `region` is
+  unaffected by it. Demo: `cargo run -p engine-odim --example gen_isosurface`
+  (writes `.glb` + `tileset.json` + a token-free CesiumJS viewer). **API route
+  is a follow-up** — the encoder + demo ship first (mirrors how `.pnts` went,
+  demo #347 → API #349). **One thing to confirm visually:** that the runtime
+  applies Y-up→Z-up to direct 1.1 `.glb` content (the standard default); if the
+  shell renders tipped 90°, that's the up-axis convention and a one-line fix.
 - **Routes** (mounted at `/3dtiles`): `GET /collections/{id}/tileset.json`
   (`?quantity=&datetime=&min_value=`) and `GET /collections/{id}/content.pnts`
   (`?quantity=&datetime=&min_value=`), plus `/` · `/collections` ·

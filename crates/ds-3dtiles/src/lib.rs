@@ -21,6 +21,12 @@ use ds_core::volume::VolumePointCloud;
 use ds_render::ColorMap;
 use serde_json::json;
 
+/// Isosurface meshing of a [`ds_core::volume::VoxelGrid`] into glTF `.glb`
+/// triangle-mesh content (#357) — the verifiable, any-client 3-D path next to
+/// the `.pnts` point cloud.
+pub mod isosurface;
+pub use isosurface::{encode_isosurface_glb, tileset_json_glb};
+
 /// Top-level tileset geometric error. Must be > 0 (see module docs); the value
 /// only needs to exceed the root's so CesiumJS refines to the content.
 const TILESET_GEOMETRIC_ERROR: f64 = 1.0e5;
