@@ -150,13 +150,15 @@ const setStatus = (msg, err) => { $status.textContent = msg; $status.className =
 // point clouds drop echoes below `min_value`; isosurfaces draw the shell AT
 // `threshold`; echo-top columns rise to where reflectivity drops below
 // `threshold`. All a dBZ number, so one input serves them, relabelled.
-// `mesh` products (isosurface/echotop) are resampled to a voxel grid, so they
-// take the low/med/high Resolution selector; the point cloud is native-res and
-// hides it.
+// `grid` products (isosurface/echotop/voxels) are resampled to a voxel grid, so
+// they take the low/med/high Resolution selector; the point cloud is native-res
+// and hides it. `voxels` is the CesiumJS VoxelPrimitive ray-march (its own load
+// path, not a tileset of tiles).
 const REP_META = {
-  points:     { label: "Point cloud", numLabel: "min dBZ",       numDefault: "5",  mesh: false },
-  isosurface: { label: "Isosurface",  numLabel: "threshold dBZ", numDefault: "20", mesh: true  },
-  echotop:    { label: "Echo top",    numLabel: "threshold dBZ", numDefault: "18", mesh: true  },
+  points:     { label: "Point cloud", numLabel: "min dBZ",       numDefault: "5",  mesh: false, voxel: false },
+  isosurface: { label: "Isosurface",  numLabel: "threshold dBZ", numDefault: "20", mesh: true,  voxel: false },
+  echotop:    { label: "Echo top",    numLabel: "threshold dBZ", numDefault: "18", mesh: true,  voxel: false },
+  voxels:     { label: "Voxels",      numLabel: "min dBZ",       numDefault: "5",  mesh: true,  voxel: true  },
 };
 
 // Token-free CesiumJS: CARTO Dark Matter basemap, no Cesium Ion.
@@ -193,6 +195,7 @@ let loadToken = 0;        // guards against out-of-order async (re)builds
 let currentRep = null;    // representation of the active frames
 let pointsFetchFloor = null; // the min_value (dBZ) the point-cloud frames were fetched at
 let legendData = null;    // colour-scale legend {title,unit,min,max,stops} from the collection doc
+let voxelPrimitive = null; // active Cesium VoxelPrimitive (the `voxels` representation)
 
 async function loadCollections() {
   setStatus("loading collections…");
@@ -313,6 +316,9 @@ function clearFrames() {
   for (const ts of frames) if (ts) viewer.scene.primitives.remove(ts);
   frames = [];
 }
+function clearVoxel() {
+  if (voxelPrimitive) { viewer.scene.primitives.remove(voxelPrimitive); voxelPrimitive = null; }
+}
 
 // (Re)build the whole frame set for the current params: one preloaded, hidden
 // tileset per timestamp (or a single latest-volume frame when the collection has
@@ -324,8 +330,21 @@ async function loadFrames(reframe = false) {
   const token = ++loadToken;
   stopPlaying();
   clearFrames();
+  clearVoxel();
   currentRep = rep;
   pointsFetchFloor = rep === "points" ? (num === "" ? -Infinity : parseFloat(num)) : null;
+
+  // Voxels are a CesiumJS VoxelPrimitive (ray-marched volume), not a tileset of
+  // tiles — their own load path. MVP: a single volume at the active time (no
+  // frame preload/animation), so the time bar stays hidden.
+  if (rep === "voxels") {
+    frameTimes = times.length ? times.slice(-MAX_FRAMES) : [null];
+    if (frameIdx >= frameTimes.length) frameIdx = frameTimes.length - 1;
+    if (frameIdx < 0) frameIdx = 0;
+    syncTimeBar();
+    await loadVoxel(token);
+    return;
+  }
 
   // Animate the most-recent MAX_FRAMES of the manifest ([null] = the single
   // latest-volume frame when there's no time axis).
@@ -362,6 +381,59 @@ async function loadFrames(reframe = false) {
   }
   if (!frames.some(Boolean)) setStatus("no data for this selection", true);
   else updateStatus();
+}
+
+// Load the cylindrical voxel volume for the active time as a CesiumJS
+// VoxelPrimitive (ray-marched), styled by a reflectivity transfer-function
+// custom shader. EXT_primitive_voxels is CesiumGS-only + draft, so this whole
+// path is best-effort — a load failure just reports, leaving the other
+// representations untouched.
+async function loadVoxel(token) {
+  const id = $coll.value, q = $qty.value;
+  setStatus(`loading ${id} · ${q} · voxels…`);
+  let url = `${BASE}/collections/${encodeURIComponent(id)}/voxel/tileset.json?quantity=${encodeURIComponent(q)}`;
+  const time = frameTimes.length ? frameTimes[frameIdx] : null;
+  if (time) url += `&datetime=${encodeURIComponent(time)}`;
+  url += `&resolution=${encodeURIComponent($res.value)}`;
+  try {
+    if (typeof Cesium.Cesium3DTilesVoxelProvider !== "function") {
+      throw new Error("this CesiumJS build has no voxel support");
+    }
+    const provider = await Cesium.Cesium3DTilesVoxelProvider.fromUrl(url);
+    if (token !== loadToken) return; // superseded
+    voxelPrimitive = viewer.scene.primitives.add(new Cesium.VoxelPrimitive({
+      provider,
+      customShader: voxelShader(q),
+    }));
+    viewer.scene.requestRender();
+    updateStatus();
+  } catch (e) {
+    if (token === loadToken) setStatus("voxels unavailable — " + e.message, true);
+    console.error("voxel load", e);
+  }
+}
+
+// Reflectivity transfer function for the voxel ray-march: the per-cell metadata
+// value (dBZ, property = the quantity) → colour + alpha. Weak echo / the nodata
+// sentinel are transparent; stronger echo ramps blue→green→yellow→red→magenta
+// and grows more opaque.
+function voxelShader(quantity) {
+  return new Cesium.CustomShader({
+    fragmentShaderText: [
+      "void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {",
+      "  float v = fsInput.metadata." + quantity + ";",
+      "  if (v < 5.0) { material.alpha = 0.0; return; }", // nodata sentinel + weak echo
+      "  float t = clamp((v - 5.0) / 60.0, 0.0, 1.0);",    // map 5..65 dBZ → 0..1
+      "  vec3 c;",
+      "  if (t < 0.25)      c = mix(vec3(0.0,0.45,1.0), vec3(0.0,0.8,0.3), t/0.25);",
+      "  else if (t < 0.5)  c = mix(vec3(0.0,0.8,0.3), vec3(0.95,0.9,0.2), (t-0.25)/0.25);",
+      "  else if (t < 0.75) c = mix(vec3(0.95,0.9,0.2), vec3(0.95,0.3,0.1), (t-0.5)/0.25);",
+      "  else               c = mix(vec3(0.95,0.3,0.1), vec3(0.8,0.1,0.5), (t-0.75)/0.25);",
+      "  material.diffuse = c;",
+      "  material.alpha = clamp(t * 0.6, 0.03, 0.6);", // denser echo = more opaque
+      "}",
+    ].join("\n"),
+  });
 }
 
 // Reveal frame `i` (wrapping), hide the rest — a pure visibility toggle, the
