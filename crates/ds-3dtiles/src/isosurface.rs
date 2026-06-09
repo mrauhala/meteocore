@@ -193,7 +193,8 @@ fn crossing(
 ) -> [f32; 3] {
     let (va, vb) = (cvals[a], cvals[b]);
     // One end is inside (>= threshold), the other outside (< threshold), so
-    // va != vb and t ∈ [0, 1).
+    // va != vb and t ∈ [0, 1] (t = 1 only when threshold == vb exactly, placing
+    // the vertex on corner b — geometrically valid).
     let t = ((threshold - va) / (vb - va)).clamp(0.0, 1.0);
     let fr = cidx[a][0] + t * (cidx[b][0] - cidx[a][0]);
     let fa = cidx[a][1] + t * (cidx[b][1] - cidx[a][1]);
@@ -216,14 +217,19 @@ fn march_tet(
     if tet.iter().any(|&c| !cvals[c].is_finite()) {
         return Ok(());
     }
-    // Local tet indices (0..4) split into inside / outside.
-    let mut inside = Vec::with_capacity(4);
-    let mut outside = Vec::with_capacity(4);
+    // Local tet indices (0..4) split into inside / outside. Fixed-size arrays +
+    // length counters, not `Vec`s — `march_tet` runs millions of times per
+    // encode (≈ cubes × 6), so a per-call heap allocation would dominate.
+    let mut inside = [0usize; 4];
+    let mut outside = [0usize; 4];
+    let (mut ni, mut no) = (0usize, 0usize);
     for (k, &c) in tet.iter().enumerate() {
         if cvals[c] >= threshold {
-            inside.push(k);
+            inside[ni] = k;
+            ni += 1;
         } else {
-            outside.push(k);
+            outside[no] = k;
+            no += 1;
         }
     }
     let cross = |a_local: usize, b_local: usize| {
@@ -237,12 +243,17 @@ fn march_tet(
             tet[b_local],
         )
     };
-    match (inside.len(), outside.len()) {
+    // Triangle winding is NOT consistently oriented across these cases (the
+    // (1,3)/(3,1) split flips the normal vs the odd corner's side, and the
+    // (2,2) quad's order isn't sign-checked either) — `build_glb` sets the
+    // material `doubleSided: true` to compensate, which is load-bearing. Fine
+    // for visualisation; a future solid-geometry use would need oriented faces.
+    match (ni, no) {
         (0, _) | (_, 0) => Ok(()), // tet fully inside or outside — no surface
         (1, 3) | (3, 1) => {
             // One odd corner vs three: the surface is the triangle on the three
             // edges from the odd corner to the others.
-            let (odd, rest) = if inside.len() == 1 {
+            let (odd, rest) = if ni == 1 {
                 (inside[0], &outside)
             } else {
                 (outside[0], &inside)
@@ -310,11 +321,18 @@ pub fn encode_isosurface_glb(
     if !threshold.is_finite() {
         return Err(Tiles3dError::NonFinite("threshold"));
     }
-    // A `Some` background must be finite, else it would behave like `None`
-    // (a NaN fill leaves the corner non-finite → tet skipped) — confusingly.
+    // A `Some` background must be finite (else it acts like `None` — a NaN fill
+    // leaves the corner non-finite → tet skipped) AND strictly below `threshold`
+    // (else unmeasured cells would seal as *inside* the surface, inverting it).
     if let Some(bg) = background {
         if !bg.is_finite() {
             return Err(Tiles3dError::NonFinite("background"));
+        }
+        if bg >= threshold {
+            return Err(Tiles3dError::BackgroundNotBelowThreshold {
+                background: bg,
+                threshold,
+            });
         }
     }
     // `NaN` corners map to this: the finite background (seal) or `NaN` (skip).
@@ -456,14 +474,13 @@ pub fn tileset_json_glb(
     content_uri: &str,
     rtc_center: [f64; 3],
 ) -> Result<String, Tiles3dError> {
-    // Reuse the shared content-URI + region validation by building the base
-    // tileset, then injecting the transform (the only glTF-specific addition).
-    let base = crate::tileset_json_for_region(region, content_uri)?;
+    // Reuse the shared content-URI + region validation, building on the tileset
+    // `Value` directly (no serialize-then-reparse) and injecting the transform
+    // (the only glTF-specific addition).
     if rtc_center.iter().any(|c| !c.is_finite()) {
         return Err(Tiles3dError::NonFinite("rtc_center"));
     }
-    let mut tileset: serde_json::Value =
-        serde_json::from_str(&base).expect("tileset_json_for_region emits valid JSON");
+    let mut tileset = crate::tileset_value_for_region(region, content_uri)?;
     let [cx, cy, cz] = rtc_center;
     // Column-major 4×4: identity rotation, translation = antenna ECEF.
     tileset["root"]["transform"] =
@@ -676,6 +693,28 @@ mod tests {
             encode_isosurface_glb(&grid, 1.5, [0, 0, 0, 255], Some(f64::INFINITY)),
             Err(Tiles3dError::NonFinite("background"))
         ));
+    }
+
+    #[test]
+    fn background_not_below_threshold_is_rejected() {
+        // background >= threshold would seal NaN cells as INSIDE the surface,
+        // inverting it — reject rather than return a meaningless mesh.
+        let grid = ramp_grid(3, 8, 5);
+        for bg in [20.0_f64, 25.0] {
+            assert!(
+                matches!(
+                    encode_isosurface_glb(&grid, 20.0, [0, 0, 0, 255], Some(bg)),
+                    Err(Tiles3dError::BackgroundNotBelowThreshold {
+                        background,
+                        threshold,
+                    }) if background == bg && threshold == 20.0
+                ),
+                "background {bg} >= threshold 20 must be rejected"
+            );
+        }
+        // Strictly below is accepted (the ramp has values 0..4, so 1.5 yields a
+        // surface; background −32 < 1.5).
+        assert!(encode_isosurface_glb(&grid, 1.5, [0, 0, 0, 255], Some(-32.0)).is_ok());
     }
 
     #[test]

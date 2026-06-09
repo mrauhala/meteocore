@@ -379,12 +379,23 @@ pub async fn get_content_glb(
 ) -> Result<Response, Tiles3dError> {
     let state = state.load_full();
     let (engine, _config) = lookup(&state, &id)?;
+    let info = engine.volume_info();
     // Reject early if the engine can't produce a voxel grid (avoids a blocking
     // task just to return the trait's "unsupported" → 404).
-    if !engine.volume_info().supports_voxel_grid {
+    if !info.supports_voxel_grid {
         return Err(Tiles3dError::BadRequest(format!(
             "collection '{id}' does not support the isosurface representation"
         )));
+    }
+    // Validate the quantity against the advertised set *before* the blocking
+    // task, like the `.pnts` handler — an unknown name shouldn't trigger a full
+    // `read_voxel_grid` (HDF5 open + polar scan) just to be rejected.
+    if let Some(q) = &params.quantity {
+        if !info.quantities.iter().any(|(qid, _)| qid == q) {
+            return Err(Tiles3dError::BadRequest(format!(
+                "unknown quantity '{q}' for collection '{id}'"
+            )));
+        }
     }
 
     let time = params.datetime.as_deref().map(parse_datetime).transpose()?;
