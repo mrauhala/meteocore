@@ -504,9 +504,10 @@ async fn content_glb_is_valid_gltf_and_etagged() {
 
 #[tokio::test]
 async fn isosurface_threshold_at_or_below_floor_is_400() {
-    // A threshold at/below the −32 dBZ no-echo floor would place clear-air floor
-    // cells inside the surface (all clear air renders as echo) — rejected.
-    for t in ["-40", "-32"] {
+    // A threshold at/below the no-echo floor would place clear-air floor cells
+    // inside the surface (all clear air renders as echo) — rejected.
+    let floor = f64::from(ds_core::volume::NO_ECHO_FLOOR_DBZ);
+    for t in [floor - 8.0, floor] {
         let (cs, _b, _h) = get(&format!(
             "/collections/radar-fivih/content.glb?threshold={t}"
         ))
@@ -518,7 +519,11 @@ async fn isosurface_threshold_at_or_below_floor_is_400() {
         );
     }
     // Just above the floor is accepted.
-    let (cs, _b, _h) = get("/collections/radar-fivih/content.glb?threshold=-30").await;
+    let (cs, _b, _h) = get(&format!(
+        "/collections/radar-fivih/content.glb?threshold={}",
+        floor + 2.0
+    ))
+    .await;
     assert_eq!(cs, StatusCode::OK, "threshold above floor is fine");
 }
 

@@ -408,7 +408,7 @@ pub async fn get_content_glb(
     let floor = f64::from(ds_core::volume::NO_ECHO_FLOOR_DBZ);
     if threshold <= floor {
         return Err(Tiles3dError::BadRequest(format!(
-            "threshold must be above the {floor} dBZ no-echo floor"
+            "threshold must be above the no-echo floor ({floor})"
         )));
     }
 
