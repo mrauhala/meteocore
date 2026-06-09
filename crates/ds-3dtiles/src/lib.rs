@@ -32,6 +32,11 @@ pub use isosurface::{encode_isosurface_glb, tileset_json_glb};
 pub mod echo_top;
 pub use echo_top::{encode_echo_top_columns_glb, encode_echo_top_glb};
 
+/// True cylindrical voxels (#351): `VoxelGrid` → `EXT_primitive_voxels` glTF
+/// `.glb` + `3DTILES_content_voxels` tileset for CesiumJS volume ray-marching.
+pub mod voxels;
+pub use voxels::{encode_voxels_glb, tileset_json_voxels, voxel_subtree_json};
+
 /// Top-level tileset geometric error. Must be > 0 (see module docs); the value
 /// only needs to exceed the root's so CesiumJS refines to the content.
 const TILESET_GEOMETRIC_ERROR: f64 = 1.0e5;
