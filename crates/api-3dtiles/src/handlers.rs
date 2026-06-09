@@ -14,7 +14,7 @@
 //! render semaphore) and encoded by `ds-3dtiles`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arc_swap::ArcSwap;
 use axum::extract::{Path, Query, State};
@@ -24,7 +24,7 @@ use chrono::{DateTime, Utc};
 use ds_core::config::CollectionConfig;
 use ds_core::geo::geodetic_to_ecef;
 use ds_core::volume::VolumeEngine;
-use ds_render::{ColorMap, ColorStop, LutColorMap};
+use ds_render::{BuiltinColormap, ColorMap, ColorStop, LutColorMap};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -93,6 +93,19 @@ const LEGEND_MIN_DBZ: f64 = 0.0;
 const LEGEND_MAX_DBZ: f64 = 70.0;
 const LEGEND_STOPS: usize = 24;
 
+/// The shared colour ramp applied to point-cloud values. v1 uses one reflectivity
+/// ramp for every 3D-Tiles collection (per-collection/per-quantity colormaps are
+/// a follow-up — #350). Single source of truth so the points the server encodes
+/// and the legend it advertises can't drift; every `TilesState3d` construction
+/// site uses this.
+pub fn default_point_colormap() -> Arc<dyn ColorMap> {
+    Arc::new(LutColorMap::from_builtin(
+        BuiltinColormap::RadarDbz,
+        -32.0,
+        95.0,
+    ))
+}
+
 /// Sample `colormap` into `(value, "#rrggbb")` stops across `[min, max]` for the
 /// viewer legend. RGB only — `.pnts` colours are opaque, so alpha is dropped.
 fn legend_stops(colormap: &dyn ColorMap, min: f64, max: f64, n: usize) -> Vec<serde_json::Value> {
@@ -115,10 +128,31 @@ fn legend_stops(colormap: &dyn ColorMap, min: f64, max: f64, n: usize) -> Vec<se
         .collect()
 }
 
+/// The point-cloud colour-scale legend, built once. The colormap is fixed for the
+/// process ([`default_point_colormap`]), so we sample it a single time rather than
+/// on every `GET /collections/{id}` (a metadata accessor — keep it O(1), #211).
+/// When per-collection colormaps land (#350) this moves into the per-collection
+/// snapshot.
+static POINT_LEGEND: LazyLock<serde_json::Value> = LazyLock::new(|| {
+    json!({
+        "title": "Reflectivity",
+        "unit": "dBZ",
+        "min": LEGEND_MIN_DBZ,
+        "max": LEGEND_MAX_DBZ,
+        "stops": legend_stops(
+            default_point_colormap().as_ref(),
+            LEGEND_MIN_DBZ,
+            LEGEND_MAX_DBZ,
+            LEGEND_STOPS,
+        ),
+    })
+});
+
 /// The blue→red **height** colour ramp for the echo-top product (stops at height
 /// values, 0–15 km) — a builtin colormap's stops are in its own units, so they
-/// collapse over a height range; build it explicitly. Cheap to construct.
-fn echo_top_height_colormap() -> LutColorMap {
+/// collapse over a height range; build it explicitly. Fixed ramp, so build it
+/// once rather than per echo-top GLB request (mirrors the `colormap` pattern).
+static ECHO_TOP_COLORMAP: LazyLock<LutColorMap> = LazyLock::new(|| {
     let stops = [
         (0.0_f64, [40u8, 70, 200, 255]),
         (3_000.0, [0, 200, 220, 255]),
@@ -129,7 +163,7 @@ fn echo_top_height_colormap() -> LutColorMap {
     ]
     .map(|(value, color)| ColorStop { value, color });
     LutColorMap::from_stops(&stops, 0.0, 15_000.0)
-}
+});
 
 /// Shared state for the 3D Tiles API. Wrapped in `ArcSwap` for lock-free reads
 /// and atomic swap on config reload.
@@ -593,11 +627,7 @@ pub async fn get_content_glb(
                 Representation::EchoTop => {
                     let grid =
                         engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;
-                    ds_3dtiles::encode_echo_top_columns_glb(
-                        &grid,
-                        threshold,
-                        &echo_top_height_colormap(),
-                    )
+                    ds_3dtiles::encode_echo_top_columns_glb(&grid, threshold, &*ECHO_TOP_COLORMAP)
                 }
                 Representation::Isosurface => {
                     let grid =
@@ -718,16 +748,11 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
         links.push(json!({ "href": format!("{base}/3dtiles/collections/{id}/tileset.json?representation=isosurface"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (isosurface mesh)" }));
         links.push(json!({ "href": format!("{base}/3dtiles/collections/{id}/tileset.json?representation=echotop"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (echo-top columns)" }));
     }
-    // Colour-scale legend for the point cloud: sample the shared reflectivity
-    // colormap so the viewer can show a gradient bar whose colours match the
-    // points (v1 uses one reflectivity ramp for all quantities — #350).
-    let legend = json!({
-        "title": "Reflectivity",
-        "unit": "dBZ",
-        "min": LEGEND_MIN_DBZ,
-        "max": LEGEND_MAX_DBZ,
-        "stops": legend_stops(state.colormap.as_ref(), LEGEND_MIN_DBZ, LEGEND_MAX_DBZ, LEGEND_STOPS),
-    });
+    // Colour-scale legend for the point cloud: the precomputed gradient of the
+    // shared reflectivity colormap, so the viewer's bar matches the point colours
+    // (built once — this is a metadata accessor; v1 uses one ramp for all
+    // quantities — #350).
+    let legend = POINT_LEGEND.clone();
     json!({
         "id": id,
         "title": title,

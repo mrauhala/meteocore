@@ -1836,13 +1836,10 @@ pub fn load_collections(
         tiles_3d_state: api_3dtiles::TilesState3d {
             volume_engines,
             collections: volume_collections,
-            // v1: one shared reflectivity ramp for all 3D-Tiles collections.
-            // Per-collection/per-quantity colormaps from config are a follow-up.
-            colormap: Arc::new(ds_render::LutColorMap::from_builtin(
-                ds_render::BuiltinColormap::RadarDbz,
-                -32.0,
-                95.0,
-            )),
+            // v1: one shared reflectivity ramp for all 3D-Tiles collections (the
+            // legend the API advertises samples this same source). Per-collection
+            // /per-quantity colormaps from config are a follow-up (#350).
+            colormap: api_3dtiles::default_point_colormap(),
             render_semaphore: render_semaphore.clone(),
             base_url: base_url.to_string(),
         },

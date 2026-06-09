@@ -404,6 +404,12 @@ async fn collections_list_and_doc() {
             .any(|h| h.contains("tileset.json?representation=isosurface")),
         "isosurface tileset link present: {hrefs:?}"
     );
+    assert!(
+        hrefs
+            .iter()
+            .any(|h| h.contains("tileset.json?representation=echotop")),
+        "echo-top tileset link present: {hrefs:?}"
+    );
 }
 
 #[tokio::test]
