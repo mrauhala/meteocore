@@ -27,6 +27,11 @@ use serde_json::json;
 pub mod isosurface;
 pub use isosurface::{encode_isosurface_glb, tileset_json_glb};
 
+/// Echo-top-height (ETH) draped-surface meshing of a
+/// [`ds_core::volume::VoxelGrid`] into a height-coloured glTF `.glb` (#362).
+pub mod echo_top;
+pub use echo_top::encode_echo_top_glb;
+
 /// Top-level tileset geometric error. Must be > 0 (see module docs); the value
 /// only needs to exceed the root's so CesiumJS refines to the content.
 const TILESET_GEOMETRIC_ERROR: f64 = 1.0e5;

@@ -285,6 +285,21 @@ into a glTF `.glb` triangle mesh.
   **render-verified live** (CesiumJS 1.124): the shell sits correctly over the
   antenna, upright (so the Y-up→Z-up flip is right for direct 1.1 `.glb`
   content), and sealing closes the curtains into solid blobs.
+- **Echo-top-height surface (#362, `ds-3dtiles/src/echo_top.rs`):**
+  `encode_echo_top_glb(grid, threshold, height_colormap)` collapses the volume
+  to a 2-D height field (per `(radius, azimuth)` column, the highest cell ≥
+  `threshold`, crossing-interpolated) and drapes it as a **height-coloured**
+  glTF `.glb` — the classic forecaster echo-top product in 3-D. Cheaper than the
+  isosurface: a regular indexed grid mesh (no marching cubes; a quad only where
+  all four corner columns have a top, so clear air is a hole), with a per-vertex
+  `COLOR_0` (normalized u8 VEC4) height colour + smooth normals. Reuses the
+  isosurface's `index_to_gltf_pos` (now `pub(crate)`) + `tileset_json_glb`.
+  **Colormap gotcha:** colour by **height** with stops AT height values
+  (`LutColorMap::from_stops`) — a *builtin* colormap's stops are in its own units
+  (Temperature's are °C), so it collapses to one colour over a 0–15 km range.
+  Demo: `cargo run -p engine-odim --example gen_echo_top` (render-verified — a
+  draped sheet graded blue/cyan→green/yellow by storm depth). API route is a
+  follow-up; the draped-grid mesher will be reused for VIL (#365).
 - **Both representations are served from the API** (selected by
   `?representation=points|isosurface` on `tileset.json`): `points` → `.pnts`
   (region-only tileset, `RTC_CENTER` self-places), `isosurface` → `.glb` plus a
