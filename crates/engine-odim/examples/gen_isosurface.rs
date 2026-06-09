@@ -106,9 +106,12 @@ fn main() {
         grid.quantity
     );
 
+    // The shell's colour = the colormap at the threshold value.
     let colormap = LutColorMap::from_builtin(BuiltinColormap::RadarDbz, -32.0, 95.0);
-    let color = colormap.color(Some(threshold)); // the shell's colour = colormap at the threshold
-    let glb = ds_3dtiles::encode_isosurface_glb(&grid, threshold, color)
+    let color = colormap.color(Some(threshold));
+    // Seal against clear air with the dBZ floor (-32) so the shell closes into
+    // solid blobs instead of open "curtains" where echo meets no-echo.
+    let glb = ds_3dtiles::encode_isosurface_glb(&grid, threshold, color, Some(-32.0))
         .expect("mesh the isosurface (try a lower threshold if this reports 'empty')");
 
     fs::create_dir_all(&out_dir).expect("mkdir out_dir");
@@ -139,10 +142,6 @@ fn main() {
         .get_locations()
         .ok()
         .and_then(|locs| locs.into_iter().next());
-    let (lon, lat) = antenna
-        .as_ref()
-        .map(|l| (l.longitude, l.latitude))
-        .unwrap_or((grid.origin_lon, grid.origin_lat));
     let site_label = antenna
         .as_ref()
         .map(|l| l.label.clone())
@@ -156,7 +155,7 @@ fn main() {
         "{site_label} ({nod}) {} isosurface — {time_str} · {threshold:.0} dBZ shell",
         grid.quantity
     );
-    write_viewer(&out_dir, lon, lat, grid.origin_height, &hud);
+    write_viewer(&out_dir, &hud);
 
     eprintln!(
         "wrote {}/  (tileset.json, content.glb, index.html) — {:.1} MB glb",
@@ -166,8 +165,10 @@ fn main() {
 }
 
 /// Write a self-contained, token-free CesiumJS viewer (CARTO Dark Matter
-/// basemap) for the glTF isosurface tileset.
-fn write_viewer(out_dir: &Path, lon: f64, lat: f64, base_alt: f64, hud: &str) {
+/// basemap) for the glTF isosurface tileset. The camera auto-frames the tileset
+/// (`zoomTo`) so it works regardless of where the echoes sit — no hard-coded
+/// position to land on empty sky.
+fn write_viewer(out_dir: &Path, hud: &str) {
     fn html_escape(s: &str) -> String {
         s.replace('&', "&amp;")
             .replace('<', "&lt;")
@@ -175,7 +176,6 @@ fn write_viewer(out_dir: &Path, lon: f64, lat: f64, base_alt: f64, hud: &str) {
             .replace('"', "&quot;")
     }
     let hud = html_escape(hud);
-    let cam_alt = base_alt + 90_000.0;
     let html = format!(
         r#"<!doctype html>
 <html><head><meta charset="utf-8"><title>{hud} — 3D Tiles</title>
@@ -197,6 +197,8 @@ const viewer = new Cesium.Viewer("c", {{
 }});
 viewer.scene.backgroundColor = Cesium.Color.BLACK;
 viewer.scene.globe.depthTestAgainstTerrain = false;
+// Lift the dark basemap a touch so the shell sits on a visible map.
+viewer.imageryLayers.get(0).brightness = 1.6;
 // Light the mesh from the scene's sun; the doubleSided material shades both
 // faces so the shell reads as a solid 3-D surface.
 viewer.scene.light = new Cesium.DirectionalLight({{
@@ -204,16 +206,14 @@ viewer.scene.light = new Cesium.DirectionalLight({{
 }});
 Cesium.Cesium3DTileset.fromUrl("tileset.json", {{ maximumScreenSpaceError: 1 }}).then(ts => {{
   viewer.scene.primitives.add(ts);
-  viewer.camera.flyTo({{
-    destination: Cesium.Cartesian3.fromDegrees({lon}, {lat_s}, {cam_alt}),
-    orientation: {{ heading: 0, pitch: Cesium.Math.toRadians(-30), roll: 0 }},
-    duration: 0
-  }});
+  // Auto-frame the tileset obliquely (heading 20°, pitch -25°) from its own
+  // bounding sphere — robust whatever the echo layout.
+  viewer.zoomTo(ts, new Cesium.HeadingPitchRange(
+    Cesium.Math.toRadians(20), Cesium.Math.toRadians(-25), ts.boundingSphere.radius * 1.3));
   console.log("isosurface tileset ready");
 }}).catch(e => console.error("tileset error", e));
 </script></body></html>
-"#,
-        lat_s = lat - 0.9,
+"#
     );
     fs::write(out_dir.join("index.html"), html).expect("write index.html");
 }

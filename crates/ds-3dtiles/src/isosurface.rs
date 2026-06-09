@@ -31,9 +31,17 @@
 //! 3D Tiles runtime applies the inverse Y-up→Z-up to glTF content (this is the
 //! flip the `.pnts` path deliberately avoids; here the content *is* glTF).
 //!
-//! Cells with no data are `NaN`; any tetrahedron touching a `NaN` corner is
-//! skipped, so no surface is fabricated across the cone of silence or beyond the
-//! beam fan.
+//! ## Clear air vs unmeasured (`NaN`)
+//!
+//! A radar volume stores `NaN` for both "the radar saw nothing" (clear air) and
+//! "the radar couldn't see here" (cone of silence / beyond range) — they are
+//! indistinguishable in the grid. The `background` parameter of
+//! [`encode_isosurface_glb`] decides how `NaN` corners behave: `None` skips any
+//! tetrahedron touching one (open surface — never fabricates), while `Some(bg)`
+//! treats them as the below-threshold value `bg`, **sealing** the surface into
+//! solid blobs by assuming absence of echo where unmeasured. Sealing is the
+//! sensible default for a reflectivity shell (otherwise echo→clear-air
+//! boundaries render as open vertical "curtains" instead of closed domes).
 
 use crate::Tiles3dError;
 use ds_core::geo::{destination_point, geodetic_to_ecef};
@@ -268,19 +276,49 @@ fn march_tet(
 /// mesh shaded a single `color` (`[r, g, b, a]`, 0–255) — typically the
 /// colormap colour at `threshold`, i.e. "the 20 dBZ shell".
 ///
+/// ## `background` — sealing the surface against clear air
+///
+/// A radar volume stores **`NaN` for both** "the radar looked and saw nothing"
+/// (clear air, *undetect*) and "the radar couldn't see here" (cone of silence /
+/// beyond range, *nodata*) — the engine can't tell them apart in the grid. With
+/// `background = None`, any tetrahedron touching a `NaN` corner is skipped, so
+/// the surface **does not close** where echo meets clear air → open vertical
+/// walls/blades, not solid blobs.
+///
+/// `background = Some(bg)` (with `bg < threshold`) treats every `NaN` corner as
+/// the value `bg`, i.e. **assumes absence of echo** wherever the radar didn't
+/// report one. The surface then seals into closed blobs. This never *invents*
+/// echo (it assumes the conservative direction — no reflectivity); its only
+/// cost is that a surface also caps at the true coverage boundary (the narrow
+/// cone of silence above the antenna and the max-range cylinder), which is the
+/// standard "no echo where unmeasured" convention every radar 3-D view uses.
+/// For a reflectivity shell pass e.g. `Some(-32.0)` (the dBZ floor).
+/// Distinguishing *undetect* from *nodata* in the engine sampler (so only the
+/// real cone of silence stays open) is a follow-up.
+///
 /// Returns [`Tiles3dError::Empty`] when no cell straddles the threshold (an
 /// empty surface — caller maps to 404), [`Tiles3dError::NonFinite`] for a
-/// non-finite `threshold`/origin, and [`Tiles3dError::TooLarge`] past
-/// [`MAX_TRIANGLES`]. Pair with [`tileset_json_glb`], which carries the antenna
-/// ECEF as the tile `transform`.
+/// non-finite `threshold`/origin/`background`, and [`Tiles3dError::TooLarge`]
+/// past [`MAX_TRIANGLES`]. Pair with [`tileset_json_glb`], which carries the
+/// antenna ECEF as the tile `transform`.
 pub fn encode_isosurface_glb(
     grid: &VoxelGrid,
     threshold: f64,
     color: [u8; 4],
+    background: Option<f64>,
 ) -> Result<Vec<u8>, Tiles3dError> {
     if !threshold.is_finite() {
         return Err(Tiles3dError::NonFinite("threshold"));
     }
+    // A `Some` background must be finite, else it would behave like `None`
+    // (a NaN fill leaves the corner non-finite → tet skipped) — confusingly.
+    if let Some(bg) = background {
+        if !bg.is_finite() {
+            return Err(Tiles3dError::NonFinite("background"));
+        }
+    }
+    // `NaN` corners map to this: the finite background (seal) or `NaN` (skip).
+    let nan_fill = background.unwrap_or(f64::NAN);
     let rtc = geodetic_to_ecef(grid.origin_lon, grid.origin_lat, grid.origin_height);
     if rtc.iter().any(|c| !c.is_finite()) {
         return Err(Tiles3dError::NonFinite("rtc_center"));
@@ -298,7 +336,9 @@ pub fn encode_isosurface_glb(
                 let mut cidx = [[0.0_f64; 3]; 8];
                 for (c, off) in CORNER.iter().enumerate() {
                     let (ir, ia, ih) = (i_r + off[0], i_a + off[1], i_h + off[2]);
-                    cvals[c] = grid.values[grid.index(ir, ia, ih)] as f64;
+                    let raw = grid.values[grid.index(ir, ia, ih)] as f64;
+                    // Clear air / unmeasured → background (seal) or NaN (skip).
+                    cvals[c] = if raw.is_finite() { raw } else { nan_fill };
                     cidx[c] = [ir as f64, ia as f64, ih as f64];
                 }
                 for tet in TETS {
@@ -500,7 +540,7 @@ mod tests {
     #[test]
     fn isosurface_glb_is_wellformed() {
         let grid = ramp_grid(3, 8, 5);
-        let glb = encode_isosurface_glb(&grid, 1.5, [255, 0, 0, 255]).expect("encode");
+        let glb = encode_isosurface_glb(&grid, 1.5, [255, 0, 0, 255], None).expect("encode");
         let (json, bin) = parse_glb(&glb);
 
         assert_eq!(json["asset"]["version"], "2.0");
@@ -544,7 +584,7 @@ mod tests {
         // reconstruct each vertex's height above the antenna and assert ≈4000 m.
         let mut grid = ramp_grid(4, 16, 5);
         grid.radius_range = [0.0, 5_000.0];
-        let glb = encode_isosurface_glb(&grid, 1.5, [0, 128, 255, 255]).unwrap();
+        let glb = encode_isosurface_glb(&grid, 1.5, [0, 128, 255, 255], None).unwrap();
         let (json, bin) = parse_glb(&glb);
 
         let rtc = geodetic_to_ecef(grid.origin_lon, grid.origin_lat, grid.origin_height);
@@ -571,31 +611,70 @@ mod tests {
     fn empty_when_threshold_above_all_data() {
         let grid = ramp_grid(3, 8, 5); // values 0..4
         assert!(matches!(
-            encode_isosurface_glb(&grid, 100.0, [255, 0, 0, 255]),
+            encode_isosurface_glb(&grid, 100.0, [255, 0, 0, 255], None),
             Err(Tiles3dError::Empty)
         ));
     }
 
     #[test]
-    fn nodata_corners_do_not_fabricate_surface() {
-        // A grid that is all-NaN except a single isolated finite cell can form no
-        // tetrahedron with all-finite corners → no surface (not a 1-cell blob).
+    fn nodata_corners_do_not_fabricate_surface_without_background() {
+        // With background = None, a grid that is all-NaN except a single isolated
+        // finite cell can form no tetrahedron with all-finite corners → no surface
+        // (NaN corners are skipped, not fabricated into a 1-cell blob).
         let mut grid = ramp_grid(3, 8, 5);
         grid.values.iter_mut().for_each(|v| *v = f32::NAN);
         let i = grid.index(1, 4, 2);
         grid.values[i] = 50.0;
         assert!(matches!(
-            encode_isosurface_glb(&grid, 1.5, [255, 0, 0, 255]),
+            encode_isosurface_glb(&grid, 1.5, [255, 0, 0, 255], None),
             Err(Tiles3dError::Empty)
         ));
     }
 
     #[test]
-    fn non_finite_threshold_is_rejected() {
+    fn background_seals_echo_surrounded_by_clear_air() {
+        // A compact echo core embedded in NaN (clear air). With background = None
+        // the surface can't close (Empty). With background = Some(below-threshold),
+        // the NaN corners are treated as no-echo and the surface seals into a
+        // closed blob — exactly the fix for the "curtains" artifact.
+        let mut grid = ramp_grid(6, 16, 6);
+        grid.values.iter_mut().for_each(|v| *v = f32::NAN);
+        // A 2×2×2 finite >threshold core in the interior, rest NaN.
+        for ir in 2..4 {
+            for ia in 7..9 {
+                for ih in 2..4 {
+                    let idx = grid.index(ir, ia, ih);
+                    grid.values[idx] = 40.0;
+                }
+            }
+        }
+        // No finite-<threshold neighbours, so without a background it can't close.
+        assert!(matches!(
+            encode_isosurface_glb(&grid, 20.0, [0, 200, 0, 255], None),
+            Err(Tiles3dError::Empty)
+        ));
+        // With a background floor below the threshold, it seals into a real mesh.
+        let glb = encode_isosurface_glb(&grid, 20.0, [0, 200, 0, 255], Some(-32.0))
+            .expect("sealed surface");
+        let (json, _bin) = parse_glb(&glb);
+        let count = json["accessors"][0]["count"].as_u64().unwrap();
+        assert!(
+            count > 0 && count % 3 == 0,
+            "sealed blob has triangles: {count}"
+        );
+    }
+
+    #[test]
+    fn non_finite_threshold_or_background_is_rejected() {
         let grid = ramp_grid(3, 8, 5);
         assert!(matches!(
-            encode_isosurface_glb(&grid, f64::NAN, [0, 0, 0, 255]),
+            encode_isosurface_glb(&grid, f64::NAN, [0, 0, 0, 255], None),
             Err(Tiles3dError::NonFinite("threshold"))
+        ));
+        // A Some(non-finite) background is rejected (would silently act like None).
+        assert!(matches!(
+            encode_isosurface_glb(&grid, 1.5, [0, 0, 0, 255], Some(f64::INFINITY)),
+            Err(Tiles3dError::NonFinite("background"))
         ));
     }
 

@@ -265,7 +265,16 @@ into a glTF `.glb` triangle mesh.
   cell-centre convention as the engine sampler) → `destination_point` +
   `geodetic_to_ecef` (both now in `ds_core::geo`), stored antenna-relative and
   pre-flipped Z-up→Y-up because a runtime re-applies Y-up→Z-up to **glTF**
-  content (the flip the `.pnts` path skips — pnts isn't glTF). `tileset_json_glb`
+  content (the flip the `.pnts` path skips — pnts isn't glTF). **`background`
+  sealing (load-bearing for radar):** the grid stores `NaN` for *both* clear-air
+  (`undetect`) and unmeasured (`nodata`/cone of silence) — `RawPixels::sample`
+  masks both identically (reader.rs). `encode_isosurface_glb(grid, threshold,
+  color, background)` with `background=Some(bg<threshold)` treats `NaN` as
+  no-echo so the surface **closes into solid blobs**; `None` skips `NaN`-touching
+  tets and the echo→clear-air boundary renders as open vertical *curtains*. The
+  demo seals with `Some(-32.0)` (the dBZ floor). Splitting `undetect` from
+  `nodata` in the engine sampler (so only the real cone of silence stays open) is
+  a follow-up. `tileset_json_glb`
   carries the antenna ECEF as the tile **`transform`** (glTF content has no
   embedded origin, unlike `.pnts` `RTC_CENTER`); the geodetic `region` is
   unaffected by it. Demo: `cargo run -p engine-odim --example gen_isosurface`
