@@ -346,8 +346,12 @@ into a glTF `.glb` triangle mesh.
   network per frame** (verified). A play/pause + slider time bar shows only when
   the collection has >1 volume; the point-cloud style (size + client-side filter)
   is applied across all frames. A non-time-dynamic collection is the degenerate
-  1-frame case. Preloading-all suits the engine's bounded retained-volume count; a
-  sliding window for much longer sequences is a follow-up.
+  1-frame case. The number of frames = the engine's retained volumes per site
+  (`[odim] max_files`, **default unbounded** — a day ≈ 288 at 5-min cadence — or
+  `time_window`); the viewer caps preload at the most-recent `MAX_FRAMES` (48) so
+  an unbounded source can't fetch/hold hundreds of tilesets. A true sliding window
+  for longer runs is a follow-up; operators should bound the source with
+  `max_files`/`time_window`.
 - **Routes** (mounted at `/3dtiles`): `GET /collections/{id}/tileset.json`
   (`?representation=&quantity=&datetime=&min_value=&threshold=&resolution=`),
   `GET /collections/{id}/content.pnts` (`?quantity=&datetime=&min_value=`),

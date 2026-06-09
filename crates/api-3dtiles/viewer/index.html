@@ -176,12 +176,19 @@ viewer.scene.globe.depthTestAgainstTerrain = false;
 // (#350). All frames are built up front and kept hidden except the active one, so
 // scrubbing/playing just toggles `.show` — no per-frame network/reload stall. A
 // non-time-dynamic collection is just the degenerate 1-frame case.
-let frames = [];          // Cesium3DTileset per timestamp (parallel to `times`; null = failed)
-let times = [];           // available volume timestamps (ISO Z) from the collection doc
-let frameIdx = 0;         // active frame index
+let frames = [];          // Cesium3DTileset per animated timestamp (parallel to `frameTimes`; null = failed)
+let times = [];           // full volume-time manifest (ISO Z) from the collection doc
+let frameTimes = [];      // the timestamps actually animated = most-recent MAX_FRAMES of `times`
+let frameIdx = 0;         // active index into `frameTimes`
 let playing = false;      // animation running?
 let playTimer = null;     // setInterval handle while playing
 const FRAME_MS = 600;     // per-frame dwell when playing
+// Safety cap on preloaded frames: a source with `max_files` unset (the default)
+// can retain hundreds of volumes (a day ≈ 288 at 5-min cadence), and preloading
+// all of them would mean hundreds of concurrent fetches + GPU-resident tilesets.
+// Animate the most-recent MAX_FRAMES; a true sliding window for longer runs is a
+// follow-up. Operators bound the source itself with `[odim] max_files`/`time_window`.
+const MAX_FRAMES = 48;
 let loadToken = 0;        // guards against out-of-order async (re)builds
 let currentRep = null;    // representation of the active frames
 let pointsFetchFloor = null; // the min_value (dBZ) the point-cloud frames were fetched at
@@ -320,10 +327,13 @@ async function loadFrames(reframe = false) {
   currentRep = rep;
   pointsFetchFloor = rep === "points" ? (num === "" ? -Infinity : parseFloat(num)) : null;
 
-  const frameTimes = times.length ? times : [null]; // [null] = the latest-volume frame
+  // Animate the most-recent MAX_FRAMES of the manifest ([null] = the single
+  // latest-volume frame when there's no time axis).
+  frameTimes = times.length ? times.slice(-MAX_FRAMES) : [null];
   if (frameIdx >= frameTimes.length) frameIdx = frameTimes.length - 1;
   if (frameIdx < 0) frameIdx = 0;
-  setStatus(`loading ${id} · ${q} · ${rep}${frameTimes.length > 1 ? ` · ${frameTimes.length} frames` : ""}…`);
+  const capped = times.length > frameTimes.length ? ` (latest ${frameTimes.length} of ${times.length})` : "";
+  setStatus(`loading ${id} · ${q} · ${rep}${frameTimes.length > 1 ? ` · ${frameTimes.length} frames${capped}` : ""}…`);
 
   // Preload all frames concurrently, each hidden. `preloadWhenHidden` is
   // load-bearing: without it a hidden tileset doesn't fetch tiles, so the first
@@ -406,7 +416,7 @@ function onNumCommit() {
 // Show the bar only for a genuine time axis (>1 volume); size the slider to the
 // frames and seek to the active one.
 function syncTimeBar() {
-  const n = times.length;
+  const n = frameTimes.length;
   $timebar.hidden = n <= 1;
   $time.max = String(Math.max(0, n - 1));
   $time.value = String(frameIdx);
@@ -416,10 +426,10 @@ function syncTimeBar() {
 // Compact label for the active timestamp, e.g. `2026-05-15 00:05Z  (1/3)`
 // (`2026-05-15T00:05:00Z` → drop the `T` and the trailing `:00` seconds).
 function updateTimeLabel() {
-  const t = times[frameIdx];
+  const t = frameTimes[frameIdx];
   if (!t) { $timeLabel.textContent = ""; return; }
   const pretty = t.replace("T", " ").replace(/:\d{2}Z$/, "Z");
-  $timeLabel.textContent = `${pretty}  (${frameIdx + 1}/${times.length})`;
+  $timeLabel.textContent = `${pretty}  (${frameIdx + 1}/${frameTimes.length})`;
 }
 
 function updateStatus(extra) {
