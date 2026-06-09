@@ -219,6 +219,17 @@ pub fn tileset_json_voxels(
     let [cx, cy, cz] = geodetic_to_ecef(antenna_lon, antenna_lat, antenna_height);
     let [n_r, n_a, n_h] = dims;
 
+    // East-North-Up → ECEF rotation at the antenna, so the cylinder's local z is
+    // local **up** (its height axis) and its radial plane is horizontal. (An
+    // identity rotation — fine for the mesh products, whose vertices are absolute
+    // ECEF — would align the cylinder's z with global ECEF-Z, tilting the whole
+    // volume by the latitude; the parametric cylinder needs the real local frame.)
+    let (sl, cl) = antenna_lon.to_radians().sin_cos();
+    let (sp, cp) = antenna_lat.to_radians().sin_cos();
+    let east = [-sl, cl, 0.0];
+    let north = [-sp * cl, -sp * sl, cp];
+    let up = [cp * cl, cp * sl, sp];
+
     let tileset = json!({
         "asset": { "version": "1.1" },
         "schema": voxel_schema(quantity),
@@ -235,9 +246,14 @@ pub fn tileset_json_voxels(
         "extensionsUsed": ["3DTILES_bounding_volume_cylinder", "3DTILES_content_voxels"],
         "extensionsRequired": ["3DTILES_bounding_volume_cylinder", "3DTILES_content_voxels"],
         "root": {
-            // Cylinder local frame at the antenna ECEF (z-up; CesiumJS applies
-            // the glTF y-up→z-up to the voxel content). Identity rotation.
-            "transform": [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, cx, cy, cz, 1.0],
+            // ENU→ECEF tile transform (column-major): local x=east, y=north,
+            // z=up at the antenna, translation = antenna ECEF.
+            "transform": [
+                east[0], east[1], east[2], 0.0,
+                north[0], north[1], north[2], 0.0,
+                up[0], up[1], up[2], 0.0,
+                cx, cy, cz, 1.0
+            ],
             "boundingVolume": {
                 "extensions": {
                     // Centred at the local origin, height along z; lift it so the

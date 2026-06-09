@@ -305,17 +305,19 @@ into a glTF `.glb` triangle mesh.
   first cut rendered uniformly red). Demo: `cargo run -p engine-odim --example
   gen_echo_top` (render-verified). API route is a follow-up; the mesher will be
   reused for VIL (#365).
-- **Three representations are served from the API** (selected by
-  `?representation=points|isosurface|echotop` on `tileset.json`): `points` →
+- **Four representations are served from the API.** Three are selected by
+  `?representation=points|isosurface|echotop` on `tileset.json`: `points` →
   `.pnts` (region-only tileset, `RTC_CENTER` self-places), `isosurface` /
   `echotop` → `.glb` plus a tile **`transform`** = the antenna ECEF. The two glTF
   products share `content.glb`, disambiguated by `?representation=echotop` in the
-  content URI (default = isosurface). Capability + the origin both glTF products
-  need are coupled in one field: `VolumeInfo.voxel_grid: Option<VoxelGridCaps {
-  origin }>` — `Some` ⇒ the mesh products are available and the origin is present
-  (tileset built without sampling; "supports but no origin" is unrepresentable,
-  never a 500). It drives the collection JSON's `representations` array → the
-  viewer's toggle. The isosurface seals (`background=Some(-32)`); echo-top is
+  content URI (default = isosurface). The fourth — **`voxels`** (#351) — has its
+  own `…/voxel/` sub-path (below), not a `?representation=` variant. Capability +
+  the origin/extents all of them need are coupled in one field:
+  `VolumeInfo.voxel_grid: Option<VoxelGridCaps { origin, radius_m, height_m }>` —
+  `Some` ⇒ the mesh + voxel products are available and the cylinder origin/extents
+  are present (tileset built without sampling; "supports but no origin" is
+  unrepresentable, never a 500). It drives the collection JSON's `representations`
+  array → the viewer's toggle. The isosurface seals (`background=Some(-32)`); echo-top is
   coloured by a height ramp. Both mesh products take a `?resolution=` detail tier
   (`Resolution` enum → voxel-grid dims; `low` `[128,360,48]` ≈2.2 M cells, `med`
   `[256,360,56]` ≈5.2 M *default*, `high` `[512,360,64]` ≈11.8 M / ~12 s first
@@ -352,10 +354,34 @@ into a glTF `.glb` triangle mesh.
   an unbounded source can't fetch/hold hundreds of tilesets. A true sliding window
   for longer runs is a follow-up; operators should bound the source with
   `max_files`/`time_window`.
+- **True cylindrical voxels (#351, Tier B — `ds-3dtiles/voxels.rs`):** a
+  `VoxelGrid` → `EXT_primitive_voxels` glTF `.glb` + a
+  `3DTILES_content_voxels` / `3DTILES_bounding_volume_cylinder` tileset that
+  CesiumJS 1.142 ray-marches as a volume (render-verified). **Draft, CesiumGS-only
+  — NOT in the Khronos registry, CesiumJS the sole implementation**, so encode
+  against the live `VoxelCylinder3DTiles` **fixtures, not the README** (which is
+  stale: cylinder `mode` = `2147483650` (0x80000002 — box 0x80000000, ellipsoid
+  0x80000001), *not* the README's `2147483647`). Load-bearing gotchas: **axis
+  swap** content `[radius,angle,height]` → glTF `dimensions [radius,height,angle]`,
+  data **radius-fastest → height → angle-slowest** (our grid is the transpose);
+  `EXT_structural_metadata` (schema + `propertyAttributes`) at the glTF **top
+  level**; embedded BIN buffer; `NaN` → a declared `noData` sentinel; **implicit
+  OCTREE tiling + a constant `.subtree`** is required; and the tile **`transform`
+  must be the real ENU→ECEF frame** (east/north/up), *not* identity-rotation —
+  identity works for the mesh products (absolute-ECEF vertices) but tilts the
+  *parametric* cylinder by the latitude. Cylinder extents come from
+  `VoxelGridCaps.radius_m`/`height_m` (= the grid's exact extents, O(1)); the
+  bounding cylinder is lifted by `height/2` so data sits 0..H above the antenna.
+  Served under its own sub-path so the implicit-tiling URIs resolve relatively;
+  the viewer renders it via `Cesium3DTilesVoxelProvider` + a `VoxelPrimitive`
+  with a reflectivity transfer-function `CustomShader` (`fsInput.metadata.<q>`).
+  v1 MVP: single tile, latest time (no octree/mosaic/animation — follow-ups).
 - **Routes** (mounted at `/3dtiles`): `GET /collections/{id}/tileset.json`
   (`?representation=&quantity=&datetime=&min_value=&threshold=&resolution=`),
   `GET /collections/{id}/content.pnts` (`?quantity=&datetime=&min_value=`),
   `GET /collections/{id}/content.glb` (`?representation=&quantity=&datetime=&threshold=&resolution=`),
+  the voxel trio `GET /collections/{id}/voxel/{tileset.json,subtrees/*,content/*}`
+  (`?quantity=&datetime=&resolution=`),
   plus `/` · `/collections` · `/collections/{id}` · **`/viewer`** (a bundled
   CesiumJS page with collection + quantity + **representation** + **resolution**
   pickers and a **time scrubber** (play/pause + slider) for multi-volume
