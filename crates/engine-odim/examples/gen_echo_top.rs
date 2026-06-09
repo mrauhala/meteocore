@@ -9,10 +9,12 @@
 //! coloured by height (low = blue → high = red). It shows storm *depth*.
 //!
 //! Usage:
-//!   cargo run -p engine-odim --example gen_echo_top -- [file.h5] [out_dir] [threshold_dbz]
+//!   cargo run -p engine-odim --example gen_echo_top -- [file.h5] [out_dir] [threshold_dbz] [n_radius] [n_height]
 //!     file.h5        default: the (uncommitted) FMI Vihti fixture
 //!     out_dir        default: target/3dtiles-echotop-fivih
 //!     threshold_dbz  default: 18.0  (the standard echo-top reflectivity)
+//!     n_radius       default: 128   (radial cells ≈ 2 km bins; ~500 ≈ native)
+//!     n_height       default: 48    (height cells ≈ 420 m; capped by ~10 sweeps)
 
 use ds_core::config::OdimConfig;
 use ds_core::edr_engine::EdrEngine;
@@ -43,6 +45,19 @@ fn main() {
         .next()
         .map(|s| s.parse().expect("threshold_dbz must be a number"))
         .unwrap_or(18.0);
+    // Optional resampling resolution: radial cells (default 128 ≈ 2 km bins) and
+    // height cells (default 48 ≈ 420 m). Azimuth stays 360 = 1° (native). The
+    // fivih range bins are 125–500 m natively, so bumping radial toward ~500
+    // sharpens the bars; bumping azimuth past 360 or height past the ~10 sweeps
+    // adds no real detail. Bounded by the engine's MAX_VOXELS.
+    let n_radius: usize = args
+        .next()
+        .map(|s| s.parse().expect("n_radius must be an integer"))
+        .unwrap_or(128);
+    let n_height: usize = args
+        .next()
+        .map(|s| s.parse().expect("n_height must be an integer"))
+        .unwrap_or(48);
 
     let file = Path::new(&file);
     if !file.exists() {
@@ -96,11 +111,13 @@ fn main() {
         .expect("site advertises at least one quantity");
 
     let grid = view
-        .read_voxel_grid(Some(&quantity), None, None, None)
+        .read_voxel_grid(Some(&quantity), None, Some([n_radius, 360, n_height]), None)
         .expect("resample the volume into a voxel grid");
     eprintln!(
-        "site {nod} — voxel grid {:?}, quantity {}",
-        grid.dims, grid.quantity
+        "site {nod} — voxel grid {:?} ({} cells), quantity {}",
+        grid.dims,
+        grid.dims[0] * grid.dims[1] * grid.dims[2],
+        grid.quantity
     );
 
     // Colour the draped surface by HEIGHT (not reflectivity): blue (shallow) →
