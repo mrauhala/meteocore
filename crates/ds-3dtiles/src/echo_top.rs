@@ -63,7 +63,11 @@ fn echo_top_index(grid: &VoxelGrid, threshold: f64, i_r: usize, i_a: usize) -> O
     if top + 1 < n_h {
         let v_top = grid.values[grid.index(i_r, i_a, top)] as f64;
         let v_above = grid.values[grid.index(i_r, i_a, top + 1)] as f64;
-        if v_above.is_finite() && v_above < threshold && v_top > v_above {
+        if v_above.is_finite() && v_above < threshold {
+            // `top` is the highest cell ≥ threshold, so v_top ≥ threshold >
+            // v_above ⇒ the denominator (v_above − v_top) is strictly negative,
+            // never zero (so no `v_top > v_above` runtime guard is needed).
+            debug_assert!(v_top > v_above);
             let t = ((threshold - v_top) / (v_above - v_top)).clamp(0.0, 1.0);
             return Some(top as f64 + t);
         }
