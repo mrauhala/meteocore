@@ -316,7 +316,10 @@ fn march_tet(
             // Two vs two: the surface is a quad on the four crossing edges.
             // Order its corners around the perimeter so the two triangles don't
             // self-intersect: (a–c, b–c, b–d, a–d) — consecutive edges share an
-            // endpoint, forming a proper cycle.
+            // endpoint, forming a proper cycle. (We always fan from q0; picking
+            // the shorter diagonal would give marginally better aspect ratios on
+            // the mildly non-planar projected quad — a follow-up if vertex
+            // sharing lands, negligible at radar grid scale.)
             let (a, b) = (inside[0], inside[1]);
             let (c, d) = (outside[0], outside[1]);
             let q0 = cross(a, c);

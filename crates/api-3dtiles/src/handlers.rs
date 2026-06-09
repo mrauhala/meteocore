@@ -447,6 +447,15 @@ pub async fn get_content_glb(
                     ds_3dtiles::Tiles3dError::TooLarge(_) => Tiles3dError::BadRequest(format!(
                         "threshold {threshold} produces too large an isosurface; raise it"
                     )),
+                    // The seal floor is clamped < threshold above, so this is
+                    // currently unreachable — but map it to 400 (a bad
+                    // parameter combination) so a future floor-formula change
+                    // can't silently surface as an opaque 500.
+                    ds_3dtiles::Tiles3dError::BackgroundNotBelowThreshold { .. } => {
+                        Tiles3dError::BadRequest(
+                            "isosurface sealing floor is not below the threshold".into(),
+                        )
+                    }
                     other => Tiles3dError::Internal(format!("isosurface encode failed: {other}")),
                 })?;
             let etag = etag_of(&bytes);
