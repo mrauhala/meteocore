@@ -56,7 +56,7 @@ impl Resolution {
     /// Parse the `resolution` query value (`None`/empty → `Med`).
     fn parse(s: Option<&str>) -> Result<Self, Tiles3dError> {
         match s.map(str::trim) {
-            None | Some("") | Some("med") | Some("medium") => Ok(Self::Med),
+            None | Some("") | Some("med") => Ok(Self::Med),
             Some("low") => Ok(Self::Low),
             Some("high") => Ok(Self::High),
             Some(other) => Err(Tiles3dError::BadRequest(format!(
@@ -98,7 +98,14 @@ const LEGEND_STOPS: usize = 24;
 fn legend_stops(colormap: &dyn ColorMap, min: f64, max: f64, n: usize) -> Vec<serde_json::Value> {
     (0..n)
         .map(|i| {
-            let v = min + (max - min) * (i as f64) / ((n - 1) as f64);
+            // Guard n == 1: `i/(n-1)` would be `0/0 = NaN`, which serde emits as
+            // `null`. (LEGEND_STOPS is 24 today, but keep the invariant explicit.)
+            let v = min
+                + if n <= 1 {
+                    0.0
+                } else {
+                    (max - min) * (i as f64) / ((n - 1) as f64)
+                };
             let c = colormap.color(Some(v));
             json!({
                 "value": (v * 10.0).round() / 10.0,
