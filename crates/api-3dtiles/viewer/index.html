@@ -136,13 +136,17 @@ async function loadCollections() {
       $coll.appendChild(o);
     }
     if (!cols.length) { setStatus("no 3D-Tiles collections at " + BASE, true); return; }
-    await loadCollectionMeta();
+    await loadCollectionMeta(true); // first view → frame the volume
   } catch (e) {
     setStatus("can't reach " + BASE + " — " + e, true);
   }
 }
 
-async function loadCollectionMeta() {
+// `reframe` controls whether the camera is moved to frame the volume. Frame on a
+// collection switch (the volume may be elsewhere); preserve the camera for
+// in-place changes (quantity/representation/threshold/resolution) so adjusting a
+// filter doesn't yank the view.
+async function loadCollectionMeta(reframe) {
   const id = $coll.value;
   if (!id) return;
   try {
@@ -168,7 +172,7 @@ async function loadCollectionMeta() {
       $rep.appendChild(o);
     }
     syncNumField();
-    await loadTileset();
+    await loadTileset(reframe);
   } catch (e) {
     setStatus("error loading collection — " + e, true);
   }
@@ -183,7 +187,7 @@ function syncNumField() {
   $resField.hidden = !meta.mesh;
 }
 
-async function loadTileset() {
+async function loadTileset(reframe = false) {
   const id = $coll.value, q = $qty.value;
   const rep = $rep.value || "points";
   const num = $num.value.trim();
@@ -217,8 +221,12 @@ async function loadTileset() {
         pointSize: "clamp((${value} - 5.0) * 0.16 + 1.0, 1.0, 10.0)",
       });
     }
-    await viewer.zoomTo(ts, new Cesium.HeadingPitchRange(
-      Cesium.Math.toRadians(210), Cesium.Math.toRadians(-28), 300000));
+    // Frame from the south-west (camera faces NE, heading 45°) looking down at
+    // -28° — only on a reframe; otherwise leave the camera where the user put it.
+    if (reframe) {
+      await viewer.zoomTo(ts, new Cesium.HeadingPitchRange(
+        Cesium.Math.toRadians(45), Cesium.Math.toRadians(-28), 300000));
+    }
     setStatus(`${id} · ${q} · ${rep}`);
   } catch (e) {
     if (token === loadToken) setStatus("no data for this selection", true);
@@ -226,13 +234,17 @@ async function loadTileset() {
   }
 }
 
-$coll.addEventListener("change", loadCollectionMeta);
-$qty.addEventListener("change", loadTileset);
+// Collection switch → reframe (new volume, possibly elsewhere). Every other
+// control is an in-place change → preserve the camera. (Arrow wrappers are
+// load-bearing: passing the handler bare would feed the DOM Event as `reframe`,
+// which is truthy and would reframe on every filter tweak.)
+$coll.addEventListener("change", () => loadCollectionMeta(true));
+$qty.addEventListener("change", () => loadTileset(false));
 // Switching representation relabels + re-defaults the numeric field, toggles the
-// Resolution selector, then reloads.
-$rep.addEventListener("change", () => { syncNumField(); loadTileset(); });
-$res.addEventListener("change", loadTileset);
-$num.addEventListener("change", loadTileset);
+// Resolution selector, then reloads (camera preserved).
+$rep.addEventListener("change", () => { syncNumField(); loadTileset(false); });
+$res.addEventListener("change", () => loadTileset(false));
+$num.addEventListener("change", () => loadTileset(false));
 loadCollections();
 </script>
 </body>
