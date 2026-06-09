@@ -683,6 +683,173 @@ pub async fn get_content_glb(
 }
 
 // ---------------------------------------------------------------------------
+// True voxels (#351): EXT_primitive_voxels cylinder tileset + subtree + content
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct VoxelParams {
+    pub quantity: Option<String>,
+    pub datetime: Option<String>,
+    /// Voxel-grid detail tier (`low`/`med`/`high`). `None` → `med`.
+    pub resolution: Option<String>,
+}
+
+/// `GET /collections/{id}/voxel/tileset.json` — the implicit-tiling cylinder
+/// voxel tileset. O(1): the cylinder extent + origin come from `VolumeInfo`'s
+/// `VoxelGridCaps` (no grid sample). Relative content/subtree URIs resolve under
+/// `…/voxel/`; the content URI carries the resolved quantity/time/resolution.
+pub async fn get_voxel_tileset(
+    Path(id): Path<String>,
+    Query(params): Query<VoxelParams>,
+    State(state): State<AppState>,
+) -> Result<Response, Tiles3dError> {
+    let state = state.load_full();
+    let (engine, _config) = lookup(&state, &id)?;
+    let info = engine.volume_info();
+    let caps = info.voxel_grid.as_ref().ok_or_else(|| {
+        Tiles3dError::BadRequest(format!(
+            "collection '{id}' does not support the voxels representation"
+        ))
+    })?;
+    if !(caps.radius_m > 0.0 && caps.height_m > 0.0) {
+        return Err(Tiles3dError::NotFound(format!(
+            "collection '{id}' has no voxel coverage yet"
+        )));
+    }
+    let quantity = match &params.quantity {
+        Some(q) => {
+            if !info.quantities.iter().any(|(qid, _)| qid == q) {
+                return Err(Tiles3dError::BadRequest(format!(
+                    "unknown quantity '{q}' for collection '{id}'"
+                )));
+            }
+            q.clone()
+        }
+        None => info.default_quantity.clone(),
+    };
+    if quantity.is_empty() {
+        return Err(Tiles3dError::NotFound(format!(
+            "collection '{id}' has no quantities"
+        )));
+    }
+    let resolution = Resolution::parse(params.resolution.as_deref())?;
+    let [n_r, n_a, n_h] = resolution.dims();
+
+    // The content fetch must render the same selection — bake it into the
+    // (relative) content URI's query, alongside the implicit-tiling placeholders.
+    let mut q = format!("quantity={}", pct_encode(&quantity));
+    if let Some(dt) = &params.datetime {
+        let dt = parse_datetime(dt)?;
+        q.push_str(&format!("&datetime={}", dt.format("%Y-%m-%dT%H:%M:%SZ")));
+    }
+    q.push_str(&format!("&resolution={}", resolution.as_str()));
+    let content_uri = format!("content/{{level}}/{{x}}/{{y}}/{{z}}.glb?{q}");
+
+    let [olon, olat, oh] = caps.origin;
+    let tileset = ds_3dtiles::tileset_json_voxels(
+        olon,
+        olat,
+        oh,
+        caps.radius_m,
+        caps.height_m,
+        [n_r, n_a, n_h],
+        &quantity,
+        LEGEND_MIN_DBZ,
+        LEGEND_MAX_DBZ,
+        &content_uri,
+        "subtrees/{level}/{x}/{y}/{z}.json",
+    )
+    .map_err(|e| Tiles3dError::Internal(format!("voxel tileset build failed: {e}")))?;
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "public, max-age=60"),
+        ],
+        tileset,
+    )
+        .into_response())
+}
+
+/// `GET /collections/{id}/voxel/subtrees/{*tile}` — the implicit-tiling
+/// availability subtree. One tile is available (the root), so every requested
+/// slot returns the same constant subtree.
+pub async fn get_voxel_subtree(
+    Path((id, _tile)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Response, Tiles3dError> {
+    let state = state.load_full();
+    let (engine, _config) = lookup(&state, &id)?;
+    if engine.volume_info().voxel_grid.is_none() {
+        return Err(Tiles3dError::NotFound(format!(
+            "collection '{id}' has no voxels"
+        )));
+    }
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "public, max-age=300"),
+        ],
+        ds_3dtiles::voxel_subtree_json(),
+    )
+        .into_response())
+}
+
+/// `GET /collections/{id}/voxel/content/{*tile}` — the `EXT_primitive_voxels`
+/// glTF `.glb`. Samples the grid (blocking) under the shared render semaphore,
+/// same as the mesh content path; content-derived ETag.
+pub async fn get_voxel_content(
+    headers: HeaderMap,
+    Path((id, _tile)): Path<(String, String)>,
+    Query(params): Query<VoxelParams>,
+    State(state): State<AppState>,
+) -> Result<Response, Tiles3dError> {
+    let state = state.load_full();
+    let (engine, _config) = lookup(&state, &id)?;
+    let info = engine.volume_info();
+    if info.voxel_grid.is_none() {
+        return Err(Tiles3dError::BadRequest(format!(
+            "collection '{id}' does not support voxels"
+        )));
+    }
+    if let Some(q) = &params.quantity {
+        if !info.quantities.iter().any(|(qid, _)| qid == q) {
+            return Err(Tiles3dError::BadRequest(format!(
+                "unknown quantity '{q}' for collection '{id}'"
+            )));
+        }
+    }
+    let time = params.datetime.as_deref().map(parse_datetime).transpose()?;
+    let quantity = params.quantity.clone();
+    let dims = Resolution::parse(params.resolution.as_deref())?.dims();
+
+    let _permit = state
+        .render_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| Tiles3dError::Internal("render semaphore closed".into()))?;
+    let engine = engine.clone();
+    let id_for_err = id.clone();
+    let (bytes, etag) =
+        tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
+            let grid = engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;
+            let bytes = ds_3dtiles::encode_voxels_glb(&grid).map_err(|e| match e {
+                ds_3dtiles::Tiles3dError::Empty => {
+                    Tiles3dError::NotFound(format!("no voxel data for collection '{id_for_err}'"))
+                }
+                other => Tiles3dError::Internal(format!("voxel encode failed: {other}")),
+            })?;
+            let etag = etag_of(&bytes);
+            Ok((bytes, etag))
+        })
+        .await
+        .map_err(|e| Tiles3dError::Internal(format!("voxel task failed: {e}")))??;
+
+    Ok(binary_response(&headers, "model/gltf-binary", &etag, bytes))
+}
+
+// ---------------------------------------------------------------------------
 // Landing / collections
 // ---------------------------------------------------------------------------
 
@@ -763,6 +930,10 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
     if supports_mesh {
         representations.push("isosurface");
         representations.push("echotop");
+        // True cylindrical voxels (#351) — same capability gate (a voxel grid),
+        // but its own implicit-tiling tileset under `…/voxel/`, not a
+        // `?representation=` variant of the shared tileset.
+        representations.push("voxels");
     }
     // A link per representation so a link-following client (not just one that
     // reads `representations` and builds URLs itself) can discover them.
@@ -773,6 +944,7 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
     if supports_mesh {
         links.push(json!({ "href": format!("{base}/3dtiles/collections/{id}/tileset.json?representation=isosurface"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (isosurface mesh)" }));
         links.push(json!({ "href": format!("{base}/3dtiles/collections/{id}/tileset.json?representation=echotop"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (echo-top columns)" }));
+        links.push(json!({ "href": format!("{base}/3dtiles/collections/{id}/voxel/tileset.json"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (cylindrical voxels)" }));
     }
     // Colour-scale legend for the point cloud: the precomputed gradient of the
     // shared reflectivity colormap, so the viewer's bar matches the point colours

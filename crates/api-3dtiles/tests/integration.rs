@@ -115,6 +115,8 @@ impl VolumeEngine for MockVolume {
             region: Some([0.42, 1.05, 0.44, 1.07, 100.0, 25_000.0]),
             voxel_grid: Some(VoxelGridCaps {
                 origin: [24.5, 60.5, 100.0],
+                radius_m: 250_000.0,
+                height_m: 20_000.0,
             }),
         })
     }
@@ -391,7 +393,7 @@ async fn collections_list_and_doc() {
         .iter()
         .map(|r| r.as_str().unwrap())
         .collect();
-    assert_eq!(reps, vec!["points", "isosurface", "echotop"]);
+    assert_eq!(reps, vec!["points", "isosurface", "echotop", "voxels"]);
     // A colour-scale legend is advertised for the point cloud: a unit, a range,
     // and sampled `#rrggbb` stops the viewer renders as a gradient bar.
     let lg = &v["legend"];
@@ -565,6 +567,55 @@ async fn glb_rejects_points_representation() {
     let (status, _body, _h) =
         get("/collections/radar-fivih/content.glb?representation=points&quantity=DBZH").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn voxel_tileset_subtree_and_content_are_well_formed() {
+    // Tileset: cylinder bounding volume + content_voxels + implicit OCTREE +
+    // a content URI carrying the resolved selection.
+    let (status, body, _h) =
+        get("/collections/radar-fivih/voxel/tileset.json?quantity=DBZH&resolution=low").await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let bv = &v["root"]["boundingVolume"]["extensions"]["3DTILES_bounding_volume_cylinder"];
+    assert!(bv["maxRadius"].as_f64().unwrap() > 0.0);
+    assert_eq!(
+        v["root"]["content"]["extensions"]["3DTILES_content_voxels"]["class"],
+        "voxel"
+    );
+    assert_eq!(v["root"]["implicitTiling"]["subdivisionScheme"], "OCTREE");
+    let curi = v["root"]["content"]["uri"].as_str().unwrap();
+    assert!(
+        curi.starts_with("content/{level}/{x}/{y}/{z}.glb?"),
+        "{curi}"
+    );
+    assert!(curi.contains("quantity=DBZH") && curi.contains("resolution=low"));
+
+    // Subtree: constant single-tile availability.
+    let (status, body, _h) = get("/collections/radar-fivih/voxel/subtrees/0/0/0/0.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let s: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(s["contentAvailability"]["constant"], 1);
+
+    // Content: a valid EXT_primitive_voxels glb (cylinder mode 2147483650).
+    let (status, body, headers) =
+        get("/collections/radar-fivih/voxel/content/0/0/0/0.glb?quantity=DBZH&resolution=low")
+            .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[0..4], b"glTF", "glb magic");
+    assert_eq!(
+        headers[axum::http::header::CONTENT_TYPE],
+        "model/gltf-binary"
+    );
+    // Parse the JSON chunk and check the voxel extension + cylinder mode.
+    let jlen = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
+    let j: serde_json::Value = serde_json::from_slice(&body[20..20 + jlen]).unwrap();
+    assert_eq!(j["meshes"][0]["primitives"][0]["mode"], 2_147_483_650u64);
+    assert!(j["extensionsRequired"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e == "EXT_primitive_voxels"));
 }
 
 #[tokio::test]
