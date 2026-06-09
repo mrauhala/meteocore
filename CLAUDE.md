@@ -322,9 +322,19 @@ into a glTF `.glb` triangle mesh.
   compute — ETag caches repeats); the tier is echoed into the `content.uri`. The
   point cloud is native-resolution and ignores it. A too-low threshold or a bad
   resolution token → 400, an empty result → 404.
-- **Point sizing:** `encode_pnts` writes a per-point `value` (the physical value)
-  into the `.pnts` **batch table** (no `BATCH_ID` ⇒ per-point properties), so the
-  viewer styles `pointSize` by `${value}` — weak echo → ~1 px, strong → ~10 px.
+- **Point sizing + client-side filter:** `encode_pnts` writes a per-point `value`
+  (the physical value) into the `.pnts` **batch table** (no `BATCH_ID` ⇒ per-point
+  properties; CesiumJS exposes them to the style engine as `${value}`). The viewer
+  styles `pointSize` by `${value}` (weak echo → ~1 px, strong → ~16 px) and
+  **filters** by it: the `min dBZ` field restyles `show` client-side (instant, no
+  re-fetch, as long as it stays ≥ the fetched floor; going lower re-fetches the
+  larger set). **Do not add `BATCH_ID`** to make points pickable features — it
+  disables per-point `pointSize` in CesiumJS's point-cloud pipeline (verified;
+  `pickMetadata` also can't read a `.pnts` batch table in 1.124 — only its
+  schema). The value is read off **color + size**, and the collection JSON
+  carries a `legend` (the point colormap sampled into `#rrggbb` stops over a dBZ
+  range via `legend_stops`) which the viewer renders as a gradient bar for the
+  point cloud.
 - **Routes** (mounted at `/3dtiles`): `GET /collections/{id}/tileset.json`
   (`?representation=&quantity=&datetime=&min_value=&threshold=&resolution=`),
   `GET /collections/{id}/content.pnts` (`?quantity=&datetime=&min_value=`),

@@ -151,9 +151,12 @@ pub fn encode_pnts(
         ft_json.push(b' ');
     }
 
-    // Batch table: one per-point `value` (the physical value, e.g. dBZ) so a
-    // client can style point size by it. No `BATCH_ID` in the feature table ⇒
-    // the batch table holds POINTS_LENGTH per-point properties (one per point).
+    // Batch table: one per-point `value` (the physical value, e.g. dBZ). No
+    // `BATCH_ID` in the feature table ⇒ the batch table holds POINTS_LENGTH
+    // per-point properties (one per point), which CesiumJS exposes to the style
+    // engine as `${value}` — driving client-side point sizing AND filtering.
+    // (A `BATCH_ID` would make points pickable features but disables per-point
+    // `pointSize` styling in CesiumJS's point-cloud pipeline — not worth it.)
     let bt = json!({
         "value": { "byteOffset": 0, "componentType": "FLOAT", "type": "SCALAR" },
     });
@@ -344,6 +347,13 @@ mod tests {
         assert_eq!(ft["RTC_CENTER"][0], 3_000_000.0);
         // RGB starts after the 3 positions (3 * 12 = 36 bytes).
         assert_eq!(ft["RGB"]["byteOffset"], 36);
+        // No BATCH_ID: per-point `value` reaches the style engine (sizing +
+        // filtering) without promoting points to features (which would disable
+        // per-point pointSize in CesiumJS).
+        assert!(
+            ft.get("BATCH_ID").is_none(),
+            "no BATCH_ID (keeps pointSize)"
+        );
 
         // Batch table declares the per-point `value` (FLOAT SCALAR), and its
         // binary carries the three sample values (10, 45, 60).
@@ -355,8 +365,10 @@ mod tests {
         let vbin = &bytes[bt_start + bt_json_len..bt_start + bt_json_len + bt_bin_len];
         let v0 = f32::from_le_bytes(vbin[0..4].try_into().unwrap());
         let v1 = f32::from_le_bytes(vbin[4..8].try_into().unwrap());
+        let v2 = f32::from_le_bytes(vbin[8..12].try_into().unwrap());
         assert_eq!(v0, 10.0);
         assert_eq!(v1, 45.0);
+        assert_eq!(v2, 60.0); // all three written — a truncated loop would fail here
     }
 
     #[test]

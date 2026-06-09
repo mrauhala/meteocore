@@ -84,6 +84,30 @@ impl Resolution {
     }
 }
 
+/// Reflectivity range (dBZ) sampled for the viewer's colour-scale legend. The
+/// shared point colormap is sampled across this span so the legend reads the
+/// same colours the points show. 0–70 dBZ is the conventional radar display
+/// range — it covers the whole coloured ramp (the radar colormap is ~black
+/// below a few dBZ, so a lower bound just adds an invisible band).
+const LEGEND_MIN_DBZ: f64 = 0.0;
+const LEGEND_MAX_DBZ: f64 = 70.0;
+const LEGEND_STOPS: usize = 24;
+
+/// Sample `colormap` into `(value, "#rrggbb")` stops across `[min, max]` for the
+/// viewer legend. RGB only — `.pnts` colours are opaque, so alpha is dropped.
+fn legend_stops(colormap: &dyn ColorMap, min: f64, max: f64, n: usize) -> Vec<serde_json::Value> {
+    (0..n)
+        .map(|i| {
+            let v = min + (max - min) * (i as f64) / ((n - 1) as f64);
+            let c = colormap.color(Some(v));
+            json!({
+                "value": (v * 10.0).round() / 10.0,
+                "color": format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]),
+            })
+        })
+        .collect()
+}
+
 /// The blue→red **height** colour ramp for the echo-top product (stops at height
 /// values, 0–15 km) — a builtin colormap's stops are in its own units, so they
 /// collapse over a height range; build it explicitly. Cheap to construct.
@@ -585,11 +609,13 @@ pub async fn get_content_glb(
                 ds_3dtiles::Tiles3dError::TooLarge(_) => Tiles3dError::BadRequest(format!(
                     "threshold {threshold} produces too large a {product}; raise it"
                 )),
-                // Unreachable (floor < threshold above) — defensive 400.
+                // Unreachable (floor < threshold above) — defensive 400. Only
+                // the isosurface encoder emits this today, but this `map_err`
+                // covers both products, so use `{product}` for consistency.
                 ds_3dtiles::Tiles3dError::BackgroundNotBelowThreshold { .. } => {
-                    Tiles3dError::BadRequest(
-                        "isosurface sealing floor is not below the threshold".into(),
-                    )
+                    Tiles3dError::BadRequest(format!(
+                        "{product} sealing floor is not below the threshold"
+                    ))
                 }
                 other => Tiles3dError::Internal(format!("{product} encode failed: {other}")),
             })?;
@@ -681,12 +707,23 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
         links.push(json!({ "href": format!("{base}/3dtiles/collections/{id}/tileset.json?representation=isosurface"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (isosurface mesh)" }));
         links.push(json!({ "href": format!("{base}/3dtiles/collections/{id}/tileset.json?representation=echotop"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (echo-top columns)" }));
     }
+    // Colour-scale legend for the point cloud: sample the shared reflectivity
+    // colormap so the viewer can show a gradient bar whose colours match the
+    // points (v1 uses one reflectivity ramp for all quantities — #350).
+    let legend = json!({
+        "title": "Reflectivity",
+        "unit": "dBZ",
+        "min": LEGEND_MIN_DBZ,
+        "max": LEGEND_MAX_DBZ,
+        "stops": legend_stops(state.colormap.as_ref(), LEGEND_MIN_DBZ, LEGEND_MAX_DBZ, LEGEND_STOPS),
+    });
     json!({
         "id": id,
         "title": title,
         "description": description,
         "quantities": quantities,
         "representations": representations,
+        "legend": legend,
         "links": links,
     })
 }

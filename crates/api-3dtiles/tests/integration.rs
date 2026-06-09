@@ -375,6 +375,18 @@ async fn collections_list_and_doc() {
         .map(|r| r.as_str().unwrap())
         .collect();
     assert_eq!(reps, vec!["points", "isosurface", "echotop"]);
+    // A colour-scale legend is advertised for the point cloud: a unit, a range,
+    // and sampled `#rrggbb` stops the viewer renders as a gradient bar.
+    let lg = &v["legend"];
+    assert_eq!(lg["unit"], "dBZ");
+    assert!(lg["min"].as_f64().unwrap() < lg["max"].as_f64().unwrap());
+    let stops = lg["stops"].as_array().unwrap();
+    assert!(stops.len() >= 2, "legend has multiple stops");
+    let c0 = stops[0]["color"].as_str().unwrap();
+    assert!(
+        c0.starts_with('#') && c0.len() == 7,
+        "stop colour is #rrggbb: {c0}"
+    );
     // …and a link-following client can discover the isosurface tileset too.
     let hrefs: Vec<&str> = v["links"]
         .as_array()
@@ -469,6 +481,9 @@ async fn echotop_tileset_and_content_is_valid_glb() {
         uri.contains("representation=echotop"),
         "echotop-tagged: {uri}"
     );
+    // Both mesh products embed the (defaulted) resolution tier — the tileset
+    // handler shares the code path, but assert it here so the two can't diverge.
+    assert!(uri.contains("resolution="), "resolution tier in uri: {uri}");
 
     // The content itself is a valid glTF binary.
     let (status, body, headers) =
