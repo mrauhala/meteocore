@@ -46,6 +46,11 @@
   <div class="field"><label for="coll">Collection</label><select id="coll"></select></div>
   <div class="field"><label for="qty">Quantity</label><select id="qty"></select></div>
   <div class="field"><label for="rep">View</label><select id="rep"></select></div>
+  <div class="field" id="resField" hidden><label for="res">Resolution</label><select id="res">
+    <option value="low">Low</option>
+    <option value="med" selected>Med</option>
+    <option value="high">High</option>
+  </select></div>
   <div class="field"><label id="numLabel" for="num">min dBZ</label><input id="num" type="number" value="5" step="1"></div>
   <div id="status"></div>
 </div>
@@ -83,6 +88,8 @@ const BASE = override || sameOrigin || "https://meteocore.app.meteo.fi/3dtiles";
 const $coll = document.getElementById("coll");
 const $qty = document.getElementById("qty");
 const $rep = document.getElementById("rep");
+const $res = document.getElementById("res");
+const $resField = document.getElementById("resField");
 const $num = document.getElementById("num");
 const $numLabel = document.getElementById("numLabel");
 const $status = document.getElementById("status");
@@ -92,10 +99,13 @@ const setStatus = (msg, err) => { $status.textContent = msg; $status.className =
 // point clouds drop echoes below `min_value`; isosurfaces draw the shell AT
 // `threshold`; echo-top columns rise to where reflectivity drops below
 // `threshold`. All a dBZ number, so one input serves them, relabelled.
+// `mesh` products (isosurface/echotop) are resampled to a voxel grid, so they
+// take the low/med/high Resolution selector; the point cloud is native-res and
+// hides it.
 const REP_META = {
-  points:     { label: "Point cloud", numLabel: "min dBZ",       numDefault: "5"  },
-  isosurface: { label: "Isosurface",  numLabel: "threshold dBZ", numDefault: "20" },
-  echotop:    { label: "Echo top",    numLabel: "threshold dBZ", numDefault: "18" },
+  points:     { label: "Point cloud", numLabel: "min dBZ",       numDefault: "5",  mesh: false },
+  isosurface: { label: "Isosurface",  numLabel: "threshold dBZ", numDefault: "20", mesh: true  },
+  echotop:    { label: "Echo top",    numLabel: "threshold dBZ", numDefault: "18", mesh: true  },
 };
 
 // Token-free CesiumJS: CARTO Dark Matter basemap, no Cesium Ion.
@@ -164,11 +174,13 @@ async function loadCollectionMeta() {
   }
 }
 
-// Relabel + default the numeric field for the active representation.
+// Relabel + default the numeric field for the active representation, and show
+// the Resolution selector only for the (resampled) mesh products.
 function syncNumField() {
   const meta = REP_META[$rep.value] || REP_META.points;
   $numLabel.textContent = meta.numLabel;
   $num.value = meta.numDefault;
+  $resField.hidden = !meta.mesh;
 }
 
 async function loadTileset() {
@@ -188,6 +200,7 @@ async function loadTileset() {
   if (rep === "isosurface" || rep === "echotop") {
     url += `&representation=${rep}`;
     if (num !== "") url += `&threshold=${encodeURIComponent(num)}`;
+    url += `&resolution=${encodeURIComponent($res.value)}`;
   } else if (num !== "") {
     url += `&min_value=${encodeURIComponent(num)}`;
   }
@@ -215,8 +228,10 @@ async function loadTileset() {
 
 $coll.addEventListener("change", loadCollectionMeta);
 $qty.addEventListener("change", loadTileset);
-// Switching representation relabels + re-defaults the numeric field, then reloads.
+// Switching representation relabels + re-defaults the numeric field, toggles the
+// Resolution selector, then reloads.
 $rep.addEventListener("change", () => { syncNumField(); loadTileset(); });
+$res.addEventListener("change", loadTileset);
 $num.addEventListener("change", loadTileset);
 loadCollections();
 </script>

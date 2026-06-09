@@ -1,14 +1,16 @@
 //! HTTP handlers for the 3D Tiles API.
 //!
-//! Serves OGC 3D Tiles from any collection implementing `VolumeEngine`, in two
+//! Serves OGC 3D Tiles from any collection implementing `VolumeEngine`, in three
 //! representations (selected by `?representation=`):
 //! - `GET /collections/{id}/tileset.json` — the tileset (bounding region from
 //!   `VolumeInfo`; content points at `.pnts` for `points`, or `.glb` plus an
-//!   antenna-ECEF `transform` for `isosurface`).
+//!   antenna-ECEF `transform` for the `isosurface`/`echotop` mesh products).
 //! - `GET /collections/{id}/content.pnts` — the point-cloud tile.
-//! - `GET /collections/{id}/content.glb` — the isosurface-mesh tile.
+//! - `GET /collections/{id}/content.glb` — a mesh tile (`isosurface` shell, the
+//!   default, or `echotop` columns). The mesh products take a `resolution`
+//!   (`low`/`med`/`high`) detail tier; the point cloud is native-resolution.
 //!
-//! Both content types are sampled on a blocking thread (bounded by the shared
+//! All content types are sampled on a blocking thread (bounded by the shared
 //! render semaphore) and encoded by `ds-3dtiles`.
 
 use std::collections::HashMap;
@@ -33,11 +35,54 @@ use crate::error::Tiles3dError;
 const ISOSURFACE_DEFAULT_THRESHOLD: f64 = 20.0;
 /// Default echo-top reflectivity (dBZ) — the standard echo-top value.
 const ECHO_TOP_DEFAULT_THRESHOLD: f64 = 18.0;
-/// Voxel-grid resolution for the echo-top product: `[radius, azimuth, height]`.
-/// Full radial resolution (≈ the native 500 m range bins; azimuth 360 = native;
-/// height interpolates the ~10 elevation sweeps). ~11.8 M cells — bounded by the
-/// engine's `MAX_VOXELS`; the heavier `.glb` is offset by the content ETag.
-const ECHO_TOP_DIMS: [usize; 3] = [512, 360, 64];
+
+/// Voxel-grid resolution tier for the glTF mesh products (isosurface, echo-top):
+/// `[radius, azimuth, height]`. Azimuth stays 360 (the native 1° ray spacing) at
+/// every tier; radius/height trade detail for compute. The cell count drives both
+/// the resample and the mesher, so the first-request cost scales with it (repeats
+/// are ETag-cached). `High` ≈ the native 500 m range bins; `Low` is the engine's
+/// historical default. All tiers stay under the engine's `MAX_VOXELS` cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolution {
+    /// `[128, 360, 48]` ≈ 2.2 M cells — fast, coarse radial (~2 km bins).
+    Low,
+    /// `[256, 360, 56]` ≈ 5.2 M cells — the balanced default.
+    Med,
+    /// `[512, 360, 64]` ≈ 11.8 M cells — full radial detail; ~12 s first compute.
+    High,
+}
+
+impl Resolution {
+    /// Parse the `resolution` query value (`None`/empty → `Med`).
+    fn parse(s: Option<&str>) -> Result<Self, Tiles3dError> {
+        match s.map(str::trim) {
+            None | Some("") | Some("med") | Some("medium") => Ok(Self::Med),
+            Some("low") => Ok(Self::Low),
+            Some("high") => Ok(Self::High),
+            Some(other) => Err(Tiles3dError::BadRequest(format!(
+                "unknown resolution '{other}' (expected 'low', 'med', or 'high')"
+            ))),
+        }
+    }
+
+    /// The voxel-grid dimensions `[radius, azimuth, height]` for this tier.
+    fn dims(self) -> [usize; 3] {
+        match self {
+            Self::Low => [128, 360, 48],
+            Self::Med => [256, 360, 56],
+            Self::High => [512, 360, 64],
+        }
+    }
+
+    /// The canonical query-string token (round-trips through `parse`).
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Med => "med",
+            Self::High => "high",
+        }
+    }
+}
 
 /// The blue→red **height** colour ramp for the echo-top product (stops at height
 /// values, 0–15 km) — a builtin colormap's stops are in its own units, so they
@@ -106,6 +151,10 @@ pub struct TilesetParams {
     /// `isosurface` only: the iso-value (e.g. dBZ) of the shell; carried into
     /// the `.glb` `content.uri`. `None` → [`ISOSURFACE_DEFAULT_THRESHOLD`].
     pub threshold: Option<f64>,
+    /// Mesh products only (`isosurface`/`echotop`): voxel-grid detail tier
+    /// (`low`/`med`/`high`); carried into the `.glb` `content.uri`. `None` →
+    /// `med`. Ignored for `points` (the cloud is native-resolution).
+    pub resolution: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +175,8 @@ pub struct GlbContentParams {
     pub threshold: Option<f64>,
     /// Which glTF product: `isosurface` (default) or `echotop`.
     pub representation: Option<String>,
+    /// Voxel-grid detail tier (`low`/`med`/`high`). `None` → `med`.
+    pub resolution: Option<String>,
 }
 
 /// The 3D Tiles representations of a volume — all valid OGC 3D Tiles tilesets,
@@ -330,6 +381,12 @@ pub async fn get_tileset(
                 }
                 query.push_str(&format!("&threshold={t}"));
             }
+            // Carry the detail tier so the content fetch matches the tileset.
+            // Validate now (a bad value is a 400 here, not a surprise on fetch);
+            // emit the canonical token even when the request omitted it, so the
+            // `content.uri` is self-describing.
+            let resolution = Resolution::parse(params.resolution.as_deref())?;
+            query.push_str(&format!("&resolution={}", resolution.as_str()));
             // The `content.glb` handler defaults to isosurface; tag echo-top.
             if representation == Representation::EchoTop {
                 query.push_str("&representation=echotop");
@@ -462,6 +519,9 @@ pub async fn get_content_glb(
 
     let time = params.datetime.as_deref().map(parse_datetime).transpose()?;
     let quantity = params.quantity.clone();
+    // Detail tier (`low`/`med`/`high`, default `med`) → voxel-grid dims, applied
+    // to both mesh products. A bad value is a 400 before the blocking task.
+    let dims = Resolution::parse(params.resolution.as_deref())?.dims();
     let threshold = params.threshold.unwrap_or(match representation {
         Representation::EchoTop => ECHO_TOP_DEFAULT_THRESHOLD,
         _ => ISOSURFACE_DEFAULT_THRESHOLD,
@@ -496,13 +556,8 @@ pub async fn get_content_glb(
         tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
             let result = match representation {
                 Representation::EchoTop => {
-                    // Full radial resolution for the bars (ECHO_TOP_DIMS).
-                    let grid = engine.read_voxel_grid(
-                        quantity.as_deref(),
-                        time,
-                        Some(ECHO_TOP_DIMS),
-                        None,
-                    )?;
+                    let grid =
+                        engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;
                     ds_3dtiles::encode_echo_top_columns_glb(
                         &grid,
                         threshold,
@@ -510,7 +565,8 @@ pub async fn get_content_glb(
                     )
                 }
                 Representation::Isosurface => {
-                    let grid = engine.read_voxel_grid(quantity.as_deref(), time, None, None)?;
+                    let grid =
+                        engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;
                     // Colour the shell at the threshold (v1: one colormap for all
                     // quantities — #350); seal NaN at the no-echo floor so it
                     // closes into solid blobs (`floor < threshold` guaranteed).

@@ -486,6 +486,32 @@ async fn echotop_tileset_and_content_is_valid_glb() {
 }
 
 #[tokio::test]
+async fn tileset_carries_resolution_tier_into_glb_content_uri() {
+    // An explicit resolution is validated and echoed into the content.uri so the
+    // content fetch matches the tileset.
+    let (status, body, _h) = get(
+        "/collections/radar-fivih/tileset.json?representation=isosurface&quantity=DBZH&threshold=20&resolution=high",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let uri = v["root"]["content"]["uri"].as_str().unwrap();
+    assert!(uri.contains("resolution=high"), "tier in uri: {uri}");
+
+    // A bad tier is a 400 at the tileset, not a surprise on the content fetch.
+    let (status, _b, _h) = get(
+        "/collections/radar-fivih/tileset.json?representation=isosurface&quantity=DBZH&resolution=ultra",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // …and on the content route too.
+    let (status, _b, _h) =
+        get("/collections/radar-fivih/content.glb?quantity=DBZH&resolution=ultra").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn glb_rejects_points_representation() {
     // `.glb` serves only the mesh products — asking it for `points` is a 400
     // (the point cloud has its own `content.pnts` route), not a silently
@@ -506,9 +532,10 @@ async fn isosurface_tileset_has_transform_and_glb_content() {
     // glTF content needs the antenna-ECEF tile transform (16-element matrix).
     let t = v["root"]["transform"].as_array().unwrap();
     assert_eq!(t.len(), 16);
-    // Content points at the .glb, carrying the resolved quantity + threshold.
+    // Content points at the .glb, carrying the resolved quantity + threshold +
+    // the (defaulted) resolution tier, so the content fetch is deterministic.
     let uri = v["root"]["content"]["uri"].as_str().unwrap();
-    assert_eq!(uri, "content.glb?quantity=DBZH&threshold=20");
+    assert_eq!(uri, "content.glb?quantity=DBZH&threshold=20&resolution=med");
     // The region bounding volume is still present (unaffected by the transform).
     assert_eq!(
         v["root"]["boundingVolume"]["region"]

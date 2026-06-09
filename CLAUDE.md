@@ -315,23 +315,27 @@ into a glTF `.glb` triangle mesh.
   origin }>` — `Some` ⇒ the mesh products are available and the origin is present
   (tileset built without sampling; "supports but no origin" is unrepresentable,
   never a 500). It drives the collection JSON's `representations` array → the
-  viewer's toggle. The isosurface seals (`background=Some(-32)`); echo-top uses
-  full `[512,360,64]` resolution (`ECHO_TOP_DIMS`, ~12 s first compute — ETag
-  caches repeats) coloured by a height ramp. A too-low threshold → 400, an empty
-  result → 404.
+  viewer's toggle. The isosurface seals (`background=Some(-32)`); echo-top is
+  coloured by a height ramp. Both mesh products take a `?resolution=` detail tier
+  (`Resolution` enum → voxel-grid dims; `low` `[128,360,48]` ≈2.2 M cells, `med`
+  `[256,360,56]` ≈5.2 M *default*, `high` `[512,360,64]` ≈11.8 M / ~12 s first
+  compute — ETag caches repeats); the tier is echoed into the `content.uri`. The
+  point cloud is native-resolution and ignores it. A too-low threshold or a bad
+  resolution token → 400, an empty result → 404.
 - **Point sizing:** `encode_pnts` writes a per-point `value` (the physical value)
   into the `.pnts` **batch table** (no `BATCH_ID` ⇒ per-point properties), so the
   viewer styles `pointSize` by `${value}` — weak echo → ~1 px, strong → ~10 px.
 - **Routes** (mounted at `/3dtiles`): `GET /collections/{id}/tileset.json`
-  (`?representation=&quantity=&datetime=&min_value=&threshold=`),
+  (`?representation=&quantity=&datetime=&min_value=&threshold=&resolution=`),
   `GET /collections/{id}/content.pnts` (`?quantity=&datetime=&min_value=`),
-  `GET /collections/{id}/content.glb` (`?representation=&quantity=&datetime=&threshold=`),
+  `GET /collections/{id}/content.glb` (`?representation=&quantity=&datetime=&threshold=&resolution=`),
   plus `/` · `/collections` · `/collections/{id}` · **`/viewer`** (a bundled
-  CesiumJS page with collection + quantity + **representation** pickers,
-  `include_str!`-baked from `crates/api-3dtiles/viewer/index.html`; same-origin
-  API base by default, with a `?base=` override). The tileset's `content.uri`
-  embeds the resolved quantity (+ pinned time + `min_value`/`threshold` +
-  `representation`) so the content fetch is deterministic.
+  CesiumJS page with collection + quantity + **representation** + **resolution**
+  pickers, `include_str!`-baked from `crates/api-3dtiles/viewer/index.html`;
+  same-origin API base by default, with a `?base=` override). The tileset's
+  `content.uri` embeds the resolved quantity (+ pinned time +
+  `min_value`/`threshold` + `representation` + `resolution`) so the content fetch
+  is deterministic.
 - **Concurrency:** `read_point_cloud` / `read_voxel_grid` are sync (blocking
   HDF5 I/O + a long CPU loop — marching tet for the latter), so both content
   handlers bound them with the shared render semaphore and run via
