@@ -79,7 +79,7 @@ use crate::engine::EngineError;
 use crate::pixel_cache::PixelCache;
 use crate::pvol::{read_moment_pixels, read_polar_volume, PolarMoment, PolarVolume, Sweep};
 use crate::quantities;
-use crate::reader::RawPixels;
+use crate::reader::{PixelClass, RawPixels};
 
 /// Default lazy-pixel cache size (MB) when `MC_PVOL_PIXEL_CACHE_MB` is
 /// unset. One shared budget bounds resident decoded pixels across every
@@ -2267,9 +2267,45 @@ fn sample_polar_slant(
     azimuth_deg: f64,
     elangle_deg: f64,
 ) -> Option<f64> {
-    let sweep = nearest_sweep(volume, elangle_deg)?;
+    // Point-cloud / EDR path: only real values; clear-air `Undetect` and
+    // `Masked` both collapse to `None` (no point), unchanged from before #360.
+    match sample_polar_slant_class(
+        volume,
+        file_id,
+        pix,
+        envelope,
+        quantity,
+        slant_range_m,
+        azimuth_deg,
+        elangle_deg,
+    ) {
+        PixelClass::Value(v) => Some(v),
+        PixelClass::Undetect | PixelClass::Masked => None,
+    }
+}
+
+/// Like [`sample_polar_slant`] but **classifies** the cell (#360): an out-of-
+/// envelope / out-of-range / malformed target is `Masked` (genuinely
+/// unmeasured — the cone of silence, beyond max range, below the lowest beam),
+/// while a sampled gate that is clear air returns `Undetect`. The voxel-grid
+/// sampler uses this to fill clear air with a finite "no echo" floor (so an
+/// isosurface seals against it) while leaving `Masked` cells `NaN`.
+#[allow(clippy::too_many_arguments)]
+fn sample_polar_slant_class(
+    volume: &PolarVolume,
+    file_id: &str,
+    pix: Pixels,
+    envelope: (f64, f64),
+    quantity: &str,
+    slant_range_m: f64,
+    azimuth_deg: f64,
+    elangle_deg: f64,
+) -> PixelClass {
+    let Some(sweep) = nearest_sweep(volume, elangle_deg) else {
+        return PixelClass::Masked;
+    };
     if sweep.nrays == 0 || sweep.nbins == 0 {
-        return None;
+        return PixelClass::Masked;
     }
     // Reject targets outside the sweep envelope (see the constant's doc
     // for the rationale). Pre-computed envelope keeps this O(1) per cell.
@@ -2278,7 +2314,7 @@ fn sample_polar_slant(
         || elangle_deg < min_el - SWEEP_ENVELOPE_TOL_DEG
         || elangle_deg > max_el + SWEEP_ENVELOPE_TOL_DEG
     {
-        return None;
+        return PixelClass::Masked;
     }
     // A malformed sweep with `rscale <= 0` would silently mis-sample:
     // `rscale = 0` makes the divisor zero (a NaN cast to `i64` becomes
@@ -2288,16 +2324,20 @@ fn sample_polar_slant(
     // defensive guard here is cheap and keeps a corrupted file from
     // ever surfacing fabricated values.
     if !sweep.rscale.is_finite() || sweep.rscale <= 0.0 {
-        return None;
+        return PixelClass::Masked;
     }
-    let moment = sweep.moments.iter().find(|m| m.quantity == *quantity)?;
+    let Some(moment) = sweep.moments.iter().find(|m| m.quantity == *quantity) else {
+        return PixelClass::Masked;
+    };
     let bin = ((slant_range_m - sweep.rstart) / sweep.rscale).floor() as i64;
     if bin < 0 || bin >= sweep.nbins as i64 {
-        return None;
+        return PixelClass::Masked;
     }
     let ray = (azimuth_deg / (360.0 / sweep.nrays as f64)).floor() as usize % sweep.nrays;
-    let pixels = pix.moment(file_id, moment, sweep.nrays, sweep.nbins)?;
-    pixels.sample(
+    let Some(pixels) = pix.moment(file_id, moment, sweep.nrays, sweep.nbins) else {
+        return PixelClass::Masked;
+    };
+    pixels.sample_class(
         ray,
         bin as usize,
         moment.gain,
@@ -3218,16 +3258,28 @@ const DEFAULT_VOXEL_DIMS: [usize; 3] = [128, 360, 48];
 const MAX_VOXELS: usize = 32_000_000;
 /// Height ceiling (metres above antenna) for the voxel grid — above any echo.
 const VOXEL_HEIGHT_CEILING_M: f64 = 20_000.0;
+/// Physical value written for **clear-air** (`undetect`) voxel cells (#360): a
+/// finite floor well below any reflectivity threshold, so an isosurface seals
+/// against clear air (closed blobs) while genuinely-unmeasured cells stay `NaN`
+/// (and an isosurface leaves them open — no fabricated cap over the cone of
+/// silence). v1 uses the standard −32 dBZ radar floor regardless of quantity
+/// (consistent with the single reflectivity colormap); a per-quantity floor is
+/// a follow-up (tied to per-quantity colormaps, #350).
+const NO_ECHO_FLOOR: f32 = -32.0;
 
 /// Resample one polar volume into a regular cylindrical [`VoxelGrid`]: for each
 /// `(radius, azimuth, height)` cell centre, invert to `(slant_range, elevation)`
-/// via the 4/3-Earth beam model and sample the volume — reusing the same
-/// `sample_polar_slant` (with its sweep-envelope guard) the cross-section path
-/// uses, so cells outside the surveyed beam fan stay `NaN`. The angle axis is
-/// azimuth `0..2π` (the encoder maps to the cylinder convention); radius is
-/// ground range `0..max`, height `0..ceiling`.
-/// Returns the grid plus the count of sampled (finite) cells — counted during
-/// the fill so the caller needn't re-scan up to `MAX_VOXELS` cells.
+/// via the 4/3-Earth beam model and classify the volume sample
+/// (`sample_polar_slant_class`, with its sweep-envelope guard). Three outcomes
+/// (#360): an echo → its value; **clear air** (`undetect`) → the finite
+/// [`NO_ECHO_FLOOR`] (so an isosurface seals against it); **unmeasured**
+/// (outside the beam fan — cone of silence, beyond range, below the lowest
+/// beam) → `NaN` (so an isosurface leaves it open, not a fabricated cap). The
+/// angle axis is azimuth `0..2π` (the encoder maps to the cylinder convention);
+/// radius is ground range `0..max`, height `0..ceiling`.
+/// Returns the grid plus the count of **echo** cells (clear-air floor cells are
+/// not counted) — counted during the fill so the caller needn't re-scan up to
+/// `MAX_VOXELS` cells.
 fn voxel_grid_from_volume(
     volume: &PolarVolume,
     file_id: &str,
@@ -3282,7 +3334,7 @@ fn voxel_grid_from_volume(
             for i_h in 0..n_h {
                 let height = (i_h as f64 + 0.5) * ceiling / n_h as f64;
                 let (slant, el) = ground_height_to_slant(ground, height);
-                if let Some(v) = sample_polar_slant(
+                match sample_polar_slant_class(
                     volume,
                     file_id,
                     pix,
@@ -3292,16 +3344,29 @@ fn voxel_grid_from_volume(
                     azimuth_deg,
                     el,
                 ) {
-                    // Only finite samples count as data — a non-finite gain/
-                    // offset in a malformed file can yield `Some(NaN)`; writing
-                    // it would make `valid` (and the 404 guard) disagree with
-                    // the finite-only `valid_count()`.
-                    let fv = v as f32;
-                    if fv.is_finite() {
-                        // One source of truth for the axis order (in flux per #351).
-                        values[VoxelGrid::index_of(dims, i_r, i_a, i_h)] = fv;
-                        valid += 1;
+                    PixelClass::Value(v) => {
+                        // Only finite samples count as data — a non-finite gain/
+                        // offset in a malformed file can yield `Value(NaN)`;
+                        // writing it would make `valid` (and the 404 guard)
+                        // disagree with the finite-only `valid_count()`.
+                        let fv = v as f32;
+                        if fv.is_finite() {
+                            // One source of truth for the axis order (in flux #351).
+                            values[VoxelGrid::index_of(dims, i_r, i_a, i_h)] = fv;
+                            valid += 1;
+                        }
                     }
+                    // Clear air (radar looked, saw nothing): a finite "no echo"
+                    // floor so an isosurface seals against it into closed blobs.
+                    // NOT counted as `valid` — it is the absence of echo, so a
+                    // clear-air-only volume still yields an empty grid (→ 404).
+                    PixelClass::Undetect => {
+                        values[VoxelGrid::index_of(dims, i_r, i_a, i_h)] = NO_ECHO_FLOOR;
+                    }
+                    // Genuinely unmeasured (cone of silence / beyond range /
+                    // below the lowest beam) → leave `NaN`, so an isosurface
+                    // doesn't fabricate a cap there.
+                    PixelClass::Masked => {}
                 }
             }
         }
@@ -4330,6 +4395,48 @@ mod tests {
             object: "PVOL".to_string(),
             sweeps: vec![sweep],
         }
+    }
+
+    /// #360: the voxel grid fills clear air (`undetect`) with the finite
+    /// [`NO_ECHO_FLOOR`] (so an isosurface seals against it) while leaving
+    /// genuinely-unmeasured cells (outside the single sweep's envelope) as
+    /// `NaN`. An all-`undetect` volume therefore yields a grid that has both
+    /// finite floor cells and NaN cells, and ZERO echo cells (floor is not
+    /// counted as echo, so a clear-air-only volume still reads as empty → 404).
+    #[test]
+    fn voxel_grid_fills_clear_air_floor_and_leaves_unmeasured_nan() {
+        // The radar looked across its whole fan and saw nothing (all undetect).
+        let (nrays, nbins) = (360usize, 100usize);
+        let data = Array2::<u16>::from_elem((nrays, nbins), 65_534u16); // 65534 = undetect
+        let fid = unique_file_id();
+        pixel_cache().insert(
+            &fid,
+            SYNTHETIC_DS,
+            std::sync::Arc::new(RawPixels::U16(data)),
+        );
+        let vol = synthetic_volume(25.0, 60.0);
+
+        let (grid, echoes) =
+            voxel_grid_from_volume(&vol, &fid, test_pixels(), "DBZH", Some([64, 90, 48]))
+                .expect("voxel grid builds");
+
+        let floor = grid.values.iter().filter(|v| **v == NO_ECHO_FLOOR).count();
+        let nan = grid.values.iter().filter(|v| v.is_nan()).count();
+        // Clear air inside the surveyed fan → finite floor; outside it → NaN.
+        assert!(floor > 0, "clear air is filled with the no-echo floor");
+        assert!(
+            nan > 0,
+            "unmeasured cells (cone of silence / beyond fan) stay NaN"
+        );
+        // No reflectivity anywhere → no echo cells, and the floor cells are NOT
+        // counted as echo (the returned count and `valid_count` disagree: the
+        // former is echoes, the latter is all finite = the floor cells).
+        assert_eq!(echoes, 0, "floor cells are not counted as echo");
+        assert_eq!(
+            grid.valid_count(),
+            floor,
+            "valid_count (finite) == the clear-air floor cells"
+        );
     }
 
     /// Polar→Cartesian: a pixel at a known bearing/range must sample

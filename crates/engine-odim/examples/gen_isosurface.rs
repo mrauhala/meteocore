@@ -109,9 +109,11 @@ fn main() {
     // The shell's colour = the colormap at the threshold value.
     let colormap = LutColorMap::from_builtin(BuiltinColormap::RadarDbz, -32.0, 95.0);
     let color = colormap.color(Some(threshold));
-    // Seal against clear air with the dBZ floor (-32) so the shell closes into
-    // solid blobs instead of open "curtains" where echo meets no-echo.
-    let glb = ds_3dtiles::encode_isosurface_glb(&grid, threshold, color, Some(-32.0))
+    // background = None: the engine now fills clear air with a finite floor
+    // (#360), so the surface seals against clear air on its own; only genuinely
+    // unmeasured cells stay NaN, which we leave OPEN (no fabricated cap over the
+    // cone of silence).
+    let glb = ds_3dtiles::encode_isosurface_glb(&grid, threshold, color, None)
         .expect("mesh the isosurface (try a lower threshold if this reports 'empty')");
 
     fs::create_dir_all(&out_dir).expect("mkdir out_dir");

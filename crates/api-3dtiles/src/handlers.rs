@@ -403,22 +403,15 @@ pub async fn get_content_glb(
         return Err(Tiles3dError::BadRequest("threshold must be finite".into()));
     }
 
-    // Colour the shell at the threshold; seal NaN (clear air / unmeasured) at
-    // the colormap's floor so the surface closes into solid blobs. The floor
-    // must be < threshold (clamp defensively against an odd colormap domain).
-    //
-    // v1 uses the single collection-level colormap regardless of quantity (the
-    // `.pnts` path has the same limitation), so for a non-reflectivity quantity
-    // (VRADH/ZDR/…) the dBZ floor is only "below any likely threshold", not
-    // physically the quantity's minimum — geometrically fine (the seal still
-    // closes), semantically approximate. Per-quantity colormaps (#350) fix it.
+    // Colour the shell at the threshold. v1 uses the single collection-level
+    // colormap regardless of quantity (the `.pnts` path has the same
+    // limitation); per-quantity colormaps are #350.
     let color = state.colormap.color(Some(threshold));
-    let floor = state
-        .colormap
-        .domain()
-        .map(|(lo, _)| lo)
-        .unwrap_or(threshold - 64.0)
-        .min(threshold - 1.0);
+    // background = None: the engine fills clear air (undetect) with a finite
+    // floor (#360), so the surface seals against it on its own; genuinely
+    // unmeasured cells stay NaN and are left OPEN — no fabricated cap over the
+    // cone of silence.
+    let background = None;
 
     // read_voxel_grid does blocking HDF5 I/O + a long CPU loop (marching tet),
     // so bound it with the shared render semaphore and run on a blocking thread
@@ -435,7 +428,7 @@ pub async fn get_content_glb(
     let (bytes, etag) =
         tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
             let grid = engine.read_voxel_grid(quantity.as_deref(), time, None, None)?;
-            let bytes = ds_3dtiles::encode_isosurface_glb(&grid, threshold, color, Some(floor))
+            let bytes = ds_3dtiles::encode_isosurface_glb(&grid, threshold, color, background)
                 .map_err(|e| match e {
                     // An empty surface (threshold above all echo) is "no data
                     // here", not a server fault — 404, matching the no-data path.
