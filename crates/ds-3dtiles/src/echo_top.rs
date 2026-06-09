@@ -8,12 +8,18 @@
 //! continuous surface, **per-vertex coloured by that height**. It answers "how
 //! tall is each storm", the classic forecaster echo-top view, in 3-D.
 //!
-//! Cheaper than the isosurface: no marching tetrahedra, just a regular grid of
-//! cell-centre columns triangulated into quads. A quad is emitted only where all
-//! four corner columns have an echo top (so clear-air / no-echo regions are
-//! holes, not a surface at height 0). Geometry reuses the isosurface's
-//! cell-index → ground/azimuth/height → ECEF → glTF-Y-up mapping
-//! ([`crate::isosurface::index_to_gltf_pos`]) and pairs with
+//! Two encoders off the same per-column echo-top height:
+//! - [`encode_echo_top_columns_glb`] — **extruded bins**: one solid box per echo
+//!   cell from the ground up to its echo top (walls, flat normals, coloured
+//!   ground→top). The preferred 3-D look — grounded, no open edges, the blocky
+//!   bins read as a bar field of storm depth.
+//! - [`encode_echo_top_glb`] — the thin **draped surface**: a regular grid of
+//!   cell-centre columns triangulated into quads (a quad only where all four
+//!   corners have a top, so clear air is a hole), smooth normals. The flat 2-D
+//!   height-field product — cheaper, but floats at echo-top height with no sides.
+//!
+//! Both reuse the isosurface's cell-index → ground/azimuth/height → ECEF →
+//! glTF-Y-up mapping ([`crate::isosurface::index_to_gltf_pos`]) and pair with
 //! [`crate::tileset_json_glb`] (antenna-ECEF tile transform).
 
 use crate::isosurface::index_to_gltf_pos;
@@ -196,6 +202,139 @@ pub fn encode_echo_top_glb(
         }
     }
 
+    Ok(build_glb(&positions, &normals, &colors, &indices, min, max))
+}
+
+/// The 8 corners of a cell column, indexed by bits `r<<0 | a<<1 | top<<2`
+/// (r/a = high edge?, top = at the echo top vs the ground).
+const CORNER_BITS: [(bool, bool, bool); 8] = [
+    (false, false, false), // 0: r_lo a_lo ground
+    (true, false, false),  // 1: r_hi a_lo ground
+    (false, true, false),  // 2: r_lo a_hi ground
+    (true, true, false),   // 3: r_hi a_hi ground
+    (false, false, true),  // 4: r_lo a_lo top
+    (true, false, true),   // 5: r_hi a_lo top
+    (false, true, true),   // 6: r_lo a_hi top
+    (true, true, true),    // 7: r_hi a_hi top
+];
+
+/// The 6 faces of a column, each 4 corner indices wound around the quad. The
+/// outward orientation is enforced at emit time (vs the box centre), so the
+/// winding here only needs to form the quad.
+const COLUMN_FACES: [[usize; 4]; 6] = [
+    [4, 5, 7, 6], // top (at echo-top height)
+    [0, 2, 3, 1], // bottom (on the ground)
+    [0, 1, 5, 4], // wall a_lo
+    [2, 6, 7, 3], // wall a_hi
+    [0, 4, 6, 2], // wall r_lo
+    [1, 3, 7, 5], // wall r_hi
+];
+
+/// Encode a [`VoxelGrid`] as **extruded echo-top columns**: one solid box per
+/// `(radius, azimuth)` cell that has an echo, from the **ground** up to that
+/// cell's echo-top height (highest cell ≥ `threshold`), vertices coloured by
+/// height (`height_colormap`, metres) so each bar runs from the ground colour
+/// up to its top colour. Unlike [`encode_echo_top_glb`] (a thin draped sheet),
+/// the columns have side walls and sit on the ground — no open edges, nothing
+/// floating. Flat-shaded (per-face normals) for crisp blocky bars.
+///
+/// Errors as [`encode_echo_top_glb`]. Pair with [`crate::tileset_json_glb`].
+pub fn encode_echo_top_columns_glb(
+    grid: &VoxelGrid,
+    threshold: f64,
+    height_colormap: &dyn ColorMap,
+) -> Result<Vec<u8>, Tiles3dError> {
+    if !threshold.is_finite() {
+        return Err(Tiles3dError::NonFinite("threshold"));
+    }
+    let rtc = geodetic_to_ecef(grid.origin_lon, grid.origin_lat, grid.origin_height);
+    if rtc.iter().any(|c| !c.is_finite()) {
+        return Err(Tiles3dError::NonFinite("rtc_center"));
+    }
+    let [n_r, n_a, _n_h] = grid.dims;
+
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut colors: Vec<[u8; 4]> = Vec::new();
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    let mut tris = 0usize;
+
+    for i_r in 0..n_r {
+        for i_a in 0..n_a {
+            let Some(fh_top) = echo_top_index(grid, threshold, i_r, i_a) else {
+                continue;
+            };
+            // The 8 corners (position + the colour for their height). The cell
+            // spans index ±0.5 around its centre; the ground is `fh = -0.5`
+            // (height 0 above the antenna ≈ the surface).
+            let mut corner_pos = [[0.0f32; 3]; 8];
+            let mut corner_col = [[0u8; 4]; 8];
+            let mut center = [0.0f32; 3];
+            for (c, &(rh, ah, top)) in CORNER_BITS.iter().enumerate() {
+                let fr = i_r as f64 + if rh { 0.5 } else { -0.5 };
+                let fa = i_a as f64 + if ah { 0.5 } else { -0.5 };
+                let fh = if top { fh_top } else { -0.5 };
+                let p = index_to_gltf_pos(grid, rtc, fr, fa, fh);
+                let h = if top { height_at(grid, fh_top) } else { 0.0 };
+                corner_pos[c] = p;
+                corner_col[c] = height_colormap.color(Some(h));
+                for k in 0..3 {
+                    center[k] += p[k] / 8.0;
+                }
+            }
+            // Emit the 6 faces, each as 2 outward-wound flat-shaded triangles.
+            for face in COLUMN_FACES {
+                let [q0, q1, q2, q3] = face;
+                let fc = [
+                    (corner_pos[q0][0] + corner_pos[q1][0] + corner_pos[q2][0] + corner_pos[q3][0])
+                        / 4.0,
+                    (corner_pos[q0][1] + corner_pos[q1][1] + corner_pos[q2][1] + corner_pos[q3][1])
+                        / 4.0,
+                    (corner_pos[q0][2] + corner_pos[q1][2] + corner_pos[q2][2] + corner_pos[q3][2])
+                        / 4.0,
+                ];
+                // Outward direction = face centre − box centre.
+                let out = [fc[0] - center[0], fc[1] - center[1], fc[2] - center[2]];
+                for &(a, b, cc) in &[(q0, q1, q2), (q0, q2, q3)] {
+                    tris += 1;
+                    if tris > MAX_TRIANGLES {
+                        return Err(Tiles3dError::TooLarge("echo-top column triangles"));
+                    }
+                    let (p0, p1, p2) = (corner_pos[a], corner_pos[b], corner_pos[cc]);
+                    let u = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+                    let v = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+                    let mut nrm = [
+                        u[1] * v[2] - u[2] * v[1],
+                        u[2] * v[0] - u[0] * v[2],
+                        u[0] * v[1] - u[1] * v[0],
+                    ];
+                    let len = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt();
+                    if len > 0.0 {
+                        nrm = [nrm[0] / len, nrm[1] / len, nrm[2] / len];
+                        if nrm[0] * out[0] + nrm[1] * out[1] + nrm[2] * out[2] < 0.0 {
+                            nrm = [-nrm[0], -nrm[1], -nrm[2]];
+                        }
+                    }
+                    for ci in [a, b, cc] {
+                        let p = corner_pos[ci];
+                        positions.push(p);
+                        normals.push(nrm);
+                        colors.push(corner_col[ci]);
+                        for k in 0..3 {
+                            min[k] = min[k].min(p[k]);
+                            max[k] = max[k].max(p[k]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if positions.is_empty() {
+        return Err(Tiles3dError::Empty);
+    }
+    // Non-indexed (flat shading needs per-face vertices), so indices are trivial.
+    let indices: Vec<u32> = (0..positions.len() as u32).collect();
     Ok(build_glb(&positions, &normals, &colors, &indices, min, max))
 }
 
@@ -435,6 +574,48 @@ mod tests {
             let h = off[0] * up[0] + off[1] * up[1] + off[2] * up[2];
             assert!((h - 4000.0).abs() < 30.0, "vertex height {h} ≉ 4000 m");
         }
+    }
+
+    #[test]
+    fn echo_top_columns_glb_is_wellformed_and_grounded() {
+        let grid = ramp_top_grid(6, 12, 8);
+        let glb = encode_echo_top_columns_glb(&grid, 20.0, &height_map()).expect("encode");
+        let json = parse_glb(&glb);
+        let prim = &json["meshes"][0]["primitives"][0];
+        assert!(prim["attributes"]["COLOR_0"].is_number());
+        let vcount = json["accessors"][0]["count"].as_u64().unwrap();
+        // Per-face vertices (36 per box) → a multiple of 3, non-empty.
+        assert!(
+            vcount > 0 && vcount.is_multiple_of(3),
+            "triangle-list vertices: {vcount}"
+        );
+
+        // Every column reaches the ground: reconstruct height-above-antenna and
+        // assert the minimum is ≈ 0 (the bottom face), not floating.
+        let rtc = geodetic_to_ecef(grid.origin_lon, grid.origin_lat, grid.origin_height);
+        let m = (rtc[0] * rtc[0] + rtc[1] * rtc[1] + rtc[2] * rtc[2]).sqrt();
+        let up = [rtc[0] / m, rtc[1] / m, rtc[2] / m];
+        let pos_len = json["bufferViews"][0]["byteLength"].as_u64().unwrap() as usize;
+        let bin_start = {
+            let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+            20 + json_len + 8
+        };
+        let mut min_h = f64::INFINITY;
+        for w in glb[bin_start..bin_start + pos_len].chunks_exact(12) {
+            let v = [
+                f32::from_le_bytes(w[0..4].try_into().unwrap()),
+                f32::from_le_bytes(w[4..8].try_into().unwrap()),
+                f32::from_le_bytes(w[8..12].try_into().unwrap()),
+            ];
+            // small-disc grid (ramp_top_grid radius 100 km) — curvature keeps it
+            // modest; the ground vertices land near 0.
+            let off = [v[0] as f64, -(v[2] as f64), v[1] as f64];
+            min_h = min_h.min(off[0] * up[0] + off[1] * up[1] + off[2] * up[2]);
+        }
+        assert!(
+            min_h.abs() < 1500.0,
+            "columns reach the ground, min height {min_h}"
+        );
     }
 
     #[test]

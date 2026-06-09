@@ -117,8 +117,11 @@ fn main() {
     ]
     .map(|(value, color)| ColorStop { value, color });
     let height_map = LutColorMap::from_stops(&stops, HEIGHT_MIN_M, HEIGHT_MAX_M);
-    let glb = ds_3dtiles::encode_echo_top_glb(&grid, threshold, &height_map)
-        .expect("mesh the echo-top surface (try a lower threshold if this reports 'empty')");
+    // Extruded columns (one box per bin, ground → echo top) — solid walls,
+    // grounded, blocky-by-bin. (`encode_echo_top_glb` is the thin draped-surface
+    // variant.)
+    let glb = ds_3dtiles::encode_echo_top_columns_glb(&grid, threshold, &height_map)
+        .expect("mesh the echo-top columns (try a lower threshold if this reports 'empty')");
 
     fs::create_dir_all(&out_dir).expect("mkdir out_dir");
     fs::write(out_dir.join("content.glb"), &glb).expect("write content.glb");
