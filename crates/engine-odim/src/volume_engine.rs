@@ -3258,14 +3258,10 @@ const DEFAULT_VOXEL_DIMS: [usize; 3] = [128, 360, 48];
 const MAX_VOXELS: usize = 32_000_000;
 /// Height ceiling (metres above antenna) for the voxel grid — above any echo.
 const VOXEL_HEIGHT_CEILING_M: f64 = 20_000.0;
-/// Physical value written for **clear-air** (`undetect`) voxel cells (#360): a
-/// finite floor well below any reflectivity threshold, so an isosurface seals
-/// against clear air (closed blobs) while genuinely-unmeasured cells stay `NaN`
-/// (and an isosurface leaves them open — no fabricated cap over the cone of
-/// silence). v1 uses the standard −32 dBZ radar floor regardless of quantity
-/// (consistent with the single reflectivity colormap); a per-quantity floor is
-/// a follow-up (tied to per-quantity colormaps, #350).
-const NO_ECHO_FLOOR: f32 = -32.0;
+/// Value written for **clear-air** (`undetect`) voxel cells (#360) — the shared
+/// no-echo floor (so the engine fill and the isosurface seal use one constant,
+/// not two hardcoded `-32`s). See [`ds_core::volume::NO_ECHO_FLOOR_DBZ`].
+const NO_ECHO_FLOOR: f32 = ds_core::volume::NO_ECHO_FLOOR_DBZ;
 
 /// Resample one polar volume into a regular cylindrical [`VoxelGrid`]: for each
 /// `(radius, azimuth, height)` cell centre, invert to `(slant_range, elevation)`

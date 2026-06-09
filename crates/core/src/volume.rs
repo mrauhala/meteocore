@@ -89,6 +89,15 @@ pub struct VoxelGridCaps {
     pub origin: [f64; 3],
 }
 
+/// The physical value (dBZ) marking a radar voxel cell as **clear air / no
+/// echo**: the level a producer fills `undetect` cells with, and the level a
+/// 3D Tiles isosurface seals `NaN` corners at (`background`). Shared here so the
+/// *fill* (the radar engine) and the *seal* (the API/encoder) stay in lockstep
+/// — an isosurface threshold must be **above** this floor, or clear air would
+/// fall inside the surface. v1 uses one reflectivity floor regardless of
+/// quantity (per-quantity floors are a follow-up, tied to #350).
+pub const NO_ECHO_FLOOR_DBZ: f32 = -32.0;
+
 /// A regular **cylindrical voxel grid** sampled from a volume — the structured
 /// substrate for true 3D Tiles voxel content (`EXT_primitive_voxels`, #351) and
 /// isosurface meshing (#357). Cylinder axes match radar's native geometry:

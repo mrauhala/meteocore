@@ -402,17 +402,25 @@ pub async fn get_content_glb(
     if !threshold.is_finite() {
         return Err(Tiles3dError::BadRequest("threshold must be finite".into()));
     }
+    // The engine fills clear air with the no-echo floor; a threshold at/below it
+    // would put clear air *inside* the surface (all clear air would render as
+    // echo). Reject — a reflectivity shell below the −32 dBZ floor is meaningless.
+    let floor = f64::from(ds_core::volume::NO_ECHO_FLOOR_DBZ);
+    if threshold <= floor {
+        return Err(Tiles3dError::BadRequest(format!(
+            "threshold must be above the {floor} dBZ no-echo floor"
+        )));
+    }
 
     // Colour the shell at the threshold. v1 uses the single collection-level
     // colormap regardless of quantity (the `.pnts` path has the same
     // limitation); per-quantity colormaps are #350.
     let color = state.colormap.color(Some(threshold));
-    // Seal NaN at the no-echo floor so the shell closes into solid blobs (the
-    // preferred look — leaving the unmeasured boundary open reads as "curtains").
-    // The engine fills clear air with the same -32 dBZ floor (#360), so clear
-    // air and unmeasured cells seal at one uniform level. Clamp < threshold so
-    // a (nonsensical) sub-floor threshold can't trip the encoder's guard.
-    let background = Some((-32.0_f64).min(threshold - 1.0));
+    // Seal NaN at the same no-echo floor the engine fills clear air with, so the
+    // shell closes into solid blobs (the preferred look — an open unmeasured
+    // boundary reads as "curtains") and clear air + unmeasured seal at one
+    // uniform level. `floor < threshold` is guaranteed above.
+    let background = Some(floor);
 
     // read_voxel_grid does blocking HDF5 I/O + a long CPU loop (marching tet),
     // so bound it with the shared render semaphore and run on a blocking thread
