@@ -3345,10 +3345,10 @@ fn voxel_grid_from_volume(
                     el,
                 ) {
                     PixelClass::Value(v) => {
-                        // Only finite samples count as data — a non-finite gain/
-                        // offset in a malformed file can yield `Value(NaN)`;
-                        // writing it would make `valid` (and the 404 guard)
-                        // disagree with the finite-only `valid_count()`.
+                        // Only a finite echo is written + counted — a non-finite
+                        // gain/offset in a malformed file can yield `Value(NaN)`;
+                        // writing it would leave a stray `NaN` cell counted as
+                        // neither echo (`valid`) nor clear-air floor.
                         let fv = v as f32;
                         if fv.is_finite() {
                             // One source of truth for the axis order (in flux #351).

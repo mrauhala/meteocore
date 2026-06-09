@@ -145,8 +145,12 @@ impl VoxelGrid {
         Self::index_of(self.dims, i_r, i_a, i_h)
     }
 
-    /// Count of cells with a **finite** sampled value (excludes `NaN` *and*
-    /// `±∞`) — for diagnostics / emptiness checks.
+    /// Count of cells with a **finite** value (excludes `NaN` *and* `±∞`) — for
+    /// diagnostics. Note this counts **every** finite cell, including a
+    /// producer's finite "clear air / no echo" floor (e.g. the radar engine's
+    /// `NO_ECHO_FLOOR`, #360) — so it is **not** equivalent to "has echo data":
+    /// a clear-air-only grid still has `valid_count() > 0`. Callers needing an
+    /// echo-emptiness check must use the engine's own echo count, not this.
     pub fn valid_count(&self) -> usize {
         self.values.iter().filter(|v| v.is_finite()).count()
     }

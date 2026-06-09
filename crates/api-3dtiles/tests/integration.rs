@@ -73,9 +73,11 @@ impl VolumeEngine for MockVolume {
         }
         let dims = dims.unwrap_or([4, 8, 4]);
         let [n_r, n_a, n_h] = dims;
-        let mut values = vec![f32::NAN; n_r * n_a * n_h];
-        // A finite >threshold echo core (surrounded by NaN) so a sealed
-        // isosurface at the default 20 dBZ produces a non-empty mesh.
+        // Clear air is a finite floor (−32 dBZ), matching the post-#360 engine
+        // fill, so an isosurface at the default 20 dBZ seals against it
+        // (background=None) and yields a non-empty mesh. A finite >threshold
+        // echo core sits in the middle.
+        let mut values = vec![-32.0_f32; n_r * n_a * n_h];
         for i_r in 1..n_r.min(3) {
             for i_a in 0..n_a {
                 for i_h in 1..n_h.min(3) {

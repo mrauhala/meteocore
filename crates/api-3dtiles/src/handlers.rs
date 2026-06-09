@@ -407,11 +407,12 @@ pub async fn get_content_glb(
     // colormap regardless of quantity (the `.pnts` path has the same
     // limitation); per-quantity colormaps are #350.
     let color = state.colormap.color(Some(threshold));
-    // background = None: the engine fills clear air (undetect) with a finite
-    // floor (#360), so the surface seals against it on its own; genuinely
-    // unmeasured cells stay NaN and are left OPEN — no fabricated cap over the
-    // cone of silence.
-    let background = None;
+    // Seal NaN at the no-echo floor so the shell closes into solid blobs (the
+    // preferred look — leaving the unmeasured boundary open reads as "curtains").
+    // The engine fills clear air with the same -32 dBZ floor (#360), so clear
+    // air and unmeasured cells seal at one uniform level. Clamp < threshold so
+    // a (nonsensical) sub-floor threshold can't trip the encoder's guard.
+    let background = Some((-32.0_f64).min(threshold - 1.0));
 
     // read_voxel_grid does blocking HDF5 I/O + a long CPU loop (marching tet),
     // so bound it with the shared render semaphore and run on a blocking thread

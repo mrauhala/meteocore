@@ -198,12 +198,15 @@ impl RawPixels {
         // sentinels.
         //
         // NaN-aware: some PVOL producers declare `nodata`/`undetect`
-        // as NaN. `raw == nodata` is always false when `nodata` is
-        // NaN (IEEE-754), so a NaN raw is masked here unconditionally
-        // (a NaN physical value is never meaningful radar data); a NaN
-        // undetect sentinel therefore can't be told from nodata and
-        // its cells fall to `Masked` rather than `Undetect` — an
-        // acceptable edge (integer undetect codes are the norm).
+        // as NaN. A NaN raw is masked unconditionally below (a NaN
+        // physical value is never meaningful radar data), and `raw ==
+        // sentinel` is always false for a NaN sentinel (IEEE-754). So
+        // with a NaN `undetect`, the `!u.is_nan()` guard skips the
+        // undetect check entirely: a clear-air cell (which stores NaN)
+        // is classified `Masked` by the raw-is-NaN guard, never
+        // `Undetect`. An acceptable edge — integer undetect codes are
+        // the norm; a NaN-undetect producer's clear air just won't
+        // seal an isosurface (it stays open, like the cone of silence).
         if raw.is_nan() {
             return PixelClass::Masked;
         }
