@@ -30,6 +30,8 @@
   #bar .brand { font-weight: 650; letter-spacing: .2px; margin-right: 4px; }
   #bar .brand span { opacity: .55; font-weight: 400; }
   #bar .field { display: flex; align-items: center; gap: 6px; }
+  /* `[hidden]` alone loses to the rule above on specificity — force it. */
+  #bar .field[hidden] { display: none; }
   #bar label { opacity: .6; }
   #bar select, #bar input {
     background: #161b25; color: #e8eef6; border: 1px solid #2a3340;
@@ -38,6 +40,21 @@
   #bar input[type=number] { width: 58px; }
   #status { margin-left: auto; opacity: .6; font-size: 12px; white-space: nowrap; }
   #status.err { color: #ff8a8a; opacity: .95; }
+  /* Colour-scale legend for the point cloud (value → colour). */
+  #legend {
+    position: absolute; left: 14px; bottom: 34px; z-index: 10;
+    padding: 8px 10px; border-radius: 8px;
+    background: rgba(10, 13, 20, 0.82); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: #e8eef6; font: 11px/1.2 system-ui, -apple-system, sans-serif;
+  }
+  #legend[hidden] { display: none; }
+  #legend .ltitle { opacity: .7; margin-bottom: 6px; font-size: 11px; }
+  #legend .lwrap { display: flex; height: 132px; }
+  #legend .lbar { width: 13px; height: 100%; border: 1px solid rgba(255,255,255,.18); border-radius: 2px; }
+  #legend .lticks { position: relative; width: 30px; margin-left: 5px; }
+  #legend .tick { position: absolute; left: 0; transform: translateY(50%); white-space: nowrap; opacity: .85; }
+  #legend .tick::before { content: "– "; opacity: .5; }
 </style>
 </head>
 <body>
@@ -46,10 +63,19 @@
   <div class="field"><label for="coll">Collection</label><select id="coll"></select></div>
   <div class="field"><label for="qty">Quantity</label><select id="qty"></select></div>
   <div class="field"><label for="rep">View</label><select id="rep"></select></div>
+  <div class="field" id="resField" hidden><label for="res">Resolution</label><select id="res">
+    <option value="low">Low</option>
+    <option value="med" selected>Med</option>
+    <option value="high">High</option>
+  </select></div>
   <div class="field"><label id="numLabel" for="num">min dBZ</label><input id="num" type="number" value="5" step="1"></div>
   <div id="status"></div>
 </div>
 <div id="cesium"></div>
+<div id="legend" hidden>
+  <div class="ltitle"></div>
+  <div class="lwrap"><div class="lbar"></div><div class="lticks"></div></div>
+</div>
 <script>
 "use strict";
 
@@ -83,17 +109,28 @@ const BASE = override || sameOrigin || "https://meteocore.app.meteo.fi/3dtiles";
 const $coll = document.getElementById("coll");
 const $qty = document.getElementById("qty");
 const $rep = document.getElementById("rep");
+const $res = document.getElementById("res");
+const $resField = document.getElementById("resField");
 const $num = document.getElementById("num");
 const $numLabel = document.getElementById("numLabel");
 const $status = document.getElementById("status");
+const $legend = document.getElementById("legend");
+const $legendTitle = $legend.querySelector(".ltitle");
+const $legendBar = $legend.querySelector(".lbar");
+const $legendTicks = $legend.querySelector(".lticks");
 const setStatus = (msg, err) => { $status.textContent = msg; $status.className = err ? "err" : ""; };
 
 // Each representation's label for the numeric field + its default value:
 // point clouds drop echoes below `min_value`; isosurfaces draw the shell AT
-// `threshold`. Both are a dBZ number, so one input serves both, relabelled.
+// `threshold`; echo-top columns rise to where reflectivity drops below
+// `threshold`. All a dBZ number, so one input serves them, relabelled.
+// `mesh` products (isosurface/echotop) are resampled to a voxel grid, so they
+// take the low/med/high Resolution selector; the point cloud is native-res and
+// hides it.
 const REP_META = {
-  points:     { label: "Point cloud", numLabel: "min dBZ",       numDefault: "5"  },
-  isosurface: { label: "Isosurface",  numLabel: "threshold dBZ", numDefault: "20" },
+  points:     { label: "Point cloud", numLabel: "min dBZ",       numDefault: "5",  mesh: false },
+  isosurface: { label: "Isosurface",  numLabel: "threshold dBZ", numDefault: "20", mesh: true  },
+  echotop:    { label: "Echo top",    numLabel: "threshold dBZ", numDefault: "18", mesh: true  },
 };
 
 // Token-free CesiumJS: CARTO Dark Matter basemap, no Cesium Ion.
@@ -111,6 +148,9 @@ viewer.scene.globe.depthTestAgainstTerrain = false;
 
 let current = null;       // active tileset
 let loadToken = 0;        // guards against out-of-order async loads
+let currentRep = null;    // representation of the active tileset
+let pointsFetchFloor = null; // the min_value (dBZ) the active point cloud was fetched at
+let legendData = null;    // colour-scale legend {title,unit,min,max,stops} from the collection doc
 
 async function loadCollections() {
   setStatus("loading collections…");
@@ -124,17 +164,23 @@ async function loadCollections() {
       $coll.appendChild(o);
     }
     if (!cols.length) { setStatus("no 3D-Tiles collections at " + BASE, true); return; }
-    await loadCollectionMeta();
+    await loadCollectionMeta(true); // first view → frame the volume
   } catch (e) {
     setStatus("can't reach " + BASE + " — " + e, true);
   }
 }
 
-async function loadCollectionMeta() {
+// `reframe` controls whether the camera is moved to frame the volume. Frame on a
+// collection switch (the volume may be elsewhere); preserve the camera for
+// in-place changes (quantity/representation/threshold/resolution) so adjusting a
+// filter doesn't yank the view.
+async function loadCollectionMeta(reframe) {
   const id = $coll.value;
   if (!id) return;
   try {
     const data = await (await fetch(`${BASE}/collections/${encodeURIComponent(id)}`)).json();
+    legendData = data.legend || null;
+    buildLegend();
     const qs = data.quantities || [];
     $qty.innerHTML = "";
     for (const q of qs) {
@@ -156,20 +202,49 @@ async function loadCollectionMeta() {
       $rep.appendChild(o);
     }
     syncNumField();
-    await loadTileset();
+    await loadTileset(reframe);
   } catch (e) {
     setStatus("error loading collection — " + e, true);
   }
 }
 
-// Relabel + default the numeric field for the active representation.
+// Relabel + default the numeric field for the active representation, show the
+// Resolution selector only for the (resampled) mesh products, and show the
+// colour legend only for the point cloud (whose points are coloured by value;
+// the mesh products colour by threshold / height instead).
 function syncNumField() {
   const meta = REP_META[$rep.value] || REP_META.points;
   $numLabel.textContent = meta.numLabel;
   $num.value = meta.numDefault;
+  $resField.hidden = !meta.mesh;
+  $legend.hidden = meta.mesh || !legendData;
 }
 
-async function loadTileset() {
+// Build the colour-scale legend from the collection doc's `legend` (a sampled
+// gradient of the point colormap). A vertical bar, low value at the bottom, with
+// tick labels at round values across the range.
+function buildLegend() {
+  const lg = legendData;
+  if (!lg || !lg.stops || !lg.stops.length) { $legend.hidden = true; return; }
+  $legendTitle.textContent = (lg.title || "") + (lg.unit ? ` (${lg.unit})` : "");
+  const span = (lg.max - lg.min) || 1;
+  const frac = (v) => Math.max(0, Math.min(1, (v - lg.min) / span));
+  // CSS gradient bottom→top, each stop placed at its value's fraction.
+  const css = lg.stops.map(s => `${s.color} ${(frac(s.value) * 100).toFixed(1)}%`).join(", ");
+  $legendBar.style.background = `linear-gradient(to top, ${css})`;
+  // ~5 tick labels at round values within the range.
+  const step = span > 80 ? 25 : span > 40 ? 10 : 5;
+  $legendTicks.innerHTML = "";
+  for (let val = Math.ceil(lg.min / step) * step; val <= lg.max + 1e-6; val += step) {
+    const el = document.createElement("div");
+    el.className = "tick";
+    el.style.bottom = (frac(val) * 100) + "%";
+    el.textContent = val;
+    $legendTicks.appendChild(el);
+  }
+}
+
+async function loadTileset(reframe = false) {
   const id = $coll.value, q = $qty.value;
   const rep = $rep.value || "points";
   const num = $num.value.trim();
@@ -183,9 +258,10 @@ async function loadTileset() {
   if (current) { viewer.scene.primitives.remove(current); current = null; }
 
   let url = `${BASE}/collections/${encodeURIComponent(id)}/tileset.json?quantity=${encodeURIComponent(q)}`;
-  if (rep === "isosurface") {
-    url += `&representation=isosurface`;
+  if (rep === "isosurface" || rep === "echotop") {
+    url += `&representation=${rep}`;
     if (num !== "") url += `&threshold=${encodeURIComponent(num)}`;
+    url += `&resolution=${encodeURIComponent($res.value)}`;
   } else if (num !== "") {
     url += `&min_value=${encodeURIComponent(num)}`;
   }
@@ -193,11 +269,20 @@ async function loadTileset() {
     const ts = await Cesium.Cesium3DTileset.fromUrl(url, { maximumScreenSpaceError: 1 });
     if (token !== loadToken) { ts.destroy(); return; } // superseded — free its GPU buffers
     current = ts;
+    currentRep = rep;
     viewer.scene.primitives.add(ts);
-    // pointSize styling only applies to the .pnts point cloud; a mesh ignores it.
-    if (rep === "points") ts.style = new Cesium.Cesium3DTileStyle({ pointSize: 5.0 });
-    await viewer.zoomTo(ts, new Cesium.HeadingPitchRange(
-      Cesium.Math.toRadians(210), Cesium.Math.toRadians(-28), 300000));
+    if (rep === "points") {
+      // The server already dropped points below `num`; remember that floor so
+      // the slider can filter *up* from it client-side (see applyPointFilter).
+      pointsFetchFloor = num === "" ? -Infinity : parseFloat(num);
+      applyPointStyle(pointsFetchFloor);
+    }
+    // Frame from the south-west (camera faces NE, heading 45°) looking down at
+    // -28° — only on a reframe; otherwise leave the camera where the user put it.
+    if (reframe) {
+      await viewer.zoomTo(ts, new Cesium.HeadingPitchRange(
+        Cesium.Math.toRadians(45), Cesium.Math.toRadians(-28), 300000));
+    }
     setStatus(`${id} · ${q} · ${rep}`);
   } catch (e) {
     if (token === loadToken) setStatus("no data for this selection", true);
@@ -205,11 +290,59 @@ async function loadTileset() {
   }
 }
 
-$coll.addEventListener("change", loadCollectionMeta);
-$qty.addEventListener("change", loadTileset);
-// Switching representation relabels + re-defaults the numeric field, then reloads.
-$rep.addEventListener("change", () => { syncNumField(); loadTileset(); });
-$num.addEventListener("change", loadTileset);
+// Point-cloud style: drop points below `min` and scale each dot by its
+// reflectivity (the per-point `value` batch property) — faint/small for weak
+// echo, big for strong. Both expressions read `${value}`, which is why the
+// `.pnts` carries it. (A mesh ignores both.)
+function applyPointStyle(min) {
+  if (!current) return;
+  const cond = Number.isFinite(min) ? "${value} >= " + min : "true";
+  current.style = new Cesium.Cesium3DTileStyle({
+    show: cond,
+    // Steep ramp so weak vs strong reads clearly: ~1 px at 5 dBZ up to 16 px at
+    // 55 dBZ (slope 0.3). Weak clutter stays a speck; storm cores are fat dots.
+    pointSize: "clamp((${value} - 5.0) * 0.3 + 1.0, 1.0, 16.0)",
+  });
+}
+
+// The `min dBZ` field for a point cloud filters CLIENT-SIDE (no re-fetch) by
+// restyling `show` — instant, since every point carries its value. We can only
+// hide points we already have, so dropping below the fetched floor re-fetches
+// the (larger) set; raising the threshold is always client-side.
+//   - `pointsClientFilter()` runs live on every `input` (fast, points-in-range).
+//   - `onNumCommit()` runs on `change` and re-fetches when needed: meshes, or a
+//     point cloud that needs values below its fetched floor.
+function pointsClientFilter() {
+  if (($rep.value || "points") !== "points" || currentRep !== "points" || !current) return false;
+  const min = parseFloat($num.value);
+  if (!Number.isFinite(min) || pointsFetchFloor === null || min < pointsFetchFloor) return false;
+  applyPointStyle(min);
+  viewer.scene.requestRender();
+  setStatus(`${$coll.value} · ${$qty.value} · points · ≥ ${min} dBZ`);
+  return true;
+}
+
+function onNumCommit() {
+  // Points within the fetched range already restyled live → nothing to fetch.
+  if (pointsClientFilter()) return;
+  loadTileset(false); // mesh threshold/resolution, or points needing more data
+}
+
+// Collection switch → reframe (new volume, possibly elsewhere). Every other
+// control is an in-place change → preserve the camera. (Arrow wrappers are
+// load-bearing: passing the handler bare would feed the DOM Event as `reframe`,
+// which is truthy and would reframe on every filter tweak.)
+$coll.addEventListener("change", () => loadCollectionMeta(true));
+$qty.addEventListener("change", () => loadTileset(false));
+// Switching representation relabels + re-defaults the numeric field, toggles the
+// Resolution selector, then reloads (camera preserved).
+$rep.addEventListener("change", () => { syncNumField(); loadTileset(false); });
+$res.addEventListener("change", () => loadTileset(false));
+// Live: a point cloud re-filters client-side as you drag the field. Commit
+// (`change`): re-fetch for meshes, or for points that need values below their
+// fetched floor.
+$num.addEventListener("input", pointsClientFilter);
+$num.addEventListener("change", onNumCommit);
 loadCollections();
 </script>
 </body>

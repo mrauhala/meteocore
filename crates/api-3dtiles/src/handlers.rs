@@ -1,18 +1,20 @@
 //! HTTP handlers for the 3D Tiles API.
 //!
-//! Serves OGC 3D Tiles from any collection implementing `VolumeEngine`, in two
+//! Serves OGC 3D Tiles from any collection implementing `VolumeEngine`, in three
 //! representations (selected by `?representation=`):
 //! - `GET /collections/{id}/tileset.json` — the tileset (bounding region from
 //!   `VolumeInfo`; content points at `.pnts` for `points`, or `.glb` plus an
-//!   antenna-ECEF `transform` for `isosurface`).
+//!   antenna-ECEF `transform` for the `isosurface`/`echotop` mesh products).
 //! - `GET /collections/{id}/content.pnts` — the point-cloud tile.
-//! - `GET /collections/{id}/content.glb` — the isosurface-mesh tile.
+//! - `GET /collections/{id}/content.glb` — a mesh tile (`isosurface` shell, the
+//!   default, or `echotop` columns). The mesh products take a `resolution`
+//!   (`low`/`med`/`high`) detail tier; the point cloud is native-resolution.
 //!
-//! Both content types are sampled on a blocking thread (bounded by the shared
+//! All content types are sampled on a blocking thread (bounded by the shared
 //! render semaphore) and encoded by `ds-3dtiles`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arc_swap::ArcSwap;
 use axum::extract::{Path, Query, State};
@@ -22,7 +24,7 @@ use chrono::{DateTime, Utc};
 use ds_core::config::CollectionConfig;
 use ds_core::geo::geodetic_to_ecef;
 use ds_core::volume::VolumeEngine;
-use ds_render::ColorMap;
+use ds_render::{BuiltinColormap, ColorMap, ColorStop, LutColorMap};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -31,6 +33,147 @@ use crate::error::Tiles3dError;
 /// Default isosurface threshold (dBZ) when a request names none — a light-rain
 /// reflectivity shell.
 const ISOSURFACE_DEFAULT_THRESHOLD: f64 = 20.0;
+/// Default echo-top reflectivity (dBZ) — the standard echo-top value. Like the
+/// isosurface threshold and the no-echo-floor guard below, this is
+/// reflectivity-specific: an echo-top request for a non-reflectivity quantity
+/// (e.g. `VRADH`) still validates against the −32 dBZ floor, which is meaningless
+/// for velocity. Per-quantity floors land with per-quantity colormaps (#350).
+const ECHO_TOP_DEFAULT_THRESHOLD: f64 = 18.0;
+
+/// Voxel-grid resolution tier for the glTF mesh products (isosurface, echo-top):
+/// `[radius, azimuth, height]`. Azimuth stays 360 (the native 1° ray spacing) at
+/// every tier; radius/height trade detail for compute. The cell count drives both
+/// the resample and the mesher, so the first-request cost scales with it (repeats
+/// are ETag-cached). `High` ≈ the native 500 m range bins; `Low` is the engine's
+/// historical default. All tiers stay under the engine's `MAX_VOXELS` cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolution {
+    /// `[128, 360, 48]` ≈ 2.2 M cells — fast, coarse radial (~2 km bins). Equals
+    /// the engine's historical `read_voxel_grid(None)` default.
+    Low,
+    /// `[256, 360, 56]` ≈ 5.2 M cells — the balanced default for an *absent*
+    /// `?resolution=`. NOTE: this is intentionally higher than the engine's old
+    /// `None` default (`Low` above) — adding the tiers deliberately bumped the
+    /// no-tier-specified isosurface/echo-top quality from coarse to balanced, so
+    /// a pre-tier bookmarked content URI without `?resolution=` now renders one
+    /// step sharper (and a touch slower), not differently-wrong.
+    Med,
+    /// `[512, 360, 64]` ≈ 11.8 M cells — full radial detail; ~12 s first compute.
+    High,
+}
+
+impl Resolution {
+    /// Parse the `resolution` query value (`None`/empty → `Med`).
+    fn parse(s: Option<&str>) -> Result<Self, Tiles3dError> {
+        match s.map(str::trim) {
+            None | Some("") | Some("med") => Ok(Self::Med),
+            Some("low") => Ok(Self::Low),
+            Some("high") => Ok(Self::High),
+            Some(other) => Err(Tiles3dError::BadRequest(format!(
+                "unknown resolution '{other}' (expected 'low', 'med', or 'high')"
+            ))),
+        }
+    }
+
+    /// The voxel-grid dimensions `[radius, azimuth, height]` for this tier.
+    fn dims(self) -> [usize; 3] {
+        match self {
+            Self::Low => [128, 360, 48],
+            Self::Med => [256, 360, 56],
+            Self::High => [512, 360, 64],
+        }
+    }
+
+    /// The canonical query-string token (round-trips through `parse`).
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Med => "med",
+            Self::High => "high",
+        }
+    }
+}
+
+/// Reflectivity range (dBZ) sampled for the viewer's colour-scale legend. The
+/// shared point colormap is sampled across this span so the legend reads the
+/// same colours the points show. 0–70 dBZ is the conventional radar display
+/// range — it covers the whole coloured ramp (the radar colormap is ~black
+/// below a few dBZ, so a lower bound just adds an invisible band).
+const LEGEND_MIN_DBZ: f64 = 0.0;
+const LEGEND_MAX_DBZ: f64 = 70.0;
+const LEGEND_STOPS: usize = 24;
+
+/// The shared colour ramp applied to point-cloud values. v1 uses one reflectivity
+/// ramp for every 3D-Tiles collection (per-collection/per-quantity colormaps are
+/// a follow-up — #350). Single source of truth so the points the server encodes
+/// and the legend it advertises can't drift; every `TilesState3d` construction
+/// site uses this.
+pub fn default_point_colormap() -> Arc<dyn ColorMap> {
+    Arc::new(LutColorMap::from_builtin(
+        BuiltinColormap::RadarDbz,
+        -32.0,
+        95.0,
+    ))
+}
+
+/// Sample `colormap` into `(value, "#rrggbb")` stops across `[min, max]` for the
+/// viewer legend. RGB only — `.pnts` colours are opaque, so alpha is dropped.
+fn legend_stops(colormap: &dyn ColorMap, min: f64, max: f64, n: usize) -> Vec<serde_json::Value> {
+    (0..n)
+        .map(|i| {
+            // Guard n == 1: `i/(n-1)` would be `0/0 = NaN`, which serde emits as
+            // `null`. (LEGEND_STOPS is 24 today, but keep the invariant explicit.)
+            let v = min
+                + if n <= 1 {
+                    0.0
+                } else {
+                    (max - min) * (i as f64) / ((n - 1) as f64)
+                };
+            let c = colormap.color(Some(v));
+            json!({
+                "value": (v * 10.0).round() / 10.0,
+                "color": format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]),
+            })
+        })
+        .collect()
+}
+
+/// The point-cloud colour-scale legend, built once. The colormap is fixed for the
+/// process ([`default_point_colormap`]), so we sample it a single time rather than
+/// on every `GET /collections/{id}` (a metadata accessor — keep it O(1), #211).
+/// When per-collection colormaps land (#350) this moves into the per-collection
+/// snapshot.
+static POINT_LEGEND: LazyLock<serde_json::Value> = LazyLock::new(|| {
+    json!({
+        "title": "Reflectivity",
+        "unit": "dBZ",
+        "min": LEGEND_MIN_DBZ,
+        "max": LEGEND_MAX_DBZ,
+        "stops": legend_stops(
+            default_point_colormap().as_ref(),
+            LEGEND_MIN_DBZ,
+            LEGEND_MAX_DBZ,
+            LEGEND_STOPS,
+        ),
+    })
+});
+
+/// The blue→red **height** colour ramp for the echo-top product (stops at height
+/// values, 0–15 km) — a builtin colormap's stops are in its own units, so they
+/// collapse over a height range; build it explicitly. Fixed ramp, so build it
+/// once rather than per echo-top GLB request (mirrors the `colormap` pattern).
+static ECHO_TOP_COLORMAP: LazyLock<LutColorMap> = LazyLock::new(|| {
+    let stops = [
+        (0.0_f64, [40u8, 70, 200, 255]),
+        (3_000.0, [0, 200, 220, 255]),
+        (6_000.0, [40, 200, 80, 255]),
+        (9_000.0, [240, 230, 60, 255]),
+        (12_000.0, [240, 140, 40, 255]),
+        (15_000.0, [220, 40, 40, 255]),
+    ]
+    .map(|(value, color)| ColorStop { value, color });
+    LutColorMap::from_stops(&stops, 0.0, 15_000.0)
+});
 
 /// Shared state for the 3D Tiles API. Wrapped in `ArcSwap` for lock-free reads
 /// and atomic swap on config reload.
@@ -83,6 +226,10 @@ pub struct TilesetParams {
     /// `isosurface` only: the iso-value (e.g. dBZ) of the shell; carried into
     /// the `.glb` `content.uri`. `None` → [`ISOSURFACE_DEFAULT_THRESHOLD`].
     pub threshold: Option<f64>,
+    /// Mesh products only (`isosurface`/`echotop`): voxel-grid detail tier
+    /// (`low`/`med`/`high`); carried into the `.glb` `content.uri`. `None` →
+    /// `med`. Ignored for `points` (the cloud is native-resolution).
+    pub resolution: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,16 +244,27 @@ pub struct ContentParams {
 pub struct GlbContentParams {
     pub quantity: Option<String>,
     pub datetime: Option<String>,
-    /// Iso-value of the reflectivity shell. `None` → [`ISOSURFACE_DEFAULT_THRESHOLD`].
+    /// `isosurface`: iso-value of the shell; `echotop`: the reflectivity floor
+    /// for the echo top. `None` → [`ISOSURFACE_DEFAULT_THRESHOLD`] /
+    /// [`ECHO_TOP_DEFAULT_THRESHOLD`].
     pub threshold: Option<f64>,
+    /// Which glTF product: `isosurface` (default) or `echotop`.
+    pub representation: Option<String>,
+    /// Voxel-grid detail tier (`low`/`med`/`high`). `None` → `med`.
+    pub resolution: Option<String>,
 }
 
-/// The two 3D Tiles representations of a volume. Both are valid OGC 3D Tiles
-/// tilesets; they differ only in content type (`.pnts` vs glTF `.glb`).
+/// The 3D Tiles representations of a volume — all valid OGC 3D Tiles tilesets,
+/// differing in content (`.pnts` point cloud vs glTF `.glb` mesh) and, for the
+/// two mesh products, in what the mesh *is*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Representation {
+    /// `.pnts` point cloud — one point per echo cell.
     Points,
+    /// `.glb` closed reflectivity shell at a threshold.
     Isosurface,
+    /// `.glb` extruded echo-top columns (ground → echo-top height, by column).
+    EchoTop,
 }
 
 impl Representation {
@@ -115,8 +273,9 @@ impl Representation {
         match s.map(str::trim) {
             None | Some("") | Some("points") => Ok(Self::Points),
             Some("isosurface") => Ok(Self::Isosurface),
+            Some("echotop") => Ok(Self::EchoTop),
             Some(other) => Err(Tiles3dError::BadRequest(format!(
-                "unknown representation '{other}' (expected 'points' or 'isosurface')"
+                "unknown representation '{other}' (expected 'points', 'isosurface', or 'echotop')"
             ))),
         }
     }
@@ -223,6 +382,10 @@ pub async fn get_tileset(
     let (engine, _config) = lookup(&state, &id)?;
     let info = engine.volume_info();
     let representation = Representation::parse(params.representation.as_deref())?;
+    // Validate the detail tier up front so a bad `resolution=` is a 400 for *any*
+    // representation, not silently ignored on a `points` request (which doesn't
+    // use it). Only the mesh arm below consumes the parsed value.
+    let resolution = Resolution::parse(params.resolution.as_deref())?;
 
     // Resolve + validate the quantity against what the collection advertises.
     let quantity = match &params.quantity {
@@ -271,12 +434,18 @@ pub async fn get_tileset(
             ds_3dtiles::tileset_json_for_region(region, &content_uri)
                 .map_err(|e| Tiles3dError::Internal(format!("tileset build failed: {e}")))?
         }
-        Representation::Isosurface => {
-            // `voxel_grid` couples capability with the origin, so an isosurface
-            // collection always has the origin — no separate `None` → 500 path.
+        Representation::Isosurface | Representation::EchoTop => {
+            // Both glTF products need the voxel grid. `voxel_grid` couples the
+            // capability with the origin, so such a collection always has the
+            // origin — no separate `None` → 500 path.
             let caps = info.voxel_grid.as_ref().ok_or_else(|| {
+                let name = if representation == Representation::EchoTop {
+                    "echo-top"
+                } else {
+                    "isosurface"
+                };
                 Tiles3dError::BadRequest(format!(
-                    "collection '{id}' does not support the isosurface representation"
+                    "collection '{id}' does not support the {name} representation"
                 ))
             })?;
             // The glTF `.glb` content has no embedded origin (unlike `.pnts`
@@ -291,6 +460,18 @@ pub async fn get_tileset(
                 }
                 query.push_str(&format!("&threshold={t}"));
             }
+            // Carry the detail tier so the content fetch matches the tileset;
+            // emit the canonical token even when the request omitted it, so the
+            // `content.uri` is self-describing. (Parsed/validated above.)
+            query.push_str(&format!("&resolution={}", resolution.as_str()));
+            // Tag the mesh product explicitly for *both* (not just echo-top), so
+            // the `content.uri` is unambiguous and doesn't depend on the
+            // content.glb handler's absent→isosurface default — a future default
+            // change there can't then silently repoint old isosurface tilesets.
+            query.push_str(match representation {
+                Representation::EchoTop => "&representation=echotop",
+                _ => "&representation=isosurface",
+            });
             let content_uri = format!("content.glb?{query}");
             ds_3dtiles::tileset_json_glb(region, &content_uri, rtc)
                 .map_err(|e| Tiles3dError::Internal(format!("tileset build failed: {e}")))?
@@ -366,9 +547,11 @@ pub async fn get_content(
 // Content (.glb isosurface)
 // ---------------------------------------------------------------------------
 
-/// `GET /collections/{id}/content.glb` — the isosurface reflectivity-shell mesh,
-/// resampled to a voxel grid and meshed (marching tetrahedra) on a blocking
-/// thread, then encoded as a glTF `.glb` by `ds-3dtiles`.
+/// `GET /collections/{id}/content.glb` — a glTF `.glb` mesh of the volume:
+/// `representation=isosurface` (default) is a reflectivity shell (marching
+/// tetrahedra); `representation=echotop` is extruded echo-top columns. Resampled
+/// to a voxel grid and meshed on a blocking thread (bounded by the shared render
+/// semaphore), encoded by `ds-3dtiles`.
 pub async fn get_content_glb(
     headers: HeaderMap,
     Path(id): Path<String>,
@@ -376,13 +559,32 @@ pub async fn get_content_glb(
     State(state): State<AppState>,
 ) -> Result<Response, Tiles3dError> {
     let state = state.load_full();
+    // `.glb` serves the mesh products. An *absent* representation defaults to
+    // the isosurface (the isosurface tileset's `content.uri` omits the param),
+    // but an *explicit* `points` is rejected below — the point cloud has its own
+    // `content.pnts` route, and a tileset-following client never asks `.glb` for
+    // it. (Distinguishing absent from explicit-points is why we don't lean on
+    // `Representation::parse`'s `None → Points` default here.)
+    let representation = match params.representation.as_deref().map(str::trim) {
+        None | Some("") => Representation::Isosurface,
+        other => Representation::parse(other)?,
+    };
+    let product = match representation {
+        Representation::Points => {
+            return Err(Tiles3dError::BadRequest(
+                "use content.pnts for the point-cloud representation".into(),
+            ))
+        }
+        Representation::EchoTop => "echo-top",
+        Representation::Isosurface => "isosurface",
+    };
     let (engine, _config) = lookup(&state, &id)?;
     let info = engine.volume_info();
     // Reject early if the engine can't produce a voxel grid (avoids a blocking
     // task just to return the trait's "unsupported" → 404).
     if info.voxel_grid.is_none() {
         return Err(Tiles3dError::BadRequest(format!(
-            "collection '{id}' does not support the isosurface representation"
+            "collection '{id}' does not support the {product} representation"
         )));
     }
     // Validate the quantity against the advertised set *before* the blocking
@@ -398,15 +600,19 @@ pub async fn get_content_glb(
 
     let time = params.datetime.as_deref().map(parse_datetime).transpose()?;
     let quantity = params.quantity.clone();
-    let threshold = params.threshold.unwrap_or(ISOSURFACE_DEFAULT_THRESHOLD);
+    // Detail tier (`low`/`med`/`high`, default `med`) → voxel-grid dims, applied
+    // to both mesh products. A bad value is a 400 before the blocking task.
+    let dims = Resolution::parse(params.resolution.as_deref())?.dims();
+    let threshold = params.threshold.unwrap_or(match representation {
+        Representation::EchoTop => ECHO_TOP_DEFAULT_THRESHOLD,
+        _ => ISOSURFACE_DEFAULT_THRESHOLD,
+    });
     if !threshold.is_finite() {
         return Err(Tiles3dError::BadRequest("threshold must be finite".into()));
     }
-    // The engine fills clear air with the no-echo floor; a threshold at/below it
-    // would put clear air *inside* the surface (all clear air would render as
-    // echo). Reject — a reflectivity shell below the −32 dBZ floor is meaningless.
-    // (v1: the floor is dBZ for every quantity; for a non-reflectivity quantity
-    // it's just "below any sane threshold" — per-quantity floors are #350.)
+    // Both products lean on the engine's no-echo floor: the isosurface seals NaN
+    // at it; an echo-top column needs its threshold above it (else clear air
+    // would count as echo). (v1: the floor is dBZ for every quantity — #350.)
     let floor = f64::from(ds_core::volume::NO_ECHO_FLOOR_DBZ);
     if threshold <= floor {
         return Err(Tiles3dError::BadRequest(format!(
@@ -414,19 +620,9 @@ pub async fn get_content_glb(
         )));
     }
 
-    // Colour the shell at the threshold. v1 uses the single collection-level
-    // colormap regardless of quantity (the `.pnts` path has the same
-    // limitation); per-quantity colormaps are #350.
-    let color = state.colormap.color(Some(threshold));
-    // Seal NaN at the same no-echo floor the engine fills clear air with, so the
-    // shell closes into solid blobs (the preferred look — an open unmeasured
-    // boundary reads as "curtains") and clear air + unmeasured seal at one
-    // uniform level. `floor < threshold` is guaranteed above.
-    let background = Some(floor);
-
-    // read_voxel_grid does blocking HDF5 I/O + a long CPU loop (marching tet),
-    // so bound it with the shared render semaphore and run on a blocking thread
-    // (same rule as the `.pnts` path / the raster `get_raster_tile`).
+    // read_voxel_grid + meshing do blocking HDF5 I/O + a long CPU loop, so bound
+    // them with the shared render semaphore and run on a blocking thread (same
+    // rule as the `.pnts` path / the raster `get_raster_tile`).
     let _permit = state
         .render_semaphore
         .clone()
@@ -435,33 +631,47 @@ pub async fn get_content_glb(
         .map_err(|_| Tiles3dError::Internal("render semaphore closed".into()))?;
 
     let engine = engine.clone();
+    let colormap = state.colormap.clone(); // reflectivity ramp (isosurface)
     let id_for_err = id.clone();
     let (bytes, etag) =
         tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
-            let grid = engine.read_voxel_grid(quantity.as_deref(), time, None, None)?;
-            let bytes = ds_3dtiles::encode_isosurface_glb(&grid, threshold, color, background)
-                .map_err(|e| match e {
-                    // An empty surface (threshold above all echo) is "no data
-                    // here", not a server fault — 404, matching the no-data path.
-                    ds_3dtiles::Tiles3dError::Empty => Tiles3dError::NotFound(format!(
-                        "no isosurface at threshold {threshold} for collection '{id_for_err}'"
-                    )),
-                    // Too many triangles is client-driven (the threshold is too
-                    // low for this grid) — 400, not a 500 server fault.
-                    ds_3dtiles::Tiles3dError::TooLarge(_) => Tiles3dError::BadRequest(format!(
-                        "threshold {threshold} produces too large an isosurface; raise it"
-                    )),
-                    // The seal floor is clamped < threshold above, so this is
-                    // currently unreachable — but map it to 400 (a bad
-                    // parameter combination) so a future floor-formula change
-                    // can't silently surface as an opaque 500.
-                    ds_3dtiles::Tiles3dError::BackgroundNotBelowThreshold { .. } => {
-                        Tiles3dError::BadRequest(
-                            "isosurface sealing floor is not below the threshold".into(),
-                        )
-                    }
-                    other => Tiles3dError::Internal(format!("isosurface encode failed: {other}")),
-                })?;
+            let result = match representation {
+                Representation::EchoTop => {
+                    let grid =
+                        engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;
+                    ds_3dtiles::encode_echo_top_columns_glb(&grid, threshold, &*ECHO_TOP_COLORMAP)
+                }
+                Representation::Isosurface => {
+                    let grid =
+                        engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;
+                    // Colour the shell at the threshold (v1: one colormap for all
+                    // quantities — #350); seal NaN at the no-echo floor so it
+                    // closes into solid blobs (`floor < threshold` guaranteed).
+                    let color = colormap.color(Some(threshold));
+                    ds_3dtiles::encode_isosurface_glb(&grid, threshold, color, Some(floor))
+                }
+                // Rejected before the blocking task (see the `product` match).
+                Representation::Points => unreachable!("points rejected above"),
+            };
+            let bytes = result.map_err(|e| match e {
+                // No surface / no columns (threshold above all echo) — 404.
+                ds_3dtiles::Tiles3dError::Empty => Tiles3dError::NotFound(format!(
+                    "no {product} at threshold {threshold} for collection '{id_for_err}'"
+                )),
+                // Client-driven (threshold too low for this grid) — 400.
+                ds_3dtiles::Tiles3dError::TooLarge(_) => Tiles3dError::BadRequest(format!(
+                    "threshold {threshold} produces too large a {product}; raise it"
+                )),
+                // Unreachable (floor < threshold above) — defensive 400. Only
+                // the isosurface encoder emits this today, but this `map_err`
+                // covers both products, so use `{product}` for consistency.
+                ds_3dtiles::Tiles3dError::BackgroundNotBelowThreshold { .. } => {
+                    Tiles3dError::BadRequest(format!(
+                        "{product} sealing floor is not below the threshold"
+                    ))
+                }
+                other => Tiles3dError::Internal(format!("{product} encode failed: {other}")),
+            })?;
             let etag = etag_of(&bytes);
             Ok((bytes, etag))
         })
@@ -532,28 +742,36 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
         })
         .unwrap_or_default();
     // Every volume collection serves a point cloud; those whose engine can also
-    // produce a voxel grid additionally serve an isosurface mesh. The viewer
-    // reads this to populate its representation toggle.
-    let supports_iso = info.as_ref().is_some_and(|i| i.voxel_grid.is_some());
+    // produce a voxel grid additionally serve the two glTF mesh products
+    // (isosurface, echo-top). The viewer reads this to populate its toggle.
+    let supports_mesh = info.as_ref().is_some_and(|i| i.voxel_grid.is_some());
     let mut representations = vec!["points"];
-    if supports_iso {
+    if supports_mesh {
         representations.push("isosurface");
+        representations.push("echotop");
     }
     // A link per representation so a link-following client (not just one that
-    // reads `representations` and builds URLs itself) can discover both.
+    // reads `representations` and builds URLs itself) can discover them.
     let mut links = vec![
         json!({ "href": format!("{base}/3dtiles/collections/{id}"), "rel": "self", "type": "application/json", "title": "This document" }),
         json!({ "href": format!("{base}/3dtiles/collections/{id}/tileset.json"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (point cloud)" }),
     ];
-    if supports_iso {
+    if supports_mesh {
         links.push(json!({ "href": format!("{base}/3dtiles/collections/{id}/tileset.json?representation=isosurface"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (isosurface mesh)" }));
+        links.push(json!({ "href": format!("{base}/3dtiles/collections/{id}/tileset.json?representation=echotop"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (echo-top columns)" }));
     }
+    // Colour-scale legend for the point cloud: the precomputed gradient of the
+    // shared reflectivity colormap, so the viewer's bar matches the point colours
+    // (built once — this is a metadata accessor; v1 uses one ramp for all
+    // quantities — #350).
+    let legend = POINT_LEGEND.clone();
     json!({
         "id": id,
         "title": title,
         "description": description,
         "quantities": quantities,
         "representations": representations,
+        "legend": legend,
         "links": links,
     })
 }

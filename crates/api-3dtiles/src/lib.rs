@@ -16,7 +16,7 @@ pub mod error;
 pub mod handlers;
 
 pub use error::Tiles3dError;
-pub use handlers::{AppState, TilesState3d};
+pub use handlers::{default_point_colormap, AppState, TilesState3d};
 
 use axum::routing::get;
 use axum::Router;

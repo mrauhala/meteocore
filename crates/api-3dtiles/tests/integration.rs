@@ -367,14 +367,26 @@ async fn collections_list_and_doc() {
     assert_eq!(status, StatusCode::OK);
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["quantities"][0]["id"], "DBZH");
-    // The mock supports voxel grids, so both representations are advertised.
+    // The mock supports voxel grids, so all three representations are advertised.
     let reps: Vec<&str> = v["representations"]
         .as_array()
         .unwrap()
         .iter()
         .map(|r| r.as_str().unwrap())
         .collect();
-    assert_eq!(reps, vec!["points", "isosurface"]);
+    assert_eq!(reps, vec!["points", "isosurface", "echotop"]);
+    // A colour-scale legend is advertised for the point cloud: a unit, a range,
+    // and sampled `#rrggbb` stops the viewer renders as a gradient bar.
+    let lg = &v["legend"];
+    assert_eq!(lg["unit"], "dBZ");
+    assert!(lg["min"].as_f64().unwrap() < lg["max"].as_f64().unwrap());
+    let stops = lg["stops"].as_array().unwrap();
+    assert!(stops.len() >= 2, "legend has multiple stops");
+    let c0 = stops[0]["color"].as_str().unwrap();
+    assert!(
+        c0.starts_with('#') && c0.len() == 7,
+        "stop colour is #rrggbb: {c0}"
+    );
     // …and a link-following client can discover the isosurface tileset too.
     let hrefs: Vec<&str> = v["links"]
         .as_array()
@@ -391,6 +403,12 @@ async fn collections_list_and_doc() {
             .iter()
             .any(|h| h.contains("tileset.json?representation=isosurface")),
         "isosurface tileset link present: {hrefs:?}"
+    );
+    assert!(
+        hrefs
+            .iter()
+            .any(|h| h.contains("tileset.json?representation=echotop")),
+        "echo-top tileset link present: {hrefs:?}"
     );
 }
 
@@ -455,6 +473,84 @@ async fn isosurface_on_unsupported_collection_is_400() {
 }
 
 #[tokio::test]
+async fn echotop_tileset_and_content_is_valid_glb() {
+    // The tileset advertises echo-top glb content tagged with the representation,
+    // plus the antenna-ECEF transform (like the isosurface).
+    let (status, body, _h) =
+        get("/collections/radar-fivih/tileset.json?representation=echotop&quantity=DBZH").await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["root"]["transform"].as_array().unwrap().len(), 16);
+    let uri = v["root"]["content"]["uri"].as_str().unwrap();
+    assert!(uri.starts_with("content.glb?"), "glb content: {uri}");
+    assert!(
+        uri.contains("representation=echotop"),
+        "echotop-tagged: {uri}"
+    );
+    // Both mesh products embed the (defaulted) resolution tier — the tileset
+    // handler shares the code path, but assert it here so the two can't diverge.
+    assert!(uri.contains("resolution="), "resolution tier in uri: {uri}");
+
+    // The content itself is a valid glTF binary.
+    let (status, body, headers) =
+        get("/collections/radar-fivih/content.glb?representation=echotop&quantity=DBZH").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[0..4], b"glTF", "glb magic");
+    assert_eq!(
+        u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize,
+        body.len()
+    );
+    assert_eq!(
+        headers[axum::http::header::CONTENT_TYPE],
+        "model/gltf-binary"
+    );
+}
+
+#[tokio::test]
+async fn tileset_carries_resolution_tier_into_glb_content_uri() {
+    // An explicit resolution is validated and echoed into the content.uri so the
+    // content fetch matches the tileset.
+    let (status, body, _h) = get(
+        "/collections/radar-fivih/tileset.json?representation=isosurface&quantity=DBZH&threshold=20&resolution=high",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let uri = v["root"]["content"]["uri"].as_str().unwrap();
+    assert!(uri.contains("resolution=high"), "tier in uri: {uri}");
+
+    // A bad tier is a 400 at the tileset, not a surprise on the content fetch.
+    let (status, _b, _h) = get(
+        "/collections/radar-fivih/tileset.json?representation=isosurface&quantity=DBZH&resolution=ultra",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // …and on the content route too.
+    let (status, _b, _h) =
+        get("/collections/radar-fivih/content.glb?quantity=DBZH&resolution=ultra").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A bad tier is rejected even on a `points` tileset (which ignores the value)
+    // — the param is validated up front regardless of representation.
+    let (status, _b, _h) = get(
+        "/collections/radar-fivih/tileset.json?representation=points&quantity=DBZH&resolution=ultra",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn glb_rejects_points_representation() {
+    // `.glb` serves only the mesh products — asking it for `points` is a 400
+    // (the point cloud has its own `content.pnts` route), not a silently
+    // mislabelled isosurface.
+    let (status, _body, _h) =
+        get("/collections/radar-fivih/content.glb?representation=points&quantity=DBZH").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn isosurface_tileset_has_transform_and_glb_content() {
     let (status, body, _h) =
         get("/collections/radar-fivih/tileset.json?representation=isosurface&quantity=DBZH&threshold=20")
@@ -465,9 +561,14 @@ async fn isosurface_tileset_has_transform_and_glb_content() {
     // glTF content needs the antenna-ECEF tile transform (16-element matrix).
     let t = v["root"]["transform"].as_array().unwrap();
     assert_eq!(t.len(), 16);
-    // Content points at the .glb, carrying the resolved quantity + threshold.
+    // Content points at the .glb, carrying the resolved quantity + threshold +
+    // the (defaulted) resolution tier + the explicit representation, so the
+    // content fetch is deterministic and unambiguous.
     let uri = v["root"]["content"]["uri"].as_str().unwrap();
-    assert_eq!(uri, "content.glb?quantity=DBZH&threshold=20");
+    assert_eq!(
+        uri,
+        "content.glb?quantity=DBZH&threshold=20&resolution=med&representation=isosurface"
+    );
     // The region bounding volume is still present (unaffected by the transform).
     assert_eq!(
         v["root"]["boundingVolume"]["region"]

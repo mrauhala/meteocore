@@ -952,11 +952,7 @@ mod tests {
             tiles_3d: Arc::new(ArcSwap::from_pointee(api_3dtiles::TilesState3d {
                 volume_engines: std::collections::HashMap::new(),
                 collections: std::collections::HashMap::new(),
-                colormap: Arc::new(ds_render::LutColorMap::from_builtin(
-                    ds_render::BuiltinColormap::RadarDbz,
-                    -32.0,
-                    95.0,
-                )),
+                colormap: api_3dtiles::default_point_colormap(),
                 render_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
                 base_url: String::new(),
             })),

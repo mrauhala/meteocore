@@ -305,27 +305,47 @@ into a glTF `.glb` triangle mesh.
   first cut rendered uniformly red). Demo: `cargo run -p engine-odim --example
   gen_echo_top` (render-verified). API route is a follow-up; the mesher will be
   reused for VIL (#365).
-- **Both representations are served from the API** (selected by
-  `?representation=points|isosurface` on `tileset.json`): `points` → `.pnts`
-  (region-only tileset, `RTC_CENTER` self-places), `isosurface` → `.glb` plus a
-  tile **`transform`** = the antenna ECEF. Capability + the origin it needs are
-  coupled in one field: `VolumeInfo.voxel_grid: Option<VoxelGridCaps { origin }>`
-  — `Some` ⇒ isosurface available and the origin is present (so the tileset is
-  built without sampling, and "supports but no origin" is unrepresentable, never
-  a 500). It drives the collection JSON's `representations` array → the viewer's
-  representation toggle. The isosurface seals (`background=Some(-32)`, clamped
-  `< threshold`) for the solid-blob look; an over-large surface (threshold too
-  low) → 400, an empty one (threshold above all echo) → 404.
+- **Three representations are served from the API** (selected by
+  `?representation=points|isosurface|echotop` on `tileset.json`): `points` →
+  `.pnts` (region-only tileset, `RTC_CENTER` self-places), `isosurface` /
+  `echotop` → `.glb` plus a tile **`transform`** = the antenna ECEF. The two glTF
+  products share `content.glb`, disambiguated by `?representation=echotop` in the
+  content URI (default = isosurface). Capability + the origin both glTF products
+  need are coupled in one field: `VolumeInfo.voxel_grid: Option<VoxelGridCaps {
+  origin }>` — `Some` ⇒ the mesh products are available and the origin is present
+  (tileset built without sampling; "supports but no origin" is unrepresentable,
+  never a 500). It drives the collection JSON's `representations` array → the
+  viewer's toggle. The isosurface seals (`background=Some(-32)`); echo-top is
+  coloured by a height ramp. Both mesh products take a `?resolution=` detail tier
+  (`Resolution` enum → voxel-grid dims; `low` `[128,360,48]` ≈2.2 M cells, `med`
+  `[256,360,56]` ≈5.2 M *default*, `high` `[512,360,64]` ≈11.8 M / ~12 s first
+  compute — ETag caches repeats); the tier is echoed into the `content.uri`. The
+  point cloud is native-resolution and ignores it. A too-low threshold or a bad
+  resolution token → 400, an empty result → 404.
+- **Point sizing + client-side filter:** `encode_pnts` writes a per-point `value`
+  (the physical value) into the `.pnts` **batch table** (no `BATCH_ID` ⇒ per-point
+  properties; CesiumJS exposes them to the style engine as `${value}`). The viewer
+  styles `pointSize` by `${value}` (weak echo → ~1 px, strong → ~16 px) and
+  **filters** by it: the `min dBZ` field restyles `show` client-side (instant, no
+  re-fetch, as long as it stays ≥ the fetched floor; going lower re-fetches the
+  larger set). **Do not add `BATCH_ID`** to make points pickable features — it
+  disables per-point `pointSize` in CesiumJS's point-cloud pipeline (verified;
+  `pickMetadata` also can't read a `.pnts` batch table in 1.124 — only its
+  schema). The value is read off **color + size**, and the collection JSON
+  carries a `legend` (the point colormap sampled into `#rrggbb` stops over a dBZ
+  range via `legend_stops`) which the viewer renders as a gradient bar for the
+  point cloud.
 - **Routes** (mounted at `/3dtiles`): `GET /collections/{id}/tileset.json`
-  (`?representation=&quantity=&datetime=&min_value=&threshold=`),
+  (`?representation=&quantity=&datetime=&min_value=&threshold=&resolution=`),
   `GET /collections/{id}/content.pnts` (`?quantity=&datetime=&min_value=`),
-  `GET /collections/{id}/content.glb` (`?quantity=&datetime=&threshold=`), plus
-  `/` · `/collections` · `/collections/{id}` · **`/viewer`** (a bundled CesiumJS
-  page with collection + quantity + **representation** pickers,
-  `include_str!`-baked from `crates/api-3dtiles/viewer/index.html`; same-origin
-  API base by default, with a `?base=` override). The tileset's `content.uri`
-  embeds the resolved quantity (+ pinned time + `min_value`/`threshold`) so the
-  content fetch is deterministic.
+  `GET /collections/{id}/content.glb` (`?representation=&quantity=&datetime=&threshold=&resolution=`),
+  plus `/` · `/collections` · `/collections/{id}` · **`/viewer`** (a bundled
+  CesiumJS page with collection + quantity + **representation** + **resolution**
+  pickers, `include_str!`-baked from `crates/api-3dtiles/viewer/index.html`;
+  same-origin API base by default, with a `?base=` override). The tileset's
+  `content.uri` embeds the resolved quantity (+ pinned time +
+  `min_value`/`threshold` + `representation` + `resolution`) so the content fetch
+  is deterministic.
 - **Concurrency:** `read_point_cloud` / `read_voxel_grid` are sync (blocking
   HDF5 I/O + a long CPU loop — marching tet for the latter), so both content
   handlers bound them with the shared render semaphore and run via
