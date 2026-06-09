@@ -265,16 +265,19 @@ into a glTF `.glb` triangle mesh.
   cell-centre convention as the engine sampler) → `destination_point` +
   `geodetic_to_ecef` (both now in `ds_core::geo`), stored antenna-relative and
   pre-flipped Z-up→Y-up because a runtime re-applies Y-up→Z-up to **glTF**
-  content (the flip the `.pnts` path skips — pnts isn't glTF). **`background`
-  sealing (load-bearing for radar):** the grid stores `NaN` for *both* clear-air
-  (`undetect`) and unmeasured (`nodata`/cone of silence) — `RawPixels::sample`
-  masks both identically (reader.rs). `encode_isosurface_glb(grid, threshold,
-  color, background)` with `background=Some(bg<threshold)` treats `NaN` as
-  no-echo so the surface **closes into solid blobs**; `None` skips `NaN`-touching
-  tets and the echo→clear-air boundary renders as open vertical *curtains*. The
-  demo seals with `Some(-32.0)` (the dBZ floor). Splitting `undetect` from
-  `nodata` in the engine sampler (so only the real cone of silence stays open) is
-  a follow-up. `tileset_json_glb`
+  content (the flip the `.pnts` path skips — pnts isn't glTF). **Sealing
+  (load-bearing for radar):** `encode_isosurface_glb(grid, threshold, color,
+  background)` with `background=Some(bg<threshold)` treats every `NaN` corner as
+  no-echo, so the surface **closes into solid blobs** — the **default** the API +
+  demo use (`Some(-32.0)`), because leaving boundaries open renders as vertical
+  *curtains*. `None` skips `NaN`-touching tets (open surface). **#360 layer
+  (foundation, currently invisible under the sealed default):** the engine *does*
+  distinguish clear air (`undetect`) from genuinely-unmeasured (`nodata`/cone of
+  silence) — `RawPixels::sample_class` (reader.rs) → `Value`/`Undetect`/`Masked`,
+  and `voxel_grid_from_volume` fills `Undetect` with the finite `NO_ECHO_FLOOR`
+  (−32 dBZ) and leaves `Masked` `NaN`. With `Some` both seal alike (solid look);
+  with `None` clear air still seals but unmeasured stays open — an opt-in "honest
+  boundary" mode, and the substrate true voxels (#351) need. `tileset_json_glb`
   carries the antenna ECEF as the tile **`transform`** (glTF content has no
   embedded origin, unlike `.pnts` `RTC_CENTER`); the geodetic `region` is
   unaffected by it. Demo: `cargo run -p engine-odim --example gen_isosurface`
@@ -290,8 +293,9 @@ into a glTF `.glb` triangle mesh.
   — `Some` ⇒ isosurface available and the origin is present (so the tileset is
   built without sampling, and "supports but no origin" is unrepresentable, never
   a 500). It drives the collection JSON's `representations` array → the viewer's
-  representation toggle. The isosurface floor (seal) = `ColorMap::domain()` min
-  (clamped `< threshold`); an over-large surface (threshold too low) → 400.
+  representation toggle. The isosurface seals (`background=Some(-32)`, clamped
+  `< threshold`) for the solid-blob look; an over-large surface (threshold too
+  low) → 400, an empty one (threshold above all echo) → 404.
 - **Routes** (mounted at `/3dtiles`): `GET /collections/{id}/tileset.json`
   (`?representation=&quantity=&datetime=&min_value=&threshold=`),
   `GET /collections/{id}/content.pnts` (`?quantity=&datetime=&min_value=`),

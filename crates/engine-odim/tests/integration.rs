@@ -712,12 +712,24 @@ fn pvol_volume_engine_voxel_grid() {
     );
     assert!(grid.height_range[1] > 0.0 && grid.height_range[0] == 0.0);
 
-    // Some cells sampled (echoes), but not all — the cone of silence + below
-    // the lowest sweep + out-of-range stay NaN (no fabricated data).
-    let valid = grid.valid_count();
-    assert!(valid > 0, "a real volume must yield sampled voxels");
+    // Real echoes are present — cells *above* the clear-air floor (#360 fills
+    // clear air with exactly `NO_ECHO_FLOOR_DBZ`, so `valid_count()` alone, which
+    // now also counts those floor cells, would no longer prove "has echo"). Uses
+    // `>` (not `>=`): an echo measured at exactly the floor is indistinguishable
+    // from clear air at the grid level — fine here, precip is well above −32 dBZ.
+    let echoes = grid
+        .values
+        .iter()
+        .filter(|v| **v > ds_core::volume::NO_ECHO_FLOOR_DBZ)
+        .count();
     assert!(
-        valid < grid.values.len(),
+        echoes > 0,
+        "a real volume must yield echo voxels above the floor"
+    );
+    // …but not every cell is finite — the cone of silence + below the lowest
+    // sweep + out-of-range stay NaN (no fabricated data).
+    assert!(
+        grid.valid_count() < grid.values.len(),
         "expect NaN gaps (cone of silence etc.)"
     );
     // Every sampled value is a finite dBZ in a sane band.

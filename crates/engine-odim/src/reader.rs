@@ -101,6 +101,23 @@ pub enum RawPixels {
     F64(Array2<f64>),
 }
 
+/// Classification of a single sampled radar pixel, distinguishing the two
+/// kinds of "no value": clear air vs genuinely unmeasured. Returned by
+/// [`RawPixels::sample_class`]; the volume voxel-grid sampler uses it to seal
+/// an isosurface against clear air without fabricating across the cone of
+/// silence (#360).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PixelClass {
+    /// A real physical value (`raw * gain + offset`).
+    Value(f64),
+    /// In-coverage but below detection — the radar looked and saw nothing
+    /// (the ODIM `undetect` sentinel). "Clear air".
+    Undetect,
+    /// Out-of-range index, the ODIM `nodata` sentinel, or a non-finite raw —
+    /// genuinely unmeasured / outside coverage.
+    Masked,
+}
+
 impl RawPixels {
     /// Shape as `(height, width)` — same ordering ndarray uses
     /// internally. The first axis is rows (y), the second is columns
@@ -119,11 +136,12 @@ impl RawPixels {
     /// `None`.
     ///
     /// Both `nodata` ("outside coverage") and `undetect` ("radar
-    /// looked but saw nothing") are treated as masked in Phase 1 —
-    /// neither renders as a colored pixel. Splitting them into
-    /// distinct visible classes can be revisited if a use case asks
-    /// for it (e.g. precipitation accumulation overlays often want
-    /// undetect = 0 mm, not transparent).
+    /// looked but saw nothing") are masked here (→ `None`) — neither
+    /// renders as a colored pixel. The volume voxel-grid path needs to
+    /// tell them apart (to seal an isosurface against clear air without
+    /// fabricating across the cone of silence), so it uses
+    /// [`Self::sample_class`]; this thin wrapper preserves the
+    /// raster/EDR "both masked" behaviour.
     pub fn sample(
         &self,
         row: usize,
@@ -133,10 +151,41 @@ impl RawPixels {
         nodata: f64,
         undetect: Option<f64>,
     ) -> Option<f64> {
+        match self.sample_class(row, col, gain, offset, nodata, undetect) {
+            PixelClass::Value(v) => Some(v),
+            PixelClass::Undetect | PixelClass::Masked => None,
+        }
+    }
+
+    /// Read a single pixel at `(row, col)`, **classifying** it as a real
+    /// value, clear-air `Undetect` ("the radar looked and saw nothing"), or
+    /// `Masked` (out-of-range index, the `nodata` sentinel, or a non-finite
+    /// raw — i.e. genuinely unmeasured / outside coverage). `physical =
+    /// raw * gain + offset`. The distinction lets a consumer fill clear air
+    /// with a finite "no echo" floor while leaving unmeasured cells unknown
+    /// (#360).
+    pub fn sample_class(
+        &self,
+        row: usize,
+        col: usize,
+        gain: f64,
+        offset: f64,
+        nodata: f64,
+        undetect: Option<f64>,
+    ) -> PixelClass {
         let raw = match self {
-            RawPixels::U8(a) => a.get((row, col)).map(|v| *v as f64)?,
-            RawPixels::U16(a) => a.get((row, col)).map(|v| *v as f64)?,
-            RawPixels::F64(a) => a.get((row, col)).copied()?,
+            RawPixels::U8(a) => match a.get((row, col)) {
+                Some(v) => *v as f64,
+                None => return PixelClass::Masked,
+            },
+            RawPixels::U16(a) => match a.get((row, col)) {
+                Some(v) => *v as f64,
+                None => return PixelClass::Masked,
+            },
+            RawPixels::F64(a) => match a.get((row, col)) {
+                Some(v) => *v,
+                None => return PixelClass::Masked,
+            },
         };
         // Exact equality is intentional for nodata/undetect: ODIM
         // producers store integer sentinels (e.g. OPERA's
@@ -149,27 +198,27 @@ impl RawPixels {
         // sentinels.
         //
         // NaN-aware: some PVOL producers declare `nodata`/`undetect`
-        // as NaN. `raw == nodata` is always false when `nodata` is
-        // NaN (IEEE-754), so it would never mask — and a NaN raw
-        // value would fall through to `raw * gain + offset = NaN`,
-        // which the colorizer renders as a stray pixel. Treat a NaN
-        // sentinel as "mask any NaN raw"; also mask a NaN raw value
-        // unconditionally, since a NaN physical value is never
-        // meaningful radar data.
+        // as NaN. A NaN raw is masked unconditionally below (a NaN
+        // physical value is never meaningful radar data), and `raw ==
+        // sentinel` is always false for a NaN sentinel (IEEE-754). So
+        // with a NaN `undetect`, the `!u.is_nan()` guard skips the
+        // undetect check entirely: a clear-air cell (which stores NaN)
+        // is classified `Masked` by the raw-is-NaN guard, never
+        // `Undetect`. An acceptable edge — integer undetect codes are
+        // the norm; a NaN-undetect producer's clear air just won't
+        // seal an isosurface (it stays open, like the cone of silence).
         if raw.is_nan() {
-            return None;
+            return PixelClass::Masked;
         }
-        if nodata.is_nan() {
-            // sentinel is NaN — only NaN raws (handled above) match it
-        } else if raw == nodata {
-            return None;
+        if !nodata.is_nan() && raw == nodata {
+            return PixelClass::Masked;
         }
         if let Some(u) = undetect {
             if !u.is_nan() && raw == u {
-                return None;
+                return PixelClass::Undetect;
             }
         }
-        Some(raw * gain + offset)
+        PixelClass::Value(raw * gain + offset)
     }
 
     /// Approximate heap footprint of the backing array, in bytes — element
@@ -795,5 +844,47 @@ mod tests {
             None,
             "undetect sentinel must mask"
         );
+    }
+
+    /// `sample_class` keeps the value/undetect/nodata distinction that `sample`
+    /// flattens (#360): a real value, clear-air `Undetect`, and genuinely
+    /// unmeasured `Masked` (nodata sentinel + out-of-range index) are separate.
+    #[test]
+    fn raw_pixels_sample_class_distinguishes_undetect_from_nodata() {
+        // [value, value, nodata, undetect]
+        let arr =
+            Array2::from_shape_vec((1, 4), vec![5.0_f64, 25.0, -9999000.0, -8888000.0]).unwrap();
+        let px = RawPixels::F64(arr);
+        let nodata = -9999000.0;
+        let undetect = Some(-8888000.0);
+
+        assert_eq!(
+            px.sample_class(0, 0, 1.0, 0.0, nodata, undetect),
+            PixelClass::Value(5.0)
+        );
+        assert_eq!(
+            px.sample_class(0, 2, 1.0, 0.0, nodata, undetect),
+            PixelClass::Masked,
+            "nodata → Masked (genuinely unmeasured)"
+        );
+        assert_eq!(
+            px.sample_class(0, 3, 1.0, 0.0, nodata, undetect),
+            PixelClass::Undetect,
+            "undetect → Undetect (clear air)"
+        );
+        // Out-of-range index is Masked, not Undetect.
+        assert_eq!(
+            px.sample_class(0, 99, 1.0, 0.0, nodata, undetect),
+            PixelClass::Masked
+        );
+        // A NaN raw is Masked regardless of sentinels.
+        let nanpx = RawPixels::F64(Array2::from_shape_vec((1, 1), vec![f64::NAN]).unwrap());
+        assert_eq!(
+            nanpx.sample_class(0, 0, 1.0, 0.0, nodata, undetect),
+            PixelClass::Masked
+        );
+        // And `sample` still flattens Undetect + Masked to None (unchanged).
+        assert_eq!(px.sample(0, 3, 1.0, 0.0, nodata, undetect), None);
+        assert_eq!(px.sample(0, 2, 1.0, 0.0, nodata, undetect), None);
     }
 }

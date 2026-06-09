@@ -402,23 +402,27 @@ pub async fn get_content_glb(
     if !threshold.is_finite() {
         return Err(Tiles3dError::BadRequest("threshold must be finite".into()));
     }
+    // The engine fills clear air with the no-echo floor; a threshold at/below it
+    // would put clear air *inside* the surface (all clear air would render as
+    // echo). Reject — a reflectivity shell below the −32 dBZ floor is meaningless.
+    // (v1: the floor is dBZ for every quantity; for a non-reflectivity quantity
+    // it's just "below any sane threshold" — per-quantity floors are #350.)
+    let floor = f64::from(ds_core::volume::NO_ECHO_FLOOR_DBZ);
+    if threshold <= floor {
+        return Err(Tiles3dError::BadRequest(format!(
+            "threshold must be above the no-echo floor ({floor})"
+        )));
+    }
 
-    // Colour the shell at the threshold; seal NaN (clear air / unmeasured) at
-    // the colormap's floor so the surface closes into solid blobs. The floor
-    // must be < threshold (clamp defensively against an odd colormap domain).
-    //
-    // v1 uses the single collection-level colormap regardless of quantity (the
-    // `.pnts` path has the same limitation), so for a non-reflectivity quantity
-    // (VRADH/ZDR/…) the dBZ floor is only "below any likely threshold", not
-    // physically the quantity's minimum — geometrically fine (the seal still
-    // closes), semantically approximate. Per-quantity colormaps (#350) fix it.
+    // Colour the shell at the threshold. v1 uses the single collection-level
+    // colormap regardless of quantity (the `.pnts` path has the same
+    // limitation); per-quantity colormaps are #350.
     let color = state.colormap.color(Some(threshold));
-    let floor = state
-        .colormap
-        .domain()
-        .map(|(lo, _)| lo)
-        .unwrap_or(threshold - 64.0)
-        .min(threshold - 1.0);
+    // Seal NaN at the same no-echo floor the engine fills clear air with, so the
+    // shell closes into solid blobs (the preferred look — an open unmeasured
+    // boundary reads as "curtains") and clear air + unmeasured seal at one
+    // uniform level. `floor < threshold` is guaranteed above.
+    let background = Some(floor);
 
     // read_voxel_grid does blocking HDF5 I/O + a long CPU loop (marching tet),
     // so bound it with the shared render semaphore and run on a blocking thread
@@ -435,7 +439,7 @@ pub async fn get_content_glb(
     let (bytes, etag) =
         tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
             let grid = engine.read_voxel_grid(quantity.as_deref(), time, None, None)?;
-            let bytes = ds_3dtiles::encode_isosurface_glb(&grid, threshold, color, Some(floor))
+            let bytes = ds_3dtiles::encode_isosurface_glb(&grid, threshold, color, background)
                 .map_err(|e| match e {
                     // An empty surface (threshold above all echo) is "no data
                     // here", not a server fault — 404, matching the no-data path.

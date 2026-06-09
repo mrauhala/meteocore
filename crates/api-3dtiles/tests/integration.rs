@@ -73,9 +73,11 @@ impl VolumeEngine for MockVolume {
         }
         let dims = dims.unwrap_or([4, 8, 4]);
         let [n_r, n_a, n_h] = dims;
-        let mut values = vec![f32::NAN; n_r * n_a * n_h];
-        // A finite >threshold echo core (surrounded by NaN) so a sealed
-        // isosurface at the default 20 dBZ produces a non-empty mesh.
+        // Clear air is the finite no-echo floor (matching the post-#360 engine
+        // fill), with a finite >threshold echo core in the middle — so the
+        // isosurface (which the handler seals with `background=Some(floor)`)
+        // produces a non-empty mesh.
+        let mut values = vec![ds_core::volume::NO_ECHO_FLOOR_DBZ; n_r * n_a * n_h];
         for i_r in 1..n_r.min(3) {
             for i_a in 0..n_a {
                 for i_h in 1..n_h.min(3) {
@@ -498,6 +500,31 @@ async fn content_glb_is_valid_gltf_and_etagged() {
         "model/gltf-binary"
     );
     assert!(headers.contains_key(axum::http::header::ETAG));
+}
+
+#[tokio::test]
+async fn isosurface_threshold_at_or_below_floor_is_400() {
+    // A threshold at/below the no-echo floor would place clear-air floor cells
+    // inside the surface (all clear air renders as echo) — rejected.
+    let floor = f64::from(ds_core::volume::NO_ECHO_FLOOR_DBZ);
+    for t in [floor - 8.0, floor] {
+        let (cs, _b, _h) = get(&format!(
+            "/collections/radar-fivih/content.glb?threshold={t}"
+        ))
+        .await;
+        assert_eq!(
+            cs,
+            StatusCode::BAD_REQUEST,
+            "threshold {t} <= floor must 400"
+        );
+    }
+    // Just above the floor is accepted.
+    let (cs, _b, _h) = get(&format!(
+        "/collections/radar-fivih/content.glb?threshold={}",
+        floor + 2.0
+    ))
+    .await;
+    assert_eq!(cs, StatusCode::OK, "threshold above floor is fine");
 }
 
 #[tokio::test]
