@@ -7,9 +7,10 @@
 //! the engine registry is keyed by collection id and swapped via `ArcSwap`.
 //!
 //! Routes (mounted under `/3dtiles` by the server):
-//! - `GET /collections/{id}/tileset.json`
-//! - `GET /collections/{id}/content.pnts`
-//! - `GET /` · `/collections` · `/collections/{id}`
+//! - `GET /collections/{id}/tileset.json` (`?representation=points|isosurface`)
+//! - `GET /collections/{id}/content.pnts` — point-cloud content
+//! - `GET /collections/{id}/content.glb` — isosurface-mesh content
+//! - `GET /` · `/collections` · `/collections/{id}` · `/viewer`
 
 pub mod error;
 pub mod handlers;
@@ -29,5 +30,9 @@ pub fn router(state: AppState) -> Router {
         .route("/collections/{id}", get(handlers::collection))
         .route("/collections/{id}/tileset.json", get(handlers::get_tileset))
         .route("/collections/{id}/content.pnts", get(handlers::get_content))
+        .route(
+            "/collections/{id}/content.glb",
+            get(handlers::get_content_glb),
+        )
         .with_state(state)
 }

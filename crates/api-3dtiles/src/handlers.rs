@@ -1,10 +1,15 @@
 //! HTTP handlers for the 3D Tiles API.
 //!
-//! Serves OGC 3D Tiles from any collection implementing `VolumeEngine`:
+//! Serves OGC 3D Tiles from any collection implementing `VolumeEngine`, in two
+//! representations (selected by `?representation=`):
 //! - `GET /collections/{id}/tileset.json` — the tileset (bounding region from
-//!   `VolumeInfo`, content pointing at the `.pnts` below).
-//! - `GET /collections/{id}/content.pnts` — the point-cloud tile, sampled on a
-//!   blocking thread and encoded by `ds-3dtiles`.
+//!   `VolumeInfo`; content points at `.pnts` for `points`, or `.glb` plus an
+//!   antenna-ECEF `transform` for `isosurface`).
+//! - `GET /collections/{id}/content.pnts` — the point-cloud tile.
+//! - `GET /collections/{id}/content.glb` — the isosurface-mesh tile.
+//!
+//! Both content types are sampled on a blocking thread (bounded by the shared
+//! render semaphore) and encoded by `ds-3dtiles`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,12 +20,17 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use chrono::{DateTime, Utc};
 use ds_core::config::CollectionConfig;
+use ds_core::geo::geodetic_to_ecef;
 use ds_core::volume::VolumeEngine;
 use ds_render::ColorMap;
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::error::Tiles3dError;
+
+/// Default isosurface threshold (dBZ) when a request names none — a light-rain
+/// reflectivity shell.
+const ISOSURFACE_DEFAULT_THRESHOLD: f64 = 20.0;
 
 /// Shared state for the 3D Tiles API. Wrapped in `ArcSwap` for lock-free reads
 /// and atomic swap on config reload.
@@ -64,9 +74,15 @@ pub struct TilesetParams {
     pub quantity: Option<String>,
     /// Valid time (RFC 3339). `None` → latest.
     pub datetime: Option<String>,
-    /// Drop points below this physical value (e.g. a dBZ floor); carried into
-    /// the tileset's `content.uri` so the `.pnts` fetch applies it.
+    /// Which 3D Tiles representation: `points` (the `.pnts` point cloud,
+    /// default) or `isosurface` (a glTF `.glb` reflectivity-shell mesh).
+    pub representation: Option<String>,
+    /// `points` only: drop points below this physical value (e.g. a dBZ floor);
+    /// carried into the tileset's `content.uri` so the `.pnts` fetch applies it.
     pub min_value: Option<f64>,
+    /// `isosurface` only: the iso-value (e.g. dBZ) of the shell; carried into
+    /// the `.glb` `content.uri`. `None` → [`ISOSURFACE_DEFAULT_THRESHOLD`].
+    pub threshold: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +91,35 @@ pub struct ContentParams {
     pub datetime: Option<String>,
     /// Drop points below this physical value (e.g. a dBZ floor).
     pub min_value: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GlbContentParams {
+    pub quantity: Option<String>,
+    pub datetime: Option<String>,
+    /// Iso-value of the reflectivity shell. `None` → [`ISOSURFACE_DEFAULT_THRESHOLD`].
+    pub threshold: Option<f64>,
+}
+
+/// The two 3D Tiles representations of a volume. Both are valid OGC 3D Tiles
+/// tilesets; they differ only in content type (`.pnts` vs glTF `.glb`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Representation {
+    Points,
+    Isosurface,
+}
+
+impl Representation {
+    /// Parse the `representation` query value (`None`/empty → `Points`).
+    fn parse(s: Option<&str>) -> Result<Self, Tiles3dError> {
+        match s.map(str::trim) {
+            None | Some("") | Some("points") => Ok(Self::Points),
+            Some("isosurface") => Ok(Self::Isosurface),
+            Some(other) => Err(Tiles3dError::BadRequest(format!(
+                "unknown representation '{other}' (expected 'points' or 'isosurface')"
+            ))),
+        }
+    }
 }
 
 /// Percent-encode a query-string value (RFC 3986 unreserved set passes
@@ -114,8 +159,48 @@ fn etag_of(bytes: &[u8]) -> String {
     format!("\"{h:016x}\"")
 }
 
-/// The bundled CesiumJS viewer page (collection + quantity picker), baked into
-/// the binary and served at `GET /3dtiles/viewer`.
+/// Build a binary content response with strong-ETag conditional handling: a
+/// matching `If-None-Match` (or `*`) yields 304, otherwise 200 with the bytes.
+///
+/// Note the 304 saves the *network transfer* but not the recompute — the
+/// caller already sampled + encoded + hashed to obtain `etag` (the
+/// `If-None-Match` value can't be trusted to match without recomputing the
+/// content). A CPU-cheap 304 needs an ETag cache keyed by the request params +
+/// a data-version — a follow-up. RFC 7232 §3.2: `If-None-Match` may be `*` or a
+/// comma-separated list.
+fn binary_response(
+    headers: &HeaderMap,
+    content_type: &'static str,
+    etag: &str,
+    bytes: Vec<u8>,
+) -> Response {
+    let not_modified = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|v| v == "*" || v.split(',').any(|t| t.trim() == etag));
+    if not_modified {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, "public, max-age=60"),
+            ],
+        )
+            .into_response();
+    }
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, "public, max-age=60"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// The bundled CesiumJS viewer page (collection + quantity + representation
+/// picker), baked into the binary and served at `GET /3dtiles/viewer`.
 const VIEWER_HTML: &str = include_str!("../viewer/index.html");
 
 /// `GET /viewer` — interactive CesiumJS viewer. It calls this same API
@@ -137,6 +222,7 @@ pub async fn get_tileset(
     let state = state.load_full();
     let (engine, _config) = lookup(&state, &id)?;
     let info = engine.volume_info();
+    let representation = Representation::parse(params.representation.as_deref())?;
 
     // Resolve + validate the quantity against what the collection advertises.
     let quantity = match &params.quantity {
@@ -159,28 +245,59 @@ pub async fn get_tileset(
         Tiles3dError::NotFound(format!("collection '{id}' has no spatial coverage yet"))
     })?;
 
-    // The `.pnts` content lives next to this tileset; carry the resolved
-    // quantity (and pinned time, if any) so the content fetch is deterministic.
-    // Re-format the parsed time as UTC `…Z` — a raw `+hh:mm` offset would be
-    // decoded as a space by the client's URL parser and 400 on the fetch.
+    // Carry the resolved quantity (and pinned time, if any) into the content
+    // URI so the content fetch is deterministic. Re-format the parsed time as
+    // UTC `…Z` — a raw `+hh:mm` offset would be decoded as a space by the
+    // client's URL parser and 400 on the fetch.
     let mut query = format!("quantity={}", pct_encode(&quantity));
     if let Some(dt_str) = &params.datetime {
         let dt = parse_datetime(dt_str)?;
         query.push_str(&format!("&datetime={}", dt.format("%Y-%m-%dT%H:%M:%SZ")));
     }
-    if let Some(min) = params.min_value {
-        // `serde_urlencoded` parses "NaN"/"inf" as valid f64; a non-finite
-        // threshold filters every point → a silently-empty tile. Reject → 400.
-        if !min.is_finite() {
-            return Err(Tiles3dError::BadRequest("min_value must be finite".into()));
-        }
-        // f64 Display is URL-safe for a finite value (digits, `.`, `-`).
-        query.push_str(&format!("&min_value={min}"));
-    }
-    let content_uri = format!("content.pnts?{query}");
 
-    let tileset = ds_3dtiles::tileset_json_for_region(region, &content_uri)
-        .map_err(|e| Tiles3dError::Internal(format!("tileset build failed: {e}")))?;
+    let tileset = match representation {
+        Representation::Points => {
+            if let Some(min) = params.min_value {
+                // `serde_urlencoded` parses "NaN"/"inf" as a valid f64; a
+                // non-finite threshold filters every point → a silently-empty
+                // tile. Reject → 400. (f64 Display is URL-safe for a finite
+                // value: digits, `.`, `-`.)
+                if !min.is_finite() {
+                    return Err(Tiles3dError::BadRequest("min_value must be finite".into()));
+                }
+                query.push_str(&format!("&min_value={min}"));
+            }
+            let content_uri = format!("content.pnts?{query}");
+            ds_3dtiles::tileset_json_for_region(region, &content_uri)
+                .map_err(|e| Tiles3dError::Internal(format!("tileset build failed: {e}")))?
+        }
+        Representation::Isosurface => {
+            if !info.supports_voxel_grid {
+                return Err(Tiles3dError::BadRequest(format!(
+                    "collection '{id}' does not support the isosurface representation"
+                )));
+            }
+            // The glTF `.glb` content has no embedded origin (unlike `.pnts`
+            // `RTC_CENTER`), so the tileset places it via a `transform` = the
+            // volume origin (antenna) in ECEF — taken from `VolumeInfo` so we
+            // don't sample the grid just to emit the tileset.
+            let origin = info.origin.ok_or_else(|| {
+                Tiles3dError::Internal(format!(
+                    "collection '{id}' has no origin for the mesh transform"
+                ))
+            })?;
+            let rtc = geodetic_to_ecef(origin[0], origin[1], origin[2]);
+            if let Some(t) = params.threshold {
+                if !t.is_finite() {
+                    return Err(Tiles3dError::BadRequest("threshold must be finite".into()));
+                }
+                query.push_str(&format!("&threshold={t}"));
+            }
+            let content_uri = format!("content.glb?{query}");
+            ds_3dtiles::tileset_json_glb(region, &content_uri, rtc)
+                .map_err(|e| Tiles3dError::Internal(format!("tileset build failed: {e}")))?
+        }
+    };
 
     Ok((
         [
@@ -239,36 +356,87 @@ pub async fn get_content(
         .await
         .map_err(|e| Tiles3dError::Internal(format!("sample task failed: {e}")))??;
 
-    // A 304 here saves the *network transfer* but not the recompute: the
-    // sample + encode + hash already ran above (the `If-None-Match` value can't
-    // be trusted to match without recomputing the content). Making 304s
-    // CPU-cheap needs an ETag cache keyed by (collection, quantity, time,
-    // min_value) + a data-version (latest data changes on poll) — a follow-up.
-    // RFC 7232 §3.2: `If-None-Match` may be `*` or a comma-separated list.
-    let not_modified = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|h| h.to_str().ok())
-        .is_some_and(|v| v == "*" || v.split(',').any(|t| t.trim() == etag));
-    if not_modified {
-        return Ok((
-            StatusCode::NOT_MODIFIED,
-            [
-                (header::ETAG, etag.as_str()),
-                (header::CACHE_CONTROL, "public, max-age=60"),
-            ],
-        )
-            .into_response());
+    Ok(binary_response(
+        &headers,
+        "application/octet-stream",
+        &etag,
+        bytes,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Content (.glb isosurface)
+// ---------------------------------------------------------------------------
+
+/// `GET /collections/{id}/content.glb` — the isosurface reflectivity-shell mesh,
+/// resampled to a voxel grid and meshed (marching tetrahedra) on a blocking
+/// thread, then encoded as a glTF `.glb` by `ds-3dtiles`.
+pub async fn get_content_glb(
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(params): Query<GlbContentParams>,
+    State(state): State<AppState>,
+) -> Result<Response, Tiles3dError> {
+    let state = state.load_full();
+    let (engine, _config) = lookup(&state, &id)?;
+    // Reject early if the engine can't produce a voxel grid (avoids a blocking
+    // task just to return the trait's "unsupported" → 404).
+    if !engine.volume_info().supports_voxel_grid {
+        return Err(Tiles3dError::BadRequest(format!(
+            "collection '{id}' does not support the isosurface representation"
+        )));
     }
 
-    Ok((
-        [
-            (header::CONTENT_TYPE, "application/octet-stream"),
-            (header::ETAG, etag.as_str()),
-            (header::CACHE_CONTROL, "public, max-age=60"),
-        ],
-        bytes,
-    )
-        .into_response())
+    let time = params.datetime.as_deref().map(parse_datetime).transpose()?;
+    let quantity = params.quantity.clone();
+    let threshold = params.threshold.unwrap_or(ISOSURFACE_DEFAULT_THRESHOLD);
+    if !threshold.is_finite() {
+        return Err(Tiles3dError::BadRequest("threshold must be finite".into()));
+    }
+
+    // Colour the shell at the threshold; seal NaN (clear air / unmeasured) at
+    // the colormap's floor so the surface closes into solid blobs. The floor
+    // must be < threshold (clamp defensively against an odd colormap domain).
+    let color = state.colormap.color(Some(threshold));
+    let floor = state
+        .colormap
+        .domain()
+        .map(|(lo, _)| lo)
+        .unwrap_or(threshold - 64.0)
+        .min(threshold - 1.0);
+
+    // read_voxel_grid does blocking HDF5 I/O + a long CPU loop (marching tet),
+    // so bound it with the shared render semaphore and run on a blocking thread
+    // (same rule as the `.pnts` path / the raster `get_raster_tile`).
+    let _permit = state
+        .render_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| Tiles3dError::Internal("render semaphore closed".into()))?;
+
+    let engine = engine.clone();
+    let id_for_err = id.clone();
+    let (bytes, etag) =
+        tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
+            let grid = engine.read_voxel_grid(quantity.as_deref(), time, None, None)?;
+            let bytes = ds_3dtiles::encode_isosurface_glb(&grid, threshold, color, Some(floor))
+                .map_err(|e| match e {
+                    // An empty surface (threshold above all echo) is "no data
+                    // here", not a server fault — 404, matching the no-data path.
+                    ds_3dtiles::Tiles3dError::Empty => Tiles3dError::NotFound(format!(
+                        "no isosurface at threshold {threshold} for collection '{id_for_err}'"
+                    )),
+                    other => Tiles3dError::Internal(format!("isosurface encode failed: {other}")),
+                })?;
+            let etag = etag_of(&bytes);
+            Ok((bytes, etag))
+        })
+        .await
+        .map_err(|e| Tiles3dError::Internal(format!("sample task failed: {e}")))??;
+
+    // glTF binary media type (CesiumJS also keys off the `.glb` magic).
+    Ok(binary_response(&headers, "model/gltf-binary", &etag, bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -330,14 +498,22 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
                 .collect()
         })
         .unwrap_or_default();
+    // Every volume collection serves a point cloud; those whose engine can also
+    // produce a voxel grid additionally serve an isosurface mesh. The viewer
+    // reads this to populate its representation toggle.
+    let mut representations = vec!["points"];
+    if info.as_ref().is_some_and(|i| i.supports_voxel_grid) {
+        representations.push("isosurface");
+    }
     json!({
         "id": id,
         "title": title,
         "description": description,
         "quantities": quantities,
+        "representations": representations,
         "links": [
             { "href": format!("{base}/3dtiles/collections/{id}"), "rel": "self", "type": "application/json", "title": "This document" },
-            { "href": format!("{base}/3dtiles/collections/{id}/tileset.json"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset" },
+            { "href": format!("{base}/3dtiles/collections/{id}/tileset.json"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (point cloud)" },
         ]
     })
 }
