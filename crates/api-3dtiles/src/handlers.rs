@@ -20,7 +20,7 @@ use arc_swap::ArcSwap;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use ds_core::config::CollectionConfig;
 use ds_core::geo::geodetic_to_ecef;
 use ds_core::volume::VolumeEngine;
@@ -741,19 +741,17 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
                 .collect()
         })
         .unwrap_or_default();
-    // Available volume timestamps (RFC 3339 `…Z`, ascending) — the time axis a
-    // client scrubs for animation. Each value round-trips straight back as the
-    // `?datetime=` on tileset.json/content.* (same format the content.uri uses).
-    // `VolumeInfo.times` is already sorted/deduped by the engine; sort defensively
-    // so the manifest is always monotonic for a slider.
+    // Available volume timestamps (RFC 3339 `…Z`) — the time axis a client scrubs
+    // for animation. Each value round-trips straight back as the `?datetime=` on
+    // tileset.json/content.*. `VolumeInfo.times` is already sorted ascending +
+    // deduped by the engine, so emit directly (no per-request sort — this is a
+    // metadata accessor, #211).
     let times: Vec<String> = info
         .as_ref()
         .map(|i| {
-            let mut ts: Vec<DateTime<Utc>> = i.times.clone();
-            ts.sort_unstable();
-            ts.dedup();
-            ts.iter()
-                .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            i.times
+                .iter()
+                .map(|t| t.to_rfc3339_opts(SecondsFormat::Secs, true))
                 .collect()
         })
         .unwrap_or_default();

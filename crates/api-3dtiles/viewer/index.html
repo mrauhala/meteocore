@@ -358,6 +358,7 @@ async function loadFrames(reframe = false) {
     const ts = frames[frameIdx];
     if (ts) await viewer.zoomTo(ts, new Cesium.HeadingPitchRange(
       Cesium.Math.toRadians(45), Cesium.Math.toRadians(-28), 300000));
+    if (token !== loadToken) return; // superseded during the zoomTo animation
   }
   if (!frames.some(Boolean)) setStatus("no data for this selection", true);
   else updateStatus();
