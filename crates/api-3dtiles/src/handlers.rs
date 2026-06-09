@@ -741,6 +741,22 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
                 .collect()
         })
         .unwrap_or_default();
+    // Available volume timestamps (RFC 3339 `…Z`, ascending) — the time axis a
+    // client scrubs for animation. Each value round-trips straight back as the
+    // `?datetime=` on tileset.json/content.* (same format the content.uri uses).
+    // `VolumeInfo.times` is already sorted/deduped by the engine; sort defensively
+    // so the manifest is always monotonic for a slider.
+    let times: Vec<String> = info
+        .as_ref()
+        .map(|i| {
+            let mut ts: Vec<DateTime<Utc>> = i.times.clone();
+            ts.sort_unstable();
+            ts.dedup();
+            ts.iter()
+                .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     // Every volume collection serves a point cloud; those whose engine can also
     // produce a voxel grid additionally serve the two glTF mesh products
     // (isosurface, echo-top). The viewer reads this to populate its toggle.
@@ -770,6 +786,7 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
         "title": title,
         "description": description,
         "quantities": quantities,
+        "times": times,
         "representations": representations,
         "legend": legend,
         "links": links,

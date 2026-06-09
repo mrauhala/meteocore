@@ -10,6 +10,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use api_3dtiles::TilesState3d;
+use chrono::{TimeZone, Utc};
 use ds_core::config::CollectionConfig;
 use ds_core::error::DataServerError;
 use ds_core::volume::{
@@ -102,7 +103,12 @@ impl VolumeEngine for MockVolume {
     fn volume_info(&self) -> Arc<VolumeInfo> {
         Arc::new(VolumeInfo {
             quantities: vec![("DBZH".into(), "Reflectivity".into())],
-            times: vec![],
+            // Two volume timesteps — the time axis a client scrubs. Given
+            // out-of-order to prove the manifest sorts them.
+            times: vec![
+                Utc.with_ymd_and_hms(2026, 5, 15, 0, 5, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 5, 15, 0, 0, 0).unwrap(),
+            ],
             default_quantity: "DBZH".into(),
             default_unit: "dBZ".into(),
             region: Some([0.42, 1.05, 0.44, 1.07, 100.0, 25_000.0]),
@@ -367,6 +373,16 @@ async fn collections_list_and_doc() {
     assert_eq!(status, StatusCode::OK);
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["quantities"][0]["id"], "DBZH");
+    // The available volume timestamps are advertised (RFC 3339 Z), sorted
+    // ascending even though the engine returned them out of order — the time
+    // axis a client scrubs, each value reusable as `?datetime=`.
+    let times: Vec<&str> = v["times"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
+    assert_eq!(times, vec!["2026-05-15T00:00:00Z", "2026-05-15T00:05:00Z"]);
     // The mock supports voxel grids, so all three representations are advertised.
     let reps: Vec<&str> = v["representations"]
         .as_array()

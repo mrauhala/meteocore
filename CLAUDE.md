@@ -335,13 +335,27 @@ into a glTF `.glb` triangle mesh.
   carries a `legend` (the point colormap sampled into `#rrggbb` stops over a dBZ
   range via `legend_stops`) which the viewer renders as a gradient bar for the
   point cloud.
+- **Time-dynamic playback (#350, done):** per-timestep tilesets already work via
+  `?datetime=<volume time>` on tileset.json/content.* (the engine selects the
+  volume nearest the time; `None` ⇒ latest). The collection JSON advertises a
+  `times` manifest (`VolumeInfo.times` → RFC 3339 `…Z`, sorted ascending — each
+  value round-trips straight back as `?datetime=`). The viewer **preloads one
+  hidden tileset per timestamp** (`preloadWhenHidden: true` is load-bearing — a
+  hidden tileset otherwise fetches no tiles, so the first reveal would stall) and
+  animates by toggling `.show` — scrub/play is a pure visibility flip, **zero
+  network per frame** (verified). A play/pause + slider time bar shows only when
+  the collection has >1 volume; the point-cloud style (size + client-side filter)
+  is applied across all frames. A non-time-dynamic collection is the degenerate
+  1-frame case. Preloading-all suits the engine's bounded retained-volume count; a
+  sliding window for much longer sequences is a follow-up.
 - **Routes** (mounted at `/3dtiles`): `GET /collections/{id}/tileset.json`
   (`?representation=&quantity=&datetime=&min_value=&threshold=&resolution=`),
   `GET /collections/{id}/content.pnts` (`?quantity=&datetime=&min_value=`),
   `GET /collections/{id}/content.glb` (`?representation=&quantity=&datetime=&threshold=&resolution=`),
   plus `/` · `/collections` · `/collections/{id}` · **`/viewer`** (a bundled
   CesiumJS page with collection + quantity + **representation** + **resolution**
-  pickers, `include_str!`-baked from `crates/api-3dtiles/viewer/index.html`;
+  pickers and a **time scrubber** (play/pause + slider) for multi-volume
+  collections, `include_str!`-baked from `crates/api-3dtiles/viewer/index.html`;
   same-origin API base by default, with a `?base=` override). The tileset's
   `content.uri` embeds the resolved quantity (+ pinned time +
   `min_value`/`threshold` + `representation` + `resolution`) so the content fetch
@@ -356,8 +370,9 @@ into a glTF `.glb` triangle mesh.
   validated (no `..`/absolute/scheme) in `ds-3dtiles`.
 - **Config:** add `"3dtiles"` to a collection's `apis` (only `odim-volume`
   supports it today). v1 uses one shared reflectivity colormap; per-collection /
-  per-quantity colormaps, time-dynamic tilesets (#350), and true cylindrical
-  voxels (#351) are follow-ups. **Encoder/CesiumJS gotchas** (load-bearing) live
+  per-quantity colormaps and true cylindrical voxels (#351) are follow-ups
+  (time-dynamic tilesets #350 are done — see above). **Encoder/CesiumJS gotchas**
+  (load-bearing) live
   in `ds-3dtiles`: tileset `geometricError > 0`, ECEF-native `.pnts` POSITION,
   `.pnts` not glb-with-POINTS.
 
