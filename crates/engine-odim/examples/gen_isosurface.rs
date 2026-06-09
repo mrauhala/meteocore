@@ -117,23 +117,26 @@ fn main() {
     fs::create_dir_all(&out_dir).expect("mkdir out_dir");
     fs::write(out_dir.join("content.glb"), &glb).expect("write content.glb");
 
-    // A geodetic bounding region that *contains* the grid: origin ± angular
-    // radius, heights origin..origin+ceiling. lon/lat in radians (3D Tiles
-    // `region` layout). Slightly over-covers — that's fine for culling.
-    let earth_r = ds_core::geo::EARTH_RADIUS_M;
-    let radius_max = grid.radius_range[1];
-    let lat_r = grid.origin_lat.to_radians();
-    let dlat = radius_max / earth_r;
-    let dlon = radius_max / (earth_r * lat_r.cos().max(1e-6));
-    let lon_r = grid.origin_lon.to_radians();
-    let region = [
-        lon_r - dlon,
-        lat_r - dlat,
-        lon_r + dlon,
-        lat_r + dlat,
-        grid.origin_height + grid.height_range[0],
-        grid.origin_height + grid.height_range[1],
-    ];
+    // Prefer the engine's authoritative coverage region (the same value the
+    // production `/tileset.json` endpoint uses), falling back to an
+    // origin±angular-radius approximation only if it's absent. lon/lat in
+    // radians (3D Tiles `region` layout).
+    let region = info.region.unwrap_or_else(|| {
+        let earth_r = ds_core::geo::EARTH_RADIUS_M;
+        let radius_max = grid.radius_range[1];
+        let lat_r = grid.origin_lat.to_radians();
+        let dlat = radius_max / earth_r;
+        let dlon = radius_max / (earth_r * lat_r.cos().max(1e-6));
+        let lon_r = grid.origin_lon.to_radians();
+        [
+            lon_r - dlon,
+            lat_r - dlat,
+            lon_r + dlon,
+            lat_r + dlat,
+            grid.origin_height + grid.height_range[0],
+            grid.origin_height + grid.height_range[1],
+        ]
+    });
     let rtc = geodetic_to_ecef(grid.origin_lon, grid.origin_lat, grid.origin_height);
     let tileset = ds_3dtiles::tileset_json_glb(region, "content.glb", rtc).expect("build tileset");
     fs::write(out_dir.join("tileset.json"), tileset).expect("write tileset.json");

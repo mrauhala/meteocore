@@ -108,6 +108,45 @@ impl VolumeEngine for MockVolume {
     }
 }
 
+/// A volume engine that serves a point cloud but NOT a voxel grid (uses the
+/// default `read_voxel_grid` → unsupported), like a non-PVOL volume source.
+struct MockNoVoxel;
+
+impl VolumeEngine for MockNoVoxel {
+    fn read_point_cloud(
+        &self,
+        _quantity: Option<&str>,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _min_value: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<VolumePointCloud, DataServerError> {
+        Ok(VolumePointCloud {
+            rtc_center: [3_000_000.0, 1_000_000.0, 5_000_000.0],
+            region: [0.42, 1.05, 0.44, 1.07, 100.0, 12_000.0],
+            points: vec![VolumePoint {
+                offset: [0.0, 0.0, 0.0],
+                value: 10.0,
+            }],
+            quantity: "DBZH".into(),
+            unit: "dBZ".into(),
+        })
+    }
+
+    // read_voxel_grid uses the trait default (unsupported).
+
+    fn volume_info(&self) -> Arc<VolumeInfo> {
+        Arc::new(VolumeInfo {
+            quantities: vec![("DBZH".into(), "Reflectivity".into())],
+            times: vec![],
+            default_quantity: "DBZH".into(),
+            default_unit: "dBZ".into(),
+            region: Some([0.42, 1.05, 0.44, 1.07, 100.0, 25_000.0]),
+            supports_voxel_grid: false,
+            origin: None,
+        })
+    }
+}
+
 fn collection_config(id: &str) -> CollectionConfig {
     // Build via TOML so this test doesn't depend on every CollectionConfig field.
     toml::from_str(&format!(
@@ -349,6 +388,66 @@ async fn collections_list_and_doc() {
             .any(|h| h.contains("tileset.json?representation=isosurface")),
         "isosurface tileset link present: {hrefs:?}"
     );
+}
+
+#[tokio::test]
+async fn isosurface_on_unsupported_collection_is_400() {
+    // A collection whose engine can't voxel-grid advertises only `points` and
+    // rejects isosurface requests at both the tileset and content routes.
+    let engine: Arc<dyn VolumeEngine> = Arc::new(MockNoVoxel);
+    let mut volume_engines = HashMap::new();
+    volume_engines.insert("radar-novox".to_string(), engine);
+    let mut collections = HashMap::new();
+    collections.insert("radar-novox".to_string(), collection_config("radar-novox"));
+    let state = Arc::new(ArcSwap::from_pointee(TilesState3d {
+        volume_engines,
+        collections,
+        colormap: Arc::new(LutColorMap::from_builtin(
+            BuiltinColormap::RadarDbz,
+            -32.0,
+            95.0,
+        )),
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        base_url: String::new(),
+    }));
+    let app = api_3dtiles::router(state);
+
+    let send = |uri: &str| {
+        let app = app.clone();
+        let uri = uri.to_string();
+        async move {
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+    };
+
+    assert_eq!(
+        send("/collections/radar-novox/tileset.json?representation=isosurface")
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        send("/collections/radar-novox/content.glb").await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    // The point-cloud representation still works.
+    assert_eq!(
+        send("/collections/radar-novox/tileset.json").await.status(),
+        StatusCode::OK
+    );
+    // Collection doc advertises only `points`.
+    let resp = send("/collections/radar-novox").await;
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let reps: Vec<&str> = v["representations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    assert_eq!(reps, vec!["points"]);
 }
 
 #[tokio::test]

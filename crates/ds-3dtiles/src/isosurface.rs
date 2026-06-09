@@ -108,10 +108,21 @@ impl MeshBuilder {
         }
     }
 
-    /// Append one triangle. Computes the geometric (flat) face normal and skips
-    /// degenerate (zero-area) triangles so no `NaN` normal reaches the buffer.
-    /// Errors with [`Tiles3dError::TooLarge`] past [`MAX_TRIANGLES`].
-    fn push(&mut self, p0: [f32; 3], p1: [f32; 3], p2: [f32; 3]) -> Result<(), Tiles3dError> {
+    /// Append one triangle, with its face normal oriented to agree with
+    /// `outward` (the local "toward lower values / out of the echo" direction).
+    /// The marching-tet cases don't emit a consistent winding on their own, so
+    /// without this ~half the faces would have inward normals and render with
+    /// inverted lighting; here the winding is flipped to match `outward` so the
+    /// stored normal always points outward. Skips degenerate (zero-area)
+    /// triangles so no `NaN` normal reaches the buffer. Errors with
+    /// [`Tiles3dError::TooLarge`] past [`MAX_TRIANGLES`].
+    fn push(
+        &mut self,
+        p0: [f32; 3],
+        p1: [f32; 3],
+        p2: [f32; 3],
+        outward: [f32; 3],
+    ) -> Result<(), Tiles3dError> {
         let u = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
         let v = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
         let n = [
@@ -122,25 +133,34 @@ impl MeshBuilder {
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
         // Positive comparison (not `!(len > 0.0)`) keeps it NaN-safe — a
         // non-finite `len` falls to the `else` and is dropped — and clippy-clean.
-        let nrm = if len > 0.0 {
+        let mut nrm = if len > 0.0 {
             [n[0] / len, n[1] / len, n[2] / len]
         } else {
             return Ok(()); // degenerate sliver (zero area) — drop it
+        };
+        // Orient outward: if the geometric normal points the wrong way, flip the
+        // normal AND the winding (swap p1/p2) so both stay consistent.
+        let dot = nrm[0] * outward[0] + nrm[1] * outward[1] + nrm[2] * outward[2];
+        let (a, b, c) = if dot < 0.0 {
+            nrm = [-nrm[0], -nrm[1], -nrm[2]];
+            (p0, p2, p1)
+        } else {
+            (p0, p1, p2)
         };
 
         self.triangles += 1;
         if self.triangles > MAX_TRIANGLES {
             return Err(Tiles3dError::TooLarge("isosurface triangles"));
         }
-        for p in [p0, p1, p2] {
-            for c in 0..3 {
-                self.positions.push(p[c]);
-                self.normals.push(nrm[c]);
-                if p[c] < self.min[c] {
-                    self.min[c] = p[c];
+        for p in [a, b, c] {
+            for k in 0..3 {
+                self.positions.push(p[k]);
+                self.normals.push(nrm[k]);
+                if p[k] < self.min[k] {
+                    self.min[k] = p[k];
                 }
-                if p[c] > self.max[c] {
-                    self.max[c] = p[c];
+                if p[k] > self.max[k] {
+                    self.max[k] = p[k];
                 }
             }
         }
@@ -232,6 +252,9 @@ fn march_tet(
             no += 1;
         }
     }
+    if ni == 0 || no == 0 {
+        return Ok(()); // tet fully inside or outside — no surface
+    }
     let cross = |a_local: usize, b_local: usize| {
         crossing(
             grid,
@@ -243,13 +266,31 @@ fn march_tet(
             tet[b_local],
         )
     };
-    // Triangle winding is NOT consistently oriented across these cases (the
-    // (1,3)/(3,1) split flips the normal vs the odd corner's side, and the
-    // (2,2) quad's order isn't sign-checked either) — `build_glb` sets the
-    // material `doubleSided: true` to compensate, which is load-bearing. Fine
-    // for visualisation; a future solid-geometry use would need oriented faces.
+    // The marching-tet cases don't produce a consistent winding, so derive the
+    // local outward direction (inside-corner centroid → outside-corner centroid,
+    // i.e. toward lower values) and let `MeshBuilder::push` orient each face's
+    // normal to it. Centroids in index space, mapped once to glTF space.
+    let centroid = |members: &[usize; 4], count: usize| -> [f64; 3] {
+        let mut s = [0.0_f64; 3];
+        for &k in &members[..count] {
+            let p = cidx[tet[k]];
+            for d in 0..3 {
+                s[d] += p[d];
+            }
+        }
+        [
+            s[0] / count as f64,
+            s[1] / count as f64,
+            s[2] / count as f64,
+        ]
+    };
+    let ic = centroid(&inside, ni);
+    let oc = centroid(&outside, no);
+    let iw = index_to_gltf_pos(grid, rtc, ic[0], ic[1], ic[2]);
+    let ow = index_to_gltf_pos(grid, rtc, oc[0], oc[1], oc[2]);
+    let outward = [ow[0] - iw[0], ow[1] - iw[1], ow[2] - iw[2]];
+
     match (ni, no) {
-        (0, _) | (_, 0) => Ok(()), // tet fully inside or outside — no surface
         (1, 3) | (3, 1) => {
             // One odd corner vs three: the surface is the triangle on the three
             // edges from the odd corner to the others.
@@ -262,6 +303,7 @@ fn march_tet(
                 cross(odd, rest[0]),
                 cross(odd, rest[1]),
                 cross(odd, rest[2]),
+                outward,
             )
         }
         (2, 2) => {
@@ -275,8 +317,8 @@ fn march_tet(
             let q1 = cross(b, c);
             let q2 = cross(b, d);
             let q3 = cross(a, d);
-            mesh.push(q0, q1, q2)?;
-            mesh.push(q0, q2, q3)
+            mesh.push(q0, q1, q2, outward)?;
+            mesh.push(q0, q2, q3, outward)
         }
         _ => unreachable!("a tetrahedron has exactly 4 corners"),
     }
@@ -416,8 +458,9 @@ fn build_glb(mesh: &MeshBuilder, color: [u8; 4]) -> Vec<u8> {
                 "metallicFactor": 0.0,
                 "roughnessFactor": 1.0,
             },
-            // Two-sided: marching-tet winding isn't oriented, so light both
-            // faces (CesiumJS flips the normal toward the camera per-face).
+            // Normals are oriented outward in `MeshBuilder::push`, so lighting
+            // is correct from the front; `doubleSided` is belt-and-suspenders
+            // for grazing/back views (and any residual ambiguous quad).
             "doubleSided": true,
         } ],
         "accessors": [
@@ -621,6 +664,38 @@ mod tests {
             let offset = [v[0] as f64, -(v[2] as f64), v[1] as f64];
             let h = offset[0] * up[0] + offset[1] * up[1] + offset[2] * up[2];
             assert!((h - 4000.0).abs() < 50.0, "vertex height {h} ≉ 4000 m");
+        }
+    }
+
+    #[test]
+    fn isosurface_normals_point_outward() {
+        // value = i_h increases with height, so inside (>= 1.5) is the UPPER
+        // region and "outward" (toward lower values) is DOWNWARD. Every stored
+        // face normal must therefore have a negative geocentric-up component —
+        // this is the orientation fix (without it ~half would point up/inward).
+        let mut grid = ramp_grid(4, 16, 5);
+        grid.radius_range = [0.0, 5_000.0]; // small disc → up ≈ geocentric up
+        let glb = encode_isosurface_glb(&grid, 1.5, [0, 128, 255, 255], None).unwrap();
+        let (json, bin) = parse_glb(&glb);
+
+        let rtc = geodetic_to_ecef(grid.origin_lon, grid.origin_lat, grid.origin_height);
+        let m = (rtc[0] * rtc[0] + rtc[1] * rtc[1] + rtc[2] * rtc[2]).sqrt();
+        let up = [rtc[0] / m, rtc[1] / m, rtc[2] / m];
+        let nrm_off = json["bufferViews"][1]["byteOffset"].as_u64().unwrap() as usize;
+        let nrm_len = json["bufferViews"][1]["byteLength"].as_u64().unwrap() as usize;
+        let normals: Vec<f32> = bin[nrm_off..nrm_off + nrm_len]
+            .chunks_exact(4)
+            .map(|w| f32::from_le_bytes(w.try_into().unwrap()))
+            .collect();
+        assert!(!normals.is_empty(), "surface has normals");
+        for n in normals.chunks_exact(3) {
+            // Invert the Y-up flip: glTF normal (x,y,z) → ECEF (x,−z,y).
+            let ne = [n[0] as f64, -(n[2] as f64), n[1] as f64];
+            let up_comp = ne[0] * up[0] + ne[1] * up[1] + ne[2] * up[2];
+            assert!(
+                up_comp < 0.0,
+                "normal must point outward (down): up={up_comp}"
+            );
         }
     }
 
