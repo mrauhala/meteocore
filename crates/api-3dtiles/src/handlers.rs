@@ -33,7 +33,11 @@ use crate::error::Tiles3dError;
 /// Default isosurface threshold (dBZ) when a request names none — a light-rain
 /// reflectivity shell.
 const ISOSURFACE_DEFAULT_THRESHOLD: f64 = 20.0;
-/// Default echo-top reflectivity (dBZ) — the standard echo-top value.
+/// Default echo-top reflectivity (dBZ) — the standard echo-top value. Like the
+/// isosurface threshold and the no-echo-floor guard below, this is
+/// reflectivity-specific: an echo-top request for a non-reflectivity quantity
+/// (e.g. `VRADH`) still validates against the −32 dBZ floor, which is meaningless
+/// for velocity. Per-quantity floors land with per-quantity colormaps (#350).
 const ECHO_TOP_DEFAULT_THRESHOLD: f64 = 18.0;
 
 /// Voxel-grid resolution tier for the glTF mesh products (isosurface, echo-top):
@@ -44,9 +48,15 @@ const ECHO_TOP_DEFAULT_THRESHOLD: f64 = 18.0;
 /// historical default. All tiers stay under the engine's `MAX_VOXELS` cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Resolution {
-    /// `[128, 360, 48]` ≈ 2.2 M cells — fast, coarse radial (~2 km bins).
+    /// `[128, 360, 48]` ≈ 2.2 M cells — fast, coarse radial (~2 km bins). Equals
+    /// the engine's historical `read_voxel_grid(None)` default.
     Low,
-    /// `[256, 360, 56]` ≈ 5.2 M cells — the balanced default.
+    /// `[256, 360, 56]` ≈ 5.2 M cells — the balanced default for an *absent*
+    /// `?resolution=`. NOTE: this is intentionally higher than the engine's old
+    /// `None` default (`Low` above) — adding the tiers deliberately bumped the
+    /// no-tier-specified isosurface/echo-top quality from coarse to balanced, so
+    /// a pre-tier bookmarked content URI without `?resolution=` now renders one
+    /// step sharper (and a touch slower), not differently-wrong.
     Med,
     /// `[512, 360, 64]` ≈ 11.8 M cells — full radial detail; ~12 s first compute.
     High,
@@ -372,6 +382,10 @@ pub async fn get_tileset(
     let (engine, _config) = lookup(&state, &id)?;
     let info = engine.volume_info();
     let representation = Representation::parse(params.representation.as_deref())?;
+    // Validate the detail tier up front so a bad `resolution=` is a 400 for *any*
+    // representation, not silently ignored on a `points` request (which doesn't
+    // use it). Only the mesh arm below consumes the parsed value.
+    let resolution = Resolution::parse(params.resolution.as_deref())?;
 
     // Resolve + validate the quantity against what the collection advertises.
     let quantity = match &params.quantity {
@@ -446,11 +460,9 @@ pub async fn get_tileset(
                 }
                 query.push_str(&format!("&threshold={t}"));
             }
-            // Carry the detail tier so the content fetch matches the tileset.
-            // Validate now (a bad value is a 400 here, not a surprise on fetch);
+            // Carry the detail tier so the content fetch matches the tileset;
             // emit the canonical token even when the request omitted it, so the
-            // `content.uri` is self-describing.
-            let resolution = Resolution::parse(params.resolution.as_deref())?;
+            // `content.uri` is self-describing. (Parsed/validated above.)
             query.push_str(&format!("&resolution={}", resolution.as_str()));
             // Tag the mesh product explicitly for *both* (not just echo-top), so
             // the `content.uri` is unambiguous and doesn't depend on the

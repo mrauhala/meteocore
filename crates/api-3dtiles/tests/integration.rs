@@ -530,6 +530,14 @@ async fn tileset_carries_resolution_tier_into_glb_content_uri() {
     let (status, _b, _h) =
         get("/collections/radar-fivih/content.glb?quantity=DBZH&resolution=ultra").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A bad tier is rejected even on a `points` tileset (which ignores the value)
+    // — the param is validated up front regardless of representation.
+    let (status, _b, _h) = get(
+        "/collections/radar-fivih/tileset.json?representation=points&quantity=DBZH&resolution=ultra",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
