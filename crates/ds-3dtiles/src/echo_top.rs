@@ -252,6 +252,17 @@ pub fn encode_echo_top_columns_glb(
         return Err(Tiles3dError::NonFinite("rtc_center"));
     }
     let [n_r, n_a, _n_h] = grid.dims;
+    // glTF-space up (geocentric up, Z-up→Y-up flipped) — the fallback normal for
+    // a degenerate (zero-area) triangle, so no `[0,0,0]` normal reaches the
+    // buffer (invalid per the glTF spec).
+    let up_gltf = {
+        let m = (rtc[0] * rtc[0] + rtc[1] * rtc[1] + rtc[2] * rtc[2]).sqrt();
+        [
+            (rtc[0] / m) as f32,
+            (rtc[2] / m) as f32,
+            -((rtc[1] / m) as f32),
+        ]
+    };
 
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
@@ -315,6 +326,8 @@ pub fn encode_echo_top_columns_glb(
                         if nrm[0] * out[0] + nrm[1] * out[1] + nrm[2] * out[2] < 0.0 {
                             nrm = [-nrm[0], -nrm[1], -nrm[2]];
                         }
+                    } else {
+                        nrm = up_gltf; // degenerate triangle — no zero normal
                     }
                     for ci in [a, b, cc] {
                         let p = corner_pos[ci];
@@ -625,6 +638,10 @@ mod tests {
             encode_echo_top_glb(&grid, 60.0, &height_map()),
             Err(Tiles3dError::Empty)
         ));
+        assert!(matches!(
+            encode_echo_top_columns_glb(&grid, 60.0, &height_map()),
+            Err(Tiles3dError::Empty)
+        ));
     }
 
     #[test]
@@ -632,6 +649,10 @@ mod tests {
         let grid = ramp_top_grid(4, 8, 6);
         assert!(matches!(
             encode_echo_top_glb(&grid, f64::NAN, &height_map()),
+            Err(Tiles3dError::NonFinite("threshold"))
+        ));
+        assert!(matches!(
+            encode_echo_top_columns_glb(&grid, f64::NAN, &height_map()),
             Err(Tiles3dError::NonFinite("threshold"))
         ));
     }
