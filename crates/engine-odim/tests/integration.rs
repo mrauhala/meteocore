@@ -656,6 +656,76 @@ fn pvol_volume_engine_emits_point_cloud() {
     );
 }
 
+/// `VolumeEngine::read_voxel_grid` on the real FMI Vihti volume: resample the
+/// polar volume into a regular cylindrical voxel grid. Skips when the
+/// uncommitted fixture is absent.
+#[test]
+fn pvol_volume_engine_voxel_grid() {
+    use ds_core::volume::VolumeEngine;
+
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/radar-fmi-pvol/202605191050_fivih_PVOL.h5");
+    if !fixture.exists() {
+        eprintln!("skipping pvol_volume_engine_voxel_grid: fixture absent at {fixture:?}");
+        return;
+    }
+    let data_dir = fixture.parent().unwrap().to_str().unwrap();
+    let config = OdimConfig {
+        filename_template: None,
+        filename_pattern: None,
+        timestamp_format: None,
+        parameter: None,
+        unit: None,
+        nodata: None,
+        gain: None,
+        offset: None,
+        poll_interval_secs: 30,
+        max_files: None,
+        endpoint: None,
+        bucket: None,
+        prefix_pattern: None,
+        time_window: None,
+        discovery: None,
+        cadence_secs: None,
+    };
+    let engine = engine_odim::PolarVolumeEngine::new("fivih-voxel-test", Some(data_dir), &config)
+        .expect("PolarVolumeEngine::new");
+    let view = engine.site_view("fivih", "fivih-voxel-test-fivih");
+
+    // A modest grid keeps the test quick.
+    let dims = [48, 180, 24];
+    let grid = view
+        .read_voxel_grid(Some("DBZH"), None, Some(dims), None)
+        .expect("read_voxel_grid over the real volume");
+
+    assert_eq!(grid.dims, dims);
+    assert_eq!(
+        grid.values.len(),
+        dims[0] * dims[1] * dims[2],
+        "values tile the grid"
+    );
+    assert_eq!(grid.quantity, "DBZH");
+    assert_eq!(grid.angle_range, [0.0, std::f64::consts::TAU]);
+    assert!(
+        grid.radius_range[1] > 100_000.0,
+        "coverage radius is ~250 km"
+    );
+    assert!(grid.height_range[1] > 0.0 && grid.height_range[0] == 0.0);
+
+    // Some cells sampled (echoes), but not all — the cone of silence + below
+    // the lowest sweep + out-of-range stay NaN (no fabricated data).
+    let valid = grid.valid_count();
+    assert!(valid > 0, "a real volume must yield sampled voxels");
+    assert!(
+        valid < grid.values.len(),
+        "expect NaN gaps (cone of silence etc.)"
+    );
+    // Every sampled value is a finite dBZ in a sane band.
+    for v in grid.values.iter().filter(|v| v.is_finite()) {
+        assert!((-40.0..100.0).contains(v), "sane dBZ, got {v}");
+    }
+}
+
 /// End-to-end `FeatureEngine` surface on the real FMI Vihti volume: the
 /// owning `PolarVolumeEngine` exposes its sites as a Features collection (one
 /// Point Feature per site). Skips when the uncommitted 15 MB fixture is absent.

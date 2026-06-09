@@ -57,6 +57,9 @@ impl VolumeEngine for MockVolume {
         })
     }
 
+    // read_voxel_grid uses the trait default (unsupported) — the API has no
+    // voxel route yet, so the mock doesn't need it.
+
     fn volume_info(&self) -> Arc<VolumeInfo> {
         Arc::new(VolumeInfo {
             quantities: vec![("DBZH".into(), "Reflectivity".into())],
