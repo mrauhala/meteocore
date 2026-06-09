@@ -272,21 +272,19 @@ pub async fn get_tileset(
                 .map_err(|e| Tiles3dError::Internal(format!("tileset build failed: {e}")))?
         }
         Representation::Isosurface => {
-            if !info.supports_voxel_grid {
-                return Err(Tiles3dError::BadRequest(format!(
+            // `voxel_grid` couples capability with the origin, so an isosurface
+            // collection always has the origin — no separate `None` → 500 path.
+            let caps = info.voxel_grid.as_ref().ok_or_else(|| {
+                Tiles3dError::BadRequest(format!(
                     "collection '{id}' does not support the isosurface representation"
-                )));
-            }
+                ))
+            })?;
             // The glTF `.glb` content has no embedded origin (unlike `.pnts`
             // `RTC_CENTER`), so the tileset places it via a `transform` = the
             // volume origin (antenna) in ECEF — taken from `VolumeInfo` so we
             // don't sample the grid just to emit the tileset.
-            let origin = info.origin.ok_or_else(|| {
-                Tiles3dError::Internal(format!(
-                    "collection '{id}' has no origin for the mesh transform"
-                ))
-            })?;
-            let rtc = geodetic_to_ecef(origin[0], origin[1], origin[2]);
+            let [olon, olat, oh] = caps.origin;
+            let rtc = geodetic_to_ecef(olon, olat, oh);
             if let Some(t) = params.threshold {
                 if !t.is_finite() {
                     return Err(Tiles3dError::BadRequest("threshold must be finite".into()));
@@ -382,7 +380,7 @@ pub async fn get_content_glb(
     let info = engine.volume_info();
     // Reject early if the engine can't produce a voxel grid (avoids a blocking
     // task just to return the trait's "unsupported" → 404).
-    if !info.supports_voxel_grid {
+    if info.voxel_grid.is_none() {
         return Err(Tiles3dError::BadRequest(format!(
             "collection '{id}' does not support the isosurface representation"
         )));
@@ -443,6 +441,11 @@ pub async fn get_content_glb(
                     // here", not a server fault — 404, matching the no-data path.
                     ds_3dtiles::Tiles3dError::Empty => Tiles3dError::NotFound(format!(
                         "no isosurface at threshold {threshold} for collection '{id_for_err}'"
+                    )),
+                    // Too many triangles is client-driven (the threshold is too
+                    // low for this grid) — 400, not a 500 server fault.
+                    ds_3dtiles::Tiles3dError::TooLarge(_) => Tiles3dError::BadRequest(format!(
+                        "threshold {threshold} produces too large an isosurface; raise it"
                     )),
                     other => Tiles3dError::Internal(format!("isosurface encode failed: {other}")),
                 })?;
@@ -518,7 +521,7 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
     // Every volume collection serves a point cloud; those whose engine can also
     // produce a voxel grid additionally serve an isosurface mesh. The viewer
     // reads this to populate its representation toggle.
-    let supports_iso = info.as_ref().is_some_and(|i| i.supports_voxel_grid);
+    let supports_iso = info.as_ref().is_some_and(|i| i.voxel_grid.is_some());
     let mut representations = vec!["points"];
     if supports_iso {
         representations.push("isosurface");

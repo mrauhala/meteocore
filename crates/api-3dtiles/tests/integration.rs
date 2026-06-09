@@ -12,7 +12,9 @@ use tower::ServiceExt;
 use api_3dtiles::TilesState3d;
 use ds_core::config::CollectionConfig;
 use ds_core::error::DataServerError;
-use ds_core::volume::{VolumeEngine, VolumeInfo, VolumePoint, VolumePointCloud, VoxelGrid};
+use ds_core::volume::{
+    VolumeEngine, VolumeInfo, VolumePoint, VolumePointCloud, VoxelGrid, VoxelGridCaps,
+};
 use ds_render::{BuiltinColormap, LutColorMap};
 
 /// Mock engine: a tiny fixed cloud, one quantity (`DBZH`), a coverage region.
@@ -102,8 +104,9 @@ impl VolumeEngine for MockVolume {
             default_quantity: "DBZH".into(),
             default_unit: "dBZ".into(),
             region: Some([0.42, 1.05, 0.44, 1.07, 100.0, 25_000.0]),
-            supports_voxel_grid: true,
-            origin: Some([24.5, 60.5, 100.0]),
+            voxel_grid: Some(VoxelGridCaps {
+                origin: [24.5, 60.5, 100.0],
+            }),
         })
     }
 }
@@ -141,8 +144,7 @@ impl VolumeEngine for MockNoVoxel {
             default_quantity: "DBZH".into(),
             default_unit: "dBZ".into(),
             region: Some([0.42, 1.05, 0.44, 1.07, 100.0, 25_000.0]),
-            supports_voxel_grid: false,
-            origin: None,
+            voxel_grid: None,
         })
     }
 }

@@ -285,11 +285,13 @@ into a glTF `.glb` triangle mesh.
 - **Both representations are served from the API** (selected by
   `?representation=points|isosurface` on `tileset.json`): `points` → `.pnts`
   (region-only tileset, `RTC_CENTER` self-places), `isosurface` → `.glb` plus a
-  tile **`transform`** = the antenna ECEF (from `VolumeInfo.origin`, so the
-  tileset is built without sampling). A collection advertises which it supports
-  via `VolumeInfo.supports_voxel_grid` → the collection JSON's `representations`
-  array → the viewer's representation toggle. The isosurface floor (seal) =
-  `ColorMap::domain()` min (clamped `< threshold`).
+  tile **`transform`** = the antenna ECEF. Capability + the origin it needs are
+  coupled in one field: `VolumeInfo.voxel_grid: Option<VoxelGridCaps { origin }>`
+  — `Some` ⇒ isosurface available and the origin is present (so the tileset is
+  built without sampling, and "supports but no origin" is unrepresentable, never
+  a 500). It drives the collection JSON's `representations` array → the viewer's
+  representation toggle. The isosurface floor (seal) = `ColorMap::domain()` min
+  (clamped `< threshold`); an over-large surface (threshold too low) → 400.
 - **Routes** (mounted at `/3dtiles`): `GET /collections/{id}/tileset.json`
   (`?representation=&quantity=&datetime=&min_value=&threshold=`),
   `GET /collections/{id}/content.pnts` (`?quantity=&datetime=&min_value=`),

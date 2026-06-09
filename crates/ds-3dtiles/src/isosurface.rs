@@ -108,20 +108,21 @@ impl MeshBuilder {
         }
     }
 
-    /// Append one triangle, with its face normal oriented to agree with
-    /// `outward` (the local "toward lower values / out of the echo" direction).
-    /// The marching-tet cases don't emit a consistent winding on their own, so
-    /// without this ~half the faces would have inward normals and render with
-    /// inverted lighting; here the winding is flipped to match `outward` so the
-    /// stored normal always points outward. Skips degenerate (zero-area)
-    /// triangles so no `NaN` normal reaches the buffer. Errors with
-    /// [`Tiles3dError::TooLarge`] past [`MAX_TRIANGLES`].
+    /// Append one triangle, with its face normal oriented outward. `out_ref` is
+    /// a point on the OUTSIDE of the surface (the tet's outside-corner centroid);
+    /// the outward direction is `out_ref − triangle_centroid`. The marching-tet
+    /// cases don't emit a consistent winding on their own, so without this ~half
+    /// the faces would have inward normals and render with inverted lighting;
+    /// here the winding is flipped to match outward so the stored normal always
+    /// points outward. Skips degenerate (zero-area) triangles so no `NaN` normal
+    /// reaches the buffer. Errors with [`Tiles3dError::TooLarge`] past
+    /// [`MAX_TRIANGLES`].
     fn push(
         &mut self,
         p0: [f32; 3],
         p1: [f32; 3],
         p2: [f32; 3],
-        outward: [f32; 3],
+        out_ref: [f32; 3],
     ) -> Result<(), Tiles3dError> {
         let u = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
         let v = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
@@ -138,6 +139,17 @@ impl MeshBuilder {
         } else {
             return Ok(()); // degenerate sliver (zero area) — drop it
         };
+        // Outward = from the triangle's own centroid toward the outside ref.
+        let centroid = [
+            (p0[0] + p1[0] + p2[0]) / 3.0,
+            (p0[1] + p1[1] + p2[1]) / 3.0,
+            (p0[2] + p1[2] + p2[2]) / 3.0,
+        ];
+        let outward = [
+            out_ref[0] - centroid[0],
+            out_ref[1] - centroid[1],
+            out_ref[2] - centroid[2],
+        ];
         // Orient outward: if the geometric normal points the wrong way, flip the
         // normal AND the winding (swap p1/p2) so both stay consistent.
         let dot = nrm[0] * outward[0] + nrm[1] * outward[1] + nrm[2] * outward[2];
@@ -266,29 +278,23 @@ fn march_tet(
             tet[b_local],
         )
     };
-    // The marching-tet cases don't produce a consistent winding, so derive the
-    // local outward direction (inside-corner centroid → outside-corner centroid,
-    // i.e. toward lower values) and let `MeshBuilder::push` orient each face's
-    // normal to it. Centroids in index space, mapped once to glTF space.
-    let centroid = |members: &[usize; 4], count: usize| -> [f64; 3] {
+    // The marching-tet cases don't produce a consistent winding, so give
+    // `MeshBuilder::push` a reference point on the OUTSIDE of the surface — the
+    // outside-corner centroid, in glTF space — and it orients each face's normal
+    // to point from the triangle toward it (outward, toward lower values). Only
+    // ONE glTF projection per tet (the inside-centroid round-trip the earlier
+    // version did was redundant: push already has the triangle's own centroid).
+    let oc = {
         let mut s = [0.0_f64; 3];
-        for &k in &members[..count] {
+        for &k in &outside[..no] {
             let p = cidx[tet[k]];
             for d in 0..3 {
                 s[d] += p[d];
             }
         }
-        [
-            s[0] / count as f64,
-            s[1] / count as f64,
-            s[2] / count as f64,
-        ]
+        [s[0] / no as f64, s[1] / no as f64, s[2] / no as f64]
     };
-    let ic = centroid(&inside, ni);
-    let oc = centroid(&outside, no);
-    let iw = index_to_gltf_pos(grid, rtc, ic[0], ic[1], ic[2]);
-    let ow = index_to_gltf_pos(grid, rtc, oc[0], oc[1], oc[2]);
-    let outward = [ow[0] - iw[0], ow[1] - iw[1], ow[2] - iw[2]];
+    let out_ref = index_to_gltf_pos(grid, rtc, oc[0], oc[1], oc[2]);
 
     match (ni, no) {
         (1, 3) | (3, 1) => {
@@ -303,7 +309,7 @@ fn march_tet(
                 cross(odd, rest[0]),
                 cross(odd, rest[1]),
                 cross(odd, rest[2]),
-                outward,
+                out_ref,
             )
         }
         (2, 2) => {
@@ -317,8 +323,8 @@ fn march_tet(
             let q1 = cross(b, c);
             let q2 = cross(b, d);
             let q3 = cross(a, d);
-            mesh.push(q0, q1, q2, outward)?;
-            mesh.push(q0, q2, q3, outward)
+            mesh.push(q0, q1, q2, out_ref)?;
+            mesh.push(q0, q2, q3, out_ref)
         }
         _ => unreachable!("a tetrahedron has exactly 4 corners"),
     }
