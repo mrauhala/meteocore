@@ -714,7 +714,9 @@ fn pvol_volume_engine_voxel_grid() {
 
     // Real echoes are present — cells *above* the clear-air floor (#360 fills
     // clear air with exactly `NO_ECHO_FLOOR_DBZ`, so `valid_count()` alone, which
-    // now also counts those floor cells, would no longer prove "has echo").
+    // now also counts those floor cells, would no longer prove "has echo"). Uses
+    // `>` (not `>=`): an echo measured at exactly the floor is indistinguishable
+    // from clear air at the grid level — fine here, precip is well above −32 dBZ.
     let echoes = grid
         .values
         .iter()

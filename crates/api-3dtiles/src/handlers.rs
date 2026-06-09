@@ -405,6 +405,8 @@ pub async fn get_content_glb(
     // The engine fills clear air with the no-echo floor; a threshold at/below it
     // would put clear air *inside* the surface (all clear air would render as
     // echo). Reject — a reflectivity shell below the −32 dBZ floor is meaningless.
+    // (v1: the floor is dBZ for every quantity; for a non-reflectivity quantity
+    // it's just "below any sane threshold" — per-quantity floors are #350.)
     let floor = f64::from(ds_core::volume::NO_ECHO_FLOOR_DBZ);
     if threshold <= floor {
         return Err(Tiles3dError::BadRequest(format!(
