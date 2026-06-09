@@ -55,39 +55,49 @@ pub fn encode_voxels_glb(grid: &VoxelGrid) -> Result<Vec<u8>, Tiles3dError> {
         .and_then(|n| u32::try_from(n).ok())
         .ok_or(Tiles3dError::TooLarge("voxel buffer"))?;
 
-    // Transpose our `[radius, angle, height]` grid (height-fastest) into the glТF
-    // cylinder layout `[radius, height, angle]` (radius-fastest → height →
-    // angle-slowest), and fill **unmeasured** (`NaN`: cone of silence, below the
-    // lowest beam, beyond range) cells with the no-echo floor — NOT an extreme
-    // nodata sentinel. CesiumJS *trilinearly interpolates* the metadata before
-    // the shader, so an extreme sentinel makes the echo→unmeasured transition
-    // razor-sharp and grid-aligned → flat **walls and floors** at the volume
-    // boundaries. Filling with the clear-air floor (which the transfer function
-    // makes transparent, like real clear air) keeps those transitions gentle.
-    // So no `noData` is declared — the whole cylinder is a dense field whose low
-    // end the transfer function fades out.
-    let mut bin = Vec::with_capacity(count * 4);
+    // Fill **unmeasured** (`NaN`: cone of silence, below the lowest beam, beyond
+    // range) cells with the no-echo floor — NOT an extreme nodata sentinel.
+    // CesiumJS *trilinearly interpolates* the metadata before the shader, so an
+    // extreme sentinel makes the echo→unmeasured transition razor-sharp and
+    // grid-aligned. The floor (which the transfer function makes transparent,
+    // like real clear air) keeps those transitions gentle; no `noData` is
+    // declared, so the whole cylinder is a dense field whose low end fades out.
+    let mut native: Vec<f32> = Vec::with_capacity(count);
     let mut any_finite = false;
+    for &v in &grid.values {
+        if v.is_finite() {
+            any_finite = true;
+            native.push(v);
+        } else {
+            native.push(NO_ECHO_FLOOR_DBZ);
+        }
+    }
+    if !any_finite {
+        return Err(Tiles3dError::Empty); // every cell unmeasured — nothing to render
+    }
+    // Radar echo is **cellular** — each ~native-resolution cell is a local
+    // reflectivity maximum, so even with GPU trilinear interpolation a raw render
+    // shows one blob per cell (a visible grid of cells at close zoom). A light
+    // separable 3-D smoothing merges adjacent cells into a continuous field — the
+    // standard radar-volume reconstruction. Angle is periodic (full circle);
+    // radius/height clamp at the ends.
+    let native = smooth_grid(native, grid.dims);
+
+    // Transpose the smoothed grid from native `[radius, angle, height]`
+    // (height-fastest) into the glТF cylinder layout `[radius, height, angle]`
+    // (radius-fastest → height → angle-slowest), and track the range.
+    let mut bin = Vec::with_capacity(count * 4);
     let mut vmin = f32::INFINITY;
     let mut vmax = f32::NEG_INFINITY;
     for i_a in 0..n_a {
         for i_h in 0..n_h {
             for i_r in 0..n_r {
-                let v = grid.values[grid.index(i_r, i_a, i_h)];
-                let f = if v.is_finite() {
-                    any_finite = true;
-                    v
-                } else {
-                    NO_ECHO_FLOOR_DBZ
-                };
+                let f = native[grid.index(i_r, i_a, i_h)];
                 vmin = vmin.min(f);
                 vmax = vmax.max(f);
                 bin.extend_from_slice(&f.to_le_bytes());
             }
         }
-    }
-    if !any_finite {
-        return Err(Tiles3dError::Empty); // every cell unmeasured — nothing to render
     }
 
     let q = grid.quantity.clone();
@@ -132,6 +142,54 @@ pub fn encode_voxels_glb(grid: &VoxelGrid) -> Result<Vec<u8>, Tiles3dError> {
     });
 
     assemble_glb(&gltf, bin)
+}
+
+/// Light separable 3-D smoothing of the (NaN-filled) grid in its native
+/// `[radius, angle, height]` index order — a `[0.25, 0.5, 0.25]` kernel along
+/// each axis. Merges the cellular radar field so a voxel render doesn't show one
+/// blob per cell. Angle wraps (full circle); radius/height clamp at the ends.
+/// Three passes ping-pong between two buffers.
+fn smooth_grid(vals: Vec<f32>, dims: [usize; 3]) -> Vec<f32> {
+    let [n_r, n_a, n_h] = dims;
+    let idx = |r: usize, a: usize, h: usize| VoxelGrid::index_of(dims, r, a, h);
+    let blur = |lo: f32, mid: f32, hi: f32| 0.25 * lo + 0.5 * mid + 0.25 * hi;
+
+    let mut src = vals;
+    let mut dst = vec![0.0f32; src.len()];
+
+    // Height (clamp).
+    for r in 0..n_r {
+        for a in 0..n_a {
+            for h in 0..n_h {
+                let lo = src[idx(r, a, h.saturating_sub(1))];
+                let hi = src[idx(r, a, (h + 1).min(n_h - 1))];
+                dst[idx(r, a, h)] = blur(lo, src[idx(r, a, h)], hi);
+            }
+        }
+    }
+    std::mem::swap(&mut src, &mut dst);
+    // Angle (periodic).
+    for r in 0..n_r {
+        for h in 0..n_h {
+            for a in 0..n_a {
+                let lo = src[idx(r, (a + n_a - 1) % n_a, h)];
+                let hi = src[idx(r, (a + 1) % n_a, h)];
+                dst[idx(r, a, h)] = blur(lo, src[idx(r, a, h)], hi);
+            }
+        }
+    }
+    std::mem::swap(&mut src, &mut dst);
+    // Radius (clamp).
+    for a in 0..n_a {
+        for h in 0..n_h {
+            for r in 0..n_r {
+                let lo = src[idx(r.saturating_sub(1), a, h)];
+                let hi = src[idx((r + 1).min(n_r - 1), a, h)];
+                dst[idx(r, a, h)] = blur(lo, src[idx(r, a, h)], hi);
+            }
+        }
+    }
+    dst
 }
 
 /// The `EXT_structural_metadata` schema for one scalar voxel property named
@@ -385,23 +443,38 @@ mod tests {
         assert_eq!(pa["properties"]["DBZH"]["attribute"], "_VOXEL");
         assert_eq!(j["extensionsRequired"][0], "EXT_primitive_voxels");
 
-        // Accessor: SCALAR FLOAT, one element per cell, range = [0, 2] (height idx).
+        // Accessor: SCALAR FLOAT, one element per cell. The 3-D smoothing shifts
+        // the boundary values inward, so the range is within [0, 2] (height idx).
         let acc = &j["accessors"][0];
         assert_eq!(acc["componentType"], 5126);
         assert_eq!(acc["count"], 24);
-        assert_eq!(acc["min"], json!([0.0]));
-        assert_eq!(acc["max"], json!([2.0]));
         assert_eq!(bin.len(), 24 * 4);
+        let amin = acc["min"][0].as_f64().unwrap();
+        let amax = acc["max"][0].as_f64().unwrap();
+        assert!(amin >= 0.0 && amax <= 2.0 && amin < amax, "{amin}..{amax}");
 
         // Data layout: glТF order is radius-fastest → height → angle-slowest, and
-        // value == height index. So the first `n_r` floats (radius run at h=0)
-        // are 0.0, the next `n_r` (h=1) are 1.0, then h=2 → 2.0; that block of
-        // n_r*n_h repeats per angle slice.
+        // value == height index (constant across radius+angle). Assert the
+        // *structure* (robust to the smoothing): each radius run is flat, height
+        // increases monotonically, and the per-angle block repeats.
         let f = |i: usize| f32::from_le_bytes(bin[i * 4..i * 4 + 4].try_into().unwrap());
-        assert_eq!([f(0), f(1)], [0.0, 0.0]); // radius run, height 0
-        assert_eq!([f(2), f(3)], [1.0, 1.0]); // radius run, height 1
-        assert_eq!([f(4), f(5)], [2.0, 2.0]); // radius run, height 2
-        assert_eq!(f(6), 0.0); // next angle slice restarts at height 0
+        assert_eq!(
+            f(0),
+            f(1),
+            "radius run is flat (value independent of radius)"
+        );
+        assert!(
+            f(2) > f(0) && f(4) > f(2),
+            "height increases: {} {} {}",
+            f(0),
+            f(2),
+            f(4)
+        );
+        assert_eq!(
+            f(6),
+            f(0),
+            "next angle slice repeats (value independent of angle)"
+        );
     }
 
     #[test]
@@ -411,10 +484,18 @@ mod tests {
         g.values[idx] = f32::NAN;
         let glb = encode_voxels_glb(&g).expect("encode");
         let (j, bin) = parse_glb(&glb);
-        let f = |i: usize| f32::from_le_bytes(bin[i * 4..i * 4 + 4].try_into().unwrap());
         // Unmeasured → the no-echo floor (a real low dBZ), NOT an extreme nodata
-        // sentinel — so CesiumJS's interpolation has no razor-sharp wall.
-        assert_eq!(f(0), NO_ECHO_FLOOR_DBZ, "NaN cell → no-echo floor");
+        // sentinel — so every (smoothed) cell stays ≥ the floor and CesiumJS's
+        // interpolation has no razor-sharp wall toward -9999.
+        let vals: Vec<f32> = bin
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert!(
+            vals.iter().all(|&v| v >= NO_ECHO_FLOOR_DBZ - 1e-3),
+            "no extreme sentinel; min = {:?}",
+            vals.iter().cloned().fold(f32::INFINITY, f32::min)
+        );
         // No `noData` is declared, on the primitive or the schema.
         assert!(
             j["meshes"][0]["primitives"][0]["extensions"]["EXT_primitive_voxels"]
