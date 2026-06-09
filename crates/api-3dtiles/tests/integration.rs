@@ -486,6 +486,16 @@ async fn echotop_tileset_and_content_is_valid_glb() {
 }
 
 #[tokio::test]
+async fn glb_rejects_points_representation() {
+    // `.glb` serves only the mesh products — asking it for `points` is a 400
+    // (the point cloud has its own `content.pnts` route), not a silently
+    // mislabelled isosurface.
+    let (status, _body, _h) =
+        get("/collections/radar-fivih/content.glb?representation=points&quantity=DBZH").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn isosurface_tileset_has_transform_and_glb_content() {
     let (status, body, _h) =
         get("/collections/radar-fivih/tileset.json?representation=isosurface&quantity=DBZH&threshold=20")

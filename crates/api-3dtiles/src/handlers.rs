@@ -421,10 +421,24 @@ pub async fn get_content_glb(
     State(state): State<AppState>,
 ) -> Result<Response, Tiles3dError> {
     let state = state.load_full();
-    let representation = Representation::parse(params.representation.as_deref())?;
+    // `.glb` serves the mesh products. An *absent* representation defaults to
+    // the isosurface (the isosurface tileset's `content.uri` omits the param),
+    // but an *explicit* `points` is rejected below — the point cloud has its own
+    // `content.pnts` route, and a tileset-following client never asks `.glb` for
+    // it. (Distinguishing absent from explicit-points is why we don't lean on
+    // `Representation::parse`'s `None → Points` default here.)
+    let representation = match params.representation.as_deref().map(str::trim) {
+        None | Some("") => Representation::Isosurface,
+        other => Representation::parse(other)?,
+    };
     let product = match representation {
+        Representation::Points => {
+            return Err(Tiles3dError::BadRequest(
+                "use content.pnts for the point-cloud representation".into(),
+            ))
+        }
         Representation::EchoTop => "echo-top",
-        _ => "isosurface",
+        Representation::Isosurface => "isosurface",
     };
     let (engine, _config) = lookup(&state, &id)?;
     let info = engine.volume_info();
@@ -495,7 +509,7 @@ pub async fn get_content_glb(
                         &echo_top_height_colormap(),
                     )
                 }
-                _ => {
+                Representation::Isosurface => {
                     let grid = engine.read_voxel_grid(quantity.as_deref(), time, None, None)?;
                     // Colour the shell at the threshold (v1: one colormap for all
                     // quantities — #350); seal NaN at the no-echo floor so it
@@ -503,6 +517,8 @@ pub async fn get_content_glb(
                     let color = colormap.color(Some(threshold));
                     ds_3dtiles::encode_isosurface_glb(&grid, threshold, color, Some(floor))
                 }
+                // Rejected before the blocking task (see the `product` match).
+                Representation::Points => unreachable!("points rejected above"),
             };
             let bytes = result.map_err(|e| match e {
                 // No surface / no columns (threshold above all echo) — 404.
