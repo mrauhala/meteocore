@@ -365,11 +365,25 @@ into a glTF `.glb` triangle mesh.
   swap** content `[radius,angle,height]` → glTF `dimensions [radius,height,angle]`,
   data **radius-fastest → height → angle-slowest** (our grid is the transpose);
   `EXT_structural_metadata` (schema + `propertyAttributes`) at the glTF **top
-  level**; embedded BIN buffer; `NaN` → a declared `noData` sentinel; **implicit
-  OCTREE tiling + a constant `.subtree`** is required; and the tile **`transform`
-  must be the real ENU→ECEF frame** (east/north/up), *not* identity-rotation —
-  identity works for the mesh products (absolute-ECEF vertices) but tilts the
-  *parametric* cylinder by the latitude. Cylinder extents come from
+  level**; embedded BIN buffer; **implicit OCTREE tiling + a constant `.subtree`**
+  is required; and the tile **`transform` must be the real ENU→ECEF frame**
+  (east/north/up), *not* identity-rotation — identity works for the mesh products
+  (absolute-ECEF vertices) but tilts the *parametric* cylinder by the latitude.
+  **Azimuth convention remap (load-bearing — else the volume is rotated 90° AND
+  mirrored vs the point/mesh products):** the grid angle axis is radar azimuth
+  (index 0 → bearing 0, **clockwise from North**), but CesiumJS's cylinder
+  (`VoxelCylinderShape`, verified in the 1.142 source) uses default angle bounds
+  **-π..+π**, angle-index 0 → -π, angle **counter-clockwise from local +X**
+  (=East via the ENU transform). The encoder remaps each output angle slot `s`
+  to the radar bin at compass bearing `90° - (-π + (s+0.5)/nA·2π)`
+  (`grid_azimuth_index`); the mesh/point products skip this (they map azimuth →
+  ECEF directly). **Unmeasured (`NaN`) cells → the no-echo floor (-32 dBZ), NO
+  `noData`** — an extreme sentinel trilinearly-interpolates into hard
+  walls/floors at the data boundary; the floor (faded out by the transfer
+  function) keeps boundaries soft, at the cost of a dense volume (no empty-space
+  skipping → slower ray-march). The cellular radar field is further smoothed by a
+  **multi-pass separable blur** (`smooth_grid`, 4 passes) so the cell lattice
+  doesn't show at close zoom. Cylinder extents come from
   `VoxelGridCaps.radius_m`/`height_m` (= the grid's exact extents, O(1)); the
   bounding cylinder is lifted by `height/2` so data sits 0..H above the antenna.
   Served under its own sub-path so the implicit-tiling URIs resolve relatively;
