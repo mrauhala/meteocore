@@ -178,10 +178,13 @@ viewer.scene.backgroundColor = Cesium.Color.BLACK;
 viewer.scene.globe.depthTestAgainstTerrain = false;
 
 // Time-dynamic playback: one preloaded tileset per available volume timestamp
-// (#350). All frames are built up front and kept hidden except the active one, so
-// scrubbing/playing just toggles `.show` — no per-frame network/reload stall. A
-// non-time-dynamic collection is just the degenerate 1-frame case.
-let frames = [];          // Cesium3DTileset per animated timestamp (parallel to `frameTimes`; null = failed)
+// (#350). All frames are kept hidden except the active one, so scrubbing/playing
+// just toggles `.show` — no per-frame network/reload stall. A non-time-dynamic
+// collection is just the degenerate 1-frame case. Frames load progressively
+// (active frame first, then newest→oldest, bounded concurrency) and every loaded
+// tileset is kept in an LRU cache keyed by its tileset URL, so toggling a
+// control and back is a pure visibility flip, not a refetch (#379).
+let frames = [];          // Cesium3DTileset per animated timestamp (parallel to `frameTimes`; null = failed/not yet loaded)
 let times = [];           // full volume-time manifest (ISO Z) from the collection doc
 let frameTimes = [];      // the timestamps actually animated = most-recent MAX_FRAMES of `times`
 let frameIdx = 0;         // active index into `frameTimes`
@@ -197,6 +200,7 @@ const MAX_FRAMES = 48;
 let loadToken = 0;        // guards against out-of-order async (re)builds
 let currentRep = null;    // representation of the active frames
 let pointsFetchFloor = null; // the min_value (dBZ) the point-cloud frames were fetched at
+let pointsStyleMin = null;   // the min currently applied to point styles (client-side filter)
 let legendData = null;    // colour-scale legend {title,unit,min,max,stops} from the collection doc
 let voxelPrimitive = null; // active Cesium VoxelPrimitive (the `voxels` representation)
 
@@ -313,26 +317,69 @@ function tilesetUrl(time) {
   return url;
 }
 
-// Remove every frame tileset from the scene (destroying its GPU buffers — the
-// primitive collection's destroyPrimitives:true does the destroy on remove()).
-function clearFrames() {
-  for (const ts of frames) if (ts) viewer.scene.primitives.remove(ts);
+// Frame cache (#379): every loaded tileset is keyed by its full tileset URL —
+// which encodes collection, quantity, representation, threshold/min_value,
+// resolution AND datetime — and kept in the scene hidden, so toggling a control
+// and back reuses the already-downloaded tileset instead of refetching every
+// frame. LRU-capped at the active frame set plus one full previous set; eviction
+// removes the tileset from the scene (the primitive collection's
+// destroyPrimitives:true destroys its GPU buffers on remove()).
+const tileCache = new Map(); // tileset URL → Cesium3DTileset (in scene.primitives, hidden)
+const TILE_CACHE_MAX = 2 * MAX_FRAMES;
+
+function cacheGet(url) {
+  const ts = tileCache.get(url);
+  if (!ts) return null;
+  tileCache.delete(url); tileCache.set(url, ts); // LRU bump
+  return ts;
+}
+function cachePut(url, ts) {
+  // Two overlapping builds can both fetch the same URL (the first superseded
+  // mid-flight); overwriting the map entry would orphan the loser in the scene.
+  const prev = tileCache.get(url);
+  if (prev && prev !== ts && !frames.includes(prev)) viewer.scene.primitives.remove(prev);
+  tileCache.set(url, ts);
+  for (const [u, old] of tileCache) {
+    if (tileCache.size <= TILE_CACHE_MAX) break;
+    if (frames.includes(old)) continue; // never evict a frame in active use
+    tileCache.delete(u);
+    viewer.scene.primitives.remove(old);
+  }
+}
+// Collection switch: the cached frames belong to another volume entirely —
+// destroy them all rather than letting them age out of the LRU.
+function clearFrameCache() {
+  frames = [];
+  for (const ts of tileCache.values()) viewer.scene.primitives.remove(ts);
+  tileCache.clear();
+}
+
+// Hide the current frame set. The tilesets stay in the scene + cache, so coming
+// back to the same params is a visibility flip; only LRU eviction or a
+// collection switch (clearFrameCache) actually destroys them.
+function hideFrames() {
+  for (const ts of frames) if (ts) ts.show = false;
   frames = [];
 }
 function clearVoxel() {
   if (voxelPrimitive) { viewer.scene.primitives.remove(voxelPrimitive); voxelPrimitive = null; }
 }
 
-// (Re)build the whole frame set for the current params: one preloaded, hidden
-// tileset per timestamp (or a single latest-volume frame when the collection has
-// no time axis). The active frame is revealed; on `reframe` the camera frames it.
+// (Re)build the frame set for the current params: one hidden tileset per
+// timestamp (or a single latest-volume frame when the collection has no time
+// axis). Cached frames appear instantly; missing ones load progressively — the
+// active frame first (shown + reframed as soon as it's ready), then the rest
+// newest→oldest with bounded concurrency — instead of one unthrottled
+// Promise.all over all 48 (#379).
+const PRELOAD_CONCURRENCY = 6;
+
 async function loadFrames(reframe = false) {
   const id = $coll.value, q = $qty.value, rep = $rep.value || "points";
   const num = $num.value.trim();
   if (!id || !q) return;
   const token = ++loadToken;
   stopPlaying();
-  clearFrames();
+  hideFrames();
   clearVoxel();
   currentRep = rep;
   pointsFetchFloor = rep === "points" ? (num === "" ? -Infinity : parseFloat(num)) : null;
@@ -358,33 +405,71 @@ async function loadFrames(reframe = false) {
   if (frameIdx >= frameTimes.length) frameIdx = frameTimes.length - 1;
   if (frameIdx < 0) frameIdx = 0;
   const capped = times.length > frameTimes.length ? ` (latest ${frameTimes.length} of ${times.length})` : "";
-  setStatus(`loading ${id} · ${q} · ${rep}${frameTimes.length > 1 ? ` · ${frameTimes.length} frames${capped}` : ""}…`);
 
-  // Preload all frames concurrently, each hidden. `preloadWhenHidden` is
-  // load-bearing: without it a hidden tileset doesn't fetch tiles, so the first
-  // reveal of each frame would stall — with it, every frame's content streams in
-  // the background and showing it is an instant visibility flip. (Bounded by the
-  // engine's retained-volume count; a sliding window would suit much longer
-  // sequences — a follow-up.) `fromUrl` rejects on a 4xx (e.g. no data).
-  const built = await Promise.all(frameTimes.map((t) =>
-    Cesium.Cesium3DTileset.fromUrl(tilesetUrl(t),
-      { maximumScreenSpaceError: 1, show: false, preloadWhenHidden: true })
-      .catch((e) => { console.error("frame", t, e); return null; })
-  ));
-  if (token !== loadToken) { for (const ts of built) if (ts) ts.destroy(); return; } // superseded
-
-  frames = built;
-  for (const ts of frames) if (ts) viewer.scene.primitives.add(ts);
+  // Satisfy what we can from the frame cache, then show it immediately — a
+  // control toggled back to cached params renders with zero network.
+  const urls = frameTimes.map((t) => tilesetUrl(t));
+  frames = urls.map((u) => cacheGet(u));
   if (rep === "points") applyPointStyle(pointsFetchFloor);
   syncTimeBar();
   showFrame(frameIdx);
 
-  if (reframe) {
+  // Load order for the misses: the active frame first (it's what's on screen),
+  // then the rest newest→oldest so recent frames fill in first.
+  const pending = [];
+  if (!frames[frameIdx]) pending.push(frameIdx);
+  for (let i = frames.length - 1; i >= 0; i--) if (i !== frameIdx && !frames[i]) pending.push(i);
+  const progress = () => {
+    const done = frames.filter(Boolean).length;
+    setStatus(`loading ${id} · ${q} · ${rep} · frame ${done}/${frameTimes.length}${capped}…`);
+  };
+  if (pending.length) progress();
+
+  // Reframe the camera as soon as the active frame exists (cached, or first to
+  // load) — don't hold the view hostage to the background fill.
+  let needReframe = reframe;
+  const maybeReframe = async () => {
     const ts = frames[frameIdx];
-    if (ts) await viewer.zoomTo(ts, new Cesium.HeadingPitchRange(
+    if (!needReframe || !ts) return;
+    needReframe = false;
+    await viewer.zoomTo(ts, new Cesium.HeadingPitchRange(
       Cesium.Math.toRadians(45), Cesium.Math.toRadians(-28), 300000));
-    if (token !== loadToken) return; // superseded during the zoomTo animation
-  }
+  };
+  await maybeReframe();
+  if (token !== loadToken) return; // superseded during the zoomTo animation
+
+  // Bounded-concurrency fill: PRELOAD_CONCURRENCY workers pull from `pending`.
+  // Each frame is created hidden; `preloadWhenHidden` is load-bearing — without
+  // it a hidden tileset doesn't fetch tiles, so the first reveal would stall.
+  // `fromUrl` rejects on a 4xx (e.g. no data) → that slot stays null. A
+  // superseded build still caches what it fetched (it may be toggled back to);
+  // it just stops touching the live `frames`.
+  let next = 0;
+  const worker = async () => {
+    while (next < pending.length && token === loadToken) {
+      const i = pending[next++];
+      let ts = null;
+      try {
+        ts = await Cesium.Cesium3DTileset.fromUrl(urls[i],
+          { maximumScreenSpaceError: 1, show: false, preloadWhenHidden: true });
+      } catch (e) { console.error("frame", frameTimes[i], e); }
+      if (ts) {
+        viewer.scene.primitives.add(ts);
+        cachePut(urls[i], ts);
+      }
+      if (token !== loadToken) return; // superseded — the tileset stays cached
+      frames[i] = ts;
+      if (ts) {
+        if (currentRep === "points") stylePointFrame(ts, pointsStyleMin);
+        syncTimeBar(); // unhides the time bar once the first frame exists
+        if (i === frameIdx) { showFrame(frameIdx); await maybeReframe(); }
+      }
+      progress();
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(PRELOAD_CONCURRENCY, pending.length) }, () => worker()));
+  if (token !== loadToken) return;
+
   if (!frames.some(Boolean)) setStatus("no data for this selection", true);
   else updateStatus();
 }
@@ -509,18 +594,20 @@ function showFrame(i) {
 // Point-cloud style applied to EVERY frame so the whole animation filters/sizes
 // consistently: drop points below `min` and scale each dot by its reflectivity
 // (the per-point `value` batch property). Both read `${value}` (a mesh ignores
-// both).
-function applyPointStyle(min) {
+// both). `pointsStyleMin` remembers the applied min so frames still arriving
+// from the progressive preload get the same style.
+function stylePointFrame(ts, min) {
   const cond = Number.isFinite(min) ? "${value} >= " + min : "true";
-  for (const ts of frames) {
-    if (!ts) continue;
-    ts.style = new Cesium.Cesium3DTileStyle({
-      show: cond,
-      // Steep ramp so weak vs strong reads clearly: ~1 px at 5 dBZ up to 16 px at
-      // 55 dBZ (slope 0.3). Weak clutter stays a speck; storm cores are fat dots.
-      pointSize: "clamp((${value} - 5.0) * 0.3 + 1.0, 1.0, 16.0)",
-    });
-  }
+  ts.style = new Cesium.Cesium3DTileStyle({
+    show: cond,
+    // Steep ramp so weak vs strong reads clearly: ~1 px at 5 dBZ up to 16 px at
+    // 55 dBZ (slope 0.3). Weak clutter stays a speck; storm cores are fat dots.
+    pointSize: "clamp((${value} - 5.0) * 0.3 + 1.0, 1.0, 16.0)",
+  });
+}
+function applyPointStyle(min) {
+  pointsStyleMin = min;
+  for (const ts of frames) if (ts) stylePointFrame(ts, min);
 }
 
 // The `min dBZ` field for a point cloud filters CLIENT-SIDE across all frames (no
@@ -571,13 +658,24 @@ function updateStatus(extra) {
   setStatus(extra ? `${base} · ${extra}` : base);
 }
 
+// Next loaded frame at-or-after `from` (wrapping): playback can start while the
+// progressive preload is still filling, so skip slots that are null (failed or
+// not yet loaded) rather than flashing empty frames.
+function nextLoadedFrame(from) {
+  for (let k = 0; k < frames.length; k++) {
+    const i = (((from + k) % frames.length) + frames.length) % frames.length;
+    if (frames[i]) return i;
+  }
+  return from;
+}
+
 function startPlaying() {
   // Need >1 frame AND at least one that actually loaded — otherwise play would
   // loop forever showing nothing (every frame's fromUrl can fail → all null).
   if (playing || frames.length <= 1 || !frames.some(Boolean)) return;
   playing = true;
   $play.textContent = "⏸";
-  playTimer = setInterval(() => showFrame(frameIdx + 1), FRAME_MS);
+  playTimer = setInterval(() => showFrame(nextLoadedFrame(frameIdx + 1)), FRAME_MS);
 }
 
 function stopPlaying() {
@@ -586,11 +684,12 @@ function stopPlaying() {
   if (playTimer) { clearInterval(playTimer); playTimer = null; }
 }
 
-// Collection switch → reframe (new volume, possibly elsewhere). Every other
-// control is an in-place change → preserve the camera. (Arrow wrappers are
-// load-bearing: passing the handler bare would feed the DOM Event as `reframe`,
-// which is truthy and would reframe on every filter tweak.)
-$coll.addEventListener("change", () => loadCollectionMeta(true));
+// Collection switch → drop the frame cache (those tilesets are another volume,
+// likely elsewhere) and reframe. Every other control is an in-place change →
+// preserve the camera AND the cache, so toggling back is instant. (Arrow
+// wrappers are load-bearing: passing the handler bare would feed the DOM Event
+// as `reframe`, which is truthy and would reframe on every filter tweak.)
+$coll.addEventListener("change", () => { clearFrameCache(); loadCollectionMeta(true); });
 $qty.addEventListener("change", () => loadFrames(false));
 // Switching representation relabels + re-defaults the numeric field, toggles the
 // Resolution selector, then rebuilds the frames (camera preserved).
