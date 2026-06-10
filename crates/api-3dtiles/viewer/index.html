@@ -332,6 +332,15 @@ function tilesetUrl(time) {
 const tileCache = new Map(); // tileset URL → Cesium3DTileset (in scene.primitives, hidden)
 const TILE_CACHE_MAX = 2 * MAX_FRAMES;
 
+// Remove a tileset from the scene AND make sure its GPU buffers are freed.
+// remove() destroys only when the primitive collection has
+// destroyPrimitives:true (the CesiumJS default, but nothing asserts it) — the
+// explicit destroy() makes eviction leak-proof regardless of the flag.
+function dropTileset(ts) {
+  viewer.scene.primitives.remove(ts);
+  if (!ts.isDestroyed()) ts.destroy();
+}
+
 function cacheGet(url) {
   const ts = tileCache.get(url);
   if (!ts) return null;
@@ -345,27 +354,27 @@ function cachePut(url, ts) {
   pinned.add(ts);
   // Two overlapping builds can both fetch the same URL (the first superseded
   // mid-flight), so the slower one finds the winner already in the map. If the
-  // existing entry is hidden, it's the orphan — remove it and overwrite. But a
+  // existing entry is hidden, it's the orphan — drop it and overwrite. But a
   // stale worker can also land AFTER a newer build cached and displayed the
   // same URL (rapid A→B→A toggling): then `prev` is the live, pinned frame and
-  // the incoming `ts` is the stale duplicate — discard `ts` (it was added to
-  // the scene just before this call) and keep the map pointing at `prev`;
-  // overwriting would orphan the live tileset out of the cache, beyond the
-  // reach of both LRU eviction and clearFrameCache. (The stale caller's
-  // token guard fires right after this returns, so the destroyed `ts` is
-  // never assigned into `frames`.)
+  // the incoming `ts` is the stale duplicate — destroy `ts` (it was added to
+  // the scene just before this call), keep the map pointing at `prev`, and
+  // return false so the caller drops its now-dead reference; overwriting would
+  // orphan the live tileset out of the cache, beyond the reach of both LRU
+  // eviction and clearFrameCache.
   const prev = tileCache.get(url);
   if (prev && prev !== ts) {
-    if (pinned.has(prev)) { viewer.scene.primitives.remove(ts); return; }
-    viewer.scene.primitives.remove(prev);
+    if (pinned.has(prev)) { dropTileset(ts); return false; }
+    dropTileset(prev);
   }
   tileCache.set(url, ts);
   for (const [u, old] of tileCache) {
     if (tileCache.size <= TILE_CACHE_MAX) break;
     if (pinned.has(old)) continue; // never evict a frame in active use
     tileCache.delete(u);
-    viewer.scene.primitives.remove(old);
+    dropTileset(old);
   }
+  return true;
 }
 // Collection switch: the cached frames belong to another volume entirely —
 // destroy them all rather than letting them age out of the LRU. Bumping
@@ -377,7 +386,7 @@ function clearFrameCache() {
   stopPlaying(); // don't leave the play timer ticking over an emptied `frames`
   cacheGen++;
   frames = [];
-  for (const ts of tileCache.values()) viewer.scene.primitives.remove(ts);
+  for (const ts of tileCache.values()) dropTileset(ts);
   tileCache.clear();
 }
 
@@ -491,7 +500,7 @@ async function loadFrames(reframe = false) {
       if (ts && gen !== cacheGen) { ts.destroy(); ts = null; }
       if (ts) {
         viewer.scene.primitives.add(ts);
-        cachePut(urls[i], ts);
+        if (!cachePut(urls[i], ts)) ts = null; // stale dup of a live pinned frame — destroyed
       }
       if (token !== loadToken) return; // superseded — the tileset stays cached
       frames[i] = ts;
