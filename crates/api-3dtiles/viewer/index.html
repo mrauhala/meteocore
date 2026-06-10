@@ -448,7 +448,11 @@ function voxelShader(quantity, legend, min) {
   // though it comes from server metadata (ODIM quantities are A-Z0-9_). Sandboxed
   // to our own GPU context, but cheap defence-in-depth.
   if (!/^[A-Z][A-Z0-9_]*$/.test(quantity)) throw new Error("invalid quantity: " + quantity);
-  const lg = (legend && legend.stops && legend.stops.length >= 2)
+  // Also guard non-finite min/max: `(NaN|Infinity).toFixed(2)` emits the
+  // literal "NaN"/"Infinity" into the GLSL below → the shader fails to compile
+  // and the volume goes dark. (serde can emit those for IEEE-754 specials.)
+  const lg = (legend && legend.stops && legend.stops.length >= 2
+              && Number.isFinite(legend.min) && Number.isFinite(legend.max))
     ? legend
     : { min: 0, max: 70, stops: [{ color: "#0000ff" }, { color: "#ff0000" }] };
   const n = lg.stops.length;

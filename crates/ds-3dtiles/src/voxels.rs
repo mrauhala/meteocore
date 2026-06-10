@@ -638,4 +638,24 @@ mod tests {
         }
         assert!(call(safe, safe_sub).is_ok());
     }
+
+    #[test]
+    fn azimuth_remap_pins_the_render_verified_270_offset() {
+        // `grid_azimuth_index` carries the one value in this encoder that a
+        // structural/round-trip test can't catch: the **270° − φ** offset, which
+        // is render-verified against the point cloud (CesiumJS's effective
+        // cylinder-angle origin sits opposite to its spec — see the fn docs). For
+        // n_a = 360 the mapping reduces to `(449 − slot) mod 360`; pin a few
+        // points so a future CesiumJS convention shift trips this test rather
+        // than silently rotating the volume.
+        assert_eq!(grid_azimuth_index(0, 360), 89);
+        assert_eq!(grid_azimuth_index(90, 360), 359);
+        assert_eq!(grid_azimuth_index(180, 360), 269);
+        assert_eq!(grid_azimuth_index(270, 360), 179);
+        // Must be a bijection over 0..n_a — every radar azimuth bin used exactly
+        // once (no bin dropped or doubled by a bad offset/rounding).
+        let mapped: std::collections::HashSet<usize> =
+            (0..360).map(|s| grid_azimuth_index(s, 360)).collect();
+        assert_eq!(mapped.len(), 360);
+    }
 }

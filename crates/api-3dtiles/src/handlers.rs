@@ -158,6 +158,21 @@ static POINT_LEGEND: LazyLock<serde_json::Value> = LazyLock::new(|| {
     })
 });
 
+/// Dedicated concurrency limiter for **voxel** content encodes — separate from
+/// the shared `render_semaphore`. A `high`-resolution voxel (11.8 M cells, 4
+/// blur passes) is ~12 s of single-threaded CPU; running it on the shared raster
+/// pool would let one voxel request hold a WMS/Maps/Tiles render slot for that
+/// whole window. On its own small pool, slow voxel encodes serialise among
+/// themselves and never touch raster capacity. Sized to ¼ of the cores (≥1) so a
+/// couple can overlap without oversubscribing the box. Process-global (one
+/// server, one limit) → a `LazyLock` static, not per-collection state.
+static VOXEL_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
+    let n = std::thread::available_parallelism()
+        .map(|c| (c.get() / 4).max(1))
+        .unwrap_or(1);
+    Arc::new(tokio::sync::Semaphore::new(n))
+});
+
 /// The blue→red **height** colour ramp for the echo-top product (stops at height
 /// values, 0–15 km) — a builtin colormap's stops are in its own units, so they
 /// collapse over a height range; build it explicitly. Fixed ramp, so build it
@@ -862,12 +877,14 @@ pub async fn get_voxel_content(
     let quantity = params.quantity.clone();
     let dims = Resolution::parse(params.resolution.as_deref())?.dims();
 
-    let _permit = state
-        .render_semaphore
+    // Dedicated voxel pool (NOT the shared raster `render_semaphore`) so a slow
+    // `high`-res encode can't hold a WMS/Maps/Tiles render slot — see
+    // `VOXEL_SEMAPHORE`.
+    let _permit = VOXEL_SEMAPHORE
         .clone()
         .acquire_owned()
         .await
-        .map_err(|_| Tiles3dError::Internal("render semaphore closed".into()))?;
+        .map_err(|_| Tiles3dError::Internal("voxel semaphore closed".into()))?;
     let engine = engine.clone();
     let id_for_err = id.clone();
     let (bytes, etag) =
