@@ -258,6 +258,11 @@ async function loadCollectionMeta(reframe) {
       $rep.appendChild(o);
     }
     syncNumField();
+    // Drop the previous collection's cached frames only now that the new
+    // collection's metadata is in hand — if the fetch above failed, the old
+    // collection stays on screen instead of going blank. (On the initial load
+    // the cache is empty and this is a no-op.)
+    clearFrameCache();
     await loadFrames(reframe);
   } catch (e) {
     setStatus("error loading collection — " + e, true);
@@ -343,7 +348,10 @@ function cachePut(url, ts) {
   const prev = tileCache.get(url);
   if (prev && prev !== ts && !frames.includes(prev)) viewer.scene.primitives.remove(prev);
   tileCache.set(url, ts);
+  // Pin the active frames AND the entry just inserted (`frames[i] = ts` only
+  // happens after cachePut returns, so `ts` isn't in `frames` yet).
   const pinned = new Set(frames);
+  pinned.add(ts);
   for (const [u, old] of tileCache) {
     if (tileCache.size <= TILE_CACHE_MAX) break;
     if (pinned.has(old)) continue; // never evict a frame in active use
@@ -699,12 +707,12 @@ function stopPlaying() {
   if (playTimer) { clearInterval(playTimer); playTimer = null; }
 }
 
-// Collection switch → drop the frame cache (those tilesets are another volume,
-// likely elsewhere) and reframe. Every other control is an in-place change →
-// preserve the camera AND the cache, so toggling back is instant. (Arrow
-// wrappers are load-bearing: passing the handler bare would feed the DOM Event
-// as `reframe`, which is truthy and would reframe on every filter tweak.)
-$coll.addEventListener("change", () => { clearFrameCache(); loadCollectionMeta(true); });
+// Collection switch → drop the frame cache (inside loadCollectionMeta, once the
+// new metadata fetch succeeds) and reframe. Every other control is an in-place
+// change → preserve the camera AND the cache, so toggling back is instant.
+// (Arrow wrappers are load-bearing: passing the handler bare would feed the DOM
+// Event as `reframe`, which is truthy and would reframe on every filter tweak.)
+$coll.addEventListener("change", () => loadCollectionMeta(true));
 $qty.addEventListener("change", () => loadFrames(false));
 // Switching representation relabels + re-defaults the numeric field, toggles the
 // Resolution selector, then rebuilds the frames (camera preserved).
