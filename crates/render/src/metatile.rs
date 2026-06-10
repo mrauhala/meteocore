@@ -30,7 +30,6 @@
 //! CRSs fall back to a direct single-shot render. Degenerate or pathologically
 //! large requests return [`MetaTile::Fallback`] so the caller renders directly.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -317,8 +316,18 @@ where
     }
 
     // Render or fetch each covering tile's RGBA pixels. `None` = an all-nodata
-    // tile (cached as a marker, drawn transparent at assembly time).
-    let mut tiles: HashMap<(i64, i64), Option<Arc<[u8]>>> = HashMap::with_capacity(ncols * nrows);
+    // tile (cached as a marker, drawn transparent at assembly time). The cover
+    // is a dense rectangle, so the tiles live in a row-major `Vec` indexed by
+    // grid position — the assembly loop below samples it 4× per output pixel,
+    // and a hash lookup there was ~8× the cost of the whole resample at
+    // megapixel viewports.
+    let mut tiles = Mosaic {
+        col0,
+        row0,
+        ncols,
+        nrows,
+        tiles: Vec::with_capacity(ncols * nrows),
+    };
     let mut any_data = false;
     let mut misses: u32 = 0;
     let tiles_count = (ncols * nrows) as u32;
@@ -374,7 +383,7 @@ where
                 );
                 entry
             };
-            tiles.insert((col, row), rgba);
+            tiles.tiles.push(rgba);
         }
     }
     let tile_loop_ms = t_loop.elapsed().as_millis() as u64;
@@ -438,29 +447,55 @@ where
     })
 }
 
+/// The rendered covering tiles, stored row-major over the dense rectangular
+/// grid `[col0..col0+ncols) × [row0..row0+nrows)`. `None` = an all-nodata
+/// tile. Indexed (not hashed) because the assembly loop samples it 4× per
+/// output pixel.
+struct Mosaic {
+    col0: i64,
+    row0: i64,
+    ncols: usize,
+    nrows: usize,
+    tiles: Vec<Option<Arc<[u8]>>>,
+}
+
+impl Mosaic {
+    /// The tile at grid position `(col, row)`, or `None` for a nodata marker
+    /// or a position outside the cover (only reachable ≤1px past an edge).
+    #[inline]
+    fn tile(&self, col: i64, row: i64) -> Option<&Arc<[u8]>> {
+        let c = col.wrapping_sub(self.col0) as usize;
+        let r = row.wrapping_sub(self.row0) as usize;
+        if c >= self.ncols || r >= self.nrows {
+            return None;
+        }
+        self.tiles[r * self.ncols + c].as_ref()
+    }
+}
+
 /// Fetch one global tile-pixel (nearest) from the covering set; transparent if
 /// the pixel falls outside the rendered tiles (only possible ≤1px past an edge).
 #[inline]
-fn global_pixel(tiles: &HashMap<(i64, i64), Option<Arc<[u8]>>>, xi: i64, yi: i64) -> [u8; 4] {
+fn global_pixel(tiles: &Mosaic, xi: i64, yi: i64) -> [u8; 4] {
     let col = xi.div_euclid(TILE_PX as i64);
     let row = yi.div_euclid(TILE_PX as i64);
     let lx = xi.rem_euclid(TILE_PX as i64) as usize;
     let ly = yi.rem_euclid(TILE_PX as i64) as usize;
-    match tiles.get(&(col, row)) {
-        // Present with data; nodata markers (`Some(None)`) and absent tiles
-        // (≤1px past an edge) are transparent.
-        Some(Some(rgba)) => {
+    match tiles.tile(col, row) {
+        // Present with data; nodata markers and absent tiles (≤1px past an
+        // edge) are transparent.
+        Some(rgba) => {
             let o = (ly * TILE_PX as usize + lx) * 4;
             [rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3]]
         }
-        _ => [0, 0, 0, 0],
+        None => [0, 0, 0, 0],
     }
 }
 
 /// Premultiplied-alpha bilinear sample of the mosaic at global tile-pixel
 /// coordinates `(gx, gy)` (pixel centres at integer + 0.5).
 #[inline]
-fn sample_bilinear(tiles: &HashMap<(i64, i64), Option<Arc<[u8]>>>, gx: f64, gy: f64) -> [u8; 4] {
+fn sample_bilinear(tiles: &Mosaic, gx: f64, gy: f64) -> [u8; 4] {
     let fx = gx - 0.5;
     let fy = gy - 0.5;
     let x0 = fx.floor();
