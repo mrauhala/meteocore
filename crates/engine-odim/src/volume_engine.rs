@@ -136,6 +136,12 @@ pub fn pixel_cache_metrics() -> (u64, u64, u64, u64, u64) {
 /// `(volume, quantity, dims)` — without this cache every representation,
 /// threshold change, and animation frame repeats the multi-million-cell polar
 /// resample. 512 MB holds ~24 `med` grids — roughly one animation window.
+///
+/// Memory-hygiene note: entries for volumes retired by `max_files` /
+/// `time_window` are only reclaimed by LRU pressure (the key has no
+/// data-version, because a volume file is immutable). On a long-running
+/// deployment, bound the source's retention (`max_files` / `time_window`) so
+/// retired-volume grids cycle out instead of crowding the budget.
 const DEFAULT_VOXEL_GRID_CACHE_MB: u64 = 512;
 
 /// Cache key: source-qualified volume file id (see [`pixel_cache_id`]) +
@@ -3665,11 +3671,16 @@ impl VolumeEngine for PolarVolumeSiteView {
             Arc::from(quantity.as_str()),
             dims,
         );
-        let (grid, valid) = if let Some(hit) = VOXEL_GRID_CACHE.get(&key) {
-            VOXEL_GRID_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            hit
-        } else {
-            VOXEL_GRID_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // `get_or_insert_with` is the single-flight: quick_cache's placeholder
+        // guard runs the closure for exactly one caller per key and blocks
+        // concurrent callers until it finishes — so simultaneous first-time
+        // requests for *different representations* of the same grid (whose
+        // content-cache keys differ, hence separate gates there) still share
+        // one polar resample (PR #378 review). Blocking the calling thread is
+        // fine: every caller is on a `spawn_blocking` pool by contract.
+        let mut computed = false;
+        let (grid, valid) = VOXEL_GRID_CACHE.get_or_insert_with(&key, || {
+            computed = true;
             let handle = blocking_pixel_handle();
             let pix = Pixels {
                 source: &self.source,
@@ -3677,10 +3688,13 @@ impl VolumeEngine for PolarVolumeSiteView {
             };
             let (grid, valid) =
                 voxel_grid_from_volume(&entry.volume, &entry.id, pix, &quantity, Some(dims))?;
-            let cached = (Arc::new(grid), valid);
-            VOXEL_GRID_CACHE.insert(key, cached.clone());
-            cached
-        };
+            Ok::<_, DataServerError>((Arc::new(grid), valid))
+        })?;
+        if computed {
+            VOXEL_GRID_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            VOXEL_GRID_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // No sampled cell (every cell outside the beam fan / nodata) ⇒ 404,
         // matching the other engines' "no data in window" convention.

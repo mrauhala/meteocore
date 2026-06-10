@@ -335,27 +335,32 @@ fn etag_of(bytes: &[u8]) -> String {
     format!("\"{h:016x}\"")
 }
 
-/// The `Cache-Control` for a response: content pinned to an explicit
-/// `?datetime=` is an archived volume that effectively never changes, so let
+/// The `Cache-Control` for a response: content pinned to an **exactly
+/// advertised** volume time is an archived volume that never changes, so let
 /// browsers hold it for a day without revalidating (`immutable`) — exactly the
-/// WMS explicit-`TIME` policy. The bundled viewer pins every animation frame,
-/// so a reload re-uses all of them from the browser cache instead of issuing
-/// one revalidation per frame.
+/// WMS explicit-`TIME` policy. The bundled viewer pins every animation frame
+/// from the `times` manifest, so a reload re-uses all of them from the browser
+/// cache instead of issuing one revalidation per frame.
 ///
-/// Caveat (accepted): for a pinned time the engine selects the *nearest*
-/// retained volume, so if a closer volume arrives later the same URL would
-/// serve different bytes; clients that pin times from the advertised `times`
-/// manifest (the viewer does) always name an exact volume, where the response
-/// truly is immutable.
-///
-/// "Latest" (no `?datetime=`) keeps the short window: a new volume must show
-/// up within a minute.
+/// `pinned` must be computed via [`exact_volume_time`], NOT from the mere
+/// presence of `?datetime=`: the engine selects the *nearest* retained volume,
+/// so a datetime **between** volumes can start resolving to different bytes
+/// when a closer volume arrives — `immutable` would let browsers and shared
+/// caches (CDN/reverse proxy) serve that stale for a day (PR #378 review).
+/// Non-exact pinned times and "latest" both keep the short window.
 fn cache_control(pinned: bool) -> &'static str {
     if pinned {
         "public, max-age=86400, immutable"
     } else {
         "public, max-age=60"
     }
+}
+
+/// Whether `time` names an **exactly advertised** volume time — the only case
+/// where a response is truly immutable (see [`cache_control`]). `VolumeInfo.
+/// times` is sorted ascending per the engine contract, so binary search.
+fn exact_volume_time(info: &ds_core::volume::VolumeInfo, time: Option<DateTime<Utc>>) -> bool {
+    time.is_some_and(|t| info.times.binary_search(&t).is_ok())
 }
 
 /// Build a binary content response with strong-ETag conditional handling: a
@@ -467,9 +472,9 @@ pub async fn get_tileset(
     // URI so the content fetch is deterministic. Re-format the parsed time as
     // UTC `…Z` — a raw `+hh:mm` offset would be decoded as a space by the
     // client's URL parser and 400 on the fetch.
+    let time = params.datetime.as_deref().map(parse_datetime).transpose()?;
     let mut query = format!("quantity={}", pct_encode(&quantity));
-    if let Some(dt_str) = &params.datetime {
-        let dt = parse_datetime(dt_str)?;
+    if let Some(dt) = time {
         query.push_str(&format!("&datetime={}", dt.format("%Y-%m-%dT%H:%M:%SZ")));
     }
 
@@ -536,12 +541,13 @@ pub async fn get_tileset(
     Ok((
         [
             (header::CONTENT_TYPE, "application/json"),
-            // Pinned-time tilesets are stable like their content (the region
-            // is the site's static coverage), so let browsers keep them too —
-            // the viewer fetches one tileset per preloaded animation frame.
+            // Tilesets pinned to an exact advertised volume time are stable
+            // like their content (the region is the site's static coverage),
+            // so let browsers keep them too — the viewer fetches one tileset
+            // per preloaded animation frame.
             (
                 header::CACHE_CONTROL,
-                cache_control(params.datetime.is_some()),
+                cache_control(exact_volume_time(&info, time)),
             ),
         ],
         tileset,
@@ -585,7 +591,7 @@ pub async fn get_content(
         dims: [0; 3],
         version: data_version(&info),
     };
-    let pinned = time.is_some();
+    let pinned = exact_volume_time(&info, time);
 
     let engine = engine.clone();
     let semaphore = state.render_semaphore.clone();
@@ -720,7 +726,7 @@ pub async fn get_content_glb(
         dims,
         version: data_version(&info),
     };
-    let pinned = time.is_some();
+    let pinned = exact_volume_time(&info, time);
 
     let engine = engine.clone();
     let semaphore = state.render_semaphore.clone();
@@ -853,9 +859,9 @@ pub async fn get_voxel_tileset(
 
     // The content fetch must render the same selection — bake it into the
     // (relative) content URI's query, alongside the implicit-tiling placeholders.
+    let time = params.datetime.as_deref().map(parse_datetime).transpose()?;
     let mut q = format!("quantity={}", pct_encode(&quantity));
-    if let Some(dt) = &params.datetime {
-        let dt = parse_datetime(dt)?;
+    if let Some(dt) = time {
         q.push_str(&format!("&datetime={}", dt.format("%Y-%m-%dT%H:%M:%SZ")));
     }
     q.push_str(&format!("&resolution={}", resolution.as_str()));
@@ -881,7 +887,7 @@ pub async fn get_voxel_tileset(
     // route through the shared ETag/conditional-GET helper so a CesiumJS poll
     // with a matching `If-None-Match` short-circuits to 304 (matches the
     // `content.pnts`/`content.glb` handlers).
-    let pinned = params.datetime.is_some();
+    let pinned = exact_volume_time(&info, time);
     let bytes = Bytes::from(tileset.into_bytes());
     let etag = etag_of(&bytes);
     Ok(binary_response(
@@ -1006,7 +1012,7 @@ pub async fn get_voxel_content(
         dims,
         version: data_version(&info),
     };
-    let pinned = time.is_some();
+    let pinned = exact_volume_time(&info, time);
 
     let engine = engine.clone();
     let id_for_err = key.collection.clone();

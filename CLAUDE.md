@@ -428,10 +428,11 @@ into a glTF `.glb` triangle mesh.
   changes share one polar resample (`MC_PVOL_VOXEL_GRID_CACHE_MB`, default 512);
   the resample itself resolves each `(radius, height)` column once
   (`ColumnTarget`) instead of per-cell sweep/moment/pixel-cache lookups.
-  **`Cache-Control`:** content/tilesets pinned to an explicit `?datetime=` get
-  `max-age=86400, immutable` (the viewer pins every animation frame, so reloads
-  re-use the browser cache); "latest" keeps `max-age=60`. A 304 revalidation
-  costs two cache lookups, not a recompute. Cache metrics are in `/metrics`
+  **`Cache-Control`:** content/tilesets whose `?datetime=` **exactly matches an
+  advertised volume time** get `max-age=86400, immutable` (the viewer pins every
+  animation frame from the `times` manifest, so reloads re-use the browser
+  cache); a between-volumes datetime (nearest-selection can change) and "latest"
+  keep `max-age=60`. A 304 revalidation costs two cache lookups, not a recompute. Cache metrics are in `/metrics`
   (`tiles3d_content_cache_*`, `pvol_voxel_grid_cache_*`). `content_uri` is
   validated (no `..`/absolute/scheme) in `ds-3dtiles`.
 - **Config:** add `"3dtiles"` to a collection's `apis` (only `odim-volume`

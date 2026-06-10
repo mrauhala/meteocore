@@ -989,3 +989,15 @@ async fn pinned_datetime_gets_immutable_cache_control() {
         "public, max-age=86400, immutable"
     );
 }
+
+#[tokio::test]
+async fn non_manifest_datetime_is_not_immutable() {
+    // A datetime BETWEEN advertised volume times resolves by nearest-volume
+    // selection, which can change when a closer volume arrives — it must NOT
+    // get the immutable policy (PR #378 review).
+    let (s, _b, h) =
+        get("/collections/radar-fivih/content.pnts?quantity=DBZH&datetime=2026-05-15T00:02:30Z")
+            .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h[axum::http::header::CACHE_CONTROL], "public, max-age=60");
+}
