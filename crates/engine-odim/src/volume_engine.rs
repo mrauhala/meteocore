@@ -1303,6 +1303,11 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         // voxel grid — and thus the isosurface mesh — is built relative to).
         voxel_grid: Some(ds_core::volume::VoxelGridCaps {
             origin: [site.lon, site.lat, site.height],
+            // Cylinder extents for the voxel 3D Tiles bounding volume — the same
+            // ground-coverage radius the grid sampler uses (so the bounding
+            // cylinder matches the grid exactly) and the shared height ceiling.
+            radius_m: coverage_radius_m.unwrap_or(0.0),
+            height_m: VOXEL_HEIGHT_CEILING_M,
         }),
     });
 

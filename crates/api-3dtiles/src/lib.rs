@@ -34,5 +34,19 @@ pub fn router(state: AppState) -> Router {
             "/collections/{id}/content.glb",
             get(handlers::get_content_glb),
         )
+        // True-voxel tileset (#351): its own sub-path so the implicit-tiling
+        // `{level}/{x}/{y}/{z}` content/subtree URIs resolve relatively.
+        .route(
+            "/collections/{id}/voxel/tileset.json",
+            get(handlers::get_voxel_tileset),
+        )
+        .route(
+            "/collections/{id}/voxel/subtrees/{*tile}",
+            get(handlers::get_voxel_subtree),
+        )
+        .route(
+            "/collections/{id}/voxel/content/{*tile}",
+            get(handlers::get_voxel_content),
+        )
         .with_state(state)
 }

@@ -32,6 +32,11 @@ pub use isosurface::{encode_isosurface_glb, tileset_json_glb};
 pub mod echo_top;
 pub use echo_top::{encode_echo_top_columns_glb, encode_echo_top_glb};
 
+/// True cylindrical voxels (#351): `VoxelGrid` → `EXT_primitive_voxels` glTF
+/// `.glb` + `3DTILES_content_voxels` tileset for CesiumJS volume ray-marching.
+pub mod voxels;
+pub use voxels::{encode_voxels_glb, tileset_json_voxels, voxel_subtree_json};
+
 /// Top-level tileset geometric error. Must be > 0 (see module docs); the value
 /// only needs to exceed the root's so CesiumJS refines to the content.
 const TILESET_GEOMETRIC_ERROR: f64 = 1.0e5;
@@ -73,6 +78,68 @@ pub enum Tiles3dError {
     /// returning a bogus mesh.
     #[error("isosurface background {background} must be < threshold {threshold}")]
     BackgroundNotBelowThreshold { background: f64, threshold: f64 },
+    /// `serde_json` failed to serialize a tile/tileset value. The values are
+    /// built from finite numbers and owned strings, so this is not expected in
+    /// practice — but returning it (rather than `expect`-panicking inside a
+    /// `spawn_blocking` task, where the message is lost to a generic 500)
+    /// preserves the source error for the caller to surface.
+    #[error("3D Tiles JSON serialize failed: {0}")]
+    Serialize(String),
+}
+
+/// Reject a `content`/`subtree` URI that is not a safe **server-relative** path:
+/// empty, absolute (`/…`), scheme-qualified (`…://…`), or `..`-traversing.
+/// CesiumJS fetches whatever URL a tileset names, so every encoder that embeds a
+/// caller-supplied URI runs it through this guard (defence-in-depth for a `pub`
+/// API — today's callers all build the URIs server-side).
+pub(crate) fn validate_uri(uri: &str) -> Result<(), Tiles3dError> {
+    // Scan for `..` over the PATH only (drop any `?query`/`#fragment` first):
+    // a `..` directly before the query (`a/..?x=1`) must still be caught, while
+    // a `..` *inside* a query value (`a.glb?from=../b`) is not a path segment and
+    // is harmless. The empty/absolute/scheme checks apply to the whole URI.
+    let path = uri.split(['?', '#']).next().unwrap_or(uri);
+    if uri.is_empty()
+        || uri.starts_with('/')
+        || uri.contains("://")
+        || path.split('/').any(|s| s == "..")
+    {
+        return Err(Tiles3dError::InvalidUri(uri.to_string()));
+    }
+    Ok(())
+}
+
+/// Assemble a binary glTF (`.glb`) from a glTF JSON value + a BIN buffer. Both
+/// chunks are padded to a 4-byte boundary (JSON with spaces, BIN with zeros) per
+/// the glTF 2.0 spec, and the total length is `u32::try_from`-checked so a >4 GiB
+/// tile errors rather than wrapping. Shared by every `.glb` encoder in the crate
+/// (voxels, isosurface, echo-top) so the overflow guard and the serialize-error
+/// path are written once.
+pub(crate) fn assemble_glb(
+    gltf: &serde_json::Value,
+    mut bin: Vec<u8>,
+) -> Result<Vec<u8>, Tiles3dError> {
+    let mut json_bytes =
+        serde_json::to_vec(gltf).map_err(|e| Tiles3dError::Serialize(e.to_string()))?;
+    while !json_bytes.len().is_multiple_of(4) {
+        json_bytes.push(b' ');
+    }
+    while !bin.len().is_multiple_of(4) {
+        bin.push(0);
+    }
+    let total = 12 + 8 + json_bytes.len() + 8 + bin.len();
+    let total = u32::try_from(total).map_err(|_| Tiles3dError::TooLarge("glb byteLength"))?;
+
+    let mut glb = Vec::with_capacity(total as usize);
+    glb.extend_from_slice(b"glTF");
+    glb.extend_from_slice(&2u32.to_le_bytes()); // version
+    glb.extend_from_slice(&total.to_le_bytes());
+    glb.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"JSON");
+    glb.extend_from_slice(&json_bytes);
+    glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"BIN\0");
+    glb.extend_from_slice(&bin);
+    Ok(glb)
 }
 
 /// Encode a point cloud as a 3D Tiles **`.pnts`** tile (the 3D Tiles 1.0 Point
@@ -246,13 +313,7 @@ pub(crate) fn tileset_value_for_region(
     region: [f64; 6],
     content_uri: &str,
 ) -> Result<serde_json::Value, Tiles3dError> {
-    if content_uri.is_empty()
-        || content_uri.starts_with('/')
-        || content_uri.contains("://")
-        || content_uri.split('/').any(|s| s == "..")
-    {
-        return Err(Tiles3dError::InvalidUri(content_uri.to_string()));
-    }
+    validate_uri(content_uri)?;
     if region.iter().any(|v| !v.is_finite()) {
         return Err(Tiles3dError::NonFinite("region"));
     }
@@ -452,6 +513,19 @@ mod tests {
         // A plain relative path is accepted.
         assert!(tileset_json(&cloud, "content.pnts").is_ok());
         assert!(tileset_json(&cloud, "tiles/0/content.pnts").is_ok());
+    }
+
+    #[test]
+    fn validate_uri_isolates_path_from_query() {
+        // `..` as a path segment right before the query is caught …
+        assert!(matches!(
+            validate_uri("content/..?t=1"),
+            Err(Tiles3dError::InvalidUri(_))
+        ));
+        // … but a `..` inside a query *value* is not a path segment — allowed
+        // (the implicit-tiling content URIs carry `?datetime=…` query strings).
+        assert!(validate_uri("content/0/0/0/0.glb?from=../other").is_ok());
+        assert!(validate_uri("content/{level}/{x}/{y}/{z}.glb?quantity=DBZH").is_ok());
     }
 
     #[test]

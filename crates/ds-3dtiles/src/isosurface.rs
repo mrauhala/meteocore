@@ -426,11 +426,11 @@ pub fn encode_isosurface_glb(
     if mesh.triangles == 0 {
         return Err(Tiles3dError::Empty);
     }
-    Ok(build_glb(&mesh, color))
+    build_glb(&mesh, color)
 }
 
 /// Assemble a single-mesh `.glb` from the accumulated triangles.
-fn build_glb(mesh: &MeshBuilder, color: [u8; 4]) -> Vec<u8> {
+fn build_glb(mesh: &MeshBuilder, color: [u8; 4]) -> Result<Vec<u8>, Tiles3dError> {
     let vertex_count = mesh.positions.len() / 3;
 
     // BIN buffer: POSITION (count·3·f32) then NORMAL (count·3·f32). Both are
@@ -495,27 +495,10 @@ fn build_glb(mesh: &MeshBuilder, color: [u8; 4]) -> Vec<u8> {
         "buffers": [ { "byteLength": bin.len() } ],
     });
 
-    let mut json_chunk = serde_json::to_vec(&gltf).expect("glTF JSON serializes");
-    while !json_chunk.len().is_multiple_of(4) {
-        json_chunk.push(b' '); // JSON chunk padded with spaces
-    }
-
-    // GLB = 12-byte header + JSON chunk + BIN chunk (each chunk: u32 length,
-    // u32 type, payload).
-    let total = 12 + 8 + json_chunk.len() + 8 + bin.len();
-    let mut glb = Vec::with_capacity(total);
-    glb.extend_from_slice(&0x46546C67u32.to_le_bytes()); // "glTF"
-    glb.extend_from_slice(&2u32.to_le_bytes()); // version
-    glb.extend_from_slice(&(total as u32).to_le_bytes());
-    // JSON chunk
-    glb.extend_from_slice(&(json_chunk.len() as u32).to_le_bytes());
-    glb.extend_from_slice(&0x4E4F534Au32.to_le_bytes()); // "JSON"
-    glb.extend_from_slice(&json_chunk);
-    // BIN chunk
-    glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
-    glb.extend_from_slice(&0x004E4942u32.to_le_bytes()); // "BIN\0"
-    glb.extend_from_slice(&bin);
-    glb
+    // Shared GLB assembler: 4-byte chunk padding + `u32`-checked total length +
+    // a serialize-error path instead of an `expect` panic. The BIN above is
+    // f32-only (always 4-aligned), so the helper's padding is a no-op here.
+    crate::assemble_glb(&gltf, bin)
 }
 
 /// Build the `tileset.json` for an isosurface `.glb`. Like

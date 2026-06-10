@@ -158,6 +158,21 @@ static POINT_LEGEND: LazyLock<serde_json::Value> = LazyLock::new(|| {
     })
 });
 
+/// Dedicated concurrency limiter for **voxel** content encodes — separate from
+/// the shared `render_semaphore`. A `high`-resolution voxel (11.8 M cells, 4
+/// blur passes) is ~12 s of single-threaded CPU; running it on the shared raster
+/// pool would let one voxel request hold a WMS/Maps/Tiles render slot for that
+/// whole window. On its own small pool, slow voxel encodes serialise among
+/// themselves and never touch raster capacity. Sized to ¼ of the cores (≥1) so a
+/// couple can overlap without oversubscribing the box. Process-global (one
+/// server, one limit) → a `LazyLock` static, not per-collection state.
+static VOXEL_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
+    let n = std::thread::available_parallelism()
+        .map(|c| (c.get() / 4).max(1))
+        .unwrap_or(1);
+    Arc::new(tokio::sync::Semaphore::new(n))
+});
+
 /// The blue→red **height** colour ramp for the echo-top product (stops at height
 /// values, 0–15 km) — a builtin colormap's stops are in its own units, so they
 /// collapse over a height range; build it explicitly. Fixed ramp, so build it
@@ -683,6 +698,216 @@ pub async fn get_content_glb(
 }
 
 // ---------------------------------------------------------------------------
+// True voxels (#351): EXT_primitive_voxels cylinder tileset + subtree + content
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct VoxelParams {
+    pub quantity: Option<String>,
+    pub datetime: Option<String>,
+    /// Voxel-grid detail tier (`low`/`med`/`high`). `None` → `med`.
+    pub resolution: Option<String>,
+}
+
+/// `GET /collections/{id}/voxel/tileset.json` — the implicit-tiling cylinder
+/// voxel tileset. O(1): the cylinder extent + origin come from `VolumeInfo`'s
+/// `VoxelGridCaps` (no grid sample). Relative content/subtree URIs resolve under
+/// `…/voxel/`; the content URI carries the resolved quantity/time/resolution.
+pub async fn get_voxel_tileset(
+    Path(id): Path<String>,
+    Query(params): Query<VoxelParams>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Response, Tiles3dError> {
+    let state = state.load_full();
+    let (engine, _config) = lookup(&state, &id)?;
+    let info = engine.volume_info();
+    let caps = info.voxel_grid.as_ref().ok_or_else(|| {
+        Tiles3dError::BadRequest(format!(
+            "collection '{id}' does not support the voxels representation"
+        ))
+    })?;
+    if !(caps.radius_m > 0.0 && caps.height_m > 0.0) {
+        return Err(Tiles3dError::NotFound(format!(
+            "collection '{id}' has no voxel coverage yet"
+        )));
+    }
+    let quantity = match &params.quantity {
+        Some(q) => {
+            if !info.quantities.iter().any(|(qid, _)| qid == q) {
+                return Err(Tiles3dError::BadRequest(format!(
+                    "unknown quantity '{q}' for collection '{id}'"
+                )));
+            }
+            q.clone()
+        }
+        None => info.default_quantity.clone(),
+    };
+    if quantity.is_empty() {
+        return Err(Tiles3dError::NotFound(format!(
+            "collection '{id}' has no quantities"
+        )));
+    }
+    let resolution = Resolution::parse(params.resolution.as_deref())?;
+    let [n_r, n_a, n_h] = resolution.dims();
+
+    // The content fetch must render the same selection — bake it into the
+    // (relative) content URI's query, alongside the implicit-tiling placeholders.
+    let mut q = format!("quantity={}", pct_encode(&quantity));
+    if let Some(dt) = &params.datetime {
+        let dt = parse_datetime(dt)?;
+        q.push_str(&format!("&datetime={}", dt.format("%Y-%m-%dT%H:%M:%SZ")));
+    }
+    q.push_str(&format!("&resolution={}", resolution.as_str()));
+    let content_uri = format!("content/{{level}}/{{x}}/{{y}}/{{z}}.glb?{q}");
+
+    let [olon, olat, oh] = caps.origin;
+    let tileset = ds_3dtiles::tileset_json_voxels(
+        olon,
+        olat,
+        oh,
+        caps.radius_m,
+        caps.height_m,
+        [n_r, n_a, n_h],
+        &quantity,
+        LEGEND_MIN_DBZ,
+        LEGEND_MAX_DBZ,
+        &content_uri,
+        "subtrees/{level}/{x}/{y}/{z}.json",
+    )
+    .map_err(|e| Tiles3dError::Internal(format!("voxel tileset build failed: {e}")))?;
+
+    // Deterministic bytes for a given (quantity, datetime, resolution, caps) —
+    // route through the shared ETag/conditional-GET helper so a CesiumJS poll
+    // with a matching `If-None-Match` short-circuits to 304 (matches the
+    // `content.pnts`/`content.glb` handlers).
+    let bytes = tileset.into_bytes();
+    let etag = etag_of(&bytes);
+    Ok(binary_response(&headers, "application/json", &etag, bytes))
+}
+
+/// `GET /collections/{id}/voxel/subtrees/{*tile}` — the implicit-tiling
+/// availability subtree. One tile is available (the root), so every requested
+/// slot returns the same constant subtree.
+pub async fn get_voxel_subtree(
+    Path((id, tile)): Path<(String, String)>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Response, Tiles3dError> {
+    let state = state.load_full();
+    let (engine, _config) = lookup(&state, &id)?;
+    // Same support/coverage gate (and status codes) as the tileset/content
+    // handlers, so the three voxel routes agree on whether a collection serves
+    // voxels: no voxel grid → 400, no coverage yet → 404.
+    let caps = engine.volume_info().voxel_grid.ok_or_else(|| {
+        Tiles3dError::BadRequest(format!("collection '{id}' does not support voxels"))
+    })?;
+    if !(caps.radius_m > 0.0 && caps.height_m > 0.0) {
+        return Err(Tiles3dError::NotFound(format!(
+            "collection '{id}' has no voxel coverage yet"
+        )));
+    }
+    if !is_root_voxel_tile(&tile) {
+        return Err(Tiles3dError::NotFound(format!(
+            "voxel subtree '{tile}' is out of range (single-tile set)"
+        )));
+    }
+    // Constant body ⇒ constant ETag; route through `binary_response` so a
+    // CesiumJS subtree re-poll with a matching `If-None-Match` short-circuits to
+    // 304 (the subtree is fetched during voxel traversal).
+    let bytes = ds_3dtiles::voxel_subtree_json()
+        .map_err(|e| Tiles3dError::Internal(format!("voxel subtree build failed: {e}")))?
+        .into_bytes();
+    let etag = etag_of(&bytes);
+    Ok(binary_response(&headers, "application/json", &etag, bytes))
+}
+
+/// The implicit voxel tiling is a single tile (`subtreeLevels`/`availableLevels`
+/// = 1), so only the root `0/0/0/0` slot exists. The `{*tile}` capture is the
+/// `{level}/{x}/{y}/{z}.{ext}` path; accept only the root and 404 anything else,
+/// rather than serving the root's constant subtree/content for an out-of-range
+/// coordinate a strict client (or a fuzzer) might request.
+fn is_root_voxel_tile(tile: &str) -> bool {
+    let path = tile.rsplit_once('.').map_or(tile, |(stem, _)| stem);
+    let mut parts = path.split('/');
+    [
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ] == [Some("0"), Some("0"), Some("0"), Some("0"), None]
+}
+
+/// `GET /collections/{id}/voxel/content/{*tile}` — the `EXT_primitive_voxels`
+/// glTF `.glb`. Samples the grid (blocking) under the shared render semaphore,
+/// same as the mesh content path; content-derived ETag.
+pub async fn get_voxel_content(
+    headers: HeaderMap,
+    Path((id, tile)): Path<(String, String)>,
+    Query(params): Query<VoxelParams>,
+    State(state): State<AppState>,
+) -> Result<Response, Tiles3dError> {
+    let state = state.load_full();
+    let (engine, _config) = lookup(&state, &id)?;
+    let info = engine.volume_info();
+    // Same support/coverage gate as `get_voxel_tileset`/`get_voxel_subtree` (no
+    // grid → 400, no coverage yet → 404). Crucially this 404s a no-coverage site
+    // CHEAPLY — before acquiring a render-semaphore slot and a `spawn_blocking`
+    // task that would otherwise sample, encode, and only then 404 via `Empty`.
+    let caps = info.voxel_grid.as_ref().ok_or_else(|| {
+        Tiles3dError::BadRequest(format!("collection '{id}' does not support voxels"))
+    })?;
+    if !(caps.radius_m > 0.0 && caps.height_m > 0.0) {
+        return Err(Tiles3dError::NotFound(format!(
+            "collection '{id}' has no voxel coverage yet"
+        )));
+    }
+    if !is_root_voxel_tile(&tile) {
+        return Err(Tiles3dError::NotFound(format!(
+            "voxel content '{tile}' is out of range (single-tile set)"
+        )));
+    }
+    if let Some(q) = &params.quantity {
+        if !info.quantities.iter().any(|(qid, _)| qid == q) {
+            return Err(Tiles3dError::BadRequest(format!(
+                "unknown quantity '{q}' for collection '{id}'"
+            )));
+        }
+    }
+    let time = params.datetime.as_deref().map(parse_datetime).transpose()?;
+    let quantity = params.quantity.clone();
+    let dims = Resolution::parse(params.resolution.as_deref())?.dims();
+
+    // Dedicated voxel pool (NOT the shared raster `render_semaphore`) so a slow
+    // `high`-res encode can't hold a WMS/Maps/Tiles render slot — see
+    // `VOXEL_SEMAPHORE`.
+    let _permit = VOXEL_SEMAPHORE
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| Tiles3dError::Internal("voxel semaphore closed".into()))?;
+    let engine = engine.clone();
+    let id_for_err = id.clone();
+    let (bytes, etag) =
+        tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
+            let grid = engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;
+            let bytes = ds_3dtiles::encode_voxels_glb(&grid).map_err(|e| match e {
+                ds_3dtiles::Tiles3dError::Empty => {
+                    Tiles3dError::NotFound(format!("no voxel data for collection '{id_for_err}'"))
+                }
+                other => Tiles3dError::Internal(format!("voxel encode failed: {other}")),
+            })?;
+            let etag = etag_of(&bytes);
+            Ok((bytes, etag))
+        })
+        .await
+        .map_err(|e| Tiles3dError::Internal(format!("voxel task failed: {e}")))??;
+
+    Ok(binary_response(&headers, "model/gltf-binary", &etag, bytes))
+}
+
+// ---------------------------------------------------------------------------
 // Landing / collections
 // ---------------------------------------------------------------------------
 
@@ -759,10 +984,26 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
     // produce a voxel grid additionally serve the two glTF mesh products
     // (isosurface, echo-top). The viewer reads this to populate its toggle.
     let supports_mesh = info.as_ref().is_some_and(|i| i.voxel_grid.is_some());
+    // Voxels need a non-degenerate cylinder: the `voxel/tileset.json` route
+    // 404s unless `radius_m > 0 && height_m > 0` (a healthy site that has
+    // ingested no volumes yet has `radius_m = 0`). Gate the advertisement on the
+    // SAME condition so we never advertise a representation whose tileset is a
+    // 404 — the failure a `Cesium3DTilesVoxelProvider` can't tell apart from
+    // "voxels unsupported". The mesh products degrade differently (404 on the
+    // *content* endpoint, not the tileset), so they stay on `supports_mesh`.
+    let supports_voxels = info
+        .as_ref()
+        .and_then(|i| i.voxel_grid.as_ref())
+        .is_some_and(|c| c.radius_m > 0.0 && c.height_m > 0.0);
     let mut representations = vec!["points"];
     if supports_mesh {
         representations.push("isosurface");
         representations.push("echotop");
+    }
+    if supports_voxels {
+        // True cylindrical voxels (#351) — its own implicit-tiling tileset under
+        // `…/voxel/`, not a `?representation=` variant of the shared tileset.
+        representations.push("voxels");
     }
     // A link per representation so a link-following client (not just one that
     // reads `representations` and builds URLs itself) can discover them.
@@ -773,6 +1014,9 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
     if supports_mesh {
         links.push(json!({ "href": format!("{base}/3dtiles/collections/{id}/tileset.json?representation=isosurface"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (isosurface mesh)" }));
         links.push(json!({ "href": format!("{base}/3dtiles/collections/{id}/tileset.json?representation=echotop"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (echo-top columns)" }));
+    }
+    if supports_voxels {
+        links.push(json!({ "href": format!("{base}/3dtiles/collections/{id}/voxel/tileset.json"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (cylindrical voxels)" }));
     }
     // Colour-scale legend for the point cloud: the precomputed gradient of the
     // shared reflectivity colormap, so the viewer's bar matches the point colours
@@ -793,7 +1037,7 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
 
 #[cfg(test)]
 mod tests {
-    use super::pct_encode;
+    use super::{is_root_voxel_tile, pct_encode};
 
     #[test]
     fn pct_encode_passes_unreserved_and_escapes_specials() {
@@ -802,5 +1046,26 @@ mod tests {
         // Chars that would break a query value are escaped.
         assert_eq!(pct_encode("a&b+c#d%e"), "a%26b%2Bc%23d%25e");
         assert_eq!(pct_encode("x y"), "x%20y");
+    }
+
+    #[test]
+    fn only_the_root_voxel_tile_is_accepted() {
+        // Root, with either content extension (or none).
+        assert!(is_root_voxel_tile("0/0/0/0.json"));
+        assert!(is_root_voxel_tile("0/0/0/0.glb"));
+        assert!(is_root_voxel_tile("0/0/0/0"));
+        // Any non-root coordinate, wrong arity, or non-numeric is rejected
+        // (single-tile implicit set → only 0/0/0/0 exists).
+        for bad in [
+            "1/0/0/0.json",
+            "0/0/0/1.json",
+            "0/1/0/0.glb",
+            "0/0/0.json",     // too few
+            "0/0/0/0/0.json", // too many
+            "a/0/0/0.json",
+            "",
+        ] {
+            assert!(!is_root_voxel_tile(bad), "{bad:?} should be rejected");
+        }
     }
 }

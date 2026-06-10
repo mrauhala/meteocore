@@ -87,6 +87,14 @@ pub struct VoxelGridCaps {
     /// to. Lets the 3D Tiles layer build the glTF tile `transform` (antenna
     /// ECEF) **without** sampling the grid.
     pub origin: [f64; 3],
+    /// Cylinder radial extent (metres): the ground coverage radius, = the
+    /// [`VoxelGrid::radius_range`] max the sampler produces. Lets the voxel 3D
+    /// Tiles layer size the `3DTILES_bounding_volume_cylinder` **without**
+    /// sampling the grid (the cylinder extent must match the grid exactly).
+    pub radius_m: f64,
+    /// Cylinder vertical extent (metres): the volume height ceiling, = the
+    /// [`VoxelGrid::height_range`] max. Same purpose as [`Self::radius_m`].
+    pub height_m: f64,
 }
 
 /// The physical value (dBZ) marking a radar voxel cell as **clear air / no

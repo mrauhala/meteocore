@@ -10,10 +10,10 @@
      MANDATORY when bumping the CesiumJS version below: recompute these two
      sha384 hashes with `scripts/check-cesium-sri.sh` — a stale hash makes
      browsers silently refuse to load CesiumJS (blank viewer for everyone). -->
-<script src="https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/Cesium.js"
+<script src="https://cesium.com/downloads/cesiumjs/releases/1.142/Build/Cesium/Cesium.js"
         crossorigin="anonymous"
-        integrity="sha384-5oazsHA45lZs9jgvxUv40qbMATfjwmtR/wQePfqDAeIDIhGmSK2V0gpRoCpZVBzJ"></script>
-<link href="https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/Widgets/widgets.css" rel="stylesheet"
+        integrity="sha384-PCryXL7CqnqM5KijUKfJgy+y9b4vE7GzIHvb5J/MSSnIkFptiGOUrlt4s9uBUdtO"></script>
+<link href="https://cesium.com/downloads/cesiumjs/releases/1.142/Build/Cesium/Widgets/widgets.css" rel="stylesheet"
       crossorigin="anonymous"
       integrity="sha384-ghEeMdcWWzRv/BPeUcX835vcKDGrxvROXisl/Btpv3GeekBUXTSPVcFJpI1Tcrgp">
 <style>
@@ -150,13 +150,18 @@ const setStatus = (msg, err) => { $status.textContent = msg; $status.className =
 // point clouds drop echoes below `min_value`; isosurfaces draw the shell AT
 // `threshold`; echo-top columns rise to where reflectivity drops below
 // `threshold`. All a dBZ number, so one input serves them, relabelled.
-// `mesh` products (isosurface/echotop) are resampled to a voxel grid, so they
-// take the low/med/high Resolution selector; the point cloud is native-res and
-// hides it.
+// `grid` products (isosurface/echotop/voxels) are resampled to a voxel grid, so
+// they take the low/med/high Resolution selector; the point cloud is native-res
+// and hides it. `voxels` is the CesiumJS VoxelPrimitive ray-march (its own load
+// path, not a tileset of tiles).
+// `legend` = coloured by the reflectivity ramp (points + voxels show the colour
+// scale; isosurface is one threshold colour, echo-top a height ramp → no
+// reflectivity legend).
 const REP_META = {
-  points:     { label: "Point cloud", numLabel: "min dBZ",       numDefault: "5",  mesh: false },
-  isosurface: { label: "Isosurface",  numLabel: "threshold dBZ", numDefault: "20", mesh: true  },
-  echotop:    { label: "Echo top",    numLabel: "threshold dBZ", numDefault: "18", mesh: true  },
+  points:     { label: "Point cloud", numLabel: "min dBZ",       numDefault: "5",  mesh: false, voxel: false, legend: true  },
+  isosurface: { label: "Isosurface",  numLabel: "threshold dBZ", numDefault: "20", mesh: true,  voxel: false, legend: false },
+  echotop:    { label: "Echo top",    numLabel: "threshold dBZ", numDefault: "18", mesh: true,  voxel: false, legend: false },
+  voxels:     { label: "Voxels",      numLabel: "min dBZ",       numDefault: "5",  mesh: true,  voxel: true,  legend: true  },
 };
 
 // Token-free CesiumJS: CARTO Dark Matter basemap, no Cesium Ion.
@@ -193,6 +198,7 @@ let loadToken = 0;        // guards against out-of-order async (re)builds
 let currentRep = null;    // representation of the active frames
 let pointsFetchFloor = null; // the min_value (dBZ) the point-cloud frames were fetched at
 let legendData = null;    // colour-scale legend {title,unit,min,max,stops} from the collection doc
+let voxelPrimitive = null; // active Cesium VoxelPrimitive (the `voxels` representation)
 
 async function loadCollections() {
   setStatus("loading collections…");
@@ -263,7 +269,7 @@ function syncNumField() {
   $numLabel.textContent = meta.numLabel;
   $num.value = meta.numDefault;
   $resField.hidden = !meta.mesh;
-  $legend.hidden = meta.mesh || !legendData;
+  $legend.hidden = !meta.legend || !legendData;
 }
 
 // Build the colour-scale legend from the collection doc's `legend` (a sampled
@@ -313,6 +319,9 @@ function clearFrames() {
   for (const ts of frames) if (ts) viewer.scene.primitives.remove(ts);
   frames = [];
 }
+function clearVoxel() {
+  if (voxelPrimitive) { viewer.scene.primitives.remove(voxelPrimitive); voxelPrimitive = null; }
+}
 
 // (Re)build the whole frame set for the current params: one preloaded, hidden
 // tileset per timestamp (or a single latest-volume frame when the collection has
@@ -324,8 +333,24 @@ async function loadFrames(reframe = false) {
   const token = ++loadToken;
   stopPlaying();
   clearFrames();
+  clearVoxel();
   currentRep = rep;
   pointsFetchFloor = rep === "points" ? (num === "" ? -Infinity : parseFloat(num)) : null;
+
+  // Voxels are a CesiumJS VoxelPrimitive (ray-marched volume), not a tileset of
+  // tiles — their own load path. MVP: pin to the LATEST volume (no frame
+  // preload/animation — voxel time-dynamic playback is a #351 follow-up). Force
+  // a single-entry `frameTimes` so `syncTimeBar()` keeps the bar hidden: the
+  // scrubber drives `showFrame()` over `frames[]` (always empty for voxels), so
+  // on a multi-volume collection a shown bar would be inert. (`frameTimes[0] =
+  // null` → `loadVoxel` requests the server's latest-volume default.)
+  if (rep === "voxels") {
+    frameTimes = [null];
+    frameIdx = 0;
+    syncTimeBar();
+    await loadVoxel(token);
+    return;
+  }
 
   // Animate the most-recent MAX_FRAMES of the manifest ([null] = the single
   // latest-volume frame when there's no time axis).
@@ -362,6 +387,103 @@ async function loadFrames(reframe = false) {
   }
   if (!frames.some(Boolean)) setStatus("no data for this selection", true);
   else updateStatus();
+}
+
+// Load the cylindrical voxel volume for the active time as a CesiumJS
+// VoxelPrimitive (ray-marched), styled by a reflectivity transfer-function
+// custom shader. EXT_primitive_voxels is CesiumGS-only + draft, so this whole
+// path is best-effort — a load failure just reports, leaving the other
+// representations untouched.
+async function loadVoxel(token) {
+  const id = $coll.value, q = $qty.value;
+  setStatus(`loading ${id} · ${q} · voxels…`);
+  let url = `${BASE}/collections/${encodeURIComponent(id)}/voxel/tileset.json?quantity=${encodeURIComponent(q)}`;
+  const time = frameTimes.length ? frameTimes[frameIdx] : null;
+  if (time) url += `&datetime=${encodeURIComponent(time)}`;
+  url += `&resolution=${encodeURIComponent($res.value)}`;
+  try {
+    if (typeof Cesium.Cesium3DTilesVoxelProvider !== "function") {
+      throw new Error("this CesiumJS build has no voxel support");
+    }
+    const provider = await Cesium.Cesium3DTilesVoxelProvider.fromUrl(url);
+    if (token !== loadToken) return; // superseded
+    voxelPrimitive = viewer.scene.primitives.add(new Cesium.VoxelPrimitive({
+      provider,
+      customShader: voxelShader(q, legendData, voxelMin()),
+    }));
+    // Default ray-march step (1 sample/cell). Finer stepping was tried (0.4,
+    // 0.12) to smooth the cell lattice but made no visible difference — the
+    // lattice is a property of the DATA, now dissolved by the encoder's
+    // multi-pass blur, not of the step size — so it was pure cost (a smaller
+    // multiplier means proportionally more samples per ray). Left at the
+    // default for ~2.5× faster ray-marching with no quality loss.
+    voxelPrimitive.stepSizeMultiplier = 1.0;
+    viewer.scene.requestRender();
+    updateStatus(voxelMinLabel());
+  } catch (e) {
+    if (token === loadToken) setStatus("voxels unavailable — " + e.message, true);
+    console.error("voxel load", e);
+  }
+}
+
+// The `min dBZ` field value for voxels (cells below it are fully transparent).
+function voxelMin() { const m = parseFloat($num.value); return Number.isFinite(m) ? m : parseFloat(REP_META.voxels.numDefault); }
+function voxelMinLabel() { const m = parseFloat($num.value); return Number.isFinite(m) ? `≥ ${m} dBZ` : ""; }
+
+// #rrggbb → "vec3(r,g,b)" (0..1) for GLSL.
+function hexToGlslVec3(hex) {
+  const r = parseInt(hex.slice(1, 3), 16) / 255;
+  const g = parseInt(hex.slice(3, 5), 16) / 255;
+  const b = parseInt(hex.slice(5, 7), 16) / 255;
+  return `vec3(${r.toFixed(4)},${g.toFixed(4)},${b.toFixed(4)})`;
+}
+
+// Reflectivity transfer function for the voxel ray-march: the per-cell metadata
+// value (dBZ, property = the quantity) → colour + alpha. The colour ramp is built
+// from the SAME legend stops the colour-scale bar shows, so the voxels match the
+// legend exactly; `min` (the `min dBZ` field) makes weaker cells (and the nodata
+// sentinel) transparent; denser echo grows more opaque.
+function voxelShader(quantity, legend, min) {
+  // `quantity` is interpolated into GLSL source — guard the property name even
+  // though it comes from server metadata (ODIM quantities are A-Z0-9_). Sandboxed
+  // to our own GPU context, but cheap defence-in-depth.
+  if (!/^[A-Z][A-Z0-9_]*$/.test(quantity)) throw new Error("invalid quantity: " + quantity);
+  // Also guard non-finite min/max: `(NaN|Infinity).toFixed(2)` emits the
+  // literal "NaN"/"Infinity" into the GLSL below → the shader fails to compile
+  // and the volume goes dark. (serde can emit those for IEEE-754 specials.)
+  const lg = (legend && legend.stops && legend.stops.length >= 2
+              && Number.isFinite(legend.min) && Number.isFinite(legend.max))
+    ? legend
+    : { min: 0, max: 70, stops: [{ color: "#0000ff" }, { color: "#ff0000" }] };
+  const n = lg.stops.length;
+  const ramp = lg.stops.map(s => hexToGlslVec3(s.color)).join(",");
+  const span = (lg.max - lg.min) || 1;
+  const fs = [
+    `vec3 voxRamp(float v){`,
+    `  vec3 ramp[${n}]=vec3[${n}](${ramp});`,
+    `  float t=clamp((v-(${lg.min.toFixed(2)}))/${span.toFixed(2)},0.0,1.0)*float(${n - 1});`,
+    `  int i=int(floor(t));`,
+    `  return mix(ramp[i],ramp[min(i+1,${n - 1})],fract(t));`,
+    `}`,
+    `void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material){`,
+    `  float v=fsInput.metadata.${quantity};`,
+    `  material.diffuse=voxRamp(v);`,
+    // Density rises smoothly FROM 0 at the `min` threshold (no hard alpha step →
+    // no shell/"walls and floors" at the min isovalue), ~0.55 by +25 dBZ above it.
+    `  material.alpha=clamp((v-(${min.toFixed(2)}))*0.022,0.0,0.55);`,
+    `}`,
+  ].join("\n");
+  return new Cesium.CustomShader({ fragmentShaderText: fs });
+}
+
+// `min dBZ` for voxels updates the transfer-function shader live (no reload):
+// rebuild the customShader with the new threshold and reassign it.
+function voxelClientFilter() {
+  if (($rep.value || "points") !== "voxels" || currentRep !== "voxels" || !voxelPrimitive) return false;
+  try { voxelPrimitive.customShader = voxelShader($qty.value, legendData, voxelMin()); } catch (e) { console.error(e); return false; }
+  viewer.scene.requestRender();
+  updateStatus(voxelMinLabel());
+  return true;
 }
 
 // Reveal frame `i` (wrapping), hide the rest — a pure visibility toggle, the
@@ -408,9 +530,10 @@ function pointsClientFilter() {
 }
 
 function onNumCommit() {
-  // Points within the fetched range already restyled live → nothing to fetch.
-  if (pointsClientFilter()) return;
-  loadFrames(false); // mesh threshold/resolution, or points needing more data
+  // Points (client restyle) and voxels (shader rebuild) handle the field live →
+  // nothing to fetch; everything else (mesh threshold/resolution) re-fetches.
+  if (pointsClientFilter() || voxelClientFilter()) return;
+  loadFrames(false);
 }
 
 // ── Time scrubber ──────────────────────────────────────────────────────────
@@ -468,7 +591,7 @@ $res.addEventListener("change", () => loadFrames(false));
 // Live: a point cloud re-filters client-side as you drag the field. Commit
 // (`change`): re-fetch for meshes, or for points that need values below their
 // fetched floor.
-$num.addEventListener("input", pointsClientFilter);
+$num.addEventListener("input", () => { pointsClientFilter() || voxelClientFilter(); });
 $num.addEventListener("change", onNumCommit);
 // Time scrubber: play/pause toggles the loop; dragging the slider seeks (and
 // pauses, so the frame you drag to stays put).
