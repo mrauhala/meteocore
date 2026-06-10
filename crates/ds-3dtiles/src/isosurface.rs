@@ -384,10 +384,12 @@ pub fn encode_isosurface_glb(
         return Err(Tiles3dError::NonFinite("threshold"));
     }
     // A `Some` background must be finite (else it acts like `None` — a NaN fill
-    // leaves the corner non-finite → tet skipped) AND strictly below `threshold`
-    // (else unmeasured cells would seal as *inside* the surface, inverting it).
+    // leaves the corner non-finite → tet skipped) AND representable as `f32`
+    // (the seal narrows `bg as f32`; an out-of-range f64 would cast to ±inf and
+    // propagate through the dense blur) AND strictly below `threshold` (else
+    // unmeasured cells would seal as *inside* the surface, inverting it).
     if let Some(bg) = background {
-        if !bg.is_finite() {
+        if !bg.is_finite() || bg.abs() > f64::from(f32::MAX) {
             return Err(Tiles3dError::NonFinite("background"));
         }
         if bg >= threshold {
@@ -773,7 +775,12 @@ mod tests {
                 }
             }
         }
-        // …with a 40 dBZ core in its middle, ≥2 finite cells from any NaN.
+        // …with a 40 dBZ core in its middle. The 40↔0 crossing must sit
+        // ≥ SMOOTH_PASSES (= 2) finite cells from any NaN: the NaN-aware blur
+        // renormalizes over finite neighbours, so finite cells within `passes`
+        // cells of the open boundary shift toward their finite neighbours — a
+        // crossing closer than that could move or vanish. If SMOOTH_PASSES is
+        // bumped, widen the shell margin here to match.
         for ir in 3..7 {
             for ia in 6..10 {
                 for ih in 3..7 {
@@ -838,6 +845,12 @@ mod tests {
         // A Some(non-finite) background is rejected (would silently act like None).
         assert!(matches!(
             encode_isosurface_glb(&grid, 1.5, [0, 0, 0, 255], Some(f64::INFINITY)),
+            Err(Tiles3dError::NonFinite("background"))
+        ));
+        // A finite f64 beyond f32 range is rejected too (the seal narrows to
+        // f32, so 1e39 would cast to -inf and poison the dense blur).
+        assert!(matches!(
+            encode_isosurface_glb(&grid, 1.5, [0, 0, 0, 255], Some(-1e39)),
             Err(Tiles3dError::NonFinite("background"))
         ));
     }
