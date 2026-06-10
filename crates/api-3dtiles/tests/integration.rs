@@ -160,6 +160,42 @@ impl VolumeEngine for MockNoVoxel {
     }
 }
 
+/// A healthy voxel engine that has ingested no volumes yet: `volume_info`
+/// carries `voxel_grid = Some` but with `radius_m = 0` (no coverage). The
+/// `voxels` representation must NOT be advertised (its tileset 404s), while the
+/// mesh products (which 404 on the *content* route, not the tileset) still are.
+struct MockZeroRadiusVoxel;
+
+impl VolumeEngine for MockZeroRadiusVoxel {
+    fn read_point_cloud(
+        &self,
+        _quantity: Option<&str>,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _min_value: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<VolumePointCloud, DataServerError> {
+        Err(DataServerError::LocationNotFound("no data yet".into()))
+    }
+
+    // read_voxel_grid uses the trait default (unsupported) — the test never
+    // reaches it (the tileset 404s on the `radius_m == 0` gate first).
+
+    fn volume_info(&self) -> Arc<VolumeInfo> {
+        Arc::new(VolumeInfo {
+            quantities: vec![("DBZH".into(), "Reflectivity".into())],
+            times: vec![],
+            default_quantity: "DBZH".into(),
+            default_unit: "dBZ".into(),
+            region: Some([0.42, 1.05, 0.44, 1.07, 100.0, 25_000.0]),
+            voxel_grid: Some(VoxelGridCaps {
+                origin: [24.5, 60.5, 100.0],
+                radius_m: 0.0,
+                height_m: 0.0,
+            }),
+        })
+    }
+}
+
 fn collection_config(id: &str) -> CollectionConfig {
     // Build via TOML so this test doesn't depend on every CollectionConfig field.
     toml::from_str(&format!(
@@ -432,6 +468,66 @@ async fn collections_list_and_doc() {
 }
 
 #[tokio::test]
+async fn voxels_not_advertised_without_coverage() {
+    // A site whose engine supports voxels but has no scanned volume yet
+    // (`radius_m = 0`) must NOT advertise the `voxels` representation — its
+    // tileset 404s, which a `Cesium3DTilesVoxelProvider` can't distinguish from
+    // "unsupported". The advertisement gate must match the tileset's gate.
+    let engine: Arc<dyn VolumeEngine> = Arc::new(MockZeroRadiusVoxel);
+    let mut volume_engines = HashMap::new();
+    volume_engines.insert("radar-nocov".to_string(), engine);
+    let mut collections = HashMap::new();
+    collections.insert("radar-nocov".to_string(), collection_config("radar-nocov"));
+    let state = Arc::new(ArcSwap::from_pointee(TilesState3d {
+        volume_engines,
+        collections,
+        colormap: Arc::new(LutColorMap::from_builtin(
+            BuiltinColormap::RadarDbz,
+            -32.0,
+            95.0,
+        )),
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        base_url: String::new(),
+    }));
+    let app = api_3dtiles::router(state);
+    let send = |uri: &str| {
+        let app = app.clone();
+        let uri = uri.to_string();
+        async move {
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+    };
+
+    // Collection doc: mesh products advertised, `voxels` NOT.
+    let resp = send("/collections/radar-nocov").await;
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let reps: Vec<&str> = v["representations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    assert!(
+        reps.contains(&"isosurface") && reps.contains(&"echotop"),
+        "mesh products still advertised: {reps:?}"
+    );
+    assert!(
+        !reps.contains(&"voxels"),
+        "voxels must NOT be advertised without coverage: {reps:?}"
+    );
+    // And the voxel tileset itself is 404 (the gate the advertisement now mirrors).
+    assert_eq!(
+        send("/collections/radar-nocov/voxel/tileset.json")
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
 async fn isosurface_on_unsupported_collection_is_400() {
     // A collection whose engine can't voxel-grid advertises only `points` and
     // rejects isosurface requests at both the tileset and content routes.
@@ -598,6 +694,15 @@ async fn voxel_tileset_subtree_and_content_are_well_formed() {
     let s: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(s["tileAvailability"]["constant"], 1);
     assert_eq!(s["contentAvailability"][0]["constant"], 1);
+
+    // Single-tile implicit set: only the root 0/0/0/0 exists — a non-root
+    // subtree/content coordinate is 404, not the root's constant data.
+    let (status, _b, _h) = get("/collections/radar-fivih/voxel/subtrees/1/0/0/0.json").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _b, _h) =
+        get("/collections/radar-fivih/voxel/content/0/0/0/1.glb?quantity=DBZH&resolution=low")
+            .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 
     // Content: a valid EXT_primitive_voxels glb (cylinder mode 2147483650).
     let (status, body, headers) =

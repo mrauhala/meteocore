@@ -775,7 +775,8 @@ pub async fn get_voxel_tileset(
 /// availability subtree. One tile is available (the root), so every requested
 /// slot returns the same constant subtree.
 pub async fn get_voxel_subtree(
-    Path((id, _tile)): Path<(String, String)>,
+    Path((id, tile)): Path<(String, String)>,
+    headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Response, Tiles3dError> {
     let state = state.load_full();
@@ -791,14 +792,34 @@ pub async fn get_voxel_subtree(
             "collection '{id}' has no voxel coverage yet"
         )));
     }
-    Ok((
-        [
-            (header::CONTENT_TYPE, "application/json"),
-            (header::CACHE_CONTROL, "public, max-age=300"),
-        ],
-        ds_3dtiles::voxel_subtree_json(),
-    )
-        .into_response())
+    if !is_root_voxel_tile(&tile) {
+        return Err(Tiles3dError::NotFound(format!(
+            "voxel subtree '{tile}' is out of range (single-tile set)"
+        )));
+    }
+    // Constant body ⇒ constant ETag; route through `binary_response` so a
+    // CesiumJS subtree re-poll with a matching `If-None-Match` short-circuits to
+    // 304 (the subtree is fetched during voxel traversal).
+    let bytes = ds_3dtiles::voxel_subtree_json().into_bytes();
+    let etag = etag_of(&bytes);
+    Ok(binary_response(&headers, "application/json", &etag, bytes))
+}
+
+/// The implicit voxel tiling is a single tile (`subtreeLevels`/`availableLevels`
+/// = 1), so only the root `0/0/0/0` slot exists. The `{*tile}` capture is the
+/// `{level}/{x}/{y}/{z}.{ext}` path; accept only the root and 404 anything else,
+/// rather than serving the root's constant subtree/content for an out-of-range
+/// coordinate a strict client (or a fuzzer) might request.
+fn is_root_voxel_tile(tile: &str) -> bool {
+    let path = tile.rsplit_once('.').map_or(tile, |(stem, _)| stem);
+    let mut parts = path.split('/');
+    [
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ] == [Some("0"), Some("0"), Some("0"), Some("0"), None]
 }
 
 /// `GET /collections/{id}/voxel/content/{*tile}` — the `EXT_primitive_voxels`
@@ -806,7 +827,7 @@ pub async fn get_voxel_subtree(
 /// same as the mesh content path; content-derived ETag.
 pub async fn get_voxel_content(
     headers: HeaderMap,
-    Path((id, _tile)): Path<(String, String)>,
+    Path((id, tile)): Path<(String, String)>,
     Query(params): Query<VoxelParams>,
     State(state): State<AppState>,
 ) -> Result<Response, Tiles3dError> {
@@ -816,6 +837,11 @@ pub async fn get_voxel_content(
     if info.voxel_grid.is_none() {
         return Err(Tiles3dError::BadRequest(format!(
             "collection '{id}' does not support voxels"
+        )));
+    }
+    if !is_root_voxel_tile(&tile) {
+        return Err(Tiles3dError::NotFound(format!(
+            "voxel content '{tile}' is out of range (single-tile set)"
         )));
     }
     if let Some(q) = &params.quantity {
@@ -985,7 +1011,7 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
 
 #[cfg(test)]
 mod tests {
-    use super::pct_encode;
+    use super::{is_root_voxel_tile, pct_encode};
 
     #[test]
     fn pct_encode_passes_unreserved_and_escapes_specials() {
@@ -994,5 +1020,26 @@ mod tests {
         // Chars that would break a query value are escaped.
         assert_eq!(pct_encode("a&b+c#d%e"), "a%26b%2Bc%23d%25e");
         assert_eq!(pct_encode("x y"), "x%20y");
+    }
+
+    #[test]
+    fn only_the_root_voxel_tile_is_accepted() {
+        // Root, with either content extension (or none).
+        assert!(is_root_voxel_tile("0/0/0/0.json"));
+        assert!(is_root_voxel_tile("0/0/0/0.glb"));
+        assert!(is_root_voxel_tile("0/0/0/0"));
+        // Any non-root coordinate, wrong arity, or non-numeric is rejected
+        // (single-tile implicit set → only 0/0/0/0 exists).
+        for bad in [
+            "1/0/0/0.json",
+            "0/0/0/1.json",
+            "0/1/0/0.glb",
+            "0/0/0.json",     // too few
+            "0/0/0/0/0.json", // too many
+            "a/0/0/0.json",
+            "",
+        ] {
+            assert!(!is_root_voxel_tile(bad), "{bad:?} should be rejected");
+        }
     }
 }
