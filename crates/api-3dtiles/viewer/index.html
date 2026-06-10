@@ -347,8 +347,13 @@ function cachePut(url, ts) {
   }
 }
 // Collection switch: the cached frames belong to another volume entirely —
-// destroy them all rather than letting them age out of the LRU.
+// destroy them all rather than letting them age out of the LRU. Bumping
+// `cacheGen` makes in-flight workers from the old build discard what they
+// fetched instead of repopulating the just-cleared cache + scene (each build
+// captures the generation it started under).
+let cacheGen = 0;
 function clearFrameCache() {
+  cacheGen++;
   frames = [];
   for (const ts of tileCache.values()) viewer.scene.primitives.remove(ts);
   tileCache.clear();
@@ -378,6 +383,7 @@ async function loadFrames(reframe = false) {
   const num = $num.value.trim();
   if (!id || !q) return;
   const token = ++loadToken;
+  const gen = cacheGen; // cache generation this build belongs to
   stopPlaying();
   hideFrames();
   clearVoxel();
@@ -441,9 +447,11 @@ async function loadFrames(reframe = false) {
   // Bounded-concurrency fill: PRELOAD_CONCURRENCY workers pull from `pending`.
   // Each frame is created hidden; `preloadWhenHidden` is load-bearing — without
   // it a hidden tileset doesn't fetch tiles, so the first reveal would stall.
-  // `fromUrl` rejects on a 4xx (e.g. no data) → that slot stays null. A
-  // superseded build still caches what it fetched (it may be toggled back to);
-  // it just stops touching the live `frames`.
+  // `fromUrl` rejects on a 4xx (e.g. no data) → that slot stays null. A build
+  // superseded by a control change still caches what it fetched (it may be
+  // toggled back to) and just stops touching the live `frames`; a build that
+  // raced past a collection-switch clearFrameCache (gen mismatch) discards
+  // instead — its tilesets belong to the dropped collection.
   let next = 0;
   const worker = async () => {
     while (next < pending.length && token === loadToken) {
@@ -453,6 +461,7 @@ async function loadFrames(reframe = false) {
         ts = await Cesium.Cesium3DTileset.fromUrl(urls[i],
           { maximumScreenSpaceError: 1, show: false, preloadWhenHidden: true });
       } catch (e) { console.error("frame", frameTimes[i], e); }
+      if (ts && gen !== cacheGen) { ts.destroy(); ts = null; } // cache cleared mid-flight
       if (ts) {
         viewer.scene.primitives.add(ts);
         cachePut(urls[i], ts);
