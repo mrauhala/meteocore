@@ -1570,3 +1570,197 @@ async fn getmap_reference_time_against_non_forecast_layer_returns_400() {
         "reference_time on a non-forecast layer must be InvalidDimensionValue; got:\n{xml}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// TIME-less GetMap must track the engine's latest timestamp
+// ---------------------------------------------------------------------------
+
+/// Mock engine whose advertised `times` can be advanced mid-test, recording
+/// the `time` each render was asked for. Regression fixture for the
+/// stale-latest bug: the rendered/meta-tile caches have no TTL, so a TIME-less
+/// request keyed as `time: None` would serve the first rendered frame forever.
+struct AdvancingMockMapEngine {
+    times: Arc<std::sync::Mutex<Vec<chrono::DateTime<chrono::Utc>>>>,
+    calls: Arc<std::sync::Mutex<Vec<Option<chrono::DateTime<chrono::Utc>>>>>,
+}
+
+impl MapEngine for AdvancingMockMapEngine {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        self.calls.lock().unwrap().push(time);
+        let pixel_count = (width * height) as usize;
+        let values: Vec<Option<f64>> = (0..pixel_count)
+            .map(|i| Some(i as f64 / pixel_count as f64))
+            .collect();
+        Ok(RasterTile {
+            width,
+            height,
+            values,
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            native_crs: "EPSG:4326".into(),
+            spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
+            times: self.times.lock().unwrap().clone(),
+            parameter: "reflectivity".into(),
+            unit: "dBZ".into(),
+            parameters: vec![],
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: Vec::new(),
+        }
+    }
+}
+
+type AdvancingFixture = (
+    axum::Router,
+    Arc<std::sync::Mutex<Vec<chrono::DateTime<chrono::Utc>>>>,
+    Arc<std::sync::Mutex<Vec<Option<chrono::DateTime<chrono::Utc>>>>>,
+);
+
+fn build_advancing_router() -> AdvancingFixture {
+    let t1 = chrono::DateTime::parse_from_rfc3339("2026-06-10T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let times = Arc::new(std::sync::Mutex::new(vec![t1]));
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let engine: Arc<dyn MapEngine> = Arc::new(AdvancingMockMapEngine {
+        times: times.clone(),
+        calls: calls.clone(),
+    });
+    let mut engines = HashMap::new();
+    let mut collections = HashMap::new();
+    let mut styles_map = HashMap::new();
+
+    engines.insert("radar-live".to_string(), engine);
+    collections.insert(
+        "radar-live".to_string(),
+        CollectionConfig {
+            id: "radar-live".to_string(),
+            title: "Live Radar".to_string(),
+            description: "Fixture for the TIME-less stale-latest regression".into(),
+            data_path: None,
+            apis: vec!["wms".to_string()],
+            engine_type: "geotiff".to_string(),
+            keywords: Vec::new(),
+            license: None,
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            zarr: None,
+            odim: None,
+            postgis: None,
+            preview: None,
+        },
+    );
+
+    let cmap = Arc::new(LutColorMap::from_builtin(
+        BuiltinColormap::Viridis,
+        0.0,
+        1.0,
+    ));
+    let mut layer_styles = HashMap::new();
+    layer_styles.insert(
+        "default".to_string(),
+        StyleInfo {
+            name: "default".to_string(),
+            title: "Default".to_string(),
+            colormap: cmap,
+            min: 0.0,
+            max: 1.0,
+            parameter: None,
+        },
+    );
+    styles_map.insert("radar-live".to_string(), layer_styles);
+
+    let state = Arc::new(ArcSwap::from_pointee(WmsState {
+        engines,
+        collections,
+        styles: styles_map,
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
+        base_url: String::new(),
+    }));
+    (api_wms::router(state), times, calls)
+}
+
+const LIVE_GETMAP_URI: &str = "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=radar-live\
+                               &STYLES=&CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64\
+                               &FORMAT=image/png";
+
+/// A TIME-less GetMap is keyed on the engine's *current latest* timestamp, not
+/// `time: None` — so when a newer volume arrives, the next TIME-less request
+/// re-renders instead of serving the previous frame from the TTL-less cache.
+#[tokio::test]
+async fn timeless_getmap_tracks_new_latest_data() {
+    let (app, times, calls) = build_advancing_router();
+
+    // First TIME-less request renders the current latest (t1).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(LIVE_GETMAP_URI)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["x-cache"], "MISS");
+    let t1 = times.lock().unwrap()[0];
+    assert_eq!(calls.lock().unwrap().clone(), vec![Some(t1)]);
+
+    // Same request again: cache HIT, no new engine call.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(LIVE_GETMAP_URI)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["x-cache"], "HIT");
+    assert_eq!(calls.lock().unwrap().len(), 1);
+
+    // A newer timestep arrives (poll cycle): the next TIME-less request must
+    // re-render at the new latest, not serve the stale cached frame.
+    let t2 = chrono::DateTime::parse_from_rfc3339("2026-06-10T10:05:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    times.lock().unwrap().push(t2);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(LIVE_GETMAP_URI)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()["x-cache"],
+        "MISS",
+        "a TIME-less request after new data must re-render, not serve the stale frame"
+    );
+    assert_eq!(calls.lock().unwrap().last().copied(), Some(Some(t2)));
+}
