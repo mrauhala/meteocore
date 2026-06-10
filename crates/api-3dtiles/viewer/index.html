@@ -339,19 +339,20 @@ function cacheGet(url) {
   return ts;
 }
 function cachePut(url, ts) {
+  // Pinned = the active frames plus the entry being inserted (`frames[i] = ts`
+  // only happens after cachePut returns, so `ts` isn't in `frames` yet).
+  const pinned = new Set(frames);
+  pinned.add(ts);
   // Two overlapping builds can both fetch the same URL (the first superseded
   // mid-flight); overwriting the map entry would orphan the loser in the scene.
   // `prev` can never be a live frame today — a cached URL is pre-populated into
   // `frames` by cacheGet and excluded from `pending`, so no worker re-fetches
-  // it — the includes() is defence-in-depth: if that invariant ever breaks,
-  // leak the orphan rather than destroy a tileset that's on screen.
+  // it — the pinned check is defence-in-depth: if that invariant ever breaks,
+  // leak the orphan (it stays in the scene, unreachable by LRU eviction, until
+  // the next collection switch) rather than destroy a tileset that's on screen.
   const prev = tileCache.get(url);
-  if (prev && prev !== ts && !frames.includes(prev)) viewer.scene.primitives.remove(prev);
+  if (prev && prev !== ts && !pinned.has(prev)) viewer.scene.primitives.remove(prev);
   tileCache.set(url, ts);
-  // Pin the active frames AND the entry just inserted (`frames[i] = ts` only
-  // happens after cachePut returns, so `ts` isn't in `frames` yet).
-  const pinned = new Set(frames);
-  pinned.add(ts);
   for (const [u, old] of tileCache) {
     if (tileCache.size <= TILE_CACHE_MAX) break;
     if (pinned.has(old)) continue; // never evict a frame in active use
@@ -475,7 +476,12 @@ async function loadFrames(reframe = false) {
         ts = await Cesium.Cesium3DTileset.fromUrl(urls[i],
           { maximumScreenSpaceError: 1, show: false, preloadWhenHidden: true });
       } catch (e) { console.error("frame", frameTimes[i], e); }
-      if (ts && gen !== cacheGen) { ts.destroy(); ts = null; } // cache cleared mid-flight
+      // Distinct from the token guard below, which CACHES the superseded
+      // tileset (a control change may toggle back to it): a generation
+      // mismatch means the cache was cleared by a collection switch, so the
+      // tileset belongs to the dropped collection — destroy it instead. Don't
+      // fold this into the token check.
+      if (ts && gen !== cacheGen) { ts.destroy(); ts = null; }
       if (ts) {
         viewer.scene.primitives.add(ts);
         cachePut(urls[i], ts);
