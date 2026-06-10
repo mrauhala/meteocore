@@ -12,9 +12,11 @@
 //! - `GET /collections/{id}/content.glb` — isosurface-mesh content
 //! - `GET /` · `/collections` · `/collections/{id}` · `/viewer`
 
+pub mod cache;
 pub mod error;
 pub mod handlers;
 
+pub use cache::content_cache_metrics;
 pub use error::Tiles3dError;
 pub use handlers::{default_point_colormap, AppState, TilesState3d};
 

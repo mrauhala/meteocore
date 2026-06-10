@@ -76,6 +76,7 @@ dependencies = [
  "ds-core",
  "ds-render",
  "http-body-util",
+ "quick_cache",
  "serde",
  "serde_json",
  "tokio",
