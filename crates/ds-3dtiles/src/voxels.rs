@@ -259,7 +259,8 @@ fn voxel_schema(quantity: &str) -> serde_json::Value {
 /// chunks are padded to a 4-byte boundary (JSON with spaces, BIN with zeros) per
 /// the glTF 2.0 spec.
 fn assemble_glb(gltf: &serde_json::Value, mut bin: Vec<u8>) -> Result<Vec<u8>, Tiles3dError> {
-    let mut json_bytes = serde_json::to_vec(gltf).expect("voxel glTF serializes");
+    let mut json_bytes =
+        serde_json::to_vec(gltf).map_err(|e| Tiles3dError::Serialize(e.to_string()))?;
     while !json_bytes.len().is_multiple_of(4) {
         json_bytes.push(b' ');
     }
@@ -304,6 +305,12 @@ pub fn tileset_json_voxels(
     content_uri: &str,
     subtree_uri: &str,
 ) -> Result<String, Tiles3dError> {
+    // Both URIs are embedded into the tileset CesiumJS fetches; reject anything
+    // that could traverse or redirect (same guard as the `.pnts`/mesh tilesets —
+    // the contract documented in CLAUDE.md). Today's caller builds them
+    // server-side, so this is defence-in-depth for a `pub` API.
+    crate::validate_uri(content_uri)?;
+    crate::validate_uri(subtree_uri)?;
     for v in [
         antenna_lon,
         antenna_lat,
@@ -400,7 +407,7 @@ pub fn tileset_json_voxels(
             "refine": "REPLACE"
         }
     });
-    Ok(serde_json::to_string_pretty(&tileset).expect("voxel tileset serializes"))
+    serde_json::to_string_pretty(&tileset).map_err(|e| Tiles3dError::Serialize(e.to_string()))
 }
 
 /// The implicit-tiling **subtree** for a single available tile: the one level-0
@@ -409,7 +416,12 @@ pub fn tileset_json_voxels(
 pub fn voxel_subtree_json() -> String {
     let subtree = json!({
         "tileAvailability": { "constant": 1, "availableCount": 1 },
-        "contentAvailability": { "constant": 1, "availableCount": 1 },
+        // Per the 3D Tiles 1.1 implicit-tiling spec, `contentAvailability` is an
+        // ARRAY (one entry per content layer) — unlike the scalar
+        // `tileAvailability`/`childSubtreeAvailability`. CesiumJS 1.142 accepts a
+        // bare object, but strict validators (and likely future CesiumJS) require
+        // the array form.
+        "contentAvailability": [{ "constant": 1, "availableCount": 1 }],
         "childSubtreeAvailability": { "constant": 0, "availableCount": 0 }
     });
     serde_json::to_string(&subtree).expect("subtree serializes")
@@ -594,5 +606,38 @@ mod tests {
             v["statistics"]["classes"]["voxel"]["properties"]["DBZH"]["max"],
             json!([70.0])
         );
+    }
+
+    #[test]
+    fn voxel_tileset_rejects_unsafe_uris() {
+        let call = |content: &str, subtree: &str| {
+            tileset_json_voxels(
+                24.5,
+                60.5,
+                100.0,
+                250_000.0,
+                15_000.0,
+                [128, 360, 48],
+                "DBZH",
+                0.0,
+                70.0,
+                content,
+                subtree,
+            )
+        };
+        let safe = "content/{level}/{x}/{y}/{z}.glb";
+        let safe_sub = "subtrees/{level}/{x}/{y}/{z}.json";
+        // A bad value in either URI slot is rejected.
+        for bad in ["", "/abs/path.glb", "http://evil/x.glb", "../escape.glb"] {
+            assert!(
+                matches!(call(bad, safe_sub), Err(Tiles3dError::InvalidUri(_))),
+                "content_uri {bad:?} should be rejected"
+            );
+            assert!(
+                matches!(call(safe, bad), Err(Tiles3dError::InvalidUri(_))),
+                "subtree_uri {bad:?} should be rejected"
+            );
+        }
+        assert!(call(safe, safe_sub).is_ok());
     }
 }

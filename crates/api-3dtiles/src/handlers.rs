@@ -701,6 +701,7 @@ pub struct VoxelParams {
 pub async fn get_voxel_tileset(
     Path(id): Path<String>,
     Query(params): Query<VoxelParams>,
+    headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Response, Tiles3dError> {
     let state = state.load_full();
@@ -761,14 +762,13 @@ pub async fn get_voxel_tileset(
     )
     .map_err(|e| Tiles3dError::Internal(format!("voxel tileset build failed: {e}")))?;
 
-    Ok((
-        [
-            (header::CONTENT_TYPE, "application/json"),
-            (header::CACHE_CONTROL, "public, max-age=60"),
-        ],
-        tileset,
-    )
-        .into_response())
+    // Deterministic bytes for a given (quantity, datetime, resolution, caps) —
+    // route through the shared ETag/conditional-GET helper so a CesiumJS poll
+    // with a matching `If-None-Match` short-circuits to 304 (matches the
+    // `content.pnts`/`content.glb` handlers).
+    let bytes = tileset.into_bytes();
+    let etag = etag_of(&bytes);
+    Ok(binary_response(&headers, "application/json", &etag, bytes))
 }
 
 /// `GET /collections/{id}/voxel/subtrees/{*tile}` — the implicit-tiling
@@ -932,13 +932,25 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
     // produce a voxel grid additionally serve the two glTF mesh products
     // (isosurface, echo-top). The viewer reads this to populate its toggle.
     let supports_mesh = info.as_ref().is_some_and(|i| i.voxel_grid.is_some());
+    // Voxels need a non-degenerate cylinder: the `voxel/tileset.json` route
+    // 404s unless `radius_m > 0 && height_m > 0` (a healthy site that has
+    // ingested no volumes yet has `radius_m = 0`). Gate the advertisement on the
+    // SAME condition so we never advertise a representation whose tileset is a
+    // 404 — the failure a `Cesium3DTilesVoxelProvider` can't tell apart from
+    // "voxels unsupported". The mesh products degrade differently (404 on the
+    // *content* endpoint, not the tileset), so they stay on `supports_mesh`.
+    let supports_voxels = info
+        .as_ref()
+        .and_then(|i| i.voxel_grid.as_ref())
+        .is_some_and(|c| c.radius_m > 0.0 && c.height_m > 0.0);
     let mut representations = vec!["points"];
     if supports_mesh {
         representations.push("isosurface");
         representations.push("echotop");
-        // True cylindrical voxels (#351) — same capability gate (a voxel grid),
-        // but its own implicit-tiling tileset under `…/voxel/`, not a
-        // `?representation=` variant of the shared tileset.
+    }
+    if supports_voxels {
+        // True cylindrical voxels (#351) — its own implicit-tiling tileset under
+        // `…/voxel/`, not a `?representation=` variant of the shared tileset.
         representations.push("voxels");
     }
     // A link per representation so a link-following client (not just one that
@@ -950,6 +962,8 @@ fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Val
     if supports_mesh {
         links.push(json!({ "href": format!("{base}/3dtiles/collections/{id}/tileset.json?representation=isosurface"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (isosurface mesh)" }));
         links.push(json!({ "href": format!("{base}/3dtiles/collections/{id}/tileset.json?representation=echotop"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (echo-top columns)" }));
+    }
+    if supports_voxels {
         links.push(json!({ "href": format!("{base}/3dtiles/collections/{id}/voxel/tileset.json"), "rel": "3dtiles", "type": "application/json", "title": "3D Tiles tileset (cylindrical voxels)" }));
     }
     // Colour-scale legend for the point cloud: the precomputed gradient of the

@@ -591,11 +591,13 @@ async fn voxel_tileset_subtree_and_content_are_well_formed() {
     );
     assert!(curi.contains("quantity=DBZH") && curi.contains("resolution=low"));
 
-    // Subtree: constant single-tile availability.
+    // Subtree: constant single-tile availability. `contentAvailability` is an
+    // ARRAY per the 3D Tiles 1.1 implicit-tiling spec (one entry per layer).
     let (status, body, _h) = get("/collections/radar-fivih/voxel/subtrees/0/0/0/0.json").await;
     assert_eq!(status, StatusCode::OK);
     let s: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(s["contentAvailability"]["constant"], 1);
+    assert_eq!(s["tileAvailability"]["constant"], 1);
+    assert_eq!(s["contentAvailability"][0]["constant"], 1);
 
     // Content: a valid EXT_primitive_voxels glb (cylinder mode 2147483650).
     let (status, body, headers) =

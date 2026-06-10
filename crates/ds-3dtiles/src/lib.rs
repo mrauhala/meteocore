@@ -78,6 +78,29 @@ pub enum Tiles3dError {
     /// returning a bogus mesh.
     #[error("isosurface background {background} must be < threshold {threshold}")]
     BackgroundNotBelowThreshold { background: f64, threshold: f64 },
+    /// `serde_json` failed to serialize a tile/tileset value. The values are
+    /// built from finite numbers and owned strings, so this is not expected in
+    /// practice — but returning it (rather than `expect`-panicking inside a
+    /// `spawn_blocking` task, where the message is lost to a generic 500)
+    /// preserves the source error for the caller to surface.
+    #[error("3D Tiles JSON serialize failed: {0}")]
+    Serialize(String),
+}
+
+/// Reject a `content`/`subtree` URI that is not a safe **server-relative** path:
+/// empty, absolute (`/…`), scheme-qualified (`…://…`), or `..`-traversing.
+/// CesiumJS fetches whatever URL a tileset names, so every encoder that embeds a
+/// caller-supplied URI runs it through this guard (defence-in-depth for a `pub`
+/// API — today's callers all build the URIs server-side).
+pub(crate) fn validate_uri(uri: &str) -> Result<(), Tiles3dError> {
+    if uri.is_empty()
+        || uri.starts_with('/')
+        || uri.contains("://")
+        || uri.split('/').any(|s| s == "..")
+    {
+        return Err(Tiles3dError::InvalidUri(uri.to_string()));
+    }
+    Ok(())
 }
 
 /// Encode a point cloud as a 3D Tiles **`.pnts`** tile (the 3D Tiles 1.0 Point
@@ -251,13 +274,7 @@ pub(crate) fn tileset_value_for_region(
     region: [f64; 6],
     content_uri: &str,
 ) -> Result<serde_json::Value, Tiles3dError> {
-    if content_uri.is_empty()
-        || content_uri.starts_with('/')
-        || content_uri.contains("://")
-        || content_uri.split('/').any(|s| s == "..")
-    {
-        return Err(Tiles3dError::InvalidUri(content_uri.to_string()));
-    }
+    validate_uri(content_uri)?;
     if region.iter().any(|v| !v.is_finite()) {
         return Err(Tiles3dError::NonFinite("region"));
     }
