@@ -21,6 +21,12 @@ use ds_core::volume::VoxelGrid;
 /// Each axis sweep ping-pongs `src`↔`dst`, so the result is always in `src`
 /// regardless of the pass count.
 pub(crate) fn smooth_grid(vals: Vec<f32>, dims: [usize; 3], passes: usize) -> Vec<f32> {
+    // A NaN slipping in would propagate to every touched neighbour and silently
+    // empty the output (debug-only: a full scan of up to MAX_VOXELS cells).
+    debug_assert!(
+        vals.iter().all(|v| v.is_finite()),
+        "smooth_grid expects a dense (all-finite) field; seal NaN first or use smooth_grid_nan_aware"
+    );
     smooth_with(vals, dims, passes, |lo, mid, hi| {
         0.25 * lo + 0.5 * mid + 0.25 * hi
     })

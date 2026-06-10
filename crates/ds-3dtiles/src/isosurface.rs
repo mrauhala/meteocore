@@ -755,6 +755,44 @@ mod tests {
     }
 
     #[test]
+    fn open_surface_meshes_crossings_inside_finite_region_only() {
+        // background = None with a crossing entirely INSIDE the finite region:
+        // a 40 dBZ core wrapped in a finite 0 dBZ shell, all surrounded by NaN.
+        // The NaN-aware pre-smoothing must keep the finite 40↔0 crossing intact
+        // (no erosion from the NaN surroundings) and the mesher must emit the
+        // surface there while still skipping every NaN-touching tetrahedron —
+        // closing the gap between the smoothing unit tests and the mesher.
+        let mut grid = ramp_grid(10, 16, 10);
+        grid.values.iter_mut().for_each(|v| *v = f32::NAN);
+        // Finite shell (0 dBZ) spanning r/h 1..9, a 3..13…
+        for ir in 1..9 {
+            for ia in 3..13 {
+                for ih in 1..9 {
+                    let idx = grid.index(ir, ia, ih);
+                    grid.values[idx] = 0.0;
+                }
+            }
+        }
+        // …with a 40 dBZ core in its middle, ≥2 finite cells from any NaN.
+        for ir in 3..7 {
+            for ia in 6..10 {
+                for ih in 3..7 {
+                    let idx = grid.index(ir, ia, ih);
+                    grid.values[idx] = 40.0;
+                }
+            }
+        }
+        let glb = encode_isosurface_glb(&grid, 20.0, [0, 200, 0, 255], None)
+            .expect("crossing inside the finite region must mesh without a background");
+        let (json, _bin) = parse_glb(&glb);
+        let count = json["accessors"][0]["count"].as_u64().unwrap();
+        assert!(
+            count > 0 && count % 3 == 0,
+            "open surface has triangles: {count}"
+        );
+    }
+
+    #[test]
     fn background_seals_echo_surrounded_by_clear_air() {
         // A compact echo core embedded in NaN (clear air). With background = None
         // the surface can't close (Empty). With background = Some(below-threshold),
