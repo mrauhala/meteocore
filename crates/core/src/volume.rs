@@ -221,13 +221,19 @@ pub trait VolumeEngine: Send + Sync {
     /// (→ 404) — a capability gap is "this resource doesn't exist for this
     /// collection", not a server fault (matching the no-data-in-window
     /// convention), so the future voxel route won't surface a misleading 500.
+    ///
+    /// Returns `Arc<VoxelGrid>` (not an owned grid): one resampled grid feeds
+    /// several consumers — the isosurface, echo-top, and voxel encoders all
+    /// mesh the same `(quantity, time, dims)` grid — so engines cache and
+    /// share the (multi-MB) result instead of recomputing the multi-million-
+    /// cell resample per representation.
     fn read_voxel_grid(
         &self,
         _quantity: Option<&str>,
         _time: Option<DateTime<Utc>>,
         _dims: Option<[usize; 3]>,
         _reference_time: Option<DateTime<Utc>>,
-    ) -> Result<VoxelGrid, DataServerError> {
+    ) -> Result<Arc<VoxelGrid>, DataServerError> {
         Err(DataServerError::LocationNotFound(
             "voxel grid not supported by this engine".into(),
         ))

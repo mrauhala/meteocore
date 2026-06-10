@@ -249,6 +249,92 @@ static PVOL_PIXEL_READ_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
     counter
 });
 
+// 3D Tiles encoded-content cache — global, the final `.pnts`/`.glb` bytes per
+// (collection, product, quantity, time, params, data-version), so repeats and
+// `If-None-Match` revalidations skip the engine read + encode entirely.
+static TILES3D_CONTENT_CACHE_HITS: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "tiles3d_content_cache_hits_total",
+        "3D Tiles encoded-content cache hits",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static TILES3D_CONTENT_CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "tiles3d_content_cache_misses_total",
+        "3D Tiles encoded-content cache misses (full engine read + encode)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static TILES3D_CONTENT_CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "tiles3d_content_cache_bytes",
+        "Bytes currently held in the 3D Tiles encoded-content cache",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static TILES3D_CONTENT_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "tiles3d_content_cache_capacity_bytes",
+        "Configured 3D Tiles encoded-content cache capacity in bytes",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+// PVOL resampled voxel-grid cache — global, the cylindrical grids the 3D Tiles
+// mesh products (isosurface / echo-top / voxels) share per (volume, quantity,
+// dims) instead of repeating the multi-million-cell polar resample.
+static PVOL_VOXEL_GRID_CACHE_HITS: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "pvol_voxel_grid_cache_hits_total",
+        "PVOL voxel-grid cache hits",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static PVOL_VOXEL_GRID_CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "pvol_voxel_grid_cache_misses_total",
+        "PVOL voxel-grid cache misses (full polar resamples)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static PVOL_VOXEL_GRID_CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "pvol_voxel_grid_cache_bytes",
+        "Bytes currently held in the PVOL voxel-grid cache",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static PVOL_VOXEL_GRID_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "pvol_voxel_grid_cache_capacity_bytes",
+        "Configured PVOL voxel-grid cache capacity in bytes",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
 // Meta-tile pixel cache (#202) — global, decoded-RGBA tiles for the Web
 // Mercator WMS meta-tiling path. Distinct from the per-collection GeoTIFF
 // compressed-byte tile cache (`tile_cache_*`).
@@ -378,6 +464,10 @@ struct CacheCounterState {
     /// PVOL pixel cache `(hits, misses, read_failures)` — global cache, never
     /// replaced on reload, so always monotonic.
     pvol_pixel: (u64, u64, u64),
+    /// PVOL voxel-grid cache `(hits, misses)` — global cache, monotonic.
+    pvol_voxel_grid: (u64, u64),
+    /// 3D Tiles encoded-content cache `(hits, misses)` — global, monotonic.
+    tiles3d_content: (u64, u64),
 }
 
 static RENDER_SEMAPHORE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -2771,6 +2861,28 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         counter_state.pvol_pixel = (p_hits, p_misses, p_fail);
         PVOL_PIXEL_CACHE_BYTES.set(p_bytes as i64);
         PVOL_PIXEL_CACHE_CAPACITY_BYTES.set(p_cap as i64);
+
+        // Voxel-grid cache: same process-global monotonic-counter shape.
+        let (v_hits, v_misses, v_bytes, v_cap) = engine_odim::voxel_grid_cache_metrics();
+        let (last_vh, last_vm) = counter_state.pvol_voxel_grid;
+        PVOL_VOXEL_GRID_CACHE_HITS.inc_by(v_hits.saturating_sub(last_vh));
+        PVOL_VOXEL_GRID_CACHE_MISSES.inc_by(v_misses.saturating_sub(last_vm));
+        counter_state.pvol_voxel_grid = (v_hits, v_misses);
+        PVOL_VOXEL_GRID_CACHE_BYTES.set(v_bytes as i64);
+        PVOL_VOXEL_GRID_CACHE_CAPACITY_BYTES.set(v_cap as i64);
+    }
+
+    // 3D Tiles encoded-content cache: process-global + monotonic, like the
+    // PVOL caches. Only emit when 3D Tiles collections are loaded, so other
+    // deployments don't carry empty `tiles3d_*` series.
+    if !state.tiles_3d.load().volume_engines.is_empty() {
+        let (c_hits, c_misses, c_bytes, c_cap) = api_3dtiles::content_cache_metrics();
+        let (last_ch, last_cm) = counter_state.tiles3d_content;
+        TILES3D_CONTENT_CACHE_HITS.inc_by(c_hits.saturating_sub(last_ch));
+        TILES3D_CONTENT_CACHE_MISSES.inc_by(c_misses.saturating_sub(last_cm));
+        counter_state.tiles3d_content = (c_hits, c_misses);
+        TILES3D_CONTENT_CACHE_BYTES.set(c_bytes as i64);
+        TILES3D_CONTENT_CACHE_CAPACITY_BYTES.set(c_cap as i64);
     }
 
     // Tile cache: per-collection

@@ -129,6 +129,76 @@ pub fn pixel_cache_metrics() -> (u64, u64, u64, u64, u64) {
     )
 }
 
+/// Default resampled voxel-grid cache size (MB) when
+/// `MC_PVOL_VOXEL_GRID_CACHE_MB` is unset. A grid is `4 B × cells` (≈ 8.5 MB
+/// `low`, 21 MB `med`, 47 MB `high`), and the 3D Tiles mesh products
+/// (isosurface, echo-top, voxels) all re-mesh the *same* grid per
+/// `(volume, quantity, dims)` — without this cache every representation,
+/// threshold change, and animation frame repeats the multi-million-cell polar
+/// resample. 512 MB holds ~24 `med` grids — roughly one animation window.
+///
+/// Memory-hygiene note: entries for volumes retired by `max_files` /
+/// `time_window` are only reclaimed by LRU pressure (the key has no
+/// data-version, because a volume file is immutable). On a long-running
+/// deployment, bound the source's retention (`max_files` / `time_window`) so
+/// retired-volume grids cycle out instead of crowding the budget.
+const DEFAULT_VOXEL_GRID_CACHE_MB: u64 = 512;
+
+/// Cache key: source-qualified volume file id (see [`pixel_cache_id`]) +
+/// quantity + resolved grid dims. Volumes are immutable once scanned, so the
+/// key needs no data-version.
+type VoxelGridKey = (Arc<str>, Arc<str>, [usize; 3]);
+
+/// Cached resample result: the shared grid plus its echo-cell count (the
+/// caller's empty ⇒ 404 decision), so a no-echo volume's 404 is cheap too.
+type VoxelGridEntry = (Arc<VoxelGrid>, usize);
+
+/// Byte-weights each entry by its `f32` cell payload (plus key overhead).
+#[derive(Clone)]
+struct VoxelGridWeighter;
+
+impl quick_cache::Weighter<VoxelGridKey, VoxelGridEntry> for VoxelGridWeighter {
+    fn weight(&self, key: &VoxelGridKey, val: &VoxelGridEntry) -> u64 {
+        (val.0.values.len() * 4) as u64 + key.0.len() as u64 + key.1.len() as u64 + 256
+    }
+}
+
+/// Process-global LRU of resampled cylindrical voxel grids, shared across
+/// every PVOL collection (keys are source-qualified). Sized once from the
+/// environment on first use; `0` disables (every read resamples).
+static VOXEL_GRID_CACHE: std::sync::LazyLock<
+    quick_cache::sync::Cache<VoxelGridKey, VoxelGridEntry, VoxelGridWeighter>,
+> = std::sync::LazyLock::new(|| {
+    let capacity_bytes = std::env::var("MC_PVOL_VOXEL_GRID_CACHE_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_VOXEL_GRID_CACHE_MB)
+        .saturating_mul(1024 * 1024);
+    // Estimate item slots at one `med` grid each; `max(1)` keeps a zero
+    // capacity valid (an effectively-disabled cache that can hold nothing).
+    let estimated_items = ((capacity_bytes / (21 * 1024 * 1024)).max(4)) as usize;
+    quick_cache::sync::Cache::with_weighter(
+        estimated_items,
+        capacity_bytes.max(1),
+        VoxelGridWeighter,
+    )
+});
+
+/// Cumulative `(hits, misses)` of [`VOXEL_GRID_CACHE`], for `/metrics`.
+static VOXEL_GRID_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static VOXEL_GRID_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the process-global voxel-grid cache for `/metrics`:
+/// `(hits, misses, resident_bytes, capacity_bytes)`.
+pub fn voxel_grid_cache_metrics() -> (u64, u64, u64, u64) {
+    (
+        VOXEL_GRID_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        VOXEL_GRID_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+        VOXEL_GRID_CACHE.weight(),
+        VOXEL_GRID_CACHE.capacity(),
+    )
+}
+
 /// Days of date-partitioned prefixes to scan when an S3 source has no
 /// `time_window`. Two days covers the just-after-midnight case where
 /// the recent tail still straddles yesterday's partition. Mirrors
@@ -3281,6 +3351,78 @@ const NO_ECHO_FLOOR: f32 = ds_core::volume::NO_ECHO_FLOOR_DBZ;
 /// Returns the grid plus the count of **echo** cells (clear-air floor cells are
 /// not counted) — counted during the fill so the caller needn't re-scan up to
 /// `MAX_VOXELS` cells.
+/// One `(radius, height)` column of the voxel grid, resolved once and reused
+/// across all azimuths. Everything `sample_polar_slant_class` derives from the
+/// cell target *except* the ray index — the nearest sweep, the envelope/range
+/// guards, the moment, the range bin, and the decoded pixels — depends only on
+/// `(ground, height)`, never azimuth. Resolving per column turns the per-cell
+/// work from "sweep scan + moment scan + pixel-cache lookup (two `Arc<str>`
+/// allocations + hashes)" into a table index + one `sample_class`, a large
+/// constant-factor win over `n_r × n_a × n_h` cells.
+enum ColumnTarget {
+    /// Outside the beam fan / unresolvable — `Masked` at every azimuth.
+    Masked,
+    /// Resolved to one sweep's range gate: sample `(ray(azimuth), bin)`.
+    Gate {
+        pixels: Arc<RawPixels>,
+        nrays: usize,
+        bin: usize,
+        gain: f64,
+        offset: f64,
+        nodata: f64,
+        undetect: f64,
+    },
+}
+
+/// Resolve one `(slant_range, elevation)` target to its [`ColumnTarget`] —
+/// the azimuth-independent prefix of [`sample_polar_slant_class`], guard for
+/// guard, so the two stay behaviourally identical.
+fn resolve_column(
+    volume: &PolarVolume,
+    file_id: &str,
+    pix: Pixels,
+    envelope: (f64, f64),
+    quantity: &str,
+    slant_range_m: f64,
+    elangle_deg: f64,
+) -> ColumnTarget {
+    let Some(sweep) = nearest_sweep(volume, elangle_deg) else {
+        return ColumnTarget::Masked;
+    };
+    if sweep.nrays == 0 || sweep.nbins == 0 {
+        return ColumnTarget::Masked;
+    }
+    let (min_el, max_el) = envelope;
+    if !elangle_deg.is_finite()
+        || elangle_deg < min_el - SWEEP_ENVELOPE_TOL_DEG
+        || elangle_deg > max_el + SWEEP_ENVELOPE_TOL_DEG
+    {
+        return ColumnTarget::Masked;
+    }
+    if !sweep.rscale.is_finite() || sweep.rscale <= 0.0 {
+        return ColumnTarget::Masked;
+    }
+    let Some(moment) = sweep.moments.iter().find(|m| m.quantity == *quantity) else {
+        return ColumnTarget::Masked;
+    };
+    let bin = ((slant_range_m - sweep.rstart) / sweep.rscale).floor() as i64;
+    if bin < 0 || bin >= sweep.nbins as i64 {
+        return ColumnTarget::Masked;
+    }
+    let Some(pixels) = pix.moment(file_id, moment, sweep.nrays, sweep.nbins) else {
+        return ColumnTarget::Masked;
+    };
+    ColumnTarget::Gate {
+        pixels,
+        nrays: sweep.nrays,
+        bin: bin as usize,
+        gain: moment.gain,
+        offset: moment.offset,
+        nodata: moment.nodata,
+        undetect: moment.undetect,
+    }
+}
+
 fn voxel_grid_from_volume(
     volume: &PolarVolume,
     file_id: &str,
@@ -3326,25 +3468,45 @@ fn voxel_grid_from_volume(
     let ceiling = VOXEL_HEIGHT_CEILING_M;
     let site = &volume.site;
 
+    // Resolve each `(radius, height)` column once — `n_r × n_h` resolutions
+    // instead of `n_r × n_a × n_h` (the geometry, sweep choice, moment, bin,
+    // and pixel-cache lookup are all azimuth-independent; see [`ColumnTarget`]).
+    // At `med` (256×360×56) this is 14 k resolutions vs 5.2 M.
+    let columns: Vec<ColumnTarget> = (0..n_r)
+        .flat_map(|i_r| {
+            let ground = (i_r as f64 + 0.5) * radius_max / n_r as f64;
+            (0..n_h).map(move |i_h| (ground, i_h))
+        })
+        .map(|(ground, i_h)| {
+            let height = (i_h as f64 + 0.5) * ceiling / n_h as f64;
+            let (slant, el) = ground_height_to_slant(ground, height);
+            resolve_column(volume, file_id, pix, envelope, quantity, slant, el)
+        })
+        .collect();
+
     let mut values = vec![f32::NAN; total];
     let mut valid = 0usize; // counted here to avoid a second O(N) pass
     for i_r in 0..n_r {
-        let ground = (i_r as f64 + 0.5) * radius_max / n_r as f64;
         for i_a in 0..n_a {
             let azimuth_deg = (i_a as f64 + 0.5) * 360.0 / n_a as f64;
             for i_h in 0..n_h {
-                let height = (i_h as f64 + 0.5) * ceiling / n_h as f64;
-                let (slant, el) = ground_height_to_slant(ground, height);
-                match sample_polar_slant_class(
-                    volume,
-                    file_id,
-                    pix,
-                    envelope,
-                    quantity,
-                    slant,
-                    azimuth_deg,
-                    el,
-                ) {
+                let ColumnTarget::Gate {
+                    ref pixels,
+                    nrays,
+                    bin,
+                    gain,
+                    offset,
+                    nodata,
+                    undetect,
+                } = columns[i_r * n_h + i_h]
+                else {
+                    // Genuinely unmeasured (cone of silence / beyond range /
+                    // below the lowest beam) → leave `NaN`, so an isosurface
+                    // doesn't fabricate a cap there.
+                    continue;
+                };
+                let ray = (azimuth_deg / (360.0 / nrays as f64)).floor() as usize % nrays;
+                match pixels.sample_class(ray, bin, gain, offset, nodata, Some(undetect)) {
                     PixelClass::Value(v) => {
                         // Only a finite echo is written + counted — a non-finite
                         // gain/offset in a malformed file can yield `Value(NaN)`;
@@ -3364,9 +3526,6 @@ fn voxel_grid_from_volume(
                     PixelClass::Undetect => {
                         values[VoxelGrid::index_of(dims, i_r, i_a, i_h)] = NO_ECHO_FLOOR;
                     }
-                    // Genuinely unmeasured (cone of silence / beyond range /
-                    // below the lowest beam) → leave `NaN`, so an isosurface
-                    // doesn't fabricate a cap there.
                     PixelClass::Masked => {}
                 }
             }
@@ -3495,16 +3654,47 @@ impl VolumeEngine for PolarVolumeSiteView {
         time: Option<DateTime<Utc>>,
         dims: Option<[usize; 3]>,
         _reference_time: Option<DateTime<Utc>>,
-    ) -> Result<VoxelGrid, DataServerError> {
+    ) -> Result<Arc<VoxelGrid>, DataServerError> {
         let catalog = self.catalog.load();
         let (entry, quantity) = self.select_entry_and_quantity(&catalog, quantity, time)?;
+        // Resolve the default *before* the cache key so `None` and an explicit
+        // default-dims request share one entry.
+        let dims = dims.unwrap_or(DEFAULT_VOXEL_DIMS);
 
-        let handle = blocking_pixel_handle();
-        let pix = Pixels {
-            source: &self.source,
-            handle: handle.as_ref(),
-        };
-        let (grid, valid) = voxel_grid_from_volume(&entry.volume, &entry.id, pix, &quantity, dims)?;
+        // A volume file is immutable once scanned, so `(file, quantity, dims)`
+        // fully determines the resample — no data-version in the key. The three
+        // 3D Tiles mesh products (isosurface, echo-top, voxels) and repeated
+        // threshold/animation requests all share one cached grid. The empty
+        // (`valid == 0`) result is cached too, so the no-echo 404 is cheap.
+        let key: VoxelGridKey = (
+            Arc::from(pixel_cache_id(&self.source, &entry.id).as_ref()),
+            Arc::from(quantity.as_str()),
+            dims,
+        );
+        // `get_or_insert_with` is the single-flight: quick_cache's placeholder
+        // guard runs the closure for exactly one caller per key and blocks
+        // concurrent callers until it finishes — so simultaneous first-time
+        // requests for *different representations* of the same grid (whose
+        // content-cache keys differ, hence separate gates there) still share
+        // one polar resample (PR #378 review). Blocking the calling thread is
+        // fine: every caller is on a `spawn_blocking` pool by contract.
+        let mut computed = false;
+        let (grid, valid) = VOXEL_GRID_CACHE.get_or_insert_with(&key, || {
+            computed = true;
+            let handle = blocking_pixel_handle();
+            let pix = Pixels {
+                source: &self.source,
+                handle: handle.as_ref(),
+            };
+            let (grid, valid) =
+                voxel_grid_from_volume(&entry.volume, &entry.id, pix, &quantity, Some(dims))?;
+            Ok::<_, DataServerError>((Arc::new(grid), valid))
+        })?;
+        if computed {
+            VOXEL_GRID_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            VOXEL_GRID_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // No sampled cell (every cell outside the beam fan / nodata) ⇒ 404,
         // matching the other engines' "no data in window" convention.

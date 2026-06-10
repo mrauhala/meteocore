@@ -66,7 +66,7 @@ impl VolumeEngine for MockVolume {
         _time: Option<chrono::DateTime<chrono::Utc>>,
         dims: Option<[usize; 3]>,
         _reference_time: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<VoxelGrid, DataServerError> {
+    ) -> Result<Arc<VoxelGrid>, DataServerError> {
         if let Some(q) = quantity {
             if q != "DBZH" {
                 return Err(DataServerError::InvalidParameter(format!("unknown {q}")));
@@ -86,7 +86,7 @@ impl VolumeEngine for MockVolume {
                 }
             }
         }
-        Ok(VoxelGrid {
+        Ok(Arc::new(VoxelGrid {
             origin_lon: 24.5,
             origin_lat: 60.5,
             origin_height: 100.0,
@@ -97,7 +97,7 @@ impl VolumeEngine for MockVolume {
             values,
             quantity: "DBZH".into(),
             unit: "dBZ".into(),
-        })
+        }))
     }
 
     fn volume_info(&self) -> Arc<VolumeInfo> {
@@ -824,4 +824,256 @@ async fn non_finite_threshold_is_400() {
         .await;
         assert_eq!(cs, StatusCode::BAD_REQUEST, "content rejects threshold={v}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Content cache + cache-control policy (hot-path audit, 2026-06)
+// ---------------------------------------------------------------------------
+
+/// `MockVolume` that counts engine reads, to prove the content cache short-
+/// circuits the recompute (not just the transfer).
+struct CountingVolume {
+    reads: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl VolumeEngine for CountingVolume {
+    fn read_point_cloud(
+        &self,
+        quantity: Option<&str>,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+        min_value: Option<f64>,
+        reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<VolumePointCloud, DataServerError> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        MockVolume.read_point_cloud(quantity, time, min_value, reference_time)
+    }
+
+    fn read_voxel_grid(
+        &self,
+        quantity: Option<&str>,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+        dims: Option<[usize; 3]>,
+        reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Arc<VoxelGrid>, DataServerError> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        MockVolume.read_voxel_grid(quantity, time, dims, reference_time)
+    }
+
+    fn volume_info(&self) -> Arc<VolumeInfo> {
+        MockVolume.volume_info()
+    }
+}
+
+/// A router over one named collection + engine (the shared `router()` is
+/// fixed to `radar-fivih`/`MockVolume`). Cache-sensitive tests use unique
+/// collection ids so the process-global content cache can't leak state
+/// between tests.
+fn router_with(id: &str, engine: Arc<dyn VolumeEngine>) -> axum::Router {
+    let mut volume_engines = HashMap::new();
+    volume_engines.insert(id.to_string(), engine);
+    let mut collections = HashMap::new();
+    collections.insert(id.to_string(), collection_config(id));
+    let state = Arc::new(ArcSwap::from_pointee(TilesState3d {
+        volume_engines,
+        collections,
+        colormap: Arc::new(LutColorMap::from_builtin(
+            BuiltinColormap::RadarDbz,
+            -32.0,
+            95.0,
+        )),
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        base_url: String::new(),
+    }));
+    api_3dtiles::router(state)
+}
+
+async fn get_on(router: &axum::Router, uri: &str) -> (StatusCode, Vec<u8>, axum::http::HeaderMap) {
+    let resp = router
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, body, headers)
+}
+
+#[tokio::test]
+async fn repeated_pnts_request_is_served_from_cache_without_recompute() {
+    let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let app = router_with(
+        "radar-cache-pnts",
+        Arc::new(CountingVolume {
+            reads: reads.clone(),
+        }),
+    );
+    let uri = "/collections/radar-cache-pnts/content.pnts?quantity=DBZH";
+    let (s1, b1, h1) = get_on(&app, uri).await;
+    let (s2, b2, h2) = get_on(&app, uri).await;
+    assert_eq!((s1, s2), (StatusCode::OK, StatusCode::OK));
+    assert_eq!(b1, b2, "identical bytes");
+    assert_eq!(
+        h1[axum::http::header::ETAG],
+        h2[axum::http::header::ETAG],
+        "identical ETag"
+    );
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "second request must hit the content cache, not the engine"
+    );
+}
+
+#[tokio::test]
+async fn glb_revalidation_304_does_not_recompute() {
+    let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let app = router_with(
+        "radar-cache-glb",
+        Arc::new(CountingVolume {
+            reads: reads.clone(),
+        }),
+    );
+    let uri = "/collections/radar-cache-glb/content.glb?quantity=DBZH&resolution=low";
+    let (s1, _b, h1) = get_on(&app, uri).await;
+    assert_eq!(s1, StatusCode::OK);
+    let etag = h1[axum::http::header::ETAG].to_str().unwrap().to_string();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(axum::http::header::IF_NONE_MATCH, &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the 304 must be served from the content cache"
+    );
+}
+
+#[tokio::test]
+async fn pinned_datetime_gets_immutable_cache_control() {
+    // Pinned to an advertised volume time → long-lived immutable.
+    let (s, _b, h) =
+        get("/collections/radar-fivih/content.pnts?quantity=DBZH&datetime=2026-05-15T00:05:00Z")
+            .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        h[axum::http::header::CACHE_CONTROL],
+        "public, max-age=86400, immutable"
+    );
+    // Latest (no datetime) → short revalidation window.
+    let (s, _b, h) = get("/collections/radar-fivih/content.pnts?quantity=DBZH").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h[axum::http::header::CACHE_CONTROL], "public, max-age=60");
+    // The tileset follows the same policy.
+    let (s, _b, h) =
+        get("/collections/radar-fivih/tileset.json?datetime=2026-05-15T00:05:00Z").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        h[axum::http::header::CACHE_CONTROL],
+        "public, max-age=86400, immutable"
+    );
+}
+
+#[tokio::test]
+async fn non_manifest_datetime_is_not_immutable() {
+    // A datetime BETWEEN advertised volume times resolves by nearest-volume
+    // selection, which can change when a closer volume arrives — it must NOT
+    // get the immutable policy (PR #378 review).
+    let (s, _b, h) =
+        get("/collections/radar-fivih/content.pnts?quantity=DBZH&datetime=2026-05-15T00:02:30Z")
+            .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h[axum::http::header::CACHE_CONTROL], "public, max-age=60");
+}
+
+/// Engine whose time manifest can grow mid-test — simulates a live collection
+/// ingesting a new volume between requests.
+struct GrowingVolume {
+    reads: Arc<std::sync::atomic::AtomicU64>,
+    times: std::sync::Mutex<Vec<chrono::DateTime<Utc>>>,
+}
+
+impl VolumeEngine for GrowingVolume {
+    fn read_point_cloud(
+        &self,
+        quantity: Option<&str>,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+        min_value: Option<f64>,
+        reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<VolumePointCloud, DataServerError> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        MockVolume.read_point_cloud(quantity, time, min_value, reference_time)
+    }
+
+    fn volume_info(&self) -> Arc<VolumeInfo> {
+        let base = MockVolume.volume_info();
+        Arc::new(VolumeInfo {
+            times: self.times.lock().unwrap().clone(),
+            ..(*base).clone()
+        })
+    }
+}
+
+#[tokio::test]
+async fn exact_time_entry_survives_new_volume_arrival() {
+    // A new volume arriving must NOT evict pinned exact-time entries (they
+    // are immutable) — only "latest"/non-exact entries re-key (PR #378 r2).
+    let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let t0 = Utc.with_ymd_and_hms(2026, 5, 15, 0, 0, 0).unwrap();
+    let t1 = Utc.with_ymd_and_hms(2026, 5, 15, 0, 5, 0).unwrap();
+    let engine = Arc::new(GrowingVolume {
+        reads: reads.clone(),
+        times: std::sync::Mutex::new(vec![t0, t1]),
+    });
+    let app = router_with("radar-grow", engine.clone());
+
+    let pinned_uri =
+        "/collections/radar-grow/content.pnts?quantity=DBZH&datetime=2026-05-15T00:00:00Z";
+    let latest_uri = "/collections/radar-grow/content.pnts?quantity=DBZH";
+    let (s, _b, _h) = get_on(&app, pinned_uri).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _b, _h) = get_on(&app, latest_uri).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+    // A new volume arrives.
+    engine
+        .times
+        .lock()
+        .unwrap()
+        .push(Utc.with_ymd_and_hms(2026, 5, 15, 0, 10, 0).unwrap());
+
+    // The pinned exact-time frame is still served from the cache…
+    let (s, _b, _h) = get_on(&app, pinned_uri).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "exact-time entry must survive the manifest change"
+    );
+    // …while "latest" re-keys (data_version changed) and recomputes.
+    let (s, _b, _h) = get_on(&app, latest_uri).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "latest entry must re-key on a new volume"
+    );
 }

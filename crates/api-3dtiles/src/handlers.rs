@@ -20,6 +20,7 @@ use arc_swap::ArcSwap;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
+use bytes::Bytes;
 use chrono::{DateTime, SecondsFormat, Utc};
 use ds_core::config::CollectionConfig;
 use ds_core::geo::geodetic_to_ecef;
@@ -28,6 +29,7 @@ use ds_render::{BuiltinColormap, ColorMap, ColorStop, LutColorMap};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::cache::{ContentKey, ContentKind, CONTENT_CACHE};
 use crate::error::Tiles3dError;
 
 /// Default isosurface threshold (dBZ) when a request names none — a light-rain
@@ -333,20 +335,47 @@ fn etag_of(bytes: &[u8]) -> String {
     format!("\"{h:016x}\"")
 }
 
+/// The `Cache-Control` for a response: content pinned to an **exactly
+/// advertised** volume time is an archived volume that never changes, so let
+/// browsers hold it for a day without revalidating (`immutable`) — exactly the
+/// WMS explicit-`TIME` policy. The bundled viewer pins every animation frame
+/// from the `times` manifest, so a reload re-uses all of them from the browser
+/// cache instead of issuing one revalidation per frame.
+///
+/// `pinned` must be computed via [`exact_volume_time`], NOT from the mere
+/// presence of `?datetime=`: the engine selects the *nearest* retained volume,
+/// so a datetime **between** volumes can start resolving to different bytes
+/// when a closer volume arrives — `immutable` would let browsers and shared
+/// caches (CDN/reverse proxy) serve that stale for a day (PR #378 review).
+/// Non-exact pinned times and "latest" both keep the short window.
+fn cache_control(pinned: bool) -> &'static str {
+    if pinned {
+        "public, max-age=86400, immutable"
+    } else {
+        "public, max-age=60"
+    }
+}
+
+/// Whether `time` names an **exactly advertised** volume time — the only case
+/// where a response is truly immutable (see [`cache_control`]). `VolumeInfo.
+/// times` is sorted ascending per the engine contract, so binary search.
+fn exact_volume_time(info: &ds_core::volume::VolumeInfo, time: Option<DateTime<Utc>>) -> bool {
+    time.is_some_and(|t| info.times.binary_search(&t).is_ok())
+}
+
 /// Build a binary content response with strong-ETag conditional handling: a
 /// matching `If-None-Match` (or `*`) yields 304, otherwise 200 with the bytes.
 ///
-/// Note the 304 saves the *network transfer* but not the recompute — the
-/// caller already sampled + encoded + hashed to obtain `etag` (the
-/// `If-None-Match` value can't be trusted to match without recomputing the
-/// content). A CPU-cheap 304 needs an ETag cache keyed by the request params +
-/// a data-version — a follow-up. RFC 7232 §3.2: `If-None-Match` may be `*` or a
-/// comma-separated list.
+/// The bytes/ETag normally come from [`crate::cache::CONTENT_CACHE`], so a
+/// revalidation that hits the cache is two lookups — not a recompute. `pinned`
+/// selects the [`cache_control`] policy. RFC 7232 §3.2: `If-None-Match` may be
+/// `*` or a comma-separated list.
 fn binary_response(
     headers: &HeaderMap,
     content_type: &'static str,
     etag: &str,
-    bytes: Vec<u8>,
+    bytes: Bytes,
+    pinned: bool,
 ) -> Response {
     let not_modified = headers
         .get(header::IF_NONE_MATCH)
@@ -357,7 +386,7 @@ fn binary_response(
             StatusCode::NOT_MODIFIED,
             [
                 (header::ETAG, etag),
-                (header::CACHE_CONTROL, "public, max-age=60"),
+                (header::CACHE_CONTROL, cache_control(pinned)),
             ],
         )
             .into_response();
@@ -366,11 +395,44 @@ fn binary_response(
         [
             (header::CONTENT_TYPE, content_type),
             (header::ETAG, etag),
-            (header::CACHE_CONTROL, "public, max-age=60"),
+            (header::CACHE_CONTROL, cache_control(pinned)),
         ],
         bytes,
     )
         .into_response()
+}
+
+/// Data version of a collection for [`ContentKey`]: an FNV-1a hash of the
+/// volume time axis. Ingesting or dropping a volume changes it, which
+/// invalidates every cached "latest" entry *and* any pinned-time entry whose
+/// nearest-volume selection could have changed — without re-implementing the
+/// engine's selection rule at the API layer.
+fn data_version(info: &ds_core::volume::VolumeInfo) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for t in &info.times {
+        for b in t.timestamp_millis().to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// [`ContentKey::version`] for a request: an **exact advertised volume time**
+/// pins an immutable volume (nearest-selection of a zero-distance match is
+/// that volume; the file never changes once scanned), so its key gets a
+/// constant version — new volume arrivals must NOT evict the whole preloaded
+/// animation window every poll cycle (PR #378 review r2). Everything else
+/// ("latest", between-volume datetimes) takes the full [`data_version`].
+/// Retirement is covered: once the volume drops from `VolumeInfo.times` the
+/// exactness check flips false and the same request maps to a fresh
+/// `data_version`-keyed entry, so a retired time can't serve stale bytes.
+fn content_version(info: &ds_core::volume::VolumeInfo, exact: bool) -> u64 {
+    if exact {
+        0
+    } else {
+        data_version(info)
+    }
 }
 
 /// The bundled CesiumJS viewer page (collection + quantity + representation
@@ -427,9 +489,9 @@ pub async fn get_tileset(
     // URI so the content fetch is deterministic. Re-format the parsed time as
     // UTC `…Z` — a raw `+hh:mm` offset would be decoded as a space by the
     // client's URL parser and 400 on the fetch.
+    let time = params.datetime.as_deref().map(parse_datetime).transpose()?;
     let mut query = format!("quantity={}", pct_encode(&quantity));
-    if let Some(dt_str) = &params.datetime {
-        let dt = parse_datetime(dt_str)?;
+    if let Some(dt) = time {
         query.push_str(&format!("&datetime={}", dt.format("%Y-%m-%dT%H:%M:%SZ")));
     }
 
@@ -496,7 +558,14 @@ pub async fn get_tileset(
     Ok((
         [
             (header::CONTENT_TYPE, "application/json"),
-            (header::CACHE_CONTROL, "public, max-age=60"),
+            // Tilesets pinned to an exact advertised volume time are stable
+            // like their content (the region is the site's static coverage),
+            // so let browsers keep them too — the viewer fetches one tileset
+            // per preloaded animation frame.
+            (
+                header::CACHE_CONTROL,
+                cache_control(exact_volume_time(&info, time)),
+            ),
         ],
         tileset,
     )
@@ -525,36 +594,60 @@ pub async fn get_content(
         return Err(Tiles3dError::BadRequest("min_value must be finite".into()));
     }
 
-    // Sample + encode off the request worker: `read_point_cloud` does blocking
-    // HDF5 I/O and a long CPU loop (CLAUDE.md concurrency rules), so bound it
-    // with the shared render semaphore and run it on a blocking thread.
-    let _permit = state
-        .render_semaphore
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| Tiles3dError::Internal("render semaphore closed".into()))?;
+    let info = engine.volume_info();
+    let exact = exact_volume_time(&info, time);
+    let key = ContentKey {
+        collection: id,
+        kind: ContentKind::Pnts,
+        // Resolve an absent quantity to the default so both forms share one
+        // entry (the engine resolves `None` to the same default).
+        quantity: quantity
+            .clone()
+            .unwrap_or_else(|| info.default_quantity.clone()),
+        datetime: time,
+        param_bits: min_value.map(f64::to_bits),
+        dims: [0; 3],
+        version: content_version(&info, exact),
+    };
+    let pinned = exact;
 
     let engine = engine.clone();
+    let semaphore = state.render_semaphore.clone();
     let colormap = state.colormap.clone();
-    // Sample, encode, and hash all on the blocking thread (the ETag hash over a
-    // multi-MB tile is real CPU — keep it off the async worker too).
-    let (bytes, etag) =
-        tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
-            let cloud = engine.read_point_cloud(quantity.as_deref(), time, min_value, None)?;
-            let bytes = ds_3dtiles::encode_pnts(&cloud, colormap.as_ref())
-                .map_err(|e| Tiles3dError::Internal(format!("pnts encode failed: {e}")))?;
-            let etag = etag_of(&bytes);
-            Ok((bytes, etag))
+    let content = CONTENT_CACHE
+        .get_or_compute(key, || async move {
+            // Sample + encode off the request worker: `read_point_cloud` does
+            // blocking HDF5 I/O and a long CPU loop (CLAUDE.md concurrency
+            // rules), so bound it with the shared render semaphore and run it
+            // on a blocking thread. Only the computing (cache-missing)
+            // request pays this — hits and coalesced waiters never queue on
+            // the semaphore.
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|_| Tiles3dError::Internal("render semaphore closed".into()))?;
+
+            // Sample, encode, and hash all on the blocking thread (the ETag
+            // hash over a multi-MB tile is real CPU — keep it off the async
+            // worker too).
+            tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
+                let cloud = engine.read_point_cloud(quantity.as_deref(), time, min_value, None)?;
+                let bytes = ds_3dtiles::encode_pnts(&cloud, colormap.as_ref())
+                    .map_err(|e| Tiles3dError::Internal(format!("pnts encode failed: {e}")))?;
+                let etag = etag_of(&bytes);
+                Ok((bytes, etag))
+            })
+            .await
+            .map_err(|e| Tiles3dError::Internal(format!("sample task failed: {e}")))?
         })
-        .await
-        .map_err(|e| Tiles3dError::Internal(format!("sample task failed: {e}")))??;
+        .await?;
 
     Ok(binary_response(
         &headers,
         "application/octet-stream",
-        &etag,
-        bytes,
+        &content.etag,
+        content.bytes,
+        pinned,
     ))
 }
 
@@ -635,66 +728,98 @@ pub async fn get_content_glb(
         )));
     }
 
-    // read_voxel_grid + meshing do blocking HDF5 I/O + a long CPU loop, so bound
-    // them with the shared render semaphore and run on a blocking thread (same
-    // rule as the `.pnts` path / the raster `get_raster_tile`).
-    let _permit = state
-        .render_semaphore
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| Tiles3dError::Internal("render semaphore closed".into()))?;
+    let exact = exact_volume_time(&info, time);
+    let key = ContentKey {
+        collection: id,
+        kind: match representation {
+            Representation::EchoTop => ContentKind::EchoTop,
+            _ => ContentKind::Isosurface,
+        },
+        quantity: quantity
+            .clone()
+            .unwrap_or_else(|| info.default_quantity.clone()),
+        datetime: time,
+        // The *applied* threshold (default already folded in above), so a
+        // defaulted and an explicit-default request share one entry.
+        param_bits: Some(threshold.to_bits()),
+        dims,
+        version: content_version(&info, exact),
+    };
+    let pinned = exact;
 
     let engine = engine.clone();
+    let semaphore = state.render_semaphore.clone();
     let colormap = state.colormap.clone(); // reflectivity ramp (isosurface)
-    let id_for_err = id.clone();
-    let (bytes, etag) =
-        tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
-            let result = match representation {
-                Representation::EchoTop => {
-                    let grid =
-                        engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;
-                    ds_3dtiles::encode_echo_top_columns_glb(&grid, threshold, &*ECHO_TOP_COLORMAP)
-                }
-                Representation::Isosurface => {
-                    let grid =
-                        engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;
-                    // Colour the shell at the threshold (v1: one colormap for all
-                    // quantities — #350); seal NaN at the no-echo floor so it
-                    // closes into solid blobs (`floor < threshold` guaranteed).
-                    let color = colormap.color(Some(threshold));
-                    ds_3dtiles::encode_isosurface_glb(&grid, threshold, color, Some(floor))
-                }
-                // Rejected before the blocking task (see the `product` match).
-                Representation::Points => unreachable!("points rejected above"),
-            };
-            let bytes = result.map_err(|e| match e {
-                // No surface / no columns (threshold above all echo) — 404.
-                ds_3dtiles::Tiles3dError::Empty => Tiles3dError::NotFound(format!(
-                    "no {product} at threshold {threshold} for collection '{id_for_err}'"
-                )),
-                // Client-driven (threshold too low for this grid) — 400.
-                ds_3dtiles::Tiles3dError::TooLarge(_) => Tiles3dError::BadRequest(format!(
-                    "threshold {threshold} produces too large a {product}; raise it"
-                )),
-                // Unreachable (floor < threshold above) — defensive 400. Only
-                // the isosurface encoder emits this today, but this `map_err`
-                // covers both products, so use `{product}` for consistency.
-                ds_3dtiles::Tiles3dError::BackgroundNotBelowThreshold { .. } => {
-                    Tiles3dError::BadRequest(format!(
-                        "{product} sealing floor is not below the threshold"
-                    ))
-                }
-                other => Tiles3dError::Internal(format!("{product} encode failed: {other}")),
-            })?;
-            let etag = etag_of(&bytes);
-            Ok((bytes, etag))
+    let id_for_err = key.collection.clone();
+    let content = CONTENT_CACHE
+        .get_or_compute(key, || async move {
+            // read_voxel_grid + meshing do blocking HDF5 I/O + a long CPU
+            // loop, so bound them with the shared render semaphore and run on
+            // a blocking thread (same rule as the `.pnts` path / the raster
+            // `get_raster_tile`). Only the computing request pays this.
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|_| Tiles3dError::Internal("render semaphore closed".into()))?;
+
+            tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
+                let result = match representation {
+                    Representation::EchoTop => {
+                        let grid =
+                            engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;
+                        ds_3dtiles::encode_echo_top_columns_glb(
+                            &grid,
+                            threshold,
+                            &*ECHO_TOP_COLORMAP,
+                        )
+                    }
+                    Representation::Isosurface => {
+                        let grid =
+                            engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;
+                        // Colour the shell at the threshold (v1: one colormap for all
+                        // quantities — #350); seal NaN at the no-echo floor so it
+                        // closes into solid blobs (`floor < threshold` guaranteed).
+                        let color = colormap.color(Some(threshold));
+                        ds_3dtiles::encode_isosurface_glb(&grid, threshold, color, Some(floor))
+                    }
+                    // Rejected before the blocking task (see the `product` match).
+                    Representation::Points => unreachable!("points rejected above"),
+                };
+                let bytes = result.map_err(|e| match e {
+                    // No surface / no columns (threshold above all echo) — 404.
+                    ds_3dtiles::Tiles3dError::Empty => Tiles3dError::NotFound(format!(
+                        "no {product} at threshold {threshold} for collection '{id_for_err}'"
+                    )),
+                    // Client-driven (threshold too low for this grid) — 400.
+                    ds_3dtiles::Tiles3dError::TooLarge(_) => Tiles3dError::BadRequest(format!(
+                        "threshold {threshold} produces too large a {product}; raise it"
+                    )),
+                    // Unreachable (floor < threshold above) — defensive 400. Only
+                    // the isosurface encoder emits this today, but this `map_err`
+                    // covers both products, so use `{product}` for consistency.
+                    ds_3dtiles::Tiles3dError::BackgroundNotBelowThreshold { .. } => {
+                        Tiles3dError::BadRequest(format!(
+                            "{product} sealing floor is not below the threshold"
+                        ))
+                    }
+                    other => Tiles3dError::Internal(format!("{product} encode failed: {other}")),
+                })?;
+                let etag = etag_of(&bytes);
+                Ok((bytes, etag))
+            })
+            .await
+            .map_err(|e| Tiles3dError::Internal(format!("sample task failed: {e}")))?
         })
-        .await
-        .map_err(|e| Tiles3dError::Internal(format!("sample task failed: {e}")))??;
+        .await?;
 
     // glTF binary media type (CesiumJS also keys off the `.glb` magic).
-    Ok(binary_response(&headers, "model/gltf-binary", &etag, bytes))
+    Ok(binary_response(
+        &headers,
+        "model/gltf-binary",
+        &content.etag,
+        content.bytes,
+        pinned,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -753,9 +878,9 @@ pub async fn get_voxel_tileset(
 
     // The content fetch must render the same selection — bake it into the
     // (relative) content URI's query, alongside the implicit-tiling placeholders.
+    let time = params.datetime.as_deref().map(parse_datetime).transpose()?;
     let mut q = format!("quantity={}", pct_encode(&quantity));
-    if let Some(dt) = &params.datetime {
-        let dt = parse_datetime(dt)?;
+    if let Some(dt) = time {
         q.push_str(&format!("&datetime={}", dt.format("%Y-%m-%dT%H:%M:%SZ")));
     }
     q.push_str(&format!("&resolution={}", resolution.as_str()));
@@ -781,9 +906,16 @@ pub async fn get_voxel_tileset(
     // route through the shared ETag/conditional-GET helper so a CesiumJS poll
     // with a matching `If-None-Match` short-circuits to 304 (matches the
     // `content.pnts`/`content.glb` handlers).
-    let bytes = tileset.into_bytes();
+    let pinned = exact_volume_time(&info, time);
+    let bytes = Bytes::from(tileset.into_bytes());
     let etag = etag_of(&bytes);
-    Ok(binary_response(&headers, "application/json", &etag, bytes))
+    Ok(binary_response(
+        &headers,
+        "application/json",
+        &etag,
+        bytes,
+        pinned,
+    ))
 }
 
 /// `GET /collections/{id}/voxel/subtrees/{*tile}` — the implicit-tiling
@@ -814,12 +946,21 @@ pub async fn get_voxel_subtree(
     }
     // Constant body ⇒ constant ETag; route through `binary_response` so a
     // CesiumJS subtree re-poll with a matching `If-None-Match` short-circuits to
-    // 304 (the subtree is fetched during voxel traversal).
-    let bytes = ds_3dtiles::voxel_subtree_json()
-        .map_err(|e| Tiles3dError::Internal(format!("voxel subtree build failed: {e}")))?
-        .into_bytes();
+    // 304 (the subtree is fetched during voxel traversal). The body never
+    // changes (single-tile set), so it gets the long-lived policy.
+    let bytes = Bytes::from(
+        ds_3dtiles::voxel_subtree_json()
+            .map_err(|e| Tiles3dError::Internal(format!("voxel subtree build failed: {e}")))?
+            .into_bytes(),
+    );
     let etag = etag_of(&bytes);
-    Ok(binary_response(&headers, "application/json", &etag, bytes))
+    Ok(binary_response(
+        &headers,
+        "application/json",
+        &etag,
+        bytes,
+        true,
+    ))
 }
 
 /// The implicit voxel tiling is a single tile (`subtreeLevels`/`availableLevels`
@@ -879,32 +1020,55 @@ pub async fn get_voxel_content(
     let quantity = params.quantity.clone();
     let dims = Resolution::parse(params.resolution.as_deref())?.dims();
 
-    // Dedicated voxel pool (NOT the shared raster `render_semaphore`) so a slow
-    // `high`-res encode can't hold a WMS/Maps/Tiles render slot — see
-    // `VOXEL_SEMAPHORE`.
-    let _permit = VOXEL_SEMAPHORE
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| Tiles3dError::Internal("voxel semaphore closed".into()))?;
-    let engine = engine.clone();
-    let id_for_err = id.clone();
-    let (bytes, etag) =
-        tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
-            let grid = engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;
-            let bytes = ds_3dtiles::encode_voxels_glb(&grid).map_err(|e| match e {
-                ds_3dtiles::Tiles3dError::Empty => {
-                    Tiles3dError::NotFound(format!("no voxel data for collection '{id_for_err}'"))
-                }
-                other => Tiles3dError::Internal(format!("voxel encode failed: {other}")),
-            })?;
-            let etag = etag_of(&bytes);
-            Ok((bytes, etag))
-        })
-        .await
-        .map_err(|e| Tiles3dError::Internal(format!("voxel task failed: {e}")))??;
+    let exact = exact_volume_time(&info, time);
+    let key = ContentKey {
+        collection: id,
+        kind: ContentKind::Voxels,
+        quantity: quantity
+            .clone()
+            .unwrap_or_else(|| info.default_quantity.clone()),
+        datetime: time,
+        param_bits: None,
+        dims,
+        version: content_version(&info, exact),
+    };
+    let pinned = exact;
 
-    Ok(binary_response(&headers, "model/gltf-binary", &etag, bytes))
+    let engine = engine.clone();
+    let id_for_err = key.collection.clone();
+    let content = CONTENT_CACHE
+        .get_or_compute(key, || async move {
+            // Dedicated voxel pool (NOT the shared raster `render_semaphore`)
+            // so a slow `high`-res encode can't hold a WMS/Maps/Tiles render
+            // slot — see `VOXEL_SEMAPHORE`. Only the computing request pays.
+            let _permit = VOXEL_SEMAPHORE
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| Tiles3dError::Internal("voxel semaphore closed".into()))?;
+            tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
+                let grid = engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;
+                let bytes = ds_3dtiles::encode_voxels_glb(&grid).map_err(|e| match e {
+                    ds_3dtiles::Tiles3dError::Empty => Tiles3dError::NotFound(format!(
+                        "no voxel data for collection '{id_for_err}'"
+                    )),
+                    other => Tiles3dError::Internal(format!("voxel encode failed: {other}")),
+                })?;
+                let etag = etag_of(&bytes);
+                Ok((bytes, etag))
+            })
+            .await
+            .map_err(|e| Tiles3dError::Internal(format!("voxel task failed: {e}")))?
+        })
+        .await?;
+
+    Ok(binary_response(
+        &headers,
+        "model/gltf-binary",
+        &content.etag,
+        content.bytes,
+        pinned,
+    ))
 }
 
 // ---------------------------------------------------------------------------

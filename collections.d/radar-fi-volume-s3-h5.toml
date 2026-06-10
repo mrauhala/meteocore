@@ -27,7 +27,7 @@ id = "radar-fi-volume-s3-h5"
 title = "FMI — radar polar volumes (S3, ODIM_H5)"
 description = "Finnish radar polar volumes (ODIM_H5 PVOL) streamed from FMI's open-data S3 bucket — every FMI radar site, all elevation sweeps and dual-polarisation moments. One collection per radar site."
 engine_type = "odim-volume"
-apis = ["edr", "wms", "maps", "tiles"]
+apis = ["edr", "wms", "maps", "tiles", "3dtiles"]
 
 [odim]
 endpoint = "https://s3-eu-west-1.amazonaws.com"

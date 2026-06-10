@@ -414,8 +414,26 @@ into a glTF `.glb` triangle mesh.
   handlers bound them with the shared render semaphore and run via
   `spawn_blocking` — never inline on a request worker (the same pattern the
   raster APIs use for `get_raster_tile`).
-- **Caching:** content-derived ETag on both `.pnts` and `.glb` (deterministic
-  bytes ⇒ cheap 304s, shared `binary_response` helper); `content_uri` is
+- **Caching (two layers, hot-path audit 2026-06):** (1) `api-3dtiles/src/cache.rs`
+  — a process-global byte-bounded LRU of the **encoded content bytes + ETag**
+  (`.pnts`/`.glb`/voxel `.glb`), keyed by (collection, product, quantity,
+  datetime, params, dims) **plus a data-version hashed from `VolumeInfo.times`**
+  (new volume ⇒ new version, so "latest" and nearest-time selection invalidate
+  without duplicating engine selection logic), with per-key **single-flight**
+  coalescing (concurrent identical requests share one compute; the semaphore is
+  only acquired by the computing request). `MC_3DTILES_CONTENT_CACHE_MB`
+  (default 512, 0 disables). (2) engine-side `VOXEL_GRID_CACHE` in
+  `engine-odim` — `read_voxel_grid` returns `Arc<VoxelGrid>` from a global LRU
+  keyed (file, quantity, dims), so isosurface/echo-top/voxels and threshold
+  changes share one polar resample (`MC_PVOL_VOXEL_GRID_CACHE_MB`, default 512);
+  the resample itself resolves each `(radius, height)` column once
+  (`ColumnTarget`) instead of per-cell sweep/moment/pixel-cache lookups.
+  **`Cache-Control`:** content/tilesets whose `?datetime=` **exactly matches an
+  advertised volume time** get `max-age=86400, immutable` (the viewer pins every
+  animation frame from the `times` manifest, so reloads re-use the browser
+  cache); a between-volumes datetime (nearest-selection can change) and "latest"
+  keep `max-age=60`. A 304 revalidation costs two cache lookups, not a recompute. Cache metrics are in `/metrics`
+  (`tiles3d_content_cache_*`, `pvol_voxel_grid_cache_*`). `content_uri` is
   validated (no `..`/absolute/scheme) in `ds-3dtiles`.
 - **Config:** add `"3dtiles"` to a collection's `apis` (only `odim-volume`
   supports it today). v1 uses one shared reflectivity colormap; per-collection /

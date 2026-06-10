@@ -31,4 +31,6 @@ pub mod volume_engine;
 
 pub use engine::{EngineError, OdimEngine};
 pub use pixel_cache::PixelCache;
-pub use volume_engine::{pixel_cache_metrics, PolarVolumeEngine, PolarVolumeSiteView};
+pub use volume_engine::{
+    pixel_cache_metrics, voxel_grid_cache_metrics, PolarVolumeEngine, PolarVolumeSiteView,
+};
