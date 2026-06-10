@@ -336,12 +336,17 @@ function cacheGet(url) {
 function cachePut(url, ts) {
   // Two overlapping builds can both fetch the same URL (the first superseded
   // mid-flight); overwriting the map entry would orphan the loser in the scene.
+  // `prev` can never be a live frame today — a cached URL is pre-populated into
+  // `frames` by cacheGet and excluded from `pending`, so no worker re-fetches
+  // it — the includes() is defence-in-depth: if that invariant ever breaks,
+  // leak the orphan rather than destroy a tileset that's on screen.
   const prev = tileCache.get(url);
   if (prev && prev !== ts && !frames.includes(prev)) viewer.scene.primitives.remove(prev);
   tileCache.set(url, ts);
+  const pinned = new Set(frames);
   for (const [u, old] of tileCache) {
     if (tileCache.size <= TILE_CACHE_MAX) break;
-    if (frames.includes(old)) continue; // never evict a frame in active use
+    if (pinned.has(old)) continue; // never evict a frame in active use
     tileCache.delete(u);
     viewer.scene.primitives.remove(old);
   }
