@@ -202,6 +202,16 @@ pub async fn wms_handler(
                 .reference_time
                 .filter(|&rt| info.reference_times.last().copied() != Some(rt));
 
+            // Resolve a TIME-less request to the engine's *current* latest
+            // timestamp before any cache key is built. The rendered + meta-tile
+            // caches have no TTL, so keying "latest" as `None` would freeze the
+            // first rendered frame (and its ETag) forever while the engine's
+            // catalog moves on — a TIME-less layer must track new data. Mirrors
+            // Maps/Tiles, which resolve latest the same way before keying.
+            // `info.times` is ascending; when it's empty (e.g. STAC cold start)
+            // the request falls through as `None` = the engine's own latest.
+            let time = params.time.or_else(|| info.times.last().copied());
+
             // Build cache key
             let cache_key = CacheKey {
                 layer: params.layer.clone(),
@@ -223,7 +233,7 @@ pub async fn wms_handler(
                 },
                 width: params.width,
                 height: params.height,
-                time: params.time,
+                time,
                 // WMS picks the parameter via `LAYERS=collection/param`
                 // (parsed into layer_parameter) and then `style_info.parameter`.
                 // Both are already folded into `style_parameter` below; mirror
@@ -298,7 +308,8 @@ pub async fn wms_handler(
             let bbox = params.bbox;
             let width = params.width;
             let height = params.height;
-            let time = params.time;
+            // `time` (latest-resolved above) is `Copy`; it flows into both the
+            // direct and meta-tile render closures below.
             let output_crs = params.output_crs.clone();
             let format = params.format;
             let elevation = params.elevation;
