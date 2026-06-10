@@ -427,7 +427,7 @@ async function loadVoxel(token) {
 }
 
 // The `min dBZ` field value for voxels (cells below it are fully transparent).
-function voxelMin() { const m = parseFloat($num.value); return Number.isFinite(m) ? m : 5; }
+function voxelMin() { const m = parseFloat($num.value); return Number.isFinite(m) ? m : parseFloat(REP_META.voxels.numDefault); }
 function voxelMinLabel() { const m = parseFloat($num.value); return Number.isFinite(m) ? `≥ ${m} dBZ` : ""; }
 
 // #rrggbb → "vec3(r,g,b)" (0..1) for GLSL.

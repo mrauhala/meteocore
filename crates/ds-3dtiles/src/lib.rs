@@ -108,6 +108,40 @@ pub(crate) fn validate_uri(uri: &str) -> Result<(), Tiles3dError> {
     Ok(())
 }
 
+/// Assemble a binary glTF (`.glb`) from a glTF JSON value + a BIN buffer. Both
+/// chunks are padded to a 4-byte boundary (JSON with spaces, BIN with zeros) per
+/// the glTF 2.0 spec, and the total length is `u32::try_from`-checked so a >4 GiB
+/// tile errors rather than wrapping. Shared by every `.glb` encoder in the crate
+/// (voxels, isosurface, echo-top) so the overflow guard and the serialize-error
+/// path are written once.
+pub(crate) fn assemble_glb(
+    gltf: &serde_json::Value,
+    mut bin: Vec<u8>,
+) -> Result<Vec<u8>, Tiles3dError> {
+    let mut json_bytes =
+        serde_json::to_vec(gltf).map_err(|e| Tiles3dError::Serialize(e.to_string()))?;
+    while !json_bytes.len().is_multiple_of(4) {
+        json_bytes.push(b' ');
+    }
+    while !bin.len().is_multiple_of(4) {
+        bin.push(0);
+    }
+    let total = 12 + 8 + json_bytes.len() + 8 + bin.len();
+    let total = u32::try_from(total).map_err(|_| Tiles3dError::TooLarge("glb byteLength"))?;
+
+    let mut glb = Vec::with_capacity(total as usize);
+    glb.extend_from_slice(b"glTF");
+    glb.extend_from_slice(&2u32.to_le_bytes()); // version
+    glb.extend_from_slice(&total.to_le_bytes());
+    glb.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"JSON");
+    glb.extend_from_slice(&json_bytes);
+    glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"BIN\0");
+    glb.extend_from_slice(&bin);
+    Ok(glb)
+}
+
 /// Encode a point cloud as a 3D Tiles **`.pnts`** tile (the 3D Tiles 1.0 Point
 /// Cloud format, still rendered by CesiumJS in 1.1 — the path where per-point
 /// RGB and `pointSize` styling actually work).
