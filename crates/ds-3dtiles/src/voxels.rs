@@ -55,6 +55,18 @@ pub fn encode_voxels_glb(grid: &VoxelGrid) -> Result<Vec<u8>, Tiles3dError> {
         .and_then(|n| u32::try_from(n).ok())
         .ok_or(Tiles3dError::TooLarge("voxel buffer"))?;
 
+    // `count` (the accessor/buffer length) is `dims` product, but the transpose
+    // and `smooth_grid` index `grid.values` by `grid.index(dims, …)` — a values
+    // length that disagrees with `dims` would panic out-of-bounds deep inside the
+    // `spawn_blocking` task. The engine builds the two consistently; assert it
+    // (debug-only, zero release cost) so an engine bug fails loud and clear here.
+    debug_assert_eq!(
+        grid.values.len(),
+        count,
+        "voxel grid values ({}) must match dims product ({count})",
+        grid.values.len(),
+    );
+
     // Fill **unmeasured** (`NaN`: cone of silence, below the lowest beam, beyond
     // range) cells with the no-echo floor — NOT an extreme nodata sentinel.
     // CesiumJS *trilinearly interpolates* the metadata before the shader, so an
@@ -222,10 +234,13 @@ fn smooth_grid(vals: Vec<f32>, dims: [usize; 3]) -> Vec<f32> {
             }
         }
         std::mem::swap(&mut src, &mut dst);
-        // Radius (clamp).
-        for a in 0..n_a {
-            for h in 0..n_h {
-                for r in 0..n_r {
+        // Radius (clamp). Loop with `r` OUTERMOST and `h` (the fastest-varying
+        // axis, stride 1) innermost: `r` has the largest stride (`n_a*n_h`), so
+        // an `r`-innermost sweep would miss cache on nearly every step. Same
+        // result, cache-friendly access.
+        for r in 0..n_r {
+            for a in 0..n_a {
+                for h in 0..n_h {
                     let lo = src[idx(r.saturating_sub(1), a, h)];
                     let hi = src[idx((r + 1).min(n_r - 1), a, h)];
                     dst[idx(r, a, h)] = blur(lo, src[idx(r, a, h)], hi);

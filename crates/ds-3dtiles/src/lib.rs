@@ -93,10 +93,15 @@ pub enum Tiles3dError {
 /// caller-supplied URI runs it through this guard (defence-in-depth for a `pub`
 /// API — today's callers all build the URIs server-side).
 pub(crate) fn validate_uri(uri: &str) -> Result<(), Tiles3dError> {
+    // Scan for `..` over the PATH only (drop any `?query`/`#fragment` first):
+    // a `..` directly before the query (`a/..?x=1`) must still be caught, while
+    // a `..` *inside* a query value (`a.glb?from=../b`) is not a path segment and
+    // is harmless. The empty/absolute/scheme checks apply to the whole URI.
+    let path = uri.split(['?', '#']).next().unwrap_or(uri);
     if uri.is_empty()
         || uri.starts_with('/')
         || uri.contains("://")
-        || uri.split('/').any(|s| s == "..")
+        || path.split('/').any(|s| s == "..")
     {
         return Err(Tiles3dError::InvalidUri(uri.to_string()));
     }
@@ -474,6 +479,19 @@ mod tests {
         // A plain relative path is accepted.
         assert!(tileset_json(&cloud, "content.pnts").is_ok());
         assert!(tileset_json(&cloud, "tiles/0/content.pnts").is_ok());
+    }
+
+    #[test]
+    fn validate_uri_isolates_path_from_query() {
+        // `..` as a path segment right before the query is caught …
+        assert!(matches!(
+            validate_uri("content/..?t=1"),
+            Err(Tiles3dError::InvalidUri(_))
+        ));
+        // … but a `..` inside a query *value* is not a path segment — allowed
+        // (the implicit-tiling content URIs carry `?datetime=…` query strings).
+        assert!(validate_uri("content/0/0/0/0.glb?from=../other").is_ok());
+        assert!(validate_uri("content/{level}/{x}/{y}/{z}.glb?quantity=DBZH").is_ok());
     }
 
     #[test]
