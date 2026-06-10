@@ -468,9 +468,17 @@ function voxelShader(quantity, legend, min) {
     `void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material){`,
     `  float v=fsInput.metadata.${quantity};`,
     `  material.diffuse=voxRamp(v);`,
-    // Density rises smoothly FROM 0 at the `min` threshold (no hard alpha step →
-    // no shell/"walls and floors" at the min isovalue), ~0.55 by +25 dBZ above it.
-    `  material.alpha=clamp((v-(${min.toFixed(2)}))*0.022,0.0,0.55);`,
+    // Opacity: a dead-band then a quadratic ramp to near-opaque (#383). The
+    // encoder fills unmeasured cells with the −32 dBZ no-echo floor, so the
+    // whole cylinder is a dense low-value field — the old slow linear ramp
+    // (0.022/dBZ from `min`, capped at 0.55) let weak echo + interpolated floor
+    // accumulate along every ray into a uniform milky haze while storm cores
+    // never read solid. Instead: fully transparent until 3 dBZ above `min`
+    // (kills the haze; still no hard alpha step — the quadratic rises smoothly
+    // from 0, so no shell/"walls and floors" at the min isovalue), then
+    // t² over the next 20 dBZ up to 0.95 so cores approach opacity.
+    `  float t=clamp((v-(${(min + 3.0).toFixed(2)}))/20.0,0.0,1.0);`,
+    `  material.alpha=t*t*0.95;`,
     `}`,
   ].join("\n");
   return new Cesium.CustomShader({ fragmentShaderText: fs });
