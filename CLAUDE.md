@@ -375,9 +375,14 @@ into a glTF `.glb` triangle mesh.
   (`VoxelCylinderShape`, verified in the 1.142 source) uses default angle bounds
   **-π..+π**, angle-index 0 → -π, angle **counter-clockwise from local +X**
   (=East via the ENU transform). The encoder remaps each output angle slot `s`
-  to the radar bin at compass bearing `90° - (-π + (s+0.5)/nA·2π)`
+  to the radar bin at compass bearing **`270° - φ`** where `φ = -π + (s+0.5)/nA·2π`
   (`grid_azimuth_index`); the mesh/point products skip this (they map azimuth →
-  ECEF directly). **Unmeasured (`NaN`) cells → the no-echo floor (-32 dBZ), NO
+  ECEF directly). **The `+180°` (270 not the 90 the stated convention implies) is
+  render-verified, not derived:** CesiumJS's effective cylinder-angle origin sits
+  opposite (-X) to where the -π bound + +X=East transform predict, so the naive
+  `90° - φ` leaves the volume 180°-rotated. ALWAYS render-verify a voxel-cylinder
+  azimuth mapping against the point cloud — the handedness/offset can't be trusted
+  from the spec alone. **Unmeasured (`NaN`) cells → the no-echo floor (-32 dBZ), NO
   `noData`** — an extreme sentinel trilinearly-interpolates into hard
   walls/floors at the data boundary; the floor (faded out by the transfer
   function) keeps boundaries soft, at the cost of a dense volume (no empty-space
