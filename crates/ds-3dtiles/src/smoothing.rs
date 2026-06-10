@@ -195,6 +195,28 @@ mod tests {
     }
 
     #[test]
+    fn nan_aware_renormalizes_weights_exactly() {
+        // Non-uniform values against a NaN boundary pin the renormalization
+        // arithmetic itself (a uniform plateau can't — any weighting of equal
+        // inputs returns the input). One pass over a [1, 1, 3] column
+        // [NaN, 10, 30]: only the height sweep does real work (the radius and
+        // angle axes are size 1, so their clamped/periodic neighbours are the
+        // cell itself and blur(v, v, v) = v).
+        //   cell 1: NaN neighbour dropped → (0.5·10 + 0.25·30) / 0.75 = 50/3
+        //   cell 2: clamped end (hi = self) → 0.25·10 + 0.75·30 = 25
+        //   cell 0: NaN stays NaN
+        let dims = [1, 1, 3];
+        let out = smooth_grid_nan_aware(vec![f32::NAN, 10.0, 30.0], dims, 1);
+        assert!(out[0].is_nan(), "NaN cell must stay NaN: {}", out[0]);
+        assert!(
+            (out[1] - 50.0 / 3.0).abs() < 1e-4,
+            "renormalized over finite neighbours only: {}",
+            out[1]
+        );
+        assert!((out[2] - 25.0).abs() < 1e-4, "clamped end: {}", out[2]);
+    }
+
+    #[test]
     fn zero_passes_is_identity() {
         let vals = fill(|r, a, h| (r * 100 + a * 10 + h) as f32);
         assert_eq!(smooth_grid(vals.clone(), DIMS, 0), vals);
