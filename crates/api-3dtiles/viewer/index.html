@@ -358,6 +358,7 @@ function cachePut(url, ts) {
 // captures the generation it started under).
 let cacheGen = 0;
 function clearFrameCache() {
+  stopPlaying(); // don't leave the play timer ticking over an emptied `frames`
   cacheGen++;
   frames = [];
   for (const ts of tileCache.values()) viewer.scene.primitives.remove(ts);
@@ -476,7 +477,7 @@ async function loadFrames(reframe = false) {
       if (ts) {
         if (currentRep === "points") stylePointFrame(ts, pointsStyleMin);
         syncTimeBar(); // unhides the time bar once the first frame exists
-        if (i === frameIdx) { showFrame(frameIdx); await maybeReframe(); }
+        if (i === frameIdx) { showFrame(frameIdx); await maybeReframe(); if (token !== loadToken) return; }
       }
       progress();
     }
