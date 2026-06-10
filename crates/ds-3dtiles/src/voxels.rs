@@ -151,19 +151,22 @@ pub fn encode_voxels_glb(grid: &VoxelGrid) -> Result<Vec<u8>, Tiles3dError> {
 /// index in the native grid.
 ///
 /// The grid's angle axis is radar azimuth: index `a` is the bearing
-/// `(a+0.5)·360/nA` **degrees clockwise from North**. CesiumJS, however, places
-/// glTF angle slot `s` at cylinder angle `φ = -π + (s+0.5)/nA·2π`, measured
-/// **counter-clockwise from local +X**, and our ENU→ECEF tile transform makes
-/// local +X = East, +Y = North. The compass bearing of that direction is
-/// `90° - φ`. So slot `s` must be filled from the azimuth bin nearest that
-/// bearing — a reflection plus a 90° offset. Skipping this remap renders the
-/// volume rotated 90° **and** mirrored (North-CW vs East-CCW), which is exactly
-/// the misplacement seen against the (absolutely-positioned) point-cloud and
-/// mesh products. Periodic, so the result is always a valid `0..nA` index.
+/// `(a+0.5)·360/nA` **degrees clockwise from North**. CesiumJS places glTF angle
+/// slot `s` at cylinder angle `φ = -π + (s+0.5)/nA·2π` (counter-clockwise; the
+/// 1.142 `VoxelCylinderShape` default bounds are -π..+π). Mapping that to a
+/// compass bearing and reading the matching radar bin corrects the North-CW vs
+/// East-CCW mismatch (a reflection + rotation). The bearing is
+/// `270° - φ`, **not** the `90° - φ` that the +X=East tile transform alone
+/// predicts: render-verification against the (absolutely-positioned) point cloud
+/// showed the naive `90° - φ` still 180°-rotated — CesiumJS's effective cylinder
+/// angle origin sits opposite (-X) to where the stated -π bound + ENU transform
+/// imply, so a +180° term is required. With it, the voxel echo footprint matches
+/// the point cloud exactly. Periodic, so the result is always a valid `0..nA`
+/// index.
 fn grid_azimuth_index(slot: usize, n_a: usize) -> usize {
     use std::f64::consts::{PI, TAU};
     let phi = -PI + (slot as f64 + 0.5) * TAU / n_a as f64;
-    let bearing_deg = 90.0 - phi.to_degrees();
+    let bearing_deg = 270.0 - phi.to_degrees();
     (bearing_deg / 360.0 * n_a as f64 - 0.5)
         .round()
         .rem_euclid(n_a as f64) as usize
