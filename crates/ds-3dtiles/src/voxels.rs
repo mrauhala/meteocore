@@ -85,11 +85,14 @@ pub fn encode_voxels_glb(grid: &VoxelGrid) -> Result<Vec<u8>, Tiles3dError> {
 
     // Transpose the smoothed grid from native `[radius, angle, height]`
     // (height-fastest) into the glТF cylinder layout `[radius, height, angle]`
-    // (radius-fastest → height → angle-slowest), and track the range.
+    // (radius-fastest → height → angle-slowest), remapping the angle axis from
+    // the radar-azimuth convention to CesiumJS's cylinder convention (see
+    // [`grid_azimuth_index`]), and track the range.
     let mut bin = Vec::with_capacity(count * 4);
     let mut vmin = f32::INFINITY;
     let mut vmax = f32::NEG_INFINITY;
-    for i_a in 0..n_a {
+    for slot in 0..n_a {
+        let i_a = grid_azimuth_index(slot, n_a);
         for i_h in 0..n_h {
             for i_r in 0..n_r {
                 let f = native[grid.index(i_r, i_a, i_h)];
@@ -142,6 +145,28 @@ pub fn encode_voxels_glb(grid: &VoxelGrid) -> Result<Vec<u8>, Tiles3dError> {
     });
 
     assemble_glb(&gltf, bin)
+}
+
+/// Map a glTF/CesiumJS cylinder **angle slot** to the source **radar-azimuth**
+/// index in the native grid.
+///
+/// The grid's angle axis is radar azimuth: index `a` is the bearing
+/// `(a+0.5)·360/nA` **degrees clockwise from North**. CesiumJS, however, places
+/// glTF angle slot `s` at cylinder angle `φ = -π + (s+0.5)/nA·2π`, measured
+/// **counter-clockwise from local +X**, and our ENU→ECEF tile transform makes
+/// local +X = East, +Y = North. The compass bearing of that direction is
+/// `90° - φ`. So slot `s` must be filled from the azimuth bin nearest that
+/// bearing — a reflection plus a 90° offset. Skipping this remap renders the
+/// volume rotated 90° **and** mirrored (North-CW vs East-CCW), which is exactly
+/// the misplacement seen against the (absolutely-positioned) point-cloud and
+/// mesh products. Periodic, so the result is always a valid `0..nA` index.
+fn grid_azimuth_index(slot: usize, n_a: usize) -> usize {
+    use std::f64::consts::{PI, TAU};
+    let phi = -PI + (slot as f64 + 0.5) * TAU / n_a as f64;
+    let bearing_deg = 90.0 - phi.to_degrees();
+    (bearing_deg / 360.0 * n_a as f64 - 0.5)
+        .round()
+        .rem_euclid(n_a as f64) as usize
 }
 
 /// Separable 3-D smoothing of the (NaN-filled) grid in its native
