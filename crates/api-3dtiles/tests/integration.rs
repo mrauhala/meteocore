@@ -72,16 +72,20 @@ impl VolumeEngine for MockVolume {
                 return Err(DataServerError::InvalidParameter(format!("unknown {q}")));
             }
         }
-        let dims = dims.unwrap_or([4, 8, 4]);
+        let dims = dims.unwrap_or([16, 16, 16]);
         let [n_r, n_a, n_h] = dims;
         // Clear air is the finite no-echo floor (matching the post-#360 engine
-        // fill), with a finite >threshold echo core in the middle — so the
-        // isosurface (which the handler seals with `background=Some(floor)`)
-        // produces a non-empty mesh.
+        // fill), with a finite >threshold echo core spanning the middle half of
+        // the radius/height axes (full angle ring) — so the isosurface (which
+        // the handler seals with `background=Some(floor)` and then smooths
+        // before marching, #381) produces a non-empty mesh: the core scales
+        // with the requested grid and its interior survives the blur against
+        // the floor, like a physical echo spanning many cells (a fixed
+        // 2-cell-wide ring would smooth entirely below the threshold).
         let mut values = vec![ds_core::volume::NO_ECHO_FLOOR_DBZ; n_r * n_a * n_h];
-        for i_r in 1..n_r.min(3) {
+        for i_r in n_r / 4..(n_r * 3 / 4) {
             for i_a in 0..n_a {
-                for i_h in 1..n_h.min(3) {
+                for i_h in n_h / 4..(n_h * 3 / 4) {
                     values[VoxelGrid::index_of(dims, i_r, i_a, i_h)] = 40.0;
                 }
             }

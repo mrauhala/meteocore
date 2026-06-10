@@ -344,6 +344,11 @@ fn march_tet(
 /// mesh shaded a single `color` (`[r, g, b, a]`, 0–255) — typically the
 /// colormap colour at `threshold`, i.e. "the 20 dBZ shell".
 ///
+/// The scalar field is lightly smoothed before marching (#381 — see
+/// `crate::smoothing`), so the shell follows the echo, not the cell lattice;
+/// expect extracted values to deviate from the raw grid by up to the
+/// cell-to-cell contrast near sharp gradients and clamped grid edges.
+///
 /// ## `background` — sealing the surface against clear air
 ///
 /// A radar volume stores **`NaN` for both** "the radar looked and saw nothing"
@@ -379,10 +384,12 @@ pub fn encode_isosurface_glb(
         return Err(Tiles3dError::NonFinite("threshold"));
     }
     // A `Some` background must be finite (else it acts like `None` — a NaN fill
-    // leaves the corner non-finite → tet skipped) AND strictly below `threshold`
-    // (else unmeasured cells would seal as *inside* the surface, inverting it).
+    // leaves the corner non-finite → tet skipped) AND representable as `f32`
+    // (the seal narrows `bg as f32`; an out-of-range f64 would cast to ±inf and
+    // propagate through the dense blur) AND strictly below `threshold` (else
+    // unmeasured cells would seal as *inside* the surface, inverting it).
     if let Some(bg) = background {
-        if !bg.is_finite() {
+        if !bg.is_finite() || bg.abs() > f64::from(f32::MAX) {
             return Err(Tiles3dError::NonFinite("background"));
         }
         if bg >= threshold {
@@ -392,13 +399,37 @@ pub fn encode_isosurface_glb(
             });
         }
     }
-    // `NaN` corners map to this: the finite background (seal) or `NaN` (skip).
-    let nan_fill = background.unwrap_or(f64::NAN);
     let rtc = geodetic_to_ecef(grid.origin_lon, grid.origin_lat, grid.origin_height);
     if rtc.iter().any(|c| !c.is_finite()) {
         return Err(Tiles3dError::NonFinite("rtc_center"));
     }
     let [n_r, n_a, n_h] = grid.dims;
+
+    // Smooth the scalar field before marching (#381). Radar echo is cellular
+    // (each cell a local reflectivity maximum), so a shell extracted from the
+    // raw grid inherits the cell lattice as stair-steps along the contour —
+    // worst at range, where 1° azimuth bins are km-wide. 2 passes (sigma ≈ 1
+    // cell) round the contour without erasing storm-core structure (the voxel
+    // ray-march uses 4 — see `crate::smoothing` — but a mesh shows its lattice
+    // less than a volume seen from inside). `NaN` handling follows the sealing
+    // decision: with a `background` the field is sealed FIRST and the dense
+    // blur runs over finite values only; without one, the NaN-aware blur keeps
+    // unmeasured cells `NaN` (still skipped below) and never bleeds them into
+    // real echo — the open-boundary semantics (#360) survive the smoothing.
+    const SMOOTH_PASSES: usize = 2;
+    let field: Vec<f32> = match background {
+        Some(bg) => {
+            let sealed = grid
+                .values
+                .iter()
+                .map(|&v| if v.is_finite() { v } else { bg as f32 })
+                .collect();
+            crate::smoothing::smooth_grid(sealed, grid.dims, SMOOTH_PASSES)
+        }
+        None => {
+            crate::smoothing::smooth_grid_nan_aware(grid.values.clone(), grid.dims, SMOOTH_PASSES)
+        }
+    };
 
     let mut mesh = MeshBuilder::new();
     // Iterate cubes. The angular seam (i_a = n_a−1 → 0) is not wrapped in v1, so
@@ -411,9 +442,9 @@ pub fn encode_isosurface_glb(
                 let mut cidx = [[0.0_f64; 3]; 8];
                 for (c, off) in CORNER.iter().enumerate() {
                     let (ir, ia, ih) = (i_r + off[0], i_a + off[1], i_h + off[2]);
-                    let raw = grid.values[grid.index(ir, ia, ih)] as f64;
-                    // Clear air / unmeasured → background (seal) or NaN (skip).
-                    cvals[c] = if raw.is_finite() { raw } else { nan_fill };
+                    // Sealed + smoothed (or NaN-aware-smoothed) value; a
+                    // remaining NaN means unmeasured with no seal → tet skipped.
+                    cvals[c] = field[grid.index(ir, ia, ih)] as f64;
                     cidx[c] = [ir as f64, ia as f64, ih as f64];
                 }
                 for tet in TETS {
@@ -633,16 +664,20 @@ mod tests {
 
     #[test]
     fn isosurface_sits_at_the_expected_height() {
-        // value = i_h, threshold 1.5 → the surface is a sheet where the field
-        // crosses 1.5, i.e. fractional height index 1.5. With height_range
-        // [0,10000] over 5 cells (cell centres 1000,3000,5000,…), index 1.5 maps
-        // to height (1.5+0.5)·2000 = 4000 m above the origin — and ONLY there,
-        // since the field depends solely on height. Use a small 5 km disc so
-        // earth-curvature/up-deflection over the span is negligible, then
-        // reconstruct each vertex's height above the antenna and assert ≈4000 m.
-        let mut grid = ramp_grid(4, 16, 5);
+        // value = i_h, threshold 4.5 → the surface is a sheet where the field
+        // crosses 4.5, i.e. fractional height index 4.5. With height_range
+        // [0,9000] over 9 cells (cell centres 500,1500,…), index 4.5 maps to
+        // height (4.5+0.5)·1000 = 5000 m above the origin — and ONLY there,
+        // since the field depends solely on height. The pre-march smoothing
+        // (#381) preserves a linear ramp exactly except within `passes` (=2)
+        // cells of the clamped height ends, so a crossing between cells 4 and 5
+        // of 9 is untouched. Use a small 5 km disc so earth-curvature/
+        // up-deflection over the span is negligible, then reconstruct each
+        // vertex's height above the antenna and assert ≈5000 m.
+        let mut grid = ramp_grid(4, 16, 9);
         grid.radius_range = [0.0, 5_000.0];
-        let glb = encode_isosurface_glb(&grid, 1.5, [0, 128, 255, 255], None).unwrap();
+        grid.height_range = [0.0, 9_000.0];
+        let glb = encode_isosurface_glb(&grid, 4.5, [0, 128, 255, 255], None).unwrap();
         let (json, bin) = parse_glb(&glb);
 
         let rtc = geodetic_to_ecef(grid.origin_lon, grid.origin_lat, grid.origin_height);
@@ -661,7 +696,7 @@ mod tests {
             // (x,−z,y); height above antenna = offset · up.
             let offset = [v[0] as f64, -(v[2] as f64), v[1] as f64];
             let h = offset[0] * up[0] + offset[1] * up[1] + offset[2] * up[2];
-            assert!((h - 4000.0).abs() < 50.0, "vertex height {h} ≉ 4000 m");
+            assert!((h - 5000.0).abs() < 50.0, "vertex height {h} ≉ 5000 m");
         }
     }
 
@@ -722,17 +757,63 @@ mod tests {
     }
 
     #[test]
+    fn open_surface_meshes_crossings_inside_finite_region_only() {
+        // background = None with a crossing entirely INSIDE the finite region:
+        // a 40 dBZ core wrapped in a finite 0 dBZ shell, all surrounded by NaN.
+        // The NaN-aware pre-smoothing must keep the finite 40↔0 crossing intact
+        // (no erosion from the NaN surroundings) and the mesher must emit the
+        // surface there while still skipping every NaN-touching tetrahedron —
+        // closing the gap between the smoothing unit tests and the mesher.
+        let mut grid = ramp_grid(10, 16, 10);
+        grid.values.iter_mut().for_each(|v| *v = f32::NAN);
+        // Finite shell (0 dBZ) spanning r/h 1..9, a 3..13…
+        for ir in 1..9 {
+            for ia in 3..13 {
+                for ih in 1..9 {
+                    let idx = grid.index(ir, ia, ih);
+                    grid.values[idx] = 0.0;
+                }
+            }
+        }
+        // …with a 40 dBZ core in its middle. The 40↔0 crossing must sit
+        // ≥ SMOOTH_PASSES (= 2) finite cells from any NaN: the NaN-aware blur
+        // renormalizes over finite neighbours, so finite cells within `passes`
+        // cells of the open boundary shift toward their finite neighbours — a
+        // crossing closer than that could move or vanish. If SMOOTH_PASSES is
+        // bumped, widen the shell margin here to match.
+        for ir in 3..7 {
+            for ia in 6..10 {
+                for ih in 3..7 {
+                    let idx = grid.index(ir, ia, ih);
+                    grid.values[idx] = 40.0;
+                }
+            }
+        }
+        let glb = encode_isosurface_glb(&grid, 20.0, [0, 200, 0, 255], None)
+            .expect("crossing inside the finite region must mesh without a background");
+        let (json, _bin) = parse_glb(&glb);
+        let count = json["accessors"][0]["count"].as_u64().unwrap();
+        assert!(
+            count > 0 && count % 3 == 0,
+            "open surface has triangles: {count}"
+        );
+    }
+
+    #[test]
     fn background_seals_echo_surrounded_by_clear_air() {
         // A compact echo core embedded in NaN (clear air). With background = None
         // the surface can't close (Empty). With background = Some(below-threshold),
         // the NaN corners are treated as no-echo and the surface seals into a
         // closed blob — exactly the fix for the "curtains" artifact.
-        let mut grid = ramp_grid(6, 16, 6);
+        let mut grid = ramp_grid(8, 16, 8);
         grid.values.iter_mut().for_each(|v| *v = f32::NAN);
-        // A 2×2×2 finite >threshold core in the interior, rest NaN.
-        for ir in 2..4 {
-            for ia in 7..9 {
-                for ih in 2..4 {
+        // A 4×4×4 finite >threshold core in the interior, rest NaN. Big enough
+        // that the pre-march smoothing (2 passes against the sealed −32 floor)
+        // leaves its centre well above the 20 dBZ threshold (a 2×2×2 core would
+        // smooth entirely below it — physical echoes span many cells).
+        for ir in 2..6 {
+            for ia in 6..10 {
+                for ih in 2..6 {
                     let idx = grid.index(ir, ia, ih);
                     grid.values[idx] = 40.0;
                 }
@@ -764,6 +845,12 @@ mod tests {
         // A Some(non-finite) background is rejected (would silently act like None).
         assert!(matches!(
             encode_isosurface_glb(&grid, 1.5, [0, 0, 0, 255], Some(f64::INFINITY)),
+            Err(Tiles3dError::NonFinite("background"))
+        ));
+        // A finite f64 beyond f32 range is rejected too (the seal narrows to
+        // f32, so 1e39 would cast to -inf and poison the dense blur).
+        assert!(matches!(
+            encode_isosurface_glb(&grid, 1.5, [0, 0, 0, 255], Some(-1e39)),
             Err(Tiles3dError::NonFinite("background"))
         ));
     }

@@ -91,9 +91,15 @@ pub fn encode_voxels_glb(grid: &VoxelGrid) -> Result<Vec<u8>, Tiles3dError> {
     // reflectivity maximum, so even with GPU trilinear interpolation a raw render
     // shows one blob per cell (a visible grid of cells at close zoom). A light
     // separable 3-D smoothing merges adjacent cells into a continuous field — the
-    // standard radar-volume reconstruction. Angle is periodic (full circle);
-    // radius/height clamp at the ends.
-    let native = smooth_grid(native, grid.dims);
+    // standard radar-volume reconstruction (see `crate::smoothing`).
+    //
+    // 4 passes ⇒ sigma ≈ 1.4 cells (FWHM ≈ 3.3): dissolves the cell lattice —
+    // height floors and the fainter angular-sector walls — at close zoom under
+    // GPU trilinear interpolation (which is only C0, so every cell boundary is a
+    // faint crease whose visibility scales with cell-to-cell contrast, and the
+    // height layers are coarse at ~300 m) without smearing storm cores into a
+    // flat haze.
+    let native = crate::smoothing::smooth_grid(native, grid.dims, 4);
 
     // Transpose the smoothed grid from native `[radius, angle, height]`
     // (height-fastest) into the glTF cylinder layout `[radius, height, angle]`
@@ -182,79 +188,6 @@ fn grid_azimuth_index(slot: usize, n_a: usize) -> usize {
     (bearing_deg / 360.0 * n_a as f64 - 0.5)
         .round()
         .rem_euclid(n_a as f64) as usize
-}
-
-/// Separable 3-D smoothing of the (NaN-filled) grid in its native
-/// `[radius, angle, height]` index order — `PASSES` applications of a
-/// `[0.25, 0.5, 0.25]` kernel along each axis.
-///
-/// Radar echo is **cellular** (each native cell a local reflectivity maximum)
-/// and the voxel grid is coarse in height (~300 m layers), so a *single* pass
-/// still leaves the cell floors (height-layer boundaries) and walls
-/// (radial/angular boundaries) visible under GPU trilinear interpolation when
-/// the camera is close or inside the volume — trilinear is only C0, so every
-/// cell boundary is a faint crease whose visibility scales with the field's
-/// cell-to-cell contrast. Repeated passes widen the effective Gaussian
-/// (`sigma ≈ sqrt(PASSES/2)` cells), dropping that contrast until the field
-/// reads as a continuous volume. Angle wraps (full circle); radius/height clamp
-/// at the ends. Each axis sweep ping-pongs `src`↔`dst`, so the result is always
-/// in `src` regardless of the pass count.
-fn smooth_grid(vals: Vec<f32>, dims: [usize; 3]) -> Vec<f32> {
-    // 4 passes ⇒ sigma ≈ 1.4 cells (FWHM ≈ 3.3): dissolves the cell lattice —
-    // height floors and the fainter angular-sector walls — at close zoom without
-    // smearing storm cores into a flat haze.
-    const PASSES: usize = 4;
-    let [n_r, n_a, n_h] = dims;
-    let idx = |r: usize, a: usize, h: usize| VoxelGrid::index_of(dims, r, a, h);
-    let blur = |lo: f32, mid: f32, hi: f32| 0.25 * lo + 0.5 * mid + 0.25 * hi;
-
-    let mut src = vals;
-    let mut dst = vec![0.0f32; src.len()];
-
-    for _ in 0..PASSES {
-        // Height (clamp).
-        for r in 0..n_r {
-            for a in 0..n_a {
-                for h in 0..n_h {
-                    let lo = src[idx(r, a, h.saturating_sub(1))];
-                    let hi = src[idx(r, a, (h + 1).min(n_h - 1))];
-                    dst[idx(r, a, h)] = blur(lo, src[idx(r, a, h)], hi);
-                }
-            }
-        }
-        std::mem::swap(&mut src, &mut dst);
-        // Angle (periodic). `h` (stride 1) innermost, `a` (stride n_h) in the
-        // middle: an `a`-innermost sweep would jump `n_h` elements per step.
-        // Hoist the periodic neighbour indices out of the `h` loop. Same result,
-        // stride-1 access on all three touched rows.
-        for r in 0..n_r {
-            for a in 0..n_a {
-                let a_lo = (a + n_a - 1) % n_a;
-                let a_hi = (a + 1) % n_a;
-                for h in 0..n_h {
-                    let lo = src[idx(r, a_lo, h)];
-                    let hi = src[idx(r, a_hi, h)];
-                    dst[idx(r, a, h)] = blur(lo, src[idx(r, a, h)], hi);
-                }
-            }
-        }
-        std::mem::swap(&mut src, &mut dst);
-        // Radius (clamp). Loop with `r` OUTERMOST and `h` (the fastest-varying
-        // axis, stride 1) innermost: `r` has the largest stride (`n_a*n_h`), so
-        // an `r`-innermost sweep would miss cache on nearly every step. Same
-        // result, cache-friendly access.
-        for r in 0..n_r {
-            for a in 0..n_a {
-                for h in 0..n_h {
-                    let lo = src[idx(r.saturating_sub(1), a, h)];
-                    let hi = src[idx((r + 1).min(n_r - 1), a, h)];
-                    dst[idx(r, a, h)] = blur(lo, src[idx(r, a, h)], hi);
-                }
-            }
-        }
-        std::mem::swap(&mut src, &mut dst);
-    }
-    src
 }
 
 /// The `EXT_structural_metadata` schema for one scalar voxel property named
