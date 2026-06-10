@@ -355,7 +355,12 @@ pub fn tileset_json_voxels(
             "classes": {
                 "voxel": {
                     "properties": {
-                        quantity: { "min": [stat_min], "max": [stat_max] }
+                        // `min`/`max` are BARE SCALARS for a SCALAR property per
+                        // the 3D Tiles 1.1 EXT_structural_metadata statistics
+                        // schema (the array form is for VEC2/VEC3/…). CesiumJS
+                        // 1.142 tolerates the array, but a conforming validator
+                        // rejects it.
+                        quantity: { "min": stat_min, "max": stat_max }
                     }
                 }
             }
@@ -604,7 +609,7 @@ mod tests {
         // Statistics drive the transfer-function range.
         assert_eq!(
             v["statistics"]["classes"]["voxel"]["properties"]["DBZH"]["max"],
-            json!([70.0])
+            json!(70.0) // bare SCALAR per EXT_structural_metadata, not an array
         );
     }
 

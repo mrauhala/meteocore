@@ -338,12 +338,15 @@ async function loadFrames(reframe = false) {
   pointsFetchFloor = rep === "points" ? (num === "" ? -Infinity : parseFloat(num)) : null;
 
   // Voxels are a CesiumJS VoxelPrimitive (ray-marched volume), not a tileset of
-  // tiles — their own load path. MVP: a single volume at the active time (no
-  // frame preload/animation), so the time bar stays hidden.
+  // tiles — their own load path. MVP: pin to the LATEST volume (no frame
+  // preload/animation — voxel time-dynamic playback is a #351 follow-up). Force
+  // a single-entry `frameTimes` so `syncTimeBar()` keeps the bar hidden: the
+  // scrubber drives `showFrame()` over `frames[]` (always empty for voxels), so
+  // on a multi-volume collection a shown bar would be inert. (`frameTimes[0] =
+  // null` → `loadVoxel` requests the server's latest-volume default.)
   if (rep === "voxels") {
-    frameTimes = times.length ? times.slice(-MAX_FRAMES) : [null];
-    if (frameIdx >= frameTimes.length) frameIdx = frameTimes.length - 1;
-    if (frameIdx < 0) frameIdx = 0;
+    frameTimes = [null];
+    frameIdx = 0;
     syncTimeBar();
     await loadVoxel(token);
     return;

@@ -834,9 +834,16 @@ pub async fn get_voxel_content(
     let state = state.load_full();
     let (engine, _config) = lookup(&state, &id)?;
     let info = engine.volume_info();
-    if info.voxel_grid.is_none() {
-        return Err(Tiles3dError::BadRequest(format!(
-            "collection '{id}' does not support voxels"
+    // Same support/coverage gate as `get_voxel_tileset`/`get_voxel_subtree` (no
+    // grid → 400, no coverage yet → 404). Crucially this 404s a no-coverage site
+    // CHEAPLY — before acquiring a render-semaphore slot and a `spawn_blocking`
+    // task that would otherwise sample, encode, and only then 404 via `Empty`.
+    let caps = info.voxel_grid.as_ref().ok_or_else(|| {
+        Tiles3dError::BadRequest(format!("collection '{id}' does not support voxels"))
+    })?;
+    if !(caps.radius_m > 0.0 && caps.height_m > 0.0) {
+        return Err(Tiles3dError::NotFound(format!(
+            "collection '{id}' has no voxel coverage yet"
         )));
     }
     if !is_root_voxel_tile(&tile) {
