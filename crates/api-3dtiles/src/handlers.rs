@@ -418,6 +418,23 @@ fn data_version(info: &ds_core::volume::VolumeInfo) -> u64 {
     h
 }
 
+/// [`ContentKey::version`] for a request: an **exact advertised volume time**
+/// pins an immutable volume (nearest-selection of a zero-distance match is
+/// that volume; the file never changes once scanned), so its key gets a
+/// constant version — new volume arrivals must NOT evict the whole preloaded
+/// animation window every poll cycle (PR #378 review r2). Everything else
+/// ("latest", between-volume datetimes) takes the full [`data_version`].
+/// Retirement is covered: once the volume drops from `VolumeInfo.times` the
+/// exactness check flips false and the same request maps to a fresh
+/// `data_version`-keyed entry, so a retired time can't serve stale bytes.
+fn content_version(info: &ds_core::volume::VolumeInfo, exact: bool) -> u64 {
+    if exact {
+        0
+    } else {
+        data_version(info)
+    }
+}
+
 /// The bundled CesiumJS viewer page (collection + quantity + representation
 /// picker), baked into the binary and served at `GET /3dtiles/viewer`.
 const VIEWER_HTML: &str = include_str!("../viewer/index.html");
@@ -578,6 +595,7 @@ pub async fn get_content(
     }
 
     let info = engine.volume_info();
+    let exact = exact_volume_time(&info, time);
     let key = ContentKey {
         collection: id,
         kind: ContentKind::Pnts,
@@ -589,9 +607,9 @@ pub async fn get_content(
         datetime: time,
         param_bits: min_value.map(f64::to_bits),
         dims: [0; 3],
-        version: data_version(&info),
+        version: content_version(&info, exact),
     };
-    let pinned = exact_volume_time(&info, time);
+    let pinned = exact;
 
     let engine = engine.clone();
     let semaphore = state.render_semaphore.clone();
@@ -710,6 +728,7 @@ pub async fn get_content_glb(
         )));
     }
 
+    let exact = exact_volume_time(&info, time);
     let key = ContentKey {
         collection: id,
         kind: match representation {
@@ -724,9 +743,9 @@ pub async fn get_content_glb(
         // defaulted and an explicit-default request share one entry.
         param_bits: Some(threshold.to_bits()),
         dims,
-        version: data_version(&info),
+        version: content_version(&info, exact),
     };
-    let pinned = exact_volume_time(&info, time);
+    let pinned = exact;
 
     let engine = engine.clone();
     let semaphore = state.render_semaphore.clone();
@@ -1001,6 +1020,7 @@ pub async fn get_voxel_content(
     let quantity = params.quantity.clone();
     let dims = Resolution::parse(params.resolution.as_deref())?.dims();
 
+    let exact = exact_volume_time(&info, time);
     let key = ContentKey {
         collection: id,
         kind: ContentKind::Voxels,
@@ -1010,9 +1030,9 @@ pub async fn get_voxel_content(
         datetime: time,
         param_bits: None,
         dims,
-        version: data_version(&info),
+        version: content_version(&info, exact),
     };
-    let pinned = exact_volume_time(&info, time);
+    let pinned = exact;
 
     let engine = engine.clone();
     let id_for_err = key.collection.clone();

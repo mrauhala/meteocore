@@ -38,8 +38,11 @@ use crate::error::Tiles3dError;
 /// Default encoded-content cache size (MB) when `MC_3DTILES_CONTENT_CACHE_MB`
 /// is unset. Encoded tiles are a few hundred KB (echo-top) to tens of MB
 /// (dense point clouds); 512 MB comfortably holds an animation window of one
-/// busy collection. `0` disables caching (every request recomputes —
-/// diagnostic only; single-flight still coalesces concurrent duplicates).
+/// busy collection. `0` disables caching entirely (diagnostic only): every
+/// request recomputes — concurrent duplicates are merely **serialized** by the
+/// per-key gate (each waiter re-checks the cache, misses because nothing is
+/// admitted at capacity 0, and recomputes in turn), so the gate bounds the
+/// stampede to one compute at a time but does not share results.
 const DEFAULT_CONTENT_CACHE_MB: u64 = 512;
 
 /// Which encoded product the bytes are — part of the key so two products with

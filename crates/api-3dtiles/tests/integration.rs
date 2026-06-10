@@ -1001,3 +1001,79 @@ async fn non_manifest_datetime_is_not_immutable() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(h[axum::http::header::CACHE_CONTROL], "public, max-age=60");
 }
+
+/// Engine whose time manifest can grow mid-test — simulates a live collection
+/// ingesting a new volume between requests.
+struct GrowingVolume {
+    reads: Arc<std::sync::atomic::AtomicU64>,
+    times: std::sync::Mutex<Vec<chrono::DateTime<Utc>>>,
+}
+
+impl VolumeEngine for GrowingVolume {
+    fn read_point_cloud(
+        &self,
+        quantity: Option<&str>,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+        min_value: Option<f64>,
+        reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<VolumePointCloud, DataServerError> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        MockVolume.read_point_cloud(quantity, time, min_value, reference_time)
+    }
+
+    fn volume_info(&self) -> Arc<VolumeInfo> {
+        let base = MockVolume.volume_info();
+        Arc::new(VolumeInfo {
+            times: self.times.lock().unwrap().clone(),
+            ..(*base).clone()
+        })
+    }
+}
+
+#[tokio::test]
+async fn exact_time_entry_survives_new_volume_arrival() {
+    // A new volume arriving must NOT evict pinned exact-time entries (they
+    // are immutable) — only "latest"/non-exact entries re-key (PR #378 r2).
+    let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let t0 = Utc.with_ymd_and_hms(2026, 5, 15, 0, 0, 0).unwrap();
+    let t1 = Utc.with_ymd_and_hms(2026, 5, 15, 0, 5, 0).unwrap();
+    let engine = Arc::new(GrowingVolume {
+        reads: reads.clone(),
+        times: std::sync::Mutex::new(vec![t0, t1]),
+    });
+    let app = router_with("radar-grow", engine.clone());
+
+    let pinned_uri =
+        "/collections/radar-grow/content.pnts?quantity=DBZH&datetime=2026-05-15T00:00:00Z";
+    let latest_uri = "/collections/radar-grow/content.pnts?quantity=DBZH";
+    let (s, _b, _h) = get_on(&app, pinned_uri).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _b, _h) = get_on(&app, latest_uri).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+    // A new volume arrives.
+    engine
+        .times
+        .lock()
+        .unwrap()
+        .push(Utc.with_ymd_and_hms(2026, 5, 15, 0, 10, 0).unwrap());
+
+    // The pinned exact-time frame is still served from the cache…
+    let (s, _b, _h) = get_on(&app, pinned_uri).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "exact-time entry must survive the manifest change"
+    );
+    // …while "latest" re-keys (data_version changed) and recomputes.
+    let (s, _b, _h) = get_on(&app, latest_uri).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "latest entry must re-key on a new volume"
+    );
+}
