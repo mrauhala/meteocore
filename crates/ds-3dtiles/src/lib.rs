@@ -32,6 +32,10 @@ pub use isosurface::{encode_isosurface_glb, tileset_json_glb};
 pub mod echo_top;
 pub use echo_top::{encode_echo_top_columns_glb, encode_echo_top_glb};
 
+/// Separable 3-D smoothing of a cylindrical voxel field (#381) — shared by the
+/// voxel encoder and the isosurface mesher.
+mod smoothing;
+
 /// True cylindrical voxels (#351): `VoxelGrid` → `EXT_primitive_voxels` glTF
 /// `.glb` + `3DTILES_content_voxels` tileset for CesiumJS volume ray-marching.
 pub mod voxels;
