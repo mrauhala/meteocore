@@ -408,9 +408,13 @@ async function loadVoxel(token) {
       provider,
       customShader: voxelShader(q, legendData, voxelMin()),
     }));
-    // Finer ray-march than the default (1 sample/cell) so the trilinearly-
-    // interpolated field reads as a smooth volume, not a stack of cells.
-    voxelPrimitive.stepSizeMultiplier = 0.4;
+    // Default ray-march step (1 sample/cell). Finer stepping was tried (0.4,
+    // 0.12) to smooth the cell lattice but made no visible difference — the
+    // lattice is a property of the DATA, now dissolved by the encoder's
+    // multi-pass blur, not of the step size — so it was pure cost (a smaller
+    // multiplier means proportionally more samples per ray). Left at the
+    // default for ~2.5× faster ray-marching with no quality loss.
+    voxelPrimitive.stepSizeMultiplier = 1.0;
     viewer.scene.requestRender();
     updateStatus(voxelMinLabel());
   } catch (e) {
