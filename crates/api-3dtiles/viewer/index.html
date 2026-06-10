@@ -344,14 +344,21 @@ function cachePut(url, ts) {
   const pinned = new Set(frames);
   pinned.add(ts);
   // Two overlapping builds can both fetch the same URL (the first superseded
-  // mid-flight); overwriting the map entry would orphan the loser in the scene.
-  // `prev` can never be a live frame today — a cached URL is pre-populated into
-  // `frames` by cacheGet and excluded from `pending`, so no worker re-fetches
-  // it — the pinned check is defence-in-depth: if that invariant ever breaks,
-  // leak the orphan (it stays in the scene, unreachable by LRU eviction, until
-  // the next collection switch) rather than destroy a tileset that's on screen.
+  // mid-flight), so the slower one finds the winner already in the map. If the
+  // existing entry is hidden, it's the orphan — remove it and overwrite. But a
+  // stale worker can also land AFTER a newer build cached and displayed the
+  // same URL (rapid A→B→A toggling): then `prev` is the live, pinned frame and
+  // the incoming `ts` is the stale duplicate — discard `ts` (it was added to
+  // the scene just before this call) and keep the map pointing at `prev`;
+  // overwriting would orphan the live tileset out of the cache, beyond the
+  // reach of both LRU eviction and clearFrameCache. (The stale caller's
+  // token guard fires right after this returns, so the destroyed `ts` is
+  // never assigned into `frames`.)
   const prev = tileCache.get(url);
-  if (prev && prev !== ts && !pinned.has(prev)) viewer.scene.primitives.remove(prev);
+  if (prev && prev !== ts) {
+    if (pinned.has(prev)) { viewer.scene.primitives.remove(ts); return; }
+    viewer.scene.primitives.remove(prev);
+  }
   tileCache.set(url, ts);
   for (const [u, old] of tileCache) {
     if (tileCache.size <= TILE_CACHE_MAX) break;
