@@ -11,7 +11,7 @@
 //!   README's `2147483647` is wrong);
 //! - the per-cell scalar is a custom vertex attribute (`_VOXEL`), no `POSITION`,
 //!   no indices; the buffer is embedded in the glb BIN chunk;
-//! - `EXT_structural_metadata` (schema + `propertyAttributes`) lives at the glТF
+//! - `EXT_structural_metadata` (schema + `propertyAttributes`) lives at the glTF
 //!   **top level**, not on the primitive;
 //! - **axis swap**: a content grid `[radius, angle, height]` becomes glTF
 //!   `EXT_primitive_voxels.dimensions` `[radius, height, angle]`, and the data
@@ -32,7 +32,7 @@ use crate::Tiles3dError;
 /// the shape. Read from the CesiumJS fixtures (not the draft README).
 const VOXEL_MODE_CYLINDER: u64 = 2_147_483_650;
 
-/// Encode a cylindrical [`VoxelGrid`] as an `EXT_primitive_voxels` glТF `.glb`
+/// Encode a cylindrical [`VoxelGrid`] as an `EXT_primitive_voxels` glTF `.glb`
 /// (self-contained: the float data is embedded in the BIN chunk). The single
 /// scalar property is named after `grid.quantity`.
 ///
@@ -96,7 +96,7 @@ pub fn encode_voxels_glb(grid: &VoxelGrid) -> Result<Vec<u8>, Tiles3dError> {
     let native = smooth_grid(native, grid.dims);
 
     // Transpose the smoothed grid from native `[radius, angle, height]`
-    // (height-fastest) into the glТF cylinder layout `[radius, height, angle]`
+    // (height-fastest) into the glTF cylinder layout `[radius, height, angle]`
     // (radius-fastest → height → angle-slowest), remapping the angle axis from
     // the radar-azimuth convention to CesiumJS's cylinder convention (see
     // [`grid_azimuth_index`]), and track the range.
@@ -223,12 +223,17 @@ fn smooth_grid(vals: Vec<f32>, dims: [usize; 3]) -> Vec<f32> {
             }
         }
         std::mem::swap(&mut src, &mut dst);
-        // Angle (periodic).
+        // Angle (periodic). `h` (stride 1) innermost, `a` (stride n_h) in the
+        // middle: an `a`-innermost sweep would jump `n_h` elements per step.
+        // Hoist the periodic neighbour indices out of the `h` loop. Same result,
+        // stride-1 access on all three touched rows.
         for r in 0..n_r {
-            for h in 0..n_h {
-                for a in 0..n_a {
-                    let lo = src[idx(r, (a + n_a - 1) % n_a, h)];
-                    let hi = src[idx(r, (a + 1) % n_a, h)];
+            for a in 0..n_a {
+                let a_lo = (a + n_a - 1) % n_a;
+                let a_hi = (a + 1) % n_a;
+                for h in 0..n_h {
+                    let lo = src[idx(r, a_lo, h)];
+                    let hi = src[idx(r, a_hi, h)];
                     dst[idx(r, a, h)] = blur(lo, src[idx(r, a, h)], hi);
                 }
             }
@@ -253,7 +258,7 @@ fn smooth_grid(vals: Vec<f32>, dims: [usize; 3]) -> Vec<f32> {
 }
 
 /// The `EXT_structural_metadata` schema for one scalar voxel property named
-/// `quantity` (shared by the glТF and the tileset so the classes match).
+/// `quantity` (shared by the glTF and the tileset so the classes match).
 fn voxel_schema(quantity: &str) -> serde_json::Value {
     json!({
         "id": "voxel",
@@ -386,7 +391,7 @@ pub fn tileset_json_voxels(
                     "3DTILES_content_voxels": {
                         // Content/radar order `[radius, angle, height]` here —
                         // deliberately NOT the glb's `EXT_primitive_voxels.dimensions`
-                        // `[radius, height, angle]` (the axis-swapped glТF order).
+                        // `[radius, height, angle]` (the axis-swapped glTF order).
                         // Render-verified: CesiumJS takes the actual layout from
                         // the glb field, so this one is advisory; keep it in the
                         // natural content order.
@@ -411,7 +416,7 @@ pub fn tileset_json_voxels(
 /// The implicit-tiling **subtree** for a single available tile: the one level-0
 /// tile and its content are present, with no child subtrees. A JSON subtree (3D
 /// Tiles 1.1) with constant availability — matches the CesiumJS fixture.
-pub fn voxel_subtree_json() -> String {
+pub fn voxel_subtree_json() -> Result<String, Tiles3dError> {
     let subtree = json!({
         "tileAvailability": { "constant": 1, "availableCount": 1 },
         // Per the 3D Tiles 1.1 implicit-tiling spec, `contentAvailability` is an
@@ -422,7 +427,7 @@ pub fn voxel_subtree_json() -> String {
         "contentAvailability": [{ "constant": 1, "availableCount": 1 }],
         "childSubtreeAvailability": { "constant": 0, "availableCount": 0 }
     });
-    serde_json::to_string(&subtree).expect("subtree serializes")
+    serde_json::to_string(&subtree).map_err(|e| Tiles3dError::Serialize(e.to_string()))
 }
 
 #[cfg(test)]
@@ -508,7 +513,7 @@ mod tests {
         let amax = acc["max"][0].as_f64().unwrap();
         assert!(amin >= 0.0 && amax <= 2.0 && amin < amax, "{amin}..{amax}");
 
-        // Data layout: glТF order is radius-fastest → height → angle-slowest, and
+        // Data layout: glTF order is radius-fastest → height → angle-slowest, and
         // value == height index (constant across radius+angle). Assert the
         // *structure* (robust to the smoothing): each radius run is flat, height
         // increases monotonically, and the per-angle block repeats.

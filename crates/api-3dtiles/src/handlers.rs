@@ -815,7 +815,9 @@ pub async fn get_voxel_subtree(
     // Constant body ⇒ constant ETag; route through `binary_response` so a
     // CesiumJS subtree re-poll with a matching `If-None-Match` short-circuits to
     // 304 (the subtree is fetched during voxel traversal).
-    let bytes = ds_3dtiles::voxel_subtree_json().into_bytes();
+    let bytes = ds_3dtiles::voxel_subtree_json()
+        .map_err(|e| Tiles3dError::Internal(format!("voxel subtree build failed: {e}")))?
+        .into_bytes();
     let etag = etag_of(&bytes);
     Ok(binary_response(&headers, "application/json", &etag, bytes))
 }
