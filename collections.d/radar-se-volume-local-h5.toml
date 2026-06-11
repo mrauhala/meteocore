@@ -1,21 +1,25 @@
-# FMI weather-radar polar volumes (ODIM_H5 PVOL).
+# SMHI weather-radar polar volumes (ODIM_H5 PVOL).
 #
 # Each radar site is a stack of elevation sweeps, each with multiple
-# dual-pol moments (TH, DBZH, VRADH, ZDR, RHOHV...). Under the
+# dual-pol moments (DBZH, VRADH, ZDR, RHOHV, WRADH...). Under the
 # per-site collection model the odim-volume engine expands this one
 # source into **one OGC collection per radar site** (id =
-# `radar-fi-volume-local-h5-<nod>`, e.g. `…-fivih`). Within a site
-# collection the parameters are the **bare quantities** (`DBZH`,
-# `VRADH`, …) — the site is the collection (its EDR location, its
-# spatial/vertical extent), so it is not part of the parameter name.
+# `radar-se-volume-local-h5-<nod>`, e.g. `…-sekrn` (Kiruna),
+# `…-sehem` (Hemse)). Within a site collection the parameters are the
+# **bare quantities** (`DBZH`, `VRADH`, …) — the site is the collection
+# (its EDR location, its spatial/vertical extent), so it is not part of
+# the parameter name.
+#
+# SMHI ships these as signed-i16 scaled integers in a 32-bit-superblock
+# HDF5 file — see engine-odim `reader::read_raw_pixels_2d` and the
+# `hdf5-reader` chunk-key patch in the root Cargo.toml.
 #
 # Because each quantity is now a bare parameter, WMS styling can be set
 # per quantity via `[[wms.parameters]]` below — reflectivity, velocity,
 # and the dual-pol moments each get a fitting colormap and range rather
 # than one reflectivity palette stretched over every moment.
 #
-# data_path points at a local test fixture directory; see
-# `radar-fi-volume-s3-h5` for the S3-streamed sibling.
+# data_path points at a local test fixture directory.
 
 id = "radar-se-volume-local-h5"
 title = "SMHI — radar polar volumes (local, ODIM_H5)"
@@ -45,7 +49,7 @@ name = "DBZH"
 colormap = "radar_dbz"
 
 # Doppler radial velocity — m/s, diverging blue→white→red about zero
-# (toward/away). FMI volumes are dealiased to a ±48 m/s Nyquist band.
+# (toward/away). The ±48 m/s span covers a typical C-band Nyquist range.
 [[wms.parameters]]
 name = "VRADH"
 min = -48.0

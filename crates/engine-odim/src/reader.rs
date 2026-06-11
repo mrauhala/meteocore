@@ -288,7 +288,11 @@ pub(crate) fn read_raw_pixels_2d(
     }
 
     let pixels = match ds.dtype() {
-        Datatype::FixedPoint { size: 1, .. } => read_2d!(u8, U8),
+        Datatype::FixedPoint {
+            size: 1,
+            signed: false,
+            ..
+        } => read_2d!(u8, U8),
         Datatype::FixedPoint {
             size: 2,
             signed: false,
