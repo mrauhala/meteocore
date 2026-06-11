@@ -8,6 +8,16 @@ const PNG8_MAX_COLORS: usize = 256;
 /// chains stay short even with all 256 entries occupied.
 const PALETTE_TABLE_SLOTS: usize = 512;
 
+// `palette_slot` uses `trailing_zeros()` as log2 — only valid for a
+// power-of-two slot count (a non-power-of-two would silently cluster every
+// key into a few slots: correct output, catastrophic probing).
+const _: () = assert!(PALETTE_TABLE_SLOTS.is_power_of_two());
+// The probe loop in `encode_png_indexed` terminates only because the table
+// always has a free slot to land on; growing the palette cap without growing
+// the table would otherwise turn the 257th-distinct-colour probe into an
+// infinite loop.
+const _: () = assert!(PALETTE_TABLE_SLOTS >= 2 * PNG8_MAX_COLORS);
+
 /// Hash a packed RGBA pixel to a probe-table slot. FxHash-style multiplicative
 /// hash (golden-ratio constant), taking the high bits — the per-pixel cost is
 /// one multiply instead of a SipHash round (#376).
