@@ -12,16 +12,18 @@
 //! CesiumJS viewer.
 //!
 //! Usage:
-//!   cargo run -p engine-odim --example gen_isosurface -- [file.h5] [out_dir] [threshold_dbz]
-//!     file.h5        default: the (uncommitted) FMI Vihti fixture
-//!     out_dir        default: target/3dtiles-iso-fivih
-//!     threshold_dbz  default: 20.0  (the reflectivity shell to draw)
+//!   cargo run -p engine-odim --example gen_isosurface -- [file.h5] [out_dir] [thresholds_dbz]
+//!     file.h5         default: the (uncommitted) FMI Vihti fixture
+//!     out_dir         default: target/3dtiles-iso-fivih
+//!     thresholds_dbz  default: 20,35,50 — comma-separated reflectivity shells
+//!                     (#363): nested translucent envelopes around an opaque
+//!                     core; a single value draws one opaque shell (#357)
 
 use ds_core::config::OdimConfig;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::geo::geodetic_to_ecef;
 use ds_core::volume::VolumeEngine;
-use ds_render::{BuiltinColormap, ColorMap, LutColorMap};
+use ds_render::{BuiltinColormap, LutColorMap};
 use engine_odim::PolarVolumeEngine;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,10 +40,16 @@ fn main() {
         args.next()
             .unwrap_or_else(|| "target/3dtiles-iso-fivih".to_string()),
     );
-    let threshold: f64 = args
+    let thresholds: Vec<f64> = args
         .next()
-        .map(|s| s.parse().expect("threshold_dbz must be a number"))
-        .unwrap_or(20.0);
+        .unwrap_or_else(|| "20,35,50".to_string())
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse()
+                .expect("thresholds_dbz must be comma-separated numbers")
+        })
+        .collect();
 
     let file = Path::new(&file);
     if !file.exists() {
@@ -106,17 +114,21 @@ fn main() {
         grid.quantity
     );
 
-    // The shell's colour = the colormap at the threshold value.
+    // Nested shells (#363): each coloured by the colormap at its threshold,
+    // alpha ramped translucent (outer) → opaque (inner) so the intense core
+    // glows through the weaker envelope. One threshold = one opaque shell.
+    let mut sorted = thresholds.clone();
+    sorted.sort_by(f64::total_cmp);
     let colormap = LutColorMap::from_builtin(BuiltinColormap::RadarDbz, -32.0, 95.0);
-    let color = colormap.color(Some(threshold));
+    let shells = ds_3dtiles::nested_shells(&sorted, &colormap);
     // Seal at the shared no-echo floor (the engine fills clear air with it too,
-    // #360) so the shell closes into solid blobs (the preferred look);
+    // #360) so the shells close into solid blobs (the preferred look);
     // background=Some additionally seals the genuinely-unmeasured (NaN) cells, so
     // there are no open boundaries. (Pass None instead for honest open
     // boundaries — leaves the cone of silence / below-lowest-beam uncapped.)
     let background = Some(f64::from(ds_core::volume::NO_ECHO_FLOOR_DBZ));
-    let glb = ds_3dtiles::encode_isosurface_glb(&grid, threshold, color, background)
-        .expect("mesh the isosurface (try a lower threshold if this reports 'empty')");
+    let glb = ds_3dtiles::encode_isosurfaces_glb(&grid, &shells, background)
+        .expect("mesh the isosurfaces (try lower thresholds if this reports 'empty')");
 
     fs::create_dir_all(&out_dir).expect("mkdir out_dir");
     fs::write(out_dir.join("content.glb"), &glb).expect("write content.glb");
@@ -158,9 +170,15 @@ fn main() {
         .last()
         .map(|t| t.format("%Y-%m-%d %H:%MZ").to_string())
         .unwrap_or_default();
+    let shell_label = sorted
+        .iter()
+        .map(|t| format!("{t:.0}"))
+        .collect::<Vec<_>>()
+        .join("/");
     let hud = format!(
-        "{site_label} ({nod}) {} isosurface — {time_str} · {threshold:.0} dBZ shell",
-        grid.quantity
+        "{site_label} ({nod}) {} isosurface — {time_str} · {shell_label} dBZ shell{}",
+        grid.quantity,
+        if sorted.len() > 1 { "s" } else { "" }
     );
     write_viewer(&out_dir, &hud);
 

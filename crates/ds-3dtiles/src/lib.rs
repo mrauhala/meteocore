@@ -23,9 +23,12 @@ use serde_json::json;
 
 /// Isosurface meshing of a [`ds_core::volume::VoxelGrid`] into glTF `.glb`
 /// triangle-mesh content (#357) — the verifiable, any-client 3-D path next to
-/// the `.pnts` point cloud.
+/// the `.pnts` point cloud. Supports nested multi-threshold translucent shells
+/// (#363) via [`encode_isosurfaces_glb`].
 pub mod isosurface;
-pub use isosurface::{encode_isosurface_glb, tileset_json_glb};
+pub use isosurface::{
+    encode_isosurface_glb, encode_isosurfaces_glb, nested_shells, tileset_json_glb, IsoShell,
+};
 
 /// Echo-top-height (ETH) draped-surface meshing of a
 /// [`ds_core::volume::VoxelGrid`] into a height-coloured glTF `.glb` (#362).

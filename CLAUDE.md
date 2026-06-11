@@ -281,10 +281,33 @@ into a glTF `.glb` triangle mesh.
   carries the antenna ECEF as the tile **`transform`** (glTF content has no
   embedded origin, unlike `.pnts` `RTC_CENTER`); the geodetic `region` is
   unaffected by it. Demo: `cargo run -p engine-odim --example gen_isosurface`
-  (writes `.glb` + `tileset.json` + a token-free CesiumJS viewer). The mesh is
+  (writes `.glb` + `tileset.json` + a token-free CesiumJS viewer; takes a
+  comma-separated threshold list, default `20,35,50`). The mesh is
   **render-verified live** (CesiumJS 1.124): the shell sits correctly over the
   antenna, upright (so the Y-up→Z-up flip is right for direct 1.1 `.glb`
   content), and sealing closes the curtains into solid blobs.
+  **Nested multi-threshold shells (#363):** `encode_isosurfaces_glb(grid,
+  &[IsoShell], background)` meshes several thresholds into ONE `.glb` — one
+  primitive + material per shell; alpha < 255 ⇒ `alphaMode: "BLEND"` (opaque
+  shells stay OPAQUE to keep depth-writes), so the intense core glows through
+  translucent envelopes ("onion-skin"). `nested_shells(thresholds, colormap)`
+  is the shared colour/alpha-ramp policy (outer 35% → inner opaque; single
+  threshold = opaque, the classic #357 look). Primitives are emitted
+  **innermost-first** — glTF has no draw order, but nested shells share a
+  bounding-sphere centre so CesiumJS's back-to-front translucency sort ties and
+  primitive order breaks the tie (render-verified). The blur runs ONCE (shells
+  re-march the same smoothed field); a threshold above all data is **skipped**
+  (weak storm still shows its envelope), all-empty ⇒ `Empty`; `background` must
+  sit below the *lowest* threshold; the triangle cap bounds the SUM. API:
+  `?threshold=20,35,50` (comma list, ≤ 5 values, sorted+deduped into the
+  canonical `content.uri`; isosurface-only — a list on `echotop` is a 400).
+  **Indexed mesh + smooth normals (#382):** `MeshBuilder` interns vertices by
+  exact position bits (marching-tet shared crossings are bit-identical — no
+  quantisation) and accumulates area-weighted outward face normals, normalized
+  per vertex at encode — kills the flat-shaded "crumpled paper" facets and
+  shrinks the `.glb` by the vertex-sharing factor (~2.5×; 3 shells of the fivih
+  fixture = 2.7 MB). Keep the `out_ref` outward-orientation logic — it's what
+  keeps winding + normals consistent.
 - **Echo-top-height (#362, `ds-3dtiles/src/echo_top.rs`):** two encoders off the
   per-`(radius, azimuth)`-column echo top (highest cell ≥ `threshold`,
   crossing-interpolated), each a height-coloured glTF `.glb` (per-vertex
