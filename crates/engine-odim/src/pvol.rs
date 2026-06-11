@@ -143,8 +143,9 @@ fn parse_source(source: &str) -> (Option<String>, Option<String>, Option<String>
 }
 
 /// Read a `RawPixels` array of declared shape `(nrays, nbins)` from a
-/// `/datasetN/dataM/data` dataset, probing u8 → u16 → f64 — the same
-/// dtype-fallback chain [`crate::reader::read_composite`] uses.
+/// `/datasetN/dataM/data` dataset, selecting the storage type from the
+/// dataset's actual HDF5 datatype (u8/u16/i16/f64) — see
+/// [`crate::reader::read_raw_pixels_2d`].
 fn read_moment_array(
     file: &Hdf5File,
     path: &str,
@@ -154,42 +155,7 @@ fn read_moment_array(
     let ds = file
         .dataset(path)
         .map_err(|_| ReadError::MissingGroup(path.to_string()))?;
-    let shape = ds.shape();
-    if shape.len() != 2 {
-        return Err(ReadError::UnsupportedRank(shape.len()));
-    }
-
-    let check = |dim: (usize, usize)| -> Result<(), ReadError> {
-        if dim != (nrays, nbins) {
-            return Err(ReadError::DatasetRead(format!(
-                "{path}: array shape {dim:?} doesn't match sweep metadata {nrays}x{nbins}"
-            )));
-        }
-        Ok(())
-    };
-
-    if let Ok(arr) = ds.read_array::<u8>() {
-        let a2 = arr
-            .into_dimensionality::<ndarray::Ix2>()
-            .map_err(|e| ReadError::DatasetRead(format!("{path}: u8 reshape failed: {e}")))?;
-        check(a2.dim())?;
-        return Ok(RawPixels::U8(a2));
-    }
-    if let Ok(arr) = ds.read_array::<u16>() {
-        let a2 = arr
-            .into_dimensionality::<ndarray::Ix2>()
-            .map_err(|e| ReadError::DatasetRead(format!("{path}: u16 reshape failed: {e}")))?;
-        check(a2.dim())?;
-        return Ok(RawPixels::U16(a2));
-    }
-    if let Ok(arr) = ds.read_array::<f64>() {
-        let a2 = arr
-            .into_dimensionality::<ndarray::Ix2>()
-            .map_err(|e| ReadError::DatasetRead(format!("{path}: f64 reshape failed: {e}")))?;
-        check(a2.dim())?;
-        return Ok(RawPixels::F64(a2));
-    }
-    Err(ReadError::UnsupportedPixelType)
+    crate::reader::read_raw_pixels_2d(&ds, nrays, nbins, path)
 }
 
 /// Parse an ODIM_H5 polar volume from a byte slice. The whole file

@@ -1338,11 +1338,23 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         (!levels.is_empty()).then(|| VerticalDimension::new(VerticalKind::ElevationAngle, levels));
 
     // Pre-build the 3D Tiles metadata snapshot once per catalog rebuild so the
-    // per-request `volume_info()` is an O(1) Arc clone (#211). The default
-    // quantity is `quantities.first()` — the *same* source `read_point_cloud`
-    // and `get_raster_tile` default to, so the advertised default matches what
-    // an unqualified request actually renders.
-    let default_quantity = quantities.first().cloned().unwrap_or_default();
+    // per-request `volume_info()` is an O(1) Arc clone (#211). The advertised
+    // default is the *same* value `read_point_cloud` and `get_raster_tile`
+    // default to (all read `volume_info.default_quantity`), so an unqualified
+    // request renders exactly what the metadata advertises.
+    //
+    // Prefer reflectivity — corrected `DBZH`, then total `TH` — as the default
+    // product. A bare `quantities.first()` is alphabetical, so a dual-pol volume
+    // whose moments sort `CCORH` < `DBZH` (e.g. SMHI) would default to a
+    // clutter-correction quality field: defined across the *whole* volume
+    // ("full cones") with near-zero values that wash out to white on the dBZ
+    // colormap. Every quantity stays selectable; only the default changes.
+    let default_quantity = ["DBZH", "TH"]
+        .into_iter()
+        .find(|q| quantities.iter().any(|x| x == q))
+        .map(str::to_string)
+        .or_else(|| quantities.first().cloned())
+        .unwrap_or_default();
     let default_unit = quantities::quantity_unit(&default_quantity).to_string();
     // 3D Tiles coverage region: the WGS84 coverage bbox (→ radians) plus a
     // generous vertical span (antenna height up to a 25 km ceiling — above any

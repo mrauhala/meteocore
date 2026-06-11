@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 ds-core = { path = "../core" }
 ds-storage = { path = "../storage" }
-hdf5-reader = "0.4"
+hdf5-reader = "0.6"
 ndarray = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
 arc-swap = "1"
