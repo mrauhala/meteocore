@@ -1,9 +1,20 @@
-use std::collections::HashMap;
-
 use ds_core::error::DataServerError;
 
 /// Maximum number of distinct RGBA colours that can fit in an 8-bit indexed PNG.
 const PNG8_MAX_COLORS: usize = 256;
+
+/// Slot count for the open-addressing palette probe table: a power of two at
+/// 2× the palette cap, so the load factor never exceeds 50% and linear-probe
+/// chains stay short even with all 256 entries occupied.
+const PALETTE_TABLE_SLOTS: usize = 512;
+
+/// Hash a packed RGBA pixel to a probe-table slot. FxHash-style multiplicative
+/// hash (golden-ratio constant), taking the high bits — the per-pixel cost is
+/// one multiply instead of a SipHash round (#376).
+#[inline(always)]
+fn palette_slot(key: u32) -> usize {
+    (key.wrapping_mul(0x9E37_79B9) >> (u32::BITS - PALETTE_TABLE_SLOTS.trailing_zeros())) as usize
+}
 
 /// Encode an RGBA buffer to PNG bytes.
 ///
@@ -18,8 +29,8 @@ const PNG8_MAX_COLORS: usize = 256;
 ///   multi-band false-colour layers land here.
 ///
 /// Content-type is `image/png` either way — there is no API knob to choose
-/// between them, since the per-pixel scan is bounded (≤ one HashMap insert
-/// per output pixel, early-exit at 257) and clients can't tell the two
+/// between them, since the per-pixel scan is bounded (≤ one probe-table
+/// lookup per output pixel, early-exit at 257) and clients can't tell the two
 /// encodings apart without decoding. The scan is deterministic (palette
 /// ordered by first pixel-occurrence) so two encodes of the same buffer
 /// produce byte-identical output and the content-derived ETag stays stable
@@ -86,25 +97,50 @@ fn encode_png_indexed(
     width: u32,
     height: u32,
 ) -> Result<Option<Vec<u8>>, DataServerError> {
-    let mut palette_index: HashMap<[u8; 4], u8> = HashMap::with_capacity(PNG8_MAX_COLORS);
     let mut palette: Vec<[u8; 4]> = Vec::with_capacity(PNG8_MAX_COLORS);
     let mut indices: Vec<u8> = Vec::with_capacity((width as usize) * (height as usize));
 
+    // Open-addressing probe table replacing the former per-pixel SipHash
+    // HashMap lookup (#376): `table_idx[slot]` holds palette-index + 1
+    // (0 = empty slot), `table_key[slot]` the packed RGBA it maps. Colormapped
+    // rasters are extremely run-heavy, so a previous-pixel memo short-circuits
+    // most probes entirely.
+    let mut table_idx = [0u16; PALETTE_TABLE_SLOTS];
+    let mut table_key = [0u32; PALETTE_TABLE_SLOTS];
+    let mut last: Option<(u32, u8)> = None;
+
     for pixel in rgba.chunks_exact(4) {
-        let key = [pixel[0], pixel[1], pixel[2], pixel[3]];
-        if let Some(&idx) = palette_index.get(&key) {
-            indices.push(idx);
-            continue;
+        let key = u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
+        if let Some((last_key, last_idx)) = last {
+            if last_key == key {
+                indices.push(last_idx);
+                continue;
+            }
         }
-        if palette.len() >= PNG8_MAX_COLORS {
-            // Palette would overflow — signal the caller to fall through to
-            // the RGBA path. No partial state escapes this function.
-            return Ok(None);
-        }
-        let idx = palette.len() as u8;
-        palette_index.insert(key, idx);
-        palette.push(key);
+        let mut slot = palette_slot(key);
+        let idx = loop {
+            let stored = table_idx[slot];
+            if stored == 0 {
+                // Empty slot — `key` is a new colour.
+                if palette.len() >= PNG8_MAX_COLORS {
+                    // Palette would overflow — signal the caller to fall
+                    // through to the RGBA path. No partial state escapes this
+                    // function.
+                    return Ok(None);
+                }
+                let idx = palette.len() as u8;
+                table_idx[slot] = idx as u16 + 1;
+                table_key[slot] = key;
+                palette.push(key.to_le_bytes());
+                break idx;
+            }
+            if table_key[slot] == key {
+                break (stored - 1) as u8;
+            }
+            slot = (slot + 1) % PALETTE_TABLE_SLOTS;
+        };
         indices.push(idx);
+        last = Some((key, idx));
     }
 
     // Flatten the palette into the PLTE chunk (RGB triples) and, when any
@@ -401,6 +437,53 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "ad-hoc timing, run manually with --release"]
+    fn bench_palette_scan() {
+        let palette: [[u8; 4]; 16] = [
+            [0, 0, 0, 0],
+            [10, 20, 30, 255],
+            [200, 0, 0, 255],
+            [0, 200, 0, 255],
+            [0, 0, 200, 255],
+            [255, 255, 0, 255],
+            [0, 255, 255, 255],
+            [255, 0, 255, 255],
+            [128, 128, 128, 200],
+            [64, 64, 64, 150],
+            [255, 128, 0, 255],
+            [128, 0, 255, 255],
+            [0, 128, 255, 255],
+            [128, 255, 0, 255],
+            [255, 0, 128, 255],
+            [0, 255, 128, 255],
+        ];
+        // Run-heavy variant (realistic colormapped raster)
+        let runs = rgba_from(1024, 1024, |x, y| {
+            palette[((x / 32 + y / 32) % 16) as usize]
+        });
+        // Noisy variant (worst case for the memo)
+        let noisy = rgba_from(1024, 1024, |x, y| {
+            let mut s: u32 = x
+                .wrapping_mul(1_103_515_245)
+                .wrapping_add(y.wrapping_mul(12_345));
+            s ^= s >> 16;
+            palette[(s as usize) & 0xF]
+        });
+        for (name, buf) in [("runs", &runs), ("noisy", &noisy)] {
+            // Warmup
+            for _ in 0..3 {
+                let _ = encode_png_indexed(buf, 1024, 1024).unwrap();
+            }
+            let n = 20;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                let _ = encode_png_indexed(buf, 1024, 1024).unwrap();
+            }
+            println!("{name}: {:?}/encode", t0.elapsed() / n);
+        }
+    }
+
+    #[test]
     fn encode_png_auto_palettes_when_under_256_colors() {
         // 16-colour pattern over 256×256: `encode_png` must auto-select the
         // indexed-palette path and round-trip every pixel byte-for-byte.
@@ -517,6 +600,26 @@ mod tests {
             png::ColorType::Indexed,
             "this test must exercise the indexed-palette path, not the RGBA fallback"
         );
+    }
+
+    #[test]
+    fn encode_png_stays_indexed_at_exactly_256_colors() {
+        // Exactly 256 distinct colours — the palette cap and the probe
+        // table's maximum load. Must still take the indexed path and
+        // round-trip every pixel exactly (exercises full probe chains and
+        // the stored-index encoding at the boundary, #376).
+        let rgba = rgba_from(256, 16, |x, _| {
+            [x as u8, (x as u8).wrapping_mul(37), 99, 255]
+        });
+        let bytes = encode_png(&rgba, 256, 16).unwrap();
+        let (w, h, ct, decoded) = decode_png_to_rgba(&bytes);
+        assert_eq!((w, h), (256, 16));
+        assert_eq!(
+            ct,
+            png::ColorType::Indexed,
+            "exactly 256 colours must still take the indexed path"
+        );
+        assert_eq!(decoded, rgba, "256-colour boundary must round-trip exactly");
     }
 
     #[test]
