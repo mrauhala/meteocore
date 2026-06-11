@@ -287,6 +287,11 @@ pub(crate) fn read_raw_pixels_2d(
         }};
     }
 
+    // `byte_order` is intentionally wildcarded: `read_array::<T>()` applies any
+    // byte-swapping internally, so the storage variant is fixed by (size, signed)
+    // alone. Matching on `signed` is what's load-bearing (the size-only read in
+    // hdf5-reader 0.6 would otherwise let a signed array bit-reinterpret as the
+    // unsigned reader type).
     let pixels = match ds.dtype() {
         Datatype::FixedPoint {
             size: 1,

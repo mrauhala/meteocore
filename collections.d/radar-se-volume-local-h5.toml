@@ -30,6 +30,12 @@ data_path = "testdata/radar-smhi-pvol"
 
 [odim]
 poll_interval_secs = 300
+# Retain at most the last 24 volumes per site (≈2 h at 5-min cadence).
+# Bounds the time-dynamic playback set and the viewer's tileset preload —
+# an unbounded source accumulates ~288 volumes/day/site. Raise this, or
+# add `time_window = "-PT6H"`, for a longer window. Omitting both is valid
+# for a static local fixture but not recommended for a production source.
+max_files = 24
 
 [wms]
 # Collection-level fallback for any quantity without a per-parameter
