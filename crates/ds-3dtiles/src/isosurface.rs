@@ -641,7 +641,7 @@ fn build_glb(meshes: &[(MeshBuilder, [u8; 4])]) -> Result<Vec<u8>, Tiles3dError>
     // byte offsets stay 4-aligned for free.
     let total_bytes: usize = meshes
         .iter()
-        .map(|(m, _)| (m.positions.len() + m.normal_acc.len()) * 4 + m.indices.len() * 4)
+        .map(|(m, _)| (m.vertex_count() * 6 + m.indices.len()) * 4)
         .sum();
     let mut bin = Vec::with_capacity(total_bytes);
     let mut primitives = Vec::with_capacity(meshes.len());
