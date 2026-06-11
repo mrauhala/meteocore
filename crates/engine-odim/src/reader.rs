@@ -310,10 +310,13 @@ pub(crate) fn read_raw_pixels_2d(
         } => read_2d!(i16, I16),
         Datatype::FloatingPoint { size: 8, .. } => read_2d!(f64, F64),
         // f32 storage is not yet supported (no observed ODIM producer uses it;
-        // tracked as a follow-up). Log the actual dtype so an operator hitting an
-        // unsupported source sees *which* type, not just "unsupported".
+        // tracked as a follow-up — #393). `warn!` (not `debug!`): an unsupported
+        // dtype means the data won't load at all, which an operator needs to see
+        // in production — and the actual dtype is the actionable detail the
+        // caller's generic "unsupported pixel type" error lacks. Matches the
+        // pre-dispatch probe chain, which also warned when every probe failed.
         dt => {
-            tracing::debug!("ODIM unsupported pixel dtype {dt:?} at {path}");
+            tracing::warn!("ODIM unsupported pixel dtype {dt:?} at {path}");
             return Err(ReadError::UnsupportedPixelType);
         }
     };
