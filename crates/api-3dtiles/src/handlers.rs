@@ -50,7 +50,9 @@ const MAX_ISOSURFACE_SHELLS: usize = 5;
 /// for nested translucent isosurface shells (#363), e.g. `20,35,50`. Returns
 /// the values sorted ascending and de-duplicated (a duplicate would just mesh
 /// the same shell twice). Non-numeric, non-finite, empty, and over-long lists
-/// are a 400.
+/// are a 400 — the shell cap applies to the **deduped** count (what's actually
+/// meshed), so a list of repeats that collapses under the cap is fine. Parse
+/// work on the raw list is bounded by the HTTP stack's URL-length limit.
 fn parse_thresholds(s: &str) -> Result<Vec<f64>, Tiles3dError> {
     let mut vals = Vec::new();
     for part in s.split(',') {
@@ -63,14 +65,14 @@ fn parse_thresholds(s: &str) -> Result<Vec<f64>, Tiles3dError> {
         }
         vals.push(t);
     }
+    vals.sort_by(f64::total_cmp);
+    vals.dedup();
     if vals.len() > MAX_ISOSURFACE_SHELLS {
         return Err(Tiles3dError::BadRequest(format!(
             "too many thresholds ({}; at most {MAX_ISOSURFACE_SHELLS})",
             vals.len()
         )));
     }
-    vals.sort_by(f64::total_cmp);
-    vals.dedup();
     Ok(vals)
 }
 

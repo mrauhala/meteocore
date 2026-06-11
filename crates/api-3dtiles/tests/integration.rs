@@ -899,6 +899,13 @@ async fn bad_threshold_lists_are_400() {
         let (status, _b, _h) = get(path).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
     }
+    // The shell cap counts DEDUPED values: six repeats collapse to one shell
+    // and pass, six distinct values are over the cap (asserted below).
+    let (status, _b, _h) = get(
+        "/collections/radar-fivih/tileset.json?representation=isosurface&threshold=20,20,20,20,20,20",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "repeats collapse under the cap");
     // Junk inside a list, an empty slot, and an over-long list are all 400 on
     // both routes.
     for t in ["20,abc", "20,,35", "5,10,15,20,25,30"] {
