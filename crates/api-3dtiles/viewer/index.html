@@ -469,8 +469,14 @@ async function loadFrames(reframe = false) {
     const ts = frames[frameIdx];
     if (!needReframe || !ts) return;
     needReframe = false;
-    await viewer.zoomTo(ts, new Cesium.HeadingPitchRange(
-      Cesium.Math.toRadians(45), Cesium.Math.toRadians(-28), 300000));
+    try {
+      await viewer.zoomTo(ts, new Cesium.HeadingPitchRange(
+        Cesium.Math.toRadians(45), Cesium.Math.toRadians(-28), 300000));
+    } catch (_) {
+      // A second collection switch during the ~1 s flight destroys `ts` via
+      // clearFrameCache and zoomTo throws on it — a superseded build, not an
+      // error to surface (the token check after each maybeReframe call exits).
+    }
   };
   await maybeReframe();
   if (token !== loadToken) return; // superseded during the zoomTo animation
