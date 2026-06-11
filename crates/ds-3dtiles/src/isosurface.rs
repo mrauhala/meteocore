@@ -106,27 +106,27 @@ pub struct IsoShell {
     pub color: [u8; 4],
 }
 
-/// Build the conventional "onion-skin" shell set from ascending `thresholds`:
-/// each shell is coloured by `colormap` at its threshold, with alpha ramped from
-/// translucent (outermost / lowest threshold) to opaque (innermost / highest),
-/// so the intense core glows through the weaker envelope. A single threshold
-/// yields one fully opaque shell — identical to [`encode_isosurface_glb`]'s
-/// classic look. The one policy both the API layer and the demo use, kept here
-/// so they can't drift.
+/// Build the conventional "onion-skin" shell set from `thresholds` (any order —
+/// sorted internally): each shell is coloured by `colormap` at its threshold,
+/// with alpha ramped from translucent (outermost / lowest threshold) to opaque
+/// (innermost / highest), so the intense core glows through the weaker
+/// envelope. The returned shells are in ascending-threshold order. A single
+/// threshold yields one fully opaque shell — identical to
+/// [`encode_isosurface_glb`]'s classic look. The one policy both the API layer
+/// and the demo use, kept here so they can't drift.
 pub fn nested_shells(thresholds: &[f64], colormap: &dyn ColorMap) -> Vec<IsoShell> {
-    // The alpha ramp keys off list POSITION (i=0 = outermost), so it is only
-    // meaningful for an ascending list — a descending one would silently
-    // produce inside-out translucency. Both call sites sort first; catch a
-    // future one that doesn't.
-    debug_assert!(
-        thresholds.windows(2).all(|w| w[0] <= w[1]),
-        "thresholds must be sorted ascending"
-    );
-    let n = thresholds.len();
-    thresholds
-        .iter()
+    // The alpha ramp keys off ascending rank (outermost = lowest threshold),
+    // so sort internally — self-enforcing, rather than a caller contract whose
+    // violation would only show as quietly-inverted translucency. No caller
+    // depends on positional correspondence with the input (the encoder
+    // re-sorts shells for draw order anyway).
+    let mut sorted = thresholds.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let n = sorted.len();
+    sorted
+        .into_iter()
         .enumerate()
-        .map(|(i, &threshold)| {
+        .map(|(i, threshold)| {
             let mut color = colormap.color(Some(threshold));
             // Outer 35% opacity → inner fully opaque (linear in shell index, not
             // threshold value, so the steps read evenly however the thresholds
@@ -719,7 +719,8 @@ fn build_glb(meshes: &[(MeshBuilder, [u8; 4])]) -> Result<Vec<u8>, Tiles3dError>
             "mode": MODE_TRIANGLES,
         }));
     }
-    // BIN chunk must be 4-byte aligned (f32-only, so it already is — defensive).
+    // BIN chunk must be 4-byte aligned; every section is a multiple of 4 bytes
+    // (f32 positions/normals, u32 indices), so this is a no-op — defensive.
     while !bin.len().is_multiple_of(4) {
         bin.push(0);
     }
@@ -737,8 +738,9 @@ fn build_glb(meshes: &[(MeshBuilder, [u8; 4])]) -> Result<Vec<u8>, Tiles3dError>
     });
 
     // Shared GLB assembler: 4-byte chunk padding + `u32`-checked total length +
-    // a serialize-error path instead of an `expect` panic. The BIN above is
-    // f32-only (always 4-aligned), so the helper's padding is a no-op here.
+    // a serialize-error path instead of an `expect` panic. The BIN above holds
+    // only 4-byte units (f32 attributes, u32 indices — always 4-aligned), so
+    // the helper's padding is a no-op here.
     crate::assemble_glb(&gltf, bin)
 }
 
@@ -1130,6 +1132,9 @@ mod tests {
             let c = cm.color(Some(s.threshold));
             assert_eq!(&s.color[..3], &c[..3]);
         }
+        // Input order doesn't matter — sorted internally, so an unsorted list
+        // can't quietly invert the translucency ramp.
+        assert_eq!(nested_shells(&[50.0, 20.0, 35.0], &cm), three);
     }
 
     #[test]
