@@ -19,7 +19,11 @@
 # and the dual-pol moments each get a fitting colormap and range rather
 # than one reflectivity palette stretched over every moment.
 #
-# data_path points at a local test fixture directory.
+# data_path points at a local test fixture directory. The fixtures
+# (testdata/radar-smhi-pvol/, ~113 MB) are NOT committed — like the FMI
+# `radar-fi-volume-local-h5` sibling. Without them this collection loads
+# but reports `degraded` (empty catalog) on /health; drop the .h5 volumes
+# in place to activate it, or rename this file `.toml.disabled` to skip it.
 
 id = "radar-se-volume-local-h5"
 title = "SMHI — radar polar volumes (local, ODIM_H5)"
