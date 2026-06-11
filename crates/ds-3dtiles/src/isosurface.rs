@@ -114,6 +114,14 @@ pub struct IsoShell {
 /// classic look. The one policy both the API layer and the demo use, kept here
 /// so they can't drift.
 pub fn nested_shells(thresholds: &[f64], colormap: &dyn ColorMap) -> Vec<IsoShell> {
+    // The alpha ramp keys off list POSITION (i=0 = outermost), so it is only
+    // meaningful for an ascending list — a descending one would silently
+    // produce inside-out translucency. Both call sites sort first; catch a
+    // future one that doesn't.
+    debug_assert!(
+        thresholds.windows(2).all(|w| w[0] <= w[1]),
+        "thresholds must be sorted ascending"
+    );
     let n = thresholds.len();
     thresholds
         .iter()

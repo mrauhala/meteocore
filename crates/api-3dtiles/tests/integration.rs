@@ -785,7 +785,9 @@ async fn content_glb_is_valid_gltf_and_etagged() {
 #[tokio::test]
 async fn isosurface_threshold_at_or_below_floor_is_400() {
     // A threshold at/below the no-echo floor would place clear-air floor cells
-    // inside the surface (all clear air renders as echo) — rejected.
+    // inside the surface (all clear air renders as echo) — rejected, on the
+    // tileset route too (a bad threshold must 400 up front, not surprise the
+    // client on the content fetch the tileset points at).
     let floor = f64::from(ds_core::volume::NO_ECHO_FLOOR_DBZ);
     for t in [floor - 8.0, floor] {
         let (cs, _b, _h) = get(&format!(
@@ -796,6 +798,15 @@ async fn isosurface_threshold_at_or_below_floor_is_400() {
             cs,
             StatusCode::BAD_REQUEST,
             "threshold {t} <= floor must 400"
+        );
+        let (ts, _b, _h) = get(&format!(
+            "/collections/radar-fivih/tileset.json?representation=isosurface&threshold={t},20"
+        ))
+        .await;
+        assert_eq!(
+            ts,
+            StatusCode::BAD_REQUEST,
+            "tileset with lowest threshold {t} <= floor must 400"
         );
     }
     // Just above the floor is accepted.

@@ -603,6 +603,16 @@ pub async fn get_tileset(
                             .into(),
                     ));
                 }
+                // Same no-echo-floor gate as the content handler, so a bad
+                // threshold is a 400 HERE, not a surprise on the content fetch
+                // the tileset points at. (The lowest covers the whole ascending
+                // list; the `None` defaults are above the floor by construction.)
+                let floor = f64::from(ds_core::volume::NO_ECHO_FLOOR_DBZ);
+                if thresholds[0] <= floor {
+                    return Err(Tiles3dError::BadRequest(format!(
+                        "threshold must be above the no-echo floor ({floor})"
+                    )));
+                }
                 query.push_str(&format!("&threshold={}", thresholds_token(&thresholds)));
             }
             // Carry the detail tier so the content fetch matches the tileset;
