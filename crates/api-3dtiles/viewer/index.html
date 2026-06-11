@@ -38,6 +38,7 @@
     border-radius: 6px; padding: 5px 8px; font: 13px system-ui; max-width: 320px;
   }
   #bar input[type=number] { width: 58px; }
+  #bar input[type=text] { width: 96px; }
   #status { margin-left: auto; opacity: .6; font-size: 12px; white-space: nowrap; }
   #status.err { color: #ff8a8a; opacity: .95; }
   /* Colour-scale legend for the point cloud (value → colour). */
@@ -147,21 +148,23 @@ const $timeLabel = document.getElementById("timeLabel");
 const setStatus = (msg, err) => { $status.textContent = msg; $status.className = err ? "err" : ""; };
 
 // Each representation's label for the numeric field + its default value:
-// point clouds drop echoes below `min_value`; isosurfaces draw the shell AT
-// `threshold`; echo-top columns rise to where reflectivity drops below
-// `threshold`. All a dBZ number, so one input serves them, relabelled.
-// `grid` products (isosurface/echotop/voxels) are resampled to a voxel grid, so
-// they take the low/med/high Resolution selector; the point cloud is native-res
-// and hides it. `voxels` is the CesiumJS VoxelPrimitive ray-march (its own load
-// path, not a tileset of tiles).
+// point clouds drop echoes below `min_value`; isosurfaces draw nested shells AT
+// the comma-separated `threshold` list (#363 — translucent envelopes around an
+// opaque core; a single value is one opaque shell); echo-top columns rise to
+// where reflectivity drops below `threshold`. All dBZ, so one input serves
+// them, relabelled — `multi` switches it to a free-text field accepting the
+// comma list. `grid` products (isosurface/echotop/voxels) are resampled to a
+// voxel grid, so they take the low/med/high Resolution selector; the point
+// cloud is native-res and hides it. `voxels` is the CesiumJS VoxelPrimitive
+// ray-march (its own load path, not a tileset of tiles).
 // `legend` = coloured by the reflectivity ramp (points + voxels show the colour
-// scale; isosurface is one threshold colour, echo-top a height ramp → no
-// reflectivity legend).
+// scale; isosurface is coloured per-shell threshold, echo-top a height ramp →
+// no reflectivity legend).
 const REP_META = {
-  points:     { label: "Point cloud", numLabel: "min dBZ",       numDefault: "5",  mesh: false, voxel: false, legend: true  },
-  isosurface: { label: "Isosurface",  numLabel: "threshold dBZ", numDefault: "20", mesh: true,  voxel: false, legend: false },
-  echotop:    { label: "Echo top",    numLabel: "threshold dBZ", numDefault: "18", mesh: true,  voxel: false, legend: false },
-  voxels:     { label: "Voxels",      numLabel: "min dBZ",       numDefault: "5",  mesh: true,  voxel: true,  legend: true  },
+  points:     { label: "Point cloud", numLabel: "min dBZ",        numDefault: "5",        mesh: false, voxel: false, legend: true  },
+  isosurface: { label: "Isosurface",  numLabel: "shells dBZ",     numDefault: "20,35,50", mesh: true,  voxel: false, legend: false, multi: true },
+  echotop:    { label: "Echo top",    numLabel: "threshold dBZ",  numDefault: "18",       mesh: true,  voxel: false, legend: false },
+  voxels:     { label: "Voxels",      numLabel: "min dBZ",        numDefault: "5",        mesh: true,  voxel: true,  legend: true  },
 };
 
 // Token-free CesiumJS: CARTO Dark Matter basemap, no Cesium Ion.
@@ -276,6 +279,9 @@ async function loadCollectionMeta(reframe) {
 function syncNumField() {
   const meta = REP_META[$rep.value] || REP_META.points;
   $numLabel.textContent = meta.numLabel;
+  // A multi-value field (isosurface shell list, e.g. "20,35,50") needs a text
+  // input — type=number silently rejects commas.
+  $num.type = meta.multi ? "text" : "number";
   $num.value = meta.numDefault;
   $resField.hidden = !meta.mesh;
   $legend.hidden = !meta.legend || !legendData;

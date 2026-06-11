@@ -46,20 +46,27 @@
 use crate::Tiles3dError;
 use ds_core::geo::{destination_point, geodetic_to_ecef};
 use ds_core::volume::VoxelGrid;
+use ds_render::ColorMap;
 use serde_json::json;
 
-/// Cap on emitted triangles. The mesh is non-indexed (3 vertices ×
-/// `POSITION`+`NORMAL` = 72 bytes/triangle), so this bounds the encode buffer at
-/// ~216 MB worst case. A radar reflectivity shell is far smaller; exceeding the
-/// cap means the threshold is too low or the grid too fine — fail loudly rather
-/// than allocate unbounded.
+/// Cap on emitted triangles. The mesh is indexed (#382): 12 bytes of `u32`
+/// indices per triangle plus 24 bytes (`POSITION`+`NORMAL`) per unique vertex —
+/// marching-tet surfaces share each crossing vertex ~5–6 ways, so this bounds
+/// the encode buffer at roughly 50 MB typical, ~250 MB in the no-sharing worst
+/// case. A radar reflectivity shell is far smaller; exceeding the cap means the
+/// threshold is too low or the grid too fine — fail loudly rather than allocate
+/// unbounded.
 const MAX_TRIANGLES: usize = 3_000_000;
 
-/// glTF component type `FLOAT` (5126) and primitive mode `TRIANGLES` (4).
+/// glTF component types `FLOAT` (5126) / `UNSIGNED_INT` (5125) and primitive
+/// mode `TRIANGLES` (4).
 const COMPONENT_FLOAT: u32 = 5126;
+const COMPONENT_UNSIGNED_INT: u32 = 5125;
 const MODE_TRIANGLES: u32 = 4;
-/// glTF `bufferView.target` `ARRAY_BUFFER` (34962).
+/// glTF `bufferView.target`s `ARRAY_BUFFER` (34962) / `ELEMENT_ARRAY_BUFFER`
+/// (34963).
 const TARGET_ARRAY_BUFFER: u32 = 34962;
+const TARGET_ELEMENT_ARRAY_BUFFER: u32 = 34963;
 
 /// Cube-corner offsets `(Δradius, Δangle, Δheight)`, indexed by the standard
 /// corner numbering `bit0=Δr, bit1=Δa, bit2=Δh`.
@@ -87,25 +94,104 @@ const TETS: [[usize; 4]; 6] = [
     [0, 4, 6, 7],
 ];
 
-/// Accumulates a non-indexed triangle mesh (one flat normal per face) plus the
-/// `POSITION` accessor's `min`/`max` (required by the glTF spec).
+/// One nested isosurface shell: the iso-value to extract plus the RGBA the
+/// shell's material gets. Alpha < 255 makes the material **alpha-blended**
+/// (`alphaMode: "BLEND"`), so an opaque core shows through translucent outer
+/// envelopes (#363). Build a conventional set with [`nested_shells`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IsoShell {
+    /// Iso-value in the grid's physical units (e.g. dBZ).
+    pub threshold: f64,
+    /// Shell material colour `[r, g, b, a]`, 0–255.
+    pub color: [u8; 4],
+}
+
+/// Build the conventional "onion-skin" shell set from ascending `thresholds`:
+/// each shell is coloured by `colormap` at its threshold, with alpha ramped from
+/// translucent (outermost / lowest threshold) to opaque (innermost / highest),
+/// so the intense core glows through the weaker envelope. A single threshold
+/// yields one fully opaque shell — identical to [`encode_isosurface_glb`]'s
+/// classic look. The one policy both the API layer and the demo use, kept here
+/// so they can't drift.
+pub fn nested_shells(thresholds: &[f64], colormap: &dyn ColorMap) -> Vec<IsoShell> {
+    let n = thresholds.len();
+    thresholds
+        .iter()
+        .enumerate()
+        .map(|(i, &threshold)| {
+            let mut color = colormap.color(Some(threshold));
+            // Outer 35% opacity → inner fully opaque (linear in shell index, not
+            // threshold value, so the steps read evenly however the thresholds
+            // are spaced). n == 1 stays opaque.
+            color[3] = if n <= 1 {
+                255
+            } else {
+                let frac = 0.35 + 0.65 * (i as f64) / ((n - 1) as f64);
+                (frac * 255.0).round() as u8
+            };
+            IsoShell { threshold, color }
+        })
+        .collect()
+}
+
+/// Accumulates an **indexed** triangle mesh with **smooth vertex normals**
+/// (#382): vertices are interned by exact position (the marching-tet topology
+/// computes every shared edge crossing from the same corner values, so shared
+/// vertices are bit-identical — no quantisation needed), each accumulating the
+/// area-weighted outward face normal of every triangle that touches it. The
+/// per-vertex normalize happens in [`MeshBuilder::smooth_normals`]. Also tracks
+/// the `POSITION` accessor's `min`/`max` (required by the glTF spec). Indexed +
+/// smooth replaces the old non-indexed flat-shaded soup, killing the faceted
+/// "crumpled paper" look and shrinking the `.glb` by the vertex-sharing factor.
 struct MeshBuilder {
-    positions: Vec<f32>, // xyz per vertex, 3 vertices per triangle
-    normals: Vec<f32>,   // xyz per vertex
+    positions: Vec<f32>,  // xyz per unique vertex
+    normal_acc: Vec<f64>, // xyz accumulated area-weighted outward face normals
+    indices: Vec<u32>,    // 3 per triangle, wound to match the outward normal
+    /// Position bit-pattern → vertex index (exact match — see struct doc).
+    vertex_ids: std::collections::HashMap<[u32; 3], u32>,
     triangles: usize,
+    /// Triangle budget for THIS builder — [`MAX_TRIANGLES`] minus what earlier
+    /// shells in the same encode already used, so the cap bounds the whole
+    /// `.glb`, not each shell independently.
+    budget: usize,
     min: [f32; 3],
     max: [f32; 3],
 }
 
 impl MeshBuilder {
-    fn new() -> Self {
+    fn new(budget: usize) -> Self {
         Self {
             positions: Vec::new(),
-            normals: Vec::new(),
+            normal_acc: Vec::new(),
+            indices: Vec::new(),
+            vertex_ids: std::collections::HashMap::new(),
             triangles: 0,
+            budget,
             min: [f32::INFINITY; 3],
             max: [f32::NEG_INFINITY; 3],
         }
+    }
+
+    /// Intern a vertex position, returning its index (new vertices update
+    /// `min`/`max` and get a zeroed normal accumulator).
+    fn vertex(&mut self, p: [f32; 3]) -> u32 {
+        let key = [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()];
+        if let Some(&i) = self.vertex_ids.get(&key) {
+            return i;
+        }
+        let i = (self.positions.len() / 3) as u32;
+        self.vertex_ids.insert(key, i);
+        for (k, &c) in p.iter().enumerate() {
+            self.positions.push(c);
+            if c < self.min[k] {
+                self.min[k] = c;
+            }
+            if c > self.max[k] {
+                self.max[k] = c;
+            }
+        }
+        self.normal_acc.extend_from_slice(&[0.0; 3]);
+        i
     }
 
     /// Append one triangle, with its face normal oriented outward. `out_ref` is
@@ -113,10 +199,12 @@ impl MeshBuilder {
     /// the outward direction is `out_ref − triangle_centroid`. The marching-tet
     /// cases don't emit a consistent winding on their own, so without this ~half
     /// the faces would have inward normals and render with inverted lighting;
-    /// here the winding is flipped to match outward so the stored normal always
-    /// points outward. Skips degenerate (zero-area) triangles so no `NaN` normal
-    /// reaches the buffer. Errors with [`Tiles3dError::TooLarge`] past
-    /// [`MAX_TRIANGLES`].
+    /// here the winding is flipped to match outward, and the **unnormalized**
+    /// (= area-weighted) outward face normal is accumulated onto each corner
+    /// vertex for the smooth-shading pass. Skips degenerate (zero-area)
+    /// triangles so no `NaN` reaches the accumulators. Errors with
+    /// [`Tiles3dError::TooLarge`] past the builder's `budget`
+    /// (≤ [`MAX_TRIANGLES`]).
     fn push(
         &mut self,
         p0: [f32; 3],
@@ -126,19 +214,18 @@ impl MeshBuilder {
     ) -> Result<(), Tiles3dError> {
         let u = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
         let v = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
-        let n = [
+        let mut n = [
             u[1] * v[2] - u[2] * v[1],
             u[2] * v[0] - u[0] * v[2],
             u[0] * v[1] - u[1] * v[0],
         ];
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-        // Positive comparison (not `!(len > 0.0)`) keeps it NaN-safe — a
-        // non-finite `len` falls to the `else` and is dropped — and clippy-clean.
-        let mut nrm = if len > 0.0 {
-            [n[0] / len, n[1] / len, n[2] / len]
-        } else {
+        // NaN-safe degenerate check: a non-finite `len` fails `is_finite`, a
+        // zero-area sliver fails `> 0.0` — both are dropped, so no `NaN`
+        // reaches the accumulators.
+        if !len.is_finite() || len <= 0.0 {
             return Ok(()); // degenerate sliver (zero area) — drop it
-        };
+        }
         // Outward = from the triangle's own centroid toward the outside ref.
         let centroid = [
             (p0[0] + p1[0] + p2[0]) / 3.0,
@@ -152,31 +239,54 @@ impl MeshBuilder {
         ];
         // Orient outward: if the geometric normal points the wrong way, flip the
         // normal AND the winding (swap p1/p2) so both stay consistent.
-        let dot = nrm[0] * outward[0] + nrm[1] * outward[1] + nrm[2] * outward[2];
+        let dot = n[0] * outward[0] + n[1] * outward[1] + n[2] * outward[2];
         let (a, b, c) = if dot < 0.0 {
-            nrm = [-nrm[0], -nrm[1], -nrm[2]];
+            n = [-n[0], -n[1], -n[2]];
             (p0, p2, p1)
         } else {
             (p0, p1, p2)
         };
 
         self.triangles += 1;
-        if self.triangles > MAX_TRIANGLES {
+        if self.triangles > self.budget {
             return Err(Tiles3dError::TooLarge("isosurface triangles"));
         }
         for p in [a, b, c] {
-            for k in 0..3 {
-                self.positions.push(p[k]);
-                self.normals.push(nrm[k]);
-                if p[k] < self.min[k] {
-                    self.min[k] = p[k];
-                }
-                if p[k] > self.max[k] {
-                    self.max[k] = p[k];
-                }
+            let i = self.vertex(p);
+            self.indices.push(i);
+            // `n` is the unnormalized cross product (|n| = 2·area), so summing
+            // it IS the area-weighted average — big faces steer the shared
+            // vertex normal more than slivers, the standard smoothing weight.
+            for (k, &nk) in n.iter().enumerate() {
+                self.normal_acc[i as usize * 3 + k] += f64::from(nk);
             }
         }
         Ok(())
+    }
+
+    /// The per-vertex smooth normals: normalized accumulated area-weighted face
+    /// normals. All contributions are outward-oriented, so they can only cancel
+    /// at a non-manifold pinch (two blobs touching at a point) — such a vertex
+    /// falls back to +Y rather than emitting a zero/NaN normal (invalid glTF).
+    fn smooth_normals(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.normal_acc.len());
+        for acc in self.normal_acc.chunks_exact(3) {
+            let len = (acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]).sqrt();
+            if len > 0.0 {
+                out.extend_from_slice(&[
+                    (acc[0] / len) as f32,
+                    (acc[1] / len) as f32,
+                    (acc[2] / len) as f32,
+                ]);
+            } else {
+                out.extend_from_slice(&[0.0, 1.0, 0.0]);
+            }
+        }
+        out
+    }
+
+    fn vertex_count(&self) -> usize {
+        self.positions.len() / 3
     }
 }
 
@@ -380,22 +490,61 @@ pub fn encode_isosurface_glb(
     color: [u8; 4],
     background: Option<f64>,
 ) -> Result<Vec<u8>, Tiles3dError> {
-    if !threshold.is_finite() {
+    encode_isosurfaces_glb(grid, &[IsoShell { threshold, color }], background)
+}
+
+/// Encode **nested multi-threshold isosurfaces** (#363): one glTF primitive per
+/// [`IsoShell`], all in a single `.glb`, each with its own material. A shell
+/// whose alpha is < 255 gets `alphaMode: "BLEND"`, so e.g. an opaque 50 dBZ
+/// storm core glows through translucent 35/20 dBZ envelopes — the "onion-skin"
+/// of storm intensity. [`nested_shells`] builds the conventional shell set from
+/// a threshold list + colormap.
+///
+/// Shells are emitted **innermost-first** (sorted by threshold, descending)
+/// regardless of input order: glTF imposes no draw order, but when a renderer's
+/// back-to-front translucency sort ties — and nested shells share nearly the
+/// same bounding-sphere centre, so it does — primitive order is the tie-break,
+/// and inner-before-outer blends correctly from outside (CesiumJS render-
+/// verified). The scalar field is smoothed **once** and re-marched per shell,
+/// so extra shells cost only the march, not another blur.
+///
+/// A shell whose threshold is above all data is **skipped** (a weak storm has
+/// no 50 dBZ core — the outer shells still render); only when *every* shell is
+/// empty does this return [`Tiles3dError::Empty`] (and an empty `shells` slice
+/// is likewise `Empty`). `threshold`/`background` validation is per
+/// [`encode_isosurface_glb`], with `background` required to sit strictly below
+/// the *lowest* threshold. The [`MAX_TRIANGLES`] cap bounds the **sum** across
+/// shells. Callers should de-duplicate thresholds (a duplicate yields two
+/// identical primitives).
+pub fn encode_isosurfaces_glb(
+    grid: &VoxelGrid,
+    shells: &[IsoShell],
+    background: Option<f64>,
+) -> Result<Vec<u8>, Tiles3dError> {
+    if shells.is_empty() {
+        return Err(Tiles3dError::Empty);
+    }
+    if shells.iter().any(|s| !s.threshold.is_finite()) {
         return Err(Tiles3dError::NonFinite("threshold"));
     }
+    // Innermost (highest threshold) first — the translucency draw-order
+    // tie-break (see the doc above). Total order is safe: all finite.
+    let mut shells: Vec<IsoShell> = shells.to_vec();
+    shells.sort_by(|a, b| b.threshold.total_cmp(&a.threshold));
+    let min_threshold = shells.last().expect("non-empty").threshold;
     // A `Some` background must be finite (else it acts like `None` — a NaN fill
     // leaves the corner non-finite → tet skipped) AND representable as `f32`
     // (the seal narrows `bg as f32`; an out-of-range f64 would cast to ±inf and
-    // propagate through the dense blur) AND strictly below `threshold` (else
-    // unmeasured cells would seal as *inside* the surface, inverting it).
+    // propagate through the dense blur) AND strictly below every threshold
+    // (else unmeasured cells would seal as *inside* that shell, inverting it).
     if let Some(bg) = background {
         if !bg.is_finite() || bg.abs() > f64::from(f32::MAX) {
             return Err(Tiles3dError::NonFinite("background"));
         }
-        if bg >= threshold {
+        if bg >= min_threshold {
             return Err(Tiles3dError::BackgroundNotBelowThreshold {
                 background: bg,
-                threshold,
+                threshold: min_threshold,
             });
         }
     }
@@ -416,6 +565,7 @@ pub fn encode_isosurface_glb(
     // blur runs over finite values only; without one, the NaN-aware blur keeps
     // unmeasured cells `NaN` (still skipped below) and never bleeds them into
     // real echo — the open-boundary semantics (#360) survive the smoothing.
+    // One blur, shared by every shell — only the march repeats per threshold.
     const SMOOTH_PASSES: usize = 2;
     let field: Vec<f32> = match background {
         Some(bg) => {
@@ -431,74 +581,109 @@ pub fn encode_isosurface_glb(
         }
     };
 
-    let mut mesh = MeshBuilder::new();
-    // Iterate cubes. The angular seam (i_a = n_a−1 → 0) is not wrapped in v1, so
-    // a one-cell-wide gap remains at azimuth 0; acceptable for a visualisation
-    // shell (a closed radar volume is rarely intersected exactly there).
-    for i_r in 0..n_r.saturating_sub(1) {
-        for i_a in 0..n_a.saturating_sub(1) {
-            for i_h in 0..n_h.saturating_sub(1) {
-                let mut cvals = [0.0_f64; 8];
-                let mut cidx = [[0.0_f64; 3]; 8];
-                for (c, off) in CORNER.iter().enumerate() {
-                    let (ir, ia, ih) = (i_r + off[0], i_a + off[1], i_h + off[2]);
-                    // Sealed + smoothed (or NaN-aware-smoothed) value; a
-                    // remaining NaN means unmeasured with no seal → tet skipped.
-                    cvals[c] = field[grid.index(ir, ia, ih)] as f64;
-                    cidx[c] = [ir as f64, ia as f64, ih as f64];
-                }
-                for tet in TETS {
-                    march_tet(&mut mesh, grid, rtc, threshold, &cvals, &cidx, tet)?;
+    let mut meshes: Vec<(MeshBuilder, [u8; 4])> = Vec::with_capacity(shells.len());
+    let mut used = 0usize; // triangles emitted by earlier shells (shared cap)
+    for shell in &shells {
+        let mut mesh = MeshBuilder::new(MAX_TRIANGLES - used);
+        // Iterate cubes. The angular seam (i_a = n_a−1 → 0) is not wrapped in
+        // v1, so a one-cell-wide gap remains at azimuth 0; acceptable for a
+        // visualisation shell (a closed radar volume is rarely intersected
+        // exactly there).
+        for i_r in 0..n_r.saturating_sub(1) {
+            for i_a in 0..n_a.saturating_sub(1) {
+                for i_h in 0..n_h.saturating_sub(1) {
+                    let mut cvals = [0.0_f64; 8];
+                    let mut cidx = [[0.0_f64; 3]; 8];
+                    for (c, off) in CORNER.iter().enumerate() {
+                        let (ir, ia, ih) = (i_r + off[0], i_a + off[1], i_h + off[2]);
+                        // Sealed + smoothed (or NaN-aware-smoothed) value; a
+                        // remaining NaN means unmeasured with no seal → tet
+                        // skipped.
+                        cvals[c] = field[grid.index(ir, ia, ih)] as f64;
+                        cidx[c] = [ir as f64, ia as f64, ih as f64];
+                    }
+                    for tet in TETS {
+                        march_tet(&mut mesh, grid, rtc, shell.threshold, &cvals, &cidx, tet)?;
+                    }
                 }
             }
         }
+        used += mesh.triangles;
+        // A shell with no surface (threshold above all data) is skipped, not an
+        // error — a weak storm has no 50 dBZ core but its 20/35 shells render.
+        if mesh.triangles > 0 {
+            meshes.push((mesh, shell.color));
+        }
     }
 
-    if mesh.triangles == 0 {
+    if meshes.is_empty() {
         return Err(Tiles3dError::Empty);
     }
-    build_glb(&mesh, color)
+    build_glb(&meshes)
 }
 
-/// Assemble a single-mesh `.glb` from the accumulated triangles.
-fn build_glb(mesh: &MeshBuilder, color: [u8; 4]) -> Result<Vec<u8>, Tiles3dError> {
-    let vertex_count = mesh.positions.len() / 3;
-
-    // BIN buffer: POSITION (count·3·f32) then NORMAL (count·3·f32). Both are
-    // 12-byte-strided, so byte offsets stay 4-aligned for free.
-    let pos_bytes = mesh.positions.len() * 4;
-    let nrm_off = pos_bytes;
-    let mut bin = Vec::with_capacity(pos_bytes + mesh.normals.len() * 4);
-    for f in &mesh.positions {
-        bin.extend_from_slice(&f.to_le_bytes());
-    }
-    for f in &mesh.normals {
-        bin.extend_from_slice(&f.to_le_bytes());
-    }
-    // BIN chunk must be 4-byte aligned (count·24 already is, but stay defensive).
-    while !bin.len().is_multiple_of(4) {
-        bin.push(0);
-    }
-
-    let base_color = [
-        color[0] as f64 / 255.0,
-        color[1] as f64 / 255.0,
-        color[2] as f64 / 255.0,
-        color[3] as f64 / 255.0,
-    ];
-    let gltf = json!({
-        "asset": { "version": "2.0", "generator": "MeteoCore ds-3dtiles isosurface" },
-        "scene": 0,
-        "scenes": [ { "nodes": [0] } ],
-        "nodes": [ { "mesh": 0 } ],
-        "meshes": [ {
-            "primitives": [ {
-                "attributes": { "POSITION": 0, "NORMAL": 1 },
-                "material": 0,
-                "mode": MODE_TRIANGLES,
-            } ]
-        } ],
-        "materials": [ {
+/// Assemble a `.glb` from one or more accumulated shells: a single mesh with
+/// one **indexed** primitive + one material per shell (in slice order =
+/// innermost-first), all sharing one BIN buffer. A shell colour with alpha
+/// < 255 gets `alphaMode: "BLEND"` (the glTF default OPAQUE ignores alpha
+/// entirely).
+fn build_glb(meshes: &[(MeshBuilder, [u8; 4])]) -> Result<Vec<u8>, Tiles3dError> {
+    // BIN buffer: per shell, POSITION (count·3·f32), NORMAL (count·3·f32), then
+    // indices (3·triangles·u32). Every section is a multiple of 4 bytes, so
+    // byte offsets stay 4-aligned for free.
+    let total_bytes: usize = meshes
+        .iter()
+        .map(|(m, _)| (m.positions.len() + m.normal_acc.len()) * 4 + m.indices.len() * 4)
+        .sum();
+    let mut bin = Vec::with_capacity(total_bytes);
+    let mut primitives = Vec::with_capacity(meshes.len());
+    let mut materials = Vec::with_capacity(meshes.len());
+    let mut accessors = Vec::with_capacity(meshes.len() * 3);
+    let mut buffer_views = Vec::with_capacity(meshes.len() * 3);
+    for (i, (mesh, color)) in meshes.iter().enumerate() {
+        let vertex_count = mesh.vertex_count();
+        let normals = mesh.smooth_normals();
+        let pos_off = bin.len();
+        for f in &mesh.positions {
+            bin.extend_from_slice(&f.to_le_bytes());
+        }
+        let nrm_off = bin.len();
+        for f in &normals {
+            bin.extend_from_slice(&f.to_le_bytes());
+        }
+        let idx_off = bin.len();
+        for ix in &mesh.indices {
+            bin.extend_from_slice(&ix.to_le_bytes());
+        }
+        let pos_bytes = mesh.positions.len() * 4;
+        buffer_views.push(json!({
+            "buffer": 0, "byteOffset": pos_off, "byteLength": pos_bytes, "target": TARGET_ARRAY_BUFFER,
+        }));
+        buffer_views.push(json!({
+            "buffer": 0, "byteOffset": nrm_off, "byteLength": normals.len() * 4, "target": TARGET_ARRAY_BUFFER,
+        }));
+        buffer_views.push(json!({
+            "buffer": 0, "byteOffset": idx_off, "byteLength": mesh.indices.len() * 4, "target": TARGET_ELEMENT_ARRAY_BUFFER,
+        }));
+        accessors.push(json!({
+            "bufferView": 3 * i, "componentType": COMPONENT_FLOAT, "count": vertex_count,
+            "type": "VEC3", "min": mesh.min, "max": mesh.max,
+        }));
+        accessors.push(json!({
+            "bufferView": 3 * i + 1, "componentType": COMPONENT_FLOAT, "count": vertex_count,
+            "type": "VEC3",
+        }));
+        accessors.push(json!({
+            "bufferView": 3 * i + 2, "componentType": COMPONENT_UNSIGNED_INT, "count": mesh.indices.len(),
+            "type": "SCALAR",
+        }));
+        let base_color = [
+            color[0] as f64 / 255.0,
+            color[1] as f64 / 255.0,
+            color[2] as f64 / 255.0,
+            color[3] as f64 / 255.0,
+        ];
+        let mut material = json!({
             "pbrMetallicRoughness": {
                 "baseColorFactor": base_color,
                 "metallicFactor": 0.0,
@@ -506,23 +691,40 @@ fn build_glb(mesh: &MeshBuilder, color: [u8; 4]) -> Result<Vec<u8>, Tiles3dError
             },
             // Normals are oriented outward in `MeshBuilder::push`, so lighting
             // is correct from the front; `doubleSided` is belt-and-suspenders
-            // for grazing/back views (and any residual ambiguous quad).
+            // for grazing/back views (and any residual ambiguous quad) — and
+            // load-bearing for a translucent shell, whose back faces are
+            // visible through the front by design.
             "doubleSided": true,
-        } ],
-        "accessors": [
-            {
-                "bufferView": 0, "componentType": COMPONENT_FLOAT, "count": vertex_count,
-                "type": "VEC3", "min": mesh.min, "max": mesh.max,
-            },
-            {
-                "bufferView": 1, "componentType": COMPONENT_FLOAT, "count": vertex_count,
-                "type": "VEC3",
-            },
-        ],
-        "bufferViews": [
-            { "buffer": 0, "byteOffset": 0, "byteLength": pos_bytes, "target": TARGET_ARRAY_BUFFER },
-            { "buffer": 0, "byteOffset": nrm_off, "byteLength": mesh.normals.len() * 4, "target": TARGET_ARRAY_BUFFER },
-        ],
+        });
+        // Translucent shell → alpha-blend; the glTF default (OPAQUE) ignores
+        // the baseColorFactor alpha entirely. Opaque shells stay OPAQUE so
+        // they keep depth-writing (BLEND everywhere would make even the solid
+        // core depth-sorted, for no benefit).
+        if color[3] < 255 {
+            material["alphaMode"] = json!("BLEND");
+        }
+        materials.push(material);
+        primitives.push(json!({
+            "attributes": { "POSITION": 3 * i, "NORMAL": 3 * i + 1 },
+            "indices": 3 * i + 2,
+            "material": i,
+            "mode": MODE_TRIANGLES,
+        }));
+    }
+    // BIN chunk must be 4-byte aligned (f32-only, so it already is — defensive).
+    while !bin.len().is_multiple_of(4) {
+        bin.push(0);
+    }
+
+    let gltf = json!({
+        "asset": { "version": "2.0", "generator": "MeteoCore ds-3dtiles isosurface" },
+        "scene": 0,
+        "scenes": [ { "nodes": [0] } ],
+        "nodes": [ { "mesh": 0 } ],
+        "meshes": [ { "primitives": primitives } ],
+        "materials": materials,
+        "accessors": accessors,
+        "bufferViews": buffer_views,
         "buffers": [ { "byteLength": bin.len() } ],
     });
 
@@ -636,29 +838,47 @@ mod tests {
         assert_eq!(json["meshes"][0]["primitives"][0]["mode"], MODE_TRIANGLES);
         assert!(json["materials"][0]["doubleSided"].as_bool().unwrap());
 
-        // POSITION + NORMAL accessors, same non-zero count, POSITION has min/max.
+        // POSITION + NORMAL accessors, same non-zero count, POSITION has
+        // min/max; the indexed (#382) mesh shares vertices, so the vertex count
+        // is well BELOW 3·triangles while the index count is exactly that.
         let pos = &json["accessors"][0];
         let nrm = &json["accessors"][1];
+        let idx = &json["accessors"][2];
         let count = pos["count"].as_u64().unwrap();
-        assert!(
-            count > 0 && count % 3 == 0,
-            "vertex count {count} = 3·triangles"
-        );
+        assert!(count > 0);
         assert_eq!(nrm["count"].as_u64().unwrap(), count);
         assert_eq!(pos["min"].as_array().unwrap().len(), 3);
         assert_eq!(pos["max"].as_array().unwrap().len(), 3);
+        let icount = idx["count"].as_u64().unwrap();
+        assert!(icount > 0 && icount % 3 == 0, "indices {icount} = 3·tris");
+        assert!(count < icount, "indexed mesh shares vertices");
+        assert_eq!(idx["componentType"].as_u64().unwrap() as u32, 5125);
+        assert_eq!(
+            json["meshes"][0]["primitives"][0]["indices"]
+                .as_u64()
+                .unwrap(),
+            2
+        );
 
-        // BIN holds exactly POSITION + NORMAL (count·3·f32 each).
-        assert_eq!(bin.len(), (count as usize) * 3 * 4 * 2);
+        // BIN holds exactly POSITION + NORMAL (count·3·f32 each) + the indices.
+        assert_eq!(
+            bin.len(),
+            (count as usize) * 3 * 4 * 2 + (icount as usize) * 4
+        );
         // The buffer byteLength matches the BIN payload.
         assert_eq!(
             json["buffers"][0]["byteLength"].as_u64().unwrap(),
             bin.len() as u64
         );
 
-        // Every position/normal float is finite (no NaN leaked from nodata).
-        for w in bin.chunks_exact(4) {
+        // Every position/normal float is finite (no NaN leaked from nodata)…
+        let float_bytes = (count as usize) * 3 * 4 * 2;
+        for w in bin[..float_bytes].chunks_exact(4) {
             assert!(f32::from_le_bytes(w.try_into().unwrap()).is_finite());
+        }
+        // …and every index points at a real vertex.
+        for w in bin[float_bytes..].chunks_exact(4) {
+            assert!(u64::from(u32::from_le_bytes(w.try_into().unwrap())) < count);
         }
     }
 
@@ -793,9 +1013,11 @@ mod tests {
             .expect("crossing inside the finite region must mesh without a background");
         let (json, _bin) = parse_glb(&glb);
         let count = json["accessors"][0]["count"].as_u64().unwrap();
+        let icount = json["accessors"][2]["count"].as_u64().unwrap();
+        assert!(count > 0, "open surface has vertices: {count}");
         assert!(
-            count > 0 && count % 3 == 0,
-            "open surface has triangles: {count}"
+            icount > 0 && icount % 3 == 0,
+            "open surface has triangles: {icount}"
         );
     }
 
@@ -829,9 +1051,11 @@ mod tests {
             .expect("sealed surface");
         let (json, _bin) = parse_glb(&glb);
         let count = json["accessors"][0]["count"].as_u64().unwrap();
+        let icount = json["accessors"][2]["count"].as_u64().unwrap();
+        assert!(count > 0, "sealed blob has vertices: {count}");
         assert!(
-            count > 0 && count % 3 == 0,
-            "sealed blob has triangles: {count}"
+            icount > 0 && icount % 3 == 0,
+            "sealed blob has triangles: {icount}"
         );
     }
 
@@ -875,6 +1099,148 @@ mod tests {
         // Strictly below is accepted (the ramp has values 0..4, so 1.5 yields a
         // surface; background −32 < 1.5).
         assert!(encode_isosurface_glb(&grid, 1.5, [0, 0, 0, 255], Some(-32.0)).is_ok());
+    }
+
+    #[test]
+    fn nested_shells_ramp_alpha_outer_translucent_inner_opaque() {
+        use ds_render::{BuiltinColormap, LutColorMap};
+        let cm = LutColorMap::from_builtin(BuiltinColormap::RadarDbz, -32.0, 95.0);
+        // Single threshold → one fully opaque shell (the classic look).
+        let one = nested_shells(&[20.0], &cm);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].color[3], 255);
+        // Three thresholds → alpha strictly ascending, innermost opaque,
+        // outermost at the 35% floor.
+        let three = nested_shells(&[20.0, 35.0, 50.0], &cm);
+        assert_eq!(three.len(), 3);
+        assert_eq!(three[0].color[3], (0.35f64 * 255.0).round() as u8);
+        assert!(three[0].color[3] < three[1].color[3]);
+        assert!(three[1].color[3] < three[2].color[3]);
+        assert_eq!(three[2].color[3], 255);
+        // RGB comes from the colormap at each threshold.
+        for s in &three {
+            let c = cm.color(Some(s.threshold));
+            assert_eq!(&s.color[..3], &c[..3]);
+        }
+    }
+
+    #[test]
+    fn multi_shell_glb_emits_one_blended_primitive_per_shell_innermost_first() {
+        // value = i_h (0..4), so thresholds 1.5 and 3.5 each yield a horizontal
+        // sheet. Pass the shells OUTERMOST-first to prove the encoder re-sorts
+        // to innermost-first (the translucency draw-order tie-break).
+        let grid = ramp_grid(3, 8, 5);
+        let outer = IsoShell {
+            threshold: 1.5,
+            color: [0, 255, 0, 90],
+        };
+        let inner = IsoShell {
+            threshold: 3.5,
+            color: [255, 0, 0, 255],
+        };
+        let glb = encode_isosurfaces_glb(&grid, &[outer, inner], None).expect("encode");
+        let (json, bin) = parse_glb(&glb);
+
+        let prims = json["meshes"][0]["primitives"].as_array().unwrap();
+        assert_eq!(prims.len(), 2, "one primitive per shell");
+        let materials = json["materials"].as_array().unwrap();
+        assert_eq!(materials.len(), 2, "one material per shell");
+
+        // Primitive 0 = the INNER (3.5, opaque red) shell despite input order.
+        let m0 = &materials[prims[0]["material"].as_u64().unwrap() as usize];
+        let m1 = &materials[prims[1]["material"].as_u64().unwrap() as usize];
+        let c0 = m0["pbrMetallicRoughness"]["baseColorFactor"]
+            .as_array()
+            .unwrap();
+        assert_eq!(c0[0].as_f64().unwrap(), 1.0, "inner shell is red");
+        assert_eq!(c0[3].as_f64().unwrap(), 1.0, "inner shell opaque");
+        // Opaque shell: no alphaMode (glTF default OPAQUE keeps depth-writes).
+        assert!(m0.get("alphaMode").is_none());
+        // Outer shell: translucent → BLEND, alpha 90/255.
+        assert_eq!(m1["alphaMode"], "BLEND");
+        let c1 = m1["pbrMetallicRoughness"]["baseColorFactor"]
+            .as_array()
+            .unwrap();
+        assert!((c1[3].as_f64().unwrap() - 90.0 / 255.0).abs() < 1e-9);
+        assert!(m1["doubleSided"].as_bool().unwrap());
+
+        // Per-shell accessors/bufferViews tile the BIN exactly:
+        // POSITION+NORMAL+indices per shell (#382 — indexed), counts > 0,
+        // total bytes == bin length.
+        let accessors = json["accessors"].as_array().unwrap();
+        assert_eq!(accessors.len(), 6);
+        let mut total = 0usize;
+        for p in prims {
+            let pos = &accessors[p["attributes"]["POSITION"].as_u64().unwrap() as usize];
+            let nrm = &accessors[p["attributes"]["NORMAL"].as_u64().unwrap() as usize];
+            let idx = &accessors[p["indices"].as_u64().unwrap() as usize];
+            let count = pos["count"].as_u64().unwrap();
+            let icount = idx["count"].as_u64().unwrap();
+            assert!(count > 0);
+            assert!(icount > 0 && icount % 3 == 0);
+            assert_eq!(nrm["count"].as_u64().unwrap(), count);
+            total += (count as usize) * 3 * 4 * 2 + (icount as usize) * 4;
+        }
+        assert_eq!(total, bin.len(), "BIN holds exactly the shells' data");
+    }
+
+    #[test]
+    fn empty_shell_is_skipped_but_others_render() {
+        // 100 is above all data (values 0..4) → that shell is skipped, the 1.5
+        // shell still renders: a weak storm without a 50 dBZ core must still
+        // show its outer envelope.
+        let grid = ramp_grid(3, 8, 5);
+        let shells = [
+            IsoShell {
+                threshold: 1.5,
+                color: [0, 255, 0, 90],
+            },
+            IsoShell {
+                threshold: 100.0,
+                color: [255, 0, 0, 255],
+            },
+        ];
+        let glb = encode_isosurfaces_glb(&grid, &shells, None).expect("encode");
+        let (json, _bin) = parse_glb(&glb);
+        assert_eq!(json["meshes"][0]["primitives"].as_array().unwrap().len(), 1);
+        // All shells empty → Empty (and so is an empty shell list).
+        assert!(matches!(
+            encode_isosurfaces_glb(
+                &grid,
+                &[IsoShell {
+                    threshold: 100.0,
+                    color: [0, 0, 0, 255]
+                }],
+                None
+            ),
+            Err(Tiles3dError::Empty)
+        ));
+        assert!(matches!(
+            encode_isosurfaces_glb(&grid, &[], None),
+            Err(Tiles3dError::Empty)
+        ));
+    }
+
+    #[test]
+    fn multi_shell_background_must_be_below_lowest_threshold() {
+        let grid = ramp_grid(3, 8, 5);
+        let shells = [
+            IsoShell {
+                threshold: 1.5,
+                color: [0, 255, 0, 90],
+            },
+            IsoShell {
+                threshold: 3.5,
+                color: [255, 0, 0, 255],
+            },
+        ];
+        // bg = 2.0 sits below the inner threshold but NOT below the outer one —
+        // rejected against the lowest.
+        assert!(matches!(
+            encode_isosurfaces_glb(&grid, &shells, Some(2.0)),
+            Err(Tiles3dError::BackgroundNotBelowThreshold { threshold, .. }) if threshold == 1.5
+        ));
+        assert!(encode_isosurfaces_glb(&grid, &shells, Some(-32.0)).is_ok());
     }
 
     #[test]

@@ -41,6 +41,63 @@ const ISOSURFACE_DEFAULT_THRESHOLD: f64 = 20.0;
 /// (e.g. `VRADH`) still validates against the −32 dBZ floor, which is meaningless
 /// for velocity. Per-quantity floors land with per-quantity colormaps (#350).
 const ECHO_TOP_DEFAULT_THRESHOLD: f64 = 18.0;
+/// Cap on nested isosurface shells per request (#363). Each extra shell is
+/// another full marching pass over the voxel grid (the blur + resample are
+/// shared), so an unbounded list would let one request buy unbounded CPU.
+const MAX_ISOSURFACE_SHELLS: usize = 5;
+
+/// Parse a `threshold` query value: a single number, or a comma-separated list
+/// for nested translucent isosurface shells (#363), e.g. `20,35,50`. Returns
+/// the values sorted ascending and de-duplicated (a duplicate would just mesh
+/// the same shell twice). Non-numeric, non-finite, empty, and over-long lists
+/// are a 400.
+fn parse_thresholds(s: &str) -> Result<Vec<f64>, Tiles3dError> {
+    let mut vals = Vec::new();
+    for part in s.split(',') {
+        let t: f64 = part.trim().parse().map_err(|_| {
+            Tiles3dError::BadRequest(format!("invalid threshold {part:?} (expected a number)"))
+        })?;
+        // `str::parse` accepts "NaN"/"inf"; a non-finite iso-value is meaningless.
+        if !t.is_finite() {
+            return Err(Tiles3dError::BadRequest("threshold must be finite".into()));
+        }
+        vals.push(t);
+    }
+    if vals.len() > MAX_ISOSURFACE_SHELLS {
+        return Err(Tiles3dError::BadRequest(format!(
+            "too many thresholds ({}; at most {MAX_ISOSURFACE_SHELLS})",
+            vals.len()
+        )));
+    }
+    vals.sort_by(f64::total_cmp);
+    vals.dedup();
+    Ok(vals)
+}
+
+/// The canonical query-string form of an applied threshold list (ascending,
+/// comma-joined — `,` is a legal query sub-delim, and finite f64 `Display` is
+/// URL-safe), used in `content.uri` so the content fetch is deterministic.
+fn thresholds_token(thresholds: &[f64]) -> String {
+    thresholds
+        .iter()
+        .map(f64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Fold the applied thresholds into [`ContentKey::param_bits`]: FNV-1a over the
+/// sorted bit patterns. A defaulted and an explicit-default request share one
+/// entry; every distinct shell list keys distinctly.
+fn thresholds_bits(thresholds: &[f64]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for t in thresholds {
+        for b in t.to_bits().to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
 
 /// Voxel-grid resolution tier for the glTF mesh products (isosurface, echo-top):
 /// `[radius, azimuth, height]`. Azimuth stays 360 (the native 1° ray spacing) at
@@ -240,9 +297,11 @@ pub struct TilesetParams {
     /// `points` only: drop points below this physical value (e.g. a dBZ floor);
     /// carried into the tileset's `content.uri` so the `.pnts` fetch applies it.
     pub min_value: Option<f64>,
-    /// `isosurface` only: the iso-value (e.g. dBZ) of the shell; carried into
-    /// the `.glb` `content.uri`. `None` → [`ISOSURFACE_DEFAULT_THRESHOLD`].
-    pub threshold: Option<f64>,
+    /// Mesh products only: the iso-value(s) (e.g. dBZ). For `isosurface`, a
+    /// comma-separated list (e.g. `20,35,50`) yields nested translucent shells
+    /// (#363); `echotop` takes exactly one. Carried into the `.glb`
+    /// `content.uri`. `None` → the product default.
+    pub threshold: Option<String>,
     /// Mesh products only (`isosurface`/`echotop`): voxel-grid detail tier
     /// (`low`/`med`/`high`); carried into the `.glb` `content.uri`. `None` →
     /// `med`. Ignored for `points` (the cloud is native-resolution).
@@ -261,10 +320,11 @@ pub struct ContentParams {
 pub struct GlbContentParams {
     pub quantity: Option<String>,
     pub datetime: Option<String>,
-    /// `isosurface`: iso-value of the shell; `echotop`: the reflectivity floor
-    /// for the echo top. `None` → [`ISOSURFACE_DEFAULT_THRESHOLD`] /
-    /// [`ECHO_TOP_DEFAULT_THRESHOLD`].
-    pub threshold: Option<f64>,
+    /// `isosurface`: iso-value(s) of the shell(s) — a comma-separated list
+    /// yields nested translucent shells (#363); `echotop`: the (single)
+    /// reflectivity floor for the echo top. `None` →
+    /// [`ISOSURFACE_DEFAULT_THRESHOLD`] / [`ECHO_TOP_DEFAULT_THRESHOLD`].
+    pub threshold: Option<String>,
     /// Which glTF product: `isosurface` (default) or `echotop`.
     pub representation: Option<String>,
     /// Voxel-grid detail tier (`low`/`med`/`high`). `None` → `med`.
@@ -531,11 +591,17 @@ pub async fn get_tileset(
             // don't sample the grid just to emit the tileset.
             let [olon, olat, oh] = caps.origin;
             let rtc = geodetic_to_ecef(olon, olat, oh);
-            if let Some(t) = params.threshold {
-                if !t.is_finite() {
-                    return Err(Tiles3dError::BadRequest("threshold must be finite".into()));
+            if let Some(raw) = &params.threshold {
+                let thresholds = parse_thresholds(raw)?;
+                // Nested shells are an isosurface feature; an echo top is one
+                // surface per column and has exactly one threshold.
+                if representation == Representation::EchoTop && thresholds.len() > 1 {
+                    return Err(Tiles3dError::BadRequest(
+                        "echotop takes a single threshold (nested shells are isosurface-only)"
+                            .into(),
+                    ));
                 }
-                query.push_str(&format!("&threshold={t}"));
+                query.push_str(&format!("&threshold={}", thresholds_token(&thresholds)));
             }
             // Carry the detail tier so the content fetch matches the tileset;
             // emit the canonical token even when the request omitted it, so the
@@ -711,22 +777,36 @@ pub async fn get_content_glb(
     // Detail tier (`low`/`med`/`high`, default `med`) → voxel-grid dims, applied
     // to both mesh products. A bad value is a 400 before the blocking task.
     let dims = Resolution::parse(params.resolution.as_deref())?.dims();
-    let threshold = params.threshold.unwrap_or(match representation {
-        Representation::EchoTop => ECHO_TOP_DEFAULT_THRESHOLD,
-        _ => ISOSURFACE_DEFAULT_THRESHOLD,
-    });
-    if !threshold.is_finite() {
-        return Err(Tiles3dError::BadRequest("threshold must be finite".into()));
+    // The applied threshold list (ascending, deduped): one value for echo-top,
+    // one or more nested shells for the isosurface (#363).
+    let thresholds = match params.threshold.as_deref() {
+        None => vec![match representation {
+            Representation::EchoTop => ECHO_TOP_DEFAULT_THRESHOLD,
+            _ => ISOSURFACE_DEFAULT_THRESHOLD,
+        }],
+        Some(raw) => parse_thresholds(raw)?,
+    };
+    if representation == Representation::EchoTop && thresholds.len() > 1 {
+        return Err(Tiles3dError::BadRequest(
+            "echotop takes a single threshold (nested shells are isosurface-only)".into(),
+        ));
     }
     // Both products lean on the engine's no-echo floor: the isosurface seals NaN
     // at it; an echo-top column needs its threshold above it (else clear air
     // would count as echo). (v1: the floor is dBZ for every quantity — #350.)
+    // Checking the lowest covers the whole ascending list.
     let floor = f64::from(ds_core::volume::NO_ECHO_FLOOR_DBZ);
-    if threshold <= floor {
+    if thresholds[0] <= floor {
         return Err(Tiles3dError::BadRequest(format!(
             "threshold must be above the no-echo floor ({floor})"
         )));
     }
+    // For error messages (e.g. "no isosurface at threshold 20, 35, 50").
+    let threshold_label = thresholds
+        .iter()
+        .map(f64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let exact = exact_volume_time(&info, time);
     let key = ContentKey {
@@ -739,9 +819,10 @@ pub async fn get_content_glb(
             .clone()
             .unwrap_or_else(|| info.default_quantity.clone()),
         datetime: time,
-        // The *applied* threshold (default already folded in above), so a
-        // defaulted and an explicit-default request share one entry.
-        param_bits: Some(threshold.to_bits()),
+        // The *applied* thresholds (default already folded in above, sorted +
+        // deduped), so a defaulted and an explicit-default request share one
+        // entry whatever the spelling.
+        param_bits: Some(thresholds_bits(&thresholds)),
         dims,
         version: content_version(&info, exact),
     };
@@ -769,18 +850,21 @@ pub async fn get_content_glb(
                             engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;
                         ds_3dtiles::encode_echo_top_columns_glb(
                             &grid,
-                            threshold,
+                            thresholds[0],
                             &*ECHO_TOP_COLORMAP,
                         )
                     }
                     Representation::Isosurface => {
                         let grid =
                             engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;
-                        // Colour the shell at the threshold (v1: one colormap for all
-                        // quantities — #350); seal NaN at the no-echo floor so it
-                        // closes into solid blobs (`floor < threshold` guaranteed).
-                        let color = colormap.color(Some(threshold));
-                        ds_3dtiles::encode_isosurface_glb(&grid, threshold, color, Some(floor))
+                        // Colour each shell at its threshold, alpha ramped outer-
+                        // translucent → inner-opaque (#363; one threshold = one
+                        // opaque shell, the classic look; v1: one colormap for
+                        // all quantities — #350); seal NaN at the no-echo floor
+                        // so shells close into solid blobs (`floor <
+                        // thresholds[0]` guaranteed above).
+                        let shells = ds_3dtiles::nested_shells(&thresholds, colormap.as_ref());
+                        ds_3dtiles::encode_isosurfaces_glb(&grid, &shells, Some(floor))
                     }
                     // Rejected before the blocking task (see the `product` match).
                     Representation::Points => unreachable!("points rejected above"),
@@ -788,11 +872,11 @@ pub async fn get_content_glb(
                 let bytes = result.map_err(|e| match e {
                     // No surface / no columns (threshold above all echo) — 404.
                     ds_3dtiles::Tiles3dError::Empty => Tiles3dError::NotFound(format!(
-                        "no {product} at threshold {threshold} for collection '{id_for_err}'"
+                        "no {product} at threshold {threshold_label} for collection '{id_for_err}'"
                     )),
                     // Client-driven (threshold too low for this grid) — 400.
                     ds_3dtiles::Tiles3dError::TooLarge(_) => Tiles3dError::BadRequest(format!(
-                        "threshold {threshold} produces too large a {product}; raise it"
+                        "threshold {threshold_label} produces too large a {product}; raise it"
                     )),
                     // Unreachable (floor < threshold above) — defensive 400. Only
                     // the isosurface encoder emits this today, but this `map_err`

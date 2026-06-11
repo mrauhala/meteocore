@@ -830,6 +830,100 @@ async fn non_finite_threshold_is_400() {
     }
 }
 
+#[tokio::test]
+async fn nested_isosurface_thresholds_yield_blended_primitives() {
+    // Tileset: an unsorted, duplicated list is canonicalised (sorted ascending,
+    // deduped) into the content.uri so spelling variants share one content URL.
+    let (status, body, _h) = get(
+        "/collections/radar-fivih/tileset.json?representation=isosurface&quantity=DBZH&threshold=35,20,35",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        v["root"]["content"]["uri"].as_str().unwrap(),
+        "content.glb?quantity=DBZH&threshold=20,35&resolution=med&representation=isosurface"
+    );
+
+    // Content: the mock grid's echo core is 40 dBZ, so 20 and 35 both yield a
+    // shell while 50 is empty (skipped, not an error — a weak storm without a
+    // 50 dBZ core must still show its envelope). One primitive + material per
+    // surviving shell, innermost first; translucent shells are alpha-BLENDed.
+    let (status, body, _h) =
+        get("/collections/radar-fivih/content.glb?quantity=DBZH&threshold=20,35,50").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[0..4], b"glTF");
+    let jlen = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
+    let j: serde_json::Value = serde_json::from_slice(&body[20..20 + jlen]).unwrap();
+    let prims = j["meshes"][0]["primitives"].as_array().unwrap();
+    assert_eq!(prims.len(), 2, "50 dBZ shell is empty and skipped");
+    let materials = j["materials"].as_array().unwrap();
+    assert_eq!(materials.len(), 2);
+    // Both surviving shells are translucent (the opaque slot belonged to the
+    // empty 50 dBZ core) — alpha keyed to the REQUESTED list, so a frame where
+    // the core vanishes doesn't re-shade the envelope.
+    for m in materials {
+        assert_eq!(m["alphaMode"], "BLEND");
+        assert!(m["doubleSided"].as_bool().unwrap());
+        let a = m["pbrMetallicRoughness"]["baseColorFactor"][3]
+            .as_f64()
+            .unwrap();
+        assert!((0.0..1.0).contains(&a), "translucent alpha, got {a}");
+    }
+    // Innermost (35) first: its alpha is the higher of the two.
+    let alpha = |i: usize| {
+        materials[prims[i]["material"].as_u64().unwrap() as usize]["pbrMetallicRoughness"]
+            ["baseColorFactor"][3]
+            .as_f64()
+            .unwrap()
+    };
+    assert!(alpha(0) > alpha(1), "inner shell more opaque than outer");
+
+    // A single threshold keeps the classic fully-opaque shell (no alphaMode).
+    let (status, body, _h) =
+        get("/collections/radar-fivih/content.glb?quantity=DBZH&threshold=20").await;
+    assert_eq!(status, StatusCode::OK);
+    let jlen = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
+    let j: serde_json::Value = serde_json::from_slice(&body[20..20 + jlen]).unwrap();
+    assert_eq!(j["meshes"][0]["primitives"].as_array().unwrap().len(), 1);
+    assert!(j["materials"][0].get("alphaMode").is_none());
+}
+
+#[tokio::test]
+async fn bad_threshold_lists_are_400() {
+    // Echo-top takes exactly one threshold — a list is isosurface-only.
+    for path in [
+        "/collections/radar-fivih/tileset.json?representation=echotop&threshold=18,30",
+        "/collections/radar-fivih/content.glb?representation=echotop&threshold=18,30",
+    ] {
+        let (status, _b, _h) = get(path).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+    }
+    // Junk inside a list, an empty slot, and an over-long list are all 400 on
+    // both routes.
+    for t in ["20,abc", "20,,35", "5,10,15,20,25,30"] {
+        let (ts, _b, _h) = get(&format!(
+            "/collections/radar-fivih/tileset.json?representation=isosurface&threshold={t}"
+        ))
+        .await;
+        assert_eq!(ts, StatusCode::BAD_REQUEST, "tileset rejects {t:?}");
+        let (cs, _b, _h) = get(&format!(
+            "/collections/radar-fivih/content.glb?threshold={t}"
+        ))
+        .await;
+        assert_eq!(cs, StatusCode::BAD_REQUEST, "content rejects {t:?}");
+    }
+    // A list whose LOWEST member is at/below the no-echo floor is rejected even
+    // when other members are fine.
+    let floor = f64::from(ds_core::volume::NO_ECHO_FLOOR_DBZ);
+    let (cs, _b, _h) = get(&format!(
+        "/collections/radar-fivih/content.glb?threshold={},20",
+        floor
+    ))
+    .await;
+    assert_eq!(cs, StatusCode::BAD_REQUEST);
+}
+
 // ---------------------------------------------------------------------------
 // Content cache + cache-control policy (hot-path audit, 2026-06)
 // ---------------------------------------------------------------------------
