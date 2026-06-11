@@ -309,7 +309,13 @@ pub(crate) fn read_raw_pixels_2d(
             ..
         } => read_2d!(i16, I16),
         Datatype::FloatingPoint { size: 8, .. } => read_2d!(f64, F64),
-        _ => return Err(ReadError::UnsupportedPixelType),
+        // f32 storage is not yet supported (no observed ODIM producer uses it;
+        // tracked as a follow-up). Log the actual dtype so an operator hitting an
+        // unsupported source sees *which* type, not just "unsupported".
+        dt => {
+            tracing::debug!("ODIM unsupported pixel dtype {dt:?} at {path}");
+            return Err(ReadError::UnsupportedPixelType);
+        }
     };
     Ok(pixels)
 }
