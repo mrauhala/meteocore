@@ -68,3 +68,18 @@ debug = false
 # `cargo update` can't silently follow a moved branch tip.
 [patch.crates-io]
 icechunk = { git = "https://github.com/earth-mover/icechunk.git", rev = "5f56b13605745ea06ec6558bcd8ed4a8f5805a3e" }
+
+# Interim patch until upstream releases the fix.
+#
+# hdf5-reader's version 1 B-tree raw-data chunk-key parser read each
+# per-dimension chunk offset as `size_of_offsets` bytes, but the HDF5 format
+# spec fixes those key dimension offsets at 8 bytes regardless of the
+# superblock's offset size. On 32-bit-superblock files (`size_of_offsets = 4`)
+# — e.g. SMHI ODIM_H5 radar polar volumes — this misaligned the cursor, located
+# a garbage chunk address, and made every chunked-dataset read fail to
+# decompress ("corrupt deflate stream"), even though libhdf5/h5dump read the
+# same files fine. Fixed in our fork (read the dim offsets as fixed u64); PR
+# filed upstream (roteiro-gis/netcdf-rust#54). Pinned to an immutable `rev` so a
+# `cargo update` can't follow a moved branch. Remove once a crates.io release
+# > 0.6.0 carries the fix — tracked in #394.
+hdf5-reader = { git = "https://github.com/mrauhala/netcdf-rust.git", rev = "767add81eb12d0fd123f3550637fc001c2f40ff7" }

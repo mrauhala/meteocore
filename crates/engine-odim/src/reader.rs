@@ -14,7 +14,7 @@
 //! | Producer | ODIM version | Pixel type | Renders | Notes                                       |
 //! |----------|--------------|------------|---------|---------------------------------------------|
 //! | DMI      | v2.0         | u8         | yes     | No `/where/xsize`/`ysize`; gain/offset/nodata at root `/what`; quantity as attr on `/dataset1/data1` |
-//! | SMHI     | v2.2         | u8         | no      | Canonical layout; DEFLATE decompression fails in `hdf5-reader` 0.4 (upstream bug — `h5dump` reads the same file fine) |
+//! | SMHI     | v2.2 (PVOL)  | i16        | yes     | **Signed** scaled integers (gain=0.01, sentinels nodata=-32768/undetect=-32767); 32-bit superblock + single DEFLATE chunks — needed both the `i16` storage variant and the patched `hdf5-reader` v1-B-tree chunk-key fix (see root `Cargo.toml`) |
 //! | DWD      | v2.3         | u16        | yes     | Canonical layout; polar stere (lat_0=90, lat_ts=60); 250m grid over Germany; fine gain=0.00293, offset=-64 |
 //! | OPERA    | v2.4         | f64        | yes     | Canonical layout; LAEA grid (EPSG:3035-style); already-decoded physical dBZ with `nodata=-9999000`, `undetect=-8888000` |
 //!
@@ -36,15 +36,15 @@
 //!
 //! Phase 1 narrows the scope further than the format allows:
 //! - Single dataset (`/dataset1` only), single data layer (`/data1`)
-//! - Three raw pixel types: u8, u16, f64 (all the variants we've
-//!   actually encountered)
+//! - Four raw pixel types: u8, u16, i16, f64 (all the variants we've
+//!   actually encountered; i16 is SMHI's signed scaled-integer PVOL)
 //! - No quality layers, no `how/*` attributes, no PVOL volume data
 //!
 //! See [[project_odim_engine_plan]] for the full multi-phase plan.
 
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use ds_core::geo::Crs;
-use hdf5_reader::{Attribute, Hdf5File};
+use hdf5_reader::{Attribute, Dataset, Datatype, Hdf5File};
 use ndarray::Array2;
 
 use crate::proj;
@@ -71,7 +71,7 @@ pub enum ReadError {
     #[error("dataset `/dataset1/data1/data` has unsupported shape: expected 2D, got {0}D")]
     UnsupportedRank(usize),
     #[error(
-        "dataset `/dataset1/data1/data` has unsupported pixel type (Phase 1: u8, u16, or f64)"
+        "dataset `/dataset1/data1/data` has unsupported pixel type (Phase 1: u8, u16, i16, or f64)"
     )]
     UnsupportedPixelType,
     #[error("dataset read failed: {0}")]
@@ -84,10 +84,12 @@ pub enum ReadError {
     NoMoments { dataset: String },
 }
 
-/// Raw pixel storage as it appears on disk. ODIM composites ship
+/// Raw pixel storage as it appears on disk. ODIM composites/volumes ship
 /// one of:
 /// - `u8`  — single-byte reflectivity classes (DMI v2.0)
-/// - `u16` — extended dynamic range (some EUMETNET v2.x producers)
+/// - `u16` — extended dynamic range (some EUMETNET v2.x producers, DWD v2.3)
+/// - `i16` — **signed** scaled integers (SMHI PVOL: `gain=0.01`, sentinels
+///   `nodata=-32768`/`undetect=-32767` — only representable as signed)
 /// - `f64` — already-decoded physical values (OPERA v2.4 ACRR/DBZH)
 ///
 /// For the integer variants the physical value is `raw * gain + offset`.
@@ -98,6 +100,7 @@ pub enum ReadError {
 pub enum RawPixels {
     U8(Array2<u8>),
     U16(Array2<u16>),
+    I16(Array2<i16>),
     F64(Array2<f64>),
 }
 
@@ -126,6 +129,7 @@ impl RawPixels {
         match self {
             RawPixels::U8(a) => a.dim(),
             RawPixels::U16(a) => a.dim(),
+            RawPixels::I16(a) => a.dim(),
             RawPixels::F64(a) => a.dim(),
         }
     }
@@ -182,6 +186,10 @@ impl RawPixels {
                 Some(v) => *v as f64,
                 None => return PixelClass::Masked,
             },
+            RawPixels::I16(a) => match a.get((row, col)) {
+                Some(v) => *v as f64,
+                None => return PixelClass::Masked,
+            },
             RawPixels::F64(a) => match a.get((row, col)) {
                 Some(v) => *v,
                 None => return PixelClass::Masked,
@@ -228,10 +236,91 @@ impl RawPixels {
         let elem = match self {
             RawPixels::U8(_) => 1,
             RawPixels::U16(_) => 2,
+            RawPixels::I16(_) => 2,
             RawPixels::F64(_) => 8,
         };
         h * w * elem
     }
+}
+
+/// Decode a 2-D ODIM pixel array into [`RawPixels`], selecting the storage
+/// variant from the dataset's **actual** HDF5 datatype rather than probing
+/// reader types in fallback order.
+///
+/// dtype inspection is load-bearing, not stylistic: `hdf5-reader` matches a
+/// typed `read_array::<T>()` on element **byte-size only**, not signedness. A
+/// signed `i16` moment (SMHI) therefore reads *successfully* — but with every
+/// value bit-reinterpreted — as `u16` (e.g. the `undetect` sentinel `-32767`
+/// becomes `32769`), so a u16-before-i16 probe order would silently return
+/// garbage. Branching on `Datatype` picks the one correct reader.
+///
+/// Supported ODIM element types: `u8`/`u16`/`i16` scaled integers (physical =
+/// `raw * gain + offset`) and `f64` pre-decoded physical values. Anything else
+/// (i8, i32, f32, …) is [`ReadError::UnsupportedPixelType`]. `path` only labels
+/// error messages.
+pub(crate) fn read_raw_pixels_2d(
+    ds: &Dataset,
+    rows: usize,
+    cols: usize,
+    path: &str,
+) -> Result<RawPixels, ReadError> {
+    let shape = ds.shape();
+    if shape.len() != 2 {
+        return Err(ReadError::UnsupportedRank(shape.len()));
+    }
+
+    macro_rules! read_2d {
+        ($t:ty, $variant:ident) => {{
+            let arr = ds
+                .read_array::<$t>()
+                .map_err(|e| ReadError::DatasetRead(format!("{path}: {e}")))?;
+            let a2 = arr
+                .into_dimensionality::<ndarray::Ix2>()
+                .map_err(|e| ReadError::DatasetRead(format!("{path}: reshape failed: {e}")))?;
+            if a2.dim() != (rows, cols) {
+                return Err(ReadError::DatasetRead(format!(
+                    "{path}: array shape {:?} doesn't match metadata {rows}x{cols}",
+                    a2.dim()
+                )));
+            }
+            RawPixels::$variant(a2)
+        }};
+    }
+
+    // `byte_order` is intentionally wildcarded: `read_array::<T>()` applies any
+    // byte-swapping internally, so the storage variant is fixed by (size, signed)
+    // alone. Matching on `signed` is what's load-bearing (the size-only read in
+    // hdf5-reader 0.6 would otherwise let a signed array bit-reinterpret as the
+    // unsigned reader type).
+    let pixels = match ds.dtype() {
+        Datatype::FixedPoint {
+            size: 1,
+            signed: false,
+            ..
+        } => read_2d!(u8, U8),
+        Datatype::FixedPoint {
+            size: 2,
+            signed: false,
+            ..
+        } => read_2d!(u16, U16),
+        Datatype::FixedPoint {
+            size: 2,
+            signed: true,
+            ..
+        } => read_2d!(i16, I16),
+        Datatype::FloatingPoint { size: 8, .. } => read_2d!(f64, F64),
+        // f32 storage is not yet supported (no observed ODIM producer uses it;
+        // tracked as a follow-up — #393). `warn!` (not `debug!`): an unsupported
+        // dtype means the data won't load at all, which an operator needs to see
+        // in production — and the actual dtype is the actionable detail the
+        // caller's generic "unsupported pixel type" error lacks. Matches the
+        // pre-dispatch probe chain, which also warned when every probe failed.
+        dt => {
+            tracing::warn!("ODIM unsupported pixel dtype {dt:?} at {path}");
+            return Err(ReadError::UnsupportedPixelType);
+        }
+    };
+    Ok(pixels)
 }
 
 /// A parsed ODIM composite ready for sampling. Carries the raw
@@ -572,79 +661,12 @@ pub fn read_composite(bytes: &[u8]) -> Result<OdimComposite, ReadError> {
             name: "quantity".into(),
         })?;
 
-    // Try u8 (DMI v2.0, SMHI v2.2), u16 (some EUMETNET v2.x, DWD
-    // v2.3), then f64 (OPERA v2.4 — pre-decoded physical values).
-    // `read_array` returns `Err` on dtype mismatch rather than
-    // panicking, so the fallback chain is safe. Per-probe errors
-    // are captured at `debug!` (every load of a DWD or OPERA file
-    // would otherwise spam the u8 error) and only escalated to
-    // `warn!` when every probe fails — at that point a likely
-    // upstream cause (hdf5-reader 0.4 silently mis-handling
-    // DEFLATE on certain SMHI files) is worth surfacing.
-    let u8_probe = ds.read_array::<u8>();
-    if let Err(ref e) = u8_probe {
-        tracing::debug!("ODIM u8 pixel-array probe failed: {e}");
-    }
-    let pixels = if let Ok(arr) = u8_probe {
-        let a2 = arr
-            .into_dimensionality::<ndarray::Ix2>()
-            .map_err(|e| ReadError::DatasetRead(format!("u8 reshape failed: {e}")))?;
-        if a2.dim() != (rows, cols) {
-            return Err(ReadError::DatasetRead(format!(
-                "u8 array shape {:?} doesn't match metadata {rows}x{cols}",
-                a2.dim()
-            )));
-        }
-        RawPixels::U8(a2)
-    } else {
-        let u16_probe = ds.read_array::<u16>();
-        if let Err(ref e) = u16_probe {
-            tracing::debug!("ODIM u16 pixel-array probe failed: {e}");
-        }
-        if let Ok(arr) = u16_probe {
-            let a2 = arr
-                .into_dimensionality::<ndarray::Ix2>()
-                .map_err(|e| ReadError::DatasetRead(format!("u16 reshape failed: {e}")))?;
-            if a2.dim() != (rows, cols) {
-                return Err(ReadError::DatasetRead(format!(
-                    "u16 array shape {:?} doesn't match metadata {rows}x{cols}",
-                    a2.dim()
-                )));
-            }
-            RawPixels::U16(a2)
-        } else {
-            let f64_probe = ds.read_array::<f64>();
-            if let Err(ref e) = f64_probe {
-                tracing::debug!("ODIM f64 pixel-array probe failed: {e}");
-            }
-            if let Ok(arr) = f64_probe {
-                let a2 = arr
-                    .into_dimensionality::<ndarray::Ix2>()
-                    .map_err(|e| ReadError::DatasetRead(format!("f64 reshape failed: {e}")))?;
-                if a2.dim() != (rows, cols) {
-                    return Err(ReadError::DatasetRead(format!(
-                        "f64 array shape {:?} doesn't match metadata {rows}x{cols}",
-                        a2.dim()
-                    )));
-                }
-                RawPixels::F64(a2)
-            } else {
-                // All three probes failed. This is the only point at
-                // which a u8 probe error indicates something genuinely
-                // wrong (a real u8 file that hdf5-reader couldn't
-                // decompress, or an unsupported dtype like i32). Log
-                // both the u8 and u16 errors at WARN since either may
-                // be the diagnostic clue an operator needs.
-                if let Err(e) = &u8_probe {
-                    tracing::warn!(
-                        "ODIM pixel-array unreadable as u8/u16/f64; u8 probe error \
-                         (possible hdf5-reader DEFLATE bug on SMHI files): {e}"
-                    );
-                }
-                return Err(ReadError::UnsupportedPixelType);
-            }
-        }
-    };
+    // Decode the raw pixel array, selecting the storage type from the
+    // dataset's actual HDF5 datatype: u8 (DMI v2.0), u16 (DWD v2.3), i16
+    // (SMHI — signed scaled integers), or f64 (OPERA v2.4 — pre-decoded
+    // physical values). See [`read_raw_pixels_2d`] for why dtype inspection
+    // (not type-probing) is required.
+    let pixels = read_raw_pixels_2d(&ds, rows, cols, "/dataset1/data1/data")?;
 
     Ok(OdimComposite {
         crs,

@@ -738,6 +738,91 @@ fn pvol_volume_engine_voxel_grid() {
     }
 }
 
+/// Regression guard for SMHI signed-integer PVOL: SMHI ships its moments as
+/// **signed `i16`** (DBZH `gain=0.01`, sentinels `nodata=-32768` /
+/// `undetect=-32767` — only representable as signed), which the original
+/// u8→u16→f64 probe chain rejected as `UnsupportedPixelType`. The moment then
+/// failed to decode, so every Swedish site returned no data on 3D Tiles / WMS /
+/// EDR (the symptom: a 404 with the quantity menu still populated). The added
+/// i16 probe fixes it. The 21 MB Kiruna fixture is **not committed to git**, so
+/// the test skips gracefully when absent.
+#[test]
+fn pvol_smhi_signed_i16_moment_decodes() {
+    use engine_odim::reader::RawPixels;
+
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/radar-smhi-pvol/radar_kiruna_qcvol_202606111000.h5");
+    if !fixture.exists() {
+        eprintln!("skipping pvol_smhi_signed_i16_moment_decodes: fixture absent at {fixture:?}");
+        return;
+    }
+    let bytes = std::fs::read(&fixture).expect("read SMHI PVOL fixture bytes");
+    let volume = engine_odim::pvol::read_polar_volume(&bytes).expect("parse SMHI PVOL fixture");
+    assert_eq!(volume.site.nod.as_deref(), Some("sekrn"), "Kiruna NOD");
+
+    // The DBZH moment in the lowest sweep — SMHI's signed scaled-integer
+    // encoding (gain 0.01, signed-only sentinels).
+    let sweep = volume.sweeps.first().expect("at least one sweep");
+    let moment = sweep
+        .moments
+        .iter()
+        .find(|m| m.quantity == "DBZH")
+        .expect("DBZH moment present in the lowest sweep");
+    // gain is stored f32 in the file, so compare with tolerance; the
+    // signed-only sentinels are exact integers.
+    assert!(
+        (moment.gain - 0.01).abs() < 1e-6,
+        "gain ≈ 0.01, got {}",
+        moment.gain
+    );
+    assert_eq!(moment.nodata, -32768.0);
+    assert_eq!(moment.undetect, -32767.0);
+
+    // The decode that previously returned `Err(UnsupportedPixelType)`.
+    let raw = engine_odim::pvol::read_moment_pixels(
+        &bytes,
+        &moment.dataset_path,
+        sweep.nrays,
+        sweep.nbins,
+    )
+    .expect("decode the signed-i16 DBZH moment");
+    assert!(
+        matches!(raw, RawPixels::I16(_)),
+        "SMHI DBZH must decode as signed i16"
+    );
+    assert_eq!(raw.shape(), (sweep.nrays, sweep.nbins));
+
+    // The signed sentinels mask (→ None); real cells decode to a sane dBZ band
+    // via `raw * gain + offset`. Scan every sweep's DBZH moment so the
+    // "has echo" assertion doesn't hinge on a single clear-air sweep.
+    let mut finite = 0usize;
+    for sweep in &volume.sweeps {
+        let Some(m) = sweep.moments.iter().find(|m| m.quantity == "DBZH") else {
+            continue;
+        };
+        let raw = engine_odim::pvol::read_moment_pixels(
+            &bytes,
+            &m.dataset_path,
+            sweep.nrays,
+            sweep.nbins,
+        )
+        .expect("decode i16 DBZH moment");
+        let (h, w) = raw.shape();
+        for r in 0..h {
+            for c in 0..w {
+                if let Some(v) = raw.sample(r, c, m.gain, m.offset, m.nodata, Some(m.undetect)) {
+                    assert!((-40.0..100.0).contains(&v), "sane dBZ, got {v}");
+                    finite += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        finite > 0,
+        "the SMHI volume must yield some finite echo cells once i16 decodes"
+    );
+}
+
 /// End-to-end `FeatureEngine` surface on the real FMI Vihti volume: the
 /// owning `PolarVolumeEngine` exposes its sites as a Features collection (one
 /// Point Feature per site). Skips when the uncommitted 15 MB fixture is absent.

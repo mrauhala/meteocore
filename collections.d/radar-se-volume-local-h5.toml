@@ -1,0 +1,109 @@
+# SMHI weather-radar polar volumes (ODIM_H5 PVOL).
+#
+# Each radar site is a stack of elevation sweeps, each with multiple
+# dual-pol moments (DBZH, VRADH, ZDR, RHOHV, WRADH...). Under the
+# per-site collection model the odim-volume engine expands this one
+# source into **one OGC collection per radar site** (id =
+# `radar-se-volume-local-h5-<nod>`, e.g. `…-sekrn` (Kiruna),
+# `…-sehem` (Hemse)). Within a site collection the parameters are the
+# **bare quantities** (`DBZH`, `VRADH`, …) — the site is the collection
+# (its EDR location, its spatial/vertical extent), so it is not part of
+# the parameter name.
+#
+# SMHI ships these as signed-i16 scaled integers in a 32-bit-superblock
+# HDF5 file — see engine-odim `reader::read_raw_pixels_2d` and the
+# `hdf5-reader` chunk-key patch in the root Cargo.toml.
+#
+# Because each quantity is now a bare parameter, WMS styling can be set
+# per quantity via `[[wms.parameters]]` below — reflectivity, velocity,
+# and the dual-pol moments each get a fitting colormap and range rather
+# than one reflectivity palette stretched over every moment.
+#
+# data_path points at a local test fixture directory. The fixtures
+# (testdata/radar-smhi-pvol/, ~113 MB) are NOT committed — like the FMI
+# `radar-fi-volume-local-h5` sibling. Without them this collection loads
+# but reports `degraded` (empty catalog) on /health; drop the .h5 volumes
+# in place to activate it, or rename this file `.toml.disabled` to skip it.
+
+id = "radar-se-volume-local-h5"
+title = "SMHI — radar polar volumes (local, ODIM_H5)"
+description = "Swedish radar polar volumes (ODIM_H5 PVOL) from local sample files — every elevation sweep and dual-polarisation moment. One collection per radar site."
+engine_type = "odim-volume"
+apis = ["edr", "wms", "maps", "tiles", "3dtiles"]
+data_path = "testdata/radar-smhi-pvol"
+
+[odim]
+poll_interval_secs = 300
+# Retain at most the last 24 volumes per site (≈2 h at 5-min cadence).
+# Bounds the time-dynamic playback set and the viewer's tileset preload —
+# an unbounded source accumulates ~288 volumes/day/site. Raise this, or
+# add `time_window = "-PT6H"`, for a longer window. Omitting both is valid
+# for a static local fixture but not recommended for a production source.
+max_files = 24
+
+[wms]
+# Collection-level fallback for any quantity without a per-parameter
+# override below (e.g. an unlisted moment renders on the dBZ palette).
+colormap = "radar_dbz"
+
+# Per-quantity colormaps. `name` is the bare ODIM quantity — matched
+# against the site collection's parameter list. Quantities the file
+# doesn't carry are simply ignored.
+
+# Horizontal reflectivity (uncorrected / corrected) — dBZ.
+[[wms.parameters]]
+name = "TH"
+colormap = "radar_dbz"
+[[wms.parameters]]
+name = "DBZH"
+colormap = "radar_dbz"
+
+# Doppler radial velocity — m/s, diverging blue→white→red about zero
+# (toward/away). The ±48 m/s span covers a typical C-band Nyquist range.
+[[wms.parameters]]
+name = "VRADH"
+min = -48.0
+max = 48.0
+[[wms.parameters.color_stops]]
+value = -48.0
+color = "#1a1aff"
+[[wms.parameters.color_stops]]
+value = -24.0
+color = "#66ccff"
+[[wms.parameters.color_stops]]
+value = 0.0
+color = "#f5f5f5"
+[[wms.parameters.color_stops]]
+value = 24.0
+color = "#ff8c66"
+[[wms.parameters.color_stops]]
+value = 48.0
+color = "#cc0000"
+
+# Spectrum width — m/s.
+[[wms.parameters]]
+name = "WRADH"
+colormap = "viridis"
+min = 0.0
+max = 10.0
+
+# Differential reflectivity — dB.
+[[wms.parameters]]
+name = "ZDR"
+colormap = "viridis"
+min = -2.0
+max = 6.0
+
+# Co-polar correlation coefficient — unitless 0..1.
+[[wms.parameters]]
+name = "RHOHV"
+colormap = "viridis"
+min = 0.0
+max = 1.0
+
+# Specific differential phase — °/km.
+[[wms.parameters]]
+name = "KDP"
+colormap = "viridis"
+min = -1.0
+max = 6.0
