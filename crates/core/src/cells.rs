@@ -223,10 +223,10 @@ impl Default for TrackingOptions {
 // Extraction
 // ---------------------------------------------------------------------------
 
-/// Per-component accumulator for the labeling pass.
+/// Per-component accumulator: footprint columns + 3-D member voxels.
 struct Comp {
-    count: usize,
     volume_m3: f64,
+    area_m2: f64,
     /// Linear-Z weighted ENU sums (metres relative to the grid origin).
     sum_w: f64,
     sum_we: f64,
@@ -236,12 +236,28 @@ struct Comp {
     max_idx: (usize, usize, usize),
     min_ih: usize,
     max_ih: usize,
+    max_vil: f64,
+    bbox: [f64; 6],
 }
 
-/// Segment the connected echo regions of `grid` with `value >= threshold`
-/// into [`StormCell`]s. Connectivity is 6-neighbour (±radius, ±azimuth,
-/// ±height) with the azimuth axis wrapping when the grid spans the full
-/// circle. `NaN` (unmeasured) and sub-threshold cells are background.
+/// Segment the echo regions of `grid` into [`StormCell`]s.
+///
+/// Segmentation runs on the **column-maximum projection** — a
+/// `(radius, azimuth)` column is in the mask when any voxel in it reaches
+/// the threshold — closed morphologically by one cell (3×3 dilate + erode,
+/// bridging single-cell speckle gaps without ever shrinking the original
+/// mask), then 4-neighbour 2-D connected components (azimuth wrapping on a
+/// full-circle grid). Working in the column projection rather than full-3-D
+/// components is the operational-radar convention (TITAN-style): footprints
+/// can never nest or overlap on a map, and a storm whose echo is split
+/// vertically (an elevated core above low-level rain) is **one** cell, not
+/// a confusing stack of rings.
+///
+/// Attributes are still computed from the **3-D member voxels** (raw
+/// `value >= threshold`, f64 comparison so a non-representable threshold is
+/// not silently narrowed) within the footprint columns — the closing widens
+/// only the footprint/area, never the physics. `NaN` (unmeasured) voxels
+/// are background.
 ///
 /// `time` is the scan's valid time, carried into the [`CellSet`] (a grid does
 /// not know its own time).
@@ -252,6 +268,7 @@ pub fn extract_cells(
 ) -> CellSet {
     let [n_r, n_a, n_h] = grid.dims;
     let total = n_r * n_a * n_h;
+    let n_cols = n_r * n_a;
     let origin = [grid.origin_lon, grid.origin_lat, grid.origin_height];
     let mut set = CellSet {
         time,
@@ -260,10 +277,9 @@ pub fn extract_cells(
         origin,
         cells: Vec::new(),
     };
-    // `u32::MAX` guards the packed BFS frontier indices; any real grid is
-    // orders of magnitude below it (engines cap cell counts in the tens of
-    // millions).
-    if total == 0 || grid.values.len() != total || opts.max_cells == 0 || total > u32::MAX as usize
+    // `u32::MAX` guards the packed BFS frontier (column indices); any real
+    // grid is orders of magnitude below it.
+    if total == 0 || grid.values.len() != total || opts.max_cells == 0 || n_cols > u32::MAX as usize
     {
         return set;
     }
@@ -280,111 +296,163 @@ pub fn extract_cells(
     let r_centre = |i_r: usize| grid.radius_range[0] + (i_r as f64 + 0.5) * dr;
     let a_centre = |i_a: usize| grid.angle_range[0] + (i_a as f64 + 0.5) * da;
     let h_centre = |i_h: usize| grid.height_range[0] + (i_h as f64 + 0.5) * dh;
+    // A column's voxels are contiguous (height varies fastest): column
+    // `i_r * n_a + i_a` owns `values[col * n_h .. (col + 1) * n_h]`.
+    let column = |col: usize| &grid.values[col * n_h..(col + 1) * n_h];
+    let member = |v: f32| (v as f64) >= opts.threshold; // NaN compares false
 
-    // Compare in f64: an f32-narrowed threshold (e.g. 35.1 → 35.09999847…)
-    // would silently lower the effective cutoff. NaN compares false.
-    let member = |idx: usize| (grid.values[idx] as f64) >= opts.threshold;
+    // --- Column-maximum mask + single-cell closing -------------------------
+    let mut mask: Vec<bool> = (0..n_cols)
+        .map(|col| column(col).iter().any(|&v| member(v)))
+        .collect();
+    close_mask(&mut mask, n_r, n_a, wrap);
 
-    // --- Pass 1: BFS connected components, scalar accumulation -------------
-    let mut labels = vec![0u32; total];
+    // --- 2-D connected components (4-neighbour, azimuth wrap) --------------
+    let mut labels2d = vec![0u32; n_cols];
     let mut comps: Vec<Comp> = Vec::new();
-    // The frontier holds packed flat indices (u32, valid up to MAX_VOXELS),
-    // not (usize, usize, usize) triples — 4 B/slot instead of 24 keeps the
-    // worst case (a storm spanning a large fraction of a `high`-tier grid)
-    // at tens of MB transient instead of hundreds.
     let mut queue: VecDeque<u32> = VecDeque::new();
-    let unpack_idx = |idx: u32| {
-        let idx = idx as usize;
-        let i_h = idx % n_h;
-        let rest = idx / n_h;
-        (rest / n_a, rest % n_a, i_h)
-    };
-
-    for seed_r in 0..n_r {
-        for seed_a in 0..n_a {
-            for seed_h in 0..n_h {
-                let seed_idx = VoxelGrid::index_of(grid.dims, seed_r, seed_a, seed_h);
-                if labels[seed_idx] != 0 || !member(seed_idx) {
-                    continue;
+    for seed in 0..n_cols {
+        if labels2d[seed] != 0 || !mask[seed] {
+            continue;
+        }
+        let raw_label = comps.len() as u32 + 1;
+        labels2d[seed] = raw_label;
+        queue.push_back(seed as u32);
+        while let Some(col) = queue.pop_front() {
+            let col = col as usize;
+            let (i_r, i_a) = (col / n_a, col % n_a);
+            let mut visit = |r: usize, a: usize| {
+                let n = r * n_a + a;
+                if labels2d[n] == 0 && mask[n] {
+                    labels2d[n] = raw_label;
+                    queue.push_back(n as u32);
                 }
-                let raw_label = comps.len() as u32 + 1;
-                let mut comp = Comp {
-                    count: 0,
-                    volume_m3: 0.0,
-                    sum_w: 0.0,
-                    sum_we: 0.0,
-                    sum_wn: 0.0,
-                    sum_wu: 0.0,
-                    max_dbz: f64::NEG_INFINITY,
-                    max_idx: (seed_r, seed_a, seed_h),
-                    min_ih: seed_h,
-                    max_ih: seed_h,
-                };
-                labels[seed_idx] = raw_label;
-                queue.push_back(seed_idx as u32);
-                while let Some(packed) = queue.pop_front() {
-                    let (i_r, i_a, i_h) = unpack_idx(packed);
-                    let idx = packed as usize;
-                    let v = grid.values[idx] as f64;
-                    let rc = r_centre(i_r);
-                    comp.count += 1;
-                    comp.volume_m3 += dr * (rc * da) * dh;
-                    let w = 10f64.powf(v / 10.0); // linear Z
-                    let az = a_centre(i_a);
-                    comp.sum_w += w;
-                    comp.sum_we += w * rc * az.sin();
-                    comp.sum_wn += w * rc * az.cos();
-                    comp.sum_wu += w * h_centre(i_h);
-                    if v > comp.max_dbz {
-                        comp.max_dbz = v;
-                        comp.max_idx = (i_r, i_a, i_h);
-                    }
-                    comp.min_ih = comp.min_ih.min(i_h);
-                    comp.max_ih = comp.max_ih.max(i_h);
-
-                    // 6-connectivity: ±r, ±a (wrapping), ±h.
-                    let mut visit = |r: usize, a: usize, h: usize| {
-                        let nidx = VoxelGrid::index_of(grid.dims, r, a, h);
-                        if labels[nidx] == 0 && member(nidx) {
-                            labels[nidx] = raw_label;
-                            queue.push_back(nidx as u32);
-                        }
-                    };
-                    if i_r > 0 {
-                        visit(i_r - 1, i_a, i_h);
-                    }
-                    if i_r + 1 < n_r {
-                        visit(i_r + 1, i_a, i_h);
-                    }
-                    if i_h > 0 {
-                        visit(i_r, i_a, i_h - 1);
-                    }
-                    if i_h + 1 < n_h {
-                        visit(i_r, i_a, i_h + 1);
-                    }
-                    if i_a > 0 {
-                        visit(i_r, i_a - 1, i_h);
-                    } else if wrap && n_a > 1 {
-                        visit(i_r, n_a - 1, i_h);
-                    }
-                    if i_a + 1 < n_a {
-                        visit(i_r, i_a + 1, i_h);
-                    } else if wrap && n_a > 1 {
-                        visit(i_r, 0, i_h);
-                    }
-                }
-                comps.push(comp);
+            };
+            if i_r > 0 {
+                visit(i_r - 1, i_a);
+            }
+            if i_r + 1 < n_r {
+                visit(i_r + 1, i_a);
+            }
+            if i_a > 0 {
+                visit(i_r, i_a - 1);
+            } else if wrap && n_a > 1 {
+                visit(i_r, n_a - 1);
+            }
+            if i_a + 1 < n_a {
+                visit(i_r, i_a + 1);
+            } else if wrap && n_a > 1 {
+                visit(i_r, 0);
             }
         }
+        comps.push(Comp {
+            volume_m3: 0.0,
+            area_m2: 0.0,
+            sum_w: 0.0,
+            sum_we: 0.0,
+            sum_wn: 0.0,
+            sum_wu: 0.0,
+            max_dbz: f64::NEG_INFINITY,
+            max_idx: (0, 0, 0),
+            min_ih: usize::MAX,
+            max_ih: 0,
+            max_vil: 0.0,
+            bbox: [
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            ],
+        });
     }
     if comps.is_empty() {
         return set;
     }
 
+    // --- Accumulate footprint + 3-D member attributes per component --------
+    // Azimuth-boundary sin/cos tables (n_a + 1 boundaries) for the bbox
+    // corner math, instead of 4 trig calls per member voxel.
+    let a_boundary: Vec<(f64, f64)> = (0..=n_a)
+        .map(|i| (grid.angle_range[0] + i as f64 * da).sin_cos())
+        .collect();
+    for i_r in 0..n_r {
+        let r_lo = grid.radius_range[0] + i_r as f64 * dr;
+        let r_hi = r_lo + dr;
+        let rc = r_centre(i_r);
+        let col_area = dr * (rc * da);
+        let voxel_vol = col_area * dh;
+        for i_a in 0..n_a {
+            let col = i_r * n_a + i_a;
+            let raw = labels2d[col] as usize;
+            if raw == 0 {
+                continue;
+            }
+            let comp = &mut comps[raw - 1];
+            comp.area_m2 += col_area;
+
+            // 3-D member voxels of this column (a 2-D label owns the whole
+            // column, so the per-column VIL integral needs no scratch map).
+            let az = a_centre(i_a);
+            let (az_sin, az_cos) = az.sin_cos();
+            let mut col_vil = 0.0;
+            for (i_h, &v) in column(col).iter().enumerate() {
+                if !member(v) {
+                    continue;
+                }
+                let v = v as f64;
+                comp.volume_m3 += voxel_vol;
+                let w = 10f64.powf(v / 10.0); // linear Z
+                comp.sum_w += w;
+                comp.sum_we += w * rc * az_sin;
+                comp.sum_wn += w * rc * az_cos;
+                comp.sum_wu += w * h_centre(i_h);
+                if v > comp.max_dbz {
+                    comp.max_dbz = v;
+                    comp.max_idx = (i_r, i_a, i_h);
+                }
+                comp.min_ih = comp.min_ih.min(i_h);
+                comp.max_ih = comp.max_ih.max(i_h);
+
+                // VIL layer contribution: M(Z)·Δh with the hail cap.
+                let dbz = v.min(VIL_DBZ_CAP);
+                let z_lin = 10f64.powf(dbz / 10.0);
+                col_vil += VIL_COEFF * z_lin.powf(4.0 / 7.0) * dh;
+
+                // ENU bbox over the voxel's 4 (r, az) corners + height span.
+                let (s_lo, c_lo) = a_boundary[i_a];
+                let (s_hi, c_hi) = a_boundary[i_a + 1];
+                for (r, (s, c)) in [
+                    (r_lo, (s_lo, c_lo)),
+                    (r_lo, (s_hi, c_hi)),
+                    (r_hi, (s_lo, c_lo)),
+                    (r_hi, (s_hi, c_hi)),
+                ] {
+                    let e = r * s;
+                    let n = r * c;
+                    comp.bbox[0] = comp.bbox[0].min(e);
+                    comp.bbox[1] = comp.bbox[1].min(n);
+                    comp.bbox[3] = comp.bbox[3].max(e);
+                    comp.bbox[4] = comp.bbox[4].max(n);
+                }
+                let h_lo = grid.height_range[0] + i_h as f64 * dh;
+                comp.bbox[2] = comp.bbox[2].min(h_lo);
+                comp.bbox[5] = comp.bbox[5].max(h_lo + dh);
+            }
+            if col_vil > comp.max_vil {
+                comp.max_vil = col_vil;
+            }
+        }
+    }
+
     // --- Filter + rank: volume floor, largest first, hard cap --------------
+    // Every component contains at least one pre-closing column (closing only
+    // grows the mask), so `volume_m3 > 0` always holds — the floor is the
+    // only filter.
     let min_volume_m3 = opts.min_volume_km3 * 1e9;
     let mut ranked: Vec<usize> = (0..comps.len())
-        .filter(|&i| comps[i].volume_m3 >= min_volume_m3)
+        .filter(|&i| comps[i].volume_m3 >= min_volume_m3 && comps[i].sum_w > 0.0)
         .collect();
     ranked.sort_by(|&a, &b| {
         comps[b]
@@ -403,96 +471,13 @@ pub fn extract_cells(
         rank_of[ci + 1] = rank;
     }
 
-    // --- Pass 2: per-kept-cell footprint mask, column VIL, ENU bbox --------
-    // Azimuth-boundary sin/cos tables (n_a + 1 boundaries) for the bbox
-    // corner math, instead of 4 trig calls per member voxel.
-    let a_boundary: Vec<(f64, f64)> = (0..=n_a)
-        .map(|i| (grid.angle_range[0] + i as f64 * da).sin_cos())
-        .collect();
-
-    struct Detail {
-        mask: Vec<bool>, // (r, a) footprint columns, n_r × n_a
-        area_m2: f64,    // Σ over claimed columns of Δr · (r_c · Δa)
-        max_vil: f64,
-        bbox: [f64; 6],
-    }
-    let mut details: Vec<Detail> = ranked
-        .iter()
-        .map(|_| Detail {
-            mask: vec![false; n_r * n_a],
-            area_m2: 0.0,
-            max_vil: 0.0,
-            bbox: [
-                f64::INFINITY,
-                f64::INFINITY,
-                f64::INFINITY,
-                f64::NEG_INFINITY,
-                f64::NEG_INFINITY,
-                f64::NEG_INFINITY,
-            ],
-        })
-        .collect();
-
-    // Per-column scratch: (rank, accumulated VIL) — a column rarely holds
-    // more than one or two distinct cells.
-    let mut col_vil: Vec<(usize, f64)> = Vec::with_capacity(4);
-    for i_r in 0..n_r {
-        let r_lo = grid.radius_range[0] + i_r as f64 * dr;
-        let r_hi = r_lo + dr;
-        for i_a in 0..n_a {
-            col_vil.clear();
-            for i_h in 0..n_h {
-                let idx = VoxelGrid::index_of(grid.dims, i_r, i_a, i_h);
-                let raw = labels[idx] as usize;
-                if raw == 0 {
-                    continue;
-                }
-                let rank = rank_of[raw];
-                if rank == usize::MAX {
-                    continue;
-                }
-                let d = &mut details[rank];
-                // First claim of this column for this cell: count its ground
-                // area here, in the voxel pass — a per-cell mask sweep after
-                // the loop would cost O(max_cells × n_r × n_a).
-                if !d.mask[i_r * n_a + i_a] {
-                    d.mask[i_r * n_a + i_a] = true;
-                    d.area_m2 += dr * (r_centre(i_r) * da);
-                }
-
-                // VIL layer contribution: M(Z)·Δh with the hail cap.
-                let dbz = (grid.values[idx] as f64).min(VIL_DBZ_CAP);
-                let z_lin = 10f64.powf(dbz / 10.0);
-                let m = VIL_COEFF * z_lin.powf(4.0 / 7.0) * dh;
-                match col_vil.iter_mut().find(|(r, _)| *r == rank) {
-                    Some((_, vil)) => *vil += m,
-                    None => col_vil.push((rank, m)),
-                }
-
-                // ENU bbox over the voxel's 4 (r, az) corners + height span.
-                let (s_lo, c_lo) = a_boundary[i_a];
-                let (s_hi, c_hi) = a_boundary[i_a + 1];
-                for (r, (s, c)) in [
-                    (r_lo, (s_lo, c_lo)),
-                    (r_lo, (s_hi, c_hi)),
-                    (r_hi, (s_lo, c_lo)),
-                    (r_hi, (s_hi, c_hi)),
-                ] {
-                    let e = r * s;
-                    let n = r * c;
-                    d.bbox[0] = d.bbox[0].min(e);
-                    d.bbox[1] = d.bbox[1].min(n);
-                    d.bbox[3] = d.bbox[3].max(e);
-                    d.bbox[4] = d.bbox[4].max(n);
-                }
-                let h_lo = grid.height_range[0] + i_h as f64 * dh;
-                d.bbox[2] = d.bbox[2].min(h_lo);
-                d.bbox[5] = d.bbox[5].max(h_lo + dh);
-            }
-            for &(rank, vil) in &col_vil {
-                if vil > details[rank].max_vil {
-                    details[rank].max_vil = vil;
-                }
+    // --- Footprint masks for the kept components ---------------------------
+    let mut masks: Vec<Vec<bool>> = ranked.iter().map(|_| vec![false; n_cols]).collect();
+    for (col, &raw) in labels2d.iter().enumerate() {
+        if raw != 0 {
+            let rank = rank_of[raw as usize];
+            if rank != usize::MAX {
+                masks[rank][col] = true;
             }
         }
     }
@@ -520,24 +505,19 @@ pub fn extract_cells(
 
     for (rank, &ci) in ranked.iter().enumerate() {
         let comp = &comps[ci];
-        let d = &details[rank];
 
-        let (ce, cn, cu) = if comp.sum_w > 0.0 {
-            (
-                comp.sum_we / comp.sum_w,
-                comp.sum_wn / comp.sum_w,
-                comp.sum_wu / comp.sum_w,
-            )
-        } else {
-            (0.0, 0.0, 0.0)
-        };
+        let (ce, cn, cu) = (
+            comp.sum_we / comp.sum_w,
+            comp.sum_wn / comp.sum_w,
+            comp.sum_wu / comp.sum_w,
+        );
         let (clon, clat) = enu_to_lonlat(ce, cn);
 
         let (mr, ma, mh) = comp.max_idx;
         let (mlon, mlat) = to_lonlat(r_centre(mr), a_centre(ma));
 
         let footprint = footprint_ring(
-            &d.mask,
+            &masks[rank],
             n_r,
             n_a,
             wrap,
@@ -557,13 +537,60 @@ pub fn extract_cells(
             echo_top_m: origin[2] + grid.height_range[0] + (comp.max_ih as f64 + 1.0) * dh,
             base_m: origin[2] + grid.height_range[0] + comp.min_ih as f64 * dh,
             volume_km3: comp.volume_m3 / 1e9,
-            area_km2: d.area_m2 / 1e6,
-            max_vil_kg_m2: d.max_vil,
+            area_km2: comp.area_m2 / 1e6,
+            max_vil_kg_m2: comp.max_vil,
             footprint,
-            bbox_enu_m: d.bbox,
+            bbox_enu_m: comp.bbox,
         });
     }
     set
+}
+
+/// Single-cell morphological **closing** of the column mask: 3×3 dilation
+/// followed by 3×3 erosion. Bridges gaps of up to ~one column (so a patchy
+/// rain area segments as one cell instead of confetti) while never removing
+/// an original column (out-of-range radial neighbours count as background
+/// for the dilation but as foreground for the erosion, the standard padding
+/// that makes closing a superset of the input). The azimuth axis wraps on
+/// full-circle grids.
+fn close_mask(mask: &mut [bool], n_r: usize, n_a: usize, wrap: bool) {
+    if n_r == 0 || n_a == 0 {
+        return;
+    }
+    // at(r, a, outside) — `outside` is the value returned for out-of-range
+    // neighbours (background for dilate, foreground for erode).
+    let at = |m: &[bool], r: i64, a: i64, outside: bool| -> bool {
+        if r < 0 || r >= n_r as i64 {
+            return outside;
+        }
+        let a = if wrap {
+            a.rem_euclid(n_a as i64)
+        } else if a < 0 || a >= n_a as i64 {
+            return outside;
+        } else {
+            a
+        };
+        m[r as usize * n_a + a as usize]
+    };
+    let offsets = [-1i64, 0, 1];
+
+    let mut dilated = vec![false; mask.len()];
+    for r in 0..n_r as i64 {
+        for a in 0..n_a as i64 {
+            let any = offsets
+                .iter()
+                .any(|&dr| offsets.iter().any(|&da| at(mask, r + dr, a + da, false)));
+            dilated[r as usize * n_a + a as usize] = any;
+        }
+    }
+    for r in 0..n_r as i64 {
+        for a in 0..n_a as i64 {
+            let all = offsets
+                .iter()
+                .all(|&dr| offsets.iter().all(|&da| at(&dilated, r + dr, a + da, true)));
+            mask[r as usize * n_a + a as usize] = all;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1377,6 +1404,56 @@ mod tests {
             .collect();
         assert_eq!(continued.len(), 1, "exactly one track continues");
         assert_eq!(continued[0].points[0].label, 1, "the nearer cell wins");
+    }
+
+    #[test]
+    fn vertically_stacked_echo_is_one_cell_not_nested_rings() {
+        // An elevated core above low-level rain in the SAME columns,
+        // separated by a sub-threshold layer: 3-D components would yield two
+        // cells with stacked footprints (nested rings on a map — the exact
+        // mess users see); the column projection must yield ONE cell whose
+        // vertical extent spans both layers.
+        let mut g = empty_grid();
+        fill(&mut g, 4..8, &[9, 10, 11], 1..3, 40.0); // low layer
+        fill(&mut g, 4..8, &[9, 10, 11], 6..8, 45.0); // elevated core
+        let set = extract_cells(&g, t0(), &opts());
+        assert_eq!(set.cells.len(), 1, "stacked layers are one cell");
+        let c = &set.cells[0];
+        assert_eq!(c.max_dbz, 45.0);
+        assert!(
+            (c.base_m - (100.0 + 1_000.0)).abs() < 1e-9,
+            "base from the low layer"
+        );
+        assert!(
+            (c.echo_top_m - (100.0 + 8_000.0)).abs() < 1e-9,
+            "echo top from the elevated core"
+        );
+        // Volume counts only the member voxels, not the empty gap between.
+        let da = std::f64::consts::TAU / 36.0;
+        let expected: f64 = (4..8)
+            .map(|i_r| 5_000.0 * ((i_r as f64 + 0.5) * 5_000.0) * da * 1_000.0 * 3.0 * 4.0)
+            .sum::<f64>()
+            / 1e9;
+        assert!((c.volume_km3 - expected).abs() / expected < 1e-9);
+    }
+
+    #[test]
+    fn closing_bridges_single_column_gaps_but_not_wide_ones() {
+        // Patchy rain: two fragments one azimuth column apart segment as ONE
+        // cell (the closing bridges the speckle gap)…
+        let mut g = empty_grid();
+        fill(&mut g, 5..8, &[9, 10], 2..5, 40.0);
+        fill(&mut g, 5..8, &[12, 13], 2..5, 41.0);
+        let set = extract_cells(&g, t0(), &opts());
+        assert_eq!(set.cells.len(), 1, "1-column gap bridges");
+        assert_eq!(set.cells[0].max_dbz, 41.0);
+
+        // …while genuinely separate cells (3 columns apart) stay separate.
+        let mut g2 = empty_grid();
+        fill(&mut g2, 5..8, &[9, 10], 2..5, 40.0);
+        fill(&mut g2, 5..8, &[14, 15], 2..5, 41.0);
+        let set2 = extract_cells(&g2, t0(), &opts());
+        assert_eq!(set2.cells.len(), 2, "3-column gap stays separate");
     }
 
     #[test]

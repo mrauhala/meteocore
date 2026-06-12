@@ -952,9 +952,11 @@ fn pvol_cells_raster_layer() {
         "the fixture storm must paint at least one outline"
     );
     for v in &painted {
+        // The code's invariant is only `>= threshold` — an upper bound would
+        // pin this fixture's accident and spuriously fail on a hail scan.
         assert!(
-            (35.0..70.0).contains(v),
-            "painted values are cell max dBZ, got {v}"
+            (35.0_f64..).contains(v),
+            "painted values are cell max dBZ (>= threshold), got {v}"
         );
     }
 
