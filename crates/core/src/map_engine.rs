@@ -117,6 +117,9 @@ impl OutputCrs {
                 )
             }
             OutputCrs::Projected { crs, bbox } => {
+                // `wgs84_bbox` is not used here: the projected tile extents
+                // are already embedded in this variant's `bbox` field
+                // (mirroring `project_node`).
                 let [min_e, min_n, max_e, max_n] = bbox;
                 let (e, n) = crs.forward(lon, lat);
                 ((e - min_e) / (max_e - min_e), (max_n - n) / (max_n - min_n))
