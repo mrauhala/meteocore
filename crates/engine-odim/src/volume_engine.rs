@@ -644,7 +644,7 @@ pub(crate) struct SiteMeta {
     /// the collection, so the parameter is the bare quantity.
     parameters: Vec<(String, String)>,
     /// Bare EDR quantities (lowest sweep), sorted distinct.
-    quantities: Vec<String>,
+    pub(crate) quantities: Vec<String>,
     /// This site's distinct volume times, ascending.
     times: Vec<DateTime<Utc>>,
     /// This site's circular coverage bbox `[w, s, e, n]` (WGS84).
@@ -1298,7 +1298,7 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
     // Title is the human-readable label from the ODIM quantity dictionary
     // (acronym + name); the tuple key stays the bare quantity so the
     // parameter id / WMS `<Name>` token is unchanged.
-    let parameters: Vec<(String, String)> = quantities
+    let mut parameters: Vec<(String, String)> = quantities
         .iter()
         .map(|q| (q.clone(), quantities::quantity_label(q)))
         .collect();
@@ -1394,6 +1394,21 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
             height_m: VOXEL_HEIGHT_CEILING_M,
         }),
     });
+
+    // Derived storm-cell overlay layer (#367), appended AFTER `volume_info`
+    // captured its clone of `parameters`: CELLS is a WMS/Maps/Tiles map
+    // layer only — not an EDR quantity (those come from `quantities`) and
+    // not a 3D Tiles quantity. Only for sites with a reflectivity moment to
+    // derive cells from (the same dBZ gate `cell_product` enforces).
+    if quantities
+        .iter()
+        .any(|q| quantities::quantity_unit(q) == "dBZ")
+    {
+        parameters.push((
+            crate::cells::CELLS_PARAMETER.to_string(),
+            crate::cells::CELLS_PARAMETER_TITLE.to_string(),
+        ));
+    }
 
     Some(SiteMeta {
         lon: site.lon,
@@ -3109,6 +3124,15 @@ impl MapEngine for PolarVolumeSiteView {
         z: Option<f64>,
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
+        // Derived storm-cell overlay (#367): outlines + centroid markers +
+        // track polylines painted in output pixel space. Intercepted before
+        // quantity resolution — CELLS is a layer, not a moment. `z` doesn't
+        // apply (cells are 3-D objects, not per-sweep slices) and is
+        // deliberately ignored, like the COMP engine ignores it for 2-D data.
+        if parameter == Some(crate::cells::CELLS_PARAMETER) {
+            return self.cells_raster_tile(bbox, width, height, time, output_crs);
+        }
+
         let catalog = self.catalog.load();
         // A per-site PVOL collection is still multi-parameter — one layer per
         // radar quantity (the bare quantity, no `<site>:` prefix). When no
@@ -5523,13 +5547,15 @@ mod tests {
         );
         let view = site_view_for(by_site, "fivih");
 
-        // Map/WMS parameters are the bare quantity — no `fivih:` prefix.
+        // Map/WMS parameters are the bare quantity — no `fivih:` prefix —
+        // plus the derived CELLS overlay layer (appended last, after the
+        // real quantities, because the site carries a dBZ moment).
         let info = MapEngine::raster_info(&view);
         let names: Vec<&str> = info.parameters.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             names,
-            vec!["DBZH"],
-            "per-site layer must be the bare quantity, got {names:?}"
+            vec!["DBZH", crate::cells::CELLS_PARAMETER],
+            "per-site layers are the bare quantity + the CELLS overlay, got {names:?}"
         );
         assert!(
             info.spatial_extent.is_some(),
