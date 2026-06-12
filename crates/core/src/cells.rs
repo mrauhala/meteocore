@@ -580,20 +580,31 @@ fn footprint_ring(
             // i.e. original index a maps to shifted (a + n_a - 1 - gap) % n_a.
             Some(gap) => (n_a - 1 - gap) % n_a,
             None => {
-                // Full annulus: outer-radius circle (inner hole dropped).
+                // Full annulus: outer-radius circle (inner hole dropped),
+                // simplified like the normal path — Douglas–Peucker keeps
+                // only the vertices a `tol_m` chord deviation requires, so
+                // a 360-column circle collapses to a few dozen points.
                 let max_r = (0..n_r)
                     .rev()
                     .find(|&r| (0..n_a).any(|a| mask[r * n_a + a]))
                     .map(|r| r0 + (r as f64 + 1.0) * dr)
                     .unwrap_or(r0);
-                let mut ring: Vec<[f64; 2]> = (0..=n_a)
+                let enu: Vec<(f64, f64)> = (0..n_a)
                     .map(|a| {
+                        let angle = a0 + a as f64 * da;
+                        (max_r * angle.sin(), max_r * angle.cos())
+                    })
+                    .collect();
+                let keep = douglas_peucker_closed(&enu, tol_m);
+                let mut ring: Vec<[f64; 2]> = keep
+                    .iter()
+                    .map(|&a| {
                         let (lon, lat) = to_lonlat(max_r, a0 + a as f64 * da);
                         [lon, lat]
                     })
                     .collect();
                 if let Some(first) = ring.first().copied() {
-                    *ring.last_mut().expect("non-empty ring") = first; // exact closure
+                    ring.push(first);
                 }
                 return ring;
             }
@@ -734,20 +745,24 @@ fn footprint_ring(
         (radius * angle.sin(), radius * angle.cos())
     };
 
-    // Largest |area| ring is the outer boundary; holes are dropped.
-    let ring = rings
+    // Largest |area| ring is the outer boundary; holes are dropped. The
+    // signed area is computed once per ring — magnitude selects the ring,
+    // sign settles its orientation.
+    let (mut ring, signed_area) = rings
         .into_iter()
+        .map(|r| {
+            let area = shoelace(r.iter().map(|&v| vertex_enu(v)));
+            (r, area)
+        })
         .max_by(|a, b| {
-            let area = |r: &Vec<usize>| shoelace(r.iter().map(|&v| vertex_enu(v))).abs();
-            area(a)
-                .partial_cmp(&area(b))
+            a.1.abs()
+                .partial_cmp(&b.1.abs())
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .expect("non-empty rings");
 
     // Orient CCW in ENU (east/north), per RFC 7946 exterior convention.
-    let mut ring = ring;
-    if shoelace(ring.iter().map(|&v| vertex_enu(v))) < 0.0 {
+    if signed_area < 0.0 {
         ring.reverse();
     }
 
