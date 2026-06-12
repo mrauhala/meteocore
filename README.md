@@ -101,16 +101,26 @@ Traits are separate — not all engines need to support all APIs. Engines return
 
 ### Collection Routing
 
-- API state is a registry of engines keyed by collection ID (`EdrState` / `FeaturesState` / `MapsState` / `WmsState`).
-- Handlers look up engines from a `HashMap<String, Arc<dyn EdrEngine/FeatureEngine/MapEngine>>` by collection ID from the URL path.
-- The `apis` config field is enforced — only collections listing a given API in their `apis` array are wired to that API's router.
-- Tiles reuses MapEngine — tile z/x/y coordinates are converted to a bbox via TileMatrixSet math, then passed to `MapEngine::get_raster_tile()`.
+Each API has its own state struct — a registry of engines keyed by collection ID:
+
+| State type | Engine map key type | Used by |
+|------------|---------------------|---------|
+| `EdrState` | `Arc<dyn EdrEngine>` | `api-edr` |
+| `FeaturesState` | `Arc<dyn FeatureEngine>` | `api-features` |
+| `MapsState` | `Arc<dyn MapEngine>` | `api-maps` |
+| `TilesState` | `Arc<dyn MapEngine>` (raster) + `Arc<dyn FeatureEngine>` (vector/MVT) | `api-tiles` |
+| `WmsState` | `Arc<dyn MapEngine>` | `api-wms` |
+| `TilesState3d` | `Arc<dyn VolumeEngine>` | `api-3dtiles` |
+
+Handlers look up the engine for a request's `{id}` path segment from the appropriate `HashMap<String, Arc<dyn …>>`. The `apis` config field is enforced at load time — only collections listing a given API in their `apis` array are wired into that API's state. Tiles keeps two independent maps (`map_engines` for raster, `feature_engines` for MVT) because a collection may serve one or both.
+
+Tiles (raster) reuses `MapEngine` — z/x/y coordinates are converted to a bbox via TileMatrixSet math and passed to `MapEngine::get_raster_tile()`.
 
 ### State Architecture
 
-API state (`EdrState`, `FeaturesState`, `MapsState`, `TilesState`, `WmsState`) is wrapped in `ArcSwap` for lock-free reads and atomic swaps on reload. The `ServerState` in `server/src/admin.rs` holds the `ArcSwap` pointers, health registry, and GeoTIFF engine list. Engine loading logic is in `admin::load_collections()`, shared by startup and reload.
+Each state struct is wrapped in `Arc<ArcSwap<…>>` for lock-free reads and atomic swaps on reload. `ServerState` (in `server/src/admin.rs`) owns all six `ArcSwap` pointers plus the health registry and GeoTIFF engine list (kept separately for the poll runtime). Engine loading lives in `admin::load_collections()`, called by both startup and `POST /admin/collections/reload`.
 
-The render semaphore (sized to 2× available CPU cores, minimum 8) and rendered cache are shared across Maps, Tiles, and WMS APIs. The semaphore uses `acquire().await` so excess requests queue instead of failing. The 2× oversubscription reflects that a slot's "ownership" of a CPU is loose — image decode (libpng, libdeflate) and PNG encode bursts interleave with bilinear-sample passes, leaving CPU idle a non-trivial fraction of the slot's wall time.
+The render semaphore (2× CPU cores, minimum 8) and rendered-image cache are shared across `MapsState`, `TilesState`, and `WmsState`. `TilesState3d` shares the same render semaphore for encode work but has its own content cache (`api-3dtiles/src/cache.rs`). The semaphore uses `acquire().await` so excess requests queue rather than fail. The 2× factor reflects loose CPU ownership — libpng decode bursts and bilinear-sample passes interleave, leaving the slot idle a non-trivial fraction of its wall time.
 
 ## Route Structure
 
