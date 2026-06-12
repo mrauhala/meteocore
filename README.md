@@ -1,6 +1,6 @@
 # MeteoCore
 
-A high-performance modular meteorological data server built in Rust. Implements [OGC API - EDR 1.1](https://ogcapi.ogc.org/edr/), [OGC API - Features 1.0](https://ogcapi.ogc.org/features/), [OGC API - Maps 1.0](https://ogcapi.ogc.org/maps/), [OGC API - Tiles 1.0](https://ogcapi.ogc.org/tiles/), and [OGC WMS 1.3.0](https://www.ogc.org/standard/wms/) as separate services sharing the same data sources. A built-in `/preview` SPA renders every configured collection on a MapLibre canvas for quick visual smoke-testing.
+A high-performance modular meteorological data server built in Rust. Implements [OGC API - EDR 1.1](https://ogcapi.ogc.org/edr/), [OGC API - Features 1.0](https://ogcapi.ogc.org/features/), [OGC API - Maps 1.0](https://ogcapi.ogc.org/maps/), [OGC API - Tiles 1.0](https://ogcapi.ogc.org/tiles/), [OGC WMS 1.3.0](https://www.ogc.org/standard/wms/), and [OGC 3D Tiles 1.1](https://ogcapi.ogc.org/3dtiles/) as separate services sharing the same data sources. A built-in `/preview` SPA renders every configured collection on a MapLibre canvas for quick visual smoke-testing; a bundled CesiumJS viewer serves volumetric 3D Tiles collections.
 
 ## Workspace Crates
 
@@ -8,10 +8,11 @@ A high-performance modular meteorological data server built in Rust. Implements 
 
 | Crate | Description |
 |-------|-------------|
-| `ds-core` | Domain traits (`EdrEngine`, `FeatureEngine`, `MapEngine`), shared types (CRS, GeoTransform, PropertyValue), config parsing. No framework deps. |
+| `ds-core` | Domain traits (`EdrEngine`, `FeatureEngine`, `MapEngine`, `VolumeEngine`), shared types (CRS, GeoTransform, PropertyValue), config parsing. No framework deps. |
 | `ds-storage` | Unified S3 / HTTP / local-filesystem object store, used by every engine that fetches remote data. |
 | `ds-render` | Raster colorization (LUT + linear gradient) and PNG encoding. No framework deps. |
 | `ds-mvt` | Mapbox Vector Tile encoder + weighted LRU cache. Used by `api-tiles` to serve `?f=mvt` from `FeatureEngine` collections. |
+| `ds-3dtiles` | Framework-free OGC 3D Tiles encoder — `.pnts` point clouds, glTF `.glb` isosurfaces (marching tetrahedra), echo-top column meshes, and cylindrical voxel grids. No framework deps. |
 
 ### Data Engines
 
@@ -23,7 +24,7 @@ Each engine implements one or more of the core traits.
 | `engine-geojson` | `FeatureEngine` | GeoJSON FeatureCollection files (WGS84 only) |
 | `engine-geotiff` | `EdrEngine` + `MapEngine` | Cloud-Optimized GeoTIFF (local dir, S3, or STAC catalog) |
 | `engine-grib` | `EdrEngine` + `MapEngine` | GRIB2 NWP data via JSON/wgrib2 index sidecars (ECMWF IFS, NOAA GFS) |
-| `engine-odim` | `EdrEngine` + `MapEngine` | ODIM_H5 weather radar — 2-D composites (FMI / DMI / SMHI / OPERA) and native polar volumes (`odim-volume`, one collection per radar site); pure-Rust HDF5 |
+| `engine-odim` | `EdrEngine` + `MapEngine` (composites); `EdrEngine` + `MapEngine` + `VolumeEngine` + `FeatureEngine` (polar volumes) | ODIM_H5 weather radar — 2-D composites (FMI / DMI / SMHI / OPERA) and native polar volumes (`odim-volume`, one collection per radar site); pure-Rust HDF5 |
 | `engine-querydata` | `EdrEngine` + `MapEngine` | FMI QueryData (`.sqd`) binary files, memory-mapped |
 | `engine-zarr` | `EdrEngine` + `MapEngine` | Zarr V2/V3 multidimensional arrays with CF metadata (local, S3, HTTP); optional Icechunk repositories |
 | `engine-postgis` | `EdrEngine` + `FeatureEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible) |
@@ -37,6 +38,7 @@ Each engine implements one or more of the core traits.
 | `api-maps` | [OGC API - Maps 1.0](https://docs.ogc.org/is/20-058/20-058.html) | core, collection-map, styled-map, spatial-subsetting, scaling, datetime, crs, png, jpeg |
 | `api-tiles` | [OGC API - Tiles 1.0](https://docs.ogc.org/is/20-057/20-057.html) | ogcapi-tiles-1: core, tileset, tilesets-list, png, jpeg, mvt; tms 2.0: tilematrixset, json-tilematrixset |
 | `api-wms` | [OGC WMS 1.3.0](https://portal.ogc.org/files/?artifact_id=14416) | GetCapabilities, GetMap, GetLegendGraphic |
+| `api-3dtiles` | [OGC 3D Tiles 1.1](https://docs.ogc.org/cs/22-025r4/22-025r4.html) | point clouds (`.pnts`), glTF mesh content (`.glb` — isosurface + echo-top), cylindrical voxels (`.glb`, `EXT_primitive_voxels` draft); bundled CesiumJS viewer SPA |
 
 ### Binary
 
@@ -78,13 +80,14 @@ Seed corpus in `fuzz/corpus/fuzz_tiff_metadata/` — add real GeoTIFF files for 
 
 ### Core Traits
 
-Three core traits, each corresponding to one or more APIs:
+Four core traits, each corresponding to one or more APIs:
 
 | Trait | APIs | Description |
 |-------|------|-------------|
 | `EdrEngine` | OGC API - EDR 1.1 | Time-series queries (position, area, locations) returning CoverageJSON |
 | `FeatureEngine` | OGC API - Features 1.0, OGC API - Tiles 1.0 (MVT) | Paginated spatial feature queries returning GeoJSON; vector tiles are encoded from the same query via `ds-mvt` |
 | `MapEngine` | OGC API - Maps 1.0, OGC WMS 1.3.0, OGC API - Tiles 1.0 (raster) | Raster tile rendering returning PNG/JPEG/WebP |
+| `VolumeEngine` | OGC 3D Tiles 1.1 | Volumetric point clouds and voxel grids — radar polar volumes rendered as `.pnts`, glTF isosurfaces, echo-top meshes, and cylindrical voxels |
 
 Traits are separate — not all engines need to support all APIs. Engines return domain types, never JSON/XML. Serialization belongs in the API crates.
 
@@ -159,6 +162,17 @@ The render semaphore (sized to 2× available CPU cores, minimum 8) and rendered 
 /wms/?SERVICE=WMS&REQUEST=GetMap&...           WMS 1.3.0 GetMap (PNG/JPEG/WebP)
 /wms/?SERVICE=WMS&REQUEST=GetLegendGraphic&... WMS 1.3.0 GetLegendGraphic (PNG/JPEG/WebP)
 
+/3dtiles/                                      3D Tiles landing page
+/3dtiles/collections                           3D Tiles collection listing
+/3dtiles/collections/{id}                      3D Tiles collection detail (times, representations)
+/3dtiles/collections/{id}/tileset.json         Root tileset (?representation=points|isosurface|echotop, ?quantity=, ?datetime=, ?threshold=, ?resolution=, ?min_value=)
+/3dtiles/collections/{id}/content.pnts         Point cloud content (?quantity=, ?datetime=, ?min_value=)
+/3dtiles/collections/{id}/content.glb          Mesh content — isosurface or echo-top (?representation=, ?quantity=, ?datetime=, ?threshold=, ?resolution=)
+/3dtiles/collections/{id}/voxel/tileset.json   Cylindrical voxel tileset (?quantity=, ?datetime=, ?resolution=)
+/3dtiles/collections/{id}/voxel/subtrees/*     Implicit tiling subtree files
+/3dtiles/collections/{id}/voxel/content/*      Voxel glTF content chunks
+/3dtiles/viewer                                Bundled CesiumJS SPA with collection/quantity/representation/resolution pickers and time scrubber
+
 /preview                                       Built-in MapLibre SPA (cards + map for every collection)
 /preview/manifest.json                         Aggregated discovery JSON consumed by the SPA
 /preview/{*path}                               Embedded SPA assets (HTML, JS, CSS, vendored MapLibre)
@@ -230,7 +244,9 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `port` | yes | — | Bind port |
 | `base_url` | no | `http://{host}:{port}` | External base URL for absolute links (set when behind a reverse proxy) |
 | `collections_dir` | no | — | Directory of per-collection `.toml` config files (see [Per-File Collection Configs](#per-file-collection-configs)) |
-| `metatile_cache_mb` | no | `1024` | Size (MB) of the global Web Mercator meta-tile cache (#202). Server-wide, not per-collection. `0` disables meta-tiling (EPSG:3857 GetMap reverts to a direct render; reload-reversible). Consumed by WMS today; Maps/Tiles will share it when meta-tiling extends to them. |
+| `watch_collections_dir` | no | `false` | Auto-reload when files in `collections_dir` are added, changed, or removed. Debounced; runs on the background runtime. See trust-model note in [Per-File Collection Configs](#per-file-collection-configs). |
+| `watch_debounce_ms` | no | `500` | Coalesce-window in milliseconds for the filesystem watcher (only used when `watch_collections_dir = true`). |
+| `metatile_cache_mb` | no | `1024` | Size (MB) of the global Web Mercator meta-tile cache. Server-wide, not per-collection. `0` disables meta-tiling (EPSG:3857 GetMap reverts to a direct render; reload-reversible). Consumed by WMS today; Maps/Tiles will share it when meta-tiling extends to them. |
 
 ### Collection Config Fields
 
@@ -240,8 +256,10 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `title` | yes | — | Human-readable collection title |
 | `description` | yes | — | Collection description |
 | `data_path` | yes* | — | Path to data file (CSV, GeoJSON) or directory (GeoTIFF) |
-| `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, `"maps"`, `"tiles"`, `"wms"` |
+| `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, `"maps"`, `"tiles"`, `"wms"`, `"3dtiles"` |
 | `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, `"odim"` (radar composite), `"odim-volume"` (radar polar volumes), `"querydata"`, `"zarr"`, `"postgis"` |
+| `keywords` | no | — | Array of discovery keyword strings, e.g. `["radar", "reflectivity"]`. Surfaced in collection JSON, WMS capabilities, and matched by `/collections?q=`. |
+| `license` | no | — | `[collections.license]` table with `title` (required — SPDX id or human name) and optional `url`. When `url` is omitted and `title` is an SPDX id, the URL is synthesized from `https://spdx.org/licenses/<id>.html`. |
 | `wms` | no | — | WMS rendering config. Required when `apis` contains `"wms"`. |
 
 ### Per-File Collection Configs
@@ -298,6 +316,7 @@ time_window = "PT12H"
 - **`id` is required in file content**, not derived from the filename. A warning is logged if the filename stem differs from the `id`.
 - **Missing directory is a hard error.** If `collections_dir` is set but the directory doesn't exist, the server refuses to start.
 - **Hot-reload picks up changes.** `POST /admin/collections/reload` re-reads the directory, loading new files, removing deleted ones, and applying edits.
+- **Filesystem watcher** (`watch_collections_dir = true`) triggers the same reload automatically on add/edit/remove — debounced, no manual reload needed. **Trust model:** the watcher is authorized by *filesystem write access to `collections_dir`*, not the HTTP `ADMIN_TOKEN` that gates `POST /admin/collections/reload`. Anyone who can write a collection file already controls what the server serves. When both are active, a startup WARN makes the asymmetry explicit. Keep `collections_dir` writable only by trusted principals (avoid shared/NFS mounts).
 
 ## Data Engines
 
@@ -538,30 +557,34 @@ The engine caches **compressed** tile bytes (not decoded pixels) in a lock-free 
 
 ### GRIB2
 
-GRIB2 files from NWP models. The engine discovers data via JSON index sidecar files, fetches individual GRIB messages via byte-range reads. Primary target: ECMWF IFS open data on S3.
+GRIB2 files from NWP models. The engine discovers data via index sidecar files, fetches individual GRIB messages via byte-range reads. Primary targets: ECMWF IFS open data on S3 (JSON-lines index) and NOAA GFS (wgrib2 index).
 
 **Requirements:**
-- **Index sidecar files (`.index`)** — JSON-lines format with `_offset` and `_length` fields per GRIB message.
+- **Index sidecar files** — either ECMWF JSON-lines (default, `_offset`/`_length` per message) or wgrib2 colon-separated text (set `index_format = "wgrib2"`).
 - **Regular lat/lon grid** — Template 3.0 (equidistant cylindrical) only.
-- **S3/HTTP access** — Uses `ds_storage` for byte-range reads.
+- **Data source:** S3/HTTP remote (default) or a local directory (`data_path`).
 
 **Data access pattern:**
-1. Poll S3 prefix for `.index` files (lightweight, ~35 KB each)
-2. Parse index -> build catalog: `(reference_time, step) -> (file_url, message_offsets)`
-3. On query: HTTP Range request for the specific GRIB message (~500 KB per surface field)
-4. Decode message -> regular lat/lon grid -> serve via EdrEngine/MapEngine
+1. Poll S3 prefix (or local directory) for index files (lightweight, ~35 KB each)
+2. Parse index → build catalog: `(reference_time, step) → (file_url, message_offsets)`
+3. On query: byte-range read for the specific GRIB message (~500 KB per surface field)
+4. Decode message → regular lat/lon grid → serve via EdrEngine/MapEngine
 
 **Multi-parameter collections:** Unlike GeoTIFF (one band per collection), a GRIB collection exposes all parameters from the data source. EDR queries select parameters via `parameter-name`. MapEngine uses per-parameter WMS layers.
 
 **Automatic unit conversion** (config-free):
 
-| Source Unit | Display Unit | Conversion | Parameters |
-|-------------|-------------|------------|------------|
-| K | C | -273.15 | 2t, 2d, skt, t, sot |
-| Pa | hPa | x0.01 | msl, sp |
-| m | mm | x1000 | tp, cp, sf, sd |
-| 0-1 | % | x100 | tcc, lcc, mcc, hcc, lsm |
-| m2/s2 | gpm | /9.80665 | z |
+Unit conversion is driven by the WMO `(discipline, category, parameter_number)` triple read from each GRIB message, not by short-name tables. Source units come from WMO Code Table 4.2 plus per-center overlays for local parameter numbers 192–254.
+
+| Source Unit | Display Unit | Conversion |
+|-------------|-------------|------------|
+| K | °C | −273.15 |
+| Pa | hPa | ×0.01 |
+| kg m⁻² | mm | ×1 (same value) |
+| m² s⁻² | gpm | ÷9.80665 |
+| proportion (0–1) | % | ×100 |
+
+Adding a new provider only requires new center-overlay entries if it uses local parameter numbers 192–254. Providers that use standard WMO triples (ECMWF IFS, NOAA GFS) are handled automatically.
 
 **Supported compression:**
 
@@ -573,17 +596,21 @@ GRIB2 files from NWP models. The engine discovers data via JSON index sidecar fi
 
 #### GRIB Config Fields
 
+Either `data_path` **or** `endpoint`+`bucket` must be set (mutually exclusive).
+
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `endpoint` | yes | — | S3-compatible endpoint URL |
-| `bucket` | yes | — | S3 bucket name |
-| `prefix_pattern` | yes | — | Prefix with strftime templates |
+| `data_path` | * | — | Local directory of `.grib2` + index files, or an `s3://`/`http(s)://` fixed-prefix URL. Mutually exclusive with `endpoint`+`bucket`. |
+| `endpoint` | * | — | S3-compatible endpoint URL. |
+| `bucket` | * | — | S3 bucket name. |
+| `prefix_pattern` | * | — | Object prefix with optional strftime date templates (e.g. `"%Y%m%d/00z/ifs/0p25/oper/"`). Required for S3; optional literal sub-prefix for `data_path`. |
+| `index_format` | no | `"ecmwf-json"` | Index format: `"ecmwf-json"` (JSON-lines, ECMWF open data) or `"wgrib2"` (colon-separated text, NOAA GFS). |
 | `index_suffix` | no | `".index"` | Suffix for index sidecar files |
 | `data_suffix` | no | `".grib2"` | Suffix for GRIB data files |
 | `poll_interval_secs` | no | `300` | Poll interval in seconds |
 | `max_runs` | no | none | Keep only the N most recent forecast runs |
 | `time_window` | no | none | ISO 8601 duration for valid time filtering |
-| `parameters` | no | all | Optional parameter filter, e.g., `["2t", "msl", "tp"]` |
+| `parameters` | no | all | Optional parameter filter, e.g., `["2t", "msl", "tp"]`. Strongly recommended with `index_format = "wgrib2"` (a single GFS file can have ~700 messages). |
 | `grid_cache_mb` | no | `256` | LRU cache size for decoded grids |
 | `run_hours` | no | all | Model run hours to poll, e.g., `[0, 6, 12, 18]` |
 
@@ -716,6 +743,7 @@ FMI QueryData (.sqd) binary format for NWP gridded data. Implements `EdrEngine` 
 |-------|----------|---------|-------------|
 | `wms_parameter` | no | first param | Parameter to render for WMS. Matched by full name, short name in parens, or numeric ID. |
 | `poll_interval_secs` | no | `30` | Directory poll interval in seconds (clamped to >= 1) |
+| `max_runs` | no | `4` | Number of most-recent `.sqd` files to retain as model runs. Each file is keyed by its origin (analysis) time and exposed as an EDR instance and a `RasterInfo.reference_times` entry. Set `1` for latest-only (no history). |
 
 #### QueryData Config Example
 
@@ -879,6 +907,61 @@ max = 40.0
 ```
 
 Ready-to-use disabled examples ship in `collections.d/` (`ecmwf-aifs-single.toml.disabled`, `noaa-gfs-icechunk.toml.disabled`, `dwd-icon-eu.toml.disabled`) — rename to drop `.disabled` and run with `--features icechunk`.
+
+## OGC 3D Tiles
+
+Volumetric weather data served as OGC 3D Tiles 1.1. Currently only the `odim-volume` (polar volume) engine implements `VolumeEngine`. Add `"3dtiles"` to a collection's `apis` to enable it.
+
+### Representations
+
+Each per-site PVOL collection exposes four product representations selectable at request time:
+
+| `?representation=` | Content | Endpoint |
+|--------------------|---------|----------|
+| `points` (default) | `.pnts` point cloud — one point per radar echo cell, placed at its true ECEF position via the 4/3-Earth beam model | `content.pnts` |
+| `isosurface` | glTF `.glb` isosurface mesh (marching tetrahedra) — a constant-value shell such as the 20 dBZ surface, with nested translucent shells supported via `?threshold=20,35,50` | `content.glb` |
+| `echotop` | glTF `.glb` echo-top column mesh — extruded bins from ground up to the highest echo ≥ threshold, height-coloured | `content.glb` |
+| `voxels` | glTF `.glb` cylindrical voxel grid (`EXT_primitive_voxels` draft extension, CesiumJS ≥ 1.142 only) | `voxel/tileset.json` + content |
+
+### Time-Dynamic Playback
+
+Each tileset includes a `times` manifest of all available volume timestamps (RFC 3339 `…Z`, sorted ascending). The bundled CesiumJS viewer preloads one tileset per timestamp and animates by toggling visibility — scrubbing and playback require no additional network requests per frame.
+
+### Routes and Query Parameters
+
+| Route | Key parameters |
+|-------|----------------|
+| `GET /3dtiles/collections/{id}/tileset.json` | `representation`, `quantity`, `datetime`, `min_value`, `threshold` (comma list ≤5, isosurface only), `resolution` (`low`/`med`/`high`) |
+| `GET /3dtiles/collections/{id}/content.pnts` | `quantity`, `datetime`, `min_value` |
+| `GET /3dtiles/collections/{id}/content.glb` | `representation`, `quantity`, `datetime`, `threshold`, `resolution` |
+| `GET /3dtiles/collections/{id}/voxel/tileset.json` | `quantity`, `datetime`, `resolution` |
+| `GET /3dtiles/viewer` | Built-in CesiumJS SPA; `?base=` overrides API origin |
+
+`datetime` accepts any RFC 3339 instant and selects the nearest available volume; omitting it selects the latest. `?datetime=` values that exactly match an advertised volume time receive `Cache-Control: max-age=86400, immutable`; others receive `max-age=60`.
+
+### Config
+
+```toml
+[[collections]]
+id = "radar-fi-volume"
+title = "FMI radar polar volumes"
+engine_type = "odim-volume"
+apis = ["edr", "wms", "maps", "tiles", "3dtiles"]
+data_path = "testdata/radar-fmi-pvol"
+
+[collections.odim]
+poll_interval_secs = 300
+# max_files = 48    # retain last 48 volumes for time-dynamic playback
+```
+
+### Caching
+
+Two complementary LRU caches reduce per-request compute:
+
+- **Content cache** (`MC_3DTILES_CONTENT_CACHE_MB`, default 512 MB) — caches encoded `.pnts`/`.glb` bytes keyed by (collection, product, quantity, datetime, params, dims) plus a data-version hash derived from `VolumeInfo.times`. Concurrent identical requests share one compute via single-flight coalescing.
+- **Voxel-grid cache** (`MC_PVOL_VOXEL_GRID_CACHE_MB`, default 512 MB, engine-side) — caches the polar-resampled `VoxelGrid` (keyed by file + quantity + dims) so isosurface, echo-top, and voxels all share one resample pass. Threshold changes re-use the cached grid.
+
+Cache metrics: `tiles3d_content_cache_*` and `pvol_voxel_grid_cache_*` in `/metrics`.
 
 ### PostGIS observation data
 
@@ -1325,6 +1408,26 @@ Returns HTTP 503 only when all collections have failed.
 | `grid_cache_capacity_bytes` | gauge | collection | Configured capacity |
 | `grid_cache_entries` | gauge | collection | Number of cached entries |
 
+**3D Tiles content cache** (global, encoded `.pnts`/`.glb`/voxel bytes):
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `tiles3d_content_cache_hits_total` | counter | — | 3D Tiles content cache hits |
+| `tiles3d_content_cache_misses_total` | counter | — | 3D Tiles content cache misses |
+| `tiles3d_content_cache_bytes` | gauge | — | Bytes currently held |
+| `tiles3d_content_cache_capacity_bytes` | gauge | — | Configured capacity |
+| `tiles3d_content_cache_entries` | gauge | — | Number of cached entries |
+
+**PVOL voxel-grid cache** (global, polar-resampled voxel grids):
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pvol_voxel_grid_cache_hits_total` | counter | — | Voxel-grid cache hits |
+| `pvol_voxel_grid_cache_misses_total` | counter | — | Voxel-grid cache misses |
+| `pvol_voxel_grid_cache_bytes` | gauge | — | Bytes currently held |
+| `pvol_voxel_grid_cache_capacity_bytes` | gauge | — | Configured capacity |
+| `pvol_voxel_grid_cache_entries` | gauge | — | Number of cached entries |
+
 **Render & storage:**
 
 | Metric | Type | Labels | Description |
@@ -1424,10 +1527,11 @@ CoverageJSON output is validated against the official [OGC CoverageJSON 1.0 sche
 - WMS/Maps/Tiles: nearest-neighbor resampling only
 - STAC: no retry logic, no HTTP caching (ETag/Last-Modified)
 - Tiles: WebMercatorQuad and WorldCRS84Quad only; fixed 256x256 raster tiles; MVT is supported via `?f=mvt` for `FeatureEngine`-backed collections
-- GRIB: regular lat/lon grids only, GRIB2 only, requires index sidecar files
-- QueryData: serves latest file only, no compressed files, EDR position only, level 0 only
+- GRIB: regular lat/lon grids only, GRIB2 only, requires index sidecar files; accumulated/averaged aggregate fields (`APCP`, `acc fcst`) are dropped
+- QueryData: no compressed files, EDR position only, level 0 only; retains up to `max_runs` (default 4) most-recent files as model runs
 - Zarr: geographic (WGS84 lat/lon) grids only, EDR position only; forecast model-run selection pins the latest run (#337); STAC per-item-CRS and kerchunk modes not yet implemented
 - Zarr/Icechunk: requires the `icechunk` build feature, anonymous (public) S3 only, new snapshots picked up on reload (not poll)
+- 3D Tiles: only `odim-volume` collections support `VolumeEngine`; voxel representation (`EXT_primitive_voxels`) requires CesiumJS ≥ 1.142 and is a CesiumGS draft extension (not in the Khronos registry); voxel octree/time-dynamic voxels are follow-ups; Maps/Tiles `reference_time` parameter not yet wired for 3D Tiles
 
 ## Tech Stack
 
@@ -1443,3 +1547,4 @@ CoverageJSON output is validated against the official [OGC CoverageJSON 1.0 sche
 - **libaec-sys** for GRIB CCSDS/AEC decompression
 - **memmap2** for memory-mapped QueryData file access
 - **zarrs** for Zarr V2/V3 array reading and codecs (with optional **icechunk** for versioned repositories)
+- **CesiumJS** (vendored, bundled via `include_str!`) for the 3D Tiles viewer SPA
