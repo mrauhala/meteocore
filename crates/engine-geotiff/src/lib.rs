@@ -61,6 +61,9 @@ impl InFlightLoads {
     /// is now the loader (path claimed — pair with `InFlightGuard`). If the
     /// in-flight loader exceeds `CONCURRENT_LOAD_WAIT` the caller claims the
     /// path anyway rather than failing the request.
+    ///
+    /// `is_done` is invoked while `self.paths` is held; it must not acquire
+    /// that lock (directly or transitively) or the thread deadlocks itself.
     fn wait_then_claim(&self, path: &Path, is_done: impl Fn() -> bool) -> bool {
         let mut in_flight = self.paths.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = std::time::Instant::now() + CONCURRENT_LOAD_WAIT;
@@ -2037,20 +2040,31 @@ mod tests {
         // Loader claims the path.
         assert!(!loads.wait_then_claim(&path, || false));
 
+        let barrier = Arc::new(std::sync::Barrier::new(2));
         let waiter = {
             let loads = Arc::clone(&loads);
             let path = path.clone();
             let done = Arc::clone(&done);
-            std::thread::spawn(move || loads.wait_then_claim(&path, || done.load(Ordering::SeqCst)))
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                loads.wait_then_claim(&path, || done.load(Ordering::SeqCst))
+            })
         };
 
-        // Let the waiter park, then finish the load successfully.
+        // Sync to just before the waiter's call, give it a moment to park,
+        // then finish the load successfully.
+        barrier.wait();
         std::thread::sleep(Duration::from_millis(50));
+        let start = std::time::Instant::now();
         done.store(true, Ordering::SeqCst);
         drop(InFlightGuard::new(&loads, path.clone()));
 
-        // Waiter observed the completed work — nothing left to do.
+        // Waiter observed the completed work — nothing left to do. If the
+        // guard's notify were broken, a parked waiter would sleep out the
+        // full CONCURRENT_LOAD_WAIT, tripping the elapsed bound.
         assert!(waiter.join().unwrap());
+        assert!(start.elapsed() < CONCURRENT_LOAD_WAIT / 2);
         let in_flight = loads.paths.lock().unwrap();
         assert!(!in_flight.contains(&path));
     }
@@ -2064,16 +2078,24 @@ mod tests {
 
         assert!(!loads.wait_then_claim(&path, || false));
 
+        let barrier = Arc::new(std::sync::Barrier::new(2));
         let waiter = {
             let loads = Arc::clone(&loads);
             let path = path.clone();
-            std::thread::spawn(move || loads.wait_then_claim(&path, || false))
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                loads.wait_then_claim(&path, || false)
+            })
         };
 
+        barrier.wait();
         std::thread::sleep(Duration::from_millis(50));
+        let start = std::time::Instant::now();
         drop(InFlightGuard::new(&loads, path.clone()));
 
         assert!(!waiter.join().unwrap());
+        assert!(start.elapsed() < CONCURRENT_LOAD_WAIT / 2);
         // The waiter is now the loader and holds the claim.
         let in_flight = loads.paths.lock().unwrap();
         assert!(in_flight.contains(&path));
