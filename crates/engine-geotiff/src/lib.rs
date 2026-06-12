@@ -16,7 +16,7 @@ pub mod fuzz_exports {
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -32,24 +32,95 @@ use ds_core::model::*;
 
 use crate::catalog::{scan_directory, scan_remote_with_limit, Catalog, PendingFile};
 
-/// RAII guard that removes a path from the `loading_in_flight` set on drop.
-/// Prevents paths from getting stuck if a thread panics during metadata loading.
+/// Tracks STAC entries currently being loaded, deduplicating concurrent
+/// loads: the first caller claims the path and loads, later callers park on
+/// the condvar until the loader finishes (success, error, or panic) instead
+/// of sleep-polling with a render permit held (#213).
+struct InFlightLoads {
+    paths: Mutex<std::collections::HashSet<PathBuf>>,
+    completed: Condvar,
+}
+
+/// Upper bound on how long a loser of the load race waits for the in-flight
+/// loader. Waiters wake immediately when the loader finishes, so this only
+/// bounds a stuck loader — it can be generous (a STAC asset fetch downloads
+/// the whole file, which can legitimately take seconds).
+const CONCURRENT_LOAD_WAIT: Duration = Duration::from_secs(10);
+
+impl InFlightLoads {
+    fn new() -> Self {
+        Self {
+            paths: Mutex::new(std::collections::HashSet::new()),
+            completed: Condvar::new(),
+        }
+    }
+
+    /// Park until no other thread is loading `path`, then atomically either
+    /// observe the work done or claim the path. Returns `None` if `is_done`
+    /// reports the work complete (nothing left to do); `Some(guard)` if the
+    /// caller is now the loader — dropping the guard (on success, error, or
+    /// panic) releases the claim and wakes waiters, so the pairing is
+    /// compiler-enforced. If the in-flight loader exceeds
+    /// `CONCURRENT_LOAD_WAIT` the caller claims the path anyway rather than
+    /// failing the request.
+    ///
+    /// `is_done` is invoked while `self.paths` is held; it must not acquire
+    /// that lock (directly or transitively) or the thread deadlocks itself.
+    fn wait_then_claim(
+        &self,
+        path: &Path,
+        is_done: impl Fn() -> bool,
+    ) -> Option<InFlightGuard<'_>> {
+        let mut in_flight = self.paths.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = std::time::Instant::now() + CONCURRENT_LOAD_WAIT;
+        while in_flight.contains(path) {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                // Stuck loader: deliberately claim anyway rather than fail
+                // the request. The insert below is a no-op and whichever
+                // load finishes first clears the path — same liveness
+                // behavior as the old polling code. Note dedup is best-effort
+                // past this point: the early clear lets later callers claim
+                // too, so a stuck loader can fan out to several parallel
+                // fetches of the same asset, not just one duplicate.
+                break;
+            }
+            let (guard, _) = self
+                .completed
+                .wait_timeout(in_flight, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            in_flight = guard;
+        }
+        if is_done() {
+            return None;
+        }
+        in_flight.insert(path.to_path_buf());
+        drop(in_flight);
+        Some(InFlightGuard::new(self, path.to_path_buf()))
+    }
+}
+
+/// RAII guard that removes a path from the `loading_in_flight` set on drop
+/// and wakes waiting threads. Prevents paths from getting stuck (and waiters
+/// from sleeping out their full timeout) if a thread panics during metadata
+/// loading.
 struct InFlightGuard<'a> {
-    set: &'a Mutex<std::collections::HashSet<PathBuf>>,
+    loads: &'a InFlightLoads,
     path: PathBuf,
 }
 
 impl<'a> InFlightGuard<'a> {
-    fn new(set: &'a Mutex<std::collections::HashSet<PathBuf>>, path: PathBuf) -> Self {
-        Self { set, path }
+    fn new(loads: &'a InFlightLoads, path: PathBuf) -> Self {
+        Self { loads, path }
     }
 }
 
 impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.set.lock() {
-            guard.remove(&self.path);
-        }
+        let mut guard = self.loads.paths.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(&self.path);
+        drop(guard);
+        self.loads.completed.notify_all();
     }
 }
 
@@ -106,7 +177,7 @@ pub struct GeoTiffEngine {
     /// Consecutive poll failures/empty results (for escalating warnings).
     consecutive_poll_failures: AtomicU32,
     /// Tracks STAC entries currently being loaded to prevent concurrent loads.
-    loading_in_flight: Mutex<std::collections::HashSet<PathBuf>>,
+    loading_in_flight: InFlightLoads,
     /// Circuit breaker: consecutive STAC API failures.
     stac_consecutive_failures: AtomicU32,
     /// Circuit breaker: last STAC API attempt time.
@@ -421,7 +492,7 @@ impl GeoTiffEngine {
             override_offset: config.offset,
             shutdown_tx,
             consecutive_poll_failures: AtomicU32::new(0),
-            loading_in_flight: Mutex::new(std::collections::HashSet::new()),
+            loading_in_flight: InFlightLoads::new(),
             stac_consecutive_failures: AtomicU32::new(0),
             stac_last_attempt: Mutex::new(None),
             catalog_updated_at: Mutex::new(Some(Utc::now())),
@@ -698,41 +769,13 @@ impl GeoTiffEngine {
         }
     }
 
-    /// Wait for another thread to finish loading metadata for the given path.
-    /// Returns `true` if another thread successfully loaded it.
-    fn wait_for_concurrent_load(&self, timestamp: &DateTime<Utc>, path: &Path) -> bool {
-        for attempt in 0u64..20 {
-            std::thread::sleep(Duration::from_millis(100 * (attempt + 1).min(5)));
-            let catalog = self.catalog.load();
-            if let Some(entry) = catalog.entries.get(timestamp) {
-                if entry.is_loaded() {
-                    return true;
-                }
-            }
-            // Check if still in-flight (other thread may have errored out)
-            let in_flight = self
-                .loading_in_flight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if !in_flight.contains(path) {
-                // Other thread finished (possibly with error), try loading ourselves
-                return false;
-            }
-        }
-        false
-    }
-
     /// Load metadata for a stub entry and update the catalog.
     fn do_load_metadata(
         &self,
         timestamp: &DateTime<Utc>,
         asset_url: &str,
         file_size: u64,
-        path: &Path,
     ) -> Result<(), DataServerError> {
-        // RAII guard ensures path is removed from in-flight set even on panic
-        let _guard = InFlightGuard::new(&self.loading_in_flight, path.to_path_buf());
-
         let stub = catalog::StacStub {
             bbox: None, // Not needed for loading
             asset_url: asset_url.to_string(),
@@ -785,29 +828,20 @@ impl GeoTiffEngine {
             (entry.path.clone(), stub.asset_url.clone(), entry.file_size)
         };
 
-        // Check/acquire in-flight lock
+        // Single-flight: park until any in-flight load of this path finishes,
+        // then atomically either observe its result or claim the load. The
+        // done-check happens under the in-flight lock, so two losers of the
+        // race can't both end up loading the same asset. The guard releases
+        // the claim and wakes waiters on drop — success, error, or panic.
+        let _guard = match self
+            .loading_in_flight
+            .wait_then_claim(&path, || self.is_metadata_loaded(timestamp))
         {
-            let in_flight = self
-                .loading_in_flight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if in_flight.contains(&path) {
-                drop(in_flight);
-                if self.wait_for_concurrent_load(timestamp, &path) {
-                    return Ok(());
-                }
-                // Fall through to try loading ourselves
-            }
-        }
-        {
-            let mut in_flight = self
-                .loading_in_flight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            in_flight.insert(path.clone());
-        }
+            None => return Ok(()),
+            Some(guard) => guard,
+        };
 
-        self.do_load_metadata(timestamp, &asset_url, file_size, &path)
+        self.do_load_metadata(timestamp, &asset_url, file_size)
     }
 
     /// Ensure entries exist and have metadata loaded for the requested datetime range.
@@ -2006,6 +2040,104 @@ use parse::parse_coords;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_flight_claim_then_done_wakes_waiter() {
+        // Loser of the load race parks on the condvar and wakes as soon as
+        // the loader's guard drops — no sleep-polling (#213).
+        let loads = Arc::new(InFlightLoads::new());
+        let path = PathBuf::from("a.tif");
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Loader claims the path.
+        let loader_guard = loads.wait_then_claim(&path, || false);
+        assert!(loader_guard.is_some());
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let waiter = {
+            let loads = Arc::clone(&loads);
+            let path = path.clone();
+            let done = Arc::clone(&done);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                loads
+                    .wait_then_claim(&path, || done.load(Ordering::SeqCst))
+                    .is_none()
+            })
+        };
+
+        // Sync to just before the waiter's call, give it a moment to park,
+        // then finish the load successfully.
+        barrier.wait();
+        std::thread::sleep(Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        done.store(true, Ordering::SeqCst);
+        drop(loader_guard);
+
+        // Waiter observed the completed work — nothing left to do. If the
+        // guard's notify were broken, a parked waiter would sleep out the
+        // full CONCURRENT_LOAD_WAIT, tripping the elapsed bound.
+        assert!(waiter.join().unwrap());
+        assert!(start.elapsed() < CONCURRENT_LOAD_WAIT / 2);
+        let in_flight = loads.paths.lock().unwrap();
+        assert!(!in_flight.contains(&path));
+    }
+
+    #[test]
+    fn in_flight_loader_failure_hands_claim_to_waiter() {
+        // If the loader errors out (guard drops without the work done), the
+        // waiter takes over the claim instead of returning success.
+        let loads = Arc::new(InFlightLoads::new());
+        let path = PathBuf::from("b.tif");
+
+        let loader_guard = loads.wait_then_claim(&path, || false);
+        assert!(loader_guard.is_some());
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let waiter = {
+            let loads = Arc::clone(&loads);
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let takeover = loads.wait_then_claim(&path, || false);
+                let claimed = takeover.is_some();
+                // While the takeover guard is alive, the claim is held.
+                if claimed {
+                    assert!(loads.paths.lock().unwrap().contains(&path));
+                }
+                claimed
+            })
+        };
+
+        barrier.wait();
+        std::thread::sleep(Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        drop(loader_guard);
+
+        assert!(waiter.join().unwrap());
+        assert!(start.elapsed() < CONCURRENT_LOAD_WAIT / 2);
+        // The waiter's guard dropped at thread end, releasing its claim.
+        let in_flight = loads.paths.lock().unwrap();
+        assert!(!in_flight.contains(&path));
+    }
+
+    #[test]
+    fn in_flight_unclaimed_path_claims_immediately() {
+        let loads = InFlightLoads::new();
+        let path = PathBuf::from("c.tif");
+        let guard = loads.wait_then_claim(&path, || false);
+        assert!(guard.is_some());
+        assert!(loads.paths.lock().unwrap().contains(&path));
+        // Already-done work short-circuits without claiming.
+        let other = PathBuf::from("d.tif");
+        assert!(loads.wait_then_claim(&other, || true).is_none());
+        assert!(!loads.paths.lock().unwrap().contains(&other));
+        // Dropping the guard releases the claim.
+        drop(guard);
+        assert!(!loads.paths.lock().unwrap().contains(&path));
+    }
 
     #[test]
     fn expand_prefix_static() {
