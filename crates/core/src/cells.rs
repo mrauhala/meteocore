@@ -252,7 +252,11 @@ pub fn extract_cells(
         origin,
         cells: Vec::new(),
     };
-    if total == 0 || grid.values.len() != total || opts.max_cells == 0 {
+    // `u32::MAX` guards the packed BFS frontier indices; any real grid is
+    // orders of magnitude below it (engines cap cell counts in the tens of
+    // millions).
+    if total == 0 || grid.values.len() != total || opts.max_cells == 0 || total > u32::MAX as usize
+    {
         return set;
     }
 
@@ -269,13 +273,24 @@ pub fn extract_cells(
     let a_centre = |i_a: usize| grid.angle_range[0] + (i_a as f64 + 0.5) * da;
     let h_centre = |i_h: usize| grid.height_range[0] + (i_h as f64 + 0.5) * dh;
 
-    let threshold = opts.threshold as f32;
-    let member = |idx: usize| grid.values[idx] >= threshold; // NaN compares false
+    // Compare in f64: an f32-narrowed threshold (e.g. 35.1 → 35.09999847…)
+    // would silently lower the effective cutoff. NaN compares false.
+    let member = |idx: usize| (grid.values[idx] as f64) >= opts.threshold;
 
     // --- Pass 1: BFS connected components, scalar accumulation -------------
     let mut labels = vec![0u32; total];
     let mut comps: Vec<Comp> = Vec::new();
-    let mut queue: VecDeque<(usize, usize, usize)> = VecDeque::new();
+    // The frontier holds packed flat indices (u32, valid up to MAX_VOXELS),
+    // not (usize, usize, usize) triples — 4 B/slot instead of 24 keeps the
+    // worst case (a storm spanning a large fraction of a `high`-tier grid)
+    // at tens of MB transient instead of hundreds.
+    let mut queue: VecDeque<u32> = VecDeque::new();
+    let unpack_idx = |idx: u32| {
+        let idx = idx as usize;
+        let i_h = idx % n_h;
+        let rest = idx / n_h;
+        (rest / n_a, rest % n_a, i_h)
+    };
 
     for seed_r in 0..n_r {
         for seed_a in 0..n_a {
@@ -298,9 +313,10 @@ pub fn extract_cells(
                     max_ih: seed_h,
                 };
                 labels[seed_idx] = raw_label;
-                queue.push_back((seed_r, seed_a, seed_h));
-                while let Some((i_r, i_a, i_h)) = queue.pop_front() {
-                    let idx = VoxelGrid::index_of(grid.dims, i_r, i_a, i_h);
+                queue.push_back(seed_idx as u32);
+                while let Some(packed) = queue.pop_front() {
+                    let (i_r, i_a, i_h) = unpack_idx(packed);
+                    let idx = packed as usize;
                     let v = grid.values[idx] as f64;
                     let rc = r_centre(i_r);
                     comp.count += 1;
@@ -323,7 +339,7 @@ pub fn extract_cells(
                         let nidx = VoxelGrid::index_of(grid.dims, r, a, h);
                         if labels[nidx] == 0 && member(nidx) {
                             labels[nidx] = raw_label;
-                            queue.push_back((r, a, h));
+                            queue.push_back(nidx as u32);
                         }
                     };
                     if i_r > 0 {

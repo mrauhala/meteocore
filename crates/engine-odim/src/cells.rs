@@ -26,10 +26,12 @@ use std::sync::Arc;
 /// regardless of storm activity.
 const DEFAULT_CELL_SET_CACHE_MB: u64 = 64;
 
-/// Cache key: source-qualified volume file id + quantity + grid dims + a
-/// bit-fold of the extraction options. Volumes are immutable once scanned,
-/// so the key needs no data-version (the `VOXEL_GRID_CACHE` argument).
-type CellSetKey = (Arc<str>, Arc<str>, [usize; 3], u64);
+/// Cache key: source-qualified volume file id + quantity + grid dims + the
+/// extraction options **verbatim** (threshold/min-volume bit patterns and
+/// the cell cap — not a hash of them, so distinct options can never collide
+/// onto one entry). Volumes are immutable once scanned, so the key needs no
+/// data-version (the `VOXEL_GRID_CACHE` argument).
+type CellSetKey = (Arc<str>, Arc<str>, [usize; 3], (u64, u64, u64));
 
 /// Approximate resident bytes of a cached [`CellSet`]: the struct itself,
 /// per-cell fixed fields, and each footprint ring's vertices — the term that
@@ -87,19 +89,14 @@ pub fn cell_set_cache_metrics() -> (u64, u64, u64, u64) {
     )
 }
 
-/// FNV-1a fold of the extraction options into the cache key — the same idiom
-/// the 3D Tiles content cache uses for threshold lists. Bit-exact: two
-/// requests share an entry only when every knob matches exactly.
-fn extraction_bits(opts: &ds_core::cells::CellExtractionOptions) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    let mut fold = |v: u64| {
-        h ^= v;
-        h = h.wrapping_mul(0x100000001b3);
-    };
-    fold(opts.threshold.to_bits());
-    fold(opts.min_volume_km3.to_bits());
-    fold(opts.max_cells as u64);
-    h
+/// The extraction options as an exact key component: two requests share an
+/// entry iff every knob is bit-identical (no hash, no collision).
+fn extraction_key(opts: &ds_core::cells::CellExtractionOptions) -> (u64, u64, u64) {
+    (
+        opts.threshold.to_bits(),
+        opts.min_volume_km3.to_bits(),
+        opts.max_cells as u64,
+    )
 }
 
 impl PolarVolumeSiteView {
@@ -148,7 +145,7 @@ impl PolarVolumeSiteView {
             .unwrap_or(volumes.len().saturating_sub(1));
         let start = target_idx.saturating_sub(query.track_scans);
         let dims = query.dims.unwrap_or(DEFAULT_VOXEL_DIMS);
-        let opts_bits = extraction_bits(&query.extraction);
+        let opts_key = extraction_key(&query.extraction);
 
         let mut cell_sets = Vec::with_capacity(target_idx - start + 1);
         for entry in &volumes[start..=target_idx] {
@@ -156,7 +153,7 @@ impl PolarVolumeSiteView {
                 Arc::from(pixel_cache_id(&self.source, &entry.id).as_ref()),
                 Arc::from(quantity.as_str()),
                 dims,
-                opts_bits,
+                opts_key,
             );
             let mut computed = false;
             let set = CELL_SET_CACHE.get_or_insert_with(&key, || {
