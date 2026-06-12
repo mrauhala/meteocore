@@ -1714,8 +1714,9 @@ dependencies = [
 
 [[package]]
 name = "hdf5-reader"
-version = "0.6.0"
-source = "git+https://github.com/mrauhala/netcdf-rust.git?rev=767add81eb12d0fd123f3550637fc001c2f40ff7#767add81eb12d0fd123f3550637fc001c2f40ff7"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e2d49abfb73b2ab63c3ae7a51f8c3779967402eac9e07f2490ba16e1dac5a9e"
 dependencies = [
  "flate2",
  "lru",
