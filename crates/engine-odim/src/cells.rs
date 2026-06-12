@@ -19,8 +19,13 @@ use ds_core::volume::{CellProduct, CellQuery};
 use std::sync::Arc;
 
 /// Default [`CELL_SET_CACHE`] entry count when `MC_PVOL_CELL_SET_CACHE` is
-/// unset. Entries are KB-sized (attributes + a simplified footprint ring per
-/// cell), so this is a few MB at worst — bounded by count, not bytes.
+/// unset. Each entry holds a `CellSet` whose dominant cost is the per-cell
+/// footprint ring: on the default grid a single entry can reach ~400 KB at
+/// the 256-cell cap with complex rings, so 4096 entries is a ~1.6 GB
+/// *pathological* ceiling — unlike the byte-weighted `VOXEL_GRID_CACHE`,
+/// this cache is count-bounded only. In practice a scan carries a handful
+/// of cells with simplified rings (entries well under ~10 KB); tune down
+/// via the env var if memory is tight.
 const DEFAULT_CELL_SET_CACHE_ENTRIES: usize = 4096;
 
 /// Cache key: source-qualified volume file id + quantity + grid dims + a

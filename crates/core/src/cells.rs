@@ -388,6 +388,7 @@ pub fn extract_cells(
 
     struct Detail {
         mask: Vec<bool>, // (r, a) footprint columns, n_r × n_a
+        area_m2: f64,    // Σ over claimed columns of Δr · (r_c · Δa)
         max_vil: f64,
         bbox: [f64; 6],
     }
@@ -395,6 +396,7 @@ pub fn extract_cells(
         .iter()
         .map(|_| Detail {
             mask: vec![false; n_r * n_a],
+            area_m2: 0.0,
             max_vil: 0.0,
             bbox: [
                 f64::INFINITY,
@@ -426,7 +428,13 @@ pub fn extract_cells(
                     continue;
                 }
                 let d = &mut details[rank];
-                d.mask[i_r * n_a + i_a] = true;
+                // First claim of this column for this cell: count its ground
+                // area here, in the voxel pass — a per-cell mask sweep after
+                // the loop would cost O(max_cells × n_r × n_a) (#404 review).
+                if !d.mask[i_r * n_a + i_a] {
+                    d.mask[i_r * n_a + i_a] = true;
+                    d.area_m2 += dr * (r_centre(i_r) * da);
+                }
 
                 // VIL layer contribution: M(Z)·Δh with the hail cap.
                 let dbz = (grid.values[idx] as f64).min(VIL_DBZ_CAP);
@@ -504,17 +512,6 @@ pub fn extract_cells(
         let (mr, ma, mh) = comp.max_idx;
         let (mlon, mlat) = to_lonlat(r_centre(mr), a_centre(ma));
 
-        // Footprint area: Σ over set columns of Δr · (r_c · Δa).
-        let mut area_m2 = 0.0;
-        for i_r in 0..n_r {
-            let cell_area = dr * (r_centre(i_r) * da);
-            for i_a in 0..n_a {
-                if d.mask[i_r * n_a + i_a] {
-                    area_m2 += cell_area;
-                }
-            }
-        }
-
         let footprint = footprint_ring(
             &d.mask,
             n_r,
@@ -536,7 +533,7 @@ pub fn extract_cells(
             echo_top_m: origin[2] + grid.height_range[0] + (comp.max_ih as f64 + 1.0) * dh,
             base_m: origin[2] + grid.height_range[0] + comp.min_ih as f64 * dh,
             volume_km3: comp.volume_m3 / 1e9,
-            area_km2: area_m2 / 1e6,
+            area_km2: d.area_m2 / 1e6,
             max_vil_kg_m2: d.max_vil,
             footprint,
             bbox_enu_m: d.bbox,
