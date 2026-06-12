@@ -28,8 +28,9 @@ use std::sync::Arc;
 /// Liquid-water cap (dBZ) for the VIL integral: reflectivity above this is
 /// treated as hail contamination and clamped, per the standard NSSL practice.
 const VIL_DBZ_CAP: f64 = 56.0;
-/// VIL mass coefficient: `M = 3.44e-6 · Z^(4/7)` (g m⁻³, Z in mm⁶ m⁻³) —
-/// integrated over height it yields kg m⁻² directly.
+/// VIL mass coefficient: `M = 3.44e-6 · Z^(4/7)` (**kg m⁻³**, Z in mm⁶ m⁻³;
+/// the textbook form is `3.44e-3 g m⁻³`) — integrated over height in metres
+/// it yields kg m⁻² directly.
 const VIL_COEFF: f64 = 3.44e-6;
 
 /// Knobs for [`extract_cells`]. `Default` is the canonical configuration
@@ -714,10 +715,21 @@ fn footprint_ring(
     }
 
     // Vertex (x, y) → ENU metres (for area + simplification) and lon/lat.
+    // The azimuth must be mapped back through the **inverse** of the seam
+    // rotation (the same `orig_a` mapping the occupancy lookups use) —
+    // `y + shift` would rotate the whole ring around the radar. The modulo
+    // is only valid on a full-circle grid (where the angle is periodic);
+    // a sector grid never rotates (`shift == 0`), so `y` is already the
+    // original boundary there.
     let vertex_polar = |v: usize| {
         let (x, y) = unpack(v);
         let radius = r0 + x as f64 * dr;
-        let angle = a0 + (y as usize + shift) as f64 * da;
+        let boundary = if wrap {
+            (y as usize + n_a - shift) % n_a
+        } else {
+            y as usize
+        };
+        let angle = a0 + boundary as f64 * da;
         (radius, angle)
     };
     let vertex_enu = |v: usize| {
@@ -1068,6 +1080,28 @@ mod tests {
         assert_eq!(set.cells.len(), 1, "seam blob must not split");
         let cell = &set.cells[0];
         assert_eq!(cell.footprint.first(), cell.footprint.last());
+        // Every ring vertex must sit where the blob actually is: azimuth
+        // boundaries 340°–20° (columns 34..1 of 36), radius boundaries
+        // 25–45 km (rows 5..9). A wrong seam-rotation inverse rotates the
+        // whole ring around the radar (review on #404) — these bounds catch
+        // any such constant-angle offset.
+        for v in &cell.footprint {
+            let de = (v[0] - g.origin_lon).to_radians()
+                * g.origin_lat.to_radians().cos()
+                * crate::geo::EARTH_RADIUS_M;
+            let dn = (v[1] - g.origin_lat).to_radians() * crate::geo::EARTH_RADIUS_M;
+            let bearing = de.atan2(dn).to_degrees().rem_euclid(360.0);
+            let from_north = bearing.min(360.0 - bearing);
+            assert!(
+                from_north <= 20.5,
+                "vertex bearing {bearing}° outside the blob's 340°–20° span"
+            );
+            let ground = de.hypot(dn);
+            assert!(
+                (24_500.0..=45_500.0).contains(&ground),
+                "vertex ground range {ground} m outside the blob's 25–45 km span"
+            );
+        }
         // Centroid bearing ≈ north (azimuth ≈ 0): the centroid must sit
         // north of the origin and essentially on its meridian.
         assert!(cell.centroid[1] > g.origin_lat);
