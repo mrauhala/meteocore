@@ -307,6 +307,14 @@ pub trait VolumeEngine: Send + Sync {
     /// [`DataServerError::LocationNotFound`] is reserved for "this engine /
     /// collection has no voxel-grid capability or no volumes at all".
     ///
+    /// **Quantity contract:** the quantity selected via [`CellQuery::quantity`]
+    /// **must** be a radar reflectivity in dBZ — the linear-Z centroid
+    /// weighting and the VIL integral in [`extract_cells`] are reflectivity
+    /// physics and produce garbage for wind speed, temperature, etc. This
+    /// default cannot check units generically, so an implementor whose
+    /// quantities are not all reflectivity must gate (the ODIM override
+    /// rejects non-dBZ-unit quantities with `InvalidParameter` → 400).
+    ///
     /// **Concurrency contract:** same as [`Self::read_voxel_grid`] — call
     /// from a context where that method is callable (the 3D Tiles / raster
     /// paths run it under `spawn_blocking`).

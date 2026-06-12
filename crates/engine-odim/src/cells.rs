@@ -29,7 +29,10 @@ const DEFAULT_CELL_SET_CACHE_ENTRIES: usize = 4096;
 type CellSetKey = (Arc<str>, Arc<str>, [usize; 3], u64);
 
 /// Process-global memo of per-volume segmentations, shared across every PVOL
-/// collection. `0` (via the env var) disables — every request re-segments.
+/// collection. `MC_PVOL_CELL_SET_CACHE=0` *effectively* disables it — the
+/// `max(1)` below still builds a 1-entry LRU (quick_cache has no zero
+/// capacity), which hits only on an exact back-to-back repeat and evicts on
+/// every new `(file, quantity, dims, opts)` key.
 static CELL_SET_CACHE: std::sync::LazyLock<quick_cache::sync::Cache<CellSetKey, Arc<CellSet>>> =
     std::sync::LazyLock::new(|| {
         let entries = std::env::var("MC_PVOL_CELL_SET_CACHE")
