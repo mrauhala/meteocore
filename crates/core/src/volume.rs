@@ -12,6 +12,9 @@
 //! Like the other engine traits, `VolumeEngine` returns domain types only —
 //! colorization and byte encoding live in `ds-3dtiles`, not here.
 
+use crate::cells::{
+    extract_cells, track_cells, CellExtractionOptions, CellSet, TrackSet, TrackingOptions,
+};
 use crate::error::DataServerError;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
@@ -173,6 +176,53 @@ impl VoxelGrid {
     }
 }
 
+/// Query for [`VolumeEngine::read_cells`]: the usual selection knobs
+/// (quantity / time / dims / reference time) plus the segmentation +
+/// tracking options. Bundled in one struct so the trait method stays
+/// readable and future knobs (e.g. a motion-field request) don't churn
+/// every implementor.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CellQuery {
+    /// Quantity to segment (`None` → the engine default). Engines may
+    /// restrict cells to reflectivity-like quantities (the VIL / linear-Z
+    /// math assumes dBZ).
+    pub quantity: Option<String>,
+    /// Target scan: nearest retained volume (`None` → latest), the same
+    /// selection rule as [`VolumeEngine::read_voxel_grid`].
+    pub time: Option<DateTime<Utc>>,
+    /// Voxel-grid resolution to segment on (`None` → engine default).
+    /// Cells don't need a fine grid — callers typically pass a low tier.
+    pub dims: Option<[usize; 3]>,
+    /// Segmentation knobs (threshold, speckle floor, cap).
+    pub extraction: CellExtractionOptions,
+    /// Centroid-matching knobs.
+    pub tracking: TrackingOptions,
+    /// How many scans **before** the target to segment and track across
+    /// (`0` → the target scan only, no trajectories).
+    pub track_scans: usize,
+    /// Forecast model run (`None` → latest; ignored by non-forecast engines).
+    pub reference_time: Option<DateTime<Utc>>,
+}
+
+/// The cells + tracks product for one scan window — what every API surface
+/// (3D Tiles, Features, WMS/Maps/Tiles) renders.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CellProduct {
+    /// Per-scan cell sets, ascending in time; the **last** entry is the
+    /// target scan. A scan with no echo at the threshold is present as an
+    /// empty set (so tracking sees the death). Never empty.
+    pub cell_sets: Vec<(DateTime<Utc>, Arc<CellSet>)>,
+    /// Trajectories across the window.
+    pub tracks: TrackSet,
+}
+
+impl CellProduct {
+    /// The target scan's cells.
+    pub fn target(&self) -> &(DateTime<Utc>, Arc<CellSet>) {
+        self.cell_sets.last().expect("cell_sets is never empty")
+    }
+}
+
 /// An engine that samples a collection's data into a volumetric point cloud
 /// for OGC 3D Tiles delivery.
 ///
@@ -239,6 +289,81 @@ pub trait VolumeEngine: Send + Sync {
         ))
     }
 
+    /// Segment storm cells on the target scan and track them across the
+    /// preceding `query.track_scans` scans (#367).
+    ///
+    /// **Generic by default:** any engine with voxel-grid capability
+    /// ([`VolumeInfo::voxel_grid`] is `Some`) gets cells for free — the
+    /// default implementation walks [`VolumeInfo::times`] backwards from the
+    /// target, reads one grid per scan via [`Self::read_voxel_grid`], runs
+    /// [`extract_cells`] per scan and [`track_cells`] over the window.
+    /// Engines override only to add caching (the ODIM engine memoizes
+    /// per-volume cell sets — volume files are immutable).
+    ///
+    /// Returns `Ok` with an **empty** target set when the scan simply has no
+    /// echo at the threshold (Features needs "no cells now" as a valid empty
+    /// collection; the 3D Tiles layer maps all-empty to its 404) — unlike
+    /// `read_point_cloud`/`read_voxel_grid`, whose empty case is an error.
+    /// [`DataServerError::LocationNotFound`] is reserved for "this engine /
+    /// collection has no voxel-grid capability or no volumes at all".
+    ///
+    /// **Concurrency contract:** same as [`Self::read_voxel_grid`] — call
+    /// from a context where that method is callable (the 3D Tiles / raster
+    /// paths run it under `spawn_blocking`).
+    fn read_cells(&self, query: &CellQuery) -> Result<CellProduct, DataServerError> {
+        let info = self.volume_info();
+        let Some(caps) = info.voxel_grid else {
+            return Err(DataServerError::LocationNotFound(
+                "storm cells not supported: engine has no voxel-grid capability".into(),
+            ));
+        };
+        if info.times.is_empty() {
+            return Err(DataServerError::LocationNotFound(
+                "storm cells: no volumes retained".into(),
+            ));
+        }
+        // Nearest retained scan (latest if None) — the read_voxel_grid rule.
+        let target_idx = match query.time {
+            Some(t) => info
+                .times
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, vt)| (**vt - t).num_seconds().abs())
+                .map(|(i, _)| i)
+                .expect("times is non-empty"),
+            None => info.times.len() - 1,
+        };
+        let start = target_idx.saturating_sub(query.track_scans);
+        let quantity_label = query
+            .quantity
+            .clone()
+            .unwrap_or_else(|| info.default_quantity.clone());
+
+        let mut cell_sets = Vec::with_capacity(target_idx - start + 1);
+        for &t in &info.times[start..=target_idx] {
+            let set = match self.read_voxel_grid(
+                query.quantity.as_deref(),
+                Some(t),
+                query.dims,
+                query.reference_time,
+            ) {
+                Ok(grid) => Arc::new(extract_cells(&grid, t, &query.extraction)),
+                // The voxel-grid convention reports "no echo" as
+                // LocationNotFound; for cells that is a valid empty scan.
+                Err(DataServerError::LocationNotFound(_)) => Arc::new(CellSet::empty(
+                    t,
+                    quantity_label.clone(),
+                    query.extraction.threshold,
+                    caps.origin,
+                )),
+                Err(e) => return Err(e),
+            };
+            cell_sets.push((t, set));
+        }
+        let tracks = track_cells(&cell_sets, &query.tracking);
+        Ok(CellProduct { cell_sets, tracks })
+    }
+
     /// Metadata for the volumetric collection (quantities, valid times).
     ///
     /// Returns a shared snapshot so it stays **O(1) on a per-request path** (no
@@ -279,5 +404,154 @@ mod tests {
         g.values[i] = 35.0;
         g.values[5] = f32::INFINITY; // non-finite is not "valid"
         assert_eq!(g.valid_count(), 1);
+    }
+
+    use chrono::TimeZone;
+
+    /// Stub engine: three retained scans; the blob sits at azimuth column 0
+    /// in scan 0 and 1, and the middle scan has no echo (exercises the
+    /// empty-set path). Grids are rebuilt per call (no caching — that's the
+    /// point of the default impl).
+    struct StubVolumes {
+        times: Vec<DateTime<Utc>>,
+        info: Arc<VolumeInfo>,
+    }
+
+    impl StubVolumes {
+        fn new() -> Self {
+            let t0 = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+            let times: Vec<_> = (0..3)
+                .map(|i| t0 + chrono::Duration::minutes(5 * i))
+                .collect();
+            let info = Arc::new(VolumeInfo {
+                quantities: vec![("DBZH".into(), "Reflectivity".into())],
+                times: times.clone(),
+                default_quantity: "DBZH".into(),
+                default_unit: "dBZ".into(),
+                region: None,
+                voxel_grid: Some(VoxelGridCaps {
+                    origin: [24.5, 60.5, 100.0],
+                    radius_m: 100_000.0,
+                    height_m: 10_000.0,
+                }),
+            });
+            Self { times, info }
+        }
+
+        fn grid_with_blob(&self) -> VoxelGrid {
+            let dims = [20, 36, 10];
+            let mut g = VoxelGrid {
+                origin_lon: 24.5,
+                origin_lat: 60.5,
+                origin_height: 100.0,
+                dims,
+                radius_range: [0.0, 100_000.0],
+                angle_range: [0.0, std::f64::consts::TAU],
+                height_range: [0.0, 10_000.0],
+                values: vec![f32::NAN; 20 * 36 * 10],
+                quantity: "DBZH".into(),
+                unit: "dBZ".into(),
+            };
+            for i_r in 4..8 {
+                for i_h in 2..6 {
+                    let idx = g.index(i_r, 9, i_h);
+                    g.values[idx] = 45.0;
+                }
+            }
+            g
+        }
+    }
+
+    impl VolumeEngine for StubVolumes {
+        fn read_point_cloud(
+            &self,
+            _quantity: Option<&str>,
+            _time: Option<DateTime<Utc>>,
+            _min_value: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<VolumePointCloud, DataServerError> {
+            unimplemented!("not used by read_cells")
+        }
+
+        fn read_voxel_grid(
+            &self,
+            _quantity: Option<&str>,
+            time: Option<DateTime<Utc>>,
+            _dims: Option<[usize; 3]>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<Arc<VoxelGrid>, DataServerError> {
+            // Middle scan: no echo ⇒ the voxel-grid 404 convention.
+            if time == Some(self.times[1]) {
+                return Err(DataServerError::LocationNotFound("no echoes".into()));
+            }
+            Ok(Arc::new(self.grid_with_blob()))
+        }
+
+        fn volume_info(&self) -> Arc<VolumeInfo> {
+            Arc::clone(&self.info)
+        }
+    }
+
+    #[test]
+    fn default_read_cells_segments_window_and_tracks() {
+        let engine = StubVolumes::new();
+        let query = CellQuery {
+            extraction: CellExtractionOptions {
+                threshold: 35.0,
+                min_volume_km3: 0.0,
+                max_cells: 16,
+            },
+            track_scans: 2,
+            ..CellQuery::default()
+        };
+        let product = engine.read_cells(&query).expect("cells");
+        assert_eq!(product.cell_sets.len(), 3);
+        // Scan 0 and 2 have the blob; scan 1 is the empty set, not an error.
+        assert_eq!(product.cell_sets[0].1.cells.len(), 1);
+        assert!(product.cell_sets[1].1.cells.is_empty());
+        assert_eq!(product.cell_sets[2].1.cells.len(), 1);
+        assert_eq!(product.target().0, engine.times[2]);
+        // The empty middle scan breaks the trajectory: two 1-point tracks.
+        assert_eq!(product.tracks.tracks.len(), 2);
+
+        // track_scans = 0 ⇒ target scan only.
+        let solo = engine
+            .read_cells(&CellQuery {
+                extraction: query.extraction,
+                ..CellQuery::default()
+            })
+            .expect("cells");
+        assert_eq!(solo.cell_sets.len(), 1);
+
+        // Explicit target pinned to the empty middle scan.
+        let pinned = engine
+            .read_cells(&CellQuery {
+                time: Some(engine.times[1]),
+                extraction: query.extraction,
+                ..CellQuery::default()
+            })
+            .expect("cells");
+        assert!(pinned.target().1.cells.is_empty());
+    }
+
+    #[test]
+    fn read_cells_without_voxel_caps_is_not_found() {
+        struct NoCaps;
+        impl VolumeEngine for NoCaps {
+            fn read_point_cloud(
+                &self,
+                _q: Option<&str>,
+                _t: Option<DateTime<Utc>>,
+                _m: Option<f64>,
+                _r: Option<DateTime<Utc>>,
+            ) -> Result<VolumePointCloud, DataServerError> {
+                unimplemented!()
+            }
+            fn volume_info(&self) -> Arc<VolumeInfo> {
+                Arc::new(VolumeInfo::default())
+            }
+        }
+        let err = NoCaps.read_cells(&CellQuery::default()).unwrap_err();
+        assert!(matches!(err, DataServerError::LocationNotFound(_)));
     }
 }

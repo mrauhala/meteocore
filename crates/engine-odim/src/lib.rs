@@ -20,6 +20,7 @@
 //! minimal PROJ-string parser in `proj.rs`.
 
 pub mod catalog;
+pub mod cells;
 pub mod edr;
 pub mod engine;
 pub mod pixel_cache;
@@ -29,6 +30,7 @@ pub mod quantities;
 pub mod reader;
 pub mod volume_engine;
 
+pub use cells::cell_set_cache_metrics;
 pub use engine::{EngineError, OdimEngine};
 pub use pixel_cache::PixelCache;
 pub use volume_engine::{

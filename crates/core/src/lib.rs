@@ -1,3 +1,4 @@
+pub mod cells;
 pub mod collection_search;
 pub mod config;
 pub mod datetime;

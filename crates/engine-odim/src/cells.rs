@@ -1,0 +1,155 @@
+//! Storm-cell extraction + tracking for PVOL per-site collections (#367).
+//!
+//! The algorithms live in `ds_core::cells` (pure geometry/physics on a
+//! [`ds_core::volume::VoxelGrid`]); this module adds the engine-side
+//! plumbing: a process-global memo of per-volume [`CellSet`]s (a volume file
+//! is immutable, so a scan's segmentation never goes stale) and the
+//! window-walk that feeds [`ds_core::cells::track_cells`].
+//!
+//! [`PolarVolumeSiteView::cell_product`] is the one entry point; the
+//! [`ds_core::volume::VolumeEngine::read_cells`] override delegates here
+//! with the `spawn_blocking` runtime bridge, while engine-internal callers
+//! on a request worker (the Features path) pass `handle: None`.
+
+use crate::quantities;
+use crate::volume_engine::{pixel_cache_id, PolarVolumeSiteView, DEFAULT_VOXEL_DIMS};
+use ds_core::cells::{extract_cells, track_cells, CellSet};
+use ds_core::error::DataServerError;
+use ds_core::volume::{CellProduct, CellQuery};
+use std::sync::Arc;
+
+/// Default [`CELL_SET_CACHE`] entry count when `MC_PVOL_CELL_SET_CACHE` is
+/// unset. Entries are KB-sized (attributes + a simplified footprint ring per
+/// cell), so this is a few MB at worst — bounded by count, not bytes.
+const DEFAULT_CELL_SET_CACHE_ENTRIES: usize = 4096;
+
+/// Cache key: source-qualified volume file id + quantity + grid dims + a
+/// bit-fold of the extraction options. Volumes are immutable once scanned,
+/// so the key needs no data-version (the `VOXEL_GRID_CACHE` argument).
+type CellSetKey = (Arc<str>, Arc<str>, [usize; 3], u64);
+
+/// Process-global memo of per-volume segmentations, shared across every PVOL
+/// collection. `0` (via the env var) disables — every request re-segments.
+static CELL_SET_CACHE: std::sync::LazyLock<quick_cache::sync::Cache<CellSetKey, Arc<CellSet>>> =
+    std::sync::LazyLock::new(|| {
+        let entries = std::env::var("MC_PVOL_CELL_SET_CACHE")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_CELL_SET_CACHE_ENTRIES);
+        quick_cache::sync::Cache::new(entries.max(1))
+    });
+
+/// Cumulative `(hits, misses)` of [`CELL_SET_CACHE`], for `/metrics`.
+static CELL_SET_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CELL_SET_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the process-global cell-set cache for `/metrics`:
+/// `(hits, misses, entries)`.
+pub fn cell_set_cache_metrics() -> (u64, u64, u64) {
+    (
+        CELL_SET_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        CELL_SET_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+        CELL_SET_CACHE.len() as u64,
+    )
+}
+
+/// FNV-1a fold of the extraction options into the cache key — the same idiom
+/// the 3D Tiles content cache uses for threshold lists. Bit-exact: two
+/// requests share an entry only when every knob matches exactly.
+fn extraction_bits(opts: &ds_core::cells::CellExtractionOptions) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut fold = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x100000001b3);
+    };
+    fold(opts.threshold.to_bits());
+    fold(opts.min_volume_km3.to_bits());
+    fold(opts.max_cells as u64);
+    h
+}
+
+impl PolarVolumeSiteView {
+    /// Segment + track storm cells for this site (the engine-side
+    /// [`ds_core::volume::VolumeEngine::read_cells`], plus a `handle`
+    /// parameter so both runtime contexts can call it — see
+    /// `volume_engine::blocking_pixel_handle` for the contract; the trait
+    /// override passes the `spawn_blocking` bridge, a request-worker caller
+    /// passes `None`).
+    ///
+    /// Cells are reflectivity physics (linear-Z weighting, VIL), so only
+    /// dBZ-unit quantities are accepted — anything else is
+    /// [`DataServerError::InvalidParameter`] (→ 400).
+    ///
+    /// Each scan's segmentation is memoized in the process-global
+    /// [`CELL_SET_CACHE`]; in steady state only the newest volume pays the
+    /// resample + extraction, so a poll-cadence animation window stays cheap.
+    pub fn cell_product(
+        &self,
+        query: &CellQuery,
+        handle: Option<&tokio::runtime::Handle>,
+    ) -> Result<CellProduct, DataServerError> {
+        let catalog = self.catalog.load();
+        // Validates the quantity, resolves the default, selects the volume
+        // nearest `query.time` (latest if `None`), guards the antenna.
+        let (target, quantity) =
+            self.select_entry_and_quantity(&catalog, query.quantity.as_deref(), query.time)?;
+        if quantities::quantity_unit(&quantity) != "dBZ" {
+            return Err(DataServerError::InvalidParameter(format!(
+                "[{}] storm cells require a reflectivity (dBZ) quantity, `{}` is not one",
+                self.collection_id, quantity
+            )));
+        }
+        let volumes = catalog.by_site.get(&self.nod).ok_or_else(|| {
+            DataServerError::LocationNotFound(format!(
+                "[{}] radar site `{}` has no current volumes",
+                self.collection_id, self.nod
+            ))
+        })?;
+        // The tracking window: up to `track_scans` volumes preceding the
+        // target, from the site's time-sorted list.
+        let target_time = target.volume.time;
+        let target_idx = volumes
+            .iter()
+            .position(|e| e.volume.time == target_time)
+            .unwrap_or(volumes.len().saturating_sub(1));
+        let start = target_idx.saturating_sub(query.track_scans);
+        let dims = query.dims.unwrap_or(DEFAULT_VOXEL_DIMS);
+        let opts_bits = extraction_bits(&query.extraction);
+
+        let mut cell_sets = Vec::with_capacity(target_idx - start + 1);
+        for entry in &volumes[start..=target_idx] {
+            let key: CellSetKey = (
+                Arc::from(pixel_cache_id(&self.source, &entry.id).as_ref()),
+                Arc::from(quantity.as_str()),
+                dims,
+                opts_bits,
+            );
+            let mut computed = false;
+            let set = CELL_SET_CACHE.get_or_insert_with(&key, || {
+                computed = true;
+                let (grid, valid) = self.voxel_grid_cached(entry, &quantity, dims, handle)?;
+                let set = if valid == 0 {
+                    // No echo anywhere in the volume: a valid empty scan
+                    // (tracking sees the death) — cached like any other.
+                    CellSet::empty(
+                        entry.volume.time,
+                        quantity.as_str(),
+                        query.extraction.threshold,
+                        [grid.origin_lon, grid.origin_lat, grid.origin_height],
+                    )
+                } else {
+                    extract_cells(&grid, entry.volume.time, &query.extraction)
+                };
+                Ok::<_, DataServerError>(Arc::new(set))
+            })?;
+            if computed {
+                CELL_SET_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                CELL_SET_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            cell_sets.push((entry.volume.time, set));
+        }
+        let tracks = track_cells(&cell_sets, &query.tracking);
+        Ok(CellProduct { cell_sets, tracks })
+    }
+}

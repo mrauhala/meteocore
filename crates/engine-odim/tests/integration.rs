@@ -738,6 +738,128 @@ fn pvol_volume_engine_voxel_grid() {
     }
 }
 
+/// `VolumeEngine::read_cells` (#367) on the real FMI Vihti volume, which holds
+/// a strong (≈59 dBZ) convective storm: segmentation must find at least one
+/// cell with physically sane attributes, and the per-volume cell-set memo must
+/// hit on a repeat call. Skips when the uncommitted fixture is absent.
+#[test]
+fn pvol_volume_engine_read_cells() {
+    use ds_core::cells::CellExtractionOptions;
+    use ds_core::volume::{CellQuery, VolumeEngine};
+
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/radar-fmi-pvol/202605191050_fivih_PVOL.h5");
+    if !fixture.exists() {
+        eprintln!("skipping pvol_volume_engine_read_cells: fixture absent at {fixture:?}");
+        return;
+    }
+    let data_dir = fixture.parent().unwrap().to_str().unwrap();
+    let config = OdimConfig {
+        filename_template: None,
+        filename_pattern: None,
+        timestamp_format: None,
+        parameter: None,
+        unit: None,
+        nodata: None,
+        gain: None,
+        offset: None,
+        poll_interval_secs: 30,
+        max_files: None,
+        endpoint: None,
+        bucket: None,
+        prefix_pattern: None,
+        time_window: None,
+        discovery: None,
+        cadence_secs: None,
+    };
+    let engine = engine_odim::PolarVolumeEngine::new("fivih-cells-test", Some(data_dir), &config)
+        .expect("PolarVolumeEngine::new");
+    let view = engine.site_view("fivih", "fivih-cells-test-fivih");
+
+    let query = CellQuery {
+        quantity: Some("DBZH".into()),
+        dims: Some([48, 180, 24]), // modest grid keeps the test quick
+        extraction: CellExtractionOptions {
+            threshold: 35.0,
+            min_volume_km3: 5.0,
+            max_cells: 64,
+        },
+        track_scans: 4, // only one volume retained — window clamps to it
+        ..CellQuery::default()
+    };
+
+    let (_, _, m0) = engine_odim::cell_set_cache_metrics();
+    let product = view.read_cells(&query).expect("read_cells over the volume");
+
+    // One retained volume ⇒ one scan in the window, even with track_scans=4.
+    assert_eq!(product.cell_sets.len(), 1);
+    let (time, set) = product.target();
+    assert_eq!(set.time, *time);
+    assert_eq!(set.quantity, "DBZH");
+    assert!(
+        !set.cells.is_empty(),
+        "the fixture's 59 dBZ storm must segment into at least one cell"
+    );
+    let strongest = set
+        .cells
+        .iter()
+        .map(|c| c.max_dbz)
+        .fold(f64::NEG_INFINITY, f64::max);
+    // The native-resolution peak is ≈59 dBZ; cell-centre resampling onto the
+    // modest test grid smooths it to ≈43 dBZ (≈46 at the default dims).
+    assert!(
+        (40.0..50.0).contains(&strongest),
+        "fixture storm peak on this grid ≈43 dBZ, got {strongest}"
+    );
+    for cell in &set.cells {
+        assert!(cell.max_dbz >= 35.0, "member values reach the threshold");
+        assert!(
+            cell.echo_top_m > cell.base_m && cell.echo_top_m < 20_000.0 + 1_000.0,
+            "echo top within the sampled ceiling: {} vs base {}",
+            cell.echo_top_m,
+            cell.base_m
+        );
+        assert!(cell.volume_km3 >= 5.0, "speckle floor respected");
+        assert!(cell.area_km2 > 0.0);
+        assert!(cell.max_vil_kg_m2 > 0.0, "a 59 dBZ storm carries VIL");
+        assert!(
+            cell.footprint.len() >= 4 && cell.footprint.first() == cell.footprint.last(),
+            "closed footprint ring"
+        );
+        // Footprint and centroid sit within coverage of the Vihti radar.
+        for v in &cell.footprint {
+            assert!((v[0] - 24.5).abs() < 5.0 && (v[1] - 60.6).abs() < 3.0);
+        }
+        let [min_e, min_n, min_u, max_e, max_n, max_u] = cell.bbox_enu_m;
+        assert!(min_e < max_e && min_n < max_n && min_u < max_u);
+    }
+    // Single scan ⇒ one single-point track per cell, no motion yet.
+    assert_eq!(product.tracks.tracks.len(), set.cells.len());
+    assert!(product.tracks.tracks.iter().all(|t| t.motion_ms.is_none()));
+    let (_, _, m1) = engine_odim::cell_set_cache_metrics();
+    assert!(m1 > m0, "first segmentation is a cache miss");
+
+    // Repeat: the per-volume memo must serve the second call.
+    let (h0, _, _) = engine_odim::cell_set_cache_metrics();
+    let again = view.read_cells(&query).expect("read_cells repeat");
+    let (h1, _, _) = engine_odim::cell_set_cache_metrics();
+    assert!(h1 > h0, "repeat segmentation is a cache hit");
+    assert_eq!(again.cell_sets[0].1.cells.len(), set.cells.len());
+
+    // A non-reflectivity quantity is a clean 400, not a panic or a bogus run.
+    let bad = view.read_cells(&CellQuery {
+        quantity: Some("VRADH".into()),
+        ..query.clone()
+    });
+    assert!(
+        matches!(
+            bad,
+            Err(ds_core::error::DataServerError::InvalidParameter(_))
+        ),
+        "cells on a velocity quantity must be InvalidParameter"
+    );
+}
+
 /// Regression guard for SMHI signed-integer PVOL: SMHI ships its moments as
 /// **signed `i16`** (DBZH `gain=0.01`, sentinels `nodata=-32768` /
 /// `undetect=-32767` — only representable as signed), which the original

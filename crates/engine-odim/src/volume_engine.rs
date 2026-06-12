@@ -69,7 +69,9 @@ use ds_core::model::{
     VerticalCoord,
 };
 use ds_core::vertical::{VerticalDimension, VerticalKind};
-use ds_core::volume::{VolumeEngine, VolumeInfo, VolumePoint, VolumePointCloud, VoxelGrid};
+use ds_core::volume::{
+    CellProduct, CellQuery, VolumeEngine, VolumeInfo, VolumePoint, VolumePointCloud, VoxelGrid,
+};
 use tokio::sync::Notify;
 
 use ds_storage::discovery::{expand_prefix_for_dates, expand_prefix_pattern, TimeWindow};
@@ -376,7 +378,7 @@ pub(crate) fn ground_height_to_slant(
 /// Mirrors [`crate::engine::OdimEngine`]'s `Source` exactly: a local
 /// filesystem directory or an S3/HTTP object store.
 #[derive(Clone)]
-enum Source {
+pub(crate) enum Source {
     /// A local filesystem directory, scanned with `read_dir`.
     Local { data_dir: PathBuf },
     /// An S3/HTTP object store. `prefix_pattern` may carry strftime
@@ -476,7 +478,7 @@ fn source_label(source: &Source) -> String {
 /// different buckets collide in the process-global cache and silently serve
 /// each other's pixels (PR #290 review). The bare `file_id` is still used as
 /// the object path for the fetch itself.
-fn pixel_cache_id<'a>(source: &Source, file_id: &'a str) -> std::borrow::Cow<'a, str> {
+pub(crate) fn pixel_cache_id<'a>(source: &Source, file_id: &'a str) -> std::borrow::Cow<'a, str> {
     match source {
         Source::Local { .. } => std::borrow::Cow::Borrowed(file_id),
         Source::Remote {
@@ -491,7 +493,7 @@ fn pixel_cache_id<'a>(source: &Source, file_id: &'a str) -> std::borrow::Cow<'a,
 /// request-worker query paths pass `None` instead. Uses `try_current` (not
 /// `current`) so unit tests that invoke the trait methods outside any runtime
 /// — always with a `Local` source that ignores the handle — don't panic.
-fn blocking_pixel_handle() -> Option<tokio::runtime::Handle> {
+pub(crate) fn blocking_pixel_handle() -> Option<tokio::runtime::Handle> {
     tokio::runtime::Handle::try_current().ok()
 }
 
@@ -609,13 +611,13 @@ impl Pixels<'_> {
 /// `Arc` so the catalog can be cheaply cloned out of the `ArcSwap`
 /// snapshot without re-parsing HDF5.
 #[derive(Clone)]
-struct VolumeEntry {
+pub(crate) struct VolumeEntry {
     /// Source file identity — the parse-cache key (local path string or
     /// S3 object key); used to evict cache entries the (`max_files`-
     /// capped) catalog no longer references.
-    id: FileId,
+    pub(crate) id: FileId,
     /// Parsed volume — `Arc` so repeated requests share one parse.
-    volume: Arc<PolarVolume>,
+    pub(crate) volume: Arc<PolarVolume>,
 }
 
 /// Per-site derived metadata, computed once per scan in [`derive_catalog`].
@@ -626,7 +628,7 @@ struct VolumeEntry {
 /// from sweeps on every request. Mirrors the union fields on [`Catalog`]
 /// but scoped to one radar `nod`.
 #[derive(Clone)]
-struct SiteMeta {
+pub(crate) struct SiteMeta {
     /// Antenna longitude (WGS84).
     lon: f64,
     /// Antenna latitude (WGS84).
@@ -665,15 +667,15 @@ struct SiteMeta {
 /// There is no network-level collection — each radar site is
 /// its own collection — so the catalog carries only the per-site index and
 /// no union/aggregate metadata.
-struct Catalog {
+pub(crate) struct Catalog {
     /// Volumes grouped by `site.nod`, each list sorted by `time`
     /// ascending.
-    by_site: HashMap<String, Vec<VolumeEntry>>,
+    pub(crate) by_site: HashMap<String, Vec<VolumeEntry>>,
     /// Per-site derived metadata keyed by `nod` — the snapshot each
     /// [`PolarVolumeSiteView`] answers capability queries from. Keys
     /// match `by_site` (a site with no derivable metadata, e.g. every
     /// sweep malformed, is simply absent here).
-    by_site_meta: HashMap<String, SiteMeta>,
+    pub(crate) by_site_meta: HashMap<String, SiteMeta>,
     /// `by_site_meta` keys pre-sorted at build time, so the network-inventory
     /// `FeatureEngine` never sorts per request (CLAUDE.md hot-path rule).
     sorted_nods: Vec<String>,
@@ -3084,14 +3086,14 @@ impl FeatureEngine for PolarVolumeEngine {
 /// owning engine.
 pub struct PolarVolumeSiteView {
     /// Live catalog shared with the owning [`PolarVolumeEngine`].
-    catalog: Arc<ArcSwap<Catalog>>,
+    pub(crate) catalog: Arc<ArcSwap<Catalog>>,
     /// The owning engine's file source, shared so the view can lazily
     /// re-fetch a volume's bytes to decode a moment's pixels on demand.
-    source: Arc<Source>,
+    pub(crate) source: Arc<Source>,
     /// ODIM NOD code this view is scoped to.
-    nod: String,
+    pub(crate) nod: String,
     /// Per-site OGC collection id (`{base}-{nod}`), for error messages.
-    collection_id: String,
+    pub(crate) collection_id: String,
 }
 
 impl MapEngine for PolarVolumeSiteView {
@@ -3340,7 +3342,7 @@ fn volume_point_cloud(
 /// Default voxel grid resolution `[n_radius, n_angle, n_height]`: 1° azimuth
 /// bins (matching radar rays), ~2 km radial and ~420 m vertical cells over the
 /// ranges below. ~2.2M cells.
-const DEFAULT_VOXEL_DIMS: [usize; 3] = [128, 360, 48];
+pub(crate) const DEFAULT_VOXEL_DIMS: [usize; 3] = [128, 360, 48];
 /// Hard cap on requested voxel-grid cell count (memory + sample-loop bound).
 const MAX_VOXELS: usize = 32_000_000;
 /// Height ceiling (metres above antenna) for the voxel grid — above any echo.
@@ -3568,7 +3570,7 @@ impl PolarVolumeSiteView {
     /// `reference_time` is deliberately not a parameter: ODIM PVOL has no
     /// model-run machinery (radar volumes aren't forecasts), so both callers
     /// accept-and-ignore it — see the `ds_core::instances` engine contract.
-    fn select_entry_and_quantity<'c>(
+    pub(crate) fn select_entry_and_quantity<'c>(
         &self,
         catalog: &'c Catalog,
         quantity: Option<&str>,
@@ -3628,6 +3630,61 @@ impl PolarVolumeSiteView {
         }
         Ok((entry, quantity))
     }
+
+    /// The [`VOXEL_GRID_CACHE`] fill for one `(volume, quantity, dims)` —
+    /// the body of [`VolumeEngine::read_voxel_grid`], factored out so the
+    /// storm-cell path (`cells.rs`) can drive it from **either** runtime
+    /// context: `handle` is the async→sync bridge selector for a remote
+    /// pixel fetch (`Some` on a `spawn_blocking` pool thread, where
+    /// `block_in_place` panics; `None` on a request worker, where
+    /// `block_in_place` is the valid bridge — see [`Pixels::handle`]).
+    ///
+    /// Returns the shared grid plus its echo-cell count; the caller owns the
+    /// "no echo ⇒ 404 or empty set" decision.
+    pub(crate) fn voxel_grid_cached(
+        &self,
+        entry: &VolumeEntry,
+        quantity: &str,
+        dims: [usize; 3],
+        handle: Option<&tokio::runtime::Handle>,
+    ) -> Result<(Arc<VoxelGrid>, usize), DataServerError> {
+        // A volume file is immutable once scanned, so `(file, quantity, dims)`
+        // fully determines the resample — no data-version in the key. The
+        // 3D Tiles mesh products (isosurface, echo-top, voxels), the storm-
+        // cell extractor, and repeated threshold/animation requests all share
+        // one cached grid. The empty (`valid == 0`) result is cached too, so
+        // the no-echo case is cheap.
+        let key: VoxelGridKey = (
+            Arc::from(pixel_cache_id(&self.source, &entry.id).as_ref()),
+            Arc::from(quantity),
+            dims,
+        );
+        // `get_or_insert_with` is the single-flight: quick_cache's placeholder
+        // guard runs the closure for exactly one caller per key and blocks
+        // concurrent callers until it finishes — so simultaneous first-time
+        // requests for *different representations* of the same grid (whose
+        // content-cache keys differ, hence separate gates there) still share
+        // one polar resample (PR #378 review). Blocking the calling thread is
+        // acceptable in both caller contexts (a `spawn_blocking` pool thread,
+        // or a request worker that would have done the resample itself).
+        let mut computed = false;
+        let result = VOXEL_GRID_CACHE.get_or_insert_with(&key, || {
+            computed = true;
+            let pix = Pixels {
+                source: &self.source,
+                handle,
+            };
+            let (grid, valid) =
+                voxel_grid_from_volume(&entry.volume, &entry.id, pix, quantity, Some(dims))?;
+            Ok::<_, DataServerError>((Arc::new(grid), valid))
+        })?;
+        if computed {
+            VOXEL_GRID_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            VOXEL_GRID_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(result)
+    }
 }
 
 impl VolumeEngine for PolarVolumeSiteView {
@@ -3673,40 +3730,10 @@ impl VolumeEngine for PolarVolumeSiteView {
         // default-dims request share one entry.
         let dims = dims.unwrap_or(DEFAULT_VOXEL_DIMS);
 
-        // A volume file is immutable once scanned, so `(file, quantity, dims)`
-        // fully determines the resample — no data-version in the key. The three
-        // 3D Tiles mesh products (isosurface, echo-top, voxels) and repeated
-        // threshold/animation requests all share one cached grid. The empty
-        // (`valid == 0`) result is cached too, so the no-echo 404 is cheap.
-        let key: VoxelGridKey = (
-            Arc::from(pixel_cache_id(&self.source, &entry.id).as_ref()),
-            Arc::from(quantity.as_str()),
-            dims,
-        );
-        // `get_or_insert_with` is the single-flight: quick_cache's placeholder
-        // guard runs the closure for exactly one caller per key and blocks
-        // concurrent callers until it finishes — so simultaneous first-time
-        // requests for *different representations* of the same grid (whose
-        // content-cache keys differ, hence separate gates there) still share
-        // one polar resample (PR #378 review). Blocking the calling thread is
-        // fine: every caller is on a `spawn_blocking` pool by contract.
-        let mut computed = false;
-        let (grid, valid) = VOXEL_GRID_CACHE.get_or_insert_with(&key, || {
-            computed = true;
-            let handle = blocking_pixel_handle();
-            let pix = Pixels {
-                source: &self.source,
-                handle: handle.as_ref(),
-            };
-            let (grid, valid) =
-                voxel_grid_from_volume(&entry.volume, &entry.id, pix, &quantity, Some(dims))?;
-            Ok::<_, DataServerError>((Arc::new(grid), valid))
-        })?;
-        if computed {
-            VOXEL_GRID_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            VOXEL_GRID_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        // Every `read_voxel_grid` caller is on a `spawn_blocking` pool by
+        // contract, so the remote pixel fetch bridges via the runtime handle.
+        let handle = blocking_pixel_handle();
+        let (grid, valid) = self.voxel_grid_cached(entry, &quantity, dims, handle.as_ref())?;
 
         // No sampled cell (every cell outside the beam fan / nodata) ⇒ 404,
         // matching the other engines' "no data in window" convention.
@@ -3730,6 +3757,14 @@ impl VolumeEngine for PolarVolumeSiteView {
             .get(&self.nod)
             .map(|m| Arc::clone(&m.volume_info))
             .unwrap_or_default()
+    }
+
+    fn read_cells(&self, query: &CellQuery) -> Result<CellProduct, DataServerError> {
+        // Same runtime contract as `read_voxel_grid` (spawn_blocking callers);
+        // engine-internal callers on a request worker (the Features path,
+        // #367 follow-up) call `cell_product` with `handle: None` directly.
+        let handle = blocking_pixel_handle();
+        self.cell_product(query, handle.as_ref())
     }
 }
 

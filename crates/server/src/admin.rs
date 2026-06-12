@@ -335,6 +335,39 @@ static PVOL_VOXEL_GRID_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(
     gauge
 });
 
+// Storm-cell segmentation memo (#367) — per-volume `CellSet`s, so an
+// animation window / repeated tracking request re-segments only the newest
+// volume.
+static PVOL_CELL_SET_CACHE_HITS: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "pvol_cell_set_cache_hits_total",
+        "PVOL storm-cell set cache hits",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static PVOL_CELL_SET_CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "pvol_cell_set_cache_misses_total",
+        "PVOL storm-cell set cache misses (full segmentations)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static PVOL_CELL_SET_CACHE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "pvol_cell_set_cache_entries",
+        "Entries currently held in the PVOL storm-cell set cache",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
 // Meta-tile pixel cache (#202) — global, decoded-RGBA tiles for the Web
 // Mercator WMS meta-tiling path. Distinct from the per-collection GeoTIFF
 // compressed-byte tile cache (`tile_cache_*`).
@@ -466,6 +499,8 @@ struct CacheCounterState {
     pvol_pixel: (u64, u64, u64),
     /// PVOL voxel-grid cache `(hits, misses)` — global cache, monotonic.
     pvol_voxel_grid: (u64, u64),
+    /// PVOL storm-cell set cache `(hits, misses)` — global cache, monotonic.
+    pvol_cell_set: (u64, u64),
     /// 3D Tiles encoded-content cache `(hits, misses)` — global, monotonic.
     tiles3d_content: (u64, u64),
 }
@@ -2870,6 +2905,14 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         counter_state.pvol_voxel_grid = (v_hits, v_misses);
         PVOL_VOXEL_GRID_CACHE_BYTES.set(v_bytes as i64);
         PVOL_VOXEL_GRID_CACHE_CAPACITY_BYTES.set(v_cap as i64);
+
+        // Storm-cell set cache: same process-global monotonic-counter shape.
+        let (s_hits, s_misses, s_entries) = engine_odim::cell_set_cache_metrics();
+        let (last_sh, last_sm) = counter_state.pvol_cell_set;
+        PVOL_CELL_SET_CACHE_HITS.inc_by(s_hits.saturating_sub(last_sh));
+        PVOL_CELL_SET_CACHE_MISSES.inc_by(s_misses.saturating_sub(last_sm));
+        counter_state.pvol_cell_set = (s_hits, s_misses);
+        PVOL_CELL_SET_CACHE_ENTRIES.set(s_entries as i64);
     }
 
     // 3D Tiles encoded-content cache: process-global + monotonic, like the
