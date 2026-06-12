@@ -1,6 +1,6 @@
 # MeteoCore
 
-A high-performance modular meteorological data server built in Rust. Implements [OGC API - EDR 1.1](https://ogcapi.ogc.org/edr/), [OGC API - Features 1.0](https://ogcapi.ogc.org/features/), [OGC API - Maps 1.0](https://ogcapi.ogc.org/maps/), [OGC API - Tiles 1.0](https://ogcapi.ogc.org/tiles/), [OGC WMS 1.3.0](https://www.ogc.org/standard/wms/), and [OGC 3D Tiles 1.1](https://ogcapi.ogc.org/3dtiles/) as separate services sharing the same data sources. A built-in `/preview` SPA renders every configured collection on a MapLibre canvas for quick visual smoke-testing; a bundled CesiumJS viewer serves volumetric 3D Tiles collections.
+A high-performance modular meteorological data server built in Rust. Implements [OGC API - EDR 1.1](https://ogcapi.ogc.org/edr/), [OGC API - Features 1.0](https://ogcapi.ogc.org/features/), [OGC API - Maps 1.0](https://ogcapi.ogc.org/maps/), [OGC API - Tiles 1.0](https://ogcapi.ogc.org/tiles/), [OGC WMS 1.3.0](https://www.ogc.org/standard/wms/), and [OGC 3D Tiles 1.1](https://www.ogc.org/standard/3dtiles/) as separate services sharing the same data sources. A built-in `/preview` SPA renders every configured collection on a MapLibre canvas for quick visual smoke-testing; a bundled CesiumJS viewer serves volumetric 3D Tiles collections.
 
 ## Workspace Crates
 
@@ -120,7 +120,7 @@ Tiles (raster) reuses `MapEngine` — z/x/y coordinates are converted to a bbox 
 
 Each state struct is wrapped in `Arc<ArcSwap<…>>` for lock-free reads and atomic swaps on reload. `ServerState` (in `server/src/admin.rs`) owns all six `ArcSwap` pointers plus the health registry and GeoTIFF engine list (kept separately for the poll runtime). Engine loading lives in `admin::load_collections()`, called by both startup and `POST /admin/collections/reload`.
 
-The render semaphore (2× CPU cores, minimum 8) and rendered-image cache are shared across `MapsState`, `TilesState`, and `WmsState`. `TilesState3d` shares the same render semaphore for encode work but has its own content cache (`api-3dtiles/src/cache.rs`). The semaphore uses `acquire().await` so excess requests queue rather than fail. The 2× factor reflects loose CPU ownership — libpng decode bursts and bilinear-sample passes interleave, leaving the slot idle a non-trivial fraction of its wall time.
+The render semaphore (2× CPU cores, minimum 8) and rendered-image cache are shared across `MapsState`, `TilesState`, and `WmsState`. `TilesState3d` holds the shared render semaphore (used for `.pnts` and `.glb` isosurface/echo-top encoding) and its own content cache (`api-3dtiles/src/cache.rs`). Voxel content uses a separate `VOXEL_SEMAPHORE` (¼ CPU cores) so slow high-resolution voxel encodes cannot occupy raster render slots. The semaphore uses `acquire().await` so excess requests queue rather than fail. The 2× factor reflects loose CPU ownership — libpng decode bursts and bilinear-sample passes interleave, leaving the slot idle a non-trivial fraction of its wall time.
 
 ## Route Structure
 
