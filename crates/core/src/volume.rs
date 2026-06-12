@@ -318,6 +318,13 @@ pub trait VolumeEngine: Send + Sync {
     /// **Concurrency contract:** same as [`Self::read_voxel_grid`] — call
     /// from a context where that method is callable (the 3D Tiles / raster
     /// paths run it under `spawn_blocking`).
+    ///
+    /// **Performance:** the default walks `track_scans + 1` scans with one
+    /// [`Self::read_voxel_grid`] call each — for an engine backed by remote
+    /// storage that is N sequential blocking reads on one thread, exactly
+    /// the stall-multiplying pattern the engine concurrency rules prohibit.
+    /// Such engines must override `read_cells` to cache per-scan
+    /// segmentations (as the ODIM engine does) or batch the reads.
     fn read_cells(&self, query: &CellQuery) -> Result<CellProduct, DataServerError> {
         let info = self.volume_info();
         let Some(caps) = info.voxel_grid else {

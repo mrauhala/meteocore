@@ -358,10 +358,20 @@ static PVOL_CELL_SET_CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
     counter
 });
 
-static PVOL_CELL_SET_CACHE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
+static PVOL_CELL_SET_CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
     let gauge = IntGauge::new(
-        "pvol_cell_set_cache_entries",
-        "Entries currently held in the PVOL storm-cell set cache",
+        "pvol_cell_set_cache_bytes",
+        "Bytes currently held in the PVOL storm-cell set cache",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static PVOL_CELL_SET_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "pvol_cell_set_cache_capacity_bytes",
+        "Configured PVOL storm-cell set cache capacity in bytes",
     )
     .unwrap();
     REGISTRY.register(Box::new(gauge.clone())).unwrap();
@@ -2907,12 +2917,13 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         PVOL_VOXEL_GRID_CACHE_CAPACITY_BYTES.set(v_cap as i64);
 
         // Storm-cell set cache: same process-global monotonic-counter shape.
-        let (s_hits, s_misses, s_entries) = engine_odim::cell_set_cache_metrics();
+        let (s_hits, s_misses, s_bytes, s_cap) = engine_odim::cell_set_cache_metrics();
         let (last_sh, last_sm) = counter_state.pvol_cell_set;
         PVOL_CELL_SET_CACHE_HITS.inc_by(s_hits.saturating_sub(last_sh));
         PVOL_CELL_SET_CACHE_MISSES.inc_by(s_misses.saturating_sub(last_sm));
         counter_state.pvol_cell_set = (s_hits, s_misses);
-        PVOL_CELL_SET_CACHE_ENTRIES.set(s_entries as i64);
+        PVOL_CELL_SET_CACHE_BYTES.set(s_bytes as i64);
+        PVOL_CELL_SET_CACHE_CAPACITY_BYTES.set(s_cap as i64);
     }
 
     // 3D Tiles encoded-content cache: process-global + monotonic, like the

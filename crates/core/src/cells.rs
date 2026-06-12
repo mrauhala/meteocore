@@ -430,7 +430,7 @@ pub fn extract_cells(
                 let d = &mut details[rank];
                 // First claim of this column for this cell: count its ground
                 // area here, in the voxel pass — a per-cell mask sweep after
-                // the loop would cost O(max_cells × n_r × n_a) (#404 review).
+                // the loop would cost O(max_cells × n_r × n_a).
                 if !d.mask[i_r * n_a + i_a] {
                     d.mask[i_r * n_a + i_a] = true;
                     d.area_m2 += dr * (r_centre(i_r) * da);
@@ -1080,8 +1080,8 @@ mod tests {
         // Every ring vertex must sit where the blob actually is: azimuth
         // boundaries 340°–20° (columns 34..1 of 36), radius boundaries
         // 25–45 km (rows 5..9). A wrong seam-rotation inverse rotates the
-        // whole ring around the radar (review on #404) — these bounds catch
-        // any such constant-angle offset.
+        // whole ring around the radar — these bounds catch any such
+        // constant-angle offset.
         for v in &cell.footprint {
             let de = (v[0] - g.origin_lon).to_radians()
                 * g.origin_lat.to_radians().cos()
