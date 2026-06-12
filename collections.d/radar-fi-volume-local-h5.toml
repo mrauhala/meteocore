@@ -44,6 +44,15 @@ colormap = "radar_dbz"
 name = "DBZH"
 colormap = "radar_dbz"
 
+# Derived storm-cell overlay (#367): footprint outlines + centroid markers
+# + track polylines, painted at each cell's max dBZ — so the dBZ palette
+# applies and the overlay reads against the DBZH layer underneath. This
+# entry is optional (CELLS inherits the collection fallback colormap);
+# set it to restyle the overlay independently of the base reflectivity.
+[[wms.parameters]]
+name = "CELLS"
+colormap = "radar_dbz"
+
 # Doppler radial velocity — m/s, diverging blue→white→red about zero
 # (toward/away). FMI volumes are dealiased to a ±48 m/s Nyquist band.
 [[wms.parameters]]

@@ -10,13 +10,38 @@
 //! [`ds_core::volume::VolumeEngine::read_cells`] override delegates here
 //! with the `spawn_blocking` runtime bridge, while engine-internal callers
 //! on a request worker (the Features path) pass `handle: None`.
+//!
+//! [`PolarVolumeSiteView::cells_raster_tile`] renders the product as the
+//! derived **`CELLS`** WMS/Maps/Tiles layer: footprint outlines, centroid
+//! markers, and track polylines painted into a [`RasterTile`] at the cell's
+//! max dBZ, so the ordinary radar colormap styles the overlay.
 
 use crate::quantities;
-use crate::volume_engine::{pixel_cache_id, PolarVolumeSiteView, DEFAULT_VOXEL_DIMS};
+use crate::volume_engine::{
+    blocking_pixel_handle, pixel_cache_id, PolarVolumeSiteView, DEFAULT_VOXEL_DIMS,
+};
 use ds_core::cells::{extract_cells, track_cells, CellSet, MAX_TRACK_SCANS};
 use ds_core::error::DataServerError;
+use ds_core::map_engine::{OutputCrs, RasterTile};
+use ds_core::raster_paint::Canvas;
 use ds_core::volume::{CellProduct, CellQuery};
 use std::sync::Arc;
+
+/// Derived map-layer parameter id for the storm-cell overlay. Uppercase like
+/// the bare ODIM quantities it sits alongside in the WMS layer list, but
+/// never a real moment — `get_raster_tile` intercepts it before quantity
+/// resolution, and it is **not** added to the EDR quantity list or the
+/// 3D Tiles quantity menu.
+pub const CELLS_PARAMETER: &str = "CELLS";
+/// Human-readable layer title for [`CELLS_PARAMETER`].
+pub(crate) const CELLS_PARAMETER_TITLE: &str = "Storm cells";
+/// Scans tracked behind the rendered one for the overlay's trajectories —
+/// half an hour at 5-minute cadence.
+const CELLS_TRACK_SCANS: usize = 6;
+/// Stroke width (px) for footprint rings and track polylines.
+const STROKE_PX: u32 = 2;
+/// Centroid marker arm length (px).
+const MARKER_HALF_PX: u32 = 3;
 
 /// Default [`CELL_SET_CACHE`] size (MB) when `MC_PVOL_CELL_SET_CACHE_MB` is
 /// unset. An entry's dominant cost is the per-cell footprint ring; a typical
@@ -192,5 +217,102 @@ impl PolarVolumeSiteView {
         }
         let tracks = track_cells(&cell_sets, &query.tracking);
         Ok(CellProduct { cell_sets, tracks })
+    }
+
+    /// Render the derived **`CELLS`** overlay layer: the selected scan's
+    /// footprint outlines + centroid markers, and the tracking window's
+    /// centroid trajectories, painted into a [`RasterTile`] at each cell's
+    /// max dBZ (so the collection's radar colormap styles the overlay; a
+    /// `[[wms.parameters]]` entry named `CELLS` overrides it).
+    ///
+    /// Geometry vertices are projected **per-vertex** via
+    /// [`OutputCrs::world_to_fraction`] (a few hundred points, never per
+    /// pixel); painting clips to the tile, so an off-coverage viewport
+    /// renders an empty (transparent) tile. Runs under `spawn_blocking`
+    /// like every `get_raster_tile` path.
+    pub(crate) fn cells_raster_tile(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+        output_crs: &OutputCrs,
+    ) -> Result<RasterTile, DataServerError> {
+        // The overlay's source quantity: corrected reflectivity first, then
+        // total, then any other dBZ-unit moment. The CELLS parameter is only
+        // advertised for sites that have one, so a miss here is a catalog
+        // race, reported as no-data like the other paths.
+        let quantity = {
+            let catalog = self.catalog.load();
+            let meta = catalog.by_site_meta.get(&self.nod).ok_or_else(|| {
+                DataServerError::LocationNotFound(format!(
+                    "[{}] radar site `{}` has no current volumes",
+                    self.collection_id, self.nod
+                ))
+            })?;
+            ["DBZH", "TH"]
+                .into_iter()
+                .find(|q| meta.quantities.iter().any(|x| x == q))
+                .map(str::to_string)
+                .or_else(|| {
+                    meta.quantities
+                        .iter()
+                        .find(|q| quantities::quantity_unit(q) == "dBZ")
+                        .cloned()
+                })
+                .ok_or_else(|| {
+                    DataServerError::LocationNotFound(format!(
+                        "[{}] no reflectivity quantity to derive storm cells from",
+                        self.collection_id
+                    ))
+                })?
+        };
+        let query = CellQuery {
+            quantity: Some(quantity),
+            time,
+            dims: None, // engine default (low) — cells don't need a fine grid
+            track_scans: CELLS_TRACK_SCANS,
+            ..CellQuery::default()
+        };
+        let handle = blocking_pixel_handle();
+        let product = self.cell_product(&query, handle.as_ref())?;
+
+        let mut values = vec![None; width as usize * height as usize];
+        let mut canvas = Canvas::new(&mut values, width, height).ok_or_else(|| {
+            DataServerError::Engine(format!(
+                "[{}] invalid raster dimensions {width}×{height}",
+                self.collection_id
+            ))
+        })?;
+        let px = |lon: f64, lat: f64| {
+            let (fx, fy) = output_crs.world_to_fraction(bbox, lon, lat);
+            (fx * width as f64, fy * height as f64)
+        };
+
+        let (_, target) = product.target();
+        for cell in &target.cells {
+            // An empty footprint (degenerate mask — unreachable for a
+            // BFS-produced component) simply paints nothing.
+            let ring: Vec<(f64, f64)> = cell.footprint.iter().map(|v| px(v[0], v[1])).collect();
+            canvas.stroke_ring(&ring, STROKE_PX, cell.max_dbz);
+            canvas.paint_marker(
+                px(cell.centroid[0], cell.centroid[1]),
+                MARKER_HALF_PX,
+                cell.max_dbz,
+            );
+        }
+        for track in &product.tracks.tracks {
+            if track.points.len() < 2 {
+                continue;
+            }
+            let line: Vec<(f64, f64)> = track.points.iter().map(|p| px(p.lon, p.lat)).collect();
+            let value = track.points.last().expect("non-empty track").max_dbz;
+            canvas.stroke_polyline(&line, STROKE_PX, value);
+        }
+        Ok(RasterTile {
+            width,
+            height,
+            values,
+        })
     }
 }

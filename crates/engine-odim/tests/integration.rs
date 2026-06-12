@@ -860,6 +860,136 @@ fn pvol_volume_engine_read_cells() {
     );
 }
 
+/// The derived `CELLS` map layer (#367) on the real FMI Vihti volume: the
+/// overlay must be advertised as a WMS/Maps/Tiles parameter (but NOT as an
+/// EDR quantity or 3D Tiles quantity), and `get_raster_tile` must paint the
+/// storm's outlines/markers/tracks at dBZ values inside the coverage and an
+/// empty tile far away. Skips when the uncommitted fixture is absent.
+#[test]
+fn pvol_cells_raster_layer() {
+    use ds_core::map_engine::{MapEngine, OutputCrs};
+    use ds_core::volume::VolumeEngine;
+
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/radar-fmi-pvol/202605191050_fivih_PVOL.h5");
+    if !fixture.exists() {
+        eprintln!("skipping pvol_cells_raster_layer: fixture absent at {fixture:?}");
+        return;
+    }
+    let data_dir = fixture.parent().unwrap().to_str().unwrap();
+    let config = OdimConfig {
+        filename_template: None,
+        filename_pattern: None,
+        timestamp_format: None,
+        parameter: None,
+        unit: None,
+        nodata: None,
+        gain: None,
+        offset: None,
+        poll_interval_secs: 30,
+        max_files: None,
+        endpoint: None,
+        bucket: None,
+        prefix_pattern: None,
+        time_window: None,
+        discovery: None,
+        cadence_secs: None,
+    };
+    let engine =
+        engine_odim::PolarVolumeEngine::new("fivih-cells-wms-test", Some(data_dir), &config)
+            .expect("PolarVolumeEngine::new");
+    let view = engine.site_view("fivih", "fivih-cells-wms-test-fivih");
+
+    // Advertised on the map-layer list, with the bare quantities still first…
+    let info = view.raster_info();
+    assert!(
+        info.parameters
+            .iter()
+            .any(|(name, title)| name == engine_odim::cells::CELLS_PARAMETER
+                && title == "Storm cells"),
+        "CELLS layer advertised in raster_info().parameters"
+    );
+    assert_ne!(
+        info.parameter,
+        engine_odim::cells::CELLS_PARAMETER,
+        "default parameter stays a real quantity"
+    );
+    // …but never as an EDR quantity or a 3D Tiles quantity.
+    use ds_core::edr_engine::EdrEngine;
+    assert!(
+        !EdrEngine::get_parameters(&view)
+            .iter()
+            .any(|q| q == engine_odim::cells::CELLS_PARAMETER),
+        "CELLS must not leak into the EDR quantity list"
+    );
+    assert!(
+        !view
+            .volume_info()
+            .quantities
+            .iter()
+            .any(|(q, _)| q == engine_odim::cells::CELLS_PARAMETER),
+        "CELLS must not leak into the 3D Tiles quantity menu"
+    );
+
+    // Render over the radar's coverage: the storm's outlines/markers/tracks
+    // paint dBZ values.
+    let tile = view
+        .get_raster_tile(
+            [19.5, 57.6, 29.5, 63.6],
+            512,
+            512,
+            None,
+            &OutputCrs::Wgs84,
+            Some(engine_odim::cells::CELLS_PARAMETER),
+            None,
+            None,
+        )
+        .expect("CELLS raster over coverage");
+    assert_eq!((tile.width, tile.height), (512, 512));
+    let painted: Vec<f64> = tile.values.iter().filter_map(|v| *v).collect();
+    assert!(
+        !painted.is_empty(),
+        "the fixture storm must paint at least one outline"
+    );
+    for v in &painted {
+        assert!(
+            (35.0..70.0).contains(v),
+            "painted values are cell max dBZ, got {v}"
+        );
+    }
+
+    // Same request through Web Mercator paints too (axis-order/projection
+    // sanity for the painted path).
+    let merc = view
+        .get_raster_tile(
+            [19.5, 57.6, 29.5, 63.6],
+            512,
+            512,
+            None,
+            &OutputCrs::WebMercator,
+            Some(engine_odim::cells::CELLS_PARAMETER),
+            None,
+            None,
+        )
+        .expect("CELLS raster in Web Mercator");
+    assert!(!merc.is_empty());
+
+    // A viewport far outside coverage renders an empty (transparent) tile.
+    let far = view
+        .get_raster_tile(
+            [-10.0, 40.0, -5.0, 45.0],
+            256,
+            256,
+            None,
+            &OutputCrs::Wgs84,
+            Some(engine_odim::cells::CELLS_PARAMETER),
+            None,
+            None,
+        )
+        .expect("CELLS raster far away");
+    assert!(far.is_empty(), "off-coverage viewport is transparent");
+}
+
 /// Regression guard for SMHI signed-integer PVOL: SMHI ships its moments as
 /// **signed `i16`** (DBZH `gain=0.01`, sentinels `nodata=-32768` /
 /// `undetect=-32767` — only representable as signed), which the original

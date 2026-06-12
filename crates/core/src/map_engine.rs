@@ -91,6 +91,38 @@ impl OutputCrs {
             }
         }
     }
+
+    /// Inverse of [`Self::project_node`]: map a WGS84 `(lon, lat)` to the
+    /// fractional output position `(fx, fy)` (`fx = 0` west/left edge,
+    /// `fy = 0` north/top edge). Results may fall outside `[0, 1]²` (the
+    /// point is off-tile) or be non-finite (outside a projection's valid
+    /// domain) — callers bounds/finite-check.
+    ///
+    /// For **per-vertex** use only (painting overlay geometry, locating a
+    /// handful of points): the per-pixel direction stays
+    /// [`Self::project_node`] via `ProjectionGrid` (never project per
+    /// pixel).
+    pub fn world_to_fraction(&self, wgs84_bbox: [f64; 4], lon: f64, lat: f64) -> (f64, f64) {
+        let [west, south, east, north] = wgs84_bbox;
+        match self {
+            OutputCrs::Wgs84 => (
+                (lon - west) / (east - west),
+                (north - lat) / (north - south),
+            ),
+            OutputCrs::WebMercator => {
+                let (my_n, my_s) = (lat_to_merc_y(north), lat_to_merc_y(south));
+                (
+                    (lon - west) / (east - west),
+                    (my_n - lat_to_merc_y(lat)) / (my_n - my_s),
+                )
+            }
+            OutputCrs::Projected { crs, bbox } => {
+                let [min_e, min_n, max_e, max_n] = bbox;
+                let (e, n) = crs.forward(lon, lat);
+                ((e - min_e) / (max_e - min_e), (max_n - n) / (max_n - min_n))
+            }
+        }
+    }
 }
 
 /// A raster tile that can be colorized and served as a map image.
@@ -260,5 +292,33 @@ mod tests {
             (15.0..35.0).contains(&lon) && (55.0..72.0).contains(&lat),
             "{lon},{lat}"
         );
+    }
+
+    #[test]
+    fn world_to_fraction_inverts_project_node_for_every_variant() {
+        let proj = projected_output_crs("EPSG:3067").unwrap();
+        let (e_w, n_s) = proj.forward(20.0, 60.0);
+        let (e_e, n_n) = proj.forward(30.0, 68.0);
+        let variants = [
+            OutputCrs::Wgs84,
+            OutputCrs::WebMercator,
+            OutputCrs::Projected {
+                crs: proj,
+                bbox: [e_w.min(e_e), n_s.min(n_n), e_w.max(e_e), n_s.max(n_n)],
+            },
+        ];
+        for out in &variants {
+            for &(fx, fy) in &[(0.0, 0.0), (1.0, 1.0), (0.25, 0.75), (0.5, 0.5)] {
+                let (lon, lat) = out.project_node(FINLAND_WGS84, fx, fy);
+                let (gx, gy) = out.world_to_fraction(FINLAND_WGS84, lon, lat);
+                assert!(
+                    (gx - fx).abs() < 1e-9 && (gy - fy).abs() < 1e-9,
+                    "{out:?}: ({fx},{fy}) → ({lon},{lat}) → ({gx},{gy})"
+                );
+            }
+            // Off-tile points land outside [0,1] rather than clamping.
+            let (gx, _) = out.world_to_fraction(FINLAND_WGS84, 5.0, 64.0);
+            assert!(gx < 0.0, "west of the tile must map to fx < 0, got {gx}");
+        }
     }
 }
