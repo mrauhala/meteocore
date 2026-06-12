@@ -76,10 +76,13 @@ impl InFlightLoads {
         while in_flight.contains(path) {
             let now = std::time::Instant::now();
             if now >= deadline {
-                // Stuck loader: deliberately claim anyway (a duplicate fetch)
-                // rather than failing the request. The insert below is a
-                // no-op and whichever load finishes first clears the path —
-                // same liveness behavior as the old polling code.
+                // Stuck loader: deliberately claim anyway rather than fail
+                // the request. The insert below is a no-op and whichever
+                // load finishes first clears the path — same liveness
+                // behavior as the old polling code. Note dedup is best-effort
+                // past this point: the early clear lets later callers claim
+                // too, so a stuck loader can fan out to several parallel
+                // fetches of the same asset, not just one duplicate.
                 break;
             }
             let (guard, _) = self
