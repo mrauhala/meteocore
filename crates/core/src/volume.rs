@@ -14,6 +14,7 @@
 
 use crate::cells::{
     extract_cells, track_cells, CellExtractionOptions, CellSet, TrackSet, TrackingOptions,
+    MAX_TRACK_SCANS,
 };
 use crate::error::DataServerError;
 use chrono::{DateTime, Utc};
@@ -348,7 +349,10 @@ pub trait VolumeEngine: Send + Sync {
                 .expect("times is non-empty"),
             None => info.times.len() - 1,
         };
-        let start = target_idx.saturating_sub(query.track_scans);
+        // Clamp the window: each scan is one sequential blocking
+        // read_voxel_grid, so an unbounded caller value would multiply the
+        // stall arbitrarily (see the performance note above).
+        let start = target_idx.saturating_sub(query.track_scans.min(MAX_TRACK_SCANS));
         let quantity_label = query
             .quantity
             .clone()

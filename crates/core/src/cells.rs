@@ -33,6 +33,14 @@ const VIL_DBZ_CAP: f64 = 56.0;
 /// it yields kg m⁻² directly.
 const VIL_COEFF: f64 = 3.44e-6;
 
+/// Hard ceiling on how many scans a tracking window may walk
+/// ([`crate::volume::CellQuery::track_scans`] is clamped to this). Each scan
+/// in the window costs one `read_voxel_grid` — sequential blocking reads on
+/// one thread for a remote-backed engine — so an unbounded caller value
+/// would multiply that stall arbitrarily. 24 covers two hours of 5-minute
+/// radar cadence.
+pub const MAX_TRACK_SCANS: usize = 24;
+
 /// Knobs for [`extract_cells`]. `Default` is the canonical configuration
 /// (35 dBZ — the classic TITAN cell threshold — with a 5 km³ speckle floor).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -675,9 +683,17 @@ fn footprint_ring(
     let mut rings: Vec<Vec<usize>> = Vec::new();
     let mut consumed = 0usize;
     while consumed < edge_count {
-        // Take any remaining start vertex.
-        let (&start, _) = match edges_from.iter().find(|(_, v)| !v.is_empty()) {
-            Some(kv) => kv,
+        // Start each ring at the smallest remaining vertex id — HashMap
+        // iteration order is per-process random, and the start vertex fixes
+        // the output vertex sequence, which must be deterministic (stable
+        // GeoJSON bytes / ETags for identical inputs).
+        let start = match edges_from
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(&k, _)| k)
+            .min()
+        {
+            Some(k) => k,
             None => break,
         };
         let mut ring = vec![start];
@@ -1356,6 +1372,21 @@ mod tests {
             .collect();
         assert_eq!(continued.len(), 1, "exactly one track continues");
         assert_eq!(continued[0].points[0].label, 1, "the nearer cell wins");
+    }
+
+    #[test]
+    fn extraction_is_deterministic() {
+        // The ring tracer must not inherit HashMap iteration order: two
+        // extractions of the same grid (fresh HashMaps with different
+        // RandomState seeds) must produce byte-identical cell sets, or
+        // Features ETags / cached GeoJSON would churn across restarts.
+        let mut g = empty_grid();
+        fill(&mut g, 4..8, &[9, 10, 11], 2..6, 45.0);
+        fill(&mut g, 12..16, &[20, 21], 1..4, 38.0);
+        fill(&mut g, 5..9, &[34, 35, 0, 1], 2..5, 42.0); // seam blob
+        let a = extract_cells(&g, t0(), &opts());
+        let b = extract_cells(&g, t0(), &opts());
+        assert_eq!(a, b);
     }
 
     #[test]

@@ -13,7 +13,7 @@
 
 use crate::quantities;
 use crate::volume_engine::{pixel_cache_id, PolarVolumeSiteView, DEFAULT_VOXEL_DIMS};
-use ds_core::cells::{extract_cells, track_cells, CellSet};
+use ds_core::cells::{extract_cells, track_cells, CellSet, MAX_TRACK_SCANS};
 use ds_core::error::DataServerError;
 use ds_core::volume::{CellProduct, CellQuery};
 use std::sync::Arc;
@@ -142,8 +142,18 @@ impl PolarVolumeSiteView {
         let target_idx = volumes
             .iter()
             .position(|e| e.volume.time == target_time)
-            .unwrap_or(volumes.len().saturating_sub(1));
-        let start = target_idx.saturating_sub(query.track_scans);
+            .ok_or_else(|| {
+                // `target` came from this same slice, so a miss is a logic
+                // error — surface it rather than silently tracking against
+                // the wrong window.
+                DataServerError::Engine(format!(
+                    "[{}] selected volume at {target_time} not found in site `{}` volume list",
+                    self.collection_id, self.nod
+                ))
+            })?;
+        // Same window ceiling as the trait default: even with the per-scan
+        // memo, a cold window is one grid resample per scan.
+        let start = target_idx.saturating_sub(query.track_scans.min(MAX_TRACK_SCANS));
         let dims = query.dims.unwrap_or(DEFAULT_VOXEL_DIMS);
         let opts_key = extraction_key(&query.extraction);
 
