@@ -590,7 +590,8 @@ Unit conversion is driven by the WMO `(discipline, category, parameter_number)` 
 |-------------|-------------|------------|
 | K | °C | −273.15 |
 | Pa | hPa | ×0.01 |
-| kg m⁻² | mm | ×1 (same value) |
+| kg m⁻² | mm | ×1 (accumulated liquid-equivalent, WMO standard triples) |
+| m (metres of water) | mm | ×1000 (ECMWF local params 193/198/254) |
 | m² s⁻² | gpm | ÷9.80665 |
 | proportion (0–1) | % | ×100 |
 
@@ -1541,7 +1542,7 @@ CoverageJSON output is validated against the official [OGC CoverageJSON 1.0 sche
 - QueryData: no compressed files, EDR position only, level 0 only; retains up to `max_runs` (default 4) most-recent files as model runs
 - Zarr: geographic (WGS84 lat/lon) grids only, EDR position only; forecast model-run selection pins the latest run (#337); STAC per-item-CRS and kerchunk modes not yet implemented
 - Zarr/Icechunk: requires the `icechunk` build feature, anonymous (public) S3 only, new snapshots picked up on reload (not poll)
-- 3D Tiles: only `odim-volume` collections support `VolumeEngine`; voxel representation (`EXT_primitive_voxels`) requires CesiumJS ≥ 1.142 and is a CesiumGS draft extension (not in the Khronos registry); voxel octree/time-dynamic voxels are follow-ups; Maps/Tiles `reference_time` parameter not yet wired for 3D Tiles
+- 3D Tiles: only `odim-volume` collections support `VolumeEngine`; voxel representation (`EXT_primitive_voxels`) requires CesiumJS ≥ 1.142 and is a CesiumGS draft extension (not in the Khronos registry); voxel octree/time-dynamic voxels are follow-ups; the 3D Tiles API has no `reference_time` parameter yet (model-run pinning; `datetime` selects valid time only)
 
 ## Tech Stack
 
