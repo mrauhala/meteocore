@@ -64,6 +64,31 @@ cargo build --release -p server
 
 The release binary is self-contained — deploy it alongside `config.toml` and your data files.
 
+### Command-Line Options
+
+```
+Usage: server [OPTIONS]
+
+Options:
+  --collections <id1,id2,...>   Only load collections with these IDs (comma-separated).
+                                All others are silently skipped. Useful for smoke-testing
+                                a single collection without editing config.toml.
+  -h, --help                    Print this help and exit.
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CONFIG_PATH` | `./config.toml` | Path to the server configuration file |
+| `LOG_FORMAT` | human-readable | Set to `json` for newline-delimited JSON logs (production / Loki ingestion) |
+| `RUST_LOG` | `info` | Log level filter, e.g. `server=debug,engine_geotiff=warn` |
+| `ADMIN_TOKEN` | _(none — unauthenticated)_ | Bearer token required for `POST /admin/collections/reload`. When unset, the admin endpoint is open. |
+| `MC_3DTILES_CONTENT_CACHE_MB` | `512` | 3D Tiles encoded-content cache size in MB. `0` disables. |
+| `MC_PVOL_VOXEL_GRID_CACHE_MB` | `512` | PVOL polar-resampled voxel-grid cache size in MB. `0` disables. |
+| `MC_PVOL_PIXEL_CACHE_MB` | `1024` | PVOL per-moment decoded-pixel cache size in MB. `0` disables. |
+| `MC_ALLOW_INLINE_DB_URL` | _(unset)_ | Set to `1` to allow a literal `postgres://` URL in TOML instead of `dsn_env` (development only). |
+
 ### Fuzz Testing
 
 Fuzz targets live in `fuzz/` (separate from workspace, uses `cargo-fuzz` + `libfuzzer`). Requires nightly.
