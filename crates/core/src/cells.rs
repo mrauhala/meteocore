@@ -613,8 +613,13 @@ fn footprint_ring(
                     .find(|&r| (0..n_a).any(|a| mask[r * n_a + a]))
                     .map(|r| r0 + (r as f64 + 1.0) * dr)
                     .unwrap_or(r0);
-                let enu: Vec<(f64, f64)> = (0..n_a)
-                    .map(|a| {
+                // Walk azimuth boundaries in DECREASING order: compass
+                // azimuth increases clockwise on the ground, so the CCW
+                // exterior ring (RFC 7946) traces the circle backwards.
+                let boundaries: Vec<usize> = (0..n_a).rev().collect();
+                let enu: Vec<(f64, f64)> = boundaries
+                    .iter()
+                    .map(|&a| {
                         let angle = a0 + a as f64 * da;
                         (max_r * angle.sin(), max_r * angle.cos())
                     })
@@ -622,8 +627,8 @@ fn footprint_ring(
                 let keep = douglas_peucker_closed(&enu, tol_m);
                 let mut ring: Vec<[f64; 2]> = keep
                     .iter()
-                    .map(|&a| {
-                        let (lon, lat) = to_lonlat(max_r, a0 + a as f64 * da);
+                    .map(|&i| {
+                        let (lon, lat) = to_lonlat(max_r, a0 + boundaries[i] as f64 * da);
                         [lon, lat]
                     })
                     .collect();
@@ -1372,6 +1377,40 @@ mod tests {
             .collect();
         assert_eq!(continued.len(), 1, "exactly one track continues");
         assert_eq!(continued[0].points[0].label, 1, "the nearer cell wins");
+    }
+
+    #[test]
+    fn full_annulus_footprint_is_ccw_at_outer_radius() {
+        // Echo in every azimuth column (a rain shield wrapped around the
+        // radar) takes the annulus fallback: outer-radius circle, which must
+        // still be CCW (RFC 7946) and sit at the component's outer boundary.
+        let mut g = empty_grid();
+        let all: Vec<usize> = (0..36).collect();
+        fill(&mut g, 10..12, &all, 2..4, 40.0);
+        let set = extract_cells(&g, t0(), &opts());
+        assert_eq!(set.cells.len(), 1);
+        let ring = &set.cells[0].footprint;
+        assert_eq!(ring.first(), ring.last());
+        let mut area = 0.0;
+        for w in ring.windows(2) {
+            area += w[0][0] * w[1][1] - w[1][0] * w[0][1];
+        }
+        assert!(
+            area > 0.0,
+            "annulus fallback ring must be counter-clockwise"
+        );
+        // Every vertex sits on the outer radius boundary (12 × 5 km = 60 km).
+        for v in &ring[..ring.len() - 1] {
+            let de = (v[0] - g.origin_lon).to_radians()
+                * g.origin_lat.to_radians().cos()
+                * crate::geo::EARTH_RADIUS_M;
+            let dn = (v[1] - g.origin_lat).to_radians() * crate::geo::EARTH_RADIUS_M;
+            let ground = de.hypot(dn);
+            assert!(
+                (ground - 60_000.0).abs() < 600.0,
+                "vertex at {ground} m, expected ≈60 km"
+            );
+        }
     }
 
     #[test]
