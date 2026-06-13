@@ -26,7 +26,8 @@
 /// slash.
 ///
 /// Precedence when `trust` is `true`:
-///   1. RFC 7239 `Forwarded` — `proto=` / `host=` of the **first** element.
+///   1. RFC 7239 `Forwarded` — `proto=` / `host=` of the **last** element (the
+///      closest trusted proxy; see [`from_forwarded`] for why not the first).
 ///   2. `X-Forwarded-Proto` + `X-Forwarded-Host` (+ optional `X-Forwarded-Port`).
 ///   3. `fallback` — the startup-resolved base (`BASE_URL` env > `[server]
 ///      base_url` > `http://{host}:{port}`).
@@ -60,15 +61,22 @@ pub fn resolve_base_url<'h>(
     fallback.to_string()
 }
 
-/// Parse an RFC 7239 `Forwarded` header, using the first forwarded element.
+/// Parse an RFC 7239 `Forwarded` header, using the **last** forwarded element.
 /// The `host` directive already includes any port, so it is used verbatim.
+///
+/// RFC 7239 §4 requires each proxy to *append* its entry to a comma-separated
+/// list, so the **first** element is the oldest hop — which a client can
+/// pre-inject (`Forwarded: host=evil.example.com;proto=https`) before the
+/// trusted proxy appends its own entry. The last element is the one written by
+/// the closest upstream proxy (the trusted one), so it is the only safe choice.
+/// (`X-Forwarded-*` differs: proxies conventionally *overwrite* those, so the
+/// trust model — "enable only when a trusted proxy sets/overwrites these" — makes
+/// the single value authoritative there.)
 fn from_forwarded(value: Option<&str>, fallback: &str) -> Option<String> {
-    // Multiple proxies append elements separated by commas; use the first
-    // (closest to the client) hop.
-    let first = first_value(value?);
+    let last = value?.split(',').next_back().unwrap_or_default().trim();
     let mut host: Option<&str> = None;
     let mut proto: Option<&str> = None;
-    for pair in first.split(';') {
+    for pair in last.split(';') {
         let Some((k, v)) = pair.split_once('=') else {
             continue;
         };
@@ -364,16 +372,20 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_first_element_only() {
+    fn forwarded_uses_last_element_not_client_injected_first() {
+        // RFC 7239 §4: proxies *append*, so the first element is the oldest hop
+        // (a client can pre-inject it); the trusted proxy's entry is last. The
+        // client-supplied `evil.example.com` must be ignored in favour of the
+        // trusted proxy's `trusted.example.com`.
         let url = resolve_base_url(
             "http://127.0.0.1:8000",
             true,
             hdrs(&[(
                 "forwarded",
-                "host=first.example.com;proto=https, host=second.example.com;proto=http",
+                "host=evil.example.com;proto=https, host=trusted.example.com;proto=https",
             )]),
         );
-        assert_eq!(url, "https://first.example.com");
+        assert_eq!(url, "https://trusted.example.com");
     }
 
     #[test]

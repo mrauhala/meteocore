@@ -752,7 +752,8 @@ the server sits behind a reverse proxy (`http://0.0.0.0:8000/edr/...`).
 With `[server] trust_proxy_headers = true`, the base URL is instead resolved
 **per request** from the standard forwarding headers, with this precedence:
 
-1. RFC 7239 `Forwarded` (`proto=`/`host=` of the first element),
+1. RFC 7239 `Forwarded` (`proto=`/`host=` of the **last** element — the closest
+   trusted proxy; the first element is the client-injectable oldest hop),
 2. `X-Forwarded-Proto` + `X-Forwarded-Host` (+ optional `X-Forwarded-Port`),
 3. the static fallback above.
 
