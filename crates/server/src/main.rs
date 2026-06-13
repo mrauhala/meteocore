@@ -362,10 +362,14 @@ async fn main() {
         }
     };
     // Reflect the actually-bound port back into config so base_url() and any
-    // downstream use see the real value (the auto-scan may have moved it).
-    if let Ok(local) = listener.local_addr() {
-        config.server.port = local.port();
-    }
+    // downstream use see the real value (the auto-scan may have moved it). A
+    // just-bound listener always has a local address (plain getsockname), but
+    // don't swallow the impossible case: a wrong write-back would make
+    // base_url()/logs/reload silently report the wrong port.
+    config.server.port = listener
+        .local_addr()
+        .expect("bound TcpListener must have a local address")
+        .port();
 
     let base_url = config.server.base_url();
     info!("Base URL: {base_url}");
@@ -470,6 +474,16 @@ async fn main() {
         info!("Admin endpoint authentication enabled");
     } else {
         info!("Admin endpoint authentication disabled (no ADMIN_TOKEN set)");
+        // Loopback default is safe; a non-loopback bind (e.g. `--host 0.0.0.0`)
+        // with no token exposes POST /admin/collections/reload to the network.
+        let host = config.server.host.as_str();
+        if !matches!(host, "127.0.0.1" | "::1" | "localhost") {
+            tracing::warn!(
+                "Admin endpoint is UNAUTHENTICATED and bound to a non-loopback host ({host}): \
+                 POST /admin/collections/reload is reachable from the network. Set ADMIN_TOKEN, \
+                 or bind to 127.0.0.1."
+            );
+        }
     }
 
     // Resolve the collections_dir to watch (issue #318) before `config_path` is
@@ -824,17 +838,24 @@ mod tests {
 
     #[tokio::test]
     async fn bind_auto_port_picks_start_when_free() {
-        // Grab a free port from the OS, release it, then confirm the scan
-        // binds exactly that one when it's available.
+        // Grab a free port from the OS as the scan start. We can't release and
+        // re-bind it atomically, so don't assert an exact match (another process
+        // could claim it in the gap); instead assert the scan lands within the
+        // window starting at `free`. The skips-used-port test covers advancing
+        // past a held port.
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let free = probe.local_addr().unwrap().port();
         drop(probe);
 
-        let (listener, addr) = bind_auto_port("127.0.0.1", free)
+        let (listener, _addr) = bind_auto_port("127.0.0.1", free)
             .await
-            .expect("should bind the free start port");
-        assert_eq!(listener.local_addr().unwrap().port(), free);
-        assert_eq!(addr, format!("127.0.0.1:{free}"));
+            .expect("should find a free port in the scan window");
+        let chosen = listener.local_addr().unwrap().port();
+        assert!(
+            chosen >= free && chosen < free.saturating_add(AUTO_PORT_SCAN),
+            "expected a port in [{free}, {}), got {chosen}",
+            free.saturating_add(AUTO_PORT_SCAN)
+        );
     }
 
     #[tokio::test]
