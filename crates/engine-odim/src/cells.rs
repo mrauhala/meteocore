@@ -38,10 +38,25 @@ pub(crate) const CELLS_PARAMETER_TITLE: &str = "Storm cells";
 /// Scans tracked behind the rendered one for the overlay's trajectories —
 /// half an hour at 5-minute cadence.
 const CELLS_TRACK_SCANS: usize = 6;
-/// Stroke width (px) for footprint rings and track polylines.
+/// Stroke width (px) for footprint rings.
 const STROKE_PX: u32 = 2;
+/// Stroke width (px) for track trails — one thinner than the outlines so a
+/// trail reads as subordinate to the cell it leads to.
+const TRACK_STROKE_PX: u32 = 1;
 /// Centroid marker arm length (px).
 const MARKER_HALF_PX: u32 = 3;
+
+/// Reserved raster value painted along track trails in the `CELLS` overlay.
+/// It is **not** a dBZ measurement — a fixed sentinel far outside any real
+/// reflectivity, rendered as a single neutral colour by the
+/// [`ds_render::OverlayColorMap`] the `CELLS` layer is styled with (so trails
+/// are visually distinct from the dBZ-coloured cell outlines, not blended
+/// into them). The styling side matches it by exact `f64` equality, so this
+/// value must be painted verbatim.
+pub const CELLS_TRACK_SENTINEL: f64 = -9999.0;
+/// Neutral colour the `CELLS` track trails render as (dark grey — contrasts
+/// with both the warm dBZ outline colours and light basemaps). RGBA.
+pub const CELLS_TRACK_COLOR: [u8; 4] = [60, 60, 60, 255];
 
 /// Default [`CELL_SET_CACHE`] size (MB) when `MC_PVOL_CELL_SET_CACHE_MB` is
 /// unset. An entry's dominant cost is the per-cell footprint ring; a typical
@@ -289,7 +304,7 @@ impl PolarVolumeSiteView {
             (fx * width as f64, fy * height as f64)
         };
 
-        let (_, target) = product.target();
+        let (target_time, target) = product.target();
         for cell in &target.cells {
             // An empty footprint (degenerate mask — unreachable for a
             // BFS-produced component) simply paints nothing.
@@ -301,13 +316,21 @@ impl PolarVolumeSiteView {
                 cell.max_dbz,
             );
         }
+        // Trails only for cells that are present in the rendered (target) scan
+        // — a trail must terminate at a visible outline. Drawing every track
+        // in the window painted orphan lines for cells that had died or
+        // weakened out of the latest scan (user-reported clutter). Trails are
+        // painted at the reserved sentinel so the overlay colormap renders
+        // them one neutral colour, not the cell's dBZ colour.
         for track in &product.tracks.tracks {
             if track.points.len() < 2 {
                 continue;
             }
+            if track.points.last().expect("non-empty track").time != *target_time {
+                continue;
+            }
             let line: Vec<(f64, f64)> = track.points.iter().map(|p| px(p.lon, p.lat)).collect();
-            let value = track.points.last().expect("non-empty track").max_dbz;
-            canvas.stroke_polyline(&line, STROKE_PX, value);
+            canvas.stroke_polyline(&line, TRACK_STROKE_PX, CELLS_TRACK_SENTINEL);
         }
         Ok(RasterTile {
             width,

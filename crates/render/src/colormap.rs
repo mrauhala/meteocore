@@ -200,6 +200,48 @@ impl ColorMap for IntegerLutColorMap {
     }
 }
 
+/// Wraps an inner colormap so a single reserved **sentinel** value renders as
+/// one fixed colour, while every other value (and nodata) delegates to the
+/// inner colormap.
+///
+/// This is how a single colormap-driven raster layer carries two visually
+/// distinct symbol classes: the derived storm-cell (`CELLS`) overlay paints
+/// cell outlines/markers at their dBZ value (→ the inner radar ramp) and
+/// track trails at the sentinel (→ one neutral colour), so trails read as
+/// subordinate to the intensity-coloured cells instead of blending into them.
+/// The sentinel is matched by exact `f64` equality, so the producer must
+/// paint trails at the identical constant (`==`, no rounding).
+pub struct OverlayColorMap {
+    inner: std::sync::Arc<dyn ColorMap>,
+    sentinel: f64,
+    overlay_color: [u8; 4],
+}
+
+impl OverlayColorMap {
+    pub fn new(inner: std::sync::Arc<dyn ColorMap>, sentinel: f64, overlay_color: [u8; 4]) -> Self {
+        Self {
+            inner,
+            sentinel,
+            overlay_color,
+        }
+    }
+}
+
+impl ColorMap for OverlayColorMap {
+    fn nodata_color(&self) -> [u8; 4] {
+        self.inner.nodata_color()
+    }
+
+    fn color(&self, value: Option<f64>) -> [u8; 4] {
+        match value {
+            // Exact match (the producer paints this literal constant), and
+            // finite so it never collides with the nodata/NaN path.
+            Some(v) if v == self.sentinel => self.overlay_color,
+            other => self.inner.color(other),
+        }
+    }
+}
+
 /// Linear interpolation colormap for continuous data.
 pub struct LinearColorMap {
     stops: Vec<ColorStop>,
@@ -715,6 +757,28 @@ mod tests {
     fn test_lut_colormap_nodata() {
         let cmap = LutColorMap::from_builtin(BuiltinColormap::Grayscale, 0.0, 100.0);
         assert_eq!(cmap.color(None), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_overlay_colormap_sentinel_and_passthrough() {
+        let inner = std::sync::Arc::new(LutColorMap::from_builtin(
+            BuiltinColormap::Grayscale,
+            0.0,
+            100.0,
+        ));
+        let overlay = OverlayColorMap::new(inner, -9999.0, [60, 60, 60, 255]);
+        // The sentinel renders as the fixed overlay colour…
+        assert_eq!(overlay.color(Some(-9999.0)), [60, 60, 60, 255]);
+        // …every other value delegates to the inner colormap…
+        assert_eq!(overlay.color(Some(0.0)), [0, 0, 0, 255]);
+        assert_eq!(overlay.color(Some(100.0)), [255, 255, 255, 255]);
+        // …and nodata / NaN follow the inner colormap's nodata colour, never
+        // the overlay colour (sentinel match is finite-exact).
+        assert_eq!(overlay.color(None), [0, 0, 0, 0]);
+        assert_eq!(overlay.color(Some(f64::NAN)), [0, 0, 0, 0]);
+        // A near-but-not-equal value is NOT the sentinel.
+        assert_eq!(overlay.color(Some(-9998.0)), overlay.color(Some(-9998.0)));
+        assert_ne!(overlay.color(Some(-9998.0)), [60, 60, 60, 255]);
     }
 
     #[test]
