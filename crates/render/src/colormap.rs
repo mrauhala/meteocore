@@ -776,8 +776,11 @@ mod tests {
         // the overlay colour (sentinel match is finite-exact).
         assert_eq!(overlay.color(None), [0, 0, 0, 0]);
         assert_eq!(overlay.color(Some(f64::NAN)), [0, 0, 0, 0]);
-        // A near-but-not-equal value is NOT the sentinel.
-        assert_eq!(overlay.color(Some(-9998.0)), overlay.color(Some(-9998.0)));
+        // A near-but-not-equal value is NOT the sentinel: it delegates to the
+        // inner colormap (here clamped to the min/black end), never the
+        // overlay colour.
+        let inner = LutColorMap::from_builtin(BuiltinColormap::Grayscale, 0.0, 100.0);
+        assert_eq!(overlay.color(Some(-9998.0)), inner.color(Some(-9998.0)));
         assert_ne!(overlay.color(Some(-9998.0)), [60, 60, 60, 255]);
     }
 
