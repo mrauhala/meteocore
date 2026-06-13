@@ -365,13 +365,15 @@ fn mk_collection(
 
 // ---- helpers ---------------------------------------------------------------
 
-/// A directory is a Zarr store if its name ends in `.zarr` or it holds Zarr
-/// group/array metadata (`zarr.json` for V3, `.zgroup`/`.zarray` for V2).
+/// A directory is a Zarr store **root** if its name ends in `.zarr` or it holds
+/// store-root metadata: `zarr.json` (V3 root) or `.zgroup` (V2 group root). We
+/// deliberately do **not** match `.zarray` — that marks a V2 *array* node (a leaf
+/// inside a store, or a chunk subdirectory), not a store the engine can open as a
+/// root group; matching it would hand the engine an array dir that fails at load.
 fn dir_is_zarr_store(dir: &Path) -> bool {
     file_name(dir).to_ascii_lowercase().ends_with(".zarr")
         || dir.join("zarr.json").exists()
         || dir.join(".zgroup").exists()
-        || dir.join(".zarray").exists()
 }
 
 fn has_ext(path: &Path, ext: &str) -> bool {
@@ -686,6 +688,23 @@ mod tests {
         assert_eq!(cfgs.len(), 1, "{:?}", ids(&cfgs));
         assert_eq!(cfgs[0].engine_type, "zarr");
         assert!(cfgs[0].zarr.is_some());
+    }
+
+    #[test]
+    fn bare_zarray_dir_is_not_a_store() {
+        // `.zarray` marks a V2 array node (a leaf inside a store / a chunk dir),
+        // not a store root — it must NOT be handed to the engine as a store.
+        let root = TempDir::new().unwrap();
+        let arr = root.path().join("some-array");
+        fs::create_dir(&arr).unwrap();
+        touch(&arr, ".zarray");
+
+        let cfgs = scan_roots(&[root.path().to_str().unwrap().to_string()]);
+        assert!(
+            !cfgs.iter().any(|c| c.engine_type == "zarr"),
+            "a bare .zarray dir must not be detected as a zarr store: {:?}",
+            ids(&cfgs)
+        );
     }
 
     #[test]

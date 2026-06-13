@@ -251,7 +251,7 @@ don't collide. **Maps/Tiles `reference_time` query parameter is still a follow-u
 | Engine | Traits | APIs |
 |--------|--------|------|
 | CSV | `EdrEngine` + `FeatureEngine` | EDR (locations only), Features |
-| GeoJSON | `FeatureEngine` | Features |
+| GeoJSON | `FeatureEngine` | Features, Tiles (MVT) |
 | GeoTIFF | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
 | GRIB | `EdrEngine` + `MapEngine` | EDR, WMS, Maps, Tiles |
 | ODIM COMP | `EdrEngine` + `MapEngine` | EDR (position, area), WMS, Maps, Tiles |
