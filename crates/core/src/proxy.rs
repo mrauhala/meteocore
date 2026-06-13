@@ -166,9 +166,32 @@ fn sanitize_host(host: &str) -> Option<&str> {
     if !safe {
         return None;
     }
-    // A bare leading/trailing colon (`:8080`, `example.com:`) is malformed.
-    if host.starts_with(':') || host.ends_with(':') {
-        return None;
+    // Beyond the byte allowlist, validate the authority *structure* so a
+    // malformed header can never yield a broken URL (the module invariant).
+    if host.starts_with('[') {
+        // IPv6 literal: exactly one bracket pair, non-empty contents, and only
+        // an optional `:port` after the closing bracket.
+        if host.matches('[').count() != 1 || host.matches(']').count() != 1 {
+            return None;
+        }
+        let close = host.find(']')?;
+        if close == 1 {
+            return None; // empty `[]`
+        }
+        match &host[close + 1..] {
+            "" => {}
+            rest => validate_port(rest.strip_prefix(':')?).map(|_| ())?,
+        }
+    } else {
+        // Non-bracketed: no stray brackets, and a bare IPv6 (more than one
+        // colon) MUST be bracketed — reject it rather than emit `https://::1`.
+        if host.contains('[') || host.contains(']') || host.matches(':').count() > 1 {
+            return None;
+        }
+        // A bare leading/trailing colon (`:8080`, `example.com:`) is malformed.
+        if host.starts_with(':') || host.ends_with(':') {
+            return None;
+        }
     }
     Some(host)
 }
@@ -412,6 +435,69 @@ mod tests {
             ]),
         );
         assert_eq!(url, "https://[2001:db8::1]:8443");
+    }
+
+    #[test]
+    fn ipv6_literal_host_with_separate_port() {
+        // Bracketed IPv6 with no embedded port + a separate X-Forwarded-Port:
+        // the port is appended after the closing bracket.
+        let url = resolve_base_url(
+            "http://127.0.0.1:8000",
+            true,
+            hdrs(&[
+                ("x-forwarded-host", "[2001:db8::1]"),
+                ("x-forwarded-proto", "https"),
+                ("x-forwarded-port", "8443"),
+            ]),
+        );
+        assert_eq!(url, "https://[2001:db8::1]:8443");
+    }
+
+    #[test]
+    fn bare_unbracketed_ipv6_rejected() {
+        // A literal IPv6 in a URL authority MUST be bracketed; an unbracketed or
+        // malformed one must not yield a broken URL — it falls back.
+        for bad in ["2001:db8::1", "::1", "[2001:db8::1", "2001:db8::1]", "[]"] {
+            let url = resolve_base_url(
+                "http://127.0.0.1:8000",
+                true,
+                hdrs(&[("x-forwarded-host", bad), ("x-forwarded-proto", "https")]),
+            );
+            assert_eq!(
+                url, "http://127.0.0.1:8000",
+                "host {bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_colon_edges_rejected() {
+        for bad in [":8080", "example.com:"] {
+            let url = resolve_base_url(
+                "http://127.0.0.1:8000",
+                true,
+                hdrs(&[("x-forwarded-host", bad), ("x-forwarded-proto", "https")]),
+            );
+            assert_eq!(
+                url, "http://127.0.0.1:8000",
+                "host {bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn http_default_port_not_appended_and_fallback_scheme() {
+        // Covers the http/80 default-port arm and scheme_of's http branch
+        // (no proto + http fallback).
+        let url = resolve_base_url(
+            "http://internal:8000",
+            true,
+            hdrs(&[
+                ("x-forwarded-host", "api.example.com"),
+                ("x-forwarded-port", "80"),
+            ]),
+        );
+        assert_eq!(url, "http://api.example.com");
     }
 
     #[test]
