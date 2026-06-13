@@ -907,9 +907,14 @@ impl OdimEngine {
         let mut computed = false;
         // The fallible form returns a fetch/decode error to *this* caller
         // without inserting (the placeholder is dropped), so a transient read
-        // failure does NOT poison the key — the next request retries it.
+        // failure does NOT poison the key — the next request retries it. The
+        // miss is counted at the TOP of the closure, before the fallible
+        // fetch/decode, so a failed read still registers as a miss rather than
+        // a silent gap in the metric (the `?` below would otherwise skip the
+        // post-call accounting on error).
         let composite = COMPOSITE_CACHE.get_or_insert_with(&key, || {
             computed = true;
+            COMPOSITE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let bytes = fetch_bytes(location)
                 .map_err(|e| DataServerError::Engine(format!("[{}] {e}", self.collection_id)))?;
             let composite = Arc::new(read_composite(&bytes).map_err(|e| {
@@ -920,11 +925,10 @@ impl OdimEngine {
             })?);
             Ok::<_, DataServerError>(composite)
         })?;
-        // The closure running == a genuine miss; otherwise the value came from
-        // the cache (mirrors `voxel_grid_cached`'s hit/miss accounting).
-        if computed {
-            COMPOSITE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        } else {
+        // The closure ran (miss, counted inside) iff `computed`; otherwise the
+        // value came from the cache, so count a hit here. Mirrors
+        // `voxel_grid_cached`'s hit/miss accounting.
+        if !computed {
             COMPOSITE_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(composite)
