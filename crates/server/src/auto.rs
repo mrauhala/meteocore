@@ -201,7 +201,7 @@ fn mk_zarr(dir: &Path) -> Option<CollectionConfig> {
     // Strip a trailing ".zarr" from the store directory name for the id.
     let raw = file_name(dir);
     let stem = raw.strip_suffix(".zarr").unwrap_or(&raw);
-    let id = slugify(stem);
+    let id = slug_id(stem, dir)?;
     Some(mk_collection(
         id,
         "zarr",
@@ -217,7 +217,7 @@ fn mk_zarr(dir: &Path) -> Option<CollectionConfig> {
 fn mk_querydata(dir: &Path, id_hint: &str) -> Option<CollectionConfig> {
     let path = path_str(dir)?;
     Some(mk_collection(
-        slugify(id_hint),
+        slug_id(id_hint, dir)?,
         "querydata",
         vec!["edr".into()],
         Some(path), // querydata reads collection.data_path
@@ -237,7 +237,7 @@ fn mk_grib(
 ) -> Option<CollectionConfig> {
     let path = path_str(dir)?;
     Some(mk_collection(
-        slugify(id_hint),
+        slug_id(id_hint, dir)?,
         "grib",
         vec!["edr".into()],
         None, // grib reads GribConfig.data_path
@@ -255,7 +255,7 @@ fn mk_grib(
 
 fn mk_geojson(file: &Path) -> Option<CollectionConfig> {
     let path = path_str(file)?;
-    let id = slugify(&file_stem(file));
+    let id = slug_id(&file_stem(file), file)?;
     Some(mk_collection(
         id,
         "geojson",
@@ -270,7 +270,7 @@ fn mk_geojson(file: &Path) -> Option<CollectionConfig> {
 
 fn mk_csv(file: &Path) -> Option<CollectionConfig> {
     let path = path_str(file)?;
-    let id = slugify(&file_stem(file));
+    let id = slug_id(&file_stem(file), file)?;
     Some(mk_collection(
         id,
         "csv",
@@ -358,6 +358,25 @@ fn path_str(path: &Path) -> Option<String> {
             );
             None
         }
+    }
+}
+
+/// Slugify `name` into a collection id, or `None` (with a WARN naming the
+/// source path) when it has no URL-safe characters to form an id from — e.g. a
+/// directory named `---` or a file like `.gitkeep`. Returning `None` keeps the
+/// module's skip-rather-than-fail contract instead of letting an `id = ""`
+/// surface as a generic "empty id" `validate()` error.
+fn slug_id(name: &str, source: &Path) -> Option<String> {
+    let id = slugify(name);
+    if id.is_empty() {
+        tracing::warn!(
+            "--auto-collections: skipping {} — its name has no URL-safe characters \
+             for a collection id",
+            source.display()
+        );
+        None
+    } else {
+        Some(id)
     }
 }
 
@@ -556,6 +575,47 @@ mod tests {
             cfgs.is_empty(),
             "phase-2 formats must be skipped: {:?}",
             ids(&cfgs)
+        );
+    }
+
+    #[test]
+    fn name_with_no_url_safe_chars_is_skipped() {
+        let root = TempDir::new().unwrap();
+        // A directory whose name slugifies to "" must be skipped, not yield an
+        // empty-id collection that fails validate() with a generic error.
+        let weird = root.path().join("---");
+        fs::create_dir(&weird).unwrap();
+        touch(&weird, "run.sqd");
+
+        let cfgs = scan_roots(&[root.path().to_str().unwrap().to_string()]);
+        assert!(cfgs.is_empty(), "{:?}", ids(&cfgs));
+    }
+
+    #[test]
+    fn duplicate_ids_rejected_by_validate() {
+        use ds_core::config::ServerConfig;
+        let root = TempDir::new().unwrap();
+        let r = root.path();
+        // Two subdirs that slugify to the same id ("radar-fmi").
+        for name in ["radar-fmi", "radar_fmi"] {
+            let d = r.join(name);
+            fs::create_dir(&d).unwrap();
+            touch(&d, "run.sqd");
+        }
+        let cfgs = scan_roots(&[r.to_str().unwrap().to_string()]);
+        assert_eq!(
+            cfgs.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["radar-fmi", "radar-fmi"],
+            "both names must collapse to the same slug",
+        );
+
+        // The merged set goes through the same validate() as TOML collections,
+        // which rejects duplicate ids — the path that also covers config + auto.
+        let mut config = ServerConfig::default_for_auto();
+        config.collections = cfgs;
+        assert!(
+            config.validate().is_err(),
+            "duplicate collection ids must fail validate()",
         );
     }
 }

@@ -192,18 +192,15 @@ fn parse_cli_args() -> CliArgs {
             s if s.starts_with("--config=") => {
                 config = Some(s["--config=".len()..].to_string());
             }
-            "--auto-collections" | "--auto" => {
+            "--auto-collections" => {
                 let Some(value) = args.next() else {
-                    eprintln!("error: {arg} requires a directory");
+                    eprintln!("error: --auto-collections requires a directory");
                     std::process::exit(2);
                 };
                 auto_collections.push(value);
             }
             s if s.starts_with("--auto-collections=") => {
                 auto_collections.push(s["--auto-collections=".len()..].to_string());
-            }
-            s if s.starts_with("--auto=") => {
-                auto_collections.push(s["--auto=".len()..].to_string());
             }
             other => {
                 eprintln!("error: unknown argument '{other}' (try --help)");
