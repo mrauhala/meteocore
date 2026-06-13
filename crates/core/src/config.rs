@@ -62,6 +62,31 @@ impl ServerSettings {
     }
 }
 
+impl ServerConfig {
+    /// Build a config for the no-config-file boot path: the server is started
+    /// without a `config.toml` (e.g. to be pointed at a directory with no
+    /// config — see #411 auto-collections). Host defaults to loopback and port
+    /// to 8000; when the port is not pinned by config or `--port`, the binary
+    /// auto-scans upward from there for the first free port. Collections and
+    /// style bundles start empty and can be added via reload.
+    pub fn default_for_auto() -> Self {
+        ServerConfig {
+            server: ServerSettings {
+                host: "127.0.0.1".to_string(),
+                port: 8000,
+                base_url: None,
+                admin_token: None,
+                collections_dir: None,
+                metatile_cache_mb: default_metatile_cache_mb(),
+                watch_collections_dir: false,
+                watch_debounce_ms: default_watch_debounce_ms(),
+            },
+            collections: Vec::new(),
+            style_bundles: Vec::new(),
+        }
+    }
+}
+
 /// Deserialize a keyword list, trimming surrounding whitespace from each entry
 /// and dropping exact duplicates (first occurrence wins, order preserved) so
 /// `["radar", "radar"]` can't produce doubled chips / `<Keyword>` elements / JSON
@@ -1744,6 +1769,22 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn default_for_auto_is_loopback_and_empty() {
+        let cfg = ServerConfig::default_for_auto();
+        assert_eq!(cfg.server.host, "127.0.0.1");
+        assert_eq!(cfg.server.port, 8000);
+        assert!(cfg.server.base_url.is_none());
+        assert!(!cfg.server.watch_collections_dir);
+        assert!(cfg.collections.is_empty());
+        assert!(cfg.style_bundles.is_empty());
+        // No BASE_URL env in the test process => derived from host:port.
+        // (Guard against a stray env var in the harness.)
+        if std::env::var("BASE_URL").is_err() {
+            assert_eq!(cfg.server.base_url(), "http://127.0.0.1:8000");
+        }
+    }
 
     fn minimal_collection_toml(id: &str) -> String {
         format!(

@@ -73,14 +73,39 @@ Options:
   --collections <id1,id2,...>   Only load collections with these IDs (comma-separated).
                                 All others are silently skipped. Useful for smoke-testing
                                 a single collection without editing config.toml.
+  --host <HOST>                 Bind host. Overrides [server].host (CLI wins over config).
+  --port <PORT>                 Bind port. Overrides [server].port (CLI wins over config).
+                                Must be 1..=65535.
+  --config <PATH>               Config file path. Overrides the CONFIG_PATH env var and the
+                                ./config.toml default. A path given here that does not exist
+                                is a hard error.
   -h, --help                    Print this help and exit.
+```
+
+Each flag also accepts the `--flag=value` spelling (e.g. `--port=8011`). The
+parser is hand-rolled (no `clap`); `BASE_URL` still wins over `--host`/`--port`
+for generated links.
+
+**No-config boot.** If the default config path (`./config.toml`) is absent **and**
+no `--config` is given, the server starts from built-in defaults — host
+`127.0.0.1`, **auto-selecting the first free port at or above 8000** (scanning up
+to 100 ports) — with no collections (it answers `/health` and an empty
+`/collections`, and can be populated via `POST /admin/collections/reload`). A port
+pinned by config or `--port` is **not** auto-scanned: a bind conflict is fatal.
+This is the base for pointing the server at a directory of data with no
+`config.toml` (auto-collections — see issue #411).
+
+```bash
+server                         # no config.toml present -> 127.0.0.1, first free port >= 8000
+server --port 9000             # explicit port; conflict is fatal (no scan)
+server --config /etc/mc.toml   # explicit config; missing path is an error
 ```
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CONFIG_PATH` | `./config.toml` | Path to the server configuration file |
+| `CONFIG_PATH` | `./config.toml` | Path to the server configuration file (the `--config` flag takes priority) |
 | `LOG_FORMAT` | human-readable | Set to `json` for newline-delimited JSON logs (production / Loki ingestion) |
 | `RUST_LOG` | `info` | Log level filter, e.g. `server=debug,engine_geotiff=warn` |
 | `ADMIN_TOKEN` | _(none — unauthenticated)_ | Bearer token required for `POST /admin/collections/reload`. When unset, the admin endpoint is open. |
