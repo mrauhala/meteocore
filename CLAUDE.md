@@ -765,7 +765,13 @@ are client-controllable; even when enabled, host values are sanitised
 (whitespace/slashes/`@`/non-ASCII rejected), the scheme is restricted to
 `http`/`https`, and only the first value of a comma list is used — a malformed
 header falls through to the next source rather than producing a spoofed URL.
-Enable it only when a trusted proxy sets/overwrites these headers.
+Enable it only when a trusted proxy sets/overwrites these headers. **Ensure the
+proxy strips or overwrites `Forwarded`/`X-Forwarded-*` on untrusted client
+requests, and that clients cannot reach the backend directly** — otherwise a
+client bypassing the proxy could spoof these headers and control the emitted
+self-links (an open-redirect risk for downstream consumers of those links). The
+`Forwarded` parser uses the **last** element specifically because a client can
+pre-inject the first one (RFC 7239 §4 append semantics).
 
 ### Collection Keywords & License
 
