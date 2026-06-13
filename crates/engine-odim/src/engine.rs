@@ -9,8 +9,9 @@
 //!
 //! 1. Picks the catalog entry matching the requested time (or the
 //!    most recent if `time` is `None`).
-//! 2. Loads the composite into a single-entry path-keyed cache
-//!    (subsequent same-file reads avoid disk + HDF5 reparse).
+//! 2. Loads the composite from a process-global path-keyed LRU cache
+//!    (decoded once per file and shared across collections and concurrent
+//!    requests; subsequent same-file reads avoid disk + HDF5 reparse).
 //! 3. Walks the output grid pixel-by-pixel, projecting the WGS84
 //!    or Web-Mercator output coords into the composite's native
 //!    CRS, and samples via nearest-neighbour.
