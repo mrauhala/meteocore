@@ -260,20 +260,54 @@ const EARTH_RADIUS_M: f64 = 6_371_000.0;
 /// isolation — the polar→Cartesian resampler's correctness hinges on
 /// it.
 pub fn ground_distance_bearing(lon0: f64, lat0: f64, lon1: f64, lat1: f64) -> (f64, f64) {
-    let lat0_r = lat0.to_radians();
+    ground_distance_bearing_from(&OriginTrig::new(lon0, lat0), lon1, lat1)
+}
+
+/// Precomputed trig for a fixed origin (e.g. a radar antenna), so a
+/// per-output-pixel sampling loop doesn't recompute the origin's
+/// `to_radians`/`sin`/`cos(lat)` for every pixel — a whole-sweep render shares
+/// one origin across millions of pixels. Down-payment on #268.
+#[derive(Clone, Copy)]
+struct OriginTrig {
+    lon0: f64,
+    lat0: f64,
+    sin_lat0: f64,
+    cos_lat0: f64,
+}
+
+impl OriginTrig {
+    fn new(lon0: f64, lat0: f64) -> Self {
+        let lat0_r = lat0.to_radians();
+        Self {
+            lon0,
+            lat0,
+            sin_lat0: lat0_r.sin(),
+            cos_lat0: lat0_r.cos(),
+        }
+    }
+}
+
+/// [`ground_distance_bearing`] with the origin's trig hoisted out of the
+/// per-pixel hot loop. **Bit-identical** to the inline form: the origin's
+/// `sin`/`cos(lat0)` are precomputed, and `cos(lat1)` is reused within the call
+/// rather than recomputed three times. Trims ~3–4 transcendentals per output
+/// pixel; the full coarse ENU-offset `ProjectionGrid` that removes the rest of
+/// the per-pixel geometry is tracked in #268.
+fn ground_distance_bearing_from(origin: &OriginTrig, lon1: f64, lat1: f64) -> (f64, f64) {
     let lat1_r = lat1.to_radians();
-    let dlat = (lat1 - lat0).to_radians();
-    let dlon = (lon1 - lon0).to_radians();
+    let cos_lat1 = lat1_r.cos();
+    let dlat = (lat1 - origin.lat0).to_radians();
+    let dlon = (lon1 - origin.lon0).to_radians();
 
     // Haversine great-circle distance.
-    let a = (dlat / 2.0).sin().powi(2) + lat0_r.cos() * lat1_r.cos() * (dlon / 2.0).sin().powi(2);
+    let a = (dlat / 2.0).sin().powi(2) + origin.cos_lat0 * cos_lat1 * (dlon / 2.0).sin().powi(2);
     let c = 2.0 * a.sqrt().clamp(0.0, 1.0).asin();
     let distance = EARTH_RADIUS_M * c;
 
     // Initial bearing (forward azimuth): atan2 of the east/north
     // components of the great-circle tangent at the start point.
-    let y = dlon.sin() * lat1_r.cos();
-    let x = lat0_r.cos() * lat1_r.sin() - lat0_r.sin() * lat1_r.cos() * dlon.cos();
+    let y = dlon.sin() * cos_lat1;
+    let x = origin.cos_lat0 * lat1_r.sin() - origin.sin_lat0 * cos_lat1 * dlon.cos();
     let bearing = y.atan2(x).to_degrees().rem_euclid(360.0);
 
     (distance, bearing)
@@ -1780,8 +1814,7 @@ fn sample_sweep_moment_bilinear(
     sweep: &Sweep,
     moment: &PolarMoment,
     pixels: &RawPixels,
-    site_lon: f64,
-    site_lat: f64,
+    origin: &OriginTrig,
     lon: f64,
     lat: f64,
 ) -> Option<f64> {
@@ -1796,7 +1829,7 @@ fn sample_sweep_moment_bilinear(
     if !sweep.rscale.is_finite() || sweep.rscale <= 0.0 {
         return None;
     }
-    let (dist, az) = ground_distance_bearing(site_lon, site_lat, lon, lat);
+    let (dist, az) = ground_distance_bearing_from(origin, lon, lat);
 
     // Fractional bin (ground-range interim). Bin `i` starts at
     // `rstart + i*rscale`, matching the nearest-neighbour `floor` mapping;
@@ -1894,7 +1927,7 @@ fn polar_sample(
         .find(|m| m.quantity == quantity)
         .expect("candidate sweep contains the quantity");
 
-    let (site_lon, site_lat) = (volume.site.lon, volume.site.lat);
+    let origin = OriginTrig::new(volume.site.lon, volume.site.lat);
     if sweep.nrays == 0 || sweep.nbins == 0 {
         return Err(DataServerError::Engine(
             "PVOL lowest sweep has zero rays or bins".into(),
@@ -1920,10 +1953,13 @@ fn polar_sample(
     // `OutputCrs::project_node` directly — covering linear lon/lat, Mercator Y,
     // and projected output CRSs (EPSG:3067/3035) in one place (#160).
     //
-    // For `OutputCrs::Projected` this adds one `Crs::inverse` per pixel on top of
-    // the inherent per-pixel polar geometry. A coarse-grid map (as the gridded
-    // engines use) doesn't drop in cleanly here because the polar sampler is not
-    // a smooth source-pixel function; tracked in #268 if it proves to matter.
+    // The site's trig is hoisted into `origin` once (above) so the per-pixel
+    // `ground_distance_bearing_from` doesn't recompute `sin`/`cos(site_lat)` ~2 M
+    // times. The remaining per-pixel cost (the haversine to the target point, and
+    // for `OutputCrs::Projected` one `Crs::inverse` via `project_node`) is removed
+    // by interpolating a coarse ENU-offset grid — the polar sampler IS smooth in
+    // planar (east, north) metres even though the raw (bin, ray) map has a
+    // seam/antenna-origin singularity — tracked in #268.
     let mut values: Vec<Option<f64>> = Vec::with_capacity((width as usize) * (height as usize));
     for oy in 0..height {
         let frac_y = (oy as f64 + 0.5) / height as f64;
@@ -1940,7 +1976,7 @@ fn polar_sample(
             }
 
             values.push(sample_sweep_moment_bilinear(
-                sweep, moment, &pixels, site_lon, site_lat, lon, lat,
+                sweep, moment, &pixels, &origin, lon, lat,
             ));
         }
     }
@@ -4886,8 +4922,7 @@ mod tests {
             sweep,
             moment,
             &synthetic_raw(),
-            site_lon,
-            site_lat,
+            &OriginTrig::new(site_lon, site_lat),
             lon,
             lat,
         )
@@ -4924,8 +4959,7 @@ mod tests {
             &vol.sweeps[0],
             &vol.sweeps[0].moments[0],
             &synthetic_raw(),
-            site_lon,
-            site_lat,
+            &OriginTrig::new(site_lon, site_lat),
             lon,
             lat
         )
@@ -4937,8 +4971,7 @@ mod tests {
                     &vol.sweeps[0],
                     &vol.sweeps[0].moments[0],
                     &synthetic_raw(),
-                    site_lon,
-                    site_lat,
+                    &OriginTrig::new(site_lon, site_lat),
                     lon,
                     lat
                 )
