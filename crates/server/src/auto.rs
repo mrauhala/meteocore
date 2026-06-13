@@ -17,6 +17,12 @@
 //! The synthesized configs are appended to the live config and run through the
 //! same [`ServerConfig::validate`](ds_core::config::ServerConfig::validate) as
 //! TOML collections (so e.g. duplicate ids are rejected uniformly).
+//!
+//! **Symlinks are followed** (`is_dir`/`is_file` resolve them): a symlinked
+//! subdirectory or data file is scanned like a real one — operators commonly
+//! symlink data into a serving directory. This is the same trust model as
+//! `collections_dir`: whoever can write the scan root already controls what the
+//! server serves, so keep it writable only by trusted principals.
 
 use ds_core::config::{CollectionConfig, GribConfig, QueryDataConfig, ZarrConfig};
 use std::path::Path;
@@ -47,6 +53,12 @@ pub fn scan_roots(roots: &[String]) -> Vec<CollectionConfig> {
 fn scan_one_root(root: &Path) -> Result<Vec<CollectionConfig>, String> {
     if !root.is_dir() {
         return Err(format!("not a directory: {}", root.display()));
+    }
+    // The root may itself be a Zarr store (user pointed --auto-collections at the
+    // store rather than its parent). Detect it before enumerating, so its chunk
+    // subdirectories aren't each mis-scanned as candidate collections.
+    if dir_is_zarr_store(root) {
+        return Ok(mk_zarr(root).into_iter().collect());
     }
     let mut subdirs = Vec::new();
     let mut loose_files = Vec::new();
@@ -113,8 +125,19 @@ fn classify_files(
         return vec![];
     }
 
+    let has_grib_data = files
+        .iter()
+        .any(|f| has_ext(f, "grib2") || has_ext(f, "grb2"));
+
     // 1. QueryData — a directory of .sqd (time + params read from the file).
     if files.iter().any(|f| has_ext(f, "sqd")) {
+        if has_grib_data {
+            tracing::warn!(
+                "--auto-collections: {} has both .sqd and GRIB2 data — using querydata, \
+                 ignoring the GRIB files",
+                dir.display()
+            );
+        }
         return mk_querydata(dir, id_hint).into_iter().collect();
     }
 
@@ -128,9 +151,18 @@ fn classify_files(
     };
     if let Some(data_suffix) = data_suffix {
         // `.index` => ECMWF JSON-lines (engine default); `.idx` => wgrib2.
-        let index = if files.iter().any(|f| has_ext(f, "index")) {
+        let has_index = files.iter().any(|f| has_ext(f, "index"));
+        let has_idx = files.iter().any(|f| has_ext(f, "idx"));
+        if has_index && has_idx {
+            tracing::warn!(
+                "--auto-collections: {} has both .index and .idx sidecars — using .index \
+                 (ecmwf-json)",
+                dir.display()
+            );
+        }
+        let index = if has_index {
             Some((".index", Some("ecmwf-json")))
-        } else if files.iter().any(|f| has_ext(f, "idx")) {
+        } else if has_idx {
             Some((".idx", Some("wgrib2")))
         } else {
             None
@@ -623,6 +655,24 @@ mod tests {
             config.validate().is_err(),
             "duplicate collection ids must fail validate()",
         );
+    }
+
+    #[test]
+    fn root_that_is_itself_a_zarr_store() {
+        // Pointing --auto-collections directly at a Zarr store (marker file, name
+        // not ending in .zarr) yields one zarr collection and does NOT descend
+        // into chunk subdirectories.
+        let root = TempDir::new().unwrap();
+        let r = root.path();
+        touch(r, "zarr.json");
+        let chunk = r.join("c");
+        fs::create_dir(&chunk).unwrap();
+        touch(&chunk, "0.0.0");
+
+        let cfgs = scan_roots(&[r.to_str().unwrap().to_string()]);
+        assert_eq!(cfgs.len(), 1, "{:?}", ids(&cfgs));
+        assert_eq!(cfgs[0].engine_type, "zarr");
+        assert!(cfgs[0].zarr.is_some());
     }
 
     #[test]

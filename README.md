@@ -126,6 +126,13 @@ the same way under the root's name. Detection per directory (first match wins):
 | `*.geojson` | one `geojson` collection **per file** | Features |
 | `*.csv` | one `csv` collection **per file** | EDR + Features; columns are positional: `location,latitude,longitude,time,<params…>` |
 
+Pointing `--auto-collections` directly at a single Zarr store (rather than its
+parent) also works. **Symlinks are followed** — a symlinked subdirectory or data
+file is scanned like a real one (operators commonly symlink data into a serving
+directory). This is the same trust model as `collections_dir`: whoever can write
+the scan root controls what is served, so keep it writable only by trusted
+principals.
+
 **Phase 1 limitations:** raster/grid collections come up **EDR-only** — WMS/Maps/
 Tiles need a colormap that can't be inferred, so configure those via `config.toml`.
 GeoTIFF and ODIM (the filename-timestamped formats) are deferred to phase 2.

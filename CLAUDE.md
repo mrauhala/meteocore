@@ -47,7 +47,9 @@ appended to `config.collections` and run through the same `ServerConfig::validat
 as TOML (duplicate ids rejected). Resolved once at startup (reload does not
 re-scan auto roots in v1). Engine-config defaults come from
 `{QueryData,Grib,Zarr}Config::auto_*` constructors in `ds-core` (reuse the serde
-default fns — keep them DRY).
+default fns — keep them DRY). The root may itself be a Zarr store (not just its
+parent). **Symlinks are followed** (`is_dir`/`is_file` resolve them) — same trust
+model as `collections_dir` (whoever can write the scan root controls what's served).
 
 ### Fuzz testing
 
