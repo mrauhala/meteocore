@@ -21,11 +21,22 @@ use crate::response::{feature_page_to_geojson, feature_to_geojson};
 pub struct FeaturesState {
     pub engines: HashMap<String, Arc<dyn FeatureEngine>>,
     pub collections: HashMap<String, CollectionConfig>,
-    /// Base URL for generating absolute links (e.g. "https://api.example.com").
+    /// Static fallback base URL for absolute links (e.g. "https://api.example.com").
+    /// Used as-is unless `trust_proxy_headers` resolves a per-request value.
     pub base_url: String,
+    /// Honour reverse-proxy forwarding headers when generating self-links (#12).
+    pub trust_proxy_headers: bool,
 }
 
 pub type AppState = Arc<ArcSwap<FeaturesState>>;
+
+/// Resolve the absolute base URL for the current request, honouring reverse-proxy
+/// forwarding headers when `trust_proxy_headers` is enabled (#12).
+fn request_base_url(state: &FeaturesState, headers: &HeaderMap) -> String {
+    ds_core::proxy::resolve_base_url(&state.base_url, state.trust_proxy_headers, |name| {
+        headers.get(name).and_then(|v| v.to_str().ok())
+    })
+}
 
 /// Custom response type for GeoJSON with correct Content-Type.
 pub struct GeoJsonResponse(pub serde_json::Value);
@@ -96,7 +107,7 @@ pub async fn landing_page(
     use ds_core::html::{LinkView, Wanted};
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
     let title = "MeteoCore - Features";
     let description = "Metocean Data Server — OGC API Features";
     // (href, rel, type, title) — one source for both representations.
@@ -166,7 +177,7 @@ pub async fn conformance(
     use ds_core::html::{LinkView, Wanted};
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
     let classes = [
         // OGC API – Common – Part 1: Core and Part 2: Geospatial Data. The
         // Features landing page, /conformance, /api, and
@@ -454,9 +465,9 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
     Json(openapi)
 }
 
-pub async fn api_docs(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn api_docs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let state = state.load_full();
-    let spec_url = format!("{}/features/api", state.base_url);
+    let spec_url = format!("{}/features/api", request_base_url(&state, &headers));
     axum::response::Html(ds_core::openapi::swagger_ui_html(
         "MeteoCore - Features API",
         &spec_url,
@@ -474,7 +485,7 @@ pub async fn collections(
     let wanted = negotiate(sp.f.as_deref(), &headers)?;
     let params = sp.parse().map_err(|e| bad_request_msg(&e.to_string()))?;
     let state = state.load_full();
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
 
     // (id, title, description, bbox, metadata, keywords, license) per
     // collection. Features carry no temporal extent today (`time: None`), so per
@@ -613,7 +624,7 @@ pub async fn collection(
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
     Ok(with_vary(match wanted {
         Wanted::Json => {
             Json(build_collection_metadata(engine.as_ref(), config, base)).into_response()
@@ -648,6 +659,7 @@ pub async fn items(
     Path(id): Path<String>,
     Query(params): Query<ItemsQueryParams>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
@@ -700,13 +712,14 @@ pub async fn items(
         limit,
         offset,
         &timestamp,
-        &state.base_url,
+        &request_base_url(&state, &headers),
     )))
 }
 
 pub async fn item(
     Path((id, feature_id)): Path<(String, String)>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
@@ -725,7 +738,7 @@ pub async fn item(
     Ok(GeoJsonResponse(feature_to_geojson(
         &feature,
         &id,
-        &state.base_url,
+        &request_base_url(&state, &headers),
     )))
 }
 

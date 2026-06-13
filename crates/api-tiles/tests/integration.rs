@@ -184,6 +184,7 @@ fn build_router() -> axum::Router {
         rendered_cache: Arc::new(RenderedCache::new(16)),
         vector_tile_cache: Arc::new(VectorTileCache::new(16)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     api_tiles::router(state)
 }
@@ -244,6 +245,7 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
         rendered_cache: Arc::new(RenderedCache::new(16)),
         vector_tile_cache: Arc::new(VectorTileCache::new(16)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     api_tiles::router(state)
 }
@@ -1064,6 +1066,7 @@ fn build_empty_router() -> axum::Router {
         rendered_cache: Arc::new(RenderedCache::new(16)),
         vector_tile_cache: Arc::new(VectorTileCache::new(16)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     api_tiles::router(state)
 }
@@ -1183,6 +1186,7 @@ fn build_multi_param_router() -> axum::Router {
         rendered_cache: Arc::new(RenderedCache::new(16)),
         vector_tile_cache: Arc::new(VectorTileCache::new(16)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     api_tiles::router(state)
 }
@@ -1381,6 +1385,7 @@ mod mvt {
             rendered_cache: Arc::new(RenderedCache::new(16)),
             vector_tile_cache: Arc::new(VectorTileCache::new(16)),
             base_url: String::new(),
+            trust_proxy_headers: false,
         }));
         api_tiles::router(state)
     }
@@ -1467,6 +1472,7 @@ mod mvt {
             rendered_cache: Arc::new(RenderedCache::new(16)),
             vector_tile_cache: Arc::new(VectorTileCache::new(16)),
             base_url: String::new(),
+            trust_proxy_headers: false,
         }));
         api_tiles::router(state)
     }
@@ -1778,6 +1784,7 @@ mod temporal_grid_jitter {
             rendered_cache: Arc::new(RenderedCache::new(16)),
             vector_tile_cache: Arc::new(VectorTileCache::new(16)),
             base_url: String::new(),
+            trust_proxy_headers: false,
         }));
         let app = api_tiles::router(state);
         let req = Request::builder()
@@ -1947,6 +1954,7 @@ mod metadata_extras {
             rendered_cache: Arc::new(RenderedCache::new(16)),
             vector_tile_cache: Arc::new(VectorTileCache::new(16)),
             base_url: String::new(),
+            trust_proxy_headers: false,
         }));
         api_tiles::router(state)
     }

@@ -123,6 +123,7 @@ fn build_empty_router() -> axum::Router {
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     api_wms::router(state)
 }
@@ -278,6 +279,7 @@ fn build_failing_router() -> axum::Router {
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     api_wms::router(state)
 }
@@ -424,6 +426,7 @@ fn build_populated_router() -> axum::Router {
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     api_wms::router(state)
 }
@@ -788,6 +791,7 @@ fn build_counting_router(
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: tile_cache.clone(),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     (api_wms::router(state), tile_cache, calls)
 }
@@ -1258,6 +1262,7 @@ fn build_forecast_router() -> (axum::Router, RunRecorder) {
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     (api_wms::router(state), calls)
 }
@@ -1694,6 +1699,7 @@ fn build_advancing_router() -> AdvancingFixture {
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     (api_wms::router(state), times, calls)
 }

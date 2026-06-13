@@ -230,6 +230,7 @@ fn router() -> axum::Router {
         )),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     api_3dtiles::router(state)
 }
@@ -492,6 +493,7 @@ async fn voxels_not_advertised_without_coverage() {
         )),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     let app = api_3dtiles::router(state);
     let send = |uri: &str| {
@@ -550,6 +552,7 @@ async fn isosurface_on_unsupported_collection_is_400() {
         )),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     let app = api_3dtiles::router(state);
 
@@ -1001,6 +1004,7 @@ fn router_with(id: &str, engine: Arc<dyn VolumeEngine>) -> axum::Router {
         )),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     api_3dtiles::router(state)
 }

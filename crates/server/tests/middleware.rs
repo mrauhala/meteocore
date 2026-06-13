@@ -127,6 +127,7 @@ fn build_wms_router() -> axum::Router {
         rendered_cache: Arc::new(RenderedCache::new(16)),
         tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     api_wms::router(state)
 }
@@ -326,6 +327,7 @@ mod load_shedding {
             rendered_cache: Arc::new(RenderedCache::new(16)),
             tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
             base_url: String::new(),
+            trust_proxy_headers: false,
         }));
         let app = api_wms::router(state);
 

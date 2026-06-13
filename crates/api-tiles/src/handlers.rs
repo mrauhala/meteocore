@@ -57,10 +57,22 @@ pub struct TilesState {
     pub render_semaphore: Arc<tokio::sync::Semaphore>,
     pub rendered_cache: Arc<RenderedCache>,
     pub vector_tile_cache: Arc<VectorTileCache>,
+    /// Static fallback base URL for absolute links. Used as-is unless
+    /// `trust_proxy_headers` resolves a per-request value.
     pub base_url: String,
+    /// Honour reverse-proxy forwarding headers when generating self-links (#12).
+    pub trust_proxy_headers: bool,
 }
 
 pub type AppState = Arc<ArcSwap<TilesState>>;
+
+/// Resolve the absolute base URL for the current request, honouring reverse-proxy
+/// forwarding headers when `trust_proxy_headers` is enabled (#12).
+fn request_base_url(state: &TilesState, headers: &HeaderMap) -> String {
+    ds_core::proxy::resolve_base_url(&state.base_url, state.trust_proxy_headers, |name| {
+        headers.get(name).and_then(|v| v.to_str().ok())
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -294,7 +306,7 @@ pub async fn landing_page(
     use ds_core::html::{LinkView, Wanted};
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
     let title = "MeteoCore - Tiles";
     let description = "Metocean Data Server \u{2014} OGC API Tiles";
     // (href, rel, type, title) — one source for both representations.
@@ -621,9 +633,9 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
 }
 
 /// GET /tiles/api/docs — Swagger UI
-pub async fn api_docs(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn api_docs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let state = state.load_full();
-    let spec_url = format!("{}/tiles/api", state.base_url);
+    let spec_url = format!("{}/tiles/api", request_base_url(&state, &headers));
     axum::response::Html(ds_core::openapi::swagger_ui_html(
         "MeteoCore - Tiles API",
         &spec_url,
@@ -639,7 +651,7 @@ pub async fn conformance(
     use ds_core::html::{LinkView, Wanted};
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
     let classes = [
         // OGC API - Common - Part 1: Core (landing page, /conformance,
         // /api) and Part 2: Geospatial Data (/collections + /collections/
@@ -682,9 +694,12 @@ pub async fn conformance(
 }
 
 /// GET /tiles/tileMatrixSets — List supported tile matrix sets
-pub async fn tile_matrix_sets(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn tile_matrix_sets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let state = state.load_full();
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
     let sets: Vec<serde_json::Value> = SUPPORTED_TILE_MATRIX_SETS
         .iter()
         .filter_map(|id| {
@@ -739,7 +754,7 @@ pub async fn collections(
         .parse()
         .map_err(|e| TilesError::BadRequest(e.to_string()))?;
     let state = state.load_full();
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
 
     // Surface every tile-enabled collection, regardless of which engine backs
     // it — a vector-only collection that lives in `feature_collections` would
@@ -904,7 +919,7 @@ pub async fn collection(
             "Collection '{id}' has no tile source"
         )));
     }
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
     Ok(with_vary(match wanted {
         Wanted::Json => {
             let styles = state.styles.get(&id);
@@ -947,6 +962,7 @@ pub async fn collection(
 pub async fn collection_tilesets(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, TilesError> {
     let state = state.load_full();
     let raster_info = state.map_engines.get(&id).map(|e| e.raster_info());
@@ -966,7 +982,7 @@ pub async fn collection_tilesets(
             "Collection '{id}' has no tile source"
         )));
     }
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
 
     let max_zoom = params::DEFAULT_MAX_ZOOM;
     let spatial_extent = raster_info

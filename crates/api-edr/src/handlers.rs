@@ -103,11 +103,22 @@ fn with_vary(mut resp: Response) -> Response {
 pub struct EdrState {
     pub engines: HashMap<String, Arc<dyn EdrEngine>>,
     pub collections: HashMap<String, CollectionConfig>,
-    /// Base URL for generating absolute links (e.g. "https://api.example.com").
+    /// Static fallback base URL for absolute links (e.g. "https://api.example.com").
+    /// Used as-is unless `trust_proxy_headers` resolves a per-request value.
     pub base_url: String,
+    /// Honour reverse-proxy forwarding headers when generating self-links (#12).
+    pub trust_proxy_headers: bool,
 }
 
 pub type AppState = Arc<ArcSwap<EdrState>>;
+
+/// Resolve the absolute base URL for the current request, honouring reverse-proxy
+/// forwarding headers when `trust_proxy_headers` is enabled (#12).
+fn request_base_url(state: &EdrState, headers: &HeaderMap) -> String {
+    ds_core::proxy::resolve_base_url(&state.base_url, state.trust_proxy_headers, |name| {
+        headers.get(name).and_then(|v| v.to_str().ok())
+    })
+}
 
 #[allow(clippy::type_complexity)]
 fn lookup_collection<'a>(
@@ -205,7 +216,7 @@ pub async fn landing_page(
     use ds_core::html::{LinkView, Wanted};
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
     let title = "MeteoCore - EDR";
     let description = "Metocean Data Server — OGC API EDR";
     // (href, rel, type, title) — one source for both representations.
@@ -747,9 +758,9 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
     Json(openapi)
 }
 
-pub async fn api_docs(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn api_docs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let state = state.load_full();
-    let spec_url = format!("{}/edr/api", state.base_url);
+    let spec_url = format!("{}/edr/api", request_base_url(&state, &headers));
     axum::response::Html(ds_core::openapi::swagger_ui_html(
         "MeteoCore - EDR API",
         &spec_url,
@@ -764,7 +775,7 @@ pub async fn conformance(
     use ds_core::html::{LinkView, Wanted};
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
     let classes = [
         "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core",
         "http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page",
@@ -812,7 +823,7 @@ pub async fn collections(
     let wanted = negotiate(sp.f.as_deref(), &headers)?;
     let params = sp.parse().map_err(|e| bad_request_msg(&e.to_string()))?;
     let state = state.load_full();
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
 
     // (id, title, description, bbox, time, metadata, keywords, license) per
     // collection. Tuple element types are inferred, so no extra chrono import is
@@ -949,7 +960,7 @@ pub async fn collection(
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
     Ok(with_vary(match wanted {
         Wanted::Json => Json(build_collection_metadata(
             engine.as_ref(),
@@ -989,10 +1000,11 @@ pub async fn collection(
 pub async fn instances(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
     // A non-forecast collection (no instances) returns 200 with an empty
     // `instances` list rather than 404. This is the standard REST list
     // convention and matches `/collections` (empty ⇒ 200 `{"collections":[]}`),
@@ -1028,10 +1040,11 @@ pub async fn instances(
 pub async fn instance(
     Path((id, instance_id)): Path<(String, String)>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
     // A collection with no instances has no instance sub-resources at all, so
     // any id (parseable or not) is 404 — consistent with the query path's
     // `resolve_instance` guard, rather than 400 on an unparseable id.
@@ -1075,6 +1088,7 @@ pub async fn instance(
 pub async fn locations(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
     let (engine, _config) = lookup_collection(&state, &id)?;
@@ -1093,7 +1107,7 @@ pub async fn locations(
         collection_id: &id,
         parameter_names: &params,
         temporal_extent: temporal,
-        base_url: &state.base_url,
+        base_url: &request_base_url(&state, &headers),
     };
     let body = serde_json::to_string(&locations_to_geojson(&locs, &ctx)).unwrap();
     Ok(([(header::CONTENT_TYPE, "application/geo+json")], body))

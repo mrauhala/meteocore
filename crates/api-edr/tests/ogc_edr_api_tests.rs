@@ -209,6 +209,7 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
         engines,
         collections,
         base_url: String::new(),
+        trust_proxy_headers: false,
     }))
 }
 
@@ -225,6 +226,95 @@ async fn get(uri: &str) -> (StatusCode, Value) {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let json: Value = serde_json::from_slice(&body).unwrap();
     (status, json)
+}
+
+// ---------------------------------------------------------------------------
+// Reverse-proxy base-URL resolution (#12)
+// ---------------------------------------------------------------------------
+
+mod proxy_headers {
+    use super::*;
+
+    /// Build a router whose state has an explicit fallback base URL and a
+    /// configurable `trust_proxy_headers` flag.
+    fn router_with(base_url: &str, trust_proxy_headers: bool) -> axum::Router {
+        let engine: Arc<dyn EdrEngine> = Arc::new(MockEngine);
+        let state = make_edr_state(engine);
+        let cur = state.load();
+        state.store(Arc::new(EdrState {
+            engines: cur.engines.clone(),
+            collections: cur.collections.clone(),
+            base_url: base_url.to_string(),
+            trust_proxy_headers,
+        }));
+        api_edr::router(state)
+    }
+
+    /// Fetch the landing page's `self` link href with the given forwarding headers.
+    async fn self_href(app: axum::Router, headers: &[(&str, &str)]) -> String {
+        let mut req = Request::builder().uri("/");
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let resp = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        json["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["rel"] == "self")
+            .expect("landing page has a self link")["href"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn x_forwarded_headers_rewrite_links_when_trusted() {
+        let href = self_href(
+            router_with("http://127.0.0.1:8000", true),
+            &[
+                ("x-forwarded-host", "api.example.com"),
+                ("x-forwarded-proto", "https"),
+            ],
+        )
+        .await;
+        assert_eq!(href, "https://api.example.com/edr/");
+    }
+
+    #[tokio::test]
+    async fn forwarded_header_rewrites_links_when_trusted() {
+        let href = self_href(
+            router_with("http://127.0.0.1:8000", true),
+            &[(
+                "forwarded",
+                "for=192.0.2.1;host=proxy.example.com;proto=https",
+            )],
+        )
+        .await;
+        assert_eq!(href, "https://proxy.example.com/edr/");
+    }
+
+    #[tokio::test]
+    async fn headers_ignored_when_not_trusted() {
+        // The default: a client cannot spoof the base URL.
+        let href = self_href(
+            router_with("http://127.0.0.1:8000", false),
+            &[
+                ("x-forwarded-host", "evil.example.com"),
+                ("x-forwarded-proto", "https"),
+            ],
+        )
+        .await;
+        assert_eq!(href, "http://127.0.0.1:8000/edr/");
+    }
+
+    #[tokio::test]
+    async fn falls_back_without_headers() {
+        let href = self_href(router_with("http://127.0.0.1:8000", true), &[]).await;
+        assert_eq!(href, "http://127.0.0.1:8000/edr/");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1393,6 +1483,7 @@ mod metadata_extras {
             engines,
             collections,
             base_url: String::new(),
+            trust_proxy_headers: false,
         }))
     }
 

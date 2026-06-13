@@ -45,6 +45,14 @@ pub struct ServerSettings {
     /// window coalesce into a single reload. Default: 500.
     #[serde(default = "default_watch_debounce_ms")]
     pub watch_debounce_ms: u64,
+    /// Trust reverse-proxy forwarding headers (`Forwarded`, `X-Forwarded-Proto`,
+    /// `X-Forwarded-Host`, `X-Forwarded-Port`) to derive each request's
+    /// absolute self-link base URL (#12). Default `false`. Enable ONLY when the
+    /// server sits behind a trusted proxy that sets/overwrites these headers —
+    /// otherwise a client could spoof them. When `false`, links use the static
+    /// base URL (`BASE_URL` env > `[server] base_url` > `http://{host}:{port}`).
+    #[serde(default)]
+    pub trust_proxy_headers: bool,
 }
 
 impl ServerSettings {
@@ -80,6 +88,7 @@ impl ServerConfig {
                 metatile_cache_mb: default_metatile_cache_mb(),
                 watch_collections_dir: false,
                 watch_debounce_ms: default_watch_debounce_ms(),
+                trust_proxy_headers: false,
             },
             collections: Vec::new(),
             style_bundles: Vec::new(),

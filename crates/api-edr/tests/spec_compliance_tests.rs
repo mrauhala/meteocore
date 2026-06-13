@@ -137,6 +137,7 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
         engines,
         collections,
         base_url: String::new(),
+        trust_proxy_headers: false,
     }))
 }
 

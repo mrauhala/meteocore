@@ -676,7 +676,8 @@ tracked in #125. **The crate is phased; Phases 1-3 ship today.**
 [server]
 host = "0.0.0.0"
 port = 8000
-# base_url = "https://api.example.com"  # optional, for absolute links behind a proxy
+# base_url = "https://api.example.com"  # optional, static fallback for absolute links behind a proxy
+# trust_proxy_headers = true            # optional, derive per-request link base from proxy headers (default false)
 # collections_dir = "collections.d"     # optional, directory of per-collection .toml files
 # watch_collections_dir = true          # optional, auto-reload on collections_dir changes (default false)
 # watch_debounce_ms = 500               # optional, coalesce-window for the watcher (default 500)
@@ -739,6 +740,31 @@ time_window = "PT12H"
 ```
 
 See config struct definitions in each engine crate and `ds-core/src/config.rs` for all fields.
+
+### Reverse-proxy base URL (`trust_proxy_headers`, #12)
+
+Absolute self-links (landing pages, `collections`, GeoJSON `links`, WMS
+`GetCapabilities` OnlineResource/legend URLs, 3D Tiles docs, …) are built from a
+base URL. By default that base is resolved **once at startup** —
+`BASE_URL` env > `[server] base_url` > `http://{host}:{port}` — and is wrong when
+the server sits behind a reverse proxy (`http://0.0.0.0:8000/edr/...`).
+
+With `[server] trust_proxy_headers = true`, the base URL is instead resolved
+**per request** from the standard forwarding headers, with this precedence:
+
+1. RFC 7239 `Forwarded` (`proto=`/`host=` of the first element),
+2. `X-Forwarded-Proto` + `X-Forwarded-Host` (+ optional `X-Forwarded-Port`),
+3. the static fallback above.
+
+The pure resolver is `ds_core::proxy::resolve_base_url` (framework-free — the
+axum handlers pass header values in via a closure, so ds-core keeps its no-HTTP
+rule); each API handler calls it through a small per-crate `request_base_url`
+helper. **Security:** the flag is `false` by default because forwarding headers
+are client-controllable; even when enabled, host values are sanitised
+(whitespace/slashes/`@`/non-ASCII rejected), the scheme is restricted to
+`http`/`https`, and only the first value of a comma list is used — a malformed
+header falls through to the next source rather than producing a spoofed URL.
+Enable it only when a trusted proxy sets/overwrites these headers.
 
 ### Collection Keywords & License
 

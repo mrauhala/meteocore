@@ -231,6 +231,7 @@ fn state() -> api_edr::handlers::AppState {
         engines,
         collections,
         base_url: String::new(),
+        trust_proxy_headers: false,
     }))
 }
 

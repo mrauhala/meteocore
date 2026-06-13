@@ -176,6 +176,7 @@ fn router_with(engine: Arc<dyn EdrEngine>) -> axum::Router {
         engines,
         collections,
         base_url: String::new(),
+        trust_proxy_headers: false,
     })))
 }
 

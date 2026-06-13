@@ -167,6 +167,7 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     api_maps::router(state)
 }
@@ -241,6 +242,7 @@ fn build_router_with_apis(apis: Vec<String>) -> axum::Router {
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     api_maps::router(state)
 }
@@ -312,6 +314,7 @@ async fn fetch_collection_json(engine: Arc<dyn MapEngine>, id: &str, apis: Vec<S
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     let (_, json) = get_on(api_maps::router(state), &format!("/collections/{id}")).await;
     json
@@ -357,6 +360,7 @@ fn router_with(
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     api_maps::router(state)
 }
@@ -1290,6 +1294,7 @@ fn build_empty_router() -> axum::Router {
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     api_maps::router(state)
 }
@@ -1406,6 +1411,7 @@ fn build_multi_param_router() -> axum::Router {
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     api_maps::router(state)
 }
@@ -1829,6 +1835,7 @@ mod searchable {
             render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             rendered_cache: Arc::new(RenderedCache::new(16)),
             base_url: String::new(),
+            trust_proxy_headers: false,
         }));
         api_maps::router(state)
     }

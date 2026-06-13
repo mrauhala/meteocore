@@ -888,6 +888,7 @@ mod tests {
             engines: HashMap::new(),
             collections: HashMap::new(),
             base_url: String::new(),
+            trust_proxy_headers: false,
         }
     }
 
@@ -896,6 +897,7 @@ mod tests {
             engines: HashMap::new(),
             collections: HashMap::new(),
             base_url: String::new(),
+            trust_proxy_headers: false,
         }
     }
 
@@ -908,6 +910,7 @@ mod tests {
             rendered_cache: Arc::new(ds_render::RenderedCache::new(1)),
             tile_cache: Arc::new(ds_render::TilePixelCache::new(1)),
             base_url: String::new(),
+            trust_proxy_headers: false,
         }
     }
 
@@ -919,6 +922,7 @@ mod tests {
             render_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             rendered_cache: Arc::new(ds_render::RenderedCache::new(1)),
             base_url: String::new(),
+            trust_proxy_headers: false,
         }
     }
 
@@ -933,6 +937,7 @@ mod tests {
             rendered_cache: Arc::new(ds_render::RenderedCache::new(1)),
             vector_tile_cache: Arc::new(ds_mvt::VectorTileCache::new(1)),
             base_url: String::new(),
+            trust_proxy_headers: false,
         }
     }
 
@@ -955,6 +960,7 @@ mod tests {
                 colormap: api_3dtiles::default_point_colormap(),
                 render_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
                 base_url: String::new(),
+                trust_proxy_headers: false,
             })),
             config_path: String::new(),
             health: RwLock::new(Vec::new()),

@@ -24,10 +24,22 @@ pub struct MapsState {
     pub styles: HashMap<String, HashMap<String, StyleInfo>>,
     pub render_semaphore: Arc<tokio::sync::Semaphore>,
     pub rendered_cache: Arc<RenderedCache>,
+    /// Static fallback base URL for absolute links. Used as-is unless
+    /// `trust_proxy_headers` resolves a per-request value.
     pub base_url: String,
+    /// Honour reverse-proxy forwarding headers when generating self-links (#12).
+    pub trust_proxy_headers: bool,
 }
 
 pub type AppState = Arc<ArcSwap<MapsState>>;
+
+/// Resolve the absolute base URL for the current request, honouring reverse-proxy
+/// forwarding headers when `trust_proxy_headers` is enabled (#12).
+fn request_base_url(state: &MapsState, headers: &HeaderMap) -> String {
+    ds_core::proxy::resolve_base_url(&state.base_url, state.trust_proxy_headers, |name| {
+        headers.get(name).and_then(|v| v.to_str().ok())
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -238,7 +250,7 @@ pub async fn landing_page(
     use ds_core::html::{LinkView, Wanted};
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
     let title = "MeteoCore - Maps";
     let description = "Metocean Data Server — OGC API Maps";
     // (href, rel, type, title) — one source for both representations.
@@ -633,9 +645,9 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
 }
 
 /// GET /maps/api/docs — Swagger UI
-pub async fn api_docs(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn api_docs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let state = state.load_full();
-    let spec_url = format!("{}/maps/api", state.base_url);
+    let spec_url = format!("{}/maps/api", request_base_url(&state, &headers));
     axum::response::Html(ds_core::openapi::swagger_ui_html(
         "MeteoCore - Maps API",
         &spec_url,
@@ -651,7 +663,7 @@ pub async fn conformance(
     use ds_core::html::{LinkView, Wanted};
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
     let classes = [
         // OGC API - Common - Part 1: Core (landing page, /conformance,
         // /api) and Part 2: Geospatial Data (/collections + /collections/
@@ -716,7 +728,7 @@ pub async fn collections(
         .parse()
         .map_err(|e| MapsError::BadRequest(e.to_string()))?;
     let state = state.load_full();
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
 
     // (id, title, description, bbox, time, metadata, keywords, license) per
     // collection; tuple element types are inferred (no extra chrono import).
@@ -857,7 +869,7 @@ pub async fn collection(
     let wanted = negotiate(fp.f.as_deref(), &headers)?;
     let state = state.load_full();
     let (engine, config) = lookup_engine(&state, &id)?;
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
     Ok(with_vary(match wanted {
         Wanted::Json => {
             let info = engine.raster_info();
@@ -894,10 +906,11 @@ pub async fn collection(
 pub async fn styles(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, MapsError> {
     let state = state.load_full();
     let (_engine, config) = lookup_engine(&state, &id)?;
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
 
     let mut style_list = Vec::new();
     if let Some(layer_styles) = state.styles.get(&id) {
