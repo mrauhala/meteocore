@@ -79,6 +79,9 @@ Options:
   --config <PATH>               Config file path. Overrides the CONFIG_PATH env var and the
                                 ./config.toml default. A path given here that does not exist
                                 is a hard error.
+  --auto-collections <DIR>      Auto-discover collections from a directory (repeatable).
+                                Synthesizes collections from the data files found, with no
+                                config.toml. zarr/grib/querydata/csv/geojson (see below).
   -h, --help                    Print this help and exit.
 ```
 
@@ -89,17 +92,59 @@ for generated links.
 **No-config boot.** If the default config path (`./config.toml`) is absent **and**
 no `--config` is given, the server starts from built-in defaults — host
 `127.0.0.1`, **auto-selecting the first free port at or above 8000** (scanning up
-to 100 ports) — with no collections (it answers `/health` and an empty
-`/collections`, and can be populated via `POST /admin/collections/reload`). A port
-pinned by config or `--port` is **not** auto-scanned: a bind conflict is fatal.
-This is the base for pointing the server at a directory of data with no
-`config.toml` (auto-collections — see issue #411).
+to 100 ports). With no `--auto-collections` it comes up empty (it answers
+`/health` and an empty `/collections`, and can be populated via
+`POST /admin/collections/reload`). A port pinned by config or `--port` is **not**
+auto-scanned: a bind conflict is fatal.
 
 ```bash
-server                         # no config.toml present -> 127.0.0.1, first free port >= 8000
-server --port 9000             # explicit port; conflict is fatal (no scan)
-server --config /etc/mc.toml   # explicit config; missing path is an error
+server                                 # no config.toml -> 127.0.0.1, first free port >= 8000
+server --port 9000                     # explicit port; conflict is fatal (no scan)
+server --config /etc/mc.toml           # explicit config; missing path is an error
+server --auto-collections ./data       # serve a directory of data with no config.toml
 ```
+
+#### Auto-collections (`--auto-collections <DIR>`)
+
+Point the server at a directory and it **synthesizes collections from the data
+files on disk** — no `config.toml` needed (combine with the no-config boot above
+for a zero-config `server --auto-collections ./data`). The flag is repeatable to
+scan several roots. Synthesized collections are merged with any config-file
+collections and validated together (duplicate ids are rejected).
+
+**Mapping:** each immediate **subdirectory** of a root becomes a collection (id =
+slugified directory name); data files sitting **loose** in the root are grouped
+the same way under the root's name. Detection per directory (first match wins):
+
+| On disk | Becomes | APIs |
+|---------|---------|------|
+| `zarr.json` / `.zgroup` / `.zarray`, or a `*.zarr` dir name | one `zarr` collection | EDR, WMS, Maps, Tiles |
+| `*.sqd` | one `querydata` collection | EDR, WMS, Maps, Tiles; model runs from the files |
+| `*.grib2`/`*.grb2` **with** `*.index`/`*.idx` sidecars | one `grib` collection | EDR, WMS, Maps, Tiles; `index_format` inferred (`.idx`→wgrib2, `.index`→ecmwf-json) |
+| `*.grib2` **without** index sidecars | _(skipped)_ | the GRIB engine needs prebuilt indexes |
+| `*.tif`/`*.tiff` (GeoTIFF), `*.h5`/`*.hdf5` (ODIM) | _(skipped)_ | **phase 2** — needs filename-template inference (#411) |
+| `*.geojson` | one `geojson` collection **per file** | Features, Tiles (MVT) |
+| `*.csv` | one `csv` collection **per file** | EDR, Features; columns are positional: `location,latitude,longitude,time,<params…>` |
+
+Each collection enables **all APIs relevant to its type** so the data is
+browsable in `/preview` (with a parameter selector) out of the box. Raster/grid
+collections (zarr/grib/querydata) render via a **default colormap** when no
+`[wms]` block is configured — the colormap *range* is generic (viridis `0..1`),
+so weather data in physical units renders but with poor colour contrast until you
+add a per-collection `[wms]` colormap with `min`/`max` (or auto-scaling lands,
+[#320](https://github.com/mrauhala/meteocore/issues/320)).
+
+Pointing `--auto-collections` directly at a single Zarr store (rather than its
+parent) also works. **Symlinks are followed** — a symlinked subdirectory or data
+file is scanned like a real one (operators commonly symlink data into a serving
+directory). This is the same trust model as `collections_dir`: whoever can write
+the scan root controls what is served, so keep it writable only by trusted
+principals.
+
+**Phase 1 limitations:** GeoTIFF and ODIM (the filename-timestamped formats) are
+deferred to phase 2. Auto-collections are resolved once at startup;
+`POST /admin/collections/reload` re-reads `config.toml`/`collections_dir` but does
+not re-scan the auto roots.
 
 ### Environment Variables
 
