@@ -128,6 +128,10 @@ fn classify_files(
     let has_grib_data = files
         .iter()
         .any(|f| has_ext(f, "grib2") || has_ext(f, "grb2"));
+    // Co-located single-file formats that a directory-native winner displaces.
+    let has_leaf = files
+        .iter()
+        .any(|f| has_ext(f, "geojson") || has_ext(f, "csv"));
 
     // 1. QueryData — a directory of .sqd (time + params read from the file).
     if files.iter().any(|f| has_ext(f, "sqd")) {
@@ -137,6 +141,9 @@ fn classify_files(
                  ignoring the GRIB files",
                 dir.display()
             );
+        }
+        if has_leaf {
+            warn_ignored_leaf(dir, "querydata");
         }
         return mk_querydata(dir, id_hint).into_iter().collect();
     }
@@ -168,9 +175,28 @@ fn classify_files(
             None
         };
         return match index {
-            Some((index_suffix, fmt)) => mk_grib(dir, id_hint, index_suffix, data_suffix, fmt)
-                .into_iter()
-                .collect(),
+            // The engine pairs index <-> data by basename (X.index <-> X.grib2),
+            // so the chosen suffixes must actually share a basename. A directory
+            // mixing suffixes (e.g. a.grib2 + b.grb2 + b.idx) picks .grib2 + .idx,
+            // which never pair — skip with a clear warning rather than load a
+            // silently-empty collection.
+            Some((index_suffix, fmt)) => {
+                if index_pairs_with_data(files, index_suffix, data_suffix) {
+                    if has_leaf {
+                        warn_ignored_leaf(dir, "grib");
+                    }
+                    mk_grib(dir, id_hint, index_suffix, data_suffix, fmt)
+                        .into_iter()
+                        .collect()
+                } else {
+                    tracing::warn!(
+                        "--auto-collections: {} GRIB {data_suffix} data and {index_suffix} \
+                         sidecars share no common basename (mixed/mismatched files) — skipping",
+                        dir.display()
+                    );
+                    vec![]
+                }
+            }
             None => {
                 tracing::warn!(
                     "--auto-collections: {} has GRIB2 data but no .index/.idx sidecars — \
@@ -244,9 +270,15 @@ fn classify_files(
 
 fn mk_zarr(dir: &Path) -> Option<CollectionConfig> {
     let path = path_str(dir)?;
-    // Strip a trailing ".zarr" from the store directory name for the id.
+    // Strip a trailing ".zarr" from the store directory name for the id —
+    // case-insensitively, to match `dir_is_zarr_store`'s detection (else a dir
+    // named `Era5.Zarr` is detected as a store but keeps `.zarr` in its id).
     let raw = file_name(dir);
-    let stem = raw.strip_suffix(".zarr").unwrap_or(&raw);
+    let stem = if raw.to_ascii_lowercase().ends_with(".zarr") {
+        &raw[..raw.len() - ".zarr".len()]
+    } else {
+        &raw
+    };
     let id = slug_id(stem, dir)?;
     Some(mk_collection(
         id,
@@ -374,6 +406,36 @@ fn dir_is_zarr_store(dir: &Path) -> bool {
     file_name(dir).to_ascii_lowercase().ends_with(".zarr")
         || dir.join("zarr.json").exists()
         || dir.join(".zgroup").exists()
+}
+
+/// True if at least one `<base><index_suffix>` file has a sibling
+/// `<base><data_suffix>` file — i.e. the chosen index/data suffixes actually pair
+/// by basename, the way the GRIB engine matches them (X.index <-> X.grib2).
+fn index_pairs_with_data(
+    files: &[std::path::PathBuf],
+    index_suffix: &str,
+    data_suffix: &str,
+) -> bool {
+    let data_bases: std::collections::HashSet<&str> = files
+        .iter()
+        .filter_map(|f| f.file_name().and_then(|n| n.to_str()))
+        .filter_map(|n| n.strip_suffix(data_suffix))
+        .collect();
+    files
+        .iter()
+        .filter_map(|f| f.file_name().and_then(|n| n.to_str()))
+        .filter_map(|n| n.strip_suffix(index_suffix))
+        .any(|base| data_bases.contains(base))
+}
+
+/// Warn that co-located `.geojson`/`.csv` files were ignored because a
+/// directory-native engine claimed the directory (first-match-wins).
+fn warn_ignored_leaf(dir: &Path, winner: &str) {
+    tracing::warn!(
+        "--auto-collections: {} has co-located .geojson/.csv files — ignored \
+         ({winner} took the directory)",
+        dir.display()
+    );
 }
 
 fn has_ext(path: &Path, ext: &str) -> bool {
@@ -552,6 +614,56 @@ mod tests {
         assert_eq!(g.index_suffix.as_deref(), Some(".idx"));
         assert_eq!(g.data_suffix.as_deref(), Some(".grib2"));
         assert!(g.data_path.is_some());
+    }
+
+    #[test]
+    fn grib_with_mismatched_suffixes_is_skipped() {
+        // a.grib2 has no index; b uses .grb2 + .idx. The chosen suffixes
+        // (.grib2 + .idx) never share a basename, so don't load an empty grib.
+        let root = TempDir::new().unwrap();
+        let d = root.path().join("mix");
+        fs::create_dir(&d).unwrap();
+        touch(&d, "a.grib2");
+        touch(&d, "b.grb2");
+        touch(&d, "b.idx");
+
+        let cfgs = scan_roots(&[root.path().to_str().unwrap().to_string()]);
+        assert!(
+            !cfgs.iter().any(|c| c.engine_type == "grib"),
+            "mismatched grib suffixes must skip, not load empty: {:?}",
+            ids(&cfgs)
+        );
+    }
+
+    #[test]
+    fn grib_wins_over_colocated_csv() {
+        // A directory-native winner (grib) claims the dir; a stray .csv is
+        // dropped (warned), not turned into its own collection.
+        let root = TempDir::new().unwrap();
+        let d = root.path().join("ec");
+        fs::create_dir(&d).unwrap();
+        touch(&d, "run.grib2");
+        touch(&d, "run.index");
+        touch(&d, "stray.csv");
+
+        let cfgs = scan_roots(&[root.path().to_str().unwrap().to_string()]);
+        let got = ids(&cfgs);
+        assert!(got.contains(&("ec".into(), "grib".into())), "{got:?}");
+        assert!(!got.iter().any(|(_, e)| e == "csv"), "{got:?}");
+    }
+
+    #[test]
+    fn zarr_suffix_stripped_case_insensitively() {
+        // `Era5.Zarr` is detected as a store (case-insensitive) and its id must
+        // drop the suffix the same way → "era5", not "era5-zarr".
+        let root = TempDir::new().unwrap();
+        let store = root.path().join("Era5.Zarr");
+        fs::create_dir(&store).unwrap();
+        touch(&store, ".zgroup");
+
+        let cfgs = scan_roots(&[root.path().to_str().unwrap().to_string()]);
+        let z = cfgs.iter().find(|c| c.engine_type == "zarr").unwrap();
+        assert_eq!(z.id, "era5", "id was {:?}", z.id);
     }
 
     #[test]
