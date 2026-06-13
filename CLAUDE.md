@@ -13,6 +13,24 @@ cargo run -p server          # Start server (reads config.toml)
 cargo check -p <crate>       # Type-check a single crate
 ```
 
+### Server CLI flags
+
+The `server` binary takes a small hand-rolled set of flags (no `clap`), each
+also accepting `--flag=value` (see `parse_cli_args` in `server/src/main.rs`):
+
+- `--collections <id1,id2,…>` — only load these collection IDs.
+- `--host <HOST>` / `--port <PORT>` — override `[server].host`/`port` (CLI wins
+  over config). `BASE_URL` still wins for link generation.
+- `--config <PATH>` — config file path (wins over `CONFIG_PATH` env, then
+  `./config.toml`). A missing `--config` path is a hard error.
+
+**No-config boot:** if the default config path is absent **and** no `--config`
+is given, the server starts from built-in defaults — host `127.0.0.1`, and it
+**auto-scans for the first free port at/above 8000** (up to 100 ports) — with no
+collections. A port pinned by config or `--port` does **not** auto-scan: a bind
+conflict is fatal. This is the base for pointing the server at a directory with
+no `config.toml` (auto-collections, #411).
+
 ### Fuzz testing
 
 Fuzz targets live in `fuzz/` (separate from workspace, uses `cargo-fuzz` + `libfuzzer`). Requires nightly.

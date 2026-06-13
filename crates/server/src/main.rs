@@ -89,17 +89,33 @@ struct CliArgs {
     /// all others are silently skipped. Useful for smoke-testing a single
     /// collection without editing `config.toml`.
     collections: Option<Vec<String>>,
+    /// Override `[server].host`. Takes priority over config.
+    host: Option<String>,
+    /// Override `[server].port`. Takes priority over config. When neither this
+    /// nor a config file is present, the binary auto-scans for a free port
+    /// starting at the default (8000).
+    port: Option<u16>,
+    /// Path to the config file. Takes priority over the `CONFIG_PATH` env var
+    /// and the `./config.toml` default. A path given here that does not exist
+    /// is a hard error (unlike the default path, which falls back to built-in
+    /// defaults when absent).
+    config: Option<String>,
 }
 
-/// Very small hand-rolled argv parser — the server only has a couple of
+/// Very small hand-rolled argv parser — the server only has a handful of
 /// flags, so pulling in clap would be overkill.
 ///
-/// Supported forms:
-///   --collections=id1,id2
+/// Supported forms (each flag also accepts the `--flag=value` spelling):
 ///   --collections id1,id2
+///   --host 0.0.0.0
+///   --port 8011
+///   --config /etc/meteocore/config.toml
 ///   -h / --help
 fn parse_cli_args() -> CliArgs {
     let mut collections: Option<Vec<String>> = None;
+    let mut host: Option<String> = None;
+    let mut port: Option<u16> = None;
+    let mut config: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -109,10 +125,17 @@ fn parse_cli_args() -> CliArgs {
                      \n\
                      Options:\n  \
                        --collections <id1,id2,...>   Only load collections with these IDs\n  \
+                       --host <HOST>                 Bind host (overrides [server].host)\n  \
+                       --port <PORT>                 Bind port (overrides [server].port)\n  \
+                       --config <PATH>               Config file path (overrides CONFIG_PATH)\n  \
                        -h, --help                    Show this help\n\
                      \n\
+                     With no config file and no --port, the server binds localhost\n  \
+                     and auto-selects the first free port at or above 8000.\n\
+                     \n\
                      Environment:\n  \
-                       CONFIG_PATH    Path to config.toml (default: ./config.toml)\n  \
+                       CONFIG_PATH    Path to config.toml (default: ./config.toml; --config wins)\n  \
+                       BASE_URL       External base URL for links (wins over --host/--port)\n  \
                        LOG_FORMAT     'json' for structured logs (default: human-readable)\n  \
                        RUST_LOG       Log filter (default: info)\n  \
                        ADMIN_TOKEN    Bearer token for admin endpoints"
@@ -130,13 +153,88 @@ fn parse_cli_args() -> CliArgs {
                 let list = &s["--collections=".len()..];
                 collections = Some(parse_collection_list(list));
             }
+            "--host" => {
+                let Some(value) = args.next() else {
+                    eprintln!("error: --host requires a value");
+                    std::process::exit(2);
+                };
+                host = Some(value);
+            }
+            s if s.starts_with("--host=") => {
+                host = Some(s["--host=".len()..].to_string());
+            }
+            "--port" => {
+                let Some(value) = args.next() else {
+                    eprintln!("error: --port requires a value");
+                    std::process::exit(2);
+                };
+                port = Some(parse_port(&value));
+            }
+            s if s.starts_with("--port=") => {
+                port = Some(parse_port(&s["--port=".len()..]));
+            }
+            "--config" => {
+                let Some(value) = args.next() else {
+                    eprintln!("error: --config requires a value");
+                    std::process::exit(2);
+                };
+                config = Some(value);
+            }
+            s if s.starts_with("--config=") => {
+                config = Some(s["--config=".len()..].to_string());
+            }
             other => {
                 eprintln!("error: unknown argument '{other}' (try --help)");
                 std::process::exit(2);
             }
         }
     }
-    CliArgs { collections }
+    CliArgs {
+        collections,
+        host,
+        port,
+        config,
+    }
+}
+
+/// Parse a `--port` value, exiting with code 2 on anything that isn't a valid
+/// TCP port (1..=65535). `u16::from_str` already rejects negatives and values
+/// above 65535; we additionally reject 0 (not a bindable listen port).
+fn parse_port(s: &str) -> u16 {
+    match s.trim().parse::<u16>() {
+        Ok(p) if p > 0 => p,
+        _ => {
+            eprintln!("error: --port must be a number in 1..=65535 (got '{s}')");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Number of consecutive ports to try when auto-selecting a free one.
+const AUTO_PORT_SCAN: u16 = 100;
+
+/// Bind `host` on the first free port at or above `start`, scanning up to
+/// [`AUTO_PORT_SCAN`] ports. Returns the listener and the address it bound.
+///
+/// Only "address in use" advances to the next port; any other bind error
+/// (permission denied, unresolvable host, …) won't be fixed by trying another
+/// port, so it stops and returns `None`.
+async fn bind_auto_port(host: &str, start: u16) -> Option<(tokio::net::TcpListener, String)> {
+    for offset in 0..AUTO_PORT_SCAN {
+        let port = start.checked_add(offset)?;
+        let addr = format!("{host}:{port}");
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => return Some((listener, addr)),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                tracing::debug!("Port {port} in use, trying next");
+            }
+            Err(e) => {
+                tracing::error!("Failed to bind {addr}: {e}");
+                return None;
+            }
+        }
+    }
+    None
 }
 
 fn parse_collection_list(s: &str) -> Vec<String> {
@@ -152,14 +250,43 @@ async fn main() {
 
     let cli = parse_cli_args();
 
-    let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
-    let (mut config, config_warnings) = match ds_core::config::ServerConfig::from_file(&config_path)
-    {
-        Ok(result) => result,
-        Err(e) => {
-            tracing::error!("Failed to load {}: {}", config_path, e);
-            std::process::exit(1);
+    // Resolve the config path: --config flag > CONFIG_PATH env > ./config.toml.
+    let config_path = cli
+        .config
+        .clone()
+        .or_else(|| std::env::var("CONFIG_PATH").ok())
+        .unwrap_or_else(|| "config.toml".to_string());
+
+    // Whether a config file is actually present drives the no-config boot path
+    // (built-in defaults + auto-port) and whether an all-failed load is fatal.
+    let config_present = std::path::Path::new(&config_path).exists();
+
+    let (mut config, config_warnings) = if config_present {
+        match ds_core::config::ServerConfig::from_file(&config_path) {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!("Failed to load {}: {}", config_path, e);
+                std::process::exit(1);
+            }
         }
+    } else if cli.config.is_some() {
+        // An explicitly requested config file that doesn't exist is a hard
+        // error — don't silently ignore a typo'd --config path.
+        tracing::error!("Config file not found: {}", config_path);
+        std::process::exit(1);
+    } else {
+        // No config file at the default path and none requested: boot from
+        // built-in defaults (localhost + auto-selected port, no collections).
+        // This is the base for pointing the server at a directory with no
+        // config.toml (auto-collections, #411).
+        tracing::warn!(
+            "No config file at '{config_path}'; starting with built-in defaults \
+             (localhost, auto-selected port, no collections)."
+        );
+        (
+            ds_core::config::ServerConfig::default_for_auto(),
+            Vec::new(),
+        )
     };
     for warning in &config_warnings {
         tracing::warn!("{warning}");
@@ -195,21 +322,53 @@ async fn main() {
         );
     }
 
-    let base_url = config.server.base_url();
-    info!("Base URL: {base_url}");
+    // CLI host/port overrides take priority over config.
+    if let Some(host) = &cli.host {
+        config.server.host = host.clone();
+    }
+    if let Some(port) = cli.port {
+        config.server.port = port;
+    }
+
+    // The port is "pinned" when it comes from a config file or an explicit
+    // --port: bind exactly that, and a conflict is fatal. With neither (the
+    // no-config-file boot), auto-scan upward from the default for a free port.
+    let port_pinned = config_present || cli.port.is_some();
 
     // Bind the listen socket before loading collections: engine
     // construction runs synchronous S3/disk scans that can take
     // minutes, so a port conflict must fail fast rather than after
     // that whole load. The listener is held until `axum::serve`.
-    let addr = format!("{}:{}", config.server.host, config.server.port);
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            tracing::error!("Failed to bind {addr}: {e}");
-            std::process::exit(1);
+    let host = config.server.host.clone();
+    let (listener, addr) = if port_pinned {
+        let addr = format!("{host}:{}", config.server.port);
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => (listener, addr),
+            Err(e) => {
+                tracing::error!("Failed to bind {addr}: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match bind_auto_port(&host, config.server.port).await {
+            Some(bound) => bound,
+            None => {
+                tracing::error!(
+                    "Failed to find a free port for {host} starting at {} (tried {AUTO_PORT_SCAN})",
+                    config.server.port
+                );
+                std::process::exit(1);
+            }
         }
     };
+    // Reflect the actually-bound port back into config so base_url() and any
+    // downstream use see the real value (the auto-scan may have moved it).
+    if let Ok(local) = listener.local_addr() {
+        config.server.port = local.port();
+    }
+
+    let base_url = config.server.base_url();
+    info!("Base URL: {base_url}");
     // The socket is bound + listening from here, but HTTP is not served
     // until `axum::serve` below — keep the message explicit so a
     // log-watching operator isn't misled. (A TCP-only readiness probe
@@ -230,17 +389,28 @@ async fn main() {
         .count();
 
     if loaded == 0 {
-        tracing::error!(
-            "No collections loaded successfully ({} configured). Refusing to start an empty server.",
+        if config.collections.is_empty() {
+            // Nothing was configured to fail — a legitimately empty server
+            // (e.g. the no-config-file boot). Start it: it answers /health and
+            // an empty /collections, and can be populated via reload.
+            tracing::warn!(
+                "Starting with no collections. The server responds to /health and an empty \
+                 /collections; add collections via config + POST /admin/collections/reload."
+            );
+        } else {
+            tracing::error!(
+                "No collections loaded successfully ({} configured). Refusing to start an empty server.",
+                config.collections.len()
+            );
+            std::process::exit(1);
+        }
+    } else {
+        info!(
+            "Loaded {}/{} collections successfully",
+            loaded,
             config.collections.len()
         );
-        std::process::exit(1);
     }
-    info!(
-        "Loaded {}/{} collections successfully",
-        loaded,
-        config.collections.len()
-    );
 
     // Spawn poll loops on the dedicated background runtime so their blocking
     // I/O never parks a request-serving worker (#221).
@@ -633,4 +803,53 @@ async fn root_landing_page(state: AdminState) -> impl IntoResponse {
             }
         ]
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_collection_list_trims_and_drops_empties() {
+        assert_eq!(parse_collection_list("a, b ,,c"), vec!["a", "b", "c"]);
+        assert!(parse_collection_list("  ,  ").is_empty());
+    }
+
+    #[test]
+    fn parse_port_accepts_valid() {
+        assert_eq!(parse_port("8080"), 8080);
+        assert_eq!(parse_port(" 1 "), 1);
+        assert_eq!(parse_port("65535"), 65535);
+    }
+
+    #[tokio::test]
+    async fn bind_auto_port_picks_start_when_free() {
+        // Grab a free port from the OS, release it, then confirm the scan
+        // binds exactly that one when it's available.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let free = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let (listener, addr) = bind_auto_port("127.0.0.1", free)
+            .await
+            .expect("should bind the free start port");
+        assert_eq!(listener.local_addr().unwrap().port(), free);
+        assert_eq!(addr, format!("127.0.0.1:{free}"));
+    }
+
+    #[tokio::test]
+    async fn bind_auto_port_skips_used_port() {
+        // Hold a port, then confirm the scan moves past it to a higher one.
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let start = held.local_addr().unwrap().port();
+
+        let (listener, _addr) = bind_auto_port("127.0.0.1", start)
+            .await
+            .expect("should find a free port above the held one");
+        let chosen = listener.local_addr().unwrap().port();
+        assert!(
+            chosen > start,
+            "expected a port above {start}, got {chosen}"
+        );
+    }
 }
