@@ -4839,7 +4839,9 @@ mod tests {
     /// sampler within its sub-bin error budget — the projection optimisation is
     /// numerically faithful, not merely "renders something". The synthetic raw
     /// value equals the bin index, so a ≤ 0.2-bin position error bounds the
-    /// value error.
+    /// value error. Checked on both the linear `Wgs84` axes and the non-linear
+    /// `WebMercator` axes (the production web-client CRS, where `out_to_world`
+    /// curves and the adaptive grid has to refine hardest).
     #[test]
     fn polar_sample_grid_matches_per_pixel_reference() {
         let (site_lon, site_lat) = (25.0, 60.0);
@@ -4858,43 +4860,60 @@ mod tests {
             site_lat + 0.5,
         ];
         let (w, h) = (40u32, 40u32);
-        let tile = polar_sample(
-            &vol,
-            TEST_FILE,
-            test_pixels(),
-            "DBZH",
-            bbox,
-            w,
-            h,
-            &OutputCrs::Wgs84,
-            None,
-        )
-        .unwrap();
 
-        let mut max_diff = 0.0_f64;
-        let mut compared = 0usize;
-        for oy in 0..h {
-            for ox in 0..w {
-                let frac_x = (ox as f64 + 0.5) / w as f64;
-                let frac_y = (oy as f64 + 0.5) / h as f64;
-                let (lon, lat) = OutputCrs::Wgs84.project_node(bbox, frac_x, frac_y);
-                let reference =
-                    sample_sweep_moment_bilinear(sweep, moment, &raw, &origin, lon, lat);
-                let grid = tile.values[(oy * w + ox) as usize];
-                if let (Some(g), Some(r)) = (grid, reference) {
-                    max_diff = max_diff.max((g - r).abs());
-                    compared += 1;
+        for (label, output_crs) in [
+            ("Wgs84", OutputCrs::Wgs84),
+            ("WebMercator", OutputCrs::WebMercator),
+        ] {
+            let tile = polar_sample(
+                &vol,
+                TEST_FILE,
+                test_pixels(),
+                "DBZH",
+                bbox,
+                w,
+                h,
+                &output_crs,
+                None,
+            )
+            .unwrap();
+
+            let mut max_diff = 0.0_f64;
+            let mut compared = 0usize;
+            // Pixels the per-pixel reference samples but the grid drops: a coarse
+            // grid must not shrink coverage (beyond a ≤ 1-bin boundary slop).
+            let mut grid_dropped = 0usize;
+            for oy in 0..h {
+                for ox in 0..w {
+                    let frac_x = (ox as f64 + 0.5) / w as f64;
+                    let frac_y = (oy as f64 + 0.5) / h as f64;
+                    let (lon, lat) = output_crs.project_node(bbox, frac_x, frac_y);
+                    let reference =
+                        sample_sweep_moment_bilinear(sweep, moment, &raw, &origin, lon, lat);
+                    let grid = tile.values[(oy * w + ox) as usize];
+                    match (grid, reference) {
+                        (Some(g), Some(r)) => {
+                            max_diff = max_diff.max((g - r).abs());
+                            compared += 1;
+                        }
+                        (None, Some(_)) => grid_dropped += 1,
+                        _ => {}
+                    }
                 }
             }
+            assert!(
+                compared > 100,
+                "{label}: most pixels should sample in both paths, got {compared}"
+            );
+            assert!(
+                max_diff < 0.5,
+                "{label}: grid vs per-pixel reference max value diff {max_diff} exceeds budget"
+            );
+            assert!(
+                grid_dropped <= 2,
+                "{label}: grid dropped {grid_dropped} pixels the reference sampled"
+            );
         }
-        assert!(
-            compared > 100,
-            "most pixels should sample in both paths, got {compared}"
-        );
-        assert!(
-            max_diff < 0.5,
-            "grid vs per-pixel reference max value diff {max_diff} exceeds budget"
-        );
     }
 
     /// A pixel beyond the sweep's maximum range samples `None`.
