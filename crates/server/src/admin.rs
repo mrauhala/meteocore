@@ -2153,8 +2153,14 @@ fn register_parameter_layer_styles(
         // at their dBZ value and track trails at a reserved sentinel; wrap
         // whatever colormap it resolves to so the sentinel renders one neutral
         // colour (distinct from the dBZ-coloured outlines) regardless of the
-        // base colormap (inherited or overridden).
-        let is_cells = short_name == engine_odim::cells::CELLS_PARAMETER;
+        // base colormap (inherited or overridden). Scoped to `odim-volume` —
+        // this generic helper runs for every engine, and only the ODIM PVOL
+        // engine produces a CELLS overlay; without the engine-type gate a
+        // non-ODIM collection with a band coincidentally named `CELLS` would
+        // get `-9999.0` hijacked to grey (#410 will remove the engine-specific
+        // branch entirely via an `OverlaySpec` on `StyleInfo`).
+        let is_cells = collection.engine_type == "odim-volume"
+            && short_name == engine_odim::cells::CELLS_PARAMETER;
         let wrap_cells = |cmap: Arc<dyn ds_render::ColorMap>| -> Arc<dyn ds_render::ColorMap> {
             if is_cells {
                 Arc::new(ds_render::OverlayColorMap::new(
