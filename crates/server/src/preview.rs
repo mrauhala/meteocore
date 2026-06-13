@@ -229,9 +229,17 @@ impl ManifestParams {
 pub async fn manifest_handler(
     State(state): State<AdminState>,
     Query(params): Query<ManifestParams>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let (offset, limit) = params.resolved();
-    let manifest = build_manifest(&state, offset, limit);
+    // Resolve the link base per request so the emitted tile-URL templates honour
+    // reverse-proxy forwarding headers (#12), matching the OGC API handlers.
+    let tiles = state.tiles.load_full();
+    let base_url =
+        ds_core::proxy::resolve_base_url(&tiles.base_url, tiles.trust_proxy_headers, |name| {
+            headers.get(name).and_then(|v| v.to_str().ok())
+        });
+    let manifest = build_manifest_with_base(&state, &base_url, offset, limit);
 
     // Size guard — log only, never reject; pagination defaults already prevent
     // pathological responses, and the soft warn lets operators see drift early.
@@ -289,21 +297,35 @@ pub async fn manifest_handler(
 /// once all five `ArcSwap`s settle. This is an accepted trade-off of
 /// the per-API `ArcSwap` pattern — wrapping all five in a single outer
 /// `ArcSwap` would fix it but is out of scope for this PR.
+#[cfg(test)]
 pub(crate) fn build_manifest(state: &AdminState, offset: usize, limit: usize) -> Value {
+    // Tests and any non-HTTP caller get the static startup base URL. The HTTP
+    // handler uses `build_manifest_with_base` with a per-request,
+    // reverse-proxy-aware base so tile URL templates are correct behind a proxy
+    // (#12).
+    //
+    // All five `*State.base_url` fields are initialised from the same
+    // `config.server.base_url()` at load time, so `tiles.base_url` is correct;
+    // sourcing it from `tiles` makes the dependency explicit (this builds tile
+    // URL templates), and keeps a tile-only deployment correct if per-API
+    // base-URL overrides ever land.
+    let base_url = state.tiles.load_full().base_url.clone();
+    build_manifest_with_base(state, &base_url, offset, limit)
+}
+
+/// As [`build_manifest`], but with an explicit, already-resolved link base URL
+/// — the per-request, reverse-proxy-aware value computed by `manifest_handler`.
+pub(crate) fn build_manifest_with_base(
+    state: &AdminState,
+    base_url: &str,
+    offset: usize,
+    limit: usize,
+) -> Value {
     let edr = state.edr.load_full();
     let features = state.features.load_full();
     let maps = state.maps.load_full();
     let tiles = state.tiles.load_full();
     let wms = state.wms.load_full();
-
-    // All five `*State.base_url` fields are initialised from the same
-    // `config.server.base_url()` at load time, so any of them is correct
-    // in practice. Sourcing from `tiles.base_url` makes the dependency
-    // explicit: this function builds tile URL templates, so it reads
-    // base_url from the state that owns those URLs. A tile-only
-    // deployment with no EDR collections would now stay correct if
-    // per-API base-URL overrides ever land.
-    let base_url = tiles.base_url.clone();
 
     // Build the canonical id ordering: union of all *State.collections keys,
     // sorted lexicographically. Stable across reloads when configs are stable.
@@ -321,7 +343,7 @@ pub(crate) fn build_manifest(state: &AdminState, offset: usize, limit: usize) ->
 
     let entries: Vec<Value> = returned
         .into_iter()
-        .map(|id| build_entry(id, &base_url, &edr, &features, &maps, &tiles, &wms))
+        .map(|id| build_entry(id, base_url, &edr, &features, &maps, &tiles, &wms))
         .collect();
 
     let next = if offset + returned_count < total {
@@ -888,6 +910,7 @@ mod tests {
             engines: HashMap::new(),
             collections: HashMap::new(),
             base_url: String::new(),
+            trust_proxy_headers: false,
         }
     }
 
@@ -896,6 +919,7 @@ mod tests {
             engines: HashMap::new(),
             collections: HashMap::new(),
             base_url: String::new(),
+            trust_proxy_headers: false,
         }
     }
 
@@ -908,6 +932,7 @@ mod tests {
             rendered_cache: Arc::new(ds_render::RenderedCache::new(1)),
             tile_cache: Arc::new(ds_render::TilePixelCache::new(1)),
             base_url: String::new(),
+            trust_proxy_headers: false,
         }
     }
 
@@ -919,6 +944,7 @@ mod tests {
             render_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             rendered_cache: Arc::new(ds_render::RenderedCache::new(1)),
             base_url: String::new(),
+            trust_proxy_headers: false,
         }
     }
 
@@ -933,6 +959,7 @@ mod tests {
             rendered_cache: Arc::new(ds_render::RenderedCache::new(1)),
             vector_tile_cache: Arc::new(ds_mvt::VectorTileCache::new(1)),
             base_url: String::new(),
+            trust_proxy_headers: false,
         }
     }
 
@@ -955,6 +982,7 @@ mod tests {
                 colormap: api_3dtiles::default_point_colormap(),
                 render_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
                 base_url: String::new(),
+                trust_proxy_headers: false,
             })),
             config_path: String::new(),
             health: RwLock::new(Vec::new()),
@@ -1165,6 +1193,62 @@ mod tests {
         );
         assert!(vector_url.contains("f=mvt"));
         assert!(stations["tiles"].get("raster").is_none());
+    }
+
+    #[tokio::test]
+    async fn manifest_handler_honours_proxy_headers() {
+        use axum::extract::{Query, State};
+        // Regression guard (#12): the preview manifest's tile URL templates must
+        // follow reverse-proxy forwarding headers when trust_proxy_headers is on
+        // — this is the /preview/manifest.json endpoint that was initially missed.
+        let mut tiles = empty_tiles();
+        tiles.base_url = "http://127.0.0.1:8000".into();
+        tiles.trust_proxy_headers = true;
+        let raster: Arc<dyn MapEngine> = Arc::new(RasterMock {
+            spatial_extent: Some([-180.0, -85.0, 180.0, 85.0]),
+            times: vec![],
+            parameter: "reflectivity".into(),
+            unit: "dBZ".into(),
+            parameters: vec![],
+        });
+        tiles.map_engines.insert("radar".into(), raster);
+        tiles
+            .collections
+            .insert("radar".into(), config("radar", &["tiles"]));
+
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            tiles,
+            empty_wms(),
+        );
+
+        let mut req_headers = axum::http::HeaderMap::new();
+        req_headers.insert(
+            "x-forwarded-host",
+            axum::http::HeaderValue::from_static("radar.example.com"),
+        );
+        req_headers.insert(
+            "x-forwarded-proto",
+            axum::http::HeaderValue::from_static("https"),
+        );
+
+        let resp = manifest_handler(State(state), Query(ManifestParams::default()), req_headers)
+            .await
+            .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let m: Value = serde_json::from_slice(&body).unwrap();
+
+        let url = m["collections"][0]["tiles"]["raster"]["url_template"]
+            .as_str()
+            .unwrap();
+        assert!(
+            url.starts_with("https://radar.example.com/tiles/collections/radar/tiles/"),
+            "manifest tile URL must use the proxy host, got: {url}"
+        );
     }
 
     #[test]
@@ -2235,9 +2319,13 @@ mod tests {
             empty_tiles(),
             empty_wms(),
         );
-        let resp = manifest_handler(State(state), Query(ManifestParams::default()))
-            .await
-            .into_response();
+        let resp = manifest_handler(
+            State(state),
+            Query(ManifestParams::default()),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .into_response();
         assert_eq!(
             resp.headers().get(header::CACHE_CONTROL).unwrap(),
             "no-store"

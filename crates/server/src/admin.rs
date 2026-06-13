@@ -619,6 +619,7 @@ pub fn load_collections(
     collections: &[CollectionConfig],
     style_bundles: &[StyleBundle],
     base_url: &str,
+    trust_proxy_headers: bool,
     metatile_cache_mb: u64,
 ) -> LoadResult {
     let bundle_index: HashMap<&str, &StyleBundle> =
@@ -1934,11 +1935,13 @@ pub fn load_collections(
             engines: edr_engines,
             collections: edr_collections,
             base_url: base_url.to_string(),
+            trust_proxy_headers,
         },
         features_state: FeaturesState {
             engines: feature_engines,
             collections: feature_collections,
             base_url: base_url.to_string(),
+            trust_proxy_headers,
         },
         wms_state: WmsState {
             engines: map_engines,
@@ -1948,6 +1951,7 @@ pub fn load_collections(
             rendered_cache: rendered_cache.clone(),
             tile_cache,
             base_url: base_url.to_string(),
+            trust_proxy_headers,
         },
         maps_state: MapsState {
             engines: maps_engines,
@@ -1956,6 +1960,7 @@ pub fn load_collections(
             render_semaphore: render_semaphore.clone(),
             rendered_cache: rendered_cache.clone(),
             base_url: base_url.to_string(),
+            trust_proxy_headers,
         },
         tiles_state: TilesState {
             map_engines: tiles_engines,
@@ -1967,6 +1972,7 @@ pub fn load_collections(
             rendered_cache: rendered_cache.clone(),
             vector_tile_cache: vector_tile_cache.clone(),
             base_url: base_url.to_string(),
+            trust_proxy_headers,
         },
         tiles_3d_state: api_3dtiles::TilesState3d {
             volume_engines,
@@ -1977,6 +1983,7 @@ pub fn load_collections(
             colormap: api_3dtiles::default_point_colormap(),
             render_semaphore: render_semaphore.clone(),
             base_url: base_url.to_string(),
+            trust_proxy_headers,
         },
         health,
         geotiff_engines,
@@ -2465,6 +2472,7 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         &config.collections,
         &config.style_bundles,
         &base_url,
+        config.server.trust_proxy_headers,
         config.server.metatile_cache_mb,
     );
 

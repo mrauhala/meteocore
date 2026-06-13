@@ -13,6 +13,7 @@ pub mod map_engine;
 pub mod model;
 pub mod ogc_extent;
 pub mod openapi;
+pub mod proxy;
 pub mod raster_paint;
 pub mod resample;
 pub mod vertical;

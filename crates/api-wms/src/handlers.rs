@@ -45,10 +45,22 @@ pub struct WmsState {
     pub rendered_cache: Arc<RenderedCache>,
     /// Decoded-RGBA meta-tile cache for the Web Mercator GetMap path (#202).
     pub tile_cache: Arc<ds_render::TilePixelCache>,
+    /// Static fallback base URL for absolute links. Used as-is unless
+    /// `trust_proxy_headers` resolves a per-request value.
     pub base_url: String,
+    /// Honour reverse-proxy forwarding headers when generating self-links (#12).
+    pub trust_proxy_headers: bool,
 }
 
 pub type AppState = Arc<ArcSwap<WmsState>>;
+
+/// Resolve the absolute base URL for the current request, honouring reverse-proxy
+/// forwarding headers when `trust_proxy_headers` is enabled (#12).
+fn request_base_url(state: &WmsState, headers: &HeaderMap) -> String {
+    ds_core::proxy::resolve_base_url(&state.base_url, state.trust_proxy_headers, |name| {
+        headers.get(name).and_then(|v| v.to_str().ok())
+    })
+}
 
 /// Render a semi-transparent red error tile to make failed areas visible.
 fn render_error_tile(width: u32, height: u32) -> Result<Vec<u8>, WmsError> {
@@ -87,7 +99,7 @@ pub async fn wms_handler(
                 &state.engines,
                 &state.collections,
                 &state.styles,
-                &state.base_url,
+                &request_base_url(&state, &headers),
             );
             Ok((
                 [

@@ -157,6 +157,7 @@ fn build_router() -> axum::Router {
         engines,
         collections,
         base_url: String::new(),
+        trust_proxy_headers: false,
     }));
     api_features::router(state)
 }
@@ -452,6 +453,7 @@ mod vector_tile_discovery {
             engines,
             collections,
             base_url: String::new(),
+            trust_proxy_headers: false,
         }));
         api_features::router(state)
     }
@@ -918,6 +920,7 @@ mod metadata_extras {
             engines,
             collections,
             base_url: String::new(),
+            trust_proxy_headers: false,
         }));
         api_features::router(state)
     }

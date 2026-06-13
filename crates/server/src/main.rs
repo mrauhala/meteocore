@@ -426,6 +426,7 @@ async fn main() {
         &config.collections,
         &config.style_bundles,
         &base_url,
+        config.server.trust_proxy_headers,
         config.server.metatile_cache_mb,
     );
 
@@ -605,7 +606,12 @@ async fn main() {
 
     // Public routes get permissive CORS (OGC APIs, health, metrics)
     let public = Router::new()
-        .route("/", get(move || root_landing_page(root_state)))
+        .route(
+            "/",
+            get(move |headers: axum::http::HeaderMap| {
+                root_landing_page(root_state.clone(), headers)
+            }),
+        )
         .nest("/edr", api_edr::router(edr_swap.clone()))
         .nest("/features", api_features::router(features_swap.clone()))
         .nest("/wms", api_wms::router(wms_swap.clone()))
@@ -749,9 +755,13 @@ async fn shutdown_signal() {
     }
 }
 
-async fn root_landing_page(state: AdminState) -> impl IntoResponse {
+async fn root_landing_page(state: AdminState, headers: axum::http::HeaderMap) -> impl IntoResponse {
     let edr_state = state.edr.load_full();
-    let base = &edr_state.base_url;
+    let base = &ds_core::proxy::resolve_base_url(
+        &edr_state.base_url,
+        edr_state.trust_proxy_headers,
+        |name| headers.get(name).and_then(|v| v.to_str().ok()),
+    );
     Json(json!({
         "title": "MeteoCore",
         "description": "Metocean Data Server implementing OGC API - EDR, OGC API - Features, OGC API - Maps, OGC API - Tiles, and OGC WMS 1.3.0",

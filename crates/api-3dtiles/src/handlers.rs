@@ -265,11 +265,22 @@ pub struct TilesState3d {
     pub colormap: Arc<dyn ColorMap>,
     /// Bounds concurrent sampling/encoding, shared with the raster render path.
     pub render_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Public base URL for absolute links.
+    /// Static fallback base URL for absolute links. Used as-is unless
+    /// `trust_proxy_headers` resolves a per-request value.
     pub base_url: String,
+    /// Honour reverse-proxy forwarding headers when generating self-links (#12).
+    pub trust_proxy_headers: bool,
 }
 
 pub type AppState = Arc<ArcSwap<TilesState3d>>;
+
+/// Resolve the absolute base URL for the current request, honouring reverse-proxy
+/// forwarding headers when `trust_proxy_headers` is enabled (#12).
+fn request_base_url(state: &TilesState3d, headers: &HeaderMap) -> String {
+    ds_core::proxy::resolve_base_url(&state.base_url, state.trust_proxy_headers, |name| {
+        headers.get(name).and_then(|v| v.to_str().ok())
+    })
+}
 
 /// Look up a collection's volume engine + config, 404 if absent.
 fn lookup<'a>(
@@ -1172,9 +1183,12 @@ pub async fn get_voxel_content(
 // ---------------------------------------------------------------------------
 
 /// `GET /` — API landing document.
-pub async fn landing_page(State(state): State<AppState>) -> Json<serde_json::Value> {
+pub async fn landing_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<serde_json::Value> {
     let state = state.load_full();
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
     Json(json!({
         "title": "MeteoCore — 3D Tiles",
         "description": "Volumetric weather data as OGC 3D Tiles (radar polar volumes)",
@@ -1187,9 +1201,12 @@ pub async fn landing_page(State(state): State<AppState>) -> Json<serde_json::Val
 }
 
 /// `GET /collections` — list 3D-Tiles-capable collections.
-pub async fn collections(State(state): State<AppState>) -> Json<serde_json::Value> {
+pub async fn collections(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<serde_json::Value> {
     let state = state.load_full();
-    let base = &state.base_url;
+    let base = &request_base_url(&state, &headers);
     let mut ids: Vec<&String> = state.volume_engines.keys().collect();
     ids.sort();
     let items: Vec<_> = ids
@@ -1203,11 +1220,16 @@ pub async fn collections(State(state): State<AppState>) -> Json<serde_json::Valu
 pub async fn collection(
     Path(id): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, Tiles3dError> {
     let state = state.load_full();
     // 404 if not a volume collection.
     lookup(&state, &id)?;
-    Ok(Json(collection_doc(&state, &id, &state.base_url)))
+    Ok(Json(collection_doc(
+        &state,
+        &id,
+        &request_base_url(&state, &headers),
+    )))
 }
 
 fn collection_doc(state: &TilesState3d, id: &str, base: &str) -> serde_json::Value {

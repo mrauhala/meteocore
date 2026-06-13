@@ -2,6 +2,9 @@
 host = "127.0.0.1"
 port = 8000
 collections_dir = "collections.d"
+# Derive each request's absolute link base from reverse-proxy headers
+# (Forwarded / X-Forwarded-*). Default false; enable only behind a trusted proxy.
+# trust_proxy_headers = true
 
 # Shared WMS style bundles. Collections reference these by id from their
 # [wms] style_bundle field to avoid duplicating the same default + extras

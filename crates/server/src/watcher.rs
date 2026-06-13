@@ -157,6 +157,7 @@ mod tests {
             &config.collections,
             &config.style_bundles,
             &config.server.base_url(),
+            config.server.trust_proxy_headers,
             config.server.metatile_cache_mb,
         );
         Arc::new(ServerState {
