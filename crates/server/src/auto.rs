@@ -233,6 +233,14 @@ fn classify_files(
 }
 
 // ---- engine-specific synthesizers -----------------------------------------
+//
+// `apis` is the full set relevant to each engine type (mirroring the
+// `engine_type -> supported_apis` allowlist in `admin.rs`): raster/grid engines
+// get edr + wms + maps + tiles, csv gets edr + features, geojson gets features +
+// tiles. WMS/Maps/Tiles load without a `[wms]` block — the render path falls
+// back to a default colormap — so the data is browsable in `/preview` out of the
+// box. The default colormap range is generic (viridis 0..1); a per-collection
+// `[wms]` colormap/min-max gives correct colours for the data's domain (#320).
 
 fn mk_zarr(dir: &Path) -> Option<CollectionConfig> {
     let path = path_str(dir)?;
@@ -243,7 +251,7 @@ fn mk_zarr(dir: &Path) -> Option<CollectionConfig> {
     Some(mk_collection(
         id,
         "zarr",
-        vec!["edr".into()],
+        vec!["edr".into(), "wms".into(), "maps".into(), "tiles".into()],
         None,
         Some(ZarrConfig::auto_local(path)),
         None,
@@ -257,7 +265,7 @@ fn mk_querydata(dir: &Path, id_hint: &str) -> Option<CollectionConfig> {
     Some(mk_collection(
         slug_id(id_hint, dir)?,
         "querydata",
-        vec!["edr".into()],
+        vec!["edr".into(), "wms".into(), "maps".into(), "tiles".into()],
         Some(path), // querydata reads collection.data_path
         None,
         None,
@@ -277,7 +285,7 @@ fn mk_grib(
     Some(mk_collection(
         slug_id(id_hint, dir)?,
         "grib",
-        vec!["edr".into()],
+        vec!["edr".into(), "wms".into(), "maps".into(), "tiles".into()],
         None, // grib reads GribConfig.data_path
         None,
         Some(GribConfig::auto_local(
@@ -297,7 +305,7 @@ fn mk_geojson(file: &Path) -> Option<CollectionConfig> {
     Some(mk_collection(
         id,
         "geojson",
-        vec!["features".into()],
+        vec!["features".into(), "tiles".into()],
         Some(path),
         None,
         None,
@@ -520,6 +528,11 @@ mod tests {
         assert!(got.contains(&("era5".into(), "zarr".into())), "{got:?}");
         // grib-without-index produced nothing
         assert!(!got.iter().any(|(id, _)| id == "noidx"), "{got:?}");
+
+        // Raster/grid engines enable the full relevant API set so they render
+        // and surface a parameter selector in /preview (not EDR-only).
+        let meps = cfgs.iter().find(|c| c.id == "meps").unwrap();
+        assert_eq!(meps.apis, vec!["edr", "wms", "maps", "tiles"]);
     }
 
     #[test]

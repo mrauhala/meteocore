@@ -116,15 +116,23 @@ collections and validated together (duplicate ids are rejected).
 slugified directory name); data files sitting **loose** in the root are grouped
 the same way under the root's name. Detection per directory (first match wins):
 
-| On disk | Becomes | Notes |
-|---------|---------|-------|
-| `zarr.json` / `.zgroup` / `.zarray`, or a `*.zarr` dir name | one `zarr` collection | EDR |
-| `*.sqd` | one `querydata` collection | EDR; model runs from the files |
-| `*.grib2`/`*.grb2` **with** `*.index`/`*.idx` sidecars | one `grib` collection | EDR; `index_format` inferred (`.idx`→wgrib2, `.index`→ecmwf-json) |
+| On disk | Becomes | APIs |
+|---------|---------|------|
+| `zarr.json` / `.zgroup` / `.zarray`, or a `*.zarr` dir name | one `zarr` collection | EDR, WMS, Maps, Tiles |
+| `*.sqd` | one `querydata` collection | EDR, WMS, Maps, Tiles; model runs from the files |
+| `*.grib2`/`*.grb2` **with** `*.index`/`*.idx` sidecars | one `grib` collection | EDR, WMS, Maps, Tiles; `index_format` inferred (`.idx`→wgrib2, `.index`→ecmwf-json) |
 | `*.grib2` **without** index sidecars | _(skipped)_ | the GRIB engine needs prebuilt indexes |
 | `*.tif`/`*.tiff` (GeoTIFF), `*.h5`/`*.hdf5` (ODIM) | _(skipped)_ | **phase 2** — needs filename-template inference (#411) |
-| `*.geojson` | one `geojson` collection **per file** | Features |
-| `*.csv` | one `csv` collection **per file** | EDR + Features; columns are positional: `location,latitude,longitude,time,<params…>` |
+| `*.geojson` | one `geojson` collection **per file** | Features, Tiles (MVT) |
+| `*.csv` | one `csv` collection **per file** | EDR, Features; columns are positional: `location,latitude,longitude,time,<params…>` |
+
+Each collection enables **all APIs relevant to its type** so the data is
+browsable in `/preview` (with a parameter selector) out of the box. Raster/grid
+collections (zarr/grib/querydata) render via a **default colormap** when no
+`[wms]` block is configured — the colormap *range* is generic (viridis `0..1`),
+so weather data in physical units renders but with poor colour contrast until you
+add a per-collection `[wms]` colormap with `min`/`max` (or auto-scaling lands,
+[#320](https://github.com/mrauhala/meteocore/issues/320)).
 
 Pointing `--auto-collections` directly at a single Zarr store (rather than its
 parent) also works. **Symlinks are followed** — a symlinked subdirectory or data
@@ -133,11 +141,10 @@ directory). This is the same trust model as `collections_dir`: whoever can write
 the scan root controls what is served, so keep it writable only by trusted
 principals.
 
-**Phase 1 limitations:** raster/grid collections come up **EDR-only** — WMS/Maps/
-Tiles need a colormap that can't be inferred, so configure those via `config.toml`.
-GeoTIFF and ODIM (the filename-timestamped formats) are deferred to phase 2.
-Auto-collections are resolved once at startup; `POST /admin/collections/reload`
-re-reads `config.toml`/`collections_dir` but does not re-scan the auto roots.
+**Phase 1 limitations:** GeoTIFF and ODIM (the filename-timestamped formats) are
+deferred to phase 2. Auto-collections are resolved once at startup;
+`POST /admin/collections/reload` re-reads `config.toml`/`collections_dir` but does
+not re-scan the auto roots.
 
 ### Environment Variables
 

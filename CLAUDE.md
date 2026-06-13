@@ -41,8 +41,13 @@ wins): zarr store (`zarr.json`/`.zgroup`/`*.zarr` name) → `zarr`; `*.sqd` →
 `querydata`; `*.grib2`+index sidecars → `grib` (`.idx`→wgrib2, `.index`→ecmwf-json;
 **no index ⇒ skipped**, the engine never builds them); `*.tif`/`*.h5` → **phase 2,
 skipped** (need filename-template inference + ODIM COMP/PVOL probe); `*.geojson`
-and `*.csv` → one collection **per file**. Raster/grid auto-collections are
-**EDR-only** (no inferable colormap → no WMS/Maps/Tiles). Synthesized configs are
+and `*.csv` → one collection **per file**. Each collection enables **all APIs
+relevant to its type** (mirroring the `engine_type → supported_apis` allowlist):
+raster/grid (zarr/grib/querydata) get edr+wms+maps+tiles, csv gets edr+features,
+geojson gets features+tiles — so the data renders + shows a parameter selector in
+`/preview` without a `[wms]` block (the render path falls back to a default
+viridis colormap; range is generic `0..1` until a per-collection `[wms]`
+colormap/min-max is set — #320). Synthesized configs are
 appended to `config.collections` and run through the same `ServerConfig::validate()`
 as TOML (duplicate ids rejected). Resolved once at startup (reload does not
 re-scan auto roots in v1). Engine-config defaults come from
