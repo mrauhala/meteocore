@@ -219,6 +219,12 @@ pub struct OverlayColorMap {
 
 impl OverlayColorMap {
     pub fn new(inner: std::sync::Arc<dyn ColorMap>, sentinel: f64, overlay_color: [u8; 4]) -> Self {
+        // A NaN sentinel could never match (`NaN != NaN`), silently making this
+        // a pure passthrough — catch that misuse in debug builds.
+        debug_assert!(
+            sentinel.is_finite(),
+            "OverlayColorMap sentinel must be finite; NaN/±inf never match"
+        );
         Self {
             inner,
             sentinel,

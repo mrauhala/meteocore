@@ -388,16 +388,32 @@ mod tests {
         }
     }
 
-    fn track(first: i64, last: i64, label: u32, lon: f64, lat: f64) -> Track {
-        let points = (first..=last)
-            .step_by(5)
-            .map(|m| TrackPoint {
-                time: t(m),
-                lon,
-                lat,
-                height_m: 3_000.0,
-                label,
-                max_dbz: 45.0,
+    /// A track moving in a straight line from `(lon0, lat0)` at `t(first)` to
+    /// `(lon1, lat1)` at `t(last)`, one point per 5-minute step. Distinct
+    /// endpoints make the trail a real multi-pixel polyline (not a degenerate
+    /// zero-length one), so the orphan-filter assertions are unambiguous.
+    fn track(
+        first: i64,
+        last: i64,
+        label: u32,
+        (lon0, lat0): (f64, f64),
+        (lon1, lat1): (f64, f64),
+    ) -> Track {
+        let steps: Vec<i64> = (first..=last).step_by(5).collect();
+        let span = (steps.len().max(2) - 1) as f64;
+        let points = steps
+            .iter()
+            .enumerate()
+            .map(|(i, &m)| {
+                let f = i as f64 / span;
+                TrackPoint {
+                    time: t(m),
+                    lon: lon0 + f * (lon1 - lon0),
+                    lat: lat0 + f * (lat1 - lat0),
+                    height_m: 3_000.0,
+                    label,
+                    max_dbz: 45.0,
+                }
             })
             .collect::<Vec<_>>();
         Track {
@@ -426,10 +442,12 @@ mod tests {
             cell_sets: vec![(target_time, target)],
             tracks: TrackSet {
                 tracks: vec![
-                    // Connected: last point at the target time.
-                    track(0, 10, 1, 25.0, 60.0),
-                    // Orphan: last point at t(5), before the target scan.
-                    track(0, 5, 2, 24.0, 60.5),
+                    // Connected: a real line ending at the target time, near
+                    // the visible cell (right half of the canvas).
+                    track(0, 10, 1, (25.4, 60.0), (25.0, 60.0)),
+                    // Orphan: a real line that ended at t(5), in the left half
+                    // — well clear of the connected trail.
+                    track(0, 5, 2, (23.5, 60.6), (24.2, 60.4)),
                 ],
             },
         };
@@ -437,13 +455,14 @@ mod tests {
         // 100×100 canvas over a bbox that contains both tracks.
         let mut values = vec![None; 100 * 100];
         let bbox = [23.0, 59.0, 26.0, 61.0];
+        let project = |lon: f64, lat: f64| {
+            let fx = (lon - bbox[0]) / (bbox[2] - bbox[0]);
+            let fy = (bbox[3] - lat) / (bbox[3] - bbox[1]);
+            (fx * 100.0, fy * 100.0)
+        };
         {
             let mut canvas = Canvas::new(&mut values, 100, 100).unwrap();
-            paint_cell_product(&mut canvas, &product, |lon, lat| {
-                let fx = (lon - bbox[0]) / (bbox[2] - bbox[0]);
-                let fy = (bbox[3] - lat) / (bbox[3] - bbox[1]);
-                (fx * 100.0, fy * 100.0)
-            });
+            paint_cell_product(&mut canvas, &product, project);
         }
 
         let sentinel_px = values
@@ -455,21 +474,33 @@ mod tests {
             outline_px > 0,
             "the visible cell's outline + marker is painted"
         );
+        // The connected trail is a multi-pixel line, not one degenerate pixel.
         assert!(
-            sentinel_px > 0,
-            "the connected track leaves a sentinel-valued trail"
+            sentinel_px > 2,
+            "the connected track leaves a real sentinel-valued trail, got {sentinel_px}px"
         );
 
-        // The orphan track sits around pixel x≈33, y≈25 (lon 24.0, lat 60.5).
-        // No sentinel pixel may appear in that neighbourhood.
-        let orphan_region = values.iter().enumerate().any(|(i, v)| {
-            let (x, y) = (i % 100, i / 100);
-            (28..=40).contains(&x) && (18..=32).contains(&y) && *v == Some(CELLS_TRACK_SENTINEL)
-        });
-        assert!(
-            !orphan_region,
-            "the orphan track (ended before the rendered scan) must leave no trail"
-        );
+        // No sentinel pixel anywhere along the orphan track's path. Sample its
+        // every point: a broken filter would draw a clear line through these.
+        let orphan = track(0, 5, 2, (23.5, 60.6), (24.2, 60.4));
+        for p in &orphan.points {
+            let (px, py) = project(p.lon, p.lat);
+            let (cx, cy) = (px.round() as i64, py.round() as i64);
+            // Check a small neighbourhood around each orphan vertex.
+            for dy in -2..=2 {
+                for dx in -2..=2 {
+                    let (x, y) = (cx + dx, cy + dy);
+                    if (0..100).contains(&x) && (0..100).contains(&y) {
+                        assert_ne!(
+                            values[(y * 100 + x) as usize],
+                            Some(CELLS_TRACK_SENTINEL),
+                            "orphan track (ended before the rendered scan) must leave no trail \
+                             near ({x}, {y})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// A single-observation track (just born) never draws a trail.
@@ -486,7 +517,7 @@ mod tests {
         let product = CellProduct {
             cell_sets: vec![(target_time, target)],
             tracks: TrackSet {
-                tracks: vec![track(0, 0, 1, 25.0, 60.0)], // one point
+                tracks: vec![track(0, 0, 1, (25.0, 60.0), (25.0, 60.0))], // one point
             },
         };
         let mut values = vec![None; 64 * 64];
