@@ -335,6 +335,50 @@ static PVOL_VOXEL_GRID_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(
     gauge
 });
 
+// COMP composite cache (#212) — process-global, byte-bounded LRU of decoded
+// ODIM composites, so a concurrent full-viewport WMS animation keeps every
+// active timestep resident instead of ping-ponging a single slot and
+// re-decoding the same (up to 134 MB OPERA) grid many times.
+static ODIM_COMPOSITE_CACHE_HITS: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "odim_composite_cache_hits_total",
+        "ODIM COMP composite cache hits",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static ODIM_COMPOSITE_CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "odim_composite_cache_misses_total",
+        "ODIM COMP composite cache misses (full HDF5 decodes)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static ODIM_COMPOSITE_CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "odim_composite_cache_bytes",
+        "Bytes currently held in the ODIM COMP composite cache",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static ODIM_COMPOSITE_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "odim_composite_cache_capacity_bytes",
+        "Configured ODIM COMP composite cache capacity in bytes",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
 // Storm-cell segmentation memo (#367) — per-volume `CellSet`s, so an
 // animation window / repeated tracking request re-segments only the newest
 // volume.
@@ -511,6 +555,8 @@ struct CacheCounterState {
     pvol_voxel_grid: (u64, u64),
     /// PVOL storm-cell set cache `(hits, misses)` — global cache, monotonic.
     pvol_cell_set: (u64, u64),
+    /// ODIM COMP composite cache `(hits, misses)` — global cache, monotonic.
+    odim_composite: (u64, u64),
     /// 3D Tiles encoded-content cache `(hits, misses)` — global, monotonic.
     tiles3d_content: (u64, u64),
 }
@@ -2967,6 +3013,25 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         counter_state.pvol_cell_set = (s_hits, s_misses);
         PVOL_CELL_SET_CACHE_BYTES.set(s_bytes as i64);
         PVOL_CELL_SET_CACHE_CAPACITY_BYTES.set(s_cap as i64);
+    }
+
+    // COMP composite cache: same process-global monotonic-counter shape as the
+    // PVOL caches. Only emit when COMP (`engine_type = "odim"`) collections are
+    // loaded, so non-radar / PVOL-only deployments don't carry empty
+    // `odim_composite_*` series.
+    let has_comp = !state
+        .odim_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty();
+    if has_comp {
+        let (cc_hits, cc_misses, cc_bytes, cc_cap) = engine_odim::composite_cache_metrics();
+        let (last_cch, last_ccm) = counter_state.odim_composite;
+        ODIM_COMPOSITE_CACHE_HITS.inc_by(cc_hits.saturating_sub(last_cch));
+        ODIM_COMPOSITE_CACHE_MISSES.inc_by(cc_misses.saturating_sub(last_ccm));
+        counter_state.odim_composite = (cc_hits, cc_misses);
+        ODIM_COMPOSITE_CACHE_BYTES.set(cc_bytes as i64);
+        ODIM_COMPOSITE_CACHE_CAPACITY_BYTES.set(cc_cap as i64);
     }
 
     // 3D Tiles encoded-content cache: process-global + monotonic, like the

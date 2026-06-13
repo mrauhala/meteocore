@@ -374,6 +374,15 @@ pub struct OdimComposite {
     pub pixels: RawPixels,
 }
 
+impl OdimComposite {
+    /// Approximate heap footprint of the decoded composite, in bytes —
+    /// dominated by the raw pixel array. Byte-weights the process-global
+    /// composite LRU cache (#212).
+    pub fn size_bytes(&self) -> usize {
+        self.pixels.size_bytes()
+    }
+}
+
 /// Compute the WGS84 envelope `[west, south, east, north]` of a
 /// native-CRS `bbox` `[west, south, east, north]` by sampling
 /// `EDGE_SAMPLES` points along every edge and inverse-projecting

@@ -29,7 +29,7 @@
 //! See [[project_odim_engine_plan]] for the full multi-phase plan.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -51,6 +51,77 @@ use crate::reader::{read_composite, OdimComposite};
 /// `time_window`. Two days covers the just-after-midnight case where
 /// the recent tail still straddles yesterday's partition.
 const DEFAULT_SCAN_DAYS: u32 = 2;
+
+/// Default decoded-composite cache size (MB) when `MC_ODIM_COMPOSITE_CACHE_MB`
+/// is unset. A decoded `OdimComposite` is essentially its raw pixel array:
+/// national COMP grids are a few MB, but the OPERA pan-European composite is a
+/// 134 MB `f64` array whose HDF5 decode is ~111 ms (measured). 1024 MB holds
+/// ≈7 OPERA-class grids resident — enough for a typical concurrent
+/// full-viewport WMS animation working set, where N distinct-time render tasks
+/// each fire ~40 [`OdimEngine::load_composite`] calls through the meta-tile
+/// loop. A single-slot cache ping-pongs across those N tasks and re-decodes
+/// the same file many times (#212); a multi-entry LRU keeps every active
+/// timestep resident instead.
+///
+/// Sizing note: a heavy OPERA animation of ~13 concurrent frames is ≈1.7 GB
+/// resident, so it can still thrash a 1 GB cap — raise this knob (or bound the
+/// client's preload concurrency) for that workload. `0` disables the cache,
+/// so every load decodes (same convention as the PVOL pixel / voxel-grid
+/// caches in `volume_engine.rs`).
+const DEFAULT_COMPOSITE_CACHE_MB: u64 = 1024;
+
+/// Byte-weights each cached composite by its decoded pixel array (plus the
+/// key string and `Arc`/control overhead). Mirrors the PVOL pixel / voxel-grid
+/// weighters.
+#[derive(Clone)]
+struct CompositeWeighter;
+
+impl quick_cache::Weighter<Arc<str>, Arc<OdimComposite>> for CompositeWeighter {
+    fn weight(&self, key: &Arc<str>, val: &Arc<OdimComposite>) -> u64 {
+        val.size_bytes() as u64 + key.len() as u64 + 64
+    }
+}
+
+/// Process-global byte-bounded LRU of decoded ODIM composites, shared across
+/// every COMP collection. Keyed by the composite's location id
+/// ([`Location::id`] — a globally-unique local path or S3 object key), which
+/// fully determines the immutable decode, so the key carries no data-version
+/// (same as the PVOL pixel / voxel-grid caches). Sized once from the
+/// environment on first use; `0` disables (`capacity_bytes.max(1)` keeps the
+/// cache valid but unable to retain anything, so every load decodes).
+static COMPOSITE_CACHE: std::sync::LazyLock<
+    quick_cache::sync::Cache<Arc<str>, Arc<OdimComposite>, CompositeWeighter>,
+> = std::sync::LazyLock::new(|| {
+    let capacity_bytes = std::env::var("MC_ODIM_COMPOSITE_CACHE_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_COMPOSITE_CACHE_MB)
+        .saturating_mul(1024 * 1024);
+    // Estimate item slots at one OPERA-class (134 MB) grid each; `max(4)`
+    // keeps a small/zero capacity valid (a near-disabled cache holds nothing).
+    let estimated_items = ((capacity_bytes / (134 * 1024 * 1024)).max(4)) as usize;
+    quick_cache::sync::Cache::with_weighter(
+        estimated_items,
+        capacity_bytes.max(1),
+        CompositeWeighter,
+    )
+});
+
+/// Cumulative `(hits, misses)` of [`COMPOSITE_CACHE`], for `/metrics`.
+static COMPOSITE_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COMPOSITE_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the process-global composite cache for `/metrics`:
+/// `(hits, misses, resident_bytes, capacity_bytes)`. Mirrors
+/// `volume_engine::voxel_grid_cache_metrics`.
+pub fn composite_cache_metrics() -> (u64, u64, u64, u64) {
+    (
+        COMPOSITE_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        COMPOSITE_CACHE_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+        COMPOSITE_CACHE.weight(),
+        COMPOSITE_CACHE.capacity(),
+    )
+}
 
 /// Where an [`OdimEngine`] reads ODIM files from.
 #[derive(Clone)]
@@ -356,18 +427,13 @@ pub struct OdimEngine {
     /// these are stable for the engine's lifetime. Holding them as
     /// plain fields lets `raster_info()` (MapEngine) and the EDR
     /// metadata / area-grid-sizing paths answer without touching the
-    /// render cache `Mutex` — and, crucially, without depending on
-    /// whether a `get_raster_tile` call has warmed that cache yet
-    /// (an `apis = ["edr"]`-only collection never issues one).
+    /// process-global composite cache — and, crucially, without
+    /// depending on whether a `get_raster_tile` call has warmed that
+    /// cache yet (an `apis = ["edr"]`-only collection never issues one).
     pub(crate) seed_native_crs: String,
     pub(crate) seed_spatial_extent: [f64; 4],
     pub(crate) seed_xsize: u32,
     pub(crate) seed_ysize: u32,
-    /// Single-entry cache keyed by [`Location::id`]. ODIM composites
-    /// are small (a few MB) but HDF5 parsing dominates `get_raster_tile`
-    /// latency at high request rates — keeping the last file resident
-    /// makes hot-tile loops effectively free of read cost.
-    pub(crate) cached: Mutex<Option<(String, Arc<OdimComposite>)>>,
     /// Local directory or S3/HTTP object store the poll loop re-scans.
     source: Source,
     matcher: FilenameMatcher,
@@ -552,6 +618,12 @@ impl OdimEngine {
         let seed_xsize = composite.xsize;
         let seed_ysize = composite.ysize;
 
+        // Seed the process-global composite cache so the first render of the
+        // most recent file is a hit (we just decoded it for the metadata
+        // seed). `insert` rather than the old per-engine slot — every COMP
+        // collection shares the one byte-bounded LRU (#212).
+        COMPOSITE_CACHE.insert(Arc::from(seed_location.id().as_str()), composite);
+
         Ok(Self {
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
             collection_id: collection_id.to_string(),
@@ -564,7 +636,6 @@ impl OdimEngine {
             seed_spatial_extent,
             seed_xsize,
             seed_ysize,
-            cached: Mutex::new(Some((seed_location.id(), composite))),
             source,
             matcher,
             max_files,
@@ -798,8 +869,10 @@ impl OdimEngine {
         }
     }
 
-    /// Read + parse the ODIM file at `path` and return a shared
-    /// `Arc<OdimComposite>` snapshot. Cached single-entry by path.
+    /// Read + parse the ODIM file at `location` and return a shared
+    /// `Arc<OdimComposite>` snapshot, served from the process-global
+    /// byte-bounded composite LRU ([`COMPOSITE_CACHE`]) keyed by
+    /// [`Location::id`].
     ///
     /// **Blocking call** — reads the file (local `read` or S3 `get`)
     /// and parses HDF5 directly. Callers from async contexts must wrap
@@ -819,63 +892,41 @@ impl OdimEngine {
         &self,
         location: &Location,
     ) -> Result<Arc<OdimComposite>, DataServerError> {
-        // Use an id-keyed single-entry cache. Cache hits return the
-        // same `Arc` to every caller; on a cold miss two concurrent
-        // `spawn_blocking` callers may both read the file and both
-        // write the cache slot — the second write overwrites the
-        // first with an identical, immutable composite. The cost is
-        // at most one redundant read at the moment the slot fills,
-        // never visible to clients. A swap to a different file
-        // happens only when a different entry is asked for.
-        //
-        // Different-path concurrent misses (e.g. two adjacent
-        // timestep requests arriving during a time-slider scrub)
-        // are tolerated but not optimised: both callers fall
-        // through to a fresh fetch, both decode, and whichever
-        // takes the write lock last evicts the other's entry. Both
-        // callers still get a valid `Arc` (data is correct,
-        // composites are immutable) — the cost is at most one
-        // extra file read per burst. A future LRU upgrade should
-        // be a multi-entry cache rather than this single-slot
-        // version to eliminate that cost.
-        //
-        // Mutex poison is recovered (rather than silently disabling
-        // the cache for the lifetime of the engine). The cached
-        // entry is just an id string + composite — no invariants to
-        // protect — so the previous panic that poisoned the lock
-        // can't have corrupted what we're reading. An ERROR-level log
-        // on recovery makes the latent panic visible.
-        let cache_key = location.id();
-        {
-            let guard = self.cached.lock().unwrap_or_else(|e| {
-                tracing::error!(
-                    "[{}] ODIM cache mutex was poisoned; recovering",
-                    self.collection_id
-                );
-                e.into_inner()
-            });
-            if let Some((ref cached_key, ref cached_comp)) = *guard {
-                if *cached_key == cache_key {
-                    return Ok(cached_comp.clone());
-                }
-            }
+        // Composites are immutable, so the location id (local path or S3 key)
+        // fully determines the decode — no data-version in the key (same as
+        // the PVOL pixel / voxel-grid caches). `get_or_insert_with` is the
+        // single-flight: quick_cache's placeholder guard runs the fetch+decode
+        // closure for exactly one caller per key and blocks concurrent callers
+        // for the SAME key until it finishes, so a burst of cold misses on one
+        // file decodes once. Crucially, distinct timesteps stay resident
+        // side-by-side, so a concurrent full-viewport WMS animation — N
+        // distinct-time render tasks, each firing ~40 `load_composite` calls
+        // through the meta-tile loop — no longer ping-pongs a single slot and
+        // re-decodes the same 134 MB OPERA grid many times (#212).
+        let key: Arc<str> = Arc::from(location.id().as_str());
+        let mut computed = false;
+        // The fallible form returns a fetch/decode error to *this* caller
+        // without inserting (the placeholder is dropped), so a transient read
+        // failure does NOT poison the key — the next request retries it.
+        let composite = COMPOSITE_CACHE.get_or_insert_with(&key, || {
+            computed = true;
+            let bytes = fetch_bytes(location)
+                .map_err(|e| DataServerError::Engine(format!("[{}] {e}", self.collection_id)))?;
+            let composite = Arc::new(read_composite(&bytes).map_err(|e| {
+                DataServerError::Engine(format!(
+                    "[{}] failed to parse ODIM file `{}`: {e}",
+                    self.collection_id, key
+                ))
+            })?);
+            Ok::<_, DataServerError>(composite)
+        })?;
+        // The closure running == a genuine miss; otherwise the value came from
+        // the cache (mirrors `voxel_grid_cached`'s hit/miss accounting).
+        if computed {
+            COMPOSITE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            COMPOSITE_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let bytes = fetch_bytes(location)
-            .map_err(|e| DataServerError::Engine(format!("[{}] {e}", self.collection_id)))?;
-        let composite = Arc::new(read_composite(&bytes).map_err(|e| {
-            DataServerError::Engine(format!(
-                "[{}] failed to parse ODIM file `{}`: {e}",
-                self.collection_id, cache_key
-            ))
-        })?);
-        let mut guard = self.cached.lock().unwrap_or_else(|e| {
-            tracing::error!(
-                "[{}] ODIM cache mutex was poisoned on insert; recovering",
-                self.collection_id
-            );
-            e.into_inner()
-        });
-        *guard = Some((cache_key, composite.clone()));
         Ok(composite)
     }
 }
@@ -1283,6 +1334,78 @@ mod tests {
             discovery: None,
             cadence_secs: None,
         }
+    }
+
+    /// The composite cache is **multi-entry**, not single-slot (#212):
+    /// loading composite A, then B, then A again must serve A from the cache
+    /// — the load of B must NOT evict A (and A's reload must not evict B).
+    ///
+    /// Proved by pointer identity: the global [`COMPOSITE_CACHE`] hands back
+    /// the same `Arc` for a hit, so `Arc::ptr_eq` of the first and second load
+    /// of the same key is true iff the entry survived the intervening load of
+    /// the *other* key. The old single-slot cache would have re-decoded
+    /// (yielding a fresh `Arc`, `!ptr_eq`) because B's load overwrote the one
+    /// slot. Two distinct local paths (two copies of the committed DMI
+    /// fixture under timestamped names) give two distinct cache keys; the
+    /// unique tempdir path keeps them from colliding with any other test's
+    /// global-cache entries.
+    #[test]
+    fn composite_cache_keeps_distinct_timesteps_resident() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/odim-dmi-fixture.h5")
+            .canonicalize()
+            .expect("fixture path canonicalises");
+        // Two timesteps matching the template `%Y%m%dT%H%M_radar.h5`.
+        let path_a = dir.path().join("20260120T1125_radar.h5");
+        let path_b = dir.path().join("20260120T1130_radar.h5");
+        std::fs::copy(&src, &path_a).expect("copy fixture A");
+        std::fs::copy(&src, &path_b).expect("copy fixture B");
+
+        let config = config_with(None, None, None, None);
+        let engine = OdimEngine::new(
+            "composite-cache-test",
+            Some(dir.path().to_str().expect("utf8 fixture path")),
+            &config,
+        )
+        .expect("OdimEngine::new succeeds over the two-timestep dir");
+
+        let loc_a = Location::Local(path_a);
+        let loc_b = Location::Local(path_b);
+
+        let (hits_before, _, _, _) = composite_cache_metrics();
+
+        // A → B → A → B. With a multi-entry LRU both stay resident, so the
+        // second load of each key is a hit returning the identical `Arc`.
+        let a1 = engine.load_composite(&loc_a).expect("load A (1)");
+        let b1 = engine.load_composite(&loc_b).expect("load B (1)");
+        let a2 = engine.load_composite(&loc_a).expect("load A (2)");
+        let b2 = engine.load_composite(&loc_b).expect("load B (2)");
+
+        assert!(
+            Arc::ptr_eq(&a1, &a2),
+            "loading B must not evict A — A should be served from the cache"
+        );
+        assert!(
+            Arc::ptr_eq(&b1, &b2),
+            "reloading A must not evict B — B should be served from the cache"
+        );
+        // Same fixture ⇒ identical grid dims (sanity that both decoded).
+        assert_eq!((a1.xsize, a1.ysize), (b1.xsize, b1.ysize));
+
+        // Global hit counter only grows, so a `>=` delta is race-free under
+        // parallel tests: our own reloads of A and B are at least two hits.
+        let (hits_after, _, bytes, cap) = composite_cache_metrics();
+        assert!(
+            hits_after >= hits_before + 2,
+            "expected ≥2 composite-cache hits from the two reloads (before={hits_before}, after={hits_after})"
+        );
+        // Default cap is 1 GiB; both small DMI composites fit, so bytes > 0.
+        assert!(cap > 0, "composite cache should report a positive capacity");
+        assert!(
+            bytes > 0,
+            "two resident composites should report a positive resident weight"
+        );
     }
 
     #[test]
