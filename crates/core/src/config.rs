@@ -496,6 +496,18 @@ pub struct QueryDataConfig {
     pub max_runs: usize,
 }
 
+impl QueryDataConfig {
+    /// Defaults for an auto-discovered local `.sqd` directory (#411): no WMS
+    /// parameter selected (the first is used for rendering), default poll/runs.
+    pub fn auto_default() -> Self {
+        QueryDataConfig {
+            wms_parameter: None,
+            poll_interval_secs: default_poll_interval(),
+            max_runs: default_querydata_max_runs(),
+        }
+    }
+}
+
 /// Configuration for the ODIM_H5 weather-radar engine
 /// (`engine_type = "odim"`).
 ///
@@ -646,6 +658,35 @@ pub struct GribConfig {
     pub filename_contains: Option<String>,
 }
 
+impl GribConfig {
+    /// Defaults for an auto-discovered local directory of GRIB2 + index
+    /// sidecars (#411). `data_path` is the directory; the index/data suffixes
+    /// and index format come from what was found on disk.
+    pub fn auto_local(
+        data_path: String,
+        index_suffix: String,
+        data_suffix: String,
+        index_format: Option<String>,
+    ) -> Self {
+        GribConfig {
+            data_path: Some(data_path),
+            endpoint: None,
+            bucket: None,
+            prefix_pattern: None,
+            index_suffix: Some(index_suffix),
+            data_suffix: Some(data_suffix),
+            poll_interval_secs: default_grib_poll_interval(),
+            max_runs: None,
+            time_window: None,
+            parameters: None,
+            grid_cache_mb: default_grid_cache_mb(),
+            run_hours: None,
+            index_format,
+            filename_contains: None,
+        }
+    }
+}
+
 fn default_zarr_poll_interval() -> u64 {
     300
 }
@@ -697,6 +738,25 @@ pub struct ZarrConfig {
     /// (local) or `endpoint`+`bucket`+`path` (S3); this table selects the
     /// version to read. See issue #335.
     pub icechunk: Option<IcechunkConfig>,
+}
+
+impl ZarrConfig {
+    /// Defaults for an auto-discovered local Zarr store directory (#411):
+    /// `data_path` is the store root, version auto-detected, every variable
+    /// exposed, default poll/cache.
+    pub fn auto_local(data_path: String) -> Self {
+        ZarrConfig {
+            data_path: Some(data_path),
+            endpoint: None,
+            bucket: None,
+            path: None,
+            zarr_version: None,
+            parameters: None,
+            poll_interval_secs: default_zarr_poll_interval(),
+            cache_mb: default_zarr_cache_mb(),
+            icechunk: None,
+        }
+    }
 }
 
 /// Icechunk version selector for `[collections.zarr.icechunk]`.

@@ -23,13 +23,31 @@ also accepting `--flag=value` (see `parse_cli_args` in `server/src/main.rs`):
   over config). `BASE_URL` still wins for link generation.
 - `--config <PATH>` — config file path (wins over `CONFIG_PATH` env, then
   `./config.toml`). A missing `--config` path is a hard error.
+- `--auto-collections <DIR>` — auto-discover collections from a directory tree
+  (repeatable); see below.
 
 **No-config boot:** if the default config path is absent **and** no `--config`
 is given, the server starts from built-in defaults — host `127.0.0.1`, and it
-**auto-scans for the first free port at/above 8000** (up to 100 ports) — with no
-collections. A port pinned by config or `--port` does **not** auto-scan: a bind
-conflict is fatal. This is the base for pointing the server at a directory with
-no `config.toml` (auto-collections, #411).
+**auto-scans for the first free port at/above 8000** (up to 100 ports). A port
+pinned by config or `--port` does **not** auto-scan: a bind conflict is fatal.
+Combine with `--auto-collections` for a zero-config `server --auto-collections
+./data`.
+
+**Auto-collections (`server/src/auto.rs`, #411 phase 1):** `--auto-collections
+<DIR>` synthesizes `CollectionConfig`s from data files on disk (no TOML). Mapping
+is **per-subdirectory + loose files**: each immediate subdir → a collection;
+loose files in the root → grouped under the root name. Detection (first match
+wins): zarr store (`zarr.json`/`.zgroup`/`*.zarr` name) → `zarr`; `*.sqd` →
+`querydata`; `*.grib2`+index sidecars → `grib` (`.idx`→wgrib2, `.index`→ecmwf-json;
+**no index ⇒ skipped**, the engine never builds them); `*.tif`/`*.h5` → **phase 2,
+skipped** (need filename-template inference + ODIM COMP/PVOL probe); `*.geojson`
+and `*.csv` → one collection **per file**. Raster/grid auto-collections are
+**EDR-only** (no inferable colormap → no WMS/Maps/Tiles). Synthesized configs are
+appended to `config.collections` and run through the same `ServerConfig::validate()`
+as TOML (duplicate ids rejected). Resolved once at startup (reload does not
+re-scan auto roots in v1). Engine-config defaults come from
+`{QueryData,Grib,Zarr}Config::auto_*` constructors in `ds-core` (reuse the serde
+default fns — keep them DRY).
 
 ### Fuzz testing
 

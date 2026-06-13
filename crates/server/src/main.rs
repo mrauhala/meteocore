@@ -1,4 +1,5 @@
 mod admin;
+mod auto;
 mod preview;
 mod watcher;
 
@@ -100,6 +101,11 @@ struct CliArgs {
     /// is a hard error (unlike the default path, which falls back to built-in
     /// defaults when absent).
     config: Option<String>,
+    /// Directories to auto-discover collections from (`--auto-collections`,
+    /// repeatable). Each is scanned and turned into synthesized collections
+    /// (#411); the results are merged with any config-file collections and
+    /// validated together.
+    auto_collections: Vec<String>,
 }
 
 /// Very small hand-rolled argv parser — the server only has a handful of
@@ -116,6 +122,7 @@ fn parse_cli_args() -> CliArgs {
     let mut host: Option<String> = None;
     let mut port: Option<u16> = None;
     let mut config: Option<String> = None;
+    let mut auto_collections: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -128,6 +135,8 @@ fn parse_cli_args() -> CliArgs {
                        --host <HOST>                 Bind host (overrides [server].host)\n  \
                        --port <PORT>                 Bind port (overrides [server].port)\n  \
                        --config <PATH>               Config file path (overrides CONFIG_PATH)\n  \
+                       --auto-collections <DIR>      Auto-discover collections from a directory\n                                \
+                                 (repeatable; zarr/grib/querydata/csv/geojson)\n  \
                        -h, --help                    Show this help\n\
                      \n\
                      With no config file and no --port, the server binds localhost\n  \
@@ -183,6 +192,19 @@ fn parse_cli_args() -> CliArgs {
             s if s.starts_with("--config=") => {
                 config = Some(s["--config=".len()..].to_string());
             }
+            "--auto-collections" | "--auto" => {
+                let Some(value) = args.next() else {
+                    eprintln!("error: {arg} requires a directory");
+                    std::process::exit(2);
+                };
+                auto_collections.push(value);
+            }
+            s if s.starts_with("--auto-collections=") => {
+                auto_collections.push(s["--auto-collections=".len()..].to_string());
+            }
+            s if s.starts_with("--auto=") => {
+                auto_collections.push(s["--auto=".len()..].to_string());
+            }
             other => {
                 eprintln!("error: unknown argument '{other}' (try --help)");
                 std::process::exit(2);
@@ -194,6 +216,7 @@ fn parse_cli_args() -> CliArgs {
         host,
         port,
         config,
+        auto_collections,
     }
 }
 
@@ -276,12 +299,17 @@ async fn main() {
         std::process::exit(1);
     } else {
         // No config file at the default path and none requested: boot from
-        // built-in defaults (localhost + auto-selected port, no collections).
-        // This is the base for pointing the server at a directory with no
-        // config.toml (auto-collections, #411).
+        // built-in defaults (localhost + auto-selected port). Collections come
+        // from --auto-collections, if given (#411); otherwise the server starts
+        // empty.
+        let source = if cli.auto_collections.is_empty() {
+            "no collections"
+        } else {
+            "collections from --auto-collections"
+        };
         tracing::warn!(
             "No config file at '{config_path}'; starting with built-in defaults \
-             (localhost, auto-selected port, no collections)."
+             (localhost, auto-selected port, {source})."
         );
         (
             ds_core::config::ServerConfig::default_for_auto(),
@@ -290,6 +318,24 @@ async fn main() {
     };
     for warning in &config_warnings {
         tracing::warn!("{warning}");
+    }
+
+    // Auto-discover collections from any --auto-collections directories (#411)
+    // and merge them with the config-file collections. The merged set goes
+    // through the same validate() as TOML collections (so duplicate ids across
+    // config + auto, or auto + auto, are rejected uniformly).
+    if !cli.auto_collections.is_empty() {
+        let discovered = auto::scan_roots(&cli.auto_collections);
+        info!(
+            "--auto-collections: discovered {} collection(s) across {} director(ies)",
+            discovered.len(),
+            cli.auto_collections.len()
+        );
+        config.collections.extend(discovered);
+        if let Err(e) = config.validate() {
+            tracing::error!("Auto-discovered collections failed validation: {e}");
+            std::process::exit(1);
+        }
     }
 
     // Apply --collections filter if provided. Unknown IDs are a hard error —
