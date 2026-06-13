@@ -83,7 +83,7 @@ fn classify_dir(dir: &Path, id_hint: &str) -> Vec<CollectionConfig> {
             None => vec![],
         };
     }
-    let files: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
+    let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.is_file())
@@ -93,6 +93,10 @@ fn classify_dir(dir: &Path, id_hint: &str) -> Vec<CollectionConfig> {
             return vec![];
         }
     };
+    // `read_dir` order is OS/filesystem-dependent; sort so the per-file
+    // single-file branch emits collections deterministically (matching the
+    // sort `scan_one_root` already does for subdirs/loose files).
+    files.sort();
     classify_files(&files, dir, id_hint)
 }
 
@@ -187,7 +191,9 @@ fn classify_files(
         return single;
     }
 
-    tracing::info!(
+    // A directory the user explicitly pointed at that yielded nothing deserves
+    // visible feedback (warn shows at the default level; info would be silent).
+    tracing::warn!(
         "--auto-collections: no recognized data files in {}; skipping",
         dir.display()
     );
@@ -210,7 +216,7 @@ fn mk_zarr(dir: &Path) -> Option<CollectionConfig> {
         Some(ZarrConfig::auto_local(path)),
         None,
         None,
-        &dir.display().to_string(),
+        &file_name(dir),
     ))
 }
 
@@ -224,7 +230,7 @@ fn mk_querydata(dir: &Path, id_hint: &str) -> Option<CollectionConfig> {
         None,
         None,
         Some(QueryDataConfig::auto_default()),
-        &dir.display().to_string(),
+        &file_name(dir),
     ))
 }
 
@@ -249,7 +255,7 @@ fn mk_grib(
             index_format.map(|s| s.to_string()),
         )),
         None,
-        &dir.display().to_string(),
+        &file_name(dir),
     ))
 }
 
@@ -264,7 +270,7 @@ fn mk_geojson(file: &Path) -> Option<CollectionConfig> {
         None,
         None,
         None,
-        &file.display().to_string(),
+        &file_name(file),
     ))
 }
 
@@ -279,7 +285,7 @@ fn mk_csv(file: &Path) -> Option<CollectionConfig> {
         None,
         None,
         None,
-        &file.display().to_string(),
+        &file_name(file),
     ))
 }
 
@@ -616,6 +622,25 @@ mod tests {
         assert!(
             config.validate().is_err(),
             "duplicate collection ids must fail validate()",
+        );
+    }
+
+    #[test]
+    fn config_plus_auto_duplicate_id_rejected() {
+        use ds_core::config::ServerConfig;
+        let root = TempDir::new().unwrap();
+        touch(root.path(), "weather.csv");
+        let auto = scan_roots(&[root.path().to_str().unwrap().to_string()]);
+        assert_eq!(auto.len(), 1, "{:?}", ids(&auto));
+
+        // A pre-existing (config-file) collection with the same id as an
+        // auto-discovered one is rejected by the shared validate().
+        let mut config = ServerConfig::default_for_auto();
+        config.collections.push(auto[0].clone());
+        config.collections.extend(auto);
+        assert!(
+            config.validate().is_err(),
+            "config + auto duplicate id must fail validate()",
         );
     }
 }
