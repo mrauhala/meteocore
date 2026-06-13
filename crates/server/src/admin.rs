@@ -2149,6 +2149,30 @@ fn register_parameter_layer_styles(
         let layer_key = format!("{}/{}", collection.id, short_name);
         let mut layer_styles = HashMap::new();
 
+        // The derived storm-cell overlay (#367) paints cell outlines/markers
+        // at their dBZ value and track trails at a reserved sentinel; wrap
+        // whatever colormap it resolves to so the sentinel renders one neutral
+        // colour (distinct from the dBZ-coloured outlines) regardless of the
+        // base colormap (inherited or overridden). Scoped to `odim-volume` —
+        // this generic helper runs for every engine, and only the ODIM PVOL
+        // engine produces a CELLS overlay; without the engine-type gate a
+        // non-ODIM collection with a band coincidentally named `CELLS` would
+        // get `-9999.0` hijacked to grey (#410 will remove the engine-specific
+        // branch entirely via an `OverlaySpec` on `StyleInfo`).
+        let is_cells = collection.engine_type == "odim-volume"
+            && short_name == engine_odim::cells::CELLS_PARAMETER;
+        let wrap_cells = |cmap: Arc<dyn ds_render::ColorMap>| -> Arc<dyn ds_render::ColorMap> {
+            if is_cells {
+                Arc::new(ds_render::OverlayColorMap::new(
+                    cmap,
+                    engine_odim::cells::CELLS_TRACK_SENTINEL,
+                    engine_odim::cells::CELLS_TRACK_COLOR,
+                ))
+            } else {
+                cmap
+            }
+        };
+
         // Build this parameter's default style
         let (colormap, min, max) = if let Some(pc) = param_configs.get(short_name.as_str()) {
             build_colormap_from_wms_config(pc.colormap.as_deref(), &pc.color_stops, pc.min, pc.max)
@@ -2161,7 +2185,7 @@ fn register_parameter_layer_styles(
             ds_render::StyleInfo {
                 name: "default".to_string(),
                 title: "Default".to_string(),
-                colormap,
+                colormap: wrap_cells(colormap),
                 min,
                 max,
                 parameter: Some(short_name.clone()),
@@ -2181,7 +2205,18 @@ fn register_parameter_layer_styles(
                     continue;
                 }
             }
-            layer_styles.insert(name.clone(), style.clone());
+            // A CELLS-scoped named style still needs the trail sentinel handled.
+            if is_cells {
+                layer_styles.insert(
+                    name.clone(),
+                    ds_render::StyleInfo {
+                        colormap: wrap_cells(style.colormap.clone()),
+                        ..style.clone()
+                    },
+                );
+            } else {
+                layer_styles.insert(name.clone(), style.clone());
+            }
         }
 
         style_map.insert(layer_key, layer_styles);

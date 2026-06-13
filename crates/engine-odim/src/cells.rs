@@ -38,10 +38,25 @@ pub(crate) const CELLS_PARAMETER_TITLE: &str = "Storm cells";
 /// Scans tracked behind the rendered one for the overlay's trajectories —
 /// half an hour at 5-minute cadence.
 const CELLS_TRACK_SCANS: usize = 6;
-/// Stroke width (px) for footprint rings and track polylines.
+/// Stroke width (px) for footprint rings.
 const STROKE_PX: u32 = 2;
+/// Stroke width (px) for track trails — one thinner than the outlines so a
+/// trail reads as subordinate to the cell it leads to.
+const TRACK_STROKE_PX: u32 = 1;
 /// Centroid marker arm length (px).
 const MARKER_HALF_PX: u32 = 3;
+
+/// Reserved raster value painted along track trails in the `CELLS` overlay.
+/// It is **not** a dBZ measurement — a fixed sentinel far outside any real
+/// reflectivity, rendered as a single neutral colour by the
+/// [`ds_render::OverlayColorMap`] the `CELLS` layer is styled with (so trails
+/// are visually distinct from the dBZ-coloured cell outlines, not blended
+/// into them). The styling side matches it by exact `f64` equality, so this
+/// value must be painted verbatim.
+pub const CELLS_TRACK_SENTINEL: f64 = -9999.0;
+/// Neutral colour the `CELLS` track trails render as (dark grey — contrasts
+/// with both the warm dBZ outline colours and light basemaps). RGBA.
+pub const CELLS_TRACK_COLOR: [u8; 4] = [60, 60, 60, 255];
 
 /// Default [`CELL_SET_CACHE`] size (MB) when `MC_PVOL_CELL_SET_CACHE_MB` is
 /// unset. An entry's dominant cost is the per-cell footprint ring; a typical
@@ -284,35 +299,243 @@ impl PolarVolumeSiteView {
                 self.collection_id
             ))
         })?;
-        let px = |lon: f64, lat: f64| {
+        paint_cell_product(&mut canvas, &product, |lon, lat| {
             let (fx, fy) = output_crs.world_to_fraction(bbox, lon, lat);
             (fx * width as f64, fy * height as f64)
-        };
-
-        let (_, target) = product.target();
-        for cell in &target.cells {
-            // An empty footprint (degenerate mask — unreachable for a
-            // BFS-produced component) simply paints nothing.
-            let ring: Vec<(f64, f64)> = cell.footprint.iter().map(|v| px(v[0], v[1])).collect();
-            canvas.stroke_ring(&ring, STROKE_PX, cell.max_dbz);
-            canvas.paint_marker(
-                px(cell.centroid[0], cell.centroid[1]),
-                MARKER_HALF_PX,
-                cell.max_dbz,
-            );
-        }
-        for track in &product.tracks.tracks {
-            if track.points.len() < 2 {
-                continue;
-            }
-            let line: Vec<(f64, f64)> = track.points.iter().map(|p| px(p.lon, p.lat)).collect();
-            let value = track.points.last().expect("non-empty track").max_dbz;
-            canvas.stroke_polyline(&line, STROKE_PX, value);
-        }
+        });
         Ok(RasterTile {
             width,
             height,
             values,
         })
+    }
+}
+
+/// Paint a [`CellProduct`] into `canvas`: the target scan's footprint
+/// outlines + centroid markers (at each cell's max dBZ), and the **connected**
+/// track trails (at the reserved [`CELLS_TRACK_SENTINEL`]). `project` maps a
+/// WGS84 `(lon, lat)` to output pixel coordinates.
+///
+/// Free function (no engine state) so the rendering rules — especially the
+/// orphan-trail filter — are unit-testable against a synthetic `CellProduct`
+/// without a multi-volume fixture.
+fn paint_cell_product(
+    canvas: &mut Canvas,
+    product: &CellProduct,
+    project: impl Fn(f64, f64) -> (f64, f64),
+) {
+    let (target_time, target) = product.target();
+    for cell in &target.cells {
+        // An empty footprint (degenerate mask — unreachable for a
+        // BFS-produced component) simply paints nothing.
+        let ring: Vec<(f64, f64)> = cell.footprint.iter().map(|v| project(v[0], v[1])).collect();
+        canvas.stroke_ring(&ring, STROKE_PX, cell.max_dbz);
+        canvas.paint_marker(
+            project(cell.centroid[0], cell.centroid[1]),
+            MARKER_HALF_PX,
+            cell.max_dbz,
+        );
+    }
+    // Trails only for cells that are present in the rendered (target) scan —
+    // a trail must terminate at a visible outline. Drawing every track in the
+    // window painted orphan lines for cells that had died or weakened out of
+    // the latest scan (user-reported clutter). Trails are painted at the
+    // reserved sentinel so the overlay colormap renders them one neutral
+    // colour, not the cell's dBZ colour.
+    for track in &product.tracks.tracks {
+        if track.points.len() < 2 {
+            continue;
+        }
+        if track.points.last().expect("non-empty track").time != *target_time {
+            continue;
+        }
+        let line: Vec<(f64, f64)> = track.points.iter().map(|p| project(p.lon, p.lat)).collect();
+        canvas.stroke_polyline(&line, TRACK_STROKE_PX, CELLS_TRACK_SENTINEL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use ds_core::cells::{CellSet, StormCell, Track, TrackPoint, TrackSet};
+    use std::sync::Arc;
+
+    fn t(min: i64) -> chrono::DateTime<chrono::Utc> {
+        Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap() + chrono::Duration::minutes(min)
+    }
+
+    fn cell(label: u32, lon: f64, lat: f64) -> StormCell {
+        // A small square footprint around (lon, lat); attributes are nominal.
+        StormCell {
+            label,
+            max_dbz: 45.0,
+            max_dbz_pos: [lon, lat, 3_000.0],
+            centroid: [lon, lat, 3_000.0],
+            echo_top_m: 8_000.0,
+            base_m: 1_000.0,
+            volume_km3: 50.0,
+            area_km2: 25.0,
+            max_vil_kg_m2: 10.0,
+            footprint: vec![
+                [lon - 0.2, lat - 0.2],
+                [lon + 0.2, lat - 0.2],
+                [lon + 0.2, lat + 0.2],
+                [lon - 0.2, lat + 0.2],
+                [lon - 0.2, lat - 0.2],
+            ],
+            bbox_enu_m: [0.0; 6],
+        }
+    }
+
+    /// A track moving in a straight line from `(lon0, lat0)` at `t(first)` to
+    /// `(lon1, lat1)` at `t(last)`, one point per 5-minute step. Distinct
+    /// endpoints make the trail a real multi-pixel polyline (not a degenerate
+    /// zero-length one), so the orphan-filter assertions are unambiguous.
+    fn track(
+        first: i64,
+        last: i64,
+        label: u32,
+        (lon0, lat0): (f64, f64),
+        (lon1, lat1): (f64, f64),
+    ) -> Track {
+        let steps: Vec<i64> = (first..=last).step_by(5).collect();
+        let span = (steps.len().max(2) - 1) as f64;
+        let points = steps
+            .iter()
+            .enumerate()
+            .map(|(i, &m)| {
+                let f = i as f64 / span;
+                TrackPoint {
+                    time: t(m),
+                    lon: lon0 + f * (lon1 - lon0),
+                    lat: lat0 + f * (lat1 - lat0),
+                    height_m: 3_000.0,
+                    label,
+                    max_dbz: 45.0,
+                }
+            })
+            .collect::<Vec<_>>();
+        Track {
+            id: format!("trk-{label}"),
+            points,
+            motion_ms: Some((1.0, 0.0)),
+        }
+    }
+
+    /// The orphan-trail fix (#367 user report): a trail is painted only when
+    /// its last observation is the rendered scan. A track that ended earlier
+    /// (a dead/weakened cell) must NOT leave a line. The connected track's
+    /// trail is painted at the sentinel; the orphan's is not.
+    #[test]
+    fn only_connected_trails_are_painted() {
+        let target_time = t(10);
+        // One cell visible in the target scan, at the centre.
+        let target = Arc::new(CellSet {
+            time: target_time,
+            quantity: "DBZH".into(),
+            threshold: 35.0,
+            origin: [25.0, 60.0, 100.0],
+            cells: vec![cell(1, 25.0, 60.0)],
+        });
+        let product = CellProduct {
+            cell_sets: vec![(target_time, target)],
+            tracks: TrackSet {
+                tracks: vec![
+                    // Connected: a real line ending at the target time, near
+                    // the visible cell (right half of the canvas).
+                    track(0, 10, 1, (25.4, 60.0), (25.0, 60.0)),
+                    // Orphan: a real line that ended at t(5), in the left half
+                    // — well clear of the connected trail.
+                    track(0, 5, 2, (23.5, 60.6), (24.2, 60.4)),
+                ],
+            },
+        };
+
+        // 100×100 canvas over a bbox that contains both tracks.
+        let mut values = vec![None; 100 * 100];
+        let bbox = [23.0, 59.0, 26.0, 61.0];
+        let project = |lon: f64, lat: f64| {
+            let fx = (lon - bbox[0]) / (bbox[2] - bbox[0]);
+            let fy = (bbox[3] - lat) / (bbox[3] - bbox[1]);
+            (fx * 100.0, fy * 100.0)
+        };
+        {
+            let mut canvas = Canvas::new(&mut values, 100, 100).unwrap();
+            paint_cell_product(&mut canvas, &product, project);
+        }
+
+        let sentinel_px = values
+            .iter()
+            .filter(|v| **v == Some(CELLS_TRACK_SENTINEL))
+            .count();
+        let outline_px = values.iter().filter(|v| **v == Some(45.0)).count();
+        assert!(
+            outline_px > 0,
+            "the visible cell's outline + marker is painted"
+        );
+        // The connected trail is a multi-pixel line, not one degenerate pixel.
+        assert!(
+            sentinel_px > 2,
+            "the connected track leaves a real sentinel-valued trail, got {sentinel_px}px"
+        );
+
+        // No sentinel pixel anywhere along the orphan track's path. Sample its
+        // every point: a broken filter would draw a clear line through these.
+        let orphan = track(0, 5, 2, (23.5, 60.6), (24.2, 60.4));
+        for p in &orphan.points {
+            let (px, py) = project(p.lon, p.lat);
+            let (cx, cy) = (px.round() as i64, py.round() as i64);
+            // Check a small neighbourhood around each orphan vertex.
+            for dy in -2..=2 {
+                for dx in -2..=2 {
+                    let (x, y) = (cx + dx, cy + dy);
+                    if (0..100).contains(&x) && (0..100).contains(&y) {
+                        assert_ne!(
+                            values[(y * 100 + x) as usize],
+                            Some(CELLS_TRACK_SENTINEL),
+                            "orphan track (ended before the rendered scan) must leave no trail \
+                             near ({x}, {y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A single-observation track (just born) never draws a trail.
+    #[test]
+    fn single_point_track_draws_no_trail() {
+        let target_time = t(0);
+        let target = Arc::new(CellSet {
+            time: target_time,
+            quantity: "DBZH".into(),
+            threshold: 35.0,
+            origin: [25.0, 60.0, 100.0],
+            cells: vec![cell(1, 25.0, 60.0)],
+        });
+        let product = CellProduct {
+            cell_sets: vec![(target_time, target)],
+            tracks: TrackSet {
+                tracks: vec![track(0, 0, 1, (25.0, 60.0), (25.0, 60.0))], // one point
+            },
+        };
+        let mut values = vec![None; 64 * 64];
+        {
+            let mut canvas = Canvas::new(&mut values, 64, 64).unwrap();
+            paint_cell_product(&mut canvas, &product, |lon, lat| {
+                let fx = (lon - 23.0) / 3.0;
+                let fy = (61.0 - lat) / 2.0;
+                (fx * 64.0, fy * 64.0)
+            });
+        }
+        assert_eq!(
+            values
+                .iter()
+                .filter(|v| **v == Some(CELLS_TRACK_SENTINEL))
+                .count(),
+            0,
+            "a one-point track has no trajectory to draw"
+        );
     }
 }

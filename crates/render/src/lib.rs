@@ -5,7 +5,7 @@ pub mod plot;
 
 pub use colormap::{
     parse_hex_color, BuiltinColormap, ColorMap, ColorStop, IntegerLutColorMap, LinearColorMap,
-    LutColorMap,
+    LutColorMap, OverlayColorMap,
 };
 pub use encode::{encode_jpeg, encode_png, encode_webp};
 pub use metatile::{render_metatiled, MetaTile, MetaTileStats, TileKeyPrefix, TilePixelCache};
