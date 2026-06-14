@@ -1352,24 +1352,109 @@ pub fn read_pixel(
     Ok(values[local_idx])
 }
 
-/// Maximum number of concurrent tile fetches for remote sources.
-const MAX_TILE_CONCURRENCY: usize = 5;
+/// Default ceiling on concurrent remote-tile fetches when
+/// `MC_COG_TILE_CONCURRENCY` is unset.
+///
+/// A cold full-viewport WMS GetMap over a remote COG fetches all covering tiles
+/// through [`TILE_FETCH_POOL`], so the pool's thread count is the number of
+/// byte-range reads in flight at once. The work is **I/O-bound** — each worker
+/// blocks on a network range read (driven on the captured runtime handle), then
+/// spends a short CPU burst decoding the tile — so the right ceiling is set by
+/// remote round-trip latency, not CPU cores. Measured against the live OPERA
+/// pan-European COG on CloudFerro S3 (2026-06-14): a 1900×1100 EPSG:3857 cold
+/// render fetches 70 tiles; at the old cap of 5 that serialized into ~14 waves
+/// (~127 ms/wave ≈ 1.78 s in the tile loop, 96% of a 1.84 s render). 16 cuts
+/// that to ~5 waves. The threads are mostly parked on the network, so a count
+/// above the core count is fine; raise it further for high-latency stores.
+const DEFAULT_TILE_CONCURRENCY: usize = 16;
+
+/// Hard safety ceiling on the resolved tile-fetch concurrency.
+///
+/// `MC_COG_TILE_CONCURRENCY` feeds `rayon::ThreadPoolBuilder::num_threads`
+/// inside the [`TILE_FETCH_POOL`] `LazyLock`. A fat-fingered value (e.g. a
+/// `100000` typo) would make the OS refuse to spawn that many threads, the
+/// `build().expect(...)` would panic *inside the static initialiser*, poison
+/// the `LazyLock`, and then **every** later request that touches the pool would
+/// panic too — an unrecoverable crash from one bad env var. Clamping to this
+/// ceiling keeps the process alive; 1024 is far above any useful I/O fan-out
+/// yet trivially creatable.
+const MAX_TILE_CONCURRENCY: usize = 1024;
+
+/// Pure parse of `MC_COG_TILE_CONCURRENCY`: `Some(n)` is an applied override
+/// clamped into `[1, MAX_TILE_CONCURRENCY]`; `None` means fall back to
+/// [`DEFAULT_TILE_CONCURRENCY`] (unset, non-numeric, or zero). Returning an
+/// `Option` lets the pool initialiser report whether an override actually took
+/// effect — the resolved value alone is ambiguous (an override of 16 and the
+/// compiled default 16 are indistinguishable in a log line).
+fn parse_tile_concurrency(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .map(|n| n.min(MAX_TILE_CONCURRENCY))
+}
 
 /// Shared rayon thread pool for parallel tile fetching.
 /// Avoids the overhead of creating a new pool per request (~10-50us each).
-static TILE_FETCH_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(MAX_TILE_CONCURRENCY)
-        .thread_name(|i| format!("tile-fetch-{i}"))
-        .build()
-        .expect("failed to create tile fetch thread pool")
-});
+/// Sized once on first use (the first remote-COG render); the resolved thread
+/// count and its source are logged there so operators can confirm an
+/// `MC_COG_TILE_CONCURRENCY` override took effect.
+static TILE_FETCH_POOL: LazyLock<rayon::ThreadPool> =
+    LazyLock::new(|| {
+        match parse_tile_concurrency(std::env::var("MC_COG_TILE_CONCURRENCY").ok().as_deref()) {
+            Some(n) => build_tile_pool(n, "MC_COG_TILE_CONCURRENCY"),
+            None => build_tile_pool(DEFAULT_TILE_CONCURRENCY, "default"),
+        }
+    });
 
-/// Read pixel values within a bounding box from a GeoTIFF data source.
-/// Returns a row-major grid of values [row_start..row_end, col_start..col_end].
-/// `band_index` selects which band (0-based) for multi-band files.
+/// Build the tile-fetch pool, degrading gracefully instead of poisoning the
+/// [`TILE_FETCH_POOL`] `LazyLock`.
 ///
-/// For remote sources, tiles are fetched in parallel (up to `MAX_TILE_CONCURRENCY`
+/// `rayon::ThreadPoolBuilder::build` can fail to spawn the requested threads for
+/// reasons unrelated to the value being absurd — OS thread limits (`ulimit -u`,
+/// a cgroup `pids.max`, container runtime caps) can refuse even a modest count
+/// like 32 in a constrained pod. A bare `.expect()` there would panic *inside
+/// the static initialiser*, poison the lock, and crash every subsequent
+/// remote-COG render with no recovery path. Instead we **halve and retry** until
+/// a pool builds, recovering whatever concurrency the OS does allow rather than
+/// dropping straight to fully serial. A 1-thread pool needs exactly one
+/// spawnable thread; if even that fails the process can't serve any request, so
+/// the final panic is a genuinely unreachable last resort.
+///
+/// `source` ("MC_COG_TILE_CONCURRENCY" or "default") is logged so an operator
+/// can tell an applied override from the compiled default — the count alone is
+/// ambiguous.
+fn build_tile_pool(requested: usize, source: &str) -> rayon::ThreadPool {
+    tracing::info!(
+        threads = requested,
+        source,
+        "initializing remote-COG tile fetch pool"
+    );
+    let mut threads = requested.max(1);
+    loop {
+        match rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("tile-fetch-{i}"))
+            .build()
+        {
+            Ok(pool) => {
+                if threads != requested {
+                    tracing::warn!(
+                        requested,
+                        threads,
+                        "tile fetch pool built below requested size (OS thread limit?); \
+                         remote-COG fetches will use reduced concurrency"
+                    );
+                }
+                return pool;
+            }
+            Err(e) if threads > 1 => {
+                tracing::debug!(threads, error = %e, "tile fetch pool build failed; halving and retrying");
+                threads /= 2;
+            }
+            Err(e) => panic!("failed to build even a single-thread tile fetch pool: {e}"),
+        }
+    }
+}
+
 /// Read a bbox from a specific overview level for map rendering.
 ///
 /// Uses the overview's tile layout and geometry. Falls back to full resolution
@@ -1761,7 +1846,8 @@ where
 }
 
 /// Parallel tile fetching for remote data sources.
-/// Uses a rayon thread pool capped at `MAX_TILE_CONCURRENCY` threads.
+/// Uses the shared [`TILE_FETCH_POOL`] (sized by `MC_COG_TILE_CONCURRENCY` /
+/// [`DEFAULT_TILE_CONCURRENCY`]).
 #[allow(clippy::too_many_arguments)]
 fn read_bbox_parallel(
     store: &ds_storage::DataStore,
@@ -2873,5 +2959,33 @@ mod tests {
         let meta = meta_with_nodata(65535.0);
         assert!(meta.is_nodata_raw(65535.0));
         assert!(!meta.is_nodata_raw(65534.0));
+    }
+
+    #[test]
+    fn tile_concurrency_parse() {
+        // Unset / malformed / zero → no override (caller falls back to default).
+        assert_eq!(parse_tile_concurrency(None), None);
+        assert_eq!(parse_tile_concurrency(Some("")), None);
+        assert_eq!(parse_tile_concurrency(Some("abc")), None);
+        assert_eq!(parse_tile_concurrency(Some("0")), None);
+        // Explicit value ≥ 1 is an applied override (whitespace tolerated).
+        assert_eq!(parse_tile_concurrency(Some("1")), Some(1));
+        assert_eq!(parse_tile_concurrency(Some(" 32 ")), Some(32));
+        // The ceiling itself passes through unchanged, and anything above it is
+        // clamped down. Boundaries derive from the constant so the test tracks
+        // MAX_TILE_CONCURRENCY instead of silently desyncing from a literal.
+        assert_eq!(
+            parse_tile_concurrency(Some(&MAX_TILE_CONCURRENCY.to_string())),
+            Some(MAX_TILE_CONCURRENCY)
+        );
+        assert_eq!(
+            parse_tile_concurrency(Some(&(MAX_TILE_CONCURRENCY + 1).to_string())),
+            Some(MAX_TILE_CONCURRENCY)
+        );
+        // …and a wildly oversized value clamps too, never reaching the builder.
+        assert_eq!(
+            parse_tile_concurrency(Some("100000")),
+            Some(MAX_TILE_CONCURRENCY)
+        );
     }
 }
