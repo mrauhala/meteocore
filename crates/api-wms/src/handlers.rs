@@ -591,18 +591,21 @@ pub async fn wms_handler(
                 ))
             })?;
 
+            // Default to a size that fits the value-tick labels + title (#371);
+            // a client can still request a smaller thumbnail, where the renderer
+            // degrades to a bare swatch.
             let width: u32 = query
                 .width
                 .as_deref()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(40);
+                .unwrap_or(180);
             let height: u32 = query
                 .height
                 .as_deref()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(200);
-            let width = width.min(256);
-            let height = height.min(1024);
+                .unwrap_or(300);
+            let width = width.clamp(1, 512);
+            let height = height.clamp(1, 1024);
 
             let format = crate::params::parse_image_format(query.format.as_deref())?;
 
@@ -610,8 +613,57 @@ pub async fn wms_handler(
             let min = style_info.min;
             let max = style_info.max;
 
+            // Resolve a title ("<parameter> (<unit>)") for the legend from the
+            // engine's raster metadata (#371). The parameter is the style's
+            // configured one (set for per-parameter layers), falling back to the
+            // "collection/param" layer segment, then the engine's default
+            // parameter. The unit is the collection-level unit; multi-unit
+            // sources (e.g. radar polar volumes) report none, so it's omitted.
+            let info = state
+                .engines
+                .get(legend_collection_id)
+                .map(|e| e.raster_info());
+            let param = style_info
+                .parameter
+                .clone()
+                .or_else(|| layer_name.split('/').nth(1).map(str::to_string))
+                .or_else(|| {
+                    info.as_ref()
+                        .map(|i| i.parameter.clone())
+                        .filter(|p| !p.is_empty())
+                });
+            let unit = info
+                .as_ref()
+                .map(|i| i.unit.clone())
+                .filter(|u| !u.is_empty());
+            let param_unit = match (param, unit) {
+                (Some(p), Some(u)) => Some(format!("{p} ({u})")),
+                (Some(s), None) | (None, Some(s)) => Some(s),
+                (None, None) => None,
+            };
+            // For a non-default style, show its name on a second line so the
+            // legend identifies which of a layer's styles it depicts (the colours
+            // already come from this style's colormap). "default"/"Default" carry
+            // no information, so they're omitted.
+            let style_line = (style_name != "default")
+                .then(|| style_info.title.trim().to_string())
+                .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("default"));
+            let title = match (param_unit, style_line) {
+                (Some(pu), Some(sl)) => Some(format!("{pu}\n{sl}")),
+                (Some(s), None) | (None, Some(s)) => Some(s),
+                (None, None) => None,
+            };
+
             let legend_bytes = tokio::task::spawn_blocking(move || {
-                ds_render::render_legend(colormap.as_ref(), min, max, width, height, format)
+                ds_render::render_legend(
+                    colormap.as_ref(),
+                    min,
+                    max,
+                    width,
+                    height,
+                    format,
+                    title.as_deref(),
+                )
             })
             .await
             .map_err(|e| WmsError::Internal(format!("Legend render failed: {e}")))?

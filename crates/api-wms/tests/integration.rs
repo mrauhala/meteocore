@@ -113,6 +113,24 @@ fn build_empty_router() -> axum::Router {
             parameter: None,
         },
     );
+    // A second, named style so legend tests can assert the selected STYLE flows
+    // through (distinct colormap + range → distinct legend, plus the style name
+    // on the legend's second title line).
+    layer_styles.insert(
+        "radar_fmi".to_string(),
+        StyleInfo {
+            name: "radar_fmi".to_string(),
+            title: "FMI Radar".to_string(),
+            colormap: Arc::new(LutColorMap::from_builtin(
+                BuiltinColormap::RadarDbz,
+                -32.0,
+                95.0,
+            )),
+            min: -32.0,
+            max: 95.0,
+            parameter: None,
+        },
+    );
     styles_map.insert("empty".to_string(), layer_styles);
 
     let state = Arc::new(ArcSwap::from_pointee(WmsState {
@@ -1769,4 +1787,98 @@ async fn timeless_getmap_tracks_new_latest_data() {
         "a TIME-less request after new data must re-render, not serve the stale frame"
     );
     assert_eq!(calls.lock().unwrap().last().copied(), Some(Some(t2)));
+}
+
+/// Parse a PNG's IHDR `(width, height)`. The signature is 8 bytes, then the
+/// IHDR chunk: 4-byte length, the `IHDR` tag, then width/height as big-endian
+/// u32s. Lets the legend tests assert dimensions without a PNG decoder dep.
+fn png_dims(bytes: &[u8]) -> (u32, u32) {
+    assert!(
+        bytes.starts_with(&[0x89, b'P', b'N', b'G']),
+        "not a PNG: {:?}",
+        &bytes[..4.min(bytes.len())]
+    );
+    let w = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+    let h = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+    (w, h)
+}
+
+/// `GetLegendGraphic` (#371): with no WIDTH/HEIGHT the handler returns the new
+/// labelled default-size legend (180×300), as an immutable-cacheable PNG. The
+/// title/unit resolution from `raster_info()` runs end-to-end (a panic there
+/// would fail this test).
+#[tokio::test]
+async fn legend_graphic_defaults_to_labelled_size() {
+    let app = build_empty_router();
+    let req = Request::builder()
+        .uri(
+            "/?SERVICE=WMS&REQUEST=GetLegendGraphic&VERSION=1.3.0\
+             &LAYER=empty&FORMAT=image/png",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let headers = resp.headers().clone();
+    assert_eq!(headers.get("content-type").unwrap(), "image/png");
+    assert_eq!(
+        headers.get("cache-control").unwrap(),
+        "public, max-age=86400, immutable"
+    );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        png_dims(&body),
+        (180, 300),
+        "legend should default to the labelled 180×300 size"
+    );
+}
+
+/// `GetLegendGraphic` reflects the selected `STYLES`: the named style's distinct
+/// colormap/range (and its name on the legend) make its legend bytes differ from
+/// the default style's. Confirms the legend isn't pinned to the default colormap.
+#[tokio::test]
+async fn legend_graphic_reflects_selected_style() {
+    let app = build_empty_router();
+    let fetch = |styles: &str| {
+        let uri = format!(
+            "/?SERVICE=WMS&REQUEST=GetLegendGraphic&VERSION=1.3.0\
+             &LAYER=empty&FORMAT=image/png&STYLES={styles}"
+        );
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            resp.into_body().collect().await.unwrap().to_bytes()
+        }
+    };
+    let default = fetch("default").await;
+    let named = fetch("radar_fmi").await;
+    assert!(default.starts_with(&[0x89, b'P', b'N', b'G']));
+    assert!(named.starts_with(&[0x89, b'P', b'N', b'G']));
+    assert_ne!(
+        default, named,
+        "the selected style must change the rendered legend"
+    );
+}
+
+/// A client may still request an explicit (smaller) legend size; the handler
+/// honours it and the renderer degrades to a bare swatch when too narrow for
+/// labels. Asserts the requested dimensions round-trip.
+#[tokio::test]
+async fn legend_graphic_honours_explicit_size() {
+    let app = build_empty_router();
+    let req = Request::builder()
+        .uri(
+            "/?SERVICE=WMS&REQUEST=GetLegendGraphic&VERSION=1.3.0\
+             &LAYER=empty&FORMAT=image/png&WIDTH=20&HEIGHT=120",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(png_dims(&body), (20, 120));
 }

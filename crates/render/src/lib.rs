@@ -1,5 +1,8 @@
 pub mod colormap;
 mod encode;
+/// 5×7 bitmap font for in-image text (legend labels). Crate-internal — an
+/// implementation detail of the legend renderer, not part of the public API.
+pub(crate) mod font;
 pub mod metatile;
 pub mod plot;
 
@@ -412,10 +415,70 @@ pub fn render_tile_png(
     render_tile(tile, colormap, ImageFormat::Png)
 }
 
+/// "Nice" round tick values to label a legend gradient over `[min, max]`.
+///
+/// Reuses the chart axis tick generator ([`plot::nice_ticks`], the shared 1-2-5
+/// nice-number algorithm) and clips to `[min, max]` — a colorbar tick must map
+/// onto the gradient, so unlike a chart axis it can't extend a half-step past
+/// the data extent. Aims for ~6 ticks; an empty result (degenerate / inverted
+/// range) means the caller draws no ticks.
+fn legend_ticks(min: f64, max: f64) -> Vec<f64> {
+    plot::nice_ticks(min, max, 6)
+        .into_iter()
+        .filter(|&v| v >= min && v <= max)
+        .collect()
+}
+
+/// Format a tick value for a legend label with the *fewest* decimals (0–6) that
+/// reproduce it, so round numbers stay clean (`10`, `0.2`) while a small-range
+/// gradient keeps its digits (a `[0, 0.001]` scale labels `0.0002`, not `0`).
+/// A fixed decimal count can't do both — too few collapses tiny ticks to `0`,
+/// too many leaves trailing zeros on round ones. Values too small to show at
+/// 6 dp fall back to scientific notation (`2e-8`) so sub-µ ranges stay legible.
+fn format_tick(v: f64) -> String {
+    if v == 0.0 {
+        return "0".to_string(); // also catches -0.0
+    }
+    // Smallest precision whose round-trip is within a relative epsilon of `v`.
+    // The ticks come from `(t/step).round()*step` so they carry float noise
+    // (0.30000000000000004); the tolerance snaps that back to "0.3".
+    let mut chosen = format!("{v:.6}");
+    for prec in 0..=6 {
+        let s = format!("{v:.prec$}");
+        if s.parse::<f64>()
+            .is_ok_and(|p| (p - v).abs() <= v.abs() * 1e-9)
+        {
+            chosen = s;
+            break;
+        }
+    }
+    // A value too small to show at 6 dp prints as all zeros — fall back to
+    // scientific notation ("2e-8") so a sub-µ range's ticks stay distinct
+    // instead of all collapsing to "0" (the font renders `e`/`-`/digits).
+    if chosen
+        .trim_start_matches('-')
+        .bytes()
+        .all(|b| b == b'0' || b == b'.')
+    {
+        format!("{v:e}")
+    } else {
+        chosen
+    }
+}
+
 /// Render a legend image showing the colormap scale.
 ///
-/// Produces a vertical gradient with labeled tick marks.
-/// Width: `width` pixels, Height: `height` pixels.
+/// Produces a vertical colour gradient (top = `max`, bottom = `min`) with a
+/// bordered swatch, a nice-number tick scale with numeric value labels, and an
+/// optional `title` (e.g. `"reflectivity (dBZ)"`). The title may contain
+/// newlines to stack multiple lines — the WMS handler uses a second line for the
+/// selected style's name. Labels are drawn with the embedded [`font`] so
+/// `ds-render` stays framework-free.
+///
+/// The layout adapts to the requested size: the title and the tick labels are
+/// each drawn only when there is room, so the function degrades gracefully to a
+/// bare gradient for very small `width`/`height` (e.g. a 40×200 thumbnail) while
+/// producing a fully labelled legend at the WMS default size.
 pub fn render_legend(
     colormap: &dyn ColorMap,
     min: f64,
@@ -423,22 +486,138 @@ pub fn render_legend(
     width: u32,
     height: u32,
     format: ImageFormat,
+    title: Option<&str>,
 ) -> Result<Vec<u8>, DataServerError> {
-    let gradient_width = (width * 2 / 5).max(10); // left 40% is gradient
-    let mut rgba = vec![255u8; (width * height * 4) as usize]; // white background
+    // Normalise so the gradient always runs large-at-top → small-at-bottom even
+    // if a caller passes the bounds reversed.
+    let (min, max) = if min <= max { (min, max) } else { (max, min) };
+    let span = max - min;
 
-    for y in 0..height {
-        // Map y position to value (top = max, bottom = min)
-        let frac = y as f64 / (height.saturating_sub(1).max(1)) as f64;
-        let value = max - frac * (max - min);
-        let color = colormap.color(Some(value));
+    const PAD: u32 = 4;
+    const TEXT: [u8; 4] = [0, 0, 0, 255]; // opaque black labels
+    const BORDER: [u8; 4] = [80, 80, 80, 255]; // grey swatch border
+    const SCALE: u32 = 1;
+    const TICK_LEN: u32 = 4; // tick mark length past the swatch
+    const LABEL_GAP: u32 = 3; // gap between tick mark and its label
+    const LINE_GAP: u32 = 2; // vertical gap between stacked title lines
 
-        for x in 0..gradient_width {
-            let idx = ((y * width + x) * 4) as usize;
-            rgba[idx] = color[0];
-            rgba[idx + 1] = color[1];
-            rgba[idx + 2] = color[2];
-            rgba[idx + 3] = color[3];
+    let mut rgba = vec![255u8; (width as usize * height as usize) * 4]; // white background
+
+    // Reserve a title block at the top. The title may carry several lines
+    // (newline-separated) — e.g. "<parameter> (<unit>)" plus the selected WMS
+    // style's name — each drawn top-aligned. Drawn only when there's vertical
+    // room for the whole block plus a usable gradient below; a single line
+    // reduces to the original one-row reservation.
+    let title_lines: Vec<&str> = title
+        .map(|t| t.split('\n').filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default();
+    let title_h = if title_lines.is_empty() {
+        0
+    } else {
+        let n = title_lines.len() as u32;
+        let block = n * font::GLYPH_H * SCALE + (n - 1) * LINE_GAP;
+        if height >= PAD * 2 + block + 20 {
+            for (i, line) in title_lines.iter().enumerate() {
+                let ly = PAD + i as u32 * (font::GLYPH_H * SCALE + LINE_GAP);
+                font::draw_text(
+                    &mut rgba, width, height, PAD as i32, ly as i32, line, TEXT, SCALE,
+                );
+            }
+            block + PAD // block + a small gap below it before the gradient
+        } else {
+            0
+        }
+    };
+
+    // Will we have horizontal room for tick labels? Size the decision from the
+    // *actual widest* label (e.g. "-32", "0.0008"), not a fixed 2-digit guess —
+    // otherwise a narrow legend whose labels are wider than "00" would pass the
+    // check and then clip the labels' right edge. Empty ticks (degenerate range)
+    // → no labels, full-width swatch.
+    let ticks = legend_ticks(min, max);
+    let max_label_w = ticks
+        .iter()
+        .map(|v| font::text_width(&format_tick(*v), SCALE))
+        .max()
+        .unwrap_or(0);
+    let want_labels =
+        !ticks.is_empty() && width >= PAD * 2 + 12 + TICK_LEN + LABEL_GAP + max_label_w;
+
+    let grad_x0 = PAD;
+
+    // Swatch width: a slim bar when we're labelling (the labels carry the
+    // information), or the historical ~40% when there's no room for labels.
+    // Both branches must keep `grad_x0 + swatch_w <= width` — the swatch starts
+    // at `grad_x0`, so capping at `width` alone would let the gradient loop spill
+    // `grad_x0` columns past the row end into the next row (corruption, and an
+    // out-of-bounds write at the smallest requestable sizes).
+    let swatch_w = if want_labels {
+        ((width / 6).clamp(14, 30)).min(width.saturating_sub(2 * PAD).max(1))
+    } else {
+        (width * 2 / 5).max(10).min(width.saturating_sub(grad_x0))
+    };
+
+    let grad_y0 = PAD + title_h;
+    // Bottom of the swatch; `grad_h` is 0 when the image is too short to hold a
+    // PAD-margined swatch below the title. All pixel writes below are bounds-
+    // checked (via `set_px`), so a 0-height swatch simply draws nothing rather
+    // than spilling past the buffer at pathologically small heights.
+    let grad_h = height.saturating_sub(PAD).saturating_sub(grad_y0);
+
+    // Map a value to its pixel row in the gradient (top = max, bottom = min).
+    let value_to_y = |value: f64| -> u32 {
+        let frac = if span > 0.0 {
+            ((max - value) / span).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        grad_y0 + (frac * (grad_h.saturating_sub(1)) as f64).round() as u32
+    };
+
+    // Paint the gradient swatch. Colours are composited over white so a colormap
+    // with transparent low values (e.g. radar dBZ below the floor) reads as a
+    // solid faded swatch instead of a see-through strip.
+    for gy in 0..grad_h {
+        let frac = gy as f64 / (grad_h.saturating_sub(1).max(1)) as f64;
+        let value = max - frac * span;
+        let c = colormap.color(Some(value));
+        let a = c[3] as u32;
+        let over_white = |ch: u8| -> u8 { ((ch as u32 * a + 255 * (255 - a)) / 255) as u8 };
+        let px = [over_white(c[0]), over_white(c[1]), over_white(c[2]), 255];
+        let py = grad_y0 + gy;
+        for gx in 0..swatch_w {
+            set_px(&mut rgba, width, height, grad_x0 + gx, py, px);
+        }
+    }
+
+    // 1px border around the swatch so it stands out against the white canvas.
+    draw_rect_border(
+        &mut rgba, width, height, grad_x0, grad_y0, swatch_w, grad_h, BORDER,
+    );
+
+    // Tick marks + numeric labels in the reserved right-hand area.
+    if want_labels {
+        let tick_x0 = grad_x0 + swatch_w;
+        let label_x = tick_x0 + TICK_LEN + LABEL_GAP;
+        let half_text = (font::GLYPH_H * SCALE) as i32 / 2;
+        for v in &ticks {
+            let v = *v;
+            let py = value_to_y(v);
+            // Short tick mark butting up against the swatch edge.
+            for tx in 0..TICK_LEN {
+                set_px(&mut rgba, width, height, tick_x0 + tx, py, TEXT);
+            }
+            // Label, vertically centred on the tick row.
+            font::draw_text(
+                &mut rgba,
+                width,
+                height,
+                label_x as i32,
+                py as i32 - half_text,
+                &format_tick(v),
+                TEXT,
+                SCALE,
+            );
         }
     }
 
@@ -446,6 +625,52 @@ pub fn render_legend(
         ImageFormat::Png => encode::encode_png(&rgba, width, height),
         ImageFormat::Jpeg => encode::encode_jpeg(&rgba, width, height),
         ImageFormat::Webp => encode::encode_webp(&rgba, width, height),
+    }
+}
+
+/// Write one RGBA pixel, clipped to the buffer bounds. The legend's geometry can
+/// place a swatch row or tick mark off-canvas at pathologically small sizes; this
+/// keeps every write safe so the renderer degrades to "draws nothing" instead of
+/// panicking.
+#[inline]
+fn set_px(rgba: &mut [u8], width: u32, height: u32, x: u32, y: u32, color: [u8; 4]) {
+    if x < width && y < height {
+        let idx = ((y * width + x) * 4) as usize;
+        rgba[idx..idx + 4].copy_from_slice(&color);
+    }
+}
+
+/// Draw a 1px rectangle outline into an RGBA buffer. `(x, y)` is the top-left
+/// corner, `w`×`h` the size. Clipped to the buffer bounds.
+#[allow(clippy::too_many_arguments)]
+fn draw_rect_border(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    color: [u8; 4],
+) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let mut put = |px: u32, py: u32| {
+        if px < width && py < height {
+            let idx = ((py * width + px) * 4) as usize;
+            rgba[idx..idx + 4].copy_from_slice(&color);
+        }
+    };
+    let x1 = x + w - 1;
+    let y1 = y + h - 1;
+    for px in x..=x1 {
+        put(px, y);
+        put(px, y1);
+    }
+    for py in y..=y1 {
+        put(x, py);
+        put(x1, py);
     }
 }
 
@@ -545,8 +770,192 @@ mod tests {
     #[test]
     fn test_render_legend_png() {
         let cmap = LutColorMap::from_builtin(BuiltinColormap::Viridis, 0.0, 1.0);
-        let legend = render_legend(&cmap, 0.0, 1.0, 40, 200, ImageFormat::Png).unwrap();
+        let legend = render_legend(&cmap, 0.0, 1.0, 40, 200, ImageFormat::Png, None).unwrap();
         assert!(legend.starts_with(&[0x89, b'P', b'N', b'G']));
+    }
+
+    #[test]
+    fn legend_ticks_land_on_round_values_within_range() {
+        // Intent-level checks (robust to retuning the tick-density heuristic):
+        // a 0..70 range yields ≥4 evenly-spaced ascending ticks that include
+        // both extremes. Including the extremes is the property this PR fixed —
+        // taking the step from the raw range, not a nice-rounded range, keeps
+        // step 10 (0,10,…,70) instead of step 20 (0,20,40,60, dropping 70).
+        let ticks = legend_ticks(0.0, 70.0);
+        assert!(
+            ticks.len() >= 4,
+            "want a usable number of ticks, got {ticks:?}"
+        );
+        assert!(
+            (ticks[0] - 0.0).abs() < 1e-9,
+            "first tick should be the min"
+        );
+        assert!(
+            (ticks[ticks.len() - 1] - 70.0).abs() < 1e-9,
+            "last tick should be the max (extreme must not be dropped)"
+        );
+        let step = ticks[1] - ticks[0];
+        assert!(step > 0.0);
+        assert!(
+            ticks.windows(2).all(|w| (w[1] - w[0] - step).abs() < 1e-9),
+            "ticks should be uniformly spaced, got {ticks:?}"
+        );
+
+        // Every tick stays inside the gradient's value range (the legend clips
+        // the chart axis generator, which may overshoot the extent).
+        let ticks = legend_ticks(-32.0, 95.0);
+        assert!(!ticks.is_empty());
+        for t in &ticks {
+            assert!((-32.0..=95.0).contains(t), "tick {t} escaped the range");
+        }
+        // A sub-unit range still produces sane ascending round ticks.
+        let small = legend_ticks(0.0, 1.0);
+        assert!(small.contains(&0.0) && small.contains(&1.0));
+        assert!(small.windows(2).all(|w| w[1] > w[0]));
+    }
+
+    #[test]
+    fn legend_ticks_handle_degenerate_ranges() {
+        // Zero-width / inverted / non-finite ranges yield no ticks (the legend
+        // then draws a bare gradient) rather than panicking.
+        assert!(legend_ticks(5.0, 5.0).is_empty());
+        assert!(legend_ticks(70.0, 0.0).is_empty());
+        assert!(legend_ticks(f64::NAN, 1.0).is_empty());
+    }
+
+    #[test]
+    fn format_tick_strips_trailing_zeros() {
+        assert_eq!(format_tick(10.0), "10");
+        assert_eq!(format_tick(0.0), "0");
+        assert_eq!(format_tick(-0.0), "0");
+        assert_eq!(format_tick(-32.0), "-32");
+        assert_eq!(format_tick(0.2), "0.2");
+        assert_eq!(format_tick(0.25), "0.25");
+        assert_eq!(format_tick(1.5), "1.5");
+        // Float noise from `(t/step).round()*step` snaps to the clean value.
+        assert_eq!(format_tick(0.1 + 0.2), "0.3");
+    }
+
+    #[test]
+    fn format_tick_keeps_small_magnitude_digits() {
+        // A `[0, 0.001]`-style range: ticks must not all collapse to "0" (the
+        // bug a fixed `.3` format had).
+        assert_eq!(format_tick(0.0002), "0.0002");
+        assert_eq!(format_tick(0.0005), "0.0005");
+        assert_eq!(format_tick(-0.0008), "-0.0008");
+        // Distinct small ticks stay distinct.
+        assert_ne!(format_tick(0.0002), format_tick(0.0004));
+    }
+
+    #[test]
+    fn format_tick_uses_scientific_for_sub_micro() {
+        // Below 6 dp, fixed notation would print "0" for every tick; scientific
+        // notation keeps a sub-µ range's labels distinct. Exact zero is still "0".
+        assert_eq!(format_tick(0.0), "0");
+        assert_eq!(format_tick(2e-8), "2e-8");
+        assert_ne!(format_tick(2e-8), format_tick(4e-8));
+        // A tiny negative is rendered, not flattened to "0".
+        assert_eq!(format_tick(-1e-10), "-1e-10");
+    }
+
+    #[test]
+    fn render_legend_tiny_sizes_do_not_panic() {
+        // The swatch starts at PAD, so a too-small width must not let the
+        // gradient loop write past a row (corruption / OOB panic). Sweep the
+        // pathological small sizes the API clamp permits (min 1×1).
+        let cmap = LutColorMap::from_builtin(BuiltinColormap::RadarDbz, -32.0, 95.0);
+        for w in [1u32, 2, 4, 5, 8, 10, 13, 38, 40] {
+            for h in [1u32, 2, 8, 200] {
+                let png = render_legend(
+                    &cmap,
+                    -32.0,
+                    95.0,
+                    w,
+                    h,
+                    ImageFormat::Png,
+                    Some("DBZH (dBZ)"),
+                )
+                .expect("tiny legend must still encode");
+                assert!(png.starts_with(&[0x89, b'P', b'N', b'G']), "w={w} h={h}");
+            }
+        }
+    }
+
+    #[test]
+    fn render_legend_with_title_is_larger_and_deterministic() {
+        let cmap = LutColorMap::from_builtin(BuiltinColormap::Viridis, 0.0, 1.0);
+        // A labelled legend at the WMS default size encodes to a valid PNG…
+        let a = render_legend(
+            &cmap,
+            0.0,
+            70.0,
+            180,
+            300,
+            ImageFormat::Png,
+            Some("reflectivity (dBZ)"),
+        )
+        .unwrap();
+        assert!(a.starts_with(&[0x89, b'P', b'N', b'G']));
+        // …and is byte-for-byte deterministic across calls.
+        let b = render_legend(
+            &cmap,
+            0.0,
+            70.0,
+            180,
+            300,
+            ImageFormat::Png,
+            Some("reflectivity (dBZ)"),
+        )
+        .unwrap();
+        assert_eq!(a, b, "legend rendering must be deterministic");
+        // Different title → different bytes (the title is actually drawn).
+        let c = render_legend(&cmap, 0.0, 70.0, 180, 300, ImageFormat::Png, Some("other")).unwrap();
+        assert_ne!(a, c, "the title must affect the rendered output");
+        // Tick labels are drawn: a titled legend differs from one rendered into
+        // a swatch-only size where labels don't fit.
+        let bare = render_legend(&cmap, 0.0, 70.0, 16, 200, ImageFormat::Png, None).unwrap();
+        assert_ne!(a, bare);
+    }
+
+    #[test]
+    fn render_legend_draws_multi_line_title() {
+        // A second title line (the selected WMS style's name) is drawn and shifts
+        // the gradient down, so the output differs from the single-line legend.
+        let cmap = LutColorMap::from_builtin(BuiltinColormap::RadarDbz, -32.0, 95.0);
+        let one = render_legend(
+            &cmap,
+            -32.0,
+            95.0,
+            180,
+            300,
+            ImageFormat::Png,
+            Some("DBZH (dBZ)"),
+        )
+        .unwrap();
+        let two = render_legend(
+            &cmap,
+            -32.0,
+            95.0,
+            180,
+            300,
+            ImageFormat::Png,
+            Some("DBZH (dBZ)\nFMI Radar"),
+        )
+        .unwrap();
+        assert!(two.starts_with(&[0x89, b'P', b'N', b'G']));
+        assert_ne!(one, two, "the style-name line must affect the output");
+        // Deterministic across calls.
+        let two_again = render_legend(
+            &cmap,
+            -32.0,
+            95.0,
+            180,
+            300,
+            ImageFormat::Png,
+            Some("DBZH (dBZ)\nFMI Radar"),
+        )
+        .unwrap();
+        assert_eq!(two, two_again);
     }
 
     #[test]
