@@ -1,0 +1,19 @@
+[package]
+name = "engine-cap"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ds-core = { path = "../core" }
+ds-storage = { path = "../storage" }
+ds-render = { path = "../render" }
+quick-xml = "0.37"
+chrono = { version = "0.4", features = ["serde"] }
+arc-swap = "1"
+rstar = "0.12"
+url = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

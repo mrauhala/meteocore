@@ -167,6 +167,8 @@ pub struct CollectionConfig {
     pub zarr: Option<ZarrConfig>,
     /// ODIM_H5 radar-specific configuration. Required when engine_type = "odim".
     pub odim: Option<OdimConfig>,
+    /// CAP alert-specific configuration. Required when engine_type = "cap".
+    pub cap: Option<CapConfig>,
     /// WMS map rendering configuration. Required when apis contains "wms".
     pub wms: Option<WmsConfig>,
     /// PostGIS-specific configuration. Required when engine_type = "postgis".
@@ -515,6 +517,63 @@ impl QueryDataConfig {
             max_runs: default_querydata_max_runs(),
         }
     }
+}
+
+fn default_cap_poll_interval() -> u64 {
+    300
+}
+
+fn default_circle_segments() -> u32 {
+    64
+}
+
+fn default_status_filter() -> Vec<String> {
+    vec!["Actual".to_string()]
+}
+
+/// Configuration for the CAP (Common Alerting Protocol) v1.2 alert engine
+/// (`engine_type = "cap"`).
+///
+/// The source is **exactly one** of a local directory of CAP `.xml` files
+/// (`data_path`) or an Atom/RSS feed whose entries link to individual CAP
+/// documents (`feed_url`, the MeteoAlarm / US-NWS pattern). Each alert area
+/// becomes one OGC API Features feature and is rendered into the WMS/Maps/Tiles
+/// alert layer as a severity-shaded polygon. See the "CAP Engine Notes" section
+/// in `CLAUDE.md`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CapConfig {
+    /// Local directory of CAP `.xml` files. Mutually exclusive with `feed_url`.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub data_path: Option<String>,
+    /// Atom/RSS feed URL whose entries link to individual CAP documents.
+    /// Mutually exclusive with `data_path`; must be `http(s)`.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub feed_url: Option<String>,
+    /// Poll interval in seconds for re-scanning the directory / re-fetching the
+    /// feed. Default: 300.
+    #[serde(default = "default_cap_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// Which `<info>` language to expose when an alert carries multiple
+    /// translations (CAP `<info><language>`, a BCP 47 / RFC 3066 tag). When set,
+    /// the matching `<info>` is preferred; when absent or unmatched, the first
+    /// `<info>` is used. Empty string is rejected at config load.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub language: Option<String>,
+    /// CAP `<status>` values to serve (case-insensitive). Default `["Actual"]`,
+    /// dropping `Test`/`Exercise`/`Draft`/`System` alerts. An empty list serves
+    /// every status.
+    #[serde(default = "default_status_filter")]
+    pub status_filter: Vec<String>,
+    /// Validity window applied when an info has no `<expires>` — an ISO 8601
+    /// positive duration (e.g. `"PT24H"`, `"P1D"`) added to the onset/effective
+    /// time. When absent, a missing `<expires>` means open-ended (active until
+    /// superseded).
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub default_ttl: Option<String>,
+    /// Number of polygon vertices used to approximate a CAP `<circle>` as an
+    /// N-gon on the geodesic. Default: 64.
+    #[serde(default = "default_circle_segments")]
+    pub circle_segments: u32,
 }
 
 /// Configuration for the ODIM_H5 weather-radar engine
@@ -1804,6 +1863,82 @@ impl ServerConfig {
                 )));
             }
 
+            // CAP engine: requires [cap] section; source is data_path XOR feed_url.
+            if collection.engine_type == "cap" && collection.cap.is_none() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': engine_type 'cap' requires a [collections.cap] config section"
+                )));
+            }
+            if collection.cap.is_some() && collection.engine_type != "cap" {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': [collections.cap] is set but engine_type is '{}'",
+                    collection.engine_type
+                )));
+            }
+            if let Some(cap) = &collection.cap {
+                if cap.poll_interval_secs == 0 {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap poll_interval_secs must be > 0"
+                    )));
+                }
+
+                // Data source: exactly one of local `data_path` or `feed_url`
+                // (mirrors the geotiff/grib/zarr local-vs-remote mutual exclusion).
+                let has_local = cap.data_path.is_some();
+                let has_feed = cap.feed_url.is_some();
+                if has_local && has_feed {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap 'data_path' (local) is mutually exclusive with \
+                         'feed_url'"
+                    )));
+                }
+                if !has_local && !has_feed {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap requires either 'data_path' (local) or 'feed_url'"
+                    )));
+                }
+                if let Some(url) = &cap.feed_url {
+                    if !(url.starts_with("http://") || url.starts_with("https://")) {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': cap 'feed_url' must be an http(s) URL"
+                        )));
+                    }
+                }
+
+                // `language`, when present, must be a non-empty tag (trimmed at
+                // load, so an all-whitespace value arrives here as "").
+                if cap.language.as_deref() == Some("") {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap 'language' must not be empty"
+                    )));
+                }
+
+                // Each status filter entry must be non-empty (a blank entry can
+                // never match a CAP `<status>` and is almost certainly a typo).
+                if cap.status_filter.iter().any(|s| s.trim().is_empty()) {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap 'status_filter' must not contain empty strings"
+                    )));
+                }
+
+                // `default_ttl`, when present, must be a positive ISO 8601 duration.
+                if let Some(ttl) = &cap.default_ttl {
+                    crate::datetime::parse_iso8601_duration(ttl).map_err(|e| {
+                        crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': cap 'default_ttl' is not a valid positive ISO 8601 \
+                             duration: {e}"
+                        ))
+                    })?;
+                }
+
+                // A circle needs at least a triangle to have area.
+                if cap.circle_segments < 3 {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap 'circle_segments' must be >= 3"
+                    )));
+                }
+            }
+
             // style_bundle: reference must resolve, must not mix with inline WMS style fields
             if let Some(wms) = &collection.wms {
                 if let Some(bundle_ref) = &wms.style_bundle {
@@ -1962,6 +2097,84 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         collection_with(&format!(
             "engine_type = \"grib\"\n[collections.grib]\n{grib_body}"
         ))
+    }
+
+    fn cap_collection(cap_body: &str) -> ServerConfig {
+        collection_with(&format!(
+            "engine_type = \"cap\"\napis = [\"features\", \"wms\"]\n\
+             [collections.cap]\n{cap_body}"
+        ))
+    }
+
+    #[test]
+    fn cap_local_data_path_validates() {
+        let cfg = cap_collection("data_path = \"testdata/cap\"\n");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn cap_feed_url_validates() {
+        let cfg = cap_collection("feed_url = \"https://example.org/feed.atom\"\n");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn cap_rejects_both_sources() {
+        let cfg = cap_collection("data_path = \"x\"\nfeed_url = \"https://e/f\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cap_rejects_no_source() {
+        let cfg = cap_collection("language = \"en\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cap_rejects_non_http_feed() {
+        let cfg = cap_collection("feed_url = \"ftp://e/f\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cap_rejects_empty_language() {
+        let cfg = cap_collection("data_path = \"x\"\nlanguage = \"  \"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cap_rejects_bad_ttl_and_small_circle() {
+        assert!(
+            cap_collection("data_path = \"x\"\ndefault_ttl = \"banana\"\n")
+                .validate()
+                .is_err()
+        );
+        assert!(cap_collection("data_path = \"x\"\ncircle_segments = 2\n")
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn cap_section_requires_cap_engine_type() {
+        // [collections.cap] present but engine_type defaults to csv → rejected.
+        let cfg = collection_with("[collections.cap]\ndata_path = \"x\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cap_engine_requires_cap_section() {
+        let cfg = collection_with("engine_type = \"cap\"\napis = [\"features\"]\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cap_defaults_parse() {
+        let cfg = cap_collection("data_path = \"testdata/cap\"\n");
+        let cap = cfg.collections[0].cap.as_ref().unwrap();
+        assert_eq!(cap.poll_interval_secs, 300);
+        assert_eq!(cap.circle_segments, 64);
+        assert_eq!(cap.status_filter, vec!["Actual".to_string()]);
+        assert!(cap.language.is_none());
     }
 
     #[test]

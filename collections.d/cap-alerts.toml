@@ -1,0 +1,19 @@
+id = "cap-alerts"
+title = "CAP Emergency Alerts (demo)"
+description = "Common Alerting Protocol (CAP) v1.2 weather/emergency alert areas, served as Features and a severity-shaded map layer."
+engine_type = "cap"
+apis = ["features", "wms", "maps", "tiles"]
+keywords = ["alerts", "warnings", "CAP", "emergency"]
+
+[cap]
+# Local directory of CAP *.xml files (synthetic demo fixtures). Swap for a feed:
+#   feed_url = "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-europe"
+data_path = "testdata/cap"
+poll_interval_secs = 300
+# language = "en"            # which <info> translation to expose (default: first)
+status_filter = ["Actual"]   # drop Test/Exercise/Draft
+circle_segments = 64
+# default_ttl = "PT24H"      # validity when <expires> is absent
+
+[wms]
+colormap = "cap_severity"    # Unknown→grey, Minor→green … Extreme→red

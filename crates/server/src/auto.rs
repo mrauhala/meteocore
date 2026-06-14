@@ -389,6 +389,7 @@ fn mk_collection(
         grib,
         zarr,
         odim: None,
+        cap: None,
         wms: None,
         postgis: None,
         preview: None,

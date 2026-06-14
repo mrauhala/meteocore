@@ -630,6 +630,7 @@ pub struct ServerState {
     pub zarr_engines: RwLock<Vec<Arc<engine_zarr::ZarrEngine>>>,
     pub odim_engines: RwLock<Vec<Arc<engine_odim::OdimEngine>>>,
     pub odim_volume_engines: RwLock<Vec<Arc<engine_odim::PolarVolumeEngine>>>,
+    pub cap_engines: RwLock<Vec<Arc<engine_cap::CapEngine>>>,
     pub postgis_engines: RwLock<Vec<Arc<engine_postgis::PostgisEngine>>>,
     /// Serializes reload requests to prevent concurrent reloads from racing.
     pub reload_lock: tokio::sync::Mutex<()>,
@@ -658,6 +659,7 @@ pub struct LoadResult {
     pub zarr_engines: Vec<Arc<engine_zarr::ZarrEngine>>,
     pub odim_engines: Vec<Arc<engine_odim::OdimEngine>>,
     pub odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>>,
+    pub cap_engines: Vec<Arc<engine_cap::CapEngine>>,
     pub postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>>,
 }
 
@@ -719,6 +721,7 @@ pub fn load_collections(
     let mut zarr_engines: Vec<Arc<engine_zarr::ZarrEngine>> = Vec::new();
     let mut odim_engines: Vec<Arc<engine_odim::OdimEngine>> = Vec::new();
     let mut odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>> = Vec::new();
+    let mut cap_engines: Vec<Arc<engine_cap::CapEngine>> = Vec::new();
     let mut postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>> = Vec::new();
     // Pool registry is local to this load: collections sharing a DSN share a
     // pool via Arc<Pool>. Across reloads, pools are rebuilt — documented
@@ -746,6 +749,7 @@ pub fn load_collections(
             "zarr" => &["edr", "wms", "maps", "tiles"],
             "odim" => &["edr", "wms", "maps", "tiles"],
             "odim-volume" => &["edr", "wms", "maps", "tiles", "3dtiles", "features"],
+            "cap" => &["features", "wms", "maps", "tiles"],
             "postgis" => &["edr", "features", "tiles"],
             _ => &[],
         };
@@ -1798,6 +1802,106 @@ pub fn load_collections(
                     }
                 }
             }
+            "cap" => {
+                let cap_config = match collection.cap.as_ref() {
+                    Some(c) => c,
+                    None => {
+                        tracing::error!(
+                            "Collection '{}': engine_type 'cap' but missing [collections.cap] config, skipping",
+                            collection.id
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "cap".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some("missing [collections.cap] config".into()),
+                        });
+                        continue;
+                    }
+                };
+
+                let engine = match engine_cap::CapEngine::new(cap_config, &collection.id) {
+                    Ok(e) => Arc::new(e),
+                    Err(e) => {
+                        tracing::error!(
+                            "Collection '{}': failed to initialize CAP engine: {}",
+                            collection.id,
+                            e
+                        );
+                        health.push(CollectionHealth {
+                            id: collection.id.clone(),
+                            engine_type: "cap".into(),
+                            status: CollectionStatus::Failed,
+                            error: Some(format!("{e}")),
+                        });
+                        continue;
+                    }
+                };
+
+                cap_engines.push(engine.clone());
+
+                if collection.apis.contains(&"features".to_string()) {
+                    feature_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
+                    );
+                    feature_collections.insert(collection.id.clone(), collection.clone());
+                }
+                if collection.apis.contains(&"wms".to_string()) {
+                    map_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    map_collections.insert(collection.id.clone(), collection.clone());
+                    map_styles.insert(
+                        collection.id.clone(),
+                        build_styles(collection, &bundle_index),
+                    );
+                    info!("Collection '{}': wired to WMS API", collection.id);
+                }
+                if collection.apis.contains(&"maps".to_string()) {
+                    maps_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    maps_collections.insert(collection.id.clone(), collection.clone());
+                    maps_styles.insert(
+                        collection.id.clone(),
+                        build_styles(collection, &bundle_index),
+                    );
+                    info!("Collection '{}': wired to Maps API", collection.id);
+                }
+                if collection.apis.contains(&"tiles".to_string()) {
+                    tiles_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    tiles_collections.insert(collection.id.clone(), collection.clone());
+                    tiles_styles.insert(
+                        collection.id.clone(),
+                        build_styles(collection, &bundle_index),
+                    );
+                    info!("Collection '{}': wired to Tiles API", collection.id);
+                }
+
+                // Ready once the first load found alerts; otherwise degraded
+                // until the poll loop populates (an unreachable feed at startup).
+                let count = ds_core::feature_engine::FeatureEngine::feature_count(engine.as_ref());
+                health.push(CollectionHealth {
+                    id: collection.id.clone(),
+                    engine_type: "cap".into(),
+                    status: if count > 0 {
+                        CollectionStatus::Ready
+                    } else {
+                        CollectionStatus::Degraded
+                    },
+                    error: if count > 0 {
+                        None
+                    } else {
+                        Some("no alerts loaded yet (waiting for poll)".into())
+                    },
+                });
+            }
             "postgis" => {
                 let postgis_cfg = match collection.postgis.as_ref() {
                     Some(c) => c,
@@ -2074,6 +2178,7 @@ pub fn load_collections(
         zarr_engines,
         odim_engines,
         odim_volume_engines,
+        cap_engines,
         postgis_engines,
     }
 }
@@ -2703,6 +2808,14 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         {
             engine.shutdown();
         }
+        for engine in state
+            .cap_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            engine.shutdown();
+        }
     }
 
     // Spawn poll loops for new engines on the dedicated background runtime
@@ -2738,6 +2851,12 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         });
     }
     for engine in &result.odim_volume_engines {
+        let poller = engine.clone();
+        crate::poll_runtime().spawn(async move {
+            poller.poll_loop().await;
+        });
+    }
+    for engine in &result.cap_engines {
         let poller = engine.clone();
         crate::poll_runtime().spawn(async move {
             poller.poll_loop().await;
@@ -2781,6 +2900,7 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         .odim_volume_engines
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.odim_volume_engines;
+    *state.cap_engines.write().unwrap_or_else(|e| e.into_inner()) = result.cap_engines;
     *state
         .postgis_engines
         .write()

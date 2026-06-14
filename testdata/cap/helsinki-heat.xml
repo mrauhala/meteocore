@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+  <identifier>urn:test:helsinki-heat-1</identifier>
+  <sender>test@meteocore.example</sender>
+  <sent>2020-01-01T00:00:00+00:00</sent>
+  <status>Actual</status>
+  <msgType>Alert</msgType>
+  <scope>Public</scope>
+  <info>
+    <language>en-US</language>
+    <category>Met</category>
+    <category>Health</category>
+    <event>Extreme Heat Warning</event>
+    <responseType>Prepare</responseType>
+    <urgency>Immediate</urgency>
+    <severity>Extreme</severity>
+    <certainty>Observed</certainty>
+    <onset>2020-01-01T00:00:00+00:00</onset>
+    <senderName>MeteoCore Test Weather Service</senderName>
+    <headline>Extreme Heat Warning</headline>
+    <description>Dangerous heat across the metropolitan area.</description>
+    <area>
+      <areaDesc>Helsinki metropolitan circle</areaDesc>
+      <circle>60.20,25.00 8.0</circle>
+    </area>
+  </info>
+  <info>
+    <language>fi-FI</language>
+    <category>Met</category>
+    <event>Hellevaroitus</event>
+    <urgency>Immediate</urgency>
+    <severity>Extreme</severity>
+    <certainty>Observed</certainty>
+    <onset>2020-01-01T00:00:00+00:00</onset>
+    <senderName>MeteoCore-testisääpalvelu</senderName>
+    <headline>Vaarallinen helle</headline>
+    <description>Vaarallisen kuumaa pääkaupunkiseudulla.</description>
+    <area>
+      <areaDesc>Helsingin seudun ympyrä</areaDesc>
+      <circle>60.20,25.00 8.0</circle>
+    </area>
+  </info>
+</alert>

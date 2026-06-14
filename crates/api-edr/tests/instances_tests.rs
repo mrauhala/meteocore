@@ -215,6 +215,7 @@ fn config(id: &str, engine_type: &str) -> CollectionConfig {
         grib: None,
         zarr: None,
         odim: None,
+        cap: None,
         postgis: None,
         preview: None,
     }
