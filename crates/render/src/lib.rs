@@ -1,5 +1,6 @@
 pub mod colormap;
 mod encode;
+pub mod font;
 pub mod metatile;
 pub mod plot;
 
@@ -412,10 +413,107 @@ pub fn render_tile_png(
     render_tile(tile, colormap, ImageFormat::Png)
 }
 
+/// Compute "nice" round tick values spanning `[min, max]` aiming for roughly
+/// `target` ticks, using the classic 1-2-5 nice-number algorithm (Heckbert,
+/// *Graphics Gems*). Returns values inside `[min, max]` (inclusive, with a small
+/// tolerance) in ascending order, so a legend's labels land on human-friendly
+/// round numbers (0, 10, 20, …) rather than the raw extents.
+///
+/// Degenerate inputs (`min == max`, non-finite bounds) yield a single tick at
+/// `min`. `min`/`max` may be passed in either order.
+fn nice_ticks(min: f64, max: f64, target: usize) -> Vec<f64> {
+    if !min.is_finite() || !max.is_finite() || min == max {
+        return vec![min];
+    }
+    let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
+
+    // Round a number to a "nice" 1-2-5 × 10^k value.
+    fn nice_num(range: f64, round: bool) -> f64 {
+        let exp = range.log10().floor();
+        let frac = range / 10f64.powf(exp);
+        let nice = if round {
+            if frac < 1.5 {
+                1.0
+            } else if frac < 3.0 {
+                2.0
+            } else if frac < 7.0 {
+                5.0
+            } else {
+                10.0
+            }
+        } else if frac <= 1.0 {
+            1.0
+        } else if frac <= 2.0 {
+            2.0
+        } else if frac <= 5.0 {
+            5.0
+        } else {
+            10.0
+        };
+        nice * 10f64.powf(exp)
+    }
+
+    let target = target.max(2);
+    // Step straight from the raw range (not a nice-rounded range): rounding the
+    // range up first tends to overshoot the step and drop the extreme ticks
+    // (0..70 → step 20 → no 70). From the raw range, 0..70/5 → step 10 → 0,10,…,70.
+    let step = nice_num((hi - lo) / (target - 1) as f64, true);
+    if !step.is_finite() || step <= 0.0 {
+        return vec![lo, hi];
+    }
+    let graph_lo = (lo / step).floor() * step;
+    let graph_hi = (hi / step).ceil() * step;
+
+    let mut ticks = Vec::new();
+    let tol = step * 1e-6;
+    // Bound the loop defensively so a pathological step can't spin forever.
+    let max_ticks = target * 4 + 4;
+    let mut v = graph_lo;
+    while v <= graph_hi + tol && ticks.len() < max_ticks {
+        if v >= lo - tol && v <= hi + tol {
+            ticks.push(v);
+        }
+        v += step;
+    }
+    if ticks.is_empty() {
+        ticks.push(lo);
+        ticks.push(hi);
+    }
+    ticks
+}
+
+/// Format a tick value for a legend label: fixed enough decimals to be exact for
+/// the nice-number ticks [`nice_ticks`] produces, with trailing zeros and a
+/// dangling decimal point stripped (`10.000` → `10`, `0.200` → `0.2`). Negative
+/// zero normalises to `0`.
+fn format_tick(v: f64) -> String {
+    if v == 0.0 {
+        return "0".to_string(); // also catches -0.0
+    }
+    let s = format!("{v:.3}");
+    let trimmed = if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        &s
+    };
+    if trimmed == "-0" {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Render a legend image showing the colormap scale.
 ///
-/// Produces a vertical gradient with labeled tick marks.
-/// Width: `width` pixels, Height: `height` pixels.
+/// Produces a vertical colour gradient (top = `max`, bottom = `min`) with a
+/// bordered swatch, a nice-number tick scale with numeric value labels, and an
+/// optional `title` line (e.g. `"reflectivity (dBZ)"`). Labels are drawn with
+/// the embedded [`font`] so `ds-render` stays framework-free.
+///
+/// The layout adapts to the requested size: the title and the tick labels are
+/// each drawn only when there is room, so the function degrades gracefully to a
+/// bare gradient for very small `width`/`height` (e.g. a 40×200 thumbnail) while
+/// producing a fully labelled legend at the WMS default size.
 pub fn render_legend(
     colormap: &dyn ColorMap,
     min: f64,
@@ -423,22 +521,107 @@ pub fn render_legend(
     width: u32,
     height: u32,
     format: ImageFormat,
+    title: Option<&str>,
 ) -> Result<Vec<u8>, DataServerError> {
-    let gradient_width = (width * 2 / 5).max(10); // left 40% is gradient
-    let mut rgba = vec![255u8; (width * height * 4) as usize]; // white background
+    // Normalise so the gradient always runs large-at-top → small-at-bottom even
+    // if a caller passes the bounds reversed.
+    let (min, max) = if min <= max { (min, max) } else { (max, min) };
+    let span = max - min;
 
-    for y in 0..height {
-        // Map y position to value (top = max, bottom = min)
-        let frac = y as f64 / (height.saturating_sub(1).max(1)) as f64;
-        let value = max - frac * (max - min);
-        let color = colormap.color(Some(value));
+    const PAD: u32 = 4;
+    const TEXT: [u8; 4] = [0, 0, 0, 255]; // opaque black labels
+    const BORDER: [u8; 4] = [80, 80, 80, 255]; // grey swatch border
+    const SCALE: u32 = 1;
+    const TICK_LEN: u32 = 4; // tick mark length past the swatch
+    const LABEL_GAP: u32 = 3; // gap between tick mark and its label
 
-        for x in 0..gradient_width {
-            let idx = ((y * width + x) * 4) as usize;
-            rgba[idx] = color[0];
-            rgba[idx + 1] = color[1];
-            rgba[idx + 2] = color[2];
-            rgba[idx + 3] = color[3];
+    let mut rgba = vec![255u8; (width as usize * height as usize) * 4]; // white background
+
+    // Reserve a title row at the top when a title is given and there's vertical
+    // room for it plus a usable gradient below.
+    let title_h = match title {
+        Some(t) if !t.is_empty() && height >= PAD * 2 + font::GLYPH_H * SCALE + 24 => {
+            font::draw_text(
+                &mut rgba, width, height, PAD as i32, PAD as i32, t, TEXT, SCALE,
+            );
+            font::GLYPH_H * SCALE + PAD // text + a small gap below it
+        }
+        _ => 0,
+    };
+
+    // Will we have horizontal room for tick labels? Need: swatch + tick mark +
+    // gap + a 2-digit label (~"00") at minimum.
+    let min_label_w = font::text_width("00", SCALE);
+    let want_labels = width >= PAD * 2 + 12 + TICK_LEN + LABEL_GAP + min_label_w;
+
+    // Swatch width: a slim bar when we're labelling (the labels carry the
+    // information), or the historical ~40% when there's no room for labels.
+    let swatch_w = if want_labels {
+        ((width / 6).clamp(14, 30)).min(width.saturating_sub(2 * PAD).max(1))
+    } else {
+        (width * 2 / 5).max(10).min(width)
+    };
+
+    let grad_x0 = PAD;
+    let grad_y0 = PAD + title_h;
+    let grad_y1 = height.saturating_sub(PAD).max(grad_y0 + 1);
+    let grad_h = grad_y1 - grad_y0;
+
+    // Map a value to its pixel row in the gradient (top = max, bottom = min).
+    let value_to_y = |value: f64| -> u32 {
+        let frac = if span > 0.0 {
+            ((max - value) / span).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        grad_y0 + (frac * (grad_h.saturating_sub(1)) as f64).round() as u32
+    };
+
+    // Paint the gradient swatch. Colours are composited over white so a colormap
+    // with transparent low values (e.g. radar dBZ below the floor) reads as a
+    // solid faded swatch instead of a see-through strip.
+    for gy in 0..grad_h {
+        let frac = gy as f64 / (grad_h.saturating_sub(1).max(1)) as f64;
+        let value = max - frac * span;
+        let c = colormap.color(Some(value));
+        let a = c[3] as u32;
+        let over_white = |ch: u8| -> u8 { ((ch as u32 * a + 255 * (255 - a)) / 255) as u8 };
+        let px = [over_white(c[0]), over_white(c[1]), over_white(c[2]), 255];
+        let py = grad_y0 + gy;
+        for gx in 0..swatch_w {
+            let idx = ((py * width + (grad_x0 + gx)) * 4) as usize;
+            rgba[idx..idx + 4].copy_from_slice(&px);
+        }
+    }
+
+    // 1px border around the swatch so it stands out against the white canvas.
+    draw_rect_border(
+        &mut rgba, width, height, grad_x0, grad_y0, swatch_w, grad_h, BORDER,
+    );
+
+    // Tick marks + numeric labels in the reserved right-hand area.
+    if want_labels {
+        let tick_x0 = grad_x0 + swatch_w;
+        let label_x = tick_x0 + TICK_LEN + LABEL_GAP;
+        let half_text = (font::GLYPH_H * SCALE) as i32 / 2;
+        for v in nice_ticks(min, max, 6) {
+            let py = value_to_y(v);
+            // Short tick mark butting up against the swatch edge.
+            for tx in 0..TICK_LEN {
+                let idx = ((py * width + (tick_x0 + tx)) * 4) as usize;
+                rgba[idx..idx + 4].copy_from_slice(&TEXT);
+            }
+            // Label, vertically centred on the tick row.
+            font::draw_text(
+                &mut rgba,
+                width,
+                height,
+                label_x as i32,
+                py as i32 - half_text,
+                &format_tick(v),
+                TEXT,
+                SCALE,
+            );
         }
     }
 
@@ -446,6 +629,40 @@ pub fn render_legend(
         ImageFormat::Png => encode::encode_png(&rgba, width, height),
         ImageFormat::Jpeg => encode::encode_jpeg(&rgba, width, height),
         ImageFormat::Webp => encode::encode_webp(&rgba, width, height),
+    }
+}
+
+/// Draw a 1px rectangle outline into an RGBA buffer. `(x, y)` is the top-left
+/// corner, `w`×`h` the size. Clipped to the buffer bounds.
+#[allow(clippy::too_many_arguments)]
+fn draw_rect_border(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    color: [u8; 4],
+) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let mut put = |px: u32, py: u32| {
+        if px < width && py < height {
+            let idx = ((py * width + px) * 4) as usize;
+            rgba[idx..idx + 4].copy_from_slice(&color);
+        }
+    };
+    let x1 = x + w - 1;
+    let y1 = y + h - 1;
+    for px in x..=x1 {
+        put(px, y);
+        put(px, y1);
+    }
+    for py in y..=y1 {
+        put(x, py);
+        put(x1, py);
     }
 }
 
@@ -545,8 +762,82 @@ mod tests {
     #[test]
     fn test_render_legend_png() {
         let cmap = LutColorMap::from_builtin(BuiltinColormap::Viridis, 0.0, 1.0);
-        let legend = render_legend(&cmap, 0.0, 1.0, 40, 200, ImageFormat::Png).unwrap();
+        let legend = render_legend(&cmap, 0.0, 1.0, 40, 200, ImageFormat::Png, None).unwrap();
         assert!(legend.starts_with(&[0x89, b'P', b'N', b'G']));
+    }
+
+    #[test]
+    fn nice_ticks_lands_on_round_values() {
+        // A 0..70 dBZ-style range with ~6 ticks → 0,10,…,70.
+        let ticks = nice_ticks(0.0, 70.0, 6);
+        assert_eq!(ticks, vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0]);
+        // All ticks stay within the requested range.
+        for t in nice_ticks(-32.0, 95.0, 6) {
+            assert!((-32.0..=95.0).contains(&t));
+        }
+        // A sub-unit range still produces sane round ticks.
+        let small = nice_ticks(0.0, 1.0, 6);
+        assert!(small.contains(&0.0) && small.contains(&1.0));
+        assert!(small.windows(2).all(|w| w[1] > w[0]));
+    }
+
+    #[test]
+    fn nice_ticks_handles_degenerate_ranges() {
+        // Zero-width range → a single tick at the value.
+        assert_eq!(nice_ticks(5.0, 5.0, 6), vec![5.0]);
+        // Non-finite bounds → a single (non-finite) tick, never a panic/hang.
+        let nan_ticks = nice_ticks(f64::NAN, 1.0, 6);
+        assert_eq!(nan_ticks.len(), 1);
+        assert!(nan_ticks[0].is_nan());
+        // Reversed bounds are normalised, not dropped.
+        assert_eq!(nice_ticks(70.0, 0.0, 6), nice_ticks(0.0, 70.0, 6));
+    }
+
+    #[test]
+    fn format_tick_strips_trailing_zeros() {
+        assert_eq!(format_tick(10.0), "10");
+        assert_eq!(format_tick(0.0), "0");
+        assert_eq!(format_tick(-0.0), "0");
+        assert_eq!(format_tick(-32.0), "-32");
+        assert_eq!(format_tick(0.2), "0.2");
+        assert_eq!(format_tick(0.25), "0.25");
+        assert_eq!(format_tick(1.5), "1.5");
+    }
+
+    #[test]
+    fn render_legend_with_title_is_larger_and_deterministic() {
+        let cmap = LutColorMap::from_builtin(BuiltinColormap::Viridis, 0.0, 1.0);
+        // A labelled legend at the WMS default size encodes to a valid PNG…
+        let a = render_legend(
+            &cmap,
+            0.0,
+            70.0,
+            180,
+            300,
+            ImageFormat::Png,
+            Some("reflectivity (dBZ)"),
+        )
+        .unwrap();
+        assert!(a.starts_with(&[0x89, b'P', b'N', b'G']));
+        // …and is byte-for-byte deterministic across calls.
+        let b = render_legend(
+            &cmap,
+            0.0,
+            70.0,
+            180,
+            300,
+            ImageFormat::Png,
+            Some("reflectivity (dBZ)"),
+        )
+        .unwrap();
+        assert_eq!(a, b, "legend rendering must be deterministic");
+        // Different title → different bytes (the title is actually drawn).
+        let c = render_legend(&cmap, 0.0, 70.0, 180, 300, ImageFormat::Png, Some("other")).unwrap();
+        assert_ne!(a, c, "the title must affect the rendered output");
+        // Tick labels are drawn: a titled legend differs from one rendered into
+        // a swatch-only size where labels don't fit.
+        let bare = render_legend(&cmap, 0.0, 70.0, 16, 200, ImageFormat::Png, None).unwrap();
+        assert_ne!(a, bare);
     }
 
     #[test]

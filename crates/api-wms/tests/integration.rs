@@ -1770,3 +1770,66 @@ async fn timeless_getmap_tracks_new_latest_data() {
     );
     assert_eq!(calls.lock().unwrap().last().copied(), Some(Some(t2)));
 }
+
+/// Parse a PNG's IHDR `(width, height)`. The signature is 8 bytes, then the
+/// IHDR chunk: 4-byte length, the `IHDR` tag, then width/height as big-endian
+/// u32s. Lets the legend tests assert dimensions without a PNG decoder dep.
+fn png_dims(bytes: &[u8]) -> (u32, u32) {
+    assert!(
+        bytes.starts_with(&[0x89, b'P', b'N', b'G']),
+        "not a PNG: {:?}",
+        &bytes[..4.min(bytes.len())]
+    );
+    let w = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+    let h = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+    (w, h)
+}
+
+/// `GetLegendGraphic` (#371): with no WIDTH/HEIGHT the handler returns the new
+/// labelled default-size legend (180×300), as an immutable-cacheable PNG. The
+/// title/unit resolution from `raster_info()` runs end-to-end (a panic there
+/// would fail this test).
+#[tokio::test]
+async fn legend_graphic_defaults_to_labelled_size() {
+    let app = build_empty_router();
+    let req = Request::builder()
+        .uri(
+            "/?SERVICE=WMS&REQUEST=GetLegendGraphic&VERSION=1.3.0\
+             &LAYER=empty&FORMAT=image/png",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let headers = resp.headers().clone();
+    assert_eq!(headers.get("content-type").unwrap(), "image/png");
+    assert_eq!(
+        headers.get("cache-control").unwrap(),
+        "public, max-age=86400, immutable"
+    );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        png_dims(&body),
+        (180, 300),
+        "legend should default to the labelled 180×300 size"
+    );
+}
+
+/// A client may still request an explicit (smaller) legend size; the handler
+/// honours it and the renderer degrades to a bare swatch when too narrow for
+/// labels. Asserts the requested dimensions round-trip.
+#[tokio::test]
+async fn legend_graphic_honours_explicit_size() {
+    let app = build_empty_router();
+    let req = Request::builder()
+        .uri(
+            "/?SERVICE=WMS&REQUEST=GetLegendGraphic&VERSION=1.3.0\
+             &LAYER=empty&FORMAT=image/png&WIDTH=20&HEIGHT=120",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(png_dims(&body), (20, 120));
+}
