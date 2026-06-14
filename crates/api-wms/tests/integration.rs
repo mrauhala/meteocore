@@ -1864,6 +1864,40 @@ async fn legend_graphic_reflects_selected_style() {
     );
 }
 
+/// `GetLegendGraphic` honours the singular `STYLE` alias, not just plural
+/// `STYLES` (#165). A client sending only `STYLE=radar_fmi` must get that
+/// style's legend, identical to `STYLES=radar_fmi` — not the default.
+#[tokio::test]
+async fn legend_graphic_accepts_singular_style_alias() {
+    let app = build_empty_router();
+    let fetch = |query: &str| {
+        let uri = format!(
+            "/?SERVICE=WMS&REQUEST=GetLegendGraphic&VERSION=1.3.0\
+             &LAYER=empty&FORMAT=image/png&{query}"
+        );
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            resp.into_body().collect().await.unwrap().to_bytes()
+        }
+    };
+    let singular = fetch("STYLE=radar_fmi").await;
+    let plural = fetch("STYLES=radar_fmi").await;
+    let default = fetch("STYLES=default").await;
+    assert_eq!(
+        singular, plural,
+        "STYLE=… must resolve the same style as STYLES=…"
+    );
+    assert_ne!(
+        singular, default,
+        "STYLE=radar_fmi must not fall through to the default legend"
+    );
+}
+
 /// A client may still request an explicit (smaller) legend size; the handler
 /// honours it and the renderer degrades to a bare swatch when too narrow for
 /// labels. Asserts the requested dimensions round-trip.

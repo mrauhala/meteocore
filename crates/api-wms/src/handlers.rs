@@ -571,7 +571,12 @@ pub async fn wms_handler(
                 .or(query.layer.as_deref())
                 .ok_or(WmsError::missing_parameter("LAYER"))?;
 
-            let style_name = query.styles.as_deref().unwrap_or("default");
+            // Also accept singular STYLE= — SLD standard for GetLegendGraphic (#165).
+            let style_name = query
+                .styles
+                .as_deref()
+                .or(query.style.as_deref())
+                .unwrap_or("default");
             let style_name = if style_name.is_empty() {
                 "default"
             } else {
