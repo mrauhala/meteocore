@@ -1,5 +1,8 @@
 use std::f64::consts::PI;
 
+use crate::feature::Geometry;
+use crate::map_engine::OutputCrs;
+
 /// WGS84 ellipsoid parameters
 const WGS84_A: f64 = 6_378_137.0; // semi-major axis (meters)
 const WGS84_F: f64 = 1.0 / 298.257223563; // flattening
@@ -1270,6 +1273,93 @@ fn rotlatlon_inverse(
     (lon_norm, lat.to_degrees())
 }
 
+// ---------------------------------------------------------------------------
+// Vector geometry → output pixel space (for ds-render's polygon fill, #397)
+// ---------------------------------------------------------------------------
+
+/// A single polygon projected into output **pixel** space: an exterior ring
+/// plus interior rings (holes), each a list of `[x, y]` pixel coordinates.
+/// Feeds directly into `ds_render::rasterize::fill_polygon`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PixelPolygon {
+    /// Exterior ring, pixel coordinates.
+    pub exterior: Vec<[f64; 2]>,
+    /// Interior rings (holes), pixel coordinates.
+    pub holes: Vec<Vec<[f64; 2]>>,
+}
+
+/// A [`Geometry`] projected into output pixel space for one render request —
+/// the bridge between [`OutputCrs`] projection (here, in `ds-core`) and the
+/// pure scanline fill (`ds_render::rasterize::fill_polygon`), keeping CRS math
+/// in one place and the fill math in another.
+///
+/// **Pixel convention** — top-left origin: `x` increases east (`x = 0` at the
+/// west/left edge, `x = width` at the east/right edge), `y` increases south
+/// (`y = 0` at the north/top edge, `y = height` at the bottom). A vertex
+/// off-tile keeps its projected pixel value (the fill clips to the tile) and a
+/// vertex outside a projection's valid domain can be non-finite (the
+/// `Projected` forward may not converge) — `fill_polygon` skips edges with a
+/// non-finite endpoint, so vertex topology is preserved as-is here. Non-polygon
+/// geometries (`Point`, `Null`) yield no polygons.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PixelGeometry {
+    /// One entry per polygon (a `Polygon` yields one; a `MultiPolygon`, one
+    /// per member).
+    pub polygons: Vec<PixelPolygon>,
+}
+
+/// Project a [`Geometry`]'s polygon rings into output **pixel** space for a
+/// render request, so they can be filled by `ds_render::rasterize::fill_polygon`.
+///
+/// Only the polygonal parts contribute: `Polygon` → one [`PixelPolygon`],
+/// `MultiPolygon` → one per member, `Point`/`Null` → none. Each ring vertex
+/// `[lon, lat]` (WGS84 degrees) is mapped through [`OutputCrs::world_to_fraction`]
+/// (projecting **vertices only**, never per output pixel — #203) and scaled by
+/// `width`/`height`.
+///
+/// `bbox` is the request's WGS84 bounding box `[west, south, east, north]` (used
+/// by the `Wgs84`/`WebMercator` variants; the `Projected` variant carries its
+/// own projected extents and ignores it). See [`PixelGeometry`] for the pixel
+/// coordinate convention and out-of-domain handling.
+///
+/// **Antimeridian (v1 limitation):** vertices are projected independently with
+/// no ±180° seam handling, so a polygon ring that crosses the antimeridian — or
+/// a request bbox spanning it — is not split and will render incorrectly (a
+/// ring vertex at +179° and one at −179° map to opposite edges of the tile,
+/// filling the wrong span between them). Callers must pre-split such polygons.
+/// Antimeridian splitting is a deferred follow-up (#397); small alert/SIGMET
+/// polygons away from ±180° are unaffected.
+pub fn geometry_to_pixels(
+    geom: &Geometry,
+    bbox: [f64; 4],
+    width: u32,
+    height: u32,
+    output_crs: &OutputCrs,
+) -> PixelGeometry {
+    let (w, h) = (width as f64, height as f64);
+    let project_ring = |ring: &[[f64; 2]]| -> Vec<[f64; 2]> {
+        ring.iter()
+            .map(|&[lon, lat]| {
+                let (fx, fy) = output_crs.world_to_fraction(bbox, lon, lat);
+                [fx * w, fy * h]
+            })
+            .collect()
+    };
+    let project_polygon = |exterior: &[[f64; 2]], holes: &[Vec<[f64; 2]>]| PixelPolygon {
+        exterior: project_ring(exterior),
+        holes: holes.iter().map(|ring| project_ring(ring)).collect(),
+    };
+    let polygons = match geom {
+        Geometry::Polygon { exterior, holes } => vec![project_polygon(exterior, holes)],
+        Geometry::MultiPolygon { polygons } => polygons
+            .iter()
+            .map(|(exterior, holes)| project_polygon(exterior, holes))
+            .collect(),
+        Geometry::Point { .. } | Geometry::Null => Vec::new(),
+    };
+    PixelGeometry { polygons }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1947,5 +2037,136 @@ mod tests {
         assert!(x.abs() < 1e-6, "x={x}");
         assert!((y - (WGS84_A + 100.0)).abs() < 1e-3, "y={y}");
         assert!(z.abs() < 1e-6, "z={z}");
+    }
+
+    // -- geometry_to_pixels (#397) -----------------------------------------
+
+    fn approx(a: [f64; 2], b: [f64; 2], eps: f64) -> bool {
+        (a[0] - b[0]).abs() < eps && (a[1] - b[1]).abs() < eps
+    }
+
+    #[test]
+    fn geometry_to_pixels_wgs84_pins_corners_and_centre() {
+        // bbox [west, south, east, north] = [0, 0, 10, 10], 100×100 px.
+        // Linear lon/lat → pixel: NW corner → (0,0), SE corner → (100,100),
+        // centre → (50,50). y is top-down (north at y=0).
+        let bbox = [0.0, 0.0, 10.0, 10.0];
+        let geom = Geometry::Polygon {
+            exterior: vec![
+                [0.0, 10.0],  // NW
+                [10.0, 10.0], // NE
+                [10.0, 0.0],  // SE
+                [0.0, 0.0],   // SW
+                [5.0, 5.0],   // centre
+            ],
+            holes: vec![],
+        };
+        let px = geometry_to_pixels(&geom, bbox, 100, 100, &OutputCrs::Wgs84);
+        assert_eq!(px.polygons.len(), 1);
+        let ring = &px.polygons[0].exterior;
+        assert!(approx(ring[0], [0.0, 0.0], 1e-9), "NW {:?}", ring[0]);
+        assert!(approx(ring[1], [100.0, 0.0], 1e-9), "NE {:?}", ring[1]);
+        assert!(approx(ring[2], [100.0, 100.0], 1e-9), "SE {:?}", ring[2]);
+        assert!(approx(ring[3], [0.0, 100.0], 1e-9), "SW {:?}", ring[3]);
+        assert!(approx(ring[4], [50.0, 50.0], 1e-9), "centre {:?}", ring[4]);
+    }
+
+    #[test]
+    fn geometry_to_pixels_web_mercator_bows_y() {
+        // Same bbox; x stays linear in lon, but y follows Mercator: northern
+        // latitudes occupy more Mercator-Y space, so the geographic lat=5°
+        // midpoint is pushed *below* the geometric middle (pixel y > 50).
+        let bbox = [0.0, 0.0, 10.0, 10.0];
+        let geom = Geometry::Polygon {
+            exterior: vec![[0.0, 10.0], [10.0, 0.0], [5.0, 5.0]],
+            holes: vec![],
+        };
+        let px = geometry_to_pixels(&geom, bbox, 100, 100, &OutputCrs::WebMercator);
+        let ring = &px.polygons[0].exterior;
+        // Corners pin exactly (the bbox edges are fixed points of the mapping).
+        assert!(approx(ring[0], [0.0, 0.0], 1e-9), "NW {:?}", ring[0]);
+        assert!(approx(ring[1], [100.0, 100.0], 1e-9), "SE {:?}", ring[1]);
+        // Centre: pin y against an independently-computed Mercator fraction.
+        let merc = |lat: f64| {
+            6_378_137.0_f64 * ((std::f64::consts::FRAC_PI_4 + lat.to_radians() / 2.0).tan()).ln()
+        };
+        let (my_n, my_s, my_m) = (merc(10.0), merc(0.0), merc(5.0));
+        let expected_y = (my_n - my_m) / (my_n - my_s) * 100.0;
+        assert!(expected_y > 50.0, "Mercator midpoint below centre");
+        assert!(
+            (ring[2][0] - 50.0).abs() < 1e-9 && (ring[2][1] - expected_y).abs() < 1e-6,
+            "centre {:?} vs expected y {expected_y}",
+            ring[2]
+        );
+    }
+
+    #[test]
+    fn geometry_to_pixels_projected_epsg3067() {
+        // EPSG:3067 (TM35FIN). Output bbox in projected metres straddling the
+        // central meridian (27°E ↔ easting 500 000). A polygon vertex on the
+        // central meridian must land at fx = 0.5 — an independent pin that the
+        // projection is actually applied (not the metres treated as degrees).
+        let crs = projected_output_crs("EPSG:3067").unwrap();
+        let bbox_proj = [400_000.0, 6_600_000.0, 600_000.0, 6_900_000.0];
+        let out = OutputCrs::Projected {
+            crs: crs.clone(),
+            bbox: bbox_proj,
+        };
+        let geom = Geometry::Polygon {
+            exterior: vec![[27.0, 62.0], [28.0, 62.0], [27.0, 61.0]],
+            holes: vec![],
+        };
+        // The WGS84 `bbox` arg is ignored by the Projected variant.
+        let px = geometry_to_pixels(&geom, [0.0; 4], 200, 300, &out);
+        let ring = &px.polygons[0].exterior;
+        // Vertex 0 is on λ0=27° → easting exactly 500 000 → fx=0.5 → x=100.
+        assert!((ring[0][0] - 100.0).abs() < 1e-3, "λ0 x {:?}", ring[0]);
+        // Cross-check the full mapping against forward() + the fraction math.
+        for (i, &[lon, lat]) in geom_exterior(&geom).iter().enumerate() {
+            let (e, n) = crs.forward(lon, lat);
+            let fx = (e - bbox_proj[0]) / (bbox_proj[2] - bbox_proj[0]);
+            let fy = (bbox_proj[3] - n) / (bbox_proj[3] - bbox_proj[1]);
+            assert!(
+                approx(ring[i], [fx * 200.0, fy * 300.0], 1e-6),
+                "vertex {i} {:?}",
+                ring[i]
+            );
+        }
+    }
+
+    #[test]
+    fn geometry_to_pixels_multipolygon_and_holes() {
+        let bbox = [0.0, 0.0, 10.0, 10.0];
+        let geom = Geometry::MultiPolygon {
+            polygons: vec![
+                (
+                    vec![[0.0, 10.0], [2.0, 10.0], [0.0, 8.0]],
+                    vec![vec![[0.5, 9.5], [1.0, 9.5], [0.5, 9.0]]],
+                ),
+                (vec![[8.0, 2.0], [10.0, 2.0], [8.0, 0.0]], vec![]),
+            ],
+        };
+        let px = geometry_to_pixels(&geom, bbox, 100, 100, &OutputCrs::Wgs84);
+        assert_eq!(px.polygons.len(), 2);
+        assert_eq!(px.polygons[0].holes.len(), 1);
+        // First hole vertex [0.5, 9.5] → (5, 5).
+        assert!(approx(px.polygons[0].holes[0][0], [5.0, 5.0], 1e-9));
+        assert!(px.polygons[1].holes.is_empty());
+    }
+
+    #[test]
+    fn geometry_to_pixels_point_and_null_yield_nothing() {
+        let bbox = [0.0, 0.0, 10.0, 10.0];
+        for geom in [Geometry::Point { x: 5.0, y: 5.0 }, Geometry::Null] {
+            let px = geometry_to_pixels(&geom, bbox, 100, 100, &OutputCrs::Wgs84);
+            assert!(px.polygons.is_empty());
+        }
+    }
+
+    fn geom_exterior(geom: &Geometry) -> &[[f64; 2]] {
+        match geom {
+            Geometry::Polygon { exterior, .. } => exterior,
+            _ => panic!("not a polygon"),
+        }
     }
 }
