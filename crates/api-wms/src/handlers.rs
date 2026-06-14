@@ -510,13 +510,14 @@ pub async fn wms_handler(
                     (cached, "MISS", content_type)
                 }
                 Ok(None) => {
-                    // Empty tile: transparent PNG, never cached.
-                    let rgba = vec![0u8; (params.width * params.height * 4) as usize];
-                    let png =
-                        ds_render::encode_png(&rgba, params.width, params.height).map_err(|e| {
+                    // Empty tile: a transparent PNG, encoded once per (w,h) and
+                    // shared across WMS/Maps/Tiles (#171). Not inserted into the
+                    // rendered cache — the shared empty-tile cache already serves
+                    // the deterministic empty response.
+                    let cached =
+                        ds_render::empty_tile(params.width, params.height).map_err(|e| {
                             WmsError::Internal(format!("Failed to encode empty tile: {e}"))
                         })?;
-                    let cached = ds_render::CachedRendered::new(bytes::Bytes::from(png));
                     (cached, "EMPTY", "image/png")
                 }
                 Err(e) => {

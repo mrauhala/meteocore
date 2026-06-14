@@ -22,26 +22,19 @@ use crate::error::TilesError;
 use crate::params::{self, TileQueryParams};
 use crate::tilematrixset::{self, SUPPORTED_TILE_MATRIX_SETS};
 
-/// Pre-generated 256x256 fully transparent PNG for empty (all-nodata) tiles.
-/// Avoids running the colorization + encoding pipeline when a tile has no data.
-static EMPTY_TILE_PNG: LazyLock<bytes::Bytes> = LazyLock::new(|| {
-    let size = params::TILE_SIZE;
-    let rgba = vec![0u8; (size * size * 4) as usize];
-    bytes::Bytes::from(
-        ds_render::encode_png(&rgba, size, size).expect("encoding empty tile PNG must not fail"),
-    )
+/// Pre-generated 256×256 fully transparent `CachedRendered` for empty
+/// (all-nodata) tiles — the bytes and their FNV-1a ETag are computed once per
+/// process instead of on every empty-tile response, and the colorization +
+/// encoding pipeline is skipped when a tile has no data.
+///
+/// Sourced from the shared [`ds_render::empty_tile`] cache, which WMS and Maps
+/// now use too (#171) — so all three raster APIs share one mechanism rather than
+/// each rolling their own. Tiles is always 256×256, so a process-once `LazyLock`
+/// keeps cloning per request essentially free (`Bytes` is `Arc`-backed).
+static EMPTY_TILE_CACHED: LazyLock<ds_render::CachedRendered> = LazyLock::new(|| {
+    ds_render::empty_tile(params::TILE_SIZE, params::TILE_SIZE)
+        .expect("encoding empty tile PNG must not fail")
 });
-
-/// Companion to [`EMPTY_TILE_PNG`]: the same bytes wrapped in
-/// `CachedRendered`, so the FNV-1a hash that produces the empty-tile
-/// ETag is computed **once per process** instead of on every empty-tile
-/// response. Both fields are `Clone`-cheap (`Bytes` is `Arc`-backed,
-/// `String` is a 20-byte allocation done once), so cloning per request
-/// is essentially free. `api-maps` and `api-wms` cannot use this trick
-/// — they allocate fresh empty bytes per request to match the requested
-/// dimensions — but Tiles is always 256×256.
-static EMPTY_TILE_CACHED: LazyLock<ds_render::CachedRendered> =
-    LazyLock::new(|| ds_render::CachedRendered::new(EMPTY_TILE_PNG.clone()));
 
 /// Shared state for the OGC API Tiles service.
 #[derive(Clone)]
