@@ -113,6 +113,24 @@ fn build_empty_router() -> axum::Router {
             parameter: None,
         },
     );
+    // A second, named style so legend tests can assert the selected STYLE flows
+    // through (distinct colormap + range → distinct legend, plus the style name
+    // on the legend's second title line).
+    layer_styles.insert(
+        "radar_fmi".to_string(),
+        StyleInfo {
+            name: "radar_fmi".to_string(),
+            title: "FMI Radar".to_string(),
+            colormap: Arc::new(LutColorMap::from_builtin(
+                BuiltinColormap::RadarDbz,
+                -32.0,
+                95.0,
+            )),
+            min: -32.0,
+            max: 95.0,
+            parameter: None,
+        },
+    );
     styles_map.insert("empty".to_string(), layer_styles);
 
     let state = Arc::new(ArcSwap::from_pointee(WmsState {
@@ -1812,6 +1830,37 @@ async fn legend_graphic_defaults_to_labelled_size() {
         png_dims(&body),
         (180, 300),
         "legend should default to the labelled 180×300 size"
+    );
+}
+
+/// `GetLegendGraphic` reflects the selected `STYLES`: the named style's distinct
+/// colormap/range (and its name on the legend) make its legend bytes differ from
+/// the default style's. Confirms the legend isn't pinned to the default colormap.
+#[tokio::test]
+async fn legend_graphic_reflects_selected_style() {
+    let app = build_empty_router();
+    let fetch = |styles: &str| {
+        let uri = format!(
+            "/?SERVICE=WMS&REQUEST=GetLegendGraphic&VERSION=1.3.0\
+             &LAYER=empty&FORMAT=image/png&STYLES={styles}"
+        );
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            resp.into_body().collect().await.unwrap().to_bytes()
+        }
+    };
+    let default = fetch("default").await;
+    let named = fetch("radar_fmi").await;
+    assert!(default.starts_with(&[0x89, b'P', b'N', b'G']));
+    assert!(named.starts_with(&[0x89, b'P', b'N', b'G']));
+    assert_ne!(
+        default, named,
+        "the selected style must change the rendered legend"
     );
 }
 

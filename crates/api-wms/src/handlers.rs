@@ -636,8 +636,20 @@ pub async fn wms_handler(
                 .as_ref()
                 .map(|i| i.unit.clone())
                 .filter(|u| !u.is_empty());
-            let title = match (param, unit) {
+            let param_unit = match (param, unit) {
                 (Some(p), Some(u)) => Some(format!("{p} ({u})")),
+                (Some(s), None) | (None, Some(s)) => Some(s),
+                (None, None) => None,
+            };
+            // For a non-default style, show its name on a second line so the
+            // legend identifies which of a layer's styles it depicts (the colours
+            // already come from this style's colormap). "default"/"Default" carry
+            // no information, so they're omitted.
+            let style_line = (style_name != "default")
+                .then(|| style_info.title.trim().to_string())
+                .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("default"));
+            let title = match (param_unit, style_line) {
+                (Some(pu), Some(sl)) => Some(format!("{pu}\n{sl}")),
                 (Some(s), None) | (None, Some(s)) => Some(s),
                 (None, None) => None,
             };

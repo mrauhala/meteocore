@@ -49,6 +49,17 @@ fn main() {
         180,
         300,
     );
+    // A non-default WMS style: the parameter/unit on line 1, the style name on
+    // line 2 (what the GetLegendGraphic handler builds for STYLE=radar_fmi).
+    write_legend(
+        "styled",
+        BuiltinColormap::RadarDbz,
+        -32.0,
+        95.0,
+        Some("DBZH (dBZ)\nFMI Radar"),
+        180,
+        300,
+    );
     write_legend("small", BuiltinColormap::Viridis, 0.0, 1.0, None, 40, 200);
     write_legend(
         "fraction",
