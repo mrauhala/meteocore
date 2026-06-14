@@ -1884,21 +1884,23 @@ pub fn load_collections(
                     info!("Collection '{}': wired to Tiles API", collection.id);
                 }
 
-                // Ready once the first load found alerts; otherwise degraded
-                // until the poll loop populates (an unreachable feed at startup).
-                let count = ds_core::feature_engine::FeatureEngine::feature_count(engine.as_ref());
+                // Ready once the first load *succeeded*, even with zero alerts —
+                // a reachable CAP source can legitimately have no active alerts.
+                // Degraded only when the initial load never succeeded (e.g. an
+                // unreachable feed at startup); the poll loop retries.
+                let loaded = engine.is_loaded();
                 health.push(CollectionHealth {
                     id: collection.id.clone(),
                     engine_type: "cap".into(),
-                    status: if count > 0 {
+                    status: if loaded {
                         CollectionStatus::Ready
                     } else {
                         CollectionStatus::Degraded
                     },
-                    error: if count > 0 {
+                    error: if loaded {
                         None
                     } else {
-                        Some("no alerts loaded yet (waiting for poll)".into())
+                        Some("initial load failed (will retry on poll)".into())
                     },
                 });
             }

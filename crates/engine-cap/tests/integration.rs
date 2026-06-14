@@ -364,6 +364,20 @@ fn refresh_picks_up_added_and_removed_files() {
     assert_eq!(got, vec!["urn:test:storm-window-1.0.0".to_string()]);
 }
 
+#[test]
+fn empty_source_is_loaded_but_has_no_records() {
+    // A reachable source with zero CAP files is a healthy empty collection:
+    // is_loaded() is true (so admin marks it Ready, not Degraded), even though
+    // feature_count is 0.
+    let dir = tempfile::tempdir().unwrap();
+    let eng = CapEngine::new(&config_for(dir.path().to_str().unwrap(), None), "cap-empty").unwrap();
+    assert!(
+        eng.is_loaded(),
+        "a successful zero-record load is still 'loaded'"
+    );
+    assert_eq!(eng.feature_count(), 0);
+}
+
 fn instant(t: DateTime<Utc>) -> DatetimeInterval {
     DatetimeInterval {
         start: Some(t),

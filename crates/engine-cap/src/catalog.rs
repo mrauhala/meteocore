@@ -102,7 +102,12 @@ pub struct Catalog {
     pub info: Arc<RasterInfo>,
     /// The moment this snapshot reflects ("now" for un-pinned TIME selection).
     pub as_of: DateTime<Utc>,
-    /// Opaque content hash for Feature ETags (stable across restarts).
+    /// Opaque content hash for Feature ETags. Identical alert content hashes to
+    /// the same value within a build (and across restarts on the same
+    /// toolchain), so an unchanged data set keeps ETags valid across polls. The
+    /// hasher (`DefaultHasher`) has no cross-Rust-version guarantee, but a value
+    /// change there is consequence-free — a one-time ETag invalidation (clients
+    /// re-fetch once), never staleness.
     pub data_version: u64,
     /// Areas dropped from the map for having only geocodes (no geometry).
     pub geocode_only_count: usize,
@@ -145,6 +150,14 @@ impl Catalog {
                         geocode_only_count += 1;
                     }
                     let bbox = geometry.bbox();
+                    // Feature id `{identifier}.{infoIdx}.{areaIdx}`. This is
+                    // collision-free even when the CAP identifier contains dots:
+                    // `info_idx`/`area_idx` render as digits only, so the final
+                    // two dots are unambiguous delimiters — peel `.{digits}`
+                    // twice from the right and the remainder is exactly the
+                    // identifier. (A `/` separator would be unambiguous too but
+                    // is unsafe here: the id is a single URL path segment in
+                    // `/items/{featureId}`, where `/` would split the route.)
                     let id = format!("{}.{}.{}", alert.identifier, info_idx, area_idx);
                     let window = build_window(alert, info, cfg.default_ttl);
                     let severity_code = severity_code(info.severity.as_deref());
@@ -601,6 +614,29 @@ mod tests {
         // onset 10:00 + 2h = 12:00 end.
         assert!(r.window.active_at(at(2026, 6, 15, 11)));
         assert!(!r.window.active_at(at(2026, 6, 15, 13)));
+    }
+
+    #[test]
+    fn dotted_identifiers_produce_distinct_retrievable_ids() {
+        // Identifiers that contain dots must not collide: info/area render as
+        // digits, so the trailing `.{int}.{int}` are unambiguous delimiters.
+        let mk = |ident: &str| {
+            format!(
+                r#"<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+                  <identifier>{ident}</identifier><status>Actual</status>
+                  <info><event>E</event>
+                    <area><areaDesc>A</areaDesc><polygon>0,0 0,1 1,1 1,0 0,0</polygon></area>
+                  </info></alert>"#
+            )
+        };
+        let mut alerts = parse_document(&mk("X.0.0")).unwrap();
+        alerts.extend(parse_document(&mk("X.0.0.0")).unwrap());
+        let cat = Catalog::build(&alerts, &cfg(), "cap", "severity", at(2026, 6, 15, 12));
+        assert_eq!(cat.records.len(), 2);
+        // Distinct ids ("X.0.0.0.0" vs "X.0.0.0.0.0"), both individually retrievable.
+        assert!(cat.get("X.0.0.0.0").is_some());
+        assert!(cat.get("X.0.0.0.0.0").is_some());
+        assert_ne!(cat.records[0].id, cat.records[1].id);
     }
 
     #[test]

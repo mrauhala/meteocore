@@ -1,6 +1,7 @@
 //! The CAP engine: implements `FeatureEngine` (one feature per alert area) and
 //! `MapEngine` (severity-shaded polygon fills) over a poll-and-swap catalog.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,6 +35,10 @@ pub struct CapEngine {
     collection_id: String,
     poll_interval: Duration,
     shutdown_tx: watch::Sender<()>,
+    /// Set once the first `refresh()` succeeds — even with **zero** records. A
+    /// healthy CAP source can legitimately have no active alerts, so "loaded"
+    /// (not "non-empty") is the readiness signal; see [`Self::is_loaded`].
+    loaded: AtomicBool,
 }
 
 impl CapEngine {
@@ -73,6 +78,7 @@ impl CapEngine {
             collection_id: collection_id.to_string(),
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
             shutdown_tx,
+            loaded: AtomicBool::new(false),
         };
 
         // Best-effort initial load (so local fixtures populate immediately).
@@ -88,6 +94,14 @@ impl CapEngine {
     /// Collection id (for logging / health).
     pub fn collection_id(&self) -> &str {
         &self.collection_id
+    }
+
+    /// Whether at least one load has succeeded (regardless of record count).
+    /// This is the health-readiness signal: a reachable source with **zero**
+    /// active alerts is `Ready`, not `Degraded` — only a never-yet-successful
+    /// load (e.g. an unreachable feed at startup) is `Degraded`.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded.load(Ordering::Relaxed)
     }
 
     /// Fetch + parse the source and swap in a fresh catalog (advancing `as_of`
@@ -111,6 +125,7 @@ impl CapEngine {
             self.source.label()
         );
         self.catalog.store(Arc::new(catalog));
+        self.loaded.store(true, Ordering::Relaxed);
         Ok(())
     }
 
