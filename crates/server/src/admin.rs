@@ -661,12 +661,26 @@ pub struct LoadResult {
     pub postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>>,
 }
 
+/// Render caches carried across a reload so a config reload **preserves** the
+/// warm cache instead of rebuilding it empty. Rebuilding on every reload dumps
+/// a fully-warmed meta-tile cache (multiple GB) and forces a cold re-warm — and
+/// a spurious `collections_dir` watcher event could trigger that repeatedly,
+/// tanking render latency. `Default` (all `None`, used at startup) builds fresh;
+/// [`do_reload`] passes the live caches to reuse.
+#[derive(Default)]
+pub struct ReusableCaches {
+    pub rendered: Option<Arc<ds_render::RenderedCache>>,
+    pub tile: Option<Arc<ds_render::TilePixelCache>>,
+    pub vector: Option<Arc<ds_mvt::VectorTileCache>>,
+}
+
 pub fn load_collections(
     collections: &[CollectionConfig],
     style_bundles: &[StyleBundle],
     base_url: &str,
     trust_proxy_headers: bool,
     metatile_cache_mb: u64,
+    reuse: ReusableCaches,
 ) -> LoadResult {
     let bundle_index: HashMap<&str, &StyleBundle> =
         style_bundles.iter().map(|b| (b.id.as_str(), b)).collect();
@@ -1966,12 +1980,31 @@ pub fn load_collections(
         .max(8);
     tracing::info!("Render concurrency: {render_concurrency} (2× available CPUs, min 8)");
     let render_semaphore = Arc::new(tokio::sync::Semaphore::new(render_concurrency));
-    let rendered_cache = Arc::new(ds_render::RenderedCache::new(rendered_cache_mb));
-    let tile_cache = Arc::new(ds_render::TilePixelCache::new(metatile_cache_mb));
+    // Reuse the live render caches across a reload when their configured byte
+    // size is unchanged, so a reload preserves the warm cache instead of
+    // dumping GBs of meta-tiles and forcing a cold re-warm (see
+    // [`ReusableCaches`]). A size change (or startup, where `reuse` is empty)
+    // builds fresh. Stale entries survive harmlessly: a removed collection's
+    // layer 404s before its cached tiles can be served (they then age out via
+    // LRU), and a changed colormap re-colors as new timesteps render (the cache
+    // key carries `time`); a hard guarantee for an in-place colormap swap still
+    // needs a restart.
+    let mb = |m: u64| m.saturating_mul(1024 * 1024);
+    let rendered_cache = match reuse.rendered {
+        Some(c) if c.capacity() == mb(rendered_cache_mb) => c,
+        _ => Arc::new(ds_render::RenderedCache::new(rendered_cache_mb)),
+    };
+    let tile_cache = match reuse.tile {
+        Some(c) if c.capacity() == mb(metatile_cache_mb) => c,
+        _ => Arc::new(ds_render::TilePixelCache::new(metatile_cache_mb)),
+    };
     // Vector-tile (MVT) cache is independent of the raster cache because the
-    // workloads differ (1–50 KB vs 30–200 KB per tile). 128 MB matches the
-    // raster default; a config knob lands when an operator asks for it.
-    let vector_tile_cache = Arc::new(ds_mvt::VectorTileCache::new(128));
+    // workloads differ (1–50 KB vs 30–200 KB per tile). Fixed 128 MB; reused
+    // across reloads on the same terms.
+    let vector_tile_cache = match reuse.vector {
+        Some(c) if c.capacity_bytes() == mb(128) => c,
+        _ => Arc::new(ds_mvt::VectorTileCache::new(128)),
+    };
 
     // Set initial render semaphore total gauge
     RENDER_SEMAPHORE_TOTAL.set(render_concurrency as i64);
@@ -2514,12 +2547,25 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     // reload would freeze the live registry with dead loops and no new ones
     // spawned (the guard returns before the spawn block).
 
+    // Carry the live render caches into the reload so it preserves the warm
+    // cache instead of rebuilding it empty — a spurious `collections_dir`
+    // watcher event must not dump a multi-GB meta-tile cache. `load_collections`
+    // reuses each one iff its configured size is unchanged.
+    let reuse = {
+        let wms = state.wms.load();
+        ReusableCaches {
+            rendered: Some(wms.rendered_cache.clone()),
+            tile: Some(wms.tile_cache.clone()),
+            vector: Some(state.tiles.load().vector_tile_cache.clone()),
+        }
+    };
     let mut result = load_collections(
         &config.collections,
         &config.style_bundles,
         &base_url,
         config.server.trust_proxy_headers,
         config.server.metatile_cache_mb,
+        reuse,
     );
 
     // Reload protection counts *fully working* (`Ready`) collections, not
@@ -3386,6 +3432,76 @@ mod tests {
     use ds_core::config::{CollectionConfig, StyleBundle};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    // --- reload preserves the warm render caches (ReusableCaches) ---
+
+    #[test]
+    fn reload_reuses_render_caches_when_size_unchanged() {
+        // Startup-equivalent: fresh caches (empty collections is fine — the
+        // render caches are built unconditionally).
+        let first = super::load_collections(
+            &[],
+            &[],
+            "http://x",
+            false,
+            64,
+            super::ReusableCaches::default(),
+        );
+        let tile0 = first.wms_state.tile_cache.clone();
+        let rendered0 = first.wms_state.rendered_cache.clone();
+        let vector0 = first.tiles_state.vector_tile_cache.clone();
+
+        // Reload with the SAME meta-tile size → every cache is reused (same
+        // `Arc`), so a warm cache survives a reload instead of being dumped.
+        let second = super::load_collections(
+            &[],
+            &[],
+            "http://x",
+            false,
+            64,
+            super::ReusableCaches {
+                rendered: Some(rendered0.clone()),
+                tile: Some(tile0.clone()),
+                vector: Some(vector0.clone()),
+            },
+        );
+        assert!(
+            Arc::ptr_eq(&tile0, &second.wms_state.tile_cache),
+            "tile cache reused"
+        );
+        assert!(
+            Arc::ptr_eq(&rendered0, &second.wms_state.rendered_cache),
+            "rendered cache reused"
+        );
+        assert!(
+            Arc::ptr_eq(&vector0, &second.tiles_state.vector_tile_cache),
+            "vector cache reused"
+        );
+
+        // Reload with a CHANGED meta-tile size → the tile cache is rebuilt (a
+        // differently-sized cache can't be reused); the unchanged rendered/
+        // vector caches are still reused.
+        let third = super::load_collections(
+            &[],
+            &[],
+            "http://x",
+            false,
+            128,
+            super::ReusableCaches {
+                rendered: Some(rendered0.clone()),
+                tile: Some(tile0.clone()),
+                vector: Some(vector0.clone()),
+            },
+        );
+        assert!(
+            !Arc::ptr_eq(&tile0, &third.wms_state.tile_cache),
+            "tile cache rebuilt on size change"
+        );
+        assert!(
+            Arc::ptr_eq(&rendered0, &third.wms_state.rendered_cache),
+            "rendered cache unchanged → reused"
+        );
+    }
 
     // --- maybe_wrap_integer_lut (#207) ---
 

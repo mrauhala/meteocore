@@ -428,6 +428,8 @@ async fn main() {
         &base_url,
         config.server.trust_proxy_headers,
         config.server.metatile_cache_mb,
+        // Startup builds the render caches fresh; reloads reuse them.
+        admin::ReusableCaches::default(),
     );
 
     let loaded = result
