@@ -68,6 +68,13 @@ pub fn fill_polygon(
     value: f64,
     combine: Combine,
 ) {
+    // Precondition: fill values are finite (severity/category codes). A
+    // non-finite `value` would make `Combine::Max` order-dependent — an empty
+    // slot stores `Some(NaN)` while a populated slot drops it via `f64::max` —
+    // breaking the documented draw-order independence. Assert in debug builds
+    // to catch misuse rather than silently violating the contract.
+    debug_assert!(value.is_finite(), "fill_polygon value must be finite");
+
     let (w, h) = (width as usize, height as usize);
     if w == 0 || h == 0 || out.len() != w.saturating_mul(h) {
         return;
