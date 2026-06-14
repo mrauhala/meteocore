@@ -413,77 +413,22 @@ pub fn render_tile_png(
     render_tile(tile, colormap, ImageFormat::Png)
 }
 
-/// Compute "nice" round tick values spanning `[min, max]` aiming for roughly
-/// `target` ticks, using the classic 1-2-5 nice-number algorithm (Heckbert,
-/// *Graphics Gems*). Returns values inside `[min, max]` (inclusive, with a small
-/// tolerance) in ascending order, so a legend's labels land on human-friendly
-/// round numbers (0, 10, 20, …) rather than the raw extents.
+/// "Nice" round tick values to label a legend gradient over `[min, max]`.
 ///
-/// Degenerate inputs (`min == max`, non-finite bounds) yield a single tick at
-/// `min`. `min`/`max` may be passed in either order.
-fn nice_ticks(min: f64, max: f64, target: usize) -> Vec<f64> {
-    if !min.is_finite() || !max.is_finite() || min == max {
-        return vec![min];
-    }
-    let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
-
-    // Round a number to a "nice" 1-2-5 × 10^k value.
-    fn nice_num(range: f64, round: bool) -> f64 {
-        let exp = range.log10().floor();
-        let frac = range / 10f64.powf(exp);
-        let nice = if round {
-            if frac < 1.5 {
-                1.0
-            } else if frac < 3.0 {
-                2.0
-            } else if frac < 7.0 {
-                5.0
-            } else {
-                10.0
-            }
-        } else if frac <= 1.0 {
-            1.0
-        } else if frac <= 2.0 {
-            2.0
-        } else if frac <= 5.0 {
-            5.0
-        } else {
-            10.0
-        };
-        nice * 10f64.powf(exp)
-    }
-
-    let target = target.max(2);
-    // Step straight from the raw range (not a nice-rounded range): rounding the
-    // range up first tends to overshoot the step and drop the extreme ticks
-    // (0..70 → step 20 → no 70). From the raw range, 0..70/5 → step 10 → 0,10,…,70.
-    let step = nice_num((hi - lo) / (target - 1) as f64, true);
-    if !step.is_finite() || step <= 0.0 {
-        return vec![lo, hi];
-    }
-    let graph_lo = (lo / step).floor() * step;
-    let graph_hi = (hi / step).ceil() * step;
-
-    let mut ticks = Vec::new();
-    let tol = step * 1e-6;
-    // Bound the loop defensively so a pathological step can't spin forever.
-    let max_ticks = target * 4 + 4;
-    let mut v = graph_lo;
-    while v <= graph_hi + tol && ticks.len() < max_ticks {
-        if v >= lo - tol && v <= hi + tol {
-            ticks.push(v);
-        }
-        v += step;
-    }
-    if ticks.is_empty() {
-        ticks.push(lo);
-        ticks.push(hi);
-    }
-    ticks
+/// Reuses the chart axis tick generator ([`plot::nice_ticks`], the shared 1-2-5
+/// nice-number algorithm) and clips to `[min, max]` — a colorbar tick must map
+/// onto the gradient, so unlike a chart axis it can't extend a half-step past
+/// the data extent. Aims for ~6 ticks; an empty result (degenerate / inverted
+/// range) means the caller draws no ticks.
+fn legend_ticks(min: f64, max: f64) -> Vec<f64> {
+    plot::nice_ticks(min, max, 6)
+        .into_iter()
+        .filter(|&v| v >= min && v <= max)
+        .collect()
 }
 
 /// Format a tick value for a legend label: fixed enough decimals to be exact for
-/// the nice-number ticks [`nice_ticks`] produces, with trailing zeros and a
+/// the nice-number ticks [`legend_ticks`] produces, with trailing zeros and a
 /// dangling decimal point stripped (`10.000` → `10`, `0.200` → `0.2`). Negative
 /// zero normalises to `0`.
 fn format_tick(v: f64) -> String {
@@ -554,18 +499,26 @@ pub fn render_legend(
     let min_label_w = font::text_width("00", SCALE);
     let want_labels = width >= PAD * 2 + 12 + TICK_LEN + LABEL_GAP + min_label_w;
 
+    let grad_x0 = PAD;
+
     // Swatch width: a slim bar when we're labelling (the labels carry the
     // information), or the historical ~40% when there's no room for labels.
+    // Both branches must keep `grad_x0 + swatch_w <= width` — the swatch starts
+    // at `grad_x0`, so capping at `width` alone would let the gradient loop spill
+    // `grad_x0` columns past the row end into the next row (corruption, and an
+    // out-of-bounds write at the smallest requestable sizes).
     let swatch_w = if want_labels {
         ((width / 6).clamp(14, 30)).min(width.saturating_sub(2 * PAD).max(1))
     } else {
-        (width * 2 / 5).max(10).min(width)
+        (width * 2 / 5).max(10).min(width.saturating_sub(grad_x0))
     };
 
-    let grad_x0 = PAD;
     let grad_y0 = PAD + title_h;
-    let grad_y1 = height.saturating_sub(PAD).max(grad_y0 + 1);
-    let grad_h = grad_y1 - grad_y0;
+    // Bottom of the swatch; `grad_h` is 0 when the image is too short to hold a
+    // PAD-margined swatch below the title. All pixel writes below are bounds-
+    // checked (via `set_px`), so a 0-height swatch simply draws nothing rather
+    // than spilling past the buffer at pathologically small heights.
+    let grad_h = height.saturating_sub(PAD).saturating_sub(grad_y0);
 
     // Map a value to its pixel row in the gradient (top = max, bottom = min).
     let value_to_y = |value: f64| -> u32 {
@@ -589,8 +542,7 @@ pub fn render_legend(
         let px = [over_white(c[0]), over_white(c[1]), over_white(c[2]), 255];
         let py = grad_y0 + gy;
         for gx in 0..swatch_w {
-            let idx = ((py * width + (grad_x0 + gx)) * 4) as usize;
-            rgba[idx..idx + 4].copy_from_slice(&px);
+            set_px(&mut rgba, width, height, grad_x0 + gx, py, px);
         }
     }
 
@@ -604,12 +556,11 @@ pub fn render_legend(
         let tick_x0 = grad_x0 + swatch_w;
         let label_x = tick_x0 + TICK_LEN + LABEL_GAP;
         let half_text = (font::GLYPH_H * SCALE) as i32 / 2;
-        for v in nice_ticks(min, max, 6) {
+        for v in legend_ticks(min, max) {
             let py = value_to_y(v);
             // Short tick mark butting up against the swatch edge.
             for tx in 0..TICK_LEN {
-                let idx = ((py * width + (tick_x0 + tx)) * 4) as usize;
-                rgba[idx..idx + 4].copy_from_slice(&TEXT);
+                set_px(&mut rgba, width, height, tick_x0 + tx, py, TEXT);
             }
             // Label, vertically centred on the tick row.
             font::draw_text(
@@ -629,6 +580,18 @@ pub fn render_legend(
         ImageFormat::Png => encode::encode_png(&rgba, width, height),
         ImageFormat::Jpeg => encode::encode_jpeg(&rgba, width, height),
         ImageFormat::Webp => encode::encode_webp(&rgba, width, height),
+    }
+}
+
+/// Write one RGBA pixel, clipped to the buffer bounds. The legend's geometry can
+/// place a swatch row or tick mark off-canvas at pathologically small sizes; this
+/// keeps every write safe so the renderer degrades to "draws nothing" instead of
+/// panicking.
+#[inline]
+fn set_px(rgba: &mut [u8], width: u32, height: u32, x: u32, y: u32, color: [u8; 4]) {
+    if x < width && y < height {
+        let idx = ((y * width + x) * 4) as usize;
+        rgba[idx..idx + 4].copy_from_slice(&color);
     }
 }
 
@@ -767,30 +730,32 @@ mod tests {
     }
 
     #[test]
-    fn nice_ticks_lands_on_round_values() {
-        // A 0..70 dBZ-style range with ~6 ticks → 0,10,…,70.
-        let ticks = nice_ticks(0.0, 70.0, 6);
-        assert_eq!(ticks, vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0]);
-        // All ticks stay within the requested range.
-        for t in nice_ticks(-32.0, 95.0, 6) {
-            assert!((-32.0..=95.0).contains(&t));
+    fn legend_ticks_land_on_round_values_within_range() {
+        // A 0..70 dBZ-style range → 0,10,…,70 (extremes included).
+        assert_eq!(
+            legend_ticks(0.0, 70.0),
+            vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0]
+        );
+        // Every tick stays inside the gradient's value range (the legend clips
+        // the chart axis generator, which may overshoot the extent).
+        let ticks = legend_ticks(-32.0, 95.0);
+        assert!(!ticks.is_empty());
+        for t in &ticks {
+            assert!((-32.0..=95.0).contains(t), "tick {t} escaped the range");
         }
-        // A sub-unit range still produces sane round ticks.
-        let small = nice_ticks(0.0, 1.0, 6);
+        // A sub-unit range still produces sane ascending round ticks.
+        let small = legend_ticks(0.0, 1.0);
         assert!(small.contains(&0.0) && small.contains(&1.0));
         assert!(small.windows(2).all(|w| w[1] > w[0]));
     }
 
     #[test]
-    fn nice_ticks_handles_degenerate_ranges() {
-        // Zero-width range → a single tick at the value.
-        assert_eq!(nice_ticks(5.0, 5.0, 6), vec![5.0]);
-        // Non-finite bounds → a single (non-finite) tick, never a panic/hang.
-        let nan_ticks = nice_ticks(f64::NAN, 1.0, 6);
-        assert_eq!(nan_ticks.len(), 1);
-        assert!(nan_ticks[0].is_nan());
-        // Reversed bounds are normalised, not dropped.
-        assert_eq!(nice_ticks(70.0, 0.0, 6), nice_ticks(0.0, 70.0, 6));
+    fn legend_ticks_handle_degenerate_ranges() {
+        // Zero-width / inverted / non-finite ranges yield no ticks (the legend
+        // then draws a bare gradient) rather than panicking.
+        assert!(legend_ticks(5.0, 5.0).is_empty());
+        assert!(legend_ticks(70.0, 0.0).is_empty());
+        assert!(legend_ticks(f64::NAN, 1.0).is_empty());
     }
 
     #[test]
@@ -802,6 +767,29 @@ mod tests {
         assert_eq!(format_tick(0.2), "0.2");
         assert_eq!(format_tick(0.25), "0.25");
         assert_eq!(format_tick(1.5), "1.5");
+    }
+
+    #[test]
+    fn render_legend_tiny_sizes_do_not_panic() {
+        // The swatch starts at PAD, so a too-small width must not let the
+        // gradient loop write past a row (corruption / OOB panic). Sweep the
+        // pathological small sizes the API clamp permits (min 1×1).
+        let cmap = LutColorMap::from_builtin(BuiltinColormap::RadarDbz, -32.0, 95.0);
+        for w in [1u32, 2, 4, 5, 8, 10, 13, 38, 40] {
+            for h in [1u32, 2, 8, 200] {
+                let png = render_legend(
+                    &cmap,
+                    -32.0,
+                    95.0,
+                    w,
+                    h,
+                    ImageFormat::Png,
+                    Some("DBZH (dBZ)"),
+                )
+                .expect("tiny legend must still encode");
+                assert!(png.starts_with(&[0x89, b'P', b'N', b'G']), "w={w} h={h}");
+            }
+        }
     }
 
     #[test]

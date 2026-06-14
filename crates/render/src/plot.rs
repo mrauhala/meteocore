@@ -607,7 +607,11 @@ fn pad_range(min: f64, max: f64) -> (f64, f64) {
 }
 
 /// ~`n` round tick values spanning `[min, max]` (1/2/5 × 10^k steps).
-fn nice_ticks(min: f64, max: f64, n: usize) -> Vec<f64> {
+///
+/// Shared with the WMS legend ([`crate::render_legend`]) so the colorbar and the
+/// chart axes pick ticks the same way; the legend additionally clips the result
+/// to its exact value range (a colorbar tick must land on the gradient).
+pub(crate) fn nice_ticks(min: f64, max: f64, n: usize) -> Vec<f64> {
     if !(min.is_finite() && max.is_finite()) || max <= min || n == 0 {
         return vec![];
     }
