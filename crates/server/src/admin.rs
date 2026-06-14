@@ -1999,11 +1999,14 @@ pub fn load_collections(
         _ => Arc::new(ds_render::TilePixelCache::new(metatile_cache_mb)),
     };
     // Vector-tile (MVT) cache is independent of the raster cache because the
-    // workloads differ (1–50 KB vs 30–200 KB per tile). Fixed 128 MB; reused
-    // across reloads on the same terms.
+    // workloads differ (1–50 KB vs 30–200 KB per tile). Fixed size, kept in a
+    // single constant so the build and the reuse-capacity check can't drift (a
+    // mismatch would silently always rebuild). Reused across reloads on the same
+    // terms as the raster caches.
+    const VECTOR_TILE_CACHE_MB: u64 = 128;
     let vector_tile_cache = match reuse.vector {
-        Some(c) if c.capacity_bytes() == mb(128) => c,
-        _ => Arc::new(ds_mvt::VectorTileCache::new(128)),
+        Some(c) if c.capacity_bytes() == mb(VECTOR_TILE_CACHE_MB) => c,
+        _ => Arc::new(ds_mvt::VectorTileCache::new(VECTOR_TILE_CACHE_MB)),
     };
 
     // Set initial render semaphore total gauge
@@ -3500,6 +3503,10 @@ mod tests {
         assert!(
             Arc::ptr_eq(&rendered0, &third.wms_state.rendered_cache),
             "rendered cache unchanged → reused"
+        );
+        assert!(
+            Arc::ptr_eq(&vector0, &third.tiles_state.vector_tile_cache),
+            "vector cache unchanged → reused"
         );
     }
 
