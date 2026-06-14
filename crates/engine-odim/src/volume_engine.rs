@@ -68,6 +68,7 @@ use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
     VerticalCoord,
 };
+use ds_core::resample::ProjectionGrid;
 use ds_core::vertical::{VerticalDimension, VerticalKind};
 use ds_core::volume::{
     CellProduct, CellQuery, VolumeEngine, VolumeInfo, VolumePoint, VolumePointCloud, VoxelGrid,
@@ -1805,11 +1806,14 @@ fn bilinear_cell(
     (wsum > 0.0).then(|| sum / wsum)
 }
 
-/// Bilinear (anti-spoke) variant of [`sample_sweep_moment`] used by the
-/// Cartesian render. Nearest-neighbour azimuth sampling leaves visible
-/// radial spokes far from the radar, where adjacent output pixels
-/// straddle a ray boundary (#186); blending between the straddling rays
-/// closes them. Same **ground-range interim** as [`sample_sweep_moment`].
+/// Per-point bilinear sampler — resolves one `(lon, lat)` to a fractional
+/// `(ray, bin)` via [`ground_distance_bearing_from`] and blends the straddling
+/// rays to kill radial spokes (#186). The Cartesian render (`polar_sample`) no
+/// longer calls this per pixel — it interpolates the antenna-relative ENU offset
+/// on a coarse [`ProjectionGrid`] and calls [`bilinear_cell`] directly (#268) —
+/// so this is retained as the **unit-test reference** for the full
+/// lon/lat → cell path. Same **ground-range interim** as [`sample_sweep_moment`].
+#[cfg(test)]
 fn sample_sweep_moment_bilinear(
     sweep: &Sweep,
     moment: &PolarMoment,
@@ -1947,36 +1951,81 @@ fn polar_sample(
         });
     };
 
-    // Polar sampling is inherently per-pixel (each output pixel resolves to a
-    // ground distance + bearing from the site), so unlike the gridded engines
-    // this loop maps each pixel's WGS84 lon/lat with the shared
-    // `OutputCrs::project_node` directly — covering linear lon/lat, Mercator Y,
-    // and projected output CRSs (EPSG:3067/3035) in one place (#160).
-    //
-    // The site's trig is hoisted into `origin` once (above) so the per-pixel
-    // `ground_distance_bearing_from` doesn't recompute `sin`/`cos(site_lat)` ~2 M
-    // times. The remaining per-pixel cost (the haversine to the target point, and
-    // for `OutputCrs::Projected` one `Crs::inverse` via `project_node`) is removed
-    // by interpolating a coarse ENU-offset grid — the polar sampler IS smooth in
-    // planar (east, north) metres even though the raw (bin, ray) map has a
-    // seam/antenna-origin singularity — tracked in #268.
+    // Malformed `rscale` (0 / negative / non-finite) makes every range bin NaN
+    // or maps to the wrong gate; treat the whole tile as no-data rather than
+    // fabricating data (the same guard the per-point samplers apply). `rscale`
+    // is constant across the render, so check it once here.
+    if !sweep.rscale.is_finite() || sweep.rscale <= 0.0 {
+        return Ok(RasterTile {
+            width,
+            height,
+            values: vec![None; (width as usize) * (height as usize)],
+        });
+    }
+
+    // Map each output pixel to a fractional `(ray, bin)` WITHOUT projecting and
+    // running a haversine per pixel (#203/#268). The output→(ray, bin) map is
+    // NOT smooth — the ray axis has a 0°/360° branch cut and the bin axis is
+    // singular at the antenna — so it can't be gridded directly. But the
+    // antenna-relative **planar ENU offset (east, north)** IS smooth everywhere
+    // (it's the azimuthal-equidistant image of lon/lat), so we interpolate THAT
+    // on a coarse `ProjectionGrid` and recover `(bin, ray)` per pixel with one
+    // `hypot`/`atan2`. The offset is carried in **range-bin units** (`× 1/rscale`)
+    // so the grid's source-pixel error budget (≤ 0.2) means ≤ 0.2 range-bins of
+    // positional error. The expensive `project_node` + `ground_distance_bearing`
+    // run only at the grid's ~hundreds of nodes — the same coarse-grid approach
+    // the COMP engine uses (#203). `nbins` is the on-raster window (coverage is a
+    // disk of radius `nbins` bin-units), so off-coverage cells don't force
+    // refinement.
+    let inv_rscale = 1.0 / sweep.rscale;
+    let rstart_bins = sweep.rstart * inv_rscale;
+    let ray_span = 360.0 / sweep.nrays as f64;
+    let grid = ProjectionGrid::build_2d(
+        width,
+        height,
+        sweep.nbins as u32,
+        sweep.nbins as u32,
+        |fx, fy| output_crs.project_node(bbox, fx, fy),
+        |lon, lat| {
+            // East/north components of the ground vector from the antenna, in
+            // range-bin units. Smooth through the origin and across the seam,
+            // unlike `(ray, bin)` directly. A NaN (lon, lat) — an out-of-domain
+            // projected output node — propagates to a non-finite node, which the
+            // per-pixel finite check below resolves to transparent.
+            let (dist, az) = ground_distance_bearing_from(&origin, lon, lat);
+            let az_r = az.to_radians();
+            let east = dist * az_r.sin();
+            let north = dist * az_r.cos();
+            (east * inv_rscale, north * inv_rscale)
+        },
+    );
+
     let mut values: Vec<Option<f64>> = Vec::with_capacity((width as usize) * (height as usize));
     for oy in 0..height {
-        let frac_y = (oy as f64 + 0.5) / height as f64;
         for ox in 0..width {
-            let frac_x = (ox as f64 + 0.5) / width as f64;
-            let (lon, lat) = output_crs.project_node(bbox, frac_x, frac_y);
-            // An out-of-domain projected output pixel arrives as NaN (OutputCrs::
-            // Projected inverse failure). NaN would propagate through
-            // ground_distance_bearing and saturate to (ray=0, bin=0), returning
-            // real radar data at the sweep origin instead of None (transparent).
-            if !lon.is_finite() || !lat.is_finite() {
+            let (east_bins, north_bins) = grid.sample(ox, oy);
+            if !east_bins.is_finite() || !north_bins.is_finite() {
                 values.push(None);
                 continue;
             }
-
-            values.push(sample_sweep_moment_bilinear(
-                sweep, moment, &pixels, &origin, lon, lat,
+            // Recover ground-range bin and azimuth ray from the interpolated
+            // planar offset: `bin_f = dist/rscale - rstart/rscale` (the `1/rscale`
+            // scale cancels in the `atan2` bearing). Bearing is `atan2(east,
+            // north)` — 0° = north, clockwise — matching `ground_distance_bearing`.
+            let bin_f = east_bins.hypot(north_bins) - rstart_bins;
+            if bin_f < 0.0 || bin_f >= sweep.nbins as f64 {
+                values.push(None);
+                continue;
+            }
+            let az = east_bins.atan2(north_bins).to_degrees().rem_euclid(360.0);
+            let ray_f = az / ray_span;
+            values.push(bilinear_cell(
+                &pixels,
+                moment,
+                sweep.nrays,
+                sweep.nbins,
+                ray_f,
+                bin_f,
             ));
         }
     }
@@ -4783,6 +4832,87 @@ mod tests {
         // Values increase monotonically with eastward distance.
         for w in tile.values.iter().flatten().collect::<Vec<_>>().windows(2) {
             assert!(w[0] <= w[1], "bin index must rise with distance");
+        }
+    }
+
+    /// The coarse ENU-offset grid (#268) reproduces the per-pixel reference
+    /// sampler within its sub-bin error budget — the projection optimisation is
+    /// numerically faithful, not merely "renders something". The synthetic raw
+    /// value equals the bin index, so a ≤ 0.2-bin position error bounds the
+    /// value error. Checked on both the linear `Wgs84` axes and the non-linear
+    /// `WebMercator` axes (the production web-client CRS, where `out_to_world`
+    /// curves and the adaptive grid has to refine hardest).
+    #[test]
+    fn polar_sample_grid_matches_per_pixel_reference() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let vol = synthetic_volume(site_lon, site_lat);
+        seed_synthetic(TEST_FILE);
+        let sweep = &vol.sweeps[0];
+        let moment = &sweep.moments[0];
+        let raw = synthetic_raw();
+        let origin = OriginTrig::new(site_lon, site_lat);
+
+        // A box NE of the site, within the 100 km sweep, spanning many rays/bins.
+        let bbox = [
+            site_lon + 0.05,
+            site_lat + 0.05,
+            site_lon + 0.5,
+            site_lat + 0.5,
+        ];
+        let (w, h) = (40u32, 40u32);
+
+        for (label, output_crs) in [
+            ("Wgs84", OutputCrs::Wgs84),
+            ("WebMercator", OutputCrs::WebMercator),
+        ] {
+            let tile = polar_sample(
+                &vol,
+                TEST_FILE,
+                test_pixels(),
+                "DBZH",
+                bbox,
+                w,
+                h,
+                &output_crs,
+                None,
+            )
+            .unwrap();
+
+            let mut max_diff = 0.0_f64;
+            let mut compared = 0usize;
+            // Pixels the per-pixel reference samples but the grid drops: a coarse
+            // grid must not shrink coverage (beyond a ≤ 1-bin boundary slop).
+            let mut grid_dropped = 0usize;
+            for oy in 0..h {
+                for ox in 0..w {
+                    let frac_x = (ox as f64 + 0.5) / w as f64;
+                    let frac_y = (oy as f64 + 0.5) / h as f64;
+                    let (lon, lat) = output_crs.project_node(bbox, frac_x, frac_y);
+                    let reference =
+                        sample_sweep_moment_bilinear(sweep, moment, &raw, &origin, lon, lat);
+                    let grid = tile.values[(oy * w + ox) as usize];
+                    match (grid, reference) {
+                        (Some(g), Some(r)) => {
+                            max_diff = max_diff.max((g - r).abs());
+                            compared += 1;
+                        }
+                        (None, Some(_)) => grid_dropped += 1,
+                        _ => {}
+                    }
+                }
+            }
+            assert!(
+                compared > 100,
+                "{label}: most pixels should sample in both paths, got {compared}"
+            );
+            assert!(
+                max_diff < 0.5,
+                "{label}: grid vs per-pixel reference max value diff {max_diff} exceeds budget"
+            );
+            assert!(
+                grid_dropped <= 2,
+                "{label}: grid dropped {grid_dropped} pixels the reference sampled"
+            );
         }
     }
 
