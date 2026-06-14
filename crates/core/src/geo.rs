@@ -1317,10 +1317,12 @@ pub struct PixelGeometry {
 /// (projecting **vertices only**, never per output pixel — #203) and scaled by
 /// `width`/`height`.
 ///
-/// `bbox` is the request's WGS84 bounding box `[west, south, east, north]` (used
-/// by the `Wgs84`/`WebMercator` variants; the `Projected` variant carries its
-/// own projected extents and ignores it). See [`PixelGeometry`] for the pixel
-/// coordinate convention and out-of-domain handling.
+/// `wgs84_bbox` is the request's WGS84 bounding box `[west, south, east, north]`
+/// (used by the `Wgs84`/`WebMercator` variants; the `Projected` variant carries
+/// its own projected extents and ignores it — the name matches the downstream
+/// [`OutputCrs::world_to_fraction`] parameter and flags the WGS84-only
+/// semantics at the call site). See [`PixelGeometry`] for the pixel coordinate
+/// convention and out-of-domain handling.
 ///
 /// **Antimeridian (v1 limitation):** vertices are projected independently with
 /// no ±180° seam handling, so a polygon ring that crosses the antimeridian — or
@@ -1331,7 +1333,7 @@ pub struct PixelGeometry {
 /// polygons away from ±180° are unaffected.
 pub fn geometry_to_pixels(
     geom: &Geometry,
-    bbox: [f64; 4],
+    wgs84_bbox: [f64; 4],
     width: u32,
     height: u32,
     output_crs: &OutputCrs,
@@ -1340,7 +1342,7 @@ pub fn geometry_to_pixels(
     let project_ring = |ring: &[[f64; 2]]| -> Vec<[f64; 2]> {
         ring.iter()
             .map(|&[lon, lat]| {
-                let (fx, fy) = output_crs.world_to_fraction(bbox, lon, lat);
+                let (fx, fy) = output_crs.world_to_fraction(wgs84_bbox, lon, lat);
                 [fx * w, fy * h]
             })
             .collect()

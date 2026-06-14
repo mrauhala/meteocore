@@ -69,10 +69,12 @@ pub fn fill_polygon(
     combine: Combine,
 ) {
     // Precondition: fill values are finite (severity/category codes). A
-    // non-finite `value` would make `Combine::Max` order-dependent — an empty
-    // slot stores `Some(NaN)` while a populated slot drops it via `f64::max` —
-    // breaking the documented draw-order independence. Assert in debug builds
-    // to catch misuse rather than silently violating the contract.
+    // non-finite `value` would corrupt the first fill: `None => value` writes
+    // `Some(NaN)` into the slot, and Rust's f64::max maxNum semantics mean
+    // subsequent fills (`existing.max(value)`) keep `existing` — so a pixel
+    // covered only by a NaN alert stays `Some(NaN)` and colorizes incorrectly.
+    // Assert in debug builds to catch misuse rather than silently violating the
+    // contract.
     debug_assert!(value.is_finite(), "fill_polygon value must be finite");
 
     let (w, h) = (width as usize, height as usize);
@@ -122,7 +124,7 @@ pub fn fill_polygon(
         while i + 1 < crossings.len() {
             let (span_start, span_end) = (crossings[i], crossings[i + 1]);
             // Pixels whose centre (x + 0.5) lies in [span_start, span_end).
-            let x_start = (span_start - 0.5).ceil().max(0.0) as usize;
+            let x_start = ((span_start - 0.5).ceil().max(0.0) as usize).min(w);
             let x_end = ((span_end - 0.5).ceil().max(0.0) as usize).min(w);
             for x in x_start..x_end {
                 paint(&mut out[row + x], value, combine);
@@ -454,8 +456,9 @@ mod tests {
         let mut out = vec![None; 100];
         let ring = vec![[2.0, 2.0], [f64::NAN, 4.0], [8.0, 8.0], [2.0, 8.0]];
         fill_polygon(&mut out, 10, 10, &ring, &[], 1.0, Combine::Replace);
-        // No panic; the result is well-defined (whatever the finite edges give).
-        // The key contract is robustness, not a specific shape.
+        // No panic; one valid edge remains but produces only one crossing per
+        // scanline (odd count), so the guard fires and zero pixels are filled.
+        // The key contract is robustness against NaN vertices, not a specific shape.
         let _ = filled(&out);
     }
 }
