@@ -571,10 +571,7 @@ pub async fn wms_handler(
                 .or(query.layer.as_deref())
                 .ok_or(WmsError::missing_parameter("LAYER"))?;
 
-            // Accept singular STYLE as well as plural STYLES — GetLegendGraphic's
-            // SLD parameter is `STYLE`, and GetMap already honours both. Without
-            // this a client sending only STYLE=… silently gets the default
-            // legend instead of the one it asked for (#165).
+            // Also accept singular STYLE= — SLD standard for GetLegendGraphic (#165).
             let style_name = query
                 .styles
                 .as_deref()
