@@ -186,6 +186,13 @@ mod tests {
         assert!(is_read_only_event(&EventKind::Access(AccessKind::Open(
             AccessMode::Read
         ))));
+        // Open(Write) must ALSO be dropped — the `Open(_)` wildcard is
+        // deliberate: a write-mode open is not evidence the data was committed
+        // (the real signals are Close(Write)/Modify(Data)), so reloading on it
+        // would be premature. Narrowing to `Open(Any | Read)` would regress this.
+        assert!(is_read_only_event(&EventKind::Access(AccessKind::Open(
+            AccessMode::Write
+        ))));
         assert!(is_read_only_event(&EventKind::Access(AccessKind::Read)));
         assert!(is_read_only_event(&EventKind::Access(AccessKind::Close(
             AccessMode::Read
