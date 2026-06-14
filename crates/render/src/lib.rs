@@ -433,8 +433,8 @@ fn legend_ticks(min: f64, max: f64) -> Vec<f64> {
 /// reproduce it, so round numbers stay clean (`10`, `0.2`) while a small-range
 /// gradient keeps its digits (a `[0, 0.001]` scale labels `0.0002`, not `0`).
 /// A fixed decimal count can't do both — too few collapses tiny ticks to `0`,
-/// too many leaves trailing zeros on round ones. Negative values that round to
-/// zero normalise to `0`.
+/// too many leaves trailing zeros on round ones. Values too small to show at
+/// 6 dp fall back to scientific notation (`2e-8`) so sub-µ ranges stay legible.
 fn format_tick(v: f64) -> String {
     if v == 0.0 {
         return "0".to_string(); // also catches -0.0
@@ -452,14 +452,15 @@ fn format_tick(v: f64) -> String {
             break;
         }
     }
-    // A value too small to show at 6 dp (or a tiny negative) prints as all
-    // zeros — normalise to a bare "0".
+    // A value too small to show at 6 dp prints as all zeros — fall back to
+    // scientific notation ("2e-8") so a sub-µ range's ticks stay distinct
+    // instead of all collapsing to "0" (the font renders `e`/`-`/digits).
     if chosen
         .trim_start_matches('-')
         .bytes()
         .all(|b| b == b'0' || b == b'.')
     {
-        "0".to_string()
+        format!("{v:e}")
     } else {
         chosen
     }
@@ -528,10 +529,19 @@ pub fn render_legend(
         }
     };
 
-    // Will we have horizontal room for tick labels? Need: swatch + tick mark +
-    // gap + a 2-digit label (~"00") at minimum.
-    let min_label_w = font::text_width("00", SCALE);
-    let want_labels = width >= PAD * 2 + 12 + TICK_LEN + LABEL_GAP + min_label_w;
+    // Will we have horizontal room for tick labels? Size the decision from the
+    // *actual widest* label (e.g. "-32", "0.0008"), not a fixed 2-digit guess —
+    // otherwise a narrow legend whose labels are wider than "00" would pass the
+    // check and then clip the labels' right edge. Empty ticks (degenerate range)
+    // → no labels, full-width swatch.
+    let ticks = legend_ticks(min, max);
+    let max_label_w = ticks
+        .iter()
+        .map(|v| font::text_width(&format_tick(*v), SCALE))
+        .max()
+        .unwrap_or(0);
+    let want_labels =
+        !ticks.is_empty() && width >= PAD * 2 + 12 + TICK_LEN + LABEL_GAP + max_label_w;
 
     let grad_x0 = PAD;
 
@@ -590,7 +600,8 @@ pub fn render_legend(
         let tick_x0 = grad_x0 + swatch_w;
         let label_x = tick_x0 + TICK_LEN + LABEL_GAP;
         let half_text = (font::GLYPH_H * SCALE) as i32 / 2;
-        for v in legend_ticks(min, max) {
+        for v in &ticks {
+            let v = *v;
             let py = value_to_y(v);
             // Short tick mark butting up against the swatch edge.
             for tx in 0..TICK_LEN {
@@ -765,11 +776,31 @@ mod tests {
 
     #[test]
     fn legend_ticks_land_on_round_values_within_range() {
-        // A 0..70 dBZ-style range → 0,10,…,70 (extremes included).
-        assert_eq!(
-            legend_ticks(0.0, 70.0),
-            vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0]
+        // Intent-level checks (robust to retuning the tick-density heuristic):
+        // a 0..70 range yields ≥4 evenly-spaced ascending ticks that include
+        // both extremes. Including the extremes is the property this PR fixed —
+        // taking the step from the raw range, not a nice-rounded range, keeps
+        // step 10 (0,10,…,70) instead of step 20 (0,20,40,60, dropping 70).
+        let ticks = legend_ticks(0.0, 70.0);
+        assert!(
+            ticks.len() >= 4,
+            "want a usable number of ticks, got {ticks:?}"
         );
+        assert!(
+            (ticks[0] - 0.0).abs() < 1e-9,
+            "first tick should be the min"
+        );
+        assert!(
+            (ticks[ticks.len() - 1] - 70.0).abs() < 1e-9,
+            "last tick should be the max (extreme must not be dropped)"
+        );
+        let step = ticks[1] - ticks[0];
+        assert!(step > 0.0);
+        assert!(
+            ticks.windows(2).all(|w| (w[1] - w[0] - step).abs() < 1e-9),
+            "ticks should be uniformly spaced, got {ticks:?}"
+        );
+
         // Every tick stays inside the gradient's value range (the legend clips
         // the chart axis generator, which may overshoot the extent).
         let ticks = legend_ticks(-32.0, 95.0);
@@ -814,6 +845,17 @@ mod tests {
         assert_eq!(format_tick(-0.0008), "-0.0008");
         // Distinct small ticks stay distinct.
         assert_ne!(format_tick(0.0002), format_tick(0.0004));
+    }
+
+    #[test]
+    fn format_tick_uses_scientific_for_sub_micro() {
+        // Below 6 dp, fixed notation would print "0" for every tick; scientific
+        // notation keeps a sub-µ range's labels distinct. Exact zero is still "0".
+        assert_eq!(format_tick(0.0), "0");
+        assert_eq!(format_tick(2e-8), "2e-8");
+        assert_ne!(format_tick(2e-8), format_tick(4e-8));
+        // A tiny negative is rendered, not flattened to "0".
+        assert_eq!(format_tick(-1e-10), "-1e-10");
     }
 
     #[test]
