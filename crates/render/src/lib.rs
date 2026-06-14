@@ -265,6 +265,40 @@ impl CachedRendered {
     }
 }
 
+/// Max distinct `(width, height)` transparent tiles retained (see
+/// [`empty_tile`]). 64 covers any realistic mix of client viewport sizes;
+/// beyond that the LRU recycles.
+const EMPTY_TILE_CACHE_ITEMS: usize = 64;
+
+/// Process-global cache of transparent (all-nodata) PNGs keyed by output
+/// dimensions, as ready-to-serve [`CachedRendered`] entries (bytes + their
+/// stable FNV-1a ETag).
+///
+/// WMS / Maps `GetMap` take an all-nodata fast path on off-coverage viewports;
+/// the encoded transparent PNG and its ETag are identical for a given
+/// `(width, height)`, so encoding once per distinct size and cloning the
+/// `Arc`-backed bytes is far cheaper than re-allocating `width·height·4` zero
+/// bytes and re-encoding + re-hashing on every empty response (#171). The Tiles
+/// service (always 256×256) sources its single global from here too, so all
+/// three raster APIs share one mechanism. Bounded by item count so a
+/// `?WIDTH=…&HEIGHT=…` fan-out can't pin unbounded memory — an abuser just
+/// cycles the LRU; a real client uses a handful of viewport sizes.
+static EMPTY_TILE_CACHE: std::sync::LazyLock<Cache<(u32, u32), CachedRendered>> =
+    std::sync::LazyLock::new(|| Cache::new(EMPTY_TILE_CACHE_ITEMS));
+
+/// A fully-transparent `width`×`height` PNG as a ready-to-serve
+/// [`CachedRendered`], encoded once per distinct size and cloned thereafter
+/// (#171). Use this for the all-nodata fast path instead of allocating and
+/// encoding a fresh transparent image on every empty response.
+pub fn empty_tile(width: u32, height: u32) -> Result<CachedRendered, DataServerError> {
+    EMPTY_TILE_CACHE.get_or_insert_with(&(width, height), || {
+        let rgba = vec![0u8; width as usize * height as usize * 4];
+        Ok(CachedRendered::new(Bytes::from(encode_png(
+            &rgba, width, height,
+        )?)))
+    })
+}
+
 /// Weight function: count the byte size of each cached rendered image.
 #[derive(Clone)]
 struct RenderedWeighter;
@@ -429,6 +463,24 @@ pub(crate) fn colorize(tile: &RasterTile, colormap: &dyn ColorMap) -> Vec<u8> {
 mod tests {
     use super::*;
     use ds_core::map_engine::RasterTile;
+
+    #[test]
+    fn empty_tile_is_deterministic_and_memoized() {
+        let a = empty_tile(64, 48).expect("encode empty tile");
+        let b = empty_tile(64, 48).expect("encode empty tile");
+        // Same dimensions → identical bytes + ETag (the second call is a cache
+        // hit), so browsers can revalidate empty responses across requests.
+        assert_eq!(a.etag(), b.etag(), "same (w,h) must yield a stable ETag");
+        assert_eq!(
+            a.bytes(),
+            b.bytes(),
+            "same (w,h) must yield identical bytes"
+        );
+        // Different dimensions → different content (and a different ETag).
+        let c = empty_tile(100, 100).expect("encode empty tile");
+        assert_ne!(a.etag(), c.etag(), "different (w,h) must differ");
+        assert!(!a.bytes().is_empty(), "an empty tile is still a real PNG");
+    }
 
     #[test]
     fn test_render_tile_png_produces_valid_png() {

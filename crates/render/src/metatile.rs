@@ -504,10 +504,27 @@ fn sample_bilinear(tiles: &Mosaic, gx: f64, gy: f64) -> [u8; 4] {
     let dy = fy - y0;
     let (x0, y0) = (x0 as i64, y0 as i64);
 
-    let c00 = premul(global_pixel(tiles, x0, y0));
-    let c10 = premul(global_pixel(tiles, x0 + 1, y0));
-    let c01 = premul(global_pixel(tiles, x0, y0 + 1));
-    let c11 = premul(global_pixel(tiles, x0 + 1, y0 + 1));
+    let p00 = global_pixel(tiles, x0, y0);
+    let p10 = global_pixel(tiles, x0 + 1, y0);
+    let p01 = global_pixel(tiles, x0, y0 + 1);
+    let p11 = global_pixel(tiles, x0 + 1, y0 + 1);
+
+    // Uniform-region fast path (#416): bilinear interpolation of four identical
+    // texels IS that texel — exactly, not an approximation — so skip the
+    // premultiply / blend / unpremultiply (including the per-pixel alpha
+    // reciprocal divide) when all four are equal. Antialiased edges have
+    // differing corners and fall through to the full path, so this can't soften
+    // them. Radar composites are mostly transparent ([0,0,0,0] over clear air /
+    // ocean) with large flat regions, so this fires on the majority of output
+    // pixels.
+    if p00 == p10 && p00 == p01 && p00 == p11 {
+        return p00;
+    }
+
+    let c00 = premul(p00);
+    let c10 = premul(p10);
+    let c01 = premul(p01);
+    let c11 = premul(p11);
 
     let mut acc = [0.0f64; 4];
     for i in 0..4 {
@@ -547,6 +564,45 @@ fn unpremul(c: [f64; 4]) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_bilinear_uniform_region_is_exact() {
+        // One opaque tile filled with a single non-trivial colour.
+        let fill = |colour: [u8; 4]| {
+            let mut tile = vec![0u8; TILE_PX as usize * TILE_PX as usize * 4];
+            for px in tile.chunks_exact_mut(4) {
+                px.copy_from_slice(&colour);
+            }
+            Mosaic {
+                col0: 0,
+                row0: 0,
+                ncols: 1,
+                nrows: 1,
+                tiles: vec![Some(Arc::from(tile.into_boxed_slice()))],
+            }
+        };
+        // Interior fractional sample (all four texels inside the uniform tile)
+        // returns the EXACT colour — the #416 fast path must match what the full
+        // premul/blend/unpremul path recovers, with no rounding drift.
+        let opaque = [37u8, 211, 99, 255];
+        assert_eq!(sample_bilinear(&fill(opaque), 100.3, 50.7), opaque);
+        // A semi-transparent uniform colour also round-trips exactly (the case
+        // the alpha-reciprocal unpremultiply would otherwise have to recover).
+        let translucent = [37u8, 211, 99, 128];
+        assert_eq!(
+            sample_bilinear(&fill(translucent), 100.3, 50.7),
+            translucent
+        );
+        // Fully-transparent region (the common radar case) → [0, 0, 0, 0].
+        let empty = Mosaic {
+            col0: 0,
+            row0: 0,
+            ncols: 1,
+            nrows: 1,
+            tiles: vec![None],
+        };
+        assert_eq!(sample_bilinear(&empty, 100.3, 50.7), [0, 0, 0, 0]);
+    }
 
     #[test]
     fn standard_zoom_resolutions_snap_exactly() {

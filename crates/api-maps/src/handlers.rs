@@ -1184,11 +1184,10 @@ async fn render_map(
             (cached, "MISS", content_type)
         }
         Ok(None) => {
-            // Empty tile: transparent PNG, never cached.
-            let rgba = vec![0u8; (width * height * 4) as usize];
-            let png = ds_render::encode_png(&rgba, width, height)
+            // Empty tile: a transparent PNG, encoded once per (w,h) and shared
+            // across WMS/Maps/Tiles (#171). Not inserted into the rendered cache.
+            let cached = ds_render::empty_tile(width, height)
                 .map_err(|e| MapsError::Internal(format!("Failed to encode empty tile: {e}")))?;
-            let cached = ds_render::CachedRendered::new(bytes::Bytes::from(png));
             (cached, "EMPTY", "image/png")
         }
         Err(e) => {
