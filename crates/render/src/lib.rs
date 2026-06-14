@@ -5,6 +5,7 @@ mod encode;
 pub(crate) mod font;
 pub mod metatile;
 pub mod plot;
+pub mod rasterize;
 
 pub use colormap::{
     parse_hex_color, BuiltinColormap, ColorMap, ColorStop, IntegerLutColorMap, LinearColorMap,
@@ -13,6 +14,7 @@ pub use colormap::{
 pub use encode::{encode_jpeg, encode_png, encode_webp};
 pub use metatile::{render_metatiled, MetaTile, MetaTileStats, TileKeyPrefix, TilePixelCache};
 pub use plot::{render_chart, render_heatmap, Heatmap, Panel, Series};
+pub use rasterize::{fill_polygon, Combine};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
