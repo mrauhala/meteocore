@@ -15,6 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind};
 use notify::{RecursiveMode, Watcher};
 use tracing::{info, warn};
 
@@ -36,7 +37,13 @@ pub fn spawn_collections_watcher(
 
     let mut watcher =
         notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
-            Ok(event) if is_toml_event(&event) => {
+            // A reload must fire only on a real content/structural change — NOT
+            // on a read. `do_reload` re-opens every `.toml` to parse it, and
+            // notify's inotify mask always includes `IN_OPEN`, so reacting to
+            // read-access would let a reload's own file reads re-trigger the
+            // next reload — an infinite self-sustaining loop (see
+            // [`is_read_only_event`]).
+            Ok(event) if is_toml_event(&event) && !is_read_only_event(&event.kind) => {
                 // Ignore send errors — a closed receiver just means the task ended.
                 let _ = tx.send(());
             }
@@ -114,10 +121,36 @@ fn is_toml_event(event: &notify::Event) -> bool {
     })
 }
 
+/// Whether an event is a *read* (or pure-metadata touch) that must NOT trigger a
+/// reload.
+///
+/// `do_reload` re-opens and reads every collection `.toml` to re-parse the
+/// config. `notify`'s inotify backend registers `IN_OPEN` in its watch mask
+/// **unconditionally** (notify 8.x, `inotify.rs` `add_single_watch`), surfacing
+/// it as [`EventKind::Access`]`(`[`AccessKind::Open`]`)`. Because the event
+/// filter keys on the file *path* alone, reacting to that open made a reload's
+/// own reads emit events that re-triggered the next reload — an infinite,
+/// self-sustaining loop. It was invisible in `stat` (reads don't change
+/// timestamps) and only fully provable on the production *read-only*
+/// `collections_dir` mount, where `IN_OPEN` is the **only** event that can fire.
+///
+/// We therefore drop read-type accesses (`Open`/`Read`/read-`Close`) and
+/// metadata-only touches (atime/chmod/chown), while keeping every genuine
+/// change: create, remove, rename, data writes, and `IN_CLOSE_WRITE`
+/// (`Access(Close(Write))`) — which `do_reload`'s read-only opens never produce.
+fn is_read_only_event(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Access(AccessKind::Open(_))
+            | EventKind::Access(AccessKind::Read)
+            | EventKind::Access(AccessKind::Close(AccessMode::Read))
+            | EventKind::Modify(ModifyKind::Metadata(_))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notify::event::{EventKind, ModifyKind};
     use notify::Event;
 
     fn event_for(path: &str) -> Event {
@@ -140,6 +173,50 @@ mod tests {
     fn non_toml_changes_ignored() {
         assert!(!is_toml_event(&event_for("/c.d/README.md")));
         assert!(!is_toml_event(&event_for("/c.d/notes.txt")));
+    }
+
+    #[test]
+    fn read_only_events_are_dropped() {
+        // The bug: notify's inotify mask always includes IN_OPEN, surfaced as
+        // Access(Open). do_reload re-opens every .toml, so reacting to these
+        // would self-trigger an infinite reload loop.
+        assert!(is_read_only_event(&EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
+        assert!(is_read_only_event(&EventKind::Access(AccessKind::Open(
+            AccessMode::Read
+        ))));
+        assert!(is_read_only_event(&EventKind::Access(AccessKind::Read)));
+        assert!(is_read_only_event(&EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        // atime/chmod/chown touches don't change config content.
+        assert!(is_read_only_event(&EventKind::Modify(
+            ModifyKind::Metadata(notify::event::MetadataKind::Any)
+        )));
+    }
+
+    #[test]
+    fn real_changes_are_kept() {
+        use notify::event::{CreateKind, DataChange, RemoveKind, RenameMode};
+        // Create / remove / rename / data write / IN_CLOSE_WRITE all survive.
+        assert!(!is_read_only_event(&EventKind::Create(CreateKind::File)));
+        assert!(!is_read_only_event(&EventKind::Remove(RemoveKind::File)));
+        assert!(!is_read_only_event(&EventKind::Modify(ModifyKind::Name(
+            RenameMode::Any
+        ))));
+        assert!(!is_read_only_event(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Any
+        ))));
+        assert!(!is_read_only_event(&EventKind::Modify(ModifyKind::Any)));
+        // IN_CLOSE_WRITE — a real write closed; do_reload's read-only opens
+        // never produce this, so keeping it is loop-safe.
+        assert!(!is_read_only_event(&EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+        // Catch-alls stay permissive so a real change is never missed.
+        assert!(!is_read_only_event(&EventKind::Any));
+        assert!(!is_read_only_event(&EventKind::Other));
     }
 
     // -- End-to-end: a collections.d add/remove auto-reloads the registry -----
