@@ -466,11 +466,26 @@ fn build_times(records: &[AreaRecord], as_of: DateTime<Utc>) -> Vec<DateTime<Utc
 fn compute_version(records: &[AreaRecord]) -> u64 {
     let mut hasher = DefaultHasher::new();
     records.len().hash(&mut hasher);
+    // Text fields whose in-place correction must invalidate Feature ETags (a
+    // re-issued alert can fix a headline/description without touching severity
+    // or expiry, so id+severity+window alone would 304 stale text).
+    const TEXT_KEYS: [&str; 5] = [
+        "event",
+        "headline",
+        "description",
+        "instruction",
+        "areaDesc",
+    ];
     for r in records {
         r.id.hash(&mut hasher);
         r.severity_code.to_bits().hash(&mut hasher);
         r.window.start.map(|t| t.timestamp()).hash(&mut hasher);
         r.window.end.map(|t| t.timestamp()).hash(&mut hasher);
+        for key in TEXT_KEYS {
+            if let Some(PropertyValue::String(s)) = r.properties.get(key) {
+                s.hash(&mut hasher);
+            }
+        }
     }
     hasher.finish()
 }

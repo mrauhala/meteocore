@@ -47,7 +47,11 @@ impl CapEngine {
     /// (degraded) and the poll loop fills it in, matching the file-backed
     /// raster engines.
     pub fn new(config: &CapConfig, collection_id: &str) -> Result<Self, DataServerError> {
-        let source = Source::build(config.data_path.as_deref(), config.feed_url.as_deref())?;
+        let source = Source::build(
+            config.data_path.as_deref(),
+            config.feed_url.as_deref(),
+            &config.feed_allowlist,
+        )?;
 
         let default_ttl = match &config.default_ttl {
             Some(s) => Some(parse_iso8601_duration(s)?),

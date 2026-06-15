@@ -574,6 +574,15 @@ pub struct CapConfig {
     /// N-gon on the geodesic. Default: 64.
     #[serde(default = "default_circle_segments")]
     pub circle_segments: u32,
+    /// SSRF guard for feed mode: extra URL **prefixes** an entry link may match
+    /// to be fetched, *in addition to* the feed's own origin (which is always
+    /// allowed). An entry link whose origin differs from the feed's and matches
+    /// no prefix here is dropped with a WARN — so a compromised feed cannot pivot
+    /// the server to `http://169.254.169.254/…` or any internal host. Mirrors the
+    /// GeoTIFF STAC `stac_asset_allowlist`. Each entry must be `http(s)`. Empty
+    /// (default) ⇒ entry links must share the feed's origin.
+    #[serde(default)]
+    pub feed_allowlist: Vec<String>,
 }
 
 /// Configuration for the ODIM_H5 weather-radar engine
@@ -1905,6 +1914,22 @@ impl ServerConfig {
                     }
                 }
 
+                // feed_allowlist entries (SSRF prefixes) must be http(s) and are
+                // meaningless without a feed source.
+                if !cap.feed_allowlist.is_empty() && cap.feed_url.is_none() {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap 'feed_allowlist' requires 'feed_url'"
+                    )));
+                }
+                for prefix in &cap.feed_allowlist {
+                    if !(prefix.starts_with("http://") || prefix.starts_with("https://")) {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': cap 'feed_allowlist' entries must be http(s) URL \
+                             prefixes"
+                        )));
+                    }
+                }
+
                 // `language`, when present, must be a non-empty tag (trimmed at
                 // load, so an all-whitespace value arrives here as "").
                 if cap.language.as_deref() == Some("") {
@@ -2134,6 +2159,21 @@ url = "https://creativecommons.org/licenses/by/4.0/"
     fn cap_rejects_non_http_feed() {
         let cfg = cap_collection("feed_url = \"ftp://e/f\"\n");
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cap_feed_allowlist_validates_and_requires_feed() {
+        // Valid http(s) prefixes alongside a feed.
+        let ok = cap_collection(
+            "feed_url = \"https://e/f\"\nfeed_allowlist = [\"https://cdn.example/cap/\"]\n",
+        );
+        assert!(ok.validate().is_ok());
+        // Non-http prefix rejected.
+        let bad = cap_collection("feed_url = \"https://e/f\"\nfeed_allowlist = [\"ftp://x/\"]\n");
+        assert!(bad.validate().is_err());
+        // Allowlist without a feed is meaningless → rejected.
+        let no_feed = cap_collection("data_path = \"x\"\nfeed_allowlist = [\"https://cdn/\"]\n");
+        assert!(no_feed.validate().is_err());
     }
 
     #[test]

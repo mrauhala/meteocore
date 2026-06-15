@@ -674,6 +674,15 @@ the first engine to depend on `ds-render` (for the fill + `Combine`).
   loop. Config (`CapConfig` in `ds-core`) validated at load: `data_path` XOR
   `feed_url`, `feed_url` http(s), non-empty `language`, `poll_interval_secs > 0`,
   positive ISO 8601 `default_ttl`, `circle_segments >= 3`.
+- **Feed SSRF guard.** An entry link is fetched only if it shares the feed's
+  **exact** origin (scheme+host+port — not a prefix, so `https://feed` rejects
+  `https://feed.evil.com`) or matches an explicit `feed_allowlist` URL prefix;
+  others are dropped with a WARN. This stops a compromised feed from pivoting the
+  server to `http://169.254.169.254/…` or internal hosts — the threat the GeoTIFF
+  STAC `stac_asset_allowlist` addresses. Feature `data_version()` (ETag) hashes
+  severity + window **and** the text fields (event/headline/description/
+  instruction/areaDesc), so an in-place text correction invalidates the ETag (no
+  stale 304).
 - **Coordinate order is the load-bearing gotcha.** CAP polygons/circles are
   `lat,lon` (spec §3.3.4); `ds_core::Geometry` is `[lon, lat]`. `parser.rs`
   **swaps on ingest** (pinned by an absolute-position test — a Helsinki alert

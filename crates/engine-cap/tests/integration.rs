@@ -24,6 +24,7 @@ fn config_for(dir: &str, language: Option<&str>) -> CapConfig {
         status_filter: vec!["Actual".to_string()],
         default_ttl: None,
         circle_segments: 64,
+        feed_allowlist: Vec::new(),
     }
 }
 

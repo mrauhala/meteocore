@@ -8,6 +8,8 @@ keywords = ["alerts", "warnings", "CAP", "emergency"]
 [cap]
 # Local directory of CAP *.xml files (synthetic demo fixtures). Swap for a feed:
 #   feed_url = "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-europe"
+#   # SSRF guard: entries off the feed's own origin are dropped unless listed here.
+#   feed_allowlist = ["https://cap.example.org/"]
 data_path = "testdata/cap"
 poll_interval_secs = 300
 # language = "en"            # which <info> translation to expose (default: first)

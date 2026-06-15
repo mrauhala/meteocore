@@ -101,7 +101,7 @@ pub fn parse_document(xml: &str) -> Result<Vec<CapAlert>, DataServerError> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
-                let name = local_name(e.local_name().as_ref());
+                let name = decode_name(e.local_name().as_ref());
                 match name.as_str() {
                     "alert" => alert = Some(CapAlert::default()),
                     "info" => info = Some(CapInfo::default()),
@@ -126,7 +126,7 @@ pub fn parse_document(xml: &str) -> Result<Vec<CapAlert>, DataServerError> {
                 text.push_str(&String::from_utf8_lossy(e.as_ref()));
             }
             Ok(Event::End(e)) => {
-                let name = local_name(e.local_name().as_ref());
+                let name = decode_name(e.local_name().as_ref());
                 let parent = if path.len() >= 2 {
                     path[path.len() - 2].as_str()
                 } else {
@@ -226,8 +226,9 @@ pub fn parse_document(xml: &str) -> Result<Vec<CapAlert>, DataServerError> {
     Ok(alerts)
 }
 
-/// Strip any namespace prefix and lossily decode an element's local name.
-fn local_name(bytes: &[u8]) -> String {
+/// Lossily decode an already-namespace-stripped element name (`quick_xml`'s
+/// `local_name()` removes the prefix; this only turns the bytes into a `String`).
+fn decode_name(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 

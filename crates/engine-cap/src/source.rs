@@ -38,12 +38,19 @@ pub enum Source {
         index_store: DataStore,
         index_path: ObjectPath,
         feed_url: String,
+        /// SSRF allowlist of extra URL prefixes (the feed's own origin is always
+        /// allowed); see [`CapConfig::feed_allowlist`](ds_core::config::CapConfig).
+        allowlist: Vec<String>,
     },
 }
 
 impl Source {
     /// Build the source's object store(s). No network calls — only client setup.
-    pub fn build(data_path: Option<&str>, feed_url: Option<&str>) -> Result<Self, DataServerError> {
+    pub fn build(
+        data_path: Option<&str>,
+        feed_url: Option<&str>,
+        feed_allowlist: &[String],
+    ) -> Result<Self, DataServerError> {
         match (data_path, feed_url) {
             (Some(path), None) => {
                 let (store, base) = build_store(path)?;
@@ -55,6 +62,7 @@ impl Source {
                     index_store,
                     index_path,
                     feed_url: url.to_string(),
+                    allowlist: feed_allowlist.to_vec(),
                 })
             }
             _ => Err(DataServerError::Config(
@@ -79,7 +87,8 @@ impl Source {
                 index_store,
                 index_path,
                 feed_url,
-            } => load_feed(index_store, index_path, feed_url),
+                allowlist,
+            } => load_feed(index_store, index_path, feed_url, allowlist),
         }
     }
 }
@@ -108,6 +117,7 @@ fn load_feed(
     index_store: &DataStore,
     index_path: &ObjectPath,
     feed_url: &str,
+    allowlist: &[String],
 ) -> Result<Vec<CapAlert>, DataServerError> {
     let index_bytes = index_store.get(index_path)?;
     if index_bytes.len() as u64 > MAX_DOC_BYTES {
@@ -120,14 +130,26 @@ fn load_feed(
 
     let base = Url::parse(feed_url)
         .map_err(|e| DataServerError::Engine(format!("invalid cap feed_url '{feed_url}': {e}")))?;
+    let feed_origin = origin_of(&base);
     let links = extract_feed_links(&index_xml);
 
-    // Resolve to absolute URLs, dedup, and cap.
+    // Resolve to absolute URLs, SSRF-filter, dedup, and cap. An entry is fetched
+    // only if it shares the feed's exact origin (scheme+host+port) or matches a
+    // configured allowlist prefix — so a compromised feed can't redirect the
+    // server to cloud-metadata / internal hosts (mirrors STAC's allowlist).
     let mut resolved: Vec<Url> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut blocked = 0usize;
     for link in links {
         if let Ok(abs) = base.join(&link) {
-            if matches!(abs.scheme(), "http" | "https") && seen.insert(abs.as_str().to_string()) {
+            if !matches!(abs.scheme(), "http" | "https") {
+                continue;
+            }
+            if !is_allowed_entry(&abs, &feed_origin, allowlist) {
+                blocked += 1;
+                continue;
+            }
+            if seen.insert(abs.as_str().to_string()) {
                 resolved.push(abs);
                 if resolved.len() >= MAX_FEED_ENTRIES {
                     tracing::warn!("cap feed entry links capped at {MAX_FEED_ENTRIES}");
@@ -135,6 +157,12 @@ fn load_feed(
                 }
             }
         }
+    }
+    if blocked > 0 {
+        tracing::warn!(
+            "cap feed '{feed_url}': dropped {blocked} cross-origin entry link(s) not on the \
+             feed origin or allowlist (SSRF guard)"
+        );
     }
 
     if resolved.is_empty() {
@@ -159,6 +187,10 @@ fn load_feed(
         }
     }
 
+    // One HTTP client per origin per poll. After the SSRF filter the common case
+    // is a single origin (the feed's own), so this is one client per poll cycle
+    // (every `poll_interval_secs`, default 300s) — negligible. `DataStore` has no
+    // cross-call client reuse; pooling across polls is a future optimisation.
     let mut alerts: Vec<CapAlert> = Vec::new();
     for (origin, paths) in by_origin {
         match build_store(&origin) {
@@ -214,6 +246,14 @@ fn origin_of(u: &Url) -> String {
         Some(p) => format!("{}://{}:{}", u.scheme(), u.host_str().unwrap_or(""), p),
         None => format!("{}://{}", u.scheme(), u.host_str().unwrap_or("")),
     }
+}
+
+/// SSRF gate: an entry link may be fetched only if it shares the feed's **exact**
+/// origin (compared as origin strings, never a prefix — `https://feed` must not
+/// admit `https://feed.evil.com`) or starts with a configured allowlist prefix
+/// (the operator's explicit opt-in, mirroring STAC's allowlist semantics).
+fn is_allowed_entry(u: &Url, feed_origin: &str, allowlist: &[String]) -> bool {
+    origin_of(u) == feed_origin || allowlist.iter().any(|p| u.as_str().starts_with(p))
 }
 
 /// Extract candidate CAP-document links from an Atom/RSS feed index.
@@ -368,6 +408,25 @@ mod tests {
             extract_feed_links(rss),
             vec!["https://example.org/cap/9.xml".to_string()]
         );
+    }
+
+    #[test]
+    fn ssrf_filter_allows_feed_origin_and_allowlist_only() {
+        let feed_origin = "https://feeds.example.org";
+        let allow = vec!["https://cdn.example.net/cap/".to_string()];
+        let chk = |u: &str| is_allowed_entry(&Url::parse(u).unwrap(), feed_origin, &allow);
+        // Same origin as the feed → allowed.
+        assert!(chk("https://feeds.example.org/alerts/1.xml"));
+        // Allowlisted prefix → allowed.
+        assert!(chk("https://cdn.example.net/cap/1.xml"));
+        // Cloud metadata / internal hosts → blocked.
+        assert!(!chk("http://169.254.169.254/latest/meta-data/"));
+        assert!(!chk("http://localhost:8080/admin"));
+        // Look-alike host must NOT pass the exact-origin check (prefix-safety).
+        assert!(!chk("https://feeds.example.org.evil.com/x.xml"));
+        // Different scheme/port is a different origin → blocked.
+        assert!(!chk("http://feeds.example.org/alerts/1.xml"));
+        assert!(!chk("https://feeds.example.org:8443/alerts/1.xml"));
     }
 
     #[test]
