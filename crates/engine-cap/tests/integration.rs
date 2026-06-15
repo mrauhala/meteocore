@@ -390,8 +390,13 @@ fn refresh_picks_up_added_and_removed_files() {
     assert_eq!(got, vec!["urn:test:storm-window-1.0.0".to_string()]);
 }
 
-/// A minimal one-area CAP document with the given identifier.
+/// A minimal one-area CAP document with the given identifier (XML-escaped, since
+/// a CAP `<identifier>` may legitimately contain `<`/`>`/`&`).
 fn cap_xml(identifier: &str) -> String {
+    let identifier = identifier
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
     format!(
         r#"<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
           <identifier>{identifier}</identifier><status>Actual</status>
@@ -514,6 +519,27 @@ fn temporal_extent_spans_alert_windows() {
     assert!(start <= end);
     // The storm window (10:00–16:00Z on 2026-06-15) sits inside the span.
     assert!(start <= at(2026, 6, 15, 10) && end >= at(2026, 6, 15, 16));
+}
+
+// Multi-thread runtime: CapEngine::new()'s initial DataStore read uses
+// `block_in_place`, which is only valid on a multi-thread-runtime worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_before_poll_loop_is_not_lost() {
+    // A shutdown() that fires before poll_loop subscribes (rapid reload) must
+    // still stop the loop — else it runs forever. poll_loop should return
+    // promptly here rather than time out.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.xml"), cap_xml("urn:test:shut-1")).unwrap();
+    let eng = std::sync::Arc::new(
+        CapEngine::new(&config_for(dir.path().to_str().unwrap(), None), "cap-shut").unwrap(),
+    );
+    eng.shutdown(); // signal BEFORE poll_loop runs its subscribe
+    let poller = eng.clone();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+        poller.poll_loop().await
+    })
+    .await
+    .expect("poll_loop must exit after a pre-subscribe shutdown");
 }
 
 #[test]

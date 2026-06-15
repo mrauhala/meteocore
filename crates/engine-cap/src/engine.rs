@@ -35,6 +35,11 @@ pub struct CapEngine {
     collection_id: String,
     poll_interval: Duration,
     shutdown_tx: watch::Sender<()>,
+    /// The initial receiver, retained (never polled) so the channel always has a
+    /// recipient and `poll_loop` can `clone()` a receiver pinned at version 0 —
+    /// otherwise a `shutdown()` racing ahead of `poll_loop`'s subscribe (rapid
+    /// reload) would be lost and the loop would run forever.
+    shutdown_rx: watch::Receiver<()>,
     /// Set once the first `refresh()` succeeds — even with **zero** records. A
     /// healthy CAP source can legitimately have no active alerts, so "loaded"
     /// (not "non-empty") is the readiness signal; see [`Self::is_loaded`].
@@ -91,7 +96,7 @@ impl CapEngine {
             CAP_PARAMETER,
             Utc::now(),
         )));
-        let (shutdown_tx, _) = watch::channel(());
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
 
         let engine = CapEngine {
             catalog,
@@ -100,6 +105,7 @@ impl CapEngine {
             collection_id: collection_id.to_string(),
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
             shutdown_tx,
+            shutdown_rx,
             loaded: AtomicBool::new(false),
         };
 
@@ -153,7 +159,10 @@ impl CapEngine {
 
     /// Run the poll loop on the background runtime. Exits on [`Self::shutdown`].
     pub async fn poll_loop(&self) {
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        // Clone the retained (unpolled, version-0) receiver — NOT a fresh
+        // `subscribe()`, which would start at the channel's current version and
+        // miss a `shutdown()` that already fired before this loop ran.
+        let mut shutdown_rx = self.shutdown_rx.clone();
         let mut interval = tokio::time::interval(self.poll_interval);
         interval.tick().await; // skip the immediate tick — new() already loaded
 

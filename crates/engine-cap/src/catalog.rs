@@ -3,9 +3,7 @@
 //! fills). Built once per poll/refresh and swapped atomically; both trait
 //! surfaces read from the same immutable snapshot.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -105,15 +103,16 @@ pub struct Catalog {
     pub info: Arc<RasterInfo>,
     /// The moment this snapshot reflects ("now" for un-pinned TIME selection).
     pub as_of: DateTime<Utc>,
-    /// Opaque content hash for Feature ETags. Identical alert content hashes to
-    /// the same value within a build (and across restarts on the same
-    /// toolchain), so an unchanged data set keeps ETags valid across polls. The
-    /// hasher (`DefaultHasher`) has no cross-Rust-version guarantee, but a value
-    /// change there is consequence-free — a one-time ETag invalidation (clients
-    /// re-fetch once), never staleness.
+    /// Opaque content hash for Feature ETags (FNV-1a — a fixed algorithm, so the
+    /// value is stable across polls, server restarts, Rust-toolchain upgrades,
+    /// and *across instances*: a conditional GET keeps hitting `304` for
+    /// unchanged data even behind a load balancer).
     pub data_version: u64,
     /// Areas dropped from the map for having only geocodes (no geometry).
     pub geocode_only_count: usize,
+    /// Precomputed temporal extent `(start, end)` so the per-request accessor is
+    /// O(1) (#211). `None` when there are no records or no concrete time bound.
+    temporal_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
 
 impl Catalog {
@@ -128,6 +127,7 @@ impl Catalog {
             as_of,
             data_version: 0,
             geocode_only_count: 0,
+            temporal_extent: None,
         }
     }
 
@@ -243,6 +243,7 @@ impl Catalog {
         let spatial_extent = union_extent(&records);
         let times = build_times(&records, as_of);
         let data_version = compute_version(&records);
+        let temporal_extent = compute_temporal_extent(&records, as_of);
         let info = Arc::new(base_raster_info(parameter, spatial_extent, times));
 
         Catalog {
@@ -254,6 +255,7 @@ impl Catalog {
             as_of,
             data_version,
             geocode_only_count,
+            temporal_extent,
         }
     }
 
@@ -274,34 +276,41 @@ impl Catalog {
         self.id_index.get(id).map(|&i| &self.records[i])
     }
 
-    /// Temporal extent `(start, end)` of the alert set: earliest window start to
-    /// latest window end. Open bounds clamp to `as_of` (an open-start alert is
-    /// "active since now"; an open-ended alert extends the extent to "now"), so
-    /// the advertised interval is always bounded. `None` when there are no records.
+    /// Temporal extent `(start, end)` — O(1), precomputed in [`Self::build`].
     pub fn temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
-        if self.records.is_empty() {
-            return None;
-        }
-        let mut start: Option<DateTime<Utc>> = None;
-        let mut end: Option<DateTime<Utc>> = None;
-        for r in &self.records {
-            if let Some(s) = r.window.start {
-                start = Some(start.map_or(s, |m| m.min(s)));
-            }
-            if let Some(e) = r.window.end {
-                end = Some(end.map_or(e, |m| m.max(e)));
-            }
-        }
-        // No concrete bound anywhere (every window fully open) ⇒ unknown extent.
-        // Return `None` rather than a misleading zero-width `(as_of, as_of)` that
-        // would collapse a client's time slider to a point.
-        if start.is_none() && end.is_none() {
-            return None;
-        }
-        let start = start.unwrap_or(self.as_of);
-        let end = end.map_or(self.as_of, |e| e.max(self.as_of));
-        Some((start.min(end), end.max(start)))
+        self.temporal_extent
     }
+}
+
+/// Compute the alert set's temporal extent: earliest window start to latest
+/// window end. Open bounds clamp to `as_of` (an open-start alert is "active since
+/// now"; an open-ended one extends the extent to "now"), so the interval is
+/// bounded. `None` when there are no records or no concrete bound anywhere
+/// (every window fully open) — a zero-width `(as_of, as_of)` would just collapse
+/// a client's time slider to a point.
+fn compute_temporal_extent(
+    records: &[AreaRecord],
+    as_of: DateTime<Utc>,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    if records.is_empty() {
+        return None;
+    }
+    let mut start: Option<DateTime<Utc>> = None;
+    let mut end: Option<DateTime<Utc>> = None;
+    for r in records {
+        if let Some(s) = r.window.start {
+            start = Some(start.map_or(s, |m| m.min(s)));
+        }
+        if let Some(e) = r.window.end {
+            end = Some(end.map_or(e, |m| m.max(e)));
+        }
+    }
+    if start.is_none() && end.is_none() {
+        return None;
+    }
+    let start = start.unwrap_or(as_of);
+    let end = end.map_or(as_of, |e| e.max(as_of));
+    Some((start.min(end), end.max(start)))
 }
 
 /// The engine's live snapshot holder.
@@ -581,9 +590,19 @@ fn build_times(records: &[AreaRecord], as_of: DateTime<Utc>) -> Vec<DateTime<Utc
     times
 }
 
+/// FNV-1a (64-bit) — a **fixed, documented** algorithm, unlike `DefaultHasher`
+/// (SipHash, no cross-Rust-version guarantee). Feature ETags must be stable
+/// across toolchain upgrades *and* across server instances behind a load
+/// balancer, so a conditional GET keeps hitting `304` for unchanged data.
+fn fnv1a(bytes: &[u8], h: &mut u64) {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    for &b in bytes {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(PRIME);
+    }
+}
+
 fn compute_version(records: &[AreaRecord]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    records.len().hash(&mut hasher);
     // Text fields whose in-place correction must invalidate Feature ETags (a
     // re-issued alert can fix a headline/description without touching severity
     // or expiry, so id+severity+window alone would 304 stale text).
@@ -594,18 +613,33 @@ fn compute_version(records: &[AreaRecord]) -> u64 {
         "instruction",
         "areaDesc",
     ];
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    fnv1a(&(records.len() as u64).to_le_bytes(), &mut h);
     for r in records {
-        r.id.hash(&mut hasher);
-        r.severity_code.to_bits().hash(&mut hasher);
-        r.window.start.map(|t| t.timestamp()).hash(&mut hasher);
-        r.window.end.map(|t| t.timestamp()).hash(&mut hasher);
+        fnv1a(r.id.as_bytes(), &mut h);
+        fnv1a(&r.severity_code.to_bits().to_le_bytes(), &mut h);
+        // A sentinel for an open (None) bound; distinct from any real timestamp.
+        fnv1a(
+            &r.window
+                .start
+                .map_or(i64::MIN, |t| t.timestamp())
+                .to_le_bytes(),
+            &mut h,
+        );
+        fnv1a(
+            &r.window
+                .end
+                .map_or(i64::MAX, |t| t.timestamp())
+                .to_le_bytes(),
+            &mut h,
+        );
         for key in TEXT_KEYS {
             if let Some(PropertyValue::String(s)) = r.properties.get(key) {
-                s.hash(&mut hasher);
+                fnv1a(s.as_bytes(), &mut h);
             }
         }
     }
-    hasher.finish()
+    h
 }
 
 fn base_raster_info(

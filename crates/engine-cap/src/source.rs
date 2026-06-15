@@ -270,7 +270,21 @@ fn fetch_and_parse(store: &DataStore, paths: &[ObjectPath]) -> Vec<CapAlert> {
 }
 
 fn parse_into(bytes: &[u8], out: &mut Vec<CapAlert>, label: &str) {
-    let xml = String::from_utf8_lossy(bytes);
+    // CAP v1.2 mandates UTF-8. A non-UTF-8 (e.g. Latin-1) document is
+    // non-conformant: WARN so it's not *silent*, but still parse it lossily
+    // rather than dropping a real emergency alert — the load-bearing fields
+    // (geometry, severity, times) are ASCII/numeric and survive; only free text
+    // may carry a U+FFFD.
+    let xml = match std::str::from_utf8(bytes) {
+        Ok(s) => std::borrow::Cow::Borrowed(s),
+        Err(e) => {
+            tracing::warn!(
+                "cap: '{label}' is not valid UTF-8 ({e}) — parsing lossily (CAP requires UTF-8); \
+                 free-text fields may be garbled"
+            );
+            String::from_utf8_lossy(bytes)
+        }
+    };
     match parse_document(&xml) {
         Ok(parsed) => out.extend(parsed),
         Err(e) => tracing::warn!("cap: parse of '{label}' failed: {e}"),
