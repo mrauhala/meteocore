@@ -27,6 +27,9 @@ const FETCH_CONCURRENCY: usize = 8;
 const MAX_LOCAL_FILES: usize = 50_000;
 /// Cap on entry links followed from a feed index per fetch.
 const MAX_FEED_ENTRIES: usize = 2_000;
+/// Cap on query-bearing entry links (each needs its own HTTP client — object
+/// store paths can't carry a query string, so these can't share a store).
+const MAX_QUERY_ENTRIES: usize = 64;
 
 /// A resolved CAP data source. Constructed without any network I/O; the actual
 /// scan/fetch happens in [`Source::load`].
@@ -188,12 +191,16 @@ fn load_feed(
 
     // Group query-less URLs by origin so each origin's docs fetch via one
     // bounded `get_many`. URLs carrying a query string can't be expressed as an
-    // object-store path, so they fall back to individual bounded fetches.
+    // object-store path, so they fall back to individual fetches (one HTTP client
+    // each) — capped tighter than the overall entry cap so a feed of thousands of
+    // query-bearing links can't open thousands of connections per poll.
     let mut by_origin: BTreeMap<String, Vec<ObjectPath>> = BTreeMap::new();
     let mut with_query: Vec<Url> = Vec::new();
     for u in &resolved {
         if u.query().is_some() {
-            with_query.push(u.clone());
+            if with_query.len() < MAX_QUERY_ENTRIES {
+                with_query.push(u.clone());
+            }
         } else {
             let origin = origin_of(u);
             by_origin
@@ -201,6 +208,13 @@ fn load_feed(
                 .or_default()
                 .push(ObjectPath::from(u.path().trim_start_matches('/')));
         }
+    }
+    let query_total = resolved.iter().filter(|u| u.query().is_some()).count();
+    if query_total > MAX_QUERY_ENTRIES {
+        tracing::warn!(
+            "cap feed '{feed_url}': {query_total} query-bearing entry links — only the first \
+             {MAX_QUERY_ENTRIES} are fetched (each needs its own connection)"
+        );
     }
 
     // One HTTP client per origin per poll. After the SSRF filter the common case

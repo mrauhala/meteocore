@@ -208,13 +208,12 @@ impl Catalog {
         // same alert under two entry URLs can produce duplicates; without this,
         // `records` would list both while `id_index` (a HashMap) silently kept
         // only the last — a split-brain where listed features are unreachable via
-        // `get_feature`. Records are sorted by id, so duplicates are adjacent.
-        let mut dropped = 0usize;
-        records.dedup_by(|a, b| {
-            let dup = a.id == b.id;
-            dropped += dup as usize;
-            dup
-        });
+        // `get_feature`. Records are sorted by id, so duplicates are adjacent;
+        // `dedup_by_key` keeps the first occurrence (clearer than `dedup_by`'s
+        // drop-`a`/keep-`b` argument order).
+        let before = records.len();
+        records.dedup_by_key(|r| r.id.clone());
+        let dropped = before - records.len();
         if dropped > 0 {
             tracing::warn!(
                 "[{collection_id}] cap: dropped {dropped} record(s) with duplicate feature id(s) \
@@ -292,6 +291,12 @@ impl Catalog {
             if let Some(e) = r.window.end {
                 end = Some(end.map_or(e, |m| m.max(e)));
             }
+        }
+        // No concrete bound anywhere (every window fully open) ⇒ unknown extent.
+        // Return `None` rather than a misleading zero-width `(as_of, as_of)` that
+        // would collapse a client's time slider to a point.
+        if start.is_none() && end.is_none() {
+            return None;
         }
         let start = start.unwrap_or(self.as_of);
         let end = end.map_or(self.as_of, |e| e.max(self.as_of));
@@ -396,6 +401,17 @@ fn build_geometry(area: &CapArea, segments: u32, lookup: Option<&GeocodeLookup>)
             }
         }
     }
+    // Normalize ring winding to RFC 7946 (exterior CCW, holes CW). CAP polygons
+    // carry no mandated winding and circle N-gons are generated CW, so a strict
+    // GeoJSON client (MapboxGL, PostGIS strict) would otherwise read a CW
+    // exterior as the polygon's *complement* — an inverted fill over the globe.
+    // (`fill_polygon` is winding-agnostic, so the raster is unaffected either way.)
+    for (exterior, holes) in &mut polys {
+        orient_ring(exterior, true);
+        for hole in holes.iter_mut() {
+            orient_ring(hole, false);
+        }
+    }
     match polys.len() {
         0 => Geometry::Null,
         1 => {
@@ -403,6 +419,31 @@ fn build_geometry(area: &CapArea, segments: u32, lookup: Option<&GeocodeLookup>)
             Geometry::Polygon { exterior, holes }
         }
         _ => Geometry::MultiPolygon { polygons: polys },
+    }
+}
+
+/// Twice the signed area (shoelace). Positive ⇒ the ring is **counterclockwise**
+/// in lon/lat (x = lon east, y = lat north) — RFC 7946's exterior orientation.
+fn signed_area2(ring: &[[f64; 2]]) -> f64 {
+    let n = ring.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut s = 0.0;
+    for i in 0..n {
+        let a = ring[i];
+        let b = ring[(i + 1) % n];
+        s += a[0] * b[1] - b[0] * a[1];
+    }
+    s
+}
+
+/// Reverse `ring` in place if its winding doesn't match `want_ccw` (RFC 7946:
+/// exterior CCW = `true`, holes CW = `false`). A degenerate ring is left as-is.
+fn orient_ring(ring: &mut [[f64; 2]], want_ccw: bool) {
+    let area = signed_area2(ring);
+    if area != 0.0 && (area > 0.0) != want_ccw {
+        ring.reverse();
     }
 }
 
@@ -727,6 +768,44 @@ mod tests {
         // onset 10:00 + 2h = 12:00 end.
         assert!(r.window.active_at(at(2026, 6, 15, 11)));
         assert!(!r.window.active_at(at(2026, 6, 15, 13)));
+    }
+
+    #[test]
+    fn exterior_ring_is_normalized_ccw() {
+        // A clockwise CAP polygon (BL→TL→TR→BR in lon/lat) must be emitted as a
+        // CCW exterior (RFC 7946) so strict GeoJSON clients don't invert it.
+        let doc = r#"<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+          <identifier>CW1</identifier><status>Actual</status><sent>2020-01-01T00:00:00Z</sent>
+          <info><event>X</event><severity>Minor</severity><onset>2020-01-01T00:00:00Z</onset>
+            <area><areaDesc>A</areaDesc>
+              <polygon>60.10,24.90 60.30,24.90 60.30,25.10 60.10,25.10 60.10,24.90</polygon>
+            </area></info></alert>"#;
+        let alerts = parse_document(doc).unwrap();
+        let cat = Catalog::build(&alerts, &cfg(), "cap", "severity", at(2026, 6, 15, 12));
+        match &*cat.records[0].geometry {
+            Geometry::Polygon { exterior, .. } => {
+                assert!(
+                    signed_area2(exterior) > 0.0,
+                    "exterior must be counterclockwise (positive signed area)"
+                );
+            }
+            other => panic!("expected Polygon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn temporal_extent_none_for_fully_open_windows() {
+        // No sent/onset/effective/expires and no default_ttl ⇒ fully open windows
+        // ⇒ no concrete bound ⇒ None (not a zero-width as_of/as_of interval).
+        let doc = r#"<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+          <identifier>OPEN1</identifier><status>Actual</status>
+          <info><event>X</event>
+            <area><areaDesc>A</areaDesc><polygon>0,0 0,1 1,1 1,0 0,0</polygon></area>
+          </info></alert>"#;
+        let alerts = parse_document(doc).unwrap();
+        let cat = Catalog::build(&alerts, &cfg(), "cap", "severity", at(2026, 6, 15, 12));
+        assert_eq!(cat.records.len(), 1);
+        assert!(cat.temporal_extent().is_none());
     }
 
     #[test]

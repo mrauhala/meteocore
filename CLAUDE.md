@@ -664,7 +664,9 @@ poll-and-swap `Catalog` (`crates/engine-cap`). It is the **first vector→raster
 output pixel grid with the shared `ds_render::rasterize::fill_polygon` primitive
 (#397) fed by `ds_core::geo::geometry_to_pixels` (vertices projected via
 `OutputCrs::world_to_fraction`, **never per pixel** — #203). `engine-cap` is also
-the first engine to depend on `ds-render` (for the fill + `Combine`).
+the first engine to depend on `ds-render` (for the fill + `Combine`) — an
+**approved exception** for vector→raster `MapEngine` impls (#397); engines still
+return `RasterTile` domain types, colorization stays in the API layer.
 
 - **Source = exactly one of `data_path` (local dir of `*.xml`) or `feed_url`
   (Atom/RSS index → linked CAP docs).** Both go through `ds-storage` from the

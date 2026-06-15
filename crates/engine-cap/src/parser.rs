@@ -278,17 +278,17 @@ fn parse_time(s: &str) -> Option<DateTime<Utc>> {
 /// polygon. The ring is closed defensively (first == last appended if missing),
 /// matching `ds_core::Geometry::Polygon`'s closed-ring expectation.
 pub fn parse_polygon(s: &str) -> Option<Vec<[f64; 2]>> {
-    // Bound the work before allocating: reject a pathologically large ring
-    // rather than silently truncating it into a wrong shape.
-    if s.split_whitespace().count() > MAX_POLYGON_VERTICES {
-        tracing::warn!(
-            "cap: <polygon> exceeds {MAX_POLYGON_VERTICES} vertices — dropped (not truncated)"
-        );
-        return None;
-    }
+    // Single pass: reject (don't truncate into a wrong shape) once the count of
+    // *valid* vertices would exceed the cap.
     let mut ring: Vec<[f64; 2]> = Vec::new();
     for pair in s.split_whitespace() {
         if let Some(p) = parse_lat_lon(pair) {
+            if ring.len() >= MAX_POLYGON_VERTICES {
+                tracing::warn!(
+                    "cap: <polygon> exceeds {MAX_POLYGON_VERTICES} vertices — dropped (not truncated)"
+                );
+                return None;
+            }
             ring.push(p);
         }
     }
