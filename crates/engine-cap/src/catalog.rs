@@ -138,10 +138,24 @@ impl Catalog {
     ) -> Self {
         let mut records: Vec<AreaRecord> = Vec::new();
         let mut geocode_only_count = 0usize;
+        let mut missing_status = 0usize;
 
         for alert in alerts {
-            if !status_allowed(alert, &cfg.status_filter) {
-                continue;
+            // A status filter drops non-matching alerts. Distinguish a genuinely
+            // filtered status (e.g. Test/Draft — expected, silent) from a
+            // *missing* `<status>` (malformed feed — surfaced once below, since a
+            // systematically-broken feed would otherwise spam a WARN per alert).
+            if !cfg.status_filter.is_empty() {
+                match &alert.status {
+                    None => {
+                        missing_status += 1;
+                        continue;
+                    }
+                    Some(s) if !cfg.status_filter.contains(&s.trim().to_ascii_lowercase()) => {
+                        continue;
+                    }
+                    _ => {}
+                }
             }
             for (info_idx, info) in select_infos(alert, cfg.language.as_deref()) {
                 for (area_idx, area) in info.areas.iter().enumerate() {
@@ -173,6 +187,13 @@ impl Catalog {
                     });
                 }
             }
+        }
+
+        if missing_status > 0 {
+            tracing::warn!(
+                "[{collection_id}] cap: dropped {missing_status} alert(s) with no <status> while a \
+                 status filter is set — malformed feed (CAP <status> is mandatory)"
+            );
         }
 
         // Deterministic order for stable pagination.
@@ -272,16 +293,6 @@ pub fn severity_code(severity: Option<&str>) -> f64 {
         Some("minor") => 1.0,
         // "Unknown", anything unrecognised, or absent → 0.
         _ => 0.0,
-    }
-}
-
-fn status_allowed(alert: &CapAlert, filter: &[String]) -> bool {
-    if filter.is_empty() {
-        return true;
-    }
-    match &alert.status {
-        Some(s) => filter.contains(&s.trim().to_ascii_lowercase()),
-        None => false,
     }
 }
 
@@ -584,6 +595,28 @@ mod tests {
         let alerts = parse_document(&doc).unwrap();
         let cat = Catalog::build(&alerts, &cfg(), "cap", "severity", at(2026, 6, 15, 12));
         assert!(cat.records.is_empty());
+    }
+
+    #[test]
+    fn missing_status_dropped_under_filter_but_kept_when_unfiltered() {
+        // An alert with no <status> and a non-empty filter is dropped (malformed
+        // feed); with an empty filter (serve everything) it is kept.
+        let doc = r#"<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+          <identifier>NS1</identifier>
+          <info><event>Wind</event><severity>Minor</severity>
+            <area><areaDesc>A</areaDesc><polygon>0,0 0,1 1,1 1,0 0,0</polygon></area>
+          </info></alert>"#;
+        let alerts = parse_document(doc).unwrap();
+        let dropped = Catalog::build(&alerts, &cfg(), "cap", "severity", at(2026, 6, 15, 12));
+        assert!(
+            dropped.records.is_empty(),
+            "no-status alert dropped under [Actual]"
+        );
+
+        let mut serve_all = cfg();
+        serve_all.status_filter = Vec::new();
+        let kept = Catalog::build(&alerts, &serve_all, "cap", "severity", at(2026, 6, 15, 12));
+        assert_eq!(kept.records.len(), 1, "empty filter serves every status");
     }
 
     #[test]

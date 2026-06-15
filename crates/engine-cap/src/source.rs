@@ -119,6 +119,16 @@ fn load_feed(
     feed_url: &str,
     allowlist: &[String],
 ) -> Result<Vec<CapAlert>, DataServerError> {
+    // SSRF note: the index fetch (and the entry fetches below) go through
+    // `ds-storage`'s HTTP store, which uses object_store's reqwest client with
+    // its DEFAULT redirect policy (follows up to 10 redirects) — object_store
+    // 0.11 exposes no knob to disable it. So a compromised DNS/CDN for the
+    // operator-trusted `feed_url` host could redirect this fetch to an internal
+    // address; the `is_allowed_entry` guard only constrains the *request* URL of
+    // entry links, not redirect *responses*. Feed mode therefore trusts the feed
+    // host (operator-configured). A proper redirect-disabling fix belongs in
+    // ds-storage (it would harden every HTTP-backed engine, not just CAP) and is
+    // a cross-engine follow-up; see the CAP notes in CLAUDE.md.
     let index_bytes = index_store.get(index_path)?;
     if index_bytes.len() as u64 > MAX_DOC_BYTES {
         return Err(DataServerError::Engine(format!(

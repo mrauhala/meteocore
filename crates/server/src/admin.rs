@@ -1846,6 +1846,7 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
                     );
                     feature_collections.insert(collection.id.clone(), collection.clone());
+                    info!("Collection '{}': wired to Features API", collection.id);
                 }
                 if collection.apis.contains(&"wms".to_string()) {
                     map_engines.insert(

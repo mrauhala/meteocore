@@ -317,6 +317,28 @@ fn time_selection_renders_only_active_alerts() {
 }
 
 #[test]
+fn degenerate_request_bbox_renders_empty_tile() {
+    // A zero-area / non-finite request bbox asks for no region → empty tile,
+    // never a full-catalog render.
+    let eng = engine(Some("en"));
+    let degenerate = [f64::NAN, 60.0, 25.0, 61.0];
+    let tile = eng
+        .get_raster_tile(
+            degenerate,
+            32,
+            32,
+            None,
+            &OutputCrs::Wgs84,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(tile.is_empty());
+    assert_eq!(tile.values.len(), 32 * 32);
+}
+
+#[test]
 fn raster_info_advertises_layer_time_and_extent() {
     let eng = engine(None);
     let info = eng.raster_info();

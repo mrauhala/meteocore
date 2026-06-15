@@ -273,10 +273,18 @@ impl MapEngine for CapEngine {
         let mut values: Vec<Option<f64>> = vec![None; w.saturating_mul(h)];
 
         // Prefilter to areas whose bbox intersects the (WGS84) request rectangle.
+        // A degenerate request bbox (zero-area / non-finite) asks for no region,
+        // so the tile is empty — never a full-catalog render (the API layer
+        // already rejects such bboxes; this is the engine's own safety net).
         let candidates: Vec<usize> = match Bbox::new(bbox[0], bbox[1], bbox[2], bbox[3]) {
             Ok(b) => cat.query_bbox(&b),
-            // A degenerate request bbox: fall back to every geometry area.
-            Err(_) => (0..cat.records.len()).collect(),
+            Err(_) => {
+                return Ok(RasterTile {
+                    width,
+                    height,
+                    values,
+                })
+            }
         };
 
         let mut rendered = 0usize;

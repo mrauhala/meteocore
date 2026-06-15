@@ -682,7 +682,13 @@ the first engine to depend on `ds-render` (for the fill + `Combine`).
   STAC `stac_asset_allowlist` addresses. Feature `data_version()` (ETag) hashes
   severity + window **and** the text fields (event/headline/description/
   instruction/areaDesc), so an in-place text correction invalidates the ETag (no
-  stale 304).
+  stale 304). **Known limitation:** the allowlist constrains entry *request* URLs,
+  not redirect *responses* — `ds-storage`'s HTTP store uses object_store's reqwest
+  client with the default follow-redirects policy (no disable knob in
+  object_store 0.11), so a compromised DNS/CDN for the trusted `feed_url` host
+  could still redirect a fetch internally. Feed mode trusts the feed host; a
+  proper redirect-disabling fix belongs in `ds-storage` (hardens every HTTP engine)
+  and is a cross-engine follow-up.
 - **Coordinate order is the load-bearing gotcha.** CAP polygons/circles are
   `lat,lon` (spec §3.3.4); `ds_core::Geometry` is `[lon, lat]`. `parser.rs`
   **swaps on ingest** (pinned by an absolute-position test — a Helsinki alert
