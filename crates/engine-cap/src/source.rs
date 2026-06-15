@@ -214,13 +214,19 @@ fn load_feed(
             Err(e) => tracing::warn!("cap feed: cannot build store for origin '{origin}': {e}"),
         }
     }
-    // Rare query-bearing links: fetch individually (still bounded by count cap).
+    // Rare query-bearing links: fetch individually through the size-guarded
+    // `get_many` (HEAD-checks the body against MAX_DOC_BYTES before pulling it),
+    // still bounded by the entry count cap.
     for u in with_query {
-        match build_store(u.as_str()).and_then(|(store, path)| store.get(&path)) {
-            Ok(bytes) if bytes.len() as u64 <= MAX_DOC_BYTES => {
-                parse_into(&bytes, &mut alerts, u.as_str());
-            }
-            Ok(_) => tracing::warn!("cap feed doc '{u}' exceeds size limit — skipped"),
+        let fetched = build_store(u.as_str()).and_then(|(store, path)| {
+            store
+                .get_many(std::slice::from_ref(&path), 1, Some(MAX_DOC_BYTES))?
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| Err(DataServerError::Engine("empty fetch result".into())))
+        });
+        match fetched {
+            Ok(bytes) => parse_into(&bytes, &mut alerts, u.as_str()),
             Err(e) => tracing::warn!("cap feed doc '{u}' fetch failed: {e}"),
         }
     }

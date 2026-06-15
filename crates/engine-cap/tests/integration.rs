@@ -429,6 +429,25 @@ fn identifier_with_slash_is_url_safe_and_reachable() {
 }
 
 #[test]
+fn identifier_with_brackets_is_url_safe_and_reachable() {
+    // Real US-NWS-style identifiers can contain '[' / ']', which RFC 3986
+    // forbids unencoded in a path segment.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.xml"), cap_xml("NWS-IDP[KOUN][2026]")).unwrap();
+    let eng = CapEngine::new(&config_for(dir.path().to_str().unwrap(), None), "cap-brk").unwrap();
+    let fid = eng.get_features(&FeatureQuery::default()).unwrap().features[0]
+        .id
+        .clone();
+    assert!(
+        !fid.contains('[') && !fid.contains(']'),
+        "brackets must be encoded: {fid}"
+    );
+    assert!(fid.contains("%5B") && fid.contains("%5D"));
+    // The decoded form (what the route yields) resolves.
+    assert!(eng.get_feature("NWS-IDP[KOUN][2026].0.0").is_ok());
+}
+
+#[test]
 fn duplicate_identifiers_are_deduped_and_reachable() {
     // Two files (or a feed serving the same alert twice) with the same
     // identifier must not split-brain: one record, reachable via get_feature.

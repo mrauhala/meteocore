@@ -379,7 +379,11 @@ fn circle_ring(c: &CapCircle, segments: u32) -> Vec<[f64; 2]> {
         let (lon, lat) = destination_point(c.lon, c.lat, radius_m, bearing);
         ring.push([lon, lat]);
     }
-    ring.push(ring[0]); // close
+    // `n >= 3` so `ring` is non-empty; close defensively via `first()` rather
+    // than `ring[0]` so the close can never index-panic.
+    if let Some(&first) = ring.first() {
+        ring.push(first);
+    }
     ring
 }
 

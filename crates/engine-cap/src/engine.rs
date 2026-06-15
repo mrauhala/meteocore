@@ -234,18 +234,47 @@ fn to_feature(rec: &crate::catalog::AreaRecord) -> Feature {
     }
 }
 
-/// Percent-encode the characters that would break a feature id used **verbatim**
-/// as a URL path segment in the Features self-link: `%` (escape introducer —
-/// encoded first so a literal `%` isn't conflated with the escapes we add), `/`
-/// (route separator), and the `?`/`#`/space that would start a query/fragment or
-/// truncate the path. Everything else (`:`, `.`, `-`, …) is path-safe and passes
-/// through axum's decode unchanged. A no-op for the common dot/colon ids.
+/// Percent-encode a feature id into a single **URL path segment** for the
+/// Features self-link href (which api-features inserts verbatim). Encodes every
+/// byte outside RFC 3986 `pchar` (unreserved / sub-delims / `:` / `@`), so `/`
+/// `%` `?` `#` `[` `]` space and any non-ASCII byte are escaped — real CAP
+/// identifiers (e.g. US-NWS) contain brackets, and bare `[`/`]` are illegal in a
+/// path. axum's `Path` extractor decodes the segment back to `rec.id` (the
+/// lookup key) on `GET`, so the round-trip is lossless. A no-op for the common
+/// dot/colon ids (all `pchar`).
 fn encode_feature_id(id: &str) -> String {
-    id.replace('%', "%25")
-        .replace('/', "%2F")
-        .replace('?', "%3F")
-        .replace('#', "%23")
-        .replace(' ', "%20")
+    fn is_pchar(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                // unreserved
+                b'-' | b'.' | b'_' | b'~'
+                // sub-delims
+                | b'!' | b'$' | b'&' | b'\'' | b'(' | b')'
+                | b'*' | b'+' | b',' | b';' | b'='
+                // pchar extras
+                | b':' | b'@'
+            )
+    }
+    let mut out = String::with_capacity(id.len());
+    for &b in id.as_bytes() {
+        if is_pchar(b) {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(
+                char::from_digit((b >> 4) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+            out.push(
+                char::from_digit((b & 0xf) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -325,5 +354,28 @@ impl MapEngine for CapEngine {
     fn raster_info(&self) -> RasterInfo {
         // O(1) clone of the prebuilt snapshot (#211).
         (*self.snapshot().info).clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_feature_id;
+
+    #[test]
+    fn encode_feature_id_handles_path_unsafe_chars() {
+        // Common dot/colon ids are pchar → unchanged.
+        assert_eq!(
+            encode_feature_id("urn:test:flood-1.0.0"),
+            "urn:test:flood-1.0.0"
+        );
+        // Path-illegal chars are percent-encoded: '/', brackets (real US-NWS ids
+        // contain them), space, '%', '?', '#'.
+        assert_eq!(encode_feature_id("a/b"), "a%2Fb");
+        assert_eq!(encode_feature_id("zone[1]"), "zone%5B1%5D");
+        assert_eq!(encode_feature_id("a b"), "a%20b");
+        assert_eq!(encode_feature_id("a%b"), "a%25b");
+        assert_eq!(encode_feature_id("a?b#c"), "a%3Fb%23c");
+        // Non-ASCII is UTF-8 percent-encoded byte-wise.
+        assert_eq!(encode_feature_id("é"), "%C3%A9");
     }
 }

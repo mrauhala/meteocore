@@ -202,6 +202,10 @@ pub fn parse_document(xml: &str) -> Result<Vec<CapAlert>, DataServerError> {
                             if !a.identifier.is_empty() {
                                 alerts.push(a);
                                 if alerts.len() >= MAX_ALERTS_PER_DOC {
+                                    tracing::warn!(
+                                        "cap: document hit the {MAX_ALERTS_PER_DOC}-alert cap — \
+                                         remaining <alert> elements ignored"
+                                    );
                                     break;
                                 }
                             }
@@ -269,14 +273,21 @@ fn parse_time(s: &str) -> Option<DateTime<Utc>> {
 
 /// Parse a CAP `<polygon>` (`lat,lon lat,lon …`) into a closed `[lon, lat]`
 /// ring. Returns `None` if fewer than 3 distinct vertices survive validation
-/// (degenerate ring). The ring is closed defensively (first == last appended if
-/// missing), matching `ds_core::Geometry::Polygon`'s closed-ring expectation.
+/// (degenerate ring), or if the vertex count exceeds [`MAX_POLYGON_VERTICES`] —
+/// **rejected, not truncated**, since a truncated ring is a different (wrong)
+/// polygon. The ring is closed defensively (first == last appended if missing),
+/// matching `ds_core::Geometry::Polygon`'s closed-ring expectation.
 pub fn parse_polygon(s: &str) -> Option<Vec<[f64; 2]>> {
+    // Bound the work before allocating: reject a pathologically large ring
+    // rather than silently truncating it into a wrong shape.
+    if s.split_whitespace().count() > MAX_POLYGON_VERTICES {
+        tracing::warn!(
+            "cap: <polygon> exceeds {MAX_POLYGON_VERTICES} vertices — dropped (not truncated)"
+        );
+        return None;
+    }
     let mut ring: Vec<[f64; 2]> = Vec::new();
     for pair in s.split_whitespace() {
-        if ring.len() >= MAX_POLYGON_VERTICES {
-            break;
-        }
         if let Some(p) = parse_lat_lon(pair) {
             ring.push(p);
         }
