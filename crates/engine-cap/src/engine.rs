@@ -57,6 +57,24 @@ impl CapEngine {
             Some(s) => Some(parse_iso8601_duration(s)?),
             None => None,
         };
+        // Load the optional geocode → geometry lookup once (static reference
+        // data). A misconfigured path is a hard error — it's local config, unlike
+        // the pollable source.
+        let geocode_lookup = match &config.geocode_geometry {
+            Some(path) => {
+                let lk = crate::geocode::GeocodeLookup::load(
+                    path,
+                    &config.geocode_property,
+                    config.geocode_value_name.as_deref(),
+                )?;
+                tracing::info!(
+                    "[{collection_id}] cap: loaded {} geocode zone(s) from '{path}'",
+                    lk.len()
+                );
+                Some(Arc::new(lk))
+            }
+            None => None,
+        };
         let build_cfg = BuildConfig {
             language: config.language.clone(),
             status_filter: config
@@ -66,6 +84,7 @@ impl CapEngine {
                 .collect(),
             default_ttl,
             circle_segments: config.circle_segments,
+            geocode_lookup,
         };
 
         let catalog = Arc::new(ArcSwap::from_pointee(Catalog::empty(
@@ -214,6 +233,10 @@ impl ds_core::feature_engine::FeatureEngine for CapEngine {
 
     fn spatial_extent(&self) -> Option<[f64; 4]> {
         self.snapshot().spatial_extent
+    }
+
+    fn temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        self.snapshot().temporal_extent()
     }
 
     fn data_version(&self) -> u64 {

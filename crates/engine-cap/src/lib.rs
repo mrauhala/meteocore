@@ -20,6 +20,7 @@
 
 mod catalog;
 mod engine;
+mod geocode;
 mod parser;
 mod source;
 

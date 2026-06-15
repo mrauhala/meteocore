@@ -527,6 +527,10 @@ fn default_circle_segments() -> u32 {
     64
 }
 
+fn default_geocode_property() -> String {
+    "code".to_string()
+}
+
 fn default_status_filter() -> Vec<String> {
     vec!["Actual".to_string()]
 }
@@ -574,6 +578,20 @@ pub struct CapConfig {
     /// N-gon on the geodesic. Default: 64.
     #[serde(default = "default_circle_segments")]
     pub circle_segments: u32,
+    /// Optional GeoJSON `FeatureCollection` mapping zone codes → polygons, used
+    /// to give geometry to geocode-only areas (e.g. MeteoAlarm's EMMA_ID zones,
+    /// which carry no inline `<polygon>`). Without it such areas have null
+    /// geometry (listed in Features, absent from the map, no spatial extent).
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub geocode_geometry: Option<String>,
+    /// The GeoJSON feature property holding the zone code matched against CAP
+    /// `<geocode>` values. Default `"code"`.
+    #[serde(default = "default_geocode_property")]
+    pub geocode_property: String,
+    /// Restrict geocode resolution to CAP `<geocode>` entries with this
+    /// `<valueName>` (e.g. `"EMMA_ID"`); unset resolves against any geocode value.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub geocode_value_name: Option<String>,
     /// SSRF guard for feed mode: extra URL **prefixes** an entry link may match
     /// to be fetched, *in addition to* the feed's own origin (which is always
     /// allowed). An entry link whose origin differs from the feed's and matches
@@ -1973,6 +1991,19 @@ impl ServerConfig {
                         "Collection '{id}': cap 'circle_segments' must be >= 3"
                     )));
                 }
+
+                // The geocode lookup property must be non-empty (it names the
+                // GeoJSON property holding the zone code).
+                if cap.geocode_geometry.is_some() && cap.geocode_property.trim().is_empty() {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap 'geocode_property' must not be empty"
+                    )));
+                }
+                if cap.geocode_value_name.as_deref() == Some("") {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap 'geocode_value_name' must not be empty"
+                    )));
+                }
             }
 
             // style_bundle: reference must resolve, must not mix with inline WMS style fields
@@ -2231,6 +2262,28 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         assert_eq!(cap.circle_segments, 64);
         assert_eq!(cap.status_filter, vec!["Actual".to_string()]);
         assert!(cap.language.is_none());
+        assert_eq!(cap.geocode_property, "code");
+        assert!(cap.geocode_geometry.is_none());
+    }
+
+    #[test]
+    fn cap_geocode_fields_validate() {
+        let ok = cap_collection(
+            "data_path = \"x\"\ngeocode_geometry = \"emma.geojson\"\n\
+             geocode_property = \"code\"\ngeocode_value_name = \"EMMA_ID\"\n",
+        );
+        assert!(ok.validate().is_ok());
+        // Empty property / value_name rejected.
+        assert!(cap_collection(
+            "data_path = \"x\"\ngeocode_geometry = \"e.geojson\"\ngeocode_property = \"\"\n"
+        )
+        .validate()
+        .is_err());
+        assert!(
+            cap_collection("data_path = \"x\"\ngeocode_value_name = \"\"\n")
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

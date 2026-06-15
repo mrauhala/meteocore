@@ -700,9 +700,23 @@ the first engine to depend on `ds-render` (for the fill + `Combine`).
   info each fan out. `language` config keeps the matching `<info>`s
   (primary-subtag, case-insensitive), falling back to the first info if none
   match. `status_filter` (default `["Actual"]`) drops Test/Exercise/Draft at the
-  alert level. **Geocode-only areas** (UGC/EMMA_ID/FIPS, no polygon/circle) become
-  **`Geometry::Null` Features** (valid per RFC 7946 §3.2, listed but never on the
-  map) and are counted — v1 does not resolve geocodes to geometry (follow-up).
+  alert level. **Geocode-only areas** (UGC/EMMA_ID/FIPS, no polygon/circle) get
+  geometry from the optional **`geocode_geometry`** lookup — a GeoJSON
+  `FeatureCollection` mapping zone codes → polygons (`geocode_property`, default
+  `"code"`; `geocode_value_name` restricts which CAP `<geocode>` valueName is
+  resolved, e.g. `"EMMA_ID"`). **MeteoAlarm needs this** — its CAP areas are
+  geocode-only EMMA_ID zones with no inline polygon, so without the lookup they
+  render nothing and contribute no spatial extent. `testdata/cap/emma-fi.geojson`
+  is the Finland EMMA zone set (from the MeteoAlarm Python package). An area that
+  still resolves to nothing becomes a **`Geometry::Null` Feature** (valid per RFC
+  7946 §3.2, listed but never on the map) and is counted (`geocode_only` in the
+  load log). The lookup file is loaded once at construction (static reference
+  data, not polled); a bad path is a hard `new()` error.
+- **Extents.** `spatial_extent()` is the union of resolved geometry bboxes;
+  `FeatureEngine::temporal_extent()` (new, default `None`) returns the alert
+  windows' `[min start, max end]` (open bounds clamp to `as_of`), so the Features
+  collection JSON advertises **both** a spatial and a temporal `extent`
+  (api-features feeds them through `ds_core::ogc_extent::build_extent`).
 - **Active window** = `[onset∨effective∨sent, expires∨(start+default_ttl)∨open]`.
   Features `datetime=` selects areas whose window overlaps the instant/interval;
   a no-datetime request lists all loaded areas. Map `time`/WMS `TIME` selects
@@ -726,9 +740,9 @@ the first engine to depend on `ds-render` (for the fill + `Combine`).
   `server/src/admin.rs` (`"cap" => ["features","wms","maps","tiles"]`), poll loop
   on `poll_runtime()` with `shutdown()` on reload. Demo: `collections.d/cap-alerts.toml`
   over `testdata/cap/` (synthetic fixtures). **Out of scope for v1 (follow-ups):**
-  geocode→geometry lookup, reference-chain supersedes/cancel beyond latest-wins,
-  XML-DSig verification, per-`event` sub-layers, conditional-GET feed caching,
-  antimeridian splitting (inherited from `geometry_to_pixels`).
+  reference-chain supersedes/cancel beyond latest-wins, XML-DSig verification,
+  per-`event` sub-layers, conditional-GET feed caching, antimeridian splitting
+  (inherited from `geometry_to_pixels`).
 
 ## PostGIS Engine Notes
 

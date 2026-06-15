@@ -24,6 +24,9 @@ fn config_for(dir: &str, language: Option<&str>) -> CapConfig {
         status_filter: vec!["Actual".to_string()],
         default_ttl: None,
         circle_segments: 64,
+        geocode_geometry: None,
+        geocode_property: "code".to_string(),
+        geocode_value_name: None,
         feed_allowlist: Vec::new(),
     }
 }
@@ -461,6 +464,56 @@ fn duplicate_identifiers_are_deduped_and_reachable() {
         "duplicate ids collapse to one record"
     );
     assert!(eng.get_feature("urn:dup:1.0.0").is_ok());
+}
+
+#[test]
+fn geocode_only_areas_resolve_via_lookup() {
+    // MeteoAlarm-style geocode-only area (EMMA_ID, no inline polygon) gains
+    // geometry from the geocode_geometry lookup, so it positions on the map and
+    // contributes a spatial + temporal extent.
+    let dir = tempfile::tempdir().unwrap();
+    let xml = r#"<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+      <identifier>urn:test:emma-1</identifier><status>Actual</status>
+      <sent>2020-01-01T00:00:00Z</sent>
+      <info><event>Strong wind advisory</event><severity>Moderate</severity>
+        <onset>2020-01-01T00:00:00Z</onset><expires>2020-01-02T00:00:00Z</expires>
+        <area><areaDesc>Selkameri, Merenkurkku</areaDesc>
+          <geocode><valueName>EMMA_ID</valueName><value>FI801</value></geocode>
+          <geocode><valueName>EMMA_ID</valueName><value>FI802</value></geocode>
+        </area></info></alert>"#;
+    std::fs::write(dir.path().join("a.xml"), xml).unwrap();
+
+    let zones = fixtures_dir().join("zones.geojson");
+    let mut cfg = config_for(dir.path().to_str().unwrap(), None);
+    cfg.geocode_geometry = Some(zones.to_str().unwrap().to_string());
+    cfg.geocode_value_name = Some("EMMA_ID".to_string());
+    let eng = CapEngine::new(&cfg, "cap-geocode").unwrap();
+
+    // The two EMMA zones merge into one MultiPolygon feature.
+    let f = eng.get_feature("urn:test:emma-1.0.0").unwrap();
+    assert!(matches!(&*f.geometry, Geometry::MultiPolygon { polygons } if polygons.len() == 2));
+    // Resolved geometry yields a spatial extent (zones span ~20..25E, 60..63N).
+    let ext = eng.spatial_extent().unwrap();
+    assert!((19.0..26.0).contains(&ext[0]) && (59.0..64.0).contains(&ext[3]));
+
+    // Without the lookup the same alert is null-geometry (no extent).
+    let bare = CapEngine::new(&config_for(dir.path().to_str().unwrap(), None), "cap-bare").unwrap();
+    assert!(matches!(
+        &*bare.get_feature("urn:test:emma-1.0.0").unwrap().geometry,
+        Geometry::Null
+    ));
+    assert!(bare.spatial_extent().is_none());
+}
+
+#[test]
+fn temporal_extent_spans_alert_windows() {
+    let eng = engine(Some("en"));
+    let (start, end) = eng
+        .temporal_extent()
+        .expect("alerts present → temporal extent");
+    assert!(start <= end);
+    // The storm window (10:00–16:00Z on 2026-06-15) sits inside the span.
+    assert!(start <= at(2026, 6, 15, 10) && end >= at(2026, 6, 15, 16));
 }
 
 #[test]

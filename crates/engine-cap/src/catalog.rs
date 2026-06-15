@@ -16,6 +16,7 @@ use ds_core::feature::{Bbox, Geometry, PropertyValue};
 use ds_core::geo::destination_point;
 use ds_core::map_engine::RasterInfo;
 
+use crate::geocode::GeocodeLookup;
 use crate::parser::{CapAlert, CapArea, CapCircle, CapInfo};
 
 /// Cap on advertised TIME-dimension values (keeps WMS GetCapabilities bounded).
@@ -34,6 +35,8 @@ pub struct BuildConfig {
     pub default_ttl: Option<Duration>,
     /// Circle → N-gon vertex count.
     pub circle_segments: u32,
+    /// Optional zone-code → geometry table for resolving geocode-only areas.
+    pub geocode_lookup: Option<Arc<GeocodeLookup>>,
 }
 
 /// The active-validity window of an alert area: `[start, end]` with open bounds.
@@ -159,7 +162,8 @@ impl Catalog {
             }
             for (info_idx, info) in select_infos(alert, cfg.language.as_deref()) {
                 for (area_idx, area) in info.areas.iter().enumerate() {
-                    let geometry = build_geometry(area, cfg.circle_segments);
+                    let geometry =
+                        build_geometry(area, cfg.circle_segments, cfg.geocode_lookup.as_deref());
                     if matches!(geometry, Geometry::Null) && area.has_geocode_only() {
                         geocode_only_count += 1;
                     }
@@ -270,6 +274,29 @@ impl Catalog {
     pub fn get(&self, id: &str) -> Option<&AreaRecord> {
         self.id_index.get(id).map(|&i| &self.records[i])
     }
+
+    /// Temporal extent `(start, end)` of the alert set: earliest window start to
+    /// latest window end. Open bounds clamp to `as_of` (an open-start alert is
+    /// "active since now"; an open-ended alert extends the extent to "now"), so
+    /// the advertised interval is always bounded. `None` when there are no records.
+    pub fn temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        if self.records.is_empty() {
+            return None;
+        }
+        let mut start: Option<DateTime<Utc>> = None;
+        let mut end: Option<DateTime<Utc>> = None;
+        for r in &self.records {
+            if let Some(s) = r.window.start {
+                start = Some(start.map_or(s, |m| m.min(s)));
+            }
+            if let Some(e) = r.window.end {
+                end = Some(end.map_or(e, |m| m.max(e)));
+            }
+        }
+        let start = start.unwrap_or(self.as_of);
+        let end = end.map_or(self.as_of, |e| e.max(self.as_of));
+        Some((start.min(end), end.max(start)))
+    }
 }
 
 /// The engine's live snapshot holder.
@@ -349,8 +376,10 @@ fn geometry_kind_radius(area: &CapArea) -> Option<f64> {
 }
 
 /// Assemble an area's geometry from its polygons + circles (each circle → an
-/// N-gon). 0 shapes ⇒ `Null`, 1 ⇒ `Polygon`, >1 ⇒ `MultiPolygon`.
-fn build_geometry(area: &CapArea, segments: u32) -> Geometry {
+/// N-gon). When the area has **no** inline geometry, fall back to resolving its
+/// `<geocode>`s through the optional [`GeocodeLookup`] (e.g. MeteoAlarm EMMA_ID
+/// zones). 0 shapes ⇒ `Null`, 1 ⇒ `Polygon`, >1 ⇒ `MultiPolygon`.
+fn build_geometry(area: &CapArea, segments: u32, lookup: Option<&GeocodeLookup>) -> Geometry {
     #[allow(clippy::type_complexity)]
     let mut polys: Vec<(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>)> = Vec::new();
     for ring in &area.polygons {
@@ -359,6 +388,14 @@ fn build_geometry(area: &CapArea, segments: u32) -> Geometry {
     for c in &area.circles {
         polys.push((circle_ring(c, segments), Vec::new()));
     }
+    // Inline geometry wins; only resolve geocodes for an otherwise-empty area.
+    if polys.is_empty() {
+        if let Some(lk) = lookup {
+            for geom in lk.resolve(&area.geocodes) {
+                polys.extend(polygon_parts(&geom));
+            }
+        }
+    }
     match polys.len() {
         0 => Geometry::Null,
         1 => {
@@ -366,6 +403,17 @@ fn build_geometry(area: &CapArea, segments: u32) -> Geometry {
             Geometry::Polygon { exterior, holes }
         }
         _ => Geometry::MultiPolygon { polygons: polys },
+    }
+}
+
+/// Flatten a (resolved) geometry into its constituent `(exterior, holes)` polygon
+/// parts, so several resolved zones merge into one `MultiPolygon`.
+#[allow(clippy::type_complexity)]
+fn polygon_parts(g: &Geometry) -> Vec<(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>)> {
+    match g {
+        Geometry::Polygon { exterior, holes } => vec![(exterior.clone(), holes.clone())],
+        Geometry::MultiPolygon { polygons } => polygons.clone(),
+        _ => Vec::new(),
     }
 }
 
@@ -556,6 +604,7 @@ mod tests {
             status_filter: vec!["actual".to_string()],
             default_ttl: None,
             circle_segments: 16,
+            geocode_lookup: None,
         }
     }
 
