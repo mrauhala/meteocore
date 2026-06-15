@@ -128,14 +128,20 @@ fn load_feed(
     // entry links, not redirect *responses*. Feed mode therefore trusts the feed
     // host (operator-configured). A proper redirect-disabling fix belongs in
     // ds-storage (it would harden every HTTP-backed engine, not just CAP) and is
-    // a cross-engine follow-up; see the CAP notes in CLAUDE.md.
-    let index_bytes = index_store.get(index_path)?;
-    if index_bytes.len() as u64 > MAX_DOC_BYTES {
-        return Err(DataServerError::Engine(format!(
-            "cap feed index is {} bytes — exceeds the {MAX_DOC_BYTES}-byte limit",
-            index_bytes.len()
-        )));
-    }
+    // a cross-engine follow-up — tracked in #431; see the CAP notes in CLAUDE.md.
+    // Fetch the index through the size-guarded path (HEAD-checks the body
+    // against MAX_DOC_BYTES before pulling it into memory), so an oversized or
+    // malicious feed can't exhaust the heap before a post-hoc length check —
+    // the same cap the entry fetches use.
+    let index_bytes = match index_store
+        .get_many(std::slice::from_ref(index_path), 1, Some(MAX_DOC_BYTES))?
+        .into_iter()
+        .next()
+    {
+        Some(Ok(bytes)) => bytes,
+        Some(Err(e)) => return Err(e),
+        None => return Ok(Vec::new()),
+    };
     let index_xml = String::from_utf8_lossy(&index_bytes);
 
     let base = Url::parse(feed_url)
@@ -434,9 +440,12 @@ mod tests {
         assert!(!chk("http://localhost:8080/admin"));
         // Look-alike host must NOT pass the exact-origin check (prefix-safety).
         assert!(!chk("https://feeds.example.org.evil.com/x.xml"));
-        // Different scheme/port is a different origin → blocked.
+        // Different scheme / non-default port is a different origin → blocked.
         assert!(!chk("http://feeds.example.org/alerts/1.xml"));
         assert!(!chk("https://feeds.example.org:8443/alerts/1.xml"));
+        // An explicit *default* port is the same origin (the `url` crate
+        // normalises `:443`/`:80` away), so it must still be allowed.
+        assert!(chk("https://feeds.example.org:443/alerts/1.xml"));
     }
 
     #[test]

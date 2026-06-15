@@ -69,7 +69,6 @@ impl CapEngine {
         };
 
         let catalog = Arc::new(ArcSwap::from_pointee(Catalog::empty(
-            collection_id,
             CAP_PARAMETER,
             Utc::now(),
         )));

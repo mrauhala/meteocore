@@ -115,13 +115,13 @@ pub struct Catalog {
 
 impl Catalog {
     /// An empty snapshot (before the first successful load).
-    pub fn empty(collection_id: &str, parameter: &str, as_of: DateTime<Utc>) -> Self {
+    pub fn empty(parameter: &str, as_of: DateTime<Utc>) -> Self {
         Catalog {
             records: Vec::new(),
             id_index: HashMap::new(),
             tree: RTree::new(),
             spatial_extent: None,
-            info: Arc::new(base_raster_info(collection_id, parameter, None, Vec::new())),
+            info: Arc::new(base_raster_info(parameter, None, Vec::new())),
             as_of,
             data_version: 0,
             geocode_only_count: 0,
@@ -240,12 +240,7 @@ impl Catalog {
         let spatial_extent = union_extent(&records);
         let times = build_times(&records, as_of);
         let data_version = compute_version(&records);
-        let info = Arc::new(base_raster_info(
-            collection_id,
-            parameter,
-            spatial_extent,
-            times,
-        ));
+        let info = Arc::new(base_raster_info(parameter, spatial_extent, times));
 
         Catalog {
             records,
@@ -521,12 +516,10 @@ fn compute_version(records: &[AreaRecord]) -> u64 {
 }
 
 fn base_raster_info(
-    collection_id: &str,
     parameter: &str,
     spatial_extent: Option<[f64; 4]>,
     times: Vec<DateTime<Utc>>,
 ) -> RasterInfo {
-    let _ = collection_id;
     RasterInfo {
         native_crs: "CRS:84".to_string(),
         spatial_extent,

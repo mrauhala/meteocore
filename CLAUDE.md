@@ -688,7 +688,7 @@ the first engine to depend on `ds-render` (for the fill + `Combine`).
   object_store 0.11), so a compromised DNS/CDN for the trusted `feed_url` host
   could still redirect a fetch internally. Feed mode trusts the feed host; a
   proper redirect-disabling fix belongs in `ds-storage` (hardens every HTTP engine)
-  and is a cross-engine follow-up.
+  and is a cross-engine follow-up (#431).
 - **Coordinate order is the load-bearing gotcha.** CAP polygons/circles are
   `lat,lon` (spec §3.3.4); `ds_core::Geometry` is `[lon, lat]`. `parser.rs`
   **swaps on ingest** (pinned by an absolute-position test — a Helsinki alert
