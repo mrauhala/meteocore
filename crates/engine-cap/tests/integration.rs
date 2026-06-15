@@ -365,6 +365,63 @@ fn refresh_picks_up_added_and_removed_files() {
     assert_eq!(got, vec!["urn:test:storm-window-1.0.0".to_string()]);
 }
 
+/// A minimal one-area CAP document with the given identifier.
+fn cap_xml(identifier: &str) -> String {
+    format!(
+        r#"<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+          <identifier>{identifier}</identifier><status>Actual</status>
+          <sent>2020-01-01T00:00:00Z</sent>
+          <info><event>Flood</event><severity>Severe</severity>
+            <onset>2020-01-01T00:00:00Z</onset>
+            <area><areaDesc>A</areaDesc><polygon>60,24 60,25 61,25 61,24 60,24</polygon></area>
+          </info></alert>"#
+    )
+}
+
+#[test]
+fn identifier_with_slash_is_url_safe_and_reachable() {
+    // A URI-style identifier containing '/' must not break the Features
+    // self-link / route: the emitted Feature id is percent-encoded (no raw '/'),
+    // while the catalog key stays the decoded id that the route resolves to.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.xml"),
+        cap_xml("urn:oid:2.49.0.1.840/abc"),
+    )
+    .unwrap();
+    let eng = CapEngine::new(&config_for(dir.path().to_str().unwrap(), None), "cap-slash").unwrap();
+
+    let page = eng.get_features(&FeatureQuery::default()).unwrap();
+    let fid = &page.features[0].id;
+    assert!(
+        !fid.contains('/'),
+        "emitted id must not contain a raw '/': {fid}"
+    );
+    assert!(
+        fid.contains("%2F"),
+        "the '/' must be percent-encoded: {fid}"
+    );
+    // The route decodes %2F back to '/', so get_feature is keyed by the decoded
+    // id (what the api-features Path extractor yields).
+    assert!(eng.get_feature("urn:oid:2.49.0.1.840/abc.0.0").is_ok());
+}
+
+#[test]
+fn duplicate_identifiers_are_deduped_and_reachable() {
+    // Two files (or a feed serving the same alert twice) with the same
+    // identifier must not split-brain: one record, reachable via get_feature.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.xml"), cap_xml("urn:dup:1")).unwrap();
+    std::fs::write(dir.path().join("b.xml"), cap_xml("urn:dup:1")).unwrap();
+    let eng = CapEngine::new(&config_for(dir.path().to_str().unwrap(), None), "cap-dup").unwrap();
+    assert_eq!(
+        eng.feature_count(),
+        1,
+        "duplicate ids collapse to one record"
+    );
+    assert!(eng.get_feature("urn:dup:1.0.0").is_ok());
+}
+
 #[test]
 fn empty_source_is_loaded_but_has_no_records() {
     // A reachable source with zero CAP files is a healthy empty collection:

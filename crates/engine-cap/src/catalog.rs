@@ -178,6 +178,25 @@ impl Catalog {
         // Deterministic order for stable pagination.
         records.sort_by(|a, b| a.id.cmp(&b.id));
 
+        // Drop duplicate feature ids, keeping the first. The CAP spec requires
+        // `<identifier>` to be unique, but a malformed file or a feed serving the
+        // same alert under two entry URLs can produce duplicates; without this,
+        // `records` would list both while `id_index` (a HashMap) silently kept
+        // only the last — a split-brain where listed features are unreachable via
+        // `get_feature`. Records are sorted by id, so duplicates are adjacent.
+        let mut dropped = 0usize;
+        records.dedup_by(|a, b| {
+            let dup = a.id == b.id;
+            dropped += dup as usize;
+            dup
+        });
+        if dropped > 0 {
+            tracing::warn!(
+                "[{collection_id}] cap: dropped {dropped} record(s) with duplicate feature id(s) \
+                 — CAP <identifier> must be unique"
+            );
+        }
+
         let id_index = records
             .iter()
             .enumerate()

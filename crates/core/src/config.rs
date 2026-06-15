@@ -579,7 +579,9 @@ pub struct CapConfig {
     /// allowed). An entry link whose origin differs from the feed's and matches
     /// no prefix here is dropped with a WARN — so a compromised feed cannot pivot
     /// the server to `http://169.254.169.254/…` or any internal host. Mirrors the
-    /// GeoTIFF STAC `stac_asset_allowlist`. Each entry must be `http(s)`. Empty
+    /// GeoTIFF STAC `stac_asset_allowlist`. Each entry must be an `http(s)` URL
+    /// prefix **ending in `/`** (enforced at load) so a prefix can't widen — e.g.
+    /// `https://cdn/cap/` must not also admit `https://cdn/cap-staging/`. Empty
     /// (default) ⇒ entry links must share the feed's origin.
     #[serde(default)]
     pub feed_allowlist: Vec<String>,
@@ -1928,6 +1930,15 @@ impl ServerConfig {
                              prefixes"
                         )));
                     }
+                    // Require a trailing '/' so a prefix can't widen unexpectedly:
+                    // `https://cdn/cap` would also admit `https://cdn/cap-staging/…`,
+                    // letting a feed reach adjacent paths on a trusted host.
+                    if !prefix.ends_with('/') {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': cap 'feed_allowlist' entry '{prefix}' must end \
+                             with '/' (a path prefix) to avoid unintended prefix widening"
+                        )));
+                    }
                 }
 
                 // `language`, when present, must be a non-empty tag (trimmed at
@@ -2171,6 +2182,11 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         // Non-http prefix rejected.
         let bad = cap_collection("feed_url = \"https://e/f\"\nfeed_allowlist = [\"ftp://x/\"]\n");
         assert!(bad.validate().is_err());
+        // Missing trailing slash rejected (prefix-widening guard).
+        let no_slash = cap_collection(
+            "feed_url = \"https://e/f\"\nfeed_allowlist = [\"https://cdn.example/cap\"]\n",
+        );
+        assert!(no_slash.validate().is_err());
         // Allowlist without a feed is meaningless → rejected.
         let no_feed = cap_collection("data_path = \"x\"\nfeed_allowlist = [\"https://cdn/\"]\n");
         assert!(no_feed.validate().is_err());

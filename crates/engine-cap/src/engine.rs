@@ -224,10 +224,29 @@ impl ds_core::feature_engine::FeatureEngine for CapEngine {
 
 fn to_feature(rec: &crate::catalog::AreaRecord) -> Feature {
     Feature {
-        id: rec.id.clone(),
+        // The catalog key (`rec.id`) is the *decoded* id. The emitted Feature id
+        // is URL-path-safe so api-features' verbatim self-link href
+        // (`…/items/{feature.id}`) is a single routable segment; axum's `Path`
+        // extractor percent-decodes that segment back to `rec.id` on `GET`, so
+        // the round-trip is lossless even for CAP identifiers containing `/`.
+        id: encode_feature_id(&rec.id),
         geometry: Arc::clone(&rec.geometry),
         properties: Arc::clone(&rec.properties),
     }
+}
+
+/// Percent-encode the characters that would break a feature id used **verbatim**
+/// as a URL path segment in the Features self-link: `%` (escape introducer —
+/// encoded first so a literal `%` isn't conflated with the escapes we add), `/`
+/// (route separator), and the `?`/`#`/space that would start a query/fragment or
+/// truncate the path. Everything else (`:`, `.`, `-`, …) is path-safe and passes
+/// through axum's decode unchanged. A no-op for the common dot/colon ids.
+fn encode_feature_id(id: &str) -> String {
+    id.replace('%', "%25")
+        .replace('/', "%2F")
+        .replace('?', "%3F")
+        .replace('#', "%23")
+        .replace(' ', "%20")
 }
 
 // ---------------------------------------------------------------------------
