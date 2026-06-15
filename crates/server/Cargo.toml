@@ -17,6 +17,7 @@ engine-querydata = { path = "../engine-querydata" }
 engine-grib = { path = "../engine-grib" }
 engine-zarr = { path = "../engine-zarr" }
 engine-odim = { path = "../engine-odim" }
+engine-cap = { path = "../engine-cap" }
 engine-postgis = { path = "../engine-postgis" }
 api-edr = { path = "../api-edr" }
 api-features = { path = "../api-features" }

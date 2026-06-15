@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+  <identifier>urn:test:helsinki-flood-1</identifier>
+  <sender>test@meteocore.example</sender>
+  <sent>2020-01-01T00:00:00+00:00</sent>
+  <status>Actual</status>
+  <msgType>Alert</msgType>
+  <scope>Public</scope>
+  <info>
+    <language>en-US</language>
+    <category>Met</category>
+    <event>Flood Warning</event>
+    <responseType>Prepare</responseType>
+    <urgency>Expected</urgency>
+    <severity>Severe</severity>
+    <certainty>Likely</certainty>
+    <onset>2020-01-01T00:00:00+00:00</onset>
+    <senderName>MeteoCore Test Weather Service</senderName>
+    <headline>Flood Warning for Helsinki region</headline>
+    <description>Heavy rainfall may cause flooding of low-lying areas.</description>
+    <instruction>Avoid riverbanks and move valuables to higher floors.</instruction>
+    <web>https://meteocore.example/alerts/helsinki-flood-1</web>
+    <area>
+      <areaDesc>Greater Helsinki</areaDesc>
+      <polygon>60.10,24.90 60.10,25.10 60.30,25.10 60.30,24.90 60.10,24.90</polygon>
+    </area>
+  </info>
+</alert>

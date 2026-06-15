@@ -1,0 +1,28 @@
+id = "cap-alerts"
+title = "CAP Emergency Alerts (demo)"
+description = "Common Alerting Protocol (CAP) v1.2 weather/emergency alert areas, served as Features and a severity-shaded map layer."
+engine_type = "cap"
+apis = ["features", "wms", "maps", "tiles"]
+keywords = ["alerts", "warnings", "CAP", "emergency"]
+
+[cap]
+# Local directory of CAP *.xml files (synthetic demo fixtures). Swap for a feed:
+#   feed_url = "https://feeds.meteoalarm.org/feeds/meteoalarm-legacy-atom-finland"
+#   # SSRF guard: entries off the feed's own origin are dropped unless listed here.
+#   feed_allowlist = ["https://cap.example.org/"]
+data_path = "testdata/cap"
+poll_interval_secs = 300
+# language = "en"            # which <info> translation to expose (default: first)
+status_filter = ["Actual"]   # drop Test/Exercise/Draft
+circle_segments = 64
+# default_ttl = "PT24H"      # validity when <expires> is absent
+
+# Geocode → geometry resolution. MeteoAlarm areas are geocode-only (EMMA_ID,
+# no inline polygon), so without this they have no map geometry / spatial extent.
+# `testdata/cap/emma-fi.geojson` maps EMMA_ID codes → zone polygons (Finland).
+# geocode_geometry = "testdata/cap/emma-fi.geojson"
+# geocode_property = "code"          # GeoJSON property holding the zone code
+# geocode_value_name = "EMMA_ID"     # CAP <geocode> valueName to resolve
+
+[wms]
+colormap = "cap_severity"    # Unknown→grey, Minor→green … Extreme→red

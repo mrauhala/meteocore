@@ -1,3 +1,5 @@
+use chrono::{DateTime, Utc};
+
 use crate::error::DataServerError;
 use crate::feature::{Feature, FeaturePage, FeatureQuery};
 
@@ -20,6 +22,15 @@ pub trait FeatureEngine: Send + Sync {
 
     /// Spatial extent as [west, south, east, north], if available.
     fn spatial_extent(&self) -> Option<[f64; 4]> {
+        None
+    }
+
+    /// Temporal extent `(start, end)` of the collection, if the features carry a
+    /// time dimension (e.g. CAP alert validity windows). Surfaced as the
+    /// `extent.temporal.interval` in the OGC API – Features collection metadata.
+    /// `None` (the default) means the collection has no temporal extent — per
+    /// OGC API – Common – Part 2, the element is then simply omitted.
+    fn temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
         None
     }
 

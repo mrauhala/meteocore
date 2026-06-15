@@ -39,6 +39,11 @@ pub enum BuiltinColormap {
     PrecipitationRate,
     /// Wind speed palette (calm green → yellow → orange → red ��� purple).
     WindSpeed,
+    /// CAP (Common Alerting Protocol) severity ramp. Integer severity codes
+    /// 0–4 → grey/green/yellow/orange/red with a semi-transparent alpha so the
+    /// alert fill overlays a basemap (Unknown=0, Minor=1, Moderate=2, Severe=3,
+    /// Extreme=4). Used by the `engine-cap` alert map layers (#396).
+    CapSeverity,
 }
 
 /// Lookup-table colormap. O(1) per pixel.
@@ -710,6 +715,28 @@ pub fn builtin_stops(builtin: &BuiltinColormap) -> Vec<ColorStop> {
                 color: [100, 0, 200, 255],
             }, // violet
         ],
+        BuiltinColormap::CapSeverity => vec![
+            ColorStop {
+                value: 0.0,
+                color: [120, 120, 120, 200],
+            }, // Unknown — grey
+            ColorStop {
+                value: 1.0,
+                color: [38, 166, 91, 200],
+            }, // Minor — green
+            ColorStop {
+                value: 2.0,
+                color: [241, 196, 15, 200],
+            }, // Moderate — yellow
+            ColorStop {
+                value: 3.0,
+                color: [230, 126, 34, 200],
+            }, // Severe — orange
+            ColorStop {
+                value: 4.0,
+                color: [192, 57, 43, 200],
+            }, // Extreme — red
+        ],
     }
 }
 
@@ -726,6 +753,7 @@ pub fn resolve_builtin(name: &str) -> Option<BuiltinColormap> {
         "precipitation" => Some(BuiltinColormap::Precipitation),
         "precipitation_rate" => Some(BuiltinColormap::PrecipitationRate),
         "wind_speed" => Some(BuiltinColormap::WindSpeed),
+        "cap_severity" => Some(BuiltinColormap::CapSeverity),
         _ => None,
     }
 }
@@ -743,6 +771,7 @@ pub fn builtin_names() -> &'static [&'static str] {
         "precipitation",
         "precipitation_rate",
         "wind_speed",
+        "cap_severity",
     ]
 }
 
@@ -797,6 +826,22 @@ mod tests {
         assert_eq!(cmap.color(Some(-10.0)), [0, 0, 0, 255]);
         // Above max should clamp to last color
         assert_eq!(cmap.color(Some(200.0)), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn test_cap_severity_ramp_resolves_and_colours_codes() {
+        let builtin = resolve_builtin("cap_severity").expect("cap_severity is a builtin");
+        // Severity codes 0..4 sit exactly on the stops, so a 0..4 LUT colours
+        // each code with its stop colour (no interpolation between codes).
+        let cmap = LutColorMap::from_builtin(builtin, 0.0, 4.0);
+        assert_eq!(cmap.color(Some(0.0)), [120, 120, 120, 200]); // Unknown
+        assert_eq!(cmap.color(Some(1.0)), [38, 166, 91, 200]); // Minor
+        assert_eq!(cmap.color(Some(2.0)), [241, 196, 15, 200]); // Moderate
+        assert_eq!(cmap.color(Some(3.0)), [230, 126, 34, 200]); // Severe
+        assert_eq!(cmap.color(Some(4.0)), [192, 57, 43, 200]); // Extreme
+                                                               // No alert (nodata) stays fully transparent.
+        assert_eq!(cmap.color(None), [0, 0, 0, 0]);
+        assert!(builtin_names().contains(&"cap_severity"));
     }
 
     #[test]

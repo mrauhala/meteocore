@@ -167,6 +167,8 @@ pub struct CollectionConfig {
     pub zarr: Option<ZarrConfig>,
     /// ODIM_H5 radar-specific configuration. Required when engine_type = "odim".
     pub odim: Option<OdimConfig>,
+    /// CAP alert-specific configuration. Required when engine_type = "cap".
+    pub cap: Option<CapConfig>,
     /// WMS map rendering configuration. Required when apis contains "wms".
     pub wms: Option<WmsConfig>,
     /// PostGIS-specific configuration. Required when engine_type = "postgis".
@@ -515,6 +517,92 @@ impl QueryDataConfig {
             max_runs: default_querydata_max_runs(),
         }
     }
+}
+
+fn default_cap_poll_interval() -> u64 {
+    300
+}
+
+fn default_circle_segments() -> u32 {
+    64
+}
+
+fn default_geocode_property() -> String {
+    "code".to_string()
+}
+
+fn default_status_filter() -> Vec<String> {
+    vec!["Actual".to_string()]
+}
+
+/// Configuration for the CAP (Common Alerting Protocol) v1.2 alert engine
+/// (`engine_type = "cap"`).
+///
+/// The source is **exactly one** of a local directory of CAP `.xml` files
+/// (`data_path`) or an Atom/RSS feed whose entries link to individual CAP
+/// documents (`feed_url`, the MeteoAlarm / US-NWS pattern). Each alert area
+/// becomes one OGC API Features feature and is rendered into the WMS/Maps/Tiles
+/// alert layer as a severity-shaded polygon. See the "CAP Engine Notes" section
+/// in `CLAUDE.md`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CapConfig {
+    /// Local directory of CAP `.xml` files. Mutually exclusive with `feed_url`.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub data_path: Option<String>,
+    /// Atom/RSS feed URL whose entries link to individual CAP documents.
+    /// Mutually exclusive with `data_path`; must be `http(s)`.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub feed_url: Option<String>,
+    /// Poll interval in seconds for re-scanning the directory / re-fetching the
+    /// feed. Default: 300.
+    #[serde(default = "default_cap_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// Which `<info>` language to expose when an alert carries multiple
+    /// translations (CAP `<info><language>`, a BCP 47 / RFC 3066 tag). When set,
+    /// the matching `<info>` is preferred; when absent or unmatched, the first
+    /// `<info>` is used. Empty string is rejected at config load.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub language: Option<String>,
+    /// CAP `<status>` values to serve (case-insensitive). Default `["Actual"]`,
+    /// dropping `Test`/`Exercise`/`Draft`/`System` alerts. An empty list serves
+    /// every status.
+    #[serde(default = "default_status_filter")]
+    pub status_filter: Vec<String>,
+    /// Validity window applied when an info has no `<expires>` — an ISO 8601
+    /// positive duration (e.g. `"PT24H"`, `"P1D"`) added to the onset/effective
+    /// time. When absent, a missing `<expires>` means open-ended (active until
+    /// superseded).
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub default_ttl: Option<String>,
+    /// Number of polygon vertices used to approximate a CAP `<circle>` as an
+    /// N-gon on the geodesic. Default: 64.
+    #[serde(default = "default_circle_segments")]
+    pub circle_segments: u32,
+    /// Optional GeoJSON `FeatureCollection` mapping zone codes → polygons, used
+    /// to give geometry to geocode-only areas (e.g. MeteoAlarm's EMMA_ID zones,
+    /// which carry no inline `<polygon>`). Without it such areas have null
+    /// geometry (listed in Features, absent from the map, no spatial extent).
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub geocode_geometry: Option<String>,
+    /// The GeoJSON feature property holding the zone code matched against CAP
+    /// `<geocode>` values. Default `"code"`.
+    #[serde(default = "default_geocode_property")]
+    pub geocode_property: String,
+    /// Restrict geocode resolution to CAP `<geocode>` entries with this
+    /// `<valueName>` (e.g. `"EMMA_ID"`); unset resolves against any geocode value.
+    #[serde(default, deserialize_with = "de_trimmed_opt_string")]
+    pub geocode_value_name: Option<String>,
+    /// SSRF guard for feed mode: extra URL **prefixes** an entry link may match
+    /// to be fetched, *in addition to* the feed's own origin (which is always
+    /// allowed). An entry link whose origin differs from the feed's and matches
+    /// no prefix here is dropped with a WARN — so a compromised feed cannot pivot
+    /// the server to `http://169.254.169.254/…` or any internal host. Mirrors the
+    /// GeoTIFF STAC `stac_asset_allowlist`. Each entry must be an `http(s)` URL
+    /// prefix **ending in `/`** (enforced at load) so a prefix can't widen — e.g.
+    /// `https://cdn/cap/` must not also admit `https://cdn/cap-staging/`. Empty
+    /// (default) ⇒ entry links must share the feed's origin.
+    #[serde(default)]
+    pub feed_allowlist: Vec<String>,
 }
 
 /// Configuration for the ODIM_H5 weather-radar engine
@@ -1804,6 +1892,120 @@ impl ServerConfig {
                 )));
             }
 
+            // CAP engine: requires [cap] section; source is data_path XOR feed_url.
+            if collection.engine_type == "cap" && collection.cap.is_none() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': engine_type 'cap' requires a [collections.cap] config section"
+                )));
+            }
+            if collection.cap.is_some() && collection.engine_type != "cap" {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': [collections.cap] is set but engine_type is '{}'",
+                    collection.engine_type
+                )));
+            }
+            if let Some(cap) = &collection.cap {
+                if cap.poll_interval_secs == 0 {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap poll_interval_secs must be > 0"
+                    )));
+                }
+
+                // Data source: exactly one of local `data_path` or `feed_url`
+                // (mirrors the geotiff/grib/zarr local-vs-remote mutual exclusion).
+                let has_local = cap.data_path.is_some();
+                let has_feed = cap.feed_url.is_some();
+                if has_local && has_feed {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap 'data_path' (local) is mutually exclusive with \
+                         'feed_url'"
+                    )));
+                }
+                if !has_local && !has_feed {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap requires either 'data_path' (local) or 'feed_url'"
+                    )));
+                }
+                if let Some(url) = &cap.feed_url {
+                    if !(url.starts_with("http://") || url.starts_with("https://")) {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': cap 'feed_url' must be an http(s) URL"
+                        )));
+                    }
+                }
+
+                // feed_allowlist entries (SSRF prefixes) must be http(s) and are
+                // meaningless without a feed source.
+                if !cap.feed_allowlist.is_empty() && cap.feed_url.is_none() {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap 'feed_allowlist' requires 'feed_url'"
+                    )));
+                }
+                for prefix in &cap.feed_allowlist {
+                    if !(prefix.starts_with("http://") || prefix.starts_with("https://")) {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': cap 'feed_allowlist' entries must be http(s) URL \
+                             prefixes"
+                        )));
+                    }
+                    // Require a trailing '/' so a prefix can't widen unexpectedly:
+                    // `https://cdn/cap` would also admit `https://cdn/cap-staging/…`,
+                    // letting a feed reach adjacent paths on a trusted host.
+                    if !prefix.ends_with('/') {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': cap 'feed_allowlist' entry '{prefix}' must end \
+                             with '/' (a path prefix) to avoid unintended prefix widening"
+                        )));
+                    }
+                }
+
+                // `language`, when present, must be a non-empty tag (trimmed at
+                // load, so an all-whitespace value arrives here as "").
+                if cap.language.as_deref() == Some("") {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap 'language' must not be empty"
+                    )));
+                }
+
+                // Each status filter entry must be non-empty (a blank entry can
+                // never match a CAP `<status>` and is almost certainly a typo).
+                if cap.status_filter.iter().any(|s| s.trim().is_empty()) {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap 'status_filter' must not contain empty strings"
+                    )));
+                }
+
+                // `default_ttl`, when present, must be a positive ISO 8601 duration.
+                if let Some(ttl) = &cap.default_ttl {
+                    crate::datetime::parse_iso8601_duration(ttl).map_err(|e| {
+                        crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': cap 'default_ttl' is not a valid positive ISO 8601 \
+                             duration: {e}"
+                        ))
+                    })?;
+                }
+
+                // A circle needs at least a triangle to have area.
+                if cap.circle_segments < 3 {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap 'circle_segments' must be >= 3"
+                    )));
+                }
+
+                // The geocode lookup property must be non-empty (it names the
+                // GeoJSON property holding the zone code).
+                if cap.geocode_geometry.is_some() && cap.geocode_property.trim().is_empty() {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap 'geocode_property' must not be empty"
+                    )));
+                }
+                if cap.geocode_value_name.as_deref() == Some("") {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': cap 'geocode_value_name' must not be empty"
+                    )));
+                }
+            }
+
             // style_bundle: reference must resolve, must not mix with inline WMS style fields
             if let Some(wms) = &collection.wms {
                 if let Some(bundle_ref) = &wms.style_bundle {
@@ -1962,6 +2164,126 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         collection_with(&format!(
             "engine_type = \"grib\"\n[collections.grib]\n{grib_body}"
         ))
+    }
+
+    fn cap_collection(cap_body: &str) -> ServerConfig {
+        collection_with(&format!(
+            "engine_type = \"cap\"\napis = [\"features\", \"wms\"]\n\
+             [collections.cap]\n{cap_body}"
+        ))
+    }
+
+    #[test]
+    fn cap_local_data_path_validates() {
+        let cfg = cap_collection("data_path = \"testdata/cap\"\n");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn cap_feed_url_validates() {
+        let cfg = cap_collection("feed_url = \"https://example.org/feed.atom\"\n");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn cap_rejects_both_sources() {
+        let cfg = cap_collection("data_path = \"x\"\nfeed_url = \"https://e/f\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cap_rejects_no_source() {
+        let cfg = cap_collection("language = \"en\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cap_rejects_non_http_feed() {
+        let cfg = cap_collection("feed_url = \"ftp://e/f\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cap_feed_allowlist_validates_and_requires_feed() {
+        // Valid http(s) prefixes alongside a feed.
+        let ok = cap_collection(
+            "feed_url = \"https://e/f\"\nfeed_allowlist = [\"https://cdn.example/cap/\"]\n",
+        );
+        assert!(ok.validate().is_ok());
+        // Non-http prefix rejected.
+        let bad = cap_collection("feed_url = \"https://e/f\"\nfeed_allowlist = [\"ftp://x/\"]\n");
+        assert!(bad.validate().is_err());
+        // Missing trailing slash rejected (prefix-widening guard).
+        let no_slash = cap_collection(
+            "feed_url = \"https://e/f\"\nfeed_allowlist = [\"https://cdn.example/cap\"]\n",
+        );
+        assert!(no_slash.validate().is_err());
+        // Allowlist without a feed is meaningless → rejected.
+        let no_feed = cap_collection("data_path = \"x\"\nfeed_allowlist = [\"https://cdn/\"]\n");
+        assert!(no_feed.validate().is_err());
+    }
+
+    #[test]
+    fn cap_rejects_empty_language() {
+        let cfg = cap_collection("data_path = \"x\"\nlanguage = \"  \"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cap_rejects_bad_ttl_and_small_circle() {
+        assert!(
+            cap_collection("data_path = \"x\"\ndefault_ttl = \"banana\"\n")
+                .validate()
+                .is_err()
+        );
+        assert!(cap_collection("data_path = \"x\"\ncircle_segments = 2\n")
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn cap_section_requires_cap_engine_type() {
+        // [collections.cap] present but engine_type defaults to csv → rejected.
+        let cfg = collection_with("[collections.cap]\ndata_path = \"x\"\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cap_engine_requires_cap_section() {
+        let cfg = collection_with("engine_type = \"cap\"\napis = [\"features\"]\n");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cap_defaults_parse() {
+        let cfg = cap_collection("data_path = \"testdata/cap\"\n");
+        let cap = cfg.collections[0].cap.as_ref().unwrap();
+        assert_eq!(cap.poll_interval_secs, 300);
+        assert_eq!(cap.circle_segments, 64);
+        assert_eq!(cap.status_filter, vec!["Actual".to_string()]);
+        assert!(cap.language.is_none());
+        assert_eq!(cap.geocode_property, "code");
+        assert!(cap.geocode_geometry.is_none());
+    }
+
+    #[test]
+    fn cap_geocode_fields_validate() {
+        let ok = cap_collection(
+            "data_path = \"x\"\ngeocode_geometry = \"emma.geojson\"\n\
+             geocode_property = \"code\"\ngeocode_value_name = \"EMMA_ID\"\n",
+        );
+        assert!(ok.validate().is_ok());
+        // Empty property / value_name rejected.
+        assert!(cap_collection(
+            "data_path = \"x\"\ngeocode_geometry = \"e.geojson\"\ngeocode_property = \"\"\n"
+        )
+        .validate()
+        .is_err());
+        assert!(
+            cap_collection("data_path = \"x\"\ngeocode_value_name = \"\"\n")
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

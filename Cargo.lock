@@ -1102,6 +1102,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-cap"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "chrono",
+ "ds-core",
+ "ds-render",
+ "ds-storage",
+ "quick-xml 0.37.5",
+ "rstar",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "engine-csv"
 version = "0.1.0"
 dependencies = [
@@ -4019,6 +4037,7 @@ dependencies = [
  "ds-core",
  "ds-mvt",
  "ds-render",
+ "engine-cap",
  "engine-csv",
  "engine-geojson",
  "engine-geotiff",

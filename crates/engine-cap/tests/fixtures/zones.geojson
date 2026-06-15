@@ -1,0 +1,9 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {"type":"Feature","properties":{"code":"FI801","name":"Selkameri","type":"EMMA_ID"},
+     "geometry":{"type":"Polygon","coordinates":[[[24.0,60.0],[25.0,60.0],[25.0,61.0],[24.0,61.0],[24.0,60.0]]]}},
+    {"type":"Feature","properties":{"code":"FI802","name":"Merenkurkku","type":"EMMA_ID"},
+     "geometry":{"type":"Polygon","coordinates":[[[20.0,62.0],[21.0,62.0],[21.0,63.0],[20.0,63.0],[20.0,62.0]]]}}
+  ]
+}

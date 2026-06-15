@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+  <identifier>urn:test:exercise-1</identifier>
+  <sender>test@meteocore.example</sender>
+  <sent>2020-01-01T00:00:00+00:00</sent>
+  <status>Test</status>
+  <msgType>Alert</msgType>
+  <scope>Public</scope>
+  <info>
+    <language>en-US</language>
+    <category>Met</category>
+    <event>Test Message — do not serve</event>
+    <urgency>Unknown</urgency>
+    <severity>Extreme</severity>
+    <certainty>Unknown</certainty>
+    <onset>2020-01-01T00:00:00+00:00</onset>
+    <area>
+      <areaDesc>Test area</areaDesc>
+      <polygon>60.10,24.90 60.10,25.10 60.30,25.10 60.30,24.90 60.10,24.90</polygon>
+    </area>
+  </info>
+</alert>

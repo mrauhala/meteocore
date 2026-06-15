@@ -992,6 +992,7 @@ mod tests {
             zarr_engines: RwLock::new(Vec::new()),
             odim_engines: RwLock::new(Vec::new()),
             odim_volume_engines: RwLock::new(Vec::new()),
+            cap_engines: RwLock::new(Vec::new()),
             postgis_engines: RwLock::new(Vec::new()),
             reload_lock: tokio::sync::Mutex::new(()),
             admin_token: None,
@@ -1014,6 +1015,7 @@ mod tests {
             grib: None,
             zarr: None,
             odim: None,
+            cap: None,
             postgis: None,
             preview: None,
         }

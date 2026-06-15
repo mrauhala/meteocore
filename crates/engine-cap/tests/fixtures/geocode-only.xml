@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+  <identifier>urn:test:geocode-only-1</identifier>
+  <sender>test@meteocore.example</sender>
+  <sent>2020-01-01T00:00:00+00:00</sent>
+  <status>Actual</status>
+  <msgType>Alert</msgType>
+  <scope>Public</scope>
+  <info>
+    <language>en-US</language>
+    <category>Met</category>
+    <event>Wind Advisory</event>
+    <urgency>Expected</urgency>
+    <severity>Minor</severity>
+    <certainty>Possible</certainty>
+    <onset>2020-01-01T00:00:00+00:00</onset>
+    <senderName>MeteoCore Test Weather Service</senderName>
+    <headline>Wind Advisory (zone-coded, no polygon)</headline>
+    <area>
+      <areaDesc>Zone FIC001</areaDesc>
+      <geocode>
+        <valueName>UGC</valueName>
+        <value>FIC001</value>
+      </geocode>
+    </area>
+  </info>
+</alert>

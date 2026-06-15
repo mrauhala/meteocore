@@ -84,6 +84,7 @@ fn make_collection(id: &str) -> CollectionConfig {
         grib: None,
         zarr: None,
         odim: None,
+        cap: None,
         postgis: None,
         preview: None,
     }

@@ -260,6 +260,7 @@ mod tests {
             zarr_engines: RwLock::new(result.zarr_engines),
             odim_engines: RwLock::new(result.odim_engines),
             odim_volume_engines: RwLock::new(result.odim_volume_engines),
+            cap_engines: RwLock::new(result.cap_engines),
             postgis_engines: RwLock::new(result.postgis_engines),
             reload_lock: tokio::sync::Mutex::new(()),
             admin_token: None,
