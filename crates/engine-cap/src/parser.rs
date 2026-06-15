@@ -278,18 +278,24 @@ fn parse_time(s: &str) -> Option<DateTime<Utc>> {
 /// polygon. The ring is closed defensively (first == last appended if missing),
 /// matching `ds_core::Geometry::Polygon`'s closed-ring expectation.
 pub fn parse_polygon(s: &str) -> Option<Vec<[f64; 2]>> {
-    // Single pass: reject (don't truncate into a wrong shape) once the count of
-    // *valid* vertices would exceed the cap.
+    // Single pass. An invalid vertex (out-of-range / NaN / malformed token) is a
+    // hard failure for the whole ring — dropping it would silently serve a
+    // *different* polygon than the alert specified. Same stance as the
+    // vertex-count cap: reject, don't reshape.
     let mut ring: Vec<[f64; 2]> = Vec::new();
     for pair in s.split_whitespace() {
-        if let Some(p) = parse_lat_lon(pair) {
-            if ring.len() >= MAX_POLYGON_VERTICES {
-                tracing::warn!(
-                    "cap: <polygon> exceeds {MAX_POLYGON_VERTICES} vertices — dropped (not truncated)"
-                );
+        if ring.len() >= MAX_POLYGON_VERTICES {
+            tracing::warn!(
+                "cap: <polygon> exceeds {MAX_POLYGON_VERTICES} vertices — dropped (not truncated)"
+            );
+            return None;
+        }
+        match parse_lat_lon(pair) {
+            Some(p) => ring.push(p),
+            None => {
+                tracing::warn!("cap: <polygon> has an invalid vertex '{pair}' — dropped");
                 return None;
             }
-            ring.push(p);
         }
     }
     // Need ≥3 distinct vertices for an area; close defensively.
@@ -411,9 +417,15 @@ mod tests {
 
     #[test]
     fn polygon_rejects_out_of_range_and_degenerate() {
-        // lat 200 is out of range → that pair is dropped, leaving < 3 → None.
+        // An invalid vertex rejects the WHOLE ring — never reshaped by dropping
+        // it. `91,24` (lat>90) among otherwise-valid vertices → None, not a
+        // 4-vertex polygon.
+        assert!(parse_polygon("91,24 60,25 61,25 61,24 60,24").is_none());
         assert!(parse_polygon("200,24 60,25").is_none());
         assert!(parse_polygon("60,24 60,25").is_none()); // only 2 vertices
+        assert!(parse_polygon("60,24 NaN,25 61,25 61,24 60,24").is_none()); // NaN token
+                                                                            // A fully-valid ring still parses.
+        assert!(parse_polygon("60,24 60,25 61,25 61,24 60,24").is_some());
     }
 
     #[test]

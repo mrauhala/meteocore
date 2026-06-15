@@ -698,8 +698,13 @@ return `RasterTile` domain types, colorization stays in the API layer.
   defensively; `<circle>` → an N-gon (`circle_segments`, default 64) on the
   geodesic via `destination_point`, carrying `radius_km` as a property.
 - **One Feature per `(alert, info, area)`**, id = `{identifier}.{infoIdx}.{areaIdx}`
-  (stable, URL-safe). Multiple `<info>` (languages) and multiple `<area>` per
-  info each fan out. `language` config keeps the matching `<info>`s
+  (stable, URL-safe). The emitted `Feature.id` is **percent-encoded** to a single
+  URL path segment (RFC 3986 pchar; `/`/`[`/`]`/space/non-ASCII escaped) so the
+  api-features verbatim self-link href routes — axum's `Path` extractor decodes it
+  back on `GET`. **A client building a URL from `Feature.id` must use it as-is,
+  not re-percent-encode it**; the raw CAP `<identifier>` is in
+  `properties.identifier`. For ordinary URN/dot ids the encoding is a no-op.
+  Multiple `<info>` (languages) and multiple `<area>` per info each fan out. `language` config keeps the matching `<info>`s
   (primary-subtag, case-insensitive), falling back to the first info if none
   match. `status_filter` (default `["Actual"]`) drops Test/Exercise/Draft at the
   alert level. **Geocode-only areas** (UGC/EMMA_ID/FIPS, no polygon/circle) get

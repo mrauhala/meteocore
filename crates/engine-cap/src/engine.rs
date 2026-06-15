@@ -375,7 +375,8 @@ impl MapEngine for CapEngine {
     }
 
     fn raster_info(&self) -> RasterInfo {
-        // O(1) clone of the prebuilt snapshot (#211).
+        // Cheap clone of the prebuilt snapshot — no recomputation (#211); the
+        // cost is O(times), bounded by the 256-entry TIME cap.
         (*self.snapshot().info).clone()
     }
 }
