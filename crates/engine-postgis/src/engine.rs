@@ -44,6 +44,11 @@ pub struct PostgisEngine {
     cache: Arc<MetadataCache>,
     /// Stops the background metadata-refresh loop on reload.
     shutdown_tx: watch::Sender<()>,
+    /// The version-0 receiver retained from `watch::channel`. `poll_loop` clones
+    /// this rather than calling `shutdown_tx.subscribe()` — a fresh `subscribe()`
+    /// starts at the channel's *current* version and would miss a `shutdown()`
+    /// that fired before the spawned loop began (a rapid-reload race).
+    shutdown_rx: watch::Receiver<()>,
 }
 
 impl std::fmt::Debug for PostgisEngine {
@@ -73,13 +78,14 @@ impl PostgisEngine {
             collection = %collection_id,
             "postgis engine: live health monitoring is not implemented (#110). /health reflects the boot-time status only; a DB failure after startup will NOT flip the collection to degraded (background metadata refresh keeps the last good snapshot)."
         );
-        let (shutdown_tx, _) = watch::channel(());
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
         Self {
             collection_id,
             config,
             pool,
             cache: Arc::new(MetadataCache::new_empty()),
             shutdown_tx,
+            shutdown_rx,
         }
     }
 
@@ -118,7 +124,10 @@ impl PostgisEngine {
     /// `shutdown()` is called on reload. The initial refresh already ran at
     /// construction, so the first tick is skipped.
     pub async fn poll_loop(&self) {
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        // Clone the retained version-0 receiver — NOT `subscribe()`, which would
+        // start at the channel's current version and miss a `shutdown()` that
+        // already fired before this loop ran (rapid-reload race).
+        let mut shutdown_rx = self.shutdown_rx.clone();
         let mut interval = tokio::time::interval(Duration::from_secs(
             self.config.metadata_refresh_secs.max(1),
         ));
