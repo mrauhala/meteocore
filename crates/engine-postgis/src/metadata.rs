@@ -24,8 +24,8 @@ use tokio_postgres::types::Type;
 use tokio_postgres::Row;
 
 use crate::config::{PostgisEngineConfig, ValidatedParameter};
-use crate::query::{build_locations, SqlParam};
-use crate::schema::ObservationSchema;
+use crate::query::{build_locations, build_locations_from_observations, SqlParam, MAX_LOCATIONS};
+use crate::schema::{LocationSource, ObservationSchema};
 
 #[derive(Debug, Error)]
 pub enum MetadataError {
@@ -137,7 +137,7 @@ impl MetadataCache {
         cfg: &PostgisEngineConfig,
         pool: &Pool,
     ) -> Result<(), MetadataError> {
-        let feature_stations = fetch_feature_stations(cfg, pool).await?;
+        let feature_stations = fetch_locations(cfg, pool).await?;
         let locations: Vec<Location> = feature_stations
             .iter()
             .map(FeatureStation::to_location)
@@ -205,10 +205,39 @@ fn spatial_extent_from(locations: &[Location]) -> Option<[f64; 4]> {
     }
 }
 
-async fn fetch_feature_stations(
+/// Build the cached location/feature set per the collection's
+/// [`LocationSource`]:
+/// - `Stations` — the stations table only (rich rows: label + properties).
+/// - `Observations` — derived from the observations table's geometry (mode A):
+///   one Point per distinct `station_fk`, `label = id`, no properties.
+/// - `StationsWithOrphans` — both, merged stations-first so a registered
+///   station always wins over an orphan with the same id (mode B).
+async fn fetch_locations(
     cfg: &PostgisEngineConfig,
     pool: &Pool,
 ) -> Result<Vec<FeatureStation>, MetadataError> {
+    match &cfg.location_source {
+        LocationSource::Stations(_) => fetch_station_rows(cfg, pool).await,
+        LocationSource::Observations => fetch_observation_rows(cfg, pool).await,
+        LocationSource::StationsWithOrphans(_) => {
+            let mut stations = fetch_station_rows(cfg, pool).await?;
+            let orphans = fetch_observation_rows(cfg, pool).await?;
+            merge_orphans(&mut stations, orphans);
+            Ok(stations)
+        }
+    }
+}
+
+/// Rich station rows from the stations table (`build_locations`), each carrying
+/// its `property_cols` coerced to [`PropertyValue`]. Only called for the
+/// `Stations` / `StationsWithOrphans` variants, so the mapping is always present.
+async fn fetch_station_rows(
+    cfg: &PostgisEngineConfig,
+    pool: &Pool,
+) -> Result<Vec<FeatureStation>, MetadataError> {
+    let stations = cfg.location_source.stations().ok_or_else(|| {
+        MetadataError::Decode("fetch_station_rows called without a stations table".into())
+    })?;
     let built = build_locations(cfg).map_err(|e| MetadataError::Decode(e.to_string()))?;
     let client = pool
         .get()
@@ -239,8 +268,8 @@ async fn fetch_feature_stations(
             .try_get("lon")
             .map_err(|e| MetadataError::Decode(e.to_string()))?;
 
-        let mut properties = HashMap::with_capacity(cfg.stations.property_cols.len());
-        for col_name in &cfg.stations.property_cols {
+        let mut properties = HashMap::with_capacity(stations.property_cols.len());
+        for col_name in &stations.property_cols {
             let value = decode_property_by_name(row, col_name)?;
             properties.insert(col_name.clone(), value);
         }
@@ -254,6 +283,86 @@ async fn fetch_feature_stations(
         });
     }
     Ok(out)
+}
+
+/// Locations derived from the observations table's own geometry
+/// (`build_locations_from_observations`). Orphans carry no station metadata:
+/// `label = id`, empty properties.
+async fn fetch_observation_rows(
+    cfg: &PostgisEngineConfig,
+    pool: &Pool,
+) -> Result<Vec<FeatureStation>, MetadataError> {
+    let built =
+        build_locations_from_observations(cfg).map_err(|e| MetadataError::Decode(e.to_string()))?;
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| MetadataError::Pool(e.to_string()))?;
+    let stmt = client
+        .prepare_cached(&built.sql)
+        .await
+        .map_err(|_| MetadataError::Db)?;
+    let param_refs = crate::query::params_as_refs(&built.params);
+    let rows = client
+        .query(&stmt, &param_refs)
+        .await
+        .map_err(|_| MetadataError::Db)?;
+
+    if rows.len() >= MAX_LOCATIONS {
+        tracing::warn!(
+            rows = rows.len(),
+            cap = MAX_LOCATIONS,
+            "postgis: observations-derived location list hit the {MAX_LOCATIONS} cap — some stations may be missing; narrow the data, add a stations table, or pre-materialize distinct locations"
+        );
+    }
+
+    let empty = Arc::new(HashMap::new());
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let id: String = row
+            .try_get("id")
+            .map_err(|e| MetadataError::Decode(e.to_string()))?;
+        let lat: f64 = row
+            .try_get("lat")
+            .map_err(|e| MetadataError::Decode(e.to_string()))?;
+        let lon: f64 = row
+            .try_get("lon")
+            .map_err(|e| MetadataError::Decode(e.to_string()))?;
+        out.push(FeatureStation {
+            id: id.clone(),
+            label: id,
+            lat,
+            lon,
+            properties: empty.clone(),
+        });
+    }
+    Ok(out)
+}
+
+/// Append orphan rows whose id is not already present among the (stations-first)
+/// list. A real station always wins over an orphan with the same id — defensive
+/// even though the obs-derived set and the stations set are disjoint by
+/// definition (a registered station is not an orphan); a poll-time race where a
+/// station was just inserted could otherwise surface both.
+///
+/// Each source query is independently capped at [`MAX_LOCATIONS`], so the merged
+/// set could reach `2 × MAX_LOCATIONS`. Re-cap (and WARN) so the in-memory set
+/// honours the same documented protective limit as the single-source paths.
+fn merge_orphans(stations: &mut Vec<FeatureStation>, orphans: Vec<FeatureStation>) {
+    let known: std::collections::HashSet<&str> = stations.iter().map(|s| s.id.as_str()).collect();
+    let fresh: Vec<FeatureStation> = orphans
+        .into_iter()
+        .filter(|o| !known.contains(o.id.as_str()))
+        .collect();
+    stations.extend(fresh);
+    if stations.len() > MAX_LOCATIONS {
+        tracing::warn!(
+            total = stations.len(),
+            cap = MAX_LOCATIONS,
+            "postgis: merged stations + orphans exceeds the {MAX_LOCATIONS} cap — truncating; narrow the data or pre-materialize distinct locations"
+        );
+        stations.truncate(MAX_LOCATIONS);
+    }
 }
 
 /// Coerce a column value to [`PropertyValue`] based on the column's
@@ -464,6 +573,46 @@ mod tests {
     fn build_station_idx_empty_returns_empty_map() {
         let idx = build_station_idx(&[]);
         assert!(idx.is_empty());
+    }
+
+    fn mk_fs(id: &str, lon: f64, lat: f64, label: &str, props: &[(&str, &str)]) -> FeatureStation {
+        let mut m = HashMap::new();
+        for (k, v) in props {
+            m.insert((*k).to_string(), PropertyValue::String((*v).to_string()));
+        }
+        FeatureStation {
+            id: id.into(),
+            label: label.into(),
+            lat,
+            lon,
+            properties: Arc::new(m),
+        }
+    }
+
+    #[test]
+    fn merge_orphans_appends_only_unknown_ids() {
+        // Registered station "reg" (rich props) + orphan "orphan" (no props).
+        let mut stations = vec![mk_fs("reg", 24.9, 60.2, "Helsinki", &[("territory", "FI")])];
+        let orphans = vec![
+            mk_fs("orphan", 18.9, 12.1, "orphan", &[]),
+            // Collides with the registered station — must NOT shadow it.
+            mk_fs("reg", 0.0, 0.0, "reg", &[]),
+        ];
+        merge_orphans(&mut stations, orphans);
+
+        assert_eq!(stations.len(), 2);
+        // The registered station kept its rich row (label + territory, original coords).
+        let reg = stations.iter().find(|s| s.id == "reg").unwrap();
+        assert_eq!(reg.label, "Helsinki");
+        assert_eq!(reg.lon, 24.9);
+        assert_eq!(
+            reg.properties.get("territory"),
+            Some(&PropertyValue::String("FI".into()))
+        );
+        // The genuine orphan appears with id-as-label and empty properties.
+        let orphan = stations.iter().find(|s| s.id == "orphan").unwrap();
+        assert_eq!(orphan.label, "orphan");
+        assert!(orphan.properties.is_empty());
     }
 
     #[test]

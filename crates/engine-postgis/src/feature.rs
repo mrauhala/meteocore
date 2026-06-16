@@ -139,6 +139,29 @@ mod tests {
     }
 
     #[test]
+    fn orphan_station_maps_to_feature_with_empty_properties() {
+        // Mode A/B orphans carry id-as-label and no properties; they must still
+        // produce a valid Point Feature.
+        let orphan = FeatureStation {
+            id: "0-148-0-CHD64901}".into(),
+            label: "0-148-0-CHD64901}".into(),
+            lat: 13.84,
+            lon: 20.85,
+            properties: Arc::new(HashMap::new()),
+        };
+        let f = station_to_feature(&orphan);
+        assert_eq!(f.id, "0-148-0-CHD64901}");
+        assert!(f.properties.is_empty());
+        match f.geometry.as_ref() {
+            Geometry::Point { x, y } => {
+                assert_eq!(*x, 20.85);
+                assert_eq!(*y, 13.84);
+            }
+            _ => panic!("expected Point"),
+        }
+    }
+
+    #[test]
     fn bbox_contains_filters_correctly() {
         let bbox = Bbox::new(0.0, 0.0, 10.0, 10.0).unwrap();
         assert!(bbox_contains(Some(&bbox), 5.0, 5.0));

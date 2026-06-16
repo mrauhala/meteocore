@@ -20,9 +20,7 @@ use chrono::{DateTime, Utc};
 use thiserror::Error;
 
 use crate::config::PostgisEngineConfig;
-use crate::schema::{
-    LongShape, ObservationSchema, PerParameterShape, QualifiedTable, StationsMapping, WideShape,
-};
+use crate::schema::{LongShape, ObservationSchema, PerParameterShape, QualifiedTable, WideShape};
 use crate::security::{quote_ident, QuoteError};
 
 /// Maximum rows returned by a locations list query. 50_001 covers the
@@ -54,6 +52,10 @@ pub enum BuildError {
     EmptyPolygonWkt,
     #[error("radius must be positive, got {0}")]
     InvalidRadius(f64),
+    #[error("this query requires a stations table, but the collection has none")]
+    NoStations,
+    #[error("observations-derived locations require an observations geometry column")]
+    NoObservationGeom,
 }
 
 /// Typed bind parameter. Kept as a small sum so unit tests can assert
@@ -122,7 +124,10 @@ impl BuiltQuery {
 /// (identifier whitelist is not applied to the WHERE body; see plan doc
 /// B3 "only pre-validated `stations.where`").
 pub fn build_locations(cfg: &PostgisEngineConfig) -> Result<BuiltQuery, BuildError> {
-    let s = &cfg.stations;
+    let s = cfg
+        .location_source
+        .stations()
+        .ok_or(BuildError::NoStations)?;
     let id = quote_ident(&s.id_col)?;
     let label = quote_ident(&s.label_col)?;
     let geom = quote_ident(&s.geom_col)?;
@@ -166,6 +171,82 @@ pub fn build_locations(cfg: &PostgisEngineConfig) -> Result<BuiltQuery, BuildErr
     Ok(BuiltQuery::new(sql, vec![]))
 }
 
+/// Derive the location list from the observations table(s)' own geometry —
+/// used when there is no stations table (mode A) or to fill orphan stations
+/// (mode B). Returns one row per distinct `station_fk` value with its coords;
+/// the caller assembles `label = id` and empty properties (orphans carry no
+/// station metadata).
+///
+/// `DISTINCT ON (<fk>)` picks one geometry per station — stations are assumed
+/// spatially stable; if a station's geometry ever drifts, the first row by
+/// `<fk>` wins. `WHERE <geom> IS NOT NULL` drops rows that cannot be placed.
+/// For `per_parameter` the per-table selects are `UNION`-ed (a station may
+/// report only some parameters) and collapsed by an outer `DISTINCT ON (id)`.
+/// Every result is capped at [`MAX_LOCATIONS`].
+pub fn build_locations_from_observations(
+    cfg: &PostgisEngineConfig,
+) -> Result<BuiltQuery, BuildError> {
+    match &cfg.observations {
+        ObservationSchema::Long(l) => {
+            let geom = l.geom_col.as_deref().ok_or(BuildError::NoObservationGeom)?;
+            let mut sql = obs_locations_select(&l.table, &l.station_fk_col, geom)?;
+            sql.push_str(&format!(" LIMIT {MAX_LOCATIONS}"));
+            Ok(BuiltQuery::new(sql, vec![]))
+        }
+        ObservationSchema::Wide(w) => {
+            let geom = w.geom_col.as_deref().ok_or(BuildError::NoObservationGeom)?;
+            let mut sql = obs_locations_select(&w.table, &w.station_fk_col, geom)?;
+            sql.push_str(&format!(" LIMIT {MAX_LOCATIONS}"));
+            Ok(BuiltQuery::new(sql, vec![]))
+        }
+        ObservationSchema::PerParameter(pp) => {
+            let mut branches = Vec::with_capacity(pp.tables.len());
+            for t in &pp.tables {
+                let geom = t.geom_col.as_deref().ok_or(BuildError::NoObservationGeom)?;
+                // Parenthesised so each branch keeps its own DISTINCT ON/ORDER BY.
+                let inner = obs_locations_select(&t.table, &t.station_fk_col, geom)?;
+                branches.push(format!("({inner})"));
+            }
+            let unioned = branches.join(" UNION ");
+            // Outer DISTINCT ON (id) collapses the union; SELECT kept in a plain
+            // literal (tripwire) and `unioned` interpolated via format! (not a
+            // bare push_str arg). FROM/UNION are not flagged verbs.
+            let mut sql = String::from("SELECT ");
+            sql.push_str(&format!(
+                "DISTINCT ON (id) id, lat, lon \
+                 FROM ({unioned}) u \
+                 ORDER BY id LIMIT {MAX_LOCATIONS}"
+            ));
+            Ok(BuiltQuery::new(sql, vec![]))
+        }
+    }
+}
+
+/// One observations-derived `(id, lat, lon)` select for a single table, ending
+/// at its `ORDER BY <fk>` (required by `DISTINCT ON`). No outer LIMIT — the
+/// caller appends it (single table) or wraps the select in a UNION (per_parameter).
+fn obs_locations_select(
+    table: &QualifiedTable,
+    station_fk_col: &str,
+    geom_col: &str,
+) -> Result<String, BuildError> {
+    let table_fq = fq_table(table)?;
+    let fk = quote_ident(station_fk_col)?;
+    let geom = quote_ident(geom_col)?;
+    // SELECT kept in a plain literal; the format! template below interpolates
+    // only already-quoted identifiers and contains no flagged SQL verb.
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!(
+        "DISTINCT ON ({fk}) {fk}::text AS id, \
+         ST_Y({geom}) AS lat, \
+         ST_X({geom}) AS lon \
+         FROM {table_fq} \
+         WHERE {geom} IS NOT NULL \
+         ORDER BY {fk}"
+    ));
+    Ok(sql)
+}
+
 // ─── position (nearest station) ────────────────────────────────────────────
 
 /// Nearest station within `radius_m` metres of `(lon, lat)`. Used to turn
@@ -179,7 +260,10 @@ pub fn build_position(
     if !radius_m.is_finite() || radius_m <= 0.0 {
         return Err(BuildError::InvalidRadius(radius_m));
     }
-    let s = &cfg.stations;
+    let s = cfg
+        .location_source
+        .stations()
+        .ok_or(BuildError::NoStations)?;
     let id = quote_ident(&s.id_col)?;
     let label = quote_ident(&s.label_col)?;
     let geom = quote_ident(&s.geom_col)?;
@@ -234,7 +318,10 @@ pub fn build_stations_in_polygon(
     if polygon_wkt.trim().is_empty() {
         return Err(BuildError::EmptyPolygonWkt);
     }
-    let s = &cfg.stations;
+    let s = cfg
+        .location_source
+        .stations()
+        .ok_or(BuildError::NoStations)?;
     let id = quote_ident(&s.id_col)?;
     let label = quote_ident(&s.label_col)?;
     let geom = quote_ident(&s.geom_col)?;
@@ -303,7 +390,7 @@ pub fn build_location(
             Ok(vec![q])
         }
         ObservationSchema::Wide(w) => {
-            let q = build_location_wide(w, &cfg.stations, station_id, time_range, &effective)?;
+            let q = build_location_wide(w, station_id, time_range, &effective)?;
             Ok(vec![q])
         }
         ObservationSchema::PerParameter(pp) => {
@@ -360,7 +447,6 @@ fn build_location_long(
 
 fn build_location_wide(
     shape: &WideShape,
-    _stations: &StationsMapping,
     station_id: &str,
     time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
@@ -508,8 +594,8 @@ mod tests {
     use super::*;
     use crate::config::ValidatedParameter;
     use crate::schema::{
-        LongShape, ObservationSchema, PerParameterShape, PerParameterTable, QualifiedTable,
-        StationsMapping, WideShape,
+        LocationSource, LongShape, ObservationSchema, PerParameterShape, PerParameterTable,
+        QualifiedTable, StationsMapping, WideShape,
     };
     use chrono::TimeZone;
 
@@ -558,9 +644,23 @@ mod tests {
             pool_size: 4,
             pool_label: None,
             metadata_refresh_secs: 300,
-            stations,
+            location_source: LocationSource::Stations(stations),
             observations,
             parameters,
+        }
+    }
+
+    /// A config with no stations table (`LocationSource::Observations`, mode A).
+    fn mk_cfg_obs_only(observations: ObservationSchema) -> PostgisEngineConfig {
+        PostgisEngineConfig {
+            dsn: "postgres://test@localhost/x".into(),
+            dsn_was_literal: false,
+            pool_size: 4,
+            pool_label: None,
+            metadata_refresh_secs: 300,
+            location_source: LocationSource::Observations,
+            observations,
+            parameters: vec![param("t2m", "t", "°C", "t2m", "t2m")],
         }
     }
 
@@ -684,6 +784,96 @@ mod tests {
         let cfg = long_cfg();
         let q = build_locations(&cfg).unwrap();
         assert!(q.sql.contains(" WHERE active = true"));
+    }
+
+    #[test]
+    fn obs_locations_per_parameter_unions_and_distincts() {
+        let cfg = nexus_per_parameter_cfg(); // both tables carry geom_col
+        let q = build_locations_from_observations(&cfg).unwrap();
+        assert!(q.params.is_empty());
+        // Each branch is a DISTINCT ON (fk) select with a null-geom filter.
+        assert!(q.sql.contains("DISTINCT ON (\"wigos_id\")"));
+        assert!(q.sql.contains("ST_Y(\"the_geom\")"));
+        assert!(q.sql.contains("ST_X(\"the_geom\")"));
+        assert!(q.sql.contains("WHERE \"the_geom\" IS NOT NULL"));
+        // Union across both per-parameter tables.
+        assert!(q.sql.contains("FROM \"public\".\"airtemperature\""));
+        assert!(q.sql.contains("FROM \"public\".\"wind_speed\""));
+        assert!(q.sql.contains(" UNION "));
+        // Outer collapse by id + the row cap.
+        assert!(q.sql.contains("DISTINCT ON (id)"));
+        assert!(q.sql.contains(&format!("LIMIT {MAX_LOCATIONS}")));
+        // Orphans carry no station metadata columns.
+        assert!(!q.sql.contains("\"territory\""));
+        assert!(!q.sql.contains("AS label"));
+    }
+
+    #[test]
+    fn obs_locations_long_distinct_on_fk_quotes_and_caps() {
+        let cfg = mk_cfg(
+            StationsMapping {
+                table: public("stations"),
+                id_col: "wigos_id".into(),
+                label_col: "name".into(),
+                geom_col: "the_geom".into(),
+                property_cols: vec![],
+                where_clause: None,
+            },
+            ObservationSchema::Long(LongShape {
+                table: public("obs"),
+                station_fk_col: "wigos_id".into(),
+                time_col: "time".into(),
+                time_col_tz: None,
+                param_col: "param".into(),
+                value_col: "value".into(),
+                geom_col: Some("the_geom".into()),
+            }),
+            vec![param("t2m", "t", "°C", "t2m", "t2m")],
+        );
+        let q = build_locations_from_observations(&cfg).unwrap();
+        assert!(q.sql.starts_with("SELECT DISTINCT ON (\"wigos_id\")"));
+        assert!(q.sql.contains("\"wigos_id\"::text AS id"));
+        assert!(q.sql.contains("WHERE \"the_geom\" IS NOT NULL"));
+        assert!(q
+            .sql
+            .contains(&format!("ORDER BY \"wigos_id\" LIMIT {MAX_LOCATIONS}")));
+        assert!(!q.sql.contains(" UNION "));
+    }
+
+    #[test]
+    fn obs_locations_errors_without_geom() {
+        let cfg = long_cfg(); // LongShape.geom_col == None
+        let err = build_locations_from_observations(&cfg).unwrap_err();
+        assert!(matches!(err, BuildError::NoObservationGeom));
+    }
+
+    #[test]
+    fn station_builders_error_without_stations_table() {
+        // A LocationSource::Observations cfg has no stations mapping — the
+        // station-only builders must surface NoStations rather than panic.
+        let cfg = mk_cfg_obs_only(ObservationSchema::Long(LongShape {
+            table: public("obs"),
+            station_fk_col: "wigos_id".into(),
+            time_col: "time".into(),
+            time_col_tz: None,
+            param_col: "param".into(),
+            value_col: "value".into(),
+            geom_col: Some("the_geom".into()),
+        }));
+        assert!(matches!(
+            build_locations(&cfg).unwrap_err(),
+            BuildError::NoStations
+        ));
+        assert!(matches!(
+            build_position(&cfg, 24.9, 60.2, 5000.0).unwrap_err(),
+            BuildError::NoStations
+        ));
+        assert!(matches!(
+            build_stations_in_polygon(&cfg, "POLYGON((0 0,1 0,1 1,0 1,0 0))").unwrap_err(),
+            BuildError::NoStations
+        ));
+        // ...but the observations-derived builder works in this mode.
+        assert!(build_locations_from_observations(&cfg).is_ok());
     }
 
     #[test]

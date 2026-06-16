@@ -898,7 +898,12 @@ pub struct PostgisConfig {
     pub pool_label: Option<String>,
     /// Metadata cache refresh cadence. Default 300 s.
     pub metadata_refresh_secs: Option<u64>,
-    pub stations: PostgisStationsConfig,
+    /// Optional stations table. When absent (mode A), or present but with a
+    /// resolvable `observations.geom_col` (mode B, orphan fallback), location
+    /// coordinates are derived from the observations table's own geometry —
+    /// see [`PostgisObservationsConfig::obs_geom_available`].
+    #[serde(default)]
+    pub stations: Option<PostgisStationsConfig>,
     pub observations: PostgisObservationsConfig,
     #[serde(default)]
     pub parameters: Vec<PostgisParameterConfig>,
@@ -947,6 +952,27 @@ pub struct PostgisObservationsConfig {
     /// `per_parameter` shape: one entry per parameter → table mapping.
     #[serde(default)]
     pub tables: Vec<PostgisObservationTable>,
+}
+
+impl PostgisObservationsConfig {
+    /// Whether the observations side carries a resolvable geometry column for
+    /// every queried table — the precondition for deriving locations from the
+    /// observations table (modes A and B). For `long`/`wide` this is just
+    /// `geom_col`; for `per_parameter` every `[[tables]]` entry must resolve a
+    /// geom (its own `geom_col`, else the inherited `observations.geom_col`).
+    pub fn obs_geom_available(&self) -> bool {
+        match self.shape.as_str() {
+            "per_parameter" => {
+                !self.tables.is_empty()
+                    && self
+                        .tables
+                        .iter()
+                        .all(|t| t.geom_col.is_some() || self.geom_col.is_some())
+            }
+            // long / wide (and any not-yet-validated shape): single table.
+            _ => self.geom_col.is_some(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1093,30 +1119,40 @@ fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::D
         }
     }
 
-    // -- stations ---------------------------------------------------------
-    let s = &cfg.stations;
-    validate_qualified_table(&s.table)
-        .map_err(|e| Config(format!("Collection '{id}': stations.table: {e}")))?;
-    for (field, value) in [
-        ("id_col", &s.id_col),
-        ("label_col", &s.label_col),
-        ("geom_col", &s.geom_col),
-    ] {
-        if !is_valid_sql_identifier(value) {
-            return Err(Config(format!(
-                "Collection '{id}': stations.{field} '{value}' is not a valid SQL identifier"
-            )));
+    // -- stations (optional) ----------------------------------------------
+    // The stations table may be omitted entirely (mode A): locations are then
+    // derived from the observations table's own geometry. When present, all
+    // identifiers are validated exactly as before.
+    if let Some(s) = &cfg.stations {
+        validate_qualified_table(&s.table)
+            .map_err(|e| Config(format!("Collection '{id}': stations.table: {e}")))?;
+        for (field, value) in [
+            ("id_col", &s.id_col),
+            ("label_col", &s.label_col),
+            ("geom_col", &s.geom_col),
+        ] {
+            if !is_valid_sql_identifier(value) {
+                return Err(Config(format!(
+                    "Collection '{id}': stations.{field} '{value}' is not a valid SQL identifier"
+                )));
+            }
         }
-    }
-    for (i, col) in s.property_cols.iter().enumerate() {
-        if !is_valid_sql_identifier(col) {
-            return Err(Config(format!(
-                "Collection '{id}': stations.property_cols[{i}] '{col}' is not a valid SQL identifier"
-            )));
+        for (i, col) in s.property_cols.iter().enumerate() {
+            if !is_valid_sql_identifier(col) {
+                return Err(Config(format!(
+                    "Collection '{id}': stations.property_cols[{i}] '{col}' is not a valid SQL identifier"
+                )));
+            }
         }
-    }
-    if let Some(w) = s.where_clause.as_deref() {
-        validate_stations_where_clause(id, w)?;
+        if let Some(w) = s.where_clause.as_deref() {
+            validate_stations_where_clause(id, w)?;
+        }
+    } else if !cfg.observations.obs_geom_available() {
+        // No stations table AND no resolvable observations geometry — there is
+        // no way to place any location. Reject with an actionable message.
+        return Err(Config(format!(
+            "Collection '{id}': no [postgis.stations] table and no resolvable observations geometry — set observations.geom_col (per_parameter: on every table or as the shared default) or add a [postgis.stations] table"
+        )));
     }
 
     // -- observations (shape-dependent) -----------------------------------
@@ -3308,6 +3344,92 @@ engine_type = "postgis"
             .to_string();
         assert!(
             err.contains("requires a [collections.postgis]"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn postgis_stations_optional_with_obs_geom_ok() {
+        // Mode A: no [postgis.stations] block, but the per_parameter tables
+        // carry a shared `geom_col` — locations are derived from observations.
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "obs"
+title = "Obs"
+description = "Obs"
+engine_type = "postgis"
+apis = ["edr", "features"]
+
+[collections.postgis]
+dsn_env = "OBS_DSN"
+
+[collections.postgis.observations]
+shape = "per_parameter"
+station_fk_col = "wigos_id"
+time_col = "time"
+time_col_tz = "UTC"
+value_col = "value"
+geom_col = "the_geom"
+
+[[collections.postgis.observations.tables]]
+parameter = "t2m"
+table = "public.airtemperature"
+
+[[collections.postgis.parameters]]
+name = "t2m"
+label = "2 m air temperature"
+unit = "degC"
+"#;
+        let path = write_config(tmp.path(), "config.toml", toml);
+        let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        let pg = config.collections[0].postgis.as_ref().unwrap();
+        assert!(pg.stations.is_none());
+        assert!(pg.observations.obs_geom_available());
+    }
+
+    #[test]
+    fn postgis_no_stations_no_geom_rejected() {
+        // No stations table AND no observations geometry → cannot place any
+        // location → hard config error.
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "obs"
+title = "Obs"
+description = "Obs"
+engine_type = "postgis"
+
+[collections.postgis]
+dsn_env = "OBS_DSN"
+
+[collections.postgis.observations]
+shape = "long"
+table = "public.obs"
+station_fk_col = "station_id"
+time_col = "time"
+param_col = "param"
+value_col = "value"
+
+[[collections.postgis.parameters]]
+name = "t2m"
+label = "T"
+unit = "degC"
+"#;
+        let path = write_config(tmp.path(), "config.toml", toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no [postgis.stations]") && err.contains("observations geometry"),
             "got: {err}"
         );
     }

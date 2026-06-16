@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
+use ds_core::feature::Bbox;
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
 };
@@ -177,7 +178,22 @@ impl EdrEngine for PostgisEngine {
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let (lon, lat) = parse_coords(coords)?;
-        let station_id = resolve_nearest_station(&self.pool, &self.config, lon, lat)?;
+        // Observations-derived modes (A/B) resolve the nearest station in-memory
+        // from the cached location set — a scan over a few thousand points is
+        // far cheaper than a spatial query over the multi-million-row obs
+        // hypertable, and it sees orphans uniformly. Stations-only mode keeps
+        // the live `ST_DWithin` path.
+        let station_id = if self.config.location_source.uses_observations() {
+            nearest_in_memory(&self.load_meta(), lon, lat, DEFAULT_POSITION_RADIUS_M).ok_or_else(
+                || {
+                    DataServerError::LocationNotFound(format!(
+                        "no station within {DEFAULT_POSITION_RADIUS_M:.0} m of ({lon}, {lat})"
+                    ))
+                },
+            )?
+        } else {
+            resolve_nearest_station(&self.pool, &self.config, lon, lat)?
+        };
         self.query_location(&station_id, datetime, parameters, z, reference_time)
     }
 
@@ -189,11 +205,25 @@ impl EdrEngine for PostgisEngine {
         _z: Option<&[f64]>,
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
-        let polygon_wkt = normalize_area_wkt(coords)?;
         let source_keys = resolve_source_keys(&self.config, parameters)?;
         let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
 
-        let stations = run_stations_in_polygon_sync(&self.pool, &self.config, &polygon_wkt)?;
+        // Observations-derived modes (A/B) select stations in-memory from the
+        // cached set using the area's bounding box (a superset of exact
+        // `ST_Within` — documented v1 simplification). Stations-only mode keeps
+        // the live `ST_Within` prefilter.
+        let stations = if self.config.location_source.uses_observations() {
+            let bbox = area_to_bbox(coords)?;
+            let meta = self.load_meta();
+            meta.locations
+                .iter()
+                .filter(|l| bbox.contains(l.longitude, l.latitude))
+                .cloned()
+                .collect::<Vec<Location>>()
+        } else {
+            let polygon_wkt = normalize_area_wkt(coords)?;
+            run_stations_in_polygon_sync(&self.pool, &self.config, &polygon_wkt)?
+        };
         if stations.is_empty() {
             return Ok(CoverageResponse::Collection(vec![]));
         }
@@ -382,6 +412,95 @@ fn resolve_nearest_station(
             .map_err(|e| DataServerError::Engine(format!("decode station id: {e}")))?;
         Ok(id)
     })
+}
+
+// ─── in-memory station selection (observations-derived modes) ──────────────
+
+/// Nearest cached location to `(lon, lat)` within `radius_m` metres, by
+/// great-circle distance. Used by `query_position` in the observations-derived
+/// modes (A/B) — a linear scan over the cached set (a few thousand points)
+/// instead of a spatial query against the obs hypertable. Returns the
+/// location id, or `None` when nothing is in range.
+fn nearest_in_memory(meta: &CollectionMeta, lon: f64, lat: f64, radius_m: f64) -> Option<String> {
+    let mut best: Option<(f64, &str)> = None;
+    for loc in meta.locations.iter() {
+        let d = haversine_m(lat, lon, loc.latitude, loc.longitude);
+        if d <= radius_m && best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, loc.id.as_str()));
+        }
+    }
+    best.map(|(_, id)| id.to_string())
+}
+
+/// Great-circle distance in metres (haversine). Mirrors PostGIS
+/// `ST_Distance(::geography)` closely enough for nearest-station selection
+/// (both are great-circle; not byte-identical).
+fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_RADIUS_M: f64 = 6_371_000.0;
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * EARTH_RADIUS_M * a.sqrt().atan2((1.0 - a).sqrt())
+}
+
+/// Reduce an EDR area `coords` value (a `west,south,east,north` bbox string or
+/// a `POLYGON((...))` WKT, CRS84 lon/lat) to its bounding box. For a true
+/// polygon this returns the enclosing box — the documented bbox-superset
+/// behavior of the observations-derived area path. Antimeridian-crossing
+/// polygons are not special-cased (v1).
+fn area_to_bbox(coords: &str) -> Result<Bbox, DataServerError> {
+    let s = coords.trim();
+    let invalid = |m: String| {
+        DataServerError::InvalidParameter(format!("cannot parse area coordinates: {m}"))
+    };
+    let is_polygon = s
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("POLYGON"));
+    if !is_polygon {
+        let parts: Vec<&str> = s.split(',').collect();
+        if parts.len() == 4 {
+            if let Ok(v) = parts
+                .iter()
+                .map(|p| p.trim().parse::<f64>())
+                .collect::<Result<Vec<_>, _>>()
+            {
+                return Bbox::new(v[0], v[1], v[2], v[3])
+                    .map_err(|e| DataServerError::InvalidParameter(format!("invalid bbox: {e}")));
+            }
+        }
+        return Err(invalid(s.to_string()));
+    }
+    // POLYGON WKT: collect every numeric token (lon lat pairs), take min/max.
+    let mut nums: Vec<f64> = Vec::new();
+    for tok in s.split(|c: char| c == '(' || c == ')' || c == ',' || c.is_whitespace()) {
+        let t = tok.trim();
+        if t.is_empty() || t.eq_ignore_ascii_case("POLYGON") {
+            continue;
+        }
+        nums.push(
+            t.parse::<f64>()
+                .map_err(|_| invalid(format!("bad coordinate '{t}'")))?,
+        );
+    }
+    if nums.len() < 8 || !nums.len().is_multiple_of(2) {
+        return Err(invalid("polygon needs at least 4 coordinate pairs".into()));
+    }
+    let (mut w, mut so, mut e, mut n) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for pair in nums.chunks_exact(2) {
+        let (lon, lat) = (pair[0], pair[1]);
+        w = w.min(lon);
+        e = e.max(lon);
+        so = so.min(lat);
+        n = n.max(lat);
+    }
+    Bbox::new(w, so, e, n)
+        .map_err(|e| DataServerError::InvalidParameter(format!("invalid polygon bbox: {e}")))
 }
 
 fn map_pg_error(e: tokio_postgres::Error, q: &BuiltQuery) -> DataServerError {
@@ -832,7 +951,7 @@ mod tests {
             pool_size: 4,
             pool_label: None,
             metadata_refresh_secs: 300,
-            stations: dummy_stations(),
+            location_source: crate::schema::LocationSource::Stations(dummy_stations()),
             observations: dummy_long_obs(),
             parameters: vec![
                 ValidatedParameter {
@@ -858,6 +977,91 @@ mod tests {
         assert_eq!(keys, vec!["TEMP"]);
 
         assert!(resolve_source_keys(&cfg, Some(&["unknown".into()])).is_err());
+    }
+
+    fn meta_with(locations: Vec<Location>) -> CollectionMeta {
+        let stations: Vec<crate::metadata::FeatureStation> = locations
+            .iter()
+            .map(|l| crate::metadata::FeatureStation {
+                id: l.id.clone(),
+                label: l.label.clone(),
+                lat: l.latitude,
+                lon: l.longitude,
+                properties: std::sync::Arc::new(HashMap::new()),
+            })
+            .collect();
+        let station_idx: HashMap<String, usize> = locations
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (l.id.clone(), i))
+            .collect();
+        CollectionMeta {
+            feature_stations: std::sync::Arc::new(stations),
+            locations: std::sync::Arc::new(locations),
+            station_idx: std::sync::Arc::new(station_idx),
+            parameters: std::sync::Arc::new(HashMap::new()),
+            temporal_extent: None,
+            spatial_extent: None,
+            version: 1,
+        }
+    }
+
+    fn loc(id: &str, lon: f64, lat: f64) -> Location {
+        Location {
+            id: id.into(),
+            label: id.into(),
+            latitude: lat,
+            longitude: lon,
+        }
+    }
+
+    #[test]
+    fn nearest_in_memory_returns_closest_within_radius() {
+        let meta = meta_with(vec![
+            loc("helsinki", 24.94, 60.17),
+            loc("espoo", 24.66, 60.21),
+            loc("tampere", 23.76, 61.50),
+        ]);
+        // A point right next to Helsinki resolves to Helsinki.
+        let id = nearest_in_memory(&meta, 24.95, 60.16, 25_000.0).unwrap();
+        assert_eq!(id, "helsinki");
+    }
+
+    #[test]
+    fn nearest_in_memory_none_when_all_outside_radius() {
+        let meta = meta_with(vec![loc("tampere", 23.76, 61.50)]);
+        // ~250 km away with a 25 km radius → nothing in range.
+        assert!(nearest_in_memory(&meta, 24.95, 60.16, 25_000.0).is_none());
+    }
+
+    #[test]
+    fn area_to_bbox_parses_bbox_string() {
+        let b = area_to_bbox("10,40,30,50").unwrap();
+        assert_eq!((b.west, b.south, b.east, b.north), (10.0, 40.0, 30.0, 50.0));
+        assert!(b.contains(20.0, 45.0));
+        assert!(!b.contains(35.0, 45.0));
+    }
+
+    #[test]
+    fn area_to_bbox_reduces_polygon_to_bounding_box() {
+        // Triangle — bbox is its enclosing rectangle.
+        let b = area_to_bbox("POLYGON((0 0,10 0,5 8,0 0))").unwrap();
+        assert_eq!((b.west, b.south, b.east, b.north), (0.0, 0.0, 10.0, 8.0));
+        assert!(b.contains(5.0, 4.0));
+        assert!(!b.contains(20.0, 4.0));
+        // Case-insensitive WKT keyword.
+        let lc = area_to_bbox("polygon((0 0,10 0,5 8,0 0))").unwrap();
+        assert_eq!(
+            (lc.west, lc.south, lc.east, lc.north),
+            (0.0, 0.0, 10.0, 8.0)
+        );
+    }
+
+    #[test]
+    fn area_to_bbox_rejects_garbage() {
+        assert!(area_to_bbox("nonsense").is_err());
+        assert!(area_to_bbox("1,2,3").is_err());
+        assert!(area_to_bbox("POLYGON((0 0,1 1))").is_err()); // <4 pairs
     }
 
     fn dummy_stations() -> crate::schema::StationsMapping {
