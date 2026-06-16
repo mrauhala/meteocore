@@ -78,13 +78,23 @@ impl Health {
         self.probed.load(Ordering::Acquire).then(|| self.status())
     }
 
-    /// Record a `SELECT 1` ping outcome (the `/health` authority).
-    pub fn record_ping(&self, ok: bool) {
+    /// Record a `SELECT 1` ping outcome (the `/health` authority). Returns
+    /// `Some(new_status)` when reachability *changed* (a transition worth
+    /// logging), else `None`. The first ping reports a transition only if it
+    /// differs from the optimistic `true` seed (i.e. boot found the DB down).
+    pub fn record_ping(&self, ok: bool) -> Option<HealthStatus> {
         if !ok {
             self.ping_failures.fetch_add(1, Ordering::Relaxed);
         }
-        self.db_reachable.store(ok, Ordering::Release);
+        // `db_reachable` (Release) before `probed` (Release): an Acquire load of
+        // `probed == true` then guarantees the `db_reachable` write is visible.
+        let prev = self.db_reachable.swap(ok, Ordering::Release);
         self.probed.store(true, Ordering::Release);
+        (prev != ok).then_some(if ok {
+            HealthStatus::Ready
+        } else {
+            HealthStatus::Degraded
+        })
     }
 
     /// Record a metadata-refresh outcome + duration (metrics only — a refresh
@@ -104,6 +114,7 @@ impl Health {
     /// Snapshot for the `/metrics` scrape.
     pub fn snapshot(&self) -> HealthSnapshot {
         HealthSnapshot {
+            probed: self.probed.load(Ordering::Acquire),
             status: self.status(),
             ping_failures: self.ping_failures.load(Ordering::Relaxed),
             refresh_total: self.refresh_total.load(Ordering::Relaxed),
@@ -116,6 +127,8 @@ impl Health {
 /// Point-in-time view of [`Health`] for the `/metrics` handler.
 #[derive(Clone, Copy, Debug)]
 pub struct HealthSnapshot {
+    /// Whether the first ping has run — `status` is only authoritative if true.
+    pub probed: bool,
     pub status: HealthStatus,
     pub ping_failures: u64,
     pub refresh_total: u64,
@@ -141,6 +154,15 @@ mod tests {
         assert_eq!(h.live_status(), Some(HealthStatus::Ready));
         h.record_ping(false);
         assert_eq!(h.live_status(), Some(HealthStatus::Degraded));
+    }
+
+    #[test]
+    fn record_ping_reports_transitions_only() {
+        let h = Health::new(); // seeded reachable=true
+        assert_eq!(h.record_ping(true), None); // true→true: no transition
+        assert_eq!(h.record_ping(false), Some(HealthStatus::Degraded));
+        assert_eq!(h.record_ping(false), None); // stays degraded
+        assert_eq!(h.record_ping(true), Some(HealthStatus::Ready)); // recovered
     }
 
     #[test]

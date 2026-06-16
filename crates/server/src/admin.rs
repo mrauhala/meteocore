@@ -3472,10 +3472,15 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         for engine in engines.iter() {
             let cid = engine.collection_id();
             let snap = engine.health_snapshot();
-            POSTGIS_UP.with_label_values(&[cid]).set(match snap.status {
-                engine_postgis::HealthStatus::Ready => 1,
-                engine_postgis::HealthStatus::Degraded => 0,
-            });
+            // Only emit postgis_up once the first ping has run — before that the
+            // status is the optimistic seed, and emitting `1` would disagree with
+            // `/health` (which keeps the boot snapshot until probed).
+            if snap.probed {
+                POSTGIS_UP.with_label_values(&[cid]).set(match snap.status {
+                    engine_postgis::HealthStatus::Ready => 1,
+                    engine_postgis::HealthStatus::Degraded => 0,
+                });
+            }
             POSTGIS_METADATA_REFRESH_SECONDS
                 .with_label_values(&[cid])
                 .set(snap.last_refresh_secs);

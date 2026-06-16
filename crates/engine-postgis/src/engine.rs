@@ -199,7 +199,19 @@ impl PostgisEngine {
         loop {
             tokio::select! {
                 _ = ping_iv.tick() => {
-                    self.health.record_ping(self.ping().await);
+                    // Log only on a transition (not every tick) so log-based
+                    // alerting sees DB down/recovery without spam.
+                    match self.health.record_ping(self.ping().await) {
+                        Some(HealthStatus::Degraded) => tracing::warn!(
+                            collection = %self.collection_id,
+                            "postgis: DB unreachable (health ping failed) — collection degraded"
+                        ),
+                        Some(HealthStatus::Ready) => tracing::info!(
+                            collection = %self.collection_id,
+                            "postgis: DB reachable again — collection recovered"
+                        ),
+                        None => {}
+                    }
                 }
                 _ = refresh_iv.tick() => {
                     if let Err(e) = self.refresh_metadata().await {
