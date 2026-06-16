@@ -415,7 +415,8 @@ suspicious but workable (WARN — the collection still loads).
   metadata-refresh failure does NOT degrade health (the ping is the authority;
   the failure shows up in metrics + logs).
 - **Metrics:** Prometheus series under the `postgis_*` prefix, scraped live —
-  gauges `postgis_up{collection}` (1/0), `postgis_pool_{size,idle,waiting}{pool_key}`,
+  gauges `postgis_up{collection}` (1/0), `postgis_pool_{size,max_size,available,waiting}{pool_key}`
+  (`size` = open connections, `max_size` = capacity, `available` = acquirable now),
   `postgis_metadata_refresh_seconds{collection}` (last refresh duration); and
   counters `postgis_{metadata_refreshes,metadata_refresh_failures,ping_failures}_total{collection}`
   (process-global, delta-tracked so `rate()` works across reloads). Labels are

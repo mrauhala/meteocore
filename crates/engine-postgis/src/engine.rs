@@ -144,15 +144,27 @@ impl PostgisEngine {
     }
 
     /// `SELECT 1` with a 2 s deadline — the `/health` reachability probe.
+    ///
+    /// Uses a **dedicated** connection (`tokio_postgres::connect`), NOT the shared
+    /// pool: a busy pool (all connections checked out by request handlers) would
+    /// otherwise make `pool.get()` time out and masquerade as DB unreachability,
+    /// flipping a perfectly-healthy collection to `degraded`. The probe measures
+    /// reachability only; pool saturation is observable via `postgis_pool_waiting`.
+    /// `NoTls` matches the engine's connection (TLS is the remaining #110 work).
     async fn ping(&self) -> bool {
         let probe = async {
-            let client = self.pool.get().await.ok()?;
-            client.query_one("SELECT 1", &[]).await.ok()?;
-            Some(())
+            let (client, conn) = tokio_postgres::connect(&self.config.dsn, tokio_postgres::NoTls)
+                .await
+                .ok()?;
+            let driver = tokio::spawn(conn); // drive the connection for the probe
+            let ok = client.query_one("SELECT 1", &[]).await.is_ok();
+            drop(client); // closes the connection; the driver then completes
+            driver.abort();
+            Some(ok)
         };
         matches!(
             tokio::time::timeout(PING_TIMEOUT, probe).await,
-            Ok(Some(()))
+            Ok(Some(true))
         )
     }
 

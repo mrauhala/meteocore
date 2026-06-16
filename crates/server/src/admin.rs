@@ -180,14 +180,21 @@ static POSTGIS_UP: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 static POSTGIS_POOL_SIZE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     pg_int_gauge(
         "postgis_pool_size",
-        "Max connections in the PostGIS pool",
+        "Currently open/managed connections in the PostGIS pool",
         &["pool_key"],
     )
 });
-static POSTGIS_POOL_IDLE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static POSTGIS_POOL_MAX_SIZE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     pg_int_gauge(
-        "postgis_pool_idle",
-        "Idle (available) connections in the PostGIS pool",
+        "postgis_pool_max_size",
+        "Configured PostGIS pool capacity (max connections)",
+        &["pool_key"],
+    )
+});
+static POSTGIS_POOL_AVAILABLE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    pg_int_gauge(
+        "postgis_pool_available",
+        "Connections acquirable now without waiting (open-idle + unallocated slots up to max)",
         &["pool_key"],
     )
 });
@@ -3498,8 +3505,11 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
             let st = engine.pool().status();
             POSTGIS_POOL_SIZE
                 .with_label_values(&[pk])
+                .set(st.size as i64);
+            POSTGIS_POOL_MAX_SIZE
+                .with_label_values(&[pk])
                 .set(st.max_size as i64);
-            POSTGIS_POOL_IDLE
+            POSTGIS_POOL_AVAILABLE
                 .with_label_values(&[pk])
                 .set(st.available as i64);
             POSTGIS_POOL_WAITING
