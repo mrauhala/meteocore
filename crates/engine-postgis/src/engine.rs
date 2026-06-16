@@ -973,6 +973,7 @@ mod tests {
                     source_key: "WIND".into(),
                 },
             ],
+            locations_window: None,
         };
         let keys = resolve_source_keys(&cfg, None).unwrap();
         assert_eq!(keys, vec!["TEMP", "WIND"]);

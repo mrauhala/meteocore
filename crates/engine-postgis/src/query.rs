@@ -187,33 +187,45 @@ pub fn build_locations(cfg: &PostgisEngineConfig) -> Result<BuiltQuery, BuildErr
 ///
 /// `DISTINCT ON (<fk>)` picks one geometry per station — stations are assumed
 /// spatially stable; if a station's geometry ever drifts, the first row by `<fk>`
-/// wins. `WHERE <geom> IS NOT NULL` drops rows that cannot be placed. Each query
-/// is capped at [`MAX_LOCATIONS`].
+/// wins. `WHERE <geom> IS NOT NULL` drops rows that cannot be placed. When
+/// `since` is `Some`, an `AND <time_col> >= <since>` filter restricts each scan
+/// to recent hypertable chunks (the default — keeps `DISTINCT ON` cheap on huge
+/// tables and advertises only currently-reporting stations); `None` scans full
+/// history (`observations.locations_window = "all"`). Each query is capped at
+/// [`MAX_LOCATIONS`].
 pub fn build_locations_from_observations(
     cfg: &PostgisEngineConfig,
+    since: Option<DateTime<Utc>>,
 ) -> Result<Vec<BuiltQuery>, BuildError> {
     match &cfg.observations {
-        ObservationSchema::Long(l) => {
-            let geom = l.geom_col.as_deref().ok_or(BuildError::NoObservationGeom)?;
-            Ok(vec![obs_locations_query(
-                &l.table,
-                &l.station_fk_col,
-                geom,
-            )?])
-        }
-        ObservationSchema::Wide(w) => {
-            let geom = w.geom_col.as_deref().ok_or(BuildError::NoObservationGeom)?;
-            Ok(vec![obs_locations_query(
-                &w.table,
-                &w.station_fk_col,
-                geom,
-            )?])
-        }
+        ObservationSchema::Long(l) => Ok(vec![obs_locations_query(
+            &l.table,
+            &l.station_fk_col,
+            l.geom_col.as_deref().ok_or(BuildError::NoObservationGeom)?,
+            &l.time_col,
+            l.time_col_tz.as_deref(),
+            since,
+        )?]),
+        ObservationSchema::Wide(w) => Ok(vec![obs_locations_query(
+            &w.table,
+            &w.station_fk_col,
+            w.geom_col.as_deref().ok_or(BuildError::NoObservationGeom)?,
+            &w.time_col,
+            w.time_col_tz.as_deref(),
+            since,
+        )?]),
         ObservationSchema::PerParameter(pp) => {
             let mut queries = Vec::with_capacity(pp.tables.len());
             for t in &pp.tables {
                 let geom = t.geom_col.as_deref().ok_or(BuildError::NoObservationGeom)?;
-                queries.push(obs_locations_query(&t.table, &t.station_fk_col, geom)?);
+                queries.push(obs_locations_query(
+                    &t.table,
+                    &t.station_fk_col,
+                    geom,
+                    &t.time_col,
+                    t.time_col_tz.as_deref(),
+                    since,
+                )?);
             }
             Ok(queries)
         }
@@ -221,40 +233,41 @@ pub fn build_locations_from_observations(
 }
 
 /// One standalone observations-derived `(id, lat, lon)` query for a single table,
-/// capped at [`MAX_LOCATIONS`].
+/// with an optional recent-window time filter, capped at [`MAX_LOCATIONS`].
 fn obs_locations_query(
     table: &QualifiedTable,
     station_fk_col: &str,
     geom_col: &str,
+    time_col: &str,
+    time_col_tz: Option<&str>,
+    since: Option<DateTime<Utc>>,
 ) -> Result<BuiltQuery, BuildError> {
-    let mut sql = obs_locations_select(table, station_fk_col, geom_col)?;
-    sql.push_str(&format!(" LIMIT {MAX_LOCATIONS}"));
-    Ok(BuiltQuery::new(sql, vec![]))
-}
-
-/// One observations-derived `(id, lat, lon)` select for a single table, ending
-/// at its `ORDER BY <fk>` (required by `DISTINCT ON`). No outer LIMIT — the
-/// caller appends it.
-fn obs_locations_select(
-    table: &QualifiedTable,
-    station_fk_col: &str,
-    geom_col: &str,
-) -> Result<String, BuildError> {
     let table_fq = fq_table(table)?;
     let fk = quote_ident(station_fk_col)?;
     let geom = quote_ident(geom_col)?;
-    // SELECT kept in a plain literal; the format! template below interpolates
-    // only already-quoted identifiers and contains no flagged SQL verb.
+    let mut params: Vec<SqlParam> = Vec::new();
+    // SELECT kept in a plain literal; the format! templates below interpolate
+    // only already-quoted identifiers and contain no flagged SQL verb.
     let mut sql = String::from("SELECT ");
     sql.push_str(&format!(
         "DISTINCT ON ({fk}) {fk}::text AS id, \
          ST_Y({geom}) AS lat, \
          ST_X({geom}) AS lon \
          FROM {table_fq} \
-         WHERE {geom} IS NOT NULL \
-         ORDER BY {fk}"
+         WHERE {geom} IS NOT NULL"
     ));
-    Ok(sql)
+    // Recent-window filter: only stations seen since `since`. Restricts the scan
+    // to recent hypertable chunks (chunk exclusion) so the DISTINCT ON stays
+    // cheap. We wrap the *bind* (not the column) for naive-UTC columns — see
+    // `time_filter_rhs` — so the column index/chunk-pruning stays usable.
+    if let Some(ts) = since {
+        let time = quote_ident(time_col)?;
+        let rhs = time_filter_rhs("$1", time_col_tz);
+        sql.push_str(&format!(" AND {time} >= {rhs}"));
+        params.push(SqlParam::Timestamp(ts));
+    }
+    sql.push_str(&format!(" ORDER BY {fk} LIMIT {MAX_LOCATIONS}"));
+    Ok(BuiltQuery::new(sql, params))
 }
 
 // ─── position (nearest station) ────────────────────────────────────────────
@@ -657,6 +670,7 @@ mod tests {
             location_source: LocationSource::Stations(stations),
             observations,
             parameters,
+            locations_window: None,
         }
     }
 
@@ -671,6 +685,7 @@ mod tests {
             location_source: LocationSource::Observations,
             observations,
             parameters: vec![param("t2m", "t", "°C", "t2m", "t2m")],
+            locations_window: None,
         }
     }
 
@@ -799,7 +814,7 @@ mod tests {
     #[test]
     fn obs_locations_per_parameter_one_query_per_table() {
         let cfg = nexus_per_parameter_cfg(); // both tables carry geom_col
-        let qs = build_locations_from_observations(&cfg).unwrap();
+        let qs = build_locations_from_observations(&cfg, None).unwrap();
         // One standalone query per table — NOT a single UNION (a UNION of N
         // multi-second per-table scans blows a read-only role's statement_timeout).
         assert_eq!(qs.len(), 2);
@@ -820,6 +835,86 @@ mod tests {
     }
 
     #[test]
+    fn obs_locations_recent_window_filter() {
+        let cfg = nexus_per_parameter_cfg(); // tables are time_col_tz = "UTC"
+        let since = t(2026, 6, 15, 0);
+        let qs = build_locations_from_observations(&cfg, Some(since)).unwrap();
+        for q in &qs {
+            // Recent-window filter present; the bind (not the column) is wrapped
+            // for the naive-UTC column so the index/chunk-pruning stays usable.
+            assert!(q.sql.contains("AND \"time\" >= ($1 AT TIME ZONE 'UTC')"));
+            assert!(q
+                .sql
+                .contains(&format!("ORDER BY \"wigos_id\" LIMIT {MAX_LOCATIONS}")));
+            assert_eq!(q.params, vec![SqlParam::Timestamp(since)]);
+        }
+        // None ⇒ no time filter, no bind (full-history path).
+        let qs_all = build_locations_from_observations(&cfg, None).unwrap();
+        for q in &qs_all {
+            assert!(!q.sql.contains("AT TIME ZONE"));
+            assert!(q.params.is_empty());
+        }
+    }
+
+    #[test]
+    fn obs_locations_recent_window_long_and_wide() {
+        let since = t(2026, 6, 15, 0);
+        // Long, naive-UTC column ⇒ bind wrapped with AT TIME ZONE.
+        let long = mk_cfg(
+            StationsMapping {
+                table: public("stations"),
+                id_col: "wigos_id".into(),
+                label_col: "name".into(),
+                geom_col: "the_geom".into(),
+                property_cols: vec![],
+                where_clause: None,
+            },
+            ObservationSchema::Long(LongShape {
+                table: public("obs"),
+                station_fk_col: "wigos_id".into(),
+                time_col: "obstime".into(),
+                time_col_tz: Some("UTC".into()),
+                param_col: "param".into(),
+                value_col: "value".into(),
+                geom_col: Some("the_geom".into()),
+            }),
+            vec![param("t2m", "t", "°C", "t2m", "t2m")],
+        );
+        let ql = build_locations_from_observations(&long, Some(since)).unwrap();
+        assert_eq!(ql.len(), 1);
+        assert!(ql[0]
+            .sql
+            .contains("AND \"obstime\" >= ($1 AT TIME ZONE 'UTC')"));
+        assert_eq!(ql[0].params, vec![SqlParam::Timestamp(since)]);
+
+        // Wide, timestamptz column (tz = None) ⇒ bind used bare, no AT TIME ZONE.
+        let wide = mk_cfg(
+            StationsMapping {
+                table: public("stations"),
+                id_col: "station_id".into(),
+                label_col: "name".into(),
+                geom_col: "geom".into(),
+                property_cols: vec![],
+                where_clause: None,
+            },
+            ObservationSchema::Wide(WideShape {
+                table: public("synop"),
+                station_fk_col: "station_id".into(),
+                time_col: "valid_time".into(),
+                time_col_tz: None,
+                geom_col: Some("the_geom".into()),
+                columns: vec![("t2m".into(), "temp_celsius".into())],
+            }),
+            vec![param("t2m", "t", "°C", "t2m", "t2m")],
+        );
+        let qw = build_locations_from_observations(&wide, Some(since)).unwrap();
+        assert_eq!(qw.len(), 1);
+        assert!(qw[0].sql.contains("AND \"valid_time\" >= $1"));
+        assert!(!qw[0].sql.contains("AT TIME ZONE"));
+        assert_eq!(qw[0].params, vec![SqlParam::Timestamp(since)]);
+    }
+
+    #[test]
     fn obs_locations_per_parameter_inherits_shared_geom_col() {
         // A per_parameter table with NO own geom_col must inherit the shared
         // `observations.geom_col` (the nexus fmi-obs pattern). Exercise the full
@@ -835,6 +930,7 @@ mod tests {
             param_col: None,
             value_col: Some("value".into()),
             geom_col: Some("the_geom".into()), // shared default
+            locations_window: None,
             columns: vec![],
             tables: vec![PostgisObservationTable {
                 parameter: "t2m".into(),
@@ -848,7 +944,7 @@ mod tests {
         };
         let observations = ObservationSchema::from_config(&raw).unwrap();
         let cfg = mk_cfg_obs_only(observations);
-        let qs = build_locations_from_observations(&cfg).unwrap();
+        let qs = build_locations_from_observations(&cfg, None).unwrap();
         assert_eq!(qs.len(), 1);
         assert!(qs[0].sql.contains("ST_Y(\"the_geom\")"));
         assert!(qs[0].sql.contains("WHERE \"the_geom\" IS NOT NULL"));
@@ -876,7 +972,7 @@ mod tests {
             }),
             vec![param("t2m", "t", "°C", "t2m", "t2m")],
         );
-        let qs = build_locations_from_observations(&cfg).unwrap();
+        let qs = build_locations_from_observations(&cfg, None).unwrap();
         assert_eq!(qs.len(), 1);
         let q = &qs[0];
         assert!(q.sql.starts_with("SELECT DISTINCT ON (\"wigos_id\")"));
@@ -891,7 +987,7 @@ mod tests {
     #[test]
     fn obs_locations_errors_without_geom() {
         let cfg = long_cfg(); // LongShape.geom_col == None
-        let err = build_locations_from_observations(&cfg).unwrap_err();
+        let err = build_locations_from_observations(&cfg, None).unwrap_err();
         assert!(matches!(err, BuildError::NoObservationGeom));
     }
 
@@ -921,7 +1017,7 @@ mod tests {
             BuildError::NoStations
         ));
         // ...but the observations-derived builder works in this mode.
-        assert!(build_locations_from_observations(&cfg).is_ok());
+        assert!(build_locations_from_observations(&cfg, None).is_ok());
     }
 
     #[test]

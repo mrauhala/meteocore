@@ -335,25 +335,36 @@ station_fk_col = "wigos_id"
 time_col       = "time"
 time_col_tz    = "UTC"
 value_col      = "value"
-geom_col       = "the_geom"     # <-- enables orphan fallback
+geom_col       = "the_geom"          # <-- enables orphan fallback
+locations_window = "PT24H"           # optional; default 24h. "all" = full history
 # ... tables / parameters as above ...
 ```
 
-**How it performs.** The observation-derived location list is built with
-`SELECT DISTINCT ON (station_fk)` (`per_parameter` `UNION`s the per-table selects
-then collapses with an outer `DISTINCT ON (id)`), capped at `MAX_LOCATIONS`
-(50 001). On TimescaleDB the unique `(station_fk, time)` index drives a SkipScan,
-so this is ~2 s even over a multi-million-row hypertable; it runs only in the
-**background metadata refresh** (`metadata_refresh_secs`), never on a request.
-The per-request observation fetch (`WHERE station_fk = $1`) is identical in every
-mode, so request latency is unchanged. In modes A/B, `position` (nearest, by
-haversine) and `area` are answered **in-memory** from the cached location set —
-an `area` polygon returns its **bounding-box superset**, not exact `ST_Within`
-(documented v1 simplification); stations-only mode keeps the live
-`ST_DWithin`/`ST_Within` SQL path. For very large tables that strain the refresh,
-pre-materialize a distinct `(id, geom)` view and wire it as the `stations` block
-(collapsing back onto the indexed stations path), and/or raise
-`metadata_refresh_secs`.
+**How it performs.** The observation-derived location list is built with one
+`SELECT DISTINCT ON (station_fk)` **per observation table** (deduped by id in
+Rust — NOT a single `UNION`, which would run as one statement and blow a
+read-only role's `statement_timeout`), each capped at `MAX_LOCATIONS` (50 001).
+It runs only in the **background metadata refresh** (`metadata_refresh_secs`),
+never on a request; the per-request observation fetch (`WHERE station_fk = $1`)
+is identical in every mode, so request latency is unchanged.
+
+Even one table's *full-history* `DISTINCT ON` can exceed a tight
+`statement_timeout` on a large hypertable (the largest nexus table, ~13 M rows,
+took >5 s). So the derivation is **time-windowed by default**:
+
+- `observations.locations_window` — ISO 8601 duration (**default `"PT24H"`**),
+  adds `AND time_col >= now() - window` so the scan only touches recent
+  hypertable chunks (~0.1 s) and advertises only **currently-reporting**
+  stations. This is the right default for live observations.
+- `locations_window = "all"` — full history (a climate-style collection). Needs a
+  role `statement_timeout` large enough to scan the whole table (the limits come
+  from the role, not the engine), or a pre-materialized distinct-`(id, geom)`
+  table wired as the `stations` block.
+
+In modes A/B, `position` (nearest, by haversine) and `area` are answered
+**in-memory** from the cached location set — an `area` polygon returns its
+**bounding-box superset**, not exact `ST_Within` (documented v1 simplification);
+stations-only mode keeps the live `ST_DWithin`/`ST_Within` SQL path.
 
 ## Startup behavior: error vs. warning
 
