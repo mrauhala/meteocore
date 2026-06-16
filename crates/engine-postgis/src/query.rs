@@ -173,60 +173,68 @@ pub fn build_locations(cfg: &PostgisEngineConfig) -> Result<BuiltQuery, BuildErr
 
 /// Derive the location list from the observations table(s)' own geometry —
 /// used when there is no stations table (mode A) or to fill orphan stations
-/// (mode B). Returns one row per distinct `station_fk` value with its coords;
-/// the caller assembles `label = id` and empty properties (orphans carry no
-/// station metadata).
+/// (mode B). Returns **one query per observation table**, each yielding one row
+/// per distinct `station_fk` with its coords; the caller runs them, dedups by id
+/// across tables (first wins), and assembles `label = id` + empty properties
+/// (orphans carry no station metadata).
+///
+/// One query per table — NOT a single `UNION` — is load-bearing: each per-table
+/// `DISTINCT ON` scan is ~seconds over a large hypertable, and a read-only role
+/// commonly caps `statement_timeout` (nexus `meteocore_ro` = 5s), which a 6-table
+/// union blows in one statement. Splitting keeps every statement small; the
+/// cross-table dedup the `UNION`'s outer `DISTINCT ON (id)` used to do now happens
+/// in the caller (`fetch_observation_rows`).
 ///
 /// `DISTINCT ON (<fk>)` picks one geometry per station — stations are assumed
-/// spatially stable; if a station's geometry ever drifts, the first row by
-/// `<fk>` wins. `WHERE <geom> IS NOT NULL` drops rows that cannot be placed.
-/// For `per_parameter` the per-table selects are `UNION`-ed (a station may
-/// report only some parameters) and collapsed by an outer `DISTINCT ON (id)`.
-/// Every result is capped at [`MAX_LOCATIONS`].
+/// spatially stable; if a station's geometry ever drifts, the first row by `<fk>`
+/// wins. `WHERE <geom> IS NOT NULL` drops rows that cannot be placed. Each query
+/// is capped at [`MAX_LOCATIONS`].
 pub fn build_locations_from_observations(
     cfg: &PostgisEngineConfig,
-) -> Result<BuiltQuery, BuildError> {
+) -> Result<Vec<BuiltQuery>, BuildError> {
     match &cfg.observations {
         ObservationSchema::Long(l) => {
             let geom = l.geom_col.as_deref().ok_or(BuildError::NoObservationGeom)?;
-            let mut sql = obs_locations_select(&l.table, &l.station_fk_col, geom)?;
-            sql.push_str(&format!(" LIMIT {MAX_LOCATIONS}"));
-            Ok(BuiltQuery::new(sql, vec![]))
+            Ok(vec![obs_locations_query(
+                &l.table,
+                &l.station_fk_col,
+                geom,
+            )?])
         }
         ObservationSchema::Wide(w) => {
             let geom = w.geom_col.as_deref().ok_or(BuildError::NoObservationGeom)?;
-            let mut sql = obs_locations_select(&w.table, &w.station_fk_col, geom)?;
-            sql.push_str(&format!(" LIMIT {MAX_LOCATIONS}"));
-            Ok(BuiltQuery::new(sql, vec![]))
+            Ok(vec![obs_locations_query(
+                &w.table,
+                &w.station_fk_col,
+                geom,
+            )?])
         }
         ObservationSchema::PerParameter(pp) => {
-            let mut branches = Vec::with_capacity(pp.tables.len());
+            let mut queries = Vec::with_capacity(pp.tables.len());
             for t in &pp.tables {
                 let geom = t.geom_col.as_deref().ok_or(BuildError::NoObservationGeom)?;
-                // Parenthesised so each branch keeps its own DISTINCT ON/ORDER BY.
-                let inner = obs_locations_select(&t.table, &t.station_fk_col, geom)?;
-                branches.push(format!("({inner})"));
+                queries.push(obs_locations_query(&t.table, &t.station_fk_col, geom)?);
             }
-            // UNION ALL (not UNION): the outer DISTINCT ON (id) already collapses
-            // duplicate ids across tables, so per-branch dedup is wasted work.
-            let unioned = branches.join(" UNION ALL ");
-            // Outer DISTINCT ON (id) collapses the union; SELECT kept in a plain
-            // literal (tripwire) and `unioned` interpolated via format! (not a
-            // bare push_str arg). FROM/UNION are not flagged verbs.
-            let mut sql = String::from("SELECT ");
-            sql.push_str(&format!(
-                "DISTINCT ON (id) id, lat, lon \
-                 FROM ({unioned}) u \
-                 ORDER BY id LIMIT {MAX_LOCATIONS}"
-            ));
-            Ok(BuiltQuery::new(sql, vec![]))
+            Ok(queries)
         }
     }
 }
 
+/// One standalone observations-derived `(id, lat, lon)` query for a single table,
+/// capped at [`MAX_LOCATIONS`].
+fn obs_locations_query(
+    table: &QualifiedTable,
+    station_fk_col: &str,
+    geom_col: &str,
+) -> Result<BuiltQuery, BuildError> {
+    let mut sql = obs_locations_select(table, station_fk_col, geom_col)?;
+    sql.push_str(&format!(" LIMIT {MAX_LOCATIONS}"));
+    Ok(BuiltQuery::new(sql, vec![]))
+}
+
 /// One observations-derived `(id, lat, lon)` select for a single table, ending
 /// at its `ORDER BY <fk>` (required by `DISTINCT ON`). No outer LIMIT — the
-/// caller appends it (single table) or wraps the select in a UNION (per_parameter).
+/// caller appends it.
 fn obs_locations_select(
     table: &QualifiedTable,
     station_fk_col: &str,
@@ -789,25 +797,26 @@ mod tests {
     }
 
     #[test]
-    fn obs_locations_per_parameter_unions_and_distincts() {
+    fn obs_locations_per_parameter_one_query_per_table() {
         let cfg = nexus_per_parameter_cfg(); // both tables carry geom_col
-        let q = build_locations_from_observations(&cfg).unwrap();
-        assert!(q.params.is_empty());
-        // Each branch is a DISTINCT ON (fk) select with a null-geom filter.
-        assert!(q.sql.contains("DISTINCT ON (\"wigos_id\")"));
-        assert!(q.sql.contains("ST_Y(\"the_geom\")"));
-        assert!(q.sql.contains("ST_X(\"the_geom\")"));
-        assert!(q.sql.contains("WHERE \"the_geom\" IS NOT NULL"));
-        // Union across both per-parameter tables (UNION ALL — outer DISTINCT ON dedups).
-        assert!(q.sql.contains("FROM \"public\".\"airtemperature\""));
-        assert!(q.sql.contains("FROM \"public\".\"wind_speed\""));
-        assert!(q.sql.contains(" UNION ALL "));
-        // Outer collapse by id + the row cap.
-        assert!(q.sql.contains("DISTINCT ON (id)"));
-        assert!(q.sql.contains(&format!("LIMIT {MAX_LOCATIONS}")));
-        // Orphans carry no station metadata columns.
-        assert!(!q.sql.contains("\"territory\""));
-        assert!(!q.sql.contains("AS label"));
+        let qs = build_locations_from_observations(&cfg).unwrap();
+        // One standalone query per table — NOT a single UNION (a UNION of N
+        // multi-second per-table scans blows a read-only role's statement_timeout).
+        assert_eq!(qs.len(), 2);
+        for q in &qs {
+            assert!(q.params.is_empty());
+            assert!(q.sql.starts_with("SELECT DISTINCT ON (\"wigos_id\")"));
+            assert!(q.sql.contains("ST_Y(\"the_geom\")"));
+            assert!(q.sql.contains("ST_X(\"the_geom\")"));
+            assert!(q.sql.contains("WHERE \"the_geom\" IS NOT NULL"));
+            assert!(q.sql.contains(&format!("LIMIT {MAX_LOCATIONS}")));
+            assert!(!q.sql.contains("UNION")); // no cross-table union in SQL
+                                               // Orphans carry no station metadata columns.
+            assert!(!q.sql.contains("\"territory\""));
+            assert!(!q.sql.contains("AS label"));
+        }
+        assert!(qs[0].sql.contains("FROM \"public\".\"airtemperature\""));
+        assert!(qs[1].sql.contains("FROM \"public\".\"wind_speed\""));
     }
 
     #[test]
@@ -839,9 +848,10 @@ mod tests {
         };
         let observations = ObservationSchema::from_config(&raw).unwrap();
         let cfg = mk_cfg_obs_only(observations);
-        let q = build_locations_from_observations(&cfg).unwrap();
-        assert!(q.sql.contains("ST_Y(\"the_geom\")"));
-        assert!(q.sql.contains("WHERE \"the_geom\" IS NOT NULL"));
+        let qs = build_locations_from_observations(&cfg).unwrap();
+        assert_eq!(qs.len(), 1);
+        assert!(qs[0].sql.contains("ST_Y(\"the_geom\")"));
+        assert!(qs[0].sql.contains("WHERE \"the_geom\" IS NOT NULL"));
     }
 
     #[test]
@@ -866,7 +876,9 @@ mod tests {
             }),
             vec![param("t2m", "t", "°C", "t2m", "t2m")],
         );
-        let q = build_locations_from_observations(&cfg).unwrap();
+        let qs = build_locations_from_observations(&cfg).unwrap();
+        assert_eq!(qs.len(), 1);
+        let q = &qs[0];
         assert!(q.sql.starts_with("SELECT DISTINCT ON (\"wigos_id\")"));
         assert!(q.sql.contains("\"wigos_id\"::text AS id"));
         assert!(q.sql.contains("WHERE \"the_geom\" IS NOT NULL"));
