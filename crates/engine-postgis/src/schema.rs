@@ -93,6 +93,45 @@ impl StationsMapping {
     }
 }
 
+/// Where the engine sources its locations — resolved once at config lowering
+/// from the presence of a `[postgis.stations]` block and a usable observations
+/// geometry column. Gates the metadata refresh and the position/area paths;
+/// the per-request observation fetch is identical in every variant.
+#[derive(Debug, Clone)]
+pub enum LocationSource {
+    /// Stations table is the sole source of locations (the original behavior).
+    Stations(StationsMapping),
+    /// No stations table — every location is derived from the observations
+    /// table's geometry (mode A). Orphan id = the `station_fk` value, label = id,
+    /// properties empty.
+    Observations,
+    /// Stations table supplies label/properties for registered stations;
+    /// observations whose `station_fk` has no stations row are filled from the
+    /// observations geometry (mode B, orphan fallback).
+    StationsWithOrphans(StationsMapping),
+}
+
+impl LocationSource {
+    /// The stations mapping, if this source has one (`Stations` /
+    /// `StationsWithOrphans`); `None` for the observations-only mode.
+    pub fn stations(&self) -> Option<&StationsMapping> {
+        match self {
+            LocationSource::Stations(s) | LocationSource::StationsWithOrphans(s) => Some(s),
+            LocationSource::Observations => None,
+        }
+    }
+
+    /// Whether observation-derived locations participate (modes A and B) — i.e.
+    /// the refresh must derive locations from the observations table and
+    /// position/area are answered in-memory from the cached set.
+    pub fn uses_observations(&self) -> bool {
+        matches!(
+            self,
+            LocationSource::Observations | LocationSource::StationsWithOrphans(_)
+        )
+    }
+}
+
 /// Observation-schema shapes. One per `observations.shape` TOML value.
 #[derive(Debug, Clone)]
 pub enum ObservationSchema {

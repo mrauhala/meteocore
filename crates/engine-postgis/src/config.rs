@@ -10,7 +10,9 @@
 use ds_core::config::PostgisConfig;
 use thiserror::Error;
 
-use crate::schema::{check_identifier, ObservationSchema, SchemaError, StationsMapping};
+use crate::schema::{
+    check_identifier, LocationSource, ObservationSchema, SchemaError, StationsMapping,
+};
 
 /// Default pool size — matches the render-semaphore sizing (`max(4, cores*2)`
 /// capped at 16). Override via `[postgis].pool_size`; hard-capped at 32 at
@@ -36,6 +38,8 @@ pub enum PostgisConfigError {
     InlineDsnNotOptedIn,
     #[error("schema mapping error: {0}")]
     Schema(#[from] SchemaError),
+    #[error("no [postgis.stations] table and no resolvable observations geometry — set observations.geom_col or add a stations table")]
+    NoLocationSource,
     #[error("parameter '{name}' (source_key '{key}') is not mapped in observations.{where_}")]
     ParameterNotMapped {
         name: String,
@@ -59,7 +63,7 @@ pub struct PostgisEngineConfig {
     pub pool_size: u32,
     pub pool_label: Option<String>,
     pub metadata_refresh_secs: u64,
-    pub stations: StationsMapping,
+    pub location_source: LocationSource,
     pub observations: ObservationSchema,
     pub parameters: Vec<ValidatedParameter>,
 }
@@ -91,7 +95,18 @@ impl PostgisEngineConfig {
     pub fn resolve(cfg: &PostgisConfig) -> Result<Self, PostgisConfigError> {
         let (dsn, dsn_was_literal) = resolve_dsn(&cfg.dsn_env)?;
 
-        let stations = StationsMapping::from_config(&cfg.stations)?;
+        // Resolve the location source from the presence of a stations table and
+        // whether the observations carry a usable geometry (mirrors the core
+        // `validate_postgis` rule; this is the engine's defense-in-depth pass).
+        let obs_geom = cfg.observations.obs_geom_available();
+        let location_source = match (&cfg.stations, obs_geom) {
+            (Some(s), true) => {
+                LocationSource::StationsWithOrphans(StationsMapping::from_config(s)?)
+            }
+            (Some(s), false) => LocationSource::Stations(StationsMapping::from_config(s)?),
+            (None, true) => LocationSource::Observations,
+            (None, false) => return Err(PostgisConfigError::NoLocationSource),
+        };
         let observations = ObservationSchema::from_config(&cfg.observations)?;
 
         let mut parameters = Vec::with_capacity(cfg.parameters.len());
@@ -144,7 +159,7 @@ impl PostgisEngineConfig {
             metadata_refresh_secs: cfg
                 .metadata_refresh_secs
                 .unwrap_or(DEFAULT_METADATA_REFRESH_SECS),
-            stations,
+            location_source,
             observations,
             parameters,
         })
@@ -217,14 +232,14 @@ mod tests {
             pool_size: None,
             pool_label: None,
             metadata_refresh_secs: None,
-            stations: PostgisStationsConfig {
+            stations: Some(PostgisStationsConfig {
                 table: "weather.stations".into(),
                 id_col: "wigos_id".into(),
                 label_col: "name".into(),
                 geom_col: "the_geom".into(),
                 property_cols: vec!["territory".into()],
                 where_clause: None,
-            },
+            }),
             observations: PostgisObservationsConfig {
                 shape: "per_parameter".into(),
                 table: None,
@@ -295,6 +310,55 @@ mod tests {
             }
             _ => panic!("expected PerParameter"),
         }
+    }
+
+    #[test]
+    fn resolve_stations_with_obs_geom_is_orphan_fallback() {
+        let g = env_guard();
+        g.set("TEST_DSN", Some("postgres://from-env/obs"));
+        // nexus_config has both a stations table and an observations geom_col.
+        let resolved = PostgisEngineConfig::resolve(&nexus_config()).unwrap();
+        assert!(matches!(
+            resolved.location_source,
+            LocationSource::StationsWithOrphans(_)
+        ));
+    }
+
+    #[test]
+    fn resolve_stations_without_obs_geom_is_stations_only() {
+        let g = env_guard();
+        g.set("TEST_DSN", Some("postgres://from-env/obs"));
+        let mut cfg = nexus_config();
+        cfg.observations.geom_col = None; // per-table geoms are already None
+        let resolved = PostgisEngineConfig::resolve(&cfg).unwrap();
+        assert!(matches!(
+            resolved.location_source,
+            LocationSource::Stations(_)
+        ));
+    }
+
+    #[test]
+    fn resolve_no_stations_with_obs_geom_is_observations() {
+        let g = env_guard();
+        g.set("TEST_DSN", Some("postgres://from-env/obs"));
+        let mut cfg = nexus_config();
+        cfg.stations = None;
+        let resolved = PostgisEngineConfig::resolve(&cfg).unwrap();
+        assert!(matches!(
+            resolved.location_source,
+            LocationSource::Observations
+        ));
+    }
+
+    #[test]
+    fn resolve_no_stations_no_geom_errors() {
+        let g = env_guard();
+        g.set("TEST_DSN", Some("postgres://from-env/obs"));
+        let mut cfg = nexus_config();
+        cfg.stations = None;
+        cfg.observations.geom_col = None;
+        let err = PostgisEngineConfig::resolve(&cfg).unwrap_err();
+        assert!(matches!(err, PostgisConfigError::NoLocationSource));
     }
 
     #[test]

@@ -277,6 +277,84 @@ If none of the three shapes fit your schema, expose a Postgres `VIEW` that does.
 The DSL deliberately does not support joins, computed expressions, or column
 transforms.
 
+## Optional stations / orphan locations
+
+The `[collections.postgis.stations]` block is **optional**. When the observation
+tables carry their own point geometry (`observations.geom_col`, e.g. `the_geom`),
+locations can be derived directly from the observations — useful when the
+observed station set is wider than (or entirely absent from) a curated stations
+registry. The mode is derived from what you configure, with no extra flag:
+
+| `[postgis.stations]` | `observations.geom_col` | Mode | Behavior |
+|---|---|---|---|
+| present | absent | stations-only | Original behavior. Locations + labels + properties from the stations table. |
+| present | present | **orphan fallback** | Registered stations get their label/properties; observations whose `station_fk` has no stations row still surface, located from the obs geometry (`label = id`, no properties). |
+| absent | present | **observations-only** | Every location derived from the obs geometry. `label = id`, no properties. |
+| absent | absent | — | Hard config error (nothing can be placed on a map). |
+
+**Mode A — no stations table** (everything from the observations geometry):
+
+```toml
+[collections.postgis]
+dsn_env = "OBS_DSN"
+
+[collections.postgis.observations]
+shape          = "per_parameter"
+station_fk_col = "wigos_id"
+time_col       = "time"
+time_col_tz    = "UTC"
+value_col      = "value"
+geom_col       = "the_geom"     # geometry(Point, 4326) on every obs table
+
+[[collections.postgis.observations.tables]]
+parameter = "air_temperature"
+table     = "public.airtemperature"
+# ... more tables ...
+
+[[collections.postgis.parameters]]
+name  = "air_temperature"
+label = "2 m air temperature"
+unit  = "degC"
+```
+
+**Mode B — stations table + orphan fallback** (add `geom_col` to an existing
+stations config; registered stations keep their `name`/properties, the rest fall
+back to the obs geometry):
+
+```toml
+[collections.postgis.stations]
+table      = "public.stations"
+id_col     = "wigos_id"
+label_col  = "name"
+geom_col   = "the_geom"
+property_cols = ["territory"]
+
+[collections.postgis.observations]
+shape          = "per_parameter"
+station_fk_col = "wigos_id"
+time_col       = "time"
+time_col_tz    = "UTC"
+value_col      = "value"
+geom_col       = "the_geom"     # <-- enables orphan fallback
+# ... tables / parameters as above ...
+```
+
+**How it performs.** The observation-derived location list is built with
+`SELECT DISTINCT ON (station_fk)` (`per_parameter` `UNION`s the per-table selects
+then collapses with an outer `DISTINCT ON (id)`), capped at `MAX_LOCATIONS`
+(50 001). On TimescaleDB the unique `(station_fk, time)` index drives a SkipScan,
+so this is ~2 s even over a multi-million-row hypertable; it runs only in the
+**background metadata refresh** (`metadata_refresh_secs`), never on a request.
+The per-request observation fetch (`WHERE station_fk = $1`) is identical in every
+mode, so request latency is unchanged. In modes A/B, `position` (nearest, by
+haversine) and `area` are answered **in-memory** from the cached location set —
+an `area` polygon returns its **bounding-box superset**, not exact `ST_Within`
+(documented v1 simplification); stations-only mode keeps the live
+`ST_DWithin`/`ST_Within` SQL path. For very large tables that strain the refresh,
+pre-materialize a distinct `(id, geom)` view and wire it as the `stations` block
+(collapsing back onto the indexed stations path), and/or raise
+`metadata_refresh_secs`.
+
 ## Startup behavior: error vs. warning
 
 The engine distinguishes between conditions that make the collection
