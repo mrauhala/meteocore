@@ -7,12 +7,19 @@
 //! re-validating. The public TOML-facing struct stays in `ds-core`; this is
 //! the internal form the engine operates on.
 
+use chrono::Duration;
 use ds_core::config::PostgisConfig;
+use ds_core::datetime::parse_iso8601_duration;
 use thiserror::Error;
 
 use crate::schema::{
     check_identifier, LocationSource, ObservationSchema, SchemaError, StationsMapping,
 };
+
+/// Default window for deriving the location list from observations when
+/// `observations.locations_window` is absent (24h). Keeps the `DISTINCT ON`
+/// scan on recent hypertable chunks.
+const DEFAULT_LOCATIONS_WINDOW_HOURS: i64 = 24;
 
 /// Default pool size — matches the render-semaphore sizing (`max(4, cores*2)`
 /// capped at 16). Override via `[postgis].pool_size`; hard-capped at 32 at
@@ -40,6 +47,8 @@ pub enum PostgisConfigError {
     Schema(#[from] SchemaError),
     #[error("no [postgis.stations] table and no resolvable observations geometry — set observations.geom_col or add a stations table")]
     NoLocationSource,
+    #[error("invalid observations.locations_window: {0}")]
+    InvalidLocationsWindow(String),
     #[error("parameter '{name}' (source_key '{key}') is not mapped in observations.{where_}")]
     ParameterNotMapped {
         name: String,
@@ -66,6 +75,11 @@ pub struct PostgisEngineConfig {
     pub location_source: LocationSource,
     pub observations: ObservationSchema,
     pub parameters: Vec<ValidatedParameter>,
+    /// Window for deriving the obs-based location list: `Some(d)` ⇒ only
+    /// stations seen within `d` of "now" (the default, 24h, keeps the scan on
+    /// recent chunks); `None` ⇒ full history (`observations.locations_window =
+    /// "all"`). Only consulted when `location_source` derives from observations.
+    pub locations_window: Option<Duration>,
 }
 
 /// Parameter descriptor after cross-checking against the observation shape.
@@ -108,6 +122,7 @@ impl PostgisEngineConfig {
             (None, false) => return Err(PostgisConfigError::NoLocationSource),
         };
         let observations = ObservationSchema::from_config(&cfg.observations)?;
+        let locations_window = resolve_locations_window(&cfg.observations.locations_window)?;
 
         let mut parameters = Vec::with_capacity(cfg.parameters.len());
         for p in &cfg.parameters {
@@ -162,7 +177,24 @@ impl PostgisEngineConfig {
             location_source,
             observations,
             parameters,
+            locations_window,
         })
+    }
+}
+
+/// Resolve `observations.locations_window` to a `chrono::Duration`:
+/// absent ⇒ the 24h default; `"all"` (case-insensitive) ⇒ `None` (full
+/// history); otherwise an ISO 8601 duration. Defense-in-depth — `ds-core`'s
+/// `validate_postgis` already rejects a bad string at config load.
+fn resolve_locations_window(raw: &Option<String>) -> Result<Option<Duration>, PostgisConfigError> {
+    match raw.as_deref() {
+        None => Ok(Some(Duration::hours(DEFAULT_LOCATIONS_WINDOW_HOURS))),
+        Some(s) if s.eq_ignore_ascii_case("all") => Ok(None),
+        Some(s) => {
+            let d = parse_iso8601_duration(s)
+                .map_err(|e| PostgisConfigError::InvalidLocationsWindow(e.to_string()))?;
+            Ok(Some(d))
+        }
     }
 }
 
@@ -249,6 +281,7 @@ mod tests {
                 param_col: None,
                 value_col: Some("value".into()),
                 geom_col: Some("the_geom".into()),
+                locations_window: None,
                 columns: vec![],
                 tables: vec![
                     PostgisObservationTable {
@@ -362,6 +395,44 @@ mod tests {
     }
 
     #[test]
+    fn resolve_locations_window_defaults_to_24h() {
+        let g = env_guard();
+        g.set("TEST_DSN", Some("postgres://from-env/obs"));
+        let resolved = PostgisEngineConfig::resolve(&nexus_config()).unwrap();
+        assert_eq!(resolved.locations_window, Some(Duration::hours(24)));
+    }
+
+    #[test]
+    fn resolve_locations_window_all_is_full_history() {
+        let g = env_guard();
+        g.set("TEST_DSN", Some("postgres://from-env/obs"));
+        let mut cfg = nexus_config();
+        cfg.observations.locations_window = Some("all".into());
+        let resolved = PostgisEngineConfig::resolve(&cfg).unwrap();
+        assert_eq!(resolved.locations_window, None);
+    }
+
+    #[test]
+    fn resolve_locations_window_parses_duration() {
+        let g = env_guard();
+        g.set("TEST_DSN", Some("postgres://from-env/obs"));
+        let mut cfg = nexus_config();
+        cfg.observations.locations_window = Some("PT12H".into());
+        let resolved = PostgisEngineConfig::resolve(&cfg).unwrap();
+        assert_eq!(resolved.locations_window, Some(Duration::hours(12)));
+    }
+
+    #[test]
+    fn resolve_locations_window_invalid_errors() {
+        let g = env_guard();
+        g.set("TEST_DSN", Some("postgres://from-env/obs"));
+        let mut cfg = nexus_config();
+        cfg.observations.locations_window = Some("garbage".into());
+        let err = PostgisEngineConfig::resolve(&cfg).unwrap_err();
+        assert!(matches!(err, PostgisConfigError::InvalidLocationsWindow(_)));
+    }
+
+    #[test]
     fn resolve_missing_env_var_errors() {
         let g = env_guard();
         g.set("TEST_DSN", None);
@@ -401,6 +472,7 @@ mod tests {
             param_col: None,
             value_col: None,
             geom_col: None,
+            locations_window: None,
             columns: vec![PostgisObservationColumn {
                 parameter: "t2m".into(),
                 column: "temperature".into(),
@@ -430,6 +502,7 @@ mod tests {
             param_col: Some("param".into()),
             value_col: Some("value".into()),
             geom_col: None,
+            locations_window: None,
             columns: vec![],
             tables: vec![],
         };

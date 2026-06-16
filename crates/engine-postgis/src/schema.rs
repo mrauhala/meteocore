@@ -456,6 +456,7 @@ mod tests {
             param_col: Some("param".into()),
             value_col: Some("value".into()),
             geom_col: None,
+            locations_window: None,
             columns: vec![],
             tables: vec![],
         }
@@ -487,6 +488,7 @@ mod tests {
             param_col: None,
             value_col: None,
             geom_col: None,
+            locations_window: None,
             columns: vec![
                 PostgisObservationColumn {
                     parameter: "t2m".into(),
@@ -520,6 +522,7 @@ mod tests {
             param_col: None,
             value_col: Some("value".into()),
             geom_col: Some("the_geom".into()),
+            locations_window: None,
             columns: vec![],
             tables: vec![PostgisObservationTable {
                 parameter: "t2m".into(),
@@ -568,6 +571,7 @@ mod tests {
             param_col: None,
             value_col: Some("value".into()),
             geom_col: None,
+            locations_window: None,
             columns: vec![],
             tables: vec![PostgisObservationTable {
                 parameter: "t2m".into(),

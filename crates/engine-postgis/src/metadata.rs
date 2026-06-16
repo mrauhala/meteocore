@@ -305,8 +305,11 @@ async fn fetch_observation_rows(
     cfg: &PostgisEngineConfig,
     pool: &Pool,
 ) -> Result<Vec<FeatureStation>, MetadataError> {
-    let queries =
-        build_locations_from_observations(cfg).map_err(|e| MetadataError::Decode(e.to_string()))?;
+    // `Some(window)` ⇒ only stations seen since `now - window` (the default —
+    // keeps the per-table DISTINCT ON on recent chunks); `None` ⇒ full history.
+    let since = cfg.locations_window.map(|w| Utc::now() - w);
+    let queries = build_locations_from_observations(cfg, since)
+        .map_err(|e| MetadataError::Decode(e.to_string()))?;
     let client = pool
         .get()
         .await

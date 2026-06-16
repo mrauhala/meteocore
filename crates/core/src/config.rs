@@ -946,6 +946,15 @@ pub struct PostgisObservationsConfig {
     /// Optional geometry column on the observations side (used in
     /// orphan-station handling — see plan doc amendment E).
     pub geom_col: Option<String>,
+    /// Time window for deriving the location list from the observations table
+    /// (only relevant when `geom_col` drives location derivation). ISO 8601
+    /// duration (e.g. `"PT24H"`, `"P7D"`) — only stations that reported within
+    /// this window of "now" are advertised, which keeps the `DISTINCT ON` scan
+    /// on recent hypertable chunks (fast) instead of full history. Defaults to
+    /// 24h when absent; set to `"all"` for full history (a climate-style
+    /// collection — needs a role `statement_timeout` large enough to scan the
+    /// whole table, or a pre-materialized locations table).
+    pub locations_window: Option<String>,
     /// `wide` shape: one entry per parameter → column mapping.
     #[serde(default)]
     pub columns: Vec<PostgisObservationColumn>,
@@ -1165,6 +1174,20 @@ fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::D
             return Err(Config(format!(
                 "Collection '{id}': observations.shape '{other}' is not one of 'long', 'wide', 'per_parameter'"
             )));
+        }
+    }
+
+    // -- observations.locations_window (optional) -------------------------
+    // ISO 8601 duration, or the sentinel "all" (full history). Absent ⇒ 24h
+    // default (applied at engine resolve). Validate the string parses now so a
+    // typo fails at config load, not at the first metadata refresh.
+    if let Some(w) = o.locations_window.as_deref() {
+        if !w.eq_ignore_ascii_case("all") {
+            crate::datetime::parse_iso8601_duration(w).map_err(|e| {
+                Config(format!(
+                    "Collection '{id}': observations.locations_window '{w}' is not a valid ISO 8601 duration (or \"all\"): {e}"
+                ))
+            })?;
         }
     }
 
@@ -3432,6 +3455,50 @@ unit = "degC"
             err.contains("no [postgis.stations]") && err.contains("observations geometry"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn postgis_invalid_locations_window_rejected() {
+        // A bad observations.locations_window must fail at config load, not at
+        // the first metadata refresh. ("all" and valid ISO 8601 durations pass.)
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "obs"
+title = "Obs"
+description = "Obs"
+engine_type = "postgis"
+
+[collections.postgis]
+dsn_env = "OBS_DSN"
+
+[collections.postgis.observations]
+shape = "per_parameter"
+station_fk_col = "wigos_id"
+time_col = "time"
+time_col_tz = "UTC"
+value_col = "value"
+geom_col = "the_geom"
+locations_window = "lol-not-a-duration"
+
+[[collections.postgis.observations.tables]]
+parameter = "t2m"
+table = "public.airtemperature"
+
+[[collections.postgis.parameters]]
+name = "t2m"
+label = "T"
+unit = "degC"
+"#;
+        let path = write_config(tmp.path(), "config.toml", toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("locations_window"), "got: {err}");
     }
 
     #[test]
