@@ -414,11 +414,12 @@ suspicious but workable (WARN — the collection still loads).
   `failed` means the collection never finished loading (config/privilege). A
   metadata-refresh failure does NOT degrade health (the ping is the authority;
   the failure shows up in metrics + logs).
-- **Metrics:** Prometheus gauges under the `postgis_*` prefix, scraped live:
-  `postgis_up{collection}` (1/0), `postgis_pool_{size,idle,waiting}{pool_key}`,
-  `postgis_metadata_refresh_seconds{collection}` (last refresh duration), and
-  `postgis_{metadata_refreshes,metadata_refresh_failures,ping_failures}{collection}`
-  (reset on reload). Labels are bounded (collection / pool_key are config-time).
+- **Metrics:** Prometheus series under the `postgis_*` prefix, scraped live —
+  gauges `postgis_up{collection}` (1/0), `postgis_pool_{size,idle,waiting}{pool_key}`,
+  `postgis_metadata_refresh_seconds{collection}` (last refresh duration); and
+  counters `postgis_{metadata_refreshes,metadata_refresh_failures,ping_failures}_total{collection}`
+  (process-global, delta-tracked so `rate()` works across reloads). Labels are
+  bounded (collection / pool_key are config-time).
   Per-query histograms (`postgis_query_duration_seconds` / `rows_returned` /
   `query_errors_total`) are a follow-up — they need recording at the API layer,
   which calls engines generically through the trait.

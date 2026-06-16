@@ -165,6 +165,11 @@ fn pg_int_gauge(name: &str, help: &str, labels: &[&str]) -> IntGaugeVec {
     REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
 }
+fn pg_int_counter(name: &str, help: &str, labels: &[&str]) -> IntCounterVec {
+    let counter = IntCounterVec::new(Opts::new(name, help), labels).unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+}
 static POSTGIS_UP: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     pg_int_gauge(
         "postgis_up",
@@ -193,24 +198,27 @@ static POSTGIS_POOL_WAITING: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         &["pool_key"],
     )
 });
-static POSTGIS_METADATA_REFRESHES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    pg_int_gauge(
-        "postgis_metadata_refreshes",
-        "Metadata refreshes since this engine started (resets on reload)",
+// Cumulative counts → real Prometheus counters (monotonic across reloads via the
+// rebaseline-on-reset delta-tracking in metrics_handler), so `rate()`/`increase()`
+// behave; a gauge would saw-tooth to 0 on reload and clamp the rate to 0.
+static POSTGIS_METADATA_REFRESHES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "postgis_metadata_refreshes_total",
+        "Total metadata refreshes",
         &["collection"],
     )
 });
-static POSTGIS_METADATA_REFRESH_FAILURES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    pg_int_gauge(
-        "postgis_metadata_refresh_failures",
-        "Failed metadata refreshes since this engine started (resets on reload)",
+static POSTGIS_METADATA_REFRESH_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "postgis_metadata_refresh_failures_total",
+        "Total failed metadata refreshes",
         &["collection"],
     )
 });
-static POSTGIS_PING_FAILURES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    pg_int_gauge(
-        "postgis_ping_failures",
-        "Failed SELECT 1 health pings since this engine started (resets on reload)",
+static POSTGIS_PING_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "postgis_ping_failures_total",
+        "Total failed SELECT 1 health pings",
         &["collection"],
     )
 });
@@ -630,6 +638,10 @@ struct CacheCounterState {
     odim_composite: (u64, u64),
     /// 3D Tiles encoded-content cache `(hits, misses)` — global, monotonic.
     tiles3d_content: (u64, u64),
+    /// PostGIS per-collection `(refreshes, refresh_failures, ping_failures)`
+    /// last-scraped values. Engines are replaced on reload (counts reset), so
+    /// the scrape rebaselines on a backward step — see `metrics_handler`.
+    postgis: HashMap<String, (u64, u64, u64)>,
 }
 
 static RENDER_SEMAPHORE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -3435,11 +3447,13 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         }
     }
 
-    drop(counter_state);
-
-    // PostGIS per-collection / per-pool gauges (#110). All true gauges, set from
-    // live engine state each scrape — no delta-tracking. Multiple collections
-    // can share a pool_key; they set the same pool gauge (idempotent).
+    // PostGIS per-collection / per-pool metrics (#110). Gauges (up, pool stats,
+    // last-refresh duration) are set live each scrape. The three cumulative
+    // counts are real counters with rebaseline-on-reset delta-tracking: engines
+    // are replaced on reload (their in-engine counts reset to 0), so a backward
+    // step rebaselines the delta to keep the Prometheus counter monotonic — no
+    // saw-tooth that would clamp `rate()`/`increase()` to 0. Multiple
+    // collections can share a pool_key; they set the same pool gauge (idempotent).
     {
         let engines = state
             .postgis_engines
@@ -3452,18 +3466,33 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
                 engine_postgis::HealthStatus::Ready => 1,
                 engine_postgis::HealthStatus::Degraded => 0,
             });
-            POSTGIS_METADATA_REFRESHES
-                .with_label_values(&[cid])
-                .set(snap.refresh_total as i64);
-            POSTGIS_METADATA_REFRESH_FAILURES
-                .with_label_values(&[cid])
-                .set(snap.refresh_failures as i64);
-            POSTGIS_PING_FAILURES
-                .with_label_values(&[cid])
-                .set(snap.ping_failures as i64);
             POSTGIS_METADATA_REFRESH_SECONDS
                 .with_label_values(&[cid])
                 .set(snap.last_refresh_secs);
+
+            let cur = (
+                snap.refresh_total,
+                snap.refresh_failures,
+                snap.ping_failures,
+            );
+            let last = counter_state.postgis.get(cid).copied().unwrap_or((0, 0, 0));
+            // Rebaseline (treat last as 0) if any count went backward — the engine
+            // was replaced on reload — so the delta is never negative.
+            let base = if cur.0 < last.0 || cur.1 < last.1 || cur.2 < last.2 {
+                (0, 0, 0)
+            } else {
+                last
+            };
+            POSTGIS_METADATA_REFRESHES_TOTAL
+                .with_label_values(&[cid])
+                .inc_by(cur.0 - base.0);
+            POSTGIS_METADATA_REFRESH_FAILURES_TOTAL
+                .with_label_values(&[cid])
+                .inc_by(cur.1 - base.1);
+            POSTGIS_PING_FAILURES_TOTAL
+                .with_label_values(&[cid])
+                .inc_by(cur.2 - base.2);
+            counter_state.postgis.insert(cid.to_string(), cur);
 
             let pk = engine.pool_key_label();
             let st = engine.pool().status();
@@ -3478,6 +3507,8 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
                 .set(st.waiting as i64);
         }
     }
+
+    drop(counter_state);
 
     let encoder = TextEncoder::new();
     let metric_families = REGISTRY.gather();
