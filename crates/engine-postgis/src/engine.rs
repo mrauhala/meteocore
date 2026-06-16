@@ -215,9 +215,13 @@ impl EdrEngine for PostgisEngine {
         let stations = if self.config.location_source.uses_observations() {
             let bbox = area_to_bbox(coords)?;
             let meta = self.load_meta();
+            // Stop at the cap + nothing more — mirrors the SQL path's
+            // `LIMIT MAX_STATIONS_IN_POLYGON`, so a huge bbox over a dense
+            // dataset never materialises an unbounded Vec just to error out.
             meta.locations
                 .iter()
                 .filter(|l| bbox.contains(l.longitude, l.latitude))
+                .take(MAX_STATIONS_IN_POLYGON)
                 .cloned()
                 .collect::<Vec<Location>>()
         } else {

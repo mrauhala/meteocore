@@ -207,7 +207,9 @@ pub fn build_locations_from_observations(
                 let inner = obs_locations_select(&t.table, &t.station_fk_col, geom)?;
                 branches.push(format!("({inner})"));
             }
-            let unioned = branches.join(" UNION ");
+            // UNION ALL (not UNION): the outer DISTINCT ON (id) already collapses
+            // duplicate ids across tables, so per-branch dedup is wasted work.
+            let unioned = branches.join(" UNION ALL ");
             // Outer DISTINCT ON (id) collapses the union; SELECT kept in a plain
             // literal (tripwire) and `unioned` interpolated via format! (not a
             // bare push_str arg). FROM/UNION are not flagged verbs.
@@ -796,10 +798,10 @@ mod tests {
         assert!(q.sql.contains("ST_Y(\"the_geom\")"));
         assert!(q.sql.contains("ST_X(\"the_geom\")"));
         assert!(q.sql.contains("WHERE \"the_geom\" IS NOT NULL"));
-        // Union across both per-parameter tables.
+        // Union across both per-parameter tables (UNION ALL — outer DISTINCT ON dedups).
         assert!(q.sql.contains("FROM \"public\".\"airtemperature\""));
         assert!(q.sql.contains("FROM \"public\".\"wind_speed\""));
-        assert!(q.sql.contains(" UNION "));
+        assert!(q.sql.contains(" UNION ALL "));
         // Outer collapse by id + the row cap.
         assert!(q.sql.contains("DISTINCT ON (id)"));
         assert!(q.sql.contains(&format!("LIMIT {MAX_LOCATIONS}")));
