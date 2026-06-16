@@ -350,19 +350,22 @@ async fn fetch_observation_rows(
 /// honours the same documented protective limit as the single-source paths.
 fn merge_orphans(stations: &mut Vec<FeatureStation>, orphans: Vec<FeatureStation>) {
     let known: std::collections::HashSet<&str> = stations.iter().map(|s| s.id.as_str()).collect();
-    let fresh: Vec<FeatureStation> = orphans
+    let mut fresh: Vec<FeatureStation> = orphans
         .into_iter()
         .filter(|o| !known.contains(o.id.as_str()))
         .collect();
-    stations.extend(fresh);
-    if stations.len() > MAX_LOCATIONS {
+    // Pre-cap before the extend so the combined Vec never exceeds MAX_LOCATIONS
+    // — each source query is capped independently, so the sum could reach 2×.
+    let total = stations.len() + fresh.len();
+    if total > MAX_LOCATIONS {
         tracing::warn!(
-            total = stations.len(),
+            total,
             cap = MAX_LOCATIONS,
             "postgis: merged stations + orphans exceeds the {MAX_LOCATIONS} cap — truncating; narrow the data or pre-materialize distinct locations"
         );
-        stations.truncate(MAX_LOCATIONS);
+        fresh.truncate(MAX_LOCATIONS.saturating_sub(stations.len()));
     }
+    stations.extend(fresh);
 }
 
 /// Coerce a column value to [`PropertyValue`] based on the column's

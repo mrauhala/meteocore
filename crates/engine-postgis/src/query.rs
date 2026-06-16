@@ -811,6 +811,40 @@ mod tests {
     }
 
     #[test]
+    fn obs_locations_per_parameter_inherits_shared_geom_col() {
+        // A per_parameter table with NO own geom_col must inherit the shared
+        // `observations.geom_col` (the nexus fmi-obs pattern). Exercise the full
+        // lowering path (ObservationSchema::from_config) → SQL builder, not a
+        // pre-populated shape, so the inheritance is actually under test.
+        use ds_core::config::{PostgisObservationTable, PostgisObservationsConfig};
+        let raw = PostgisObservationsConfig {
+            shape: "per_parameter".into(),
+            table: None,
+            station_fk_col: Some("wigos_id".into()),
+            time_col: Some("time".into()),
+            time_col_tz: Some("UTC".into()),
+            param_col: None,
+            value_col: Some("value".into()),
+            geom_col: Some("the_geom".into()), // shared default
+            columns: vec![],
+            tables: vec![PostgisObservationTable {
+                parameter: "t2m".into(),
+                table: "public.airtemperature".into(),
+                station_fk_col: None,
+                time_col: None,
+                time_col_tz: None,
+                value_col: None,
+                geom_col: None, // <-- no own geom; must inherit the default
+            }],
+        };
+        let observations = ObservationSchema::from_config(&raw).unwrap();
+        let cfg = mk_cfg_obs_only(observations);
+        let q = build_locations_from_observations(&cfg).unwrap();
+        assert!(q.sql.contains("ST_Y(\"the_geom\")"));
+        assert!(q.sql.contains("WHERE \"the_geom\" IS NOT NULL"));
+    }
+
+    #[test]
     fn obs_locations_long_distinct_on_fk_quotes_and_caps() {
         let cfg = mk_cfg(
             StationsMapping {
