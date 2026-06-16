@@ -857,6 +857,64 @@ mod tests {
     }
 
     #[test]
+    fn obs_locations_recent_window_long_and_wide() {
+        let since = t(2026, 6, 15, 0);
+        // Long, naive-UTC column ⇒ bind wrapped with AT TIME ZONE.
+        let long = mk_cfg(
+            StationsMapping {
+                table: public("stations"),
+                id_col: "wigos_id".into(),
+                label_col: "name".into(),
+                geom_col: "the_geom".into(),
+                property_cols: vec![],
+                where_clause: None,
+            },
+            ObservationSchema::Long(LongShape {
+                table: public("obs"),
+                station_fk_col: "wigos_id".into(),
+                time_col: "obstime".into(),
+                time_col_tz: Some("UTC".into()),
+                param_col: "param".into(),
+                value_col: "value".into(),
+                geom_col: Some("the_geom".into()),
+            }),
+            vec![param("t2m", "t", "°C", "t2m", "t2m")],
+        );
+        let ql = build_locations_from_observations(&long, Some(since)).unwrap();
+        assert_eq!(ql.len(), 1);
+        assert!(ql[0]
+            .sql
+            .contains("AND \"obstime\" >= ($1 AT TIME ZONE 'UTC')"));
+        assert_eq!(ql[0].params, vec![SqlParam::Timestamp(since)]);
+
+        // Wide, timestamptz column (tz = None) ⇒ bind used bare, no AT TIME ZONE.
+        let wide = mk_cfg(
+            StationsMapping {
+                table: public("stations"),
+                id_col: "station_id".into(),
+                label_col: "name".into(),
+                geom_col: "geom".into(),
+                property_cols: vec![],
+                where_clause: None,
+            },
+            ObservationSchema::Wide(WideShape {
+                table: public("synop"),
+                station_fk_col: "station_id".into(),
+                time_col: "valid_time".into(),
+                time_col_tz: None,
+                geom_col: Some("the_geom".into()),
+                columns: vec![("t2m".into(), "temp_celsius".into())],
+            }),
+            vec![param("t2m", "t", "°C", "t2m", "t2m")],
+        );
+        let qw = build_locations_from_observations(&wide, Some(since)).unwrap();
+        assert_eq!(qw.len(), 1);
+        assert!(qw[0].sql.contains("AND \"valid_time\" >= $1"));
+        assert!(!qw[0].sql.contains("AT TIME ZONE"));
+        assert_eq!(qw[0].params, vec![SqlParam::Timestamp(since)]);
+    }
+
+    #[test]
     fn obs_locations_per_parameter_inherits_shared_geom_col() {
         // A per_parameter table with NO own geom_col must inherit the shared
         // `observations.geom_col` (the nexus fmi-obs pattern). Exercise the full
