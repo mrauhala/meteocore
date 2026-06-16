@@ -77,8 +77,10 @@ impl Health {
         if !ok {
             self.refresh_failures.fetch_add(1, Ordering::Relaxed);
         }
-        self.last_refresh_millis
-            .store(dur.as_millis() as u64, Ordering::Relaxed);
+        self.last_refresh_millis.store(
+            dur.as_millis().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
     }
 
     /// Snapshot for the `/metrics` scrape.

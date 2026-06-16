@@ -156,10 +156,16 @@ impl PostgisEngine {
             let (client, conn) = tokio_postgres::connect(&self.config.dsn, tokio_postgres::NoTls)
                 .await
                 .ok()?;
-            let driver = tokio::spawn(conn); // drive the connection for the probe
-            let ok = client.query_one("SELECT 1", &[]).await.is_ok();
-            drop(client); // closes the connection; the driver then completes
-            driver.abort();
+            // Drive the connection INLINE (no `tokio::spawn`): if the outer
+            // timeout drops this future, both the query and the connection driver
+            // drop with it — a detached spawned task would instead leak one
+            // orphan driver per timed-out ping until its socket closed.
+            tokio::pin!(conn);
+            let ok = tokio::select! {
+                res = client.query_one("SELECT 1", &[]) => res.is_ok(),
+                // The driver future only resolves if the connection errors/closes.
+                _ = &mut conn => false,
+            };
             Some(ok)
         };
         matches!(
