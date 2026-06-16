@@ -7,7 +7,7 @@
 //! independently of DB health.
 //!
 //! Bootstrap: [`MetadataCache::refresh`] runs the location query (or queries)
-//! + one temporal-extent query against the pool and atomically swaps the
+//! and one temporal-extent query against the pool, then atomically swaps the
 //! result in. It's called once at engine construction and then every
 //! `metadata_refresh_secs` by `PostgisEngine::poll_loop` on the background
 //! poll runtime — so the location list / extents / windowed "reporting" set
