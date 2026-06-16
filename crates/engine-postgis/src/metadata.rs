@@ -207,11 +207,17 @@ fn spatial_extent_from(locations: &[Location]) -> Option<[f64; 4]> {
 
 /// Build the cached location/feature set per the collection's
 /// [`LocationSource`]:
-/// - `Stations` — the stations table only (rich rows: label + properties).
+/// - `Stations` — the stations table only (rich rows: label + properties); the
+///   whole registry is advertised regardless of whether it has data.
 /// - `Observations` — derived from the observations table's geometry (mode A):
-///   one Point per distinct `station_fk`, `label = id`, no properties.
-/// - `StationsWithOrphans` — both, merged stations-first so a registered
-///   station always wins over an orphan with the same id (mode B).
+///   one Point per distinct `station_fk` **reporting within the window**,
+///   `label = id`, no properties.
+/// - `StationsWithOrphans` (mode B) — **membership is the windowed obs reporters**
+///   (same set as mode A); the stations table only supplies *metadata*
+///   (label/properties/authoritative geometry) for the registered subset. A
+///   registered-but-silent station is therefore NOT advertised — every listed
+///   location has data within the window (use stations-only mode, i.e. omit
+///   `observations.geom_col`, to advertise the full registry instead).
 async fn fetch_locations(
     cfg: &PostgisEngineConfig,
     pool: &Pool,
@@ -220,10 +226,9 @@ async fn fetch_locations(
         LocationSource::Stations(_) => fetch_station_rows(cfg, pool).await,
         LocationSource::Observations => fetch_observation_rows(cfg, pool).await,
         LocationSource::StationsWithOrphans(_) => {
-            let mut stations = fetch_station_rows(cfg, pool).await?;
-            let orphans = fetch_observation_rows(cfg, pool).await?;
-            merge_orphans(&mut stations, orphans);
-            Ok(stations)
+            let reporters = fetch_observation_rows(cfg, pool).await?;
+            let stations = fetch_station_rows(cfg, pool).await?;
+            Ok(enrich_with_stations(reporters, stations))
         }
     }
 }
@@ -372,33 +377,28 @@ async fn fetch_observation_rows(
     Ok(out)
 }
 
-/// Append orphan rows whose id is not already present among the (stations-first)
-/// list. A real station always wins over an orphan with the same id — defensive
-/// even though the obs-derived set and the stations set are disjoint by
-/// definition (a registered station is not an orphan); a poll-time race where a
-/// station was just inserted could otherwise surface both.
-///
-/// Each source query is independently capped at [`MAX_LOCATIONS`], so the merged
-/// set could reach `2 × MAX_LOCATIONS`. Re-cap (and WARN) so the in-memory set
-/// honours the same documented protective limit as the single-source paths.
-fn merge_orphans(stations: &mut Vec<FeatureStation>, orphans: Vec<FeatureStation>) {
-    let known: HashSet<&str> = stations.iter().map(|s| s.id.as_str()).collect();
-    let mut fresh: Vec<FeatureStation> = orphans
+/// Mode B membership = the windowed `reporters`; the stations table only
+/// supplies *metadata*. Each reporter whose id is in the stations registry is
+/// replaced by its rich stations row (label + properties + authoritative
+/// geometry); reporters with no registry match stay as bare orphans. The result
+/// is the reporters set (already capped at [`MAX_LOCATIONS`]) — a
+/// registered-but-silent station is intentionally absent, so every advertised
+/// location has data within the window.
+fn enrich_with_stations(
+    reporters: Vec<FeatureStation>,
+    stations: Vec<FeatureStation>,
+) -> Vec<FeatureStation> {
+    let registry: HashMap<&str, &FeatureStation> =
+        stations.iter().map(|s| (s.id.as_str(), s)).collect();
+    reporters
         .into_iter()
-        .filter(|o| !known.contains(o.id.as_str()))
-        .collect();
-    // Pre-cap before the extend so the combined Vec never exceeds MAX_LOCATIONS
-    // — each source query is capped independently, so the sum could reach 2×.
-    let total = stations.len() + fresh.len();
-    if total > MAX_LOCATIONS {
-        tracing::warn!(
-            total,
-            cap = MAX_LOCATIONS,
-            "postgis: merged stations + orphans exceeds the {MAX_LOCATIONS} cap — truncating; narrow the data or pre-materialize distinct locations"
-        );
-        fresh.truncate(MAX_LOCATIONS.saturating_sub(stations.len()));
-    }
-    stations.extend(fresh);
+        .map(|r| {
+            registry
+                .get(r.id.as_str())
+                .map(|s| (*s).clone())
+                .unwrap_or(r)
+        })
+        .collect()
 }
 
 /// Coerce a column value to [`PropertyValue`] based on the column's
@@ -626,27 +626,35 @@ mod tests {
     }
 
     #[test]
-    fn merge_orphans_appends_only_unknown_ids() {
-        // Registered station "reg" (rich props) + orphan "orphan" (no props).
-        let mut stations = vec![mk_fs("reg", 24.9, 60.2, "Helsinki", &[("territory", "FI")])];
-        let orphans = vec![
+    fn enrich_with_stations_membership_is_reporters_only() {
+        // Reporters (windowed) = the membership. The registry has a rich row for
+        // "reg" and also a silent station "silent" that did NOT report.
+        let reporters = vec![
+            mk_fs("reg", 24.9, 60.2, "reg", &[]), // bare obs row (obs geom)
             mk_fs("orphan", 18.9, 12.1, "orphan", &[]),
-            // Collides with the registered station — must NOT shadow it.
-            mk_fs("reg", 0.0, 0.0, "reg", &[]),
         ];
-        merge_orphans(&mut stations, orphans);
+        let registry = vec![
+            mk_fs("reg", 25.0, 60.3, "Helsinki", &[("territory", "FI")]),
+            mk_fs("silent", 1.0, 2.0, "Nowhere", &[("territory", "XX")]),
+        ];
+        let out = enrich_with_stations(reporters, registry);
 
-        assert_eq!(stations.len(), 2);
-        // The registered station kept its rich row (label + territory, original coords).
-        let reg = stations.iter().find(|s| s.id == "reg").unwrap();
+        // Exactly the two reporters — the silent registered station is NOT listed.
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|s| s.id != "silent"));
+
+        // "reg" reported AND is registered ⇒ enriched with the registry row
+        // (rich label + territory + authoritative geometry).
+        let reg = out.iter().find(|s| s.id == "reg").unwrap();
         assert_eq!(reg.label, "Helsinki");
-        assert_eq!(reg.lon, 24.9);
+        assert_eq!(reg.lon, 25.0); // authoritative stations geom, not the obs geom
         assert_eq!(
             reg.properties.get("territory"),
             Some(&PropertyValue::String("FI".into()))
         );
-        // The genuine orphan appears with id-as-label and empty properties.
-        let orphan = stations.iter().find(|s| s.id == "orphan").unwrap();
+
+        // "orphan" reported but isn't registered ⇒ bare (id-as-label, no props).
+        let orphan = out.iter().find(|s| s.id == "orphan").unwrap();
         assert_eq!(orphan.label, "orphan");
         assert!(orphan.properties.is_empty());
     }

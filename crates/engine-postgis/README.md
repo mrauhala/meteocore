@@ -287,9 +287,9 @@ registry. The mode is derived from what you configure, with no extra flag:
 
 | `[postgis.stations]` | `observations.geom_col` | Mode | Behavior |
 |---|---|---|---|
-| present | absent | stations-only | Original behavior. Locations + labels + properties from the stations table. |
-| present | present | **orphan fallback** | Registered stations get their label/properties; observations whose `station_fk` has no stations row still surface, located from the obs geometry (`label = id`, no properties). |
-| absent | present | **observations-only** | Every location derived from the obs geometry. `label = id`, no properties. |
+| present | absent | stations-only | Original behavior. The **whole registry** is advertised (labels + properties), with or without data. |
+| present | present | **orphan fallback** | **Membership = stations reporting within the window** (same set as observations-only). Registered ones get their label/properties + authoritative geometry; reporters with no `stations` row are bare orphans (`label = id`, no properties). A **registered-but-silent station is not advertised** — use stations-only mode to advertise the full registry. |
+| absent | present | **observations-only** | Every location derived from the obs geometry (windowed reporters). `label = id`, no properties. |
 | absent | absent | — | Hard config error (nothing can be placed on a map). |
 
 **Mode A — no stations table** (everything from the observations geometry):
