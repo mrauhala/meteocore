@@ -155,6 +155,10 @@ impl PostgisEngine {
     /// `NoTls` matches the engine's connection (TLS is the remaining #110 work).
     async fn ping(&self) -> bool {
         let probe = async {
+            // TODO(#110): when TLS lands, this connector MUST match the pool's
+            // (currently both `NoTls`). If the ping stays `NoTls` against a
+            // TLS-required server, it would be rejected while the pool works —
+            // falsely degrading a healthy collection.
             let (client, conn) = tokio_postgres::connect(&self.config.dsn, tokio_postgres::NoTls)
                 .await
                 .ok()?;

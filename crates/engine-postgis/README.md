@@ -418,7 +418,7 @@ suspicious but workable (WARN — the collection still loads).
   gauges `postgis_up{collection}` (1/0), `postgis_pool_{size,max_size,available,waiting}{pool_key}`
   (`size` = open connections, `max_size` = capacity, `available` = acquirable now),
   `postgis_metadata_refresh_seconds{collection}` (last refresh duration); and
-  counters `postgis_{metadata_refreshes,metadata_refresh_failures,ping_failures}_total{collection}`
+  counters `postgis_{metadata_refreshes,metadata_refresh_failures,pings,ping_failures}_total{collection}`
   (process-global, delta-tracked so `rate()` works across reloads). Labels are
   bounded (collection / pool_key are config-time).
   Per-query histograms (`postgis_query_duration_seconds` / `rows_returned` /

@@ -222,6 +222,13 @@ static POSTGIS_METADATA_REFRESH_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLo
         &["collection"],
     )
 });
+static POSTGIS_PINGS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "postgis_pings_total",
+        "Total SELECT 1 health pings (failure ratio = failures_total / pings_total)",
+        &["collection"],
+    )
+});
 static POSTGIS_PING_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     pg_int_counter(
         "postgis_ping_failures_total",
@@ -645,10 +652,10 @@ struct CacheCounterState {
     odim_composite: (u64, u64),
     /// 3D Tiles encoded-content cache `(hits, misses)` — global, monotonic.
     tiles3d_content: (u64, u64),
-    /// PostGIS per-collection `(refreshes, refresh_failures, ping_failures)`
+    /// PostGIS per-collection `(refreshes, refresh_failures, pings, ping_failures)`
     /// last-scraped values. Engines are replaced on reload (counts reset), so
     /// the scrape rebaselines on a backward step — see `metrics_handler`.
-    postgis: HashMap<String, (u64, u64, u64)>,
+    postgis: HashMap<String, (u64, u64, u64, u64)>,
 }
 
 static RENDER_SEMAPHORE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -3488,13 +3495,18 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
             let cur = (
                 snap.refresh_total,
                 snap.refresh_failures,
+                snap.ping_total,
                 snap.ping_failures,
             );
-            let last = counter_state.postgis.get(cid).copied().unwrap_or((0, 0, 0));
+            let last = counter_state
+                .postgis
+                .get(cid)
+                .copied()
+                .unwrap_or((0, 0, 0, 0));
             // Rebaseline (treat last as 0) if any count went backward — the engine
             // was replaced on reload — so the delta is never negative.
-            let base = if cur.0 < last.0 || cur.1 < last.1 || cur.2 < last.2 {
-                (0, 0, 0)
+            let base = if cur.0 < last.0 || cur.1 < last.1 || cur.2 < last.2 || cur.3 < last.3 {
+                (0, 0, 0, 0)
             } else {
                 last
             };
@@ -3504,9 +3516,12 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
             POSTGIS_METADATA_REFRESH_FAILURES_TOTAL
                 .with_label_values(&[cid])
                 .inc_by(cur.1 - base.1);
-            POSTGIS_PING_FAILURES_TOTAL
+            POSTGIS_PINGS_TOTAL
                 .with_label_values(&[cid])
                 .inc_by(cur.2 - base.2);
+            POSTGIS_PING_FAILURES_TOTAL
+                .with_label_values(&[cid])
+                .inc_by(cur.3 - base.3);
             counter_state.postgis.insert(cid.to_string(), cur);
 
             let pk = engine.pool_key_label();

@@ -36,6 +36,7 @@ pub struct Health {
     /// `probed`). Seeded `true`; the first ping runs immediately when the poll
     /// loop starts.
     db_reachable: AtomicBool,
+    ping_total: AtomicU64,
     ping_failures: AtomicU64,
     refresh_total: AtomicU64,
     refresh_failures: AtomicU64,
@@ -47,6 +48,7 @@ impl Default for Health {
         Self {
             probed: AtomicBool::new(false),
             db_reachable: AtomicBool::new(true),
+            ping_total: AtomicU64::new(0),
             ping_failures: AtomicU64::new(0),
             refresh_total: AtomicU64::new(0),
             refresh_failures: AtomicU64::new(0),
@@ -83,6 +85,7 @@ impl Health {
     /// logging), else `None`. The first ping reports a transition only if it
     /// differs from the optimistic `true` seed (i.e. boot found the DB down).
     pub fn record_ping(&self, ok: bool) -> Option<HealthStatus> {
+        self.ping_total.fetch_add(1, Ordering::Relaxed);
         if !ok {
             self.ping_failures.fetch_add(1, Ordering::Relaxed);
         }
@@ -116,6 +119,7 @@ impl Health {
         HealthSnapshot {
             probed: self.probed.load(Ordering::Acquire),
             status: self.status(),
+            ping_total: self.ping_total.load(Ordering::Relaxed),
             ping_failures: self.ping_failures.load(Ordering::Relaxed),
             refresh_total: self.refresh_total.load(Ordering::Relaxed),
             refresh_failures: self.refresh_failures.load(Ordering::Relaxed),
@@ -130,6 +134,7 @@ pub struct HealthSnapshot {
     /// Whether the first ping has run — `status` is only authoritative if true.
     pub probed: bool,
     pub status: HealthStatus,
+    pub ping_total: u64,
     pub ping_failures: u64,
     pub refresh_total: u64,
     pub refresh_failures: u64,
