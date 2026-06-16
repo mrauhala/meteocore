@@ -288,53 +288,71 @@ async fn fetch_station_rows(
 /// Locations derived from the observations table's own geometry
 /// (`build_locations_from_observations`). Orphans carry no station metadata:
 /// `label = id`, empty properties.
+///
+/// One query per observation table (each small enough to stay under a read-only
+/// role's `statement_timeout`); rows are deduplicated by id across tables here —
+/// the cross-table dedup a single `UNION`'s outer `DISTINCT ON (id)` used to do.
+/// First occurrence wins (stations are assumed spatially stable). The merged set
+/// is capped at [`MAX_LOCATIONS`].
 async fn fetch_observation_rows(
     cfg: &PostgisEngineConfig,
     pool: &Pool,
 ) -> Result<Vec<FeatureStation>, MetadataError> {
-    let built =
+    let queries =
         build_locations_from_observations(cfg).map_err(|e| MetadataError::Decode(e.to_string()))?;
     let client = pool
         .get()
         .await
         .map_err(|e| MetadataError::Pool(e.to_string()))?;
-    let stmt = client
-        .prepare_cached(&built.sql)
-        .await
-        .map_err(|_| MetadataError::Db)?;
-    let param_refs = crate::query::params_as_refs(&built.params);
-    let rows = client
-        .query(&stmt, &param_refs)
-        .await
-        .map_err(|_| MetadataError::Db)?;
 
-    if rows.len() >= MAX_LOCATIONS {
+    let empty = Arc::new(HashMap::new());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<FeatureStation> = Vec::new();
+    let mut truncated = false;
+
+    'tables: for built in &queries {
+        let stmt = client
+            .prepare_cached(&built.sql)
+            .await
+            .map_err(|_| MetadataError::Db)?;
+        let param_refs = crate::query::params_as_refs(&built.params);
+        let rows = client
+            .query(&stmt, &param_refs)
+            .await
+            .map_err(|_| MetadataError::Db)?;
+
+        for row in &rows {
+            let id: String = row
+                .try_get("id")
+                .map_err(|e| MetadataError::Decode(e.to_string()))?;
+            if !seen.insert(id.clone()) {
+                continue; // already seen in an earlier table — first geometry wins
+            }
+            let lat: f64 = row
+                .try_get("lat")
+                .map_err(|e| MetadataError::Decode(e.to_string()))?;
+            let lon: f64 = row
+                .try_get("lon")
+                .map_err(|e| MetadataError::Decode(e.to_string()))?;
+            out.push(FeatureStation {
+                id: id.clone(),
+                label: id,
+                lat,
+                lon,
+                properties: empty.clone(),
+            });
+            if out.len() >= MAX_LOCATIONS {
+                truncated = true;
+                break 'tables;
+            }
+        }
+    }
+
+    if truncated {
         tracing::warn!(
-            rows = rows.len(),
             cap = MAX_LOCATIONS,
             "postgis: observations-derived location list hit the {MAX_LOCATIONS} cap — some stations may be missing; narrow the data, add a stations table, or pre-materialize distinct locations"
         );
-    }
-
-    let empty = Arc::new(HashMap::new());
-    let mut out = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let id: String = row
-            .try_get("id")
-            .map_err(|e| MetadataError::Decode(e.to_string()))?;
-        let lat: f64 = row
-            .try_get("lat")
-            .map_err(|e| MetadataError::Decode(e.to_string()))?;
-        let lon: f64 = row
-            .try_get("lon")
-            .map_err(|e| MetadataError::Decode(e.to_string()))?;
-        out.push(FeatureStation {
-            id: id.clone(),
-            label: id,
-            lat,
-            lon,
-            properties: empty.clone(),
-        });
     }
     Ok(out)
 }
