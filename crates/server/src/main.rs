@@ -500,6 +500,14 @@ async fn main() {
             poller.poll_loop().await;
         });
     }
+    // PostGIS metadata refresh loop — keeps the location list / extents / the
+    // `locations_window` "currently reporting" set current without a reload.
+    for engine in &result.postgis_engines {
+        let poller = engine.clone();
+        poll_runtime().spawn(async move {
+            poller.poll_loop().await;
+        });
+    }
 
     // Set initial health gauges
     admin::update_health_gauges(&result.health);

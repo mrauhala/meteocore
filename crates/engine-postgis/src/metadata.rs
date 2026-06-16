@@ -6,10 +6,12 @@
 //! endpoints (`/collections`, `/collections/{id}`) therefore scale
 //! independently of DB health.
 //!
-//! Bootstrap: [`MetadataCache::refresh`] runs one `stations` query +
-//! one temporal-extent query against the pool and atomically swaps the
-//! result in. Today it's called once at engine construction; #108's
-//! background refresh task (300 s cadence) is deferred to a follow-up.
+//! Bootstrap: [`MetadataCache::refresh`] runs the location query (or queries)
+//! and one temporal-extent query against the pool, then atomically swaps the
+//! result in. It's called once at engine construction and then every
+//! `metadata_refresh_secs` by `PostgisEngine::poll_loop` on the background
+//! poll runtime — so the location list / extents / windowed "reporting" set
+//! stay current without a manual reload.
 
 use std::sync::Arc;
 
