@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
@@ -18,6 +19,7 @@ use ds_core::feature::Bbox;
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
 };
+use tokio::sync::watch;
 use tokio_postgres::Row;
 
 use crate::config::PostgisEngineConfig;
@@ -40,6 +42,8 @@ pub struct PostgisEngine {
     config: Arc<PostgisEngineConfig>,
     pool: Arc<Pool>,
     cache: Arc<MetadataCache>,
+    /// Stops the background metadata-refresh loop on reload.
+    shutdown_tx: watch::Sender<()>,
 }
 
 impl std::fmt::Debug for PostgisEngine {
@@ -59,21 +63,23 @@ impl PostgisEngine {
         pool: Arc<Pool>,
     ) -> Self {
         let collection_id = collection_id.into();
-        // /health reports the boot-time outcome and is never updated
-        // afterwards. The 30 s background ping described in the plan
-        // doc lives in #110; until then, a DB that goes down after
-        // startup will still show `ready`. Surface this loudly per
-        // collection so operators don't trust /health more than they
-        // should.
+        // Metadata (location list / extents) IS refreshed in the background by
+        // `poll_loop` (every `metadata_refresh_secs`), but `/health` status is
+        // still only set at boot: a failed background refresh logs a WARN and
+        // keeps the previous snapshot — it does NOT flip the collection to
+        // `degraded`. So a DB that goes down after startup still shows `ready`.
+        // Live health monitoring is the remaining #110 work; surface it loudly.
         tracing::warn!(
             collection = %collection_id,
-            "postgis engine: live health monitoring is not implemented (#110). /health reflects the boot-time status only; a DB failure after startup will NOT flip the collection to degraded."
+            "postgis engine: live health monitoring is not implemented (#110). /health reflects the boot-time status only; a DB failure after startup will NOT flip the collection to degraded (background metadata refresh keeps the last good snapshot)."
         );
+        let (shutdown_tx, _) = watch::channel(());
         Self {
             collection_id,
             config,
             pool,
             cache: Arc::new(MetadataCache::new_empty()),
+            shutdown_tx,
         }
     }
 
@@ -100,6 +106,47 @@ impl PostgisEngine {
             .refresh(&self.config, &self.pool)
             .await
             .map_err(|e| DataServerError::Engine(format!("metadata refresh failed: {e}")))
+    }
+
+    /// Background metadata-refresh loop. Re-runs `refresh_metadata` every
+    /// `metadata_refresh_secs` so the location list, extents, and the
+    /// `locations_window`-derived "currently reporting" set stay current
+    /// without a manual reload. A failed refresh keeps the previous snapshot
+    /// (`MetadataCache::refresh` only swaps on success) — so a transient DB
+    /// blip never empties the cache. Spawned on the dedicated background poll
+    /// runtime in `server::admin` (never a request worker, #221); exits when
+    /// `shutdown()` is called on reload. The initial refresh already ran at
+    /// construction, so the first tick is skipped.
+    pub async fn poll_loop(&self) {
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let mut interval = tokio::time::interval(Duration::from_secs(
+            self.config.metadata_refresh_secs.max(1),
+        ));
+        interval.tick().await; // skip the immediate first tick (construction already refreshed)
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = self.refresh_metadata().await {
+                        tracing::warn!(
+                            collection = %self.collection_id,
+                            error = %e,
+                            "postgis: background metadata refresh failed — keeping the previous snapshot"
+                        );
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    tracing::info!(collection = %self.collection_id, "postgis: metadata refresh loop shutting down");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Signal [`poll_loop`] to stop (called on reload before the engine is
+    /// replaced).
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(());
     }
 
     fn load_meta(&self) -> Arc<CollectionMeta> {

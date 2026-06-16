@@ -2819,6 +2819,14 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         {
             engine.shutdown();
         }
+        for engine in state
+            .postgis_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            engine.shutdown();
+        }
     }
 
     // Spawn poll loops for new engines on the dedicated background runtime
@@ -2860,6 +2868,15 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         });
     }
     for engine in &result.cap_engines {
+        let poller = engine.clone();
+        crate::poll_runtime().spawn(async move {
+            poller.poll_loop().await;
+        });
+    }
+    // PostGIS metadata refresh loop (location list / extents / the
+    // `locations_window` "currently reporting" set). Async DB I/O on its own
+    // deadpool pool — runs on the background runtime, not a request worker.
+    for engine in &result.postgis_engines {
         let poller = engine.clone();
         crate::poll_runtime().spawn(async move {
             poller.poll_loop().await;
