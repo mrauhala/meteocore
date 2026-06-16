@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use ds_core::feature::PropertyValue;
 use ds_core::model::{Location, ParameterDescription};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use tokio_postgres::types::Type;
 use tokio_postgres::Row;
@@ -294,6 +294,13 @@ async fn fetch_station_rows(
 /// the cross-table dedup a single `UNION`'s outer `DISTINCT ON (id)` used to do.
 /// First occurrence wins (stations are assumed spatially stable). The merged set
 /// is capped at [`MAX_LOCATIONS`].
+///
+/// Buffering note: each per-table query is itself `LIMIT MAX_LOCATIONS`, run
+/// sequentially on one connection, so peak buffered rows ≈ one table's result
+/// set; the accumulated set is bounded by the early `break` at `MAX_LOCATIONS`.
+/// The *total* rows fetched across tables can reach `tables × MAX_LOCATIONS` for
+/// a high-cardinality `per_parameter` source (vs. the old single-UNION cap of
+/// one `MAX_LOCATIONS`) — narrow the source or pre-materialize if that bites.
 async fn fetch_observation_rows(
     cfg: &PostgisEngineConfig,
     pool: &Pool,
@@ -306,7 +313,7 @@ async fn fetch_observation_rows(
         .map_err(|e| MetadataError::Pool(e.to_string()))?;
 
     let empty = Arc::new(HashMap::new());
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<FeatureStation> = Vec::new();
     let mut truncated = false;
 
@@ -351,6 +358,7 @@ async fn fetch_observation_rows(
     if truncated {
         tracing::warn!(
             cap = MAX_LOCATIONS,
+            tables = queries.len(),
             "postgis: observations-derived location list hit the {MAX_LOCATIONS} cap — some stations may be missing; narrow the data, add a stations table, or pre-materialize distinct locations"
         );
     }
@@ -367,7 +375,7 @@ async fn fetch_observation_rows(
 /// set could reach `2 × MAX_LOCATIONS`. Re-cap (and WARN) so the in-memory set
 /// honours the same documented protective limit as the single-source paths.
 fn merge_orphans(stations: &mut Vec<FeatureStation>, orphans: Vec<FeatureStation>) {
-    let known: std::collections::HashSet<&str> = stations.iter().map(|s| s.id.as_str()).collect();
+    let known: HashSet<&str> = stations.iter().map(|s| s.id.as_str()).collect();
     let mut fresh: Vec<FeatureStation> = orphans
         .into_iter()
         .filter(|o| !known.contains(o.id.as_str()))
