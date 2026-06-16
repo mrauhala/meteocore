@@ -114,9 +114,11 @@ impl PostgisEngine {
         &self.cache
     }
 
-    /// Live `/health` status (`Ready`/`Degraded`) from the latest ping.
-    pub fn health_status(&self) -> HealthStatus {
-        self.health.status()
+    /// Authoritative live `/health` status — `None` until the first ping has
+    /// run (so the caller keeps the boot snapshot rather than the optimistic
+    /// seed), then `Some(Ready/Degraded)`.
+    pub fn live_health(&self) -> Option<HealthStatus> {
+        self.health.live_status()
     }
 
     /// Health + metrics-counter snapshot for the `/metrics` scrape.

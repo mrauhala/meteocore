@@ -26,8 +26,15 @@ pub enum HealthStatus {
 /// Lock-free live health + metrics counters for one collection.
 #[derive(Debug)]
 pub struct Health {
-    /// DB reachable per the most recent `SELECT 1` ping. `/health` is `Ready`
-    /// iff this is true (seeded `true`; the first ping runs within ~2 s of boot).
+    /// Whether at least one `SELECT 1` ping has completed. Until it has, the
+    /// live status is not authoritative — `/health` must keep the boot snapshot
+    /// (which reflects the boot `refresh_metadata` outcome) rather than the
+    /// optimistic `db_reachable` seed, else a boot-degraded collection briefly
+    /// shows `ready`.
+    probed: AtomicBool,
+    /// DB reachable per the most recent `SELECT 1` ping (only meaningful once
+    /// `probed`). Seeded `true`; the first ping runs immediately when the poll
+    /// loop starts.
     db_reachable: AtomicBool,
     ping_failures: AtomicU64,
     refresh_total: AtomicU64,
@@ -38,6 +45,7 @@ pub struct Health {
 impl Default for Health {
     fn default() -> Self {
         Self {
+            probed: AtomicBool::new(false),
             db_reachable: AtomicBool::new(true),
             ping_failures: AtomicU64::new(0),
             refresh_total: AtomicU64::new(0),
@@ -52,7 +60,9 @@ impl Health {
         Self::default()
     }
 
-    /// Current status — `Ready` iff the last ping reached the DB.
+    /// Current status — `Ready` iff the last ping reached the DB. Reflects the
+    /// optimistic `true` seed until the first ping; use [`Self::live_status`]
+    /// when an unprobed engine must defer to the boot snapshot instead.
     pub fn status(&self) -> HealthStatus {
         if self.db_reachable.load(Ordering::Acquire) {
             HealthStatus::Ready
@@ -61,12 +71,20 @@ impl Health {
         }
     }
 
+    /// Authoritative live status: `None` until the first ping has completed (so
+    /// `/health` keeps the boot snapshot rather than the optimistic seed), then
+    /// `Some(status)`.
+    pub fn live_status(&self) -> Option<HealthStatus> {
+        self.probed.load(Ordering::Acquire).then(|| self.status())
+    }
+
     /// Record a `SELECT 1` ping outcome (the `/health` authority).
     pub fn record_ping(&self, ok: bool) {
         if !ok {
             self.ping_failures.fetch_add(1, Ordering::Relaxed);
         }
         self.db_reachable.store(ok, Ordering::Release);
+        self.probed.store(true, Ordering::Release);
     }
 
     /// Record a metadata-refresh outcome + duration (metrics only — a refresh
@@ -112,6 +130,17 @@ mod tests {
     #[test]
     fn starts_ready() {
         assert_eq!(Health::new().status(), HealthStatus::Ready);
+    }
+
+    #[test]
+    fn live_status_none_until_first_ping() {
+        let h = Health::new();
+        // Unprobed: the boot snapshot must be kept (no live override).
+        assert_eq!(h.live_status(), None);
+        h.record_ping(true);
+        assert_eq!(h.live_status(), Some(HealthStatus::Ready));
+        h.record_ping(false);
+        assert_eq!(h.live_status(), Some(HealthStatus::Degraded));
     }
 
     #[test]

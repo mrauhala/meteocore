@@ -3056,6 +3056,9 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
     // so a DB that went down after startup flips to `degraded` and one that
     // recovered flips back (#110). A `Failed` collection has no engine (couldn't
     // construct), so it's absent from the live map and keeps its boot status.
+    // `live_health()` is `None` until the first ping completes — so a
+    // boot-degraded collection keeps that boot status instead of the optimistic
+    // `ready` seed during the load→first-ping window.
     {
         let engines = state
             .postgis_engines
@@ -3063,7 +3066,7 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             .unwrap_or_else(|e| e.into_inner());
         let live: HashMap<&str, engine_postgis::HealthStatus> = engines
             .iter()
-            .map(|e| (e.collection_id(), e.health_status()))
+            .filter_map(|e| Some((e.collection_id(), e.live_health()?)))
             .collect();
         for h in health.iter_mut().filter(|h| h.engine_type == "postgis") {
             if let Some(&s) = live.get(h.id.as_str()) {
