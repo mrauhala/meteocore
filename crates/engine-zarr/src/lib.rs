@@ -409,6 +409,13 @@ impl MapEngine for ZarrEngine {
                 // suspenders; it becomes load-bearing for projected source grids
                 // (Phase 4 STAC per-item-CRS, e.g. HRRR/Lambert), whose forward
                 // aliases like the TM/stereographic raster engines do.
+                //
+                // `footprint_pixel_window` REQUIRES `spatial_extent` to be a WGS84
+                // [w,s,e,n] envelope (it feeds it to `world_to_fraction` as
+                // lon/lat). That holds today — the catalog builds `extent` from the
+                // lon/lat CF coordinate arrays. Phase 4 projected sources must keep
+                // this invariant (reproject the native extent to WGS84 before
+                // storing it) or this guard would compute a nonsense window.
                 let (px_lo, px_hi, py_lo, py_hi) = cat
                     .raster_info
                     .spatial_extent

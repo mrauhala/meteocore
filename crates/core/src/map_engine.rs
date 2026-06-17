@@ -148,11 +148,25 @@ impl OutputCrs {
     ///
     /// If no perimeter sample yields a finite fraction (e.g. a projected output
     /// CRS whose inverse is undefined across the whole envelope) the guard is
-    /// disabled (full image) rather than risk clipping real data. **Limitation:**
-    /// a single output-space box, so on a viewport showing more than one world
-    /// copy (Web Mercator spanning > 360° of longitude) only the primary copy of
-    /// the footprint is kept; wrapped copies render as nodata (acceptable — the
-    /// alternative was ghost aliasing).
+    /// disabled (full image) rather than risk clipping real data.
+    ///
+    /// **Requires `src_env_wgs84` to be a true WGS84 `[w, s, e, n]` envelope** —
+    /// it is fed to [`Self::world_to_fraction`] as lon/lat. A native-CRS extent
+    /// (projected metres) would produce a nonsense window and silently disable
+    /// the guard; engines must reproject to WGS84 before calling.
+    ///
+    /// **Limitations:**
+    /// - A single output-space box, so on a viewport showing more than one world
+    ///   copy (Web Mercator spanning > 360° of longitude) only the primary copy
+    ///   of the footprint is kept; wrapped copies render as nodata (acceptable —
+    ///   the alternative was ghost aliasing).
+    /// - The perimeter walk assumes `w <= e` (and `s <= n`). An
+    ///   **antimeridian-crossing** envelope (`w > e`, e.g. `w=170, e=-170`) steps
+    ///   backwards through the interior instead of wrapping over ±180°, yielding
+    ///   an over-wide window that effectively disables the guard for that source.
+    ///   No current data type crosses the antimeridian (European/national
+    ///   composites, regional rasters, geographic Zarr grids); revisit if one is
+    ///   added.
     pub fn footprint_pixel_window(
         &self,
         wgs84_bbox: [f64; 4],
