@@ -226,7 +226,7 @@ pub struct MetaTileStats {
     /// for hits (normally negligible). For a cold render (all misses) this is
     /// the miss-render time — the metric the cold-tail diagnosis cares about.
     pub tile_loop_ms: u64,
-    /// Time assembling the mosaic into the output (premultiplied bilinear).
+    /// Time assembling the mosaic into the output (nearest-neighbour resample).
     pub assemble_ms: u64,
     /// Time encoding the final image (PNG/JPEG/WebP). 0 for an all-nodata render.
     pub encode_ms: u64,
@@ -421,7 +421,7 @@ where
         for px in 0..width {
             let x_m = west_m + (px as f64 + 0.5) * res_x;
             let gx = to_global_x(x_m);
-            let rgba = sample_bilinear(&tiles, gx, gy);
+            let rgba = sample_nearest(&tiles, gx, gy);
             let o = (py as usize * w_us + px as usize) * 4;
             out[o..o + 4].copy_from_slice(&rgba);
         }
@@ -492,107 +492,85 @@ fn global_pixel(tiles: &Mosaic, xi: i64, yi: i64) -> [u8; 4] {
     }
 }
 
-/// Premultiplied-alpha bilinear sample of the mosaic at global tile-pixel
-/// coordinates `(gx, gy)` (pixel centres at integer + 0.5).
+/// Nearest-neighbour sample of the mosaic at global tile-pixel coordinates
+/// `(gx, gy)`: the texel whose cell `[n, n+1)` contains the sample point, i.e.
+/// `floor(gx)` — the same source→pixel convention the engine and the direct
+/// (non-meta) render path use (`world_to_pixel_f64` + `floor`).
+///
+/// **Assembly is deliberately nearest, not bilinear (#202 follow-up).** The
+/// source layers are categorical/discrete — a radar dBZ composite colorizes to
+/// a small fixed palette (≤256 colours) — and bilinearly blending adjacent
+/// texels *fabricates intermediate colours*: a 46-colour palette became ~22 000
+/// shades plus a full 256-level alpha ramp, which defeats the encoder's PNG8
+/// indexing and bloated the output ~9× per pixel (0.68 vs 0.077 B/px), worst on
+/// high-DPI screens whose request resolution falls between zoom-ladder levels
+/// (maximal fractional sampling ⇒ blending on nearly every pixel). Nearest
+/// preserves the discrete palette so PNG8 is kept, makes the Web Mercator path
+/// match the direct / EPSG:3067 path in character, and is cheaper (one lookup
+/// vs four texels + premultiplied blend). The cost is crisper (un-smoothed)
+/// edges when up/down-scaling between ladder levels — but genuinely continuous
+/// fields colorize to >256 colours and stay RGBA32 regardless, so they forgo
+/// only cosmetic smoothing, not size.
 #[inline]
-fn sample_bilinear(tiles: &Mosaic, gx: f64, gy: f64) -> [u8; 4] {
-    let fx = gx - 0.5;
-    let fy = gy - 0.5;
-    let x0 = fx.floor();
-    let y0 = fy.floor();
-    let dx = fx - x0;
-    let dy = fy - y0;
-    let (x0, y0) = (x0 as i64, y0 as i64);
-
-    let p00 = global_pixel(tiles, x0, y0);
-    let p10 = global_pixel(tiles, x0 + 1, y0);
-    let p01 = global_pixel(tiles, x0, y0 + 1);
-    let p11 = global_pixel(tiles, x0 + 1, y0 + 1);
-
-    // Uniform-region fast path (#416): bilinear interpolation of four identical
-    // texels IS that texel — exactly, not an approximation — so skip the
-    // premultiply / blend / unpremultiply (including the per-pixel alpha
-    // reciprocal divide) when all four are equal. Antialiased edges have
-    // differing corners and fall through to the full path, so this can't soften
-    // them. Radar composites are mostly transparent ([0,0,0,0] over clear air /
-    // ocean) with large flat regions, so this fires on the majority of output
-    // pixels.
-    if p00 == p10 && p00 == p01 && p00 == p11 {
-        return p00;
-    }
-
-    let c00 = premul(p00);
-    let c10 = premul(p10);
-    let c01 = premul(p01);
-    let c11 = premul(p11);
-
-    let mut acc = [0.0f64; 4];
-    for i in 0..4 {
-        let top = c00[i] * (1.0 - dx) + c10[i] * dx;
-        let bot = c01[i] * (1.0 - dx) + c11[i] * dx;
-        acc[i] = top * (1.0 - dy) + bot * dy;
-    }
-    unpremul(acc)
-}
-
-/// RGBA u8 → premultiplied f64 (RGB scaled by alpha; alpha kept in 0..255).
-#[inline]
-fn premul(c: [u8; 4]) -> [f64; 4] {
-    let a = c[3] as f64 / 255.0;
-    [
-        c[0] as f64 * a,
-        c[1] as f64 * a,
-        c[2] as f64 * a,
-        c[3] as f64,
-    ]
-}
-
-/// Premultiplied f64 → straight RGBA u8.
-#[inline]
-fn unpremul(c: [f64; 4]) -> [u8; 4] {
-    let a = c[3];
-    if a <= 0.0 {
-        return [0, 0, 0, 0];
-    }
-    let inv = 255.0 / a;
-    let r = (c[0] * inv).round().clamp(0.0, 255.0) as u8;
-    let g = (c[1] * inv).round().clamp(0.0, 255.0) as u8;
-    let b = (c[2] * inv).round().clamp(0.0, 255.0) as u8;
-    [r, g, b, a.round().clamp(0.0, 255.0) as u8]
+fn sample_nearest(tiles: &Mosaic, gx: f64, gy: f64) -> [u8; 4] {
+    global_pixel(tiles, gx.floor() as i64, gy.floor() as i64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A 2×1-texel mosaic in one tile: texel (0,0)=`a`, texel (1,0)=`b`, rest
+    /// `fill`. Lets us probe sampling exactly across a colour boundary.
+    fn two_color_tile(a: [u8; 4], b: [u8; 4], fill: [u8; 4]) -> Mosaic {
+        let mut tile = vec![0u8; TILE_PX as usize * TILE_PX as usize * 4];
+        for px in tile.chunks_exact_mut(4) {
+            px.copy_from_slice(&fill);
+        }
+        tile[0..4].copy_from_slice(&a); // texel (0,0)
+        tile[4..8].copy_from_slice(&b); // texel (1,0)
+        Mosaic {
+            col0: 0,
+            row0: 0,
+            ncols: 1,
+            nrows: 1,
+            tiles: vec![Some(Arc::from(tile.into_boxed_slice()))],
+        }
+    }
+
     #[test]
-    fn sample_bilinear_uniform_region_is_exact() {
-        // One opaque tile filled with a single non-trivial colour.
-        let fill = |colour: [u8; 4]| {
-            let mut tile = vec![0u8; TILE_PX as usize * TILE_PX as usize * 4];
-            for px in tile.chunks_exact_mut(4) {
-                px.copy_from_slice(&colour);
-            }
-            Mosaic {
-                col0: 0,
-                row0: 0,
-                ncols: 1,
-                nrows: 1,
-                tiles: vec![Some(Arc::from(tile.into_boxed_slice()))],
-            }
-        };
-        // Interior fractional sample (all four texels inside the uniform tile)
-        // returns the EXACT colour — the #416 fast path must match what the full
-        // premul/blend/unpremul path recovers, with no rounding drift.
-        let opaque = [37u8, 211, 99, 255];
-        assert_eq!(sample_bilinear(&fill(opaque), 100.3, 50.7), opaque);
-        // A semi-transparent uniform colour also round-trips exactly (the case
-        // the alpha-reciprocal unpremultiply would otherwise have to recover).
-        let translucent = [37u8, 211, 99, 128];
-        assert_eq!(
-            sample_bilinear(&fill(translucent), 100.3, 50.7),
-            translucent
-        );
+    fn sample_nearest_picks_containing_texel() {
+        let a = [37u8, 211, 99, 255];
+        let b = [10u8, 20, 30, 128];
+        let m = two_color_tile(a, b, [0, 0, 0, 0]);
+        // gx in [0,1) → texel 0; gx in [1,2) → texel 1. y stays in row 0.
+        assert_eq!(sample_nearest(&m, 0.5, 0.5), a);
+        assert_eq!(sample_nearest(&m, 0.99, 0.5), a);
+        assert_eq!(sample_nearest(&m, 1.0, 0.5), b);
+        assert_eq!(sample_nearest(&m, 1.5, 0.5), b);
+    }
+
+    #[test]
+    fn sample_nearest_never_blends_across_a_boundary() {
+        // Regression for the PNG8 bloat: assembling across a colour boundary
+        // must return one of the two source colours, NEVER a fabricated blend.
+        // (Bilinear assembly produced ~22k shades from a ≤256-colour palette,
+        // forcing RGBA32 and ~9× larger images.)
+        let a = [200u8, 0, 0, 255];
+        let b = [0u8, 0, 200, 255];
+        let m = two_color_tile(a, b, [0, 0, 0, 0]);
+        for i in 0..=100 {
+            let gx = i as f64 / 100.0 * 2.0; // sweep 0..2 across the boundary
+            let s = sample_nearest(&m, gx, 0.5);
+            assert!(
+                s == a || s == b || s == [0, 0, 0, 0],
+                "nearest must not blend: got {s:?} at gx={gx}"
+            );
+        }
+    }
+
+    #[test]
+    fn sample_nearest_transparent_outside_tiles() {
         // Fully-transparent region (the common radar case) → [0, 0, 0, 0].
         let empty = Mosaic {
             col0: 0,
@@ -601,7 +579,7 @@ mod tests {
             nrows: 1,
             tiles: vec![None],
         };
-        assert_eq!(sample_bilinear(&empty, 100.3, 50.7), [0, 0, 0, 0]);
+        assert_eq!(sample_nearest(&empty, 100.3, 50.7), [0, 0, 0, 0]);
     }
 
     #[test]
