@@ -83,6 +83,7 @@ fn main() {
         time_window: None,
         discovery: None,
         cadence_secs: None,
+        resampling: Default::default(),
     };
     let engine = PolarVolumeEngine::new("iso-demo", Some(data_dir), &config)
         .expect("build PolarVolumeEngine over the directory");

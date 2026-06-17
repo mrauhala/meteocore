@@ -55,6 +55,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
+use ds_core::config::ResamplingMethod;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::{
@@ -1491,6 +1492,9 @@ pub struct PolarVolumeEngine {
     /// not here — one byte-budget for the whole radar network.)
     parse_cache: Arc<Mutex<HashMap<FileId, Arc<PolarVolume>>>>,
     poll_interval: Duration,
+    /// Resampling method for the per-site Cartesian render, propagated to every
+    /// [`PolarVolumeSiteView`] this engine spawns (`OdimConfig.resampling`).
+    resampling: ResamplingMethod,
     shutdown: AtomicBool,
     shutdown_notify: Notify,
 }
@@ -1562,6 +1566,7 @@ impl PolarVolumeEngine {
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
             parse_cache,
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
+            resampling: config.resampling,
             shutdown: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
         })
@@ -1621,6 +1626,7 @@ impl PolarVolumeEngine {
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
             parse_cache,
             poll_interval: Duration::from_secs(30),
+            resampling: ResamplingMethod::default(),
             shutdown: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
         })
@@ -1872,10 +1878,15 @@ fn nearest_sweep(volume: &PolarVolume, target: f64) -> Option<&Sweep> {
 ///    [`ground_distance_bearing`];
 /// 2. maps distance to a fractional range bin (ground range — see below);
 /// 3. maps azimuth to a fractional ray index;
-/// 4. **bilinearly** samples the four surrounding moment cells
-///    ([`sample_sweep_moment_bilinear`]), blending across rays to close
-///    the radial spoke gaps that nearest-neighbour sampling leaves far
-///    from the radar (#186).
+/// 4. samples the moment cell(s) per `resampling`:
+///    - [`ResamplingMethod::Nearest`] (default) — the single cell the pixel
+///      falls in (`floor` of the fractional `(ray, bin)`). Cells tile the
+///      output and widen with range, so the discrete bins stay visible with
+///      every gate's value preserved.
+///    - [`ResamplingMethod::Bilinear`] — blends the four surrounding cells
+///      ([`bilinear_cell`]) across rays to smooth the radial bin/wedge
+///      structure that gets coarse far from the radar (#186), at the cost of
+///      softening peaks/detail.
 ///
 /// **Ground-range interim.** The sweep range axis is treated as ground
 /// range: `bin = (d - rstart) / rscale`. A proper slant-range /
@@ -1896,6 +1907,7 @@ fn polar_sample(
     height: u32,
     output_crs: &OutputCrs,
     z: Option<f64>,
+    resampling: ResamplingMethod,
 ) -> Result<RasterTile, DataServerError> {
     // Pick the sweep that actually carries `quantity`: nearest to `z` (or
     // the lowest when `z` is absent) *among the sweeps that contain the
@@ -2019,14 +2031,38 @@ fn polar_sample(
             }
             let az = east_bins.atan2(north_bins).to_degrees().rem_euclid(360.0);
             let ray_f = az / ray_span;
-            values.push(bilinear_cell(
-                &pixels,
-                moment,
-                sweep.nrays,
-                sweep.nbins,
-                ray_f,
-                bin_f,
-            ));
+            let value = match resampling {
+                // Each output pixel takes its single enclosing cell. `bin_f` is
+                // already in `[0, nbins)`, so `floor` lands in range; the ray
+                // wraps at the 0°/360° seam. Cells tile the plane and widen
+                // with range — the discrete bins stay visible.
+                ResamplingMethod::Nearest => {
+                    let bin = bin_f.floor() as usize;
+                    // The `bin_f >= nbins` guard above keeps this in range; the
+                    // assert documents (and in debug builds enforces) the
+                    // invariant `pixels.sample` relies on.
+                    debug_assert!(
+                        bin < sweep.nbins,
+                        "bin_f={bin_f} out of [0, nbins={}) range",
+                        sweep.nbins
+                    );
+                    let ray = (ray_f.floor() as i64).rem_euclid(sweep.nrays as i64) as usize;
+                    pixels.sample(
+                        ray,
+                        bin,
+                        moment.gain,
+                        moment.offset,
+                        moment.nodata,
+                        Some(moment.undetect),
+                    )
+                }
+                // Blend the four surrounding cells to smooth the radial bin
+                // structure far from the radar (#186).
+                ResamplingMethod::Bilinear => {
+                    bilinear_cell(&pixels, moment, sweep.nrays, sweep.nbins, ray_f, bin_f)
+                }
+            };
+            values.push(value);
         }
     }
 
@@ -2911,6 +2947,7 @@ impl PolarVolumeEngine {
             source: self.source.clone(),
             nod: nod.to_string(),
             collection_id: collection_id.to_string(),
+            resampling: self.resampling,
         }
     }
 }
@@ -3194,6 +3231,9 @@ pub struct PolarVolumeSiteView {
     pub(crate) nod: String,
     /// Per-site OGC collection id (`{base}-{nod}`), for error messages.
     pub(crate) collection_id: String,
+    /// Resampling method for the Cartesian render (`OdimConfig.resampling`),
+    /// inherited from the owning engine. WMS/Maps/Tiles only.
+    pub(crate) resampling: ResamplingMethod,
 }
 
 impl MapEngine for PolarVolumeSiteView {
@@ -3283,6 +3323,7 @@ impl MapEngine for PolarVolumeSiteView {
             height,
             output_crs,
             z,
+            self.resampling,
         )
     }
 
@@ -4816,6 +4857,7 @@ mod tests {
             1,
             &OutputCrs::Wgs84,
             None,
+            ResamplingMethod::Bilinear,
         )
         .unwrap();
 
@@ -4875,6 +4917,8 @@ mod tests {
                 h,
                 &output_crs,
                 None,
+                // Compared against the bilinear per-pixel reference below.
+                ResamplingMethod::Bilinear,
             )
             .unwrap();
 
@@ -4942,6 +4986,7 @@ mod tests {
             1,
             &OutputCrs::Wgs84,
             None,
+            ResamplingMethod::Nearest,
         )
         .unwrap();
         assert!(
@@ -5222,6 +5267,7 @@ mod tests {
             24,
             &OutputCrs::Wgs84,
             None,
+            ResamplingMethod::Bilinear,
         )
         .unwrap();
         // Value varies only by ray, so any fractional pixel proves the
@@ -5234,6 +5280,90 @@ mod tests {
         assert!(
             fractional,
             "bilinear render must blend adjacent rays into fractional values"
+        );
+    }
+
+    /// Companion to `polar_sample_blends_across_rays_end_to_end`: with the
+    /// **default** [`ResamplingMethod::Nearest`], the same ray-only field
+    /// (`raw[ray][bin] = ray`) must render with **no** blending — every
+    /// sampled value is an exact integer ray index (the discrete bins stay
+    /// visible). This locks in the nearest default and guards against an
+    /// accidental flip back to unconditional bilinear (#186).
+    #[test]
+    fn polar_sample_nearest_does_not_blend_rays() {
+        let (site_lon, site_lat) = (25.0, 60.0);
+        let (nrays, nbins) = (360usize, 100usize);
+        let mut data = Array2::<u16>::zeros((nrays, nbins));
+        for r in 0..nrays {
+            for b in 0..nbins {
+                data[(r, b)] = r as u16; // value = ray index, constant across bins
+            }
+        }
+        let file_id = unique_file_id();
+        pixel_cache().insert(
+            &file_id,
+            SYNTHETIC_DS,
+            std::sync::Arc::new(RawPixels::U16(data)),
+        );
+        let moment = PolarMoment {
+            quantity: "DBZH".to_string(),
+            gain: 1.0,
+            offset: 0.0,
+            nodata: 65_535.0,
+            undetect: 65_534.0,
+            dataset_path: SYNTHETIC_DS.to_string(),
+        };
+        let sweep = Sweep {
+            elangle: 0.5,
+            nbins,
+            nrays,
+            rscale: 1_000.0,
+            rstart: 0.0,
+            a1gate: 0,
+            moments: vec![moment],
+        };
+        let vol = PolarVolume {
+            site: RadarSite {
+                lon: site_lon,
+                lat: site_lat,
+                height: 100.0,
+                nod: Some("test".to_string()),
+                plc: None,
+                wmo: None,
+            },
+            time: Utc::now(),
+            object: "PVOL".to_string(),
+            sweeps: vec![sweep],
+        };
+        let bbox = [
+            site_lon + 0.02,
+            site_lat + 0.02,
+            site_lon + 0.25,
+            site_lat + 0.25,
+        ];
+        let tile = polar_sample(
+            &vol,
+            &file_id,
+            test_pixels(),
+            "DBZH",
+            bbox,
+            24,
+            24,
+            &OutputCrs::Wgs84,
+            None,
+            ResamplingMethod::Nearest,
+        )
+        .unwrap();
+        // Every sampled value is the raw ray index — an exact integer. A
+        // single fractional value would mean the render blended rays.
+        let sampled = tile.values.iter().flatten().count();
+        assert!(sampled > 0, "expected some in-range pixels to sample");
+        assert!(
+            tile.values
+                .iter()
+                .flatten()
+                .all(|v| (v - v.round()).abs() < 1e-9),
+            "nearest render must return raw cell values with no blending"
         );
     }
 
@@ -5253,6 +5383,7 @@ mod tests {
             4,
             &OutputCrs::Wgs84,
             None,
+            ResamplingMethod::Nearest,
         ) {
             Err(DataServerError::InvalidParameter(_)) => {}
             Err(other) => panic!("expected InvalidParameter, got {other:?}"),
@@ -5293,6 +5424,7 @@ mod tests {
             time_window: None,
             discovery: None,
             cadence_secs: None,
+            resampling: Default::default(),
         }
     }
 
@@ -5690,6 +5822,7 @@ mod tests {
             }),
             nod: nod.to_string(),
             collection_id: format!("test-{nod}"),
+            resampling: ResamplingMethod::default(),
         }
     }
 
@@ -5851,6 +5984,7 @@ mod tests {
             }),
             nod: "good".into(),
             collection_id: "test".into(),
+            resampling: ResamplingMethod::default(),
         };
         // The view for `good` advertises its quantity; metadata is present.
         assert!(!MapEngine::raster_info(&view).parameters.is_empty());
@@ -6181,6 +6315,7 @@ mod tests {
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
             parse_cache: Arc::new(Mutex::new(HashMap::new())),
             poll_interval: Duration::from_secs(30),
+            resampling: ResamplingMethod::default(),
             shutdown: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
         }

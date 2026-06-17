@@ -605,6 +605,30 @@ pub struct CapConfig {
     pub feed_allowlist: Vec<String>,
 }
 
+/// Resampling method for the ODIM **PVOL** (`engine_type = "odim-volume"`)
+/// Cartesian render — i.e. how the polar `(range, azimuth)` field is sampled
+/// onto WMS/Maps/Tiles output pixels.
+///
+/// Only the per-site PVOL map render (`polar_sample`) reads this. The COMP
+/// composite render is always nearest-neighbour, and all EDR position/area
+/// queries are always nearest (a point query wants the measured value, not a
+/// cosmetic blend) — neither is affected by this setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ResamplingMethod {
+    /// Nearest-neighbour: each output pixel takes the value of the single
+    /// polar cell `(ray, bin)` it falls in. Cells tile the output plane and
+    /// grow wider with range, so the discrete radar bins stay visible —
+    /// sharp, with every gate's value preserved. **Default.**
+    #[default]
+    Nearest,
+    /// Bilinear: blend the four surrounding `(ray, bin)` cells, smoothing the
+    /// radial bin/wedge structure that becomes coarse far from the radar
+    /// (#186). Mask-aware (renormalises over the valid neighbours, never
+    /// blends across nodata/undetect). Smoother, but softens peaks and detail.
+    Bilinear,
+}
+
 /// Configuration for the ODIM_H5 weather-radar engine
 /// (`engine_type = "odim"`).
 ///
@@ -691,6 +715,15 @@ pub struct OdimConfig {
     /// of candidate timestamps (e.g. `300` for a 5-minute radar feed).
     /// Required in template mode; ignored otherwise.
     pub cadence_secs: Option<u64>,
+
+    /// Resampling method for the PVOL (`engine_type = "odim-volume"`)
+    /// Cartesian render (WMS/Maps/Tiles). Default `nearest` — the discrete
+    /// radar bins stay visible with full detail; set `bilinear` to smooth the
+    /// radial bin structure that gets coarse far from the radar (#186). Only
+    /// the per-site PVOL map render reads this; the COMP composite render and
+    /// every EDR query are nearest regardless. See [`ResamplingMethod`].
+    #[serde(default)]
+    pub resampling: ResamplingMethod,
 }
 
 fn default_grib_poll_interval() -> u64 {
