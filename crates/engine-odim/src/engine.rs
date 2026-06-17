@@ -560,6 +560,17 @@ impl OdimEngine {
             );
         }
 
+        // `resampling` only applies to the PVOL (`odim-volume`) Cartesian
+        // render. The COMP composite render is always nearest-neighbour, so a
+        // non-default value here is silently ignored — warn rather than swallow.
+        if config.resampling != ds_core::config::ResamplingMethod::default() {
+            tracing::warn!(
+                "[{collection_id}] `resampling` is set but has no effect on an \
+                 `odim` (COMP) collection — it only applies to the `odim-volume` \
+                 (PVOL) render; the composite render is always nearest-neighbour"
+            );
+        }
+
         Self::assemble(
             collection_id,
             parameter,
@@ -1338,6 +1349,7 @@ mod tests {
             time_window: time_window.map(str::to_string),
             discovery: None,
             cadence_secs: None,
+            resampling: Default::default(),
         }
     }
 

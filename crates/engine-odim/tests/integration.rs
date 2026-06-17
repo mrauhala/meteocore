@@ -47,6 +47,7 @@ fn dmi_engine() -> (engine_odim::OdimEngine, tempfile::TempDir) {
         time_window: None,
         discovery: None,
         cadence_secs: None,
+        resampling: Default::default(),
     };
 
     let engine = engine_odim::OdimEngine::new(
@@ -362,6 +363,7 @@ fn edr_query_area_rejects_too_many_timesteps() {
         time_window: None,
         discovery: None,
         cadence_secs: None,
+        resampling: Default::default(),
     };
     let engine = engine_odim::OdimEngine::new(
         "dmi-cap-test",
@@ -463,6 +465,7 @@ fn pvol_engine_renders_fmi_vihti_volume() {
         time_window: None,
         discovery: None,
         cadence_secs: None,
+        resampling: Default::default(),
     };
 
     let engine = engine_odim::PolarVolumeEngine::new("fivih-pvol-test", Some(data_dir), &config)
@@ -567,6 +570,7 @@ fn pvol_volume_engine_emits_point_cloud() {
         time_window: None,
         discovery: None,
         cadence_secs: None,
+        resampling: Default::default(),
     };
     let engine = engine_odim::PolarVolumeEngine::new("fivih-vol-test", Some(data_dir), &config)
         .expect("PolarVolumeEngine::new over the PVOL directory");
@@ -687,6 +691,7 @@ fn pvol_volume_engine_voxel_grid() {
         time_window: None,
         discovery: None,
         cadence_secs: None,
+        resampling: Default::default(),
     };
     let engine = engine_odim::PolarVolumeEngine::new("fivih-voxel-test", Some(data_dir), &config)
         .expect("PolarVolumeEngine::new");
@@ -771,6 +776,7 @@ fn pvol_volume_engine_read_cells() {
         time_window: None,
         discovery: None,
         cadence_secs: None,
+        resampling: Default::default(),
     };
     let engine = engine_odim::PolarVolumeEngine::new("fivih-cells-test", Some(data_dir), &config)
         .expect("PolarVolumeEngine::new");
@@ -894,6 +900,7 @@ fn pvol_cells_raster_layer() {
         time_window: None,
         discovery: None,
         cadence_secs: None,
+        resampling: Default::default(),
     };
     let engine =
         engine_odim::PolarVolumeEngine::new("fivih-cells-wms-test", Some(data_dir), &config)
@@ -1111,6 +1118,7 @@ fn pvol_engine_exposes_sites_as_features() {
         time_window: None,
         discovery: None,
         cadence_secs: None,
+        resampling: Default::default(),
     };
 
     let engine =
@@ -1317,6 +1325,7 @@ fn pvol_bare_render_defaults_to_primary_quantity() {
         time_window: None,
         discovery: None,
         cadence_secs: None,
+        resampling: Default::default(),
     };
     let engine =
         engine_odim::PolarVolumeEngine::new("fivih-pvol-test", Some(data_dir), &config).unwrap();
@@ -1370,6 +1379,7 @@ fn pvol_fixture_view() -> Option<engine_odim::PolarVolumeSiteView> {
         time_window: None,
         discovery: None,
         cadence_secs: None,
+        resampling: Default::default(),
     };
     let engine = engine_odim::PolarVolumeEngine::new(
         "fivih-edr-test",
@@ -1728,6 +1738,7 @@ fn comp_engine_remote_scan_discovers_and_renders_dmi_fixture() {
         time_window: None,
         discovery: None,
         cadence_secs: None,
+        resampling: Default::default(),
     };
 
     // Empty prefix scans the store root, where the fixtures live.
