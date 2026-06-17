@@ -401,8 +401,33 @@ impl MapEngine for ZarrEngine {
                     |fx, fy| output_crs.project_node(bbox, fx, fy),
                     |lon, lat| window.frac_px(lon, lat),
                 );
+                // Domain guard (#449): bound the output to the source footprint
+                // so the coarse grid can't map a far-away output pixel onto valid
+                // source data. For today's geographic Zarr grids the `frac_px`
+                // map is affine/monotonic and can't alias far points back onto the
+                // grid (out-of-range → nodata already), so this is belt-and-
+                // suspenders; it becomes load-bearing for projected source grids
+                // (Phase 4 STAC per-item-CRS, e.g. HRRR/Lambert), whose forward
+                // aliases like the TM/stereographic raster engines do.
+                //
+                // `footprint_pixel_window` REQUIRES `spatial_extent` to be a WGS84
+                // [w,s,e,n] envelope (it feeds it to `world_to_fraction` as
+                // lon/lat). That holds today — the catalog builds `extent` from the
+                // lon/lat CF coordinate arrays. Phase 4 projected sources must keep
+                // this invariant (reproject the native extent to WGS84 before
+                // storing it) or this guard would compute a nonsense window.
+                let (px_lo, px_hi, py_lo, py_hi) = cat
+                    .raster_info
+                    .spatial_extent
+                    .map(|env| output_crs.footprint_pixel_window(bbox, env, width, height))
+                    .unwrap_or((0, width.saturating_sub(1), 0, height.saturating_sub(1)));
                 for oy in 0..height {
+                    let in_y = oy >= py_lo && oy <= py_hi;
                     for ox in 0..width {
+                        if !in_y || ox < px_lo || ox > px_hi {
+                            values.push(None);
+                            continue;
+                        }
                         let (col_f, row_f) = grid.sample(ox, oy);
                         values.push(window.bilinear_at(col_f, row_f));
                     }

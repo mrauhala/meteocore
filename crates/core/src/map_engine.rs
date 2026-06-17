@@ -126,6 +126,106 @@ impl OutputCrs {
             }
         }
     }
+
+    /// Inclusive output-pixel window `(px_lo, px_hi, py_lo, py_hi)` that a source
+    /// raster's footprint can occupy in a `width`×`height` output image — a cheap
+    /// domain guard for projected-raster resampling.
+    ///
+    /// `src_env_wgs84` is the source raster's WGS84 envelope `[w, s, e, n]`;
+    /// `wgs84_bbox` is the requested tile bbox (for `Wgs84`/`WebMercator` output;
+    /// it is **ignored for `Projected` output**, whose extents are embedded in the
+    /// `Projected { crs, bbox }` variant — same as [`Self::world_to_fraction`]).
+    /// The envelope perimeter is mapped
+    /// to output-fraction space with [`Self::world_to_fraction`] (the per-vertex
+    /// inverse of the per-pixel [`Self::project_node`] — only ~130 perimeter
+    /// points, never per output pixel, per the #203 rule), the fractional extent
+    /// is taken and expanded by a small margin so genuine boundary data is never
+    /// clipped, then converted to inclusive pixel bounds clamped to the image.
+    ///
+    /// Purpose: at low zoom the coarse [`crate::resample::ProjectionGrid`] (and
+    /// the source projection's own out-of-domain forward) can map a far-away
+    /// output pixel onto a valid source pixel, painting "ghost" data far from
+    /// the real coverage (e.g. radar echoes in the Arctic on a whole-world Web
+    /// Mercator view that wraps past ±180°). Pixels outside this window are
+    /// dropped to nodata. Shared by every projected raster engine (#449).
+    ///
+    /// If no perimeter sample yields a finite fraction (e.g. a projected output
+    /// CRS whose inverse is undefined across the whole envelope) the guard is
+    /// disabled (full image) rather than risk clipping real data.
+    ///
+    /// **Requires `src_env_wgs84` to be a true WGS84 `[w, s, e, n]` envelope** —
+    /// it is fed to [`Self::world_to_fraction`] as lon/lat. A native-CRS extent
+    /// (projected metres) would produce a nonsense window and silently disable
+    /// the guard; engines must reproject to WGS84 before calling.
+    ///
+    /// **Limitations:**
+    /// - A single output-space box, so on a viewport showing more than one world
+    ///   copy (Web Mercator spanning > 360° of longitude) only the primary copy
+    ///   of the footprint is kept; wrapped copies render as nodata (acceptable —
+    ///   the alternative was ghost aliasing).
+    /// - The perimeter walk assumes `w <= e` (and `s <= n`). An
+    ///   **antimeridian-crossing** envelope (`w > e`, e.g. `w=170, e=-170`) steps
+    ///   backwards through the interior instead of wrapping over ±180°, yielding
+    ///   an over-wide window that effectively disables the guard for that source.
+    ///   No current data type crosses the antimeridian (European/national
+    ///   composites, regional rasters, geographic Zarr grids); revisit if one is
+    ///   added.
+    pub fn footprint_pixel_window(
+        &self,
+        wgs84_bbox: [f64; 4],
+        src_env_wgs84: [f64; 4],
+        width: u32,
+        height: u32,
+    ) -> (u32, u32, u32, u32) {
+        let [w, s, e, n] = src_env_wgs84;
+        let (mut fx_lo, mut fx_hi, mut fy_lo, mut fy_hi) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+        let mut any = false;
+        const STEPS: usize = 32;
+        for i in 0..=STEPS {
+            let t = i as f64 / STEPS as f64;
+            let lon = w + t * (e - w);
+            let lat = s + t * (n - s);
+            // All four envelope edges (curved edges can bow past the corners).
+            for (plon, plat) in [(lon, s), (lon, n), (w, lat), (e, lat)] {
+                let (fx, fy) = self.world_to_fraction(wgs84_bbox, plon, plat);
+                if fx.is_finite() && fy.is_finite() {
+                    any = true;
+                    fx_lo = fx_lo.min(fx);
+                    fx_hi = fx_hi.max(fx);
+                    fy_lo = fy_lo.min(fy);
+                    fy_hi = fy_hi.max(fy);
+                }
+            }
+        }
+        if !any {
+            return (0, width.saturating_sub(1), 0, height.saturating_sub(1));
+        }
+        // Margin: a fraction of the footprint's own output span, with a small
+        // floor, so edge-sampling gaps and sub-pixel rounding never clip boundary
+        // data. Far-away ghosts sit far outside, so the margin never readmits them.
+        let mx = ((fx_hi - fx_lo) * 0.02).max(0.005);
+        let my = ((fy_hi - fy_lo) * 0.02).max(0.005);
+        fx_lo -= mx;
+        fx_hi += mx;
+        fy_lo -= my;
+        fy_hi += my;
+        let to_px = |f: f64, dim: u32| {
+            // If dim == 0, `clamp(0.0, dim as f64 - 1.0)` panics (min > max) in
+            // both debug and release; the assert below fires first in debug with
+            // a clearer message. Callers always pass positive output dimensions.
+            debug_assert!(
+                dim > 0,
+                "footprint_pixel_window: output dimension must be > 0"
+            );
+            (f * dim as f64).floor().clamp(0.0, dim as f64 - 1.0) as u32
+        };
+        (
+            to_px(fx_lo, width),
+            to_px(fx_hi, width),
+            to_px(fy_lo, height),
+            to_px(fy_hi, height),
+        )
+    }
 }
 
 /// A raster tile that can be colorized and served as a map image.
@@ -323,5 +423,76 @@ mod tests {
             let (gx, _) = out.world_to_fraction(FINLAND_WGS84, 5.0, 64.0);
             assert!(gx < 0.0, "west of the tile must map to fx < 0, got {gx}");
         }
+    }
+
+    #[test]
+    fn footprint_window_bounds_a_small_source_in_a_wide_view() {
+        // A whole-world-ish Web Mercator view; the Finland footprint occupies
+        // only a narrow band, so the guard window must be a small sub-rectangle
+        // — NOT the full image (that's what kills ghost echoes outside it).
+        let crs = OutputCrs::WebMercator;
+        let view = [-160.0, -60.0, 160.0, 80.0]; // wide [w,s,e,n]
+        let (w, h) = (1000u32, 1000u32);
+        let (px_lo, px_hi, py_lo, py_hi) = crs.footprint_pixel_window(view, FINLAND_WGS84, w, h);
+        assert!(px_lo < px_hi && py_lo < py_hi, "window must be non-empty");
+        // Finland (lon 19..32 of a -160..160 span) sits left-of-centre and is
+        // narrow; the window must exclude the far edges where ghosts appear.
+        assert!(
+            px_lo > 0 && px_hi < w - 1,
+            "x window must not span the image"
+        );
+        assert!(
+            py_lo > 0 && py_hi < h - 1,
+            "y window must not span the image"
+        );
+        // The footprint centre (lon 25.5, lat ~64.5) must fall inside the window.
+        let (cfx, cfy) = crs.world_to_fraction(view, 25.5, 64.5);
+        let (cx, cy) = ((cfx * w as f64) as u32, (cfy * h as f64) as u32);
+        assert!(
+            (px_lo..=px_hi).contains(&cx) && (py_lo..=py_hi).contains(&cy),
+            "footprint centre must be inside the window"
+        );
+    }
+
+    #[test]
+    fn footprint_window_bounds_source_for_projected_output() {
+        // ODIM COMP serves EPSG:3067 national-grid requests via `Projected`
+        // output (a different `world_to_fraction` path — `crs.forward` against the
+        // embedded projected bbox). A view wider than the source footprint must
+        // yield a sub-window, and the footprint centre must fall inside it.
+        let crs = projected_output_crs("EPSG:3067").unwrap();
+        // Request rectangle in EPSG:3067 metres, deliberately wider than Finland.
+        let (e0, n0) = crs.forward(5.0, 53.0);
+        let (e1, n1) = crs.forward(45.0, 74.0);
+        let out = OutputCrs::Projected {
+            crs,
+            bbox: [e0.min(e1), n0.min(n1), e0.max(e1), n0.max(n1)],
+        };
+        let (w, h) = (800u32, 800u32);
+        // `wgs84_bbox` is ignored for `Projected`; pass the footprint either way.
+        let (px_lo, px_hi, py_lo, py_hi) =
+            out.footprint_pixel_window(FINLAND_WGS84, FINLAND_WGS84, w, h);
+        assert!(px_lo < px_hi && py_lo < py_hi, "window must be non-empty");
+        assert!(
+            px_lo > 0 || px_hi < w - 1 || py_lo > 0 || py_hi < h - 1,
+            "a view wider than the footprint must not span the full image"
+        );
+        let (cfx, cfy) = out.world_to_fraction(FINLAND_WGS84, 25.5, 64.5);
+        let (cx, cy) = ((cfx * w as f64) as u32, (cfy * h as f64) as u32);
+        assert!(
+            (px_lo..=px_hi).contains(&cx) && (py_lo..=py_hi).contains(&cy),
+            "footprint centre must be inside the window"
+        );
+    }
+
+    #[test]
+    fn footprint_window_is_permissive_when_view_is_inside_the_source() {
+        // Zoomed INTO the data (view ⊂ footprint): the window must cover the
+        // whole image so nothing legitimate is clipped.
+        let crs = OutputCrs::WebMercator;
+        let tight = [24.0, 63.0, 26.0, 65.0]; // well inside FINLAND_WGS84
+        let (w, h) = (256u32, 256u32);
+        let (px_lo, px_hi, py_lo, py_hi) = crs.footprint_pixel_window(tight, FINLAND_WGS84, w, h);
+        assert_eq!((px_lo, px_hi, py_lo, py_hi), (0, w - 1, 0, h - 1));
     }
 }
