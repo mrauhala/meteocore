@@ -9,6 +9,7 @@ pub mod schema;
 pub mod security;
 
 pub use engine::PostgisEngine;
+pub use health::{Health, HealthSnapshot, HealthStatus};
 
 pub use config::{PostgisConfigError, PostgisEngineConfig, ValidatedParameter};
 pub use schema::{

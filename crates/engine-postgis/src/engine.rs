@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
@@ -23,6 +23,7 @@ use tokio::sync::watch;
 use tokio_postgres::Row;
 
 use crate::config::PostgisEngineConfig;
+use crate::health::{Health, HealthSnapshot, HealthStatus};
 use crate::metadata::{CollectionMeta, MetadataCache};
 use crate::query::{
     build_location, build_position, build_stations_in_polygon, params_as_refs, BuiltQuery,
@@ -35,6 +36,11 @@ use crate::schema::ObservationSchema;
 /// the intent.
 type ParamSeries = Vec<(DateTime<Utc>, Option<f64>)>;
 
+/// `SELECT 1` health-ping cadence — the `/health` reachability probe (#110).
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Per-ping deadline; a slower response counts as unreachable.
+const PING_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Collection-scoped engine. Cheap to clone (Arcs inside); axum handlers
 /// hold it behind `Arc<dyn EdrEngine>` as is done for every engine.
 pub struct PostgisEngine {
@@ -42,6 +48,10 @@ pub struct PostgisEngine {
     config: Arc<PostgisEngineConfig>,
     pool: Arc<Pool>,
     cache: Arc<MetadataCache>,
+    /// Live health (DB-reachability) + metrics counters; updated by `poll_loop`.
+    health: Health,
+    /// `<user>@<host>:<port>/<db>` (or `pool_label`) — the `/metrics` pool label.
+    pool_key_label: String,
     /// Stops the background metadata-refresh loop on reload.
     shutdown_tx: watch::Sender<()>,
     /// The version-0 receiver retained from `watch::channel`. `poll_loop` clones
@@ -68,22 +78,21 @@ impl PostgisEngine {
         pool: Arc<Pool>,
     ) -> Self {
         let collection_id = collection_id.into();
-        // Metadata (location list / extents) IS refreshed in the background by
-        // `poll_loop` (every `metadata_refresh_secs`), but `/health` status is
-        // still only set at boot: a failed background refresh logs a WARN and
-        // keeps the previous snapshot — it does NOT flip the collection to
-        // `degraded`. So a DB that goes down after startup still shows `ready`.
-        // Live health monitoring is the remaining #110 work; surface it loudly.
-        tracing::warn!(
-            collection = %collection_id,
-            "postgis engine: live health monitoring is not implemented (#110). /health reflects the boot-time status only; a DB failure after startup will NOT flip the collection to degraded (background metadata refresh keeps the last good snapshot)."
-        );
+        // Pool label for /metrics: explicit `pool_label`, else the derived
+        // `<user>@<host>:<port>/<db>` pool key (password never included).
+        let pool_key_label = config.pool_label.clone().unwrap_or_else(|| {
+            crate::pool::normalize_dsn(&config.dsn)
+                .map(|(_, key, _)| key.to_string())
+                .unwrap_or_else(|_| "unknown".to_string())
+        });
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         Self {
             collection_id,
             config,
             pool,
             cache: Arc::new(MetadataCache::new_empty()),
+            health: Health::new(),
+            pool_key_label,
             shutdown_tx,
             shutdown_rx,
         }
@@ -105,37 +114,110 @@ impl PostgisEngine {
         &self.cache
     }
 
-    /// Run a one-shot metadata refresh. Used at construction and by the
-    /// `/admin/collections/reload` path.
-    pub async fn refresh_metadata(&self) -> Result<(), DataServerError> {
-        self.cache
-            .refresh(&self.config, &self.pool)
-            .await
-            .map_err(|e| DataServerError::Engine(format!("metadata refresh failed: {e}")))
+    /// Authoritative live `/health` status — `None` until the first ping has
+    /// run (so the caller keeps the boot snapshot rather than the optimistic
+    /// seed), then `Some(Ready/Degraded)`.
+    pub fn live_health(&self) -> Option<HealthStatus> {
+        self.health.live_status()
     }
 
-    /// Background metadata-refresh loop. Re-runs `refresh_metadata` every
-    /// `metadata_refresh_secs` so the location list, extents, and the
-    /// `locations_window`-derived "currently reporting" set stay current
-    /// without a manual reload. A failed refresh keeps the previous snapshot
-    /// (`MetadataCache::refresh` only swaps on success) — so a transient DB
-    /// blip never empties the cache. Spawned on the dedicated background poll
-    /// runtime in `server::admin` (never a request worker, #221); exits when
-    /// `shutdown()` is called on reload. The initial refresh already ran at
-    /// construction, so the first tick is skipped.
+    /// Health + metrics-counter snapshot for the `/metrics` scrape.
+    pub fn health_snapshot(&self) -> HealthSnapshot {
+        self.health.snapshot()
+    }
+
+    /// `<user>@<host>:<port>/<db>` (or `pool_label`) — the `/metrics` pool label.
+    pub fn pool_key_label(&self) -> &str {
+        &self.pool_key_label
+    }
+
+    /// Run a one-shot metadata refresh. Used at construction and by the
+    /// `/admin/collections/reload` path. Records the duration + outcome for
+    /// `/metrics` (a failure does NOT flip `/health` — the ping owns that).
+    pub async fn refresh_metadata(&self) -> Result<(), DataServerError> {
+        let start = Instant::now();
+        let result = self
+            .cache
+            .refresh(&self.config, &self.pool)
+            .await
+            .map_err(|e| DataServerError::Engine(format!("metadata refresh failed: {e}")));
+        self.health.record_refresh(result.is_ok(), start.elapsed());
+        result
+    }
+
+    /// `SELECT 1` with a 2 s deadline — the `/health` reachability probe.
+    ///
+    /// Uses a **dedicated** connection (`tokio_postgres::connect`), NOT the shared
+    /// pool: a busy pool (all connections checked out by request handlers) would
+    /// otherwise make `pool.get()` time out and masquerade as DB unreachability,
+    /// flipping a perfectly-healthy collection to `degraded`. The probe measures
+    /// reachability only; pool saturation is observable via `postgis_pool_waiting`.
+    /// `NoTls` matches the engine's connection (TLS is the remaining #110 work).
+    async fn ping(&self) -> bool {
+        let probe = async {
+            // TODO(#110): when TLS lands, this connector MUST match the pool's
+            // (currently both `NoTls`). If the ping stays `NoTls` against a
+            // TLS-required server, it would be rejected while the pool works —
+            // falsely degrading a healthy collection.
+            let (client, conn) = tokio_postgres::connect(&self.config.dsn, tokio_postgres::NoTls)
+                .await
+                .ok()?;
+            // Drive the connection INLINE (no `tokio::spawn`): if the outer
+            // timeout drops this future, both the query and the connection driver
+            // drop with it — a detached spawned task would instead leak one
+            // orphan driver per timed-out ping until its socket closed.
+            tokio::pin!(conn);
+            let ok = tokio::select! {
+                res = client.query_one("SELECT 1", &[]) => res.is_ok(),
+                // The driver future only resolves if the connection errors/closes.
+                _ = &mut conn => false,
+            };
+            Some(ok)
+        };
+        matches!(
+            tokio::time::timeout(PING_TIMEOUT, probe).await,
+            Ok(Some(true))
+        )
+    }
+
+    /// Background loop: a `SELECT 1` ping every [`PING_INTERVAL`] (the `/health`
+    /// authority — flips `Ready`/`Degraded` on DB reachability) and a metadata
+    /// refresh every `metadata_refresh_secs` (keeps the location list / extents /
+    /// `locations_window` set current — a failed refresh keeps the previous
+    /// snapshot, so a blip never empties the cache). Spawned on the dedicated
+    /// background poll runtime (never a request worker, #221); exits on
+    /// `shutdown()`. The metadata-refresh interval skips its first tick (boot
+    /// already refreshed), but the ping fires immediately so `/health` is
+    /// accurate within ~2 s of boot.
     pub async fn poll_loop(&self) {
         // Clone the retained version-0 receiver — NOT `subscribe()`, which would
         // start at the channel's current version and miss a `shutdown()` that
         // already fired before this loop ran (rapid-reload race).
         let mut shutdown_rx = self.shutdown_rx.clone();
-        let mut interval = tokio::time::interval(Duration::from_secs(
+        let mut refresh_iv = tokio::time::interval(Duration::from_secs(
             self.config.metadata_refresh_secs.max(1),
         ));
-        interval.tick().await; // skip the immediate first tick (construction already refreshed)
+        refresh_iv.tick().await; // boot already refreshed — skip the immediate tick
+        let mut ping_iv = tokio::time::interval(PING_INTERVAL); // first tick fires now
 
         loop {
             tokio::select! {
-                _ = interval.tick() => {
+                _ = ping_iv.tick() => {
+                    // Log only on a transition (not every tick) so log-based
+                    // alerting sees DB down/recovery without spam.
+                    match self.health.record_ping(self.ping().await) {
+                        Some(HealthStatus::Degraded) => tracing::warn!(
+                            collection = %self.collection_id,
+                            "postgis: DB unreachable (health ping failed) — collection degraded"
+                        ),
+                        Some(HealthStatus::Ready) => tracing::info!(
+                            collection = %self.collection_id,
+                            "postgis: DB reachable again — collection recovered"
+                        ),
+                        None => {}
+                    }
+                }
+                _ = refresh_iv.tick() => {
                     if let Err(e) = self.refresh_metadata().await {
                         tracing::warn!(
                             collection = %self.collection_id,
@@ -145,7 +227,7 @@ impl PostgisEngine {
                     }
                 }
                 _ = shutdown_rx.changed() => {
-                    tracing::info!(collection = %self.collection_id, "postgis: metadata refresh loop shutting down");
+                    tracing::info!(collection = %self.collection_id, "postgis: poll loop shutting down");
                     break;
                 }
             }

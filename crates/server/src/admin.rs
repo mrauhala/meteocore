@@ -8,8 +8,8 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry, TextEncoder,
+    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -148,6 +148,99 @@ static TILE_CACHE_ENTRIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         Opts::new(
             "tile_cache_entries",
             "Number of entries currently in the GeoTIFF tile cache",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+// PostGIS engine gauges (#110). All set per-scrape from live engine state — no
+// delta-tracking needed (they're true gauges, not cumulative counters; the
+// per-query duration/rows/error histograms are a follow-up — see the metrics
+// block in metrics_handler).
+fn pg_int_gauge(name: &str, help: &str, labels: &[&str]) -> IntGaugeVec {
+    let gauge = IntGaugeVec::new(Opts::new(name, help), labels).unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+}
+fn pg_int_counter(name: &str, help: &str, labels: &[&str]) -> IntCounterVec {
+    let counter = IntCounterVec::new(Opts::new(name, help), labels).unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+}
+static POSTGIS_UP: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    pg_int_gauge(
+        "postgis_up",
+        "1 if the PostGIS collection's DB is reachable (latest 30s SELECT 1 ping), else 0",
+        &["collection"],
+    )
+});
+static POSTGIS_POOL_SIZE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    pg_int_gauge(
+        "postgis_pool_size",
+        "Currently open/managed connections in the PostGIS pool",
+        &["pool_key"],
+    )
+});
+static POSTGIS_POOL_MAX_SIZE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    pg_int_gauge(
+        "postgis_pool_max_size",
+        "Configured PostGIS pool capacity (max connections)",
+        &["pool_key"],
+    )
+});
+static POSTGIS_POOL_AVAILABLE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    pg_int_gauge(
+        "postgis_pool_available",
+        "Connections acquirable now without waiting (open-idle + unallocated slots up to max)",
+        &["pool_key"],
+    )
+});
+static POSTGIS_POOL_WAITING: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    pg_int_gauge(
+        "postgis_pool_waiting",
+        "Tasks waiting for a PostGIS connection",
+        &["pool_key"],
+    )
+});
+// Cumulative counts → real Prometheus counters (monotonic across reloads via the
+// rebaseline-on-reset delta-tracking in metrics_handler), so `rate()`/`increase()`
+// behave; a gauge would saw-tooth to 0 on reload and clamp the rate to 0.
+static POSTGIS_METADATA_REFRESHES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "postgis_metadata_refreshes_total",
+        "Total metadata refreshes",
+        &["collection"],
+    )
+});
+static POSTGIS_METADATA_REFRESH_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "postgis_metadata_refresh_failures_total",
+        "Total failed metadata refreshes",
+        &["collection"],
+    )
+});
+static POSTGIS_PINGS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "postgis_pings_total",
+        "Total SELECT 1 health pings (failure ratio = failures_total / pings_total)",
+        &["collection"],
+    )
+});
+static POSTGIS_PING_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "postgis_ping_failures_total",
+        "Total failed SELECT 1 health pings",
+        &["collection"],
+    )
+});
+static POSTGIS_METADATA_REFRESH_SECONDS: LazyLock<GaugeVec> = LazyLock::new(|| {
+    let gauge = GaugeVec::new(
+        Opts::new(
+            "postgis_metadata_refresh_seconds",
+            "Duration of the most recent PostGIS metadata refresh, seconds",
         ),
         &["collection"],
     )
@@ -559,6 +652,10 @@ struct CacheCounterState {
     odim_composite: (u64, u64),
     /// 3D Tiles encoded-content cache `(hits, misses)` — global, monotonic.
     tiles3d_content: (u64, u64),
+    /// PostGIS per-collection `(refreshes, refresh_failures, pings, ping_failures)`
+    /// last-scraped values. Engines are replaced on reload (counts reset), so
+    /// the scrape rebaselines on a backward step — see `metrics_handler`.
+    postgis: HashMap<String, (u64, u64, u64, u64)>,
 }
 
 static RENDER_SEMAPHORE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -2956,11 +3053,45 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
 
 /// GET /health — per-collection health status with data staleness info.
 pub async fn health_handler(State(state): State<AdminState>) -> impl IntoResponse {
-    let health = state
+    let mut health = state
         .health
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+
+    // Reflect LIVE postgis health (the 30s SELECT 1 ping) over the boot snapshot,
+    // so a DB that went down after startup flips to `degraded` and one that
+    // recovered flips back (#110). A `Failed` collection has no engine (couldn't
+    // construct), so it's absent from the live map and keeps its boot status.
+    // `live_health()` is `None` until the first ping completes — so a
+    // boot-degraded collection keeps that boot status instead of the optimistic
+    // `ready` seed during the load→first-ping window.
+    {
+        let engines = state
+            .postgis_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let live: HashMap<&str, engine_postgis::HealthStatus> = engines
+            .iter()
+            .filter_map(|e| Some((e.collection_id(), e.live_health()?)))
+            .collect();
+        for h in health.iter_mut().filter(|h| h.engine_type == "postgis") {
+            if let Some(&s) = live.get(h.id.as_str()) {
+                match s {
+                    engine_postgis::HealthStatus::Ready => {
+                        h.status = CollectionStatus::Ready;
+                        h.error = None;
+                    }
+                    engine_postgis::HealthStatus::Degraded => {
+                        h.status = CollectionStatus::Degraded;
+                        h.error.get_or_insert_with(|| {
+                            "database unreachable (health ping failed)".into()
+                        });
+                    }
+                }
+            }
+        }
+    }
 
     // Build per-collection metadata from concrete engine types.
     // Uses EDR-style temporal extent format: { interval, values? }
@@ -3330,6 +3461,83 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
                     .with_label_values(&[collection, "grib"])
                     .inc_by(bytes);
             }
+        }
+    }
+
+    // PostGIS per-collection / per-pool metrics (#110). Gauges (up, pool stats,
+    // last-refresh duration) are set live each scrape. The three cumulative
+    // counts are real counters with rebaseline-on-reset delta-tracking: engines
+    // are replaced on reload (their in-engine counts reset to 0), so a backward
+    // step rebaselines the delta to keep the Prometheus counter monotonic — no
+    // saw-tooth that would clamp `rate()`/`increase()` to 0. Multiple
+    // collections can share a pool_key; they set the same pool gauge (idempotent).
+    {
+        let engines = state
+            .postgis_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        for engine in engines.iter() {
+            let cid = engine.collection_id();
+            let snap = engine.health_snapshot();
+            // Only emit postgis_up once the first ping has run — before that the
+            // status is the optimistic seed, and emitting `1` would disagree with
+            // `/health` (which keeps the boot snapshot until probed).
+            if snap.probed {
+                POSTGIS_UP.with_label_values(&[cid]).set(match snap.status {
+                    engine_postgis::HealthStatus::Ready => 1,
+                    engine_postgis::HealthStatus::Degraded => 0,
+                });
+            }
+            POSTGIS_METADATA_REFRESH_SECONDS
+                .with_label_values(&[cid])
+                .set(snap.last_refresh_secs);
+
+            let cur = (
+                snap.refresh_total,
+                snap.refresh_failures,
+                snap.ping_total,
+                snap.ping_failures,
+            );
+            let last = counter_state
+                .postgis
+                .get(cid)
+                .copied()
+                .unwrap_or((0, 0, 0, 0));
+            // Rebaseline (treat last as 0) if any count went backward — the engine
+            // was replaced on reload — so the delta is never negative.
+            let base = if cur.0 < last.0 || cur.1 < last.1 || cur.2 < last.2 || cur.3 < last.3 {
+                (0, 0, 0, 0)
+            } else {
+                last
+            };
+            POSTGIS_METADATA_REFRESHES_TOTAL
+                .with_label_values(&[cid])
+                .inc_by(cur.0 - base.0);
+            POSTGIS_METADATA_REFRESH_FAILURES_TOTAL
+                .with_label_values(&[cid])
+                .inc_by(cur.1 - base.1);
+            POSTGIS_PINGS_TOTAL
+                .with_label_values(&[cid])
+                .inc_by(cur.2 - base.2);
+            POSTGIS_PING_FAILURES_TOTAL
+                .with_label_values(&[cid])
+                .inc_by(cur.3 - base.3);
+            counter_state.postgis.insert(cid.to_string(), cur);
+
+            let pk = engine.pool_key_label();
+            let st = engine.pool().status();
+            POSTGIS_POOL_SIZE
+                .with_label_values(&[pk])
+                .set(st.size as i64);
+            POSTGIS_POOL_MAX_SIZE
+                .with_label_values(&[pk])
+                .set(st.max_size as i64);
+            POSTGIS_POOL_AVAILABLE
+                .with_label_values(&[pk])
+                .set(st.available as i64);
+            POSTGIS_POOL_WAITING
+                .with_label_values(&[pk])
+                .set(st.waiting as i64);
         }
     }
 

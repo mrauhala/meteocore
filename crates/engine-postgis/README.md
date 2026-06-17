@@ -409,11 +409,21 @@ suspicious but workable (WARN — the collection still loads).
 ## Operations
 
 - **Health:** `/health` reports per-collection `ready | degraded | failed`.
-  A 30 s background ping flips between `ready` and `degraded`. `failed` means
-  the collection never finished loading.
-- **Metrics:** Prometheus series under the `postgis_*` prefix — pool stats by
-  `pool_key`, query histograms by `collection` + `query_type`, error counters
-  by `collection` + `kind`. Labels are bounded to keep cardinality sane.
+  A 30 s background `SELECT 1` ping (2 s deadline) flips a loaded collection
+  between `ready` and `degraded` on DB reachability — live, not boot-time-only.
+  `failed` means the collection never finished loading (config/privilege). A
+  metadata-refresh failure does NOT degrade health (the ping is the authority;
+  the failure shows up in metrics + logs).
+- **Metrics:** Prometheus series under the `postgis_*` prefix, scraped live —
+  gauges `postgis_up{collection}` (1/0), `postgis_pool_{size,max_size,available,waiting}{pool_key}`
+  (`size` = open connections, `max_size` = capacity, `available` = acquirable now),
+  `postgis_metadata_refresh_seconds{collection}` (last refresh duration); and
+  counters `postgis_{metadata_refreshes,metadata_refresh_failures,pings,ping_failures}_total{collection}`
+  (process-global, delta-tracked so `rate()` works across reloads). Labels are
+  bounded (collection / pool_key are config-time).
+  Per-query histograms (`postgis_query_duration_seconds` / `rows_returned` /
+  `query_errors_total`) are a follow-up — they need recording at the API layer,
+  which calls engines generically through the trait.
 - **Reload:** `POST /admin/collections/reload` re-reads the config and swaps
   engines atomically via `ArcSwap`. Shared pools carry over by identity across
   reloads; dropped URLs' pools close naturally.
