@@ -383,12 +383,14 @@ fn parse_bbox(bbox_str: &str, crs: &str) -> Result<([f64; 4], OutputCrs), WmsErr
     }
 }
 
-/// Convert EPSG:3857 (Web Mercator) coordinates to WGS84 (lon/lat degrees).
+/// Convert EPSG:3857 (Web Mercator) metres to WGS84 (lon/lat degrees) via the
+/// shared [`ds_core::web_mercator`] conversions (single source of truth, #452).
+/// Unclamped — a zoomed-out request bbox legitimately reaches past ±85°.
 fn epsg3857_to_wgs84(x: f64, y: f64) -> (f64, f64) {
-    const EARTH_RADIUS: f64 = 6_378_137.0; // WGS84 semi-major axis
-    let lon = x * 180.0 / (std::f64::consts::PI * EARTH_RADIUS);
-    let lat = (std::f64::consts::PI * 0.5 - 2.0 * (-y / EARTH_RADIUS).exp().atan()).to_degrees();
-    (lon, lat)
+    (
+        ds_core::web_mercator::x_to_lon(x),
+        ds_core::web_mercator::y_to_lat(y),
+    )
 }
 
 /// Parse an ISO 8601 timestamp for the TIME parameter.
