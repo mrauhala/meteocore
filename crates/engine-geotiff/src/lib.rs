@@ -1380,8 +1380,10 @@ fn footprint_pixel_window(
     fy_lo -= my;
     fy_hi += my;
     let to_px = |f: f64, dim: u32| {
-        // `clamp(0.0, dim - 1.0)` would panic in debug if dim == 0 (min > max);
-        // callers always pass positive output dimensions, so assert the contract.
+        // If dim == 0, `clamp(0.0, dim as f64 - 1.0)` panics (min > max) in both
+        // debug and release; the assert below fires first in debug builds with a
+        // clearer message. Callers always pass positive output dimensions, so
+        // assert the contract.
         debug_assert!(
             dim > 0,
             "footprint_pixel_window: output dimension must be > 0"
