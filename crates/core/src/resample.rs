@@ -47,19 +47,39 @@ const MAX_CELLS: u32 = 256;
 /// the 0.5 px resolution of nearest-neighbour resampling.
 const MAX_INTERP_ERROR_PX: f64 = 0.2;
 
-/// Interior probe points `(tx, ty)` within a cell, used by `estimate_error`.
-/// The centre is the dominant (quadratic) bilinear-residual peak; the quarter
-/// points catch the asymmetric higher-order part that a real projection adds
-/// and the centre alone would miss. Sampling several points per cell also
-/// means a cell counts toward the estimate if *any* probe lands on the raster,
-/// not just its centre.
-const ERROR_PROBES: [(f64, f64); 5] = [
-    (0.5, 0.5),
-    (0.25, 0.25),
-    (0.75, 0.25),
-    (0.25, 0.75),
-    (0.75, 0.75),
-];
+/// Per-axis fractions of the 2-D grid of interior probe points `(tx, ty)` that
+/// [`ProjectionGrid::estimate_error`] samples within each cell (the cartesian
+/// product gives `PROBE_FRACS.len()²` points).
+///
+/// A **dense, regular** grid is load-bearing for correctness, not just nicety.
+/// The bilinear residual is zero at the cell corners and peaks somewhere in the
+/// interior, but for a real projection over a wide cell that peak is *not* at
+/// the centre — its location depends on the projection's higher-order terms and
+/// shifts toward the edges. The original 5-point pattern (centre + four quarter
+/// points, all clustered near the middle) systematically *missed* the peak and
+/// under-reported the true error by up to ~20× for low-zoom viewports, so
+/// [`ProjectionGrid::build`] stopped refining far too early and left several
+/// source-pixels of misregistration — visible as dotted / "curtain" artifacts
+/// along edges where the projection curves most (e.g. the eastern edge of an
+/// EPSG:3067 radar composite). The regular grid below, spanning the cell from
+/// near one edge (0.125) to the other (0.875), brackets the peak for every
+/// projection family (#203 follow-up).
+///
+/// Four fractions per axis (16 probes) is the tuned balance: it reliably catches
+/// the residual peak — verified to hold the source-pixel budget at production
+/// resolution, see `grid_holds_budget_at_production_resolution` — while keeping
+/// the estimator's cost down. The estimator runs only at grid-build time (never
+/// per output pixel), and the probe count scales its cost, which matters for the
+/// zoomed-out viewports that refine to many cells; 16 roughly halves that cost
+/// versus a 25-probe (5×5) grid with no loss of accuracy on the regression test.
+const PROBE_FRACS: [f64; 4] = [0.125, 0.375, 0.625, 0.875];
+
+/// The `PROBE_FRACS × PROBE_FRACS` interior probe grid as `(tx, ty)` pairs.
+fn error_probes() -> impl Iterator<Item = (f64, f64)> {
+    PROBE_FRACS
+        .iter()
+        .flat_map(|&ty| PROBE_FRACS.iter().map(move |&tx| (tx, ty)))
+}
 
 /// Coarse grid of exact output→source pixel correspondences, with bilinear
 /// interpolation for interior pixels.
@@ -212,15 +232,16 @@ impl ProjectionGrid {
     /// Estimate the worst-case bilinear-interpolation error, in source pixels.
     ///
     /// For each cell it compares the bilinearly-interpolated value against the
-    /// exact mapping at several interior probe points ([`ERROR_PROBES`]) and
-    /// keeps the largest deviation. Probing more than just the cell centre
-    /// makes this a robust proxy for the true per-pixel maximum even when the
-    /// projection's higher-order (non-quadratic) terms shift the residual peak
-    /// off-centre. Probe points whose exact mapping falls far outside the
-    /// raster are skipped — those output pixels resolve to nodata regardless of
-    /// interpolation error, so refining for them would be wasted work (and
-    /// could needlessly hit the [`MAX_CELLS`] cap on a viewport that mostly
-    /// misses the raster).
+    /// exact mapping at a dense regular grid of interior probe points (the
+    /// [`PROBE_FRACS`]²) and keeps the largest deviation. The dense grid is what
+    /// makes this a faithful proxy for the true per-pixel maximum: a sparse,
+    /// centre-clustered probe set misses the residual peak (which sits near the
+    /// cell edges for a real projection over a wide cell) and under-reports the
+    /// error, defeating the refinement loop. Probe points whose exact mapping
+    /// falls far outside the raster are skipped — those output pixels resolve to
+    /// nodata regardless of interpolation error, so refining for them would be
+    /// wasted work (and could needlessly hit the [`MAX_CELLS`] cap on a viewport
+    /// that mostly misses the raster).
     fn estimate_error(
         &self,
         src_cols: u32,
@@ -238,7 +259,7 @@ impl ProjectionGrid {
                 let n = j * self.stride + i;
                 let (c00, c10) = (self.nodes[n], self.nodes[n + 1]);
                 let (c01, c11) = (self.nodes[n + self.stride], self.nodes[n + self.stride + 1]);
-                for (tx, ty) in ERROR_PROBES {
+                for (tx, ty) in error_probes() {
                     let (lon, lat) = out_to_world(
                         (i as f64 + tx) / self.cells_x as f64,
                         (j as f64 + ty) / self.cells_y as f64,
@@ -322,6 +343,31 @@ mod tests {
             pixel_height: 5_080.840,
             width: 480,
             height: 360,
+            crs: Crs::TransverseMercator {
+                lat0: 0.0,
+                lon0: 27.0_f64.to_radians(),
+                k0: 0.9996,
+                false_e: 500_000.0,
+                false_n: 0.0,
+            },
+        }
+    }
+
+    /// TM35FIN at the *production* FMI composite resolution (4963×7316, 250 m
+    /// pixels). The interpolation-error budget is in **source pixels**, so the
+    /// same geographic misregistration is ~10× more pixels here than on the
+    /// 480×360 fixture — which is exactly why the under-refinement bug was
+    /// invisible at fixture resolution but produced visible "curtain" artifacts
+    /// in production. The error-estimator probe density must be dense enough to
+    /// hold the budget at this resolution.
+    fn tm35fin_full_res_transform() -> GeoTransform {
+        GeoTransform {
+            origin_x: -196_593.004,
+            origin_y: 8_084_432.005,
+            pixel_width: 250.004,
+            pixel_height: 250.014,
+            width: 4963,
+            height: 7316,
             crs: Crs::TransverseMercator {
                 lat0: 0.0,
                 lon0: 27.0_f64.to_radians(),
@@ -502,6 +548,31 @@ mod tests {
         assert!(
             err < 0.5,
             "wide Web Mercator grid error {err} px exceeds budget"
+        );
+    }
+
+    #[test]
+    fn grid_holds_budget_at_production_resolution() {
+        // Regression for the reported "east curtains" artifact: at the real FMI
+        // composite resolution (4963×7316), a zoomed-out Web Mercator viewport
+        // like the bug report's must still meet the source-pixel budget. With
+        // the old sparse, centre-clustered probe set the estimator under-reported
+        // the error (~0.08 px) and stopped refining while the TRUE error was
+        // ~1.6 source px — visible as dotted/curtain misregistration. The dense
+        // probe grid catches the residual peak so refinement actually converges.
+        let gt = tm35fin_full_res_transform();
+        // The user's "URL1" viewport: lon −13..73.8°E, lat 42.7..74.3°N, WebMerc.
+        let err = max_grid_error(
+            &gt,
+            700,
+            535,
+            |fx| -13.06 + fx * 86.86,
+            |fy| merc_lat(&(42.67, 74.33), fy),
+        );
+        assert!(
+            err < 0.5,
+            "production-resolution wide-viewport grid error {err} px exceeds \
+             budget (the sparse-probe estimator left ~1.6 px → curtain artifacts)"
         );
     }
 

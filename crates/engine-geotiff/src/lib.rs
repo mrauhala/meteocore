@@ -1316,6 +1316,78 @@ fn filter_by_datetime(
     }
 }
 
+/// Inclusive output-pixel window `(px_lo, px_hi, py_lo, py_hi)` that the source
+/// footprint can occupy in the output image — a cheap domain guard applied
+/// before resampling (see the call site in `get_raster_tile`).
+///
+/// `src_env_wgs84` is the source raster's WGS84 envelope `[w, s, e, n]`;
+/// `wgs84_bbox` is the requested tile bbox. The envelope perimeter is mapped to
+/// output-fraction space with [`OutputCrs::world_to_fraction`] (the per-vertex
+/// inverse of the per-pixel `project_node` — projecting only ~130 perimeter
+/// points, never per output pixel, per the #203 rule), the fractional extent is
+/// taken and expanded by a small margin so genuine boundary data is never
+/// clipped, then converted to inclusive pixel bounds clamped to the image.
+///
+/// Purpose: at low zoom the coarse projection grid (and the source projection's
+/// own out-of-domain forward) can map a far-away output pixel onto a valid
+/// source pixel, painting ghost echoes far from the data. Such pixels lie
+/// outside this window and are dropped to nodata.
+///
+/// If no perimeter sample yields a finite fraction (e.g. a projected output CRS
+/// whose inverse is undefined across the whole envelope) the guard is disabled
+/// (full image) rather than risk clipping real data. **Limitation:** the window
+/// is a single output-space box, so on a viewport that shows more than one world
+/// copy (Web Mercator spanning > 360° of longitude) only the primary copy of the
+/// footprint is kept; additional wrapped copies render as nodata (acceptable —
+/// the alternative was ghost aliasing).
+fn footprint_pixel_window(
+    output_crs: &ds_core::map_engine::OutputCrs,
+    wgs84_bbox: [f64; 4],
+    src_env_wgs84: [f64; 4],
+    width: u32,
+    height: u32,
+) -> (u32, u32, u32, u32) {
+    let [w, s, e, n] = src_env_wgs84;
+    let (mut fx_lo, mut fx_hi, mut fy_lo, mut fy_hi) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    let mut any = false;
+    const STEPS: usize = 32;
+    for i in 0..=STEPS {
+        let t = i as f64 / STEPS as f64;
+        let lon = w + t * (e - w);
+        let lat = s + t * (n - s);
+        // All four envelope edges (curved edges can bow past the corners).
+        for (plon, plat) in [(lon, s), (lon, n), (w, lat), (e, lat)] {
+            let (fx, fy) = output_crs.world_to_fraction(wgs84_bbox, plon, plat);
+            if fx.is_finite() && fy.is_finite() {
+                any = true;
+                fx_lo = fx_lo.min(fx);
+                fx_hi = fx_hi.max(fx);
+                fy_lo = fy_lo.min(fy);
+                fy_hi = fy_hi.max(fy);
+            }
+        }
+    }
+    if !any {
+        return (0, width.saturating_sub(1), 0, height.saturating_sub(1));
+    }
+    // Margin: a fraction of the footprint's own output span, with a small floor,
+    // so edge-sampling gaps and sub-pixel rounding never clip boundary data.
+    // Far-away ghosts sit far outside, so this margin never readmits them.
+    let mx = ((fx_hi - fx_lo) * 0.02).max(0.005);
+    let my = ((fy_hi - fy_lo) * 0.02).max(0.005);
+    fx_lo -= mx;
+    fx_hi += mx;
+    fy_lo -= my;
+    fy_hi += my;
+    let to_px = |f: f64, dim: u32| (f * dim as f64).floor().clamp(0.0, dim as f64 - 1.0) as u32;
+    (
+        to_px(fx_lo, width),
+        to_px(fx_hi, width),
+        to_px(fy_lo, height),
+        to_px(fy_hi, height),
+    )
+}
+
 /// Map a parsed [`Crs`](ds_core::geo::Crs) to the engine's native-CRS label
 /// (stored in `RasterInfo.native_crs`, surfaced as OGC `storageCrs`).
 ///
@@ -1581,9 +1653,28 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                 |lon, lat| gt.world_to_pixel_f64(lon, lat),
             );
 
+            // Domain guard against "ghost" echoes. The coarse projection grid
+            // only approximates the output→source mapping; at low zoom / extreme
+            // viewports (e.g. a whole-world Web Mercator view whose pixels wrap
+            // past ±180° or reach the poles) it — and the source projection's own
+            // out-of-domain forward — can map a far-away output pixel onto a valid
+            // source pixel, painting the radar far from where it belongs (ghosts
+            // in the Arctic/Antarctic, smear north of the data). An output pixel
+            // may only carry data if its TRUE geography lies within the source's
+            // footprint, so bound, in output-pixel space, the window the footprint
+            // can occupy and treat everything outside it as nodata. Computed once
+            // from the source's WGS84 envelope (no per-pixel projection).
+            let (px_lo, px_hi, py_lo, py_hi) =
+                footprint_pixel_window(output_crs, bbox, gt.bbox(), width, height);
+
             // Resample source grid to output dimensions using nearest-neighbor.
             for oy in 0..height {
+                let in_y = oy >= py_lo && oy <= py_hi;
                 for ox in 0..width {
+                    if !in_y || ox < px_lo || ox > px_hi {
+                        values.push(None);
+                        continue;
+                    }
                     let (col_f, row_f) = grid.sample(ox, oy);
                     if !col_f.is_finite() || !row_f.is_finite() {
                         values.push(None);
