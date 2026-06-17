@@ -1379,7 +1379,15 @@ fn footprint_pixel_window(
     fx_hi += mx;
     fy_lo -= my;
     fy_hi += my;
-    let to_px = |f: f64, dim: u32| (f * dim as f64).floor().clamp(0.0, dim as f64 - 1.0) as u32;
+    let to_px = |f: f64, dim: u32| {
+        // `clamp(0.0, dim - 1.0)` would panic in debug if dim == 0 (min > max);
+        // callers always pass positive output dimensions, so assert the contract.
+        debug_assert!(
+            dim > 0,
+            "footprint_pixel_window: output dimension must be > 0"
+        );
+        (f * dim as f64).floor().clamp(0.0, dim as f64 - 1.0) as u32
+    };
     (
         to_px(fx_lo, width),
         to_px(fx_hi, width),
