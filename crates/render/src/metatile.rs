@@ -69,6 +69,22 @@ fn lat_to_y(lat_deg: f64) -> f64 {
     let lat = lat_deg.to_radians().clamp(-LAT_LIMIT_RAD, LAT_LIMIT_RAD);
     R * (std::f64::consts::FRAC_PI_4 + lat / 2.0).tan().ln()
 }
+/// Web Mercator northing for a latitude — the inverse of [`y_to_lat`], WITHOUT
+/// [`lat_to_y`]'s ±85° tile-grid clamp.
+///
+/// The meta-tile **viewport bounds** must match the client's request bbox
+/// exactly: a zoomed-out EPSG:3857 GetMap can have a bbox reaching past ±85°
+/// toward a pole, and the client places the returned image over the FULL
+/// requested extent. Using the ±85°-clamped [`lat_to_y`] for the bounds (as this
+/// did) shrinks the assembled image's vertical span relative to the client's, so
+/// all data is shifted toward the pole — the radar composite appeared ~10° too
+/// far north on whole-world views. Clamps just shy of ±90° only to keep `tan`
+/// finite (`y_to_lat` never yields ±90, so real inputs are unaffected).
+fn merc_y_exact(lat_deg: f64) -> f64 {
+    const SAFE_LAT_DEG: f64 = 89.9;
+    let lat = lat_deg.clamp(-SAFE_LAT_DEG, SAFE_LAT_DEG).to_radians();
+    R * (std::f64::consts::FRAC_PI_4 + lat / 2.0).tan().ln()
+}
 fn x_to_lon(x: f64) -> f64 {
     (x / R).to_degrees()
 }
@@ -278,11 +294,15 @@ where
         return Ok(MetaTile::Fallback);
     }
 
-    // Viewport in Web Mercator metres. Mercator Y increases northward.
+    // Viewport in Web Mercator metres. Mercator Y increases northward. The
+    // bounds are EXACT (unclamped) so res_x/res_y and the output coordinate map
+    // match the client's request bbox even when it reaches past ±85° toward a
+    // pole; the ±85° clamp belongs only to *tile selection* (`row0`/`row1`
+    // below), not the viewport mapping. See `merc_y_exact`.
     let west_m = lon_to_x(w);
     let east_m = lon_to_x(e);
-    let north_m = lat_to_y(n);
-    let south_m = lat_to_y(s);
+    let north_m = merc_y_exact(n);
+    let south_m = merc_y_exact(s);
     if !(east_m > west_m && north_m > south_m) {
         // Antimeridian crossing or degenerate extent — let the caller render directly.
         return Ok(MetaTile::Fallback);
@@ -305,10 +325,14 @@ where
     // inside the viewport, so a tiny epsilon trims a spurious tile when an edge
     // lands exactly on a grid line.
     let eps = span * 1e-9;
+    // Tile rows use the ±85°-CLAMPED bounds (`lat_to_y`): tiles only exist
+    // within the valid Web Mercator world, so output pixels past ±85° (present
+    // when the exact `north_m`/`south_m` above run to a pole) have no tile and
+    // the assembly draws them transparent — no phantom rows to render.
     let col0 = ((west_m + ORIGIN) / span).floor() as i64;
     let col1 = ((east_m + ORIGIN - eps) / span).floor() as i64;
-    let row0 = ((ORIGIN - north_m) / span).floor() as i64;
-    let row1 = ((ORIGIN - south_m - eps) / span).floor() as i64;
+    let row0 = ((ORIGIN - lat_to_y(n)) / span).floor() as i64;
+    let row1 = ((ORIGIN - lat_to_y(s) - eps) / span).floor() as i64;
     let ncols = (col1 - col0 + 1).max(1) as usize;
     let nrows = (row1 - row0 + 1).max(1) as usize;
     if ncols.saturating_mul(nrows) > MAX_TILES {
@@ -1004,6 +1028,97 @@ mod tests {
         assert!(
             max_diff_y <= 3,
             "Y gradient mismatch: max diff {max_diff_y} (row shift / vertical flip?)"
+        );
+    }
+
+    #[test]
+    fn extreme_latitude_viewport_does_not_displace_data() {
+        // Regression: a zoomed-out EPSG:3857 GetMap whose bbox runs past the ±85°
+        // web-mercator limit must NOT shift data toward the pole. The closure
+        // paints a horizontal data stripe at lat 55..70 (rendered Mercator-spaced
+        // like a real tile); after assembly the stripe must still read at lat
+        // ~55..70. The pre-fix clamp of the viewport bounds to ±85° shrank the
+        // assembled vertical span, displacing this stripe ~10° north.
+        fn stripe_tile(b: [f64; 4], w: u32, h: u32) -> Result<RasterTile, DataServerError> {
+            let (my_n, my_s) = (merc_y_exact(b[3]), merc_y_exact(b[1]));
+            let mut values = vec![None; (w * h) as usize];
+            for row in 0..h {
+                let fy = (row as f64 + 0.5) / h as f64;
+                let lat = y_to_lat(my_n - fy * (my_n - my_s));
+                if (55.0..=70.0).contains(&lat) {
+                    for col in 0..w {
+                        values[(row * w + col) as usize] = Some(1.0);
+                    }
+                }
+            }
+            Ok(RasterTile {
+                width: w,
+                height: h,
+                values,
+            })
+        }
+        let cache = TilePixelCache::new(64);
+        let prefix = TileKeyPrefix {
+            layer: "l".into(),
+            parameter: None,
+            style: "d".into(),
+            time: None,
+            z: None,
+            reference_time: None,
+        };
+        let bbox = [-150.0, -30.0, 150.0, 87.0]; // north well past the 85° limit
+        let (w, h) = (400u32, 400u32);
+        let bytes = match render_metatiled(
+            bbox,
+            w,
+            h,
+            &prefix,
+            &SolidRed,
+            ImageFormat::Png,
+            &cache,
+            stripe_tile,
+        )
+        .unwrap()
+        {
+            MetaTile::Image { bytes, .. } => bytes,
+            other => panic!(
+                "expected an image (got Empty/Fallback): {}",
+                matches!(other, MetaTile::Fallback)
+            ),
+        };
+        // Expand indexed+tRNS → RGBA and find the opaque-pixel latitude band, read
+        // back the way the client does: over the FULL request bbox in Mercator.
+        let mut dec = png::Decoder::new(std::io::Cursor::new(&bytes));
+        dec.set_transformations(png::Transformations::EXPAND);
+        let mut reader = dec.read_info().unwrap();
+        let mut buf = vec![0u8; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        let ch = info.color_type.samples();
+        let (my_n, my_s) = (merc_y_exact(bbox[3]), merc_y_exact(bbox[1]));
+        let (mut lat_lo, mut lat_hi) = (f64::MAX, f64::MIN);
+        for row in 0..h {
+            let lat = y_to_lat(my_n - (row as f64 + 0.5) / h as f64 * (my_n - my_s));
+            for col in 0..w {
+                let a = if ch >= 4 {
+                    buf[((row * w + col) as usize) * ch + 3]
+                } else {
+                    255
+                };
+                if a > 20 {
+                    lat_lo = lat_lo.min(lat);
+                    lat_hi = lat_hi.max(lat);
+                }
+            }
+        }
+        // Band must read at ~55..70, not displaced north. Outer bounds allow a
+        // little tile-granularity spread; inner bounds prove the stripe is there.
+        assert!(
+            lat_hi <= 72.0 && lat_lo >= 53.0,
+            "data band lat[{lat_lo:.1},{lat_hi:.1}] displaced from ~55..70"
+        );
+        assert!(
+            lat_hi >= 68.0 && lat_lo <= 57.0,
+            "data band lat[{lat_lo:.1},{lat_hi:.1}] missing or too narrow"
         );
     }
 }
