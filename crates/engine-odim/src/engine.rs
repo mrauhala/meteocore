@@ -1214,13 +1214,26 @@ impl MapEngine for OdimEngine {
             world_to_src_px,
         );
 
+        // Domain guard against "ghost" echoes: at low zoom / extreme viewports
+        // the coarse grid (and the projection's out-of-domain forward) can map a
+        // far-away output pixel onto a valid source pixel, painting the composite
+        // far from its coverage. Bound the output window to the source footprint
+        // (WGS84 `seed_spatial_extent`); everything outside is nodata (#449).
+        let (px_lo, px_hi, py_lo, py_hi) =
+            output_crs.footprint_pixel_window(bbox, self.seed_spatial_extent, width, height);
+
         // Resample source grid to output dimensions using nearest-neighbour.
         // The grid interpolates only the output→source coordinate map; the data
         // values are still sampled nearest-neighbour (radar dBZ must not be
         // blended across nodata/undetect edges).
         let mut values = Vec::with_capacity((width * height) as usize);
         for oy in 0..height {
+            let in_y = oy >= py_lo && oy <= py_hi;
             for ox in 0..width {
+                if !in_y || ox < px_lo || ox > px_hi {
+                    values.push(None);
+                    continue;
+                }
                 let (col_f, row_f) = grid.sample(ox, oy);
                 if !col_f.is_finite() || !row_f.is_finite() {
                     values.push(None);
