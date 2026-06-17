@@ -132,7 +132,10 @@ impl OutputCrs {
     /// domain guard for projected-raster resampling.
     ///
     /// `src_env_wgs84` is the source raster's WGS84 envelope `[w, s, e, n]`;
-    /// `wgs84_bbox` is the requested tile bbox. The envelope perimeter is mapped
+    /// `wgs84_bbox` is the requested tile bbox (for `Wgs84`/`WebMercator` output;
+    /// it is **ignored for `Projected` output**, whose extents are embedded in the
+    /// `Projected { crs, bbox }` variant — same as [`Self::world_to_fraction`]).
+    /// The envelope perimeter is mapped
     /// to output-fraction space with [`Self::world_to_fraction`] (the per-vertex
     /// inverse of the per-pixel [`Self::project_node`] — only ~130 perimeter
     /// points, never per output pixel, per the #203 rule), the fractional extent
@@ -444,6 +447,37 @@ mod tests {
         );
         // The footprint centre (lon 25.5, lat ~64.5) must fall inside the window.
         let (cfx, cfy) = crs.world_to_fraction(view, 25.5, 64.5);
+        let (cx, cy) = ((cfx * w as f64) as u32, (cfy * h as f64) as u32);
+        assert!(
+            (px_lo..=px_hi).contains(&cx) && (py_lo..=py_hi).contains(&cy),
+            "footprint centre must be inside the window"
+        );
+    }
+
+    #[test]
+    fn footprint_window_bounds_source_for_projected_output() {
+        // ODIM COMP serves EPSG:3067 national-grid requests via `Projected`
+        // output (a different `world_to_fraction` path — `crs.forward` against the
+        // embedded projected bbox). A view wider than the source footprint must
+        // yield a sub-window, and the footprint centre must fall inside it.
+        let crs = projected_output_crs("EPSG:3067").unwrap();
+        // Request rectangle in EPSG:3067 metres, deliberately wider than Finland.
+        let (e0, n0) = crs.forward(5.0, 53.0);
+        let (e1, n1) = crs.forward(45.0, 74.0);
+        let out = OutputCrs::Projected {
+            crs,
+            bbox: [e0.min(e1), n0.min(n1), e0.max(e1), n0.max(n1)],
+        };
+        let (w, h) = (800u32, 800u32);
+        // `wgs84_bbox` is ignored for `Projected`; pass the footprint either way.
+        let (px_lo, px_hi, py_lo, py_hi) =
+            out.footprint_pixel_window(FINLAND_WGS84, FINLAND_WGS84, w, h);
+        assert!(px_lo < px_hi && py_lo < py_hi, "window must be non-empty");
+        assert!(
+            px_lo > 0 || px_hi < w - 1 || py_lo > 0 || py_hi < h - 1,
+            "a view wider than the footprint must not span the full image"
+        );
+        let (cfx, cfy) = out.world_to_fraction(FINLAND_WGS84, 25.5, 64.5);
         let (cx, cy) = ((cfx * w as f64) as u32, (cfy * h as f64) as u32);
         assert!(
             (px_lo..=px_hi).contains(&cx) && (py_lo..=py_hi).contains(&cy),
