@@ -69,6 +69,20 @@ RUN cargo chef cook --release --locked --recipe-path recipe.json -p server \
 # Now copy the actual workspace source and build. Only the changed
 # workspace member's crate needs to recompile; deps are already linked.
 COPY . .
+# Force the workspace crates to recompile against the REAL source.
+#
+# `cargo chef cook` (above) compiled every workspace crate as an empty stub.
+# `COPY . .` then lays down the real sources, but BuildKit preserves their
+# build-context mtime (the git-checkout time). When the `cook` layer is rebuilt
+# (any Cargo.lock change busts its cache), its stub artifacts in `target/` end
+# up with a *newer* mtime than these just-copied real sources — so cargo's
+# mtime-based fingerprint decides the workspace crates are "up to date" and
+# links the stale stub objects, silently shipping a binary that lags the
+# source. (Observed in prod: an engine fix was present in the image's source
+# but absent from its compiled binary.) `touch`ing the sources to "now"
+# guarantees a real recompile of the workspace crates while still reusing
+# cook's (untouched) dependency artifacts.
+RUN find crates -type f -exec touch {} +
 RUN cargo build --release --locked -p server \
         ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 
