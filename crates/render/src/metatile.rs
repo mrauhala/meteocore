@@ -45,8 +45,8 @@ use crate::{ColorMap, ImageFormat};
 
 /// Tile edge length in pixels (WebMercatorQuad standard).
 const TILE_PX: u32 = 256;
-/// EPSG:3857 sphere radius (metres).
-const R: f64 = 6_378_137.0;
+/// EPSG:3857 sphere radius (metres) — from the shared source of truth.
+const R: f64 = ds_core::web_mercator::EARTH_RADIUS;
 /// Half the Web Mercator world span in metres (`π·R`). The grid origin is the
 /// top-left corner `(-ORIGIN, +ORIGIN)`.
 const ORIGIN: f64 = std::f64::consts::PI * R;
@@ -54,43 +54,16 @@ const ORIGIN: f64 = std::f64::consts::PI * R;
 const Z0_RES: f64 = (2.0 * ORIGIN) / TILE_PX as f64;
 /// Maximum half-octave ladder level (`level/2 ≈ zoom`, so ~zoom 24).
 const MAX_LEVEL: i32 = 48;
-/// Web Mercator latitude limit in radians (~±85.0511°).
-const LAT_LIMIT_RAD: f64 = 1.484_422_229_745_332_4;
 /// Safety cap on covering tiles per request. A request that would need more
 /// (tiny resolution over a huge bbox) declines to [`MetaTile::Fallback`].
 const MAX_TILES: usize = 256;
 
-// --- Web Mercator metre <-> WGS84 degree helpers (standard EPSG:3857) --------
-
-fn lon_to_x(lon_deg: f64) -> f64 {
-    R * lon_deg.to_radians()
-}
-fn lat_to_y(lat_deg: f64) -> f64 {
-    let lat = lat_deg.to_radians().clamp(-LAT_LIMIT_RAD, LAT_LIMIT_RAD);
-    R * (std::f64::consts::FRAC_PI_4 + lat / 2.0).tan().ln()
-}
-/// Web Mercator northing for a latitude — the inverse of [`y_to_lat`], WITHOUT
-/// [`lat_to_y`]'s ±85° tile-grid clamp.
-///
-/// The meta-tile **viewport bounds** must match the client's request bbox
-/// exactly: a zoomed-out EPSG:3857 GetMap can have a bbox reaching past ±85°
-/// toward a pole, and the client places the returned image over the FULL
-/// requested extent. Using the ±85°-clamped [`lat_to_y`] for the bounds (as this
-/// did) shrinks the assembled image's vertical span relative to the client's, so
-/// all data is shifted toward the pole — the radar composite appeared ~10° too
-/// far north on whole-world views. Clamps just shy of ±90° only to keep `tan`
-/// finite (`y_to_lat` never yields ±90, so real inputs are unaffected).
-fn merc_y_exact(lat_deg: f64) -> f64 {
-    const SAFE_LAT_DEG: f64 = 89.9;
-    let lat = lat_deg.clamp(-SAFE_LAT_DEG, SAFE_LAT_DEG).to_radians();
-    R * (std::f64::consts::FRAC_PI_4 + lat / 2.0).tan().ln()
-}
-fn x_to_lon(x: f64) -> f64 {
-    (x / R).to_degrees()
-}
-fn y_to_lat(y: f64) -> f64 {
-    (2.0 * (y / R).exp().atan() - std::f64::consts::FRAC_PI_2).to_degrees()
-}
+// Web Mercator metre <-> WGS84 degree conversions come from the shared
+// `ds_core::web_mercator` module (the single source of truth, #452): `lat_to_y`
+// is UNCLAMPED — correct for the viewport bounds, which must match the client's
+// request bbox even past ±85°. The ±85° tile-grid clamp ([`LAT_LIMIT_DEG`]) is
+// applied explicitly, only where tile *indices* are selected (`row0`/`row1`).
+use ds_core::web_mercator::{lat_to_y, lon_to_x, x_to_lon, y_to_lat, LAT_LIMIT_DEG};
 
 /// Resolution (metres/pixel) of a half-octave ladder level.
 fn level_res(level: i32) -> f64 {
@@ -295,14 +268,14 @@ where
     }
 
     // Viewport in Web Mercator metres. Mercator Y increases northward. The
-    // bounds are EXACT (unclamped) so res_x/res_y and the output coordinate map
-    // match the client's request bbox even when it reaches past ±85° toward a
-    // pole; the ±85° clamp belongs only to *tile selection* (`row0`/`row1`
-    // below), not the viewport mapping. See `merc_y_exact`.
+    // bounds use the shared UNCLAMPED `lat_to_y`, so res_x/res_y and the output
+    // coordinate map match the client's request bbox even when it reaches past
+    // ±85° toward a pole; the ±85° clamp belongs only to *tile selection*
+    // (`row0`/`row1` below), not the viewport mapping (#452).
     let west_m = lon_to_x(w);
     let east_m = lon_to_x(e);
-    let north_m = merc_y_exact(n);
-    let south_m = merc_y_exact(s);
+    let north_m = lat_to_y(n);
+    let south_m = lat_to_y(s);
     if !(east_m > west_m && north_m > south_m) {
         // Antimeridian crossing or degenerate extent — let the caller render directly.
         return Ok(MetaTile::Fallback);
@@ -331,8 +304,9 @@ where
     // the assembly draws them transparent — no phantom rows to render.
     let col0 = ((west_m + ORIGIN) / span).floor() as i64;
     let col1 = ((east_m + ORIGIN - eps) / span).floor() as i64;
-    let row0 = ((ORIGIN - lat_to_y(n)) / span).floor() as i64;
-    let row1 = ((ORIGIN - lat_to_y(s) - eps) / span).floor() as i64;
+    let row0 = ((ORIGIN - lat_to_y(n.clamp(-LAT_LIMIT_DEG, LAT_LIMIT_DEG))) / span).floor() as i64;
+    let row1 =
+        ((ORIGIN - lat_to_y(s.clamp(-LAT_LIMIT_DEG, LAT_LIMIT_DEG)) - eps) / span).floor() as i64;
     let ncols = (col1 - col0 + 1).max(1) as usize;
     let nrows = (row1 - row0 + 1).max(1) as usize;
     if ncols.saturating_mul(nrows) > MAX_TILES {
@@ -1032,15 +1006,17 @@ mod tests {
     }
 
     #[test]
-    fn extreme_latitude_viewport_does_not_displace_data() {
-        // Regression: a zoomed-out EPSG:3857 GetMap whose bbox runs past the ±85°
-        // web-mercator limit must NOT shift data toward the pole. The closure
-        // paints a horizontal data stripe at lat 55..70 (rendered Mercator-spaced
-        // like a real tile); after assembly the stripe must still read at lat
-        // ~55..70. The pre-fix clamp of the viewport bounds to ±85° shrank the
-        // assembled vertical span, displacing this stripe ~10° north.
+    fn meta_and_direct_paths_agree_at_extreme_latitude() {
+        // The cross-path regression guard for #452: a zoomed-out EPSG:3857 GetMap
+        // whose bbox runs past the ±85° web-mercator limit must place data at the
+        // same latitude via the meta-tile path as via the direct single-shot
+        // render. The closure paints a horizontal data stripe at lat 55..70
+        // (Mercator-spaced like a real tile); the meta-tile band must read at
+        // ~55..70 AND match the direct band. The pre-fix clamp of the viewport
+        // bounds to ±85° shrank the assembled vertical span, displacing the
+        // meta-tile stripe ~10° north of where the direct render puts it.
         fn stripe_tile(b: [f64; 4], w: u32, h: u32) -> Result<RasterTile, DataServerError> {
-            let (my_n, my_s) = (merc_y_exact(b[3]), merc_y_exact(b[1]));
+            let (my_n, my_s) = (lat_to_y(b[3]), lat_to_y(b[1]));
             let mut values = vec![None; (w * h) as usize];
             for row in 0..h {
                 let fy = (row as f64 + 0.5) / h as f64;
@@ -1094,7 +1070,7 @@ mod tests {
         let mut buf = vec![0u8; reader.output_buffer_size()];
         let info = reader.next_frame(&mut buf).unwrap();
         let ch = info.color_type.samples();
-        let (my_n, my_s) = (merc_y_exact(bbox[3]), merc_y_exact(bbox[1]));
+        let (my_n, my_s) = (lat_to_y(bbox[3]), lat_to_y(bbox[1]));
         let (mut lat_lo, mut lat_hi) = (f64::MAX, f64::MIN);
         for row in 0..h {
             let lat = y_to_lat(my_n - (row as f64 + 0.5) / h as f64 * (my_n - my_s));
@@ -1119,6 +1095,27 @@ mod tests {
         assert!(
             lat_hi >= 68.0 && lat_lo <= 57.0,
             "data band lat[{lat_lo:.1},{lat_hi:.1}] missing or too narrow"
+        );
+
+        // Cross-path check: render the SAME bbox single-shot (the direct path a
+        // raster engine / WMS-direct fallback takes) and confirm the meta-tile
+        // path placed the stripe at the same latitudes. Before #452 the meta band
+        // sat ~10° north of this direct band; they now share `web_mercator` and
+        // must agree to within a tile-granularity slop.
+        let direct = stripe_tile(bbox, w, h).unwrap();
+        let (mut d_lo, mut d_hi) = (f64::MAX, f64::MIN);
+        for row in 0..h {
+            let lat = y_to_lat(my_n - (row as f64 + 0.5) / h as f64 * (my_n - my_s));
+            // The stripe is full-width, so column 0 represents the whole row.
+            if direct.values[(row * w) as usize].is_some() {
+                d_lo = d_lo.min(lat);
+                d_hi = d_hi.max(lat);
+            }
+        }
+        assert!(
+            (lat_lo - d_lo).abs() < 1.5 && (lat_hi - d_hi).abs() < 1.5,
+            "meta band lat[{lat_lo:.1},{lat_hi:.1}] disagrees with direct band \
+             lat[{d_lo:.1},{d_hi:.1}]"
         );
     }
 }

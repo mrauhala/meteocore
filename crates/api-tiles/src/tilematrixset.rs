@@ -206,11 +206,14 @@ fn web_mercator_tile_bbox(zoom: u32, row: u64, col: u64) -> Option<[f64; 4]> {
     let west = (col as f64 / n_f) * 360.0 - 180.0;
     let east = ((col + 1) as f64 / n_f) * 360.0 - 180.0;
 
-    // Latitude: inverse Mercator from row (row 0 = north)
-    let north_y = PI * (1.0 - 2.0 * row as f64 / n_f);
-    let south_y = PI * (1.0 - 2.0 * (row + 1) as f64 / n_f);
-    let north = north_y.sinh().atan().to_degrees();
-    let south = south_y.sinh().atan().to_degrees();
+    // Latitude: inverse Mercator from row (row 0 = north). The normalised
+    // Mercator y (`π·(1 - 2·row/n)`) scaled by the sphere radius is the northing
+    // in metres, so the shared `web_mercator::y_to_lat` (Gudermannian — identical
+    // to `atan(sinh(·))`) gives the latitude. Using the shared conversion keeps
+    // this tile-grid path from drifting from the render/bbox paths (#452).
+    let r = ds_core::web_mercator::EARTH_RADIUS;
+    let north = ds_core::web_mercator::y_to_lat(PI * (1.0 - 2.0 * row as f64 / n_f) * r);
+    let south = ds_core::web_mercator::y_to_lat(PI * (1.0 - 2.0 * (row + 1) as f64 / n_f) * r);
 
     Some([west, south, east, north])
 }

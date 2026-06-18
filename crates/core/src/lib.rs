@@ -18,3 +18,4 @@ pub mod raster_paint;
 pub mod resample;
 pub mod vertical;
 pub mod volume;
+pub mod web_mercator;

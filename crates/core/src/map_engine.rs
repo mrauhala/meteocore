@@ -34,24 +34,11 @@ pub enum OutputCrs {
     },
 }
 
-/// Convert WGS84 latitude (degrees) to Web Mercator Y (metres). Shared by every
-/// map engine's output-axis mapping so the equal-Y-metres spacing of
-/// `OutputCrs::WebMercator` is computed identically everywhere.
-fn lat_to_merc_y(lat_deg: f64) -> f64 {
-    const R: f64 = 6_378_137.0;
-    R * ((std::f64::consts::FRAC_PI_4 + lat_deg.to_radians() / 2.0).tan()).ln()
-}
-
-/// Inverse of [`lat_to_merc_y`].
-///
-/// `π/2 - 2·atan(exp(-y/R))` is algebraically equal to the standard EPSG:3857
-/// inverse `2·atan(exp(y/R)) - π/2` but negates the exponent so `exp()` decays
-/// toward zero as |y| grows rather than overflowing — numerically stable across
-/// the full ±π/2 range under f64.
-fn merc_y_to_lat(y: f64) -> f64 {
-    const R: f64 = 6_378_137.0;
-    (std::f64::consts::FRAC_PI_2 - 2.0 * (-y / R).exp().atan()).to_degrees()
-}
+// Web Mercator output-axis math comes from the shared `crate::web_mercator`
+// module — the single source of truth for EPSG:3857 ↔ WGS84 so the meta-tile
+// assembly, WMS/Tiles bbox conversions, and these output axes can't drift apart
+// (#452).
+use crate::web_mercator::{lat_to_y as lat_to_merc_y, y_to_lat as merc_y_to_lat};
 
 impl OutputCrs {
     /// Map a fractional output position `(fx, fy)` in `[0, 1]²` to WGS84
