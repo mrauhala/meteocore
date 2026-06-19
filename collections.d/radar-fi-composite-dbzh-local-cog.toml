@@ -1,0 +1,25 @@
+id = "radar-fi-composite-dbzh-local-cog"
+title = "FMI — radar reflectivity composite (local, COG)"
+description = "Finnish radar reflectivity (DBZH) composite from FMI open data. EPSG:3067 (ETRS89 / TM35FIN) Cloud-Optimized GeoTIFF, from local sample files."
+data_path = "testdata/fmi-radar"
+engine_type = "geotiff"
+apis = ["edr", "wms", "maps", "tiles"]
+keywords = ["radar", "reflectivity", "composite", "precipitation", "Finland", "FMI"]
+
+[geotiff]
+# FMI composites are 5-minute, always SS=00 (literal "00" in the name).
+filename_template = "%Y%m%d%H%M00_fmi_radar_composite_dbz.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+# Raw Byte 1..254 → dBZ via value = raw*0.5 - 32 (raw 255 = nodata). The file
+# carries no GDAL scale/offset tags, so they are applied here.
+nodata = 255
+scale = 0.5
+offset = -32
+poll_interval_secs = 30
+
+[wms]
+style_bundle = "radar_multi"
+
+[license]
+title = "CC-BY-4.0"
