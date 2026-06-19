@@ -1375,6 +1375,74 @@ fn crs_label(crs: &ds_core::geo::Crs) -> String {
     }
 }
 
+/// Half-extent (in source pixels) of an output pixel's footprint on one source
+/// axis, from the forward grid derivative: `center` is the source coordinate at
+/// the output pixel centre, `fwd_x`/`fwd_y` the source coordinate one output
+/// pixel along +x / +y. The bounding span of the (parallelogram) footprint is
+/// `|∂/∂x| + |∂/∂y|`; half of that is the half-extent.
+///
+/// Returns `0.0` (⇒ a single nearest pixel) when the span is ≤ 1 source pixel
+/// (the output is NOT downsampling that axis — zoom-in stays byte-identical to
+/// plain nearest) or when a neighbour sample is non-finite (a projection
+/// domain-edge cell — fall back to nearest rather than a NaN box).
+#[inline]
+fn footprint_half(center: f64, fwd_x: f64, fwd_y: f64) -> f64 {
+    let half = 0.5 * ((fwd_x - center).abs() + (fwd_y - center).abs());
+    if half.is_finite() && half > 0.5 {
+        half
+    } else {
+        0.0
+    }
+}
+
+/// Reduce one output pixel over its source footprint with a coverage-preserving
+/// MAX and push the result. The footprint is the integer source-pixel box
+/// `[col_f ± half_c] × [row_f ± half_r]`, clamped to the window that was read
+/// (`col_start..col_end`, `row_start..row_end`); `src_nx = col_end − col_start`
+/// is the read window's row stride. The pushed value is the largest data sample
+/// in the box (strongest echo), or `None` if the box is empty/off-window — so
+/// the result is always an actual source sample (discrete, PNG8-friendly) and
+/// never a blend. With `half_c == half_r == 0` the box is the single pixel
+/// `floor(col_f), floor(row_f)`, i.e. exactly nearest-neighbour.
+#[allow(clippy::too_many_arguments)] // window bounds + stride are all genuine inputs
+fn push_footprint_max(
+    values: &mut Vec<Option<f64>>,
+    pixels: &[Option<f64>],
+    col_f: f64,
+    row_f: f64,
+    half_c: f64,
+    half_r: f64,
+    col_start: u32,
+    col_end: u32,
+    row_start: u32,
+    row_end: u32,
+    src_nx: usize,
+) {
+    // Source-pixel box, floored to integers and clamped to the read window.
+    // (`col_end`/`row_end` are exclusive, so the inclusive upper bound is −1.)
+    let c0 = (col_f - half_c).floor().max(col_start as f64) as i64;
+    let c1 = (col_f + half_c).floor().min((col_end - 1) as f64) as i64;
+    let r0 = (row_f - half_r).floor().max(row_start as f64) as i64;
+    let r1 = (row_f + half_r).floor().min((row_end - 1) as f64) as i64;
+    if c1 < c0 || r1 < r0 {
+        // Footprint centre fell outside the read window entirely.
+        values.push(None);
+        return;
+    }
+
+    let mut best: Option<f64> = None;
+    for sr in r0..=r1 {
+        let base = (sr as usize - row_start as usize) * src_nx;
+        for sc in c0..=c1 {
+            let idx = base + (sc as usize - col_start as usize);
+            if let Some(Some(v)) = pixels.get(idx) {
+                best = Some(best.map_or(*v, |b| b.max(*v)));
+            }
+        }
+    }
+    values.push(best);
+}
+
 impl ds_core::map_engine::MapEngine for GeoTiffEngine {
     #[allow(clippy::too_many_arguments)]
     fn get_raster_tile(
@@ -1595,9 +1663,46 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             let (px_lo, px_hi, py_lo, py_hi) =
                 output_crs.footprint_pixel_window(bbox, gt.bbox(), width, height);
 
-            // Resample source grid to output dimensions using nearest-neighbor.
+            // Resample source → output. Where the output is FINER than the
+            // source (zoom-in) each output pixel lands inside a single source
+            // cell and this is exactly nearest-neighbour (unchanged). Where the
+            // output is COARSER (zoom-out / downsample) an output pixel covers
+            // MANY source cells; picking only the one under its centre (plain
+            // nearest) discards the other N−1 — and for sparse far-range radar
+            // echoes that regularly drops the echo entirely, breaking coverage
+            // into dotted "dashes"/curtains past the edge of dense coverage
+            // (#456). Instead reduce each output pixel over its full source
+            // FOOTPRINT with a coverage-preserving MAX (strongest echo wins):
+            //   * discrete — the result is an actual source sample, so the
+            //     output value set ⊆ the source value set (no new values → the
+            //     PNG8 palette is preserved);
+            //   * not smoothed — no averaging/blending; peaks are kept exactly
+            //     (the operational reflectivity-downsample convention). Bilinear
+            //     was rejected: it invents intermediate values (more colours,
+            //     defeats PNG8) and smears the radar field;
+            //   * perf-neutral — the footprint pixels are already decoded in
+            //     `pixels`; abutting footprints visit each source pixel ~once,
+            //     so total work ≈ the window already read (no extra I/O/decode).
+            // The per-axis footprint half-extent comes from the local grid
+            // derivative (cheap bilerps, never a per-pixel projection — #203):
+            // a half-extent ≤ 0.5 source px means that axis is NOT downsampling,
+            // so it collapses to 0 and the box degenerates to the single nearest
+            // pixel (byte-identical to the old path on zoom-in).
+            // `saturating_sub` so a 0-width/height tile doesn't underflow here
+            // (the loops below then run zero iterations, matching the old path).
+            let last_x = width.saturating_sub(1);
+            let last_y = height.saturating_sub(1);
             for oy in 0..height {
                 let in_y = oy >= py_lo && oy <= py_hi;
+                // Neighbour row for the y-derivative: forward, but BACKWARD on the
+                // last row so the difference stays non-zero (a forward clamp to
+                // `oy` would zero the y-span and silently revert the bottom row to
+                // nearest exactly where downsampling needs the footprint).
+                let oy_nbr = if oy < last_y {
+                    oy + 1
+                } else {
+                    oy.saturating_sub(1)
+                };
                 for ox in 0..width {
                     if !in_y || ox < px_lo || ox > px_hi {
                         values.push(None);
@@ -1608,20 +1713,35 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                         values.push(None);
                         continue;
                     }
-                    let col = col_f.floor();
-                    let row = row_f.floor();
-                    if col >= col_start as f64
-                        && col < col_end as f64
-                        && row >= row_start as f64
-                        && row < row_end as f64
-                    {
-                        let sc = col as usize - col_start as usize;
-                        let sr = row as usize - row_start as usize;
-                        let idx = sr * src_nx + sc;
-                        values.push(pixels.get(idx).copied().unwrap_or(None));
+                    // Local derivative on each output axis → the source-pixel span
+                    // this output pixel covers. Forward difference, falling back to
+                    // BACKWARD on the last column/row (same magnitude for a smooth
+                    // grid) so edge pixels are not pinned to nearest. (A neighbour
+                    // cell on the projection's domain edge yields a non-finite span
+                    // → `footprint_half` collapses it to 0, i.e. a single nearest
+                    // pixel; a 1px-wide tile has no derivative and stays nearest.)
+                    let ox_nbr = if ox < last_x {
+                        ox + 1
                     } else {
-                        values.push(None);
-                    }
+                        ox.saturating_sub(1)
+                    };
+                    let (cx, rx) = grid.sample(ox_nbr, oy);
+                    let (cy, ry) = grid.sample(ox, oy_nbr);
+                    let half_c = footprint_half(col_f, cx, cy);
+                    let half_r = footprint_half(row_f, rx, ry);
+                    push_footprint_max(
+                        &mut values,
+                        &pixels,
+                        col_f,
+                        row_f,
+                        half_c,
+                        half_r,
+                        col_start,
+                        col_end,
+                        row_start,
+                        row_end,
+                        src_nx,
+                    );
                 }
             }
         } else {
@@ -2415,5 +2535,124 @@ mod tests {
     #[test]
     fn template_no_codes_rejected() {
         assert!(expand_filename_template("radar_data.tif").is_err());
+    }
+
+    // ---- footprint-MAX resampling (#456) ----
+
+    #[test]
+    fn footprint_half_collapses_to_nearest_when_not_downsampling() {
+        // A sub-pixel span (output finer than source) ⇒ 0 ⇒ single nearest px.
+        assert_eq!(footprint_half(10.0, 10.2, 10.1), 0.0);
+        // Exact 1:1 (zero span).
+        assert_eq!(footprint_half(10.0, 10.0, 10.0), 0.0);
+        // Exactly 1 source pixel of span (1 output px → 1 source px ⇒ half ==
+        // 0.5) is still "not downsampling" — collapse to nearest, since the
+        // check is a strict `> 0.5`.
+        assert_eq!(footprint_half(10.0, 11.0, 10.0), 0.0);
+    }
+
+    #[test]
+    fn footprint_half_grows_with_downsample_factor() {
+        // 4 source px spanned along x (and 0 along y) ⇒ half-extent 2.0.
+        assert_eq!(footprint_half(10.0, 14.0, 10.0), 2.0);
+        // Both axes contribute (oblique mapping): |12-10| + |8-10| = 2+2 ⇒
+        // span 4 ⇒ half 2.0.
+        assert_eq!(footprint_half(10.0, 12.0, 8.0), 2.0);
+    }
+
+    #[test]
+    fn footprint_half_non_finite_neighbour_falls_back_to_nearest() {
+        assert_eq!(footprint_half(10.0, f64::NAN, 10.0), 0.0);
+        assert_eq!(footprint_half(10.0, 10.0, f64::INFINITY), 0.0);
+    }
+
+    /// A 3×3 read window with a single strong echo at the centre, everything
+    /// else nodata — the canonical "sparse far-range echo" the bug drops.
+    fn sparse_window() -> Vec<Option<f64>> {
+        let n = None;
+        vec![
+            n,
+            n,
+            n, //
+            n,
+            Some(55.0),
+            n, //
+            n,
+            n,
+            n,
+        ]
+    }
+
+    #[test]
+    fn footprint_max_with_zero_half_is_byte_identical_to_nearest() {
+        // half == 0 must reproduce plain nearest: it picks exactly the floored
+        // centre pixel, no neighbours. Centre lands on the empty (0,0) corner.
+        let pixels = sparse_window();
+        let mut out = Vec::new();
+        push_footprint_max(&mut out, &pixels, 0.3, 0.3, 0.0, 0.0, 0, 3, 0, 3, 3);
+        assert_eq!(out, vec![None]); // nearest of an empty cell → nodata (a dash)
+    }
+
+    #[test]
+    fn footprint_max_preserves_a_sparse_echo_a_plain_nearest_would_drop() {
+        // The downsample case: one output pixel covering the whole 3×3 window.
+        // Plain nearest at the (0,0) corner returns None (the dash); the
+        // footprint MAX sees the centre echo and keeps it.
+        let pixels = sparse_window();
+        let mut out = Vec::new();
+        // Centre at (1.5,1.5) with a half-extent of 1.5 covers cols/rows 0..=2.
+        push_footprint_max(&mut out, &pixels, 1.5, 1.5, 1.5, 1.5, 0, 3, 0, 3, 3);
+        assert_eq!(out, vec![Some(55.0)]);
+    }
+
+    #[test]
+    fn footprint_max_picks_the_strongest_and_stays_discrete() {
+        // Two echoes in the footprint: MAX returns the stronger, and the result
+        // is one of the input samples verbatim (no blended/intermediate value).
+        let pixels = vec![
+            Some(12.0),
+            Some(48.0),
+            None,
+            None,
+            Some(31.0),
+            None,
+            None,
+            None,
+            None,
+        ];
+        let mut out = Vec::new();
+        push_footprint_max(&mut out, &pixels, 1.0, 1.0, 1.0, 1.0, 0, 3, 0, 3, 3);
+        assert_eq!(out, vec![Some(48.0)]);
+        // Output value is an actual source sample (⊆ source set) — PNG8-safe.
+        assert!(pixels.contains(&out[0]));
+    }
+
+    #[test]
+    fn footprint_max_all_nodata_is_nodata() {
+        let pixels: Vec<Option<f64>> = vec![None; 9];
+        let mut out = Vec::new();
+        push_footprint_max(&mut out, &pixels, 1.0, 1.0, 1.0, 1.0, 0, 3, 0, 3, 3);
+        assert_eq!(out, vec![None]);
+    }
+
+    #[test]
+    fn footprint_max_centre_off_window_is_nodata() {
+        // Centre well past the read window (the coarse-grid "ghost" case) → the
+        // clamped box is empty (c1 < c0) → nodata, not a wrapped index.
+        let pixels = sparse_window();
+        let mut out = Vec::new();
+        push_footprint_max(&mut out, &pixels, 9.0, 1.0, 0.0, 0.0, 0, 3, 0, 3, 3);
+        assert_eq!(out, vec![None]);
+    }
+
+    #[test]
+    fn footprint_max_box_is_clamped_to_the_read_window() {
+        // A footprint that overhangs the window must not read out of bounds; it
+        // reduces only over the in-window part. Window is the full 3×3 but the
+        // requested box extends past it on both sides.
+        let pixels = sparse_window();
+        let mut out = Vec::new();
+        push_footprint_max(&mut out, &pixels, 1.0, 1.0, 5.0, 5.0, 0, 3, 0, 3, 3);
+        assert_eq!(out, vec![Some(55.0)]); // clamped to 0..=2, finds the echo
     }
 }
