@@ -1688,11 +1688,21 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             // a half-extent ≤ 0.5 source px means that axis is NOT downsampling,
             // so it collapses to 0 and the box degenerates to the single nearest
             // pixel (byte-identical to the old path on zoom-in).
-            let last_x = width - 1;
-            let last_y = height - 1;
+            // `saturating_sub` so a 0-width/height tile doesn't underflow here
+            // (the loops below then run zero iterations, matching the old path).
+            let last_x = width.saturating_sub(1);
+            let last_y = height.saturating_sub(1);
             for oy in 0..height {
                 let in_y = oy >= py_lo && oy <= py_hi;
-                let oy1 = (oy + 1).min(last_y);
+                // Neighbour row for the y-derivative: forward, but BACKWARD on the
+                // last row so the difference stays non-zero (a forward clamp to
+                // `oy` would zero the y-span and silently revert the bottom row to
+                // nearest exactly where downsampling needs the footprint).
+                let oy_nbr = if oy < last_y {
+                    oy + 1
+                } else {
+                    oy.saturating_sub(1)
+                };
                 for ox in 0..width {
                     if !in_y || ox < px_lo || ox > px_hi {
                         values.push(None);
@@ -1703,14 +1713,20 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                         values.push(None);
                         continue;
                     }
-                    // Forward derivative on each output axis → the source-pixel
-                    // span this output pixel covers. (`sample` clamps internally,
-                    // so a self-reference at the far edge yields a 0 span; a
-                    // neighbour cell on the projection's domain edge yields a
-                    // non-finite span → `footprint_half` collapses it to 0, i.e.
-                    // a single nearest pixel.)
-                    let (cx, rx) = grid.sample((ox + 1).min(last_x), oy);
-                    let (cy, ry) = grid.sample(ox, oy1);
+                    // Local derivative on each output axis → the source-pixel span
+                    // this output pixel covers. Forward difference, falling back to
+                    // BACKWARD on the last column/row (same magnitude for a smooth
+                    // grid) so edge pixels are not pinned to nearest. (A neighbour
+                    // cell on the projection's domain edge yields a non-finite span
+                    // → `footprint_half` collapses it to 0, i.e. a single nearest
+                    // pixel; a 1px-wide tile has no derivative and stays nearest.)
+                    let ox_nbr = if ox < last_x {
+                        ox + 1
+                    } else {
+                        ox.saturating_sub(1)
+                    };
+                    let (cx, rx) = grid.sample(ox_nbr, oy);
+                    let (cy, ry) = grid.sample(ox, oy_nbr);
                     let half_c = footprint_half(col_f, cx, cy);
                     let half_r = footprint_half(row_f, rx, ry);
                     push_footprint_max(
@@ -2537,8 +2553,8 @@ mod tests {
     fn footprint_half_grows_with_downsample_factor() {
         // 4 source px spanned along x (and 0 along y) ⇒ half-extent 2.0.
         assert_eq!(footprint_half(10.0, 14.0, 10.0), 2.0);
-        // Both axes contribute (oblique mapping): |12-10| + |10-13.4|... here
-        // |∂x|=2, |∂y|=2 ⇒ span 4 ⇒ half 2.0.
+        // Both axes contribute (oblique mapping): |12-10| + |8-10| = 2+2 ⇒
+        // span 4 ⇒ half 2.0.
         assert_eq!(footprint_half(10.0, 12.0, 8.0), 2.0);
     }
 
