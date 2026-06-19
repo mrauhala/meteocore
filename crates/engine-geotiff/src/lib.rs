@@ -2543,10 +2543,12 @@ mod tests {
     fn footprint_half_collapses_to_nearest_when_not_downsampling() {
         // A sub-pixel span (output finer than source) ⇒ 0 ⇒ single nearest px.
         assert_eq!(footprint_half(10.0, 10.2, 10.1), 0.0);
-        assert_eq!(footprint_half(10.0, 10.0, 10.0), 0.0); // exact 1:1
-                                                           // Exactly 1 source pixel of span (half == 0.5) is still "not
-                                                           // downsampling" — collapse to nearest (strict > 0.5).
-        assert_eq!(footprint_half(10.0, 10.5, 10.0), 0.0);
+        // Exact 1:1 (zero span).
+        assert_eq!(footprint_half(10.0, 10.0, 10.0), 0.0);
+        // Exactly 1 source pixel of span (1 output px → 1 source px ⇒ half ==
+        // 0.5) is still "not downsampling" — collapse to nearest, since the
+        // check is a strict `> 0.5`.
+        assert_eq!(footprint_half(10.0, 11.0, 10.0), 0.0);
     }
 
     #[test]
