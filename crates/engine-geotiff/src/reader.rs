@@ -2060,8 +2060,13 @@ fn read_bbox_parallel_http(
 /// interior columns are exactly `tile_width`. (The remote/HTTP path decodes the
 /// full padded raw tile and uses `tile_width` instead.)
 fn local_tile_data_width(metadata: &TiffMetadata, tile_col: u32) -> usize {
-    let col0 = tile_col * metadata.tile_width;
-    metadata.width.saturating_sub(col0).min(metadata.tile_width) as usize
+    // Compute in u64 so a pathological `tile_col * tile_width` can't overflow
+    // u32 and wrap to a too-large stride (which would silently restore the
+    // pre-fix shear). For any real TIFF the product is bounded by `width`.
+    let col0 = tile_col as u64 * metadata.tile_width as u64;
+    (metadata.width as u64)
+        .saturating_sub(col0)
+        .min(metadata.tile_width as u64) as usize
 }
 
 /// Copy pixels from a decoded tile into the output result grid.
