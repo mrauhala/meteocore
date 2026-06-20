@@ -1305,47 +1305,61 @@ pub fn read_pixel(
 
     let local_col = col % metadata.tile_width;
     let local_row = row % metadata.tile_height;
-    let local_idx = (local_row * metadata.tile_width + local_col) as usize;
 
-    let values = match source {
+    // The row stride of the decoded tile depends on the source: the local
+    // `tiff`-crate decode clips the rightmost tile column of its padding (stride
+    // = clipped width), while the remote/HTTP path decodes the full padded raw
+    // tile (stride = tile_width). Indexing with the wrong stride reads a sheared
+    // pixel in the last tile column (#458).
+    let (values, tile_data_width) = match source {
         DataSource::Remote {
             store,
             path,
             tile_info,
-        } => read_remote_chunk_f64(
-            store,
-            path,
-            tile_info,
-            metadata,
-            chunk_index,
-            cache,
-            file_path,
-            band_index,
-            0,    // full resolution IFD
-            None, // single-pixel read: caller is already on a runtime worker
-        )?,
+        } => (
+            read_remote_chunk_f64(
+                store,
+                path,
+                tile_info,
+                metadata,
+                chunk_index,
+                cache,
+                file_path,
+                band_index,
+                0,    // full resolution IFD
+                None, // single-pixel read: caller is already on a runtime worker
+            )?,
+            metadata.tile_width as usize,
+        ),
         DataSource::HttpDirect {
             url,
             http,
             tile_info,
-        } => read_http_chunk_f64(
-            http,
-            url,
-            tile_info,
-            metadata,
-            chunk_index,
-            cache,
-            file_path,
-            band_index,
-            0,    // full resolution IFD
-            None, // single-pixel read: caller is already on a runtime worker
-        )?,
+        } => (
+            read_http_chunk_f64(
+                http,
+                url,
+                tile_info,
+                metadata,
+                chunk_index,
+                cache,
+                file_path,
+                band_index,
+                0,    // full resolution IFD
+                None, // single-pixel read: caller is already on a runtime worker
+            )?,
+            metadata.tile_width as usize,
+        ),
         _ => {
             let mut decoder = source.open_decoder()?;
-            decode_chunk_f64(&mut decoder, chunk_index, metadata, band_index)?
+            (
+                decode_chunk_f64(&mut decoder, chunk_index, metadata, band_index)?,
+                local_tile_data_width(metadata, tile_col),
+            )
         }
     };
 
+    let local_idx = local_row as usize * tile_data_width + local_col as usize;
     if local_idx >= values.len() {
         return Ok(None);
     }
@@ -1587,6 +1601,7 @@ pub fn read_bbox_overview(
                 col_end,
                 row_end,
                 nx,
+                local_tile_data_width(&ov_metadata, tile_col),
             );
         }
     }
@@ -1780,6 +1795,7 @@ fn read_bbox_inner(
                 col_end,
                 row_end,
                 nx,
+                local_tile_data_width(metadata, tile_col),
             );
         }
     }
@@ -1937,6 +1953,8 @@ fn read_bbox_parallel(
             col_end,
             row_end,
             nx,
+            // Remote path decodes the full padded raw tile → stride = tile_width.
+            metadata.tile_width as usize,
         );
     }
 
@@ -2028,10 +2046,27 @@ fn read_bbox_parallel_http(
             col_end,
             row_end,
             nx,
+            // HTTP path decodes the full padded raw tile → stride = tile_width.
+            metadata.tile_width as usize,
         );
     }
 
     Ok(result)
+}
+
+/// Row stride of a tile decoded by the local `tiff`-crate path
+/// (`decode_chunk_f64` → `read_chunk`), which returns edge tiles CLIPPED of their
+/// padding. The rightmost tile column is `min(tile_width, width − col0)` wide; all
+/// interior columns are exactly `tile_width`. (The remote/HTTP path decodes the
+/// full padded raw tile and uses `tile_width` instead.)
+fn local_tile_data_width(metadata: &TiffMetadata, tile_col: u32) -> usize {
+    // Compute in u64 so a pathological `tile_col * tile_width` can't overflow
+    // u32 and wrap to a too-large stride (which would silently restore the
+    // pre-fix shear). For any real TIFF the product is bounded by `width`.
+    let col0 = tile_col as u64 * metadata.tile_width as u64;
+    (metadata.width as u64)
+        .saturating_sub(col0)
+        .min(metadata.tile_width as u64) as usize
 }
 
 /// Copy pixels from a decoded tile into the output result grid.
@@ -2047,6 +2082,15 @@ fn copy_tile_to_result(
     col_end: u32,
     row_end: u32,
     nx: usize,
+    // Row stride of `tile_data`. NOT always `tile_width`: the local `tiff`-crate
+    // decode path (`read_chunk`) returns edge tiles CLIPPED of their padding, so
+    // the rightmost tile column's rows are `min(tile_width, width - col0)` wide,
+    // not `tile_width`. Indexing such a buffer with a `tile_width` stride shears
+    // every row by the padding amount — invisible at full res (the data rarely
+    // lands in the last tile column) but a "venetian-blind" stripe block once an
+    // overview's edge tile carries real data (#458). The remote/HTTP path decodes
+    // the FULL padded raw tile, so it passes `tile_width`.
+    tile_data_width: usize,
 ) {
     let tile_pixel_col_start = tile_col * metadata.tile_width;
     let tile_pixel_row_start = tile_row * metadata.tile_height;
@@ -2060,7 +2104,7 @@ fn copy_tile_to_result(
         for col in overlap_col_start..overlap_col_end {
             let local_col = col - tile_pixel_col_start;
             let local_row = row - tile_pixel_row_start;
-            let tile_idx = (local_row * metadata.tile_width + local_col) as usize;
+            let tile_idx = local_row as usize * tile_data_width + local_col as usize;
 
             if tile_idx >= tile_data.len() {
                 continue;
@@ -2986,6 +3030,134 @@ mod tests {
         assert_eq!(
             parse_tile_concurrency(Some("100000")),
             Some(MAX_TILE_CONCURRENCY)
+        );
+    }
+
+    fn tiny_meta(width: u32, height: u32, tile: u32) -> TiffMetadata {
+        TiffMetadata {
+            width,
+            height,
+            tile_width: tile,
+            tile_height: tile,
+            tiles_across: width.div_ceil(tile),
+            tiles_down: height.div_ceil(tile),
+            samples_per_pixel: 1,
+            geo_transform: ds_core::geo::GeoTransform {
+                origin_x: 0.0,
+                origin_y: 0.0,
+                pixel_width: 1.0,
+                pixel_height: 1.0,
+                width,
+                height,
+                crs: ds_core::geo::Crs::Wgs84,
+            },
+            nodata: Some(255.0),
+            scale: None,
+            offset: None,
+            overviews: Vec::new(),
+        }
+    }
+
+    // The local `tiff`-crate decode clips the rightmost tile column of its
+    // padding, so its row stride is the clipped width, not `tile_width`.
+    #[test]
+    fn local_tile_data_width_clips_rightmost_column() {
+        // width 6, tile 4 → 2 tile columns; rightmost covers cols 4..7 but the
+        // image ends at 6, so its valid width is 2, not 4.
+        let m = tiny_meta(6, 4, 4);
+        assert_eq!(local_tile_data_width(&m, 0), 4); // interior column → full width
+        assert_eq!(local_tile_data_width(&m, 1), 2); // edge column → clipped
+    }
+
+    // Regression for #458: copying a CLIPPED rightmost edge tile must use the
+    // clipped row stride. With the old `tile_width` stride every row sheared by
+    // the padding amount, which surfaced as a "venetian-blind" stripe block once
+    // an overview's edge tile carried real data.
+    #[test]
+    fn copy_edge_tile_uses_clipped_stride_no_shear() {
+        // Image 6×4, tiles 4×4. Rightmost tile (tile_col 1) is clipped to 2 wide.
+        let m = tiny_meta(6, 4, 4);
+        let tile_col = 1u32;
+        // Clipped tile buffer: 2 (width) × 4 (height), row-major. Distinct values
+        // so any shear would scramble the placement. (Mirrors what the `tiff`
+        // crate's `read_chunk` returns for this edge tile.)
+        let tile_data: Vec<Option<f64>> = (0..8).map(|v| Some(v as f64)).collect();
+        let stride = local_tile_data_width(&m, tile_col);
+        assert_eq!(stride, 2);
+
+        // Read the whole rightmost column region: cols 4..6, rows 0..4.
+        let (col_start, col_end, row_start, row_end) = (4u32, 6u32, 0u32, 4u32);
+        let nx = (col_end - col_start) as usize;
+        let mut result = vec![None; nx * (row_end - row_start) as usize];
+        copy_tile_to_result(
+            &tile_data,
+            &mut result,
+            tile_col,
+            0,
+            &m,
+            col_start,
+            row_start,
+            col_end,
+            row_end,
+            nx,
+            stride,
+        );
+        // The window IS the clipped tile, so result must equal tile_data verbatim.
+        assert_eq!(result, tile_data);
+
+        // Contrast: the OLD buggy stride (tile_width) shears — e.g. output
+        // (row 1, col 4) would read tile_data[1*4 + 0] = 4 instead of the correct
+        // tile_data[1*2 + 0] = 2. Prove the correct stride did NOT do that.
+        // (row 1, col 0 of the window = result index `nx`.)
+        let out_row1_col4 = result[nx];
+        assert_eq!(out_row1_col4, Some(2.0)); // correct; the buggy stride gave 4.0
+    }
+
+    // Pins the load-bearing ASSUMPTION behind the #458 fix: the local
+    // `tiff`-crate decode path (`decode_chunk_f64` → `read_chunk`) really does
+    // return the rightmost tile column CLIPPED to its valid width, NOT padded to
+    // `tile_width`. The unit tests above pin the indexing math against a
+    // synthetic clipped buffer; this one decodes a REAL committed fixture so a
+    // future `tiff`-crate bump that changed to padding edge tiles would fail here
+    // (otherwise `local_tile_data_width` would silently over-clip and reintroduce
+    // the shear). Uses `testdata/radar` (3249×1750, tile 512 → rightmost column
+    // clipped to 177 wide).
+    #[test]
+    fn local_tiff_decode_returns_clipped_rightmost_tile() {
+        let dir = find_test_radar_dir();
+        let tif_path = find_first_tif(&dir);
+        let source = DataSource::from_path(&tif_path);
+        let metadata = TiffMetadata::from_source(&source).expect("parse fixture metadata");
+
+        // The test is only meaningful if the fixture actually has a clipped edge
+        // column (width not a multiple of tile_width).
+        let last_col = metadata.tiles_across - 1;
+        let clipped_w = local_tile_data_width(&metadata, last_col);
+        assert!(
+            clipped_w < metadata.tile_width as usize,
+            "fixture {} has no clipped edge tile (width {} is a multiple of tile {}) — \
+             pick a fixture whose width is not a tile multiple",
+            tif_path.display(),
+            metadata.width,
+            metadata.tile_width
+        );
+
+        // Decode the TOP rightmost tile (row 0 → full tile_height, only the width
+        // is clipped). The decoded buffer must have the CLIPPED row stride: a
+        // padded/sheared buffer would be tile_width × tile_height instead.
+        let chunk_index = safe_tile_index(0, metadata.tiles_across, last_col).unwrap();
+        let mut decoder = source.open_decoder().expect("open decoder");
+        let tile = decode_chunk_f64(&mut decoder, chunk_index, &metadata, 0).expect("decode tile");
+        assert_eq!(
+            tile.len(),
+            clipped_w * metadata.tile_height as usize,
+            "rightmost edge tile decoded with stride {} (len {}), expected clipped {}×{}; \
+             if the tiff crate now PADS edge tiles to tile_width, the #458 fix's local \
+             stride must switch back to tile_width",
+            tile.len() / metadata.tile_height as usize,
+            tile.len(),
+            clipped_w,
+            metadata.tile_height
         );
     }
 }
