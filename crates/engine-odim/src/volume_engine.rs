@@ -1258,8 +1258,11 @@ fn prewarm_pixels(
             }
         }
         // The file just parsed in `parse_and_cache`, so a re-open failure here
-        // is unexpected; leave the moments to the lazy request path.
-        Err(e) => tracing::debug!("[pvol] pixel pre-warm skipped for `{file_id}`: {e}"),
+        // is genuinely anomalous — `warn!` (not `debug!`) so a regression where
+        // pre-warm silently fails for every polled volume, re-opening the
+        // dropped-frame problem, is observable. The moments still fall back to
+        // the lazy request path; only the warm-ahead is lost.
+        Err(e) => tracing::warn!("[pvol] pixel pre-warm skipped for `{file_id}`: {e}"),
     }
 }
 
