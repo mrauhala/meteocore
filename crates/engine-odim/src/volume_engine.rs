@@ -1234,6 +1234,13 @@ fn prewarm_pixels(
     if n_sweeps == 0 || PIXEL_CACHE.capacity() == 0 {
         return;
     }
+    // Remote-only by contract: a local source's re-reads hit the OS page cache,
+    // so warming nothing is correct. Only `build_catalog`'s remote arm calls
+    // this today, but enforce it here so a future caller in the local arm
+    // degrades to a no-op rather than silently pre-warming local pixels.
+    if matches!(source, Source::Local { .. }) {
+        return;
+    }
     let cache_id = pixel_cache_id(source, file_id);
     let requests: Vec<(&str, usize, usize)> = volume
         .sweeps
