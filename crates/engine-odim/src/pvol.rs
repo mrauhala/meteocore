@@ -391,6 +391,31 @@ pub fn read_moment_pixels(
     read_moment_array(&file, dataset_path, nrays, nbins)
 }
 
+/// Decode several moments from one in-memory volume in a **single** HDF5 open.
+///
+/// The batch companion to [`read_moment_pixels`], for the engine's poll-time
+/// pixel pre-warm: priming N moments of a freshly-downloaded volume with one
+/// `from_bytes` structure parse instead of N. Each request is
+/// `(dataset_path, nrays, nbins)`; the returned vec has one
+/// `(dataset_path, RawPixels)` entry per **successfully** decoded request, in
+/// input order. A moment that fails to decode is silently skipped (the caller
+/// leaves it to the lazy request path rather than poisoning the cache from a
+/// best-effort background pass); only a failure to open the file at all is an
+/// error (it would fail every moment identically).
+pub fn read_moments_pixels<'a>(
+    bytes: &[u8],
+    requests: impl IntoIterator<Item = (&'a str, usize, usize)>,
+) -> Result<Vec<(String, RawPixels)>, ReadError> {
+    let file = Hdf5File::from_bytes(bytes).map_err(|e| ReadError::OpenFailed(e.to_string()))?;
+    let mut out = Vec::new();
+    for (path, nrays, nbins) in requests {
+        if let Ok(px) = read_moment_array(&file, path, nrays, nbins) {
+            out.push((path.to_string(), px));
+        }
+    }
+    Ok(out)
+}
+
 /// Combine ODIM's split `/what/date` (`YYYYMMDD`) and `/what/time`
 /// (`HHMMSS`) into a UTC timestamp.
 fn parse_odim_timestamp(date: &str, time: &str) -> Result<DateTime<Utc>, ReadError> {

@@ -1363,6 +1363,7 @@ mod tests {
             discovery: None,
             cadence_secs: None,
             resampling: Default::default(),
+            prewarm_sweeps: 1,
         }
     }
 
