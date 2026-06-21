@@ -398,10 +398,11 @@ pub fn read_moment_pixels(
 /// `from_bytes` structure parse instead of N. Each request is
 /// `(dataset_path, nrays, nbins)`; the returned vec has one
 /// `(dataset_path, RawPixels)` entry per **successfully** decoded request, in
-/// input order. A moment that fails to decode is silently skipped (the caller
-/// leaves it to the lazy request path rather than poisoning the cache from a
-/// best-effort background pass); only a failure to open the file at all is an
-/// error (it would fail every moment identically).
+/// input order. A moment that fails to decode is skipped — logged at `debug!`
+/// (a single undecodable sweep shouldn't sink the batch, and a real request
+/// for it still surfaces the failure via the lazy path's `warn!` + known-bad
+/// mark) — so it's diagnosable without flooding production logs. Only a failure
+/// to open the file at all is an error (it would fail every moment identically).
 pub fn read_moments_pixels<'a>(
     bytes: &[u8],
     requests: impl IntoIterator<Item = (&'a str, usize, usize)>,
@@ -409,8 +410,9 @@ pub fn read_moments_pixels<'a>(
     let file = Hdf5File::from_bytes(bytes).map_err(|e| ReadError::OpenFailed(e.to_string()))?;
     let mut out = Vec::new();
     for (path, nrays, nbins) in requests {
-        if let Ok(px) = read_moment_array(&file, path, nrays, nbins) {
-            out.push((path.to_string(), px));
+        match read_moment_array(&file, path, nrays, nbins) {
+            Ok(px) => out.push((path.to_string(), px)),
+            Err(e) => tracing::debug!("read_moments_pixels: skipping moment `{path}`: {e}"),
         }
     }
     Ok(out)

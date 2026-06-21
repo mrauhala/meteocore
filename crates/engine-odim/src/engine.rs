@@ -573,8 +573,13 @@ impl OdimEngine {
 
         // `prewarm_sweeps` only drives the PVOL (`odim-volume`) engine's
         // poll-time pixel pre-warm — COMP has no per-moment lazy pixel cache to
-        // warm, so a non-default value here is silently ignored (#461).
-        if config.prewarm_sweeps != ds_core::config::DEFAULT_PREWARM_SWEEPS {
+        // warm, so a non-default value here is silently ignored (#461). `0` is a
+        // deliberate "disable" that's already a no-op on COMP, so don't warn on
+        // it (it would be misleading in a base config shared across engine
+        // types — #462 review); only warn for a value set expecting an effect.
+        if config.prewarm_sweeps != ds_core::config::DEFAULT_PREWARM_SWEEPS
+            && config.prewarm_sweeps != 0
+        {
             tracing::warn!(
                 "[{collection_id}] `prewarm_sweeps` is set but has no effect on an \
                  `odim` (COMP) collection — it only applies to the `odim-volume` \
