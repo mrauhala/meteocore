@@ -746,9 +746,13 @@ pub struct OdimConfig {
 }
 
 /// Default lowest-sweep pre-warm depth: the base tilt (the common animation
-/// view). See [`OdimConfig::prewarm_sweeps`].
+/// view). See [`OdimConfig::prewarm_sweeps`]. Exposed so engines can compare a
+/// configured value against the default (e.g. to warn when it is set on a
+/// collection type that ignores it) without re-hardcoding the magic number.
+pub const DEFAULT_PREWARM_SWEEPS: usize = 1;
+
 fn default_prewarm_sweeps() -> usize {
-    1
+    DEFAULT_PREWARM_SWEEPS
 }
 
 fn default_grib_poll_interval() -> u64 {

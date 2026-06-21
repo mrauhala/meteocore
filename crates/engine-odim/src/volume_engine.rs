@@ -1252,7 +1252,10 @@ fn prewarm_pixels(
                 .map(move |m| (m.dataset_path.as_str(), s.nrays, s.nbins))
         })
         // Skip moments a request (or an earlier poll) already cached, so a
-        // re-fetched trimmed volume doesn't re-decode every poll.
+        // re-fetched trimmed volume doesn't re-decode every poll. Advisory, not
+        // a hard guard: a concurrent insert between this `contains` and the
+        // `insert` below at worst re-decodes once (pixel arrays are immutable,
+        // so the overwrite is identical) — never incorrect.
         .filter(|(path, _, _)| !PIXEL_CACHE.contains(&cache_id, path))
         .collect();
     if requests.is_empty() {
