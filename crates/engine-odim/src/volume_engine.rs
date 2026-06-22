@@ -804,6 +804,7 @@ fn scan_source(
     cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
     max_files: Option<usize>,
     depth: ScanDepth,
+    prewarm_sweeps: usize,
 ) -> Result<Catalog, EngineError> {
     match source {
         // A local directory is small and cheap to enumerate; the
@@ -812,7 +813,9 @@ fn scan_source(
         // full regardless of `depth`.
         Source::Local { data_dir } => {
             let pending = enumerate_local(collection_id, data_dir)?;
-            let by_site = build_catalog(collection_id, pending, None, cache);
+            // `source` is local here, so `build_catalog` skips the (remote-only)
+            // pixel pre-warm regardless of `prewarm_sweeps`.
+            let by_site = build_catalog(collection_id, pending, source, cache, prewarm_sweeps);
             Ok(derive_catalog(by_site, cache, max_files))
         }
         Source::Remote {
@@ -823,7 +826,7 @@ fn scan_source(
         } => {
             let (pending, time_filter) =
                 enumerate_remote(collection_id, store, prefix_pattern, time_window, depth)?;
-            let mut by_site = build_catalog(collection_id, pending, Some(store), cache);
+            let mut by_site = build_catalog(collection_id, pending, source, cache, prewarm_sweeps);
             // A `time_window` also bounds the timestamps kept: the
             // object listing can include volumes just outside the
             // window (the prefix is a whole UTC day).
@@ -1075,10 +1078,18 @@ fn enumerate_remote(
 fn build_catalog(
     collection_id: &str,
     pending: Vec<PendingFile>,
-    store: Option<&ds_storage::DataStore>,
+    source: &Source,
     cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
+    prewarm_sweeps: usize,
 ) -> HashMap<String, Vec<VolumeEntry>> {
     use ds_storage::object_store::path::Path as ObjectPath;
+
+    // The single source store backs every remote fetch (a scan has exactly
+    // one `Source`); `None` for a local source, whose files are read inline.
+    let store = match source {
+        Source::Remote { store, .. } => Some(store),
+        Source::Local { .. } => None,
+    };
 
     let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
     // Remote keys needing a fetch, gathered for one bounded-concurrent
@@ -1146,6 +1157,13 @@ fn build_catalog(
             match res {
                 Ok(bytes) => {
                     if let Some(v) = parse_and_cache(collection_id, id, &bytes, cache) {
+                        // Prime the pixel cache from the bytes still in hand
+                        // (background runtime), so the first interactive render
+                        // of this newly-fetched volume is a cache hit instead
+                        // of a cold whole-`.h5` S3 re-download on a render
+                        // permit (#461). Remote only — local re-reads are
+                        // page-cached, hence this lives in the remote arm.
+                        prewarm_pixels(source, id, &v, &bytes, prewarm_sweeps);
                         insert_volume(collection_id, &mut by_site, id.clone(), v);
                     }
                 }
@@ -1181,6 +1199,80 @@ fn parse_and_cache(
             tracing::warn!("[{collection_id}] skipping PVOL file `{id}`: parse failed: {e}");
             None
         }
+    }
+}
+
+/// Pre-decode the lowest `n_sweeps` elevation sweeps' moments of a
+/// freshly-fetched **remote** volume into [`PIXEL_CACHE`], straight from the
+/// `bytes` the scan already holds (so no extra S3 fetch), on the background
+/// poll runtime.
+///
+/// This is the poll-time half of the lazy-pixel design (#289): the catalog
+/// holds metadata only and a moment's array is normally read on its first
+/// render — a cold whole-`.h5` S3 download performed **while holding a render
+/// semaphore permit**. Under a burst (a client animating the latest N
+/// timesteps) those cold downloads contend and some requests are cut off by
+/// the front proxy with an empty body before the slow render finishes — the
+/// "missing timestep" frames (#461). Priming the base tilt here turns that
+/// first render into a cache hit.
+///
+/// Best-effort and purely additive: it never marks a moment known-bad (a
+/// transient background decode hiccup must not blacklist a moment for
+/// requests) and skips any moment already resident (a beyond-`max_files`
+/// volume re-fetched on a later poll keeps its primed pixels — see
+/// [`PixelCache::contains`]). Sweeps are stored elevation-ascending, so the
+/// first `n_sweeps` are the lowest tilts — the standard base-reflectivity
+/// animation view, all of their quantities. Overflow of the byte-bounded
+/// cache evicts by LRU like any other entry.
+fn prewarm_pixels(
+    source: &Source,
+    file_id: &str,
+    volume: &PolarVolume,
+    bytes: &[u8],
+    n_sweeps: usize,
+) {
+    if n_sweeps == 0 || PIXEL_CACHE.capacity() == 0 {
+        return;
+    }
+    // Remote-only by contract: a local source's re-reads hit the OS page cache,
+    // so warming nothing is correct. Only `build_catalog`'s remote arm calls
+    // this today, but enforce it here so a future caller in the local arm
+    // degrades to a no-op rather than silently pre-warming local pixels.
+    if matches!(source, Source::Local { .. }) {
+        return;
+    }
+    let cache_id = pixel_cache_id(source, file_id);
+    let requests: Vec<(&str, usize, usize)> = volume
+        .sweeps
+        .iter()
+        .take(n_sweeps)
+        .flat_map(|s| {
+            s.moments
+                .iter()
+                .map(move |m| (m.dataset_path.as_str(), s.nrays, s.nbins))
+        })
+        // Skip moments a request (or an earlier poll) already cached, so a
+        // re-fetched trimmed volume doesn't re-decode every poll. Advisory, not
+        // a hard guard: a concurrent insert between this `contains` and the
+        // `insert` below at worst re-decodes once (pixel arrays are immutable,
+        // so the overwrite is identical) — never incorrect.
+        .filter(|(path, _, _)| !PIXEL_CACHE.contains(&cache_id, path))
+        .collect();
+    if requests.is_empty() {
+        return;
+    }
+    match crate::pvol::read_moments_pixels(bytes, requests) {
+        Ok(decoded) => {
+            for (path, px) in decoded {
+                PIXEL_CACHE.insert(&cache_id, &path, Arc::new(px));
+            }
+        }
+        // The file just parsed in `parse_and_cache`, so a re-open failure here
+        // is genuinely anomalous — `warn!` (not `debug!`) so a regression where
+        // pre-warm silently fails for every polled volume, re-opening the
+        // dropped-frame problem, is observable. The moments still fall back to
+        // the lazy request path; only the warm-ahead is lost.
+        Err(e) => tracing::warn!("[pvol] pixel pre-warm skipped for `{file_id}`: {e}"),
     }
 }
 
@@ -1495,6 +1587,10 @@ pub struct PolarVolumeEngine {
     /// Resampling method for the per-site Cartesian render, propagated to every
     /// [`PolarVolumeSiteView`] this engine spawns (`OdimConfig.resampling`).
     resampling: ResamplingMethod,
+    /// Number of lowest sweeps whose pixels each poll pre-decodes into the
+    /// pixel cache for a freshly-fetched **remote** volume (`OdimConfig.
+    /// prewarm_sweeps`; `0` disables). See [`prewarm_pixels`].
+    prewarm_sweeps: usize,
     shutdown: AtomicBool,
     shutdown_notify: Notify,
 }
@@ -1543,6 +1639,7 @@ impl PolarVolumeEngine {
             &parse_cache,
             config.max_files,
             ScanDepth::Bootstrap,
+            config.prewarm_sweeps,
         )?;
         if catalog.by_site.is_empty() {
             tracing::warn!(
@@ -1567,6 +1664,7 @@ impl PolarVolumeEngine {
             parse_cache,
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
             resampling: config.resampling,
+            prewarm_sweeps: config.prewarm_sweeps,
             shutdown: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
         })
@@ -1618,7 +1716,16 @@ impl PolarVolumeEngine {
             time_window: None,
         });
         let parse_cache = Arc::new(Mutex::new(HashMap::new()));
-        let catalog = scan_source(collection_id, &source, &parse_cache, None, ScanDepth::Full)?;
+        // Pre-warm one sweep so the test path exercises the prime-from-bytes
+        // branch (the integration suite drives the full remote scan).
+        let catalog = scan_source(
+            collection_id,
+            &source,
+            &parse_cache,
+            None,
+            ScanDepth::Full,
+            1,
+        )?;
         Ok(Self {
             collection_id: collection_id.to_string(),
             source,
@@ -1627,6 +1734,7 @@ impl PolarVolumeEngine {
             parse_cache,
             poll_interval: Duration::from_secs(30),
             resampling: ResamplingMethod::default(),
+            prewarm_sweeps: 1,
             shutdown: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
         })
@@ -1664,6 +1772,7 @@ impl PolarVolumeEngine {
             &self.parse_cache,
             self.max_files,
             ScanDepth::Full,
+            self.prewarm_sweeps,
         ) {
             Ok(catalog) => {
                 let prev = self.catalog.load();
@@ -4678,6 +4787,68 @@ mod tests {
         }
     }
 
+    /// #461 — the poll-time pre-warm primes the lowest sweep's moments into
+    /// the process-global pixel cache (so the first interactive render of a
+    /// freshly-fetched remote volume is a cache hit, not a cold whole-`.h5`
+    /// S3 re-download on a render permit), and only the lowest `n_sweeps`.
+    /// Uses a real fivih volume; skipped when the fixture is absent.
+    #[test]
+    fn prewarm_primes_lowest_sweep_only() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/radar-fmi-pvol/202605191050_fivih_PVOL.h5");
+        if !fixture.exists() {
+            eprintln!("skipping prewarm_primes_lowest_sweep_only: fixture absent at {fixture:?}");
+            return;
+        }
+        if pixel_cache().capacity() == 0 {
+            eprintln!("skipping prewarm_primes_lowest_sweep_only: pixel cache disabled");
+            return;
+        }
+        let bytes = std::fs::read(&fixture).expect("read fivih fixture");
+        let volume = crate::pvol::read_polar_volume(&bytes).expect("parse fivih volume");
+        assert!(
+            volume.sweeps.len() > 1,
+            "fixture must have multiple sweeps to test the bound"
+        );
+
+        // A unique source+id so these keys can't collide with another test
+        // sharing the process-global PIXEL_CACHE.
+        let source = dummy_remote("prewarm-461-bucket");
+        let file_id = "prewarm-461/202605191050_fivih_PVOL.h5";
+        let cid = pixel_cache_id(&source, file_id);
+
+        let lowest = volume.sweeps[0].moments[0].dataset_path.clone();
+        let highest = volume.sweeps.last().unwrap().moments[0]
+            .dataset_path
+            .clone();
+        assert_ne!(lowest, highest, "sweeps must have distinct dataset paths");
+
+        assert!(
+            !pixel_cache().contains(&cid, &lowest),
+            "moment must be cold before pre-warm"
+        );
+
+        prewarm_pixels(&source, file_id, &volume, &bytes, 1);
+
+        assert!(
+            pixel_cache().contains(&cid, &lowest),
+            "lowest sweep's moment must be resident after pre-warm"
+        );
+        assert!(
+            !pixel_cache().contains(&cid, &highest),
+            "a sweep above n_sweeps must stay cold (pre-warm is bounded)"
+        );
+
+        // n_sweeps = 0 is the disable switch: a fresh id warms nothing.
+        let file_id0 = "prewarm-461-zero/202605191050_fivih_PVOL.h5";
+        let cid0 = pixel_cache_id(&source, file_id0);
+        prewarm_pixels(&source, file_id0, &volume, &bytes, 0);
+        assert!(
+            !pixel_cache().contains(&cid0, &lowest),
+            "n_sweeps = 0 must pre-warm nothing"
+        );
+    }
+
     #[test]
     fn pixel_cache_id_local_is_bare_path() {
         let local = Source::Local {
@@ -5425,6 +5596,7 @@ mod tests {
             discovery: None,
             cadence_secs: None,
             resampling: Default::default(),
+            prewarm_sweeps: 1,
         }
     }
 
@@ -6316,6 +6488,7 @@ mod tests {
             parse_cache: Arc::new(Mutex::new(HashMap::new())),
             poll_interval: Duration::from_secs(30),
             resampling: ResamplingMethod::default(),
+            prewarm_sweeps: 1,
             shutdown: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
         }

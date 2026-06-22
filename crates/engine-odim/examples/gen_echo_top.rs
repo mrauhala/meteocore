@@ -92,6 +92,7 @@ fn main() {
         discovery: None,
         cadence_secs: None,
         resampling: Default::default(),
+        prewarm_sweeps: 1,
     };
     let engine = PolarVolumeEngine::new("echotop-demo", Some(data_dir), &config)
         .expect("build PolarVolumeEngine over the directory");

@@ -91,6 +91,20 @@ impl PixelCache {
         self.misses.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Whether `(file_id, dataset_path)` is already resident — a presence
+    /// check that, unlike [`Self::get`], does **not** count a hit or bump LRU
+    /// recency. Used by the poll-time pre-warm to skip re-decoding a moment
+    /// that is already cached (e.g. a beyond-`max_files` volume re-fetched on a
+    /// later poll) without polluting the hit metric or keeping evicted volumes
+    /// artificially warm. Always `false` when disabled (`capacity_mb == 0`).
+    pub fn contains(&self, file_id: &str, dataset_path: &str) -> bool {
+        if self.capacity_bytes == 0 {
+            return false;
+        }
+        let key: PixelKey = (Arc::from(file_id), Arc::from(dataset_path));
+        self.inner.contains_key(&key)
+    }
+
     /// Insert a freshly-decoded array. No-op when disabled.
     pub fn insert(&self, file_id: &str, dataset_path: &str, pixels: Arc<RawPixels>) {
         if self.capacity_bytes == 0 {
@@ -190,6 +204,34 @@ mod tests {
         assert_eq!(c.stats(), (h0, m0), "get() miss must not be counted");
         c.record_miss();
         assert_eq!(c.stats(), (h0, m0 + 1), "record_miss() counts the miss");
+    }
+
+    #[test]
+    fn contains_checks_presence_without_counting_a_hit() {
+        use ndarray::Array2;
+        let c = PixelCache::new(64);
+        let (h0, m0) = c.stats();
+        // Absent → false, and no hit/miss counted (mirrors `get`).
+        assert!(!c.contains("f", "/d"));
+        assert_eq!(c.stats(), (h0, m0), "contains on a miss counts nothing");
+        // Present → true, but — unlike `get` — still no hit counted, so the
+        // pre-warm's existence checks don't inflate the cache hit metric.
+        c.insert("f", "/d", Arc::new(RawPixels::U8(Array2::zeros((2, 2)))));
+        assert!(c.contains("f", "/d"));
+        assert_eq!(c.stats(), (h0, m0), "contains must not bump hits");
+        // Contrast: `get` on the same key *does* count a hit.
+        assert!(c.get("f", "/d").is_some());
+        assert_eq!(c.stats().0, h0 + 1, "get bumps hits where contains did not");
+    }
+
+    #[test]
+    fn contains_false_when_positive_cache_disabled() {
+        use ndarray::Array2;
+        // capacity 0 disables the positive cache: insert is a no-op and
+        // contains reports nothing resident (the pre-warm skips entirely).
+        let c = PixelCache::new(0);
+        c.insert("f", "/d", Arc::new(RawPixels::U8(Array2::zeros((2, 2)))));
+        assert!(!c.contains("f", "/d"));
     }
 
     #[test]
