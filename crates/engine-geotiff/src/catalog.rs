@@ -953,7 +953,7 @@ mod tests {
         let cached_mmap_ptr = match &**sample_source {
             DataSource::LocalFile { mmap_cache, .. } => {
                 let cached = mmap_cache.get().expect("mmap_cache populated");
-                let mmap = cached.as_ref().expect("mmap succeeded");
+                let (mmap, _) = cached.as_ref().expect("mmap succeeded");
                 Arc::as_ptr(mmap)
             }
             _ => panic!("expected LocalFile"),
@@ -1001,7 +1001,7 @@ mod tests {
                          modified by checking `stat testdata/radar/*.tif`."
                     ),
                 };
-                let mmap = cached
+                let (mmap, _) = cached
                     .as_ref()
                     .expect("mmap was successful on the first scan");
                 Arc::as_ptr(mmap)

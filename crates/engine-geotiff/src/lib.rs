@@ -1,7 +1,12 @@
 mod cache;
 mod catalog;
+mod decoded_cache;
 mod parse;
 mod reader;
+
+/// Snapshot of the process-global decoded-chunk cache (#463) for `/metrics`:
+/// `(hits, misses, bytes, capacity_bytes)`.
+pub use decoded_cache::metrics as decoded_chunk_cache_metrics;
 pub mod stac;
 mod time_window;
 

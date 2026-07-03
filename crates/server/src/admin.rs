@@ -156,6 +156,50 @@ static TILE_CACHE_ENTRIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     gauge
 });
 
+// GeoTIFF decoded-chunk cache (#463) — process-global, byte-bounded LRU of
+// decoded (native) source tiles for LOCAL files, so the ~50–190 meta-tile
+// renders tiling one viewport don't re-decompress the same source tile ~6×
+// per frame.
+static GEOTIFF_DECODED_CHUNK_CACHE_HITS: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "geotiff_decoded_chunk_cache_hits_total",
+        "GeoTIFF decoded-chunk cache hits (local sources)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static GEOTIFF_DECODED_CHUNK_CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "geotiff_decoded_chunk_cache_misses_total",
+        "GeoTIFF decoded-chunk cache misses (tile decompressions)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static GEOTIFF_DECODED_CHUNK_CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "geotiff_decoded_chunk_cache_bytes",
+        "Bytes currently held in the GeoTIFF decoded-chunk cache",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static GEOTIFF_DECODED_CHUNK_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "geotiff_decoded_chunk_cache_capacity_bytes",
+        "Configured GeoTIFF decoded-chunk cache capacity in bytes",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
 // PostGIS engine gauges (#110). All set per-scrape from live engine state — no
 // delta-tracking needed (they're true gauges, not cumulative counters; the
 // per-query duration/rows/error histograms are a follow-up — see the metrics
@@ -650,6 +694,8 @@ struct CacheCounterState {
     pvol_cell_set: (u64, u64),
     /// ODIM COMP composite cache `(hits, misses)` — global cache, monotonic.
     odim_composite: (u64, u64),
+    /// GeoTIFF decoded-chunk cache `(hits, misses)` — global cache, monotonic.
+    geotiff_decoded_chunk: (u64, u64),
     /// 3D Tiles encoded-content cache `(hits, misses)` — global, monotonic.
     tiles3d_content: (u64, u64),
     /// PostGIS per-collection `(refreshes, refresh_failures, pings, ping_failures)`
@@ -3365,6 +3411,24 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         counter_state.tiles3d_content = (c_hits, c_misses);
         TILES3D_CONTENT_CACHE_BYTES.set(c_bytes as i64);
         TILES3D_CONTENT_CACHE_CAPACITY_BYTES.set(c_cap as i64);
+    }
+
+    // GeoTIFF decoded-chunk cache (#463): process-global + monotonic, like the
+    // ODIM caches. Only emit when geotiff collections are loaded, so other
+    // deployments don't carry empty `geotiff_decoded_chunk_*` series.
+    let has_geotiff = !state
+        .geotiff_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty();
+    if has_geotiff {
+        let (g_hits, g_misses, g_bytes, g_cap) = engine_geotiff::decoded_chunk_cache_metrics();
+        let (last_gh, last_gm) = counter_state.geotiff_decoded_chunk;
+        GEOTIFF_DECODED_CHUNK_CACHE_HITS.inc_by(g_hits.saturating_sub(last_gh));
+        GEOTIFF_DECODED_CHUNK_CACHE_MISSES.inc_by(g_misses.saturating_sub(last_gm));
+        counter_state.geotiff_decoded_chunk = (g_hits, g_misses);
+        GEOTIFF_DECODED_CHUNK_CACHE_BYTES.set(g_bytes as i64);
+        GEOTIFF_DECODED_CHUNK_CACHE_CAPACITY_BYTES.set(g_cap as i64);
     }
 
     // Tile cache: per-collection
