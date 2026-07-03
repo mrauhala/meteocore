@@ -11,7 +11,7 @@
 //! with band extraction / nodata mapping / scale-offset deferred to the
 //! copy into the output window.
 //!
-//! Keying: `(path, mtime, size, ifd, chunk)`. The mtime+size identity is
+//! Keying: `(path, mtime, size, inode, ifd, chunk)`. The identity is
 //! captured from the same file handle the mmap was created from, so a file
 //! replaced via atomic rename (new inode → new identity on the next catalog
 //! scan) can never serve stale pixels; stale-generation entries age out of
@@ -32,10 +32,20 @@ use tiff::decoder::DecodingResult;
 /// Identity of a local file's contents, captured from the open file handle
 /// at mmap time (so it describes exactly the bytes the decoder sees, not
 /// whatever inode currently sits at the path).
+///
+/// Carries `inode` alongside `mtime` + `size` for the same reason the
+/// catalog's unchanged-file test does (#253 rounds 2–3): size alone misses a
+/// same-byte-count atomic replacement, and mtime alone misses the same-second
+/// case on 1-second-resolution filesystems because `rename(2)` doesn't bump
+/// the renamed file's mtime. Every atomic rename produces a new inode, so
+/// including it keeps a same-size same-second replacement from colliding
+/// with the old file's cached chunks. On non-Unix (no `MetadataExt::ino()`)
+/// it stays 0 — mtime+size only, same fallback the catalog uses.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct FileIdentity {
     pub mtime_ns: u64,
     pub size: u64,
+    pub inode: u64,
 }
 
 impl FileIdentity {
@@ -46,9 +56,17 @@ impl FileIdentity {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            meta.ino()
+        };
+        #[cfg(not(unix))]
+        let inode = 0u64;
         FileIdentity {
             mtime_ns,
             size: meta.len(),
+            inode,
         }
     }
 }
@@ -187,17 +205,20 @@ pub(crate) fn get_or_decode(
 mod tests {
     use super::*;
 
-    /// A changed file identity (mtime/size) must be a distinct cache entry —
-    /// this is the stale-pixel guard for files replaced via atomic rename.
+    /// A changed file identity (mtime/size/inode) must be a distinct cache
+    /// entry — this is the stale-pixel guard for files replaced via atomic
+    /// rename.
     #[test]
     fn changed_identity_is_a_fresh_entry() {
         let id_a = FileIdentity {
             mtime_ns: 1,
             size: 100,
+            inode: 7,
         };
         let id_b = FileIdentity {
             mtime_ns: 2,
             size: 100,
+            inode: 7,
         };
         let scope_a = FileScope::new("decoded_cache_test/file.tif", id_a);
         let scope_b = FileScope::new("decoded_cache_test/file.tif", id_b);
@@ -214,6 +235,34 @@ mod tests {
         assert!(matches!(*b, DecodingResult::U8(ref v) if v == &[2]));
     }
 
+    /// The #253 round-3 case: an atomic rename can leave mtime AND size
+    /// identical (rename(2) doesn't bump the renamed file's mtime; the new
+    /// file can be the same byte count) — only the inode changes. The cache
+    /// must treat that as a fresh file, not serve the replaced file's chunks.
+    #[test]
+    fn same_mtime_same_size_different_inode_is_a_fresh_entry() {
+        let id_old = FileIdentity {
+            mtime_ns: 5,
+            size: 400,
+            inode: 100,
+        };
+        let id_new = FileIdentity {
+            mtime_ns: 5,
+            size: 400,
+            inode: 101,
+        };
+        let scope_old = FileScope::new("decoded_cache_test/renamed.tif", id_old);
+        let scope_new = FileScope::new("decoded_cache_test/renamed.tif", id_new);
+
+        let old = get_or_decode(&scope_old, 0, 3, || Ok(DecodingResult::U8(vec![1]))).unwrap();
+        let new = get_or_decode(&scope_new, 0, 3, || Ok(DecodingResult::U8(vec![2]))).unwrap();
+        assert!(matches!(*old, DecodingResult::U8(ref v) if v == &[1]));
+        assert!(
+            matches!(*new, DecodingResult::U8(ref v) if v == &[2]),
+            "same-mtime same-size rename must not serve the old file's chunks"
+        );
+    }
+
     /// IFD index must separate full-res from overview chunks with the same
     /// chunk index (same collision the compressed TileCache guards against).
     #[test]
@@ -223,6 +272,7 @@ mod tests {
             FileIdentity {
                 mtime_ns: 3,
                 size: 200,
+                inode: 8,
             },
         );
         let full = get_or_decode(&scope, 0, 0, || Ok(DecodingResult::U8(vec![10]))).unwrap();
@@ -239,6 +289,7 @@ mod tests {
             FileIdentity {
                 mtime_ns: 4,
                 size: 300,
+                inode: 9,
             },
         );
         let err = get_or_decode(&scope, 0, 1, || Err(DataServerError::Engine("boom".into())));
