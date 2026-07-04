@@ -117,7 +117,7 @@ impl AsRef<[u8]> for SharedBytes {
 
 /// Lazily-populated mmap cache. Shared across clones of `DataSource::LocalFile`
 /// so the file is mmaped once per catalog entry and reused on every render.
-type MmapCache = Arc<OnceLock<Result<Arc<Mmap>, String>>>;
+type MmapCache = Arc<OnceLock<Result<(Arc<Mmap>, crate::decoded_cache::FileIdentity), String>>>;
 
 /// Data source for reading GeoTIFF data.
 #[derive(Debug, Clone)]
@@ -175,19 +175,28 @@ impl DataSource {
     /// produce torn reads — same hazard as the previous `File::open` path.
     fn load_mmap(
         path: &Path,
-        cache: &OnceLock<Result<Arc<Mmap>, String>>,
-    ) -> Result<Arc<Mmap>, DataServerError> {
+        cache: &OnceLock<Result<(Arc<Mmap>, crate::decoded_cache::FileIdentity), String>>,
+    ) -> Result<(Arc<Mmap>, crate::decoded_cache::FileIdentity), DataServerError> {
         let cached = cache.get_or_init(|| {
             let file =
                 File::open(path).map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
+            // Content identity for the decoded-chunk cache (#463), read from
+            // the SAME handle the mapping is created from — it describes the
+            // bytes the decoder will see, not whatever inode later sits at
+            // this path.
+            let identity = crate::decoded_cache::FileIdentity::from_metadata(
+                &file
+                    .metadata()
+                    .map_err(|e| format!("Cannot stat {}: {e}", path.display()))?,
+            );
             // SAFETY: see the doc comment above — read-only mapping of a file
             // we treat as immutable for the lifetime of this `DataSource`.
             let mmap = unsafe { Mmap::map(&file) }
                 .map_err(|e| format!("Cannot mmap {}: {e}", path.display()))?;
-            Ok(Arc::new(mmap))
+            Ok((Arc::new(mmap), identity))
         });
         match cached {
-            Ok(m) => Ok(Arc::clone(m)),
+            Ok((m, identity)) => Ok((Arc::clone(m), *identity)),
             Err(msg) => Err(DataServerError::Engine(msg.clone())),
         }
     }
@@ -196,7 +205,7 @@ impl DataSource {
     fn open_decoder(&self) -> Result<DecoderWrapper, DataServerError> {
         match self {
             DataSource::LocalFile { path, mmap_cache } => {
-                let mmap = Self::load_mmap(path, mmap_cache)?;
+                let (mmap, _) = Self::load_mmap(path, mmap_cache)?;
                 let cursor = Cursor::new(SharedBytes::Mmap(mmap));
                 Ok(DecoderWrapper(Decoder::new(cursor).map_err(|e| {
                     DataServerError::Engine(format!("Invalid TIFF {}: {e}", path.display()))
@@ -223,6 +232,68 @@ impl DataSource {
             DataSource::Remote { path, .. } => format!("<remote:{}>", path),
             DataSource::HttpDirect { url, .. } => format!("<http:{}>", url),
         }
+    }
+
+    /// Scope for the process-global decoded-chunk cache (#463): local files
+    /// only — they have a stable path + content identity (captured at mmap
+    /// time). `InMemory` fallbacks decode uncached (no stable identity), and
+    /// the remote paths never reach the local decoder.
+    fn decoded_cache_scope(
+        &self,
+    ) -> Result<Option<crate::decoded_cache::FileScope>, DataServerError> {
+        match self {
+            DataSource::LocalFile { path, mmap_cache } => {
+                let (_, identity) = Self::load_mmap(path, mmap_cache)?;
+                Ok(Some(crate::decoded_cache::FileScope::new(
+                    path.to_string_lossy().as_ref(),
+                    identity,
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Open the decoder for `source` on first use and seek it to `ifd_index`.
+/// Lazy so a read fully served by the decoded-chunk cache skips the IFD
+/// parse entirely.
+fn ensure_decoder<'a>(
+    source: &DataSource,
+    ifd_index: u16,
+    slot: &'a mut Option<DecoderWrapper>,
+) -> Result<&'a mut DecoderWrapper, DataServerError> {
+    if slot.is_none() {
+        let mut decoder = source.open_decoder()?;
+        if ifd_index > 0 {
+            decoder.seek_to_image(ifd_index as usize).map_err(|e| {
+                DataServerError::Engine(format!("Failed to seek to overview IFD {ifd_index}: {e}"))
+            })?;
+        }
+        *slot = Some(decoder);
+    }
+    Ok(slot.as_mut().expect("decoder was just initialised"))
+}
+
+/// Read one decoded chunk for the local/in-memory path, memoized in the
+/// process-global decoded-chunk cache (#463) when `scope` is `Some` (local
+/// files). The decoder is opened lazily, only when a decode actually runs.
+fn read_chunk_cached(
+    source: &DataSource,
+    scope: &Option<crate::decoded_cache::FileScope>,
+    ifd_index: u16,
+    chunk_index: u32,
+    decoder: &mut Option<DecoderWrapper>,
+) -> Result<Arc<DecodingResult>, DataServerError> {
+    let decode = |decoder: &mut Option<DecoderWrapper>| {
+        ensure_decoder(source, ifd_index, decoder)?
+            .read_chunk(chunk_index)
+            .map_err(|e| DataServerError::Engine(format!("Failed to read tile: {e}")))
+    };
+    match scope {
+        Some(scope) => {
+            crate::decoded_cache::get_or_decode(scope, ifd_index, chunk_index, || decode(decoder))
+        }
+        None => decode(decoder).map(Arc::new),
     }
 }
 
@@ -672,86 +743,35 @@ impl TiffMetadata {
     }
 }
 
-/// Decode a chunk into Vec<f64>, applying scale/offset.
-/// Returns None for nodata/NaN values.
-/// For multi-band files, `band_index` selects which band (0-based).
-fn decode_chunk_f64(
-    decoder: &mut DecoderWrapper,
-    chunk_index: u32,
-    metadata: &TiffMetadata,
-    band_index: usize,
-) -> Result<Vec<Option<f64>>, DataServerError> {
-    let result = decoder
-        .read_chunk(chunk_index)
-        .map_err(|e| DataServerError::Engine(format!("Failed to read tile: {e}")))?;
+/// Map one raw sample to the output value: `None` for nodata/NaN, else the
+/// physical (scale/offset-applied) value. The nodata comparison is against
+/// the RAW (pre-scale) value, matching the old full-tile decode.
+#[inline]
+fn raw_sample_to_value(raw: f64, metadata: &TiffMetadata) -> Option<f64> {
+    if raw.is_nan() || metadata.is_nodata_raw(raw) {
+        None
+    } else {
+        Some(metadata.to_physical(raw))
+    }
+}
 
-    let spp = metadata.samples_per_pixel as usize;
-
-    let values = match result {
-        DecodingResult::F32(data) => data
-            .iter()
-            .skip(band_index)
-            .step_by(spp)
-            .map(|&v| {
-                if v.is_nan() || metadata.is_nodata_raw(v as f64) {
-                    None
-                } else {
-                    Some(metadata.to_physical(v as f64))
-                }
-            })
-            .collect(),
-        DecodingResult::F64(data) => data
-            .iter()
-            .skip(band_index)
-            .step_by(spp)
-            .map(|&v| {
-                if v.is_nan() || metadata.is_nodata_raw(v) {
-                    None
-                } else {
-                    Some(metadata.to_physical(v))
-                }
-            })
-            .collect(),
-        DecodingResult::U8(data) => data
-            .iter()
-            .skip(band_index)
-            .step_by(spp)
-            .map(|&v| {
-                if metadata.is_nodata_raw(v as f64) {
-                    None
-                } else {
-                    Some(metadata.to_physical(v as f64))
-                }
-            })
-            .collect(),
-        DecodingResult::U16(data) => data
-            .iter()
-            .skip(band_index)
-            .step_by(spp)
-            .map(|&v| {
-                if metadata.is_nodata_raw(v as f64) {
-                    None
-                } else {
-                    Some(metadata.to_physical(v as f64))
-                }
-            })
-            .collect(),
-        DecodingResult::I16(data) => data
-            .iter()
-            .skip(band_index)
-            .step_by(spp)
-            .map(|&v| {
-                if metadata.is_nodata_raw(v as f64) {
-                    None
-                } else {
-                    Some(metadata.to_physical(v as f64))
-                }
-            })
-            .collect(),
+/// Read the raw sample at interleaved index `sample_idx` from a decoded
+/// native chunk. `None` if the index is out of bounds (clipped edge tile).
+/// Errs on sample types the engine doesn't support (same set the old
+/// full-tile decode accepted: U8/U16/I16/F32/F64).
+fn raw_sample_at(
+    chunk: &DecodingResult,
+    sample_idx: usize,
+) -> Result<Option<f64>, DataServerError> {
+    let raw = match chunk {
+        DecodingResult::U8(data) => data.get(sample_idx).map(|&v| v as f64),
+        DecodingResult::U16(data) => data.get(sample_idx).map(|&v| v as f64),
+        DecodingResult::I16(data) => data.get(sample_idx).map(|&v| v as f64),
+        DecodingResult::F32(data) => data.get(sample_idx).map(|&v| v as f64),
+        DecodingResult::F64(data) => data.get(sample_idx).copied(),
         _ => return Err(DataServerError::Engine("Unsupported data type".into())),
     };
-
-    Ok(values)
+    Ok(raw)
 }
 
 /// Extract tile layout info from a decoder for remote range-read access.
@@ -1351,11 +1371,18 @@ pub fn read_pixel(
             metadata.tile_width as usize,
         ),
         _ => {
-            let mut decoder = source.open_decoder()?;
-            (
-                decode_chunk_f64(&mut decoder, chunk_index, metadata, band_index)?,
-                local_tile_data_width(metadata, tile_col),
-            )
+            // Local/in-memory: read the decoded chunk (memoized for local
+            // files, #463) and pull the single sample straight from the
+            // native buffer — no full-tile boxing for one pixel.
+            let scope = source.decoded_cache_scope()?;
+            let mut decoder = None;
+            let chunk = read_chunk_cached(source, &scope, 0, chunk_index, &mut decoder)?;
+            let stride = local_tile_data_width(metadata, tile_col);
+            let sample_idx = (local_row as usize * stride + local_col as usize)
+                * metadata.samples_per_pixel as usize
+                + band_index;
+            return Ok(raw_sample_at(&chunk, sample_idx)?
+                .and_then(|raw| raw_sample_to_value(raw, metadata)));
         }
     };
 
@@ -1574,24 +1601,27 @@ pub fn read_bbox_overview(
         );
     }
 
-    // For local files, seek to the overview IFD and read tiles
-    let mut decoder = source.open_decoder()?;
-    decoder.seek_to_image(overview.ifd_index).map_err(|e| {
-        DataServerError::Engine(format!(
-            "Failed to seek to overview IFD {}: {e}",
-            overview.ifd_index
-        ))
-    })?;
+    // For local files, read the overview-IFD tiles through the decoded-chunk
+    // cache (#463); the decoder is opened (and seeked) lazily, only when a
+    // chunk actually needs decoding.
+    let scope = source.decoded_cache_scope()?;
+    let mut decoder: Option<DecoderWrapper> = None;
 
     let mut result = vec![None; total_pixels];
 
     for tile_row in tile_row_start..tile_row_end {
         for tile_col in tile_col_start..tile_col_end {
             let chunk_index = safe_tile_index(tile_row, overview.tiles_across, tile_col)?;
-            let tile_data = decode_chunk_f64(&mut decoder, chunk_index, &ov_metadata, band_index)?;
+            let chunk = read_chunk_cached(
+                source,
+                &scope,
+                overview.ifd_index as u16,
+                chunk_index,
+                &mut decoder,
+            )?;
 
-            copy_tile_to_result(
-                &tile_data,
+            copy_raw_tile_to_result(
+                &chunk,
                 &mut result,
                 tile_col,
                 tile_row,
@@ -1602,7 +1632,8 @@ pub fn read_bbox_overview(
                 row_end,
                 nx,
                 local_tile_data_width(&ov_metadata, tile_col),
-            );
+                band_index,
+            )?;
         }
     }
 
@@ -1775,17 +1806,22 @@ fn read_bbox_inner(
         );
     }
 
-    // Non-remote: sequential path (decoder is not thread-safe)
-    let mut decoder = source.open_decoder()?;
+    // Non-remote: sequential path (decoder is not thread-safe). Chunks are
+    // memoized in the process-global decoded-chunk cache (#463) so the many
+    // meta-tile renders tiling one viewport don't re-decode shared source
+    // tiles; the decoder is opened lazily — a fully cache-served read skips
+    // the IFD parse entirely.
+    let scope = source.decoded_cache_scope()?;
+    let mut decoder: Option<DecoderWrapper> = None;
     let mut result = vec![None; total_pixels];
 
     for tile_row in tile_row_start..tile_row_end {
         for tile_col in tile_col_start..tile_col_end {
             let chunk_index = safe_tile_index(tile_row, metadata.tiles_across, tile_col)?;
-            let tile_data = decode_chunk_f64(&mut decoder, chunk_index, metadata, band_index)?;
+            let chunk = read_chunk_cached(source, &scope, 0, chunk_index, &mut decoder)?;
 
-            copy_tile_to_result(
-                &tile_data,
+            copy_raw_tile_to_result(
+                &chunk,
                 &mut result,
                 tile_col,
                 tile_row,
@@ -1796,7 +1832,8 @@ fn read_bbox_inner(
                 row_end,
                 nx,
                 local_tile_data_width(metadata, tile_col),
-            );
+                band_index,
+            )?;
         }
     }
 
@@ -2114,6 +2151,109 @@ fn copy_tile_to_result(
             let out_row = (row - row_start) as usize;
             let out_idx = out_row * nx + out_col;
             result[out_idx] = tile_data[tile_idx];
+        }
+    }
+}
+
+/// Copy pixels from a decoded NATIVE chunk (all bands interleaved) into the
+/// output grid, applying band extraction, nodata mapping and scale/offset
+/// only for the intersecting window (#463) — the local path's replacement
+/// for boxing whole tiles to `Vec<Option<f64>>` up front. Same window/stride
+/// semantics as [`copy_tile_to_result`], including the clipped edge-tile
+/// stride (#458).
+#[allow(clippy::too_many_arguments)]
+fn copy_raw_tile_to_result(
+    chunk: &DecodingResult,
+    result: &mut [Option<f64>],
+    tile_col: u32,
+    tile_row: u32,
+    metadata: &TiffMetadata,
+    col_start: u32,
+    row_start: u32,
+    col_end: u32,
+    row_end: u32,
+    nx: usize,
+    // Row stride of the decoded chunk — see `copy_tile_to_result`'s doc on
+    // clipped edge tiles (#458). Always `local_tile_data_width` here (this
+    // function is only reached by the local `tiff`-crate decode path).
+    tile_data_width: usize,
+    band_index: usize,
+) -> Result<(), DataServerError> {
+    // One monomorphized copy loop per sample type; the macro keeps the long
+    // shared argument list in one place.
+    macro_rules! copy_as {
+        ($data:expr, $to_f64:expr) => {{
+            copy_raw_samples(
+                $data,
+                $to_f64,
+                result,
+                tile_col,
+                tile_row,
+                metadata,
+                col_start,
+                row_start,
+                col_end,
+                row_end,
+                nx,
+                tile_data_width,
+                band_index,
+            );
+            Ok(())
+        }};
+    }
+    match chunk {
+        DecodingResult::U8(data) => copy_as!(data, |v| *v as f64),
+        DecodingResult::U16(data) => copy_as!(data, |v| *v as f64),
+        DecodingResult::I16(data) => copy_as!(data, |v| *v as f64),
+        DecodingResult::F32(data) => copy_as!(data, |v| *v as f64),
+        DecodingResult::F64(data) => copy_as!(data, |v| *v),
+        _ => Err(DataServerError::Engine("Unsupported data type".into())),
+    }
+}
+
+/// Monomorphized inner loop of [`copy_raw_tile_to_result`].
+#[allow(clippy::too_many_arguments)]
+fn copy_raw_samples<T>(
+    data: &[T],
+    to_f64: impl Fn(&T) -> f64,
+    result: &mut [Option<f64>],
+    tile_col: u32,
+    tile_row: u32,
+    metadata: &TiffMetadata,
+    col_start: u32,
+    row_start: u32,
+    col_end: u32,
+    row_end: u32,
+    nx: usize,
+    tile_data_width: usize,
+    band_index: usize,
+) {
+    let spp = metadata.samples_per_pixel as usize;
+    let tile_pixel_col_start = tile_col * metadata.tile_width;
+    let tile_pixel_row_start = tile_row * metadata.tile_height;
+
+    let overlap_col_start = col_start.max(tile_pixel_col_start);
+    let overlap_col_end = col_end.min(tile_pixel_col_start + metadata.tile_width);
+    let overlap_row_start = row_start.max(tile_pixel_row_start);
+    let overlap_row_end = row_end.min(tile_pixel_row_start + metadata.tile_height);
+
+    for row in overlap_row_start..overlap_row_end {
+        for col in overlap_col_start..overlap_col_end {
+            let local_col = col - tile_pixel_col_start;
+            let local_row = row - tile_pixel_row_start;
+            let tile_idx = local_row as usize * tile_data_width + local_col as usize;
+            let sample_idx = tile_idx * spp + band_index;
+
+            // Out-of-buffer guard: clipped edge tiles are shorter than a full
+            // tile (same guard as `copy_tile_to_result`).
+            if sample_idx >= data.len() {
+                continue;
+            }
+
+            let out_col = (col - col_start) as usize;
+            let out_row = (row - row_start) as usize;
+            let out_idx = out_row * nx + out_col;
+            result[out_idx] = raw_sample_to_value(to_f64(&data[sample_idx]), metadata);
         }
     }
 }
@@ -2508,7 +2648,7 @@ mod tests {
                 let entry = mmap_cache
                     .get()
                     .expect("mmap cache populated after first open");
-                let mmap = entry.as_ref().expect("mmap should succeed for the fixture");
+                let (mmap, _) = entry.as_ref().expect("mmap should succeed for the fixture");
                 Arc::as_ptr(mmap)
             }
             _ => panic!("from_path should produce LocalFile"),
@@ -2521,7 +2661,7 @@ mod tests {
                 DataSource::LocalFile { mmap_cache, .. } => mmap_cache.get().unwrap(),
                 _ => unreachable!(),
             };
-            let mmap = entry.as_ref().unwrap();
+            let (mmap, _) = entry.as_ref().unwrap();
             assert_eq!(
                 Arc::as_ptr(mmap),
                 cached_ptr,
@@ -2535,7 +2675,7 @@ mod tests {
         let _ = source_clone.open_decoder().unwrap();
         let cloned_ptr = match &source_clone {
             DataSource::LocalFile { mmap_cache, .. } => {
-                Arc::as_ptr(mmap_cache.get().unwrap().as_ref().unwrap())
+                Arc::as_ptr(&mmap_cache.get().unwrap().as_ref().unwrap().0)
             }
             _ => unreachable!(),
         };
@@ -3114,14 +3254,14 @@ mod tests {
     }
 
     // Pins the load-bearing ASSUMPTION behind the #458 fix: the local
-    // `tiff`-crate decode path (`decode_chunk_f64` → `read_chunk`) really does
-    // return the rightmost tile column CLIPPED to its valid width, NOT padded to
-    // `tile_width`. The unit tests above pin the indexing math against a
-    // synthetic clipped buffer; this one decodes a REAL committed fixture so a
-    // future `tiff`-crate bump that changed to padding edge tiles would fail here
-    // (otherwise `local_tile_data_width` would silently over-clip and reintroduce
-    // the shear). Uses `testdata/radar` (3249×1750, tile 512 → rightmost column
-    // clipped to 177 wide).
+    // `tiff`-crate decode path (`read_chunk`) really does return the rightmost
+    // tile column CLIPPED to its valid width, NOT padded to `tile_width`. The
+    // unit tests above pin the indexing math against a synthetic clipped
+    // buffer; this one decodes a REAL committed fixture so a future
+    // `tiff`-crate bump that changed to padding edge tiles would fail here
+    // (otherwise `local_tile_data_width` would silently over-clip and
+    // reintroduce the shear). Uses `testdata/radar` (3249×1750, tile 512 →
+    // rightmost column clipped to 177 wide).
     #[test]
     fn local_tiff_decode_returns_clipped_rightmost_tile() {
         let dir = find_test_radar_dir();
@@ -3147,17 +3287,78 @@ mod tests {
         // padded/sheared buffer would be tile_width × tile_height instead.
         let chunk_index = safe_tile_index(0, metadata.tiles_across, last_col).unwrap();
         let mut decoder = source.open_decoder().expect("open decoder");
-        let tile = decode_chunk_f64(&mut decoder, chunk_index, &metadata, 0).expect("decode tile");
+        let tile = decoder.read_chunk(chunk_index).expect("decode tile");
+        let samples = crate::decoded_cache::sample_count(&tile);
         assert_eq!(
-            tile.len(),
+            samples,
             clipped_w * metadata.tile_height as usize,
-            "rightmost edge tile decoded with stride {} (len {}), expected clipped {}×{}; \
+            "rightmost edge tile decoded with stride {} (samples {}), expected clipped {}×{}; \
              if the tiff crate now PADS edge tiles to tile_width, the #458 fix's local \
              stride must switch back to tile_width",
-            tile.len() / metadata.tile_height as usize,
-            tile.len(),
+            samples / metadata.tile_height as usize,
+            samples,
             clipped_w,
             metadata.tile_height
         );
+    }
+
+    // The decoded-chunk cache (#463) must be transparent: a repeat read of the
+    // same window returns identical values while serving the chunks from cache
+    // (hits increase by at least the covering-tile count, and no new misses for
+    // this file's chunks beyond the first pass). Uses a temp COPY of the
+    // fixture so the cache key (path + mtime + size) is unique to this test —
+    // global counters are shared across parallel tests, so assertions are
+    // delta-based and directional (other tests can only ADD counts).
+    #[test]
+    fn decoded_chunk_cache_serves_repeat_reads() {
+        let dir = find_test_radar_dir();
+        let tif_path = find_first_tif(&dir);
+        let tmp =
+            std::env::temp_dir().join(format!("mc-decoded-cache-test-{}.tif", std::process::id()));
+        std::fs::copy(&tif_path, &tmp).expect("copy fixture to temp");
+
+        let source = DataSource::from_path(&tmp);
+        let metadata = TiffMetadata::from_source(&source).expect("parse fixture metadata");
+        let n_tiles = (metadata.tiles_across * metadata.tiles_down) as u64;
+
+        let (_, m0, _, _) = crate::decoded_cache::metrics();
+        let first = read_bbox_map(
+            &source,
+            &metadata,
+            0,
+            0,
+            metadata.width,
+            metadata.height,
+            None,
+            &tmp,
+            0,
+        )
+        .expect("first full read");
+        let (h1, m1, _, _) = crate::decoded_cache::metrics();
+        assert!(
+            m1 - m0 >= n_tiles,
+            "first read should decode all {n_tiles} covering tiles (misses {m0} → {m1})"
+        );
+
+        let second = read_bbox_map(
+            &source,
+            &metadata,
+            0,
+            0,
+            metadata.width,
+            metadata.height,
+            None,
+            &tmp,
+            0,
+        )
+        .expect("second full read");
+        let (h2, _, _, _) = crate::decoded_cache::metrics();
+        assert!(
+            h2 - h1 >= n_tiles,
+            "repeat read should be served from the decoded-chunk cache (hits {h1} → {h2})"
+        );
+        assert_eq!(first, second, "cached read must be value-identical");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }
