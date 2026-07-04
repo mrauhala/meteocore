@@ -129,7 +129,13 @@ pub fn composite_cache_metrics() -> (u64, u64, u64, u64) {
 #[derive(Clone)]
 enum Source {
     /// A local filesystem directory, scanned with `read_dir`.
-    Local { data_dir: PathBuf },
+    /// `time_window`, when set, bounds which timesteps are retained
+    /// (relative to now at each scan) — the local analogue of the remote
+    /// arm's timestamp filter (#465).
+    Local {
+        data_dir: PathBuf,
+        time_window: Option<TimeWindow>,
+    },
     /// An S3 or HTTP(S) object store. `prefix_pattern` may carry
     /// strftime codes (e.g. `%Y/%m/%d/OPERA/COMP/`); it is expanded
     /// per UTC date on every scan so the listing stays current across
@@ -207,7 +213,18 @@ fn scan_source(
     known: &[CatalogEntry],
 ) -> Result<Vec<CatalogEntry>, EngineError> {
     match source {
-        Source::Local { data_dir } => Ok(scan_local_directory(data_dir, matcher, max_files)?),
+        Source::Local {
+            data_dir,
+            time_window,
+        } => {
+            let time_filter = time_window.as_ref().map(|tw| tw.to_range(Utc::now()));
+            Ok(scan_local_directory(
+                data_dir,
+                matcher,
+                time_filter,
+                max_files,
+            )?)
+        }
         Source::Remote {
             store,
             prefix_pattern,
@@ -483,8 +500,9 @@ pub enum EngineError {
     MissingPrefixPattern,
     #[error(
         "no ODIM files found at `{location}` matching the configured filename \
-         pattern — verify the source exists and the template matches the \
-         producer's layout"
+         pattern (and `time_window`, if set) — verify the source exists, the \
+         template matches the producer's layout, and the window covers the \
+         available timesteps"
     )]
     NoFiles { location: String },
     #[error("ODIM source error: {0}")]
@@ -549,15 +567,24 @@ impl OdimEngine {
         let matcher = build_matcher(config)?;
         let source = build_source(collection_id, data_path, config)?;
 
-        // `time_window` only constrains a *remote* (S3/HTTP) source's
-        // prefix expansion + timestamp filtering. A local `data_path`
-        // source ignores it — warn so a misplaced setting doesn't
-        // silently do nothing. (An `http(s)://` `data_path` resolves to
-        // `Source::Remote`, so it is correctly exempt.)
-        if config.time_window.is_some() && matches!(source, Source::Local { .. }) {
+        // An unbounded local source catalogs every matching file in the
+        // directory forever (well, for as long as whatever writes the
+        // directory retains them) — warn so the operator makes retention
+        // an explicit choice (#465). Remote sources are already bounded
+        // by the scanned date prefixes (`DEFAULT_SCAN_DAYS`).
+        if config.max_files.is_none()
+            && matches!(
+                source,
+                Source::Local {
+                    time_window: None,
+                    ..
+                }
+            )
+        {
             tracing::warn!(
-                "[{collection_id}] `time_window` is set but has no effect on a \
-                 local `data_path` ODIM source — it only applies to S3/HTTP sources"
+                "[{collection_id}] local ODIM source has neither `max_files` nor \
+                 `time_window` — every matching file in the directory is cataloged; \
+                 set one to bound retention"
             );
         }
 
@@ -1099,8 +1126,13 @@ fn build_source(
                     }
                 }
             } else {
+                let time_window = match &config.time_window {
+                    Some(s) => Some(TimeWindow::parse(s)?),
+                    None => None,
+                };
                 Ok(Source::Local {
                     data_dir: PathBuf::from(data_path),
+                    time_window,
                 })
             }
         }
@@ -1156,7 +1188,7 @@ fn combine_http_prefix(base_path: &str, prefix_pattern: Option<&str>) -> String 
 /// exactly which store to check.
 fn source_label(source: &Source) -> String {
     match source {
-        Source::Local { data_dir } => data_dir.display().to_string(),
+        Source::Local { data_dir, .. } => data_dir.display().to_string(),
         Source::Remote {
             origin,
             prefix_pattern,

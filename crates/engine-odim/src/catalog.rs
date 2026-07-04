@@ -177,9 +177,12 @@ impl FilenameMatcher {
 }
 
 /// Walk a local directory, match each filename against `matcher`,
-/// and return the matched files sorted by timestamp ascending. Caps
-/// the returned vec at `max_files` from the end (most recent) when
-/// set; useful when the source directory holds years of history.
+/// and return the matched files sorted by timestamp ascending.
+/// `time_filter`, when set, drops entries whose timestamp falls outside
+/// the inclusive `(start, end)` range — the local analogue of
+/// [`scan_remote`]'s window filter (#465). `max_files` then caps the
+/// result at the most recent N; useful when the source directory holds
+/// years of history.
 ///
 /// Non-recursive — only files directly in `dir`. Directories,
 /// symlinks to directories, and files whose names don't match the
@@ -187,6 +190,7 @@ impl FilenameMatcher {
 pub fn scan_local_directory(
     dir: &Path,
     matcher: &FilenameMatcher,
+    time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
     max_files: Option<usize>,
 ) -> Result<Vec<CatalogEntry>, CatalogError> {
     let read = std::fs::read_dir(dir).map_err(|e| CatalogError::ReadDir {
@@ -216,6 +220,9 @@ pub fn scan_local_directory(
                 location: Location::Local(path),
             });
         }
+    }
+    if let Some((start, end)) = time_filter {
+        entries.retain(|e| e.time >= start && e.time <= end);
     }
     entries.sort_by_key(|e| e.time);
     if let Some(cap) = max_files {
@@ -565,7 +572,7 @@ mod tests {
             std::fs::write(dir.path().join(name), b"").unwrap();
         }
         let m = FilenameMatcher::from_template("%Y%m%dT%H%M_radar_fi.h5").unwrap();
-        let entries = scan_local_directory(dir.path(), &m, None).unwrap();
+        let entries = scan_local_directory(dir.path(), &m, None, None).unwrap();
         assert_eq!(entries.len(), 3, "README.md must be skipped");
         let times: Vec<_> = entries.iter().map(|e| e.time.to_rfc3339()).collect();
         assert_eq!(
@@ -575,6 +582,30 @@ mod tests {
                 "2025-07-14T15:00:00+00:00",
                 "2025-07-14T15:30:00+00:00",
             ]
+        );
+    }
+
+    /// `time_filter` drops entries outside the inclusive window (before
+    /// the `max_files` cap) — a local source with `time_window` retains
+    /// only the recent tail even when the directory holds more history
+    /// (#465; previously the window was silently ignored for local
+    /// sources).
+    #[test]
+    fn scan_local_directory_applies_time_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        for hour in 0..5 {
+            let name = format!("20250714T{hour:02}00_radar_fi.h5");
+            std::fs::write(dir.path().join(&name), b"").unwrap();
+        }
+        let m = FilenameMatcher::from_template("%Y%m%dT%H%M_radar_fi.h5").unwrap();
+        let start: DateTime<Utc> = "2025-07-14T02:00:00Z".parse().unwrap();
+        let end: DateTime<Utc> = "2025-07-14T03:00:00Z".parse().unwrap();
+        let entries = scan_local_directory(dir.path(), &m, Some((start, end)), None).unwrap();
+        let times: Vec<_> = entries.iter().map(|e| e.time.to_rfc3339()).collect();
+        assert_eq!(
+            times,
+            ["2025-07-14T02:00:00+00:00", "2025-07-14T03:00:00+00:00"],
+            "window is inclusive on both ends; entries outside are dropped"
         );
     }
 
@@ -589,7 +620,7 @@ mod tests {
             std::fs::write(dir.path().join(&name), b"").unwrap();
         }
         let m = FilenameMatcher::from_template("%Y%m%dT%H%M_radar_fi.h5").unwrap();
-        let entries = scan_local_directory(dir.path(), &m, Some(2)).unwrap();
+        let entries = scan_local_directory(dir.path(), &m, None, Some(2)).unwrap();
         assert_eq!(entries.len(), 2);
         let names: Vec<_> = entries
             .iter()
