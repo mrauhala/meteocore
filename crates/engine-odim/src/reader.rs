@@ -275,9 +275,10 @@ impl RawPixels {
 /// garbage. Branching on `Datatype` picks the one correct reader.
 ///
 /// Supported ODIM element types: `u8`/`u16`/`i16` scaled integers (physical =
-/// `raw * gain + offset`) and `f64` pre-decoded physical values. Anything else
-/// (i8, i32, f32, …) is [`ReadError::UnsupportedPixelType`]. `path` only labels
-/// error messages.
+/// `raw * gain + offset`) and `f32`/`f64` pre-decoded physical values — both
+/// float widths are stored as [`RawPixels::F32`] (f64 is downcast at decode,
+/// #464). Anything else (i8, i32, …) is [`ReadError::UnsupportedPixelType`].
+/// `path` only labels error messages.
 pub(crate) fn read_raw_pixels_2d(
     ds: &Dataset,
     rows: usize,
