@@ -949,6 +949,7 @@ colormap = "radar_dbz"
 - **Reload**: `POST /admin/collections/reload` — re-reads config, atomically swaps engines. Shared core `admin::do_reload` is also driven by the optional `collections_dir` watcher (`[server] watch_collections_dir`).
 - **Health**: `GET /health` — per-collection status (ready/degraded/failed). HTTP 503 only when all failed.
 - **Metrics**: `GET /metrics` — Prometheus format. Path labels use route patterns (not raw URLs) to avoid cardinality explosion.
+- **Grafana dashboards live in this repo**: `docker/grafana/dashboards/meteocore-overview.json`, provisioned into the `meteocore-grafana` container (nexus) via `docker/grafana/provisioning/` — the JSON edit here is the whole change. **When adding a new `/metrics` family, update the dashboard too** (same PR or a follow-up issue like #469); cache families follow the established panel pattern: hit ratio, bytes vs capacity, miss rate.
 - **State**: API state wrapped in `ArcSwap` for lock-free reads. Render semaphore (2× CPU cores, min 8) shared across Maps/Tiles/WMS. Engine loading in `server/src/admin.rs`.
 
 ## Code Style

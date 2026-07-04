@@ -36,8 +36,9 @@
 //!
 //! Phase 1 narrows the scope further than the format allows:
 //! - Single dataset (`/dataset1` only), single data layer (`/data1`)
-//! - Four raw pixel types: u8, u16, i16, f64 (all the variants we've
-//!   actually encountered; i16 is SMHI's signed scaled-integer PVOL)
+//! - Five raw pixel types: u8, u16, i16 (SMHI's signed scaled-integer
+//!   PVOL), and f32/f64 pre-decoded floats — float storage is downcast
+//!   to `f32` in memory (#464)
 //! - No quality layers, no `how/*` attributes, no PVOL volume data
 //!
 //! See [[project_odim_engine_plan]] for the full multi-phase plan.
@@ -71,7 +72,7 @@ pub enum ReadError {
     #[error("dataset `/dataset1/data1/data` has unsupported shape: expected 2D, got {0}D")]
     UnsupportedRank(usize),
     #[error(
-        "dataset `/dataset1/data1/data` has unsupported pixel type (Phase 1: u8, u16, i16, or f64)"
+        "dataset `/dataset1/data1/data` has unsupported pixel type (supported: u8, u16, i16, f32, f64)"
     )]
     UnsupportedPixelType,
     #[error("dataset read failed: {0}")]
@@ -84,16 +85,24 @@ pub enum ReadError {
     NoMoments { dataset: String },
 }
 
-/// Raw pixel storage as it appears on disk. ODIM composites/volumes ship
-/// one of:
+/// Raw pixel storage. ODIM composites/volumes ship one of:
 /// - `u8`  — single-byte reflectivity classes (DMI v2.0)
 /// - `u16` — extended dynamic range (some EUMETNET v2.x producers, DWD v2.3)
 /// - `i16` — **signed** scaled integers (SMHI PVOL: `gain=0.01`, sentinels
 ///   `nodata=-32768`/`undetect=-32767` — only representable as signed)
-/// - `f64` — already-decoded physical values (OPERA v2.4 ACRR/DBZH)
+/// - `f32`/`f64` — already-decoded physical values (OPERA v2.4 ACRR/DBZH
+///   ships f64)
+///
+/// **Float datasets are stored as `f32` regardless of the on-disk width**
+/// (#464/#393): radar physical values (dBZ, mm, m/s) carry nowhere near 7
+/// significant digits, and halving the element size halves the composite /
+/// pixel LRU footprint — the OPERA 4400×3800 grid drops 134 → 67 MB, so a
+/// 13-frame animation working set fits the default cache instead of
+/// thrashing it. Sentinel comparisons account for the rounding (see
+/// [`Self::sample_class`]).
 ///
 /// For the integer variants the physical value is `raw * gain + offset`.
-/// For the f64 variant the values are already in physical units, but
+/// For the float variant the values are already in physical units, but
 /// the gain/offset metadata is still applied for symmetry — typically
 /// gain=1, offset=0, so it's a no-op.
 #[derive(Debug, Clone)]
@@ -101,7 +110,7 @@ pub enum RawPixels {
     U8(Array2<u8>),
     U16(Array2<u16>),
     I16(Array2<i16>),
-    F64(Array2<f64>),
+    F32(Array2<f32>),
 }
 
 /// Classification of a single sampled radar pixel, distinguishing the two
@@ -130,7 +139,7 @@ impl RawPixels {
             RawPixels::U8(a) => a.dim(),
             RawPixels::U16(a) => a.dim(),
             RawPixels::I16(a) => a.dim(),
-            RawPixels::F64(a) => a.dim(),
+            RawPixels::F32(a) => a.dim(),
         }
     }
 
@@ -190,10 +199,21 @@ impl RawPixels {
                 Some(v) => *v as f64,
                 None => return PixelClass::Masked,
             },
-            RawPixels::F64(a) => match a.get((row, col)) {
-                Some(v) => *v,
+            RawPixels::F32(a) => match a.get((row, col)) {
+                Some(v) => *v as f64,
                 None => return PixelClass::Masked,
             },
+        };
+        // Float storage is f32 (#464): the stored raw went through an
+        // f64→f32 rounding at decode time, so the declared f64 sentinels
+        // must be rounded the same way or a sentinel that isn't exactly
+        // representable in f32 would never match its own pixels (and leak
+        // as a huge "physical" value). For f32-exact sentinels — every
+        // observed producer: OPERA ±9_999_000/±8_888_000, integer codes —
+        // this is a no-op. Integer variants widen exactly; no rounding.
+        let (nodata, undetect) = match self {
+            RawPixels::F32(_) => (nodata as f32 as f64, undetect.map(|u| u as f32 as f64)),
+            _ => (nodata, undetect),
         };
         // Exact equality is intentional for nodata/undetect: ODIM
         // producers store integer sentinels (e.g. OPERA's
@@ -237,7 +257,7 @@ impl RawPixels {
             RawPixels::U8(_) => 1,
             RawPixels::U16(_) => 2,
             RawPixels::I16(_) => 2,
-            RawPixels::F64(_) => 8,
+            RawPixels::F32(_) => 4,
         };
         h * w * elem
     }
@@ -255,9 +275,10 @@ impl RawPixels {
 /// garbage. Branching on `Datatype` picks the one correct reader.
 ///
 /// Supported ODIM element types: `u8`/`u16`/`i16` scaled integers (physical =
-/// `raw * gain + offset`) and `f64` pre-decoded physical values. Anything else
-/// (i8, i32, f32, …) is [`ReadError::UnsupportedPixelType`]. `path` only labels
-/// error messages.
+/// `raw * gain + offset`) and `f32`/`f64` pre-decoded physical values — both
+/// float widths are stored as [`RawPixels::F32`] (f64 is downcast at decode,
+/// #464). Anything else (i8, i32, …) is [`ReadError::UnsupportedPixelType`].
+/// `path` only labels error messages.
 pub(crate) fn read_raw_pixels_2d(
     ds: &Dataset,
     rows: usize,
@@ -308,13 +329,34 @@ pub(crate) fn read_raw_pixels_2d(
             signed: true,
             ..
         } => read_2d!(i16, I16),
-        Datatype::FloatingPoint { size: 8, .. } => read_2d!(f64, F64),
-        // f32 storage is not yet supported (no observed ODIM producer uses it;
-        // tracked as a follow-up — #393). `warn!` (not `debug!`): an unsupported
-        // dtype means the data won't load at all, which an operator needs to see
-        // in production — and the actual dtype is the actionable detail the
-        // caller's generic "unsupported pixel type" error lacks. Matches the
-        // pre-dispatch probe chain, which also warned when every probe failed.
+        // Native f32 datasets (#393) store directly.
+        Datatype::FloatingPoint { size: 4, .. } => read_2d!(f32, F32),
+        // f64 datasets (OPERA v2.4) are read at full width, then downcast to
+        // f32 storage (#464): radar physical values don't use the extra
+        // precision, and halving the element size halves the composite /
+        // pixel cache footprint (OPERA 4400×3800: 134 → 67 MB). Sentinel
+        // equality survives the rounding — `sample_class` rounds the declared
+        // sentinels through f32 the same way.
+        Datatype::FloatingPoint { size: 8, .. } => {
+            let arr = ds
+                .read_array::<f64>()
+                .map_err(|e| ReadError::DatasetRead(format!("{path}: {e}")))?;
+            let a2 = arr
+                .into_dimensionality::<ndarray::Ix2>()
+                .map_err(|e| ReadError::DatasetRead(format!("{path}: reshape failed: {e}")))?;
+            if a2.dim() != (rows, cols) {
+                return Err(ReadError::DatasetRead(format!(
+                    "{path}: array shape {:?} doesn't match metadata {rows}x{cols}",
+                    a2.dim()
+                )));
+            }
+            RawPixels::F32(a2.mapv(|v| v as f32))
+        }
+        // `warn!` (not `debug!`): an unsupported dtype means the data won't
+        // load at all, which an operator needs to see in production — and the
+        // actual dtype is the actionable detail the caller's generic
+        // "unsupported pixel type" error lacks. Matches the pre-dispatch
+        // probe chain, which also warned when every probe failed.
         dt => {
             tracing::warn!("ODIM unsupported pixel dtype {dt:?} at {path}");
             return Err(ReadError::UnsupportedPixelType);
@@ -848,13 +890,13 @@ mod tests {
     }
 
     /// OPERA v2.4 ships pre-decoded f64 pixels with nodata=-9999000
-    /// and undetect=-8888000. Both sentinels must mask to None; real
-    /// values fall through unchanged (gain=1, offset=0).
+    /// and undetect=-8888000 — stored as f32 (#464). Both sentinels must
+    /// mask to None; real values fall through unchanged (gain=1, offset=0).
     #[test]
-    fn raw_pixels_sample_handles_f64_with_undetect() {
+    fn raw_pixels_sample_handles_float_with_undetect() {
         let arr =
-            Array2::from_shape_vec((1, 4), vec![5.0_f64, 25.0, -9999000.0, -8888000.0]).unwrap();
-        let px = RawPixels::F64(arr);
+            Array2::from_shape_vec((1, 4), vec![5.0_f32, 25.0, -9999000.0, -8888000.0]).unwrap();
+        let px = RawPixels::F32(arr);
 
         // OPERA's real config: gain=1, offset=0
         assert_eq!(
@@ -884,8 +926,8 @@ mod tests {
     fn raw_pixels_sample_class_distinguishes_undetect_from_nodata() {
         // [value, value, nodata, undetect]
         let arr =
-            Array2::from_shape_vec((1, 4), vec![5.0_f64, 25.0, -9999000.0, -8888000.0]).unwrap();
-        let px = RawPixels::F64(arr);
+            Array2::from_shape_vec((1, 4), vec![5.0_f32, 25.0, -9999000.0, -8888000.0]).unwrap();
+        let px = RawPixels::F32(arr);
         let nodata = -9999000.0;
         let undetect = Some(-8888000.0);
 
@@ -909,7 +951,7 @@ mod tests {
             PixelClass::Masked
         );
         // A NaN raw is Masked regardless of sentinels.
-        let nanpx = RawPixels::F64(Array2::from_shape_vec((1, 1), vec![f64::NAN]).unwrap());
+        let nanpx = RawPixels::F32(Array2::from_shape_vec((1, 1), vec![f32::NAN]).unwrap());
         assert_eq!(
             nanpx.sample_class(0, 0, 1.0, 0.0, nodata, undetect),
             PixelClass::Masked
@@ -917,5 +959,26 @@ mod tests {
         // And `sample` still flattens Undetect + Masked to None (unchanged).
         assert_eq!(px.sample(0, 3, 1.0, 0.0, nodata, undetect), None);
         assert_eq!(px.sample(0, 2, 1.0, 0.0, nodata, undetect), None);
+    }
+
+    /// f32 storage rounds the pixels at decode time (#464), so a declared
+    /// f64 sentinel that is NOT exactly representable in f32 must be rounded
+    /// the same way before comparison — otherwise a nodata pixel would leak
+    /// through as a huge "physical" value. No observed producer ships such a
+    /// sentinel; this pins the guard that makes the downcast safe anyway.
+    #[test]
+    fn raw_pixels_f32_masks_non_representable_sentinel() {
+        // -9_999_000.1 is not f32-exact; on disk the f64 pixel equals the
+        // f64 sentinel, and both round to the same f32.
+        let sentinel = -9_999_000.1_f64;
+        let arr = Array2::from_shape_vec((1, 2), vec![sentinel as f32, 25.0]).unwrap();
+        let px = RawPixels::F32(arr);
+
+        assert_eq!(
+            px.sample(0, 0, 1.0, 0.0, sentinel, None),
+            None,
+            "non-f32-exact nodata sentinel must still mask its own pixels"
+        );
+        assert_eq!(px.sample(0, 1, 1.0, 0.0, sentinel, None), Some(25.0));
     }
 }

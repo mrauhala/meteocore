@@ -56,20 +56,20 @@ const DEFAULT_SCAN_DAYS: u32 = 2;
 /// Default decoded-composite cache size (MB) when `MC_ODIM_COMPOSITE_CACHE_MB`
 /// is unset. A decoded `OdimComposite` is essentially its raw pixel array:
 /// national COMP grids are a few MB, but the OPERA pan-European composite is a
-/// 134 MB `f64` array whose HDF5 decode is ~111 ms (measured). 1024 MB holds
-/// ≈7 OPERA-class grids resident — enough for a typical concurrent
-/// full-viewport WMS animation working set, where N distinct-time render tasks
-/// each fire ~40 [`OdimEngine::load_composite`] calls through the meta-tile
-/// loop. A single-slot cache ping-pongs across those N tasks and re-decodes
-/// the same file many times (#212); a multi-entry LRU keeps every active
-/// timestep resident instead.
-///
-/// Sizing note: a heavy OPERA animation of ~13 concurrent frames is ≈1.7 GB
-/// resident, so it can still thrash a 1 GB cap — raise this knob (or bound the
-/// client's preload concurrency) for that workload. `0` disables the cache,
+/// 67 MB array (4400×3800 stored as `f32` — #464 halved it from the on-disk
+/// `f64`'s 134 MB) whose HDF5 decode is ~111 ms (measured). 2048 MB holds
+/// ≈30 OPERA-class grids resident — a full 13-frame ("latest hour" at 5-min
+/// cadence) concurrent full-viewport WMS animation working set is ≈0.87 GB,
+/// so it fits with headroom for a second OPERA-class collection animating at
+/// the same time. Each of the N distinct-time render tasks fires ~40
+/// [`OdimEngine::load_composite`] calls through the meta-tile loop; a
+/// single-slot cache ping-pongs across those N tasks and re-decodes the same
+/// file many times (#212), and an undersized LRU still pays eviction
+/// re-decodes mid-burst (~10 observed for 13 frames at the old 1024 MB f64
+/// sizing — the 2026-07 audit finding behind #464). `0` disables the cache,
 /// so every load decodes (same convention as the PVOL pixel / voxel-grid
 /// caches in `volume_engine.rs`).
-const DEFAULT_COMPOSITE_CACHE_MB: u64 = 1024;
+const DEFAULT_COMPOSITE_CACHE_MB: u64 = 2048;
 
 /// Byte-weights each cached composite by its decoded pixel array (plus the
 /// key string and `Arc`/control overhead). Mirrors the PVOL pixel / voxel-grid
@@ -98,9 +98,10 @@ static COMPOSITE_CACHE: std::sync::LazyLock<
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_COMPOSITE_CACHE_MB)
         .saturating_mul(1024 * 1024);
-    // Estimate item slots at one OPERA-class (134 MB) grid each; `max(4)`
-    // keeps a small/zero capacity valid (a near-disabled cache holds nothing).
-    let estimated_items = ((capacity_bytes / (134 * 1024 * 1024)).max(4)) as usize;
+    // Estimate item slots at one OPERA-class (67 MB, f32 — #464) grid each;
+    // `max(4)` keeps a small/zero capacity valid (a near-disabled cache holds
+    // nothing).
+    let estimated_items = ((capacity_bytes / (67 * 1024 * 1024)).max(4)) as usize;
     quick_cache::sync::Cache::with_weighter(
         estimated_items,
         capacity_bytes.max(1),
@@ -930,7 +931,8 @@ impl OdimEngine {
         // side-by-side, so a concurrent full-viewport WMS animation — N
         // distinct-time render tasks, each firing ~40 `load_composite` calls
         // through the meta-tile loop — no longer ping-pongs a single slot and
-        // re-decodes the same 134 MB OPERA grid many times (#212).
+        // re-decodes the same 67 MB (f32-stored, #464) OPERA grid many
+        // times (#212).
         let key: Arc<str> = Arc::from(location.id().as_str());
         let mut computed = false;
         // The fallible form returns a fetch/decode error to *this* caller
