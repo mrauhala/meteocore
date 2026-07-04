@@ -157,7 +157,8 @@ not re-scan the auto roots.
 | `MC_3DTILES_CONTENT_CACHE_MB` | `512` | 3D Tiles encoded-content cache size in MB. `0` disables. |
 | `MC_PVOL_VOXEL_GRID_CACHE_MB` | `512` | PVOL polar-resampled voxel-grid cache size in MB. `0` disables. |
 | `MC_PVOL_PIXEL_CACHE_MB` | `1024` | PVOL per-moment decoded-pixel cache size in MB. `0` disables. |
-| `MC_ODIM_COMPOSITE_CACHE_MB` | `1024` | ODIM decoded-composite (COMP) cache size in MB. `0` disables. |
+| `MC_ODIM_COMPOSITE_CACHE_MB` | `2048` | ODIM decoded-composite (COMP) cache size in MB. `0` disables. |
+| `MC_GEOTIFF_DECODED_CHUNK_CACHE_MB` | `512` | GeoTIFF decoded-chunk cache for local sources, in MB. `0` disables. |
 | `MC_COG_TILE_CONCURRENCY` | `16` | Max concurrent remote-COG tile (byte-range) fetches in the shared fetch pool. Raise for high-latency object stores; value must be ≥ 1. |
 | `MC_ALLOW_INLINE_DB_URL` | _(unset)_ | Set to `1` to allow a literal `postgres://` URL in TOML instead of `dsn_env` (development only). |
 
