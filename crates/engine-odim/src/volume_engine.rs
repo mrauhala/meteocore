@@ -826,14 +826,22 @@ fn scan_source(
             data_dir,
             time_window,
         } => {
-            let pending = enumerate_local(collection_id, data_dir)?;
-            // `source` is local here, so `build_catalog` skips the (remote-only)
-            // pixel pre-warm regardless of `prewarm_sweeps`.
-            let mut by_site = build_catalog(collection_id, pending, source, cache, prewarm_sweeps);
             // `time_window` bounds which volumes are retained from the
             // directory — the local analogue of the remote filter below
             // (#465; previously it was silently ignored for local).
             let time_filter = time_window.as_ref().map(|tw| tw.to_range(Utc::now()));
+            let mut pending = enumerate_local(collection_id, data_dir)?;
+            // Drop out-of-window files by FILENAME timestamp *before*
+            // parsing (mirrors the remote arm's pre-filter): the post-parse
+            // filter alone would HDF5-parse every out-of-window file on
+            // every poll only to trim it — and `derive_catalog` then evicts
+            // its parse-cache entry, so it would be re-parsed forever. A
+            // file whose name carries no parseable timestamp falls through
+            // to the post-parse volume-time filter.
+            pending.retain(|p| within_window_by_name(&p.id, time_filter));
+            // `source` is local here, so `build_catalog` skips the (remote-only)
+            // pixel pre-warm regardless of `prewarm_sweeps`.
+            let mut by_site = build_catalog(collection_id, pending, source, cache, prewarm_sweeps);
             retain_within(&mut by_site, time_filter);
             Ok(derive_catalog(by_site, cache, max_files))
         }
@@ -863,6 +871,20 @@ fn retain_within(by_site: &mut HashMap<String, Vec<VolumeEntry>>, filter: Option
         for list in by_site.values_mut() {
             list.retain(|e| e.volume.time >= start && e.volume.time <= end);
         }
+    }
+}
+
+/// Pre-parse window test on a file's NAME: `false` only when the filename
+/// carries a parseable timestamp that falls outside the inclusive range.
+/// No filter, or no parseable timestamp, keeps the file — the post-parse
+/// [`retain_within`] (which sees the volume's internal time) is the
+/// authority; this only exists so out-of-window files are never opened
+/// and HDF5-parsed in the first place (the same cost the remote arm's
+/// candidate pre-filter avoids).
+fn within_window_by_name(id: &str, filter: Option<TimeRange>) -> bool {
+    match (filter, parse_key_timestamp(id)) {
+        (Some((start, end)), Some(ts)) => ts >= start && ts <= end,
+        _ => true,
     }
 }
 
@@ -6196,6 +6218,39 @@ mod tests {
             [t("2026-07-05T06:00:00Z")],
             "volumes outside the window are dropped"
         );
+    }
+
+    /// The pre-parse filename filter (review finding on #471): a file whose
+    /// NAME timestamps outside the window is dropped before it is ever
+    /// opened/parsed — otherwise out-of-window local files would be
+    /// HDF5-parsed and parse-cache-evicted on EVERY poll. Unparseable names
+    /// and no-filter pass through (the post-parse filter is the authority).
+    #[test]
+    fn within_window_by_name_drops_only_parseable_out_of_window() {
+        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let window = Some((t("2026-07-05T05:00:00Z"), t("2026-07-05T07:00:00Z")));
+
+        assert!(within_window_by_name(
+            "/data/202607050600_fivih_PVOL.h5",
+            window
+        ));
+        assert!(!within_window_by_name(
+            "/data/202607050400_fivih_PVOL.h5",
+            window
+        ));
+        // Inclusive bounds — a file exactly at the window edge is kept.
+        assert!(within_window_by_name(
+            "/data/202607050500_fivih_PVOL.h5",
+            window
+        ));
+        // No parseable timestamp in the name → keep (post-parse filter
+        // decides by the volume's internal time).
+        assert!(within_window_by_name("/data/no-timestamp.h5", window));
+        // No filter → keep everything.
+        assert!(within_window_by_name(
+            "/data/202607050400_fivih_PVOL.h5",
+            None
+        ));
     }
 
     /// A site whose latest volume has no usable lowest sweep is kept in
