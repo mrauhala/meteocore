@@ -1309,7 +1309,7 @@ impl MapEngine for OdimEngine {
         Ok(RasterTile {
             width,
             height,
-            values,
+            values: values.into(),
         })
     }
 

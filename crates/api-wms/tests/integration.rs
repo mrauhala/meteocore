@@ -43,7 +43,7 @@ impl MapEngine for EmptyMockMapEngine {
         Ok(RasterTile {
             width,
             height,
-            values: vec![None; pixel_count],
+            values: vec![None; pixel_count].into(),
         })
     }
 
@@ -368,7 +368,7 @@ impl MapEngine for PopulatedMockMapEngine {
         Ok(RasterTile {
             width,
             height,
-            values,
+            values: values.into(),
         })
     }
 
@@ -720,7 +720,7 @@ impl MapEngine for CountingMockMapEngine {
         Ok(RasterTile {
             width,
             height,
-            values: vec![Some(0.5); (width * height) as usize],
+            values: vec![Some(0.5); (width * height) as usize].into(),
         })
     }
 
@@ -941,7 +941,7 @@ impl MapEngine for SiteMockMapEngine {
         Ok(RasterTile {
             width,
             height,
-            values: vec![None; pixel_count],
+            values: vec![None; pixel_count].into(),
         })
     }
 
@@ -1202,7 +1202,7 @@ impl MapEngine for ForecastMockMapEngine {
         Ok(RasterTile {
             width,
             height,
-            values,
+            values: values.into(),
         })
     }
 
@@ -1636,7 +1636,7 @@ impl MapEngine for AdvancingMockMapEngine {
         Ok(RasterTile {
             width,
             height,
-            values,
+            values: values.into(),
         })
     }
 

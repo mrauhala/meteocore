@@ -219,14 +219,103 @@ impl OutputCrs {
 pub struct RasterTile {
     pub width: u32,
     pub height: u32,
-    /// Row-major pixel values. None = nodata (transparent).
-    pub values: Vec<Option<f64>>,
+    /// Row-major pixel values.
+    pub values: RasterValues,
+}
+
+/// Pixel storage for a [`RasterTile`] (#206).
+///
+/// `F64` is the universal boxed form every engine can produce: 16 bytes per
+/// pixel (`Option<f64>`), `None` = nodata. That representation is a 16×
+/// inflation over 1-byte sources and its memory traffic dominates cold-render
+/// cost under concurrency, so integer-typed render paths should produce the
+/// compact `U8` form instead: raw samples plus the decode parameters
+/// (`physical = raw as f64 * gain + offset`, `raw == nodata` ⇒ transparent),
+/// which the renderer colorizes through a 256-entry LUT indexed directly by
+/// the raw byte — no per-pixel float math or boxing anywhere in the pipeline.
+///
+/// Consumers must treat the variants as equivalent descriptions of the same
+/// pixels: for every index, colorizing `U8` through the LUT must produce the
+/// byte-identical RGBA that boxing the same sample to `F64` would (the LUT
+/// entry is *defined* as `colormap.color(value_at(i))`).
+pub enum RasterValues {
+    /// Row-major boxed physical values. None = nodata (transparent).
+    F64(Vec<Option<f64>>),
+    /// Row-major raw 8-bit samples + decode parameters.
+    U8 {
+        data: Vec<u8>,
+        /// Raw value meaning nodata (transparent). `None` ⇒ every sample is
+        /// a real value.
+        nodata: Option<u8>,
+        /// `physical = raw as f64 * gain + offset`.
+        gain: f64,
+        offset: f64,
+    },
+}
+
+impl From<Vec<Option<f64>>> for RasterValues {
+    fn from(values: Vec<Option<f64>>) -> Self {
+        RasterValues::F64(values)
+    }
+}
+
+impl RasterValues {
+    /// Number of pixels.
+    pub fn len(&self) -> usize {
+        match self {
+            RasterValues::F64(v) => v.len(),
+            RasterValues::U8 { data, .. } => data.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Physical value at `idx`: `None` for nodata or out of range. The
+    /// boxed-equivalent view of any variant — colorize fast paths must
+    /// match this exactly.
+    pub fn value_at(&self, idx: usize) -> Option<f64> {
+        match self {
+            RasterValues::F64(v) => v.get(idx).copied().flatten(),
+            RasterValues::U8 {
+                data,
+                nodata,
+                gain,
+                offset,
+            } => data.get(idx).and_then(|&raw| {
+                if Some(raw) == *nodata {
+                    None
+                } else {
+                    Some(raw as f64 * gain + offset)
+                }
+            }),
+        }
+    }
+
+    /// Iterate the pixels as boxed-equivalent physical values (the `F64`
+    /// view of any variant).
+    pub fn iter_values(&self) -> impl Iterator<Item = Option<f64>> + '_ {
+        (0..self.len()).map(move |i| self.value_at(i))
+    }
+
+    /// True when every pixel is nodata.
+    pub fn is_all_nodata(&self) -> bool {
+        match self {
+            RasterValues::F64(v) => v.iter().all(Option::is_none),
+            RasterValues::U8 { data, nodata, .. } => match nodata {
+                Some(nd) => data.iter().all(|b| b == nd),
+                // No nodata sentinel ⇒ every sample is a real value.
+                None => data.is_empty(),
+            },
+        }
+    }
 }
 
 impl RasterTile {
-    /// Returns true if all pixel values are nodata (None).
+    /// Returns true if all pixel values are nodata.
     pub fn is_empty(&self) -> bool {
-        self.values.iter().all(Option::is_none)
+        self.values.is_all_nodata()
     }
 }
 

@@ -1518,20 +1518,7 @@ pub fn read_bbox_overview(
     let total_pixels = nx * ny;
 
     // Build a temporary metadata for this overview level
-    let ov_metadata = TiffMetadata {
-        width: overview.width,
-        height: overview.height,
-        tile_width: overview.tile_width,
-        tile_height: overview.tile_height,
-        tiles_across: overview.tiles_across,
-        tiles_down: overview.tiles_down,
-        samples_per_pixel: metadata.samples_per_pixel,
-        geo_transform: metadata.overview_geo_transform(overview),
-        nodata: metadata.nodata,
-        scale: metadata.scale,
-        offset: metadata.offset,
-        overviews: Vec::new(),
-    };
+    let ov_metadata = overview_metadata(metadata, overview);
 
     let tile_col_start = col_start / overview.tile_width;
     let tile_col_end = (col_end - 1) / overview.tile_width + 1;
@@ -1638,6 +1625,173 @@ pub fn read_bbox_overview(
     }
 
     Ok(result)
+}
+
+/// Grid geometry of one overview level as a standalone [`TiffMetadata`]
+/// (shared by the boxed and native window reads).
+fn overview_metadata(metadata: &TiffMetadata, overview: &OverviewLevel) -> TiffMetadata {
+    TiffMetadata {
+        width: overview.width,
+        height: overview.height,
+        tile_width: overview.tile_width,
+        tile_height: overview.tile_height,
+        tiles_across: overview.tiles_across,
+        tiles_down: overview.tiles_down,
+        samples_per_pixel: metadata.samples_per_pixel,
+        geo_transform: metadata.overview_geo_transform(overview),
+        nodata: metadata.nodata,
+        scale: metadata.scale,
+        offset: metadata.offset,
+        overviews: Vec::new(),
+    }
+}
+
+/// A raw-u8 source window for the render fast path (#206): samples exactly
+/// as stored on disk, uncovered cells filled with the `nodata` sentinel.
+pub struct U8Window {
+    pub data: Vec<u8>,
+    pub nodata: u8,
+}
+
+/// Native u8 window read for the map-render path (#206). Returns
+/// `Ok(Some(window))` only when the whole read can stay in raw bytes:
+/// a local/in-memory source (the remote paths decode per fetched tile and
+/// keep the boxed pipeline), an exact-integer `nodata` sentinel in `0..=255`
+/// (needed both to fill uncovered window cells and for the renderer's
+/// LUT to mask exactly what `is_nodata_raw` masks), and every covering
+/// chunk decoding to `DecodingResult::U8`. Anything else ⇒ `Ok(None)` and
+/// the caller falls back to the boxed `Option<f64>` read — the fast path
+/// must never change WHAT is rendered, only how it is represented.
+#[allow(clippy::too_many_arguments)]
+pub fn read_bbox_u8(
+    source: &DataSource,
+    metadata: &TiffMetadata,
+    overview: Option<&OverviewLevel>,
+    col_start: u32,
+    row_start: u32,
+    col_end: u32,
+    row_end: u32,
+    band_index: usize,
+) -> Result<Option<U8Window>, DataServerError> {
+    if matches!(
+        source,
+        DataSource::Remote { .. } | DataSource::HttpDirect { .. }
+    ) {
+        return Ok(None);
+    }
+    // The sentinel must be an exact integer in u8 range: `is_nodata_raw`
+    // compares integer sentinels exactly, so `raw == nodata_u8` masks the
+    // identical pixel set.
+    let Some(nd) = metadata.nodata else {
+        return Ok(None);
+    };
+    if !(nd.is_finite() && nd == nd.trunc() && (0.0..=255.0).contains(&nd)) {
+        return Ok(None);
+    }
+    let nodata = nd as u8;
+
+    let level_meta = match overview {
+        Some(ov) => overview_metadata(metadata, ov),
+        None => metadata.clone(),
+    };
+    let ifd_index = overview.map(|ov| ov.ifd_index as u16).unwrap_or(0);
+
+    let nx = (col_end - col_start) as usize;
+    let ny = (row_end - row_start) as usize;
+    let total_pixels = nx * ny;
+    // Mirror each boxed twin exactly (this function must be a drop-in
+    // replacement, never a new failure mode): the full-res twin
+    // `read_bbox_map` enforces `MAX_MAP_PIXELS`, but the overview twin
+    // `read_bbox_overview` does NOT — the caller's overview selection
+    // deliberately accepts an over-cap read of the coarsest overview as
+    // "the smallest available source" rather than failing.
+    if overview.is_none() && total_pixels > MAX_MAP_PIXELS {
+        return Err(DataServerError::InvalidParameter(format!(
+            "Map render source area {} pixels exceeds maximum {}.",
+            total_pixels, MAX_MAP_PIXELS
+        )));
+    }
+
+    let tile_col_start = col_start / level_meta.tile_width;
+    let tile_col_end = (col_end - 1) / level_meta.tile_width + 1;
+    let tile_row_start = row_start / level_meta.tile_height;
+    let tile_row_end = (row_end - 1) / level_meta.tile_height + 1;
+
+    let scope = source.decoded_cache_scope()?;
+    let mut decoder: Option<DecoderWrapper> = None;
+    let mut data = vec![nodata; total_pixels];
+
+    for tile_row in tile_row_start..tile_row_end {
+        for tile_col in tile_col_start..tile_col_end {
+            let chunk_index = safe_tile_index(tile_row, level_meta.tiles_across, tile_col)?;
+            let chunk = read_chunk_cached(source, &scope, ifd_index, chunk_index, &mut decoder)?;
+            let DecodingResult::U8(raw) = chunk.as_ref() else {
+                // Mixed / non-u8 chunks: abandon the fast path entirely.
+                return Ok(None);
+            };
+            copy_u8_tile(
+                raw,
+                &mut data,
+                tile_col,
+                tile_row,
+                &level_meta,
+                col_start,
+                row_start,
+                col_end,
+                row_end,
+                nx,
+                local_tile_data_width(&level_meta, tile_col),
+                band_index,
+            );
+        }
+    }
+
+    Ok(Some(U8Window { data, nodata }))
+}
+
+/// Raw-byte twin of `copy_raw_samples`: same window/stride semantics
+/// (including the clipped edge-tile stride, #458), but copies the u8
+/// samples verbatim — no nodata mapping or scale/offset (both live in the
+/// `RasterValues::U8` decode parameters).
+#[allow(clippy::too_many_arguments)]
+fn copy_u8_tile(
+    data: &[u8],
+    result: &mut [u8],
+    tile_col: u32,
+    tile_row: u32,
+    metadata: &TiffMetadata,
+    col_start: u32,
+    row_start: u32,
+    col_end: u32,
+    row_end: u32,
+    nx: usize,
+    tile_data_width: usize,
+    band_index: usize,
+) {
+    let spp = metadata.samples_per_pixel as usize;
+    let tile_pixel_col_start = tile_col * metadata.tile_width;
+    let tile_pixel_row_start = tile_row * metadata.tile_height;
+
+    let overlap_col_start = col_start.max(tile_pixel_col_start);
+    let overlap_col_end = col_end.min(tile_pixel_col_start + metadata.tile_width);
+    let overlap_row_start = row_start.max(tile_pixel_row_start);
+    let overlap_row_end = row_end.min(tile_pixel_row_start + metadata.tile_height);
+
+    for row in overlap_row_start..overlap_row_end {
+        for col in overlap_col_start..overlap_col_end {
+            let local_col = col - tile_pixel_col_start;
+            let local_row = row - tile_pixel_row_start;
+            let tile_idx = local_row as usize * tile_data_width + local_col as usize;
+            let sample_idx = tile_idx * spp + band_index;
+            // Out-of-buffer guard: clipped edge tiles are shorter than a
+            // full tile; the cell keeps its sentinel fill.
+            if sample_idx >= data.len() {
+                continue;
+            }
+            let out_idx = (row - row_start) as usize * nx + (col - col_start) as usize;
+            result[out_idx] = data[sample_idx];
+        }
+    }
 }
 
 /// Maximum source pixels for map rendering. Higher than EDR area queries since
@@ -3300,6 +3454,45 @@ mod tests {
             clipped_w,
             metadata.tile_height
         );
+    }
+
+    /// The native u8 window read (#206) must describe the SAME pixels as the
+    /// boxed read: for every cell, `raw == nodata ⇒ None` else
+    /// `raw * gain + offset` must equal what `read_bbox_map` produced —
+    /// including the clipped rightmost edge tiles (#458). Overrides set a
+    /// synthetic nodata/scale/offset so the equivalence covers the decode
+    /// parameters, not just raw copying.
+    #[test]
+    fn native_u8_window_matches_boxed_read() {
+        // The one committed u8 fixture (480×360, tile 256 → the rightmost
+        // tile column is clipped to 224 px, covering the #458 stride case).
+        let tif_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/radar-tm35fin/radar_tm35_20260406T0640Z.tif");
+        let source = DataSource::from_path(&tif_path);
+        let mut metadata = TiffMetadata::from_source(&source).expect("parse fixture metadata");
+        metadata.apply_overrides(Some(255.0), Some(0.5), Some(-32.0));
+
+        // A window crossing interior AND the clipped rightmost tile column.
+        let (c0, r0, c1, r1) = (metadata.width - 300, 50, metadata.width, 300);
+        let boxed = read_bbox_map(&source, &metadata, c0, r0, c1, r1, None, &tif_path, 0)
+            .expect("boxed read");
+        let native = read_bbox_u8(&source, &metadata, None, c0, r0, c1, r1, 0)
+            .expect("native read")
+            .expect("u8 fixture with integer u8 nodata must take the native path");
+
+        assert_eq!(native.nodata, 255);
+        assert_eq!(native.data.len(), boxed.len());
+        for (i, (&raw, boxed_v)) in native.data.iter().zip(&boxed).enumerate() {
+            let native_v = if raw == native.nodata {
+                None
+            } else {
+                Some(raw as f64 * 0.5 - 32.0)
+            };
+            assert_eq!(
+                native_v, *boxed_v,
+                "pixel {i}: native raw {raw} disagrees with boxed value"
+            );
+        }
     }
 
     // The decoded-chunk cache (#463) must be transparent: a repeat read of the

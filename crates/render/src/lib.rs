@@ -677,11 +677,41 @@ fn draw_rect_border(
 }
 
 /// Colorize a raster tile into an RGBA buffer using a colormap.
+///
+/// The `U8` variant takes the #206 fast path: bake the colormap into a
+/// 256-entry LUT (256 colormap evaluations instead of one per pixel) and
+/// index it by the raw byte — no per-pixel float decode, boxing, or dyn
+/// dispatch. The LUT entry is *defined* as `colormap.color(value_at(i))`,
+/// so the output is byte-identical to boxing the same samples to `F64`.
 pub(crate) fn colorize(tile: &RasterTile, colormap: &dyn ColorMap) -> Vec<u8> {
+    use ds_core::map_engine::RasterValues;
     let mut rgba = Vec::with_capacity((tile.width * tile.height * 4) as usize);
-    for value in &tile.values {
-        let color = colormap.color(*value);
-        rgba.extend_from_slice(&color);
+    match &tile.values {
+        RasterValues::F64(values) => {
+            for value in values {
+                let color = colormap.color(*value);
+                rgba.extend_from_slice(&color);
+            }
+        }
+        RasterValues::U8 {
+            data,
+            nodata,
+            gain,
+            offset,
+        } => {
+            let mut lut = [[0u8; 4]; 256];
+            for (raw, entry) in lut.iter_mut().enumerate() {
+                let value = if Some(raw as u8) == *nodata {
+                    None
+                } else {
+                    Some(raw as f64 * gain + offset)
+                };
+                *entry = colormap.color(value);
+            }
+            for &raw in data {
+                rgba.extend_from_slice(&lut[raw as usize]);
+            }
+        }
     }
     rgba
 }
@@ -709,12 +739,62 @@ mod tests {
         assert!(!a.bytes().is_empty(), "an empty tile is still a real PNG");
     }
 
+    /// The #206 correctness property: colorizing a `U8` tile through the
+    /// 256-entry LUT must produce RGBA byte-identical to boxing the same
+    /// samples to `F64` — nodata sentinel, gain/offset decode, and every
+    /// colormap edge included. If this ever breaks, the fast path is
+    /// changing WHAT is rendered, not just how.
+    #[test]
+    fn u8_lut_colorize_matches_boxed_f64_exactly() {
+        use ds_core::map_engine::RasterValues;
+        // Every possible raw byte, plus the sentinel scattered through.
+        let data: Vec<u8> = (0..=255u8).chain([255, 0, 128, 255]).collect();
+        let (gain, offset, nodata) = (0.5, -32.0, Some(255u8));
+        let boxed: Vec<Option<f64>> = data
+            .iter()
+            .map(|&raw| {
+                if Some(raw) == nodata {
+                    None
+                } else {
+                    Some(raw as f64 * gain + offset)
+                }
+            })
+            .collect();
+        let w = data.len() as u32;
+        let u8_tile = RasterTile {
+            width: w,
+            height: 1,
+            values: RasterValues::U8 {
+                data,
+                nodata,
+                gain,
+                offset,
+            },
+        };
+        let f64_tile = RasterTile {
+            width: w,
+            height: 1,
+            values: boxed.into(),
+        };
+        // A colormap whose stops sit at fractional dBZ values, so rounding
+        // behaviour is exercised, over the packed byte range.
+        let cmap = LutColorMap::from_builtin(BuiltinColormap::RadarDbz, -32.0, 95.5);
+        assert_eq!(
+            colorize(&u8_tile, &cmap),
+            colorize(&f64_tile, &cmap),
+            "U8 LUT colorize must be byte-identical to the boxed F64 path"
+        );
+    }
+
     #[test]
     fn test_render_tile_png_produces_valid_png() {
         let tile = RasterTile {
             width: 4,
             height: 4,
-            values: (0..16).map(|i| Some(i as f64 / 15.0)).collect(),
+            values: (0..16)
+                .map(|i| Some(i as f64 / 15.0))
+                .collect::<Vec<_>>()
+                .into(),
         };
         let cmap = LutColorMap::from_builtin(BuiltinColormap::Grayscale, 0.0, 1.0);
         let png_bytes = render_tile_png(&tile, &cmap).unwrap();
@@ -726,7 +806,10 @@ mod tests {
         let tile = RasterTile {
             width: 4,
             height: 4,
-            values: (0..16).map(|i| Some(i as f64 / 15.0)).collect(),
+            values: (0..16)
+                .map(|i| Some(i as f64 / 15.0))
+                .collect::<Vec<_>>()
+                .into(),
         };
         let cmap = LutColorMap::from_builtin(BuiltinColormap::Grayscale, 0.0, 1.0);
         let jpeg_bytes = render_tile(&tile, &cmap, ImageFormat::Jpeg).unwrap();
@@ -738,7 +821,7 @@ mod tests {
         let tile = RasterTile {
             width: 1,
             height: 1,
-            values: vec![None],
+            values: vec![None].into(),
         };
         let cmap = LutColorMap::from_builtin(BuiltinColormap::Grayscale, 0.0, 1.0);
         let rgba = colorize(&tile, &cmap);
@@ -750,7 +833,7 @@ mod tests {
         let tile = RasterTile {
             width: 4,
             height: 4,
-            values: vec![None; 16],
+            values: vec![None; 16].into(),
         };
         assert!(tile.is_empty());
         let cmap = LutColorMap::from_builtin(BuiltinColormap::Grayscale, 0.0, 1.0);
@@ -764,7 +847,7 @@ mod tests {
         let tile = RasterTile {
             width: 2,
             height: 2,
-            values: vec![None, Some(1.0), None, None],
+            values: vec![None, Some(1.0), None, None].into(),
         };
         assert!(!tile.is_empty());
     }

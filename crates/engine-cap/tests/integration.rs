@@ -241,7 +241,7 @@ fn renders_severity_with_max_overlap_wgs84() {
             None,
         )
         .unwrap();
-    let px = |x: usize, y: usize| tile.values[y * 100 + x];
+    let px = |x: usize, y: usize| tile.values.value_at(y * 100 + x);
     // Centre (25.0, 60.2) is inside both the flood polygon (Severe=3) and the
     // 8 km heat circle (Extreme=4) → Combine::Max resolves to 4.
     assert_eq!(px(50, 50), Some(4.0));
@@ -269,14 +269,10 @@ fn renders_in_web_mercator() {
             None,
         )
         .unwrap();
-    let filled = tile.values.iter().filter(|v| v.is_some()).count();
+    let filled = tile.values.iter_values().filter(|v| v.is_some()).count();
     assert!(filled > 100, "expected a substantial fill, got {filled}");
     // Highest severity present is Extreme (4) where the alerts overlap.
-    let max = tile
-        .values
-        .iter()
-        .filter_map(|v| *v)
-        .fold(f64::MIN, f64::max);
+    let max = tile.values.iter_values().flatten().fold(f64::MIN, f64::max);
     assert_eq!(max, 4.0);
 }
 
@@ -299,7 +295,7 @@ fn time_selection_renders_only_active_alerts() {
         .unwrap();
     assert!(!during.is_empty());
     assert_eq!(
-        during.values.iter().filter_map(|v| *v).fold(0.0, f64::max),
+        during.values.iter_values().flatten().fold(0.0, f64::max),
         3.0
     );
 

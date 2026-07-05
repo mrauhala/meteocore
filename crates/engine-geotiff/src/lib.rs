@@ -1463,7 +1463,6 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
 
         let [west, south, east, north] = bbox;
         let total_pixels = (width as usize) * (height as usize);
-        let mut values = Vec::with_capacity(total_pixels);
 
         // Select the best overview level for the output resolution.
         // This avoids reading millions of full-resolution pixels for zoomed-out views.
@@ -1529,7 +1528,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         // Compute the source pixel range in the selected level
         let source_range = gt.bbox_to_pixels(west, south, east, north);
 
-        if let Some((col_start, row_start, col_end, row_end)) = source_range {
+        let values = if let Some((col_start, row_start, col_end, row_end)) = source_range {
             let src_nx = (col_end - col_start) as usize;
 
             tracing::debug!(
@@ -1542,34 +1541,6 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                 row_end - row_start,
                 src_nx * ((row_end - row_start) as usize)
             );
-
-            // Read from overview or full resolution
-            let pixels = if let Some(ov) = overview {
-                reader::read_bbox_overview(
-                    source,
-                    metadata,
-                    ov,
-                    col_start,
-                    row_start,
-                    col_end,
-                    row_end,
-                    Some(&self.tile_cache),
-                    &entry.path,
-                    self.band_index,
-                )
-            } else {
-                reader::read_bbox_map(
-                    source,
-                    metadata,
-                    col_start,
-                    row_start,
-                    col_end,
-                    row_end,
-                    Some(&self.tile_cache),
-                    &entry.path,
-                    self.band_index,
-                )
-            }?;
 
             // Map output pixels to source pixels through a coarse projection
             // grid instead of projecting every pixel: the CRS forward transform
@@ -1597,42 +1568,92 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             // footprint, so bound, in output-pixel space, the window the footprint
             // can occupy and treat everything outside it as nodata. Computed once
             // from the source's WGS84 envelope (no per-pixel projection).
-            let (px_lo, px_hi, py_lo, py_hi) =
-                output_crs.footprint_pixel_window(bbox, gt.bbox(), width, height);
+            let footprint = output_crs.footprint_pixel_window(bbox, gt.bbox(), width, height);
 
-            // Resample source grid to output dimensions using nearest-neighbor.
-            for oy in 0..height {
-                let in_y = oy >= py_lo && oy <= py_hi;
-                for ox in 0..width {
-                    if !in_y || ox < px_lo || ox > px_hi {
-                        values.push(None);
-                        continue;
+            // Native u8 fast path (#206): keep raw bytes end to end — window
+            // read, nearest resample, and (in ds-render) a 256-entry-LUT
+            // colorize — instead of boxing every sample to a 16-byte
+            // `Option<f64>`. `read_bbox_u8` gates itself (local source,
+            // u8 chunks, integer u8 nodata) and returns `None` to fall back;
+            // both branches render pixel-identically by construction.
+            let native = reader::read_bbox_u8(
+                source,
+                metadata,
+                overview,
+                col_start,
+                row_start,
+                col_end,
+                row_end,
+                self.band_index,
+            )?;
+            match native {
+                Some(window) => {
+                    let mut data = Vec::with_capacity(total_pixels);
+                    resample_nearest(
+                        &grid,
+                        width,
+                        height,
+                        &window.data,
+                        src_nx,
+                        (col_start, row_start, col_end, row_end),
+                        window.nodata,
+                        footprint,
+                        &mut data,
+                    );
+                    ds_core::map_engine::RasterValues::U8 {
+                        data,
+                        nodata: Some(window.nodata),
+                        gain: metadata.scale.unwrap_or(1.0),
+                        offset: metadata.offset.unwrap_or(0.0),
                     }
-                    let (col_f, row_f) = grid.sample(ox, oy);
-                    if !col_f.is_finite() || !row_f.is_finite() {
-                        values.push(None);
-                        continue;
-                    }
-                    let col = col_f.floor();
-                    let row = row_f.floor();
-                    if col >= col_start as f64
-                        && col < col_end as f64
-                        && row >= row_start as f64
-                        && row < row_end as f64
-                    {
-                        let sc = col as usize - col_start as usize;
-                        let sr = row as usize - row_start as usize;
-                        let idx = sr * src_nx + sc;
-                        values.push(pixels.get(idx).copied().unwrap_or(None));
+                }
+                None => {
+                    // Boxed fallback: read from overview or full resolution.
+                    let pixels = if let Some(ov) = overview {
+                        reader::read_bbox_overview(
+                            source,
+                            metadata,
+                            ov,
+                            col_start,
+                            row_start,
+                            col_end,
+                            row_end,
+                            Some(&self.tile_cache),
+                            &entry.path,
+                            self.band_index,
+                        )
                     } else {
-                        values.push(None);
-                    }
+                        reader::read_bbox_map(
+                            source,
+                            metadata,
+                            col_start,
+                            row_start,
+                            col_end,
+                            row_end,
+                            Some(&self.tile_cache),
+                            &entry.path,
+                            self.band_index,
+                        )
+                    }?;
+                    let mut values = Vec::with_capacity(total_pixels);
+                    resample_nearest(
+                        &grid,
+                        width,
+                        height,
+                        &pixels,
+                        src_nx,
+                        (col_start, row_start, col_end, row_end),
+                        None,
+                        footprint,
+                        &mut values,
+                    );
+                    ds_core::map_engine::RasterValues::F64(values)
                 }
             }
         } else {
             // Bbox doesn't intersect raster at all — all nodata
-            values.resize(total_pixels, None);
-        }
+            ds_core::map_engine::RasterValues::F64(vec![None; total_pixels])
+        };
 
         Ok(ds_core::map_engine::RasterTile {
             width,
@@ -1646,6 +1667,54 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         // (`refresh_raster_info`). No per-request CRS scan, timestamp Vec
         // allocation, or STAC metadata fetch on the request path (#211).
         (*self.raster_info.load_full()).clone()
+    }
+}
+
+/// Nearest-neighbour resample of a source window into the output grid,
+/// generic over the sample representation (`Option<f64>` boxed path, raw
+/// `u8` native path — #206). Byte-for-byte the same mapping in both: out-of
+/// -footprint, non-finite-grid, and out-of-window pixels get `fill` (the
+/// nodata representation of `T`), everything else copies the enclosing
+/// source sample.
+#[allow(clippy::too_many_arguments)]
+fn resample_nearest<T: Copy>(
+    grid: &ds_core::resample::ProjectionGrid,
+    width: u32,
+    height: u32,
+    window: &[T],
+    src_nx: usize,
+    (col_start, row_start, col_end, row_end): (u32, u32, u32, u32),
+    fill: T,
+    (px_lo, px_hi, py_lo, py_hi): (u32, u32, u32, u32),
+    out: &mut Vec<T>,
+) {
+    for oy in 0..height {
+        let in_y = oy >= py_lo && oy <= py_hi;
+        for ox in 0..width {
+            if !in_y || ox < px_lo || ox > px_hi {
+                out.push(fill);
+                continue;
+            }
+            let (col_f, row_f) = grid.sample(ox, oy);
+            if !col_f.is_finite() || !row_f.is_finite() {
+                out.push(fill);
+                continue;
+            }
+            let col = col_f.floor();
+            let row = row_f.floor();
+            if col >= col_start as f64
+                && col < col_end as f64
+                && row >= row_start as f64
+                && row < row_end as f64
+            {
+                let sc = col as usize - col_start as usize;
+                let sr = row as usize - row_start as usize;
+                let idx = sr * src_nx + sc;
+                out.push(window.get(idx).copied().unwrap_or(fill));
+            } else {
+                out.push(fill);
+            }
+        }
     }
 }
 

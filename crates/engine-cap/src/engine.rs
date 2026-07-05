@@ -342,7 +342,7 @@ impl MapEngine for CapEngine {
                 return Ok(RasterTile {
                     width,
                     height,
-                    values,
+                    values: values.into(),
                 })
             }
         };
@@ -379,7 +379,7 @@ impl MapEngine for CapEngine {
         Ok(RasterTile {
             width,
             height,
-            values,
+            values: values.into(),
         })
     }
 

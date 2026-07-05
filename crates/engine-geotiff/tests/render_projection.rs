@@ -44,7 +44,7 @@ fn tm35fin_engine() -> GeoTiffEngine {
 }
 
 fn count_data(tile: &ds_core::map_engine::RasterTile) -> usize {
-    tile.values.iter().filter(|v| v.is_some()).count()
+    tile.values.iter_values().filter(|v| v.is_some()).count()
 }
 
 // A bbox well inside the fixture's coverage (its trapezoid spans lon 6.7–43°E,

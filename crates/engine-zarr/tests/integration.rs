@@ -189,7 +189,7 @@ fn forecast_uses_latest_run_with_lead_as_time() {
             None,
         )
         .unwrap();
-    let rendered: Vec<f64> = tile.values.iter().flatten().copied().collect();
+    let rendered: Vec<f64> = tile.values.iter_values().flatten().collect();
     assert!(!rendered.is_empty(), "render path produced no data");
     assert!(
         rendered.iter().all(|&v| v >= 1000.0),
@@ -369,8 +369,11 @@ fn raster_tile_wgs84_matches_linear_field() {
         )
         .unwrap();
     assert_eq!(tile.values.len(), 16 * 12);
-    assert!(tile.values.iter().flatten().all(|v| v.is_finite()));
-    let v = tile.values[6 * 16 + 8].expect("pixel (8,6) has data");
+    assert!(tile.values.iter_values().flatten().all(|v| v.is_finite()));
+    let v = tile
+        .values
+        .value_at(6 * 16 + 8)
+        .expect("pixel (8,6) has data");
     // 273.15 + 0.1*54 + 0.01*8 = 278.63 at t=0.
     assert!((v - 278.63).abs() < 0.05, "pixel value {v}");
 }
@@ -398,11 +401,11 @@ fn raster_tile_projected_via_build_2d_no_nan_leak() {
         .unwrap();
     assert_eq!(tile.values.len(), 16 * 16);
     assert!(
-        tile.values.iter().flatten().all(|v| v.is_finite()),
+        tile.values.iter_values().flatten().all(|v| v.is_finite()),
         "no NaN may leak through the projected path"
     );
     assert!(
-        tile.values.iter().filter(|v| v.is_some()).count() > 0,
+        tile.values.iter_values().filter(|v| v.is_some()).count() > 0,
         "projected tile should have data"
     );
 }
@@ -423,7 +426,7 @@ fn raster_tile_off_grid_is_transparent() {
         .unwrap();
     assert_eq!(tile.values.len(), 64);
     assert!(
-        tile.values.iter().all(|v| v.is_none()),
+        tile.values.iter_values().all(|v| v.is_none()),
         "off-grid → transparent"
     );
 }
@@ -446,7 +449,7 @@ fn raster_tile_between_cell_centres_still_renders() {
         )
         .unwrap();
     assert!(
-        tile.values.iter().any(|v| v.is_some()),
+        tile.values.iter_values().any(|v| v.is_some()),
         "between-centres tile must interpolate, not be transparent"
     );
 }
