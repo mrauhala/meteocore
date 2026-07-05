@@ -839,8 +839,6 @@ fn scan_source(
             // file whose name carries no parseable timestamp falls through
             // to the post-parse volume-time filter.
             pending.retain(|p| within_window_by_name(&p.id, time_filter));
-            // `source` is local here, so `build_catalog` skips the (remote-only)
-            // pixel pre-warm regardless of `prewarm_sweeps`.
             let mut by_site = build_catalog(collection_id, pending, source, cache, prewarm_sweeps);
             retain_within(&mut by_site, time_filter);
             Ok(derive_catalog(by_site, cache, max_files))
@@ -1159,6 +1157,14 @@ fn build_catalog(
             FetchSpec::Local(path) => match std::fs::read(&path) {
                 Ok(bytes) => {
                     if let Some(v) = parse_and_cache(collection_id, &id, &bytes, cache) {
+                        // Prime the pixel cache from the bytes still in hand
+                        // (#472): off-peak the page cache for these files is
+                        // routinely reclaimed, so without this the first
+                        // render of each new timestep pays a cold whole-file
+                        // read + parse on a render permit (~2–3 s p99 spikes).
+                        // Only reached for parse-cache misses (new files), so
+                        // a stable directory re-warms nothing.
+                        prewarm_pixels(source, &id, &v, &bytes, prewarm_sweeps);
                         insert_volume(collection_id, &mut by_site, id, v);
                     }
                 }
@@ -1209,8 +1215,7 @@ fn build_catalog(
                         // (background runtime), so the first interactive render
                         // of this newly-fetched volume is a cache hit instead
                         // of a cold whole-`.h5` S3 re-download on a render
-                        // permit (#461). Remote only — local re-reads are
-                        // page-cached, hence this lives in the remote arm.
+                        // permit (#461; the local arm does the same — #472).
                         prewarm_pixels(source, id, &v, &bytes, prewarm_sweeps);
                         insert_volume(collection_id, &mut by_site, id.clone(), v);
                     }
@@ -1251,18 +1256,27 @@ fn parse_and_cache(
 }
 
 /// Pre-decode the lowest `n_sweeps` elevation sweeps' moments of a
-/// freshly-fetched **remote** volume into [`PIXEL_CACHE`], straight from the
-/// `bytes` the scan already holds (so no extra S3 fetch), on the background
-/// poll runtime.
+/// freshly-parsed volume into [`PIXEL_CACHE`], straight from the `bytes` the
+/// scan already holds (so no extra fetch or re-read), on the background poll
+/// runtime.
 ///
 /// This is the poll-time half of the lazy-pixel design (#289): the catalog
 /// holds metadata only and a moment's array is normally read on its first
-/// render — a cold whole-`.h5` S3 download performed **while holding a render
-/// semaphore permit**. Under a burst (a client animating the latest N
-/// timesteps) those cold downloads contend and some requests are cut off by
-/// the front proxy with an empty body before the slow render finishes — the
-/// "missing timestep" frames (#461). Priming the base tilt here turns that
-/// first render into a cache hit.
+/// render — a cold whole-`.h5` read + full HDF5 parse performed **while
+/// holding a render semaphore permit**. Both source kinds need the warm-up:
+///
+/// - **Remote (#461):** under a burst (a client animating the latest N
+///   timesteps) the cold S3 downloads contend and some requests are cut off
+///   by the front proxy with an empty body before the slow render finishes —
+///   the "missing timestep" frames.
+/// - **Local (#472):** off-peak, the OS page cache for a 20–40 MB volume is
+///   routinely reclaimed, so the first render of each new timestep pays a
+///   genuinely cold disk read + full-structure parse — observed as recurring
+///   night-time p99 spikes to ~2–3 s on otherwise-idle prod. (The original
+///   "local re-reads hit the page cache" assumption only holds while traffic
+///   keeps the files hot.)
+///
+/// Priming the base tilt here turns that first render into a cache hit.
 ///
 /// Best-effort and purely additive: it never marks a moment known-bad (a
 /// transient background decode hiccup must not blacklist a moment for
@@ -1280,13 +1294,6 @@ fn prewarm_pixels(
     n_sweeps: usize,
 ) {
     if n_sweeps == 0 || PIXEL_CACHE.capacity() == 0 {
-        return;
-    }
-    // Remote-only by contract: a local source's re-reads hit the OS page cache,
-    // so warming nothing is correct. Only `build_catalog`'s remote arm calls
-    // this today, but enforce it here so a future caller in the local arm
-    // degrades to a no-op rather than silently pre-warming local pixels.
-    if matches!(source, Source::Local { .. }) {
         return;
     }
     let cache_id = pixel_cache_id(source, file_id);
@@ -4915,6 +4922,23 @@ mod tests {
         assert!(
             !pixel_cache().contains(&cid0, &lowest),
             "n_sweeps = 0 must pre-warm nothing"
+        );
+
+        // Local sources pre-warm too (#472 — the remote-only guard is gone):
+        // off-peak the page cache for local volumes is reclaimed, so their
+        // first render paid a cold whole-file read + parse under the render
+        // permit exactly like the remote case #461 fixed.
+        let local = Source::Local {
+            data_dir: PathBuf::from("/prewarm-472-local"),
+            time_window: None,
+        };
+        let local_id = "/prewarm-472-local/202605191050_fivih_PVOL.h5";
+        let local_cid = pixel_cache_id(&local, local_id);
+        assert!(!pixel_cache().contains(&local_cid, &lowest));
+        prewarm_pixels(&local, local_id, &volume, &bytes, 1);
+        assert!(
+            pixel_cache().contains(&local_cid, &lowest),
+            "a local source must pre-warm its lowest sweep (#472)"
         );
     }
 

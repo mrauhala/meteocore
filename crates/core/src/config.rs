@@ -731,20 +731,19 @@ pub struct OdimConfig {
 
     /// Number of the lowest elevation sweeps whose pixel arrays are
     /// **pre-decoded into the pixel cache at poll time** (`engine_type =
-    /// "odim-volume"`, **remote/S3 sources only** — local re-reads hit the OS
-    /// page cache, so it is inert for a `data_path` source).
+    /// "odim-volume"`, remote **and** local sources — #461/#472).
     ///
-    /// The poll loop already downloads each volume's full bytes to build the
+    /// The poll loop already holds each new volume's full bytes to build the
     /// catalog; pre-warming decodes the base tilt(s) straight from those bytes
     /// (on the background runtime) so the **first** interactive WMS/Maps/Tiles
     /// render of a freshly-advertised timestep is a cache hit instead of a cold
-    /// whole-`.h5` S3 re-download on a render-semaphore permit — the cause of
-    /// dropped frames when a client animates the latest N timesteps of a remote
-    /// PVOL. Default `1` (the lowest sweep — the standard base-reflectivity
-    /// animation view, all of its quantities). Set higher to warm more tilts,
-    /// `0` to disable. Bounded by the pixel-cache byte budget
-    /// (`MC_PVOL_PIXEL_CACHE_MB`); pre-warmed entries that overflow it evict by
-    /// LRU like any other.
+    /// whole-`.h5` read on a render-semaphore permit — the cause of dropped
+    /// frames on remote sources (#461) and of off-peak p99 spikes on local
+    /// ones, whose page cache is reclaimed between renders (#472). Default `1`
+    /// (the lowest sweep — the standard base-reflectivity animation view, all
+    /// of its quantities). Set higher to warm more tilts, `0` to disable.
+    /// Bounded by the pixel-cache byte budget (`MC_PVOL_PIXEL_CACHE_MB`);
+    /// pre-warmed entries that overflow it evict by LRU like any other.
     #[serde(default = "default_prewarm_sweeps")]
     pub prewarm_sweeps: usize,
 }
