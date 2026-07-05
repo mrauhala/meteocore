@@ -70,7 +70,7 @@ impl MapEngine for MockMapEngine {
         Ok(RasterTile {
             width,
             height,
-            values,
+            values: values.into(),
         })
     }
 
@@ -1001,7 +1001,7 @@ impl MapEngine for EmptyMockMapEngine {
         Ok(RasterTile {
             width,
             height,
-            values: vec![None; pixel_count],
+            values: vec![None; pixel_count].into(),
         })
     }
 
@@ -1108,7 +1108,7 @@ impl MapEngine for MultiParamMockEngine {
         Ok(RasterTile {
             width,
             height,
-            values,
+            values: values.into(),
         })
     }
 
@@ -1722,7 +1722,7 @@ mod temporal_grid_jitter {
             Ok(RasterTile {
                 width,
                 height,
-                values: vec![None; (width * height) as usize],
+                values: vec![None; (width * height) as usize].into(),
             })
         }
 

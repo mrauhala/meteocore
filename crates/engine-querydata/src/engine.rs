@@ -451,7 +451,7 @@ impl MapEngine for QueryDataEngine {
         Ok(RasterTile {
             width,
             height,
-            values,
+            values: values.into(),
         })
     }
 
@@ -954,7 +954,7 @@ mod tests {
         assert_eq!(tile.width, 16);
         assert_eq!(tile.height, 16);
         assert_eq!(tile.values.len(), 256);
-        let non_none = tile.values.iter().filter(|v| v.is_some()).count();
+        let non_none = tile.values.iter_values().filter(|v| v.is_some()).count();
         assert!(non_none > 0, "Tile should have some data values");
     }
 
@@ -986,11 +986,11 @@ mod tests {
 
         assert_eq!(tile.values.len(), 256);
         assert!(
-            tile.values.iter().filter(|v| v.is_some()).count() > 0,
+            tile.values.iter_values().filter(|v| v.is_some()).count() > 0,
             "projected build_2d tile should have data"
         );
         assert!(
-            tile.values.iter().flatten().all(|v| v.is_finite()),
+            tile.values.iter_values().flatten().all(|v| v.is_finite()),
             "no NaN may leak through the build_2d path"
         );
     }

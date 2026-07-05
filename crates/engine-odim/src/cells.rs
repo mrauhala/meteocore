@@ -306,7 +306,7 @@ impl PolarVolumeSiteView {
         Ok(RasterTile {
             width,
             height,
-            values,
+            values: values.into(),
         })
     }
 }

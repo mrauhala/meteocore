@@ -2155,7 +2155,7 @@ fn polar_sample(
         return Ok(RasterTile {
             width,
             height,
-            values: vec![None; (width as usize) * (height as usize)],
+            values: vec![None; (width as usize) * (height as usize)].into(),
         });
     };
 
@@ -2167,7 +2167,7 @@ fn polar_sample(
         return Ok(RasterTile {
             width,
             height,
-            values: vec![None; (width as usize) * (height as usize)],
+            values: vec![None; (width as usize) * (height as usize)].into(),
         });
     }
 
@@ -2265,7 +2265,7 @@ fn polar_sample(
     Ok(RasterTile {
         width,
         height,
-        values,
+        values: values.into(),
     })
 }
 
@@ -5140,16 +5140,25 @@ mod tests {
 
         assert_eq!(tile.values.len(), 50);
         // Leftmost pixel ≈ at the site → bin 0.
-        let first = tile.values[0].expect("near-site pixel should sample");
+        let first = tile
+            .values
+            .value_at(0)
+            .expect("near-site pixel should sample");
         assert!(first < 2.0, "near-site pixel ≈ bin 0, got {first}");
         // Rightmost pixel ≈ 50 km out → bin ≈ 49.
-        let last = tile.values[49].expect("far pixel should sample");
+        let last = tile.values.value_at(49).expect("far pixel should sample");
         assert!(
             (45.0..=50.0).contains(&last),
             "far pixel ≈ bin 49, got {last}"
         );
         // Values increase monotonically with eastward distance.
-        for w in tile.values.iter().flatten().collect::<Vec<_>>().windows(2) {
+        for w in tile
+            .values
+            .iter_values()
+            .flatten()
+            .collect::<Vec<_>>()
+            .windows(2)
+        {
             assert!(w[0] <= w[1], "bin index must rise with distance");
         }
     }
@@ -5211,7 +5220,7 @@ mod tests {
                     let (lon, lat) = output_crs.project_node(bbox, frac_x, frac_y);
                     let reference =
                         sample_sweep_moment_bilinear(sweep, moment, &raw, &origin, lon, lat);
-                    let grid = tile.values[(oy * w + ox) as usize];
+                    let grid = tile.values.value_at((oy * w + ox) as usize);
                     match (grid, reference) {
                         (Some(g), Some(r)) => {
                             max_diff = max_diff.max((g - r).abs());
@@ -5267,7 +5276,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            tile.values.iter().all(Option::is_none),
+            tile.values.iter_values().all(|v| v.is_none()),
             "pixels past max range must be None"
         );
     }
@@ -5551,7 +5560,7 @@ mod tests {
         // render blended across rays — impossible for nearest-neighbour.
         let fractional = tile
             .values
-            .iter()
+            .iter_values()
             .flatten()
             .any(|v| (v - v.round()).abs() > 1e-6);
         assert!(
@@ -5633,11 +5642,11 @@ mod tests {
         .unwrap();
         // Every sampled value is the raw ray index — an exact integer. A
         // single fractional value would mean the render blended rays.
-        let sampled = tile.values.iter().flatten().count();
+        let sampled = tile.values.iter_values().flatten().count();
         assert!(sampled > 0, "expected some in-range pixels to sample");
         assert!(
             tile.values
-                .iter()
+                .iter_values()
                 .flatten()
                 .all(|v| (v - v.round()).abs() < 1e-9),
             "nearest render must return raw cell values with no blending"
@@ -6184,7 +6193,7 @@ mod tests {
         .expect("render with a bare quantity");
         assert_eq!(tile.values.len(), 32 * 4);
         assert!(
-            tile.values.iter().any(Option::is_some),
+            tile.values.iter_values().any(|v| v.is_some()),
             "a render over the radar's own coverage samples some echoes"
         );
 

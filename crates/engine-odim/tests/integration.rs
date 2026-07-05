@@ -528,7 +528,7 @@ fn pvol_engine_renders_fmi_vihti_volume() {
     assert_eq!(tile.width, 128);
     assert_eq!(tile.height, 128);
     assert_eq!(tile.values.len(), 128 * 128);
-    let non_none = tile.values.iter().filter(|v| v.is_some()).count();
+    let non_none = tile.values.iter_values().filter(|v| v.is_some()).count();
     assert!(
         non_none > 0,
         "a render over the radar's own coverage bbox must sample some \
@@ -960,7 +960,7 @@ fn pvol_cells_raster_layer() {
         )
         .expect("CELLS raster over coverage");
     assert_eq!((tile.width, tile.height), (512, 512));
-    let painted: Vec<f64> = tile.values.iter().filter_map(|v| *v).collect();
+    let painted: Vec<f64> = tile.values.iter_values().flatten().collect();
     assert!(
         !painted.is_empty(),
         "the fixture storm must paint at least one outline"
@@ -1299,7 +1299,7 @@ fn pvol_engine_remote_scan_discovers_fmi_volume() {
         .expect("render of the remotely-scanned volume succeeds");
     assert_eq!(tile.values.len(), 64 * 64);
     assert!(
-        tile.values.iter().any(Option::is_some),
+        tile.values.iter_values().any(|v| v.is_some()),
         "a render over the radar's own coverage must sample some echoes"
     );
 }

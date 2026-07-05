@@ -1279,7 +1279,7 @@ impl MapEngine for GribEngine {
         Ok(RasterTile {
             width,
             height,
-            values,
+            values: values.into(),
         })
     }
 

@@ -69,7 +69,7 @@ impl MapEngine for MockMapEngine {
         Ok(RasterTile {
             width,
             height,
-            values,
+            values: values.into(),
         })
     }
 
@@ -1234,7 +1234,7 @@ impl MapEngine for EmptyMockMapEngine {
         Ok(RasterTile {
             width,
             height,
-            values: vec![None; pixel_count],
+            values: vec![None; pixel_count].into(),
         })
     }
 
@@ -1338,7 +1338,7 @@ impl MapEngine for MultiParamMockEngine {
         Ok(ds_core::map_engine::RasterTile {
             width,
             height,
-            values,
+            values: values.into(),
         })
     }
 
@@ -1509,7 +1509,7 @@ mod vertical_extent {
             Ok(RasterTile {
                 width,
                 height,
-                values: vec![None; (width * height) as usize],
+                values: vec![None; (width * height) as usize].into(),
             })
         }
 
@@ -1575,7 +1575,7 @@ mod vertical_extent {
             Ok(RasterTile {
                 width,
                 height,
-                values: vec![None; (width * height) as usize],
+                values: vec![None; (width * height) as usize].into(),
             })
         }
 
@@ -1637,7 +1637,7 @@ mod extent_edge_cases {
             Ok(RasterTile {
                 width,
                 height,
-                values: vec![None; (width * height) as usize],
+                values: vec![None; (width * height) as usize].into(),
             })
         }
 
@@ -1676,7 +1676,7 @@ mod extent_edge_cases {
             Ok(RasterTile {
                 width,
                 height,
-                values: vec![None; (width * height) as usize],
+                values: vec![None; (width * height) as usize].into(),
             })
         }
 
@@ -1762,7 +1762,7 @@ mod extent_edge_cases {
             Ok(RasterTile {
                 width,
                 height,
-                values: vec![None; (width * height) as usize],
+                values: vec![None; (width * height) as usize].into(),
             })
         }
 

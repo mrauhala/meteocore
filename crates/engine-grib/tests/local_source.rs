@@ -73,7 +73,7 @@ fn grib_engine_serves_local_directory() {
         .expect("render a tile from the local grib");
     assert_eq!(tile.values.len(), 32 * 16);
     assert!(
-        tile.values.iter().any(|v| v.is_some()),
+        tile.values.iter_values().any(|v| v.is_some()),
         "rendered tile should contain data values"
     );
 }

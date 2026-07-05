@@ -644,7 +644,7 @@ mod tests {
         Ok(RasterTile {
             width: w,
             height: h,
-            values: vec![Some(1.0); (w * h) as usize],
+            values: vec![Some(1.0); (w * h) as usize].into(),
         })
     }
 
@@ -729,7 +729,7 @@ mod tests {
             Ok(RasterTile {
                 width: w,
                 height: h,
-                values: vec![None; (w * h) as usize],
+                values: vec![None; (w * h) as usize].into(),
             })
         };
         let out = render_metatiled(
@@ -912,7 +912,7 @@ mod tests {
             Ok(RasterTile {
                 width: tw,
                 height: th,
-                values,
+                values: values.into(),
             })
         };
         let cmap = AxisEncode {
@@ -966,7 +966,7 @@ mod tests {
             Ok(RasterTile {
                 width: tw,
                 height: th,
-                values,
+                values: values.into(),
             })
         };
         let cmap_y = AxisEncode {
@@ -1030,7 +1030,7 @@ mod tests {
             Ok(RasterTile {
                 width: w,
                 height: h,
-                values,
+                values: values.into(),
             })
         }
         let cache = TilePixelCache::new(64);
@@ -1107,7 +1107,7 @@ mod tests {
         for row in 0..h {
             let lat = y_to_lat(my_n - (row as f64 + 0.5) / h as f64 * (my_n - my_s));
             // The stripe is full-width, so column 0 represents the whole row.
-            if direct.values[(row * w) as usize].is_some() {
+            if direct.values.value_at((row * w) as usize).is_some() {
                 d_lo = d_lo.min(lat);
                 d_hi = d_hi.max(lat);
             }

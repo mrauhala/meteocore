@@ -70,7 +70,7 @@ fn ghost_count(engine: &GeoTiffEngine, bbox: [f64; 4], w: u32, h: u32) -> (usize
     let mut total = 0;
     for oy in 0..h {
         for ox in 0..w {
-            if tile.values[(oy * w + ox) as usize].is_none() {
+            if tile.values.value_at((oy * w + ox) as usize).is_none() {
                 continue;
             }
             total += 1;

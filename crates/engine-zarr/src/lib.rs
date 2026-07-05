@@ -382,7 +382,7 @@ impl MapEngine for ZarrEngine {
             return Ok(RasterTile {
                 width,
                 height,
-                values: vec![None; n],
+                values: vec![None; n].into(),
             });
         };
 
@@ -450,7 +450,7 @@ impl MapEngine for ZarrEngine {
         Ok(RasterTile {
             width,
             height,
-            values,
+            values: values.into(),
         })
     }
 

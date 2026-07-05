@@ -42,7 +42,10 @@ impl MapEngine for MockMapEngine {
         Ok(RasterTile {
             width,
             height,
-            values: (0..n).map(|i| Some(i as f64 / n as f64)).collect(),
+            values: (0..n)
+                .map(|i| Some(i as f64 / n as f64))
+                .collect::<Vec<_>>()
+                .into(),
         })
     }
 
