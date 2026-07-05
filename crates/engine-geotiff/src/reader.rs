@@ -1699,7 +1699,13 @@ pub fn read_bbox_u8(
     let nx = (col_end - col_start) as usize;
     let ny = (row_end - row_start) as usize;
     let total_pixels = nx * ny;
-    if total_pixels > MAX_MAP_PIXELS {
+    // Mirror each boxed twin exactly (this function must be a drop-in
+    // replacement, never a new failure mode): the full-res twin
+    // `read_bbox_map` enforces `MAX_MAP_PIXELS`, but the overview twin
+    // `read_bbox_overview` does NOT — the caller's overview selection
+    // deliberately accepts an over-cap read of the coarsest overview as
+    // "the smallest available source" rather than failing.
+    if overview.is_none() && total_pixels > MAX_MAP_PIXELS {
         return Err(DataServerError::InvalidParameter(format!(
             "Map render source area {} pixels exceeds maximum {}.",
             total_pixels, MAX_MAP_PIXELS
