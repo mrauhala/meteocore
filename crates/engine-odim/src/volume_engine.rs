@@ -624,9 +624,12 @@ impl Pixels<'_> {
         PIXEL_CACHE.record_miss();
         // NOTE: this fetches + parses the *whole* `.h5` to extract one dataset
         // (the reader has no slice API), so a file with Q cold moments is
-        // downloaded Q times. Batch-decoding all moments on the first miss is
-        // tracked in #293 — an S3-transfer optimisation; local re-reads hit the
-        // page cache.
+        // fetched Q times. Batch-decoding all moments on the first miss is
+        // tracked in #293 — and it matters for LOCAL sources too, not just S3:
+        // off-peak the page cache for these files is reclaimed (#472), so a
+        // cold local miss here (a moment above `prewarm_sweeps`, or an entry
+        // the LRU evicted) pays a real disk read + full parse on the render
+        // permit.
         let decoded = fetch_file_bytes(self.source, file_id, self.handle).and_then(|bytes| {
             read_moment_pixels(&bytes, &moment.dataset_path, nrays, nbins)
                 .map_err(|e| format!("decode `{}`: {e}", moment.dataset_path))
