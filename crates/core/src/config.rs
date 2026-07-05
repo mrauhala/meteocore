@@ -698,9 +698,13 @@ pub struct OdimConfig {
     /// `http(s)://` `data_path` (COMP) it is appended under the URL path.
     pub prefix_pattern: Option<String>,
     /// ISO 8601 duration bounding which timesteps to keep, relative to
-    /// now (e.g. `-PT12H` for the last 12 hours). Drives both prefix
-    /// date expansion and timestamp filtering for S3/HTTP sources. When
-    /// unset, the scan falls back to a fixed recent-days window.
+    /// now (e.g. `-PT12H` for the last 12 hours). For S3/HTTP sources it
+    /// drives both prefix date expansion and timestamp filtering; for a
+    /// local `data_path` (COMP and PVOL) it bounds which files are
+    /// retained from the directory on every scan (#465 — previously
+    /// silently ignored for local sources). When unset, a remote scan
+    /// falls back to a fixed recent-days window and a local scan keeps
+    /// everything (bound retention with `max_files` or this field).
     pub time_window: Option<String>,
     /// Discovery mode for an `http(s)://` `data_path` source (COMP only;
     /// ignored for local and S3 sources):

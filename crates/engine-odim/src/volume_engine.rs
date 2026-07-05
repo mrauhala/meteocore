@@ -416,7 +416,13 @@ pub(crate) fn ground_height_to_slant(
 #[derive(Clone)]
 pub(crate) enum Source {
     /// A local filesystem directory, scanned with `read_dir`.
-    Local { data_dir: PathBuf },
+    /// `time_window`, when set, bounds which volumes are retained
+    /// (relative to now at each scan) — the local analogue of the
+    /// remote arm's timestamp filter (#465).
+    Local {
+        data_dir: PathBuf,
+        time_window: Option<TimeWindow>,
+    },
     /// An S3/HTTP object store. `prefix_pattern` may carry strftime
     /// codes (e.g. `%Y/%m/%d/fivih/`); it is expanded per UTC date on
     /// every scan so the listing stays current across day boundaries.
@@ -485,8 +491,13 @@ fn build_source(
         }
         (None, None) => {
             let data_path = data_path.ok_or(EngineError::NoSource)?;
+            let time_window = match &config.time_window {
+                Some(s) => Some(TimeWindow::parse(s)?),
+                None => None,
+            };
             Ok(Source::Local {
                 data_dir: PathBuf::from(data_path),
+                time_window,
             })
         }
         _ => Err(EngineError::IncompleteS3Config),
@@ -497,7 +508,7 @@ fn build_source(
 /// messages.
 fn source_label(source: &Source) -> String {
     match source {
-        Source::Local { data_dir } => data_dir.display().to_string(),
+        Source::Local { data_dir, .. } => data_dir.display().to_string(),
         Source::Remote {
             endpoint,
             bucket,
@@ -811,11 +822,27 @@ fn scan_source(
         // bootstrap bound only matters for remote (S3/HTTP) sources where
         // each file is a multi-MB network fetch, so local always scans in
         // full regardless of `depth`.
-        Source::Local { data_dir } => {
-            let pending = enumerate_local(collection_id, data_dir)?;
+        Source::Local {
+            data_dir,
+            time_window,
+        } => {
+            // `time_window` bounds which volumes are retained from the
+            // directory — the local analogue of the remote filter below
+            // (#465; previously it was silently ignored for local).
+            let time_filter = time_window.as_ref().map(|tw| tw.to_range(Utc::now()));
+            let mut pending = enumerate_local(collection_id, data_dir)?;
+            // Drop out-of-window files by FILENAME timestamp *before*
+            // parsing (mirrors the remote arm's pre-filter): the post-parse
+            // filter alone would HDF5-parse every out-of-window file on
+            // every poll only to trim it — and `derive_catalog` then evicts
+            // its parse-cache entry, so it would be re-parsed forever. A
+            // file whose name carries no parseable timestamp falls through
+            // to the post-parse volume-time filter.
+            pending.retain(|p| within_window_by_name(&p.id, time_filter));
             // `source` is local here, so `build_catalog` skips the (remote-only)
             // pixel pre-warm regardless of `prewarm_sweeps`.
-            let by_site = build_catalog(collection_id, pending, source, cache, prewarm_sweeps);
+            let mut by_site = build_catalog(collection_id, pending, source, cache, prewarm_sweeps);
+            retain_within(&mut by_site, time_filter);
             Ok(derive_catalog(by_site, cache, max_files))
         }
         Source::Remote {
@@ -830,13 +857,34 @@ fn scan_source(
             // A `time_window` also bounds the timestamps kept: the
             // object listing can include volumes just outside the
             // window (the prefix is a whole UTC day).
-            if let Some((start, end)) = time_filter {
-                for list in by_site.values_mut() {
-                    list.retain(|e| e.volume.time >= start && e.volume.time <= end);
-                }
-            }
+            retain_within(&mut by_site, time_filter);
             Ok(derive_catalog(by_site, cache, max_files))
         }
+    }
+}
+
+/// Drop volumes whose nominal time falls outside the inclusive
+/// `(start, end)` range. `None` keeps everything. Shared by the local
+/// and remote scan arms so both apply the same `time_window` semantics.
+fn retain_within(by_site: &mut HashMap<String, Vec<VolumeEntry>>, filter: Option<TimeRange>) {
+    if let Some((start, end)) = filter {
+        for list in by_site.values_mut() {
+            list.retain(|e| e.volume.time >= start && e.volume.time <= end);
+        }
+    }
+}
+
+/// Pre-parse window test on a file's NAME: `false` only when the filename
+/// carries a parseable timestamp that falls outside the inclusive range.
+/// No filter, or no parseable timestamp, keeps the file — the post-parse
+/// [`retain_within`] (which sees the volume's internal time) is the
+/// authority; this only exists so out-of-window files are never opened
+/// and HDF5-parsed in the first place (the same cost the remote arm's
+/// candidate pre-filter avoids).
+fn within_window_by_name(id: &str, filter: Option<TimeRange>) -> bool {
+    match (filter, parse_key_timestamp(id)) {
+        (Some((start, end)), Some(ts)) => ts >= start && ts <= end,
+        _ => true,
     }
 }
 
@@ -1616,17 +1664,29 @@ impl PolarVolumeEngine {
         data_path: Option<&str>,
         config: &ds_core::config::OdimConfig,
     ) -> Result<Self, EngineError> {
-        // `time_window` only constrains S3 prefix expansion + timestamp
-        // filtering. A local `data_path` source ignores it — warn so a
-        // misplaced setting doesn't silently do nothing.
-        if config.time_window.is_some() && config.endpoint.is_none() {
+        let source = Arc::new(build_source(collection_id, data_path, config)?);
+
+        // An unbounded local source catalogs every `.h5` the directory
+        // holds (~288 volumes/site/day at 5-min cadence) and advertises
+        // every timestep in WMS TIME / EDR extents / 3D Tiles `times` —
+        // warn so the operator makes retention an explicit choice (#465).
+        // Remote sources are already bounded by the scanned date prefixes
+        // (`DEFAULT_SCAN_DAYS`).
+        if config.max_files.is_none()
+            && matches!(
+                *source,
+                Source::Local {
+                    time_window: None,
+                    ..
+                }
+            )
+        {
             tracing::warn!(
-                "[{collection_id}] `time_window` is set but has no effect on a \
-                 local `data_path` PVOL source — it only applies to S3 sources"
+                "[{collection_id}] local PVOL source has neither `max_files` nor \
+                 `time_window` — every `.h5` in the directory is cataloged \
+                 (~288 volumes/site/day at 5-min cadence); set one to bound retention"
             );
         }
-
-        let source = Arc::new(build_source(collection_id, data_path, config)?);
 
         let parse_cache = Arc::new(Mutex::new(HashMap::new()));
         // Bootstrap scan: parse only the most-recent slots so a whole-network
@@ -1642,8 +1702,17 @@ impl PolarVolumeEngine {
             config.prewarm_sweeps,
         )?;
         if catalog.by_site.is_empty() {
+            // With a `time_window`, an empty catalog can also mean every file
+            // present was older than the window — say so, or an operator
+            // pointing a bounded source at a stale directory chases a
+            // "missing files" ghost.
+            let window_hint = if config.time_window.is_some() {
+                " (or none within the configured `time_window`)"
+            } else {
+                ""
+            };
             tracing::warn!(
-                "[{collection_id}] no PVOL `.h5` files found at `{}` yet — \
+                "[{collection_id}] no PVOL `.h5` files found at `{}`{window_hint} yet — \
                  the catalog will populate on the next poll",
                 source_label(&source)
             );
@@ -4853,6 +4922,7 @@ mod tests {
     fn pixel_cache_id_local_is_bare_path() {
         let local = Source::Local {
             data_dir: PathBuf::from("/x"),
+            time_window: None,
         };
         // A local id is already an absolute path — used verbatim.
         assert_eq!(
@@ -4901,6 +4971,7 @@ mod tests {
     /// because tests pre-seed the cache (see [`seed_synthetic`]).
     static TEST_SOURCE: std::sync::LazyLock<Source> = std::sync::LazyLock::new(|| Source::Local {
         data_dir: PathBuf::from("/nonexistent-test-pvol"),
+        time_window: None,
     });
 
     /// A `Pixels` context over the dummy source — pairs with [`seed_synthetic`].
@@ -5606,7 +5677,7 @@ mod tests {
     fn build_source_selects_local_when_no_s3_fields() {
         let config = empty_config();
         match build_source("c", Some("/some/dir"), &config).unwrap() {
-            Source::Local { data_dir } => assert_eq!(data_dir, PathBuf::from("/some/dir")),
+            Source::Local { data_dir, .. } => assert_eq!(data_dir, PathBuf::from("/some/dir")),
             Source::Remote { .. } => panic!("expected a Local source"),
         }
     }
@@ -5991,6 +6062,7 @@ mod tests {
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
             source: Arc::new(Source::Local {
                 data_dir: PathBuf::from("/nonexistent-test-pvol"),
+                time_window: None,
             }),
             nod: nod.to_string(),
             collection_id: format!("test-{nod}"),
@@ -6118,6 +6190,69 @@ mod tests {
         ));
     }
 
+    /// The shared `time_window` filter: drops volumes outside the
+    /// inclusive range, keeps everything on `None`. The local scan arm now
+    /// applies it too (#465 — previously local silently ignored
+    /// `time_window`).
+    #[test]
+    fn retain_within_filters_by_volume_time() {
+        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let mut old = synthetic_volume(25.0, 60.0);
+        old.time = t("2026-07-05T00:00:00Z");
+        let mut recent = synthetic_volume(25.0, 60.0);
+        recent.time = t("2026-07-05T06:00:00Z");
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert("fivih".into(), vec![entry(old, "a"), entry(recent, "b")]);
+
+        let mut unfiltered = by_site.clone();
+        retain_within(&mut unfiltered, None);
+        assert_eq!(unfiltered["fivih"].len(), 2, "None keeps everything");
+
+        retain_within(
+            &mut by_site,
+            Some((t("2026-07-05T05:00:00Z"), t("2026-07-05T07:00:00Z"))),
+        );
+        let kept: Vec<_> = by_site["fivih"].iter().map(|e| e.volume.time).collect();
+        assert_eq!(
+            kept,
+            [t("2026-07-05T06:00:00Z")],
+            "volumes outside the window are dropped"
+        );
+    }
+
+    /// The pre-parse filename filter (review finding on #471): a file whose
+    /// NAME timestamps outside the window is dropped before it is ever
+    /// opened/parsed — otherwise out-of-window local files would be
+    /// HDF5-parsed and parse-cache-evicted on EVERY poll. Unparseable names
+    /// and no-filter pass through (the post-parse filter is the authority).
+    #[test]
+    fn within_window_by_name_drops_only_parseable_out_of_window() {
+        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let window = Some((t("2026-07-05T05:00:00Z"), t("2026-07-05T07:00:00Z")));
+
+        assert!(within_window_by_name(
+            "/data/202607050600_fivih_PVOL.h5",
+            window
+        ));
+        assert!(!within_window_by_name(
+            "/data/202607050400_fivih_PVOL.h5",
+            window
+        ));
+        // Inclusive bounds — a file exactly at the window edge is kept.
+        assert!(within_window_by_name(
+            "/data/202607050500_fivih_PVOL.h5",
+            window
+        ));
+        // No parseable timestamp in the name → keep (post-parse filter
+        // decides by the volume's internal time).
+        assert!(within_window_by_name("/data/no-timestamp.h5", window));
+        // No filter → keep everything.
+        assert!(within_window_by_name(
+            "/data/202607050400_fivih_PVOL.h5",
+            None
+        ));
+    }
+
     /// A site whose latest volume has no usable lowest sweep is kept in
     /// `by_site` but excluded from `by_site_meta` — so `sites()` (which the
     /// loader enumerates) never registers a parameter-less, broken
@@ -6153,6 +6288,7 @@ mod tests {
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
             source: Arc::new(Source::Local {
                 data_dir: PathBuf::from("/nonexistent-test-pvol"),
+                time_window: None,
             }),
             nod: "good".into(),
             collection_id: "test".into(),
@@ -6482,6 +6618,7 @@ mod tests {
             collection_id: collection_id.to_string(),
             source: Arc::new(Source::Local {
                 data_dir: PathBuf::from("/nonexistent-test-pvol"),
+                time_window: None,
             }),
             max_files: None,
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
