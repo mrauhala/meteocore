@@ -1162,8 +1162,16 @@ fn build_catalog(
                         // routinely reclaimed, so without this the first
                         // render of each new timestep pays a cold whole-file
                         // read + parse on a render permit (~2–3 s p99 spikes).
-                        // Only reached for parse-cache misses (new files), so
-                        // a stable directory re-warms nothing.
+                        // Only reached for parse-cache misses: steady-state
+                        // polls warm just the new files. A PROCESS START warms
+                        // the whole retained window once (every file is a
+                        // parse miss then; decode cost rides on the full parse
+                        // the local bootstrap already pays, bounded by
+                        // `max_files`/`time_window`). A RELOAD re-parses (the
+                        // engine's parse cache is per-engine) but re-warms
+                        // nothing — `PIXEL_CACHE` is process-global and local
+                        // cache ids (bare paths) are reload-stable, so the
+                        // `contains` skip inside `prewarm_pixels` no-ops it.
                         prewarm_pixels(source, &id, &v, &bytes, prewarm_sweeps);
                         insert_volume(collection_id, &mut by_site, id, v);
                     }
