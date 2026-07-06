@@ -138,10 +138,7 @@ fn lookup_collection<'a>(
             collection = id,
             "engine registered without a matching collection config"
         );
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "code": "InternalError", "description": "Internal server error" })),
-        )
+        server_error()
     })?;
     Ok((engine, config))
 }
