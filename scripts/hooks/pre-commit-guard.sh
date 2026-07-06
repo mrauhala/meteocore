@@ -26,9 +26,13 @@ input=$(cat)
 # script) is not treated as an invocation. This avoids denying
 # `git log --grep="git commit"` and heredoc data while still catching
 # `git add x && git commit`, `git  commit`, `git "commit"`,
-# `git -C /tmp commit`, `git -c user.email=x commit`, and `V=1 git commit`.
-# A variable-built command can still evade this — it is a guardrail against
-# habitual mistakes, not a security boundary.
+# `git -C /tmp commit`, `git -c user.email=x commit`, `V=1 git commit`,
+# `command git commit`, and `\git commit`. The trailing (?!-) keeps the
+# unrelated plumbing subcommands `git commit-tree` / `git commit-graph` out.
+# Known undetected-by-design forms (a guardrail against habitual mistakes,
+# not a security boundary): interpreter-wrapped commits (`sh -c "git commit"`
+# — the string is data to this shell), absolute paths (`/usr/bin/git commit`),
+# and variable-built commands.
 is_commit=$(printf '%s' "$input" | python3 -c '
 import json, re, sys
 try:
@@ -46,9 +50,9 @@ cmd = re.sub(
 pat = re.compile(
     r"(?:^|[;&|(`\n])\s*"                    # command position
     r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"    # env-var prefixes
-    r"git\s+"
+    r"(?:command\s+)?\\?git\s+"              # also `command git`, `\git`
     r"(?:-\S+(?:\s+[^-\s]\S*)?\s+)*"         # flags, each w/ optional argument
-    r"[\"\x27]?commit\b"
+    r"[\"\x27]?commit\b(?!-)"                # not commit-tree / commit-graph
 )
 print("commit" if pat.search(cmd) else "")
 ' 2>/dev/null) || exit 0
