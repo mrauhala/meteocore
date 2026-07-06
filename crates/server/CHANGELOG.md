@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.7.0](https://github.com/mrauhala/meteocore/compare/v0.6.0...v0.7.0) (2026-07-05)
+
+
+### Features
+
+* **3dtiles:** echo-top API representation + viewer toggle + reflectivity-scaled point size ([#370](https://github.com/mrauhala/meteocore/issues/370)) ([a30c4cf](https://github.com/mrauhala/meteocore/commit/a30c4cfee8e098242d936d3d68d6ae8556bd2f20))
+* **api-3dtiles:** OGC 3D Tiles HTTP service ([#349](https://github.com/mrauhala/meteocore/issues/349)) ([#354](https://github.com/mrauhala/meteocore/issues/354)) ([4fc6053](https://github.com/mrauhala/meteocore/commit/4fc605394a6f9214270209b662b851854cf14dbb))
+* **config:** per-collection keywords + license across all APIs ([#324](https://github.com/mrauhala/meteocore/issues/324)) ([f704cba](https://github.com/mrauhala/meteocore/commit/f704cbad8c2f2b4db05edb4f6b85c59c423ffa43))
+* **ds-core,engine-odim:** storm-cell extraction + tracking core ([#367](https://github.com/mrauhala/meteocore/issues/367), 1/4) ([#404](https://github.com/mrauhala/meteocore/issues/404)) ([d926905](https://github.com/mrauhala/meteocore/commit/d9269056e8a18472c909e3841f98689e57aaa3d8))
+* **edr:** model-run support — EDR instances + shared run machinery ([#337](https://github.com/mrauhala/meteocore/issues/337)) ([#338](https://github.com/mrauhala/meteocore/issues/338)) ([5491687](https://github.com/mrauhala/meteocore/commit/549168760880381af460c7ef0071bd3d865b0485))
+* **engine-cap:** CAP v1.2 alert engine — Features + vector→raster WMS/Maps/Tiles ([#396](https://github.com/mrauhala/meteocore/issues/396)) ([#430](https://github.com/mrauhala/meteocore/issues/430)) ([26f11b9](https://github.com/mrauhala/meteocore/commit/26f11b9d9454b8df4595d712f15262eb0b102bd8))
+* **engine-postgis:** background metadata refresh loop ([#110](https://github.com/mrauhala/meteocore/issues/110)) ([#441](https://github.com/mrauhala/meteocore/issues/441)) ([66d4afc](https://github.com/mrauhala/meteocore/commit/66d4afc4b2223ea5d9b3318fcf49666df53c7cf5))
+* **engine-postgis:** live health monitoring + ops metrics ([#110](https://github.com/mrauhala/meteocore/issues/110)) ([#445](https://github.com/mrauhala/meteocore/issues/445)) ([225b2d4](https://github.com/mrauhala/meteocore/commit/225b2d4ecc44a9bcd60892c0bc5f9074aa190b2f))
+* **engine-zarr:** Icechunk support (read-only, feature-gated) ([#335](https://github.com/mrauhala/meteocore/issues/335)) ([#336](https://github.com/mrauhala/meteocore/issues/336)) ([815b64a](https://github.com/mrauhala/meteocore/commit/815b64ac76b00de1551a2cdc375e02cc4cabafea))
+* **engine-zarr:** WMS/Maps/Tiles rendering — Phase 3 ([#125](https://github.com/mrauhala/meteocore/issues/125)) ([#334](https://github.com/mrauhala/meteocore/issues/334)) ([23c3307](https://github.com/mrauhala/meteocore/commit/23c3307f5d91b381dc870b38dc47d7ba9501e1a4))
+* **engine-zarr:** Zarr V2/V3 engine — Phase 1 local EDR ([#125](https://github.com/mrauhala/meteocore/issues/125)) ([#332](https://github.com/mrauhala/meteocore/issues/332)) ([88de7e9](https://github.com/mrauhala/meteocore/commit/88de7e908d891cdc582bc41a5e5c71b02822cd21))
+* **server,ds-core:** reverse-proxy base URL detection (trust_proxy_headers) ([#12](https://github.com/mrauhala/meteocore/issues/12)) ([#415](https://github.com/mrauhala/meteocore/issues/415)) ([d4b9d8e](https://github.com/mrauhala/meteocore/commit/d4b9d8e05ae8ff9412dadcd2ed9f58354765eb72))
+* **server:** auto-collection mode (--auto-collections &lt;dir&gt;) — phase 1 ([#411](https://github.com/mrauhala/meteocore/issues/411)) ([#413](https://github.com/mrauhala/meteocore/issues/413)) ([9006414](https://github.com/mrauhala/meteocore/commit/9006414c2f76702798dd22a15c0a48c6037692a9))
+* **server:** CLI startup overrides (--host/--port/--config) + no-config auto-port boot ([#412](https://github.com/mrauhala/meteocore/issues/412)) ([9bcc43d](https://github.com/mrauhala/meteocore/commit/9bcc43d1e251cc47898e293ed0541f95a622fdfe))
+
+
+### Bug Fixes
+
+* **engine-odim,ds-render:** neutral, connected storm-cell track trails ([#367](https://github.com/mrauhala/meteocore/issues/367)) ([#409](https://github.com/mrauhala/meteocore/issues/409)) ([71c5f91](https://github.com/mrauhala/meteocore/commit/71c5f915d0dc899afd79298ff7ef231b303548c3))
+* **server:** collections_dir watcher ignores read events — stops self-reload loop ([#424](https://github.com/mrauhala/meteocore/issues/424)) ([#425](https://github.com/mrauhala/meteocore/issues/425)) ([48316b7](https://github.com/mrauhala/meteocore/commit/48316b7a8b3fdf4d0593dabd4f80f4123b19e127))
+
+
+### Performance Improvements
+
+* **3dtiles:** content + voxel-grid caches — cached repeats 165× faster ([#378](https://github.com/mrauhala/meteocore/issues/378)) ([9d1e00f](https://github.com/mrauhala/meteocore/commit/9d1e00f995acf8d40e6bc730f786ba0d664b5b0f))
+* **engine-geotiff:** decoded-chunk cache for local sources ([#463](https://github.com/mrauhala/meteocore/issues/463)) ([#467](https://github.com/mrauhala/meteocore/issues/467)) ([1bf82bb](https://github.com/mrauhala/meteocore/commit/1bf82bb70235f66d74d9bd98f1c01a8e8308724a))
+* **engine-odim COMP:** process-global multi-entry composite LRU ([#212](https://github.com/mrauhala/meteocore/issues/212)) ([#419](https://github.com/mrauhala/meteocore/issues/419)) ([7719780](https://github.com/mrauhala/meteocore/commit/7719780cb8e0ea08834b3f1f6eeb76365e1792e1))
+* **server:** reload preserves the warm render caches instead of rebuilding them (closes [#421](https://github.com/mrauhala/meteocore/issues/421)) ([#422](https://github.com/mrauhala/meteocore/issues/422)) ([71d6fed](https://github.com/mrauhala/meteocore/commit/71d6fedae98e4cc40a8a90c3618c565cfd54b420))
+
 ## [0.6.0](https://github.com/mrauhala/meteocore/compare/v0.5.1...v0.6.0) (2026-06-04)
 
 
