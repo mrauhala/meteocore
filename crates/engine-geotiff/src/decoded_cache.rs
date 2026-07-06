@@ -23,7 +23,6 @@
 //! unable to hold anything, so every read decodes — same convention as the
 //! ODIM caches).
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ds_core::error::DataServerError;
@@ -127,13 +126,8 @@ fn byte_len(chunk: &DecodingResult) -> u64 {
 
 /// Byte-weights each cached chunk by its decoded buffer (plus key string and
 /// `Arc`/control overhead). Mirrors the compressed `TileCache` weighter.
-#[derive(Clone)]
-struct ChunkWeighter;
-
-impl quick_cache::Weighter<ChunkKey, Arc<DecodingResult>> for ChunkWeighter {
-    fn weight(&self, key: &ChunkKey, val: &Arc<DecodingResult>) -> u64 {
-        byte_len(val) + key.file.len() as u64 + 64
-    }
+fn weigh_chunk(key: &ChunkKey, val: &Arc<DecodingResult>) -> u64 {
+    byte_len(val) + key.file.len() as u64 + 64
 }
 
 /// Default cache size (MB) when `MC_GEOTIFF_DECODED_CHUNK_CACHE_MB` is unset.
@@ -143,33 +137,21 @@ impl quick_cache::Weighter<ChunkKey, Arc<DecodingResult>> for ChunkWeighter {
 /// (1 MB/tile) still keeps ~500 tiles resident.
 const DEFAULT_DECODED_CHUNK_CACHE_MB: u64 = 512;
 
-type ChunkCache = quick_cache::sync::Cache<ChunkKey, Arc<DecodingResult>, ChunkWeighter>;
+type ChunkCache = ds_cache::ByteBoundedCache<ChunkKey, Arc<DecodingResult>>;
 
 static CACHE: std::sync::LazyLock<ChunkCache> = std::sync::LazyLock::new(|| {
-    let capacity_bytes = std::env::var("MC_GEOTIFF_DECODED_CHUNK_CACHE_MB")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_DECODED_CHUNK_CACHE_MB)
-        .saturating_mul(1024 * 1024);
-    // Estimate item slots at one 512×512 Byte tile each; `max(16)` keeps a
-    // small/zero capacity valid (a near-disabled cache holds nothing).
-    let estimated_items = ((capacity_bytes / (256 * 1024)).max(16)) as usize;
-    quick_cache::sync::Cache::with_weighter(estimated_items, capacity_bytes.max(1), ChunkWeighter)
+    // Estimate item slots at one 512×512 Byte tile (256 KB) each.
+    ChunkCache::from_env(
+        "MC_GEOTIFF_DECODED_CHUNK_CACHE_MB",
+        DEFAULT_DECODED_CHUNK_CACHE_MB,
+        256 * 1024,
+        weigh_chunk,
+    )
 });
 
-/// Cumulative `(hits, misses)`, for `/metrics`.
-static HITS: AtomicU64 = AtomicU64::new(0);
-static MISSES: AtomicU64 = AtomicU64::new(0);
-
-/// Snapshot of the process-global decoded-chunk cache for `/metrics`:
-/// `(hits, misses, bytes, capacity_bytes)`.
-pub fn metrics() -> (u64, u64, u64, u64) {
-    (
-        HITS.load(Ordering::Relaxed),
-        MISSES.load(Ordering::Relaxed),
-        CACHE.weight(),
-        CACHE.capacity(),
-    )
+/// Snapshot of the process-global decoded-chunk cache for `/metrics`.
+pub fn metrics() -> ds_cache::CacheMetrics {
+    CACHE.metrics()
 }
 
 /// Fetch the decoded chunk for `(scope, ifd, chunk)` from the cache, or run
@@ -189,16 +171,7 @@ pub(crate) fn get_or_decode(
         ifd_index,
         chunk_index,
     };
-    let mut computed = false;
-    let chunk = CACHE.get_or_insert_with(&key, || {
-        computed = true;
-        MISSES.fetch_add(1, Ordering::Relaxed);
-        decode().map(Arc::new)
-    })?;
-    if !computed {
-        HITS.fetch_add(1, Ordering::Relaxed);
-    }
-    Ok(chunk)
+    CACHE.get_or_insert_with(&key, || decode().map(Arc::new))
 }
 
 #[cfg(test)]

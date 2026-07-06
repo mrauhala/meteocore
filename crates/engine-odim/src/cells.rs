@@ -85,48 +85,23 @@ fn cell_set_weight_bytes(key: &CellSetKey, set: &Arc<CellSet>) -> u64 {
     cells + (std::mem::size_of::<CellSet>() + key.0.len() + key.1.len() + 64) as u64
 }
 
-/// Byte-weights each entry (see [`cell_set_weight_bytes`]).
-#[derive(Clone)]
-struct CellSetWeighter;
-
-impl quick_cache::Weighter<CellSetKey, Arc<CellSet>> for CellSetWeighter {
-    fn weight(&self, key: &CellSetKey, val: &Arc<CellSet>) -> u64 {
-        cell_set_weight_bytes(key, val)
-    }
-}
-
 /// Process-global memo of per-volume segmentations, shared across every PVOL
 /// collection, byte-bounded like `VOXEL_GRID_CACHE`.
-/// `MC_PVOL_CELL_SET_CACHE_MB=0` *effectively* disables it — quick_cache has
-/// no zero capacity, so a 1-byte budget rejects every real entry on insert
-/// (every request re-segments).
-static CELL_SET_CACHE: std::sync::LazyLock<
-    quick_cache::sync::Cache<CellSetKey, Arc<CellSet>, CellSetWeighter>,
-> = std::sync::LazyLock::new(|| {
-    let capacity_bytes = std::env::var("MC_PVOL_CELL_SET_CACHE_MB")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_CELL_SET_CACHE_MB)
-        .saturating_mul(1024 * 1024);
-    // Estimate item slots at ~16 KB each; `max(...)` keeps a zero capacity
-    // valid (an effectively-disabled cache that can hold nothing).
-    let estimated_items = ((capacity_bytes / (16 * 1024)).max(4)) as usize;
-    quick_cache::sync::Cache::with_weighter(estimated_items, capacity_bytes.max(1), CellSetWeighter)
-});
+/// `MC_PVOL_CELL_SET_CACHE_MB=0` disables retention (every request
+/// re-segments). Item slots are estimated at ~16 KB each.
+static CELL_SET_CACHE: std::sync::LazyLock<ds_cache::ByteBoundedCache<CellSetKey, Arc<CellSet>>> =
+    std::sync::LazyLock::new(|| {
+        ds_cache::ByteBoundedCache::from_env(
+            "MC_PVOL_CELL_SET_CACHE_MB",
+            DEFAULT_CELL_SET_CACHE_MB,
+            16 * 1024,
+            cell_set_weight_bytes,
+        )
+    });
 
-/// Cumulative `(hits, misses)` of [`CELL_SET_CACHE`], for `/metrics`.
-static CELL_SET_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static CELL_SET_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Snapshot of the process-global cell-set cache for `/metrics`:
-/// `(hits, misses, resident_bytes, capacity_bytes)`.
-pub fn cell_set_cache_metrics() -> (u64, u64, u64, u64) {
-    (
-        CELL_SET_HITS.load(std::sync::atomic::Ordering::Relaxed),
-        CELL_SET_MISSES.load(std::sync::atomic::Ordering::Relaxed),
-        CELL_SET_CACHE.weight(),
-        CELL_SET_CACHE.capacity(),
-    )
+/// Snapshot of the process-global cell-set cache for `/metrics`.
+pub fn cell_set_cache_metrics() -> ds_cache::CacheMetrics {
+    CELL_SET_CACHE.metrics()
 }
 
 /// The extraction options as an exact key component: two requests share an
@@ -205,9 +180,7 @@ impl PolarVolumeSiteView {
                 dims,
                 opts_key,
             );
-            let mut computed = false;
             let set = CELL_SET_CACHE.get_or_insert_with(&key, || {
-                computed = true;
                 let (grid, valid) = self.voxel_grid_cached(entry, &quantity, dims, handle)?;
                 let set = if valid == 0 {
                     // No echo anywhere in the volume: a valid empty scan
@@ -223,11 +196,6 @@ impl PolarVolumeSiteView {
                 };
                 Ok::<_, DataServerError>(Arc::new(set))
             })?;
-            if computed {
-                CELL_SET_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                CELL_SET_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
             cell_sets.push((entry.volume.time, set));
         }
         let tracks = track_cells(&cell_sets, &query.tracking);

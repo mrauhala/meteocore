@@ -6,6 +6,6 @@ edition = "2021"
 [dependencies]
 ds-core = { path = "../core" }
 mvt = "0.13"
-quick_cache = "0.6"
+ds-cache = { path = "../ds-cache" }
 bytes = "1"
 thiserror = "2"

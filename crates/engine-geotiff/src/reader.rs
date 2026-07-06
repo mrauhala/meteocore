@@ -3514,7 +3514,7 @@ mod tests {
         let metadata = TiffMetadata::from_source(&source).expect("parse fixture metadata");
         let n_tiles = (metadata.tiles_across * metadata.tiles_down) as u64;
 
-        let (_, m0, _, _) = crate::decoded_cache::metrics();
+        let m0 = crate::decoded_cache::metrics().misses;
         let first = read_bbox_map(
             &source,
             &metadata,
@@ -3527,7 +3527,11 @@ mod tests {
             0,
         )
         .expect("first full read");
-        let (h1, m1, _, _) = crate::decoded_cache::metrics();
+        let ds_cache::CacheMetrics {
+            hits: h1,
+            misses: m1,
+            ..
+        } = crate::decoded_cache::metrics();
         assert!(
             m1 - m0 >= n_tiles,
             "first read should decode all {n_tiles} covering tiles (misses {m0} → {m1})"
@@ -3545,7 +3549,7 @@ mod tests {
             0,
         )
         .expect("second full read");
-        let (h2, _, _, _) = crate::decoded_cache::metrics();
+        let h2 = crate::decoded_cache::metrics().hits;
         assert!(
             h2 - h1 >= n_tiles,
             "repeat read should be served from the decoded-chunk cache (hits {h1} → {h2})"

@@ -800,7 +800,7 @@ fn pvol_volume_engine_read_cells() {
         ..CellQuery::default()
     };
 
-    let (_, m0, _, _) = engine_odim::cell_set_cache_metrics();
+    let m0 = engine_odim::cell_set_cache_metrics().misses;
     let product = view.read_cells(&query).expect("read_cells over the volume");
 
     // One retained volume ⇒ one scan in the window, even with track_scans=4.
@@ -848,13 +848,13 @@ fn pvol_volume_engine_read_cells() {
     // Single scan ⇒ one single-point track per cell, no motion yet.
     assert_eq!(product.tracks.tracks.len(), set.cells.len());
     assert!(product.tracks.tracks.iter().all(|t| t.motion_ms.is_none()));
-    let (_, m1, _, _) = engine_odim::cell_set_cache_metrics();
+    let m1 = engine_odim::cell_set_cache_metrics().misses;
     assert!(m1 > m0, "first segmentation is a cache miss");
 
     // Repeat: the per-volume memo must serve the second call.
-    let (h0, _, _, _) = engine_odim::cell_set_cache_metrics();
+    let h0 = engine_odim::cell_set_cache_metrics().hits;
     let again = view.read_cells(&query).expect("read_cells repeat");
-    let (h1, _, _, _) = engine_odim::cell_set_cache_metrics();
+    let h1 = engine_odim::cell_set_cache_metrics().hits;
     assert!(h1 > h0, "repeat segmentation is a cache hit");
     assert_eq!(again.cell_sets[0].1.cells.len(), set.cells.len());
 

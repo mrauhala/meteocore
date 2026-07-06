@@ -4,11 +4,8 @@
 //! instead of (bbox, width, height, style). Sized by bytes — eviction is driven
 //! by total weight, not entry count.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use bytes::Bytes;
-use quick_cache::sync::Cache;
-use quick_cache::Weighter;
+use ds_cache::ByteBoundedCache;
 
 use crate::encode::TmsKind;
 use crate::hash::{fnv1a_mix, FNV1A_OFFSET};
@@ -75,76 +72,50 @@ impl CachedTile {
     }
 }
 
-#[derive(Clone)]
-struct TileWeighter;
-
-impl Weighter<VectorTileKey, CachedTile> for TileWeighter {
-    fn weight(&self, key: &VectorTileKey, val: &CachedTile) -> u64 {
-        // 64-byte fixed overhead per entry + key string length + payload size
-        // + 18 bytes for the quoted hex64 ETag string.
-        64u64 + key.collection.len() as u64 + val.bytes.len() as u64 + val.etag.len() as u64
-    }
+/// Weight function: 64-byte fixed overhead per entry + key string length +
+/// payload size + 18 bytes for the quoted hex64 ETag string.
+fn weigh_tile(key: &VectorTileKey, val: &CachedTile) -> u64 {
+    64u64 + key.collection.len() as u64 + val.bytes.len() as u64 + val.etag.len() as u64
 }
 
 /// Thread-safe weighted LRU cache for MVT bytes.
 pub struct VectorTileCache {
-    cache: Cache<VectorTileKey, CachedTile, TileWeighter>,
-    capacity_bytes: u64,
-    hits: AtomicU64,
-    misses: AtomicU64,
+    cache: ByteBoundedCache<VectorTileKey, CachedTile>,
 }
 
 impl VectorTileCache {
     /// Build a cache with the given byte budget. A `capacity_mb` of 0 disables
     /// caching entirely (every `get` is a miss, every `insert` is a no-op).
     pub fn new(capacity_mb: u64) -> Self {
-        let capacity_bytes = capacity_mb.saturating_mul(1024 * 1024);
-        // quick_cache requires a non-zero estimated item count even when weighted;
-        // pick a generous number — actual eviction is driven by the weight budget.
-        let estimated_items = ((capacity_bytes / 8192).max(1)) as usize;
-        let cache = Cache::with_weighter(estimated_items, capacity_bytes.max(1), TileWeighter);
+        // ~8 KB per encoded tile for initial hash map sizing; eviction is
+        // driven by the weight budget.
         Self {
-            cache,
-            capacity_bytes,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
+            cache: ByteBoundedCache::new(
+                capacity_mb.saturating_mul(ds_cache::MIB),
+                8192,
+                weigh_tile,
+            ),
         }
     }
 
     pub fn get(&self, key: &VectorTileKey) -> Option<CachedTile> {
-        if self.capacity_bytes == 0 {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-        match self.cache.get(key) {
-            Some(v) => {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                Some(v)
-            }
-            None => {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                None
-            }
-        }
+        self.cache.get(key)
     }
 
     pub fn insert(&self, key: VectorTileKey, val: CachedTile) {
-        if self.capacity_bytes == 0 {
-            return;
-        }
         self.cache.insert(key, val);
     }
 
     pub fn capacity_bytes(&self) -> u64 {
-        self.capacity_bytes
+        self.cache.capacity_bytes()
     }
 
     pub fn hits(&self) -> u64 {
-        self.hits.load(Ordering::Relaxed)
+        self.cache.stats().0
     }
 
     pub fn misses(&self) -> u64 {
-        self.misses.load(Ordering::Relaxed)
+        self.cache.stats().1
     }
 }
 

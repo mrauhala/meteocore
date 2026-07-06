@@ -3,9 +3,9 @@
 //! Caches decoded f64 arrays keyed by (grib_url, offset) to avoid
 //! repeated byte-range fetches and GRIB decoding.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use ds_cache::ByteBoundedCache;
 use ds_core::map_engine::OutputCrs;
 
 /// Cache key: identifies a specific GRIB message.
@@ -19,13 +19,8 @@ struct GridKey {
 }
 
 /// Weight function: count the byte size of each cached grid.
-#[derive(Clone)]
-struct GridWeighter;
-
-impl quick_cache::Weighter<GridKey, Arc<DecodedGrid>> for GridWeighter {
-    fn weight(&self, _key: &GridKey, val: &Arc<DecodedGrid>) -> u64 {
-        val.size_bytes() as u64
-    }
+fn weigh_grid(_key: &GridKey, val: &Arc<DecodedGrid>) -> u64 {
+    val.size_bytes() as u64
 }
 
 /// A decoded grid with its metadata.
@@ -300,10 +295,7 @@ impl DecodedGrid {
 
 /// LRU cache for decoded grids, weighted by byte size.
 pub struct GridCache {
-    cache: quick_cache::sync::Cache<GridKey, Arc<DecodedGrid>, GridWeighter>,
-    capacity_bytes: u64,
-    hits: AtomicU64,
-    misses: AtomicU64,
+    cache: ByteBoundedCache<GridKey, Arc<DecodedGrid>>,
 }
 
 impl GridCache {
@@ -313,15 +305,13 @@ impl GridCache {
         if size_mb == 0 {
             return None;
         }
-        let max_bytes = size_mb * 1024 * 1024;
         // Estimate: each grid is ~8 MB (1440*721*8 bytes).
-        let estimated_items = (size_mb as usize * 1024 * 1024) / (8 * 1024 * 1024);
-        let items = estimated_items.max(16);
         Some(Self {
-            cache: quick_cache::sync::Cache::with_weighter(items, max_bytes, GridWeighter),
-            capacity_bytes: max_bytes,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
+            cache: ByteBoundedCache::new(
+                size_mb.saturating_mul(ds_cache::MIB),
+                8 * ds_cache::MIB,
+                weigh_grid,
+            ),
         })
     }
 
@@ -331,13 +321,7 @@ impl GridCache {
             url: Arc::from(url),
             offset,
         };
-        let result = self.cache.get(&key);
-        if result.is_some() {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-        }
-        result
+        self.cache.get(&key)
     }
 
     /// Insert a decoded grid into the cache.
@@ -351,10 +335,7 @@ impl GridCache {
 
     /// Return (hits, misses) counters.
     pub fn stats(&self) -> (u64, u64) {
-        (
-            self.hits.load(Ordering::Relaxed),
-            self.misses.load(Ordering::Relaxed),
-        )
+        self.cache.stats()
     }
 
     /// Current weight (bytes used) of the cache.
@@ -364,7 +345,7 @@ impl GridCache {
 
     /// Maximum weight (bytes) the cache will hold.
     pub fn capacity(&self) -> u64 {
-        self.capacity_bytes
+        self.cache.capacity_bytes()
     }
 
     /// Number of entries currently in the cache.

@@ -16,7 +16,6 @@ pub use metatile::{render_metatiled, MetaTile, MetaTileStats, TileKeyPrefix, Til
 pub use plot::{render_chart, render_heatmap, Heatmap, Panel, Series};
 pub use rasterize::{fill_polygon, Combine};
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -304,15 +303,10 @@ pub fn empty_tile(width: u32, height: u32) -> Result<CachedRendered, DataServerE
     })
 }
 
-/// Weight function: count the byte size of each cached rendered image.
-#[derive(Clone)]
-struct RenderedWeighter;
-
-impl quick_cache::Weighter<CacheKey, CachedRendered> for RenderedWeighter {
-    fn weight(&self, _key: &CacheKey, val: &CachedRendered) -> u64 {
-        // bytes + 18-byte quoted 16-hex-char (64-bit FNV-1a) ETag string + 64-byte overhead
-        val.bytes().len() as u64 + val.etag().len() as u64 + 64
-    }
+/// Weight function: count the byte size of each cached rendered image
+/// (bytes + 18-byte quoted 16-hex-char ETag string + 64-byte overhead).
+fn weigh_rendered(_key: &CacheKey, val: &CachedRendered) -> u64 {
+    val.bytes().len() as u64 + val.etag().len() as u64 + 64
 }
 
 /// Cache for rendered map images (Tier 2), weighted by byte size.
@@ -320,37 +314,23 @@ impl quick_cache::Weighter<CacheKey, CachedRendered> for RenderedWeighter {
 /// No TTL — radar measurements are immutable once produced.
 /// Cache is invalidated on collection reload.
 pub struct RenderedCache {
-    cache: Cache<CacheKey, CachedRendered, RenderedWeighter>,
-    capacity_bytes: u64,
-    hits: AtomicU64,
-    misses: AtomicU64,
+    cache: ds_cache::ByteBoundedCache<CacheKey, CachedRendered>,
 }
 
 impl RenderedCache {
     pub fn new(capacity_mb: u64) -> Self {
-        let max_bytes = capacity_mb * 1024 * 1024;
-        // Estimate ~60 KB per tile for initial hash map sizing
-        let estimated_items = if capacity_mb == 0 {
-            0
-        } else {
-            ((capacity_mb * 1024 * 1024) / (60 * 1024)).max(1) as usize
-        };
+        // Estimate ~60 KB per tile for initial hash map sizing.
         Self {
-            cache: Cache::with_weighter(estimated_items, max_bytes, RenderedWeighter),
-            capacity_bytes: max_bytes,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
+            cache: ds_cache::ByteBoundedCache::new(
+                capacity_mb.saturating_mul(ds_cache::MIB),
+                60 * 1024,
+                weigh_rendered,
+            ),
         }
     }
 
     pub fn get(&self, key: &CacheKey) -> Option<CachedRendered> {
-        let result = self.cache.get(key);
-        if result.is_some() {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-        }
-        result
+        self.cache.get(key)
     }
 
     pub fn insert(&self, key: CacheKey, value: CachedRendered) {
@@ -359,10 +339,7 @@ impl RenderedCache {
 
     /// Return (hits, misses) counters.
     pub fn stats(&self) -> (u64, u64) {
-        (
-            self.hits.load(Ordering::Relaxed),
-            self.misses.load(Ordering::Relaxed),
-        )
+        self.cache.stats()
     }
 
     /// Current weight (bytes used) of the cache.
@@ -372,7 +349,7 @@ impl RenderedCache {
 
     /// Maximum weight (bytes) the cache will hold.
     pub fn capacity(&self) -> u64 {
-        self.capacity_bytes
+        self.cache.capacity_bytes()
     }
 
     /// Number of entries currently in the cache.
@@ -382,7 +359,12 @@ impl RenderedCache {
 
     /// Whether the cache is currently empty.
     pub fn is_empty(&self) -> bool {
-        self.cache.len() == 0
+        self.cache.is_empty()
+    }
+
+    /// Snapshot for `/metrics`.
+    pub fn metrics(&self) -> ds_cache::CacheMetrics {
+        self.cache.metrics()
     }
 }
 
