@@ -30,6 +30,7 @@
 //! CRSs fall back to a direct single-shot render. Degenerate or pathologically
 //! large requests return [`MetaTile::Fallback`] so the caller renders directly.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -52,9 +53,41 @@ const ORIGIN: f64 = std::f64::consts::PI * R;
 const Z0_RES: f64 = (2.0 * ORIGIN) / TILE_PX as f64;
 /// Maximum half-octave ladder level (`level/2 ≈ zoom`, so ~zoom 24).
 const MAX_LEVEL: i32 = 48;
-/// Safety cap on covering tiles per request. A request that would need more
-/// (tiny resolution over a huge bbox) declines to [`MetaTile::Fallback`].
-const MAX_TILES: usize = 256;
+/// Tile-budget floor so small requests always qualify regardless of rounding.
+const MIN_TILE_BUDGET: usize = 64;
+/// Tile-budget multiplier over the request's own pixel-implied tile count
+/// (`width·height / 256²`). Half-octave snapping inflates each axis by at most
+/// √2 (≈2× tiles) and grid straddle adds one row and column, so a square-pixel
+/// request never needs more than ~3× its pixel-implied count; 4× leaves margin.
+const TILE_BUDGET_FACTOR: usize = 4;
+
+/// Maximum covering tiles allowed for a `width × height` request before
+/// meta-tiling declines to a direct render (#491). Pixel-proportional: a fixed
+/// 256-tile cap put retina-class viewports (≥4K) right on the cliff, randomly
+/// flipping the same window between cached meta-tiling and uncached direct
+/// rendering depending on how the bbox landed on the ladder. Scaling with the
+/// request keeps every square-pixel viewport cacheable (WMS bounds requests at
+/// 8000 px/dim, 64 Mpx) while still declining the pathology the guard exists
+/// for: a bbox whose aspect wildly mismatches the pixel aspect snaps to a fine
+/// level along one axis and demands orders of magnitude more tiles than the
+/// pixels justify.
+fn tile_budget(width: u32, height: u32) -> usize {
+    let px_tiles =
+        (width as usize).saturating_mul(height as usize) / (TILE_PX as usize * TILE_PX as usize);
+    TILE_BUDGET_FACTOR.saturating_mul(px_tiles) + MIN_TILE_BUDGET
+}
+
+/// Requests declined because their covering tile count exceeded
+/// [`tile_budget`] (cumulative since process start). Surfaced on `/metrics` as
+/// `metatile_declines_total`; a sustained rate means clients are sending
+/// viewports outside the cacheable envelope (extreme bbox/pixel aspect
+/// mismatch) and paying an uncached direct render every frame.
+static BUDGET_DECLINES: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of tile-budget declines, for the `/metrics` scrape.
+pub fn budget_declines_total() -> u64 {
+    BUDGET_DECLINES.load(Ordering::Relaxed)
+}
 
 // Web Mercator metre <-> WGS84 degree conversions come from the shared
 // `ds_core::web_mercator` module (the single source of truth, #452): `lat_to_y`
@@ -218,8 +251,9 @@ pub enum MetaTile {
     /// transparent tile (matching the existing all-nodata fast path). `stats`
     /// still carries the tile-loop timing (assemble/encode are skipped, so 0).
     Empty { stats: MetaTileStats },
-    /// Meta-tiling declined (degenerate bbox or > `MAX_TILES` tiles); the caller
-    /// should fall back to a direct single-shot render.
+    /// Meta-tiling declined (degenerate bbox, over-zoom past the ladder, or a
+    /// covering tile count above [`tile_budget`]); the caller should fall back
+    /// to a direct single-shot render.
     Fallback,
 }
 
@@ -295,7 +329,8 @@ where
         ((ORIGIN - lat_to_y(s.clamp(-LAT_LIMIT_DEG, LAT_LIMIT_DEG)) - eps) / span).floor() as i64;
     let ncols = (col1 - col0 + 1).max(1) as usize;
     let nrows = (row1 - row0 + 1).max(1) as usize;
-    if ncols.saturating_mul(nrows) > MAX_TILES {
+    if ncols.saturating_mul(nrows) > tile_budget(width, height) {
+        BUDGET_DECLINES.fetch_add(1, Ordering::Relaxed);
         return Ok(MetaTile::Fallback);
     }
 
@@ -731,7 +766,16 @@ mod tests {
     }
 
     #[test]
-    fn huge_tile_count_falls_back() {
+    fn tile_budget_scales_with_request_pixels() {
+        // `4 · (W·H / 256²) + 64`, integer math pinned exactly.
+        assert_eq!(tile_budget(10, 10), 64); // floor dominates tiny requests
+        assert_eq!(tile_budget(1920, 1080), 188);
+        assert_eq!(tile_budget(4503, 2255), 680); // observed prod retina client
+        assert_eq!(tile_budget(8192, 8192), 4160);
+    }
+
+    #[test]
+    fn aspect_mismatch_tile_count_falls_back() {
         let cache = TilePixelCache::new(16);
         let prefix = TileKeyPrefix {
             layer: "l".into(),
@@ -741,10 +785,16 @@ mod tests {
             z: None,
             reference_time: None,
         };
-        // Whole-world bbox at a tiny resolution forces > MAX_TILES → fallback.
+        // The pathology the budget guards (#491): a whole-world-wide bbox on a
+        // tall, narrow image. The fine y-resolution snaps the ladder deep, so
+        // the world-spanning x-axis needs ~46 columns → ~2100 tiles, while the
+        // request's own pixels justify a budget of only 192. Must decline (and
+        // count the decline) rather than render a tile grid orders of
+        // magnitude larger than the viewport.
+        let declined_before = budget_declines_total();
         let out = render_metatiled(
             [-179.0, -85.0, 179.0, 85.0],
-            8192,
+            256,
             8192,
             &prefix,
             &SolidRed,
@@ -754,6 +804,64 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(out, MetaTile::Fallback));
+        assert!(budget_declines_total() > declined_before);
+    }
+
+    #[test]
+    fn retina_viewport_above_old_cap_still_metatiles() {
+        let cache = TilePixelCache::new(256);
+        let prefix = TileKeyPrefix {
+            layer: "l".into(),
+            parameter: None,
+            style: "default".into(),
+            time: None,
+            z: None,
+            reference_time: None,
+        };
+        // Regression pin for #491: a square-pixel 4K-retina viewport whose
+        // requested resolution sits just above a ladder step, so the half-
+        // octave snap inflates the cover past the old fixed cap of 256 tiles.
+        // It must meta-tile (cacheable) instead of falling back to an uncached
+        // direct render. Build the bbox in Mercator metres around southern
+        // Finland at 1.38× a ladder resolution, square pixels on both axes.
+        let (width, height) = (3840u32, 2160u32);
+        let res = level_res(12) * 1.38; // snaps to level 12, ~1.38×/axis inflation
+        let (cx, cy) = (2_700_000.0, 8_500_000.0);
+        let half_w = width as f64 * res / 2.0;
+        let half_h = height as f64 * res / 2.0;
+        let bbox = [
+            x_to_lon(cx - half_w),
+            y_to_lat(cy - half_h),
+            x_to_lon(cx + half_w),
+            y_to_lat(cy + half_h),
+        ];
+        let out = render_metatiled(
+            bbox,
+            width,
+            height,
+            &prefix,
+            &SolidRed,
+            ImageFormat::Png,
+            &cache,
+            solid_tile,
+        )
+        .unwrap();
+        match out {
+            MetaTile::Image { stats, .. } => {
+                assert!(
+                    stats.tiles as usize > 256,
+                    "cover ({} tiles) should exceed the old fixed cap for this pin to bite",
+                    stats.tiles
+                );
+                assert!(
+                    (stats.tiles as usize) <= tile_budget(width, height),
+                    "cover ({} tiles) must fit the pixel-proportional budget ({})",
+                    stats.tiles,
+                    tile_budget(width, height)
+                );
+            }
+            _ => panic!("expected MetaTile::Image, got Fallback/Empty"),
+        }
     }
 
     #[test]

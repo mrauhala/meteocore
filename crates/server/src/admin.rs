@@ -460,6 +460,17 @@ static METATILE_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
     CacheMetricSet::new("metatile_cache", "meta-tile pixel cache", None, None, true)
 });
 
+static METATILE_DECLINES: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
+        "metatile_declines_total",
+        "WMS renders where meta-tiling declined because the covering tile \
+         count exceeded the pixel-proportional budget, falling back to an \
+         uncached direct render (#491). A sustained rate means clients are \
+         sending viewports outside the cacheable envelope (extreme bbox/pixel \
+         aspect mismatch) and re-render every frame",
+    )
+});
+
 // GRIB grid cache (per-collection).
 static GRID_CACHE_HITS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
@@ -3151,6 +3162,7 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
 
     // Meta-tile pixel cache: global, same delta-tracking as the rendered cache.
     METATILE_CACHE_METRICS.update(wms.tile_cache.metrics(), Some(wms.tile_cache.len() as u64));
+    METATILE_DECLINES.feed(ds_render::metatile::budget_declines_total());
 
     // PVOL lazy pixel cache: process-global (never replaced on reload). Only
     // emit when PVOL collections are loaded, so non-radar deployments don't
