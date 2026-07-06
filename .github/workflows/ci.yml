@@ -58,6 +58,9 @@ jobs:
     - name: SQL safety check (engine-postgis)
       run: bash scripts/check_sql_safety.sh
 
+    - name: Geo/XML safety check (web-mercator + WMS XML invariants)
+      run: bash scripts/check_geo_safety.sh
+
     - name: Clippy
       run: cargo clippy --all-targets -- -D warnings
 

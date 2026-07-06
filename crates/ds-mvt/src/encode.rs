@@ -439,9 +439,9 @@ fn signed_area(ring: &[(f64, f64)]) -> f64 {
 // Projection: WGS84 lon/lat → tile-local pixels (0..extent, 0..extent)
 // ---------------------------------------------------------------------------
 
-const EARTH_RADIUS_M: f64 = 6_378_137.0;
-/// Maximum |lat| representable in Web Mercator before y_m → ±∞.
-const WEB_MERCATOR_MAX_LAT: f64 = 85.051_128_779_806_59;
+// Tile-grid pole cutoff — geometry is pinned to the grid edge, the one
+// place clamping to the limit is allowed (see `ds_core::web_mercator`).
+use ds_core::web_mercator::LAT_LIMIT_DEG as WEB_MERCATOR_MAX_LAT;
 
 struct Projector {
     tms: TmsKind,
@@ -504,12 +504,12 @@ impl Projector {
 }
 
 fn lon_to_merc_x(lon: f64) -> f64 {
-    lon.to_radians() * EARTH_RADIUS_M
+    ds_core::web_mercator::lon_to_x(lon)
 }
 
 fn lat_to_merc_y(lat: f64) -> f64 {
     let clamped = lat.clamp(-WEB_MERCATOR_MAX_LAT, WEB_MERCATOR_MAX_LAT);
-    clamped.to_radians().tan().asinh() * EARTH_RADIUS_M
+    ds_core::web_mercator::lat_to_y(clamped)
 }
 
 /// Hash of a property allowlist for use as a component of vector-tile cache

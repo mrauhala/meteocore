@@ -127,8 +127,8 @@ fn parse_k0(params: &HashMap<String, String>) -> Result<Option<f64>, ParseError>
     }
 }
 
-/// WGS84 semi-major axis in metres (matches `ds_core::geo::WGS84_A`).
-const WGS84_A: f64 = 6_378_137.0;
+// WGS84 semi-major axis in metres (the shared ds-core constant).
+use ds_core::geo::WGS84_A;
 /// Tolerance for accepting `+R=` as WGS84-compatible. The producer
 /// is reaffirming the WGS84 sphere within ~1 metre.
 const WGS84_A_TOLERANCE: f64 = 1.0;
@@ -544,7 +544,7 @@ mod tests {
     /// alarm.
     #[test]
     fn sphere_radius_matching_wgs84_a_is_accepted() {
-        let crs = parse("+proj=stere +lat_0=56 +lon_0=10.5666 +k=1 +R=6378137").unwrap();
+        let crs = parse("+proj=stere +lat_0=56 +lon_0=10.5666 +k=1 +R=6378137").unwrap(); // nogeocheck — PROJ-string fixture, the value under test
         assert!(matches!(crs, Crs::Stereographic { .. }));
     }
 

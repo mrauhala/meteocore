@@ -3,8 +3,10 @@ use std::f64::consts::PI;
 use crate::feature::Geometry;
 use crate::map_engine::OutputCrs;
 
-/// WGS84 ellipsoid parameters
-const WGS84_A: f64 = 6_378_137.0; // semi-major axis (meters)
+/// WGS84 semi-major axis in metres. Public so engines never hardcode the
+/// radius themselves (`scripts/check_geo_safety.sh` flags the literal);
+/// numerically equal to `web_mercator::EARTH_RADIUS` (the 3857 sphere).
+pub const WGS84_A: f64 = 6_378_137.0;
 const WGS84_F: f64 = 1.0 / 298.257223563; // flattening
 const WGS84_E2: f64 = 2.0 * WGS84_F - WGS84_F * WGS84_F; // eccentricity squared
 

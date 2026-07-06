@@ -625,7 +625,7 @@ mod tests {
         }
         // Grid corners.
         assert!((lon_to_x(-180.0) + ORIGIN).abs() < 1e-3);
-        assert!((lat_to_y(85.0511287798066) - ORIGIN).abs() < 1.0);
+        assert!((lat_to_y(ds_core::web_mercator::LAT_LIMIT_DEG) - ORIGIN).abs() < 1.0);
     }
 
     /// A solid colormap so every in-extent pixel is opaque red; lets us assert
