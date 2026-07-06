@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh scripts/hooks/pre-commit-guard.sh",
+            "command": "cd \"${CLAUDE_PROJECT_DIR:-.}\" && sh scripts/hooks/pre-commit-guard.sh",
             "timeout": 120,
             "statusMessage": "Pre-commit guard: branch + cargo fmt"
           }
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 scripts/hooks/post-edit-checks.py",
+            "command": "cd \"${CLAUDE_PROJECT_DIR:-.}\" && python3 scripts/hooks/post-edit-checks.py",
             "timeout": 60,
             "statusMessage": "Post-edit checks: SQL safety / CovJSON reminder"
           }

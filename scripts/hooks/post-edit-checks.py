@@ -36,7 +36,7 @@ def main() -> None:
             capture_output=True,
             text=True,
         )
-        if result.returncode != 0:
+        if result.returncode == 1:
             output = (result.stdout + result.stderr)[-2000:]
             print(
                 json.dumps(
@@ -47,6 +47,21 @@ def main() -> None:
                             "edit - fix the flagged SQL pattern before "
                             "continuing:\n" + output
                         ),
+                    }
+                )
+            )
+        elif result.returncode != 0:
+            # Exit 2 = the script couldn't find its target directory (wrong
+            # cwd / moved tree) - a hook-config problem, not a violation.
+            # Warn without blocking.
+            print(
+                json.dumps(
+                    {
+                        "systemMessage": (
+                            "post-edit-checks: check_sql_safety.sh exited "
+                            f"{result.returncode} (config problem, not a "
+                            "violation) - run it manually from the repo root."
+                        )
                     }
                 )
             )

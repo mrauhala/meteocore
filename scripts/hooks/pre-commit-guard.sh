@@ -17,19 +17,25 @@ set -u
 
 input=$(cat)
 
-cmd=$(printf '%s' "$input" | python3 -c '
-import json, sys
+# Detect an actual `git commit` INVOCATION, not the substring: `git` must sit
+# at a command position (start of line, or after ;, &, |, (, backtick, or a
+# newline), followed only by flag-like tokens before the `commit` subcommand
+# (optionally quoted). This avoids denying e.g. `git log --grep="git commit"`
+# while still catching `git add x && git commit`, `git  commit`, and
+# `git "commit"`. A variable-built command can still evade this — it is a
+# guardrail against habitual mistakes, not a security boundary.
+is_commit=$(printf '%s' "$input" | python3 -c '
+import json, re, sys
 try:
     data = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
-print((data.get("tool_input") or {}).get("command", ""))
+cmd = (data.get("tool_input") or {}).get("command", "")
+pat = re.compile(r"(?:^|[;&|(`\n])\s*git\s+(?:-\S+\s+)*[\"\x27]?commit\b")
+print("commit" if pat.search(cmd) else "")
 ' 2>/dev/null) || exit 0
 
-case "$cmd" in
-*"git commit"*) ;;
-*) exit 0 ;;
-esac
+[ "$is_commit" = "commit" ] || exit 0
 
 deny() {
     printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}\n' "$1"
