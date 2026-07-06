@@ -129,10 +129,16 @@ jobs:
             exit 1
           fi
           tag="v${version}"
-          if gh api "repos/${REPO}/git/ref/tags/${tag}" --silent 2>/dev/null; then
+          # Branch on 404 specifically — any other API failure (rate
+          # limit, 5xx) must fail loudly here, not masquerade as "tag
+          # missing" and produce a confusing error downstream.
+          if out=$(gh api "repos/${REPO}/git/ref/tags/${tag}" 2>&1); then
             echo "Tag ${tag} already exists — nothing to release."
             echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
+          elif ! grep -q "HTTP 404" <<<"$out"; then
+            echo "::error::Failed to check for tag ${tag}: ${out}"
+            exit 1
           fi
           # The commit that introduced this manifest version is the
           # release-PR merge. Tag that commit, NOT ${HEAD_SHA} — on a
@@ -142,7 +148,9 @@ jobs:
           release_sha=$(gh api \
             "repos/${REPO}/commits?path=.release-please-manifest.json&sha=${HEAD_SHA}&per_page=1" \
             --jq '.[0].sha')
-          if [ -z "$release_sha" ]; then
+          # jq prints the literal string "null" for an empty result —
+          # catch both so this can never reach `--target null`.
+          if [ -z "$release_sha" ] || [ "$release_sha" = "null" ]; then
             echo "::error::Could not resolve the commit that last changed the manifest."
             exit 1
           fi
