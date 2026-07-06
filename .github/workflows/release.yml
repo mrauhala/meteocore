@@ -160,11 +160,34 @@ jobs:
           # Anything else means the manifest was edited by hand to a
           # version that was never released: fail loudly rather than
           # mint a public release from an accidental edit.
-          subject=$(gh api "repos/${REPO}/commits/${release_sha}" \
-            --jq '.commit.message' | head -n1)
+          meta=$(gh api "repos/${REPO}/commits/${release_sha}")
+          subject=$(jq -r '.commit.message' <<<"$meta" | head -n1)
           if ! printf '%s' "$subject" | grep -qE '^chore(\(.+\))?: release '; then
             echo "::error::Manifest names untagged ${version}, but the commit that set it ('${subject}', ${release_sha}) is not a release-PR merge. Fix the manifest or tag manually."
             exit 1
+          fi
+          # Backstop against stacked misses: if the version this one
+          # replaced is ALSO untagged, an earlier release was never cut
+          # (every push in between retried it and failed red — but a
+          # green run here would bury it for good). Refuse to leapfrog;
+          # recover the older release first, then re-run this workflow.
+          parent=$(jq -r '.parents[0].sha' <<<"$meta")
+          prev_version=""
+          if [ -n "$parent" ] && [ "$parent" != "null" ]; then
+            prev_version=$(gh api -H "Accept: application/vnd.github.raw" \
+              "repos/${REPO}/contents/.release-please-manifest.json?ref=${parent}" \
+              2>/dev/null | jq -r '."crates/server"' || true)
+          fi
+          if [ -n "$prev_version" ] && [ "$prev_version" != "null" ] \
+              && [ "$prev_version" != "$version" ]; then
+            if ! out=$(gh api "repos/${REPO}/git/ref/tags/v${prev_version}" 2>&1); then
+              if grep -q "HTTP 404" <<<"$out"; then
+                echo "::error::Previous version v${prev_version} is untagged — refusing to leapfrog a missed release. Recover v${prev_version} first (tag ${release_sha}'s predecessor per the runbook), then re-run."
+              else
+                echo "::error::Failed to check for tag v${prev_version}: ${out}"
+              fi
+              exit 1
+            fi
           fi
           # Extract this version's CHANGELOG section (from "## [X.Y.Z]"
           # up to the next "## [" heading) as the release notes.
