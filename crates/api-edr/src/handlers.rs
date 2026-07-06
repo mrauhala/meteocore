@@ -131,7 +131,15 @@ fn lookup_collection<'a>(
             Json(json!({ "code": "NotFound", "description": format!("Collection '{id}' not found") })),
         )
     })?;
-    let config = state.collections.get(id).unwrap();
+    // engines and collections are built from the same config in admin.rs, but
+    // a registration divergence must surface as a 500, not a request panic.
+    let config = state.collections.get(id).ok_or_else(|| {
+        tracing::error!(
+            collection = id,
+            "engine registered without a matching collection config"
+        );
+        server_error()
+    })?;
     Ok((engine, config))
 }
 
