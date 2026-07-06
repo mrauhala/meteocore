@@ -94,10 +94,7 @@ const DEFAULT_PIXEL_CACHE_MB: u64 = 1024;
 /// Read the configured lazy-pixel cache size from the environment, or the
 /// default. `0` disables caching (every sample re-reads — diagnostic only).
 fn pixel_cache_mb() -> u64 {
-    std::env::var("MC_PVOL_PIXEL_CACHE_MB")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_PIXEL_CACHE_MB)
+    ds_cache::env_mb("MC_PVOL_PIXEL_CACHE_MB", DEFAULT_PIXEL_CACHE_MB)
 }
 
 /// Process-global decoded-pixel LRU, shared by every PVOL collection so a
@@ -120,21 +117,34 @@ pub(crate) fn pixel_cache() -> &'static PixelCache {
 /// `/metrics`) makes the degradation observable (PR #290 review).
 static PIXEL_READ_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Snapshot of the process-global PVOL pixel cache for `/metrics`:
-/// `(hits, misses, inserts, resident_bytes, capacity_bytes, entries,
-/// read_failures)`. `inserts` + `entries` make eviction pressure observable
-/// (#476): evictions ≈ increase(inserts) − delta(entries).
-pub fn pixel_cache_metrics() -> (u64, u64, u64, u64, u64, u64, u64) {
+/// Snapshot of the process-global PVOL pixel cache for `/metrics`.
+/// `inserts` + `entries` make eviction pressure observable (#476):
+/// evictions ≈ increase(inserts) − delta(entries).
+pub struct PixelCacheMetrics {
+    /// Standard hits/misses/bytes/capacity snapshot.
+    pub cache: ds_cache::CacheMetrics,
+    /// Cumulative inserts (request-time decodes + poll-time pre-warm).
+    pub inserts: u64,
+    /// Resident entry count.
+    pub entries: u64,
+    /// Cumulative failed lazy pixel reads (degraded to nodata).
+    pub read_failures: u64,
+}
+
+/// Snapshot of the process-global PVOL pixel cache for `/metrics`.
+pub fn pixel_cache_metrics() -> PixelCacheMetrics {
     let (hits, misses) = PIXEL_CACHE.stats();
-    (
-        hits,
-        misses,
-        PIXEL_CACHE.inserts(),
-        PIXEL_CACHE.weight(),
-        PIXEL_CACHE.capacity(),
-        PIXEL_CACHE.len() as u64,
-        PIXEL_READ_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
-    )
+    PixelCacheMetrics {
+        cache: ds_cache::CacheMetrics {
+            hits,
+            misses,
+            bytes: PIXEL_CACHE.weight(),
+            capacity_bytes: PIXEL_CACHE.capacity(),
+        },
+        inserts: PIXEL_CACHE.inserts(),
+        entries: PIXEL_CACHE.len() as u64,
+        read_failures: PIXEL_READ_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+    }
 }
 
 /// Default resampled voxel-grid cache size (MB) when
@@ -162,49 +172,28 @@ type VoxelGridKey = (Arc<str>, Arc<str>, [usize; 3]);
 type VoxelGridEntry = (Arc<VoxelGrid>, usize);
 
 /// Byte-weights each entry by its `f32` cell payload (plus key overhead).
-#[derive(Clone)]
-struct VoxelGridWeighter;
-
-impl quick_cache::Weighter<VoxelGridKey, VoxelGridEntry> for VoxelGridWeighter {
-    fn weight(&self, key: &VoxelGridKey, val: &VoxelGridEntry) -> u64 {
-        (val.0.values.len() * 4) as u64 + key.0.len() as u64 + key.1.len() as u64 + 256
-    }
+fn weigh_voxel_grid(key: &VoxelGridKey, val: &VoxelGridEntry) -> u64 {
+    (val.0.values.len() * 4) as u64 + key.0.len() as u64 + key.1.len() as u64 + 256
 }
 
 /// Process-global LRU of resampled cylindrical voxel grids, shared across
 /// every PVOL collection (keys are source-qualified). Sized once from the
-/// environment on first use; `0` disables (every read resamples).
+/// environment on first use; `0` disables (every read resamples). Item
+/// slots are estimated at one `med` (21 MB) grid each.
 static VOXEL_GRID_CACHE: std::sync::LazyLock<
-    quick_cache::sync::Cache<VoxelGridKey, VoxelGridEntry, VoxelGridWeighter>,
+    ds_cache::ByteBoundedCache<VoxelGridKey, VoxelGridEntry>,
 > = std::sync::LazyLock::new(|| {
-    let capacity_bytes = std::env::var("MC_PVOL_VOXEL_GRID_CACHE_MB")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_VOXEL_GRID_CACHE_MB)
-        .saturating_mul(1024 * 1024);
-    // Estimate item slots at one `med` grid each; `max(1)` keeps a zero
-    // capacity valid (an effectively-disabled cache that can hold nothing).
-    let estimated_items = ((capacity_bytes / (21 * 1024 * 1024)).max(4)) as usize;
-    quick_cache::sync::Cache::with_weighter(
-        estimated_items,
-        capacity_bytes.max(1),
-        VoxelGridWeighter,
+    ds_cache::ByteBoundedCache::from_env(
+        "MC_PVOL_VOXEL_GRID_CACHE_MB",
+        DEFAULT_VOXEL_GRID_CACHE_MB,
+        21 * 1024 * 1024,
+        weigh_voxel_grid,
     )
 });
 
-/// Cumulative `(hits, misses)` of [`VOXEL_GRID_CACHE`], for `/metrics`.
-static VOXEL_GRID_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static VOXEL_GRID_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Snapshot of the process-global voxel-grid cache for `/metrics`:
-/// `(hits, misses, resident_bytes, capacity_bytes)`.
-pub fn voxel_grid_cache_metrics() -> (u64, u64, u64, u64) {
-    (
-        VOXEL_GRID_HITS.load(std::sync::atomic::Ordering::Relaxed),
-        VOXEL_GRID_MISSES.load(std::sync::atomic::Ordering::Relaxed),
-        VOXEL_GRID_CACHE.weight(),
-        VOXEL_GRID_CACHE.capacity(),
-    )
+/// Snapshot of the process-global voxel-grid cache for `/metrics`.
+pub fn voxel_grid_cache_metrics() -> ds_cache::CacheMetrics {
+    VOXEL_GRID_CACHE.metrics()
 }
 
 /// Days of date-partitioned prefixes to scan when an S3 source has no
@@ -4017,9 +4006,7 @@ impl PolarVolumeSiteView {
         // one polar resample (PR #378 review). Blocking the calling thread is
         // acceptable in both caller contexts (a `spawn_blocking` pool thread,
         // or a request worker that would have done the resample itself).
-        let mut computed = false;
         let result = VOXEL_GRID_CACHE.get_or_insert_with(&key, || {
-            computed = true;
             let pix = Pixels {
                 source: &self.source,
                 handle,
@@ -4028,11 +4015,6 @@ impl PolarVolumeSiteView {
                 voxel_grid_from_volume(&entry.volume, &entry.id, pix, quantity, Some(dims))?;
             Ok::<_, DataServerError>((Arc::new(grid), valid))
         })?;
-        if computed {
-            VOXEL_GRID_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            VOXEL_GRID_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         Ok(result)
     }
 }

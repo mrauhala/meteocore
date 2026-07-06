@@ -27,6 +27,7 @@ api-tiles = { path = "../api-tiles" }
 api-3dtiles = { path = "../api-3dtiles" }
 ds-render = { path = "../render" }
 ds-mvt = { path = "../ds-mvt" }
+ds-cache = { path = "../ds-cache" }
 arc-swap = "1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }

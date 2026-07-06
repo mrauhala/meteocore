@@ -7,6 +7,7 @@ weather data (radar, NWP models, observations, alerts).
 Crates: `ds-core` (traits + types + shared utilities, directory `crates/core`),
 `ds-storage` (S3/HTTP/local object store, directory `crates/storage`),
 `ds-render` (raster colorization + PNG encoding, directory `crates/render`),
+`ds-cache` (shared byte-bounded LRU cache plumbing),
 `ds-mvt` (Mapbox Vector Tile encoder + LRU tile cache), `ds-3dtiles`
 (OGC 3D Tiles encoder), engines (`engine-csv`, `engine-geojson`,
 `engine-geotiff`, `engine-grib`, `engine-odim`, `engine-querydata`,
@@ -147,6 +148,14 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
 - **`ds-render` has no framework dependencies** (only ds-core and `png`).
   `ds-mvt` and `ds-3dtiles` are likewise framework-free byte encoders,
   mirroring `ds-render`.
+- **Byte-bounded LRU caches go through `ds-cache`** (#480):
+  `ds_cache::ByteBoundedCache` owns the weigher/env-parse/hit-miss-counter/
+  metrics plumbing (including single-flight `get_or_insert_with`); call
+  sites keep their key type, weight fn, `MC_*_CACHE_MB` env var name and
+  defaults. Don't hand-roll a `quick_cache` byte-weighted cache — before
+  extraction the same ~40 lines were copy-pasted 12×. In `server/src/
+  admin.rs`, a global cache's `/metrics` family is one `CacheMetricSet`
+  static + one `update()` call in `metrics_handler`.
 - **API crates depend only on ds-core** (plus ds-render for
   api-wms/api-maps, and api-edr for its `f=png` time-series plots) — never on
   engine crates. API state is a registry of engines keyed by collection ID.

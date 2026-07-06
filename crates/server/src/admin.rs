@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Instant;
 
@@ -27,6 +28,113 @@ use ds_core::config::{CollectionConfig, StyleBundle};
 // ---------------------------------------------------------------------------
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
+
+/// Build and register a plain `IntGauge`.
+fn int_gauge(name: &str, help: &str) -> IntGauge {
+    let gauge = IntGauge::new(name, help).unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+}
+
+/// A Prometheus counter fed from a *cumulative* in-process value: each
+/// [`Self::feed`] emits the delta since the last observed value. A backward
+/// step (the underlying cache was replaced on reload, resetting its counters)
+/// rebaselines without emitting a spike (`saturating_sub` → delta 0).
+struct DeltaCounter {
+    counter: IntCounter,
+    last: AtomicU64,
+}
+
+impl DeltaCounter {
+    fn new(name: &str, help: &str) -> Self {
+        let counter = IntCounter::new(name, help).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        DeltaCounter {
+            counter,
+            last: AtomicU64::new(0),
+        }
+    }
+
+    /// Emit `cumulative - last_seen` (clamped at 0) and remember `cumulative`.
+    /// The atomic `swap` keeps concurrent scrapes correct: however feeds
+    /// interleave, each increment is emitted exactly once. Always called
+    /// (even with delta 0) so the `LazyLock` family registers on the first
+    /// scrape and dashboards see the series before any traffic.
+    fn feed(&self, cumulative: u64) {
+        let prev = self.last.swap(cumulative, Ordering::Relaxed);
+        self.counter.inc_by(cumulative.saturating_sub(prev));
+    }
+}
+
+/// One byte-bounded cache's standard `/metrics` family (#480): delta-tracked
+/// `{prefix}_hits_total` / `{prefix}_misses_total` counters plus
+/// `{prefix}_bytes` / `{prefix}_capacity_bytes` gauges, and optionally
+/// `{prefix}_entries`. Help strings are derived from `display` (the human
+/// name, first letter uppercased for the hits/misses text) with optional
+/// parenthetical notes — matching the previously hand-written families
+/// byte-for-byte.
+struct CacheMetricSet {
+    hits: DeltaCounter,
+    misses: DeltaCounter,
+    bytes: IntGauge,
+    capacity: IntGauge,
+    entries: Option<IntGauge>,
+}
+
+impl CacheMetricSet {
+    fn new(
+        prefix: &str,
+        display: &str,
+        hits_note: Option<&str>,
+        misses_note: Option<&str>,
+        with_entries: bool,
+    ) -> Self {
+        let capitalized = {
+            let mut chars = display.chars();
+            match chars.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        };
+        let note = |n: Option<&str>| n.map(|n| format!(" ({n})")).unwrap_or_default();
+        CacheMetricSet {
+            hits: DeltaCounter::new(
+                &format!("{prefix}_hits_total"),
+                &format!("{capitalized} hits{}", note(hits_note)),
+            ),
+            misses: DeltaCounter::new(
+                &format!("{prefix}_misses_total"),
+                &format!("{capitalized} misses{}", note(misses_note)),
+            ),
+            bytes: int_gauge(
+                &format!("{prefix}_bytes"),
+                &format!("Bytes currently held in the {display}"),
+            ),
+            capacity: int_gauge(
+                &format!("{prefix}_capacity_bytes"),
+                &format!("Configured {display} capacity in bytes"),
+            ),
+            entries: with_entries.then(|| {
+                int_gauge(
+                    &format!("{prefix}_entries"),
+                    &format!("Number of entries currently in the {display}"),
+                )
+            }),
+        }
+    }
+
+    /// Feed one scrape's snapshot. `entries` only lands if the set was built
+    /// `with_entries`.
+    fn update(&self, m: ds_cache::CacheMetrics, entries: Option<u64>) {
+        self.hits.feed(m.hits);
+        self.misses.feed(m.misses);
+        self.bytes.set(m.bytes as i64);
+        self.capacity.set(m.capacity_bytes as i64);
+        if let (Some(gauge), Some(n)) = (&self.entries, entries) {
+            gauge.set(n as i64);
+        }
+    }
+}
 
 static HTTP_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
@@ -160,44 +268,14 @@ static TILE_CACHE_ENTRIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 // decoded (native) source tiles for LOCAL files, so the ~50–190 meta-tile
 // renders tiling one viewport don't re-decompress the same source tile ~6×
 // per frame.
-static GEOTIFF_DECODED_CHUNK_CACHE_HITS: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter = IntCounter::new(
-        "geotiff_decoded_chunk_cache_hits_total",
-        "GeoTIFF decoded-chunk cache hits (local sources)",
+static GEOTIFF_DECODED_CHUNK_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "geotiff_decoded_chunk_cache",
+        "GeoTIFF decoded-chunk cache",
+        Some("local sources"),
+        Some("tile decompressions"),
+        false,
     )
-    .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static GEOTIFF_DECODED_CHUNK_CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter = IntCounter::new(
-        "geotiff_decoded_chunk_cache_misses_total",
-        "GeoTIFF decoded-chunk cache misses (tile decompressions)",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static GEOTIFF_DECODED_CHUNK_CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "geotiff_decoded_chunk_cache_bytes",
-        "Bytes currently held in the GeoTIFF decoded-chunk cache",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
-
-static GEOTIFF_DECODED_CHUNK_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "geotiff_decoded_chunk_cache_capacity_bytes",
-        "Configured GeoTIFF decoded-chunk cache capacity in bytes",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
 });
 
 // PostGIS engine gauges (#110). All set per-scrape from live engine state — no
@@ -294,48 +372,8 @@ static POSTGIS_METADATA_REFRESH_SECONDS: LazyLock<GaugeVec> = LazyLock::new(|| {
 });
 
 // Rendered image cache (global — shared across all collections that render).
-static RENDERED_CACHE_HITS: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter =
-        IntCounter::new("rendered_cache_hits_total", "Rendered image cache hits").unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static RENDERED_CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter =
-        IntCounter::new("rendered_cache_misses_total", "Rendered image cache misses").unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static RENDERED_CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "rendered_cache_bytes",
-        "Bytes currently held in the rendered image cache",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
-
-static RENDERED_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "rendered_cache_capacity_bytes",
-        "Configured rendered image cache capacity in bytes",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
-
-static RENDERED_CACHE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "rendered_cache_entries",
-        "Number of entries currently in the rendered image cache",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+static RENDERED_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new("rendered_cache", "rendered image cache", None, None, true)
 });
 
 // PVOL lazy pixel cache (#289 / PR #290) — global byte-bounded LRU of decoded
@@ -343,292 +381,83 @@ static RENDERED_CACHE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
 // failures counter surfaces the otherwise-silent degradation when a moment's
 // pixels can't be read/decoded at render time (was a hard catalog rejection
 // before lazy loading).
-static PVOL_PIXEL_CACHE_HITS: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter = IntCounter::new("pvol_pixel_cache_hits_total", "PVOL pixel cache hits").unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
+static PVOL_PIXEL_CACHE_METRICS: LazyLock<CacheMetricSet> =
+    LazyLock::new(|| CacheMetricSet::new("pvol_pixel_cache", "PVOL pixel cache", None, None, true));
 
-static PVOL_PIXEL_CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter =
-        IntCounter::new("pvol_pixel_cache_misses_total", "PVOL pixel cache misses").unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static PVOL_PIXEL_CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "pvol_pixel_cache_bytes",
-        "Bytes currently held in the PVOL pixel cache",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
-
-static PVOL_PIXEL_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "pvol_pixel_cache_capacity_bytes",
-        "Configured PVOL pixel cache capacity in bytes",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
-
-static PVOL_PIXEL_CACHE_INSERTS: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter = IntCounter::new(
+static PVOL_PIXEL_CACHE_INSERTS: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
         "pvol_pixel_cache_inserts_total",
         "PVOL pixel cache inserts (request-time decodes + poll-time pre-warm). \
          Sustained inserts while entries/bytes sit at capacity = LRU eviction \
          churn: the pre-warmed working set exceeds MC_PVOL_PIXEL_CACHE_MB (#476)",
     )
-    .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
 });
 
-static PVOL_PIXEL_CACHE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "pvol_pixel_cache_entries",
-        "Number of entries currently in the PVOL pixel cache",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
-
-static PVOL_PIXEL_READ_FAILURES: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter = IntCounter::new(
+static PVOL_PIXEL_READ_FAILURES: LazyLock<DeltaCounter> = LazyLock::new(|| {
+    DeltaCounter::new(
         "pvol_pixel_read_failures_total",
         "PVOL lazy pixel reads that failed (I/O or decode) and degraded to nodata",
     )
-    .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
 });
 
 // 3D Tiles encoded-content cache — global, the final `.pnts`/`.glb` bytes per
 // (collection, product, quantity, time, params, data-version), so repeats and
 // `If-None-Match` revalidations skip the engine read + encode entirely.
-static TILES3D_CONTENT_CACHE_HITS: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter = IntCounter::new(
-        "tiles3d_content_cache_hits_total",
-        "3D Tiles encoded-content cache hits",
+static TILES3D_CONTENT_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "tiles3d_content_cache",
+        "3D Tiles encoded-content cache",
+        None,
+        Some("full engine read + encode"),
+        false,
     )
-    .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static TILES3D_CONTENT_CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter = IntCounter::new(
-        "tiles3d_content_cache_misses_total",
-        "3D Tiles encoded-content cache misses (full engine read + encode)",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static TILES3D_CONTENT_CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "tiles3d_content_cache_bytes",
-        "Bytes currently held in the 3D Tiles encoded-content cache",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
-
-static TILES3D_CONTENT_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "tiles3d_content_cache_capacity_bytes",
-        "Configured 3D Tiles encoded-content cache capacity in bytes",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
 });
 
 // PVOL resampled voxel-grid cache — global, the cylindrical grids the 3D Tiles
 // mesh products (isosurface / echo-top / voxels) share per (volume, quantity,
 // dims) instead of repeating the multi-million-cell polar resample.
-static PVOL_VOXEL_GRID_CACHE_HITS: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter = IntCounter::new(
-        "pvol_voxel_grid_cache_hits_total",
-        "PVOL voxel-grid cache hits",
+static PVOL_VOXEL_GRID_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "pvol_voxel_grid_cache",
+        "PVOL voxel-grid cache",
+        None,
+        Some("full polar resamples"),
+        false,
     )
-    .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static PVOL_VOXEL_GRID_CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter = IntCounter::new(
-        "pvol_voxel_grid_cache_misses_total",
-        "PVOL voxel-grid cache misses (full polar resamples)",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static PVOL_VOXEL_GRID_CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "pvol_voxel_grid_cache_bytes",
-        "Bytes currently held in the PVOL voxel-grid cache",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
-
-static PVOL_VOXEL_GRID_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "pvol_voxel_grid_cache_capacity_bytes",
-        "Configured PVOL voxel-grid cache capacity in bytes",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
 });
 
 // COMP composite cache (#212) — process-global, byte-bounded LRU of decoded
 // ODIM composites, so a concurrent full-viewport WMS animation keeps every
 // active timestep resident instead of ping-ponging a single slot and
 // re-decoding the same (up to 134 MB OPERA) grid many times.
-static ODIM_COMPOSITE_CACHE_HITS: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter = IntCounter::new(
-        "odim_composite_cache_hits_total",
-        "ODIM COMP composite cache hits",
+static ODIM_COMPOSITE_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "odim_composite_cache",
+        "ODIM COMP composite cache",
+        None,
+        Some("full HDF5 decodes"),
+        false,
     )
-    .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static ODIM_COMPOSITE_CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter = IntCounter::new(
-        "odim_composite_cache_misses_total",
-        "ODIM COMP composite cache misses (full HDF5 decodes)",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static ODIM_COMPOSITE_CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "odim_composite_cache_bytes",
-        "Bytes currently held in the ODIM COMP composite cache",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
-
-static ODIM_COMPOSITE_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "odim_composite_cache_capacity_bytes",
-        "Configured ODIM COMP composite cache capacity in bytes",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
 });
 
 // Storm-cell segmentation memo (#367) — per-volume `CellSet`s, so an
 // animation window / repeated tracking request re-segments only the newest
 // volume.
-static PVOL_CELL_SET_CACHE_HITS: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter = IntCounter::new(
-        "pvol_cell_set_cache_hits_total",
-        "PVOL storm-cell set cache hits",
+static PVOL_CELL_SET_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "pvol_cell_set_cache",
+        "PVOL storm-cell set cache",
+        None,
+        Some("full segmentations"),
+        false,
     )
-    .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static PVOL_CELL_SET_CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter = IntCounter::new(
-        "pvol_cell_set_cache_misses_total",
-        "PVOL storm-cell set cache misses (full segmentations)",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static PVOL_CELL_SET_CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "pvol_cell_set_cache_bytes",
-        "Bytes currently held in the PVOL storm-cell set cache",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
-
-static PVOL_CELL_SET_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "pvol_cell_set_cache_capacity_bytes",
-        "Configured PVOL storm-cell set cache capacity in bytes",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
 });
 
 // Meta-tile pixel cache (#202) — global, decoded-RGBA tiles for the Web
 // Mercator WMS meta-tiling path. Distinct from the per-collection GeoTIFF
 // compressed-byte tile cache (`tile_cache_*`).
-static METATILE_CACHE_HITS: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter =
-        IntCounter::new("metatile_cache_hits_total", "Meta-tile pixel cache hits").unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static METATILE_CACHE_MISSES: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter = IntCounter::new(
-        "metatile_cache_misses_total",
-        "Meta-tile pixel cache misses",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-static METATILE_CACHE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "metatile_cache_bytes",
-        "Bytes currently held in the meta-tile pixel cache",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
-
-static METATILE_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "metatile_cache_capacity_bytes",
-        "Configured meta-tile pixel cache capacity in bytes",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
-});
-
-static METATILE_CACHE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new(
-        "metatile_cache_entries",
-        "Number of entries currently in the meta-tile pixel cache",
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(gauge.clone())).unwrap();
-    gauge
+static METATILE_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new("metatile_cache", "meta-tile pixel cache", None, None, true)
 });
 
 // GRIB grid cache (per-collection).
@@ -692,8 +521,10 @@ static GRID_CACHE_ENTRIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 });
 
 /// Tracks the last observed (hits, misses) snapshot per (cache_kind, collection)
-/// so that the metrics handler can convert cumulative cache counters into
-/// monotonically-increasing Prometheus counters via delta tracking.
+/// for the **labelled per-collection** cache families, so that the metrics
+/// handler can convert cumulative cache counters into monotonically-increasing
+/// Prometheus counters via delta tracking. (The unlabelled global caches use
+/// [`CacheMetricSet`]/[`DeltaCounter`], which carry their own last-seen state.)
 ///
 /// On collection reload the underlying cache is replaced with a fresh one
 /// (hits/misses reset to 0), which we detect as a decrease and treat as the
@@ -705,21 +536,6 @@ static CACHE_COUNTER_STATE: LazyLock<Mutex<CacheCounterState>> =
 struct CacheCounterState {
     tile: HashMap<String, (u64, u64)>,
     grid: HashMap<String, (u64, u64)>,
-    rendered: (u64, u64),
-    metatile: (u64, u64),
-    /// PVOL pixel cache `(hits, misses, inserts, read_failures)` — global
-    /// cache, never replaced on reload, so always monotonic.
-    pvol_pixel: (u64, u64, u64, u64),
-    /// PVOL voxel-grid cache `(hits, misses)` — global cache, monotonic.
-    pvol_voxel_grid: (u64, u64),
-    /// PVOL storm-cell set cache `(hits, misses)` — global cache, monotonic.
-    pvol_cell_set: (u64, u64),
-    /// ODIM COMP composite cache `(hits, misses)` — global cache, monotonic.
-    odim_composite: (u64, u64),
-    /// GeoTIFF decoded-chunk cache `(hits, misses)` — global cache, monotonic.
-    geotiff_decoded_chunk: (u64, u64),
-    /// 3D Tiles encoded-content cache `(hits, misses)` — global, monotonic.
-    tiles3d_content: (u64, u64),
     /// PostGIS per-collection `(refreshes, refresh_failures, pings, ping_failures)`
     /// last-scraped values. Engines are replaced on reload (counts reset), so
     /// the scrape rebaselines on a backward step — see `metrics_handler`.
@@ -3319,127 +3135,66 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     RENDER_SEMAPHORE_AVAILABLE.set(wms.render_semaphore.available_permits() as i64);
 
     // Delta-tracked cache counters: cache implementations expose cumulative
-    // (hits, misses) values but may be replaced on reload. Convert to
-    // monotonic Prometheus counters.
+    // (hits, misses) values but may be replaced on reload; each CacheMetricSet
+    // converts them to monotonic Prometheus counters (rebaselining on a
+    // backward step without emitting a spike). The per-collection labelled
+    // families further below still use CACHE_COUNTER_STATE.
     let mut counter_state = CACHE_COUNTER_STATE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
 
     // Rendered image cache: global (single cache shared across collections).
-    // Always call inc_by() (even with delta 0) to ensure the LazyLock counter
-    // is registered on the first scrape, so dashboards see the series even
-    // before any rendering has happened.
-    let (r_hits, r_misses) = wms.rendered_cache.stats();
-    let (last_h, last_m) = counter_state.rendered;
-    if r_hits < last_h || r_misses < last_m {
-        // Cache was replaced (reload) — rebaseline without emitting a spike.
-        counter_state.rendered = (r_hits, r_misses);
-        RENDERED_CACHE_HITS.inc_by(0);
-        RENDERED_CACHE_MISSES.inc_by(0);
-    } else {
-        RENDERED_CACHE_HITS.inc_by(r_hits - last_h);
-        RENDERED_CACHE_MISSES.inc_by(r_misses - last_m);
-        counter_state.rendered = (r_hits, r_misses);
-    }
-    RENDERED_CACHE_BYTES.set(wms.rendered_cache.weight() as i64);
-    RENDERED_CACHE_CAPACITY_BYTES.set(wms.rendered_cache.capacity() as i64);
-    RENDERED_CACHE_ENTRIES.set(wms.rendered_cache.len() as i64);
+    RENDERED_CACHE_METRICS.update(
+        wms.rendered_cache.metrics(),
+        Some(wms.rendered_cache.len() as u64),
+    );
 
     // Meta-tile pixel cache: global, same delta-tracking as the rendered cache.
-    let (m_hits, m_misses) = wms.tile_cache.stats();
-    let (last_mh, last_mm) = counter_state.metatile;
-    if m_hits < last_mh || m_misses < last_mm {
-        counter_state.metatile = (m_hits, m_misses);
-        METATILE_CACHE_HITS.inc_by(0);
-        METATILE_CACHE_MISSES.inc_by(0);
-    } else {
-        METATILE_CACHE_HITS.inc_by(m_hits - last_mh);
-        METATILE_CACHE_MISSES.inc_by(m_misses - last_mm);
-        counter_state.metatile = (m_hits, m_misses);
-    }
-    METATILE_CACHE_BYTES.set(wms.tile_cache.weight() as i64);
-    METATILE_CACHE_CAPACITY_BYTES.set(wms.tile_cache.capacity() as i64);
-    METATILE_CACHE_ENTRIES.set(wms.tile_cache.len() as i64);
+    METATILE_CACHE_METRICS.update(wms.tile_cache.metrics(), Some(wms.tile_cache.len() as u64));
 
-    // PVOL lazy pixel cache: process-global (never replaced on reload), so the
-    // cumulative counters are strictly monotonic — a per-counter
-    // `saturating_sub` delta is correct without the rebaseline branch the
-    // replaceable rendered/metatile caches above need (and `saturating_sub`
-    // can't underflow if a counter ever does appear backward). Only emit when
-    // PVOL collections are loaded, so non-radar deployments don't carry empty
-    // `pvol_*` series. Recover from a poisoned lock (`into_inner`) — a panic
-    // elsewhere must not silently suppress the failure metric.
+    // PVOL lazy pixel cache: process-global (never replaced on reload). Only
+    // emit when PVOL collections are loaded, so non-radar deployments don't
+    // carry empty `pvol_*` series. Recover from a poisoned lock
+    // (`into_inner`) — a panic elsewhere must not silently suppress the
+    // failure metric.
     let has_pvol = !state
         .odim_volume_engines
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .is_empty();
     if has_pvol {
-        let (p_hits, p_misses, p_ins, p_bytes, p_cap, p_entries, p_fail) =
-            engine_odim::pixel_cache_metrics();
-        let (last_ph, last_pm, last_pi, last_pf) = counter_state.pvol_pixel;
-        PVOL_PIXEL_CACHE_HITS.inc_by(p_hits.saturating_sub(last_ph));
-        PVOL_PIXEL_CACHE_MISSES.inc_by(p_misses.saturating_sub(last_pm));
-        PVOL_PIXEL_CACHE_INSERTS.inc_by(p_ins.saturating_sub(last_pi));
-        PVOL_PIXEL_READ_FAILURES.inc_by(p_fail.saturating_sub(last_pf));
-        counter_state.pvol_pixel = (p_hits, p_misses, p_ins, p_fail);
-        PVOL_PIXEL_CACHE_BYTES.set(p_bytes as i64);
-        PVOL_PIXEL_CACHE_CAPACITY_BYTES.set(p_cap as i64);
-        PVOL_PIXEL_CACHE_ENTRIES.set(p_entries as i64);
+        let pixel = engine_odim::pixel_cache_metrics();
+        PVOL_PIXEL_CACHE_METRICS.update(pixel.cache, Some(pixel.entries));
+        PVOL_PIXEL_CACHE_INSERTS.feed(pixel.inserts);
+        PVOL_PIXEL_READ_FAILURES.feed(pixel.read_failures);
 
-        // Voxel-grid cache: same process-global monotonic-counter shape.
-        let (v_hits, v_misses, v_bytes, v_cap) = engine_odim::voxel_grid_cache_metrics();
-        let (last_vh, last_vm) = counter_state.pvol_voxel_grid;
-        PVOL_VOXEL_GRID_CACHE_HITS.inc_by(v_hits.saturating_sub(last_vh));
-        PVOL_VOXEL_GRID_CACHE_MISSES.inc_by(v_misses.saturating_sub(last_vm));
-        counter_state.pvol_voxel_grid = (v_hits, v_misses);
-        PVOL_VOXEL_GRID_CACHE_BYTES.set(v_bytes as i64);
-        PVOL_VOXEL_GRID_CACHE_CAPACITY_BYTES.set(v_cap as i64);
-
-        // Storm-cell set cache: same process-global monotonic-counter shape.
-        let (s_hits, s_misses, s_bytes, s_cap) = engine_odim::cell_set_cache_metrics();
-        let (last_sh, last_sm) = counter_state.pvol_cell_set;
-        PVOL_CELL_SET_CACHE_HITS.inc_by(s_hits.saturating_sub(last_sh));
-        PVOL_CELL_SET_CACHE_MISSES.inc_by(s_misses.saturating_sub(last_sm));
-        counter_state.pvol_cell_set = (s_hits, s_misses);
-        PVOL_CELL_SET_CACHE_BYTES.set(s_bytes as i64);
-        PVOL_CELL_SET_CACHE_CAPACITY_BYTES.set(s_cap as i64);
+        // Voxel-grid + storm-cell set caches: same process-global shape.
+        PVOL_VOXEL_GRID_CACHE_METRICS.update(engine_odim::voxel_grid_cache_metrics(), None);
+        PVOL_CELL_SET_CACHE_METRICS.update(engine_odim::cell_set_cache_metrics(), None);
     }
 
-    // COMP composite cache: same process-global monotonic-counter shape as the
-    // PVOL caches. Only emit when COMP (`engine_type = "odim"`) collections are
-    // loaded, so non-radar / PVOL-only deployments don't carry empty
-    // `odim_composite_*` series.
+    // COMP composite cache: same process-global shape as the PVOL caches.
+    // Only emit when COMP (`engine_type = "odim"`) collections are loaded, so
+    // non-radar / PVOL-only deployments don't carry empty `odim_composite_*`
+    // series.
     let has_comp = !state
         .odim_engines
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .is_empty();
     if has_comp {
-        let (cc_hits, cc_misses, cc_bytes, cc_cap) = engine_odim::composite_cache_metrics();
-        let (last_cch, last_ccm) = counter_state.odim_composite;
-        ODIM_COMPOSITE_CACHE_HITS.inc_by(cc_hits.saturating_sub(last_cch));
-        ODIM_COMPOSITE_CACHE_MISSES.inc_by(cc_misses.saturating_sub(last_ccm));
-        counter_state.odim_composite = (cc_hits, cc_misses);
-        ODIM_COMPOSITE_CACHE_BYTES.set(cc_bytes as i64);
-        ODIM_COMPOSITE_CACHE_CAPACITY_BYTES.set(cc_cap as i64);
+        ODIM_COMPOSITE_CACHE_METRICS.update(engine_odim::composite_cache_metrics(), None);
     }
 
-    // 3D Tiles encoded-content cache: process-global + monotonic, like the
-    // PVOL caches. Only emit when 3D Tiles collections are loaded, so other
-    // deployments don't carry empty `tiles3d_*` series.
+    // 3D Tiles encoded-content cache: process-global, like the PVOL caches.
+    // Only emit when 3D Tiles collections are loaded, so other deployments
+    // don't carry empty `tiles3d_*` series.
     if !state.tiles_3d.load().volume_engines.is_empty() {
-        let (c_hits, c_misses, c_bytes, c_cap) = api_3dtiles::content_cache_metrics();
-        let (last_ch, last_cm) = counter_state.tiles3d_content;
-        TILES3D_CONTENT_CACHE_HITS.inc_by(c_hits.saturating_sub(last_ch));
-        TILES3D_CONTENT_CACHE_MISSES.inc_by(c_misses.saturating_sub(last_cm));
-        counter_state.tiles3d_content = (c_hits, c_misses);
-        TILES3D_CONTENT_CACHE_BYTES.set(c_bytes as i64);
-        TILES3D_CONTENT_CACHE_CAPACITY_BYTES.set(c_cap as i64);
+        TILES3D_CONTENT_CACHE_METRICS.update(api_3dtiles::content_cache_metrics(), None);
     }
 
-    // GeoTIFF decoded-chunk cache (#463): process-global + monotonic, like the
-    // ODIM caches. Only emit when geotiff collections are loaded, so other
+    // GeoTIFF decoded-chunk cache (#463): process-global, like the ODIM
+    // caches. Only emit when geotiff collections are loaded, so other
     // deployments don't carry empty `geotiff_decoded_chunk_*` series.
     let has_geotiff = !state
         .geotiff_engines
@@ -3447,13 +3202,8 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
         .unwrap_or_else(|e| e.into_inner())
         .is_empty();
     if has_geotiff {
-        let (g_hits, g_misses, g_bytes, g_cap) = engine_geotiff::decoded_chunk_cache_metrics();
-        let (last_gh, last_gm) = counter_state.geotiff_decoded_chunk;
-        GEOTIFF_DECODED_CHUNK_CACHE_HITS.inc_by(g_hits.saturating_sub(last_gh));
-        GEOTIFF_DECODED_CHUNK_CACHE_MISSES.inc_by(g_misses.saturating_sub(last_gm));
-        counter_state.geotiff_decoded_chunk = (g_hits, g_misses);
-        GEOTIFF_DECODED_CHUNK_CACHE_BYTES.set(g_bytes as i64);
-        GEOTIFF_DECODED_CHUNK_CACHE_CAPACITY_BYTES.set(g_cap as i64);
+        GEOTIFF_DECODED_CHUNK_CACHE_METRICS
+            .update(engine_geotiff::decoded_chunk_cache_metrics(), None);
     }
 
     // Tile cache: per-collection

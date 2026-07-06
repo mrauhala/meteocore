@@ -9,5 +9,6 @@ png = "0.17"
 jpeg-encoder = "0.6"
 webp = { version = "0.3", default-features = false }
 quick_cache = "0.6"
+ds-cache = { path = "../ds-cache" }
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }

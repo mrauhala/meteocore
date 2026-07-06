@@ -73,10 +73,10 @@ dependencies = [
  "bytes",
  "chrono",
  "ds-3dtiles",
+ "ds-cache",
  "ds-core",
  "ds-render",
  "http-body-util",
- "quick_cache",
  "serde",
  "serde_json",
  "tokio",
@@ -1030,6 +1030,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ds-cache"
+version = "0.1.0"
+dependencies = [
+ "quick_cache",
+]
+
+[[package]]
 name = "ds-core"
 version = "0.1.0"
 dependencies = [
@@ -1045,9 +1052,9 @@ name = "ds-mvt"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "ds-cache",
  "ds-core",
  "mvt",
- "quick_cache",
  "thiserror 2.0.18",
 ]
 
@@ -1057,6 +1064,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "chrono",
+ "ds-cache",
  "ds-core",
  "jpeg-encoder",
  "png",
@@ -1149,12 +1157,12 @@ dependencies = [
  "bytes",
  "chrono",
  "criterion",
+ "ds-cache",
  "ds-core",
  "ds-storage",
  "flate2",
  "futures",
  "memmap2",
- "quick_cache",
  "rayon",
  "regex",
  "reqwest",
@@ -1173,10 +1181,10 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "chrono",
+ "ds-cache",
  "ds-core",
  "ds-storage",
  "grib",
- "quick_cache",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1191,6 +1199,7 @@ dependencies = [
  "arc-swap",
  "chrono",
  "ds-3dtiles",
+ "ds-cache",
  "ds-core",
  "ds-render",
  "ds-storage",
@@ -1241,10 +1250,10 @@ dependencies = [
  "arc-swap",
  "bytes",
  "chrono",
+ "ds-cache",
  "ds-core",
  "ds-storage",
  "icechunk",
- "quick_cache",
  "serde",
  "serde_json",
  "tempfile",
@@ -4034,6 +4043,7 @@ dependencies = [
  "arc-swap",
  "axum",
  "chrono",
+ "ds-cache",
  "ds-core",
  "ds-mvt",
  "ds-render",

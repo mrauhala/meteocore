@@ -13,6 +13,7 @@ members = [
     "crates/engine-zarr",
     "crates/storage",
     "crates/render",
+    "crates/ds-cache",
     "crates/ds-mvt",
     "crates/ds-3dtiles",
     "crates/api-edr",

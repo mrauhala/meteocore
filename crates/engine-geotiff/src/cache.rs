@@ -6,10 +6,10 @@
 //! with negligible CPU overhead on cache hits.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use ds_cache::ByteBoundedCache;
 
 /// Cache key: uniquely identifies a compressed tile across all files and IFD levels.
 /// Uses Arc<str> instead of PathBuf to avoid allocation on every lookup.
@@ -22,44 +22,24 @@ struct TileCacheKey {
     ifd_index: u16,
 }
 
-/// Weight function: count the compressed byte size of each entry.
-#[derive(Clone)]
-struct TileWeighter;
-
-impl quick_cache::Weighter<TileCacheKey, Bytes> for TileWeighter {
-    fn weight(&self, _key: &TileCacheKey, val: &Bytes) -> u64 {
-        // Bytes overhead (~32 bytes) + actual data
-        val.len() as u64 + 32
-    }
+/// Weight function: count the compressed byte size of each entry
+/// (plus ~32 bytes of `Bytes` overhead).
+fn weigh_tile(_key: &TileCacheKey, val: &Bytes) -> u64 {
+    val.len() as u64 + 32
 }
 
-/// Thread-safe tile cache backed by quick_cache (lock-free concurrent LRU).
+/// Thread-safe tile cache backed by the shared byte-bounded LRU (#480).
 pub struct TileCache {
-    inner: quick_cache::sync::Cache<TileCacheKey, Bytes, TileWeighter>,
-    capacity_bytes: u64,
-    hits: AtomicU64,
-    misses: AtomicU64,
+    inner: ByteBoundedCache<TileCacheKey, Bytes>,
 }
 
 impl TileCache {
     /// Create a new tile cache with the given capacity in bytes.
     /// Pass 0 to create a no-op cache that never stores anything.
     pub fn new(max_bytes: u64) -> Self {
-        // Estimate ~100 entries per MB for initial hash map sizing
-        let estimated_items = if max_bytes > 0 {
-            (max_bytes / (16 * 1024)).max(64) as usize
-        } else {
-            0
-        };
+        // ~16 KB per compressed tile for initial hash map sizing.
         TileCache {
-            inner: quick_cache::sync::Cache::with_weighter(
-                estimated_items,
-                max_bytes,
-                TileWeighter,
-            ),
-            capacity_bytes: max_bytes,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
+            inner: ByteBoundedCache::new(max_bytes, 16 * 1024, weigh_tile),
         }
     }
 
@@ -71,13 +51,7 @@ impl TileCache {
             chunk_index,
             ifd_index,
         };
-        let result = self.inner.get(&key);
-        if result.is_some() {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-        }
-        result
+        self.inner.get(&key)
     }
 
     /// Insert compressed tile bytes into the cache.
@@ -93,10 +67,7 @@ impl TileCache {
 
     /// Return (hits, misses) counters for logging.
     pub fn stats(&self) -> (u64, u64) {
-        (
-            self.hits.load(Ordering::Relaxed),
-            self.misses.load(Ordering::Relaxed),
-        )
+        self.inner.stats()
     }
 
     /// Current weight (bytes used) of the cache.
@@ -106,7 +77,7 @@ impl TileCache {
 
     /// Maximum weight (bytes) the cache will hold.
     pub fn capacity(&self) -> u64 {
-        self.capacity_bytes
+        self.inner.capacity_bytes()
     }
 
     /// Number of entries currently in the cache.

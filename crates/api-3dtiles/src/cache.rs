@@ -27,11 +27,11 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use ds_cache::{ByteBoundedCache, CacheMetrics};
 
 use crate::error::Tiles3dError;
 
@@ -93,43 +93,32 @@ pub struct CachedContent {
 }
 
 /// Byte-weights an entry by its encoded payload.
-#[derive(Clone)]
-struct ContentWeighter;
-
-impl quick_cache::Weighter<ContentKey, CachedContent> for ContentWeighter {
-    fn weight(&self, key: &ContentKey, val: &CachedContent) -> u64 {
-        (val.bytes.len() + val.etag.len() + key.collection.len() + key.quantity.len() + 128) as u64
-    }
+fn weigh_content(key: &ContentKey, val: &CachedContent) -> u64 {
+    (val.bytes.len() + val.etag.len() + key.collection.len() + key.quantity.len() + 128) as u64
 }
 
 /// Byte-bounded LRU of encoded content + per-key single-flight gates.
 pub struct ContentCache {
-    cache: quick_cache::sync::Cache<ContentKey, CachedContent, ContentWeighter>,
+    cache: ByteBoundedCache<ContentKey, CachedContent>,
     /// One async mutex per in-flight key. The first requester computes while
     /// holding the gate; coalesced requesters block on it, then find the
     /// cache populated. Entries are removed when their compute finishes, so
     /// the map only ever holds currently-computing keys.
     inflight: Mutex<HashMap<ContentKey, Arc<tokio::sync::Mutex<()>>>>,
-    hits: AtomicU64,
-    misses: AtomicU64,
 }
 
 impl ContentCache {
     fn new(capacity_mb: u64) -> Self {
-        let capacity_bytes = capacity_mb.saturating_mul(1024 * 1024);
-        // Estimate item slots at ~2 MB each; `.max(1)` keeps capacity 0 valid
+        // Estimate item slots at ~2 MB each; capacity 0 disables retention
         // (entries heavier than capacity are simply never admitted — the same
         // "disabled" idiom as the engine's pixel cache).
-        let estimated_items = ((capacity_bytes / (2 * 1024 * 1024)).max(16)) as usize;
         ContentCache {
-            cache: quick_cache::sync::Cache::with_weighter(
-                estimated_items,
-                capacity_bytes.max(1),
-                ContentWeighter,
+            cache: ByteBoundedCache::new(
+                capacity_mb.saturating_mul(ds_cache::MIB),
+                2 * ds_cache::MIB,
+                weigh_content,
             ),
             inflight: Mutex::new(HashMap::new()),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
         }
     }
 
@@ -147,8 +136,11 @@ impl ContentCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<(Vec<u8>, String), Tiles3dError>>,
     {
-        if let Some(hit) = self.cache.get(&key) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
+        // Untracked lookups + explicit hit/miss recording: a coalesced waiter
+        // that misses the first lookup but hits the re-check under the gate
+        // must count as ONE hit, not a miss + a hit.
+        if let Some(hit) = self.cache.get_untracked(&key) {
+            self.cache.record_hit();
             return Ok(hit);
         }
         let gate = {
@@ -160,12 +152,12 @@ impl ContentCache {
         let _held = gate.lock().await;
         // Re-check under the gate: if a coalesced compute just finished, the
         // bytes are in the cache and this request cost two lookups.
-        if let Some(hit) = self.cache.get(&key) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
+        if let Some(hit) = self.cache.get_untracked(&key) {
+            self.cache.record_hit();
             self.release(&key, &gate);
             return Ok(hit);
         }
-        self.misses.fetch_add(1, Ordering::Relaxed);
+        self.cache.record_miss();
         let result = compute().await;
         let out = match result {
             Ok((bytes, etag)) => {
@@ -192,33 +184,29 @@ impl ContentCache {
         }
     }
 
-    /// Snapshot for `/metrics`: `(hits, misses, resident_bytes, capacity_bytes)`.
-    pub fn metrics(&self) -> (u64, u64, u64, u64) {
-        (
-            self.hits.load(Ordering::Relaxed),
-            self.misses.load(Ordering::Relaxed),
-            self.cache.weight(),
-            self.cache.capacity(),
-        )
+    /// Snapshot for `/metrics`.
+    pub fn metrics(&self) -> CacheMetrics {
+        self.cache.metrics()
     }
 }
 
 /// The process-global content cache, sized once from the environment.
 pub static CONTENT_CACHE: LazyLock<ContentCache> = LazyLock::new(|| {
-    let mb = std::env::var("MC_3DTILES_CONTENT_CACHE_MB")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_CONTENT_CACHE_MB);
-    ContentCache::new(mb)
+    ContentCache::new(ds_cache::env_mb(
+        "MC_3DTILES_CONTENT_CACHE_MB",
+        DEFAULT_CONTENT_CACHE_MB,
+    ))
 });
 
 /// Snapshot of the global cache for `/metrics`.
-pub fn content_cache_metrics() -> (u64, u64, u64, u64) {
+pub fn content_cache_metrics() -> CacheMetrics {
     CONTENT_CACHE.metrics()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
 
     fn key(n: u64) -> ContentKey {
@@ -250,9 +238,9 @@ mod tests {
             assert_eq!(&*got.etag, "\"abc\"");
         }
         assert_eq!(computes.load(Ordering::Relaxed), 1, "one compute, two hits");
-        let (hits, misses, bytes, _cap) = cache.metrics();
-        assert_eq!((hits, misses), (2, 1));
-        assert!(bytes > 0);
+        let m = cache.metrics();
+        assert_eq!((m.hits, m.misses), (2, 1));
+        assert!(m.bytes > 0);
     }
 
     #[tokio::test]
@@ -268,8 +256,8 @@ mod tests {
                 .unwrap();
             assert_eq!(&got.bytes[..], &[v as u8]);
         }
-        let (hits, misses, _, _) = cache.metrics();
-        assert_eq!((hits, misses), (0, 2));
+        let m = cache.metrics();
+        assert_eq!((m.hits, m.misses), (0, 2));
     }
 
     #[tokio::test]
@@ -328,7 +316,7 @@ mod tests {
                 .unwrap();
             assert_eq!(&got.bytes[..], &[1]);
         }
-        let (hits, misses, _, _) = cache.metrics();
-        assert_eq!((hits, misses), (0, 2), "nothing admitted at capacity 0");
+        let m = cache.metrics();
+        assert_eq!((m.hits, m.misses), (0, 2), "nothing admitted at capacity 0");
     }
 }

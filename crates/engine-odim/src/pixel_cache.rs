@@ -9,6 +9,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use ds_cache::ByteBoundedCache;
 use quick_cache::sync::Cache;
 
 use crate::reader::RawPixels;
@@ -19,14 +20,9 @@ use crate::reader::RawPixels;
 type PixelKey = (Arc<str>, Arc<str>);
 
 /// Byte-weights each entry by its decoded array size (plus key/Arc overhead).
-#[derive(Clone)]
-struct PixelWeighter;
-
-impl quick_cache::Weighter<PixelKey, Arc<RawPixels>> for PixelWeighter {
-    fn weight(&self, key: &PixelKey, val: &Arc<RawPixels>) -> u64 {
-        // Decoded array bytes + the two key strings + Arc/control overhead.
-        val.size_bytes() as u64 + key.0.len() as u64 + key.1.len() as u64 + 64
-    }
+fn weigh_pixels(key: &PixelKey, val: &Arc<RawPixels>) -> u64 {
+    // Decoded array bytes + the two key strings + Arc/control overhead.
+    val.size_bytes() as u64 + key.0.len() as u64 + key.1.len() as u64 + 64
 }
 
 /// Count cap on the negative (known-bad) cache. Bounds the memory a burst of
@@ -36,7 +32,7 @@ const NEGATIVE_CAPACITY_ITEMS: usize = 4096;
 
 /// Thread-safe, byte-bounded LRU of decoded moment arrays.
 pub struct PixelCache {
-    inner: Cache<PixelKey, Arc<RawPixels>, PixelWeighter>,
+    inner: ByteBoundedCache<PixelKey, Arc<RawPixels>>,
     /// Count-bounded LRU of keys whose pixel read/decode failed. A per-cell
     /// sampler loop (e.g. `volume_section`, thousands of cells) would otherwise
     /// re-fetch and re-count a failed moment on every cell, since a failure
@@ -45,9 +41,6 @@ pub struct PixelCache {
     /// Recording the failure here makes the retry a single no-op lookup and
     /// the metric increment happen once.
     negative: Cache<PixelKey, ()>,
-    capacity_bytes: u64,
-    hits: AtomicU64,
-    misses: AtomicU64,
     inserts: AtomicU64,
 }
 
@@ -56,15 +49,14 @@ impl PixelCache {
     /// (or 0) is treated as disabled — `get` always misses and `insert` is a
     /// no-op — so a misconfiguration can't silently hold one giant entry.
     pub fn new(capacity_mb: u64) -> Self {
-        let capacity_bytes = capacity_mb.saturating_mul(1024 * 1024);
         // One FMI moment ≈ 360×500×2 ≈ 360 KB; estimate items at ~256 KB.
-        let estimated_items = ((capacity_bytes / (256 * 1024)).max(16)) as usize;
         PixelCache {
-            inner: Cache::with_weighter(estimated_items, capacity_bytes.max(1), PixelWeighter),
+            inner: ByteBoundedCache::new(
+                capacity_mb.saturating_mul(ds_cache::MIB),
+                256 * 1024,
+                weigh_pixels,
+            ),
             negative: Cache::new(NEGATIVE_CAPACITY_ITEMS),
-            capacity_bytes,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
             inserts: AtomicU64::new(0),
         }
     }
@@ -76,13 +68,13 @@ impl PixelCache {
     /// review r4). Keeping `is_known_bad` *after* this on the loader's hot path
     /// means a good-key access stays a single lookup.
     pub fn get(&self, file_id: &str, dataset_path: &str) -> Option<Arc<RawPixels>> {
-        if self.capacity_bytes == 0 {
+        if self.inner.capacity_bytes() == 0 {
             return None;
         }
         let key: PixelKey = (Arc::from(file_id), Arc::from(dataset_path));
-        let hit = self.inner.get(&key);
+        let hit = self.inner.get_untracked(&key);
         if hit.is_some() {
-            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.inner.record_hit();
         }
         hit
     }
@@ -90,7 +82,7 @@ impl PixelCache {
     /// Count one genuine positive-cache miss — i.e. a key that is neither
     /// cached nor known-bad, so the loader is about to fetch + decode it.
     pub fn record_miss(&self) {
-        self.misses.fetch_add(1, Ordering::Relaxed);
+        self.inner.record_miss();
     }
 
     /// Whether `(file_id, dataset_path)` is already resident — a presence
@@ -100,7 +92,7 @@ impl PixelCache {
     /// later poll) without polluting the hit metric or keeping evicted volumes
     /// artificially warm. Always `false` when disabled (`capacity_mb == 0`).
     pub fn contains(&self, file_id: &str, dataset_path: &str) -> bool {
-        if self.capacity_bytes == 0 {
+        if self.inner.capacity_bytes() == 0 {
             return false;
         }
         let key: PixelKey = (Arc::from(file_id), Arc::from(dataset_path));
@@ -109,7 +101,7 @@ impl PixelCache {
 
     /// Insert a freshly-decoded array. No-op when disabled.
     pub fn insert(&self, file_id: &str, dataset_path: &str, pixels: Arc<RawPixels>) {
-        if self.capacity_bytes == 0 {
+        if self.inner.capacity_bytes() == 0 {
             return;
         }
         let key: PixelKey = (Arc::from(file_id), Arc::from(dataset_path));
@@ -152,15 +144,12 @@ impl PixelCache {
 
     /// Configured byte capacity.
     pub fn capacity(&self) -> u64 {
-        self.capacity_bytes
+        self.inner.capacity_bytes()
     }
 
     /// Cumulative `(hits, misses)`.
     pub fn stats(&self) -> (u64, u64) {
-        (
-            self.hits.load(Ordering::Relaxed),
-            self.misses.load(Ordering::Relaxed),
-        )
+        self.inner.stats()
     }
 
     /// Cumulative inserts (request-time decodes + poll-time pre-warm).

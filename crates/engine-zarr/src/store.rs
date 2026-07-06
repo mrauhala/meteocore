@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use quick_cache::sync::Cache;
+use ds_cache::ByteBoundedCache;
 
 use ds_storage::object_store::path::Path as ObjectPath;
 use ds_storage::DataStore;
@@ -34,12 +34,10 @@ use zarrs::storage::{
 };
 
 /// Weights cache entries by payload size (plus a small per-entry overhead).
-#[derive(Clone)]
-struct BytesWeighter;
-impl quick_cache::Weighter<String, Bytes> for BytesWeighter {
-    fn weight(&self, key: &String, val: &Bytes) -> u64 {
-        val.len() as u64 + key.len() as u64 + 64
-    }
+/// The `&String` matches the cache's `fn(&K, &V)` weight-fn shape.
+#[allow(clippy::ptr_arg)]
+fn weigh_bytes(key: &String, val: &Bytes) -> u64 {
+    val.len() as u64 + key.len() as u64 + 64
 }
 
 /// A readable + listable zarrs store backed by `ds-storage`.
@@ -49,20 +47,21 @@ pub struct DsStore {
     /// within the bucket. Empty for a locally-rooted store. No leading/trailing
     /// slashes.
     root: String,
-    cache: Cache<String, Bytes, BytesWeighter>,
+    cache: ByteBoundedCache<String, Bytes>,
 }
 
 impl DsStore {
     /// Build an adapter over `store`, rooted at `root` (the store location
     /// within the backend; `""` for a locally-rooted store), with a chunk cache
-    /// of `cache_mb` megabytes.
+    /// of `cache_mb` megabytes (floored at 1 MB).
     pub fn new(store: DataStore, root: impl Into<String>, cache_mb: u64) -> Self {
-        let max_bytes = cache_mb.saturating_mul(1024 * 1024).max(1024 * 1024);
+        let max_bytes = cache_mb.saturating_mul(ds_cache::MIB).max(ds_cache::MIB);
         Self {
             store,
             root: root.into().trim_matches('/').to_string(),
-            // 1024 is just a sizing hint; eviction is driven by `max_bytes`.
-            cache: Cache::with_weighter(1024, max_bytes, BytesWeighter),
+            // ~1 MB per chunk is just a sizing hint; eviction is driven by
+            // `max_bytes`.
+            cache: ByteBoundedCache::new(max_bytes, ds_cache::MIB, weigh_bytes),
         }
     }
 

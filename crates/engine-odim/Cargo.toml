@@ -11,6 +11,7 @@ ndarray = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
 arc-swap = "1"
 quick_cache = "0.6"
+ds-cache = { path = "../ds-cache" }
 regex = "1"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"

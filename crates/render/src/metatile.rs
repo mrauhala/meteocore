@@ -30,12 +30,10 @@
 //! CRSs fall back to a direct single-shot render. Degenerate or pathologically
 //! large requests return [`MetaTile::Fallback`] so the caller renders directly.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
-use quick_cache::sync::Cache;
 
 use ds_core::error::DataServerError;
 use ds_core::map_engine::RasterTile;
@@ -136,19 +134,14 @@ pub struct CachedTilePixels {
     rgba: Option<Arc<[u8]>>,
 }
 
-#[derive(Clone)]
-struct TilePixelWeighter;
-
-impl quick_cache::Weighter<TileKey, CachedTilePixels> for TilePixelWeighter {
-    fn weight(&self, key: &TileKey, val: &CachedTilePixels) -> u64 {
-        // Pixel bytes (zero for a nodata marker) + a flat allowance for the
-        // owned key strings + node overhead.
-        val.rgba.as_ref().map_or(0, |r| r.len()) as u64
-            + key.layer.len() as u64
-            + key.parameter.as_ref().map_or(0, String::len) as u64
-            + key.style.len() as u64
-            + 96
-    }
+/// Weight function: pixel bytes (zero for a nodata marker) + a flat
+/// allowance for the owned key strings + node overhead.
+fn weigh_tile_pixels(key: &TileKey, val: &CachedTilePixels) -> u64 {
+    val.rgba.as_ref().map_or(0, |r| r.len()) as u64
+        + key.layer.len() as u64
+        + key.parameter.as_ref().map_or(0, String::len) as u64
+        + key.style.len() as u64
+        + 96
 }
 
 /// LRU cache of decoded, colorized meta-tiles (RGBA), weighted by byte size.
@@ -157,47 +150,40 @@ impl quick_cache::Weighter<TileKey, CachedTilePixels> for TilePixelWeighter {
 /// from the request-keyed [`crate::RenderedCache`]. This one is keyed on the
 /// fixed tile grid so overlapping fullscreen viewports reuse the same entries.
 pub struct TilePixelCache {
-    cache: Cache<TileKey, CachedTilePixels, TilePixelWeighter>,
-    capacity_bytes: u64,
-    hits: AtomicU64,
-    misses: AtomicU64,
+    cache: ds_cache::ByteBoundedCache<TileKey, CachedTilePixels>,
 }
 
 impl TilePixelCache {
     pub fn new(capacity_mb: u64) -> Self {
-        let max_bytes = capacity_mb * 1024 * 1024;
         // ~256 KB per RGBA tile for initial map sizing.
-        let estimated_items = if capacity_mb == 0 {
-            0
-        } else {
-            (max_bytes / (256 * 1024)).max(1) as usize
-        };
         Self {
-            cache: Cache::with_weighter(estimated_items, max_bytes, TilePixelWeighter),
-            capacity_bytes: max_bytes,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
+            cache: ds_cache::ByteBoundedCache::new(
+                capacity_mb.saturating_mul(ds_cache::MIB),
+                256 * 1024,
+                weigh_tile_pixels,
+            ),
         }
     }
 
     /// (hits, misses) counters.
     pub fn stats(&self) -> (u64, u64) {
-        (
-            self.hits.load(Ordering::Relaxed),
-            self.misses.load(Ordering::Relaxed),
-        )
+        self.cache.stats()
     }
     pub fn weight(&self) -> u64 {
         self.cache.weight()
     }
     pub fn capacity(&self) -> u64 {
-        self.capacity_bytes
+        self.cache.capacity_bytes()
     }
     pub fn len(&self) -> usize {
         self.cache.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.cache.len() == 0
+        self.cache.is_empty()
+    }
+    /// Snapshot for `/metrics`.
+    pub fn metrics(&self) -> ds_cache::CacheMetrics {
+        self.cache.metrics()
     }
 }
 
@@ -344,11 +330,9 @@ where
                 row,
             };
             let rgba = if let Some(c) = cache.cache.get(&key) {
-                cache.hits.fetch_add(1, Ordering::Relaxed);
                 any_data |= c.rgba.is_some();
                 c.rgba
             } else {
-                cache.misses.fetch_add(1, Ordering::Relaxed);
                 misses += 1;
                 // Tile bbox in metres → WGS84 degrees for the engine call.
                 let tx0 = -ORIGIN + col as f64 * span;
