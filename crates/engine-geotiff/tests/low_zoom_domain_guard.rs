@@ -42,10 +42,13 @@ fn engine() -> GeoTiffEngine {
 }
 
 fn wgs84_of_merc(minx: f64, miny: f64, maxx: f64, maxy: f64) -> [f64; 4] {
-    const R: f64 = 6_378_137.0;
-    let lon = |x: f64| (x / R).to_degrees();
-    let lat = |y: f64| (2.0 * (y / R).exp().atan() - std::f64::consts::FRAC_PI_2).to_degrees();
-    [lon(minx), lat(miny), lon(maxx), lat(maxy)]
+    use ds_core::web_mercator::{x_to_lon, y_to_lat};
+    [
+        x_to_lon(minx),
+        y_to_lat(miny),
+        x_to_lon(maxx),
+        y_to_lat(maxy),
+    ]
 }
 
 fn normalize_lon(mut lon: f64) -> f64 {
