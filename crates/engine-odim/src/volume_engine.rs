@@ -121,14 +121,18 @@ pub(crate) fn pixel_cache() -> &'static PixelCache {
 static PIXEL_READ_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Snapshot of the process-global PVOL pixel cache for `/metrics`:
-/// `(hits, misses, resident_bytes, capacity_bytes, read_failures)`.
-pub fn pixel_cache_metrics() -> (u64, u64, u64, u64, u64) {
+/// `(hits, misses, inserts, resident_bytes, capacity_bytes, entries,
+/// read_failures)`. `inserts` + `entries` make eviction pressure observable
+/// (#476): evictions ≈ increase(inserts) − delta(entries).
+pub fn pixel_cache_metrics() -> (u64, u64, u64, u64, u64, u64, u64) {
     let (hits, misses) = PIXEL_CACHE.stats();
     (
         hits,
         misses,
+        PIXEL_CACHE.inserts(),
         PIXEL_CACHE.weight(),
         PIXEL_CACHE.capacity(),
+        PIXEL_CACHE.len() as u64,
         PIXEL_READ_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
     )
 }
