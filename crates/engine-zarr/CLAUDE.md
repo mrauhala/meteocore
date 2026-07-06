@@ -54,6 +54,13 @@ through it.**
 - **Bad-chunking WARN:** `time=1, lat=full, lon=full` chunking is
   pathological for point queries; logged at startup, still served.
 
+## APIs
+
+The `engine_type → supported_apis` allowlist in `server/src/admin.rs` lists
+`"zarr" => &["edr", "wms", "maps", "tiles"]`. WMS/Maps/Tiles need a `[wms]`
+colormap (or a `style_bundle`) like the other raster engines; each variable
+becomes its own layer via `register_parameter_layer_styles`.
+
 ## Config
 
 `data_path` (local dir or `s3://`/`http(s)://` URL) XOR

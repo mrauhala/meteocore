@@ -4,6 +4,9 @@ GRIB2 NWP data engine. Read the root `CLAUDE.md` first — Critical Rules 6–7
 and 9 (the new-run probe once did 32 sequential blocking reads on one
 thread) were learned here.
 
+Only regular lat/lon grids (Template 0). Multi-parameter collections —
+unlike GeoTIFF's one band per collection.
+
 ## Discovery & sources
 
 - Discovers data via **index sidecar files** on S3/HTTP or a local

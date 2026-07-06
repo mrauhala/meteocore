@@ -70,8 +70,9 @@ Derivation rules (hard-won from production timeouts):
 - **Session limits come from the role, not the engine:**
   `statement_timeout`, `lock_timeout`, `default_transaction_read_only` are
   set via `ALTER ROLE meteocore_ro SET ...` (crate README). The engine uses
-  `RecyclingMethod::Fast` and issues no `SET` on checkout — the role-setup
-  SQL is operationally mandatory.
+  `RecyclingMethod::Fast` and issues no `SET` on checkout, so **a superuser
+  DSN or an unconfigured role bypasses those limits entirely** — the
+  role-setup SQL is operationally mandatory, not optional.
 - **Per-URL pool** shared across collections on the same
   `(host, port, db, user, sslmode)` tuple; first-caller-wins on size;
   `HARD_POOL_CAP = 32`. Per-load only (no reuse across reloads in v1).
@@ -87,7 +88,10 @@ Derivation rules (hard-won from production timeouts):
 - **Live ping:** `poll_loop` runs `SELECT 1` every 30 s (2 s deadline) on a
   **dedicated** connection (not the shared pool — a busy pool must not
   masquerade as DB-unreachable), flipping the collection ready⇄degraded.
-  The ping is the `/health` authority.
+  The ping is the `/health` authority: the handler overrides the boot
+  snapshot with `engine.health_status()` for postgis collections, while a
+  `failed` collection (couldn't construct) has no engine and keeps its boot
+  status.
 - Metrics: `postgis_up{collection}`, `postgis_pool_*{pool_key}` gauges,
   `postgis_metadata_refresh_seconds`, and
   `postgis_{metadata_refreshes,metadata_refresh_failures,pings,
