@@ -33,8 +33,8 @@ use crate::schema::{LocationSource, ObservationSchema};
 pub enum MetadataError {
     #[error("pool error: {0}")]
     Pool(String),
-    #[error("database error")]
-    Db,
+    #[error("database error: {0}")]
+    Db(String),
     #[error("row decode error: {0}")]
     Decode(String),
 }
@@ -253,12 +253,12 @@ async fn fetch_station_rows(
     let stmt = client
         .prepare_cached(&built.sql)
         .await
-        .map_err(|_| MetadataError::Db)?;
+        .map_err(|e| MetadataError::Db(e.to_string()))?;
     let param_refs = crate::query::params_as_refs(&built.params);
     let rows = client
         .query(&stmt, &param_refs)
         .await
-        .map_err(|_| MetadataError::Db)?;
+        .map_err(|e| MetadataError::Db(e.to_string()))?;
 
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -335,12 +335,12 @@ async fn fetch_observation_rows(
         let stmt = client
             .prepare_cached(&built.sql)
             .await
-            .map_err(|_| MetadataError::Db)?;
+            .map_err(|e| MetadataError::Db(e.to_string()))?;
         let param_refs = crate::query::params_as_refs(&built.params);
         let rows = client
             .query(&stmt, &param_refs)
             .await
-            .map_err(|_| MetadataError::Db)?;
+            .map_err(|e| MetadataError::Db(e.to_string()))?;
 
         for row in &rows {
             let id: String = row
@@ -521,7 +521,7 @@ async fn fetch_temporal_extent(
     let row = client
         .query_one(&sql, &param_refs)
         .await
-        .map_err(|_| MetadataError::Db)?;
+        .map_err(|e| MetadataError::Db(e.to_string()))?;
 
     let lo: Option<DateTime<Utc>> = row
         .try_get("lo")
