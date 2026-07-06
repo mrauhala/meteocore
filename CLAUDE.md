@@ -44,10 +44,14 @@ Violating these has caused production incidents. Never break them.
    committing.** CI rejects both formatting drift and clippy warnings.
 3. **Never build XML with `format!()` or string concatenation** — XML
    injection risk. All XML output uses `quick-xml::Writer` (api-wms).
+   `scripts/check_geo_safety.sh` enforces this in CI.
 4. **Never re-implement EPSG:3857 ↔ WGS84 math.** Use `ds_core::web_mercator`
    (`lon_to_x` / `x_to_lon` / `lat_to_y` / `y_to_lat`, `EARTH_RADIUS`,
    `LAT_LIMIT_DEG`). Four hand-rolled copies once drifted and displaced data
    ~10° at low zoom (#452, fixed by consolidation in #454).
+   `scripts/check_geo_safety.sh` enforces this in CI (magic constants have
+   named homes too: `web_mercator::{EARTH_RADIUS, LAT_LIMIT_DEG}`,
+   `geo::WGS84_A`).
    - Never clamp latitude when converting a viewport/bbox — zoomed-out
      requests legitimately reach past ±85°, and the client maps the returned
      image over the full requested extent.
