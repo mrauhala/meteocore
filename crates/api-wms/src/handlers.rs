@@ -29,7 +29,8 @@ enum RenderPath {
     /// Meta-tiling path, every covered pixel nodata — carries the tile-loop
     /// timing (assemble/encode skipped).
     MetaEmpty(ds_render::MetaTileStats),
-    /// Meta-tiling declined (degenerate / >MAX_TILES / extreme zoom) → direct.
+    /// Meta-tiling declined (degenerate bbox / over tile budget / extreme
+    /// zoom) → direct.
     Fallback,
     /// Genuine non-meta path (non-3857 CRS, or meta cache disabled).
     Direct,

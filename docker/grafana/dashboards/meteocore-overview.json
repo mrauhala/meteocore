@@ -775,7 +775,7 @@
     {
       "type": "timeseries",
       "title": "Cold tile renders per second",
-      "description": "Meta-tile cache misses = tiles actually rendered (decode + resample + colorize). This is the render COST signal: p99 spikes track this, not request rate. Animation scrubbing is always cold here (TIME is in the tile key) — the rendered-output cache is what serves repeat loops.",
+      "description": "Meta-tile cache misses = tiles actually rendered (decode + resample + colorize). This is the render COST signal: p99 spikes track this, not request rate. Animation scrubbing is always cold here (TIME is in the tile key) — the rendered-output cache is what serves repeat loops. Declines = requests whose covering tile count exceeded the pixel-proportional budget (#491) and fell back to an UNCACHED direct render; a sustained rate means clients send viewports outside the cacheable envelope (extreme bbox/pixel aspect mismatch) and re-render every frame.",
       "id": 17,
       "gridPos": {
         "h": 8,
@@ -820,6 +820,11 @@
           "expr": "rate(rendered_cache_misses_total[$__rate_interval])",
           "refId": "B",
           "legendFormat": "full-viewport renders /s"
+        },
+        {
+          "expr": "rate(metatile_declines_total[$__rate_interval])",
+          "refId": "C",
+          "legendFormat": "meta-tiling declines (uncached direct) /s"
         }
       ]
     },
