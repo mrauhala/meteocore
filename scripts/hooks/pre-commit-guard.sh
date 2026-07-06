@@ -19,11 +19,16 @@ input=$(cat)
 
 # Detect an actual `git commit` INVOCATION, not the substring: `git` must sit
 # at a command position (start of line, or after ;, &, |, (, backtick, or a
-# newline), followed only by flag-like tokens before the `commit` subcommand
-# (optionally quoted). This avoids denying e.g. `git log --grep="git commit"`
-# while still catching `git add x && git commit`, `git  commit`, and
-# `git "commit"`. A variable-built command can still evade this — it is a
-# guardrail against habitual mistakes, not a security boundary.
+# newline), optionally preceded by NAME=value env assignments, followed only
+# by flag tokens (each may take one non-flag argument: -C <dir>, -c k=v)
+# before the `commit` subcommand (optionally quoted). Heredoc bodies are
+# stripped first so a data line reading "git commit" (e.g. writing an example
+# script) is not treated as an invocation. This avoids denying
+# `git log --grep="git commit"` and heredoc data while still catching
+# `git add x && git commit`, `git  commit`, `git "commit"`,
+# `git -C /tmp commit`, `git -c user.email=x commit`, and `V=1 git commit`.
+# A variable-built command can still evade this — it is a guardrail against
+# habitual mistakes, not a security boundary.
 is_commit=$(printf '%s' "$input" | python3 -c '
 import json, re, sys
 try:
@@ -31,7 +36,20 @@ try:
 except Exception:
     sys.exit(0)
 cmd = (data.get("tool_input") or {}).get("command", "")
-pat = re.compile(r"(?:^|[;&|(`\n])\s*git\s+(?:-\S+\s+)*[\"\x27]?commit\b")
+# Strip heredoc bodies (<<EOF … EOF, <<-EOF, quoted delimiters).
+cmd = re.sub(
+    r"<<-?\s*([\"\x27]?)(\w+)\1.*?\n\s*\2\s*(?=\n|$)",
+    "<<HEREDOC_STRIPPED",
+    cmd,
+    flags=re.S,
+)
+pat = re.compile(
+    r"(?:^|[;&|(`\n])\s*"                    # command position
+    r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"    # env-var prefixes
+    r"git\s+"
+    r"(?:-\S+(?:\s+[^-\s]\S*)?\s+)*"         # flags, each w/ optional argument
+    r"[\"\x27]?commit\b"
+)
 print("commit" if pat.search(cmd) else "")
 ' 2>/dev/null) || exit 0
 
