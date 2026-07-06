@@ -9,3 +9,7 @@ __pycache__/
 # Docker builder; should never be committed (.dockerignore also excludes
 # it so a stray local copy doesn't override the planner's fresh output).
 recipe.json
+
+# Personal Claude Code overrides — .claude/settings.json is committed
+# (team hooks), but the .local variant is per-machine and must never be.
+.claude/settings.local.json
