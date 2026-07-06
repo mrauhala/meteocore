@@ -140,7 +140,21 @@ impl PostgisEngine {
             .cache
             .refresh(&self.config, &self.pool)
             .await
-            .map_err(|e| DataServerError::Engine(format!("metadata refresh failed: {e}")));
+            .map_err(|e| {
+                // Full detail (including the underlying Postgres error) goes to
+                // the log only. The returned error's Display is stored on
+                // CollectionHealth.error at boot (admin.rs) and served verbatim
+                // by the public /health endpoint, so it must stay generic — the
+                // "no internal error details to clients" rule.
+                tracing::warn!(
+                    collection = %self.collection_id,
+                    error = %e,
+                    "postgis: metadata refresh failed"
+                );
+                DataServerError::Engine(
+                    "metadata refresh failed (database error; see server logs)".to_string(),
+                )
+            });
         self.health.record_refresh(result.is_ok(), start.elapsed());
         result
     }
