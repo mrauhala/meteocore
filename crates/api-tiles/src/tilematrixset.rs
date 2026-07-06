@@ -40,9 +40,9 @@ pub const SUPPORTED_TILE_MATRIX_SETS: &[&str] = &["WebMercatorQuad", "WorldCRS84
 /// Standard pixel size for scale denominator calculation: 0.28mm = 0.00028m
 const PIXEL_SIZE_M: f64 = 0.00028;
 /// Earth equatorial circumference in meters (WGS84 semi-major axis * 2 * pi)
-const EARTH_CIRCUMFERENCE: f64 = 2.0 * PI * 6_378_137.0;
+const EARTH_CIRCUMFERENCE: f64 = 2.0 * PI * ds_core::web_mercator::EARTH_RADIUS;
 /// Half the earth circumference (Web Mercator extent in each direction)
-const HALF_CIRCUMFERENCE: f64 = PI * 6_378_137.0;
+const HALF_CIRCUMFERENCE: f64 = PI * ds_core::web_mercator::EARTH_RADIUS;
 
 pub static WEB_MERCATOR_QUAD: TileMatrixSetDef = TileMatrixSetDef {
     id: "WebMercatorQuad",

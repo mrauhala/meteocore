@@ -63,28 +63,55 @@ then
     found=1
 fi
 
-# --- 1c. Web Mercator magic constants -------------------------------------
-# 20037508… (π·R, the world half-width) and 85.0511… (the tile-grid pole
-# cutoff). Both have named homes: web_mercator::{EARTH_RADIUS, LAT_LIMIT_DEG}.
+# --- 1c. Web Mercator / WGS84 magic constants ------------------------------
+# 20037508… (π·R, the world half-width), 85.0511… (the tile-grid pole
+# cutoff), and the sphere radius 6378137 itself. Rust's underscore-grouped
+# literals (85.051_128_…, 6_378_137.0) would defeat a plain grep, so
+# underscores are stripped before matching (line numbers preserved).
+# Named homes: web_mercator::{EARTH_RADIUS, LAT_LIMIT_DEG}, geo::WGS84_A.
 # shellcheck disable=SC2086
-if grep -rnE '20037508|85\.0511' $GEO_DIRS --include='*.rs' | strip_noise
+if find $GEO_DIRS -name '*.rs' -print0 | xargs -0 perl -ne '
+        my $orig = $_;
+        (my $stripped = $_) =~ s/_//g;
+        print "$ARGV:$.:$orig" if $stripped =~ /20037508|85\.0511|(?<![0-9])6378137/;
+        close ARGV if eof;
+    ' | strip_noise
 then
     echo >&2
-    echo "check_geo_safety: Web Mercator magic constant outside crates/core." >&2
-    echo "  Use ds_core::web_mercator::{EARTH_RADIUS, LAT_LIMIT_DEG} (#454)." >&2
+    echo "check_geo_safety: Web Mercator / WGS84 magic constant outside" >&2
+    echo "  crates/core. Use ds_core::web_mercator::{EARTH_RADIUS," >&2
+    echo "  LAT_LIMIT_DEG} or ds_core::geo::WGS84_A (#454)." >&2
     found=1
 fi
 
-# --- 2. XML assembled with format!() in api-wms ----------------------------
-# All XML output goes through quick-xml::Writer for escaping. A format!()
-# whose template opens an XML tag is the injection vector.
-if grep -rnE 'format!\([[:space:]]*"[^"]*<[A-Za-z/]' \
+# --- 2. XML assembled by hand in api-wms -----------------------------------
+# All XML output goes through quick-xml::Writer for escaping. The CLAUDE.md
+# rule bans format!() AND string concatenation; cover the same three vectors
+# check_sql_safety.sh covers for SQL: format!/concat!, `+ "<…"`, and
+# push_str("<…").
+if grep -rnE '(format!|concat!)\([[:space:]]*"[^"]*<[A-Za-z/]|\+[[:space:]]*"[[:space:]]*<[A-Za-z/]|push_str[[:space:]]*\([[:space:]]*"[^"]*<[A-Za-z/]' \
     crates/api-wms/src --include='*.rs' | strip_noise
 then
     echo >&2
-    echo "check_geo_safety: format!() assembling XML in api-wms." >&2
+    echo "check_geo_safety: hand-assembled XML in api-wms." >&2
     echo "  All XML must go through quick-xml::Writer (injection risk)." >&2
     found=1
+fi
+
+# Multi-line format!() opening an XML tag further down the macro body —
+# line-oriented grep misses these; perl in slurp mode (same silent-skip
+# fallback as check_sql_safety.sh when perl is unavailable).
+if command -v perl >/dev/null 2>&1; then
+    if find crates/api-wms/src -name '*.rs' -print0 | \
+        xargs -0 perl -0ne 'if (/(format!|concat!)\s*\(\s*"[^"]*<[A-Za-z\/]/) { print STDERR "$ARGV: multi-line format!/concat! assembling XML\n"; exit 1 }' \
+        2>/dev/null; then
+        : # no matches
+    else
+        echo >&2
+        echo "check_geo_safety: multi-line format!()/concat!() assembling XML" >&2
+        echo "  in api-wms. All XML must go through quick-xml::Writer." >&2
+        found=1
+    fi
 fi
 
 if [ "$found" -ne 0 ]; then
