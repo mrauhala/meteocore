@@ -7,9 +7,25 @@
 #   feat!: breaking …            # or include `BREAKING CHANGE:` in the body
 #
 # release-please watches commits to main and opens a PR titled
-# "chore(main): release X.Y.Z" with the bumped [workspace.package]
-# version + CHANGELOG. Merging that PR creates the git tag and GitHub
-# Release, which gates the build + publish jobs below.
+# "chore: release main" with the bumped version + CHANGELOG. Merging
+# that PR bumps `.release-please-manifest.json` on main; the
+# "Cut release from manifest" step below then creates the git tag and
+# GitHub Release, which gates the build + publish jobs.
+#
+# Division of labour (deliberate, see #220): release-please ONLY
+# manages the release PR (`skip-github-release: true`). It is NOT
+# trusted to cut the tag/release. Its release pass re-parses the
+# merged PR and requires the PR head branch's component to match the
+# configured `component` ("PR component: undefined does not match
+# configured component" in strategies/base.ts). A grouped manifest PR
+# lives on `release-please--branches--main` — no component in the
+# branch name — so with `component: meteocore` configured that match
+# can never succeed, and the tag was silently skipped on EVERY release
+# since the cargo-workspace merge plugin landed in #168: v0.4.0,
+# v0.5.0, v0.6.0 and v0.7.0 all had to be cut by hand. The PR half has
+# never failed, so it stays; the tagging half is deterministic shell
+# on repo state alone (manifest version + CHANGELOG), which is also
+# self-healing: any push to main cures a previously missed release.
 #
 # Single workflow on purpose: a tag pushed by GITHUB_TOKEN does NOT
 # trigger other workflows, so a separate `on: push tags` workflow would
@@ -69,67 +85,98 @@ jobs:
       contents: write
       pull-requests: write
     outputs:
-      # release-please-action v5 with a `packages` config (monorepo
-      # mode) emits flat-keyed outputs prefixed by the package path.
-      # The bare `release_created` / `tag_name` / `version` we
-      # previously read were empty in this mode, which silently
-      # skipped every downstream build job for the v0.2.0 release.
-      # `releases_created` (note the plural) is the cross-package
-      # "any release was made" flag and is the safe gate for the
-      # downstream jobs; per-package values are read by path key.
-      releases_created: ${{ steps.release.outputs.releases_created }}
-      tag_name: ${{ steps.release.outputs['crates/server--tag_name'] }}
-      version: ${{ steps.release.outputs['crates/server--version'] }}
+      releases_created: ${{ steps.cut.outputs.created }}
+      tag_name: ${{ steps.cut.outputs.tag }}
     steps:
+      # PR management only — `skip-github-release` keeps release-please
+      # away from tags/releases so it can never race (or silently skip)
+      # the deterministic cut step below. See the header comment for why.
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7  # v5
         id: release
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+          skip-github-release: true
 
-      # Loud guard against the silent failure that stranded v0.4.0: a
-      # release PR ("chore: release …") was merged, but release-please did
-      # not cut the tag/GitHub release, so `releases_created` is false and
-      # every downstream build job silently skips. Without this step the
-      # miss is invisible — the job still reports success — and is only
-      # noticed days later.
-      - name: Guard against a missed release
-        if: steps.release.outputs.releases_created != 'true'
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      # Deterministic tag + GitHub release from committed repo state
+      # alone: if `.release-please-manifest.json`'s version has no
+      # v<version> tag yet, tag the commit that last changed the
+      # manifest (the squash-merge of the release PR) and publish the
+      # matching CHANGELOG section as the release notes. No PR-body
+      # parsing, no component matching, no label state machine.
+      #
+      # Idempotent: tag already exists → clean no-op (every ordinary
+      # push to main takes this path). Self-healing: if a release-merge
+      # run ever fails before tagging, the next push to main cuts the
+      # same release — the manifest still names an untagged version and
+      # the tag target is looked up from the manifest's history, not
+      # taken from HEAD. This step replaces the old "guard" that only
+      # alarmed on a missed release (#216); a real failure here (API
+      # error, races) fails the job loudly instead.
+      - name: Cut release from manifest
+        id: cut
         env:
-          HEAD_MSG: ${{ github.event.head_commit.message }}
-          HEAD_SHA: ${{ github.sha }}
-          REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
-          subject="$(printf '%s\n' "$HEAD_MSG" | head -n1)"
-          # Release PRs are squash-merged, so the merge commit subject is
-          # the PR title ("chore: release …"). A standard (non-squash)
-          # merge would read "Merge pull request …" and not match — that
-          # is acceptable: this repo squash-merges throughout.
-          if ! printf '%s' "$subject" | grep -qE '^chore(\(.+\))?: release '; then
-            echo "Not a release-PR merge — nothing to guard."
+          set -euo pipefail
+          version=$(jq -r '."crates/server"' .release-please-manifest.json)
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "::error::No crates/server version in .release-please-manifest.json"
+            exit 1
+          fi
+          tag="v${version}"
+          if gh api "repos/${REPO}/git/ref/tags/${tag}" --silent 2>/dev/null; then
+            echo "Tag ${tag} already exists — nothing to release."
+            echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # A release PR merged but release-please reported no release.
-          # That is only a real miss if the commit is also untagged: after
-          # a manual recovery (or a release-please retry on a later run) a
-          # v* tag points at this commit, so re-running the workflow must
-          # not false-positive.
-          if gh api --paginate "repos/${REPO}/git/refs/tags" \
-              --jq '.[].object.sha' | grep -qx "${HEAD_SHA}"; then
-            echo "A tag already points at this release commit — release exists. OK."
-            exit 0
+          # The commit that introduced this manifest version is the
+          # release-PR merge. Tag that commit, NOT ${HEAD_SHA} — on a
+          # self-heal run HEAD has already moved past the release
+          # commit. Scoped to HEAD's history so a rerun of an old run
+          # can't pick a newer release commit than its own HEAD.
+          release_sha=$(gh api \
+            "repos/${REPO}/commits?path=.release-please-manifest.json&sha=${HEAD_SHA}&per_page=1" \
+            --jq '.[0].sha')
+          if [ -z "$release_sha" ]; then
+            echo "::error::Could not resolve the commit that last changed the manifest."
+            exit 1
           fi
-          echo "::error::Release PR merged ('$subject') but release-please created no release and this commit is untagged."
-          echo "Recovery runbook:"
-          echo "  1. version=\$(jq -r '.\"crates/server\"' .release-please-manifest.json)"
-          echo "  2. gh release create \"v\$version\" --target ${HEAD_SHA} --notes-file <changelog section>"
-          echo "  3. gh pr edit <release-pr#> --remove-label 'autorelease: pending' --add-label 'autorelease: tagged'"
-          echo "  4. gh workflow run release.yml -f tag=\"v\$version\"   # build + publish artifacts"
-          echo "  5. push any commit to main — that advances HEAD past the release commit so"
-          echo "     release-please opens the next release PR (re-running this run would not,"
-          echo "     since it stays on the release commit)."
-          exit 1
+          # Extract this version's CHANGELOG section (from "## [X.Y.Z]"
+          # up to the next "## [" heading) as the release notes.
+          # Substring match on "[X.Y.Z]" — no regex metacharacters from
+          # the version can misfire.
+          awk -v ver="$version" '
+            /^## \[/ { in_section = index($0, "[" ver "]") > 0 }
+            in_section { print }
+          ' crates/server/CHANGELOG.md > "${RUNNER_TEMP}/notes.md"
+          if ! [ -s "${RUNNER_TEMP}/notes.md" ]; then
+            echo "::warning::No CHANGELOG section found for ${version}; releasing without notes."
+          fi
+          gh release create "$tag" --target "$release_sha" --title "$tag" \
+            --notes-file "${RUNNER_TEMP}/notes.md"
+          echo "Created ${tag} at ${release_sha}."
+          echo "created=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # Cosmetic bookkeeping so the release PR reads as released in
+          # the GitHub UI. The squash-merge subject ends in "(#N)".
+          # Non-fatal: nothing downstream reads these labels now that
+          # release-please's release pass is skipped.
+          subject=$(gh api "repos/${REPO}/commits/${release_sha}" \
+            --jq '.commit.message' | head -n1)
+          pr=$(printf '%s' "$subject" | grep -oE '\(#[0-9]+\)$' | tr -dc '0-9') || true
+          if [ -n "${pr}" ]; then
+            gh pr edit "$pr" --repo "$REPO" \
+              --remove-label 'autorelease: pending' \
+              --add-label 'autorelease: tagged' \
+              || echo "::warning::Could not relabel release PR #${pr}."
+          else
+            echo "::warning::Could not find a PR number in '${subject}' — label not flipped."
+          fi
 
   # Resolve the tag for the build matrix from whichever entry path
   # fired this run. Centralising the resolution here means the build
