@@ -154,6 +154,18 @@ jobs:
             echo "::error::Could not resolve the commit that last changed the manifest."
             exit 1
           fi
+          # Only a release-please merge may introduce an untagged
+          # version. Checked on the RESOLVED commit, not the triggering
+          # one — self-healing runs are triggered by ordinary commits.
+          # Anything else means the manifest was edited by hand to a
+          # version that was never released: fail loudly rather than
+          # mint a public release from an accidental edit.
+          subject=$(gh api "repos/${REPO}/commits/${release_sha}" \
+            --jq '.commit.message' | head -n1)
+          if ! printf '%s' "$subject" | grep -qE '^chore(\(.+\))?: release '; then
+            echo "::error::Manifest names untagged ${version}, but the commit that set it ('${subject}', ${release_sha}) is not a release-PR merge. Fix the manifest or tag manually."
+            exit 1
+          fi
           # Extract this version's CHANGELOG section (from "## [X.Y.Z]"
           # up to the next "## [" heading) as the release notes.
           # Substring match on "[X.Y.Z]" — no regex metacharacters from
@@ -174,8 +186,6 @@ jobs:
           # the GitHub UI. The squash-merge subject ends in "(#N)".
           # Non-fatal: nothing downstream reads these labels now that
           # release-please's release pass is skipped.
-          subject=$(gh api "repos/${REPO}/commits/${release_sha}" \
-            --jq '.commit.message' | head -n1)
           pr=$(printf '%s' "$subject" | grep -oE '\(#[0-9]+\)$' | tr -dc '0-9') || true
           if [ -n "${pr}" ]; then
             gh pr edit "$pr" --repo "$REPO" \
