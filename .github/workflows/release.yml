@@ -174,15 +174,26 @@ jobs:
           parent=$(jq -r '.parents[0].sha' <<<"$meta")
           prev_version=""
           if [ -n "$parent" ] && [ "$parent" != "null" ]; then
-            prev_version=$(gh api -H "Accept: application/vnd.github.raw" \
-              "repos/${REPO}/contents/.release-please-manifest.json?ref=${parent}" \
-              2>/dev/null | jq -r '."crates/server"' || true)
+            # 404 = manifest didn't exist at the ancestor (legitimate:
+            # first ever release) — anything else must fail loudly, or
+            # a transient error would silently skip the guard below.
+            if prev_manifest=$(gh api -H "Accept: application/vnd.github.raw" \
+                "repos/${REPO}/contents/.release-please-manifest.json?ref=${parent}" 2>&1); then
+              prev_version=$(jq -r '."crates/server"' <<<"$prev_manifest")
+            elif ! grep -q "HTTP 404" <<<"$prev_manifest"; then
+              echo "::error::Failed to read the manifest at ${parent}: ${prev_manifest}"
+              exit 1
+            fi
           fi
           if [ -n "$prev_version" ] && [ "$prev_version" != "null" ] \
               && [ "$prev_version" != "$version" ]; then
             if ! out=$(gh api "repos/${REPO}/git/ref/tags/v${prev_version}" 2>&1); then
               if grep -q "HTTP 404" <<<"$out"; then
-                echo "::error::Previous version v${prev_version} is untagged — refusing to leapfrog a missed release. Recover v${prev_version} first (tag ${release_sha}'s predecessor per the runbook), then re-run."
+                echo "::error::Previous version v${prev_version} is untagged — refusing to leapfrog a missed release. Recover v${prev_version}, then re-run this run:"
+                echo "  1. sha=\$(gh api 'repos/${REPO}/commits?path=.release-please-manifest.json&sha=${parent}&per_page=1' --jq '.[0].sha')"
+                echo "  2. extract the ${prev_version} section of crates/server/CHANGELOG.md into notes.md"
+                echo "  3. gh release create v${prev_version} --target \"\$sha\" --title v${prev_version} --notes-file notes.md"
+                echo "  4. gh workflow run release.yml -f tag=v${prev_version}   # build + publish its artifacts"
               else
                 echo "::error::Failed to check for tag v${prev_version}: ${out}"
               fi
