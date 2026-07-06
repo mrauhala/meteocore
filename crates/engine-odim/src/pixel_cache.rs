@@ -48,6 +48,7 @@ pub struct PixelCache {
     capacity_bytes: u64,
     hits: AtomicU64,
     misses: AtomicU64,
+    inserts: AtomicU64,
 }
 
 impl PixelCache {
@@ -64,6 +65,7 @@ impl PixelCache {
             capacity_bytes,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            inserts: AtomicU64::new(0),
         }
     }
 
@@ -111,6 +113,7 @@ impl PixelCache {
             return;
         }
         let key: PixelKey = (Arc::from(file_id), Arc::from(dataset_path));
+        self.inserts.fetch_add(1, Ordering::Relaxed);
         self.inner.insert(key, pixels);
     }
 
@@ -158,6 +161,21 @@ impl PixelCache {
             self.hits.load(Ordering::Relaxed),
             self.misses.load(Ordering::Relaxed),
         )
+    }
+
+    /// Cumulative inserts (request-time decodes + poll-time pre-warm).
+    /// With `entries()` this makes LRU eviction pressure observable:
+    /// sustained inserts while `entries`/`weight` stay flat at capacity ⇒
+    /// the working set exceeds the cache and pre-warmed pixels are being
+    /// churned out (#476 — the 11 s burst-S3-redownload failure mode).
+    pub fn inserts(&self) -> u64 {
+        self.inserts.load(Ordering::Relaxed)
+    }
+
+    /// Number of resident entries — for metrics.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.inner.len()
     }
 }
 

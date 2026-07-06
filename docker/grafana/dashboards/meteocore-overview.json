@@ -1,705 +1,1905 @@
 {
-  "annotations": { "list": [] },
+  "uid": "meteocore-overview",
+  "title": "MeteoCore",
+  "description": "MeteoCore OGC server — traffic, render pipeline, caches, storage, PostGIS, logs. Panel descriptions explain what each signal means and what 'bad' looks like.",
+  "tags": [
+    "meteocore"
+  ],
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "30s",
+  "time": {
+    "from": "now-3h",
+    "to": "now"
+  },
+  "timezone": "utc",
   "editable": true,
-  "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
-  "links": [],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "text": "Prometheus",
+          "value": "Prometheus"
+        }
+      },
+      {
+        "name": "DS_LOKI",
+        "type": "datasource",
+        "query": "loki",
+        "current": {
+          "text": "Loki",
+          "value": "Loki"
+        }
+      }
+    ]
+  },
   "panels": [
     {
-      "title": "HTTP Traffic",
       "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
-      "collapsed": false
+      "title": "At a glance",
+      "id": 1,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
     },
     {
-      "title": "Request Rate",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "type": "stat",
+      "title": "Collections healthy",
+      "description": "Loaded collections in `ready` state (of total). Anything not green: check /health and the Failed/Degraded stats.",
+      "id": 2,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "expr": "collections_healthy",
+          "refId": "A",
+          "legendFormat": "healthy"
+        },
+        {
+          "expr": "collections_total",
+          "refId": "B",
+          "legendFormat": "total"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Degraded",
+      "description": "Collections serving with reduced capability (e.g. DB unreachable, empty catalog). Investigate via /health.",
+      "id": 3,
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 4,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "expr": "collections_degraded",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Failed",
+      "description": "Collections that could not be constructed at all.",
+      "id": 4,
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 7,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "expr": "collections_failed",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Requests /s",
+      "description": "All HTTP requests per second (5 min average).",
+      "id": 5,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 10,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
-          "custom": { "fillOpacity": 10, "lineWidth": 2 }
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
         }
       },
       "targets": [
         {
           "expr": "sum(rate(http_requests_total[5m]))",
-          "legendFormat": "Total"
-        },
-        {
-          "expr": "sum(rate(http_requests_total{path=~\"/wms.*\"}[5m]))",
-          "legendFormat": "WMS"
-        },
-        {
-          "expr": "sum(rate(http_requests_total{path=~\"/tiles.*\"}[5m]))",
-          "legendFormat": "Tiles"
-        },
-        {
-          "expr": "sum(rate(http_requests_total{path=~\"/maps.*\"}[5m]))",
-          "legendFormat": "Maps"
-        },
-        {
-          "expr": "sum(rate(http_requests_total{path=~\"/edr.*\"}[5m]))",
-          "legendFormat": "EDR"
-        },
-        {
-          "expr": "sum(rate(http_requests_total{path=~\"/features.*\"}[5m]))",
-          "legendFormat": "Features"
+          "refId": "A"
         }
       ]
     },
     {
-      "title": "Error Rate",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "type": "stat",
+      "title": "5xx in last hour",
+      "description": "Server errors in the last hour. Should be 0 — any value is worth a look at the Errors log panel.",
+      "id": 6,
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 14,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps",
-          "custom": { "fillOpacity": 10, "lineWidth": 2 },
-          "color": { "mode": "palette-classic" }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "5xx" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
-          },
-          {
-            "matcher": { "id": "byName", "options": "4xx" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }]
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
           }
-        ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
       },
       "targets": [
         {
-          "expr": "sum(rate(http_requests_total{status=~\"5..\"}[5m]))",
-          "legendFormat": "5xx"
-        },
-        {
-          "expr": "sum(rate(http_requests_total{status=~\"4..\"}[5m]))",
-          "legendFormat": "4xx"
+          "expr": "sum(increase(http_requests_total{status=~\"5..\"}[1h])) or vector(0)",
+          "refId": "A"
         }
       ]
     },
     {
-      "title": "Request Latency (p50 / p95 / p99)",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "type": "stat",
+      "title": "Render permits in use",
+      "description": "Render-semaphore permits currently held (of total, 2×cores). Pinned at max = renders queueing → latency tail.",
+      "id": 7,
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 17,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
-          "unit": "s",
-          "custom": { "fillOpacity": 5, "lineWidth": 2 }
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
         }
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
-          "legendFormat": "p50"
+          "expr": "render_semaphore_total - render_semaphore_available",
+          "refId": "A",
+          "legendFormat": "in use"
         },
         {
-          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
-          "legendFormat": "p95"
-        },
-        {
-          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
-          "legendFormat": "p99"
+          "expr": "render_semaphore_total",
+          "refId": "B",
+          "legendFormat": "total"
         }
       ]
     },
     {
-      "title": "Latency by API (p95)",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "custom": { "fillOpacity": 5, "lineWidth": 2 }
-        }
+      "type": "stat",
+      "title": "Egress",
+      "description": "Response bytes per second across all APIs (5 min average).",
+      "id": 8,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
       },
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{path=~\"/wms.*\"}[5m])) by (le))",
-          "legendFormat": "WMS p95"
-        },
-        {
-          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{path=~\"/tiles.*\"}[5m])) by (le))",
-          "legendFormat": "Tiles p95"
-        },
-        {
-          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{path=~\"/maps.*\"}[5m])) by (le))",
-          "legendFormat": "Maps p95"
-        },
-        {
-          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{path=~\"/edr.*\"}[5m])) by (le))",
-          "legendFormat": "EDR p95"
-        }
-      ]
-    },
-    {
-      "title": "Data Transfer",
-      "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
-      "collapsed": false
-    },
-    {
-      "title": "Response Throughput",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "Bps",
-          "custom": { "fillOpacity": 10, "lineWidth": 2 }
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
         }
       },
       "targets": [
         {
           "expr": "sum(rate(http_response_bytes_total[5m]))",
-          "legendFormat": "Total"
-        },
-        {
-          "expr": "sum(rate(http_response_bytes_total{path=~\"/wms.*\"}[5m]))",
-          "legendFormat": "WMS"
-        },
-        {
-          "expr": "sum(rate(http_response_bytes_total{path=~\"/tiles.*\"}[5m]))",
-          "legendFormat": "Tiles"
-        },
-        {
-          "expr": "sum(rate(http_response_bytes_total{path=~\"/maps.*\"}[5m]))",
-          "legendFormat": "Maps"
-        },
-        {
-          "expr": "sum(rate(http_response_bytes_total{path=~\"/edr.*\"}[5m]))",
-          "legendFormat": "EDR"
+          "refId": "A"
         }
       ]
     },
     {
-      "title": "Storage Bytes Read by Engine",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "Bps",
-          "custom": { "fillOpacity": 10, "lineWidth": 2 }
-        }
-      },
-      "targets": [
-        {
-          "expr": "sum(rate(storage_bytes_read_total[5m])) by (collection)",
-          "legendFormat": "{{collection}}"
-        }
-      ]
-    },
-    {
-      "title": "Response Bytes Transferred (24h)",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 26 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "bytes",
-          "thresholds": {
-            "steps": [{ "color": "blue", "value": null }]
-          }
-        }
-      },
-      "targets": [
-        {
-          "expr": "sum(increase(http_response_bytes_total[24h]))",
-          "legendFormat": "Sent"
-        }
-      ]
-    },
-    {
-      "title": "Storage Bytes Read (24h)",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 26 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "bytes",
-          "thresholds": {
-            "steps": [{ "color": "purple", "value": null }]
-          }
-        }
-      },
-      "targets": [
-        {
-          "expr": "sum(increase(storage_bytes_read_total[24h]))",
-          "legendFormat": "Read"
-        }
-      ]
-    },
-    {
-      "title": "Caches",
       "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 30 },
-      "collapsed": false
+      "title": "HTTP — traffic & latency",
+      "id": 9,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "panels": []
     },
     {
-      "title": "Tile Cache Hit Rate",
-      "type": "gauge",
-      "gridPos": { "h": 6, "w": 5, "x": 0, "y": 31 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "type": "timeseries",
+      "title": "Requests per second — by API",
+      "description": "Traffic split by API family. WMS dominates in this deployment; a sudden shape change usually means a client-side config change.",
+      "id": 10,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "thresholds": {
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "yellow", "value": 0.5 },
-              { "color": "green", "value": 0.8 }
-            ]
+          "unit": "reqps",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
           }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
         }
       },
       "targets": [
         {
-          "expr": "sum(rate(tile_cache_hits_total[5m])) / clamp_min(sum(rate(tile_cache_hits_total[5m])) + sum(rate(tile_cache_misses_total[5m])), 0.0001)",
-          "legendFormat": "Hit Rate"
+          "expr": "sum(rate(http_requests_total[5m]))",
+          "refId": "A",
+          "legendFormat": "total"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{path=~\"/wms.*\"}[5m]))",
+          "refId": "B",
+          "legendFormat": "wms"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{path=~\"/tiles.*\"}[5m]))",
+          "refId": "C",
+          "legendFormat": "tiles"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{path=~\"/maps.*\"}[5m]))",
+          "refId": "D",
+          "legendFormat": "maps"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{path=~\"/edr.*\"}[5m]))",
+          "refId": "E",
+          "legendFormat": "edr"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{path=~\"/features.*\"}[5m]))",
+          "refId": "F",
+          "legendFormat": "features"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{path=~\"/3dtiles.*\"}[5m]))",
+          "refId": "G",
+          "legendFormat": "3dtiles"
         }
       ]
     },
     {
-      "title": "Rendered Cache Hit Rate",
-      "type": "gauge",
-      "gridPos": { "h": 6, "w": 5, "x": 5, "y": 31 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "type": "timeseries",
+      "title": "Errors per second — 4xx vs 5xx",
+      "description": "4xx = client mistakes (bad params — e.g. a map client sending ELEVATION to a layer without that dimension). 5xx = our bugs; correlate with the Errors log panel below.",
+      "id": 11,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "thresholds": {
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "yellow", "value": 0.5 },
-              { "color": "green", "value": 0.8 }
-            ]
+          "unit": "reqps",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
           }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
         }
       },
       "targets": [
         {
-          "expr": "sum(rate(rendered_cache_hits_total[5m])) / clamp_min(sum(rate(rendered_cache_hits_total[5m])) + sum(rate(rendered_cache_misses_total[5m])), 0.0001)",
-          "legendFormat": "Hit Rate"
+          "expr": "sum(rate(http_requests_total{status=~\"4..\"}[5m])) or vector(0)",
+          "refId": "A",
+          "legendFormat": "4xx"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{status=~\"5..\"}[5m])) or vector(0)",
+          "refId": "B",
+          "legendFormat": "5xx"
         }
       ]
     },
     {
-      "title": "Meta-Tile Cache Hit Rate",
-      "type": "gauge",
-      "gridPos": { "h": 6, "w": 5, "x": 10, "y": 31 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "type": "timeseries",
+      "title": "WMS GetMap latency — p50 / p95 / p99",
+      "description": "The hot path. p50 ≈ warm cache hits (~20 ms); the p99 tail is cold renders. Sustained p99 > 1 s: check 'Cold tile renders /s' and the slow-render log panel.",
+      "id": 12,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "thresholds": {
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "yellow", "value": 0.5 },
-              { "color": "green", "value": 0.8 }
-            ]
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
           }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
         }
       },
       "targets": [
         {
-          "expr": "sum(rate(metatile_cache_hits_total[5m])) / clamp_min(sum(rate(metatile_cache_hits_total[5m])) + sum(rate(metatile_cache_misses_total[5m])), 0.0001)",
-          "legendFormat": "Hit Rate"
+          "expr": "histogram_quantile(0.50, sum by(le)(rate(http_request_duration_seconds_bucket{path=\"/wms\"}[5m])))",
+          "refId": "A",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket{path=\"/wms\"}[5m])))",
+          "refId": "B",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by(le)(rate(http_request_duration_seconds_bucket{path=\"/wms\"}[5m])))",
+          "refId": "C",
+          "legendFormat": "p99"
         }
       ]
     },
     {
-      "title": "GRIB Grid Cache Hit Rate",
-      "type": "gauge",
-      "gridPos": { "h": 6, "w": 5, "x": 15, "y": 31 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "type": "timeseries",
+      "title": "Latency p95 — by API",
+      "description": "Per-API p95. NOTE: quantiles are unreliable below ~0.1 req/s (they interpolate to bucket tops from single samples) — check the request rate before believing a spike on a quiet API.",
+      "id": 13,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "thresholds": {
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "yellow", "value": 0.5 },
-              { "color": "green", "value": 0.8 }
-            ]
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
           }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
         }
       },
       "targets": [
         {
-          "expr": "sum(rate(grid_cache_hits_total[5m])) / clamp_min(sum(rate(grid_cache_hits_total[5m])) + sum(rate(grid_cache_misses_total[5m])), 0.0001)",
-          "legendFormat": "Hit Rate"
+          "expr": "histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket{path=~\"/wms.*\"}[5m])))",
+          "refId": "A",
+          "legendFormat": "wms"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket{path=~\"/tiles.*\"}[5m])))",
+          "refId": "B",
+          "legendFormat": "tiles"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket{path=~\"/edr.*\"}[5m])))",
+          "refId": "C",
+          "legendFormat": "edr"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket{path=~\"/features.*\"}[5m])))",
+          "refId": "D",
+          "legendFormat": "features"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket{path=~\"/3dtiles.*\"}[5m])))",
+          "refId": "E",
+          "legendFormat": "3dtiles"
         }
       ]
     },
     {
-      "title": "Render Semaphore",
-      "type": "gauge",
-      "gridPos": { "h": 6, "w": 4, "x": 20, "y": 31 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "type": "bargauge",
+      "title": "Busiest endpoints (1 h)",
+      "description": "Requests per route pattern over the last hour.",
+      "id": 14,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "min": 0,
           "thresholds": {
+            "mode": "absolute",
             "steps": [
-              { "color": "red", "value": null },
-              { "color": "yellow", "value": 1 },
-              { "color": "green", "value": 2 }
+              {
+                "color": "blue",
+                "value": null
+              }
             ]
           }
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
         }
       },
       "targets": [
         {
-          "expr": "render_semaphore_available",
-          "legendFormat": "Available"
+          "expr": "topk(8, sum(increase(http_requests_total[1h])) by (path))",
+          "refId": "A",
+          "legendFormat": "{{path}}"
         }
-      ],
-      "options": {
-        "text": { "titleSize": 14 }
-      }
+      ]
     },
     {
-      "title": "Cache Hits vs Misses",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 37 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "title": "EDR position queries — rate and p95",
+      "description": "Point/time-series queries (map click / hover). Cheap since #463 (decoded-chunk cache) — a rising p95 here with PVOL collections in play suggests pixel-cache eviction (#476).",
+      "id": 15,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{path=\"/edr/collections/{id}/position\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "req/s"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket{path=\"/edr/collections/{id}/position\"}[5m])))",
+          "refId": "B",
+          "legendFormat": "p95 (s)"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Render pipeline (WMS / Maps / Tiles)",
+      "id": 16,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Cold tile renders per second",
+      "description": "Meta-tile cache misses = tiles actually rendered (decode + resample + colorize). This is the render COST signal: p99 spikes track this, not request rate. Animation scrubbing is always cold here (TIME is in the tile key) — the rendered-output cache is what serves repeat loops.",
+      "id": 17,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 31
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
-          "custom": { "fillOpacity": 10, "lineWidth": 2 }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byRegexp", "options": ".*Hits" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
-          },
-          {
-            "matcher": { "id": "byRegexp", "options": ".*Misses" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
           }
-        ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
-          "expr": "sum(rate(tile_cache_hits_total[5m]))",
-          "legendFormat": "Tile Hits"
+          "expr": "rate(metatile_cache_misses_total[$__rate_interval])",
+          "refId": "A",
+          "legendFormat": "cold meta-tiles /s"
         },
         {
-          "expr": "sum(rate(tile_cache_misses_total[5m]))",
-          "legendFormat": "Tile Misses"
-        },
-        {
-          "expr": "sum(rate(rendered_cache_hits_total[5m]))",
-          "legendFormat": "Rendered Hits"
-        },
-        {
-          "expr": "sum(rate(rendered_cache_misses_total[5m]))",
-          "legendFormat": "Rendered Misses"
-        },
-        {
-          "expr": "sum(rate(grid_cache_hits_total[5m]))",
-          "legendFormat": "Grid Hits"
-        },
-        {
-          "expr": "sum(rate(grid_cache_misses_total[5m]))",
-          "legendFormat": "Grid Misses"
-        },
-        {
-          "expr": "sum(rate(metatile_cache_hits_total[5m]))",
-          "legendFormat": "Meta-Tile Hits"
-        },
-        {
-          "expr": "sum(rate(metatile_cache_misses_total[5m]))",
-          "legendFormat": "Meta-Tile Misses"
+          "expr": "rate(rendered_cache_misses_total[$__rate_interval])",
+          "refId": "B",
+          "legendFormat": "full-viewport renders /s"
         }
       ]
     },
     {
-      "title": "Render Semaphore Utilization",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 37 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "title": "Render semaphore",
+      "description": "Permits in use vs total (2×cores, min 8). Flat-topped at total = renders queueing; brief touches are normal during animation bursts.",
+      "id": 18,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 31
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "custom": { "fillOpacity": 10, "lineWidth": 2 }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "In Use" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
           },
-          {
-            "matcher": { "id": "byName", "options": "Total" },
-            "properties": [
-              { "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } },
-              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
-            ]
-          }
-        ]
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
           "expr": "render_semaphore_total - render_semaphore_available",
-          "legendFormat": "In Use"
+          "refId": "A",
+          "legendFormat": "in use"
         },
         {
           "expr": "render_semaphore_total",
-          "legendFormat": "Total"
+          "refId": "B",
+          "legendFormat": "total"
         }
       ]
     },
     {
-      "title": "Cache Hit Rate Over Time",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 45 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "title": "Meta-tile cache — hit ratio and fill",
+      "description": "The pan substrate: adjacent/overlapping viewports at the same TIME reuse tiles. Healthy: ≥80% hits. Fill pinned at 100% = evicting; consider raising the metatile cache size if the hit ratio sags with it.",
+      "id": 19,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 39
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
-          "min": 0,
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
           "max": 1,
-          "custom": { "fillOpacity": 5, "lineWidth": 2 }
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
         }
       },
       "targets": [
         {
-          "expr": "sum(rate(tile_cache_hits_total[5m])) / clamp_min(sum(rate(tile_cache_hits_total[5m])) + sum(rate(tile_cache_misses_total[5m])), 0.0001)",
-          "legendFormat": "Tile Cache"
+          "expr": "rate(metatile_cache_hits_total[$__rate_interval]) / clamp_min(rate(metatile_cache_hits_total[$__rate_interval]) + rate(metatile_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "A",
+          "legendFormat": "hit ratio"
         },
         {
-          "expr": "sum(rate(rendered_cache_hits_total[5m])) / clamp_min(sum(rate(rendered_cache_hits_total[5m])) + sum(rate(rendered_cache_misses_total[5m])), 0.0001)",
-          "legendFormat": "Rendered Cache"
-        },
-        {
-          "expr": "sum(rate(grid_cache_hits_total[5m])) / clamp_min(sum(rate(grid_cache_hits_total[5m])) + sum(rate(grid_cache_misses_total[5m])), 0.0001)",
-          "legendFormat": "GRIB Grid Cache"
-        },
-        {
-          "expr": "sum(rate(metatile_cache_hits_total[5m])) / clamp_min(sum(rate(metatile_cache_hits_total[5m])) + sum(rate(metatile_cache_misses_total[5m])), 0.0001)",
-          "legendFormat": "Meta-Tile Cache"
+          "expr": "metatile_cache_bytes / clamp_min(metatile_cache_capacity_bytes, 1)",
+          "refId": "B",
+          "legendFormat": "fill (of capacity)"
         }
       ]
     },
     {
-      "title": "Cache Fill (% of capacity)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 45 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "description": "Bytes held / configured capacity. A line pinned near 100% means the cache is full and evicting on every insert — the working set exceeds capacity (consider raising the *_cache_mb).",
+      "title": "Rendered-output cache — hit ratio and fill",
+      "description": "Exact-request repeats (fixed-viewport animation loops). Low hit% is EXPECTED with diverse clients — it only pays for loopers. Bimodal by design (#202).",
+      "id": 20,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 39
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
-          "min": 0,
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
           "max": 1,
-          "custom": { "fillOpacity": 5, "lineWidth": 2 },
-          "thresholds": {
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 0.9 },
-              { "color": "red", "value": 0.98 }
-            ]
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(rendered_cache_hits_total[$__rate_interval]) / clamp_min(rate(rendered_cache_hits_total[$__rate_interval]) + rate(rendered_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "A",
+          "legendFormat": "hit ratio"
+        },
+        {
+          "expr": "rendered_cache_bytes / clamp_min(rendered_cache_capacity_bytes, 1)",
+          "refId": "B",
+          "legendFormat": "fill (of capacity)"
+        }
+      ]
+    },
+    {
+      "type": "logs",
+      "title": "Slow renders (>0.5 s) — from logs",
+      "description": "Every `slow WMS meta-tile render` line: which layer, how long, how many tiles, and whether time went to the semaphore (sem_wait) or the tile loop. This panel is how the #472 night spikes and the #476 eviction bursts were diagnosed.",
+      "id": 21,
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        {
+          "expr": "{job=\"meteocore\"} |= `slow WMS meta-tile render` | json | line_format \"{{.layer}}  {{.render_ms}}ms  tiles={{.tiles}} misses={{.misses}} sem_wait={{.sem_wait_ms}}ms  {{.width}}x{{.height}}\"",
+          "refId": "A",
+          "maxLines": 200
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Caches — all families",
+      "id": 22,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 56
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Hit ratio — every cache",
+      "description": "One line per cache family. A family sagging while its fill (right panel) is pinned at 100% = working set no longer fits. Families with no traffic show no line.",
+      "id": 23,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 57
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "max": 1,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(metatile_cache_hits_total[$__rate_interval]) / clamp_min(rate(metatile_cache_hits_total[$__rate_interval]) + rate(metatile_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "A",
+          "legendFormat": "Meta-tile (WMS pan substrate)"
+        },
+        {
+          "expr": "rate(rendered_cache_hits_total[$__rate_interval]) / clamp_min(rate(rendered_cache_hits_total[$__rate_interval]) + rate(rendered_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "D",
+          "legendFormat": "Rendered output (exact repeat)"
+        },
+        {
+          "expr": "rate(geotiff_decoded_chunk_cache_hits_total[$__rate_interval]) / clamp_min(rate(geotiff_decoded_chunk_cache_hits_total[$__rate_interval]) + rate(geotiff_decoded_chunk_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "G",
+          "legendFormat": "GeoTIFF decoded chunks (#463)"
+        },
+        {
+          "expr": "sum(rate(tile_cache_hits_total[$__rate_interval])) / clamp_min(sum(rate(tile_cache_hits_total[$__rate_interval])) + sum(rate(tile_cache_misses_total[$__rate_interval])), 1e-9)",
+          "refId": "J",
+          "legendFormat": "GeoTIFF remote tiles (S3/COG)"
+        },
+        {
+          "expr": "rate(odim_composite_cache_hits_total[$__rate_interval]) / clamp_min(rate(odim_composite_cache_hits_total[$__rate_interval]) + rate(odim_composite_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "M",
+          "legendFormat": "ODIM composite grids (#212)"
+        },
+        {
+          "expr": "rate(pvol_pixel_cache_hits_total[$__rate_interval]) / clamp_min(rate(pvol_pixel_cache_hits_total[$__rate_interval]) + rate(pvol_pixel_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "P",
+          "legendFormat": "PVOL pixels (#289/#461)"
+        },
+        {
+          "expr": "rate(pvol_voxel_grid_cache_hits_total[$__rate_interval]) / clamp_min(rate(pvol_voxel_grid_cache_hits_total[$__rate_interval]) + rate(pvol_voxel_grid_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "S",
+          "legendFormat": "PVOL voxel grids (3D Tiles)"
+        },
+        {
+          "expr": "rate(pvol_cell_set_cache_hits_total[$__rate_interval]) / clamp_min(rate(pvol_cell_set_cache_hits_total[$__rate_interval]) + rate(pvol_cell_set_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "V",
+          "legendFormat": "PVOL storm-cell sets (#367)"
+        },
+        {
+          "expr": "rate(tiles3d_content_cache_hits_total[$__rate_interval]) / clamp_min(rate(tiles3d_content_cache_hits_total[$__rate_interval]) + rate(tiles3d_content_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "Y",
+          "legendFormat": "3D Tiles content (#378)"
+        },
+        {
+          "expr": "sum(rate(grid_cache_hits_total[$__rate_interval])) / clamp_min(sum(rate(grid_cache_hits_total[$__rate_interval])) + sum(rate(grid_cache_misses_total[$__rate_interval])), 1e-9)",
+          "refId": "B",
+          "legendFormat": "GRIB decoded grids"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Miss rate — every cache (work per second)",
+      "description": "Misses are actual work: decodes, renders, S3 fetches. Watch for a family whose misses jump while traffic is flat — that is churn, not load.",
+      "id": 24,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 57
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
           }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(metatile_cache_misses_total[$__rate_interval])",
+          "refId": "B",
+          "legendFormat": "Meta-tile (WMS pan substrate)"
+        },
+        {
+          "expr": "rate(rendered_cache_misses_total[$__rate_interval])",
+          "refId": "E",
+          "legendFormat": "Rendered output (exact repeat)"
+        },
+        {
+          "expr": "rate(geotiff_decoded_chunk_cache_misses_total[$__rate_interval])",
+          "refId": "H",
+          "legendFormat": "GeoTIFF decoded chunks (#463)"
+        },
+        {
+          "expr": "sum(rate(tile_cache_misses_total[$__rate_interval]))",
+          "refId": "K",
+          "legendFormat": "GeoTIFF remote tiles (S3/COG)"
+        },
+        {
+          "expr": "rate(odim_composite_cache_misses_total[$__rate_interval])",
+          "refId": "N",
+          "legendFormat": "ODIM composite grids (#212)"
+        },
+        {
+          "expr": "rate(pvol_pixel_cache_misses_total[$__rate_interval])",
+          "refId": "Q",
+          "legendFormat": "PVOL pixels (#289/#461)"
+        },
+        {
+          "expr": "rate(pvol_voxel_grid_cache_misses_total[$__rate_interval])",
+          "refId": "T",
+          "legendFormat": "PVOL voxel grids (3D Tiles)"
+        },
+        {
+          "expr": "rate(pvol_cell_set_cache_misses_total[$__rate_interval])",
+          "refId": "W",
+          "legendFormat": "PVOL storm-cell sets (#367)"
+        },
+        {
+          "expr": "rate(tiles3d_content_cache_misses_total[$__rate_interval])",
+          "refId": "Z",
+          "legendFormat": "3D Tiles content (#378)"
+        },
+        {
+          "expr": "sum(rate(grid_cache_misses_total[$__rate_interval]))",
+          "refId": "C",
+          "legendFormat": "GRIB decoded grids"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Fill — % of configured capacity",
+      "description": "Bytes resident vs configured cap. Pinned at 100% is fine ONLY if the hit ratio holds; 100% + sagging hits + rising inserts = raise the env cap (see PVOL panel below for the worked example).",
+      "id": 25,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 57
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "max": 1,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
         }
       },
       "targets": [
         {
           "expr": "metatile_cache_bytes / clamp_min(metatile_cache_capacity_bytes, 1)",
-          "legendFormat": "Meta-Tile"
+          "refId": "C",
+          "legendFormat": "Meta-tile (WMS pan substrate)"
         },
         {
           "expr": "rendered_cache_bytes / clamp_min(rendered_cache_capacity_bytes, 1)",
-          "legendFormat": "Rendered"
-        }
-      ]
-    },
-    {
-      "title": "Collections & Endpoints",
-      "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 53 },
-      "collapsed": false
-    },
-    {
-      "title": "Collection Health",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 54 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "steps": [
-              { "color": "green", "value": null }
-            ]
-          }
-        }
-      },
-      "targets": [
-        { "expr": "collections_total", "legendFormat": "Total" },
-        { "expr": "collections_healthy", "legendFormat": "Healthy" }
-      ]
-    },
-    {
-      "title": "Degraded",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 3, "x": 6, "y": 54 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 1 }
-            ]
-          }
-        }
-      },
-      "targets": [
-        { "expr": "collections_degraded", "legendFormat": "Degraded" }
-      ]
-    },
-    {
-      "title": "Failed",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 3, "x": 9, "y": 54 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 1 }
-            ]
-          }
-        }
-      },
-      "targets": [
-        { "expr": "collections_failed", "legendFormat": "Failed" }
-      ]
-    },
-    {
-      "title": "Requests by Status Code",
-      "type": "piechart",
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 54 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "targets": [
+          "refId": "F",
+          "legendFormat": "Rendered output (exact repeat)"
+        },
         {
-          "expr": "sum(increase(http_requests_total[1h])) by (status)",
-          "legendFormat": "{{status}}"
+          "expr": "geotiff_decoded_chunk_cache_bytes / clamp_min(geotiff_decoded_chunk_cache_capacity_bytes, 1)",
+          "refId": "I",
+          "legendFormat": "GeoTIFF decoded chunks (#463)"
+        },
+        {
+          "expr": "sum(tile_cache_bytes) / clamp_min(sum(tile_cache_capacity_bytes), 1)",
+          "refId": "L",
+          "legendFormat": "GeoTIFF remote tiles (S3/COG)"
+        },
+        {
+          "expr": "odim_composite_cache_bytes / clamp_min(odim_composite_cache_capacity_bytes, 1)",
+          "refId": "O",
+          "legendFormat": "ODIM composite grids (#212)"
+        },
+        {
+          "expr": "pvol_pixel_cache_bytes / clamp_min(pvol_pixel_cache_capacity_bytes, 1)",
+          "refId": "R",
+          "legendFormat": "PVOL pixels (#289/#461)"
+        },
+        {
+          "expr": "pvol_voxel_grid_cache_bytes / clamp_min(pvol_voxel_grid_cache_capacity_bytes, 1)",
+          "refId": "U",
+          "legendFormat": "PVOL voxel grids (3D Tiles)"
+        },
+        {
+          "expr": "pvol_cell_set_cache_bytes / clamp_min(pvol_cell_set_cache_capacity_bytes, 1)",
+          "refId": "X",
+          "legendFormat": "PVOL storm-cell sets (#367)"
+        },
+        {
+          "expr": "tiles3d_content_cache_bytes / clamp_min(tiles3d_content_cache_capacity_bytes, 1)",
+          "refId": "A",
+          "legendFormat": "3D Tiles content (#378)"
+        },
+        {
+          "expr": "sum(grid_cache_bytes) / clamp_min(sum(grid_cache_capacity_bytes), 1)",
+          "refId": "D",
+          "legendFormat": "GRIB decoded grids"
         }
       ]
     },
     {
-      "title": "Top Endpoints by Request Count",
-      "type": "bargauge",
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 54 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "type": "timeseries",
+      "title": "PVOL pixel cache — eviction pressure (#476)",
+      "description": "The #461/#472 pre-warm keeps every advertised timestep's lowest sweep resident — IF it fits. Sustained inserts/s while entries stay flat at capacity = LRU churn: pre-warmed frames evicted, and the next animation pays burst S3/disk re-reads (the 11 s fikan renders). Fix: raise MC_PVOL_PIXEL_CACHE_MB above the working set (sites × window/cadence × ~4 MB).",
+      "id": 26,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 65
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
-        }
+          "unit": "ops",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
       },
       "options": {
-        "orientation": "horizontal",
-        "displayMode": "gradient"
-      },
-      "targets": [
-        {
-          "expr": "topk(10, sum(increase(http_requests_total[1h])) by (path))",
-          "legendFormat": "{{path}}"
-        }
-      ]
-    },
-    {
-      "title": "Request Rate by Endpoint",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 62 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "reqps",
-          "custom": { "fillOpacity": 10, "lineWidth": 1, "stacking": { "mode": "normal" } }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
         }
       },
       "targets": [
         {
-          "expr": "sum(rate(http_requests_total[5m])) by (path)",
-          "legendFormat": "{{path}}"
-        }
-      ]
-    },
-    {
-      "title": "Logs",
-      "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 70 },
-      "collapsed": false
-    },
-    {
-      "title": "Request Rate by Query Type (from logs)",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 71 },
-      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "reqps",
-          "custom": { "fillOpacity": 10, "lineWidth": 1 }
-        }
-      },
-      "targets": [
+          "expr": "rate(pvol_pixel_cache_inserts_total[$__rate_interval])",
+          "refId": "A",
+          "legendFormat": "inserts /s"
+        },
         {
-          "expr": "sum by (api, query_type) (rate({job=\"meteocore\"} | json | __error__=\"\" [5m]))",
-          "legendFormat": "{{api}} / {{query_type}}"
+          "expr": "rate(pvol_pixel_cache_misses_total[$__rate_interval])",
+          "refId": "B",
+          "legendFormat": "request-time misses /s"
+        },
+        {
+          "expr": "rate(pvol_pixel_read_failures_total[$__rate_interval])",
+          "refId": "C",
+          "legendFormat": "read failures /s"
         }
       ]
     },
     {
-      "title": "Error Rate by Status Class (from logs)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 71 },
-      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "title": "PVOL pixel cache — resident vs capacity",
+      "description": "Resident bytes against MC_PVOL_PIXEL_CACHE_MB, plus entry count (right side, thousands).",
+      "id": 27,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 65
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps",
-          "custom": { "fillOpacity": 20, "lineWidth": 1, "stacking": { "mode": "normal" } }
+          "unit": "bytes",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "4xx" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }]
-          },
-          {
-            "matcher": { "id": "byName", "options": "5xx" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "entries (k)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
           }
         ]
       },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
       "targets": [
         {
-          "expr": "sum by (status_class) (rate({job=\"meteocore\", status_class=~\"4xx|5xx\"} [5m]))",
-          "legendFormat": "{{status_class}}"
+          "expr": "pvol_pixel_cache_bytes",
+          "refId": "A",
+          "legendFormat": "resident bytes"
+        },
+        {
+          "expr": "pvol_pixel_cache_capacity_bytes",
+          "refId": "B",
+          "legendFormat": "capacity"
+        },
+        {
+          "expr": "pvol_pixel_cache_entries / 1000",
+          "refId": "C",
+          "legendFormat": "entries (k)"
         }
       ]
     },
     {
-      "title": "Recent Requests",
+      "type": "row",
+      "title": "Data transfer & storage",
+      "id": 28,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 73
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Egress — by API",
+      "description": "PNG/JSON bytes served per second.",
+      "id": 29,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 74
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(http_response_bytes_total[5m]))",
+          "refId": "A",
+          "legendFormat": "total"
+        },
+        {
+          "expr": "sum(rate(http_response_bytes_total{path=~\"/wms.*\"}[5m]))",
+          "refId": "B",
+          "legendFormat": "wms"
+        },
+        {
+          "expr": "sum(rate(http_response_bytes_total{path=~\"/tiles.*\"}[5m]))",
+          "refId": "C",
+          "legendFormat": "tiles"
+        },
+        {
+          "expr": "sum(rate(http_response_bytes_total{path=~\"/edr.*\"}[5m]))",
+          "refId": "D",
+          "legendFormat": "edr"
+        },
+        {
+          "expr": "sum(rate(http_response_bytes_total{path=~\"/3dtiles.*\"}[5m]))",
+          "refId": "E",
+          "legendFormat": "3dtiles"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Remote storage reads — by collection",
+      "description": "Bytes fetched from S3/HTTP sources (cold COG tiles, PVOL volumes, GRIB messages). Local-file collections read ~0 here. A burst on a pvol collection = pixel-cache misses being refetched (see #476 panel).",
+      "id": 30,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 74
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(storage_bytes_read_total[5m])) by (collection)",
+          "refId": "A",
+          "legendFormat": "{{collection}}"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Served in 24 h",
+      "description": "Total response bytes over the last day.",
+      "id": 31,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 82
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(http_response_bytes_total[24h]))",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Fetched from remote storage in 24 h",
+      "description": "Total bytes read from S3/HTTP sources over the last day.",
+      "id": 32,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 82
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(storage_bytes_read_total[24h]))",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "PostGIS (observation collections)",
+      "id": 33,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 86
+      },
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Database reachable",
+      "description": "Live 30 s SELECT-1 ping (#110). 0 = collection flips to degraded in /health.",
+      "id": 34,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 87
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "expr": "min(postgis_up)",
+          "refId": "A",
+          "legendFormat": "up"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Connection pool",
+      "description": "Open connections vs capacity, acquirable-now, and waiters. Sustained waiting > 0 = pool too small or slow queries.",
+      "id": 35,
+      "gridPos": {
+        "h": 8,
+        "w": 10,
+        "x": 4,
+        "y": 87
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "postgis_pool_size",
+          "refId": "A",
+          "legendFormat": "open {{pool_key}}"
+        },
+        {
+          "expr": "postgis_pool_max_size",
+          "refId": "B",
+          "legendFormat": "capacity {{pool_key}}"
+        },
+        {
+          "expr": "postgis_pool_available",
+          "refId": "C",
+          "legendFormat": "available {{pool_key}}"
+        },
+        {
+          "expr": "postgis_pool_waiting",
+          "refId": "D",
+          "legendFormat": "waiting {{pool_key}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Health pings & metadata refreshes — failures",
+      "description": "Failed pings flip /health; failed refreshes keep the previous snapshot (locations go stale). Both should be flat 0.",
+      "id": 36,
+      "gridPos": {
+        "h": 8,
+        "w": 10,
+        "x": 14,
+        "y": 87
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(postgis_ping_failures_total[$__rate_interval])) or vector(0)",
+          "refId": "A",
+          "legendFormat": "ping failures /s"
+        },
+        {
+          "expr": "sum(rate(postgis_metadata_refresh_failures_total[$__rate_interval])) or vector(0)",
+          "refId": "B",
+          "legendFormat": "refresh failures /s"
+        },
+        {
+          "expr": "max(postgis_metadata_refresh_seconds)",
+          "refId": "C",
+          "legendFormat": "last refresh duration (s)"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Logs",
+      "id": 37,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 95
+      },
+      "panels": []
+    },
+    {
       "type": "logs",
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 79 },
-      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "title": "Errors — 4xx / 5xx",
+      "description": "Structured request logs filtered to error statuses.",
+      "id": 38,
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 96
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        {
+          "expr": "{job=\"meteocore\", status_class=~\"4xx|5xx\"} | json | line_format \"{{.method}} {{.path}} → {{.status}} ({{.duration_ms}}ms) {{.error}} {{if .query}}?{{.query}}{{end}}\"",
+          "refId": "A",
+          "maxLines": 200
+        }
+      ]
+    },
+    {
+      "type": "logs",
+      "title": "Recent requests",
+      "description": "All structured request logs (newest first).",
+      "id": 39,
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 105
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
       "options": {
         "showTime": true,
         "showLabels": false,
@@ -713,53 +1913,10 @@
       "targets": [
         {
           "expr": "{job=\"meteocore\"} | json | line_format \"{{.method}} {{.path}} → {{.status}} ({{.duration_ms}}ms) rid={{.request_id}} {{if .query}}?{{.query}}{{end}}\"",
-          "maxLines": 500
-        }
-      ]
-    },
-    {
-      "title": "Errors (4xx / 5xx)",
-      "type": "logs",
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 91 },
-      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
-      "options": {
-        "showTime": true,
-        "showLabels": true,
-        "wrapLogMessage": true,
-        "enableLogDetails": true,
-        "dedupStrategy": "none",
-        "sortOrder": "Descending"
-      },
-      "targets": [
-        {
-          "expr": "{job=\"meteocore\", status_class=~\"4xx|5xx\"} | json | line_format \"{{.method}} {{.path}} → {{.status}} rid={{.request_id}} {{if .query}}?{{.query}}{{end}}\"",
+          "refId": "A",
           "maxLines": 200
         }
       ]
     }
-  ],
-  "schemaVersion": 39,
-  "tags": ["meteocore"],
-  "templating": {
-    "list": [
-      {
-        "name": "DS_PROMETHEUS",
-        "type": "datasource",
-        "query": "prometheus",
-        "current": { "text": "Prometheus", "value": "Prometheus" }
-      },
-      {
-        "name": "DS_LOKI",
-        "type": "datasource",
-        "query": "loki",
-        "current": { "text": "Loki", "value": "Loki" }
-      }
-    ]
-  },
-  "time": { "from": "now-1h", "to": "now" },
-  "timepicker": {},
-  "timezone": "utc",
-  "title": "MeteoCore",
-  "uid": "meteocore-overview",
-  "version": 2
+  ]
 }
