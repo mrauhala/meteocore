@@ -173,6 +173,102 @@ static COLLECTIONS_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
     gauge
 });
 
+// Process + allocator memory (#493). RSS/swap come from /proc/self/status
+// (Linux only; the series stay 0 elsewhere). The jemalloc_* gauges expose the
+// allocator's own accounting so the fragmentation multiplier is visible in
+// prod: `allocated` = live bytes the application holds, `resident` = physical
+// pages jemalloc keeps — resident far above allocated means allocator
+// retention (the glibc failure mode this deployment hit was ~3×).
+static PROCESS_MEM_GAUGES: LazyLock<[IntGauge; 2]> = LazyLock::new(|| {
+    let mk = |name: &str, help: &str| {
+        let g = IntGauge::new(name, help).unwrap();
+        REGISTRY.register(Box::new(g.clone())).unwrap();
+        g
+    };
+    [
+        mk(
+            "process_resident_memory_bytes",
+            "Resident set size (VmRSS) of the server process",
+        ),
+        mk(
+            "process_swap_memory_bytes",
+            "Swapped-out anonymous memory (VmSwap) of the server process",
+        ),
+    ]
+});
+
+#[cfg(not(target_env = "msvc"))]
+static JEMALLOC_GAUGES: LazyLock<[IntGauge; 5]> = LazyLock::new(|| {
+    let mk = |name: &str, help: &str| {
+        let g = IntGauge::new(name, help).unwrap();
+        REGISTRY.register(Box::new(g.clone())).unwrap();
+        g
+    };
+    [
+        mk(
+            "jemalloc_allocated_bytes",
+            "Bytes in live allocations (application-held)",
+        ),
+        mk(
+            "jemalloc_active_bytes",
+            "Bytes in active pages backing allocations (>= allocated; gap = internal fragmentation)",
+        ),
+        mk(
+            "jemalloc_resident_bytes",
+            "Physical bytes jemalloc keeps mapped (>= active; gap = dirty pages awaiting decay)",
+        ),
+        mk(
+            "jemalloc_mapped_bytes",
+            "Total bytes in jemalloc extent mappings",
+        ),
+        mk(
+            "jemalloc_retained_bytes",
+            "Virtual address space retained for reuse (not physically backed)",
+        ),
+    ]
+});
+
+/// Refresh the process/allocator memory gauges. Called per `/metrics` scrape.
+fn update_memory_gauges() {
+    // Touch the family even where /proc is unavailable so dashboards see the
+    // series (it just stays 0 off-Linux).
+    LazyLock::force(&PROCESS_MEM_GAUGES);
+    #[cfg(target_os = "linux")]
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        let kb = |key: &str| -> Option<i64> {
+            let line = status.lines().find(|l| l.starts_with(key))?;
+            line.split_whitespace().nth(1)?.parse::<i64>().ok()
+        };
+        if let Some(rss_kb) = kb("VmRSS:") {
+            PROCESS_MEM_GAUGES[0].set(rss_kb * 1024);
+        }
+        if let Some(swap_kb) = kb("VmSwap:") {
+            PROCESS_MEM_GAUGES[1].set(swap_kb * 1024);
+        }
+    }
+
+    #[cfg(not(target_env = "msvc"))]
+    {
+        use tikv_jemalloc_ctl::{epoch, stats};
+        // Stats are snapshotted inside jemalloc; advancing the epoch refreshes
+        // them before reading.
+        if epoch::advance().is_ok() {
+            let stats: [Result<usize, _>; 5] = [
+                stats::allocated::read(),
+                stats::active::read(),
+                stats::resident::read(),
+                stats::mapped::read(),
+                stats::retained::read(),
+            ];
+            for (gauge, value) in JEMALLOC_GAUGES.iter().zip(stats) {
+                if let Ok(v) = value {
+                    gauge.set(v as i64);
+                }
+            }
+        }
+    }
+}
+
 static COLLECTIONS_HEALTHY: LazyLock<IntGauge> = LazyLock::new(|| {
     let gauge = IntGauge::new("collections_healthy", "Collections in ready state").unwrap();
     REGISTRY.register(Box::new(gauge.clone())).unwrap();
@@ -3144,6 +3240,7 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     // Read from current WMS state (survives reloads via ArcSwap)
     let wms = state.wms.load();
     RENDER_SEMAPHORE_AVAILABLE.set(wms.render_semaphore.available_permits() as i64);
+    update_memory_gauges();
 
     // Delta-tracked cache counters: cache implementations expose cumulative
     // (hits, misses) values but may be replaced on reload; each CacheMetricSet
