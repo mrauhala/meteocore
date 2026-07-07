@@ -1453,7 +1453,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 73
+        "y": 81
       },
       "panels": []
     },
@@ -1466,7 +1466,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 74
+        "y": 82
       },
       "datasource": {
         "type": "prometheus",
@@ -1532,7 +1532,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 74
+        "y": 82
       },
       "datasource": {
         "type": "prometheus",
@@ -1578,7 +1578,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 82
+        "y": 90
       },
       "datasource": {
         "type": "prometheus",
@@ -1625,7 +1625,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 82
+        "y": 90
       },
       "datasource": {
         "type": "prometheus",
@@ -1672,7 +1672,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 86
+        "y": 94
       },
       "panels": []
     },
@@ -1685,7 +1685,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 87
+        "y": 95
       },
       "datasource": {
         "type": "prometheus",
@@ -1736,7 +1736,7 @@
         "h": 8,
         "w": 10,
         "x": 4,
-        "y": 87
+        "y": 95
       },
       "datasource": {
         "type": "prometheus",
@@ -1797,7 +1797,7 @@
         "h": 8,
         "w": 10,
         "x": 14,
-        "y": 87
+        "y": 95
       },
       "datasource": {
         "type": "prometheus",
@@ -1853,7 +1853,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 95
+        "y": 103
       },
       "panels": []
     },
@@ -1866,7 +1866,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 96
+        "y": 104
       },
       "datasource": {
         "type": "loki",
@@ -1899,7 +1899,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 105
+        "y": 113
       },
       "datasource": {
         "type": "loki",
@@ -1920,6 +1920,74 @@
           "expr": "{job=\"meteocore\"} | json | line_format \"{{.method}} {{.path}} → {{.status}} ({{.duration_ms}}ms) rid={{.request_id}} {{if .query}}?{{.query}}{{end}}\"",
           "refId": "A",
           "maxLines": 200
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Process memory — RSS, swap & allocator accounting",
+      "description": "Verifies the #493 fix (jemalloc). Healthy: process RSS ≈ jemalloc resident, and resident within ~1.5× of allocated (live application bytes). resident ≫ allocated = allocator retention/fragmentation (the glibc failure mode was ~3×). RSS ≫ jemalloc resident = memory outside the allocator (mmap'd files, thread stacks). Sustained process swap > 0 = host memory pressure — check what else grew on the box. 'live cache bytes' is the sum of every byte-bounded cache family, the floor the process can't go below.",
+      "id": 40,
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 73
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "process_resident_memory_bytes",
+          "refId": "A",
+          "legendFormat": "process RSS"
+        },
+        {
+          "expr": "process_swap_memory_bytes",
+          "refId": "B",
+          "legendFormat": "process swap"
+        },
+        {
+          "expr": "jemalloc_resident_bytes",
+          "refId": "C",
+          "legendFormat": "jemalloc resident"
+        },
+        {
+          "expr": "jemalloc_allocated_bytes",
+          "refId": "D",
+          "legendFormat": "jemalloc allocated (live)"
+        },
+        {
+          "expr": "sum({__name__=~\".+_cache_bytes\"})",
+          "refId": "E",
+          "legendFormat": "live cache bytes"
         }
       ]
     }

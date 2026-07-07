@@ -49,3 +49,7 @@ http-body-util = "0.1"
 tempfile = "3"
 toml = "0.8"
 tower = { version = "0.5", features = ["util"] }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
+tikv-jemallocator = { version = "0.7", features = ["stats"] }

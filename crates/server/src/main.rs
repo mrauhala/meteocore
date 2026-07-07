@@ -5,6 +5,18 @@ mod watcher;
 
 use std::sync::{Arc, OnceLock, RwLock};
 
+/// jemalloc as the global allocator (#493). The default glibc malloc
+/// fragments badly under this workload — many threads cycling 1–32 MB
+/// decode/render buffers interleaved with long-lived byte-bounded cache
+/// entries pins nearly every 64 MB arena heap: prod reached a ~52 GB
+/// anonymous footprint holding only ~16 GiB of live cache (~3× retention).
+/// jemalloc's size-classed extents and dirty-page decay return freed memory
+/// to the OS instead. Allocator stats are exported on `/metrics` as the
+/// `jemalloc_*` gauges (see `admin.rs`) to watch the multiplier in prod.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// Dedicated multi-thread runtime for background collection poll loops.
 ///
 /// Poll/scan loops do blocking I/O via `ds_storage::DataStore`, which parks the
