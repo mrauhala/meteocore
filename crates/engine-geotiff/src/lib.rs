@@ -1804,7 +1804,7 @@ impl EdrEngine for GeoTiffEngine {
             let nx = x.len();
             let expected_len = nt * ny * nx;
             let (col_start, row_start) = pixel_range.map_or((0, 0), |(c, r, _, _)| (c, r));
-            for (_name, ndarray) in result.ranges.iter_mut() {
+            for ndarray in result.ranges.values_mut() {
                 if ndarray.values.len() != expected_len {
                     tracing::error!(
                         "NdArray length mismatch: expected {} ({}*{}*{}), got {}",
