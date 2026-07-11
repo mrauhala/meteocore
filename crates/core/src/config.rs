@@ -2149,6 +2149,17 @@ impl ServerConfig {
                     ))
                 })?;
                 validate_postgis(id, postgis)?;
+                // The events shape serves EDR only for now — its
+                // FeatureEngine surface is #503. Without this check an
+                // `apis = ["features"]` events collection would load
+                // cleanly and silently serve an empty station inventory.
+                if postgis.observations.shape == "events" {
+                    if let Some(api) = collection.apis.iter().find(|a| a.as_str() != "edr") {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': apis entry '{api}' is not supported for observations.shape 'events' (only \"edr\" until #503 implements event features)"
+                        )));
+                    }
+                }
             } else if collection.postgis.is_some() {
                 return Err(crate::error::DataServerError::Config(format!(
                     "Collection '{id}': [collections.postgis] is set but engine_type is '{}'",
@@ -3703,6 +3714,21 @@ unit = "1"
             .to_string();
         assert!(
             err.contains("id_col is only valid for observations.shape 'events'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn postgis_events_rejects_non_edr_apis() {
+        let tmp = TempDir::new().unwrap();
+        let toml =
+            lightning_events_toml().replace("apis = [\"edr\"]", "apis = [\"edr\", \"features\"]");
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'features' is not supported for observations.shape 'events'"),
             "got: {err}"
         );
     }
