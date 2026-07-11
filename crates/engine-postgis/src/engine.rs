@@ -402,7 +402,14 @@ impl EdrEngine for PostgisEngine {
             area_queries_per_station(&self.config, &key_refs),
         )?;
 
-        let results = run_area_fanout(&self.pool, &self.config, &stations, datetime, &key_refs)?;
+        let results = run_area_fanout(
+            &self.pool,
+            &self.pool_key_label,
+            &self.config,
+            &stations,
+            datetime,
+            &key_refs,
+        )?;
         Ok(CoverageResponse::Collection(results))
     }
 }
@@ -541,17 +548,42 @@ fn run_queries_budgeted_sync(
     })
 }
 
+/// Process-global fan-out limiters, one per pool key (`<user>@<host>:
+/// <port>/<db>` or `pool_label`). The connection pool is shared across
+/// every collection on the same DSN, so the two-connection headroom must
+/// hold across ALL concurrent area requests — a per-request width alone
+/// lets two simultaneous fan-outs jointly drain the pool. Total in-flight
+/// area stations per pool key ≤ `clamp(pool max_size − 2, 1, 16)`.
+/// First-caller-wins on size (matching the pool registry's own rule);
+/// entries persist across reloads, which is correct because the pool key
+/// identifies the same upstream database.
+static FANOUT_LIMITERS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+> = std::sync::OnceLock::new();
+
+fn fanout_limiter(pool_key: &str, width: usize) -> Arc<tokio::sync::Semaphore> {
+    let map = FANOUT_LIMITERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    map.lock()
+        .expect("fanout limiter mutex poisoned")
+        .entry(pool_key.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(width)))
+        .clone()
+}
+
 /// Concurrent bounded fan-out over an area's stations (#115). Width is the
-/// pool size minus two-connection headroom (capped at 16, floor 1): the
-/// pool is shared across every collection on the same DSN, so one area
-/// request must never check out every connection and stall unrelated
-/// single-station lookups. Each in-flight station holds one pooled
-/// connection; results keep station order (`buffered`, not
-/// `buffer_unordered`) so responses stay deterministic. Rows are charged
-/// against the shared [`MAX_RESPONSE_VALUES`] budget as they arrive; each
-/// single query additionally keeps the [`MAX_OBSERVATION_ROWS`] cap so the
-/// transient row buffer is bounded by fan-out width × cap. The first error
-/// cancels the remaining in-flight queries.
+/// pool size minus two-connection headroom (capped at 16, floor 1), and is
+/// enforced *globally per pool key* via [`fanout_limiter`]: the pool is
+/// shared across every collection on the same DSN, so no combination of
+/// concurrent area requests may check out every connection and stall
+/// unrelated single-station lookups. Each in-flight station holds one
+/// semaphore permit, then one pooled connection (always in that order —
+/// permit holders never wait on permits, so there is no circular wait);
+/// results keep station order (`buffered`, not `buffer_unordered`) so
+/// responses stay deterministic. Rows are charged against the shared
+/// [`MAX_RESPONSE_VALUES`] budget as they arrive; each single query
+/// additionally keeps the [`MAX_OBSERVATION_ROWS`] cap so the transient
+/// row buffer is bounded by fan-out width × cap. The first error cancels
+/// the remaining in-flight queries.
 ///
 /// Budget semantics under concurrency: the accumulated total is checked
 /// strictly after every query, so a 200 response can never exceed the
@@ -562,20 +594,27 @@ fn run_queries_budgeted_sync(
 /// queued stations from adding to that once a breach is visible.
 fn run_area_fanout(
     pool: &Pool,
+    pool_key: &str,
     config: &Arc<PostgisEngineConfig>,
     stations: &[Location],
     datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
 ) -> Result<Vec<QueryResult>, DataServerError> {
     let width = (pool.status().max_size.saturating_sub(2)).clamp(1, 16);
+    let limiter = fanout_limiter(pool_key, width);
     let spent = AtomicUsize::new(0);
     let pool = pool.clone();
     let results: Vec<Option<QueryResult>> = block_on_async(async {
         futures::stream::iter(stations.iter().map(|station| {
             let pool = pool.clone();
             let config = Arc::clone(config);
+            let limiter = Arc::clone(&limiter);
             let spent = &spent;
             async move {
+                let _permit = limiter
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| DataServerError::Engine("fanout limiter closed".into()))?;
                 let queries = build_location(
                     &config,
                     &station.id,
@@ -601,10 +640,12 @@ fn run_area_fanout(
                         .await
                         .map_err(|e| map_pg_error(e, q))?;
                     if rows.len() >= MAX_OBSERVATION_ROWS {
+                        // Report VALUES, not rows: a wide-shape row carries
+                        // one value per selected column.
                         return Err(DataServerError::QueryTooLarge(format!(
                             "station '{}' alone has {}+ values in the window — narrow the time range, or use the position/location query for long single-station series",
                             station.id,
-                            MAX_OBSERVATION_ROWS - 1
+                            (MAX_OBSERVATION_ROWS - 1) * q.values_per_row.max(1)
                         )));
                     }
                     let values = rows.len() * q.values_per_row.max(1);

@@ -123,14 +123,17 @@ Derivation rules (hard-won from production timeouts):
   transient buffer stays ≤ width × cap. `values_per_row` weighs `wide`
   rows (one row = one value per selected column) against the budget.
 - **Area fan-out is concurrent** (#115): `stream::iter().buffered(n)`,
-  `n = clamp(pool max_size − 2, 1, 16)` — the −2 headroom is load-bearing:
-  the pool is shared per-DSN across collections, and a fan-out that checks
-  out every connection stalls unrelated requests. One pooled connection
-  per in-flight station, station order preserved, first error cancels the
-  rest. Never make it unbounded and never re-serialize it — 8k stations ×
-  ~2.4 ms sequential was ~20 s. A 200 can never exceed the value budget;
-  transient pre-400 DB work may overshoot by ≤ width ×
-  `MAX_OBSERVATION_ROWS` rows (documented on `run_area_fanout`).
+  `n = clamp(pool max_size − 2, 1, 16)`, AND a **process-global
+  per-pool-key semaphore** (`fanout_limiter`) holds that width across ALL
+  concurrent area requests — the pool is shared per-DSN across
+  collections, and per-request widths alone let two simultaneous fan-outs
+  jointly drain it. Permit acquired before the pooled connection, always
+  in that order (no circular wait). One pooled connection per in-flight
+  station, station order preserved, first error cancels the rest. Never
+  make it unbounded and never re-serialize it — 8k stations × ~2.4 ms
+  sequential was ~20 s. A 200 can never exceed the value budget; transient
+  pre-400 DB work may overshoot by ≤ width × `MAX_OBSERVATION_ROWS` rows
+  (documented on `run_area_fanout`).
 - **Time-zone columns:** `time_col_tz` is required when `time_col` is
   `timestamp without time zone`. The WHERE clause wraps the BIND
   (`$N AT TIME ZONE '<tz>'`) so the column index stays usable; the SELECT
