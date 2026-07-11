@@ -1,7 +1,8 @@
 //! Parameterized SQL builders.
 //!
-//! Every emitted SELECT ends with a hard row cap (`LIMIT 10001` for
-//! observations, `LIMIT 1001` for locations, `LIMIT 501` for the
+//! Every emitted SELECT ends with a hard row cap (a caller-supplied
+//! `LIMIT $N` bind for observations — see [`MAX_RESPONSE_VALUES`] for the
+//! budget model — `LIMIT 50001` for locations, `LIMIT 10001` for the
 //! stations-in-polygon prefilter, `LIMIT 1` for the nearest-station
 //! position query). Every identifier goes through [`quote_ident`]; every
 //! value is bound as `$1..$n`. The builders never interpolate request
@@ -30,14 +31,37 @@ use crate::security::{quote_ident, QuoteError};
 /// engine can warn — see #110 metadata refresh status.
 pub const MAX_LOCATIONS: usize = 50_001;
 
-/// Maximum rows returned per observation query. Exceeded ⇒ engine returns
-/// a `Truncated` error that the HTTP layer maps to 413.
+/// Per-query row cap for one station×parameter query inside an **area**
+/// fan-out. Area queries run concurrently, so each in-flight query needs
+/// its own bound to keep the transient row buffer small (worst case ≈
+/// fan-out width × this). Single-station paths (position/location) are
+/// NOT bound by this — their LIMIT comes from the remaining
+/// [`MAX_RESPONSE_VALUES`] budget, which is what allows long time series
+/// for one station.
 pub const MAX_OBSERVATION_ROWS: usize = 10001;
 
-/// Maximum stations returned by the area-prefilter query. `CsvEngine`
-/// caps area results at 500 stations; 501 here lets the engine tell if
-/// the cap was breached.
-pub const MAX_STATIONS_IN_POLYGON: usize = 501;
+/// Total response budget: observation values (station × parameter ×
+/// timestep cells) one request may return, across all fan-out queries.
+/// This is THE cap that matters — it scales each request dimension
+/// against the others, so "many stations × one timestep" and "one
+/// station × a year of 10-min data" both fit, while "everything ×
+/// everything" is rejected with the numbers. ~500k values ≈ 20–35 MB of
+/// CoverageJSON. Breach ⇒ `QueryTooLarge` ⇒ HTTP 400.
+pub const MAX_RESPONSE_VALUES: usize = 500_000;
+
+/// Sanity ceiling on stations matched by an area polygon (the prefilter
+/// fetches one extra row to detect the breach). NOT the real gate — the
+/// response budget and the query-count bound are — this only bounds the
+/// prefilter buffer and the per-request station Vec. Live `fmi-obs`
+/// advertises ~8.3k stations, so a whole-extent polygon fits.
+pub const MAX_STATIONS_IN_POLYGON: usize = 10_001;
+
+/// Ceiling on SQL queries one area request may fan out (stations ×
+/// requested parameters for the `per_parameter` shape; stations × 1 for
+/// `long`/`wide`). Bounds total DB work independently of row counts —
+/// 8k stations × 1 parameter is fine, 8k × 6 parameters is not; narrow
+/// `parameter-name` instead.
+pub const MAX_AREA_QUERIES: usize = 20_000;
 
 /// Default search radius for nearest-station position queries (25 km).
 pub const DEFAULT_POSITION_RADIUS_M: f64 = 25_000.0;
@@ -65,6 +89,8 @@ pub enum BuildError {
 pub enum SqlParam {
     Text(String),
     Float(f64),
+    /// `LIMIT $N` binds (Postgres treats a bound LIMIT as bigint).
+    Int(i64),
     Timestamp(DateTime<Utc>),
     TextArray(Vec<String>),
 }
@@ -77,6 +103,7 @@ impl SqlParam {
         match self {
             SqlParam::Text(s) => s,
             SqlParam::Float(f) => f,
+            SqlParam::Int(i) => i,
             SqlParam::Timestamp(t) => t,
             SqlParam::TextArray(v) => v,
         }
@@ -98,6 +125,16 @@ pub struct BuiltQuery {
     pub sql: String,
     pub params: Vec<SqlParam>,
     pub parameter: Option<String>,
+    /// Observation values one returned row contributes to the response
+    /// budget: 1 for `long`/`per_parameter` (one value per row), the
+    /// requested-parameter count for `wide` (one row carries a value per
+    /// selected column).
+    pub values_per_row: usize,
+    /// Index into `params` of the `LIMIT $N` bind, when the query has a
+    /// caller-adjustable row limit. The engine layer rewrites this bind to
+    /// the remaining response budget before executing (sequential
+    /// single-station paths), or leaves the builder's value (area fan-out).
+    pub limit_param_idx: Option<usize>,
 }
 
 impl BuiltQuery {
@@ -106,12 +143,39 @@ impl BuiltQuery {
             sql,
             params,
             parameter: None,
+            values_per_row: 1,
+            limit_param_idx: None,
         }
     }
 
     fn with_parameter(mut self, parameter: impl Into<String>) -> Self {
         self.parameter = Some(parameter.into());
         self
+    }
+
+    /// Record which bind is the LIMIT and how rows weigh against the
+    /// response budget.
+    fn with_row_limit(mut self, limit_param_idx: usize, values_per_row: usize) -> Self {
+        self.limit_param_idx = Some(limit_param_idx);
+        self.values_per_row = values_per_row;
+        self
+    }
+
+    /// The LIMIT bind's current row value (`None` when the query has no
+    /// adjustable limit).
+    pub fn row_limit(&self) -> Option<usize> {
+        let idx = self.limit_param_idx?;
+        match self.params.get(idx) {
+            Some(SqlParam::Int(v)) => Some(*v as usize),
+            _ => None,
+        }
+    }
+
+    /// Rewrite the LIMIT bind. No-op for queries without one.
+    pub fn set_row_limit(&mut self, rows: usize) {
+        if let Some(idx) = self.limit_param_idx {
+            self.params[idx] = SqlParam::Int(rows as i64);
+        }
     }
 }
 
@@ -392,11 +456,18 @@ pub fn build_stations_in_polygon(
 /// `PostgisEngineConfig::parameters`), not the advertised parameter names.
 /// When empty, the caller wants all configured parameters — the builder
 /// expands it to every parameter in the mapping.
+///
+/// `row_limit` is the initial `LIMIT $N` bind on every emitted query
+/// (rows, not values). The engine layer picks it per path: area fan-out
+/// queries keep [`MAX_OBSERVATION_ROWS`]; sequential single-station paths
+/// rewrite the bind to the remaining [`MAX_RESPONSE_VALUES`] budget via
+/// [`BuiltQuery::set_row_limit`] before each execution.
 pub fn build_location(
     cfg: &PostgisEngineConfig,
     station_id: &str,
     time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
+    row_limit: usize,
 ) -> Result<Vec<BuiltQuery>, BuildError> {
     let effective: Vec<&str> = if source_keys.is_empty() {
         cfg.parameters
@@ -409,15 +480,15 @@ pub fn build_location(
 
     match &cfg.observations {
         ObservationSchema::Long(l) => {
-            let q = build_location_long(l, station_id, time_range, &effective)?;
+            let q = build_location_long(l, station_id, time_range, &effective, row_limit)?;
             Ok(vec![q])
         }
         ObservationSchema::Wide(w) => {
-            let q = build_location_wide(w, station_id, time_range, &effective)?;
+            let q = build_location_wide(w, station_id, time_range, &effective, row_limit)?;
             Ok(vec![q])
         }
         ObservationSchema::PerParameter(pp) => {
-            build_location_per_parameter(pp, station_id, time_range, &effective)
+            build_location_per_parameter(pp, station_id, time_range, &effective, row_limit)
         }
     }
 }
@@ -427,6 +498,7 @@ fn build_location_long(
     station_id: &str,
     time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
+    row_limit: usize,
 ) -> Result<BuiltQuery, BuildError> {
     let table = fq_table(&shape.table)?;
     let station_fk = quote_ident(&shape.station_fk_col)?;
@@ -461,11 +533,11 @@ fn build_location_long(
         source_keys.iter().map(|s| s.to_string()).collect(),
     ));
 
-    sql.push_str(&format!(
-        " ORDER BY {time_col} LIMIT {MAX_OBSERVATION_ROWS}"
-    ));
+    sql.push_str(&format!(" ORDER BY {time_col} LIMIT ${}", params.len() + 1));
+    params.push(SqlParam::Int(row_limit as i64));
+    let limit_idx = params.len() - 1;
 
-    Ok(BuiltQuery::new(sql, params))
+    Ok(BuiltQuery::new(sql, params).with_row_limit(limit_idx, 1))
 }
 
 fn build_location_wide(
@@ -473,6 +545,7 @@ fn build_location_wide(
     station_id: &str,
     time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
+    row_limit: usize,
 ) -> Result<BuiltQuery, BuildError> {
     let table = fq_table(&shape.table)?;
     let station_fk = quote_ident(&shape.station_fk_col)?;
@@ -511,11 +584,13 @@ fn build_location_wide(
         params.push(SqlParam::Timestamp(t1));
     }
 
-    sql.push_str(&format!(
-        " ORDER BY {time_col} LIMIT {MAX_OBSERVATION_ROWS}"
-    ));
+    sql.push_str(&format!(" ORDER BY {time_col} LIMIT ${}", params.len() + 1));
+    params.push(SqlParam::Int(row_limit as i64));
+    let limit_idx = params.len() - 1;
 
-    Ok(BuiltQuery::new(sql, params))
+    // One wide row carries a value per selected column — weigh it so
+    // against the response budget.
+    Ok(BuiltQuery::new(sql, params).with_row_limit(limit_idx, source_keys.len().max(1)))
 }
 
 fn build_location_per_parameter(
@@ -523,6 +598,7 @@ fn build_location_per_parameter(
     station_id: &str,
     time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
+    row_limit: usize,
 ) -> Result<Vec<BuiltQuery>, BuildError> {
     let mut queries = Vec::with_capacity(source_keys.len());
 
@@ -557,10 +633,14 @@ fn build_location_per_parameter(
             params.push(SqlParam::Timestamp(t0));
             params.push(SqlParam::Timestamp(t1));
         }
-        sql.push_str(&format!(
-            " ORDER BY {time_col} LIMIT {MAX_OBSERVATION_ROWS}"
-        ));
-        queries.push(BuiltQuery::new(sql, params).with_parameter(key.to_string()));
+        sql.push_str(&format!(" ORDER BY {time_col} LIMIT ${}", params.len() + 1));
+        params.push(SqlParam::Int(row_limit as i64));
+        let limit_idx = params.len() - 1;
+        queries.push(
+            BuiltQuery::new(sql, params)
+                .with_parameter(key.to_string())
+                .with_row_limit(limit_idx, 1),
+        );
     }
 
     Ok(queries)
@@ -1082,6 +1162,7 @@ mod tests {
             "1001",
             Some((t(2026, 4, 1, 0), t(2026, 4, 1, 12))),
             &["t2m"],
+            MAX_OBSERVATION_ROWS,
         )
         .unwrap();
         assert_eq!(q.len(), 1);
@@ -1093,22 +1174,29 @@ mod tests {
                 SqlParam::Timestamp(t(2026, 4, 1, 0)),
                 SqlParam::Timestamp(t(2026, 4, 1, 12)),
                 SqlParam::TextArray(vec!["t2m".into()]),
+                SqlParam::Int(MAX_OBSERVATION_ROWS as i64),
             ]
         );
         assert!(q.sql.contains("\"param_name\" = ANY($4)"));
-        assert!(q.sql.contains(&format!("LIMIT {MAX_OBSERVATION_ROWS}")));
+        // The row cap is a bind, not a literal — the engine can rewrite it
+        // to the remaining response budget.
+        assert!(q.sql.contains("LIMIT $5"));
+        assert_eq!(q.limit_param_idx, Some(4));
+        assert_eq!(q.row_limit(), Some(MAX_OBSERVATION_ROWS));
+        assert_eq!(q.values_per_row, 1);
     }
 
     #[test]
     fn location_long_without_time_range_drops_time_binds() {
         let cfg = long_cfg();
-        let q = build_location(&cfg, "1001", None, &["t2m"]).unwrap();
+        let q = build_location(&cfg, "1001", None, &["t2m"], MAX_OBSERVATION_ROWS).unwrap();
         let q = &q[0];
         assert_eq!(
             q.params,
             vec![
                 SqlParam::Text("1001".into()),
                 SqlParam::TextArray(vec!["t2m".into()]),
+                SqlParam::Int(MAX_OBSERVATION_ROWS as i64),
             ]
         );
         assert!(q.sql.contains("\"param_name\" = ANY($2)"));
@@ -1118,7 +1206,7 @@ mod tests {
     #[test]
     fn location_wide_projects_only_requested_columns() {
         let cfg = wide_cfg();
-        let q = build_location(&cfg, "s1", None, &["t2m"]).unwrap();
+        let q = build_location(&cfg, "s1", None, &["t2m"], MAX_OBSERVATION_ROWS).unwrap();
         let q = &q[0];
         assert!(q
             .sql
@@ -1127,9 +1215,33 @@ mod tests {
     }
 
     #[test]
+    fn location_wide_weighs_rows_by_selected_column_count() {
+        // One wide row carries a value per selected column, so it must
+        // charge the response budget accordingly.
+        let cfg = wide_cfg();
+        let q = build_location(&cfg, "s1", None, &["t2m", "rh"], MAX_OBSERVATION_ROWS).unwrap();
+        assert_eq!(q[0].values_per_row, 2);
+    }
+
+    #[test]
+    fn set_row_limit_rewrites_the_limit_bind_only() {
+        let cfg = long_cfg();
+        let mut q = build_location(&cfg, "1001", None, &["t2m"], MAX_OBSERVATION_ROWS)
+            .unwrap()
+            .remove(0);
+        let n_params = q.params.len();
+        q.set_row_limit(42);
+        assert_eq!(q.row_limit(), Some(42));
+        assert_eq!(q.params.len(), n_params);
+        // Non-limit binds untouched.
+        assert_eq!(q.params[0], SqlParam::Text("1001".into()));
+    }
+
+    #[test]
     fn location_wide_unknown_parameter_errors() {
         let cfg = wide_cfg();
-        let err = build_location(&cfg, "s1", None, &["does_not_exist"]).unwrap_err();
+        let err = build_location(&cfg, "s1", None, &["does_not_exist"], MAX_OBSERVATION_ROWS)
+            .unwrap_err();
         assert!(matches!(err, BuildError::UnknownParameter(_)));
     }
 
@@ -1141,6 +1253,7 @@ mod tests {
             "0-146-0-1001",
             None,
             &["air_temperature", "wind_speed"],
+            MAX_OBSERVATION_ROWS,
         )
         .unwrap();
         assert_eq!(qs.len(), 2);
@@ -1154,14 +1267,15 @@ mod tests {
     fn location_per_parameter_emits_time_tz_conversion_when_set() {
         // nexus time_col_tz = "UTC" → SELECT list wraps in AT TIME ZONE 'UTC'.
         let cfg = nexus_per_parameter_cfg();
-        let qs = build_location(&cfg, "s", None, &["air_temperature"]).unwrap();
+        let qs =
+            build_location(&cfg, "s", None, &["air_temperature"], MAX_OBSERVATION_ROWS).unwrap();
         assert!(qs[0].sql.contains("(\"time\" AT TIME ZONE 'UTC') AS time"));
     }
 
     #[test]
     fn location_long_without_tz_emits_bare_column() {
         let cfg = long_cfg();
-        let q = build_location(&cfg, "s", None, &["t2m"]).unwrap();
+        let q = build_location(&cfg, "s", None, &["t2m"], MAX_OBSERVATION_ROWS).unwrap();
         assert!(q[0].sql.contains("\"obstime\" AS time"));
         assert!(!q[0].sql.contains("AT TIME ZONE"));
     }
@@ -1169,14 +1283,15 @@ mod tests {
     #[test]
     fn empty_source_keys_expands_to_all_configured_parameters() {
         let cfg = nexus_per_parameter_cfg();
-        let qs = build_location(&cfg, "s", None, &[]).unwrap();
+        let qs = build_location(&cfg, "s", None, &[], MAX_OBSERVATION_ROWS).unwrap();
         assert_eq!(qs.len(), 2); // both air_temperature and wind_speed
     }
 
     #[test]
     fn per_parameter_unknown_parameter_errors() {
         let cfg = nexus_per_parameter_cfg();
-        let err = build_location(&cfg, "s", None, &["not_a_real_param"]).unwrap_err();
+        let err = build_location(&cfg, "s", None, &["not_a_real_param"], MAX_OBSERVATION_ROWS)
+            .unwrap_err();
         assert!(matches!(err, BuildError::UnknownParameter(_)));
     }
 }

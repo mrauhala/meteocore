@@ -9,6 +9,8 @@ chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 deadpool-postgres = "0.14"
+# Bounded concurrent area fan-out (stream::iter().buffered()) — #115.
+futures = "0.3"
 # TLS deps (rustls / tokio-postgres-rustls / rustls-native-certs /
 # webpki-roots) are deliberately absent until #110 wires real TLS. The
 # engine currently passes NoTls. Adding those deps now implies TLS

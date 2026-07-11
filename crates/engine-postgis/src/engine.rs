@@ -8,8 +8,11 @@
 //! entering `block_in_place`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use futures::stream::{StreamExt, TryStreamExt};
 
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
@@ -27,7 +30,8 @@ use crate::health::{Health, HealthSnapshot, HealthStatus};
 use crate::metadata::{CollectionMeta, MetadataCache};
 use crate::query::{
     build_location, build_position, build_stations_in_polygon, params_as_refs, BuiltQuery,
-    DEFAULT_POSITION_RADIUS_M, MAX_OBSERVATION_ROWS, MAX_STATIONS_IN_POLYGON,
+    DEFAULT_POSITION_RADIUS_M, MAX_AREA_QUERIES, MAX_OBSERVATION_ROWS, MAX_RESPONSE_VALUES,
+    MAX_STATIONS_IN_POLYGON,
 };
 use crate::schema::ObservationSchema;
 
@@ -306,11 +310,20 @@ impl EdrEngine for PostgisEngine {
         let source_keys = resolve_source_keys(&self.config, parameters)?;
         let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
 
-        let queries = build_location(&self.config, location_id, datetime, &key_refs)
-            .map_err(|e| DataServerError::Engine(format!("build_location: {e}")))?;
+        // Single-station path: the whole response budget is this station's
+        // to spend, so long time series work — the per-query LIMIT bind is
+        // rewritten to the remaining budget as queries run.
+        let queries = build_location(
+            &self.config,
+            location_id,
+            datetime,
+            &key_refs,
+            MAX_RESPONSE_VALUES,
+        )
+        .map_err(|e| DataServerError::Engine(format!("build_location: {e}")))?;
 
         let (lon, lat) = lookup_station_coords(&self.load_meta(), location_id)?;
-        let rows_per_query = run_queries_sync(&self.pool, &queries)?;
+        let rows_per_query = run_queries_budgeted_sync(&self.pool, queries.clone())?;
         Ok(CoverageResponse::Single(assemble_query_result(
             &self.config,
             location_id,
@@ -384,48 +397,65 @@ impl EdrEngine for PostgisEngine {
             return Ok(CoverageResponse::Collection(vec![]));
         }
         let stations = enforce_station_cap(stations)?;
+        enforce_area_query_count(
+            stations.len(),
+            area_queries_per_station(&self.config, &key_refs),
+        )?;
 
-        let mut results = Vec::with_capacity(stations.len());
-        for station in &stations {
-            let queries = build_location(&self.config, &station.id, datetime, &key_refs)
-                .map_err(|e| DataServerError::Engine(format!("build_location: {e}")))?;
-            let rows_per_query = run_queries_sync(&self.pool, &queries)?;
-            // A single-station gap inside an area window is expected
-            // (sparse stations, retired sensors, missing parameter for
-            // that station). Skip it rather than 404'ing the whole
-            // request. Real errors still propagate.
-            match assemble_query_result(
-                &self.config,
-                &station.id,
-                station.longitude,
-                station.latitude,
-                &queries,
-                rows_per_query,
-            ) {
-                Ok(qr) => results.push(qr),
-                Err(DataServerError::LocationNotFound(_)) => continue,
-                Err(e) => return Err(e),
-            }
-        }
+        let results = run_area_fanout(&self.pool, &self.config, &stations, datetime, &key_refs)?;
         Ok(CoverageResponse::Collection(results))
     }
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────────
 
-/// Both area prefilters (SQL `LIMIT 501`, in-memory `.take(501)`) fetch one
-/// row past the advertised cap; a full batch means the polygon matched more
-/// stations than the server will fan out over. `QueryTooLarge` → HTTP 400,
-/// telling the client to narrow the polygon rather than masquerading as a
-/// server fault.
+/// Both area prefilters (SQL `LIMIT 10001`, in-memory `.take(10001)`) fetch
+/// one row past the ceiling; a full batch means the polygon matched more
+/// stations than the sanity ceiling. The real per-request gates are the
+/// response-value budget and the fan-out query count — this only bounds the
+/// prefilter buffer. `QueryTooLarge` → HTTP 400.
 fn enforce_station_cap(stations: Vec<Location>) -> Result<Vec<Location>, DataServerError> {
     if stations.len() >= MAX_STATIONS_IN_POLYGON {
         return Err(DataServerError::QueryTooLarge(format!(
-            "area query matched more than the {} station cap — narrow the polygon",
+            "area query matched more than the {} station ceiling — narrow the polygon",
             MAX_STATIONS_IN_POLYGON - 1
         )));
     }
     Ok(stations)
+}
+
+/// SQL queries one station contributes to an area fan-out: the
+/// `per_parameter` shape runs one query per requested parameter; `long`
+/// and `wide` run one query per station regardless of parameter count.
+fn area_queries_per_station(cfg: &PostgisEngineConfig, source_keys: &[&str]) -> usize {
+    match &cfg.observations {
+        ObservationSchema::PerParameter(_) => source_keys.len().max(1),
+        _ => 1,
+    }
+}
+
+/// Bound total DB work before any of it runs: stations × per-station
+/// queries. This is the dimension the station count and the parameter list
+/// multiply into — 8k stations × 1 parameter passes, 8k × 6 does not.
+fn enforce_area_query_count(
+    stations: usize,
+    queries_per_station: usize,
+) -> Result<(), DataServerError> {
+    let total = stations.saturating_mul(queries_per_station);
+    if total > MAX_AREA_QUERIES {
+        return Err(DataServerError::QueryTooLarge(format!(
+            "area query would fan out {stations} stations × {queries_per_station} parameter queries = {total} SQL queries (max {MAX_AREA_QUERIES}) — narrow the polygon or the parameter list"
+        )));
+    }
+    Ok(())
+}
+
+/// The response-budget breach error. One message for every path so clients
+/// see a consistent, actionable 400.
+fn budget_exceeded() -> DataServerError {
+    DataServerError::QueryTooLarge(format!(
+        "response would exceed the {MAX_RESPONSE_VALUES}-value budget (stations × parameters × timesteps) — narrow the time range, the polygon, or the parameter list"
+    ))
 }
 
 fn resolve_source_keys(
@@ -475,31 +505,122 @@ fn lookup_station_coords(
     Ok((station.longitude, station.latitude))
 }
 
-fn run_queries_sync(pool: &Pool, queries: &[BuiltQuery]) -> Result<Vec<Vec<Row>>, DataServerError> {
+/// Run one station's observation queries sequentially, spending the whole
+/// [`MAX_RESPONSE_VALUES`] budget. Before each query the `LIMIT $N` bind is
+/// rewritten to the remaining budget (in rows, +1 sentinel), so a breach is
+/// detected at the row that crosses the line instead of after an unbounded
+/// fetch — this is what lets a single station return a long time series.
+fn run_queries_budgeted_sync(
+    pool: &Pool,
+    mut queries: Vec<BuiltQuery>,
+) -> Result<Vec<Vec<Row>>, DataServerError> {
     let pool = pool.clone();
-    let queries = queries.to_vec();
     block_on_async(async move {
         let client = pool
             .get()
             .await
             .map_err(|e| DataServerError::Engine(format!("pool acquire failed: {e}")))?;
+        let mut remaining = MAX_RESPONSE_VALUES;
         let mut out = Vec::with_capacity(queries.len());
-        for q in &queries {
+        for q in &mut queries {
+            let per_row = q.values_per_row.max(1);
+            q.set_row_limit(remaining / per_row + 1);
             let refs = params_as_refs(&q.params);
             let rows = client
                 .query(&q.sql, &refs)
                 .await
                 .map_err(|e| map_pg_error(e, q))?;
-            if rows.len() >= MAX_OBSERVATION_ROWS {
-                return Err(DataServerError::QueryTooLarge(format!(
-                    "result row count hit the {} row cap — narrow the bbox or time range",
-                    MAX_OBSERVATION_ROWS - 1
-                )));
+            let values = rows.len() * per_row;
+            if values > remaining {
+                return Err(budget_exceeded());
             }
+            remaining -= values;
             out.push(rows);
         }
         Ok(out)
     })
+}
+
+/// Concurrent bounded fan-out over an area's stations (#115). At most
+/// `min(16, pool max_size)` stations are in flight at once, each on its own
+/// pooled connection; results keep station order (`buffered`, not
+/// `buffer_unordered`) so responses stay deterministic. Rows are charged
+/// against the shared [`MAX_RESPONSE_VALUES`] budget as they arrive; each
+/// single query additionally keeps the [`MAX_OBSERVATION_ROWS`] cap so the
+/// transient row buffer is bounded by fan-out width × cap. The first error
+/// cancels the remaining in-flight queries.
+fn run_area_fanout(
+    pool: &Pool,
+    config: &Arc<PostgisEngineConfig>,
+    stations: &[Location],
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    source_keys: &[&str],
+) -> Result<Vec<QueryResult>, DataServerError> {
+    let width = (pool.status().max_size).clamp(1, 16);
+    let spent = AtomicUsize::new(0);
+    let pool = pool.clone();
+    let results: Vec<Option<QueryResult>> = block_on_async(async {
+        futures::stream::iter(stations.iter().map(|station| {
+            let pool = pool.clone();
+            let config = Arc::clone(config);
+            let spent = &spent;
+            async move {
+                let queries = build_location(
+                    &config,
+                    &station.id,
+                    datetime,
+                    source_keys,
+                    MAX_OBSERVATION_ROWS,
+                )
+                .map_err(|e| DataServerError::Engine(format!("build_location: {e}")))?;
+                let client = pool
+                    .get()
+                    .await
+                    .map_err(|e| DataServerError::Engine(format!("pool acquire failed: {e}")))?;
+                let mut rows_per_query = Vec::with_capacity(queries.len());
+                for q in &queries {
+                    let refs = params_as_refs(&q.params);
+                    let rows = client
+                        .query(&q.sql, &refs)
+                        .await
+                        .map_err(|e| map_pg_error(e, q))?;
+                    if rows.len() >= MAX_OBSERVATION_ROWS {
+                        return Err(DataServerError::QueryTooLarge(format!(
+                            "station '{}' alone has {}+ values in the window — narrow the time range, or use the position/location query for long single-station series",
+                            station.id,
+                            MAX_OBSERVATION_ROWS - 1
+                        )));
+                    }
+                    let values = rows.len() * q.values_per_row.max(1);
+                    if spent.fetch_add(values, Ordering::Relaxed) + values > MAX_RESPONSE_VALUES {
+                        return Err(budget_exceeded());
+                    }
+                    rows_per_query.push(rows);
+                }
+                drop(client);
+                // A single-station gap inside an area window is expected
+                // (sparse stations, retired sensors, missing parameter for
+                // that station). Skip it rather than 404'ing the whole
+                // request. Real errors still propagate.
+                match assemble_query_result(
+                    &config,
+                    &station.id,
+                    station.longitude,
+                    station.latitude,
+                    &queries,
+                    rows_per_query,
+                ) {
+                    Ok(qr) => Ok(Some(qr)),
+                    Err(DataServerError::LocationNotFound(_)) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            }
+        }))
+        .buffered(width)
+        .try_collect()
+        .await
+    })?;
+    Ok(results.into_iter().flatten().collect())
 }
 
 fn run_stations_in_polygon_sync(
@@ -1185,7 +1306,7 @@ mod tests {
 
     #[test]
     fn station_cap_maps_to_query_too_large_not_engine_error() {
-        // 500 stations pass through untouched.
+        // A full-ceiling batch stays under the limit untouched.
         let under: Vec<Location> = (0..MAX_STATIONS_IN_POLYGON - 1)
             .map(|i| loc(&format!("s{i}"), 24.0, 60.0))
             .collect();
@@ -1194,14 +1315,46 @@ mod tests {
             MAX_STATIONS_IN_POLYGON - 1
         );
 
-        // A full 501-row batch signals the cap was breached → QueryTooLarge
-        // (HTTP 400 with the message), never Engine (opaque HTTP 500).
+        // A full sentinel batch signals the ceiling was breached →
+        // QueryTooLarge (HTTP 400 with the message), never Engine
+        // (opaque HTTP 500).
         let over: Vec<Location> = (0..MAX_STATIONS_IN_POLYGON)
             .map(|i| loc(&format!("s{i}"), 24.0, 60.0))
             .collect();
         match enforce_station_cap(over).unwrap_err() {
             DataServerError::QueryTooLarge(msg) => {
                 assert!(msg.contains("narrow the polygon"), "message: {msg}")
+            }
+            other => panic!("expected QueryTooLarge, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn area_query_count_scales_stations_against_parameters() {
+        // The parameter count multiplies into the bound: many stations ×
+        // few parameters passes, the same stations × many parameters does
+        // not — matching "number of parameters is a factor".
+        assert!(enforce_area_query_count(8_276, 1).is_ok());
+        assert!(enforce_area_query_count(8_276, 2).is_ok());
+        match enforce_area_query_count(8_276, 6).unwrap_err() {
+            DataServerError::QueryTooLarge(msg) => {
+                assert!(msg.contains("49656"), "message should show the math: {msg}");
+                assert!(msg.contains("parameter list"), "message: {msg}");
+            }
+            other => panic!("expected QueryTooLarge, got: {other:?}"),
+        }
+        // Exact boundary: MAX_AREA_QUERIES itself passes, +1 fails.
+        assert!(enforce_area_query_count(MAX_AREA_QUERIES, 1).is_ok());
+        assert!(enforce_area_query_count(MAX_AREA_QUERIES + 1, 1).is_err());
+        // Overflow-safe.
+        assert!(enforce_area_query_count(usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn budget_exceeded_is_query_too_large_with_actionable_message() {
+        match budget_exceeded() {
+            DataServerError::QueryTooLarge(msg) => {
+                assert!(msg.contains("narrow the time range"), "message: {msg}");
             }
             other => panic!("expected QueryTooLarge, got: {other:?}"),
         }

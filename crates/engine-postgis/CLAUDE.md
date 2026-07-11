@@ -101,14 +101,32 @@ Derivation rules (hard-won from production timeouts):
 
 ## Data-shape rules
 
-- Row caps (non-configurable invariants): locations `LIMIT 50_001`,
-  per-observation-query `LIMIT 10_001`, stations-in-polygon prefilter
-  `LIMIT 501`, nearest-station `LIMIT 1`. A breached station or row cap is
-  `DataServerError::QueryTooLarge` → HTTP 400 with a "narrow the polygon /
-  time range" message, never `Engine` (which the API layer hides behind an
-  opaque 500 — that misread a too-large polygon as a server fault in
-  production). Raising the 500-station area cap is gated on the N+1
-  per-station query fan-out (#115).
+- **Response budget model (#498):** the gate on query size is
+  `MAX_RESPONSE_VALUES` (500k values ≈ stations × parameters × timesteps),
+  charged as rows arrive — NOT a flat station cap. Its purpose: "many
+  stations × one timestep" and "one station × a year of 10-min data" both
+  fit; "everything × everything" is a 400 whose message names the numbers
+  and the dimension to narrow. Every breached cap is
+  `DataServerError::QueryTooLarge` → HTTP 400, never `Engine` (the API
+  layer hides that behind an opaque 500 — that misread a too-large polygon
+  as a server fault in production).
+- Supporting caps: stations-in-polygon prefilter ceiling `LIMIT 10_001`
+  (bounds the prefilter buffer, not the real gate); `MAX_AREA_QUERIES`
+  20k SQL queries per area request (stations × params for `per_parameter`
+  — the parameter list multiplies DB work); locations `LIMIT 50_001`;
+  nearest-station `LIMIT 1`.
+- Observation `LIMIT` is a **bind** (`LIMIT $N`, `SqlParam::Int`,
+  `BuiltQuery::{row_limit,set_row_limit}`), not a literal: single-station
+  paths (position/location) rewrite it to the remaining budget per query
+  (long series work); area fan-out queries pin it to
+  `MAX_OBSERVATION_ROWS` 10_001 per station×parameter so the concurrent
+  transient buffer stays ≤ width × cap. `values_per_row` weighs `wide`
+  rows (one row = one value per selected column) against the budget.
+- **Area fan-out is concurrent** (#115): `stream::iter().buffered(n)`,
+  `n = clamp(pool max_size, 1, 16)`, one pooled connection per in-flight
+  station, station order preserved, first error cancels the rest. Never
+  make it unbounded and never re-serialize it — 8k stations × ~2.4 ms
+  sequential was ~20 s.
 - **Time-zone columns:** `time_col_tz` is required when `time_col` is
   `timestamp without time zone`. The WHERE clause wraps the BIND
   (`$N AT TIME ZONE '<tz>'`) so the column index stays usable; the SELECT
