@@ -1300,6 +1300,19 @@ impl MapEngine for OdimEngine {
             reference_times: Vec::new(),
         }
     }
+
+    fn resolve_time(
+        &self,
+        time: Option<DateTime<Utc>>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        // The cache-key authority (#507): the exact entry timestamp
+        // `get_raster_tile` will render, via the SAME `select_entry`
+        // (nearest-by-abs-difference) the render path uses. An empty
+        // catalog falls back to the requested time — the render will
+        // error and cache nothing, so the key value is moot.
+        self.select_entry(time).map(|e| e.time).or(time)
+    }
 }
 
 /// Human-readable identifier for a `Crs`. Used by `raster_info()` —

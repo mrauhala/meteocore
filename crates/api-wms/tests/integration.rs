@@ -831,6 +831,225 @@ async fn get_map(app: &axum::Router, crs: &str, bbox: &str, w: u32, h: u32) -> S
     resp.status()
 }
 
+// --- #507: requested-time vs resolved-timestep cache poisoning --------------
+
+/// Engine mimicking the geotiff latest-not-after time selection over a
+/// swappable timestep catalog, rendering a DIFFERENT constant value per
+/// timestep. `resolve_time` mirrors `get_raster_tile`'s selection — the #507
+/// contract: caches key on what actually renders, not on what was asked for.
+struct SnappingMockMapEngine {
+    /// Available timesteps, ascending. Pushing a new entry simulates a file
+    /// finishing ingestion between requests.
+    catalog: Arc<std::sync::RwLock<Vec<chrono::DateTime<chrono::Utc>>>>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SnappingMockMapEngine {
+    fn select(
+        &self,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        let cat = self.catalog.read().unwrap();
+        match time {
+            Some(t) => cat
+                .iter()
+                .rev()
+                .find(|&&ts| ts <= t)
+                .copied()
+                .or_else(|| cat.first().copied()),
+            None => cat.last().copied(),
+        }
+    }
+}
+
+impl MapEngine for SnappingMockMapEngine {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let resolved = self
+            .select(time)
+            .ok_or_else(|| DataServerError::Engine("no data".into()))?;
+        let cat = self.catalog.read().unwrap();
+        let idx = cat.iter().position(|&ts| ts == resolved).unwrap_or(0);
+        // Distinct pixel value per timestep so stale tiles are detectable.
+        let v = 0.25 + 0.5 * (idx.min(1) as f64);
+        Ok(RasterTile {
+            width,
+            height,
+            values: vec![Some(v); (width * height) as usize].into(),
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            native_crs: "EPSG:3857".into(),
+            spatial_extent: Some([-20.0, 30.0, 40.0, 80.0]),
+            times: self.catalog.read().unwrap().clone(),
+            parameter: "reflectivity".into(),
+            unit: "dBZ".into(),
+            parameters: vec![],
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: Vec::new(),
+        }
+    }
+
+    fn resolve_time(
+        &self,
+        time: Option<chrono::DateTime<chrono::Utc>>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.select(time).or(time)
+    }
+}
+
+type SnappingRouter = (
+    axum::Router,
+    Arc<std::sync::RwLock<Vec<chrono::DateTime<chrono::Utc>>>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+);
+
+fn build_snapping_router(initial_times: &[&str]) -> SnappingRouter {
+    let catalog = Arc::new(std::sync::RwLock::new(
+        initial_times
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect::<Vec<chrono::DateTime<chrono::Utc>>>(),
+    ));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let engine: Arc<dyn MapEngine> = Arc::new(SnappingMockMapEngine {
+        catalog: catalog.clone(),
+        calls: calls.clone(),
+    });
+    let mut engines = HashMap::new();
+    let mut collections = HashMap::new();
+    let mut styles_map = HashMap::new();
+
+    engines.insert("data".to_string(), engine);
+    collections.insert(
+        "data".to_string(),
+        CollectionConfig {
+            id: "data".to_string(),
+            title: "Data".to_string(),
+            description: "Time-snapping fixture for the #507 poison regression".to_string(),
+            data_path: None,
+            apis: vec!["wms".to_string()],
+            engine_type: "geotiff".to_string(),
+            keywords: Vec::new(),
+            license: None,
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            zarr: None,
+            odim: None,
+            cap: None,
+            postgis: None,
+            preview: None,
+        },
+    );
+
+    let cmap = Arc::new(LutColorMap::from_builtin(
+        BuiltinColormap::Viridis,
+        0.0,
+        1.0,
+    ));
+    let mut layer_styles = HashMap::new();
+    layer_styles.insert(
+        "default".to_string(),
+        StyleInfo {
+            name: "default".to_string(),
+            title: "Default".to_string(),
+            colormap: cmap,
+            min: 0.0,
+            max: 1.0,
+            parameter: None,
+        },
+    );
+    styles_map.insert("data".to_string(), layer_styles);
+
+    let tile_cache = Arc::new(ds_render::TilePixelCache::new(64));
+    let state = Arc::new(ArcSwap::from_pointee(WmsState {
+        engines,
+        collections,
+        styles: styles_map,
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        tile_cache,
+        base_url: String::new(),
+        trust_proxy_headers: false,
+    }));
+    (api_wms::router(state), catalog, calls)
+}
+
+async fn get_map_time(app: &axum::Router, bbox: &str, time: &str) -> StatusCode {
+    let uri = format!(
+        "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=data&STYLES=\
+         &FORMAT=image/png&CRS=EPSG:3857&BBOX={bbox}&WIDTH=512&HEIGHT=512&TIME={time}"
+    );
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    resp.status()
+}
+
+/// The #507 incident replay: a `TIME=T` request served while T's file is not
+/// yet ingested must cache its (T−1) pixels under **T−1's** key — so that
+/// (a) an explicit T−1 request shares those entries, and (b) once T lands,
+/// the same `TIME=T` request re-renders fresh pixels instead of serving the
+/// pre-ingest tiles (the partial one-step-behind animation regions seen in
+/// production under storm load).
+#[tokio::test]
+async fn requested_time_ahead_of_catalog_does_not_poison_the_frame() {
+    const T5: &str = "2026-07-11T20:15:00Z"; // ingested
+    const T: &str = "2026-07-11T20:20:00Z"; // requested before ingestion
+    const BBOX: &str = "2000000,8000000,3000000,9000000";
+    let (app, catalog, calls) = build_snapping_router(&[T5]);
+
+    // 1. Too-early request for frame T: engine snaps to T−5 and renders it.
+    assert_eq!(get_map_time(&app, BBOX, T).await, StatusCode::OK);
+    let calls_cold = calls.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(calls_cold > 0, "cold request renders tiles");
+
+    // 2. An explicit T−5 request for the same viewport must be a pure cache
+    //    hit — the too-early T output was keyed under its RESOLVED timestep,
+    //    so the two frames legitimately share every entry.
+    assert_eq!(get_map_time(&app, BBOX, T5).await, StatusCode::OK);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        calls_cold,
+        "explicit T−5 must reuse the tiles the too-early T request cached under T−5's key"
+    );
+
+    // 3. T's file finishes ingestion.
+    catalog.write().unwrap().push(T.parse().unwrap());
+
+    // 4. The same TIME=T request must now re-render every tile fresh — the
+    //    pre-fix behaviour served the stale T−5 tiles as cache hits here.
+    assert_eq!(get_map_time(&app, BBOX, T).await, StatusCode::OK);
+    let calls_after = calls.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        calls_after - calls_cold,
+        calls_cold,
+        "post-ingest TIME=T must miss every cached T−5 tile and render fresh (got {} fresh renders, expected {})",
+        calls_after - calls_cold,
+        calls_cold
+    );
+}
+
 /// Two overlapping EPSG:3857 fullscreen requests at the same resolution must
 /// reuse cached meta-tiles: the second request hits the tile cache and renders
 /// strictly fewer fresh tiles than the first. This is the core #202 win.

@@ -411,6 +411,34 @@ pub trait MapEngine: Send + Sync {
     /// every call. If your engine genuinely needs to derive metadata
     /// per-request, cache it.
     fn raster_info(&self) -> RasterInfo;
+
+    /// Resolve a requested time to the **exact timestep this engine would
+    /// render** for it — the timestamp that must key any cache of the
+    /// rendered output (#507).
+    ///
+    /// Engines that snap a requested time to an available timestep (e.g.
+    /// latest-not-after selection over a file catalog) MUST override this
+    /// with the same selection logic `get_raster_tile` uses, so that a
+    /// request for a not-yet-ingested time T caches the T−1 pixels it
+    /// actually renders under T−1's key — never under T's. `None` input
+    /// means "whatever the engine treats as latest"; the override should
+    /// return that concrete timestep so caches pin it too.
+    ///
+    /// `reference_time` selects a forecast model run, mirroring
+    /// [`Self::get_raster_tile`]; non-forecast engines ignore it.
+    ///
+    /// Default: identity — correct only for engines whose time selection is
+    /// exact-match (a mismatch then fails the render rather than silently
+    /// snapping). **Expected complexity: O(log n) from a snapshot** — this
+    /// runs on the hot render path before the cache lookup.
+    fn resolve_time(
+        &self,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let _ = reference_time;
+        time
+    }
 }
 
 #[cfg(test)]

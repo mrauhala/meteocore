@@ -1010,6 +1010,11 @@ async fn render_map(
     // engines that materialise `RasterInfo` lazily.
     let raster_info = engine.raster_info();
     let time = validated.time.or_else(|| raster_info.times.last().copied());
+    // #507: snap to the exact timestep the engine will render before the
+    // cache key is built — a not-yet-ingested datetime must cache the
+    // previous timestep's pixels under the PREVIOUS timestep's key.
+    // Maps passes reference_time: None (latest run) throughout.
+    let time = engine.resolve_time(time, None);
 
     // Parameter selection precedence: ?parameter-name= wins over style.parameter.
     // Validate against the engine's advertised list when the query supplied one

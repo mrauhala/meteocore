@@ -1427,23 +1427,12 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             }
         }
 
-        // Find the target timestamp first, then ensure it's loaded
-        let target_timestamp = {
-            let catalog = self.catalog.load();
-            let entry = if let Some(t) = time {
-                catalog
-                    .entries
-                    .range(..=t)
-                    .next_back()
-                    .or_else(|| catalog.entries.iter().next())
-            } else {
-                catalog.entries.iter().next_back()
-            };
-            let (ts, _) = entry.ok_or_else(|| {
-                DataServerError::Engine("No data available for the requested time".into())
-            })?;
-            *ts
-        };
+        // Find the target timestamp first, then ensure it's loaded. The
+        // selection lives on Catalog so resolve_time (the cache-key
+        // authority, #507) shares it verbatim.
+        let target_timestamp = self.catalog.load().select_timestamp(time).ok_or_else(|| {
+            DataServerError::Engine("No data available for the requested time".into())
+        })?;
 
         // Lazily load STAC stub if needed
         self.ensure_metadata(&target_timestamp)?;
@@ -1667,6 +1656,20 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         // (`refresh_raster_info`). No per-request CRS scan, timestamp Vec
         // allocation, or STAC metadata fetch on the request path (#211).
         (*self.raster_info.load_full()).clone()
+    }
+
+    fn resolve_time(
+        &self,
+        time: Option<DateTime<Utc>>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        // The cache-key authority (#507): the exact timestep get_raster_tile
+        // will render, via the SAME Catalog::select_timestamp the render
+        // path uses. Snapshot-only — no STAC on-demand fetch here (this
+        // runs before the cache lookup on the hot path). An empty catalog
+        // falls back to the requested time: the render will error and cache
+        // nothing, so the key value is moot.
+        self.catalog.load().select_timestamp(time).or(time)
     }
 }
 

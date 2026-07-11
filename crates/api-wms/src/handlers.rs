@@ -225,6 +225,18 @@ pub async fn wms_handler(
             // the request falls through as `None` = the engine's own latest.
             let time = params.time.or_else(|| info.times.last().copied());
 
+            // #507: snap that instant to the exact timestep the engine will
+            // actually render, BEFORE any cache key is built. Engines that
+            // select latest-not-after (geotiff) would otherwise render T−1
+            // pixels for a not-yet-ingested TIME=T and cache them under T's
+            // key — permanently poisoning frame T for the covered tiles once
+            // T's file lands (the partial one-step-behind animation regions
+            // seen under storm load). Resolving here also pins one timestep
+            // for the whole request, so a catalog swap mid-render can no
+            // longer mix timesteps within a single response. Exact-match
+            // engines keep the identity default.
+            let time = engine.resolve_time(time, reference_time);
+
             // Build cache key
             let cache_key = CacheKey {
                 layer: params.layer.clone(),

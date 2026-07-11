@@ -3474,6 +3474,22 @@ pub struct PolarVolumeSiteView {
     pub(crate) resampling: ResamplingMethod,
 }
 
+/// The volume `get_raster_tile` renders for a requested time: nearest by
+/// absolute time difference, latest when `None`. The ONLY implementation of
+/// this selection — the render path and `MapEngine::resolve_time` (the
+/// cache-key authority, #507) both call it, so they cannot drift.
+fn select_volume_entry(
+    volumes: &[VolumeEntry],
+    time: Option<DateTime<Utc>>,
+) -> Option<&VolumeEntry> {
+    match time {
+        Some(target) => volumes
+            .iter()
+            .min_by_key(|e| (e.volume.time - target).num_seconds().abs()),
+        None => volumes.last(),
+    }
+}
+
 impl MapEngine for PolarVolumeSiteView {
     #[allow(clippy::too_many_arguments)]
     fn get_raster_tile(
@@ -3530,13 +3546,7 @@ impl MapEngine for PolarVolumeSiteView {
         })?;
 
         // Select the volume nearest `time` (latest if `None`).
-        let entry = match time {
-            Some(target) => site_volumes
-                .iter()
-                .min_by_key(|e| (e.volume.time - target).num_seconds().abs()),
-            None => site_volumes.last(),
-        }
-        .ok_or_else(|| {
+        let entry = select_volume_entry(site_volumes, time).ok_or_else(|| {
             DataServerError::LocationNotFound(format!(
                 "[{}] radar site `{}` has no volumes",
                 self.collection_id, self.nod
@@ -3591,6 +3601,25 @@ impl MapEngine for PolarVolumeSiteView {
             layer_subtitle: meta.map(|m| m.plc.clone().unwrap_or_else(|| self.nod.clone())),
             reference_times: Vec::new(),
         }
+    }
+
+    fn resolve_time(
+        &self,
+        time: Option<DateTime<Utc>>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        // The cache-key authority (#507): the exact volume timestamp
+        // `get_raster_tile` will render, via the SAME `select_volume_entry`
+        // the render path uses. A missing site / empty volume list falls
+        // back to the requested time — the render will error and cache
+        // nothing, so the key value is moot.
+        let catalog = self.catalog.load();
+        catalog
+            .by_site
+            .get(&self.nod)
+            .and_then(|volumes| select_volume_entry(volumes, time))
+            .map(|e| e.volume.time)
+            .or(time)
     }
 }
 
