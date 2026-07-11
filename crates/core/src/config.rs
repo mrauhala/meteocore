@@ -1391,6 +1391,14 @@ fn validate_observations_events(
         }
     }
 
+    if let Some(tz) = &o.time_col_tz {
+        if !validate_tz_name(tz) {
+            return Err(Config(format!(
+                "Collection '{id}': observations.time_col_tz '{tz}' is not a valid IANA-like name"
+            )));
+        }
+    }
+
     if let Some(w) = o.default_datetime.as_deref() {
         crate::datetime::parse_iso8601_duration(w).map_err(|e| {
             Config(format!(
@@ -1399,18 +1407,24 @@ fn validate_observations_events(
         })?;
     }
 
-    if let Some([west, south, east, north]) = o.extent_bbox {
-        let ok = west < east
-            && south < north
-            && (-180.0..=180.0).contains(&west)
-            && (-180.0..=180.0).contains(&east)
-            && (-90.0..=90.0).contains(&south)
-            && (-90.0..=90.0).contains(&north);
-        if !ok {
-            return Err(Config(format!(
-                "Collection '{id}': observations.extent_bbox must be [west, south, east, north] in CRS84 with west < east and south < north"
-            )));
-        }
+    // Required, not optional: with no stations there is no other source of a
+    // spatial extent — omitting it would silently publish a collection with
+    // no `extent.spatial` at all.
+    let Some([west, south, east, north]) = o.extent_bbox else {
+        return Err(Config(format!(
+            "Collection '{id}': observations.shape 'events' requires observations.extent_bbox (the only spatial-extent source for a station-less collection)"
+        )));
+    };
+    let ok = west < east
+        && south < north
+        && (-180.0..=180.0).contains(&west)
+        && (-180.0..=180.0).contains(&east)
+        && (-90.0..=90.0).contains(&south)
+        && (-90.0..=90.0).contains(&north);
+    if !ok {
+        return Err(Config(format!(
+            "Collection '{id}': observations.extent_bbox must be [west, south, east, north] in CRS84 with west < east and south < north"
+        )));
     }
 
     Ok(())
@@ -3691,6 +3705,32 @@ unit = "1"
             err.contains("id_col is only valid for observations.shape 'events'"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn postgis_events_requires_extent_bbox() {
+        let tmp = TempDir::new().unwrap();
+        let toml = lightning_events_toml().replace("extent_bbox = [4.0, 54.0, 42.0, 72.0]\n", "");
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("requires observations.extent_bbox"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn postgis_events_rejects_bad_time_col_tz() {
+        let tmp = TempDir::new().unwrap();
+        let toml =
+            lightning_events_toml().replace("time_col_tz = \"UTC\"", "time_col_tz = \"Bad TZ!!\"");
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a valid IANA-like name"), "got: {err}");
     }
 
     #[test]

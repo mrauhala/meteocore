@@ -302,7 +302,7 @@ time_col_tz = "UTC"           # mandatory for `timestamp without time zone`
 geom_col = "the_geom"
 id_col = "id"                 # ORDER BY time DESC, id tiebreak
 default_datetime = "PT1H"     # window when the query has no datetime (default PT1H)
-extent_bbox = [4.0, 54.0, 42.0, 72.0]   # advertised extent; never ST_Extent
+extent_bbox = [4.0, 54.0, 42.0, 72.0]   # REQUIRED: the only spatial-extent source; never ST_Extent
 
 [[postgis.parameters]]
 name = "peak_current"         # source_key defaults to name = the column name

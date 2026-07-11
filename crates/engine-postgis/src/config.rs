@@ -23,8 +23,9 @@ const DEFAULT_LOCATIONS_WINDOW_HOURS: i64 = 24;
 
 /// `events` shape: default query window when a request carries no `datetime`
 /// and the config sets no `default_datetime` (1 h). An unqualified events
-/// query never scans full history.
-const DEFAULT_EVENTS_WINDOW_HOURS: i64 = 1;
+/// query never scans full history. `pub(crate)` so the engine's fallback
+/// (`query_area_events`) cannot drift from this value.
+pub(crate) const DEFAULT_EVENTS_WINDOW_HOURS: i64 = 1;
 
 /// Default pool size — matches the render-semaphore sizing (`max(4, cores*2)`
 /// capped at 16). Override via `[postgis].pool_size`; hard-capped at 32 at

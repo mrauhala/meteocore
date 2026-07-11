@@ -278,14 +278,15 @@ impl PostgisEngine {
         let polygon_wkt = normalize_area_wkt(coords)?;
 
         // No `datetime` never means full history — fall back to the
-        // configured window ending "now".
+        // configured window ending "now". `events_default_window` is always
+        // Some for an events config (resolve sets it unconditionally); the
+        // fallback shares the resolve-time constant so they cannot drift.
         let (t0, t1) = match datetime {
             Some(range) => range,
             None => {
-                let window = self
-                    .config
-                    .events_default_window
-                    .unwrap_or_else(|| chrono::Duration::hours(1));
+                let window = self.config.events_default_window.unwrap_or_else(|| {
+                    chrono::Duration::hours(crate::config::DEFAULT_EVENTS_WINDOW_HOURS)
+                });
                 let now = Utc::now();
                 (now - window, now)
             }
@@ -300,7 +301,7 @@ impl PostgisEngine {
 
         let rows = run_single_query_sync(&self.pool, built)?;
         if rows.len() * per_row > MAX_RESPONSE_VALUES {
-            return Err(budget_exceeded());
+            return Err(events_budget_exceeded());
         }
         let events = decode_event_rows(&rows, &key_refs)?;
         Ok(CoverageResponse::Collection(assemble_event_coverages(
@@ -518,12 +519,23 @@ fn enforce_area_query_count(
     Ok(())
 }
 
-/// The response-budget breach error. One message for every path so clients
-/// see a consistent, actionable 400.
-fn budget_exceeded() -> DataServerError {
+/// The response-budget breach error. One message per shape family so the
+/// dimensions named actually exist on the collection being queried.
+fn budget_exceeded_for(dimensions: &str) -> DataServerError {
     DataServerError::QueryTooLarge(format!(
-        "response would exceed the {MAX_RESPONSE_VALUES}-value budget (stations × parameters × timesteps) — narrow the time range, the polygon, or the parameter list"
+        "response would exceed the {MAX_RESPONSE_VALUES}-value budget ({dimensions}) — narrow the time range, the polygon, or the parameter list"
     ))
+}
+
+/// Station-shape budget breach (position/location/area fan-out paths).
+fn budget_exceeded() -> DataServerError {
+    budget_exceeded_for("stations × parameters × timesteps")
+}
+
+/// Events-shape budget breach — there are no stations or timesteps here,
+/// the budget is rows × selected parameter columns.
+fn events_budget_exceeded() -> DataServerError {
+    budget_exceeded_for("events × parameters")
 }
 
 /// Station-keyed queries (position, location) are meaningless on an events
