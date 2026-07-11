@@ -146,7 +146,13 @@ impl MetadataCache {
             .collect();
         let station_idx = build_station_idx(&feature_stations);
         let parameters = build_parameter_descriptions(&cfg.parameters);
-        let spatial = spatial_extent_from(&locations);
+        // Events shape: the location list is empty, so the spatial extent
+        // comes from config (`extent_bbox`) — never from an `ST_Extent`
+        // full scan over the event table.
+        let spatial = match cfg.events_extent_bbox {
+            Some(bbox) => Some(bbox),
+            None => spatial_extent_from(&locations),
+        };
         let temporal = fetch_temporal_extent(cfg, pool).await?;
 
         let previous = self.inner.load();
@@ -232,6 +238,8 @@ async fn fetch_locations(
             let stations = fetch_station_rows(cfg, pool).await?;
             Ok(enrich_with_stations(reporters, stations))
         }
+        // Events shape: no station/location concept, nothing to fetch.
+        LocationSource::None => Ok(Vec::new()),
     }
 }
 
@@ -485,6 +493,11 @@ async fn fetch_temporal_extent(
                 first.time_col.as_str(),
                 first.time_col_tz.as_deref(),
             )
+        }
+        ObservationSchema::Events(ev) => {
+            // MIN/MAX over the event time column — index-only on any table
+            // with a leading-time btree (the documented deployment shape).
+            (&ev.table, ev.time_col.as_str(), ev.time_col_tz.as_deref())
         }
     };
 

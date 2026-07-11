@@ -277,6 +277,63 @@ If none of the three shapes fit your schema, expose a Postgres `VIEW` that does.
 The DSL deliberately does not support joins, computed expressions, or column
 transforms.
 
+## Events shape (non-station event data)
+
+The fourth shape, `events` (#113), serves tables where each row is an
+independent event with its own time and point geometry — no stations, no
+interval. Reference dataset: a lightning-strike table
+`(id, time, the_geom, multiplicity, peak_current, cloud_indicator, ellipse_major)`.
+
+```toml
+# collections.d/lightning.toml
+id = "lightning"
+title = "Lightning strikes"
+engine_type = "postgis"
+apis = ["edr"]
+
+[postgis]
+dsn_env = "MC_OBS_DSN"
+
+[postgis.observations]
+shape = "events"
+table = "public.lightning"
+time_col = "time"
+time_col_tz = "UTC"           # mandatory for `timestamp without time zone`
+geom_col = "the_geom"
+id_col = "id"                 # ORDER BY time DESC, id tiebreak
+default_datetime = "PT1H"     # window when the query has no datetime (default PT1H)
+extent_bbox = [4.0, 54.0, 42.0, 72.0]   # advertised extent; never ST_Extent
+
+[[postgis.parameters]]
+name = "peak_current"         # source_key defaults to name = the column name
+label = "Peak current"
+unit = "kA"
+
+[[postgis.parameters]]
+name = "multiplicity"
+label = "Multiplicity"
+unit = "1"
+```
+
+Behaviour:
+
+- **EDR `area` only.** One SQL statement per request (time-range + polygon
+  intersect, `ORDER BY time DESC, id`), no fan-out — the fan-out semaphore is
+  not involved. `position`/`locations` return 400 pointing at the area query.
+- **Response**: a CoverageJSON `CoverageCollection` of `Point` coverages — one
+  per event, each with its own single-value `t` axis and 0-d scalar ranges.
+  An empty window is a valid empty collection, not a 404.
+- **No `datetime`** never means full history: the `default_datetime` window
+  (ending "now") applies.
+- The response-value budget charges `rows × selected parameters`; a breach is
+  an HTTP 400 naming the numbers.
+- Parameter columns are cast `::double precision` in SQL, so `smallint` /
+  `numeric(p,s)` columns work without config.
+- A `[postgis.stations]` block, `station_fk_col`, `locations_window`, or
+  `columns`/`tables` entries are rejected for this shape at config load.
+- Recommended index: `btree (time DESC, geom) INCLUDE (<parameter columns>)`
+  plus the usual gist on the geometry column.
+
 ## Optional stations / orphan locations
 
 The `[collections.postgis.stations]` block is **optional**. When the observation

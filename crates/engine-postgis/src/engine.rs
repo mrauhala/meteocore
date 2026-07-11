@@ -29,11 +29,11 @@ use crate::config::PostgisEngineConfig;
 use crate::health::{Health, HealthSnapshot, HealthStatus};
 use crate::metadata::{CollectionMeta, MetadataCache};
 use crate::query::{
-    build_location, build_position, build_stations_in_polygon, params_as_refs, BuiltQuery,
-    DEFAULT_POSITION_RADIUS_M, MAX_AREA_QUERIES, MAX_OBSERVATION_ROWS, MAX_RESPONSE_VALUES,
-    MAX_STATIONS_IN_POLYGON,
+    build_events_area, build_location, build_position, build_stations_in_polygon, params_as_refs,
+    BuiltQuery, DEFAULT_POSITION_RADIUS_M, MAX_AREA_QUERIES, MAX_OBSERVATION_ROWS,
+    MAX_RESPONSE_VALUES, MAX_STATIONS_IN_POLYGON,
 };
-use crate::schema::ObservationSchema;
+use crate::schema::{EventsShape, ObservationSchema};
 
 /// Time-ordered observation values for a single parameter. Exists to
 /// keep the Clippy `type_complexity` lint happy without papering over
@@ -261,6 +261,54 @@ impl PostgisEngine {
     fn load_meta(&self) -> Arc<CollectionMeta> {
         self.cache.load()
     }
+
+    /// Events-shape area query: one SQL statement over the event table, one
+    /// `Point` coverage per returned event row. An empty window is a valid
+    /// empty `CoverageCollection` (no strikes in the area is an answer, not
+    /// a 404 — unlike a missing station).
+    fn query_area_events(
+        &self,
+        shape: &EventsShape,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let source_keys = resolve_source_keys(&self.config, parameters)?;
+        let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
+        let polygon_wkt = normalize_area_wkt(coords)?;
+
+        // No `datetime` never means full history — fall back to the
+        // configured window ending "now".
+        let (t0, t1) = match datetime {
+            Some(range) => range,
+            None => {
+                let window = self
+                    .config
+                    .events_default_window
+                    .unwrap_or_else(|| chrono::Duration::hours(1));
+                let now = Utc::now();
+                (now - window, now)
+            }
+        };
+
+        let per_row = key_refs.len().max(1);
+        // +1 sentinel row: crossing the budget is detected as "one more row
+        // than fits" rather than silently truncating an over-budget window.
+        let row_limit = MAX_RESPONSE_VALUES / per_row + 1;
+        let built = build_events_area(shape, &polygon_wkt, (t0, t1), &key_refs, row_limit)
+            .map_err(|e| DataServerError::Engine(format!("build_events_area: {e}")))?;
+
+        let rows = run_single_query_sync(&self.pool, built)?;
+        if rows.len() * per_row > MAX_RESPONSE_VALUES {
+            return Err(budget_exceeded());
+        }
+        let events = decode_event_rows(&rows, &key_refs)?;
+        Ok(CoverageResponse::Collection(assemble_event_coverages(
+            &self.config,
+            &key_refs,
+            events,
+        )))
+    }
 }
 
 // ─── Engine trait ────────────────────────────────────────────────────────────
@@ -291,6 +339,11 @@ impl EdrEngine for PostgisEngine {
     }
 
     fn supported_query_types(&self) -> Vec<String> {
+        if self.config.events().is_some() {
+            // Events have no stations: no locations, no position (a point
+            // has probability zero of hitting an event) — area only.
+            return vec!["area".to_string()];
+        }
         vec![
             "locations".to_string(),
             "position".to_string(),
@@ -307,6 +360,7 @@ impl EdrEngine for PostgisEngine {
         _z: Option<&[f64]>,
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
+        reject_station_query_on_events(&self.config)?;
         let source_keys = resolve_source_keys(&self.config, parameters)?;
         let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
 
@@ -342,6 +396,7 @@ impl EdrEngine for PostgisEngine {
         z: Option<&[f64]>,
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
+        reject_station_query_on_events(&self.config)?;
         let (lon, lat) = parse_coords(coords)?;
         // Observations-derived modes (A/B) resolve the nearest station in-memory
         // from the cached location set — a scan over a few thousand points is
@@ -370,6 +425,12 @@ impl EdrEngine for PostgisEngine {
         _z: Option<&[f64]>,
         _reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
+        if let ObservationSchema::Events(ev) = &self.config.observations {
+            // Clone the shape so the borrow on `self.config` ends here —
+            // `query_area_events` needs `&self` too.
+            let ev = ev.clone();
+            return self.query_area_events(&ev, coords, datetime, parameters);
+        }
         let source_keys = resolve_source_keys(&self.config, parameters)?;
         let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
 
@@ -463,6 +524,17 @@ fn budget_exceeded() -> DataServerError {
     DataServerError::QueryTooLarge(format!(
         "response would exceed the {MAX_RESPONSE_VALUES}-value budget (stations × parameters × timesteps) — narrow the time range, the polygon, or the parameter list"
     ))
+}
+
+/// Station-keyed queries (position, location) are meaningless on an events
+/// collection — reject with an actionable pointer at the area query.
+fn reject_station_query_on_events(cfg: &PostgisEngineConfig) -> Result<(), DataServerError> {
+    if cfg.events().is_some() {
+        return Err(DataServerError::InvalidParameter(
+            "this collection holds event data with no stations — use the area query".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_source_keys(
@@ -680,6 +752,24 @@ fn run_area_fanout(
     Ok(results.into_iter().flatten().collect())
 }
 
+/// Run one built query on a pooled connection (sync bridge). Used by the
+/// events area path — a single statement, no fan-out, no budget rewrite
+/// (the LIMIT bind already carries the budget sentinel).
+fn run_single_query_sync(pool: &Pool, built: BuiltQuery) -> Result<Vec<Row>, DataServerError> {
+    let pool = pool.clone();
+    block_on_async(async move {
+        let client = pool
+            .get()
+            .await
+            .map_err(|e| DataServerError::Engine(format!("pool acquire failed: {e}")))?;
+        let refs = params_as_refs(&built.params);
+        client
+            .query(&built.sql, &refs)
+            .await
+            .map_err(|e| map_pg_error(e, &built))
+    })
+}
+
 fn run_stations_in_polygon_sync(
     pool: &Pool,
     cfg: &PostgisEngineConfig,
@@ -890,7 +980,114 @@ fn assemble_query_result(
         ObservationSchema::PerParameter(_) => {
             assemble_per_parameter(cfg, lon, lat, queries, rows_per_query)
         }
+        // Events never reach the station assembly path — their area query
+        // assembles Point coverages via `assemble_event_coverages`.
+        ObservationSchema::Events(_) => Err(DataServerError::Engine(
+            "events shape has no station-keyed assembly".into(),
+        )),
     }
+}
+
+// ─── event row assembly (events shape) ──────────────────────────────────────
+
+/// One decoded event row: `(time, lon, lat)` plus one optional value per
+/// requested source_key, in request order.
+struct EventRow {
+    time: DateTime<Utc>,
+    lon: f64,
+    lat: f64,
+    values: Vec<Option<f64>>,
+}
+
+fn decode_event_rows(rows: &[Row], source_keys: &[&str]) -> Result<Vec<EventRow>, DataServerError> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let time: DateTime<Utc> = row
+            .try_get("time")
+            .map_err(|e| DataServerError::Engine(format!("decode event time: {e}")))?;
+        let lon: f64 = row
+            .try_get("lon")
+            .map_err(|e| DataServerError::Engine(format!("decode event lon: {e}")))?;
+        let lat: f64 = row
+            .try_get("lat")
+            .map_err(|e| DataServerError::Engine(format!("decode event lat: {e}")))?;
+        let mut values = Vec::with_capacity(source_keys.len());
+        for key in source_keys {
+            let v: Option<f64> = row
+                .try_get(*key)
+                .map_err(|e| DataServerError::Engine(format!("decode event {key}: {e}")))?;
+            values.push(v);
+        }
+        out.push(EventRow {
+            time,
+            lon,
+            lat,
+            values,
+        });
+    }
+    Ok(out)
+}
+
+/// One `Point` coverage per event: single-value x/y/t axes and a 0-d scalar
+/// range per parameter (`shape`/`axis_names` empty — the CoverageJSON scalar
+/// form). Serialised as a `CoverageCollection` with `domainType: "Point"`.
+fn assemble_event_coverages(
+    cfg: &PostgisEngineConfig,
+    source_keys: &[&str],
+    events: Vec<EventRow>,
+) -> Vec<QueryResult> {
+    // Descriptor per requested key, resolved once — every event coverage
+    // shares them (the API layer hoists parameters to collection level).
+    let descs: Vec<(String, ParameterDescription)> = source_keys
+        .iter()
+        .map(|key| {
+            let pname = source_key_to_param_name(cfg, key);
+            let desc = cfg
+                .parameters
+                .iter()
+                .find(|p| p.name == pname)
+                .map(|p| ParameterDescription {
+                    label: p.label.clone(),
+                    unit: p.unit.clone(),
+                    observed_property: p.observed_property.clone(),
+                })
+                .unwrap_or_else(|| ParameterDescription {
+                    label: pname.clone(),
+                    unit: String::new(),
+                    observed_property: pname.clone(),
+                });
+            (pname, desc)
+        })
+        .collect();
+
+    events
+        .into_iter()
+        .map(|ev| {
+            let mut parameters = HashMap::with_capacity(descs.len());
+            let mut ranges = HashMap::with_capacity(descs.len());
+            for ((pname, desc), v) in descs.iter().zip(&ev.values) {
+                parameters.insert(pname.clone(), desc.clone());
+                ranges.insert(
+                    pname.clone(),
+                    NdArray {
+                        shape: vec![],
+                        axis_names: vec![],
+                        values: vec![*v],
+                    },
+                );
+            }
+            QueryResult {
+                domain: DomainDescription::Point {
+                    x: ev.lon,
+                    y: ev.lat,
+                    t: Some(ev.time),
+                    z: None,
+                },
+                parameters,
+                ranges,
+            }
+        })
+        .collect()
 }
 
 fn assemble_long(
@@ -1315,6 +1512,8 @@ mod tests {
                 },
             ],
             locations_window: None,
+            events_default_window: None,
+            events_extent_bbox: None,
         };
         let keys = resolve_source_keys(&cfg, None).unwrap();
         assert_eq!(keys, vec!["TEMP", "WIND"]);
@@ -1323,6 +1522,78 @@ mod tests {
         assert_eq!(keys, vec!["TEMP"]);
 
         assert!(resolve_source_keys(&cfg, Some(&["unknown".into()])).is_err());
+    }
+
+    #[test]
+    fn assemble_event_coverages_one_point_per_event() {
+        use crate::config::ValidatedParameter;
+        use crate::schema::{EventsShape, QualifiedTable};
+        let cfg = PostgisEngineConfig {
+            dsn: "postgres://x/y".into(),
+            dsn_was_literal: false,
+            pool_size: 4,
+            pool_label: None,
+            metadata_refresh_secs: 300,
+            location_source: crate::schema::LocationSource::None,
+            observations: ObservationSchema::Events(EventsShape {
+                table: QualifiedTable {
+                    schema: "public".into(),
+                    table: "lightning".into(),
+                },
+                time_col: "time".into(),
+                time_col_tz: Some("UTC".into()),
+                geom_col: "the_geom".into(),
+                id_col: "id".into(),
+            }),
+            parameters: vec![ValidatedParameter {
+                name: "peak_current".into(),
+                label: "Peak current".into(),
+                unit: "kA".into(),
+                observed_property: "peak_current".into(),
+                source_key: "peak_current".into(),
+            }],
+            locations_window: None,
+            events_default_window: Some(chrono::Duration::hours(1)),
+            events_extent_bbox: None,
+        };
+        let t0: DateTime<Utc> = "2026-07-11T17:00:00Z".parse().unwrap();
+        let t1: DateTime<Utc> = "2026-07-11T17:05:00Z".parse().unwrap();
+        let events = vec![
+            EventRow {
+                time: t0,
+                lon: 25.0,
+                lat: 61.0,
+                values: vec![Some(-12.5)],
+            },
+            EventRow {
+                time: t1,
+                lon: 26.0,
+                lat: 62.0,
+                values: vec![None],
+            },
+        ];
+
+        let out = assemble_event_coverages(&cfg, &["peak_current"], events);
+        assert_eq!(out.len(), 2);
+
+        match &out[0].domain {
+            DomainDescription::Point { x, y, t, z } => {
+                assert_eq!(*x, 25.0);
+                assert_eq!(*y, 61.0);
+                assert_eq!(*t, Some(t0));
+                assert!(z.is_none());
+            }
+            other => panic!("expected Point domain, got {other:?}"),
+        }
+        // 0-d scalar ranges: empty shape/axis_names, exactly one value —
+        // the CoverageJSON scalar NdArray form the API layer emits.
+        let nd = &out[0].ranges["peak_current"];
+        assert!(nd.shape.is_empty());
+        assert!(nd.axis_names.is_empty());
+        assert_eq!(nd.values, vec![Some(-12.5)]);
+        assert_eq!(out[0].parameters["peak_current"].unit, "kA");
+        // A null measurement stays null, not zero.
+        assert_eq!(out[1].ranges["peak_current"].values, vec![None]);
     }
 
     fn meta_with(locations: Vec<Location>) -> CollectionMeta {

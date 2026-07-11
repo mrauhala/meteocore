@@ -1026,6 +1026,20 @@ pub struct PostgisObservationsConfig {
     /// `per_parameter` shape: one entry per parameter → table mapping.
     #[serde(default)]
     pub tables: Vec<PostgisObservationTable>,
+    /// `events` shape: unique/tiebreak column for deterministic ordering
+    /// (`ORDER BY time DESC, id`). Required for `events`, forbidden otherwise.
+    #[serde(default)]
+    pub id_col: Option<String>,
+    /// `events` shape: window applied when a query carries no `datetime`
+    /// (ISO 8601 duration, e.g. `"PT1H"`; that is also the default). Event
+    /// tables are never scanned over full history by an unqualified query.
+    #[serde(default)]
+    pub default_datetime: Option<String>,
+    /// `events` shape: advertised spatial extent `[west, south, east, north]`
+    /// (CRS84). Static config — computing `ST_Extent` over a large event
+    /// table on every metadata refresh is a full-scan trap.
+    #[serde(default)]
+    pub extent_bbox: Option<[f64; 4]>,
 }
 
 impl PostgisObservationsConfig {
@@ -1196,8 +1210,15 @@ fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::D
     // -- stations (optional) ----------------------------------------------
     // The stations table may be omitted entirely (mode A): locations are then
     // derived from the observations table's own geometry. When present, all
-    // identifiers are validated exactly as before.
-    if let Some(s) = &cfg.stations {
+    // identifiers are validated exactly as before. The `events` shape has no
+    // station concept at all — a stations table is rejected outright.
+    if cfg.observations.shape == "events" {
+        if cfg.stations.is_some() {
+            return Err(Config(format!(
+                "Collection '{id}': observations.shape 'events' does not use a [postgis.stations] table — every event row carries its own geometry"
+            )));
+        }
+    } else if let Some(s) = &cfg.stations {
         validate_qualified_table(&s.table)
             .map_err(|e| Config(format!("Collection '{id}': stations.table: {e}")))?;
         for (field, value) in [
@@ -1231,13 +1252,29 @@ fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::D
 
     // -- observations (shape-dependent) -----------------------------------
     let o = &cfg.observations;
+    // The events-only fields are meaningless on station shapes — reject
+    // rather than silently ignore (the silently-dropped-config footgun).
+    if o.shape != "events" {
+        for (field, present) in [
+            ("id_col", o.id_col.is_some()),
+            ("default_datetime", o.default_datetime.is_some()),
+            ("extent_bbox", o.extent_bbox.is_some()),
+        ] {
+            if present {
+                return Err(Config(format!(
+                    "Collection '{id}': observations.{field} is only valid for observations.shape 'events'"
+                )));
+            }
+        }
+    }
     match o.shape.as_str() {
         "long" => validate_observations_long(id, o)?,
         "wide" => validate_observations_wide(id, o)?,
         "per_parameter" => validate_observations_per_parameter(id, o)?,
+        "events" => validate_observations_events(id, o)?,
         other => {
             return Err(Config(format!(
-                "Collection '{id}': observations.shape '{other}' is not one of 'long', 'wide', 'per_parameter'"
+                "Collection '{id}': observations.shape '{other}' is not one of 'long', 'wide', 'per_parameter', 'events'"
             )));
         }
     }
@@ -1247,6 +1284,11 @@ fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::D
     // default (applied at engine resolve). Validate the string parses now so a
     // typo fails at config load, not at the first metadata refresh.
     if let Some(w) = o.locations_window.as_deref() {
+        if o.shape == "events" {
+            return Err(Config(format!(
+                "Collection '{id}': observations.locations_window is not valid for shape 'events' (no locations are derived) — use default_datetime for the query window"
+            )));
+        }
         if !w.eq_ignore_ascii_case("all") {
             crate::datetime::parse_iso8601_duration(w).map_err(|e| {
                 Config(format!(
@@ -1284,7 +1326,91 @@ fn validate_postgis(id: &str, cfg: &PostgisConfig) -> Result<(), crate::error::D
                 }
             }
         }
+        "events" => {
+            // For events the source_key IS the column name emitted into SQL
+            // (there is no columns/tables mapping to launder it through), so
+            // it must pass the identifier whitelist here.
+            for p in &cfg.parameters {
+                let key = p.source_key.as_deref().unwrap_or(p.name.as_str());
+                if !is_valid_sql_identifier(key) {
+                    return Err(Config(format!(
+                        "Collection '{id}': parameter '{}' source_key '{key}' is not a valid SQL identifier (events source_keys are column names)",
+                        p.name
+                    )));
+                }
+            }
+        }
         _ => {} // long: source_key is a string literal, no cross-ref
+    }
+
+    Ok(())
+}
+
+fn validate_observations_events(
+    id: &str,
+    o: &PostgisObservationsConfig,
+) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+
+    let table = o.table.as_deref().ok_or_else(|| {
+        Config(format!(
+            "Collection '{id}': observations.shape 'events' requires observations.table"
+        ))
+    })?;
+    validate_qualified_table(table)
+        .map_err(|e| Config(format!("Collection '{id}': observations.table: {e}")))?;
+
+    for (field, value) in [
+        ("time_col", &o.time_col),
+        ("geom_col", &o.geom_col),
+        ("id_col", &o.id_col),
+    ] {
+        let v = value.as_deref().ok_or_else(|| {
+            Config(format!(
+                "Collection '{id}': observations.shape 'events' requires observations.{field}"
+            ))
+        })?;
+        if !is_valid_sql_identifier(v) {
+            return Err(Config(format!(
+                "Collection '{id}': observations.{field} '{v}' is not a valid SQL identifier"
+            )));
+        }
+    }
+
+    for (field, present) in [
+        ("station_fk_col", o.station_fk_col.is_some()),
+        ("param_col", o.param_col.is_some()),
+        ("value_col", o.value_col.is_some()),
+        ("columns", !o.columns.is_empty()),
+        ("tables", !o.tables.is_empty()),
+    ] {
+        if present {
+            return Err(Config(format!(
+                "Collection '{id}': observations.{field} is not valid for shape 'events'"
+            )));
+        }
+    }
+
+    if let Some(w) = o.default_datetime.as_deref() {
+        crate::datetime::parse_iso8601_duration(w).map_err(|e| {
+            Config(format!(
+                "Collection '{id}': observations.default_datetime '{w}' is not a valid ISO 8601 duration: {e}"
+            ))
+        })?;
+    }
+
+    if let Some([west, south, east, north]) = o.extent_bbox {
+        let ok = west < east
+            && south < north
+            && (-180.0..=180.0).contains(&west)
+            && (-180.0..=180.0).contains(&east)
+            && (-90.0..=90.0).contains(&south)
+            && (-90.0..=90.0).contains(&north);
+        if !ok {
+            return Err(Config(format!(
+                "Collection '{id}': observations.extent_bbox must be [west, south, east, north] in CRS84 with west < east and south < north"
+            )));
+        }
     }
 
     Ok(())
@@ -3410,6 +3536,178 @@ observed_property = "wind_speed"
         assert_eq!(pg.observations.shape, "per_parameter");
         assert_eq!(pg.observations.tables.len(), 2);
         assert_eq!(pg.parameters.len(), 2);
+    }
+
+    fn lightning_events_toml() -> &'static str {
+        r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "lightning"
+title = "Lightning strikes"
+description = "Lightning detection network events"
+engine_type = "postgis"
+apis = ["edr"]
+
+[collections.postgis]
+dsn_env = "NEXUS_DSN"
+
+[collections.postgis.observations]
+shape = "events"
+table = "public.lightning"
+time_col = "time"
+time_col_tz = "UTC"
+geom_col = "the_geom"
+id_col = "id"
+default_datetime = "PT1H"
+extent_bbox = [4.0, 54.0, 42.0, 72.0]
+
+[[collections.postgis.parameters]]
+name = "peak_current"
+label = "Peak current"
+unit = "kA"
+observed_property = "peak_current"
+
+[[collections.postgis.parameters]]
+name = "multiplicity"
+label = "Multiplicity"
+unit = "1"
+"#
+    }
+
+    #[test]
+    fn postgis_events_shape_parses_clean() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(tmp.path(), "config.toml", lightning_events_toml());
+        let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        let pg = config.collections[0].postgis.as_ref().unwrap();
+        assert_eq!(pg.observations.shape, "events");
+        assert_eq!(pg.observations.id_col.as_deref(), Some("id"));
+        assert_eq!(pg.observations.default_datetime.as_deref(), Some("PT1H"));
+        assert_eq!(pg.observations.extent_bbox, Some([4.0, 54.0, 42.0, 72.0]));
+    }
+
+    #[test]
+    fn postgis_events_rejects_stations_block() {
+        let tmp = TempDir::new().unwrap();
+        let toml = format!(
+            "{}\n[collections.postgis.stations]\ntable = \"weather.stations\"\nid_col = \"id\"\nlabel_col = \"name\"\ngeom_col = \"the_geom\"\n",
+            lightning_events_toml()
+        );
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not use a [postgis.stations]"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn postgis_events_requires_id_col() {
+        let tmp = TempDir::new().unwrap();
+        let toml = lightning_events_toml().replace("id_col = \"id\"\n", "");
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires observations.id_col"), "got: {err}");
+    }
+
+    #[test]
+    fn postgis_events_rejects_station_fk_col() {
+        let tmp = TempDir::new().unwrap();
+        let toml = lightning_events_toml().replace(
+            "time_col = \"time\"\n",
+            "time_col = \"time\"\nstation_fk_col = \"nope\"\n",
+        );
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("station_fk_col is not valid for shape 'events'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn postgis_events_rejects_inverted_extent_bbox() {
+        let tmp = TempDir::new().unwrap();
+        let toml = lightning_events_toml().replace(
+            "extent_bbox = [4.0, 54.0, 42.0, 72.0]",
+            "extent_bbox = [42.0, 54.0, 4.0, 72.0]",
+        );
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("extent_bbox"), "got: {err}");
+    }
+
+    #[test]
+    fn postgis_events_rejects_bad_default_datetime() {
+        let tmp = TempDir::new().unwrap();
+        let toml = lightning_events_toml().replace(
+            "default_datetime = \"PT1H\"",
+            "default_datetime = \"garbage\"",
+        );
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("default_datetime"), "got: {err}");
+    }
+
+    #[test]
+    fn postgis_events_rejects_invalid_source_key_identifier() {
+        let tmp = TempDir::new().unwrap();
+        let toml = lightning_events_toml().replace(
+            "name = \"peak_current\"",
+            "name = \"peak_current\"\nsource_key = \"bad name; drop\"",
+        );
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a valid SQL identifier"), "got: {err}");
+    }
+
+    #[test]
+    fn postgis_station_shape_rejects_events_only_fields() {
+        let tmp = TempDir::new().unwrap();
+        let toml = nexus_postgis_toml().replace(
+            "shape = \"per_parameter\"\n",
+            "shape = \"per_parameter\"\nid_col = \"id\"\n",
+        );
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("id_col is only valid for observations.shape 'events'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn postgis_events_rejects_locations_window() {
+        let tmp = TempDir::new().unwrap();
+        let toml = lightning_events_toml().replace(
+            "default_datetime = \"PT1H\"",
+            "default_datetime = \"PT1H\"\nlocations_window = \"PT24H\"",
+        );
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("locations_window is not valid for shape 'events'"),
+            "got: {err}"
+        );
     }
 
     #[test]
