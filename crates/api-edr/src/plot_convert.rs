@@ -136,6 +136,9 @@ fn build_panel(param: &str, coverages: &[QueryResult]) -> Result<Panel, DataServ
         DomainDescription::Section { .. } => Err(DataServerError::InvalidParameter(
             "PNG output is not available for cross-section (trajectory) responses".into(),
         )),
+        DomainDescription::Point { .. } => Err(DataServerError::InvalidParameter(
+            "PNG output is not available for point-event responses".into(),
+        )),
     }
 }
 
@@ -146,6 +149,7 @@ fn domain_kind(d: &DomainDescription) -> &'static str {
         DomainDescription::PointSeries { .. } => "PointSeries",
         DomainDescription::Grid { .. } => "Grid",
         DomainDescription::Section { .. } => "Section",
+        DomainDescription::Point { .. } => "Point",
     }
 }
 

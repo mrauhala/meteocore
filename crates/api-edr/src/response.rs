@@ -118,8 +118,13 @@ fn build_ndarray(ndarray: &ds_core::model::NdArray) -> Value {
     let mut obj = Map::with_capacity(5);
     obj.insert("type".into(), Value::String("NdArray".into()));
     obj.insert("dataType".into(), Value::String("float".into()));
-    obj.insert("axisNames".into(), json!(ndarray.axis_names));
-    obj.insert("shape".into(), json!(ndarray.shape));
+    // A 0-d scalar range (a `Point` coverage's single value) omits
+    // `axisNames`/`shape` per the CoverageJSON spec; any dimensioned
+    // array keeps both.
+    if !(ndarray.axis_names.is_empty() && ndarray.shape.is_empty()) {
+        obj.insert("axisNames".into(), json!(ndarray.axis_names));
+        obj.insert("shape".into(), json!(ndarray.shape));
+    }
     obj.insert("values".into(), Value::Array(values));
     Value::Object(obj)
 }
@@ -155,6 +160,7 @@ pub fn query_result_to_coverage_json(result: &QueryResult) -> Value {
 /// CoverageJSON `domainType` string for a domain description.
 fn domain_type_name(domain: &DomainDescription) -> &'static str {
     match domain {
+        DomainDescription::Point { .. } => "Point",
         DomainDescription::PointSeries { .. } => "PointSeries",
         DomainDescription::Grid { .. } => "Grid",
         DomainDescription::VerticalProfile { .. } => "VerticalProfile",
@@ -220,6 +226,26 @@ pub fn coverage_response_to_json(result: &CoverageResponse) -> Value {
 
 fn build_domain(desc: &DomainDescription) -> Value {
     match desc {
+        DomainDescription::Point { x, y, t, z } => {
+            let mut axes = Map::new();
+            axes.insert("x".into(), json!({ "values": [x] }));
+            axes.insert("y".into(), json!({ "values": [y] }));
+            let mut referencing = vec![spatial_ref()];
+            if let Some(time) = t {
+                axes.insert("t".into(), json!({ "values": [time.to_rfc3339()] }));
+                referencing.push(temporal_ref());
+            }
+            if let Some(zc) = z {
+                axes.insert("z".into(), json!({ "values": zc.values }));
+                referencing.push(vertical_ref(zc));
+            }
+            json!({
+                "type": "Domain",
+                "domainType": "Point",
+                "axes": axes,
+                "referencing": referencing
+            })
+        }
         DomainDescription::PointSeries { x, y, t, z } => {
             let times: Vec<String> = t.iter().map(|t| t.to_rfc3339()).collect();
             let mut axes = Map::new();
