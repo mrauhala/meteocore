@@ -21,7 +21,9 @@ use chrono::{DateTime, Utc};
 use thiserror::Error;
 
 use crate::config::PostgisEngineConfig;
-use crate::schema::{LongShape, ObservationSchema, PerParameterShape, QualifiedTable, WideShape};
+use crate::schema::{
+    EventsShape, LongShape, ObservationSchema, PerParameterShape, QualifiedTable, WideShape,
+};
 use crate::security::{quote_ident, QuoteError};
 
 /// Maximum rows returned by a locations list query. 50_001 covers the
@@ -293,6 +295,8 @@ pub fn build_locations_from_observations(
             }
             Ok(queries)
         }
+        // Events have no station concept — nothing to derive.
+        ObservationSchema::Events(_) => Err(BuildError::NoStations),
     }
 }
 
@@ -490,7 +494,67 @@ pub fn build_location(
         ObservationSchema::PerParameter(pp) => {
             build_location_per_parameter(pp, station_id, time_range, &effective, row_limit)
         }
+        // Events have no stations; the engine layer rejects station-keyed
+        // queries before reaching the builder.
+        ObservationSchema::Events(_) => Err(BuildError::NoStations),
     }
+}
+
+// ─── events (non-station event tables) ─────────────────────────────────────
+
+/// Events-shape area query (#113): one statement fetching every event inside
+/// the polygon × time window. Each returned row is one event —
+/// `(time, lon, lat, <one column per requested source_key>)` — so
+/// `values_per_row` is the requested-column count for the response budget.
+/// `ORDER BY time DESC, <id>` keeps results deterministic (newest first, id
+/// tiebreak on equal timestamps); `LIMIT $4` is the budget in rows.
+///
+/// The `::double precision` cast on every parameter column also normalises
+/// `numeric`-typed columns (e.g. a `numeric(3,1)` accuracy radius) to `f64`
+/// at the SQL layer.
+pub fn build_events_area(
+    shape: &EventsShape,
+    polygon_wkt: &str,
+    time_range: (DateTime<Utc>, DateTime<Utc>),
+    source_keys: &[&str],
+    row_limit: usize,
+) -> Result<BuiltQuery, BuildError> {
+    if polygon_wkt.trim().is_empty() {
+        return Err(BuildError::EmptyPolygonWkt);
+    }
+    let table = fq_table(&shape.table)?;
+    let time_col = quote_ident(&shape.time_col)?;
+    let geom = quote_ident(&shape.geom_col)?;
+    let id = quote_ident(&shape.id_col)?;
+    let time_select = time_select_expr(&time_col, shape.time_col_tz.as_deref());
+    let tz = shape.time_col_tz.as_deref();
+
+    let mut projection = format!("{time_select} AS time, ST_X({geom}) AS lon, ST_Y({geom}) AS lat");
+    for key in source_keys {
+        // source_key == column name == row alias (identifier-validated at
+        // config load and at engine resolve).
+        let col = quote_ident(key)?;
+        projection.push_str(&format!(", {col}::double precision AS {col}"));
+    }
+
+    let rhs_lo = time_filter_rhs("$1", tz);
+    let rhs_hi = time_filter_rhs("$2", tz);
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!(
+        "{projection} \
+         FROM {table} \
+         WHERE {time_col} >= {rhs_lo} AND {time_col} <= {rhs_hi} \
+         AND {geom} && ST_GeomFromText($3, 4326) \
+         AND ST_Intersects({geom}, ST_GeomFromText($3, 4326)) \
+         ORDER BY {time_col} DESC, {id} LIMIT $4"
+    ));
+    let params = vec![
+        SqlParam::Timestamp(time_range.0),
+        SqlParam::Timestamp(time_range.1),
+        SqlParam::Text(polygon_wkt.to_string()),
+        SqlParam::Int(row_limit as i64),
+    ];
+    Ok(BuiltQuery::new(sql, params).with_row_limit(3, source_keys.len().max(1)))
 }
 
 fn build_location_long(
@@ -751,6 +815,8 @@ mod tests {
             observations,
             parameters,
             locations_window: None,
+            events_default_window: None,
+            events_extent_bbox: None,
         }
     }
 
@@ -766,6 +832,8 @@ mod tests {
             observations,
             parameters: vec![param("t2m", "t", "°C", "t2m", "t2m")],
             locations_window: None,
+            events_default_window: None,
+            events_extent_bbox: None,
         }
     }
 
@@ -1011,6 +1079,9 @@ mod tests {
             value_col: Some("value".into()),
             geom_col: Some("the_geom".into()), // shared default
             locations_window: None,
+            id_col: None,
+            default_datetime: None,
+            extent_bbox: None,
             columns: vec![],
             tables: vec![PostgisObservationTable {
                 parameter: "t2m".into(),
@@ -1293,5 +1364,101 @@ mod tests {
         let err = build_location(&cfg, "s", None, &["not_a_real_param"], MAX_OBSERVATION_ROWS)
             .unwrap_err();
         assert!(matches!(err, BuildError::UnknownParameter(_)));
+    }
+
+    // ---- events ------------------------------------------------------------
+
+    fn lightning_shape() -> EventsShape {
+        EventsShape {
+            table: QualifiedTable {
+                schema: "public".into(),
+                table: "lightning".into(),
+            },
+            time_col: "time".into(),
+            time_col_tz: Some("UTC".into()),
+            geom_col: "the_geom".into(),
+            id_col: "id".into(),
+        }
+    }
+
+    #[test]
+    fn events_area_sql_shape_and_binds() {
+        let q = build_events_area(
+            &lightning_shape(),
+            "POLYGON((21 59,29 59,29 66,21 66,21 59))",
+            (t(2026, 7, 11, 17), t(2026, 7, 11, 18)),
+            &["peak_current", "multiplicity"],
+            125_001,
+        )
+        .unwrap();
+
+        // Projection: timestamptz time + coords + one cast column per key.
+        assert!(q.sql.contains("(\"time\" AT TIME ZONE 'UTC') AS time"));
+        assert!(q.sql.contains("ST_X(\"the_geom\") AS lon"));
+        assert!(q.sql.contains("ST_Y(\"the_geom\") AS lat"));
+        assert!(q
+            .sql
+            .contains("\"peak_current\"::double precision AS \"peak_current\""));
+        assert!(q
+            .sql
+            .contains("\"multiplicity\"::double precision AS \"multiplicity\""));
+        // Time filter wraps the BINDS (index-preserving), not the column.
+        assert!(q.sql.contains("\"time\" >= ($1 AT TIME ZONE 'UTC')"));
+        assert!(q.sql.contains("\"time\" <= ($2 AT TIME ZONE 'UTC')"));
+        // Polygon test: bbox operator prefilter + exact intersects, one bind.
+        assert!(q.sql.contains("\"the_geom\" && ST_GeomFromText($3, 4326)"));
+        assert!(q
+            .sql
+            .contains("ST_Intersects(\"the_geom\", ST_GeomFromText($3, 4326))"));
+        // Deterministic newest-first ordering with id tiebreak; bound LIMIT.
+        assert!(q.sql.contains("ORDER BY \"time\" DESC, \"id\" LIMIT $4"));
+
+        assert_eq!(q.params.len(), 4);
+        assert_eq!(
+            q.params[2],
+            SqlParam::Text("POLYGON((21 59,29 59,29 66,21 66,21 59))".into())
+        );
+        assert_eq!(q.params[3], SqlParam::Int(125_001));
+        assert_eq!(q.limit_param_idx, Some(3));
+        assert_eq!(q.values_per_row, 2);
+    }
+
+    #[test]
+    fn events_area_without_tz_uses_bare_binds() {
+        let mut shape = lightning_shape();
+        shape.time_col_tz = None;
+        let q = build_events_area(
+            &shape,
+            "POLYGON((0 0,1 0,1 1,0 1,0 0))",
+            (t(2026, 7, 11, 17), t(2026, 7, 11, 18)),
+            &["peak_current"],
+            10,
+        )
+        .unwrap();
+        assert!(q.sql.contains("\"time\" >= $1 AND \"time\" <= $2"));
+        assert!(!q.sql.contains("AT TIME ZONE"));
+        assert_eq!(q.values_per_row, 1);
+    }
+
+    #[test]
+    fn events_area_rejects_empty_wkt() {
+        let err = build_events_area(
+            &lightning_shape(),
+            "  ",
+            (t(2026, 7, 11, 17), t(2026, 7, 11, 18)),
+            &["peak_current"],
+            10,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BuildError::EmptyPolygonWkt));
+    }
+
+    #[test]
+    fn events_station_builders_reject_events_shape() {
+        let cfg = mk_cfg_obs_only(ObservationSchema::Events(lightning_shape()));
+        let err = build_location(&cfg, "s", None, &["peak_current"], 10).unwrap_err();
+        assert!(matches!(err, BuildError::NoStations));
+        let err = build_locations_from_observations(&cfg, None).unwrap_err();
+        assert!(matches!(err, BuildError::NoStations));
     }
 }

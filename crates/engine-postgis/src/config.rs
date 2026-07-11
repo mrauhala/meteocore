@@ -13,13 +13,19 @@ use ds_core::datetime::parse_iso8601_duration;
 use thiserror::Error;
 
 use crate::schema::{
-    check_identifier, LocationSource, ObservationSchema, SchemaError, StationsMapping,
+    check_identifier, EventsShape, LocationSource, ObservationSchema, SchemaError, StationsMapping,
 };
 
 /// Default window for deriving the location list from observations when
 /// `observations.locations_window` is absent (24h). Keeps the `DISTINCT ON`
 /// scan on recent hypertable chunks.
 const DEFAULT_LOCATIONS_WINDOW_HOURS: i64 = 24;
+
+/// `events` shape: default query window when a request carries no `datetime`
+/// and the config sets no `default_datetime` (1 h). An unqualified events
+/// query never scans full history. `pub(crate)` so the engine's fallback
+/// (`query_area_events`) cannot drift from this value.
+pub(crate) const DEFAULT_EVENTS_WINDOW_HOURS: i64 = 1;
 
 /// Default pool size — matches the render-semaphore sizing (`max(4, cores*2)`
 /// capped at 16). Override via `[postgis].pool_size`; hard-capped at 32 at
@@ -49,6 +55,8 @@ pub enum PostgisConfigError {
     NoLocationSource,
     #[error("invalid observations.locations_window: {0}")]
     InvalidLocationsWindow(String),
+    #[error("invalid observations.default_datetime: {0}")]
+    InvalidDefaultDatetime(String),
     #[error("parameter '{name}' (source_key '{key}') is not mapped in observations.{where_}")]
     ParameterNotMapped {
         name: String,
@@ -80,6 +88,12 @@ pub struct PostgisEngineConfig {
     /// recent chunks); `None` ⇒ full history (`observations.locations_window =
     /// "all"`). Only consulted when `location_source` derives from observations.
     pub locations_window: Option<Duration>,
+    /// `events` shape: window ending "now" applied when a query has no
+    /// `datetime` (default 1 h). Unset for station shapes.
+    pub events_default_window: Option<Duration>,
+    /// `events` shape: advertised spatial extent from config
+    /// (`observations.extent_bbox`) — never computed via `ST_Extent`.
+    pub events_extent_bbox: Option<[f64; 4]>,
 }
 
 /// Parameter descriptor after cross-checking against the observation shape.
@@ -109,20 +123,36 @@ impl PostgisEngineConfig {
     pub fn resolve(cfg: &PostgisConfig) -> Result<Self, PostgisConfigError> {
         let (dsn, dsn_was_literal) = resolve_dsn(&cfg.dsn_env)?;
 
+        let observations = ObservationSchema::from_config(&cfg.observations)?;
+
         // Resolve the location source from the presence of a stations table and
         // whether the observations carry a usable geometry (mirrors the core
         // `validate_postgis` rule; this is the engine's defense-in-depth pass).
-        let obs_geom = cfg.observations.obs_geom_available();
-        let location_source = match (&cfg.stations, obs_geom) {
-            (Some(s), true) => {
-                LocationSource::StationsWithOrphans(StationsMapping::from_config(s)?)
+        // The events shape has no location concept at all.
+        let location_source = if matches!(observations, ObservationSchema::Events(_)) {
+            LocationSource::None
+        } else {
+            let obs_geom = cfg.observations.obs_geom_available();
+            match (&cfg.stations, obs_geom) {
+                (Some(s), true) => {
+                    LocationSource::StationsWithOrphans(StationsMapping::from_config(s)?)
+                }
+                (Some(s), false) => LocationSource::Stations(StationsMapping::from_config(s)?),
+                (None, true) => LocationSource::Observations,
+                (None, false) => return Err(PostgisConfigError::NoLocationSource),
             }
-            (Some(s), false) => LocationSource::Stations(StationsMapping::from_config(s)?),
-            (None, true) => LocationSource::Observations,
-            (None, false) => return Err(PostgisConfigError::NoLocationSource),
         };
-        let observations = ObservationSchema::from_config(&cfg.observations)?;
         let locations_window = resolve_locations_window(&cfg.observations.locations_window)?;
+        let events_default_window = match &observations {
+            ObservationSchema::Events(_) => {
+                Some(resolve_events_window(&cfg.observations.default_datetime)?)
+            }
+            _ => None,
+        };
+        let events_extent_bbox = match &observations {
+            ObservationSchema::Events(_) => cfg.observations.extent_bbox,
+            _ => None,
+        };
 
         let mut parameters = Vec::with_capacity(cfg.parameters.len());
         for p in &cfg.parameters {
@@ -151,6 +181,12 @@ impl PostgisEngineConfig {
                     }
                 }
                 ObservationSchema::Long(_) => {}
+                ObservationSchema::Events(_) => {
+                    // The source_key IS the column name emitted into SQL —
+                    // there is no columns/tables mapping to launder it
+                    // through, so it must pass the identifier whitelist.
+                    check_identifier(&source_key, "parameters[].source_key (events column)")?;
+                }
             }
             parameters.push(ValidatedParameter {
                 name: check_identifier(&p.name, "parameters[].name")?,
@@ -178,7 +214,28 @@ impl PostgisEngineConfig {
             observations,
             parameters,
             locations_window,
+            events_default_window,
+            events_extent_bbox,
         })
+    }
+
+    /// The events shape lowered from this config, when it is one.
+    pub fn events(&self) -> Option<&EventsShape> {
+        match &self.observations {
+            ObservationSchema::Events(ev) => Some(ev),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve `observations.default_datetime` (events shape) to a duration:
+/// absent ⇒ 1 h default. Defense-in-depth — `ds-core`'s `validate_postgis`
+/// already rejects a bad string at config load.
+fn resolve_events_window(raw: &Option<String>) -> Result<Duration, PostgisConfigError> {
+    match raw.as_deref() {
+        None => Ok(Duration::hours(DEFAULT_EVENTS_WINDOW_HOURS)),
+        Some(s) => parse_iso8601_duration(s)
+            .map_err(|e| PostgisConfigError::InvalidDefaultDatetime(e.to_string())),
     }
 }
 
@@ -282,6 +339,9 @@ mod tests {
                 value_col: Some("value".into()),
                 geom_col: Some("the_geom".into()),
                 locations_window: None,
+                id_col: None,
+                default_datetime: None,
+                extent_bbox: None,
                 columns: vec![],
                 tables: vec![
                     PostgisObservationTable {
@@ -473,6 +533,9 @@ mod tests {
             value_col: None,
             geom_col: None,
             locations_window: None,
+            id_col: None,
+            default_datetime: None,
+            extent_bbox: None,
             columns: vec![PostgisObservationColumn {
                 parameter: "t2m".into(),
                 column: "temperature".into(),
@@ -503,6 +566,9 @@ mod tests {
             value_col: Some("value".into()),
             geom_col: None,
             locations_window: None,
+            id_col: None,
+            default_datetime: None,
+            extent_bbox: None,
             columns: vec![],
             tables: vec![],
         };
@@ -521,5 +587,81 @@ mod tests {
         cfg.pool_size = Some(100);
         let resolved = PostgisEngineConfig::resolve(&cfg).unwrap();
         assert_eq!(resolved.pool_size, 32);
+    }
+
+    // ---- events ------------------------------------------------------------
+
+    fn events_config() -> PostgisConfig {
+        PostgisConfig {
+            dsn_env: "TEST_DSN".into(),
+            pool_size: None,
+            pool_label: None,
+            metadata_refresh_secs: None,
+            stations: None,
+            observations: PostgisObservationsConfig {
+                shape: "events".into(),
+                table: Some("public.lightning".into()),
+                station_fk_col: None,
+                time_col: Some("time".into()),
+                time_col_tz: Some("UTC".into()),
+                param_col: None,
+                value_col: None,
+                geom_col: Some("the_geom".into()),
+                locations_window: None,
+                columns: vec![],
+                tables: vec![],
+                id_col: Some("id".into()),
+                default_datetime: None,
+                extent_bbox: Some([4.0, 54.0, 42.0, 72.0]),
+            },
+            parameters: vec![PostgisParameterConfig {
+                name: "peak_current".into(),
+                label: "Peak current".into(),
+                unit: "kA".into(),
+                observed_property: None,
+                source_key: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn resolve_events_no_location_source_and_defaults() {
+        let g = env_guard();
+        g.set("TEST_DSN", Some("postgres://from-env/obs"));
+        let resolved = PostgisEngineConfig::resolve(&events_config()).unwrap();
+        assert!(matches!(resolved.location_source, LocationSource::None));
+        assert!(resolved.events().is_some());
+        // default_datetime absent ⇒ the 1 h default; extent from config.
+        assert_eq!(resolved.events_default_window, Some(Duration::hours(1)));
+        assert_eq!(resolved.events_extent_bbox, Some([4.0, 54.0, 42.0, 72.0]));
+    }
+
+    #[test]
+    fn resolve_events_parses_default_datetime() {
+        let g = env_guard();
+        g.set("TEST_DSN", Some("postgres://from-env/obs"));
+        let mut cfg = events_config();
+        cfg.observations.default_datetime = Some("PT15M".into());
+        let resolved = PostgisEngineConfig::resolve(&cfg).unwrap();
+        assert_eq!(resolved.events_default_window, Some(Duration::minutes(15)));
+    }
+
+    #[test]
+    fn resolve_events_rejects_invalid_source_key() {
+        let g = env_guard();
+        g.set("TEST_DSN", Some("postgres://from-env/obs"));
+        let mut cfg = events_config();
+        cfg.parameters[0].source_key = Some("bad;drop".into());
+        let err = PostgisEngineConfig::resolve(&cfg).unwrap_err();
+        assert!(matches!(err, PostgisConfigError::Schema(_)));
+    }
+
+    #[test]
+    fn resolve_station_shapes_have_no_events_window() {
+        let g = env_guard();
+        g.set("TEST_DSN", Some("postgres://from-env/obs"));
+        let resolved = PostgisEngineConfig::resolve(&nexus_config()).unwrap();
+        assert_eq!(resolved.events_default_window, None);
+        assert_eq!(resolved.events_extent_bbox, None);
     }
 }
