@@ -1161,7 +1161,8 @@ pub async fn location_query(
                 StatusCode::NOT_FOUND,
                 Json(json!({ "code": "NotFound", "description": e.to_string() })),
             ),
-            ds_core::error::DataServerError::InvalidParameter(_) => (
+            ds_core::error::DataServerError::InvalidParameter(_)
+            | ds_core::error::DataServerError::QueryTooLarge(_) => (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "code": "BadRequest", "description": e.to_string() })),
             ),
@@ -1238,7 +1239,8 @@ async fn run_position_query(
     let map_engine_error = |e: &ds_core::error::DataServerError| match e {
         ds_core::error::DataServerError::InvalidParameter(_)
         | ds_core::error::DataServerError::InvalidBbox(_)
-        | ds_core::error::DataServerError::InvalidDatetime(_) => (
+        | ds_core::error::DataServerError::InvalidDatetime(_)
+        | ds_core::error::DataServerError::QueryTooLarge(_) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "code": "BadRequest", "description": e.to_string() })),
         ),
@@ -1369,7 +1371,8 @@ async fn run_area_query(
         .map_err(|e| match &e {
             ds_core::error::DataServerError::InvalidParameter(_)
             | ds_core::error::DataServerError::InvalidBbox(_)
-            | ds_core::error::DataServerError::InvalidDatetime(_) => (
+            | ds_core::error::DataServerError::InvalidDatetime(_)
+            | ds_core::error::DataServerError::QueryTooLarge(_) => (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "code": "BadRequest", "description": e.to_string() })),
             ),
@@ -1482,7 +1485,8 @@ pub async fn trajectory_query(
     .map_err(|e| match &e {
         ds_core::error::DataServerError::InvalidParameter(_)
         | ds_core::error::DataServerError::InvalidBbox(_)
-        | ds_core::error::DataServerError::InvalidDatetime(_) => (
+        | ds_core::error::DataServerError::InvalidDatetime(_)
+        | ds_core::error::DataServerError::QueryTooLarge(_) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "code": "BadRequest", "description": e.to_string() })),
         ),

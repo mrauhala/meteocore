@@ -103,7 +103,12 @@ Derivation rules (hard-won from production timeouts):
 
 - Row caps (non-configurable invariants): locations `LIMIT 50_001`,
   per-observation-query `LIMIT 10_001`, stations-in-polygon prefilter
-  `LIMIT 501`, nearest-station `LIMIT 1`.
+  `LIMIT 501`, nearest-station `LIMIT 1`. A breached station or row cap is
+  `DataServerError::QueryTooLarge` → HTTP 400 with a "narrow the polygon /
+  time range" message, never `Engine` (which the API layer hides behind an
+  opaque 500 — that misread a too-large polygon as a server fault in
+  production). Raising the 500-station area cap is gated on the N+1
+  per-station query fan-out (#115).
 - **Time-zone columns:** `time_col_tz` is required when `time_col` is
   `timestamp without time zone`. The WHERE clause wraps the BIND
   (`$N AT TIME ZONE '<tz>'`) so the column index stays usable; the SELECT

@@ -1532,7 +1532,10 @@ async fn render_tile(
         // parameter, bad bbox/datetime) is a 400 with the engine's message,
         // not a 500 that hides it.
         match e {
-            DSE::InvalidParameter(_) | DSE::InvalidBbox(_) | DSE::InvalidDatetime(_) => {
+            DSE::InvalidParameter(_)
+            | DSE::InvalidBbox(_)
+            | DSE::InvalidDatetime(_)
+            | DSE::QueryTooLarge(_) => {
                 // 4xx-class: DEBUG (not WARN) so a misconfigured client stays
                 // diagnosable without flooding the warn stream.
                 tracing::debug!(

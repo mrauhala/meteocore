@@ -38,9 +38,10 @@ impl From<ds_core::error::DataServerError> for Tiles3dError {
     fn from(e: ds_core::error::DataServerError) -> Self {
         use ds_core::error::DataServerError as E;
         match e {
-            E::InvalidParameter(m) | E::InvalidBbox(m) | E::InvalidDatetime(m) => {
-                Tiles3dError::BadRequest(m)
-            }
+            E::InvalidParameter(m)
+            | E::InvalidBbox(m)
+            | E::InvalidDatetime(m)
+            | E::QueryTooLarge(m) => Tiles3dError::BadRequest(m),
             E::CollectionNotFound(m) | E::LocationNotFound(m) | E::FeatureNotFound(m) => {
                 Tiles3dError::NotFound(m)
             }
