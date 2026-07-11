@@ -1197,7 +1197,10 @@ async fn render_map(
             // bbox/datetime) is a 400 with the engine's helpful message —
             // not a 500 that hides it behind "Internal server error".
             return Err(match e {
-                DSE::InvalidParameter(_) | DSE::InvalidBbox(_) | DSE::InvalidDatetime(_) => {
+                DSE::InvalidParameter(_)
+                | DSE::InvalidBbox(_)
+                | DSE::InvalidDatetime(_)
+                | DSE::QueryTooLarge(_) => {
                     // 4xx-class: traced at DEBUG (not WARN) so a misconfigured
                     // client is still diagnosable server-side without inflating
                     // the warn stream with routine bad requests.

@@ -29,6 +29,13 @@ pub enum DataServerError {
     #[error("Invalid bbox: {0}")]
     InvalidBbox(String),
 
+    /// A well-formed request whose result set would exceed a hard server cap
+    /// (station count, row count). Maps to HTTP 400 — the client remediates by
+    /// narrowing the polygon, bbox, or time range — never 500: the server is
+    /// healthy and the message is safe to return verbatim.
+    #[error("Query too large: {0}")]
+    QueryTooLarge(String),
+
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
 

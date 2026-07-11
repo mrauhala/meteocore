@@ -383,12 +383,7 @@ impl EdrEngine for PostgisEngine {
         if stations.is_empty() {
             return Ok(CoverageResponse::Collection(vec![]));
         }
-        if stations.len() >= MAX_STATIONS_IN_POLYGON {
-            return Err(DataServerError::Engine(format!(
-                "area query hit the {} station cap — narrow the polygon or time range",
-                MAX_STATIONS_IN_POLYGON - 1
-            )));
-        }
+        let stations = enforce_station_cap(stations)?;
 
         let mut results = Vec::with_capacity(stations.len());
         for station in &stations {
@@ -417,6 +412,21 @@ impl EdrEngine for PostgisEngine {
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────────
+
+/// Both area prefilters (SQL `LIMIT 501`, in-memory `.take(501)`) fetch one
+/// row past the advertised cap; a full batch means the polygon matched more
+/// stations than the server will fan out over. `QueryTooLarge` → HTTP 400,
+/// telling the client to narrow the polygon rather than masquerading as a
+/// server fault.
+fn enforce_station_cap(stations: Vec<Location>) -> Result<Vec<Location>, DataServerError> {
+    if stations.len() >= MAX_STATIONS_IN_POLYGON {
+        return Err(DataServerError::QueryTooLarge(format!(
+            "area query matched more than the {} station cap — narrow the polygon",
+            MAX_STATIONS_IN_POLYGON - 1
+        )));
+    }
+    Ok(stations)
+}
 
 fn resolve_source_keys(
     cfg: &PostgisEngineConfig,
@@ -481,8 +491,9 @@ fn run_queries_sync(pool: &Pool, queries: &[BuiltQuery]) -> Result<Vec<Vec<Row>>
                 .await
                 .map_err(|e| map_pg_error(e, q))?;
             if rows.len() >= MAX_OBSERVATION_ROWS {
-                return Err(DataServerError::Engine(format!(
-                    "result row count hit cap {MAX_OBSERVATION_ROWS}; narrow bbox or time range"
+                return Err(DataServerError::QueryTooLarge(format!(
+                    "result row count hit the {} row cap — narrow the bbox or time range",
+                    MAX_OBSERVATION_ROWS - 1
                 )));
             }
             out.push(rows);
@@ -1169,6 +1180,30 @@ mod tests {
             label: id.into(),
             latitude: lat,
             longitude: lon,
+        }
+    }
+
+    #[test]
+    fn station_cap_maps_to_query_too_large_not_engine_error() {
+        // 500 stations pass through untouched.
+        let under: Vec<Location> = (0..MAX_STATIONS_IN_POLYGON - 1)
+            .map(|i| loc(&format!("s{i}"), 24.0, 60.0))
+            .collect();
+        assert_eq!(
+            enforce_station_cap(under).unwrap().len(),
+            MAX_STATIONS_IN_POLYGON - 1
+        );
+
+        // A full 501-row batch signals the cap was breached → QueryTooLarge
+        // (HTTP 400 with the message), never Engine (opaque HTTP 500).
+        let over: Vec<Location> = (0..MAX_STATIONS_IN_POLYGON)
+            .map(|i| loc(&format!("s{i}"), 24.0, 60.0))
+            .collect();
+        match enforce_station_cap(over).unwrap_err() {
+            DataServerError::QueryTooLarge(msg) => {
+                assert!(msg.contains("narrow the polygon"), "message: {msg}")
+            }
+            other => panic!("expected QueryTooLarge, got: {other:?}"),
         }
     }
 
