@@ -1903,8 +1903,29 @@ fn sample_sweep_moment(
     lon: f64,
     lat: f64,
 ) -> Option<f64> {
+    match sample_sweep_moment_class(sweep, moment, pixels, site_lon, site_lat, lon, lat) {
+        PixelClass::Value(v) => Some(v),
+        PixelClass::Undetect | PixelClass::Masked => None,
+    }
+}
+
+/// Like [`sample_sweep_moment`] but **classifying** the gate (#360): an
+/// out-of-range / malformed target is `Masked` (genuinely unmeasured),
+/// while a sampled gate that is clear air returns `Undetect`. The
+/// ground-range analog of [`sample_polar_slant_class`] — the z-pinned EDR
+/// series uses it to tell "the radar looked and saw nothing" (a valid
+/// null observation) from "the radar never measured here" (drop → 404).
+fn sample_sweep_moment_class(
+    sweep: &Sweep,
+    moment: &PolarMoment,
+    pixels: &RawPixels,
+    site_lon: f64,
+    site_lat: f64,
+    lon: f64,
+    lat: f64,
+) -> PixelClass {
     if sweep.nrays == 0 || sweep.nbins == 0 {
-        return None;
+        return PixelClass::Masked;
     }
     // Same malformed-`rscale` guard as `sample_polar_slant` /
     // `sample_sweep_moment_bilinear`: a `rscale = 0` / NaN makes the bin
@@ -1914,7 +1935,7 @@ fn sample_sweep_moment(
     // file. A negative `rscale` with `dist < rstart` likewise lands in
     // range and samples the wrong gate.
     if !sweep.rscale.is_finite() || sweep.rscale <= 0.0 {
-        return None;
+        return PixelClass::Masked;
     }
     let (dist, az) = ground_distance_bearing(site_lon, site_lat, lon, lat);
 
@@ -1922,7 +1943,7 @@ fn sample_sweep_moment(
     // correction is deferred.
     let bin = ((dist - sweep.rstart) / sweep.rscale).floor() as i64;
     if bin < 0 || bin >= sweep.nbins as i64 {
-        return None;
+        return PixelClass::Masked;
     }
 
     // Azimuth ray. ODIM rays are stored north-first, clockwise, already
@@ -1931,7 +1952,7 @@ fn sample_sweep_moment(
     let ray = (az / (360.0 / sweep.nrays as f64)).floor() as usize % sweep.nrays;
 
     // `RawPixels` is indexed [ray, bin].
-    pixels.sample(
+    pixels.sample_class(
         ray,
         bin as usize,
         moment.gain,
@@ -2429,6 +2450,14 @@ fn volume_profile(
 
 /// One `PointSeries` coverage pinned to elevation angle `level`: the
 /// sweep nearest `level` in each selected volume, sampled at `(lon, lat)`.
+///
+/// The returned flag is "this level ever *measured* the point": at least
+/// one sample classified `Value` or `Undetect` across every quantity and
+/// timestep. Clear air (`Undetect`) is a measurement — the radar looked
+/// and saw nothing — and serialises as CoverageJSON `null`; only `Masked`
+/// (out of the nearest sweep's range, sweep lacks the quantity, unreadable
+/// pixels) means the point was never observed. The caller drops the level
+/// when the flag is false.
 fn level_series(
     selected: &[&VolumeEntry],
     pix: Pixels,
@@ -2437,25 +2466,40 @@ fn level_series(
     level: f64,
     quantities: &[String],
     times: &[DateTime<Utc>],
-) -> QueryResult {
+) -> (QueryResult, bool) {
     let mut ranges = HashMap::new();
     let mut param_descs = HashMap::new();
+    let mut measured = false;
     for quantity in quantities {
         let values: Vec<Option<f64>> = selected
             .iter()
             .map(|e| {
-                let sweep = nearest_sweep(&e.volume, level)?;
-                let moment = sweep.moments.iter().find(|m| &m.quantity == quantity)?;
-                let pixels = pix.moment(&e.id, moment, sweep.nrays, sweep.nbins)?;
-                sample_sweep_moment(
-                    sweep,
-                    moment,
-                    &pixels,
-                    e.volume.site.lon,
-                    e.volume.site.lat,
-                    lon,
-                    lat,
-                )
+                let class = nearest_sweep(&e.volume, level)
+                    .and_then(|sweep| {
+                        let moment = sweep.moments.iter().find(|m| &m.quantity == quantity)?;
+                        let pixels = pix.moment(&e.id, moment, sweep.nrays, sweep.nbins)?;
+                        Some(sample_sweep_moment_class(
+                            sweep,
+                            moment,
+                            &pixels,
+                            e.volume.site.lon,
+                            e.volume.site.lat,
+                            lon,
+                            lat,
+                        ))
+                    })
+                    .unwrap_or(PixelClass::Masked);
+                match class {
+                    PixelClass::Value(v) => {
+                        measured = true;
+                        Some(v)
+                    }
+                    PixelClass::Undetect => {
+                        measured = true;
+                        None
+                    }
+                    PixelClass::Masked => None,
+                }
             })
             .collect();
         ranges.insert(
@@ -2469,7 +2513,7 @@ fn level_series(
         param_descs.insert(quantity.clone(), quantity_description(quantity));
     }
 
-    QueryResult {
+    let result = QueryResult {
         domain: DomainDescription::PointSeries {
             x: lon,
             y: lat,
@@ -2481,7 +2525,8 @@ fn level_series(
         },
         parameters: param_descs,
         ranges,
-    }
+    };
+    (result, measured)
 }
 
 // ---------------------------------------------------------------------------
@@ -2893,19 +2938,19 @@ fn site_coverages(
             let times: Vec<DateTime<Utc>> = selected.iter().map(|e| e.volume.time).collect();
             Ok(lvls
                 .iter()
-                // Drop a level whose series is all-null across every quantity
-                // and timestep (the requested point is out of range, or the
-                // nearest sweep carries no data) — otherwise an all-null
-                // `PointSeries` would serve HTTP 200, indistinguishable from
-                // clear sky. With every level dropped, `finalize_single_site`
-                // turns the empty result into a 404.
+                // Drop a level only when the point was never *measured*
+                // there — every sample `Masked` (out of the nearest sweep's
+                // range, or the sweep carries no data for the quantity).
+                // Clear air (`undetect`) IS a measurement — the radar looked
+                // and saw nothing — so an all-clear-air series is kept and
+                // serves HTTP 200 with null values; collapsing it into the
+                // 404 made "no rain at this point for an hour" an error.
+                // With every level dropped, `finalize_single_site` turns the
+                // empty result into a 404.
                 .filter_map(|&lvl| {
-                    let qr = level_series(&selected, pix, lon, lat, lvl, &quantities, &times);
-                    let all_null = qr
-                        .ranges
-                        .values()
-                        .all(|a| a.values.iter().all(Option::is_none));
-                    (!all_null).then_some(qr)
+                    let (qr, measured) =
+                        level_series(&selected, pix, lon, lat, lvl, &quantities, &times);
+                    measured.then_some(qr)
                 })
                 .collect())
         }
@@ -3053,15 +3098,19 @@ fn finalize_single_site(
     covs: Vec<QueryResult>,
     levels: &Option<Vec<f64>>,
 ) -> Result<CoverageResponse, DataServerError> {
-    // No plottable coverage — every profile/level was dropped because it
-    // sampled no data (out of range, or all-null). An empty
-    // `CoverageCollection` is invalid CoverageJSON and would serve HTTP 200
-    // for what is really "no data", so surface a 404, matching the CLAUDE.md
-    // "no data in window → LocationNotFound" rule. Checked first so it
-    // covers both the single-level and multi-coverage shapes.
+    // No plottable coverage — every profile/level was dropped because the
+    // radar never *measured* the point there (out of the selected sweep's
+    // range, or the sweep lacks the requested quantity; clear air is a
+    // measurement and is NOT dropped). An empty `CoverageCollection` is
+    // invalid CoverageJSON and would serve HTTP 200 for what is really
+    // "never observed", so surface a 404. Checked first so it covers both
+    // the single-level and multi-coverage shapes.
     if covs.is_empty() {
         return Err(DataServerError::LocationNotFound(
-            "no PVOL data for this site in the requested time window".into(),
+            "this radar never measured the requested position at the requested \
+             elevation angle(s)/parameter(s) — outside the selected sweep's range, \
+             or the sweep does not carry the parameter"
+                .into(),
         ));
     }
     if matches!(levels, Some(l) if l.len() == 1) {
@@ -4322,10 +4371,14 @@ impl EdrEngine for PolarVolumeSiteView {
         // An `area` query ALWAYS returns a `CoverageCollection` per OGC EDR —
         // unlike position/location it does NOT collapse a single-`z` result
         // to a bare `Coverage`. An all-empty result is `LocationNotFound`
-        // (404), not an empty collection served as HTTP 200.
+        // (404), not an empty collection served as HTTP 200. Empty here
+        // means the antenna point was never *measured* at any requested
+        // level (clear air is a measurement and survives as nulls).
         if covs.is_empty() {
             return Err(DataServerError::LocationNotFound(
-                "no PVOL data for this site in the requested time window".into(),
+                "this radar never measured the sampled position at the requested \
+                 elevation angle(s)/parameter(s)"
+                    .into(),
             ));
         }
         Ok(CoverageResponse::Collection(covs))
@@ -6555,9 +6608,9 @@ mod tests {
         ));
     }
 
-    /// A z-pinned query whose level series is all-null (the nearest sweep
-    /// carries no data for the requested quantity) is a 404, not an HTTP 200
-    /// all-null `PointSeries`.
+    /// A z-pinned query whose level never *measured* the point (the nearest
+    /// sweep carries no data for the requested quantity — every sample
+    /// `Masked`) is a 404, not an HTTP 200 all-null `PointSeries`.
     #[test]
     fn site_view_z_level_all_null_is_404() {
         // sweep0 @0.5° has DBZH; an added 15° sweep has VRADH only.
@@ -6583,6 +6636,58 @@ mod tests {
             ),
             Err(DataServerError::LocationNotFound(_))
         ));
+    }
+
+    /// A z-pinned query at a point the radar *measured* but where every gate
+    /// is `undetect` (clear air — no precipitation for the whole window) is
+    /// HTTP 200 with null values, NOT a 404: the radar looked and saw
+    /// nothing, which is a valid observation. Regression test for the live
+    /// bug where an hour of clear air at a point inside coverage returned
+    /// 404 "no PVOL data for this site in the requested time window".
+    #[test]
+    fn site_view_z_level_clear_air_is_200_nulls() {
+        let vol = synthetic_volume(25.0, 60.0);
+        let (nrays, nbins) = (vol.sweeps[0].nrays, vol.sweeps[0].nbins);
+        // The radar swept its whole fan and saw nothing: every raw pixel is
+        // the `undetect` sentinel (65 534 in `synthetic_volume`).
+        let fid = unique_file_id();
+        pixel_cache().insert(
+            &fid,
+            SYNTHETIC_DS,
+            std::sync::Arc::new(RawPixels::U16(Array2::from_elem((nrays, nbins), 65_534u16))),
+        );
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![VolumeEntry {
+                id: fid,
+                volume: Arc::new(vol),
+            }],
+        );
+        let view = site_view_for(by_site, "fivih");
+
+        // ~11 km north — well inside the ~100 km coverage, clear air at 0.5°.
+        let resp = EdrEngine::query_position(
+            &view,
+            "POINT(25.0 60.1)",
+            None,
+            Some(&["DBZH".to_string()]),
+            Some(&[0.5]),
+            None,
+        )
+        .expect("clear air is a measurement, not LocationNotFound");
+        match resp {
+            CoverageResponse::Single(cov) => {
+                let dbzh = cov.ranges.get("DBZH").expect("DBZH range");
+                assert_eq!(dbzh.shape, vec![1]);
+                assert!(
+                    dbzh.values.iter().all(Option::is_none),
+                    "clear air serialises as CoverageJSON nulls, got {:?}",
+                    dbzh.values
+                );
+            }
+            other => panic!("expected a single PointSeries, got {other:?}"),
+        }
     }
 
     /// The coverage radius is the **max** across sweeps: a point beyond the
