@@ -1222,6 +1222,7 @@ dependencies = [
  "chrono",
  "deadpool-postgres",
  "ds-core",
+ "futures",
  "postgis",
  "serde",
  "thiserror 2.0.18",
