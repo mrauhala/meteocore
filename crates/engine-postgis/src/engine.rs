@@ -1017,12 +1017,18 @@ fn decode_event_rows(rows: &[Row], source_keys: &[&str]) -> Result<Vec<EventRow>
         let time: DateTime<Utc> = row
             .try_get("time")
             .map_err(|e| DataServerError::Engine(format!("decode event time: {e}")))?;
-        let lon: f64 = row
+        // NULL geometries never pass the WHERE clause (`NULL && x` is NULL),
+        // but ST_X/ST_Y are still NULL for degenerate geometries such as
+        // `POINT EMPTY` — skip the row instead of failing the whole request.
+        let lon: Option<f64> = row
             .try_get("lon")
             .map_err(|e| DataServerError::Engine(format!("decode event lon: {e}")))?;
-        let lat: f64 = row
+        let lat: Option<f64> = row
             .try_get("lat")
             .map_err(|e| DataServerError::Engine(format!("decode event lat: {e}")))?;
+        let (Some(lon), Some(lat)) = (lon, lat) else {
+            continue;
+        };
         let mut values = Vec::with_capacity(source_keys.len());
         for key in source_keys {
             let v: Option<f64> = row
@@ -1534,6 +1540,78 @@ mod tests {
         assert_eq!(keys, vec!["TEMP"]);
 
         assert!(resolve_source_keys(&cfg, Some(&["unknown".into()])).is_err());
+    }
+
+    /// Build a full engine (lazy pool — no DB I/O until a query needs a
+    /// connection) around the given config to exercise the EdrEngine trait
+    /// surface. The events rejection paths bail before touching the pool.
+    fn engine_with(config: PostgisEngineConfig) -> PostgisEngine {
+        let mut registry = crate::pool::PoolRegistry::new();
+        let pool = registry
+            .get_or_create(
+                "postgres://user:pw@127.0.0.1:1/db",
+                std::num::NonZeroU32::new(2).unwrap(),
+            )
+            .expect("lazy pool");
+        PostgisEngine::new("test", Arc::new(config), pool)
+    }
+
+    fn events_engine_config() -> PostgisEngineConfig {
+        use crate::config::ValidatedParameter;
+        use crate::schema::{EventsShape, QualifiedTable};
+        PostgisEngineConfig {
+            dsn: "postgres://user:pw@127.0.0.1:1/db".into(),
+            dsn_was_literal: false,
+            pool_size: 2,
+            pool_label: None,
+            metadata_refresh_secs: 300,
+            location_source: crate::schema::LocationSource::None,
+            observations: ObservationSchema::Events(EventsShape {
+                table: QualifiedTable {
+                    schema: "public".into(),
+                    table: "lightning".into(),
+                },
+                time_col: "time".into(),
+                time_col_tz: Some("UTC".into()),
+                geom_col: "the_geom".into(),
+                id_col: "id".into(),
+            }),
+            parameters: vec![ValidatedParameter {
+                name: "peak_current".into(),
+                label: "Peak current".into(),
+                unit: "kA".into(),
+                observed_property: "peak_current".into(),
+                source_key: "peak_current".into(),
+            }],
+            locations_window: None,
+            events_default_window: Some(chrono::Duration::hours(1)),
+            events_extent_bbox: Some([4.0, 54.0, 42.0, 72.0]),
+        }
+    }
+
+    #[test]
+    fn events_engine_advertises_area_only() {
+        let engine = engine_with(events_engine_config());
+        assert_eq!(engine.supported_query_types(), vec!["area".to_string()]);
+    }
+
+    #[test]
+    fn events_engine_rejects_station_queries_with_400() {
+        let engine = engine_with(events_engine_config());
+        let err = engine
+            .query_location("some-station", None, None, None, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, DataServerError::InvalidParameter(ref m) if m.contains("area")),
+            "got: {err:?}"
+        );
+        let err = engine
+            .query_position("POINT(25 61)", None, None, None, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, DataServerError::InvalidParameter(ref m) if m.contains("area")),
+            "got: {err:?}"
+        );
     }
 
     #[test]
