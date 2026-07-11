@@ -21,6 +21,17 @@ pub struct VerticalCoord {
 
 #[derive(Debug, Clone)]
 pub enum DomainDescription {
+    /// A single point at a single (optional) time — one scattered event,
+    /// e.g. a lightning strike. An events query returns a
+    /// `CoverageResponse::Collection` of these, one coverage per event.
+    /// The CoverageJSON `Point` domain allows only single-value axes, so
+    /// `z`, when present, must carry exactly one level.
+    Point {
+        x: f64,
+        y: f64,
+        t: Option<DateTime<Utc>>,
+        z: Option<VerticalCoord>,
+    },
     /// A time series at a single point (x, y fixed, t varies). `z`, when
     /// present, pins the series to a single vertical level.
     PointSeries {

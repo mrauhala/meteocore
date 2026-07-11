@@ -790,3 +790,118 @@ fn section_coverage_validates_against_schema() {
 
     validate(&json, &schema);
 }
+
+// --- Point domain tests (scattered events, e.g. lightning strikes #501) ---
+
+/// One event = one `Point` coverage: x/y/t single-value axes, each range a
+/// 0-d scalar NdArray (no `shape`/`axisNames` — the CoverageJSON spec's
+/// scalar form).
+fn make_point_result(hour: u32, params: Vec<(&str, &str, Option<f64>)>) -> QueryResult {
+    let mut parameters = HashMap::new();
+    let mut ranges = HashMap::new();
+
+    for (name, unit, value) in &params {
+        parameters.insert(
+            name.to_string(),
+            ParameterDescription {
+                label: name.replace('_', " "),
+                unit: unit.to_string(),
+                observed_property: name.to_string(),
+            },
+        );
+        ranges.insert(
+            name.to_string(),
+            NdArray {
+                shape: vec![],
+                axis_names: vec![],
+                values: vec![*value],
+            },
+        );
+    }
+
+    QueryResult {
+        domain: DomainDescription::Point {
+            x: 24.9384 + f64::from(hour) * 0.1,
+            y: 60.1699,
+            t: Some(make_time(hour)),
+            z: None,
+        },
+        parameters,
+        ranges,
+    }
+}
+
+#[test]
+fn point_coverage_validates() {
+    let schema = load_schema();
+    let result = make_point_result(
+        3,
+        vec![
+            ("peak_current", "kA", Some(-18.0)),
+            ("multiplicity", "", Some(2.0)),
+        ],
+    );
+
+    let json = query_result_to_coverage_json(&result);
+
+    let domain = &json["domain"];
+    assert_eq!(domain["domainType"], "Point");
+    assert_eq!(domain["axes"]["x"]["values"].as_array().unwrap().len(), 1);
+    assert_eq!(domain["axes"]["y"]["values"].as_array().unwrap().len(), 1);
+    assert_eq!(domain["axes"]["t"]["values"].as_array().unwrap().len(), 1);
+
+    // Scalar ranges omit shape/axisNames (0-d NdArray).
+    let range = &json["ranges"]["peak_current"];
+    assert_eq!(range["type"], "NdArray");
+    assert!(range.get("shape").is_none(), "scalar range must omit shape");
+    assert!(
+        range.get("axisNames").is_none(),
+        "scalar range must omit axisNames"
+    );
+    assert_eq!(range["values"], serde_json::json!([-18.0]));
+
+    validate(&json, &schema);
+}
+
+#[test]
+fn point_coverage_without_time_validates() {
+    let schema = load_schema();
+    let mut result = make_point_result(0, vec![("peak_current", "kA", Some(7.5))]);
+    result.domain = DomainDescription::Point {
+        x: 24.9384,
+        y: 60.1699,
+        t: None,
+        z: None,
+    };
+
+    let json = query_result_to_coverage_json(&result);
+    assert_eq!(json["domain"]["domainType"], "Point");
+    assert!(json["domain"]["axes"].get("t").is_none());
+
+    validate(&json, &schema);
+}
+
+/// The events response shape (#502): a `CoverageCollection` of `Point`
+/// coverages, one per strike, parameters hoisted to collection level.
+#[test]
+fn point_coverage_collection_validates() {
+    let schema = load_schema();
+    let coverages = vec![
+        make_point_result(0, vec![("peak_current", "kA", Some(-12.3))]),
+        make_point_result(1, vec![("peak_current", "kA", Some(31.0))]),
+        make_point_result(2, vec![("peak_current", "kA", None)]),
+    ];
+
+    let result = CoverageResponse::Collection(coverages);
+    let json = coverage_response_to_json(&result);
+
+    assert_eq!(json["type"], "CoverageCollection");
+    assert_eq!(json["domainType"], "Point");
+    assert!(json["parameters"]["peak_current"].is_object());
+    assert_eq!(json["coverages"].as_array().unwrap().len(), 3);
+    for cov in json["coverages"].as_array().unwrap() {
+        assert_eq!(cov["domain"]["domainType"], "Point");
+    }
+
+    validate(&json, &schema);
+}
