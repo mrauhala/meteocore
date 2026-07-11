@@ -541,14 +541,25 @@ fn run_queries_budgeted_sync(
     })
 }
 
-/// Concurrent bounded fan-out over an area's stations (#115). At most
-/// `min(16, pool max_size)` stations are in flight at once, each on its own
-/// pooled connection; results keep station order (`buffered`, not
+/// Concurrent bounded fan-out over an area's stations (#115). Width is the
+/// pool size minus two-connection headroom (capped at 16, floor 1): the
+/// pool is shared across every collection on the same DSN, so one area
+/// request must never check out every connection and stall unrelated
+/// single-station lookups. Each in-flight station holds one pooled
+/// connection; results keep station order (`buffered`, not
 /// `buffer_unordered`) so responses stay deterministic. Rows are charged
 /// against the shared [`MAX_RESPONSE_VALUES`] budget as they arrive; each
 /// single query additionally keeps the [`MAX_OBSERVATION_ROWS`] cap so the
 /// transient row buffer is bounded by fan-out width × cap. The first error
 /// cancels the remaining in-flight queries.
+///
+/// Budget semantics under concurrency: the accumulated total is checked
+/// strictly after every query, so a 200 response can never exceed the
+/// budget — but up to `width` in-flight stations may each fetch (and then
+/// discard) one more capped query's rows after the crossing point, so the
+/// *transient DB work* before the 400 can overshoot by ≤ width ×
+/// [`MAX_OBSERVATION_ROWS`] rows. The pre-query `load` bail below keeps
+/// queued stations from adding to that once a breach is visible.
 fn run_area_fanout(
     pool: &Pool,
     config: &Arc<PostgisEngineConfig>,
@@ -556,7 +567,7 @@ fn run_area_fanout(
     datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
     source_keys: &[&str],
 ) -> Result<Vec<QueryResult>, DataServerError> {
-    let width = (pool.status().max_size).clamp(1, 16);
+    let width = (pool.status().max_size.saturating_sub(2)).clamp(1, 16);
     let spent = AtomicUsize::new(0);
     let pool = pool.clone();
     let results: Vec<Option<QueryResult>> = block_on_async(async {
@@ -579,6 +590,11 @@ fn run_area_fanout(
                     .map_err(|e| DataServerError::Engine(format!("pool acquire failed: {e}")))?;
                 let mut rows_per_query = Vec::with_capacity(queries.len());
                 for q in &queries {
+                    // A sibling already breached the budget — don't add
+                    // more DB work to a request that is going to 400.
+                    if spent.load(Ordering::Relaxed) > MAX_RESPONSE_VALUES {
+                        return Err(budget_exceeded());
+                    }
                     let refs = params_as_refs(&q.params);
                     let rows = client
                         .query(&q.sql, &refs)
