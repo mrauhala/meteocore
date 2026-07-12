@@ -827,26 +827,39 @@ impl GribEngine {
         &self,
         reference_time: Option<DateTime<Utc>>,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
-    ) -> Result<(u32, StepFile), DataServerError> {
+    ) -> Result<ResolvedStep, DataServerError> {
         let catalog = self.catalog.load();
         // Run selection is shared with `query_position` (see `resolve_run`); this
         // path additionally narrows to a single step.
         let run = resolve_run(&catalog, reference_time, datetime)?;
-        match datetime {
-            Some((start, _end)) => run
-                .find_step_for_time(start)
-                .map(|(step, sf)| (step, sf.clone()))
-                .ok_or_else(|| {
-                    DataServerError::InvalidParameter(format!("No forecast step for time {start}"))
-                }),
+        let (step, sf) = match datetime {
+            Some((start, _end)) => run.find_step_for_time(start).ok_or_else(|| {
+                DataServerError::InvalidParameter(format!("No forecast step for time {start}"))
+            })?,
             None => {
                 let (&step, sf) = run.steps.iter().next_back().ok_or_else(|| {
                     DataServerError::Engine("forecast run has no steps".to_string())
                 })?;
-                Ok((step, sf.clone()))
+                (step, sf)
             }
-        }
+        };
+        Ok(ResolvedStep {
+            // The valid time of the step actually selected — the cache-key
+            // timestamp `MapEngine::resolve_time` returns (#507).
+            valid_time: run.reference_time + chrono::Duration::hours(i64::from(step)),
+            file: sf.clone(),
+        })
     }
+}
+
+/// A run + step selection result: the step file to read and the exact valid
+/// time it represents. Produced only by [`GribEngine::resolve_step`] — the
+/// single selection implementation shared by the render/query paths and
+/// `MapEngine::resolve_time` (the #507 cache-key authority), so they cannot
+/// drift.
+struct ResolvedStep {
+    valid_time: DateTime<Utc>,
+    file: StepFile,
 }
 
 /// Select the forecast run to serve, shared by `query_position` and
@@ -1116,7 +1129,7 @@ impl EdrEngine for GribEngine {
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let bbox = parse_bbox_from_wkt(coords)?;
-        let (_step, step_file) = self.resolve_step(reference_time, datetime)?;
+        let step_file = self.resolve_step(reference_time, datetime)?.file;
 
         // Default to first near-surface parameter
         let query_params: Vec<&str> = match parameters {
@@ -1242,7 +1255,7 @@ impl MapEngine for GribEngine {
     ) -> Result<RasterTile, DataServerError> {
         let _ = z; // GRIB collections expose no vertical dimension yet (#185)
         let datetime = time.map(|t| (t, t));
-        let (_step, step_file) = self.resolve_step(reference_time, datetime)?;
+        let step_file = self.resolve_step(reference_time, datetime)?.file;
 
         // Determine parameter to render
         let param_name = parameter.unwrap_or_else(|| {
@@ -1291,20 +1304,13 @@ impl MapEngine for GribEngine {
         reference_time: Option<DateTime<Utc>>,
     ) -> Option<DateTime<Utc>> {
         // The cache-key authority (#507): the exact valid time
-        // `get_raster_tile` will render — same run selection (`resolve_run`)
-        // and step selection (`find_step_for_time`, exact-then-nearest;
-        // last step when `time` is `None`) as `resolve_step`. A missing
-        // run/step falls back to the requested time: the render will error
-        // and cache nothing, so the key value is moot.
-        let catalog = self.catalog.load();
-        let Ok(run) = resolve_run(&catalog, reference_time, time.map(|t| (t, t))) else {
-            return time;
-        };
-        let step = match time {
-            Some(t) => run.find_step_for_time(t).map(|(step, _)| step),
-            None => run.steps.keys().next_back().copied(),
-        };
-        step.map(|s| run.reference_time + chrono::Duration::hours(i64::from(s)))
+        // `get_raster_tile` will render, via the SAME `resolve_step` the
+        // render/query paths call (one selection implementation — cannot
+        // drift). A missing run/step falls back to the requested time: the
+        // render will error and cache nothing, so the key value is moot.
+        self.resolve_step(reference_time, time.map(|t| (t, t)))
+            .map(|r| r.valid_time)
+            .ok()
             .or(time)
     }
 
