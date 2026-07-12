@@ -188,6 +188,12 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
 6. Wire it into the appropriate registries per the collection's `apis`.
 7. Obey the Performance & Concurrency rules — especially: spawn the poll loop
    on the background runtime, and never project per output pixel.
+   **If the engine snaps a requested time to an available timestep**
+   (latest-not-after, nearest, …) instead of exact-matching, it MUST
+   override `MapEngine::resolve_time` with the SAME selection logic
+   `get_raster_tile` uses (share one helper so they cannot drift) — the API
+   layers key the no-TTL rendered/meta-tile caches on it. Skipping this
+   reintroduces the #507 cache poisoning (stale animation frames).
 8. Ship a runnable (enabled) example collection config AND do an end-to-end
    server + curl smoke test against real data. Unit tests alone miss
    integration and unit-conversion bugs.

@@ -455,6 +455,22 @@ impl MapEngine for QueryDataEngine {
         })
     }
 
+    fn resolve_time(
+        &self,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        // The cache-key authority (#507): the exact timestep
+        // `get_raster_tile` will render — same run selection (`select_data`)
+        // and nearest-neighbour time selection (`find_time_idx`) as the
+        // render path. A missing run falls back to the requested time: the
+        // render will error and cache nothing, so the key value is moot.
+        let Ok(data) = self.select_data(reference_time) else {
+            return time;
+        };
+        find_time_idx(&data, time).map(|i| data.times[i]).or(time)
+    }
+
     fn raster_info(&self) -> RasterInfo {
         let set = self.runs.load();
         // Every retained run is a selectable reference time (WMS dimension /

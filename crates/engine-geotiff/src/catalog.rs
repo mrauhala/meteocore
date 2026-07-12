@@ -158,6 +158,24 @@ impl Catalog {
         self.spatial_extent = compute_spatial_union(self.entries.values());
     }
 
+    /// The timestep `get_raster_tile` renders for a requested `time` (#507):
+    /// the newest entry not after `time`, falling back to the earliest entry
+    /// for pre-range requests; `None` request ⇒ the newest entry. Returns
+    /// `None` only for an empty catalog. This is the ONLY implementation of
+    /// that selection — `MapEngine::resolve_time` (the cache-key authority)
+    /// and the render path both call it, so they cannot drift.
+    pub fn select_timestamp(&self, time: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+        match time {
+            Some(t) => self
+                .entries
+                .range(..=t)
+                .next_back()
+                .or_else(|| self.entries.iter().next())
+                .map(|(ts, _)| *ts),
+            None => self.entries.keys().next_back().copied(),
+        }
+    }
+
     /// Trim to keep only the most recent `max` entries by timestamp.
     pub fn trim_to_latest(&mut self, max: usize) {
         if self.entries.len() <= max {
@@ -856,6 +874,54 @@ mod tests {
             offset: None,
             overviews: vec![],
         }
+    }
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    fn catalog_with(times: &[&str]) -> Catalog {
+        let mut c = Catalog::empty();
+        for t in times {
+            let path = PathBuf::from(format!("/tmp/{t}.tif"));
+            let source = DataSource::from_path(&path);
+            c.entries.insert(
+                ts(t),
+                FileEntry::loaded(path, source, dummy_metadata(), 1, None, None),
+            );
+        }
+        c
+    }
+
+    /// The render-path / cache-key time selection (#507). The
+    /// "not-yet-ingested time snaps to the previous entry" case is the exact
+    /// poison window the resolved-timestep cache keys exist to close.
+    #[test]
+    fn select_timestamp_selection_rules() {
+        let c = catalog_with(&["2026-07-11T20:10:00Z", "2026-07-11T20:15:00Z"]);
+        // Exact hit.
+        assert_eq!(
+            c.select_timestamp(Some(ts("2026-07-11T20:15:00Z"))),
+            Some(ts("2026-07-11T20:15:00Z"))
+        );
+        // Not-yet-ingested / between steps → latest-not-after.
+        assert_eq!(
+            c.select_timestamp(Some(ts("2026-07-11T20:20:00Z"))),
+            Some(ts("2026-07-11T20:15:00Z"))
+        );
+        // Before the whole range → earliest entry.
+        assert_eq!(
+            c.select_timestamp(Some(ts("2026-07-11T20:00:00Z"))),
+            Some(ts("2026-07-11T20:10:00Z"))
+        );
+        // No time → newest entry.
+        assert_eq!(c.select_timestamp(None), Some(ts("2026-07-11T20:15:00Z")));
+        // Empty catalog → nothing to resolve.
+        assert_eq!(Catalog::empty().select_timestamp(None), None);
+        assert_eq!(
+            Catalog::empty().select_timestamp(Some(ts("2026-07-11T20:20:00Z"))),
+            None
+        );
     }
 
     #[test]

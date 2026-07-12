@@ -457,6 +457,21 @@ impl MapEngine for ZarrEngine {
     fn raster_info(&self) -> RasterInfo {
         self.catalog.load().raster_info.clone()
     }
+
+    fn resolve_time(
+        &self,
+        time: Option<DateTime<Utc>>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        // The cache-key authority (#507): the exact timestep
+        // `get_raster_tile` will render, via the SAME `nearest_time_idx`
+        // the render path uses. An empty time axis falls back to the
+        // requested time — the render errors and caches nothing.
+        let cat = self.catalog.load();
+        nearest_time_idx(&cat.times, time)
+            .map(|i| cat.times[i])
+            .or(time)
+    }
 }
 
 /// Index of the time step nearest `time` (latest when `time` is `None`).
