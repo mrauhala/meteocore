@@ -110,9 +110,24 @@ pub(crate) fn build_wms_times(
 }
 
 /// Process-global strike-window cache. Global (not per-engine) so a reload
-/// keeps warm windows; the collection id in the key isolates collections
-/// sharing the process. Weight = key + one `Strike` per row.
+/// keeps warm windows; the source component of the key isolates collections
+/// sharing the process AND invalidates naturally when a reload repoints a
+/// collection id at a different table or database — the collection id alone
+/// would keep serving the old table's cached windows until eviction.
+/// Weight = key + one `Strike` per row.
 type WindowKey = (String, DateTime<Utc>, DateTime<Utc>);
+
+/// The cache-key source component: collection id + qualified table + pool
+/// identity (`<user>@<host>:<port>/<db>` or the configured `pool_label`).
+fn window_key_source(engine: &PostgisEngine, shape: &EventsShape) -> String {
+    format!(
+        "{}|{}.{}|{}",
+        engine.collection_id(),
+        shape.table.schema,
+        shape.table.table,
+        engine.pool_key_label()
+    )
+}
 
 pub fn strike_window_cache() -> &'static ByteBoundedCache<WindowKey, Arc<Vec<Strike>>> {
     static CACHE: OnceLock<ByteBoundedCache<WindowKey, Arc<Vec<Strike>>>> = OnceLock::new();
@@ -166,7 +181,7 @@ fn fetch_window(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<Arc<Vec<Strike>>, DataServerError> {
-    let key: WindowKey = (engine.collection_id().to_string(), start, end);
+    let key: WindowKey = (window_key_source(engine, shape), start, end);
     strike_window_cache().get_or_insert_with(&key, || {
         let built = build_events_window(shape, (start, end), MAX_WINDOW_STRIKES + 1)
             .map_err(|e| DataServerError::Engine(format!("build_events_window: {e}")))?;
@@ -213,6 +228,14 @@ fn fetch_window(
 /// — the newest paints last and wins overlaps. Strikes projecting outside
 /// the canvas (plus symbol margin) are skipped; the per-strike projection is
 /// one `world_to_fraction` call (per-vertex, never per output pixel).
+///
+/// The lon/lat pre-filter is the tile-loop cost guard: the window slice is
+/// whole-extent while a meta-tile covers a sliver of it, and this function
+/// runs once per covering tile (~200/viewport) — without the cheap bbox
+/// reject first, a busy storm frame would be tiles × strikes projections.
+/// The margin converts the symbol radius to degrees generously (4× the
+/// linear per-pixel estimate) so partial discs at tile edges still paint —
+/// Mercator's y-stretch stays well under 4× at the ±85° tile-grid clamp.
 pub(crate) fn splat_strikes(
     strikes: &[Strike],
     window_end: DateTime<Utc>,
@@ -223,7 +246,17 @@ pub(crate) fn splat_strikes(
 ) -> RasterTile {
     let (w, h) = (width as i64, height as i64);
     let mut values: Vec<Option<f64>> = vec![None; (width as usize) * (height as usize)];
+    let [west, south, east, north] = bbox;
+    let margin_lon = ((east - west) / width.max(1) as f64) * SYMBOL_RADIUS_PX as f64 * 4.0;
+    let margin_lat = ((north - south) / height.max(1) as f64) * SYMBOL_RADIUS_PX as f64 * 4.0;
     for s in strikes {
+        if s.lon < west - margin_lon
+            || s.lon > east + margin_lon
+            || s.lat < south - margin_lat
+            || s.lat > north + margin_lat
+        {
+            continue;
+        }
         let (fx, fy) = output_crs.world_to_fraction(bbox, s.lon, s.lat);
         if !fx.is_finite() || !fy.is_finite() {
             continue;
@@ -397,6 +430,30 @@ mod tests {
         assert!(tile.values.value_at(0).is_none());
         // A neighbour within the disc radius is painted too.
         assert!(tile.values.value_at(5 * 10 + 6).is_some());
+    }
+
+    #[test]
+    fn splat_edge_strike_still_paints_partial_disc() {
+        // A strike just outside the bbox but within the symbol margin must
+        // survive the lon/lat pre-filter and paint its in-canvas pixels.
+        let end = ts("2026-07-11T20:20:00Z");
+        let strikes = [Strike {
+            time: ts("2026-07-11T20:15:00Z"),
+            lon: 25.501, // ~0.001° east of the bbox edge; 0.1°/px canvas
+            lat: 60.0,
+        }];
+        let tile = splat_strikes(
+            &strikes,
+            end,
+            [24.5, 59.5, 25.5, 60.5],
+            10,
+            10,
+            &OutputCrs::Wgs84,
+        );
+        assert!(
+            !tile.is_empty(),
+            "edge strike's partial disc must paint into the canvas"
+        );
     }
 
     #[test]
