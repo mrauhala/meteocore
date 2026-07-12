@@ -22,8 +22,12 @@
 //! would hammer the pool. [`strike_window_cache`] (byte-bounded, #480,
 //! single-flight) holds decoded strike windows keyed
 //! `(collection, start, end)`; strikes are immutable so settled windows
-//! never go stale, and the live window's staleness is bounded by the TIME
-//! quantum (a new minute ⇒ a new key).
+//! never go stale. Staleness bounds for the live edge: an EXPLICIT TIME
+//! frame is bounded by the 1-minute quantum (a new minute ⇒ a new key),
+//! while a TIME-omitted request resolves to the latest ADVERTISED step —
+//! rebuilt on the metadata refresh cadence (`metadata_refresh_secs`,
+//! default 300; set 60 for a live lightning collection). Real-time
+//! clients should pass explicit TIME, like the animation clients do.
 
 use std::sync::{Arc, OnceLock};
 
@@ -236,6 +240,11 @@ fn fetch_window(
 /// The margin converts the symbol radius to degrees generously (4× the
 /// linear per-pixel estimate) so partial discs at tile edges still paint —
 /// Mercator's y-stretch stays well under 4× at the ±85° tile-grid clamp.
+/// Projected outputs (LAEA/LCC/stereographic) SKIP the pre-filter: their
+/// local degrees-per-pixel can exceed any fixed multiple of the bbox
+/// average near high-distortion regions, and they never take the
+/// meta-tiled path — one direct render per request makes the linear scan
+/// over the window affordable.
 pub(crate) fn splat_strikes(
     strikes: &[Strike],
     window_end: DateTime<Utc>,
@@ -247,13 +256,15 @@ pub(crate) fn splat_strikes(
     let (w, h) = (width as i64, height as i64);
     let mut values: Vec<Option<f64>> = vec![None; (width as usize) * (height as usize)];
     let [west, south, east, north] = bbox;
+    let prefilter = !matches!(output_crs, OutputCrs::Projected { .. });
     let margin_lon = ((east - west) / width.max(1) as f64) * SYMBOL_RADIUS_PX as f64 * 4.0;
     let margin_lat = ((north - south) / height.max(1) as f64) * SYMBOL_RADIUS_PX as f64 * 4.0;
     for s in strikes {
-        if s.lon < west - margin_lon
-            || s.lon > east + margin_lon
-            || s.lat < south - margin_lat
-            || s.lat > north + margin_lat
+        if prefilter
+            && (s.lon < west - margin_lon
+                || s.lon > east + margin_lon
+                || s.lat < south - margin_lat
+                || s.lat > north + margin_lat)
         {
             continue;
         }

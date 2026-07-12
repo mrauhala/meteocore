@@ -293,6 +293,8 @@ apis = ["edr", "wms", "maps", "tiles"]   # wms/maps/tiles = the #504 age layer
 
 [postgis]
 dsn_env = "MC_OBS_DSN"
+metadata_refresh_secs = 60   # TIME-less map requests track the latest
+                             # ADVERTISED step, rebuilt on this cadence
 
 [postgis.observations]
 shape = "events"
@@ -346,7 +348,10 @@ Behaviour:
   recent 6 h at 1-minute cadence; older frames render via explicit TIME.
   One whole-extent DB fetch per frame, LRU-cached
   (`MC_LIGHTNING_STRIKE_CACHE_MB`, default 32; `lightning_strike_cache_*`
-  metrics) and shared by all meta-tile renders of that frame.
+  metrics) and shared by all meta-tile renders of that frame. Explicit-TIME
+  frames are fresh to the minute; TIME-omitted requests track the latest
+  advertised step (metadata refresh cadence) — live clients should pass
+  explicit TIME.
 
 ## Optional stations / orphan locations
 
