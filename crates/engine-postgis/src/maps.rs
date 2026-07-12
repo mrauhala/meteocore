@@ -56,7 +56,7 @@ pub struct Strike {
 pub(crate) const WMS_TIME_STEP_SECS: i64 = 60;
 
 /// Advertised TIME dimension depth: 1-minute steps over the most recent 6 h
-/// (≤360 entries in GetCapabilities). Older frames still render via an
+/// (361 entries for a full window — both endpoints inclusive). Older frames still render via an
 /// explicit TIME — membership in the advertised list is not required.
 pub(crate) const WMS_TIME_DEPTH: Duration = Duration::hours(6);
 

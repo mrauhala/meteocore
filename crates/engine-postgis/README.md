@@ -345,7 +345,7 @@ Behaviour:
   (floored to the minute), splatted as fixed 2 px-radius discs whose value
   is the strike age in minutes — style them with the `lightning_age`
   builtin (min 0, max = window minutes). TIME steps advertise the most
-  recent 6 h at 1-minute cadence; older frames render via explicit TIME.
+  recent 6 h at 1-minute cadence (361 entries, endpoints inclusive); older frames render via explicit TIME.
   One whole-extent DB fetch per frame, LRU-cached
   (`MC_LIGHTNING_STRIKE_CACHE_MB`, default 32; `lightning_strike_cache_*`
   metrics) and shared by all meta-tile renders of that frame. Explicit-TIME
