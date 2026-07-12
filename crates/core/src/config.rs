@@ -2149,16 +2149,33 @@ impl ServerConfig {
                     ))
                 })?;
                 validate_postgis(id, postgis)?;
-                // The events shape serves EDR only for now — its
-                // FeatureEngine surface is #503. Without this check an
-                // `apis = ["features"]` events collection would load
-                // cleanly and silently serve an empty station inventory.
+                // The events shape serves EDR + the raster map APIs (#504
+                // age-colored strike layer). Its FeatureEngine surface is
+                // #503 — without this check an `apis = ["features"]` events
+                // collection would load cleanly and silently serve an empty
+                // station inventory. Station shapes conversely have no
+                // raster rendering: wms/maps stay rejected for them via the
+                // engine_type allowlist gate in server admin wiring.
                 if postgis.observations.shape == "events" {
-                    if let Some(api) = collection.apis.iter().find(|a| a.as_str() != "edr") {
+                    if let Some(api) = collection
+                        .apis
+                        .iter()
+                        .find(|a| !matches!(a.as_str(), "edr" | "wms" | "maps" | "tiles"))
+                    {
                         return Err(crate::error::DataServerError::Config(format!(
-                            "Collection '{id}': apis entry '{api}' is not supported for observations.shape 'events' (only \"edr\" until #503 implements event features)"
+                            "Collection '{id}': apis entry '{api}' is not supported for observations.shape 'events' (edr/wms/maps/tiles; \"features\" arrives with #503)"
                         )));
                     }
+                } else if let Some(api) = collection
+                    .apis
+                    .iter()
+                    .find(|a| matches!(a.as_str(), "wms" | "maps"))
+                {
+                    // Station shapes have no raster surface — only the events
+                    // shape implements a meaningful MapEngine (#504).
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': apis entry '{api}' requires observations.shape 'events' (station shapes serve edr/features/tiles)"
+                    )));
                 }
             } else if collection.postgis.is_some() {
                 return Err(crate::error::DataServerError::Config(format!(
@@ -3729,6 +3746,35 @@ unit = "1"
             .to_string();
         assert!(
             err.contains("'features' is not supported for observations.shape 'events'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn postgis_events_allows_map_apis() {
+        let tmp = TempDir::new().unwrap();
+        let toml = lightning_events_toml().replace(
+            "apis = [\"edr\"]",
+            "apis = [\"edr\", \"wms\", \"maps\", \"tiles\"]",
+        );
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let (config, _) = ServerConfig::from_file(path.to_str().unwrap()).unwrap();
+        assert!(config.collections[0].apis.contains(&"wms".to_string()));
+    }
+
+    #[test]
+    fn postgis_station_shape_rejects_wms_api() {
+        let tmp = TempDir::new().unwrap();
+        let toml = nexus_postgis_toml().replace(
+            "apis = [\"edr\", \"features\"]",
+            "apis = [\"edr\", \"wms\"]",
+        );
+        let path = write_config(tmp.path(), "config.toml", &toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("requires observations.shape 'events'"),
             "got: {err}"
         );
     }

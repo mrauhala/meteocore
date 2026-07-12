@@ -950,7 +950,7 @@ fn area_to_bbox(coords: &str) -> Result<Bbox, DataServerError> {
         .map_err(|e| DataServerError::InvalidParameter(format!("invalid polygon bbox: {e}")))
 }
 
-fn map_pg_error(e: tokio_postgres::Error, q: &BuiltQuery) -> DataServerError {
+pub(crate) fn map_pg_error(e: tokio_postgres::Error, q: &BuiltQuery) -> DataServerError {
     // Keep the SQL template out of the client-facing message; only log it.
     tracing::warn!(
         sql = %q.sql,
@@ -1709,6 +1709,7 @@ mod tests {
             parameters: std::sync::Arc::new(HashMap::new()),
             temporal_extent: None,
             spatial_extent: None,
+            wms_times: std::sync::Arc::new(Vec::new()),
             version: 1,
         }
     }

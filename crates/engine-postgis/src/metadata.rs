@@ -80,6 +80,10 @@ pub struct CollectionMeta {
     pub parameters: Arc<HashMap<String, ParameterDescription>>,
     pub temporal_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
     pub spatial_extent: Option<[f64; 4]>,
+    /// Events shape only (#504): the WMS/Maps/Tiles TIME dimension —
+    /// quantized steps ascending, rebuilt each metadata refresh so
+    /// `raster_info()` stays O(1). Empty for station shapes.
+    pub wms_times: Arc<Vec<DateTime<Utc>>>,
     /// Monotonic version counter — bumped by each successful refresh.
     pub version: u64,
 }
@@ -93,6 +97,7 @@ impl CollectionMeta {
             parameters: Arc::new(HashMap::new()),
             temporal_extent: None,
             spatial_extent: None,
+            wms_times: Arc::new(Vec::new()),
             version: 0,
         }
     }
@@ -154,6 +159,14 @@ impl MetadataCache {
             None => spatial_extent_from(&locations),
         };
         let temporal = fetch_temporal_extent(cfg, pool).await?;
+        // Events shape (#504): the advertised WMS/Maps/Tiles TIME steps,
+        // quantized and bounded, rebuilt per refresh so raster_info() is a
+        // snapshot clone.
+        let wms_times = if matches!(cfg.observations, ObservationSchema::Events(_)) {
+            crate::maps::build_wms_times(temporal)
+        } else {
+            Vec::new()
+        };
 
         let previous = self.inner.load();
         let next = CollectionMeta {
@@ -163,6 +176,7 @@ impl MetadataCache {
             parameters: Arc::new(parameters),
             temporal_extent: temporal,
             spatial_extent: spatial,
+            wms_times: Arc::new(wms_times),
             version: previous.version.wrapping_add(1),
         };
         self.inner.store(Arc::new(next));
@@ -593,6 +607,7 @@ mod tests {
             parameters: Arc::new(HashMap::new()),
             temporal_extent: None,
             spatial_extent: Some([1.0, 2.0, 1.0, 2.0]),
+            wms_times: Arc::new(Vec::new()),
             version: 1,
         };
         cache.store(next);
