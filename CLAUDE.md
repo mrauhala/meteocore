@@ -316,7 +316,7 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
 | ODIM PVOL | `EdrEngine` + `MapEngine` + `VolumeEngine` (per-site views) + `FeatureEngine` (network engine) | EDR (position, locations, area, trajectory), WMS, Maps, Tiles, 3D Tiles, Features (site inventory) |
 | QueryData | `EdrEngine` + `MapEngine` | EDR (position only), WMS, Maps, Tiles |
 | Zarr | `EdrEngine` + `MapEngine` | EDR (position), WMS, Maps, Tiles; local + S3/HTTP |
-| PostGIS | `EdrEngine` + `FeatureEngine` | EDR (position, locations, area), Features |
+| PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
 
 ## Config Format
 

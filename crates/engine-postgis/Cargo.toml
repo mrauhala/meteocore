@@ -5,6 +5,9 @@ edition = "2021"
 
 [dependencies]
 ds-core = { path = "../core" }
+# Strike-window LRU for the events map layer (#504) — byte-bounded caches go
+# through ds-cache (#480).
+ds-cache = { path = "../ds-cache" }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }

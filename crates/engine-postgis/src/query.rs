@@ -557,6 +557,42 @@ pub fn build_events_area(
     Ok(BuiltQuery::new(sql, params).with_row_limit(3, source_keys.len().max(1)))
 }
 
+/// Events-shape strike fetch for the map layer (#504): every event in the
+/// half-open window `(start, end]` across the WHOLE table extent — the map
+/// path caches one window per timestep and filters per tile in memory, so
+/// there is no spatial predicate here. `ORDER BY time DESC, id` so a
+/// truncated fetch keeps the NEWEST strikes (the map-relevant ones); the
+/// caller reverses to ascending for paint order. Only time + coords are
+/// selected — the splat needs no parameter columns.
+pub fn build_events_window(
+    shape: &EventsShape,
+    time_range: (DateTime<Utc>, DateTime<Utc>),
+    row_limit: usize,
+) -> Result<BuiltQuery, BuildError> {
+    let table = fq_table(&shape.table)?;
+    let time_col = quote_ident(&shape.time_col)?;
+    let geom = quote_ident(&shape.geom_col)?;
+    let id = quote_ident(&shape.id_col)?;
+    let time_select = time_select_expr(&time_col, shape.time_col_tz.as_deref());
+    let tz = shape.time_col_tz.as_deref();
+
+    let rhs_lo = time_filter_rhs("$1", tz);
+    let rhs_hi = time_filter_rhs("$2", tz);
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!(
+        "{time_select} AS time, ST_X({geom}) AS lon, ST_Y({geom}) AS lat \
+         FROM {table} \
+         WHERE {time_col} > {rhs_lo} AND {time_col} <= {rhs_hi} \
+         ORDER BY {time_col} DESC, {id} LIMIT $3"
+    ));
+    let params = vec![
+        SqlParam::Timestamp(time_range.0),
+        SqlParam::Timestamp(time_range.1),
+        SqlParam::Int(row_limit as i64),
+    ];
+    Ok(BuiltQuery::new(sql, params).with_row_limit(2, 1))
+}
+
 fn build_location_long(
     shape: &LongShape,
     station_id: &str,

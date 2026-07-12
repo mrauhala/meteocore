@@ -44,6 +44,12 @@ pub enum BuiltinColormap {
     /// alert fill overlays a basemap (Unknown=0, Minor=1, Moderate=2, Severe=3,
     /// Extreme=4). Used by the `engine-cap` alert map layers (#396).
     CapSeverity,
+    /// Lightning strike-age ramp (#504). Value = strike age in MINUTES:
+    /// fresh strikes near-white/yellow, aging through orange and red to a
+    /// dark violet at the window edge. Style min/max set the window
+    /// (default 0–60 min). Fully opaque symbols — strikes are sparse point
+    /// splats over a basemap, not an area fill.
+    LightningAge,
 }
 
 /// Lookup-table colormap. O(1) per pixel.
@@ -737,6 +743,32 @@ pub fn builtin_stops(builtin: &BuiltinColormap) -> Vec<ColorStop> {
                 color: [192, 57, 43, 200],
             }, // Extreme — red
         ],
+        BuiltinColormap::LightningAge => vec![
+            ColorStop {
+                value: 0.0,
+                color: [255, 255, 240, 255],
+            }, // just struck — near-white
+            ColorStop {
+                value: 5.0,
+                color: [255, 236, 80, 255],
+            }, // ≤5 min — bright yellow
+            ColorStop {
+                value: 15.0,
+                color: [255, 160, 40, 255],
+            }, // orange
+            ColorStop {
+                value: 30.0,
+                color: [225, 60, 50, 255],
+            }, // red
+            ColorStop {
+                value: 45.0,
+                color: [160, 40, 120, 255],
+            }, // magenta
+            ColorStop {
+                value: 60.0,
+                color: [90, 30, 130, 255],
+            }, // window edge — dark violet
+        ],
     }
 }
 
@@ -754,6 +786,7 @@ pub fn resolve_builtin(name: &str) -> Option<BuiltinColormap> {
         "precipitation_rate" => Some(BuiltinColormap::PrecipitationRate),
         "wind_speed" => Some(BuiltinColormap::WindSpeed),
         "cap_severity" => Some(BuiltinColormap::CapSeverity),
+        "lightning_age" => Some(BuiltinColormap::LightningAge),
         _ => None,
     }
 }
@@ -772,6 +805,7 @@ pub fn builtin_names() -> &'static [&'static str] {
         "precipitation_rate",
         "wind_speed",
         "cap_severity",
+        "lightning_age",
     ]
 }
 

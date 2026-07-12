@@ -1221,6 +1221,7 @@ dependencies = [
  "arc-swap",
  "chrono",
  "deadpool-postgres",
+ "ds-cache",
  "ds-core",
  "futures",
  "postgis",

@@ -2,6 +2,7 @@ pub mod config;
 pub mod engine;
 pub mod feature;
 pub mod health;
+pub mod maps;
 pub mod metadata;
 pub mod pool;
 pub mod query;
@@ -10,6 +11,7 @@ pub mod security;
 
 pub use engine::PostgisEngine;
 pub use health::{Health, HealthSnapshot, HealthStatus};
+pub use maps::strike_window_cache_metrics;
 
 pub use config::{PostgisConfigError, PostgisEngineConfig, ValidatedParameter};
 pub use schema::{

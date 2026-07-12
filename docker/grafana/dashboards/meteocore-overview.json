@@ -1124,6 +1124,11 @@
           "expr": "sum(rate(grid_cache_hits_total[$__rate_interval])) / clamp_min(sum(rate(grid_cache_hits_total[$__rate_interval])) + sum(rate(grid_cache_misses_total[$__rate_interval])), 1e-9)",
           "refId": "B",
           "legendFormat": "GRIB decoded grids"
+        },
+        {
+          "expr": "rate(lightning_strike_cache_hits_total[$__rate_interval]) / clamp_min(rate(lightning_strike_cache_hits_total[$__rate_interval]) + rate(lightning_strike_cache_misses_total[$__rate_interval]), 1e-9)",
+          "refId": "C",
+          "legendFormat": "Lightning strike windows (#504)"
         }
       ]
     },
@@ -1217,6 +1222,11 @@
           "expr": "sum(rate(grid_cache_misses_total[$__rate_interval]))",
           "refId": "C",
           "legendFormat": "GRIB decoded grids"
+        },
+        {
+          "expr": "rate(lightning_strike_cache_misses_total[$__rate_interval])",
+          "refId": "A",
+          "legendFormat": "Lightning strike windows (#504)"
         }
       ]
     },
@@ -1312,6 +1322,11 @@
           "expr": "sum(grid_cache_bytes) / clamp_min(sum(grid_cache_capacity_bytes), 1)",
           "refId": "D",
           "legendFormat": "GRIB decoded grids"
+        },
+        {
+          "expr": "lightning_strike_cache_bytes / clamp_min(lightning_strike_cache_capacity_bytes, 1)",
+          "refId": "B",
+          "legendFormat": "Lightning strike windows (#504)"
         }
       ]
     },

@@ -374,6 +374,19 @@ static GEOTIFF_DECODED_CHUNK_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock:
     )
 });
 
+// Lightning strike-window cache (#504) — process-global, byte-bounded LRU of
+// decoded event windows for the events-shape map layer, so the ~50-190
+// meta-tile renders tiling one frame share ONE DB fetch.
+static LIGHTNING_STRIKE_CACHE_METRICS: LazyLock<CacheMetricSet> = LazyLock::new(|| {
+    CacheMetricSet::new(
+        "lightning_strike_cache",
+        "Lightning strike-window cache",
+        Some("events map layers"),
+        Some("window DB fetches"),
+        false,
+    )
+});
+
 // PostGIS engine gauges (#110). All set per-scrape from live engine state — no
 // delta-tracking needed (they're true gauges, not cumulative counters; the
 // per-query duration/rows/error histograms are a follow-up — see the metrics
@@ -838,7 +851,7 @@ pub fn load_collections(
             "odim" => &["edr", "wms", "maps", "tiles"],
             "odim-volume" => &["edr", "wms", "maps", "tiles", "3dtiles", "features"],
             "cap" => &["features", "wms", "maps", "tiles"],
-            "postgis" => &["edr", "features", "tiles"],
+            "postgis" => &["edr", "features", "tiles", "wms", "maps"],
             _ => &[],
         };
         let unsupported: Vec<&str> = collection
@@ -2119,12 +2132,51 @@ pub fn load_collections(
                     );
                     feature_collections.insert(collection.id.clone(), collection.clone());
                 }
-                if collection.apis.contains(&"tiles".to_string()) {
-                    tiles_feature_engines.insert(
+                // The events shape has a raster surface (#504: the
+                // age-colored lightning layer) — wire the MapEngine into the
+                // raster APIs. Station shapes keep the MVT feature-tile
+                // path; config validation rejects wms/maps for them.
+                let is_events = validated.events().is_some();
+                if collection.apis.contains(&"wms".to_string()) && is_events {
+                    map_engines.insert(
                         collection.id.clone(),
-                        engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
-                    tiles_feature_collections.insert(collection.id.clone(), collection.clone());
+                    map_collections.insert(collection.id.clone(), collection.clone());
+                    let styles = build_styles(collection, &bundle_index);
+                    map_styles.insert(collection.id.clone(), styles);
+                    info!("Collection '{}': wired to WMS API", collection.id);
+                }
+                if collection.apis.contains(&"maps".to_string()) && is_events {
+                    maps_engines.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                    );
+                    maps_collections.insert(collection.id.clone(), collection.clone());
+                    let styles = build_styles(collection, &bundle_index);
+                    maps_styles.insert(collection.id.clone(), styles);
+                    info!("Collection '{}': wired to Maps API", collection.id);
+                }
+                if collection.apis.contains(&"tiles".to_string()) {
+                    if is_events {
+                        tiles_engines.insert(
+                            collection.id.clone(),
+                            engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+                        );
+                        tiles_collections.insert(collection.id.clone(), collection.clone());
+                        let styles = build_styles(collection, &bundle_index);
+                        tiles_styles.insert(collection.id.clone(), styles);
+                        info!(
+                            "Collection '{}': wired to Tiles API (raster)",
+                            collection.id
+                        );
+                    } else {
+                        tiles_feature_engines.insert(
+                            collection.id.clone(),
+                            engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
+                        );
+                        tiles_feature_collections.insert(collection.id.clone(), collection.clone());
+                    }
                 }
                 postgis_engines.push(engine);
                 health.push(CollectionHealth {
@@ -3313,6 +3365,17 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
     if has_geotiff {
         GEOTIFF_DECODED_CHUNK_CACHE_METRICS
             .update(engine_geotiff::decoded_chunk_cache_metrics(), None);
+    }
+
+    // Lightning strike-window cache (#504): only meaningful once a postgis
+    // events collection has rendered, but the family is cheap either way.
+    if !state
+        .postgis_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
+    {
+        LIGHTNING_STRIKE_CACHE_METRICS.update(engine_postgis::strike_window_cache_metrics(), None);
     }
 
     // Tile cache: per-collection

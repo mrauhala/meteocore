@@ -289,10 +289,12 @@ interval. Reference dataset: a lightning-strike table
 id = "lightning"
 title = "Lightning strikes"
 engine_type = "postgis"
-apis = ["edr"]
+apis = ["edr", "wms", "maps", "tiles"]   # wms/maps/tiles = the #504 age layer
 
 [postgis]
 dsn_env = "MC_OBS_DSN"
+metadata_refresh_secs = 60   # TIME-less map requests track the latest
+                             # ADVERTISED step, rebuilt on this cadence
 
 [postgis.observations]
 shape = "events"
@@ -313,6 +315,11 @@ unit = "kA"
 name = "multiplicity"
 label = "Multiplicity"
 unit = "1"
+
+[wms]
+colormap = "lightning_age"   # value = strike age in minutes
+min = 0.0
+max = 60.0                   # match the default_datetime window length
 ```
 
 Behaviour:
@@ -333,6 +340,18 @@ Behaviour:
   `columns`/`tables` entries are rejected for this shape at config load.
 - Recommended index: `btree (time DESC, geom) INCLUDE (<parameter columns>)`
   plus the usual gist on the geometry column.
+- **Map layer (#504, `apis` wms/maps/tiles):** each frame renders the
+  strikes of the `default_datetime` window ending at the requested TIME
+  (floored to the minute), splatted as fixed 2 px-radius discs whose value
+  is the strike age in minutes — style them with the `lightning_age`
+  builtin (min 0, max = window minutes). TIME steps advertise the most
+  recent 6 h at 1-minute cadence (361 entries, endpoints inclusive); older frames render via explicit TIME.
+  One whole-extent DB fetch per frame, LRU-cached
+  (`MC_LIGHTNING_STRIKE_CACHE_MB`, default 32; `lightning_strike_cache_*`
+  metrics) and shared by all meta-tile renders of that frame. Explicit-TIME
+  frames are fresh to the minute; TIME-omitted requests track the latest
+  advertised step (metadata refresh cadence) — live clients should pass
+  explicit TIME.
 
 ## Optional stations / orphan locations
 
