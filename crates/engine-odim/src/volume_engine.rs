@@ -4021,14 +4021,10 @@ impl PolarVolumeSiteView {
                 self.collection_id, self.nod
             ))
         })?;
-        // Nearest to `time` (latest if `None`) — same rule as `get_raster_tile`.
-        let entry = match time {
-            Some(target) => site_volumes
-                .iter()
-                .min_by_key(|e| (e.volume.time - target).num_seconds().abs()),
-            None => site_volumes.last(),
-        }
-        .ok_or_else(|| {
+        // Shared selection rule — the same `select_volume_entry` used by
+        // `get_raster_tile` and `resolve_time` (#507), so the CELLS overlay
+        // and 3D Tiles products can't drift from the cache-key authority.
+        let entry = select_volume_entry(site_volumes, time).ok_or_else(|| {
             DataServerError::LocationNotFound(format!(
                 "[{}] radar site `{}` has no volumes",
                 self.collection_id, self.nod

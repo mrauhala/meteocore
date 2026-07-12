@@ -815,13 +815,15 @@ impl GribEngine {
     }
 
     /// Find the best step file for a datetime query, optionally pinned to a
-    /// specific model run.
+    /// specific model run. (Formerly `resolve_time`; renamed so it cannot be
+    /// confused with `MapEngine::resolve_time`, the cache-key authority that
+    /// mirrors this selection.)
     ///
     /// `reference_time = Some(rt)` restricts the search to exactly that run
     /// (an unknown run is an error → 404 at the API layer); `None` keeps the
     /// existing "latest run, or the most recent run covering `datetime`"
     /// behaviour. See [`instances::select_run`].
-    fn resolve_time(
+    fn resolve_step(
         &self,
         reference_time: Option<DateTime<Utc>>,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -1114,7 +1116,7 @@ impl EdrEngine for GribEngine {
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         let bbox = parse_bbox_from_wkt(coords)?;
-        let (_step, step_file) = self.resolve_time(reference_time, datetime)?;
+        let (_step, step_file) = self.resolve_step(reference_time, datetime)?;
 
         // Default to first near-surface parameter
         let query_params: Vec<&str> = match parameters {
@@ -1240,7 +1242,7 @@ impl MapEngine for GribEngine {
     ) -> Result<RasterTile, DataServerError> {
         let _ = z; // GRIB collections expose no vertical dimension yet (#185)
         let datetime = time.map(|t| (t, t));
-        let (_step, step_file) = self.resolve_time(reference_time, datetime)?;
+        let (_step, step_file) = self.resolve_step(reference_time, datetime)?;
 
         // Determine parameter to render
         let param_name = parameter.unwrap_or_else(|| {
@@ -1281,6 +1283,29 @@ impl MapEngine for GribEngine {
             height,
             values: values.into(),
         })
+    }
+
+    fn resolve_time(
+        &self,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        // The cache-key authority (#507): the exact valid time
+        // `get_raster_tile` will render — same run selection (`resolve_run`)
+        // and step selection (`find_step_for_time`, exact-then-nearest;
+        // last step when `time` is `None`) as `resolve_step`. A missing
+        // run/step falls back to the requested time: the render will error
+        // and cache nothing, so the key value is moot.
+        let catalog = self.catalog.load();
+        let Ok(run) = resolve_run(&catalog, reference_time, time.map(|t| (t, t))) else {
+            return time;
+        };
+        let step = match time {
+            Some(t) => run.find_step_for_time(t).map(|(step, _)| step),
+            None => run.steps.keys().next_back().copied(),
+        };
+        step.map(|s| run.reference_time + chrono::Duration::hours(i64::from(s)))
+            .or(time)
     }
 
     fn raster_info(&self) -> RasterInfo {
