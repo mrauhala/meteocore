@@ -1193,6 +1193,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-nowcast"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "ds-core",
+ "engine-geotiff",
+]
+
+[[package]]
 name = "engine-odim"
 version = "0.1.0"
 dependencies = [
