@@ -125,6 +125,14 @@ fn parse_args() -> Result<Args, String> {
                 .into(),
         );
     }
+    // The PASS/FAIL exit code is this harness's automated signal — a gate
+    // threshold that silently fell back to another entry would be misleading.
+    if !args.thresholds.contains(&args.gate_threshold) {
+        return Err(format!(
+            "--gate-threshold {} is not among --thresholds {:?}",
+            args.gate_threshold, args.thresholds
+        ));
+    }
     Ok(args)
 }
 
@@ -266,13 +274,17 @@ fn main() -> ExitCode {
             .filter(|v| v.is_finite())
             .collect();
         let echo = finite.iter().filter(|&&v| v >= args.min_echo).count();
-        let (min, max) = finite
-            .iter()
-            .fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        let range = if finite.is_empty() {
+            "range n/a (all nodata)".to_string()
+        } else {
+            let (min, max) = finite
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+            format!("range [{min:.1}, {max:.1}] {}", info.unit)
+        };
         println!(
-            "  {t}: {} finite px, range [{min:.1}, {max:.1}] {}, {} px >= {} (echo)",
+            "  {t}: {} finite px, {range}, {} px >= {} (echo)",
             finite.len(),
-            info.unit,
             echo,
             args.min_echo
         );
@@ -337,11 +349,12 @@ fn main() -> ExitCode {
     }
 
     // The gate (#520): beat persistence at the gate threshold, lead 1.
+    // Membership was validated in parse_args, so position() always finds it.
     let gate_idx = args
         .thresholds
         .iter()
         .position(|&t| t == args.gate_threshold)
-        .unwrap_or(0);
+        .expect("gate threshold validated against thresholds at arg parse");
     let n = nowcast[0][gate_idx].csi();
     let p = persistence[0][gate_idx].csi();
     println!();
