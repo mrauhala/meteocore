@@ -204,17 +204,6 @@ pub async fn wms_handler(
             let content_type = params.format.content_type();
             let has_explicit_time = params.time.is_some();
 
-            // Normalise an explicit pin of the *current* latest run to `None`, so
-            // it shares cache entries (and the engine's latest-run path) with
-            // requests that omit the dimension — they render identical pixels.
-            // The common client flow is echoing the GetCapabilities `default=`
-            // (= the latest run), so without this those requests fragment the
-            // cache from the no-dimension ones. A pin of an *older* run stays
-            // explicit. (`info.reference_times` is ascending; latest is `.last()`.)
-            let reference_time = params
-                .reference_time
-                .filter(|&rt| info.reference_times.last().copied() != Some(rt));
-
             // Resolve a TIME-less request to the engine's *current* latest
             // timestamp before any cache key is built. The rendered + meta-tile
             // caches have no TTL, so keying "latest" as `None` would freeze the
@@ -224,6 +213,33 @@ pub async fn wms_handler(
             // `info.times` is ascending; when it's empty (e.g. STAC cold start)
             // the request falls through as `None` = the engine's own latest.
             let time = params.time.or_else(|| info.times.last().copied());
+
+            // Normalise an explicit pin of the *current* latest run to `None`
+            // BEFORE resolution, so it gets the same fallback-tolerant run
+            // selection as an omitted dimension: the common client flow
+            // echoes the GetCapabilities `default=` (the latest run) on
+            // every request — including animation frames OLDER than that
+            // run's reference time, which an exact pin would refuse (GRIB's
+            // cross-run fallback applies only to `None`). A pin of an
+            // *older* run stays explicit/exact — that is user intent.
+            let requested_run = params
+                .reference_time
+                .filter(|&rt| info.reference_times.last().copied() != Some(rt));
+
+            // #521: resolve the run axis to the CONCRETE run the engine will
+            // render — the run-axis mirror of what #508 does for TIME below.
+            // The no-TTL caches keyed on `None` ("latest at render time")
+            // would freeze whichever run was latest at first render: when a
+            // newer run re-covers the same valid times with different pixels
+            // (every few hours for NWP, every ~5 min for a nowcast
+            // generation), the stale entries would keep serving forever.
+            // Asking the ENGINE (rather than picking
+            // `reference_times.last()` here) preserves engine-specific
+            // selection such as GRIB's cross-run fallback — a valid time the
+            // newest run doesn't cover resolves to (and keys) the older run
+            // actually rendered. Engines without runs keep the identity
+            // default (`None` stays `None`).
+            let reference_time = engine.resolve_reference_time(time, requested_run);
 
             // #507: snap that instant to the exact timestep the engine will
             // actually render, BEFORE any cache key is built. Engines that
@@ -338,8 +354,9 @@ pub async fn wms_handler(
             let output_crs = params.output_crs.clone();
             let format = params.format;
             let elevation = params.elevation;
-            // `reference_time` (normalised above) is `Copy`; it flows into both
-            // the direct and meta-tile render closures below.
+            // `reference_time` (resolved to a concrete run above, #521) is
+            // `Copy`; it flows into both the direct and meta-tile render
+            // closures below.
             let z_q = elevation.map(ds_render::quantize_z);
             let layer = params.layer.clone();
             // Key meta-tiles on the *resolved* style name, not the raw STYLES

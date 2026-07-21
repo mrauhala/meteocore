@@ -471,6 +471,22 @@ impl MapEngine for QueryDataEngine {
         find_time_idx(&data, time).map(|i| data.times[i]).or(time)
     }
 
+    fn resolve_reference_time(
+        &self,
+        _time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        // The run-axis cache-key authority (#521): the exact run
+        // `get_raster_tile` will render — the SAME `instances::select_run`
+        // rule `select_data` applies (`None` ⇒ latest, `Some` ⇒ exact). A
+        // pinned run that's no longer retained echoes back: the render will
+        // error and cache nothing.
+        let set = self.runs.load();
+        ds_core::instances::select_run(&set.runs, reference_time)
+            .map(|(rt, _)| Some(*rt))
+            .unwrap_or(reference_time)
+    }
+
     fn raster_info(&self) -> RasterInfo {
         let set = self.runs.load();
         // Every retained run is a selectable reference time (WMS dimension /

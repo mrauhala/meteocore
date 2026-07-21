@@ -2036,3 +2036,113 @@ mod content_negotiation {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Run-less map must track the engine's latest model run (#521)
+// ---------------------------------------------------------------------------
+
+/// Mock forecast engine whose run list can be advanced mid-test — the Maps
+/// twin of the WMS `RunSwapMockMapEngine`. Maps never pins a run (the
+/// `reference_time` query parameter is a #337 Phase 4 follow-up), so every
+/// request exercises the `resolve_reference_time(time, None)` path.
+struct RunSwapMockMapEngine {
+    runs: Arc<std::sync::RwLock<Vec<chrono::DateTime<chrono::Utc>>>>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl MapEngine for RunSwapMockMapEngine {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let idx = self.runs.read().unwrap().len().min(2);
+        let v = 0.2 + 0.3 * idx as f64;
+        Ok(RasterTile {
+            width,
+            height,
+            values: vec![Some(v); (width * height) as usize].into(),
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            native_crs: "CRS:84".into(),
+            spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
+            times: vec!["2026-07-11T20:00:00Z".parse().unwrap()],
+            parameter: "reflectivity".into(),
+            unit: "dBZ".into(),
+            parameters: vec![],
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: self.runs.read().unwrap().clone(),
+        }
+    }
+
+    fn resolve_reference_time(
+        &self,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        // Run-retaining engine contract (#521): None ⇒ the concrete run the
+        // render would use (latest here).
+        reference_time.or_else(|| self.runs.read().unwrap().last().copied())
+    }
+}
+
+/// The #521 stale-run replay on the Maps path: the no-TTL rendered cache must
+/// key on the concrete latest run so a new run (or nowcast generation)
+/// re-renders instead of serving the first run's pixels forever.
+#[tokio::test]
+async fn map_re_renders_when_a_new_run_lands() {
+    let runs = Arc::new(std::sync::RwLock::new(vec!["2026-07-11T12:00:00Z"
+        .parse()
+        .unwrap()]));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = build_router_with_engine(Arc::new(RunSwapMockMapEngine {
+        runs: runs.clone(),
+        calls: calls.clone(),
+    }));
+    let uri = "/collections/radar/map?bbox=10,55,30,70&width=128&height=128";
+
+    // 1. Cold render under run 1.
+    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+    // 2. Repeat: pure cache hit under the concrete run-1 key.
+    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+    // 3. A new run supersedes the latest → the same request must re-render.
+    //    Pre-#521 (key reference_time: None) this served the stale hit.
+    runs.write()
+        .unwrap()
+        .push("2026-07-11T18:00:00Z".parse().unwrap());
+    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "new latest run must miss the run-1 cache entry and re-render"
+    );
+}

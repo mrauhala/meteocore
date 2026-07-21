@@ -829,36 +829,44 @@ impl GribEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
     ) -> Result<ResolvedStep, DataServerError> {
         let catalog = self.catalog.load();
-        // Run selection is shared with `query_position` (see `resolve_run`); this
-        // path additionally narrows to a single step.
-        let run = resolve_run(&catalog, reference_time, datetime)?;
-        let (step, sf) = match datetime {
-            Some((start, _end)) => run.find_step_for_time(start).ok_or_else(|| {
-                DataServerError::InvalidParameter(format!("No forecast step for time {start}"))
-            })?,
-            None => {
-                let (&step, sf) = run.steps.iter().next_back().ok_or_else(|| {
-                    DataServerError::Engine("forecast run has no steps".to_string())
-                })?;
-                (step, sf)
-            }
-        };
-        Ok(ResolvedStep {
-            // The valid time of the step actually selected — the cache-key
-            // timestamp `MapEngine::resolve_time` returns (#507).
-            valid_time: run.reference_time + chrono::Duration::hours(i64::from(step)),
-            file: sf.clone(),
-        })
+        let (_run, _step, sf) = select_run_step(&catalog, reference_time, datetime)?;
+        Ok(ResolvedStep { file: sf.clone() })
     }
 }
 
-/// A run + step selection result: the step file to read and the exact valid
-/// time it represents. Produced only by [`GribEngine::resolve_step`] — the
-/// single selection implementation shared by the render/query paths and
-/// `MapEngine::resolve_time` (the #507 cache-key authority), so they cannot
-/// drift.
+/// Borrowing run+step selection — the single authority `resolve_step` (which
+/// clones the matched file for the read path) and the resolve-only callers
+/// (`resolve_time` / `resolve_reference_time`, which need scalars and must
+/// not pay the `StepFile` clone on every request) share.
+fn select_run_step(
+    catalog: &Catalog,
+    reference_time: Option<DateTime<Utc>>,
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Result<(&ForecastRun, u32, &StepFile), DataServerError> {
+    // Run selection is shared with `query_position` (see `resolve_run`); this
+    // path additionally narrows to a single step.
+    let run = resolve_run(catalog, reference_time, datetime)?;
+    let (step, sf) = match datetime {
+        Some((start, _end)) => run.find_step_for_time(start).ok_or_else(|| {
+            DataServerError::InvalidParameter(format!("No forecast step for time {start}"))
+        })?,
+        None => {
+            let (&step, sf) =
+                run.steps.iter().next_back().ok_or_else(|| {
+                    DataServerError::Engine("forecast run has no steps".to_string())
+                })?;
+            (step, sf)
+        }
+    };
+    Ok((run, step, sf))
+}
+
+/// The step file the read paths (`get_raster_tile`, EDR queries) decode —
+/// an owned clone so the catalog snapshot can be released. Selection itself
+/// lives in [`select_run_step`], the single implementation shared with the
+/// resolve-only paths (`MapEngine::resolve_time` / `resolve_reference_time`,
+/// the #507/#521 cache-key authorities), so they cannot drift.
 struct ResolvedStep {
-    valid_time: DateTime<Utc>,
     file: StepFile,
 }
 
@@ -1304,14 +1312,33 @@ impl MapEngine for GribEngine {
         reference_time: Option<DateTime<Utc>>,
     ) -> Option<DateTime<Utc>> {
         // The cache-key authority (#507): the exact valid time
-        // `get_raster_tile` will render, via the SAME `resolve_step` the
-        // render/query paths call (one selection implementation — cannot
-        // drift). A missing run/step falls back to the requested time: the
-        // render will error and cache nothing, so the key value is moot.
-        self.resolve_step(reference_time, time.map(|t| (t, t)))
-            .map(|r| r.valid_time)
+        // `get_raster_tile` will render, via the SAME `select_run_step` the
+        // render/query paths use (one selection implementation — cannot
+        // drift). Borrowing form: no `StepFile` clone on the per-request
+        // resolve path. A missing run/step falls back to the requested time:
+        // the render will error and cache nothing, so the key value is moot.
+        let catalog = self.catalog.load();
+        select_run_step(&catalog, reference_time, time.map(|t| (t, t)))
+            .map(|(run, step, _)| run.reference_time + chrono::Duration::hours(i64::from(step)))
             .ok()
             .or(time)
+    }
+
+    fn resolve_reference_time(
+        &self,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        // The run-axis cache-key authority (#521): the exact run
+        // `get_raster_tile` will render, via the SAME `select_run_step` the
+        // render/query paths use — including the cross-run fallback, so a
+        // valid time the newest run doesn't cover keys the OLDER run
+        // actually rendered. Borrowing form: no `StepFile` clone. A failed
+        // resolution echoes the request: the render errors, nothing cached.
+        let catalog = self.catalog.load();
+        select_run_step(&catalog, reference_time, time.map(|t| (t, t)))
+            .map(|(run, _, _)| Some(run.reference_time))
+            .unwrap_or(reference_time)
     }
 
     fn raster_info(&self) -> RasterInfo {
@@ -1552,6 +1579,58 @@ mod tests {
 
     fn win<'a>(prefixes: &'a [&'a str]) -> HashSet<&'a str> {
         prefixes.iter().copied().collect()
+    }
+
+    /// The #521 cross-run fallback contract: with no pinned run, `resolve_run`
+    /// serves the newest run that COVERS the valid time. Steps snap to the
+    /// nearest available (`find_step_for_time` is unbounded at-or-after the
+    /// reference time), so the fallback triggers for valid times BEFORE the
+    /// newest run's reference time — animating past frames after a new run
+    /// lands. `resolve_reference_time` returns this run via the same
+    /// `resolve_step` authority, so the API cache keys track the run actually
+    /// rendered.
+    #[test]
+    fn resolve_run_falls_back_across_runs_for_uncovered_times() {
+        fn step_file() -> StepFile {
+            StepFile {
+                grib_url: "unused".into(),
+                messages: Vec::new(),
+            }
+        }
+        let run_a: DateTime<Utc> = "2026-06-07T00:00:00Z".parse().unwrap();
+        let run_b: DateTime<Utc> = "2026-06-07T12:00:00Z".parse().unwrap();
+        let mut catalog = Catalog::new();
+        catalog.runs.insert(
+            run_a,
+            ForecastRun {
+                reference_time: run_a,
+                steps: (0..=18).step_by(3).map(|s| (s, step_file())).collect(),
+            },
+        );
+        catalog.runs.insert(
+            run_b,
+            ForecastRun {
+                reference_time: run_b,
+                steps: [(0, step_file())].into_iter().collect(),
+            },
+        );
+
+        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let at = |s: &str| Some((t(s), t(s)));
+        // 09Z predates the newest run's reference → fall back to run A
+        // (the past-frame-after-new-run-lands case).
+        let run = resolve_run(&catalog, None, at("2026-06-07T09:00:00Z")).unwrap();
+        assert_eq!(run.reference_time, run_a, "past valid time must fall back");
+        // 15Z: the newest run covers at-or-after its reference (nearest-step
+        // snap) → run B.
+        let run = resolve_run(&catalog, None, at("2026-06-07T15:00:00Z")).unwrap();
+        assert_eq!(run.reference_time, run_b);
+        // Explicit pin stays exact even when another run also covers.
+        let run = resolve_run(&catalog, Some(run_a), at("2026-06-07T15:00:00Z")).unwrap();
+        assert_eq!(run.reference_time, run_a);
+        // No datetime: latest run wins.
+        let run = resolve_run(&catalog, None, None).unwrap();
+        assert_eq!(run.reference_time, run_b);
     }
 
     #[test]
