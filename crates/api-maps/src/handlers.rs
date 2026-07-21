@@ -1010,14 +1010,17 @@ async fn render_map(
     // engines that materialise `RasterInfo` lazily.
     let raster_info = engine.raster_info();
     let time = validated.time.or_else(|| raster_info.times.last().copied());
-    // #521: pin the run axis to the engine's CURRENT latest run before the
-    // cache key is built. The Maps `reference_time` query parameter is still
-    // a follow-up (#337 Phase 4) — the handler always renders the latest run
-    // — but the no-TTL rendered cache must key on the concrete run stamp:
-    // keyed as `None`, the first-rendered run's pixels would keep serving
-    // after a newer run re-covers the same valid times (acute for nowcast
-    // generations, latent for NWP). Empty `reference_times` stays `None`.
-    let reference_time = raster_info.reference_times.last().copied();
+    // #521: resolve the run axis to the CONCRETE run the engine will render
+    // before the cache key is built. The Maps `reference_time` query
+    // parameter is still a follow-up (#337 Phase 4) — the handler never pins
+    // a run — but the no-TTL rendered cache must key on the run actually
+    // rendered: keyed as `None`, the first-rendered run's pixels would keep
+    // serving after a newer run re-covers the same valid times (acute for
+    // nowcast generations, latent for NWP). Asking the engine (not
+    // `reference_times.last()`) preserves GRIB's cross-run fallback when the
+    // newest run doesn't cover the valid time yet. Engines without runs keep
+    // the identity default (`None` stays `None`).
+    let reference_time = engine.resolve_reference_time(time, None);
     // #507: snap to the exact timestep the engine will render before the
     // cache key is built — a not-yet-ingested datetime must cache the
     // previous timestep's pixels under the PREVIOUS timestep's key.

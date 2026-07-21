@@ -194,6 +194,13 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    `get_raster_tile` uses (share one helper so they cannot drift) — the API
    layers key the no-TTL rendered/meta-tile caches on it. Skipping this
    reintroduces the #507 cache poisoning (stale animation frames).
+   **If the engine retains model runs** (non-empty
+   `RasterInfo.reference_times`), it MUST likewise override
+   `MapEngine::resolve_reference_time` with the SAME run selection
+   `get_raster_tile` uses (`None` ⇒ the concrete run it would render,
+   including any cross-run fallback) — the caches key the run axis on it
+   (#521). Skipping this freezes the first-rendered run's pixels when a
+   newer run re-covers the same valid times.
 8. Ship a runnable (enabled) example collection config AND do an end-to-end
    server + curl smoke test against real data. Unit tests alone miss
    integration and unit-conversion bugs.

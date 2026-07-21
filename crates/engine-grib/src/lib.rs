@@ -847,18 +847,25 @@ impl GribEngine {
             // The valid time of the step actually selected — the cache-key
             // timestamp `MapEngine::resolve_time` returns (#507).
             valid_time: run.reference_time + chrono::Duration::hours(i64::from(step)),
+            // The run actually selected — the cache-key run
+            // `MapEngine::resolve_reference_time` returns (#521). Carries the
+            // cross-run fallback: for `reference_time: None` this may be an
+            // OLDER run than latest when the newest doesn't cover the valid
+            // time yet (mid-ingest).
+            reference_time: run.reference_time,
             file: sf.clone(),
         })
     }
 }
 
 /// A run + step selection result: the step file to read and the exact valid
-/// time it represents. Produced only by [`GribEngine::resolve_step`] — the
-/// single selection implementation shared by the render/query paths and
-/// `MapEngine::resolve_time` (the #507 cache-key authority), so they cannot
-/// drift.
+/// time (and run) it represents. Produced only by [`GribEngine::resolve_step`]
+/// — the single selection implementation shared by the render/query paths and
+/// `MapEngine::resolve_time` / `resolve_reference_time` (the #507/#521
+/// cache-key authorities), so they cannot drift.
 struct ResolvedStep {
     valid_time: DateTime<Utc>,
+    reference_time: DateTime<Utc>,
     file: StepFile,
 }
 
@@ -1314,6 +1321,22 @@ impl MapEngine for GribEngine {
             .or(time)
     }
 
+    fn resolve_reference_time(
+        &self,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        // The run-axis cache-key authority (#521): the exact run
+        // `get_raster_tile` will render, via the SAME `resolve_step` the
+        // render/query paths call — including the cross-run fallback, so a
+        // valid time the newest (mid-ingest) run doesn't cover yet keys the
+        // OLDER run actually rendered. A failed resolution echoes the
+        // request: the render will error and cache nothing.
+        self.resolve_step(reference_time, time.map(|t| (t, t)))
+            .map(|r| Some(r.reference_time))
+            .unwrap_or(reference_time)
+    }
+
     fn raster_info(&self) -> RasterInfo {
         let catalog = self.catalog.load();
         let times = catalog.all_valid_times();
@@ -1552,6 +1575,58 @@ mod tests {
 
     fn win<'a>(prefixes: &'a [&'a str]) -> HashSet<&'a str> {
         prefixes.iter().copied().collect()
+    }
+
+    /// The #521 cross-run fallback contract: with no pinned run, `resolve_run`
+    /// serves the newest run that COVERS the valid time. Steps snap to the
+    /// nearest available (`find_step_for_time` is unbounded at-or-after the
+    /// reference time), so the fallback triggers for valid times BEFORE the
+    /// newest run's reference time — animating past frames after a new run
+    /// lands. `resolve_reference_time` returns this run via the same
+    /// `resolve_step` authority, so the API cache keys track the run actually
+    /// rendered.
+    #[test]
+    fn resolve_run_falls_back_across_runs_for_uncovered_times() {
+        fn step_file() -> StepFile {
+            StepFile {
+                grib_url: "unused".into(),
+                messages: Vec::new(),
+            }
+        }
+        let run_a: DateTime<Utc> = "2026-06-07T00:00:00Z".parse().unwrap();
+        let run_b: DateTime<Utc> = "2026-06-07T12:00:00Z".parse().unwrap();
+        let mut catalog = Catalog::new();
+        catalog.runs.insert(
+            run_a,
+            ForecastRun {
+                reference_time: run_a,
+                steps: (0..=18).step_by(3).map(|s| (s, step_file())).collect(),
+            },
+        );
+        catalog.runs.insert(
+            run_b,
+            ForecastRun {
+                reference_time: run_b,
+                steps: [(0, step_file())].into_iter().collect(),
+            },
+        );
+
+        let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let at = |s: &str| Some((t(s), t(s)));
+        // 09Z predates the newest run's reference → fall back to run A
+        // (the past-frame-after-new-run-lands case).
+        let run = resolve_run(&catalog, None, at("2026-06-07T09:00:00Z")).unwrap();
+        assert_eq!(run.reference_time, run_a, "past valid time must fall back");
+        // 15Z: the newest run covers at-or-after its reference (nearest-step
+        // snap) → run B.
+        let run = resolve_run(&catalog, None, at("2026-06-07T15:00:00Z")).unwrap();
+        assert_eq!(run.reference_time, run_b);
+        // Explicit pin stays exact even when another run also covers.
+        let run = resolve_run(&catalog, Some(run_a), at("2026-06-07T15:00:00Z")).unwrap();
+        assert_eq!(run.reference_time, run_a);
+        // No datetime: latest run wins.
+        let run = resolve_run(&catalog, None, None).unwrap();
+        assert_eq!(run.reference_time, run_b);
     }
 
     #[test]

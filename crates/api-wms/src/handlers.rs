@@ -204,23 +204,6 @@ pub async fn wms_handler(
             let content_type = params.format.content_type();
             let has_explicit_time = params.time.is_some();
 
-            // #521: resolve the run axis to a CONCRETE reference time before
-            // any cache key is built — the run-axis mirror of what #508 does
-            // for TIME below. The rendered + meta-tile caches have no TTL, so
-            // keying "latest" as `None` freezes whichever run was latest at
-            // first render: when a newer run re-covers the same valid times
-            // with different pixels (every few hours for NWP, every ~5 min
-            // for a nowcast generation), the `None`-keyed entries would keep
-            // serving the old run's pixels forever. Keying on the concrete
-            // stamp keeps the cache-sharing property (an explicit pin of the
-            // current latest and a request omitting the dimension produce the
-            // same key) while a new run naturally rolls to fresh keys.
-            // Non-forecast collections (empty `reference_times`) stay `None`.
-            // (`info.reference_times` is ascending; latest is `.last()`.)
-            let reference_time = params
-                .reference_time
-                .or_else(|| info.reference_times.last().copied());
-
             // Resolve a TIME-less request to the engine's *current* latest
             // timestamp before any cache key is built. The rendered + meta-tile
             // caches have no TTL, so keying "latest" as `None` would freeze the
@@ -230,6 +213,21 @@ pub async fn wms_handler(
             // `info.times` is ascending; when it's empty (e.g. STAC cold start)
             // the request falls through as `None` = the engine's own latest.
             let time = params.time.or_else(|| info.times.last().copied());
+
+            // #521: resolve the run axis to the CONCRETE run the engine will
+            // render — the run-axis mirror of what #508 does for TIME below.
+            // The no-TTL caches keyed on `None` ("latest at render time")
+            // would freeze whichever run was latest at first render: when a
+            // newer run re-covers the same valid times with different pixels
+            // (every few hours for NWP, every ~5 min for a nowcast
+            // generation), the stale entries would keep serving forever.
+            // Asking the ENGINE (rather than picking
+            // `reference_times.last()` here) preserves engine-specific
+            // selection such as GRIB's cross-run fallback — a valid time the
+            // newest mid-ingest run doesn't cover yet resolves to (and keys)
+            // the older run actually rendered. Engines without runs keep the
+            // identity default (`None` stays `None`).
+            let reference_time = engine.resolve_reference_time(time, params.reference_time);
 
             // #507: snap that instant to the exact timestep the engine will
             // actually render, BEFORE any cache key is built. Engines that

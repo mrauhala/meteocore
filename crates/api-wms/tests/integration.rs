@@ -1441,6 +1441,16 @@ impl MapEngine for ForecastMockMapEngine {
             reference_times: forecast_runs().to_vec(),
         }
     }
+
+    fn resolve_reference_time(
+        &self,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        // Run-retaining engine contract (#521): None ⇒ the concrete run the
+        // render would use (latest here), Some ⇒ echo the pin.
+        reference_time.or_else(|| forecast_runs().last().copied())
+    }
 }
 
 /// Build a WMS router whose `ecmwf-fc` collection is a forecast engine with two
@@ -1877,6 +1887,16 @@ impl MapEngine for RunSwapMockMapEngine {
             layer_subtitle: None,
             reference_times: self.runs.read().unwrap().clone(),
         }
+    }
+
+    fn resolve_reference_time(
+        &self,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        // Run-retaining engine contract (#521): None ⇒ the concrete run the
+        // render would use (latest here), Some ⇒ echo the pin.
+        reference_time.or_else(|| self.runs.read().unwrap().last().copied())
     }
 }
 

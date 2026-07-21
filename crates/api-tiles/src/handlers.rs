@@ -1385,12 +1385,13 @@ async fn render_tile(
     // the redundant call.
     let raster_info = engine.raster_info();
     let time = validated.time.or_else(|| raster_info.times.last().copied());
-    // #521: pin the run axis to the engine's CURRENT latest run before the
-    // cache key is built (see api-maps for the full rationale — the no-TTL
-    // rendered cache keyed on `None` would keep serving the first-rendered
-    // run's pixels after a newer run re-covers the same valid times).
-    // Empty `reference_times` stays `None`.
-    let reference_time = raster_info.reference_times.last().copied();
+    // #521: resolve the run axis to the CONCRETE run the engine will render
+    // before the cache key is built (see api-maps for the full rationale —
+    // the no-TTL rendered cache keyed on `None` would keep serving the
+    // first-rendered run's pixels after a newer run re-covers the same valid
+    // times; asking the engine preserves GRIB's cross-run fallback). Engines
+    // without runs keep the identity default (`None` stays `None`).
+    let reference_time = engine.resolve_reference_time(time, None);
     // #507: snap to the exact timestep the engine will render before the
     // cache key is built — a not-yet-ingested datetime must cache the
     // previous timestep's pixels under the PREVIOUS timestep's key.

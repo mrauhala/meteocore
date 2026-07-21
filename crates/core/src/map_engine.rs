@@ -439,6 +439,37 @@ pub trait MapEngine: Send + Sync {
         let _ = reference_time;
         time
     }
+
+    /// Resolve a requested model run to the **exact run this engine would
+    /// render** for `(time, reference_time)` — the run-axis twin of
+    /// [`Self::resolve_time`], and the value that must key any no-TTL cache
+    /// of the rendered output (#521).
+    ///
+    /// Engines that retain model runs (non-empty
+    /// [`RasterInfo::reference_times`]) MUST override this with the same run
+    /// selection `get_raster_tile` uses — share one helper so they cannot
+    /// drift. `None` input means "whatever run the engine would pick for
+    /// this time" (usually the latest, possibly an older run when the
+    /// newest doesn't cover the valid time yet); the override must return
+    /// that concrete reference time so caches key the run actually
+    /// rendered, not a floating "latest". An explicit `Some(rt)` normally
+    /// echoes back unchanged (exact-match run pinning); a pinned run the
+    /// engine no longer retains should also echo — the render will error
+    /// and cache nothing, so the key value is moot.
+    ///
+    /// Default: identity — correct only for engines without model runs
+    /// (`reference_times` empty), where `None` stays `None` and nothing
+    /// regenerates under the same valid time. **Expected complexity:
+    /// O(log n) from a snapshot** — this runs on the hot render path before
+    /// the cache lookup.
+    fn resolve_reference_time(
+        &self,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let _ = time;
+        reference_time
+    }
 }
 
 #[cfg(test)]
