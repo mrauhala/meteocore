@@ -173,8 +173,72 @@ pub struct CollectionConfig {
     pub wms: Option<WmsConfig>,
     /// PostGIS-specific configuration. Required when engine_type = "postgis".
     pub postgis: Option<PostgisConfig>,
+    /// Nowcast derived-collection configuration. Required when
+    /// engine_type = "nowcast".
+    pub nowcast: Option<NowcastConfig>,
     /// Preview-SPA-specific tuning (e.g. bound the time slider). Optional.
     pub preview: Option<PreviewConfig>,
+}
+
+/// Configuration for the nowcast derived-collection engine (#522): wraps an
+/// already-configured raster collection and serves motion-extrapolated
+/// frames with TIME values in the future.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NowcastConfig {
+    /// Collection id of the raster collection to extrapolate. Must be a
+    /// non-derived collection defined in the same config (load order is
+    /// two-pass: base engines first, then nowcast engines).
+    pub source: String,
+    /// How far to extrapolate, ISO 8601 duration (default 2 hours).
+    #[serde(default = "default_nowcast_horizon")]
+    pub horizon: String,
+    /// Spacing of the extrapolated timesteps, ISO 8601 duration. Default:
+    /// the source's own frame cadence.
+    #[serde(default)]
+    pub step: Option<String>,
+    /// Source frames fetched per generation (motion uses the last pair;
+    /// extras are reserved for cross-generation smoothing, #524).
+    #[serde(default = "default_nowcast_history_frames")]
+    pub history_frames: usize,
+    /// How often to check the source for a new frame (seconds).
+    #[serde(default = "default_nowcast_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// Generations retained for `reference_time` pinning / EDR instances.
+    #[serde(default = "default_nowcast_max_generations")]
+    pub max_generations: usize,
+    /// Pixel budget for the working grid; the source's native grid is halved
+    /// until it fits (bounds memory and generation cost).
+    #[serde(default = "default_nowcast_max_pixels")]
+    pub max_pixels: usize,
+    /// Echo threshold (physical units, e.g. dBZ) below which a block yields
+    /// no motion vector — keeps clutter and empty sky from anchoring the
+    /// field.
+    #[serde(default = "default_nowcast_min_echo")]
+    pub min_echo: f64,
+}
+
+fn default_nowcast_horizon() -> String {
+    "PT2H".to_string()
+}
+
+fn default_nowcast_history_frames() -> usize {
+    3
+}
+
+fn default_nowcast_poll_interval() -> u64 {
+    30
+}
+
+fn default_nowcast_max_generations() -> usize {
+    6
+}
+
+fn default_nowcast_max_pixels() -> usize {
+    4_000_000
+}
+
+fn default_nowcast_min_echo() -> f64 {
+    10.0
 }
 
 /// License metadata for a collection's data.
@@ -2044,6 +2108,31 @@ impl ServerConfig {
                 }
             }
 
+            // Nowcast engine requires nowcast config section (and vice versa).
+            if collection.engine_type == "nowcast" && collection.nowcast.is_none() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': engine_type 'nowcast' requires a [collections.nowcast] config section"
+                )));
+            }
+            if collection.nowcast.is_some() && collection.engine_type != "nowcast" {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': [collections.nowcast] is set but engine_type is '{}'",
+                    collection.engine_type
+                )));
+            }
+            if let Some(nowcast) = &collection.nowcast {
+                if nowcast.source.trim().is_empty() {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': [collections.nowcast].source must be a collection id"
+                    )));
+                }
+                if nowcast.source == collection.id {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': nowcast source cannot be the collection itself"
+                    )));
+                }
+            }
+
             // Zarr engine requires zarr config section.
             if collection.engine_type == "zarr" && collection.zarr.is_none() {
                 return Err(crate::error::DataServerError::Config(format!(
@@ -2714,6 +2803,30 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         assert!(dotdot.validate().is_err());
         // A normal relative sub-path is fine.
         let ok = zarr_collection("data_path = \"x\"\npath = \"sub/data.zarr\"\n");
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_nowcast_config_pairing() {
+        // engine_type nowcast requires the section…
+        let missing = collection_with("engine_type = \"nowcast\"\n");
+        assert!(missing.validate().is_err());
+        // …and the section requires the engine type.
+        let mismatched = collection_with(
+            "engine_type = \"csv\"\ndata_path = \"x.csv\"\n[collections.nowcast]\nsource = \"radar\"\n",
+        );
+        assert!(mismatched.validate().is_err());
+        // Self-referential and empty sources are rejected.
+        let self_ref =
+            collection_with("engine_type = \"nowcast\"\n[collections.nowcast]\nsource = \"c\"\n");
+        assert!(self_ref.validate().is_err());
+        let empty =
+            collection_with("engine_type = \"nowcast\"\n[collections.nowcast]\nsource = \" \"\n");
+        assert!(empty.validate().is_err());
+        // A well-formed pair passes.
+        let ok = collection_with(
+            "engine_type = \"nowcast\"\n[collections.nowcast]\nsource = \"radar\"\n",
+        );
         assert!(ok.validate().is_ok());
     }
 

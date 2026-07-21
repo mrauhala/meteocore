@@ -140,6 +140,7 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -199,6 +200,7 @@ fn build_router_with_apis(apis: Vec<String>) -> axum::Router {
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -307,6 +309,7 @@ async fn fetch_collection_json(engine: Arc<dyn MapEngine>, id: &str, apis: Vec<S
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -354,6 +357,7 @@ fn router_with(
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -1269,6 +1273,7 @@ fn build_empty_router() -> axum::Router {
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -1387,6 +1392,7 @@ fn build_multi_param_router() -> axum::Router {
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -1831,6 +1837,7 @@ mod searchable {
                     odim: None,
                     cap: None,
                     postgis: None,
+                    nowcast: None,
                     preview: None,
                 },
             );

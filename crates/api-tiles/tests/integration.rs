@@ -137,6 +137,7 @@ fn build_router() -> axum::Router {
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -216,6 +217,7 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -1036,6 +1038,7 @@ fn build_empty_router() -> axum::Router {
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -1157,6 +1160,7 @@ fn build_multi_param_router() -> axum::Router {
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -1376,6 +1380,7 @@ mod mvt {
                 odim: None,
                 cap: None,
                 postgis: None,
+                nowcast: None,
                 preview: None,
             },
         );
@@ -1464,6 +1469,7 @@ mod mvt {
                 odim: None,
                 cap: None,
                 postgis: None,
+                nowcast: None,
                 preview: None,
             },
         );
@@ -1778,6 +1784,7 @@ mod temporal_grid_jitter {
                 odim: None,
                 cap: None,
                 postgis: None,
+                nowcast: None,
                 preview: None,
             },
         );
@@ -1949,6 +1956,7 @@ mod metadata_extras {
                 odim: None,
                 cap: None,
                 postgis: None,
+                nowcast: None,
                 preview: None,
             },
         );

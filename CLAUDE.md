@@ -31,8 +31,8 @@ of these crates, read its file — it holds that crate's rules and gotchas:
   resampling, storm cells.
 - `crates/engine-geotiff/CLAUDE.md`, `crates/engine-grib/CLAUDE.md`,
   `crates/engine-querydata/CLAUDE.md`, `crates/engine-zarr/CLAUDE.md`,
-  `crates/engine-cap/CLAUDE.md`, `crates/engine-postgis/CLAUDE.md` — one file
-  per engine.
+  `crates/engine-cap/CLAUDE.md`, `crates/engine-postgis/CLAUDE.md`,
+  `crates/engine-nowcast/CLAUDE.md` — one file per engine.
 
 This root file holds only workspace-wide rules.
 
@@ -323,6 +323,7 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
 | ODIM PVOL | `EdrEngine` + `MapEngine` + `VolumeEngine` (per-site views) + `FeatureEngine` (network engine) | EDR (position, locations, area, trajectory), WMS, Maps, Tiles, 3D Tiles, Features (site inventory) |
 | QueryData | `EdrEngine` + `MapEngine` | EDR (position only), WMS, Maps, Tiles |
 | Zarr | `EdrEngine` + `MapEngine` | EDR (position), WMS, Maps, Tiles; local + S3/HTTP |
+| Nowcast | `MapEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated frames with future TIME values (EDR + instances = phase 2, #523) |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
 
 ## Config Format
@@ -389,6 +390,22 @@ style_bundle = "radar_multi"
 # NOT constrain the underlying engine.
 [collections.preview]
 time_window = "PT12H"
+
+# Derived nowcast collection (#519): motion-extrapolates another collection's
+# frames into the future. `source` must be a non-derived collection in the
+# same config with wms/maps/tiles enabled.
+[[collections]]
+id = "radar-nowcast"
+engine_type = "nowcast"
+apis = ["wms", "maps", "tiles"]
+
+[collections.nowcast]
+source = "radar"        # collection id to extrapolate
+horizon = "PT2H"        # how far into the future (default PT2H)
+# step = "PT5M"         # timestep spacing (default: source cadence)
+
+[collections.wms]
+colormap = "radar_dbz"
 ```
 
 See config struct definitions in each engine crate and `ds-core/src/config.rs`

@@ -520,6 +520,14 @@ async fn main() {
             poller.poll_loop().await;
         });
     }
+    // Nowcast generation loop — watches the source engine and regenerates
+    // extrapolated frames (blocking source I/O; background runtime only).
+    for engine in &result.nowcast_engines {
+        let poller = engine.clone();
+        poll_runtime().spawn(async move {
+            poller.poll_loop().await;
+        });
+    }
 
     // Set initial health gauges
     admin::update_health_gauges(&result.health);
@@ -600,6 +608,7 @@ async fn main() {
         odim_volume_engines: RwLock::new(result.odim_volume_engines),
         cap_engines: RwLock::new(result.cap_engines),
         postgis_engines: RwLock::new(result.postgis_engines),
+        nowcast_engines: RwLock::new(result.nowcast_engines),
         reload_lock: tokio::sync::Mutex::new(()),
         admin_token,
     });

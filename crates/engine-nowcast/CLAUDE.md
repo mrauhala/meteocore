@@ -1,0 +1,73 @@
+# engine-nowcast crate — Claude Instructions
+
+Radar nowcasting: motion-extrapolated frames from another collection's
+raster data, served with TIME values in the future (epic #519). Read the
+root `CLAUDE.md` first — Critical Rules 5–7 apply, and this engine is the
+reason `MapEngine::resolve_reference_time` exists (#521).
+
+## Architecture: a DERIVED collection
+
+- The engine wraps an `Arc<dyn MapEngine>` of its **source** collection
+  (`[collections.nowcast] source = "<id>"`). `server/src/admin.rs` wires it
+  in a **second pass** after all base engines exist; nowcast-of-nowcast is
+  rejected at load. The source must have at least one of wms/maps/tiles in
+  its `apis` (that's the registry the lookup snapshots).
+- Poll loop (background runtime, both boot and reload paths — #442 lesson)
+  watches the source's `raster_info().times`; each new latest frame triggers
+  a **generation**: fetch the last frames at the source's native cell count
+  on a regular WGS84 grid, estimate motion, advect the analysis frame
+  `horizon` far at `step` spacing (default: source cadence).
+- The algorithm modules (`motion`, `advect`, `skill`) are dependency-free
+  pure functions — keep them that way; the engine module owns all I/O and
+  state. `examples/skill_spike.rs` is the phase-0 hindcast harness
+  (extrapolation must beat persistence; see #520 for the gate results).
+
+## Cache-correctness contracts (do not weaken)
+
+- **Every generation is a model run** (`reference_time` = the source anchor
+  frame). `RasterInfo.reference_times` is populated and
+  `resolve_reference_time` is overridden — this is LOAD-BEARING: the no-TTL
+  rendered/meta caches key the run axis on it, and a nowcast rewrites all
+  future valid times every ~5 minutes (#521).
+- `resolve_time`, `resolve_reference_time`, and `get_raster_tile` share
+  `select_generation` + `select_time` (#507/#521 — one selection
+  implementation, cannot drift).
+
+## Rendering & storage
+
+- Internal frames live on a **regular WGS84 grid** (source native cell
+  count, halved to fit `max_pixels`, default 4 Mpx), so the output→source
+  map is affine; Projected output goes through `ProjectionGrid` +
+  `footprint_pixel_window` exactly like engine-zarr. Sampling is
+  nearest-neighbour (raw values; discrete radar palettes + PNG8 survive).
+- A `RasterValues::U8` source with a nodata byte stays raw bytes end to end
+  (1 B/px; `advect_u8` moves bytes); anything else falls back to f32
+  (4 B/px — the FMI S3 COG path lands here until #475-style typed paths).
+- Motion is estimated on a coarsened grid sized so the physical search
+  window (40 m/s × source interval) fits ~24 px, then the field is scaled
+  back — deliberate scale handling; do NOT rely on the pixel budget to do
+  this implicitly.
+
+## Memory sizing (retention multiplies!)
+
+Resident bytes ≈ `max_pixels × (leads + 1) × max_generations × bytes/px`
+(1 B/px for the U8 path, 4 B/px for the f32 fallback). At the defaults
+(4 Mpx, 24 leads, 6 generations) that is ~600 MB per U8 collection and
+~2.4 GB for an f32-fallback source — PVOL-max_files territory (#493).
+Until phase 2 (#523) makes deep retention useful (EDR `/instances`; today
+only an explicit `DIM_REFERENCE_TIME` pin reads old generations), set
+`max_generations = 2` in production configs. A generation-thinning
+follow-up (full frames only for the latest generation) is scoped in #523.
+
+## Gotchas
+
+- Advection is Lagrangian persistence: no growth/decay; 35+ dBZ convective
+  cores lose skill beyond ~1 h (phase-4 territory). Inflow boundaries
+  become nodata — never echo.
+- A TIME-less request resolves to `times.last()` = the FURTHEST forecast
+  (API-layer convention). Clients should send explicit TIME; /preview does.
+- `min_echo` is in the source's physical display units (dBZ for radar
+  composites). A unit-converted source (e.g. K) needs it overridden.
+- Config: `horizon` (default PT2H), `step` (default source cadence),
+  `history_frames` ≥ 2, `poll_interval_secs` (30), `max_generations` (6),
+  `max_pixels` (4 M), `min_echo` (10.0).
