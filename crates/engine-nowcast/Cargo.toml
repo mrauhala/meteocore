@@ -1,0 +1,14 @@
+[package]
+name = "engine-nowcast"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[dev-dependencies]
+# Phase-0 skill spike only (#520): the example loads fixture composites through
+# the public GeoTiffEngine — the same decode path phase 1 consumes via
+# Arc<dyn MapEngine>. The library itself stays dependency-free.
+ds-core = { path = "../core" }
+engine-geotiff = { path = "../engine-geotiff" }
+chrono = "0.4"

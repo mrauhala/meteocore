@@ -8,6 +8,7 @@ members = [
     "crates/engine-postgis",
     "crates/engine-querydata",
     "crates/engine-grib",
+    "crates/engine-nowcast",
     "crates/engine-odim",
     "crates/engine-cap",
     "crates/engine-zarr",
