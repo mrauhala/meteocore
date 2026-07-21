@@ -48,6 +48,17 @@ reason `MapEngine::resolve_reference_time` exists (#521).
   back — deliberate scale handling; do NOT rely on the pixel budget to do
   this implicitly.
 
+## Memory sizing (retention multiplies!)
+
+Resident bytes ≈ `max_pixels × (leads + 1) × max_generations × bytes/px`
+(1 B/px for the U8 path, 4 B/px for the f32 fallback). At the defaults
+(4 Mpx, 24 leads, 6 generations) that is ~600 MB per U8 collection and
+~2.4 GB for an f32-fallback source — PVOL-max_files territory (#493).
+Until phase 2 (#523) makes deep retention useful (EDR `/instances`; today
+only an explicit `DIM_REFERENCE_TIME` pin reads old generations), set
+`max_generations = 2` in production configs. A generation-thinning
+follow-up (full frames only for the latest generation) is scoped in #523.
+
 ## Gotchas
 
 - Advection is Lagrangian persistence: no growth/decay; 35+ dBZ convective
