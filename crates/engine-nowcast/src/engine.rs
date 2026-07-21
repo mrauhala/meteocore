@@ -361,10 +361,16 @@ impl NowcastEngine {
             source_info.times[n.saturating_sub(self.cfg.history_frames)..].to_vec();
         let prev_time = history[history.len() - 2];
         let interval = anchor - prev_time;
-        if interval <= Duration::zero() {
-            return Err(DataServerError::Engine(
-                "nowcast source times are not strictly ascending".into(),
-            ));
+        // Reject sub-second cadence too, not just non-ascending times:
+        // `num_seconds()` truncates, so a <1 s interval would evaluate to 0
+        // in the lead-interval division below — Infinity leads would explode
+        // `advect`'s substep count and wedge the poll runtime.
+        if interval < Duration::seconds(1) {
+            return Err(DataServerError::Engine(format!(
+                "nowcast source cadence must be at least 1 second and ascending \
+                 (got {} ms between {prev_time} and {anchor})",
+                interval.num_milliseconds()
+            )));
         }
 
         // Working grid: the source's native cell counts, halved until the
@@ -454,7 +460,10 @@ impl NowcastEngine {
         for i in 1..=k {
             let lead_time = anchor + step * (i as i32);
             let lead_intervals =
-                (step.num_seconds() as f64 * i as f64 / interval.num_seconds() as f64) as f32;
+                // `interval` ≥ 1 s is guaranteed by the cadence guard above;
+                // `.max(1)` keeps this division safe against future edits.
+                (step.num_seconds() as f64 * i as f64 / interval.num_seconds().max(1) as f64)
+                    as f32;
             let frame = match &frames[0] {
                 FrameData::U8 {
                     data,

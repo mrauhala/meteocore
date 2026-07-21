@@ -288,3 +288,17 @@ fn excessive_lead_count_is_rejected_at_construction() {
         "error should name the cap: {err}"
     );
 }
+
+/// Sub-second source cadence must fail the generation cleanly instead of
+/// producing Infinity lead intervals (which would explode advection's
+/// substep count and wedge the poll runtime).
+#[test]
+fn sub_second_cadence_fails_generation_cleanly() {
+    let t1 = t0() + Duration::milliseconds(500);
+    let (_source, engine) = build("PT1H", &[t0(), t1]);
+    engine.poll_once();
+    assert!(!engine.has_data(), "sub-second cadence must not generate");
+    let (generations, failures, ..) = engine.metrics();
+    assert_eq!(generations, 0);
+    assert_eq!(failures, 1, "the failure must be counted, not hidden");
+}
