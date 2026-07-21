@@ -214,6 +214,18 @@ pub async fn wms_handler(
             // the request falls through as `None` = the engine's own latest.
             let time = params.time.or_else(|| info.times.last().copied());
 
+            // Normalise an explicit pin of the *current* latest run to `None`
+            // BEFORE resolution, so it gets the same fallback-tolerant run
+            // selection as an omitted dimension: the common client flow
+            // echoes the GetCapabilities `default=` (the latest run) on
+            // every request — including animation frames OLDER than that
+            // run's reference time, which an exact pin would refuse (GRIB's
+            // cross-run fallback applies only to `None`). A pin of an
+            // *older* run stays explicit/exact — that is user intent.
+            let requested_run = params
+                .reference_time
+                .filter(|&rt| info.reference_times.last().copied() != Some(rt));
+
             // #521: resolve the run axis to the CONCRETE run the engine will
             // render — the run-axis mirror of what #508 does for TIME below.
             // The no-TTL caches keyed on `None` ("latest at render time")
@@ -224,10 +236,10 @@ pub async fn wms_handler(
             // Asking the ENGINE (rather than picking
             // `reference_times.last()` here) preserves engine-specific
             // selection such as GRIB's cross-run fallback — a valid time the
-            // newest mid-ingest run doesn't cover yet resolves to (and keys)
-            // the older run actually rendered. Engines without runs keep the
-            // identity default (`None` stays `None`).
-            let reference_time = engine.resolve_reference_time(time, params.reference_time);
+            // newest run doesn't cover resolves to (and keys) the older run
+            // actually rendered. Engines without runs keep the identity
+            // default (`None` stays `None`).
+            let reference_time = engine.resolve_reference_time(time, requested_run);
 
             // #507: snap that instant to the exact timestep the engine will
             // actually render, BEFORE any cache key is built. Engines that

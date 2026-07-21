@@ -1461,6 +1461,13 @@ fn build_forecast_router() -> (axum::Router, RunRecorder) {
     let engine: Arc<dyn MapEngine> = Arc::new(ForecastMockMapEngine {
         calls: calls.clone(),
     });
+    (build_forecast_router_with_engine(engine), calls)
+}
+
+/// Like [`build_forecast_router`] but with a caller-supplied engine, for
+/// exercising engine-specific run-resolution behaviours (e.g. the cross-run
+/// fallback shape).
+fn build_forecast_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     let mut styles_map = HashMap::new();
@@ -1518,7 +1525,7 @@ fn build_forecast_router() -> (axum::Router, RunRecorder) {
         base_url: String::new(),
         trust_proxy_headers: false,
     }));
-    (api_wms::router(state), calls)
+    api_wms::router(state)
 }
 
 const FC_GETMAP_URI: &str = "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=ecmwf-fc\
@@ -2353,4 +2360,123 @@ async fn legend_graphic_honours_explicit_size() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(png_dims(&body), (20, 120));
+}
+
+// ---------------------------------------------------------------------------
+// Explicit pin of the current latest run keeps fallback-tolerant resolution
+// ---------------------------------------------------------------------------
+
+/// Mock forecast engine simulating GRIB's cross-run fallback: an UNPINNED
+/// request resolves to the OLDER run (as if the requested valid time predates
+/// the newest run's reference time), while an explicit pin echoes exactly.
+/// Records the run each render was asked for.
+struct FallbackForecastMockMapEngine {
+    calls: RunRecorder,
+}
+
+impl MapEngine for FallbackForecastMockMapEngine {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+        reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        self.calls.lock().unwrap().push(reference_time);
+        let pixel_count = (width * height) as usize;
+        let values: Vec<Option<f64>> = (0..pixel_count)
+            .map(|i| Some(i as f64 / pixel_count as f64))
+            .collect();
+        Ok(RasterTile {
+            width,
+            height,
+            values: values.into(),
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            native_crs: "EPSG:4326".into(),
+            spatial_extent: Some([10.0, 55.0, 30.0, 70.0]),
+            times: vec!["2026-06-07T00:00:00Z".parse().unwrap()],
+            parameter: "2t".into(),
+            unit: "K".into(),
+            parameters: vec![],
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: forecast_runs().to_vec(),
+        }
+    }
+
+    fn resolve_reference_time(
+        &self,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        // GRIB-shaped: `None` falls back across runs (older run covers the
+        // valid time); an explicit pin is exact.
+        reference_time.or_else(|| forecast_runs().first().copied())
+    }
+}
+
+/// Regression (#526 review round 5): a client echoing the GetCapabilities
+/// `default=` (the current latest run) must keep the fallback-tolerant run
+/// resolution an omitted dimension gets — the explicit-latest pin is
+/// normalised to `None` BEFORE `resolve_reference_time`, so the engine may
+/// still fall back to an older covering run instead of refusing. A pin of an
+/// older run stays exact.
+#[tokio::test]
+async fn getmap_explicit_latest_pin_keeps_fallback_resolution() {
+    let calls: RunRecorder = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let engine: Arc<dyn MapEngine> = Arc::new(FallbackForecastMockMapEngine {
+        calls: calls.clone(),
+    });
+    let app = build_forecast_router_with_engine(engine);
+
+    // Echoing the latest run (forecast_runs()[1]) must resolve like an
+    // omitted dimension: the mock's fallback picks the OLDER run.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "{FC_GETMAP_URI}&DIM_REFERENCE_TIME=2026-06-07T12:00:00Z"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        calls.lock().unwrap().clone(),
+        vec![Some(forecast_runs()[0])],
+        "explicit-latest pin must keep the fallback resolution (older covering run)"
+    );
+
+    // An explicit pin of the OLDER run resolves to the same concrete run the
+    // fallback picked — so it must be a pure cache hit on the entry the
+    // first request created (both key `Some(older)`), not a re-render.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "{FC_GETMAP_URI}&DIM_REFERENCE_TIME=2026-06-07T00:00:00Z"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "older-run pin must share the cache entry keyed on the fallback-resolved run"
+    );
 }
