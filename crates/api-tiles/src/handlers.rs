@@ -1385,11 +1385,16 @@ async fn render_tile(
     // the redundant call.
     let raster_info = engine.raster_info();
     let time = validated.time.or_else(|| raster_info.times.last().copied());
+    // #521: pin the run axis to the engine's CURRENT latest run before the
+    // cache key is built (see api-maps for the full rationale — the no-TTL
+    // rendered cache keyed on `None` would keep serving the first-rendered
+    // run's pixels after a newer run re-covers the same valid times).
+    // Empty `reference_times` stays `None`.
+    let reference_time = raster_info.reference_times.last().copied();
     // #507: snap to the exact timestep the engine will render before the
     // cache key is built — a not-yet-ingested datetime must cache the
     // previous timestep's pixels under the PREVIOUS timestep's key.
-    // Tiles passes reference_time: None (latest run) throughout.
-    let time = engine.resolve_time(time, None);
+    let time = engine.resolve_time(time, reference_time);
 
     let tile_size = params::TILE_SIZE;
 
@@ -1444,9 +1449,9 @@ async fn render_tile(
         time,
         parameter: effective_parameter.clone(),
         z: validated.z.map(ds_render::quantize_z),
-        // Tiles `reference_time` query parameter is a follow-up (#337 Phase 4);
-        // the handler always queries the engine's latest run for now.
-        reference_time: None,
+        // The engine's latest run, pinned above (#521); a `reference_time`
+        // query parameter is a follow-up (#337 Phase 4).
+        reference_time,
     };
 
     let cache_control = cache_control_value(has_explicit_time);
@@ -1518,7 +1523,10 @@ async fn render_tile(
             &output_crs,
             render_parameter.as_deref(),
             render_z,
-            None,
+            // The run pinned before keying (#521): `Some(latest)` renders the
+            // same pixels as `None` by the engine contract, but survives a
+            // run swap mid-render without mixing runs in one response.
+            reference_time,
         )?;
 
         // If every pixel is nodata, skip colorization + encoding entirely.

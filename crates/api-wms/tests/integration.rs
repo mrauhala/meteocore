@@ -1626,7 +1626,7 @@ fn capabilities_omit_reference_time_dimension_for_non_forecast() {
 /// `GetMap` with no `DIM_REFERENCE_TIME` defaults to the latest run — the
 /// engine is called with `reference_time = None`.
 #[tokio::test]
-async fn getmap_default_reference_time_is_none() {
+async fn getmap_default_reference_time_resolves_to_latest_run() {
     let (app, calls) = build_forecast_router();
     let resp = app
         .oneshot(
@@ -1641,8 +1641,9 @@ async fn getmap_default_reference_time_is_none() {
     let recorded = calls.lock().unwrap().clone();
     assert_eq!(
         recorded,
-        vec![None],
-        "omitting DIM_REFERENCE_TIME must query the latest run (None)"
+        vec![Some(forecast_runs()[1])],
+        "omitting DIM_REFERENCE_TIME must pin the concrete latest run (#521): \
+         keying the no-TTL caches on None would freeze the first-rendered run"
     );
 }
 
@@ -1693,8 +1694,9 @@ async fn getmap_accepts_compact_instance_id_reference_time() {
 /// The Web Mercator (EPSG:3857) meta-tile render path propagates the pinned run
 /// in two independent places — `TileKeyPrefix.reference_time` and the
 /// `get_raster_tile` closure inside `render_metatiled` — neither of which the
-/// CRS:84 direct-path tests above exercise. Pin a non-latest run (so it isn't
-/// normalised to `None`) and assert every tile render saw it.
+/// CRS:84 direct-path tests above exercise. Pin a non-latest run (so the value
+/// is distinguishable from the default latest-run pin, #521) and assert every
+/// tile render saw it.
 #[tokio::test]
 async fn getmap_metatile_path_selects_pinned_reference_time() {
     let (app, calls) = build_forecast_router();
@@ -1724,12 +1726,13 @@ async fn getmap_metatile_path_selects_pinned_reference_time() {
     );
 }
 
-/// Explicitly pinning the *current latest* run is normalised to `None` so it
-/// shares cache entries (and the engine's latest-run path) with requests that
-/// omit the dimension — both render identical pixels. The engine therefore sees
-/// `None`, not `Some(latest)`.
+/// Explicitly pinning the *current latest* run and omitting the dimension must
+/// produce the same engine call (and therefore the same cache key): both pin
+/// the concrete latest run (#521). The old behaviour normalised explicit-latest
+/// to `None`, which unified the cache in the other direction — and froze the
+/// first-rendered run's pixels in the no-TTL caches when a newer run landed.
 #[tokio::test]
-async fn getmap_explicit_latest_run_normalizes_to_none() {
+async fn getmap_explicit_latest_run_shares_key_with_default() {
     let (app, calls) = build_forecast_router();
     let resp = app
         .oneshot(
@@ -1746,8 +1749,9 @@ async fn getmap_explicit_latest_run_normalizes_to_none() {
     let recorded = calls.lock().unwrap().clone();
     assert_eq!(
         recorded,
-        vec![None],
-        "pinning the current latest run must collapse to None (cache unified with no-dimension)"
+        vec![Some(forecast_runs()[1])],
+        "pinning the current latest run must produce the same concrete-run call \
+         as omitting the dimension"
     );
 }
 
@@ -1819,6 +1823,191 @@ async fn getmap_reference_time_against_non_forecast_layer_returns_400() {
     assert!(
         xml.contains("InvalidDimensionValue"),
         "reference_time on a non-forecast layer must be InvalidDimensionValue; got:\n{xml}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Run-less GetMap must track the engine's latest model run (#521)
+// ---------------------------------------------------------------------------
+
+/// Mock forecast engine whose run list can be advanced mid-test. Each render
+/// paints a value derived from the run it was asked for (falling back to the
+/// current latest), so a stale cached tile is detectable by whether the engine
+/// re-rendered at all.
+struct RunSwapMockMapEngine {
+    /// Ascending reference times; pushing simulates a new run (or nowcast
+    /// generation) superseding the latest.
+    runs: Arc<std::sync::RwLock<Vec<chrono::DateTime<chrono::Utc>>>>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl MapEngine for RunSwapMockMapEngine {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let idx = self.runs.read().unwrap().len().min(2);
+        let v = 0.2 + 0.3 * idx as f64;
+        Ok(RasterTile {
+            width,
+            height,
+            values: vec![Some(v); (width * height) as usize].into(),
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            native_crs: "EPSG:3857".into(),
+            spatial_extent: Some([-20.0, 30.0, 40.0, 80.0]),
+            times: vec!["2026-07-11T20:00:00Z".parse().unwrap()],
+            parameter: "reflectivity".into(),
+            unit: "dBZ".into(),
+            parameters: vec![],
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: self.runs.read().unwrap().clone(),
+        }
+    }
+}
+
+type RunSwapRouter = (
+    axum::Router,
+    Arc<std::sync::RwLock<Vec<chrono::DateTime<chrono::Utc>>>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+);
+
+fn build_run_swap_router(initial_runs: &[&str]) -> RunSwapRouter {
+    let runs = Arc::new(std::sync::RwLock::new(
+        initial_runs
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect::<Vec<chrono::DateTime<chrono::Utc>>>(),
+    ));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let engine: Arc<dyn MapEngine> = Arc::new(RunSwapMockMapEngine {
+        runs: runs.clone(),
+        calls: calls.clone(),
+    });
+    let mut engines = HashMap::new();
+    let mut collections = HashMap::new();
+    let mut styles_map = HashMap::new();
+
+    engines.insert("data".to_string(), engine);
+    collections.insert(
+        "data".to_string(),
+        CollectionConfig {
+            id: "data".to_string(),
+            title: "Data".to_string(),
+            description: "Run-swap fixture for the #521 stale-run regression".to_string(),
+            data_path: None,
+            apis: vec!["wms".to_string()],
+            engine_type: "grib".to_string(),
+            keywords: Vec::new(),
+            license: None,
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            zarr: None,
+            odim: None,
+            cap: None,
+            postgis: None,
+            preview: None,
+        },
+    );
+    let cmap = Arc::new(LutColorMap::from_builtin(
+        BuiltinColormap::Viridis,
+        0.0,
+        1.0,
+    ));
+    let mut layer_styles = HashMap::new();
+    layer_styles.insert(
+        "default".to_string(),
+        StyleInfo {
+            name: "default".to_string(),
+            title: "Default".to_string(),
+            colormap: cmap,
+            min: 0.0,
+            max: 1.0,
+            parameter: None,
+        },
+    );
+    styles_map.insert("data".to_string(), layer_styles);
+
+    let tile_cache = Arc::new(ds_render::TilePixelCache::new(64));
+    let state = Arc::new(ArcSwap::from_pointee(WmsState {
+        engines,
+        collections,
+        styles: styles_map,
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        tile_cache,
+        base_url: String::new(),
+        trust_proxy_headers: false,
+    }));
+    (api_wms::router(state), runs, calls)
+}
+
+/// The #521 stale-run replay: a request that omits `DIM_REFERENCE_TIME` must
+/// key the no-TTL rendered/meta-tile caches on the CONCRETE latest run, so
+/// that when a newer run supersedes it (a new nowcast generation every ~5 min,
+/// a new NWP run every few hours) the same request re-renders fresh pixels.
+/// Keyed as `None`, step 3 would serve the run-1 tiles as cache hits forever.
+#[tokio::test]
+async fn run_less_getmap_re_renders_when_a_new_run_lands() {
+    const RUN1: &str = "2026-07-11T12:00:00Z";
+    const RUN2: &str = "2026-07-11T18:00:00Z";
+    const BBOX: &str = "2000000,8000000,3000000,9000000";
+    let (app, runs, calls) = build_run_swap_router(&[RUN1]);
+
+    // 1. Cold request (no DIM_REFERENCE_TIME): renders run 1's pixels.
+    assert_eq!(
+        get_map_time(&app, BBOX, "2026-07-11T20:00:00Z").await,
+        StatusCode::OK
+    );
+    let calls_cold = calls.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(calls_cold > 0, "cold request renders tiles");
+
+    // 2. Same request again: pure cache hit under the concrete run-1 key.
+    assert_eq!(
+        get_map_time(&app, BBOX, "2026-07-11T20:00:00Z").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        calls_cold,
+        "repeat request under the same latest run must be a pure cache hit"
+    );
+
+    // 3. A new run supersedes the latest, re-covering the same valid time
+    //    with different pixels.
+    runs.write().unwrap().push(RUN2.parse().unwrap());
+
+    // 4. The same run-less request must re-render every tile fresh — the
+    //    pre-#521 behaviour (key `reference_time: None`) served run 1's
+    //    cached tiles here.
+    assert_eq!(
+        get_map_time(&app, BBOX, "2026-07-11T20:00:00Z").await,
+        StatusCode::OK
+    );
+    let calls_after = calls.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        calls_after - calls_cold,
+        calls_cold,
+        "after a new run lands, the run-less request must miss every stale \
+         run-1 tile and render fresh (got {} fresh renders, expected {})",
+        calls_after - calls_cold,
+        calls_cold
     );
 }
 

@@ -1010,11 +1010,18 @@ async fn render_map(
     // engines that materialise `RasterInfo` lazily.
     let raster_info = engine.raster_info();
     let time = validated.time.or_else(|| raster_info.times.last().copied());
+    // #521: pin the run axis to the engine's CURRENT latest run before the
+    // cache key is built. The Maps `reference_time` query parameter is still
+    // a follow-up (#337 Phase 4) — the handler always renders the latest run
+    // — but the no-TTL rendered cache must key on the concrete run stamp:
+    // keyed as `None`, the first-rendered run's pixels would keep serving
+    // after a newer run re-covers the same valid times (acute for nowcast
+    // generations, latent for NWP). Empty `reference_times` stays `None`.
+    let reference_time = raster_info.reference_times.last().copied();
     // #507: snap to the exact timestep the engine will render before the
     // cache key is built — a not-yet-ingested datetime must cache the
     // previous timestep's pixels under the PREVIOUS timestep's key.
-    // Maps passes reference_time: None (latest run) throughout.
-    let time = engine.resolve_time(time, None);
+    let time = engine.resolve_time(time, reference_time);
 
     // Parameter selection precedence: ?parameter-name= wins over style.parameter.
     // Validate against the engine's advertised list when the query supplied one
@@ -1084,9 +1091,9 @@ async fn render_map(
         time,
         parameter: effective_parameter.clone(),
         z: validated.z.map(ds_render::quantize_z),
-        // Maps `reference_time` query parameter is a follow-up (#337 Phase 4);
-        // the handler always queries the engine's latest run for now.
-        reference_time: None,
+        // The engine's latest run, pinned above (#521); a `reference_time`
+        // query parameter is a follow-up (#337 Phase 4).
+        reference_time,
     };
 
     let cache_control = cache_control_value(has_explicit_time);
@@ -1160,7 +1167,10 @@ async fn render_map(
             &output_crs,
             render_parameter.as_deref(),
             render_z,
-            None,
+            // The run pinned before keying (#521): `Some(latest)` renders the
+            // same pixels as `None` by the engine contract, but survives a
+            // run swap mid-render without mixing runs in one response.
+            reference_time,
         )?;
         // If every pixel is nodata, skip colorization + encoding entirely.
         if tile.is_empty() {
