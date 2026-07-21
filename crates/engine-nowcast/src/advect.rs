@@ -11,59 +11,111 @@
 use crate::motion::MotionField;
 use crate::Grid;
 
-/// Walk every output pixel's backward trajectory and hand the caller the
-/// source-pixel index it departs from (`None` when the trajectory leaves the
-/// domain). Shared core for the `f32` and raw-`u8` advection variants so
-/// their trajectory math cannot drift apart.
-fn for_each_departure(
+/// Incrementally extended backward trajectories — one per output pixel.
+///
+/// A generation advects the same analysis frame to a *schedule* of leads.
+/// Re-integrating each lead's trajectory from scratch costs
+/// `Σ leadᵢ·substeps·pixels` — quadratic in the lead count (67 s per prod
+/// generation at 2.27 Mpx × 24 leads, #528). Extending the stored departure
+/// points by one lead-delta at a time walks the SAME piecewise trajectory
+/// (identical step density and step sequence when the schedule is uniform)
+/// in `Σ substeps·pixels` — linear.
+///
+/// Departure points keep integrating even outside the domain (the motion
+/// field's edge-clamped sample keeps them moving) exactly like the one-shot
+/// integration did; bounds are only checked when sampling a frame.
+pub struct TrajectoryIntegrator<'a> {
+    field: &'a MotionField,
     width: usize,
     height: usize,
-    field: &MotionField,
-    lead: f32,
-    substeps: usize,
-    mut emit: impl FnMut(usize, Option<usize>),
-) {
-    let steps = ((lead * substeps.max(1) as f32).ceil() as usize).max(1);
-    let h = lead / steps as f32;
-    for y in 0..height {
-        for x in 0..width {
-            let mut px = x as f32 + 0.5;
-            let mut py = y as f32 + 0.5;
-            for _ in 0..steps {
-                let (u, v) = field.sample(px, py);
-                px -= u * h;
-                py -= v * h;
+    /// Current departure position of each output pixel's trajectory.
+    px: Vec<f32>,
+    py: Vec<f32>,
+}
+
+impl<'a> TrajectoryIntegrator<'a> {
+    /// Trajectories at lead 0: every pixel departs from its own centre.
+    pub fn new(width: usize, height: usize, field: &'a MotionField) -> Self {
+        let mut px = Vec::with_capacity(width * height);
+        let mut py = Vec::with_capacity(width * height);
+        for y in 0..height {
+            for x in 0..width {
+                px.push(x as f32 + 0.5);
+                py.push(y as f32 + 0.5);
             }
-            let src = if px < 0.0 || py < 0.0 || px >= width as f32 || py >= height as f32 {
-                None // departure outside the domain: inflow boundary
-            } else {
-                Some(py as usize * width + px as usize)
-            };
-            emit(y * width + x, src);
         }
+        Self {
+            field,
+            width,
+            height,
+            px,
+            py,
+        }
+    }
+
+    /// Extend every trajectory backward by `delta` frame intervals, in
+    /// `ceil(delta × substeps)` integration steps (≥ 1).
+    pub fn advance(&mut self, delta: f32, substeps: usize) {
+        let steps = ((delta * substeps.max(1) as f32).ceil() as usize).max(1);
+        let h = delta / steps as f32;
+        for (px, py) in self.px.iter_mut().zip(self.py.iter_mut()) {
+            for _ in 0..steps {
+                let (u, v) = self.field.sample(*px, *py);
+                *px -= u * h;
+                *py -= v * h;
+            }
+        }
+    }
+
+    /// Source-pixel index each trajectory currently departs from; `None`
+    /// outside the domain (inflow boundary).
+    #[inline]
+    fn source_index(&self, i: usize) -> Option<usize> {
+        let (px, py) = (self.px[i], self.py[i]);
+        if px < 0.0 || py < 0.0 || px >= self.width as f32 || py >= self.height as f32 {
+            None
+        } else {
+            Some(py as usize * self.width + px as usize)
+        }
+    }
+
+    /// Sample `frame` (f32, NaN nodata) at the current departure points.
+    pub fn sample(&self, frame: &Grid) -> Grid {
+        assert_eq!((frame.width, frame.height), (self.width, self.height));
+        let mut out = Grid::filled_nodata(self.width, self.height);
+        for (i, cell) in out.data.iter_mut().enumerate() {
+            if let Some(src) = self.source_index(i) {
+                *cell = frame.data[src];
+            }
+        }
+        out
+    }
+
+    /// Sample a raw-`u8` frame at the current departure points; inflow
+    /// pixels get the `nodata` byte.
+    pub fn sample_u8(&self, frame: &[u8], nodata: u8) -> Vec<u8> {
+        assert_eq!(frame.len(), self.width * self.height);
+        let mut out = vec![nodata; frame.len()];
+        for (i, cell) in out.iter_mut().enumerate() {
+            if let Some(src) = self.source_index(i) {
+                *cell = frame[src];
+            }
+        }
+        out
     }
 }
 
-/// Extrapolate `frame` forward by `lead` frame intervals.
+/// Extrapolate `frame` forward by `lead` frame intervals (one-shot form —
+/// a single-lead wrapper over [`TrajectoryIntegrator`], so the one-shot and
+/// incremental paths share the same integration core and cannot drift).
 ///
 /// `substeps` is the number of trajectory-integration steps per interval;
 /// values around 4 track spatially varying fields well. `lead` may be
 /// fractional.
 pub fn advect(frame: &Grid, field: &MotionField, lead: f32, substeps: usize) -> Grid {
-    let mut out = Grid::filled_nodata(frame.width, frame.height);
-    for_each_departure(
-        frame.width,
-        frame.height,
-        field,
-        lead,
-        substeps,
-        |dst, src| {
-            if let Some(src) = src {
-                out.data[dst] = frame.data[src];
-            }
-        },
-    );
-    out
+    let mut integrator = TrajectoryIntegrator::new(frame.width, frame.height, field);
+    integrator.advance(lead, substeps);
+    integrator.sample(frame)
 }
 
 /// Raw-byte advection: extrapolate an 8-bit frame without decoding it, so a
@@ -79,13 +131,9 @@ pub fn advect_u8(
     substeps: usize,
 ) -> Vec<u8> {
     assert_eq!(frame.len(), width * height, "frame length must be w*h");
-    let mut out = vec![nodata; frame.len()];
-    for_each_departure(width, height, field, lead, substeps, |dst, src| {
-        if let Some(src) = src {
-            out[dst] = frame[src];
-        }
-    });
-    out
+    let mut integrator = TrajectoryIntegrator::new(width, height, field);
+    integrator.advance(lead, substeps);
+    integrator.sample_u8(frame, nodata)
 }
 
 #[cfg(test)]
@@ -146,8 +194,34 @@ mod tests {
         );
     }
 
+    /// The incremental path must walk the exact trajectory the one-shot path
+    /// does: N advances of one interval == one advance of N intervals, down
+    /// to the bit (same step size, same step sequence). This is what makes
+    /// the O(leads) generation loop (#528) safe to substitute for per-lead
+    /// from-scratch integration.
+    #[test]
+    fn incremental_advances_match_one_shot_bitwise() {
+        let t0 = disc_frame(160, 120, 60.0, 60.0, 11.0, 40.0);
+        let t1 = disc_frame(160, 120, 66.0, 56.0, 11.0, 40.0);
+        let field = estimate_motion(&t0, &t1, &MotionOptions::default());
+
+        let one_shot = advect(&t1, &field, 3.0, 4);
+        let mut integrator = TrajectoryIntegrator::new(160, 120, &field);
+        for _ in 0..3 {
+            integrator.advance(1.0, 4);
+        }
+        let incremental = integrator.sample(&t1);
+        for (a, b) in one_shot.data.iter().zip(&incremental.data) {
+            assert!(
+                (a.is_nan() && b.is_nan()) || a == b,
+                "incremental and one-shot advection diverged: {a} vs {b}"
+            );
+        }
+    }
+
     /// The raw-u8 path must move exactly the same source pixels as the f32
-    /// path — they share `for_each_departure`, and this pins that contract.
+    /// path — they share the `TrajectoryIntegrator` core, pinning that
+    /// contract.
     #[test]
     fn advect_u8_matches_f32_path_pixel_for_pixel() {
         let t0 = disc_frame(120, 90, 50.0, 40.0, 9.0, 40.0);
