@@ -2108,6 +2108,31 @@ impl ServerConfig {
                 }
             }
 
+            // Nowcast engine requires nowcast config section (and vice versa).
+            if collection.engine_type == "nowcast" && collection.nowcast.is_none() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': engine_type 'nowcast' requires a [collections.nowcast] config section"
+                )));
+            }
+            if collection.nowcast.is_some() && collection.engine_type != "nowcast" {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': [collections.nowcast] is set but engine_type is '{}'",
+                    collection.engine_type
+                )));
+            }
+            if let Some(nowcast) = &collection.nowcast {
+                if nowcast.source.trim().is_empty() {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': [collections.nowcast].source must be a collection id"
+                    )));
+                }
+                if nowcast.source == collection.id {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': nowcast source cannot be the collection itself"
+                    )));
+                }
+            }
+
             // Zarr engine requires zarr config section.
             if collection.engine_type == "zarr" && collection.zarr.is_none() {
                 return Err(crate::error::DataServerError::Config(format!(
@@ -2778,6 +2803,30 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         assert!(dotdot.validate().is_err());
         // A normal relative sub-path is fine.
         let ok = zarr_collection("data_path = \"x\"\npath = \"sub/data.zarr\"\n");
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_nowcast_config_pairing() {
+        // engine_type nowcast requires the section…
+        let missing = collection_with("engine_type = \"nowcast\"\n");
+        assert!(missing.validate().is_err());
+        // …and the section requires the engine type.
+        let mismatched = collection_with(
+            "engine_type = \"csv\"\ndata_path = \"x.csv\"\n[collections.nowcast]\nsource = \"radar\"\n",
+        );
+        assert!(mismatched.validate().is_err());
+        // Self-referential and empty sources are rejected.
+        let self_ref =
+            collection_with("engine_type = \"nowcast\"\n[collections.nowcast]\nsource = \"c\"\n");
+        assert!(self_ref.validate().is_err());
+        let empty =
+            collection_with("engine_type = \"nowcast\"\n[collections.nowcast]\nsource = \" \"\n");
+        assert!(empty.validate().is_err());
+        // A well-formed pair passes.
+        let ok = collection_with(
+            "engine_type = \"nowcast\"\n[collections.nowcast]\nsource = \"radar\"\n",
+        );
         assert!(ok.validate().is_ok());
     }
 

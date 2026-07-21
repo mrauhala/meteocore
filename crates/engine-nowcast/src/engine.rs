@@ -396,8 +396,11 @@ impl NowcastEngine {
         };
 
         // Fetch the anchor + previous frame on the working grid.
-        let prev = self.fetch_frame(&geom, prev_time)?;
-        let analysis = self.fetch_frame(&geom, anchor)?;
+        // Resolve the source's current run ONCE and pin both fetches to it
+        // (see fetch_frame). `None` for non-forecast sources.
+        let source_run = self.source.resolve_reference_time(Some(anchor), None);
+        let prev = self.fetch_frame(&geom, prev_time, source_run)?;
+        let analysis = self.fetch_frame(&geom, anchor, source_run)?;
         let prev_f32 = frame_to_grid(&prev, w as usize, h as usize);
         let analysis_f32 = frame_to_grid(&analysis, w as usize, h as usize);
 
@@ -513,6 +516,7 @@ impl NowcastEngine {
         &self,
         geom: &GridGeom,
         time: DateTime<Utc>,
+        source_run: Option<DateTime<Utc>>,
     ) -> Result<FrameData, DataServerError> {
         let tile = self.source.get_raster_tile(
             [geom.west, geom.south, geom.east, geom.north],
@@ -522,7 +526,12 @@ impl NowcastEngine {
             &OutputCrs::Wgs84,
             None,
             None,
-            None,
+            // Both frames of a generation pin the SAME source run: if the
+            // source is itself a forecast engine, a run rollover landing
+            // between the two fetches must fail the generation (retried next
+            // poll) rather than silently mix runs into the motion estimate.
+            // Non-forecast sources resolve this to `None` — no change.
+            source_run,
         )?;
         if (tile.width, tile.height) != (geom.width, geom.height) {
             return Err(DataServerError::Engine(format!(
@@ -681,7 +690,9 @@ impl MapEngine for NowcastEngine {
         let generation =
             Self::select_generation(&state, reference_time).ok_or_else(
                 || match reference_time {
-                    Some(rt) => DataServerError::Engine(format!(
+                    // A syntactically valid run the engine no longer retains
+                    // maps to HTTP 404 — the GRIB/QueryData convention.
+                    Some(rt) => DataServerError::ReferenceTimeNotFound(format!(
                         "nowcast generation {rt} is no longer retained"
                     )),
                     None => DataServerError::Engine("nowcast has no generations yet".into()),

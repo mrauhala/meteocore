@@ -261,6 +261,30 @@ fn new_source_frame_rolls_a_new_generation() {
         engine.resolve_time(None, Some(anchor1)),
         Some(anchor1 + Duration::minutes(30))
     );
+
+    // An unretained pin is the 404 shape (ReferenceTimeNotFound), matching
+    // the GRIB/QueryData convention — not a generic engine error.
+    let gone = anchor1 - Duration::hours(6);
+    let err = match engine.get_raster_tile(
+        EXTENT,
+        W,
+        H,
+        None,
+        &OutputCrs::Wgs84,
+        None,
+        None,
+        Some(gone),
+    ) {
+        Err(e) => e,
+        Ok(_) => panic!("unretained generation must error"),
+    };
+    assert!(
+        matches!(
+            err,
+            ds_core::error::DataServerError::ReferenceTimeNotFound(_)
+        ),
+        "expected ReferenceTimeNotFound, got: {err}"
+    );
 }
 
 /// No silent caps: a horizon/step pair exceeding the per-generation lead cap
