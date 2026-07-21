@@ -376,9 +376,15 @@ impl NowcastEngine {
         // Working grid: the source's native cell counts, halved until the
         // pixel budget fits (FMI's 250 m composite lands at ~1 km here).
         let [mut w, mut h] = source_info.grid_size.unwrap_or([1024, 1024]);
-        while (w as usize) * (h as usize) > self.cfg.max_pixels && w > 64 && h > 64 {
-            w /= 2;
-            h /= 2;
+        // Halve the larger axis until the budget fits — guaranteed to
+        // terminate and to hold for any aspect ratio (a per-axis floor
+        // instead would let an elongated grid blow past the budget).
+        while (w as usize) * (h as usize) > self.cfg.max_pixels && w.max(h) > 1 {
+            if w >= h {
+                w = (w / 2).max(1);
+            } else {
+                h = (h / 2).max(1);
+            }
         }
         let geom = GridGeom {
             west: extent[0],
