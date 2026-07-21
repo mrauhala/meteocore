@@ -838,11 +838,11 @@ impl GribEngine {
 /// clones the matched file for the read path) and the resolve-only callers
 /// (`resolve_time` / `resolve_reference_time`, which need scalars and must
 /// not pay the `StepFile` clone on every request) share.
-fn select_run_step<'c>(
-    catalog: &'c Catalog,
+fn select_run_step(
+    catalog: &Catalog,
     reference_time: Option<DateTime<Utc>>,
     datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
-) -> Result<(&'c ForecastRun, u32, &'c StepFile), DataServerError> {
+) -> Result<(&ForecastRun, u32, &StepFile), DataServerError> {
     // Run selection is shared with `query_position` (see `resolve_run`); this
     // path additionally narrows to a single step.
     let run = resolve_run(catalog, reference_time, datetime)?;
