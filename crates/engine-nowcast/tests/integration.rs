@@ -262,3 +262,29 @@ fn new_source_frame_rolls_a_new_generation() {
         Some(anchor1 + Duration::minutes(30))
     );
 }
+
+/// No silent caps: a horizon/step pair exceeding the per-generation lead cap
+/// is a config error at construction, not a silently shortened horizon.
+#[test]
+fn excessive_lead_count_is_rejected_at_construction() {
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0()]),
+    });
+    let config = NowcastConfig {
+        source: "mock".into(),
+        horizon: "PT2H".into(),
+        step: Some("PT1M".into()), // 120 leads > cap
+        history_frames: 2,
+        poll_interval_secs: 30,
+        max_generations: 4,
+        max_pixels: 4_000_000,
+        min_echo: 10.0,
+    };
+    let err = NowcastEngine::new("mock-nowcast", "mock", source, &config)
+        .err()
+        .expect("must reject a lead count over the cap");
+    assert!(
+        err.to_string().contains("exceeds the cap"),
+        "error should name the cap: {err}"
+    );
+}

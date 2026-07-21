@@ -147,6 +147,9 @@ pub struct NowcastEngine {
     /// Seconds between the source anchor frame and the wall clock at the end
     /// of the last generation (how far the nowcast lags reality).
     source_lag_secs: AtomicU64,
+    /// One-shot latch for the lead-cap warning (source-cadence default step
+    /// only; an explicit step is validated at construction).
+    lead_cap_warned: std::sync::atomic::AtomicBool,
 }
 
 impl NowcastEngine {
@@ -171,6 +174,18 @@ impl NowcastEngine {
                     return Err(DataServerError::Config(
                         "nowcast step must be positive".into(),
                     ));
+                }
+                // Fail fast on a horizon/step pair the per-generation lead
+                // cap would silently truncate (root rule: no silent caps).
+                // With `step = None` the cadence is unknown until data
+                // arrives; that case warns at generation time instead.
+                let step_secs = d.num_seconds().max(1);
+                let leads = (horizon.num_seconds() + step_secs - 1) / step_secs;
+                if leads > MAX_LEADS as i64 {
+                    return Err(DataServerError::Config(format!(
+                        "nowcast horizon/step = {leads} lead frames exceeds the cap of \
+                         {MAX_LEADS}; increase step or shorten horizon"
+                    )));
                 }
                 Some(d)
             }
@@ -206,6 +221,7 @@ impl NowcastEngine {
             generation_failures_total: AtomicU64::new(0),
             last_generation_ms: AtomicU64::new(0),
             source_lag_secs: AtomicU64::new(0),
+            lead_cap_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -411,11 +427,25 @@ impl NowcastEngine {
             estimate_motion(&prev_f32, &analysis_f32, &opts)
         };
 
-        // Lead schedule.
+        // Lead schedule. An explicit step was validated against MAX_LEADS at
+        // construction; the source-cadence default can still exceed it (a
+        // fast-cadence source under a long horizon), so make the truncation
+        // visible instead of silent (root rule: no silent caps). Warned once
+        // per engine — the same clamp would otherwise log every generation.
         let step = self.cfg.step.unwrap_or(interval);
-        let k = ((self.cfg.horizon.num_seconds() as f64 / step.num_seconds().max(1) as f64).ceil()
-            as usize)
-            .clamp(1, MAX_LEADS);
+        let wanted = ((self.cfg.horizon.num_seconds() as f64 / step.num_seconds().max(1) as f64)
+            .ceil() as usize)
+            .max(1);
+        let k = wanted.min(MAX_LEADS);
+        if wanted > MAX_LEADS && !self.lead_cap_warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "[{}] nowcast horizon needs {wanted} lead frames at the source cadence but \
+                 the cap is {MAX_LEADS}: serving only {} of the configured horizon — set an \
+                 explicit larger `step` or shorten `horizon`",
+                self.collection_id,
+                format_args!("{}s", step.num_seconds() * MAX_LEADS as i64),
+            );
+        }
 
         let mut times = Vec::with_capacity(k + 1);
         let mut frames = Vec::with_capacity(k + 1);
