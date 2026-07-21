@@ -392,6 +392,7 @@ fn mk_collection(
         cap: None,
         wms: None,
         postgis: None,
+        nowcast: None,
         preview: None,
     }
 }

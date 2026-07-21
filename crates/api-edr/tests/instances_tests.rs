@@ -217,6 +217,7 @@ fn config(id: &str, engine_type: &str) -> CollectionConfig {
         odim: None,
         cap: None,
         postgis: None,
+        nowcast: None,
         preview: None,
     }
 }

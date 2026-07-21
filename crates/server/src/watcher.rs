@@ -262,6 +262,7 @@ mod tests {
             odim_volume_engines: RwLock::new(result.odim_volume_engines),
             cap_engines: RwLock::new(result.cap_engines),
             postgis_engines: RwLock::new(result.postgis_engines),
+            nowcast_engines: RwLock::new(result.nowcast_engines),
             reload_lock: tokio::sync::Mutex::new(()),
             admin_token: None,
         })

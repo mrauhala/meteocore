@@ -19,6 +19,7 @@ engine-zarr = { path = "../engine-zarr" }
 engine-odim = { path = "../engine-odim" }
 engine-cap = { path = "../engine-cap" }
 engine-postgis = { path = "../engine-postgis" }
+engine-nowcast = { path = "../engine-nowcast" }
 api-edr = { path = "../api-edr" }
 api-features = { path = "../api-features" }
 api-wms = { path = "../api-wms" }

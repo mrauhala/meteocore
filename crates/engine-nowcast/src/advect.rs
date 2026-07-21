@@ -11,17 +11,22 @@
 use crate::motion::MotionField;
 use crate::Grid;
 
-/// Extrapolate `frame` forward by `lead` frame intervals.
-///
-/// `substeps` is the number of trajectory-integration steps per interval;
-/// values around 4 track spatially varying fields well. `lead` may be
-/// fractional.
-pub fn advect(frame: &Grid, field: &MotionField, lead: f32, substeps: usize) -> Grid {
+/// Walk every output pixel's backward trajectory and hand the caller the
+/// source-pixel index it departs from (`None` when the trajectory leaves the
+/// domain). Shared core for the `f32` and raw-`u8` advection variants so
+/// their trajectory math cannot drift apart.
+fn for_each_departure(
+    width: usize,
+    height: usize,
+    field: &MotionField,
+    lead: f32,
+    substeps: usize,
+    mut emit: impl FnMut(usize, Option<usize>),
+) {
     let steps = ((lead * substeps.max(1) as f32).ceil() as usize).max(1);
     let h = lead / steps as f32;
-    let mut out = Grid::filled_nodata(frame.width, frame.height);
-    for y in 0..frame.height {
-        for x in 0..frame.width {
+    for y in 0..height {
+        for x in 0..width {
             let mut px = x as f32 + 0.5;
             let mut py = y as f32 + 0.5;
             for _ in 0..steps {
@@ -29,12 +34,57 @@ pub fn advect(frame: &Grid, field: &MotionField, lead: f32, substeps: usize) -> 
                 px -= u * h;
                 py -= v * h;
             }
-            if px < 0.0 || py < 0.0 || px >= frame.width as f32 || py >= frame.height as f32 {
-                continue; // departure outside the domain: stays nodata
-            }
-            out.data[y * frame.width + x] = frame.at(px as usize, py as usize);
+            let src = if px < 0.0 || py < 0.0 || px >= width as f32 || py >= height as f32 {
+                None // departure outside the domain: inflow boundary
+            } else {
+                Some(py as usize * width + px as usize)
+            };
+            emit(y * width + x, src);
         }
     }
+}
+
+/// Extrapolate `frame` forward by `lead` frame intervals.
+///
+/// `substeps` is the number of trajectory-integration steps per interval;
+/// values around 4 track spatially varying fields well. `lead` may be
+/// fractional.
+pub fn advect(frame: &Grid, field: &MotionField, lead: f32, substeps: usize) -> Grid {
+    let mut out = Grid::filled_nodata(frame.width, frame.height);
+    for_each_departure(
+        frame.width,
+        frame.height,
+        field,
+        lead,
+        substeps,
+        |dst, src| {
+            if let Some(src) = src {
+                out.data[dst] = frame.data[src];
+            }
+        },
+    );
+    out
+}
+
+/// Raw-byte advection: extrapolate an 8-bit frame without decoding it, so a
+/// `RasterValues::U8`-shaped source stays 1 byte/pixel end to end. Inflow
+/// pixels get the `nodata` byte.
+pub fn advect_u8(
+    frame: &[u8],
+    width: usize,
+    height: usize,
+    nodata: u8,
+    field: &MotionField,
+    lead: f32,
+    substeps: usize,
+) -> Vec<u8> {
+    assert_eq!(frame.len(), width * height, "frame length must be w*h");
+    let mut out = vec![nodata; frame.len()];
+    for_each_departure(width, height, field, lead, substeps, |dst, src| {
+        if let Some(src) = src {
+            out[dst] = frame[src];
+        }
+    });
     out
 }
 
@@ -94,6 +144,30 @@ mod tests {
             nowcast > 0.9,
             "nowcast CSI {nowcast} should be near-perfect"
         );
+    }
+
+    /// The raw-u8 path must move exactly the same source pixels as the f32
+    /// path — they share `for_each_departure`, and this pins that contract.
+    #[test]
+    fn advect_u8_matches_f32_path_pixel_for_pixel() {
+        let t0 = disc_frame(120, 90, 50.0, 40.0, 9.0, 40.0);
+        let t1 = disc_frame(120, 90, 56.0, 36.0, 9.0, 40.0);
+        let field = estimate_motion(&t0, &t1, &MotionOptions::default());
+
+        // Encode t1 as raw u8: value 40.0 → raw 80 (gain 0.5), background 0,
+        // nodata byte 255.
+        let raw: Vec<u8> = t1
+            .data
+            .iter()
+            .map(|v| if v.is_nan() { 255 } else { (v * 2.0) as u8 })
+            .collect();
+
+        let f32_out = advect(&t1, &field, 1.0, 4);
+        let u8_out = advect_u8(&raw, 120, 90, 255, &field, 1.0, 4);
+        for (a, b) in f32_out.data.iter().zip(&u8_out) {
+            let expected = if a.is_nan() { 255 } else { (a * 2.0) as u8 };
+            assert_eq!(expected, *b, "u8 and f32 advection diverged");
+        }
     }
 
     #[test]

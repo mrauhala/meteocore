@@ -93,6 +93,7 @@ fn build_empty_router() -> axum::Router {
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -268,6 +269,7 @@ fn build_failing_router() -> axum::Router {
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -416,6 +418,7 @@ fn build_populated_router() -> axum::Router {
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -781,6 +784,7 @@ fn build_counting_router(
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -956,6 +960,7 @@ fn build_snapping_router(initial_times: &[&str]) -> SnappingRouter {
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -1206,6 +1211,7 @@ fn site_collection_config(id: &str) -> CollectionConfig {
         odim: None,
         cap: None,
         postgis: None,
+        nowcast: None,
         preview: None,
     }
 }
@@ -1341,6 +1347,7 @@ fn capabilities_single_param_layer_emits_keywords_and_attribution() {
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -1492,6 +1499,7 @@ fn build_forecast_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -1565,6 +1573,7 @@ fn capabilities_emit_reference_time_dimension_for_forecast() {
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -1627,6 +1636,7 @@ fn capabilities_omit_reference_time_dimension_for_non_forecast() {
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -1949,6 +1959,7 @@ fn build_run_swap_router(initial_runs: &[&str]) -> RunSwapRouter {
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );
@@ -2131,6 +2142,7 @@ fn build_advancing_router() -> AdvancingFixture {
             odim: None,
             cap: None,
             postgis: None,
+            nowcast: None,
             preview: None,
         },
     );

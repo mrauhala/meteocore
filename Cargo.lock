@@ -1196,9 +1196,12 @@ dependencies = [
 name = "engine-nowcast"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "chrono",
  "ds-core",
  "engine-geotiff",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4063,6 +4066,7 @@ dependencies = [
  "engine-geojson",
  "engine-geotiff",
  "engine-grib",
+ "engine-nowcast",
  "engine-odim",
  "engine-postgis",
  "engine-querydata",

@@ -4,11 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# The algorithm modules (motion/advect/skill) are dependency-free pure
+# functions; these dependencies serve only the engine module (#522).
+ds-core = { path = "../core" }
+chrono = "0.4"
+arc-swap = "1"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tracing = "0.1"
 
 [dev-dependencies]
-# Phase-0 skill spike only (#520): the example loads fixture composites through
-# the public GeoTiffEngine — the same decode path phase 1 consumes via
-# Arc<dyn MapEngine>. The library itself stays dependency-free.
-ds-core = { path = "../core" }
+# Phase-0 skill spike (#520): the example loads fixture composites through
+# the public GeoTiffEngine — the same decode path the engine consumes via
+# Arc<dyn MapEngine>.
 engine-geotiff = { path = "../engine-geotiff" }
-chrono = "0.4"

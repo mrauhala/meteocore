@@ -660,7 +660,88 @@ struct CacheCounterState {
     /// last-scraped values. Engines are replaced on reload (counts reset), so
     /// the scrape rebaselines on a backward step — see `metrics_handler`.
     postgis: HashMap<String, (u64, u64, u64, u64)>,
+    /// Nowcast per-collection `(generations, failures)` last-scraped values —
+    /// same reload-rebaseline scheme.
+    nowcast: HashMap<String, (u64, u64)>,
 }
+
+static NOWCAST_GENERATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "nowcast_generations_total",
+            "Nowcast generations produced (one per new source frame)",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static NOWCAST_GENERATION_FAILURES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "nowcast_generation_failures_total",
+            "Nowcast generations that failed (source fetch or extrapolation error)",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static NOWCAST_LAST_GENERATION_MS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "nowcast_last_generation_duration_ms",
+            "Wall-clock duration of the most recent nowcast generation",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static NOWCAST_SOURCE_LAG_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "nowcast_source_lag_seconds",
+            "Age of the source anchor frame when the last generation finished",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static NOWCAST_RETAINED_GENERATIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "nowcast_retained_generations",
+            "Generations currently retained (reference_time pinning window)",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static NOWCAST_FRAMES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "nowcast_frames",
+            "Frames (analysis + leads) in the latest nowcast generation",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
 
 static RENDER_SEMAPHORE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
     let gauge = IntGauge::new(
@@ -733,6 +814,7 @@ pub struct ServerState {
     pub odim_volume_engines: RwLock<Vec<Arc<engine_odim::PolarVolumeEngine>>>,
     pub cap_engines: RwLock<Vec<Arc<engine_cap::CapEngine>>>,
     pub postgis_engines: RwLock<Vec<Arc<engine_postgis::PostgisEngine>>>,
+    pub nowcast_engines: RwLock<Vec<Arc<engine_nowcast::NowcastEngine>>>,
     /// Serializes reload requests to prevent concurrent reloads from racing.
     pub reload_lock: tokio::sync::Mutex<()>,
     /// Bearer token for admin endpoint authentication.
@@ -762,6 +844,7 @@ pub struct LoadResult {
     pub odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>>,
     pub cap_engines: Vec<Arc<engine_cap::CapEngine>>,
     pub postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>>,
+    pub nowcast_engines: Vec<Arc<engine_nowcast::NowcastEngine>>,
 }
 
 /// Render caches carried across a reload so a config reload **preserves** the
@@ -824,6 +907,10 @@ pub fn load_collections(
     let mut odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>> = Vec::new();
     let mut cap_engines: Vec<Arc<engine_cap::CapEngine>> = Vec::new();
     let mut postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>> = Vec::new();
+    let mut nowcast_engines: Vec<Arc<engine_nowcast::NowcastEngine>> = Vec::new();
+    // Derived collections wire in a second pass, after every base engine
+    // exists (#522). Collected here during the main loop.
+    let mut nowcast_pending: Vec<&CollectionConfig> = Vec::new();
     // Pool registry is local to this load: collections sharing a DSN share a
     // pool via Arc<Pool>. Across reloads, pools are rebuilt — documented
     // v1 trade-off; reuse-by-identity across reloads is a follow-up.
@@ -852,6 +939,7 @@ pub fn load_collections(
             "odim-volume" => &["edr", "wms", "maps", "tiles", "3dtiles", "features"],
             "cap" => &["features", "wms", "maps", "tiles"],
             "postgis" => &["edr", "features", "tiles", "wms", "maps"],
+            "nowcast" => &["wms", "maps", "tiles"],
             _ => &[],
         };
         let unsupported: Vec<&str> = collection
@@ -2186,6 +2274,11 @@ pub fn load_collections(
                     error: status_err,
                 });
             }
+            // Derived collections defer to the second pass below, after all
+            // base engines exist (#522).
+            "nowcast" => {
+                nowcast_pending.push(collection);
+            }
             other => {
                 tracing::error!(
                     "Collection '{}': unknown engine type '{}', skipping",
@@ -2201,6 +2294,116 @@ pub fn load_collections(
                 continue;
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Second pass: derived nowcast collections (#522). Every base engine
+    // now exists; snapshot the raster-engine lookup BEFORE constructing any
+    // nowcast engine, so a nowcast can wrap any base collection but never
+    // another nowcast (chaining extrapolations compounds error and the
+    // derived engine's poll cadence assumptions).
+    // ------------------------------------------------------------------
+    let base_raster_engines: HashMap<String, Arc<dyn ds_core::map_engine::MapEngine>> = map_engines
+        .iter()
+        .chain(maps_engines.iter())
+        .chain(tiles_engines.iter())
+        .map(|(id, e)| (id.clone(), e.clone()))
+        .collect();
+    for collection in nowcast_pending {
+        let mut fail = |error: String| {
+            tracing::error!("Collection '{}': {error}, skipping", collection.id);
+            health.push(CollectionHealth {
+                id: collection.id.clone(),
+                engine_type: "nowcast".into(),
+                status: CollectionStatus::Failed,
+                error: Some(error),
+            });
+        };
+        let Some(nowcast_config) = collection.nowcast.as_ref() else {
+            fail("missing [collections.nowcast] config".into());
+            continue;
+        };
+        if collections
+            .iter()
+            .any(|c| c.id == nowcast_config.source && c.engine_type == "nowcast")
+        {
+            fail(format!(
+                "nowcast source '{}' is itself a nowcast collection (chaining is not supported)",
+                nowcast_config.source
+            ));
+            continue;
+        }
+        let Some(source) = base_raster_engines.get(&nowcast_config.source) else {
+            fail(format!(
+                "nowcast source collection '{}' not found (it must exist in the same config \
+                 and have at least one of wms/maps/tiles in its `apis`)",
+                nowcast_config.source
+            ));
+            continue;
+        };
+        let engine = match engine_nowcast::NowcastEngine::new(
+            &collection.id,
+            &nowcast_config.source,
+            source.clone(),
+            nowcast_config,
+        ) {
+            Ok(e) => Arc::new(e),
+            Err(e) => {
+                fail(format!("failed to initialize nowcast engine: {e}"));
+                continue;
+            }
+        };
+        nowcast_engines.push(engine.clone());
+
+        if collection.apis.contains(&"wms".to_string()) {
+            map_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+            );
+            map_collections.insert(collection.id.clone(), collection.clone());
+            map_styles.insert(
+                collection.id.clone(),
+                build_styles(collection, &bundle_index),
+            );
+            info!("Collection '{}': wired to WMS API", collection.id);
+        }
+        if collection.apis.contains(&"maps".to_string()) {
+            maps_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+            );
+            maps_collections.insert(collection.id.clone(), collection.clone());
+            maps_styles.insert(
+                collection.id.clone(),
+                build_styles(collection, &bundle_index),
+            );
+            info!("Collection '{}': wired to Maps API", collection.id);
+        }
+        if collection.apis.contains(&"tiles".to_string()) {
+            tiles_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+            );
+            tiles_collections.insert(collection.id.clone(), collection.clone());
+            tiles_styles.insert(
+                collection.id.clone(),
+                build_styles(collection, &bundle_index),
+            );
+            info!("Collection '{}': wired to Tiles API", collection.id);
+        }
+
+        // A nowcast starts degraded: the first generation needs the source's
+        // initial data plus one poll cycle.
+        health.push(CollectionHealth {
+            id: collection.id.clone(),
+            engine_type: "nowcast".into(),
+            status: CollectionStatus::Degraded,
+            error: Some("waiting for first nowcast generation".into()),
+        });
+        info!(
+            "Collection '{}': nowcast wrapping '{}'",
+            collection.id, nowcast_config.source
+        );
     }
 
     // Determine rendered cache size from first WMS collection config, or default
@@ -2323,6 +2526,7 @@ pub fn load_collections(
         odim_volume_engines,
         cap_engines,
         postgis_engines,
+        nowcast_engines,
     }
 }
 
@@ -2967,6 +3171,14 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         {
             engine.shutdown();
         }
+        for engine in state
+            .nowcast_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            engine.shutdown();
+        }
     }
 
     // Spawn poll loops for new engines on the dedicated background runtime
@@ -3022,6 +3234,15 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
             poller.poll_loop().await;
         });
     }
+    // Nowcast generation loop: watches the source engine and regenerates
+    // extrapolated frames. Source fetches do blocking storage I/O internally,
+    // so this must stay on the background runtime (#221, Critical Rule 7).
+    for engine in &result.nowcast_engines {
+        let poller = engine.clone();
+        crate::poll_runtime().spawn(async move {
+            poller.poll_loop().await;
+        });
+    }
 
     // Atomically swap state
     state.edr.store(Arc::new(result.edr_state));
@@ -3065,6 +3286,10 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         .postgis_engines
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.postgis_engines;
+    *state
+        .nowcast_engines
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = result.nowcast_engines;
 
     // Recount from the final `result.health` — the vanished-site block above
     // appends `Degraded` entries after the guard's `ready` was computed, so
@@ -3236,6 +3461,34 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
                 if let Some(temporal) = temporal_from_times(&times) {
                     temporal_info.insert(format!("{}-{}", engine.collection_id(), nod), temporal);
                 }
+            }
+        }
+    }
+
+    {
+        // Nowcast engines: `data_age_secs` is the age of the latest
+        // generation's anchor frame; the boot `Degraded ("waiting for first
+        // nowcast generation")` flips to `Ready` once a generation exists.
+        let engines = state
+            .nowcast_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut has_data: HashMap<&str, bool> = HashMap::new();
+        for engine in engines.iter() {
+            let id = engine.collection_id().to_string();
+            has_data.insert(engine.collection_id(), engine.has_data());
+            if let Some(age) = engine.catalog_age() {
+                data_ages.insert(id.clone(), age.num_seconds());
+            }
+            let times = ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).times;
+            if let Some(temporal) = temporal_from_times(&times) {
+                temporal_info.insert(id, temporal);
+            }
+        }
+        for h in health.iter_mut().filter(|h| h.engine_type == "nowcast") {
+            if has_data.get(h.id.as_str()).copied().unwrap_or(false) {
+                h.status = CollectionStatus::Ready;
+                h.error = None;
             }
         }
     }
@@ -3549,6 +3802,48 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
             POSTGIS_POOL_WAITING
                 .with_label_values(&[pk])
                 .set(st.waiting as i64);
+        }
+    }
+
+    // Nowcast: per-collection generation counters (delta pattern — engines
+    // are replaced on reload, detected as a backward step) and gauges.
+    if let Ok(engines) = state.nowcast_engines.read() {
+        for engine in engines.iter() {
+            let collection = engine.collection_id();
+            let (generations, failures, last_ms, lag_secs, retained, frames) = engine.metrics();
+            let entry = counter_state
+                .nowcast
+                .entry(collection.to_string())
+                .or_insert((0, 0));
+            if generations < entry.0 || failures < entry.1 {
+                *entry = (generations, failures);
+            } else {
+                let dg = generations - entry.0;
+                let df = failures - entry.1;
+                if dg > 0 {
+                    NOWCAST_GENERATIONS
+                        .with_label_values(&[collection])
+                        .inc_by(dg);
+                }
+                if df > 0 {
+                    NOWCAST_GENERATION_FAILURES
+                        .with_label_values(&[collection])
+                        .inc_by(df);
+                }
+                *entry = (generations, failures);
+            }
+            NOWCAST_LAST_GENERATION_MS
+                .with_label_values(&[collection])
+                .set(last_ms as i64);
+            NOWCAST_SOURCE_LAG_SECONDS
+                .with_label_values(&[collection])
+                .set(lag_secs as i64);
+            NOWCAST_RETAINED_GENERATIONS
+                .with_label_values(&[collection])
+                .set(retained as i64);
+            NOWCAST_FRAMES
+                .with_label_values(&[collection])
+                .set(frames as i64);
         }
     }
 
