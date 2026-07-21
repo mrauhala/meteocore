@@ -470,7 +470,10 @@ impl NowcastEngine {
         // integrates only the newest `delta` of every pixel's backward
         // trajectory, making the whole schedule O(leads) in field samples
         // instead of the O(leads²) of per-lead from-scratch integration
-        // (67 s per prod generation at 2.27 Mpx × 24 leads).
+        // (67 s per prod generation at 2.27 Mpx × 24 leads). With the
+        // default source-cadence step (`delta == 1.0`) this reproduces the
+        // one-shot trajectories bit-for-bit; an explicit fractional `step`
+        // integrates at least as finely (see `TrajectoryIntegrator` docs).
         //
         // `interval` ≥ 1 s is guaranteed by the cadence guard above;
         // `.max(1)` keeps the division safe against future edits.

@@ -17,9 +17,16 @@ use crate::Grid;
 /// Re-integrating each lead's trajectory from scratch costs
 /// `Σ leadᵢ·substeps·pixels` — quadratic in the lead count (67 s per prod
 /// generation at 2.27 Mpx × 24 leads, #528). Extending the stored departure
-/// points by one lead-delta at a time walks the SAME piecewise trajectory
-/// (identical step density and step sequence when the schedule is uniform)
-/// in `Σ substeps·pixels` — linear.
+/// points by one lead-delta at a time is `Σ substeps·pixels` — linear.
+///
+/// Equivalence to the one-shot path: when `delta × substeps` is an integer
+/// (the default config — `step` unset ⇒ `delta == 1.0`), each `advance`
+/// reproduces the one-shot step size and sequence exactly, so results are
+/// bit-identical (pinned by test). For a fractional `delta × substeps`
+/// (explicit `step` off the source cadence), the per-segment
+/// `ceil(delta × substeps)` discretization is at least as FINE as the
+/// one-shot `ceil(lead × substeps)` proportional share — trajectories may
+/// differ within sub-step tolerance, never with coarser integration.
 ///
 /// Departure points keep integrating even outside the domain (the motion
 /// field's edge-clamped sample keeps them moving) exactly like the one-shot
@@ -194,11 +201,46 @@ mod tests {
         );
     }
 
+    /// For a fractional per-lead delta (explicit `step` off the source
+    /// cadence, `delta × substeps` non-integral) exact step-sequence
+    /// equivalence is impossible by construction — but the incremental
+    /// discretization is at least as fine, so the two schemes must stay
+    /// within nearest-sample tolerance of each other on a smooth field.
+    #[test]
+    fn incremental_fractional_delta_stays_within_sampling_tolerance() {
+        let t0 = disc_frame(160, 120, 60.0, 60.0, 11.0, 40.0);
+        let t1 = disc_frame(160, 120, 66.0, 56.0, 11.0, 40.0);
+        let field = estimate_motion(&t0, &t1, &MotionOptions::default());
+
+        // 3 × 0.6 intervals vs one shot of 1.8: per-segment ceil(2.4)=3
+        // steps (9 total) vs one-shot ceil(7.2)=8 steps — different h, same
+        // trajectory within sub-step error.
+        let one_shot = advect(&t1, &field, 1.8, 4);
+        let mut integrator = TrajectoryIntegrator::new(160, 120, &field);
+        for _ in 0..3 {
+            integrator.advance(0.6, 4);
+        }
+        let incremental = integrator.sample(&t1);
+
+        let differing = one_shot
+            .data
+            .iter()
+            .zip(&incremental.data)
+            .filter(|(a, b)| !(a.is_nan() && b.is_nan()) && a != b)
+            .count();
+        let echo = one_shot.data.iter().filter(|v| **v >= 20.0).count();
+        assert!(
+            differing <= echo / 20,
+            "fractional-delta schemes diverged on {differing} px ({echo} echo px)"
+        );
+    }
+
     /// The incremental path must walk the exact trajectory the one-shot path
-    /// does: N advances of one interval == one advance of N intervals, down
-    /// to the bit (same step size, same step sequence). This is what makes
-    /// the O(leads) generation loop (#528) safe to substitute for per-lead
-    /// from-scratch integration.
+    /// does when `delta × substeps` is integral (the default source-cadence
+    /// config): N advances of one interval == one advance of N intervals,
+    /// down to the bit (same step size, same step sequence). This is what
+    /// makes the O(leads) generation loop (#528) safe to substitute for
+    /// per-lead from-scratch integration in the default configuration.
     #[test]
     fn incremental_advances_match_one_shot_bitwise() {
         let t0 = disc_frame(160, 120, 60.0, 60.0, 11.0, 40.0);
