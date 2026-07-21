@@ -38,7 +38,7 @@ use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile, RasterValues};
 use ds_core::resample::ProjectionGrid;
 
-use crate::advect::advect_u8;
+use crate::advect::TrajectoryIntegrator;
 use crate::motion::{estimate_motion, MotionOptions};
 use crate::Grid;
 
@@ -466,13 +466,22 @@ impl NowcastEngine {
         let mut frames = Vec::with_capacity(k + 1);
         times.push(anchor);
         frames.push(analysis);
+        // One trajectory set, extended lead by lead (#528): each iteration
+        // integrates only the newest `delta` of every pixel's backward
+        // trajectory, making the whole schedule O(leads) in field samples
+        // instead of the O(leads²) of per-lead from-scratch integration
+        // (67 s per prod generation at 2.27 Mpx × 24 leads). With the
+        // default source-cadence step (`delta == 1.0`) this reproduces the
+        // one-shot trajectories bit-for-bit; an explicit fractional `step`
+        // integrates at least as finely (see `TrajectoryIntegrator` docs).
+        //
+        // `interval` ≥ 1 s is guaranteed by the cadence guard above;
+        // `.max(1)` keeps the division safe against future edits.
+        let delta = (step.num_seconds() as f64 / interval.num_seconds().max(1) as f64) as f32;
+        let mut trajectories = TrajectoryIntegrator::new(w as usize, h as usize, &field);
         for i in 1..=k {
             let lead_time = anchor + step * (i as i32);
-            let lead_intervals =
-                // `interval` ≥ 1 s is guaranteed by the cadence guard above;
-                // `.max(1)` keeps this division safe against future edits.
-                (step.num_seconds() as f64 * i as f64 / interval.num_seconds().max(1) as f64)
-                    as f32;
+            trajectories.advance(delta, SUBSTEPS);
             let frame = match &frames[0] {
                 FrameData::U8 {
                     data,
@@ -480,24 +489,12 @@ impl NowcastEngine {
                     gain,
                     offset,
                 } => FrameData::U8 {
-                    data: advect_u8(
-                        data,
-                        w as usize,
-                        h as usize,
-                        *nodata,
-                        &field,
-                        lead_intervals,
-                        SUBSTEPS,
-                    ),
+                    data: trajectories.sample_u8(data, *nodata),
                     nodata: *nodata,
                     gain: *gain,
                     offset: *offset,
                 },
-                FrameData::F32(_) => {
-                    let advected =
-                        crate::advect::advect(&analysis_f32, &field, lead_intervals, SUBSTEPS);
-                    FrameData::F32(advected.data)
-                }
+                FrameData::F32(_) => FrameData::F32(trajectories.sample(&analysis_f32).data),
             };
             times.push(lead_time);
             frames.push(frame);
