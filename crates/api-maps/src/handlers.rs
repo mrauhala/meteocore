@@ -1228,7 +1228,13 @@ async fn render_map(
                     );
                     MapsError::BadRequest(e.to_string())
                 }
-                DSE::CollectionNotFound(_) | DSE::LocationNotFound(_) => {
+                // ReferenceTimeNotFound is documented to map to 404 (EDR
+                // already does); reachable here when a pinned run is pruned
+                // between resolution and render — routine for nowcast
+                // generations (#522), not an internal error.
+                DSE::CollectionNotFound(_)
+                | DSE::LocationNotFound(_)
+                | DSE::ReferenceTimeNotFound(_) => {
                     tracing::debug!(
                         "Maps render not-found for collection '{}': {e}",
                         collection_id

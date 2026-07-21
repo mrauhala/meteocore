@@ -1558,7 +1558,12 @@ async fn render_tile(
                 );
                 TilesError::BadRequest(e.to_string())
             }
-            DSE::CollectionNotFound(_) | DSE::LocationNotFound(_) => {
+            // ReferenceTimeNotFound is documented to map to 404 (EDR already
+            // does); reachable when a pinned run is pruned between resolution
+            // and render — routine for nowcast generations (#522).
+            DSE::CollectionNotFound(_)
+            | DSE::LocationNotFound(_)
+            | DSE::ReferenceTimeNotFound(_) => {
                 tracing::debug!(
                     "Tiles render not-found for collection '{}': {e}",
                     collection_id

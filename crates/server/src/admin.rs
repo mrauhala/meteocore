@@ -785,7 +785,7 @@ pub struct CollectionHealth {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CollectionStatus {
     Ready,
@@ -4089,6 +4089,157 @@ mod tests {
     use ds_core::config::{CollectionConfig, StyleBundle};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    // --- nowcast second-pass wiring (#522) ---
+
+    /// A minimal collection config for the nowcast wiring tests.
+    fn nowcast_test_collection(
+        id: &str,
+        engine_type: &str,
+        source: Option<&str>,
+    ) -> CollectionConfig {
+        CollectionConfig {
+            id: id.to_string(),
+            title: id.to_string(),
+            description: String::new(),
+            data_path: None,
+            apis: vec!["wms".to_string()],
+            engine_type: engine_type.to_string(),
+            keywords: Vec::new(),
+            license: None,
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            zarr: None,
+            odim: None,
+            cap: None,
+            postgis: None,
+            nowcast: source.map(|s| ds_core::config::NowcastConfig {
+                source: s.to_string(),
+                horizon: "PT1H".to_string(),
+                step: None,
+                history_frames: 2,
+                poll_interval_secs: 30,
+                max_generations: 2,
+                max_pixels: 500_000,
+                min_echo: 10.0,
+            }),
+            preview: None,
+        }
+    }
+
+    /// A geotiff source collection over the committed TM35FIN fixture.
+    fn tm35_source_collection(id: &str) -> CollectionConfig {
+        let mut c = nowcast_test_collection(id, "geotiff", None);
+        c.data_path = Some("../../testdata/radar-tm35fin".to_string());
+        c.geotiff = Some(ds_core::config::GeoTiffConfig {
+            filename_template: Some("radar_tm35_%Y%m%dT%H%MZ.tif".to_string()),
+            filename_pattern: None,
+            timestamp_format: None,
+            parameter: "reflectivity".to_string(),
+            unit: "dBZ".to_string(),
+            poll_interval_secs: 3600,
+            tile_cache_mb: 16,
+            band: 1,
+            max_files: None,
+            nodata: None,
+            scale: None,
+            offset: None,
+            exclude_patterns: vec![],
+            endpoint: None,
+            bucket: None,
+            prefix_pattern: None,
+            time_window: None,
+            scan_days: None,
+            stac_url: None,
+            stac_asset_key: "data".to_string(),
+            stac_asset_allowlist: None,
+        });
+        c
+    }
+
+    fn health_of<'a>(result: &'a super::LoadResult, id: &str) -> &'a super::CollectionHealth {
+        result
+            .health
+            .iter()
+            .find(|h| h.id == id)
+            .unwrap_or_else(|| panic!("no health entry for {id}"))
+    }
+
+    #[test]
+    fn nowcast_unknown_source_fails_that_collection_only() {
+        let result = super::load_collections(
+            &[nowcast_test_collection("nc", "nowcast", Some("no-such"))],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+        );
+        let h = health_of(&result, "nc");
+        assert_eq!(h.status, super::CollectionStatus::Failed);
+        assert!(
+            h.error.as_deref().unwrap_or("").contains("not found"),
+            "error should name the missing source: {:?}",
+            h.error
+        );
+        assert!(!result.wms_state.engines.contains_key("nc"));
+    }
+
+    #[test]
+    fn nowcast_of_nowcast_is_rejected() {
+        let result = super::load_collections(
+            &[
+                tm35_source_collection("radar"),
+                nowcast_test_collection("nc1", "nowcast", Some("radar")),
+                nowcast_test_collection("nc2", "nowcast", Some("nc1")),
+            ],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+        );
+        let h = health_of(&result, "nc2");
+        assert_eq!(h.status, super::CollectionStatus::Failed);
+        assert!(
+            h.error.as_deref().unwrap_or("").contains("chaining"),
+            "error should name the chaining rejection: {:?}",
+            h.error
+        );
+        assert!(!result.wms_state.engines.contains_key("nc2"));
+        // The first-level nowcast is unaffected.
+        assert!(result.wms_state.engines.contains_key("nc1"));
+    }
+
+    #[test]
+    fn nowcast_wires_into_registries_and_boots_degraded() {
+        let result = super::load_collections(
+            &[
+                tm35_source_collection("radar"),
+                nowcast_test_collection("nc", "nowcast", Some("radar")),
+            ],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+        );
+        assert!(result.wms_state.engines.contains_key("nc"));
+        assert_eq!(result.nowcast_engines.len(), 1);
+        assert_eq!(result.nowcast_engines[0].source_id(), "radar");
+        let h = health_of(&result, "nc");
+        assert_eq!(h.status, super::CollectionStatus::Degraded);
+        assert!(
+            h.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("waiting for first nowcast generation"),
+            "boot health should explain the degraded state: {:?}",
+            h.error
+        );
+    }
 
     // --- reload preserves the warm render caches (ReusableCaches) ---
 
