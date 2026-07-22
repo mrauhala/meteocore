@@ -63,6 +63,9 @@ const EMA_ALPHA_FILLED: f32 = 0.4;
 const SUBSTEPS: usize = 4;
 /// Hard cap on extrapolated frames per generation.
 const MAX_LEADS: usize = 96;
+/// Hard cap on `history_frames`: each is one sequential blocking source
+/// fetch per generation, and pair-averaging saturates after a few pairs.
+const MAX_HISTORY_FRAMES: usize = 8;
 
 /// Parsed, validated engine configuration.
 struct EngineCfg {
@@ -209,6 +212,17 @@ impl NowcastEngine {
             return Err(DataServerError::Config(
                 "nowcast history_frames must be at least 2 (motion needs a frame pair)".into(),
             ));
+        }
+        // Each history frame is one sequential blocking source fetch per
+        // generation (Critical Rule 9: never loop unbounded blocking I/O on
+        // one thread) — and motion averaging saturates after a few pairs
+        // anyway. Fail fast rather than silently clamp.
+        if config.history_frames > MAX_HISTORY_FRAMES {
+            return Err(DataServerError::Config(format!(
+                "nowcast history_frames = {} exceeds the cap of {MAX_HISTORY_FRAMES} \
+                 (each frame is one blocking source fetch per generation)",
+                config.history_frames
+            )));
         }
 
         let (shutdown_tx, _) = watch::channel(());

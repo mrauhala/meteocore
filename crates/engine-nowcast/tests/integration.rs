@@ -361,3 +361,26 @@ fn sub_second_cadence_fails_generation_cleanly() {
     assert_eq!(generations, 0);
     assert_eq!(failures, 1, "the failure must be counted, not hidden");
 }
+
+/// history_frames is bounded: each frame is a blocking source fetch per
+/// generation, so an oversized value is a config error, not a silent cap.
+#[test]
+fn oversized_history_frames_is_rejected() {
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0()]),
+    });
+    let config = NowcastConfig {
+        source: "mock".into(),
+        horizon: "PT1H".into(),
+        step: None,
+        history_frames: 24,
+        poll_interval_secs: 30,
+        max_generations: 4,
+        max_pixels: 4_000_000,
+        min_echo: 10.0,
+    };
+    let err = NowcastEngine::new("mock-nowcast", "mock", source, &config)
+        .err()
+        .expect("must reject oversized history_frames");
+    assert!(err.to_string().contains("exceeds the cap"), "got: {err}");
+}
