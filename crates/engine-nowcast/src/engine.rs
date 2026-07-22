@@ -39,15 +39,26 @@ use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile, RasterVa
 use ds_core::resample::ProjectionGrid;
 
 use crate::advect::TrajectoryIntegrator;
-use crate::motion::{estimate_motion, MotionOptions};
+use crate::motion::{estimate_motion_multi, MotionField, MotionOptions};
 use crate::Grid;
 
 /// Fastest cell motion the search window must cover (m/s). 40 m/s ≈ 144 km/h
 /// matches the cell-tracker gate in `ds_core::cells`.
 const MAX_SPEED_MS: f64 = 40.0;
 /// Target search radius (px) on the motion-estimation grid; frames are
-/// coarsened until the physical search window fits.
-const TARGET_SEARCH_PX: i32 = 24;
+/// coarsened until the physical search window fits. 48 keeps the FMI
+/// composite's ~500 m working grid uncoarsened (~16 km motion blocks
+/// instead of ~25 km — small convective cells get a closer-fitting
+/// vector), affordable since #529 made generation cost linear in leads.
+const TARGET_SEARCH_PX: i32 = 48;
+/// Temporal EMA weights for blending each generation's motion field with
+/// the previous one (#524): the new field keeps this share, per block.
+/// Measured blocks carry fresh information; filled blocks are inferred and
+/// lean harder on history. 0.7 ≈ one-and-a-half generations of memory —
+/// enough to damp single-pair convective noise without lagging a genuine
+/// wind shift by more than a couple of cadence intervals.
+const EMA_ALPHA_MEASURED: f32 = 0.7;
+const EMA_ALPHA_FILLED: f32 = 0.4;
 /// Trajectory integration substeps per frame interval.
 const SUBSTEPS: usize = 4;
 /// Hard cap on extrapolated frames per generation.
@@ -123,6 +134,9 @@ struct Generation {
     times: Vec<DateTime<Utc>>,
     frames: Vec<FrameData>,
     geom: GridGeom,
+    /// The (blended) motion field this generation advected along — the
+    /// EMA history for the NEXT generation (#524).
+    field: MotionField,
 }
 
 /// Atomically swapped engine state.
@@ -395,14 +409,31 @@ impl NowcastEngine {
             height: h,
         };
 
-        // Fetch the anchor + previous frame on the working grid.
-        // Resolve the source's current run ONCE and pin both fetches to it
-        // (see fetch_frame). `None` for non-forecast sources.
+        // Fetch the motion history + anchor frame on the working grid,
+        // every fetch pinned to ONE resolved source run (see fetch_frame).
+        // `history` holds up to `history_frames` timestamps ending at the
+        // anchor; a fetch failure on an OLDER frame degrades to fewer pairs
+        // rather than failing the generation (the last pair is mandatory).
         let source_run = self.source.resolve_reference_time(Some(anchor), None);
-        let prev = self.fetch_frame(&geom, prev_time, source_run)?;
+        let mut motion_frames: Vec<(DateTime<Utc>, Grid)> = Vec::with_capacity(history.len());
+        for &t in history.iter().rev().skip(1).rev() {
+            // All but the anchor (fetched below as the stored analysis frame).
+            match self.fetch_frame(&geom, t, source_run) {
+                Ok(f) => motion_frames.push((t, frame_to_grid(&f, w as usize, h as usize))),
+                Err(e) if t != prev_time => {
+                    tracing::debug!(
+                        "[{}] nowcast history frame {t} unavailable ({e}); \
+                         continuing with fewer motion pairs",
+                        self.collection_id
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
         let analysis = self.fetch_frame(&geom, anchor, source_run)?;
-        let prev_f32 = frame_to_grid(&prev, w as usize, h as usize);
         let analysis_f32 = frame_to_grid(&analysis, w as usize, h as usize);
+        motion_frames.push((anchor, analysis_f32));
+        let analysis_f32 = &motion_frames.last().expect("anchor pushed").1;
 
         // Deliberate scale handling (not the phase-0 accident): estimate
         // motion on a grid coarse enough that the physical search window
@@ -426,12 +457,25 @@ impl NowcastEngine {
             min_echo: self.cfg.min_echo,
             ..MotionOptions::default()
         };
-        // Vectors come out in pixels per source interval; the leads below are
-        // expressed in the same interval unit, so no time scaling is needed.
-        let field = if factor > 1 {
-            let prev_coarse = downsample(&prev_f32, factor as usize);
-            let analysis_coarse = downsample(&analysis_f32, factor as usize);
-            let mut f = estimate_motion(&prev_coarse, &analysis_coarse, &opts);
+
+        // Multi-pair estimation (#524): every consecutive history pair
+        // contributes measurements, scaled to px-per-LAST-interval so a
+        // mildly irregular cadence still averages correctly (a degenerate
+        // pair interval skips that pair inside estimate_motion_multi).
+        // Vectors come out in pixels per source interval; the leads below
+        // are expressed in the same interval unit — no time scaling needed.
+        let interval_secs = interval.num_seconds().max(1) as f32;
+        let scales: Vec<f32> = motion_frames
+            .windows(2)
+            .map(|p| interval_secs / (p[1].0 - p[0].0).num_seconds().max(0) as f32)
+            .collect();
+        let mut field = if factor > 1 {
+            let coarse: Vec<Grid> = motion_frames
+                .iter()
+                .map(|(_, g)| downsample(g, factor as usize))
+                .collect();
+            let coarse_refs: Vec<&Grid> = coarse.iter().collect();
+            let mut f = estimate_motion_multi(&coarse_refs, &scales, &opts);
             // Coarse-grid vectors/blocks → working-grid units.
             f.block *= factor as usize;
             for v in f.u.iter_mut().chain(f.v.iter_mut()) {
@@ -439,8 +483,20 @@ impl NowcastEngine {
             }
             f
         } else {
-            estimate_motion(&prev_f32, &analysis_f32, &opts)
+            let refs: Vec<&Grid> = motion_frames.iter().map(|(_, g)| g).collect();
+            estimate_motion_multi(&refs, &scales, &opts)
         };
+
+        // Temporal EMA with the previous generation's field (#524): stops
+        // the per-generation motion-noise oscillation that reads as
+        // rubber-banding in animations. No-op when the block grid changed
+        // (blend_with_previous checks dims).
+        {
+            let state = self.state.load();
+            if let Some((_, latest)) = state.generations.iter().next_back() {
+                field.blend_with_previous(&latest.field, EMA_ALPHA_MEASURED, EMA_ALPHA_FILLED);
+            }
+        }
 
         // Lead schedule. An explicit step was validated against MAX_LEADS at
         // construction; the source-cadence default can still exceed it (a
@@ -494,17 +550,19 @@ impl NowcastEngine {
                     gain: *gain,
                     offset: *offset,
                 },
-                FrameData::F32(_) => FrameData::F32(trajectories.sample(&analysis_f32).data),
+                FrameData::F32(_) => FrameData::F32(trajectories.sample(analysis_f32).data),
             };
             times.push(lead_time);
             frames.push(frame);
         }
+        drop(trajectories); // release the borrow of `field` before moving it
 
         Ok(Generation {
             reference_time: anchor,
             times,
             frames,
             geom,
+            field,
         })
     }
 

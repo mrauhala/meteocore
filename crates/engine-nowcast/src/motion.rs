@@ -66,6 +66,39 @@ pub struct MotionField {
 }
 
 impl MotionField {
+    /// Temporal EMA with the previous generation's field (#524): per block,
+    /// `self = alpha·self + (1−alpha)·prev`, where `alpha` is
+    /// `alpha_measured` for blocks this generation actually measured and the
+    /// (lower) `alpha_filled` for blocks whose vector came from fill/
+    /// smoothing — a filled block carries no new information, so it should
+    /// lean harder on history. No-op when the grids don't match (working
+    /// geometry changed, e.g. a config edit) — blending across different
+    /// grids would be nonsense.
+    ///
+    /// This is what stops nowcast animations rubber-banding between
+    /// generations: single-pair block matching re-reads convective
+    /// growth/decay as motion noise every generation, and the EMA gives the
+    /// field ~1/(1−alpha) generations of memory.
+    pub fn blend_with_previous(
+        &mut self,
+        prev: &MotionField,
+        alpha_measured: f32,
+        alpha_filled: f32,
+    ) {
+        if (self.bw, self.bh, self.block) != (prev.bw, prev.bh, prev.block) {
+            return;
+        }
+        for j in 0..self.u.len() {
+            let alpha = if self.measured[j] {
+                alpha_measured
+            } else {
+                alpha_filled
+            };
+            self.u[j] = alpha * self.u[j] + (1.0 - alpha) * prev.u[j];
+            self.v[j] = alpha * self.v[j] + (1.0 - alpha) * prev.v[j];
+        }
+    }
+
     /// Bilinear sample of (u, v) at pixel position (x, y), clamped at edges.
     pub fn sample(&self, x: f32, y: f32) -> (f32, f32) {
         if self.bw == 0 || self.bh == 0 {
@@ -94,6 +127,82 @@ impl MotionField {
 /// A vector `(u, v)` for a block means `next(x, y) ≈ prev(x - u, y - v)` for
 /// pixels in that block: echoes moved by `(u, v)` over one frame interval.
 pub fn estimate_motion(prev: &Grid, next: &Grid, opts: &MotionOptions) -> MotionField {
+    let mut field = measure_pair(prev, next, opts);
+    postprocess(&mut field, opts);
+    field
+}
+
+/// Multi-pair motion estimation (#524): measure each consecutive frame pair,
+/// scale pair *i*'s vectors by `interval_scales[i]` (converting them to the
+/// reference interval's unit — pass `1.0` for a uniform cadence), average the
+/// per-block measurements, then run the shared outlier/fill/smooth pipeline
+/// ONCE on the combined field. Averaging measured vectors across pairs damps
+/// the single-pair noise that convective growth/decay masquerades as —
+/// the dominant source of generation-to-generation nowcast rubber-banding.
+///
+/// `frames` is oldest → newest, length ≥ 2; `interval_scales.len()` must be
+/// `frames.len() - 1`.
+pub fn estimate_motion_multi(
+    frames: &[&Grid],
+    interval_scales: &[f32],
+    opts: &MotionOptions,
+) -> MotionField {
+    assert!(frames.len() >= 2, "multi-pair estimation needs >= 2 frames");
+    assert_eq!(
+        interval_scales.len(),
+        frames.len() - 1,
+        "one interval scale per consecutive pair"
+    );
+
+    let mut combined: Option<MotionField> = None;
+    let mut counts: Vec<u32> = Vec::new();
+    for (i, scale) in interval_scales.iter().enumerate() {
+        if !scale.is_finite() || *scale <= 0.0 {
+            continue; // degenerate pair interval — skip the pair
+        }
+        let pair = measure_pair(frames[i], frames[i + 1], opts);
+        match &mut combined {
+            None => {
+                counts = pair.measured.iter().map(|&m| u32::from(m)).collect();
+                let mut first = pair;
+                for (j, m) in first.measured.iter().enumerate() {
+                    if *m {
+                        first.u[j] *= scale;
+                        first.v[j] *= scale;
+                    }
+                }
+                combined = Some(first);
+            }
+            Some(acc) => {
+                debug_assert_eq!((acc.bw, acc.bh), (pair.bw, pair.bh));
+                for (j, count) in counts.iter_mut().enumerate() {
+                    if pair.measured[j] {
+                        acc.u[j] += pair.u[j] * scale;
+                        acc.v[j] += pair.v[j] * scale;
+                        acc.measured[j] = true;
+                        *count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut field = combined
+        .unwrap_or_else(|| measure_pair(frames[frames.len() - 2], frames[frames.len() - 1], opts));
+    for (j, &n) in counts.iter().enumerate() {
+        if n > 1 {
+            field.u[j] /= n as f32;
+            field.v[j] /= n as f32;
+        }
+    }
+    postprocess(&mut field, opts);
+    field
+}
+
+/// The raw block-matching stage: per-block SAD search, no outlier rejection,
+/// no fill, no smoothing. Shared by the single-pair and multi-pair paths so
+/// the measurement itself cannot drift between them.
+fn measure_pair(prev: &Grid, next: &Grid, opts: &MotionOptions) -> MotionField {
     assert_eq!(
         (prev.width, prev.height),
         (next.width, next.height),
@@ -193,12 +302,17 @@ pub fn estimate_motion(prev: &Grid, next: &Grid, opts: &MotionOptions) -> Motion
         }
     }
 
-    reject_outliers(&mut field, opts);
-    fill_unmeasured(&mut field);
-    for _ in 0..opts.smooth_passes {
-        box_smooth(&mut field);
-    }
     field
+}
+
+/// The shared post-measurement pipeline: robust outlier rejection, fill,
+/// smoothing.
+fn postprocess(field: &mut MotionField, opts: &MotionOptions) {
+    reject_outliers(field, opts);
+    fill_unmeasured(field);
+    for _ in 0..opts.smooth_passes {
+        box_smooth(field);
+    }
 }
 
 /// Keep `(cost, dx, dy)` in `best` if it beats the current candidate.
@@ -324,6 +438,75 @@ mod tests {
             }
         }
         Grid::new(w, h, data)
+    }
+
+    #[test]
+    fn multi_pair_matches_single_pair_on_uniform_motion() {
+        // Three frames of the same translation: averaging the two pairs must
+        // agree with the last pair alone (each pair measures the same shift).
+        let t0 = disc_frame(200, 200, 74.0, 124.0, 12.0, 40.0);
+        let t1 = disc_frame(200, 200, 80.0, 120.0, 12.0, 40.0);
+        let t2 = disc_frame(200, 200, 86.0, 116.0, 12.0, 40.0);
+        let opts = MotionOptions {
+            search_radius: 10,
+            ..MotionOptions::default()
+        };
+        let single = estimate_motion(&t1, &t2, &opts);
+        let multi = estimate_motion_multi(&[&t0, &t1, &t2], &[1.0, 1.0], &opts);
+        let (su, sv) = single.sample(86.0, 116.0);
+        let (mu, mv) = multi.sample(86.0, 116.0);
+        assert!(
+            (su - mu).abs() <= 1.0 && (sv - mv).abs() <= 1.0,
+            "uniform motion: multi ({mu},{mv}) must agree with single ({su},{sv})"
+        );
+    }
+
+    #[test]
+    fn multi_pair_skips_degenerate_interval_scales() {
+        let t0 = disc_frame(160, 160, 60.0, 80.0, 10.0, 40.0);
+        let t1 = disc_frame(160, 160, 66.0, 80.0, 10.0, 40.0);
+        let opts = MotionOptions {
+            search_radius: 10,
+            ..MotionOptions::default()
+        };
+        // First pair carries a non-finite scale (degenerate interval) — it
+        // must be skipped, leaving the second pair's measurement intact.
+        let multi = estimate_motion_multi(&[&t0, &t0, &t1], &[f32::INFINITY, 1.0], &opts);
+        let (u, v) = multi.sample(66.0, 80.0);
+        assert!((u - 6.0).abs() <= 1.0, "u = {u}, expected ~6");
+        assert!(v.abs() <= 1.0, "v = {v}, expected ~0");
+    }
+
+    #[test]
+    fn blend_with_previous_applies_per_block_alpha() {
+        let frame = disc_frame(128, 128, 60.0, 60.0, 10.0, 35.0);
+        let moved = disc_frame(128, 128, 66.0, 60.0, 10.0, 35.0);
+        let mut new = estimate_motion(&frame, &moved, &MotionOptions::default());
+        let mut prev = new.clone();
+        // Previous generation thought everything moved (0, 8).
+        for j in 0..prev.u.len() {
+            prev.u[j] = 0.0;
+            prev.v[j] = 8.0;
+        }
+        let before_u = new.u.clone();
+        let before_v = new.v.clone();
+        new.blend_with_previous(&prev, 0.7, 0.4);
+        for j in 0..new.u.len() {
+            let a = if new.measured[j] { 0.7 } else { 0.4 };
+            assert!((new.u[j] - a * before_u[j]).abs() < 1e-4);
+            assert!((new.v[j] - (a * before_v[j] + (1.0 - a) * 8.0)).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn blend_with_previous_is_noop_on_dimension_mismatch() {
+        let a0 = disc_frame(128, 128, 60.0, 60.0, 10.0, 35.0);
+        let mut a = estimate_motion(&a0, &a0, &MotionOptions::default());
+        let b0 = disc_frame(64, 64, 30.0, 30.0, 8.0, 35.0);
+        let b = estimate_motion(&b0, &b0, &MotionOptions::default());
+        let before = a.u.clone();
+        a.blend_with_previous(&b, 0.7, 0.4);
+        assert_eq!(a.u, before, "mismatched grids must not blend");
     }
 
     #[test]

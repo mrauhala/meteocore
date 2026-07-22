@@ -98,6 +98,14 @@ impl MapEngine for MockSource {
 }
 
 fn build(horizon: &str, source_times: &[DateTime<Utc>]) -> (Arc<MockSource>, NowcastEngine) {
+    build_with_history(horizon, source_times, 2)
+}
+
+fn build_with_history(
+    horizon: &str,
+    source_times: &[DateTime<Utc>],
+    history_frames: usize,
+) -> (Arc<MockSource>, NowcastEngine) {
     let source = Arc::new(MockSource {
         times: RwLock::new(source_times.to_vec()),
     });
@@ -105,7 +113,7 @@ fn build(horizon: &str, source_times: &[DateTime<Utc>]) -> (Arc<MockSource>, Now
         source: "mock".into(),
         horizon: horizon.into(),
         step: None,
-        history_frames: 2,
+        history_frames,
         poll_interval_secs: 30,
         max_generations: 4,
         max_pixels: 4_000_000,
@@ -114,6 +122,33 @@ fn build(horizon: &str, source_times: &[DateTime<Utc>]) -> (Arc<MockSource>, Now
     let engine =
         NowcastEngine::new("mock-nowcast", "mock", source.clone(), &config).expect("engine builds");
     (source, engine)
+}
+
+/// Multi-pair motion (#524): a three-frame history must extrapolate the
+/// translating source just as accurately end to end.
+#[test]
+fn multi_pair_history_tracks_the_source() {
+    let anchor = t0() + Duration::minutes(10);
+    let (_source, engine) =
+        build_with_history("PT1H", &[t0(), t0() + Duration::minutes(5), anchor], 3);
+    engine.poll_once();
+    assert!(engine.has_data());
+
+    let lead_time = anchor + Duration::minutes(30);
+    let forecast = render_raw(&engine, lead_time);
+    let truth = truth_frame(lead_time);
+    let (mut inter, mut union) = (0u32, 0u32);
+    for (f, o) in forecast.iter().zip(&truth) {
+        let (fe, oe) = (*f == ECHO_RAW, *o == ECHO_RAW);
+        if fe && oe {
+            inter += 1;
+        }
+        if fe || oe {
+            union += 1;
+        }
+    }
+    let iou = inter as f64 / union as f64;
+    assert!(iou > 0.8, "multi-pair extrapolation must track (IoU {iou})");
 }
 
 /// Raw bytes of a full-extent render at `time`.

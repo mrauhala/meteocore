@@ -44,9 +44,21 @@ reason `MapEngine::resolve_reference_time` exists (#521).
   (1 B/px; `advect_u8` moves bytes); anything else falls back to f32
   (4 B/px — the FMI S3 COG path lands here until #475-style typed paths).
 - Motion is estimated on a coarsened grid sized so the physical search
-  window (40 m/s × source interval) fits ~24 px, then the field is scaled
-  back — deliberate scale handling; do NOT rely on the pixel budget to do
-  this implicitly.
+  window (40 m/s × source interval) fits `TARGET_SEARCH_PX` (48 — keeps
+  the FMI 500 m grid uncoarsened), then the field is scaled back —
+  deliberate scale handling; do NOT rely on the pixel budget to do this
+  implicitly.
+- **Motion stabilization (#524 part 1)** — two mechanisms against the
+  rubber-band animation artifact (single-pair block matching re-reads
+  convective growth/decay as motion noise every generation):
+  1. multi-pair estimation: every consecutive history pair contributes
+     measurements (scaled to the last interval's unit), averaged per
+     block, then ONE shared outlier/fill/smooth pass;
+  2. temporal EMA with the previous generation's field
+     (`Generation.field`, weights `EMA_ALPHA_MEASURED = 0.7` /
+     `EMA_ALPHA_FILLED = 0.4`; auto-skipped when the block grid changes).
+  Weakening either brings the between-generation oscillation back —
+  verify with an animation loop, not stills.
 
 ## Memory sizing (retention multiplies!)
 
