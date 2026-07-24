@@ -384,3 +384,133 @@ fn oversized_history_frames_is_rejected() {
         .expect("must reject oversized history_frames");
     assert!(err.to_string().contains("exceeds the cap"), "got: {err}");
 }
+
+/// V2.1 (#542): each new generation scores the previous one's prediction for
+/// the fresh analysis against persistence. On a pure translation the
+/// extrapolation reconstructs the truth almost exactly, so its realized CSI
+/// must be high and at least match persistence.
+#[test]
+fn per_generation_skill_is_scored_against_persistence() {
+    let anchor1 = t0() + Duration::minutes(5);
+    let (source, engine) = build("PT1H", &[t0(), anchor1]);
+    engine.poll_once();
+    assert!(
+        engine.skill_permille().is_none(),
+        "no skill before a second generation exists"
+    );
+
+    let anchor2 = anchor1 + Duration::minutes(5);
+    source.times.write().unwrap().push(anchor2);
+    engine.poll_once();
+    let (csi, persistence) = engine
+        .skill_permille()
+        .expect("second generation must produce a skill measurement");
+    assert!(
+        csi >= persistence,
+        "translation nowcast CSI ({csi}) must be >= persistence ({persistence})"
+    );
+    assert!(csi > 900, "near-perfect reconstruction expected, got {csi}");
+}
+
+/// Strict lead-1 gauge semantics (#543 round 3): when a generation is
+/// skipped (source cadence gap), the previous generation's match for the
+/// new anchor sits at a deeper lead — the lead1 gauges must then stay
+/// unset rather than mislabel the measurement.
+#[test]
+fn skipped_generation_does_not_mislabel_lead1_skill() {
+    let anchor1 = t0() + Duration::minutes(5);
+    let (source, engine) = build("PT1H", &[t0(), anchor1]);
+    engine.poll_once();
+
+    // Source skips 12:10 entirely; next frame is 12:15 — the previous
+    // generation's prediction for it is lead 2, not lead 1.
+    let anchor3 = anchor1 + Duration::minutes(10);
+    source.times.write().unwrap().push(anchor3);
+    engine.poll_once();
+    assert!(engine.has_data());
+    assert_eq!(
+        engine.skill_permille(),
+        None,
+        "a lead-2 match must not populate the lead-1 gauges"
+    );
+}
+
+/// The skill gauges update as a pair from one frame comparison (#543 round
+/// 4): a scene with no scoreable echo must leave both unset — never one
+/// updated against the other's stale value.
+#[test]
+fn dry_scene_leaves_both_skill_gauges_unset() {
+    // Frames whose echo (~ -14 dBZ raw 40) never reaches min_echo = 10 dBZ:
+    // every contingency denominator is 0 on both sides.
+    struct DrySource {
+        times: RwLock<Vec<DateTime<Utc>>>,
+    }
+    impl MapEngine for DrySource {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            Ok(RasterTile {
+                width,
+                height,
+                values: RasterValues::U8 {
+                    data: vec![40u8; (width * height) as usize],
+                    nodata: Some(NODATA),
+                    gain: 0.4,
+                    offset: -30.0,
+                },
+            })
+        }
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some(EXTENT),
+                times: self.times.read().unwrap().clone(),
+                parameter: "reflectivity".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: Some([W, H]),
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+    }
+
+    let anchor1 = t0() + Duration::minutes(5);
+    let source = Arc::new(DrySource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let config = NowcastConfig {
+        source: "mock".into(),
+        horizon: "PT30M".into(),
+        step: None,
+        history_frames: 2,
+        poll_interval_secs: 30,
+        max_generations: 4,
+        max_pixels: 4_000_000,
+        min_echo: 10.0,
+    };
+    let engine =
+        NowcastEngine::new("dry-nowcast", "mock", source.clone(), &config).expect("engine builds");
+    engine.poll_once();
+    source
+        .times
+        .write()
+        .unwrap()
+        .push(anchor1 + Duration::minutes(5));
+    engine.poll_once();
+    assert!(engine.has_data());
+    assert_eq!(
+        engine.skill_permille(),
+        None,
+        "a dry scene must leave the gauge pair unset"
+    );
+}

@@ -80,7 +80,7 @@ struct EngineCfg {
 }
 
 /// The regular WGS84 grid every stored frame lives on.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct GridGeom {
     west: f64,
     south: f64,
@@ -167,6 +167,11 @@ pub struct NowcastEngine {
     /// One-shot latch for the lead-cap warning (source-cadence default step
     /// only; an explicit step is validated at construction).
     lead_cap_warned: std::sync::atomic::AtomicBool,
+    /// Latest realized lead-1 skill (#542): CSI ×1000 of the previous
+    /// generation's prediction for the newest analysis, and the persistence
+    /// baseline. `u64::MAX` = not yet measured.
+    lead_csi_permille: AtomicU64,
+    lead_persistence_csi_permille: AtomicU64,
 }
 
 impl NowcastEngine {
@@ -250,6 +255,8 @@ impl NowcastEngine {
             last_generation_ms: AtomicU64::new(0),
             source_lag_secs: AtomicU64::new(0),
             lead_cap_warned: std::sync::atomic::AtomicBool::new(false),
+            lead_csi_permille: AtomicU64::new(u64::MAX),
+            lead_persistence_csi_permille: AtomicU64::new(u64::MAX),
         })
     }
 
@@ -291,6 +298,14 @@ impl NowcastEngine {
             state.generations.len(),
             frames,
         )
+    }
+
+    /// Latest realized lead-1 skill (#542): `(nowcast_csi, persistence_csi)`
+    /// as CSI ×1000, `None` before the second generation has been scored.
+    pub fn skill_permille(&self) -> Option<(u64, u64)> {
+        let f = self.lead_csi_permille.load(Ordering::Relaxed);
+        let p = self.lead_persistence_csi_permille.load(Ordering::Relaxed);
+        (f != u64::MAX && p != u64::MAX).then_some((f, p))
     }
 
     /// Signal the poll loop to exit (server reload/shutdown).
@@ -336,6 +351,13 @@ impl NowcastEngine {
             Ok(generation) => {
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 let old = self.state.load();
+                // V2.1 (#542): score the PREVIOUS generation's prediction for
+                // this anchor against the fresh analysis, next to persistence
+                // — continuous skill telemetry, so a quality regression shows
+                // in ops instead of only at review time.
+                if let Some((_, prev)) = old.generations.iter().next_back() {
+                    self.score_previous_generation(prev, &generation, anchor);
+                }
                 let mut generations = old.generations.clone();
                 generations.insert(anchor, Arc::new(generation));
                 while generations.len() > self.cfg.max_generations {
@@ -367,6 +389,61 @@ impl NowcastEngine {
                 );
             }
         }
+    }
+
+    /// Score the previous generation's prediction for `anchor` (usually its
+    /// lead-1 frame) against the new generation's analysis frame, plus the
+    /// persistence baseline (previous analysis vs new analysis). Pixel CSI
+    /// at the `min_echo` threshold, stored ×1000 in the skill gauges.
+    /// Skipped when geometries differ (config change) or the previous
+    /// generation never predicted this anchor.
+    fn score_previous_generation(
+        &self,
+        prev: &Generation,
+        current: &Generation,
+        anchor: DateTime<Utc>,
+    ) {
+        // Full-geometry guard: same pixel dimensions over a SHIFTED extent
+        // (source coverage change, config reload) would silently compare
+        // frames that aren't co-located — bail on any geometry difference.
+        if prev.geom != current.geom {
+            return;
+        }
+        // STRICT lead-1 only: after a skipped generation (transient failure,
+        // source cadence gap) the previous generation's match for `anchor`
+        // sits at a deeper lead — reporting that under the lead1 gauge names
+        // would silently mix leads. Better no measurement than a mislabeled
+        // one.
+        let idx = 1;
+        if prev.times.get(idx) != Some(&anchor) {
+            return;
+        }
+        let w = current.geom.width as usize;
+        let h = current.geom.height as usize;
+        let observed = frame_to_grid(&current.frames[0], w, h);
+        let predicted = frame_to_grid(&prev.frames[idx], w, h);
+        let persisted = frame_to_grid(&prev.frames[0], w, h);
+        let threshold = self.cfg.min_echo;
+        let forecast_csi = crate::skill::score(&predicted, &observed, threshold).csi();
+        let persistence_csi = crate::skill::score(&persisted, &observed, threshold).csi();
+        // The measurement is the PAIR: updating one gauge while the other
+        // keeps a stale value from an earlier generation would fabricate a
+        // skill collapse (e.g. a dry scene where only the extrapolation has
+        // a few spurious echo pixels: forecast CSI Some(0), persistence
+        // None). Either both update from the same frame pair, or neither.
+        let to_permille = |c: Option<f64>| c.map(|v| (v * 1000.0).round() as u64);
+        if let (Some(f), Some(p)) = (to_permille(forecast_csi), to_permille(persistence_csi)) {
+            self.lead_csi_permille.store(f, Ordering::Relaxed);
+            self.lead_persistence_csi_permille
+                .store(p, Ordering::Relaxed);
+        }
+        tracing::info!(
+            "[{}] nowcast skill vs {anchor}: CSI {} (persistence {}) at >= {threshold} (lead {} min)",
+            self.collection_id,
+            forecast_csi.map(|v| format!("{v:.3}")).unwrap_or_else(|| "n/a".into()),
+            persistence_csi.map(|v| format!("{v:.3}")).unwrap_or_else(|| "n/a".into()),
+            (anchor - prev.reference_time).num_minutes(),
+        );
     }
 
     /// Produce one generation anchored on `anchor` (the source's latest
@@ -453,9 +530,9 @@ impl NowcastEngine {
         // motion on a grid coarse enough that the physical search window
         // (MAX_SPEED × interval) fits in TARGET_SEARCH_PX, then scale the
         // field back to working-grid units.
-        let mid_lat = ((geom.south + geom.north) / 2.0).to_radians();
-        let px_meters =
-            ((geom.east - geom.west) * 111_320.0 * mid_lat.cos().abs().max(0.05)) / w as f64;
+        let (px_km_x, _) =
+            crate::lonlat_grid_km_per_px([geom.west, geom.south, geom.east, geom.north], w, h);
+        let px_meters = px_km_x * 1000.0;
         let max_shift_px = MAX_SPEED_MS * interval.num_seconds() as f64 / px_meters.max(1.0);
         let mut factor = 1u32;
         while max_shift_px / factor as f64 > TARGET_SEARCH_PX as f64

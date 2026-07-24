@@ -23,9 +23,29 @@
 pub mod advect;
 pub mod engine;
 pub mod motion;
+pub mod objects;
 pub mod skill;
 
 pub use engine::NowcastEngine;
+
+/// Kilometres per degree of latitude (and of longitude at the equator) on
+/// the WGS84 sphere approximation — the single named home for the constant
+/// so the engine's motion-scale math and the verification harness cannot
+/// drift apart (the #452/#454 lesson, one class down from Critical Rule 4).
+pub const KM_PER_DEG: f64 = 111.32;
+
+/// Per-axis ground resolution (km per pixel) of a regular WGS84 lon/lat
+/// grid over `extent = [west, south, east, north]`. Only the east–west
+/// axis carries the `cos(latitude)` factor (evaluated at mid-latitude,
+/// floored away from the poles); the north–south axis does not — at 65°N
+/// the y-axis covers ~2.4× more km per pixel than the x-axis.
+pub fn lonlat_grid_km_per_px(extent: [f64; 4], width: u32, height: u32) -> (f64, f64) {
+    let mid_lat = ((extent[1] + extent[3]) / 2.0).to_radians();
+    let x = (extent[2] - extent[0]) * KM_PER_DEG * mid_lat.cos().abs().max(0.05)
+        / f64::from(width.max(1));
+    let y = (extent[3] - extent[1]) * KM_PER_DEG / f64::from(height.max(1));
+    (x, y)
+}
 
 /// A row-major 2-D raster of physical values; `NaN` = nodata.
 #[derive(Debug, Clone)]

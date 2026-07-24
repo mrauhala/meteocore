@@ -71,6 +71,20 @@ only an explicit `DIM_REFERENCE_TIME` pin reads old generations), set
 `max_generations = 2` in production configs. A generation-thinning
 follow-up (full frames only for the latest generation) is scoped in #523.
 
+## Verification (V2.1, #542)
+
+- `objects` module = dependency-free 2D cell segmentation (threshold
+  contour, 8-connected, min-area), Hungarian centroid matching with a
+  distance gate, growing/decaying classification by volume-proxy change —
+  the Ritvanen et al. (GMD 2025) object framework. `skill_spike` prints the
+  object CSI-by-lead table (overall + per class + centroid error) next to
+  the pixel table; every v2 quality change gates on BOTH.
+- Each generation scores the previous one's lead-1 prediction against the
+  fresh analysis (pixel CSI at `min_echo`) and the persistence baseline —
+  exported as `nowcast_lead1_csi_permille` /
+  `nowcast_lead1_persistence_csi_permille`. A persistent gap collapse in
+  prod = motion or data regression; check before blaming the client.
+
 ## Gotchas
 
 - Advection is Lagrangian persistence: no growth/decay; 35+ dBZ convective

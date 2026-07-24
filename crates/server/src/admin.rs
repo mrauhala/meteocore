@@ -743,6 +743,34 @@ static NOWCAST_FRAMES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     gauge
 });
 
+static NOWCAST_LEAD1_CSI: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "nowcast_lead1_csi_permille",
+            "Realized lead-1 skill: CSI x1000 of the previous generation's \
+             prediction scored against the newest analysis frame (#542)",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+static NOWCAST_LEAD1_PERSISTENCE_CSI: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "nowcast_lead1_persistence_csi_permille",
+            "Persistence baseline for nowcast_lead1_csi_permille: CSI x1000 \
+             of the previous analysis frame scored against the newest one",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
 static RENDER_SEMAPHORE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
     let gauge = IntGauge::new(
         "render_semaphore_available",
@@ -3844,6 +3872,14 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
             NOWCAST_FRAMES
                 .with_label_values(&[collection])
                 .set(frames as i64);
+            if let Some((csi, persistence)) = engine.skill_permille() {
+                NOWCAST_LEAD1_CSI
+                    .with_label_values(&[collection])
+                    .set(csi as i64);
+                NOWCAST_LEAD1_PERSISTENCE_CSI
+                    .with_label_values(&[collection])
+                    .set(persistence as i64);
+            }
         }
     }
 
