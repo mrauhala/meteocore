@@ -89,11 +89,40 @@ pub fn segment_cells(grid: &Grid, threshold: f32, min_area: usize) -> Vec<CellBl
     cells
 }
 
-/// Match two cell sets by centroid distance with a hard gate (pixels),
-/// minimizing total matched distance (Hungarian assignment). Returns
-/// `(index_a, index_b)` pairs; unmatched cells in either set are simply
-/// absent from the result.
-pub fn match_cells(a: &[CellBlob], b: &[CellBlob], gate_px: f32) -> Vec<(usize, usize)> {
+/// Per-axis pixel scale for distance computations. A regular lat/lon grid
+/// is anisotropic away from the equator: the east–west span carries a
+/// `cos(lat)` factor the north–south span does not (at 65°N the y-axis
+/// covers ~2.4× more km per pixel than the x-axis). Distances and gates are
+/// computed in the scale's unit — km for a real grid, or pass `UNIT` to work
+/// in raw pixels (tests, isotropic grids).
+#[derive(Debug, Clone, Copy)]
+pub struct PixelScale {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl PixelScale {
+    /// Identity scale: distances and gates are in pixels.
+    pub const UNIT: PixelScale = PixelScale { x: 1.0, y: 1.0 };
+
+    #[inline]
+    fn distance(&self, a: (f32, f32), b: (f32, f32)) -> f32 {
+        let dx = (a.0 - b.0) * self.x;
+        let dy = (a.1 - b.1) * self.y;
+        (dx * dx + dy * dy).sqrt()
+    }
+}
+
+/// Match two cell sets by centroid distance with a hard gate (in the units
+/// of `scale` — km for a real grid), minimizing total matched distance
+/// (Hungarian assignment). Returns `(index_a, index_b)` pairs; unmatched
+/// cells in either set are simply absent from the result.
+pub fn match_cells(
+    a: &[CellBlob],
+    b: &[CellBlob],
+    scale: PixelScale,
+    gate: f32,
+) -> Vec<(usize, usize)> {
     if a.is_empty() || b.is_empty() {
         return Vec::new();
     }
@@ -101,14 +130,12 @@ pub fn match_cells(a: &[CellBlob], b: &[CellBlob], gate_px: f32) -> Vec<(usize, 
     // above `forbidden` are dropped afterwards, which is how the gate and
     // the padding both work.
     let n = a.len().max(b.len());
-    let forbidden = gate_px * 10.0 + 1e6;
+    let forbidden = gate * 10.0 + 1e6;
     let mut cost = vec![forbidden; n * n];
     for (i, ca) in a.iter().enumerate() {
         for (j, cb) in b.iter().enumerate() {
-            let dx = ca.centroid.0 - cb.centroid.0;
-            let dy = ca.centroid.1 - cb.centroid.1;
-            let d = (dx * dx + dy * dy).sqrt();
-            if d <= gate_px {
+            let d = scale.distance(ca.centroid, cb.centroid);
+            if d <= gate {
                 cost[i * n + j] = d;
             }
         }
@@ -204,10 +231,11 @@ pub enum GrowthClass {
 pub fn classify_growth(
     previous: &[CellBlob],
     current: &[CellBlob],
-    gate_px: f32,
+    scale: PixelScale,
+    gate: f32,
 ) -> Vec<GrowthClass> {
     let mut classes = vec![GrowthClass::Unknown; current.len()];
-    for (pi, ci) in match_cells(previous, current, gate_px) {
+    for (pi, ci) in match_cells(previous, current, scale, gate) {
         classes[ci] = if current[ci].volume >= previous[pi].volume {
             GrowthClass::Growing
         } else {
@@ -225,9 +253,10 @@ pub struct ObjectScores {
     pub hits: u64,
     pub misses: u64,
     pub false_alarms: u64,
-    /// Sum of centroid distances (px) over hits — divide by `hits` for the
-    /// mean location error.
-    pub centroid_error_px: f64,
+    /// Sum of matched centroid distances, in the units of the
+    /// [`PixelScale`] used for matching (km for a real grid) — divide by
+    /// `hits` for the mean location error.
+    pub centroid_error: f64,
 }
 
 impl ObjectScores {
@@ -246,30 +275,36 @@ impl ObjectScores {
         (den > 0).then(|| self.hits as f64 / den as f64)
     }
 
-    pub fn mean_centroid_error_px(&self) -> Option<f64> {
-        (self.hits > 0).then(|| self.centroid_error_px / self.hits as f64)
+    pub fn mean_centroid_error(&self) -> Option<f64> {
+        (self.hits > 0).then(|| self.centroid_error / self.hits as f64)
     }
 
     pub fn merge(&mut self, other: &ObjectScores) {
         self.hits += other.hits;
         self.misses += other.misses;
         self.false_alarms += other.false_alarms;
-        self.centroid_error_px += other.centroid_error_px;
+        self.centroid_error += other.centroid_error;
     }
 }
 
 /// Score forecast cells against observed cells (one lead time). When
 /// `observed_classes` is given (from [`classify_growth`] on the observation
 /// side at forecast creation), misses and hits are attributed to the
-/// returned per-class scores as well; false alarms only enter the overall
-/// score (a spurious forecast cell has no observed class).
+/// returned per-class scores as well.
+///
+/// **Metric caveat**: false alarms only enter the overall score — a
+/// spurious forecast cell has no observed class to attribute to — so the
+/// per-class scores carry hits and misses only. Report them as
+/// [`ObjectScores::pod`]; their `csi()` would numerically equal POD and
+/// must not be presented next to the overall CSI as the same metric.
 pub fn score_objects(
     forecast: &[CellBlob],
     observed: &[CellBlob],
     observed_classes: Option<&[GrowthClass]>,
-    gate_px: f32,
+    scale: PixelScale,
+    gate: f32,
 ) -> (ObjectScores, ObjectScores, ObjectScores) {
-    let matches = match_cells(forecast, observed, gate_px);
+    let matches = match_cells(forecast, observed, scale, gate);
     let mut overall = ObjectScores::default();
     let mut growing = ObjectScores::default();
     let mut decaying = ObjectScores::default();
@@ -277,20 +312,18 @@ pub fn score_objects(
     let mut observed_hit = vec![false; observed.len()];
     for &(fi, oi) in &matches {
         observed_hit[oi] = true;
-        let dx = forecast[fi].centroid.0 - observed[oi].centroid.0;
-        let dy = forecast[fi].centroid.1 - observed[oi].centroid.1;
-        let err = ((dx * dx + dy * dy) as f64).sqrt();
+        let err = scale.distance(forecast[fi].centroid, observed[oi].centroid) as f64;
         overall.hits += 1;
-        overall.centroid_error_px += err;
+        overall.centroid_error += err;
         if let Some(classes) = observed_classes {
             match classes[oi] {
                 GrowthClass::Growing => {
                     growing.hits += 1;
-                    growing.centroid_error_px += err;
+                    growing.centroid_error += err;
                 }
                 GrowthClass::Decaying => {
                     decaying.hits += 1;
-                    decaying.centroid_error_px += err;
+                    decaying.centroid_error += err;
                 }
                 GrowthClass::Unknown => {}
             }
@@ -361,10 +394,25 @@ mod tests {
         );
         let ca = segment_cells(&a, 35.0, 5);
         let cb = segment_cells(&b, 35.0, 5);
-        let m = match_cells(&ca, &cb, 20.0);
+        let m = match_cells(&ca, &cb, PixelScale::UNIT, 20.0);
         assert_eq!(m.len(), 1, "only the near cell is inside the gate");
         let (_, bi) = m[0];
         assert!((cb[bi].centroid.0 - 58.0).abs() < 1.5);
+    }
+
+    #[test]
+    fn anisotropic_scale_gates_the_y_axis_correctly() {
+        // Two cells 10 px apart in y. With y = 2 km/px that is 20 km: inside
+        // a 25 km gate, outside a 15 km gate — an isotropic 1 km/px scale
+        // would wrongly accept the latter.
+        let a = grid_with_discs(100, 100, &[(50.0, 40.0, 6.0, 45.0)]);
+        let b = grid_with_discs(100, 100, &[(50.0, 50.0, 6.0, 45.0)]);
+        let ca = segment_cells(&a, 35.0, 5);
+        let cb = segment_cells(&b, 35.0, 5);
+        let scale = PixelScale { x: 1.0, y: 2.0 };
+        assert_eq!(match_cells(&ca, &cb, scale, 25.0).len(), 1);
+        assert_eq!(match_cells(&ca, &cb, scale, 15.0).len(), 0);
+        assert_eq!(match_cells(&ca, &cb, PixelScale::UNIT, 15.0).len(), 1);
     }
 
     #[test]
@@ -387,7 +435,7 @@ mod tests {
         let cf = segment_cells(&f, 35.0, 5);
         let co = segment_cells(&o, 35.0, 5);
         assert_eq!((cf.len(), co.len()), (2, 2), "discs must not merge");
-        let m = match_cells(&cf, &co, 15.0);
+        let m = match_cells(&cf, &co, PixelScale::UNIT, 15.0);
         assert_eq!(m.len(), 2, "optimal assignment matches both");
     }
 
@@ -405,7 +453,7 @@ mod tests {
         );
         let cp = segment_cells(&prev, 35.0, 5);
         let cc = segment_cells(&cur, 35.0, 5);
-        let classes = classify_growth(&cp, &cc, 20.0);
+        let classes = classify_growth(&cp, &cc, PixelScale::UNIT, 20.0);
         let mut by_x: Vec<(f32, GrowthClass)> = cc
             .iter()
             .zip(&classes)
@@ -433,13 +481,14 @@ mod tests {
         let co = segment_cells(&observed, 35.0, 5);
         let cf = segment_cells(&forecast, 35.0, 5);
         let classes = vec![GrowthClass::Growing, GrowthClass::Decaying];
-        let (overall, growing, decaying) = score_objects(&cf, &co, Some(&classes), 20.0);
+        let (overall, growing, decaying) =
+            score_objects(&cf, &co, Some(&classes), PixelScale::UNIT, 20.0);
         assert_eq!(
             (overall.hits, overall.misses, overall.false_alarms),
             (1, 1, 1)
         );
         assert_eq!(overall.csi(), Some(1.0 / 3.0));
-        let err = overall.mean_centroid_error_px().unwrap();
+        let err = overall.mean_centroid_error().unwrap();
         assert!((err - 6.0).abs() < 1.5, "centroid error ~6 px, got {err}");
         assert_eq!((growing.hits, growing.misses), (1, 0));
         assert_eq!((decaying.hits, decaying.misses), (0, 1));

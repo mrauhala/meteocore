@@ -22,7 +22,8 @@ use ds_core::map_engine::{MapEngine, OutputCrs, RasterValues};
 use engine_geotiff::GeoTiffEngine;
 use engine_nowcast::motion::{estimate_motion, MotionOptions};
 use engine_nowcast::objects::{
-    classify_growth, match_cells, score_objects, segment_cells, CellBlob, GrowthClass, ObjectScores,
+    classify_growth, match_cells, score_objects, segment_cells, CellBlob, GrowthClass,
+    ObjectScores, PixelScale,
 };
 use engine_nowcast::skill::{score, Contingency};
 use engine_nowcast::{advect::advect, Grid};
@@ -334,21 +335,30 @@ fn main() -> ExitCode {
     // growing/decaying at forecast creation and chain that class forward
     // through observed-cell matches so each lead's scores stratify by the
     // creation-time class.
+    // Per-axis km/px: on a regular lat/lon grid only the east–west axis
+    // carries the cos(lat) factor — at Nordic latitudes y covers ~2–3× more
+    // km per pixel than x, so distances are computed anisotropically in km.
     let mid_lat = ((extent[1] + extent[3]) / 2.0).to_radians();
-    let px_km = ((extent[2] - extent[0]) * 111.32 * mid_lat.cos().abs().max(0.05)) / w as f64;
-    let gate_px = (args.gate_km / px_km.max(1e-6)) as f32;
+    let px_km_x = ((extent[2] - extent[0]) * 111.32 * mid_lat.cos().abs().max(0.05)) / w as f64;
+    let px_km_y = ((extent[3] - extent[1]) * 111.32) / h as f64;
+    let scale = PixelScale {
+        x: px_km_x as f32,
+        y: px_km_y as f32,
+    };
+    let gate_km = args.gate_km as f32;
     let obs_cells: Vec<Vec<CellBlob>> = frames
         .iter()
         .map(|f| segment_cells(f, args.object_threshold, args.min_area))
         .collect();
     println!(
-        "objects: threshold {} {}, min area {} px, match gate {:.0} km = {:.1} px, \
-         cells per frame {:?}",
+        "objects: threshold {} {}, min area {} px, match gate {:.0} km \
+         (px {:.2}x{:.2} km), cells per frame {:?}",
         args.object_threshold,
         info.unit,
         args.min_area,
         args.gate_km,
-        gate_px,
+        px_km_x,
+        px_km_y,
         obs_cells.iter().map(Vec::len).collect::<Vec<_>>()
     );
     let mut obj_now = vec![[ObjectScores::default(); 3]; max_lead];
@@ -369,7 +379,7 @@ fn main() -> ExitCode {
 
         // Growth/decay class of each observed cell at forecast creation,
         // then chained forward through observed-track matches per lead.
-        let mut classes = classify_growth(&obs_cells[i - 1], &obs_cells[i], gate_px);
+        let mut classes = classify_growth(&obs_cells[i - 1], &obs_cells[i], scale, gate_km);
 
         for lead in 1..=(frames.len() - 1 - i) {
             let started = Instant::now();
@@ -385,17 +395,18 @@ fn main() -> ExitCode {
             let prev_obs = &obs_cells[i + lead - 1];
             let cur_obs = &obs_cells[i + lead];
             let mut next_classes = vec![GrowthClass::Unknown; cur_obs.len()];
-            for (pi, ci) in match_cells(prev_obs, cur_obs, gate_px) {
+            for (pi, ci) in match_cells(prev_obs, cur_obs, scale, gate_km) {
                 next_classes[ci] = classes[pi];
             }
             classes = next_classes;
 
             let fc_cells = segment_cells(&forecast, args.object_threshold, args.min_area);
-            let (o, g, d) = score_objects(&fc_cells, cur_obs, Some(&classes), gate_px);
+            let (o, g, d) = score_objects(&fc_cells, cur_obs, Some(&classes), scale, gate_km);
             obj_now[lead - 1][0].merge(&o);
             obj_now[lead - 1][1].merge(&g);
             obj_now[lead - 1][2].merge(&d);
-            let (po, pg, pd) = score_objects(&obs_cells[i], cur_obs, Some(&classes), gate_px);
+            let (po, pg, pd) =
+                score_objects(&obs_cells[i], cur_obs, Some(&classes), scale, gate_km);
             obj_pers[lead - 1][0].merge(&po);
             obj_pers[lead - 1][1].merge(&pg);
             obj_pers[lead - 1][2].merge(&pd);
@@ -425,21 +436,24 @@ fn main() -> ExitCode {
     // stratified by the creation-time growing/decaying class, next to the
     // persistence baseline — the metric that exposes growth/decay blindness.
     println!();
-    println!("lead  objCSI now/pers   grow now/pers   decay now/pers   cent.err km (now)");
+    // Per-class columns are POD (hits/(hits+misses)): a spurious forecast
+    // cell has no observed class, so false alarms exist only in the overall
+    // CSI — labeling per-class columns "CSI" would silently print POD anyway.
+    println!("lead  objCSI now/pers  growPOD now/pers  decayPOD now/pers  cent.err km (now)");
     for li in 0..max_lead {
         let err_km = obj_now[li][0]
-            .mean_centroid_error_px()
-            .map(|e| format!("{:.1}", e * px_km))
+            .mean_centroid_error()
+            .map(|e| format!("{e:.1}"))
             .unwrap_or_else(|| "n/a".into());
         println!(
             "  +{:<3} {:>6}/{:<6}  {:>6}/{:<6}  {:>6}/{:<6}   {}",
             li + 1,
             fmt_ratio(obj_now[li][0].csi()),
             fmt_ratio(obj_pers[li][0].csi()),
-            fmt_ratio(obj_now[li][1].csi()),
-            fmt_ratio(obj_pers[li][1].csi()),
-            fmt_ratio(obj_now[li][2].csi()),
-            fmt_ratio(obj_pers[li][2].csi()),
+            fmt_ratio(obj_now[li][1].pod()),
+            fmt_ratio(obj_pers[li][1].pod()),
+            fmt_ratio(obj_now[li][2].pod()),
+            fmt_ratio(obj_pers[li][2].pod()),
             err_km,
         );
     }
