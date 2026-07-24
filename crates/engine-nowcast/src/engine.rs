@@ -1039,6 +1039,21 @@ impl FeatureEngine for NowcastEngine {
                 next_offset: None,
             });
         };
+        // Cells exist only at the latest analysis instant: a datetime
+        // filter that excludes the anchor matches nothing (engine-cap
+        // precedent for honoring `?datetime=`).
+        if let Some(dt) = &query.datetime {
+            let after_start = dt.start.is_none_or(|s| anchor >= s);
+            let before_end = dt.end.is_none_or(|e| anchor <= e);
+            if !(after_start && before_end) {
+                return Ok(FeaturePage {
+                    features: Vec::new(),
+                    number_matched: 0,
+                    number_returned: 0,
+                    next_offset: None,
+                });
+            }
+        }
         let g = latest.geom;
         let (kx, ky) =
             crate::lonlat_grid_km_per_px([g.west, g.south, g.east, g.north], g.width, g.height);
@@ -1108,6 +1123,12 @@ impl FeatureEngine for NowcastEngine {
             number_returned,
             next_offset,
         })
+    }
+
+    /// O(1) from the snapshot — the default would build every feature just
+    /// to count them, on every collection-metadata request.
+    fn feature_count(&self) -> usize {
+        self.state.load().cells.len()
     }
 
     fn get_feature(&self, feature_id: &str) -> Result<Feature, DataServerError> {

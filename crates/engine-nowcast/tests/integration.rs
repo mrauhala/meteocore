@@ -550,4 +550,19 @@ fn cell_features_are_served_and_tracks_persist() {
     ));
     assert!(engine.get_feature(&id1).is_ok());
     assert!(engine.get_feature("9999").is_err());
+
+    // datetime filter: excluding the anchor matches nothing; including it
+    // matches; count accessor is O(1)-consistent with the page.
+    use ds_core::feature::DatetimeInterval;
+    let excl = engine
+        .get_features(&FeatureQuery {
+            datetime: Some(DatetimeInterval {
+                start: None,
+                end: Some(anchor2 - Duration::minutes(1)),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(excl.number_matched, 0);
+    assert_eq!(engine.feature_count(), 1);
 }
