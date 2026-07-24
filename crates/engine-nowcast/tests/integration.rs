@@ -434,3 +434,83 @@ fn skipped_generation_does_not_mislabel_lead1_skill() {
         "a lead-2 match must not populate the lead-1 gauges"
     );
 }
+
+/// The skill gauges update as a pair from one frame comparison (#543 round
+/// 4): a scene with no scoreable echo must leave both unset — never one
+/// updated against the other's stale value.
+#[test]
+fn dry_scene_leaves_both_skill_gauges_unset() {
+    // Frames whose echo (~ -14 dBZ raw 40) never reaches min_echo = 10 dBZ:
+    // every contingency denominator is 0 on both sides.
+    struct DrySource {
+        times: RwLock<Vec<DateTime<Utc>>>,
+    }
+    impl MapEngine for DrySource {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            Ok(RasterTile {
+                width,
+                height,
+                values: RasterValues::U8 {
+                    data: vec![40u8; (width * height) as usize],
+                    nodata: Some(NODATA),
+                    gain: 0.4,
+                    offset: -30.0,
+                },
+            })
+        }
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some(EXTENT),
+                times: self.times.read().unwrap().clone(),
+                parameter: "reflectivity".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: Some([W, H]),
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+    }
+
+    let anchor1 = t0() + Duration::minutes(5);
+    let source = Arc::new(DrySource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let config = NowcastConfig {
+        source: "mock".into(),
+        horizon: "PT30M".into(),
+        step: None,
+        history_frames: 2,
+        poll_interval_secs: 30,
+        max_generations: 4,
+        max_pixels: 4_000_000,
+        min_echo: 10.0,
+    };
+    let engine =
+        NowcastEngine::new("dry-nowcast", "mock", source.clone(), &config).expect("engine builds");
+    engine.poll_once();
+    source
+        .times
+        .write()
+        .unwrap()
+        .push(anchor1 + Duration::minutes(5));
+    engine.poll_once();
+    assert!(engine.has_data());
+    assert_eq!(
+        engine.skill_permille(),
+        None,
+        "a dry scene must leave the gauge pair unset"
+    );
+}

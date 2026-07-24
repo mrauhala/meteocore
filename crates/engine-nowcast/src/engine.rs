@@ -426,11 +426,14 @@ impl NowcastEngine {
         let threshold = self.cfg.min_echo;
         let forecast_csi = crate::skill::score(&predicted, &observed, threshold).csi();
         let persistence_csi = crate::skill::score(&persisted, &observed, threshold).csi();
+        // The measurement is the PAIR: updating one gauge while the other
+        // keeps a stale value from an earlier generation would fabricate a
+        // skill collapse (e.g. a dry scene where only the extrapolation has
+        // a few spurious echo pixels: forecast CSI Some(0), persistence
+        // None). Either both update from the same frame pair, or neither.
         let to_permille = |c: Option<f64>| c.map(|v| (v * 1000.0).round() as u64);
-        if let Some(p) = to_permille(forecast_csi) {
-            self.lead_csi_permille.store(p, Ordering::Relaxed);
-        }
-        if let Some(p) = to_permille(persistence_csi) {
+        if let (Some(f), Some(p)) = (to_permille(forecast_csi), to_permille(persistence_csi)) {
+            self.lead_csi_permille.store(f, Ordering::Relaxed);
             self.lead_persistence_csi_permille
                 .store(p, Ordering::Relaxed);
         }
