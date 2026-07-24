@@ -167,6 +167,11 @@ pub struct NowcastEngine {
     /// One-shot latch for the lead-cap warning (source-cadence default step
     /// only; an explicit step is validated at construction).
     lead_cap_warned: std::sync::atomic::AtomicBool,
+    /// Latest realized lead-1 skill (#542): CSI ×1000 of the previous
+    /// generation's prediction for the newest analysis, and the persistence
+    /// baseline. `u64::MAX` = not yet measured.
+    lead_csi_permille: AtomicU64,
+    lead_persistence_csi_permille: AtomicU64,
 }
 
 impl NowcastEngine {
@@ -250,6 +255,8 @@ impl NowcastEngine {
             last_generation_ms: AtomicU64::new(0),
             source_lag_secs: AtomicU64::new(0),
             lead_cap_warned: std::sync::atomic::AtomicBool::new(false),
+            lead_csi_permille: AtomicU64::new(u64::MAX),
+            lead_persistence_csi_permille: AtomicU64::new(u64::MAX),
         })
     }
 
@@ -291,6 +298,14 @@ impl NowcastEngine {
             state.generations.len(),
             frames,
         )
+    }
+
+    /// Latest realized lead-1 skill (#542): `(nowcast_csi, persistence_csi)`
+    /// as CSI ×1000, `None` before the second generation has been scored.
+    pub fn skill_permille(&self) -> Option<(u64, u64)> {
+        let f = self.lead_csi_permille.load(Ordering::Relaxed);
+        let p = self.lead_persistence_csi_permille.load(Ordering::Relaxed);
+        (f != u64::MAX && p != u64::MAX).then_some((f, p))
     }
 
     /// Signal the poll loop to exit (server reload/shutdown).
@@ -336,6 +351,13 @@ impl NowcastEngine {
             Ok(generation) => {
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 let old = self.state.load();
+                // V2.1 (#542): score the PREVIOUS generation's prediction for
+                // this anchor against the fresh analysis, next to persistence
+                // — continuous skill telemetry, so a quality regression shows
+                // in ops instead of only at review time.
+                if let Some((_, prev)) = old.generations.iter().next_back() {
+                    self.score_previous_generation(prev, &generation, anchor);
+                }
                 let mut generations = old.generations.clone();
                 generations.insert(anchor, Arc::new(generation));
                 while generations.len() > self.cfg.max_generations {
@@ -367,6 +389,49 @@ impl NowcastEngine {
                 );
             }
         }
+    }
+
+    /// Score the previous generation's prediction for `anchor` (usually its
+    /// lead-1 frame) against the new generation's analysis frame, plus the
+    /// persistence baseline (previous analysis vs new analysis). Pixel CSI
+    /// at the `min_echo` threshold, stored ×1000 in the skill gauges.
+    /// Skipped when geometries differ (config change) or the previous
+    /// generation never predicted this anchor.
+    fn score_previous_generation(
+        &self,
+        prev: &Generation,
+        current: &Generation,
+        anchor: DateTime<Utc>,
+    ) {
+        if (prev.geom.width, prev.geom.height) != (current.geom.width, current.geom.height) {
+            return;
+        }
+        let Some(idx) = prev.times.iter().position(|&t| t == anchor) else {
+            return; // previous generation never predicted this instant
+        };
+        let w = current.geom.width as usize;
+        let h = current.geom.height as usize;
+        let observed = frame_to_grid(&current.frames[0], w, h);
+        let predicted = frame_to_grid(&prev.frames[idx], w, h);
+        let persisted = frame_to_grid(&prev.frames[0], w, h);
+        let threshold = self.cfg.min_echo;
+        let forecast_csi = crate::skill::score(&predicted, &observed, threshold).csi();
+        let persistence_csi = crate::skill::score(&persisted, &observed, threshold).csi();
+        let to_permille = |c: Option<f64>| c.map(|v| (v * 1000.0).round() as u64);
+        if let Some(p) = to_permille(forecast_csi) {
+            self.lead_csi_permille.store(p, Ordering::Relaxed);
+        }
+        if let Some(p) = to_permille(persistence_csi) {
+            self.lead_persistence_csi_permille
+                .store(p, Ordering::Relaxed);
+        }
+        tracing::info!(
+            "[{}] nowcast skill vs {anchor}: CSI {} (persistence {}) at >= {threshold} (lead {} min)",
+            self.collection_id,
+            forecast_csi.map(|v| format!("{v:.3}")).unwrap_or_else(|| "n/a".into()),
+            persistence_csi.map(|v| format!("{v:.3}")).unwrap_or_else(|| "n/a".into()),
+            (anchor - prev.reference_time).num_minutes(),
+        );
     }
 
     /// Produce one generation anchored on `anchor` (the source's latest

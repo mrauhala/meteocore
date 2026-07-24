@@ -21,6 +21,9 @@ use ds_core::config::GeoTiffConfig;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterValues};
 use engine_geotiff::GeoTiffEngine;
 use engine_nowcast::motion::{estimate_motion, MotionOptions};
+use engine_nowcast::objects::{
+    classify_growth, match_cells, score_objects, segment_cells, CellBlob, GrowthClass, ObjectScores,
+};
 use engine_nowcast::skill::{score, Contingency};
 use engine_nowcast::{advect::advect, Grid};
 
@@ -39,6 +42,9 @@ struct Args {
     nodata: Option<f64>,
     scale: Option<f64>,
     offset: Option<f64>,
+    object_threshold: f32,
+    min_area: usize,
+    gate_km: f64,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -54,6 +60,9 @@ fn parse_args() -> Result<Args, String> {
         nodata: None,
         scale: None,
         offset: None,
+        object_threshold: 35.0,
+        min_area: 5,
+        gate_km: 20.0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -113,6 +122,21 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|e: std::num::ParseFloatError| e.to_string())?,
                 )
             }
+            "--object-threshold" => {
+                args.object_threshold = value("--object-threshold")?
+                    .parse()
+                    .map_err(|e: std::num::ParseFloatError| e.to_string())?
+            }
+            "--min-area" => {
+                args.min_area = value("--min-area")?
+                    .parse()
+                    .map_err(|e: std::num::ParseIntError| e.to_string())?
+            }
+            "--gate-km" => {
+                args.gate_km = value("--gate-km")?
+                    .parse()
+                    .map_err(|e: std::num::ParseFloatError| e.to_string())?
+            }
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -121,7 +145,8 @@ fn parse_args() -> Result<Args, String> {
             "usage: skill_spike --dir <fixture dir> --template <strftime filename> \
                     [--thresholds 10,20,35] [--gate-threshold 20] [--min-echo 10] \
                     [--block 32] [--search 20] [--substeps 4] \
-                    [--nodata <raw>] [--scale <gain>] [--offset <off>]"
+                    [--nodata <raw>] [--scale <gain>] [--offset <off>] \
+                    [--object-threshold 35] [--min-area 5] [--gate-km 20]"
                 .into(),
         );
     }
@@ -304,6 +329,31 @@ fn main() -> ExitCode {
     let mut nowcast = vec![vec![Contingency::default(); args.thresholds.len()]; max_lead];
     let mut persistence = vec![vec![Contingency::default(); args.thresholds.len()]; max_lead];
 
+    // Object-based verification (#542, after Ritvanen et al. GMD 2025):
+    // segment cells once per frame; per anchor, classify observed cells as
+    // growing/decaying at forecast creation and chain that class forward
+    // through observed-cell matches so each lead's scores stratify by the
+    // creation-time class.
+    let mid_lat = ((extent[1] + extent[3]) / 2.0).to_radians();
+    let px_km = ((extent[2] - extent[0]) * 111.32 * mid_lat.cos().abs().max(0.05)) / w as f64;
+    let gate_px = (args.gate_km / px_km.max(1e-6)) as f32;
+    let obs_cells: Vec<Vec<CellBlob>> = frames
+        .iter()
+        .map(|f| segment_cells(f, args.object_threshold, args.min_area))
+        .collect();
+    println!(
+        "objects: threshold {} {}, min area {} px, match gate {:.0} km = {:.1} px, \
+         cells per frame {:?}",
+        args.object_threshold,
+        info.unit,
+        args.min_area,
+        args.gate_km,
+        gate_px,
+        obs_cells.iter().map(Vec::len).collect::<Vec<_>>()
+    );
+    let mut obj_now = vec![[ObjectScores::default(); 3]; max_lead];
+    let mut obj_pers = vec![[ObjectScores::default(); 3]; max_lead];
+
     for i in 1..frames.len() - 1 {
         let started = Instant::now();
         let field = estimate_motion(&frames[i - 1], &frames[i], &opts);
@@ -317,6 +367,10 @@ fn main() -> ExitCode {
             field.measured.len()
         );
 
+        // Growth/decay class of each observed cell at forecast creation,
+        // then chained forward through observed-track matches per lead.
+        let mut classes = classify_growth(&obs_cells[i - 1], &obs_cells[i], gate_px);
+
         for lead in 1..=(frames.len() - 1 - i) {
             let started = Instant::now();
             let forecast = advect(&frames[i], &field, lead as f32, args.substeps);
@@ -326,6 +380,25 @@ fn main() -> ExitCode {
                 nowcast[lead - 1][k].merge(&score(&forecast, &frames[i + lead], thr));
                 persistence[lead - 1][k].merge(&score(&frames[i], &frames[i + lead], thr));
             }
+
+            // Carry creation-time classes to this lead's observed cells.
+            let prev_obs = &obs_cells[i + lead - 1];
+            let cur_obs = &obs_cells[i + lead];
+            let mut next_classes = vec![GrowthClass::Unknown; cur_obs.len()];
+            for (pi, ci) in match_cells(prev_obs, cur_obs, gate_px) {
+                next_classes[ci] = classes[pi];
+            }
+            classes = next_classes;
+
+            let fc_cells = segment_cells(&forecast, args.object_threshold, args.min_area);
+            let (o, g, d) = score_objects(&fc_cells, cur_obs, Some(&classes), gate_px);
+            obj_now[lead - 1][0].merge(&o);
+            obj_now[lead - 1][1].merge(&g);
+            obj_now[lead - 1][2].merge(&d);
+            let (po, pg, pd) = score_objects(&obs_cells[i], cur_obs, Some(&classes), gate_px);
+            obj_pers[lead - 1][0].merge(&po);
+            obj_pers[lead - 1][1].merge(&pg);
+            obj_pers[lead - 1][2].merge(&pd);
         }
     }
 
@@ -346,6 +419,29 @@ fn main() -> ExitCode {
                 fmt_ratio(row[k].far()),
             );
         }
+    }
+
+    // Object-based table (#542): cell-level CSI by lead, overall and
+    // stratified by the creation-time growing/decaying class, next to the
+    // persistence baseline — the metric that exposes growth/decay blindness.
+    println!();
+    println!("lead  objCSI now/pers   grow now/pers   decay now/pers   cent.err km (now)");
+    for li in 0..max_lead {
+        let err_km = obj_now[li][0]
+            .mean_centroid_error_px()
+            .map(|e| format!("{:.1}", e * px_km))
+            .unwrap_or_else(|| "n/a".into());
+        println!(
+            "  +{:<3} {:>6}/{:<6}  {:>6}/{:<6}  {:>6}/{:<6}   {}",
+            li + 1,
+            fmt_ratio(obj_now[li][0].csi()),
+            fmt_ratio(obj_pers[li][0].csi()),
+            fmt_ratio(obj_now[li][1].csi()),
+            fmt_ratio(obj_pers[li][1].csi()),
+            fmt_ratio(obj_now[li][2].csi()),
+            fmt_ratio(obj_pers[li][2].csi()),
+            err_km,
+        );
     }
 
     // The gate (#520): beat persistence at the gate threshold, lead 1.

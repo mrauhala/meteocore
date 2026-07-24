@@ -23,6 +23,7 @@
 pub mod advect;
 pub mod engine;
 pub mod motion;
+pub mod objects;
 pub mod skill;
 
 pub use engine::NowcastEngine;

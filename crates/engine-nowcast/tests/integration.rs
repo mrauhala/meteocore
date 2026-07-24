@@ -384,3 +384,30 @@ fn oversized_history_frames_is_rejected() {
         .expect("must reject oversized history_frames");
     assert!(err.to_string().contains("exceeds the cap"), "got: {err}");
 }
+
+/// V2.1 (#542): each new generation scores the previous one's prediction for
+/// the fresh analysis against persistence. On a pure translation the
+/// extrapolation reconstructs the truth almost exactly, so its realized CSI
+/// must be high and at least match persistence.
+#[test]
+fn per_generation_skill_is_scored_against_persistence() {
+    let anchor1 = t0() + Duration::minutes(5);
+    let (source, engine) = build("PT1H", &[t0(), anchor1]);
+    engine.poll_once();
+    assert!(
+        engine.skill_permille().is_none(),
+        "no skill before a second generation exists"
+    );
+
+    let anchor2 = anchor1 + Duration::minutes(5);
+    source.times.write().unwrap().push(anchor2);
+    engine.poll_once();
+    let (csi, persistence) = engine
+        .skill_permille()
+        .expect("second generation must produce a skill measurement");
+    assert!(
+        csi >= persistence,
+        "translation nowcast CSI ({csi}) must be >= persistence ({persistence})"
+    );
+    assert!(csi > 900, "near-perfect reconstruction expected, got {csi}");
+}
