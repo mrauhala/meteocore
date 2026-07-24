@@ -80,7 +80,7 @@ struct EngineCfg {
 }
 
 /// The regular WGS84 grid every stored frame lives on.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct GridGeom {
     west: f64,
     south: f64,
@@ -403,7 +403,10 @@ impl NowcastEngine {
         current: &Generation,
         anchor: DateTime<Utc>,
     ) {
-        if (prev.geom.width, prev.geom.height) != (current.geom.width, current.geom.height) {
+        // Full-geometry guard: same pixel dimensions over a SHIFTED extent
+        // (source coverage change, config reload) would silently compare
+        // frames that aren't co-located — bail on any geometry difference.
+        if prev.geom != current.geom {
             return;
         }
         let Some(idx) = prev.times.iter().position(|&t| t == anchor) else {
