@@ -144,6 +144,8 @@ struct Generation {
     /// The (blended) motion field this generation advected along — the
     /// EMA history for the NEXT generation (#524).
     field: MotionField,
+    /// Source interval (s) the field's vectors span.
+    interval_secs: f32,
 }
 
 /// Atomically swapped engine state.
@@ -388,11 +390,15 @@ impl NowcastEngine {
                         g.width,
                         g.height,
                     );
-                    let interval_secs = generation
-                        .times
-                        .get(1)
-                        .map(|t| (*t - generation.times[0]).num_seconds() as f32)
-                        .unwrap_or(300.0);
+                    // Displacement spans the previous generation's anchor →
+                    // this one (2× cadence after a skipped generation); field
+                    // vectors span the source interval.
+                    let displacement_secs = old
+                        .generations
+                        .iter()
+                        .next_back()
+                        .map(|(&p, _)| (anchor - p).num_seconds() as f32)
+                        .unwrap_or(generation.interval_secs);
                     Arc::new(advance_tracks(
                         &old.cells,
                         blobs,
@@ -401,7 +407,8 @@ impl NowcastEngine {
                             y: ky as f32,
                         },
                         &generation.field,
-                        interval_secs,
+                        displacement_secs,
+                        generation.interval_secs,
                         || self.next_track_id.fetch_add(1, Ordering::Relaxed),
                     ))
                 };
@@ -697,6 +704,7 @@ impl NowcastEngine {
             frames,
             geom,
             field,
+            interval_secs: interval.num_seconds() as f32,
         })
     }
 
@@ -1032,11 +1040,6 @@ impl FeatureEngine for NowcastEngine {
             });
         };
         let g = latest.geom;
-        let interval_secs = latest
-            .times
-            .get(1)
-            .map(|t| (*t - latest.times[0]).num_seconds() as f32)
-            .unwrap_or(300.0);
         let (kx, ky) =
             crate::lonlat_grid_km_per_px([g.west, g.south, g.east, g.north], g.width, g.height);
         let matched: Vec<Feature> = state
@@ -1069,7 +1072,7 @@ impl FeatureEngine for NowcastEngine {
                 props.insert("deviant_mover".into(), PropertyValue::Bool(t.deviant()));
                 props.insert(
                     "speed_ms".into(),
-                    t.speed_ms(interval_secs)
+                    t.speed_ms()
                         .map(|v| PropertyValue::Float(f64::from(v)))
                         .unwrap_or(PropertyValue::Null),
                 );

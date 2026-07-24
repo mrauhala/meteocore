@@ -79,9 +79,11 @@ pub struct CellTrack {
     pub blob: CellBlob,
     /// Generations this track has been observed in (1 = newborn).
     pub age: u32,
-    /// EMA of the track's own velocity, km/interval in grid axes
-    /// (+x east, +y south). `None` until the second observation.
-    pub velocity_km: Option<(f32, f32)>,
+    /// EMA of the track's own velocity, km/SECOND in grid axes
+    /// (+x east, +y south) — time-base free, so lead-step configs and
+    /// skipped generations cannot skew it. `None` until the second
+    /// observation.
+    pub velocity_kms: Option<(f32, f32)>,
     /// Consecutive generations the track-vs-field residual exceeded the
     /// deviant gates.
     pub deviant_streak: u32,
@@ -94,15 +96,15 @@ impl CellTrack {
         self.deviant_streak >= DEVIANT_STREAK
     }
 
-    /// Ground speed in m/s over one source interval.
-    pub fn speed_ms(&self, interval_secs: f32) -> Option<f32> {
-        self.velocity_km
-            .map(|(vx, vy)| (vx * vx + vy * vy).sqrt() * 1000.0 / interval_secs.max(1.0))
+    /// Ground speed in m/s.
+    pub fn speed_ms(&self) -> Option<f32> {
+        self.velocity_kms
+            .map(|(vx, vy)| (vx * vx + vy * vy).sqrt() * 1000.0)
     }
 
     /// Compass bearing (degrees, 0 = north, clockwise) the cell moves toward.
     pub fn bearing_deg(&self) -> Option<f64> {
-        self.velocity_km.map(|(vx, vy)| {
+        self.velocity_kms.map(|(vx, vy)| {
             // +y is SOUTH in grid coordinates.
             (f64::from(vx).atan2(f64::from(-vy)).to_degrees() + 360.0) % 360.0
         })
@@ -121,7 +123,12 @@ pub fn advance_tracks(
     blobs: Vec<CellBlob>,
     scale: PixelScale,
     field: &MotionField,
-    interval_secs: f32,
+    // Wall-clock seconds the tracked DISPLACEMENT spans (previous
+    // generation's anchor → this anchor — 2× cadence after a skipped
+    // generation), distinct from the seconds one FIELD vector spans (the
+    // source interval motion was estimated over).
+    displacement_secs: f32,
+    field_interval_secs: f32,
     mut next_id: impl FnMut() -> u64,
 ) -> Vec<CellTrack> {
     let prev_blobs: Vec<CellBlob> = previous.iter().map(|t| t.blob.clone()).collect();
@@ -141,26 +148,28 @@ pub fn advance_tracks(
                     id: next_id(),
                     blob,
                     age: 1,
-                    velocity_km: None,
+                    velocity_kms: None,
                     deviant_streak: 0,
                     severity,
                 },
                 Some(pi) => {
                     let prev = &previous[pi];
                     // Track displacement over one interval, km in grid axes.
-                    let dx = (blob.centroid.0 - prev.blob.centroid.0) * scale.x;
-                    let dy = (blob.centroid.1 - prev.blob.centroid.1) * scale.y;
-                    let (vx_km, vy_km) = match prev.velocity_km {
+                    let ds = displacement_secs.max(1.0);
+                    let dx = (blob.centroid.0 - prev.blob.centroid.0) * scale.x / ds;
+                    let dy = (blob.centroid.1 - prev.blob.centroid.1) * scale.y / ds;
+                    let (vx_km, vy_km) = match prev.velocity_kms {
                         // EMA keeps single-scan centroid jitter out of the
                         // deviant residual.
                         Some((px, py)) => (0.5 * dx + 0.5 * px, 0.5 * dy + 0.5 * py),
                         None => (dx, dy),
                     };
 
-                    // Ambient flow at the cell, converted px/interval → km.
+                    // Ambient flow at the cell: px/field-interval → km/s.
+                    let fs = field_interval_secs.max(1.0);
                     let (fu, fv) = field.sample(blob.centroid.0, blob.centroid.1);
-                    let (fx_km, fy_km) = (fu * scale.x, fv * scale.y);
-                    let to_ms = 1000.0 / interval_secs.max(1.0);
+                    let (fx_km, fy_km) = (fu * scale.x / fs, fv * scale.y / fs);
+                    let to_ms = 1000.0;
                     let residual_ms =
                         (((vx_km - fx_km).powi(2) + (vy_km - fy_km).powi(2)).sqrt()) * to_ms;
                     let cell_speed_ms = (vx_km * vx_km + vy_km * vy_km).sqrt() * to_ms;
@@ -171,7 +180,7 @@ pub fn advance_tracks(
                         id: prev.id,
                         blob,
                         age: prev.age + 1,
-                        velocity_km: Some((vx_km, vy_km)),
+                        velocity_kms: Some((vx_km, vy_km)),
                         deviant_streak: if deviant_now {
                             prev.deviant_streak + 1
                         } else {
@@ -249,10 +258,11 @@ mod tests {
             scale,
             &field,
             300.0,
+            300.0,
             &mut id_gen,
         );
         assert_eq!(t0.len(), 2);
-        assert!(t0.iter().all(|t| t.age == 1 && t.velocity_km.is_none()));
+        assert!(t0.iter().all(|t| t.age == 1 && t.velocity_kms.is_none()));
 
         let mut tracks = t0;
         for step in 1..=2 {
@@ -262,6 +272,7 @@ mod tests {
                 segment_cells(&fa, CELL_THRESHOLD_DBZ, CELL_MIN_AREA_PX),
                 scale,
                 &field,
+                300.0,
                 300.0,
                 &mut id_gen,
             );
@@ -277,7 +288,7 @@ mod tests {
         );
         assert!(!big.deviant(), "with-flow cell must not be flagged");
         // ~4 km / 300 s ≈ 13 m/s, moving due west vs due east.
-        assert!((small.speed_ms(300.0).unwrap() - 13.3).abs() < 4.0);
+        assert!((small.speed_ms().unwrap() - 13.3).abs() < 4.0);
         assert!((big.bearing_deg().unwrap() - 90.0).abs() < 20.0);
         assert!((small.bearing_deg().unwrap() - 270.0).abs() < 20.0);
     }
