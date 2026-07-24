@@ -338,9 +338,7 @@ fn main() -> ExitCode {
     // Per-axis km/px: on a regular lat/lon grid only the east–west axis
     // carries the cos(lat) factor — at Nordic latitudes y covers ~2–3× more
     // km per pixel than x, so distances are computed anisotropically in km.
-    let mid_lat = ((extent[1] + extent[3]) / 2.0).to_radians();
-    let px_km_x = ((extent[2] - extent[0]) * 111.32 * mid_lat.cos().abs().max(0.05)) / w as f64;
-    let px_km_y = ((extent[3] - extent[1]) * 111.32) / h as f64;
+    let (px_km_x, px_km_y) = engine_nowcast::lonlat_grid_km_per_px(extent, w, h);
     let scale = PixelScale {
         x: px_km_x as f32,
         y: px_km_y as f32,

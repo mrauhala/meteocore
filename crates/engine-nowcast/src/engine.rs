@@ -409,9 +409,15 @@ impl NowcastEngine {
         if prev.geom != current.geom {
             return;
         }
-        let Some(idx) = prev.times.iter().position(|&t| t == anchor) else {
-            return; // previous generation never predicted this instant
-        };
+        // STRICT lead-1 only: after a skipped generation (transient failure,
+        // source cadence gap) the previous generation's match for `anchor`
+        // sits at a deeper lead — reporting that under the lead1 gauge names
+        // would silently mix leads. Better no measurement than a mislabeled
+        // one.
+        let idx = 1;
+        if prev.times.get(idx) != Some(&anchor) {
+            return;
+        }
         let w = current.geom.width as usize;
         let h = current.geom.height as usize;
         let observed = frame_to_grid(&current.frames[0], w, h);
@@ -521,9 +527,9 @@ impl NowcastEngine {
         // motion on a grid coarse enough that the physical search window
         // (MAX_SPEED × interval) fits in TARGET_SEARCH_PX, then scale the
         // field back to working-grid units.
-        let mid_lat = ((geom.south + geom.north) / 2.0).to_radians();
-        let px_meters =
-            ((geom.east - geom.west) * 111_320.0 * mid_lat.cos().abs().max(0.05)) / w as f64;
+        let (px_km_x, _) =
+            crate::lonlat_grid_km_per_px([geom.west, geom.south, geom.east, geom.north], w, h);
+        let px_meters = px_km_x * 1000.0;
         let max_shift_px = MAX_SPEED_MS * interval.num_seconds() as f64 / px_meters.max(1.0);
         let mut factor = 1u32;
         while max_shift_px / factor as f64 > TARGET_SEARCH_PX as f64

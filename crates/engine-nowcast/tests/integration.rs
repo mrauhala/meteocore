@@ -411,3 +411,26 @@ fn per_generation_skill_is_scored_against_persistence() {
     );
     assert!(csi > 900, "near-perfect reconstruction expected, got {csi}");
 }
+
+/// Strict lead-1 gauge semantics (#543 round 3): when a generation is
+/// skipped (source cadence gap), the previous generation's match for the
+/// new anchor sits at a deeper lead — the lead1 gauges must then stay
+/// unset rather than mislabel the measurement.
+#[test]
+fn skipped_generation_does_not_mislabel_lead1_skill() {
+    let anchor1 = t0() + Duration::minutes(5);
+    let (source, engine) = build("PT1H", &[t0(), anchor1]);
+    engine.poll_once();
+
+    // Source skips 12:10 entirely; next frame is 12:15 — the previous
+    // generation's prediction for it is lead 2, not lead 1.
+    let anchor3 = anchor1 + Duration::minutes(10);
+    source.times.write().unwrap().push(anchor3);
+    engine.poll_once();
+    assert!(engine.has_data());
+    assert_eq!(
+        engine.skill_permille(),
+        None,
+        "a lead-2 match must not populate the lead-1 gauges"
+    );
+}
