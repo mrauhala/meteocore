@@ -514,3 +514,40 @@ fn dry_scene_leaves_both_skill_gauges_unset() {
         "a dry scene must leave the gauge pair unset"
     );
 }
+
+/// V2.2 (#544): after a generation, tracked cells serve as Point features
+/// with severity/motion/deviant properties; ids persist across generations.
+#[test]
+fn cell_features_are_served_and_tracks_persist() {
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+
+    let anchor1 = t0() + Duration::minutes(5);
+    let (source, engine) = build("PT30M", &[t0(), anchor1]);
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    assert_eq!(page.number_matched, 1, "one disc, one cell");
+    let f = &page.features[0];
+    assert!(matches!(
+        f.properties.get("severity"),
+        Some(PropertyValue::String(s)) if s == "moderate"
+    ));
+    assert!(matches!(
+        f.properties.get("deviant_mover"),
+        Some(PropertyValue::Bool(false))
+    ));
+    let id1 = f.id.clone();
+
+    let anchor2 = anchor1 + Duration::minutes(5);
+    source.times.write().unwrap().push(anchor2);
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+    assert_eq!(f.id, id1, "track id persists across generations");
+    assert!(matches!(
+        f.properties.get("track_age"),
+        Some(PropertyValue::Integer(2))
+    ));
+    assert!(engine.get_feature(&id1).is_ok());
+    assert!(engine.get_feature("9999").is_err());
+}

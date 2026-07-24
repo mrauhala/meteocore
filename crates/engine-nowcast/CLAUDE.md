@@ -85,6 +85,18 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   `nowcast_lead1_persistence_csi_permille`. A persistent gap collapse in
   prod = motion or data regression; check before blaming the client.
 
+## Cell intelligence (V2.2, #544)
+
+- `cells2d` tracks the analysis frame's 35 dBZ cells across generations
+  (anisotropic km matching): TRT-lite severity (max dBZ 45/50/55 steps +
+  area ≥ 50 km² — deliberately NOT VoxelGrid attributes while voxels are
+  beta/unverified), velocity EMA, and the deviant-mover flag = sustained
+  ≥5 m/s residual between the track and the ambient motion field (the
+  estimator-disagreement right-mover detector). Served as Point features
+  via `FeatureEngine` when the collection lists `features` in `apis`.
+- Lightning join (flash counts/jump per track) is part 2 — needs a ds-core
+  event-source trait + engine-postgis impl.
+
 ## Gotchas
 
 - Advection is Lagrangian persistence: no growth/decay; 35+ dBZ convective

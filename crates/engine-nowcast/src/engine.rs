@@ -35,11 +35,15 @@ use tokio::sync::watch;
 use ds_core::config::NowcastConfig;
 use ds_core::datetime::parse_iso8601_duration;
 use ds_core::error::DataServerError;
+use ds_core::feature::{Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue};
+use ds_core::feature_engine::FeatureEngine;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile, RasterValues};
 use ds_core::resample::ProjectionGrid;
 
 use crate::advect::TrajectoryIntegrator;
+use crate::cells2d::{advance_tracks, CellTrack, CELL_MIN_AREA_PX, CELL_THRESHOLD_DBZ};
 use crate::motion::{estimate_motion_multi, MotionField, MotionOptions};
+use crate::objects::{segment_cells, PixelScale};
 use crate::Grid;
 
 /// Fastest cell motion the search window must cover (m/s). 40 m/s ≈ 144 km/h
@@ -148,6 +152,8 @@ struct NowcastState {
     generations: BTreeMap<DateTime<Utc>, Arc<Generation>>,
     /// Pre-built snapshot for the O(1) `raster_info()` contract.
     info: RasterInfo,
+    /// Tracked cells of the latest generation's analysis frame (#544).
+    cells: Arc<Vec<CellTrack>>,
 }
 
 pub struct NowcastEngine {
@@ -172,6 +178,8 @@ pub struct NowcastEngine {
     /// baseline. `u64::MAX` = not yet measured.
     lead_csi_permille: AtomicU64,
     lead_persistence_csi_permille: AtomicU64,
+    /// Monotonic id source for cell tracks (#544).
+    next_track_id: AtomicU64,
 }
 
 impl NowcastEngine {
@@ -248,6 +256,7 @@ impl NowcastEngine {
             state: ArcSwap::from_pointee(NowcastState {
                 generations: BTreeMap::new(),
                 info: empty_info(&source_info),
+                cells: Arc::new(Vec::new()),
             }),
             shutdown_tx,
             generations_total: AtomicU64::new(0),
@@ -257,6 +266,7 @@ impl NowcastEngine {
             lead_cap_warned: std::sync::atomic::AtomicBool::new(false),
             lead_csi_permille: AtomicU64::new(u64::MAX),
             lead_persistence_csi_permille: AtomicU64::new(u64::MAX),
+            next_track_id: AtomicU64::new(1),
         })
     }
 
@@ -365,8 +375,41 @@ impl NowcastEngine {
                     generations.remove(&oldest);
                 }
                 let info = build_info(&source_info, &generations);
-                self.state
-                    .store(Arc::new(NowcastState { generations, info }));
+                // Cell intelligence (#544): segment the fresh analysis frame
+                // and advance the track set against the ambient motion field.
+                let cells = {
+                    let generation = generations.get(&anchor).expect("just inserted");
+                    let g = &generation.geom;
+                    let analysis =
+                        frame_to_grid(&generation.frames[0], g.width as usize, g.height as usize);
+                    let blobs = segment_cells(&analysis, CELL_THRESHOLD_DBZ, CELL_MIN_AREA_PX);
+                    let (kx, ky) = crate::lonlat_grid_km_per_px(
+                        [g.west, g.south, g.east, g.north],
+                        g.width,
+                        g.height,
+                    );
+                    let interval_secs = generation
+                        .times
+                        .get(1)
+                        .map(|t| (*t - generation.times[0]).num_seconds() as f32)
+                        .unwrap_or(300.0);
+                    Arc::new(advance_tracks(
+                        &old.cells,
+                        blobs,
+                        PixelScale {
+                            x: kx as f32,
+                            y: ky as f32,
+                        },
+                        &generation.field,
+                        interval_secs,
+                        || self.next_track_id.fetch_add(1, Ordering::Relaxed),
+                    ))
+                };
+                self.state.store(Arc::new(NowcastState {
+                    generations,
+                    info,
+                    cells,
+                }));
                 self.generations_total.fetch_add(1, Ordering::Relaxed);
                 self.last_generation_ms.store(elapsed_ms, Ordering::Relaxed);
                 let lag = (Utc::now() - anchor).num_seconds().max(0) as u64;
@@ -973,5 +1016,114 @@ impl MapEngine for NowcastEngine {
         Self::select_generation(&state, reference_time)
             .map(|g| Some(g.reference_time))
             .unwrap_or(reference_time)
+    }
+}
+
+impl FeatureEngine for NowcastEngine {
+    /// Tracked cells of the latest analysis frame as Point features (#544).
+    fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+        let state = self.state.load();
+        let Some((&anchor, latest)) = state.generations.iter().next_back() else {
+            return Ok(FeaturePage {
+                features: Vec::new(),
+                number_matched: 0,
+                number_returned: 0,
+                next_offset: None,
+            });
+        };
+        let g = latest.geom;
+        let interval_secs = latest
+            .times
+            .get(1)
+            .map(|t| (*t - latest.times[0]).num_seconds() as f32)
+            .unwrap_or(300.0);
+        let (kx, ky) =
+            crate::lonlat_grid_km_per_px([g.west, g.south, g.east, g.north], g.width, g.height);
+        let matched: Vec<Feature> = state
+            .cells
+            .iter()
+            .filter_map(|t| {
+                let lon = g.west
+                    + (f64::from(t.blob.centroid.0) / f64::from(g.width)) * (g.east - g.west);
+                let lat = g.north
+                    - (f64::from(t.blob.centroid.1) / f64::from(g.height)) * (g.north - g.south);
+                if let Some(b) = &query.bbox {
+                    if !b.contains(lon, lat) {
+                        return None;
+                    }
+                }
+                let mut props = std::collections::HashMap::new();
+                props.insert(
+                    "severity".into(),
+                    PropertyValue::String(t.severity.as_str().into()),
+                );
+                props.insert(
+                    "max_dbz".into(),
+                    PropertyValue::Float(f64::from(t.blob.max_value)),
+                );
+                props.insert(
+                    "area_km2".into(),
+                    PropertyValue::Float(t.blob.area as f64 * kx * ky),
+                );
+                props.insert("track_age".into(), PropertyValue::Integer(t.age as i64));
+                props.insert("deviant_mover".into(), PropertyValue::Bool(t.deviant()));
+                props.insert(
+                    "speed_ms".into(),
+                    t.speed_ms(interval_secs)
+                        .map(|v| PropertyValue::Float(f64::from(v)))
+                        .unwrap_or(PropertyValue::Null),
+                );
+                props.insert(
+                    "bearing_deg".into(),
+                    t.bearing_deg()
+                        .map(PropertyValue::Float)
+                        .unwrap_or(PropertyValue::Null),
+                );
+                props.insert(
+                    "observed".into(),
+                    PropertyValue::String(anchor.to_rfc3339()),
+                );
+                Some(Feature {
+                    id: t.id.to_string(),
+                    geometry: Arc::new(Geometry::Point { x: lon, y: lat }),
+                    properties: Arc::new(props),
+                })
+            })
+            .collect();
+        let number_matched = matched.len();
+        let page: Vec<Feature> = matched
+            .into_iter()
+            .skip(query.offset)
+            .take(query.limit)
+            .collect();
+        let number_returned = page.len();
+        let next_offset = (query.offset + number_returned < number_matched)
+            .then(|| query.offset + number_returned);
+        Ok(FeaturePage {
+            features: page,
+            number_matched,
+            number_returned,
+            next_offset,
+        })
+    }
+
+    fn get_feature(&self, feature_id: &str) -> Result<Feature, DataServerError> {
+        self.get_features(&FeatureQuery {
+            limit: usize::MAX,
+            ..Default::default()
+        })?
+        .features
+        .into_iter()
+        .find(|f| f.id == feature_id)
+        .ok_or_else(|| DataServerError::FeatureNotFound(feature_id.to_string()))
+    }
+
+    fn spatial_extent(&self) -> Option<[f64; 4]> {
+        self.state.load().info.spatial_extent
+    }
+
+    fn temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        let state = self.state.load();
+        state.generations.iter().next_back().map(|(&a, _)| (a, a))
     }
 }

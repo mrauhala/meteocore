@@ -21,6 +21,7 @@
 //!   timestamps.
 
 pub mod advect;
+pub mod cells2d;
 pub mod engine;
 pub mod motion;
 pub mod objects;
