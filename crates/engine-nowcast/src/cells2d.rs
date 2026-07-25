@@ -19,8 +19,12 @@ use crate::objects::{match_cells, CellBlob, PixelScale};
 pub const CELL_THRESHOLD_DBZ: f32 = 35.0;
 /// Minimum component size in pixels.
 pub const CELL_MIN_AREA_PX: usize = 5;
-/// Matching gate (km) for track continuity between generations.
+/// Matching gate (km) for track continuity between generations, per
+/// [`TRACK_GATE_BASE_SECS`] of elapsed time — the gate scales linearly
+/// with the actual span (a skipped generation doubles the distance a
+/// storm legitimately covers), never below one base gate.
 pub const TRACK_GATE_KM: f32 = 20.0;
+pub const TRACK_GATE_BASE_SECS: f32 = 300.0;
 /// Residual speed (m/s) between cell track and ambient field that counts
 /// as deviant, provided the cell itself moves faster than
 /// [`DEVIANT_MIN_CELL_SPEED_MS`].
@@ -132,8 +136,9 @@ pub fn advance_tracks(
     mut next_id: impl FnMut() -> u64,
 ) -> Vec<CellTrack> {
     let prev_blobs: Vec<CellBlob> = previous.iter().map(|t| t.blob.clone()).collect();
+    let gate = TRACK_GATE_KM * (displacement_secs / TRACK_GATE_BASE_SECS).max(1.0);
     let mut matched_prev: Vec<Option<usize>> = vec![None; blobs.len()];
-    for (pi, ci) in match_cells(&prev_blobs, &blobs, scale, TRACK_GATE_KM) {
+    for (pi, ci) in match_cells(&prev_blobs, &blobs, scale, gate) {
         matched_prev[ci] = Some(pi);
     }
 
