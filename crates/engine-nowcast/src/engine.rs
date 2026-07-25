@@ -399,8 +399,17 @@ impl NowcastEngine {
                         .next_back()
                         .map(|(&p, _)| (anchor - p).num_seconds() as f32)
                         .unwrap_or(generation.interval_secs);
+                    // Track continuity is only meaningful on an unchanged
+                    // grid: a source geometry change would silently
+                    // reinterpret previous pixel centroids on the new grid
+                    // (same class as the skill-scoring geometry guard), so
+                    // the track set resets and cells start as newborns.
+                    let previous_cells: &[CellTrack] = match old.generations.iter().next_back() {
+                        Some((_, prev)) if prev.geom == generation.geom => &old.cells,
+                        _ => &[],
+                    };
                     Arc::new(advance_tracks(
-                        &old.cells,
+                        previous_cells,
                         blobs,
                         PixelScale {
                             x: kx as f32,
