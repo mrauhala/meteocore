@@ -1036,6 +1036,60 @@ impl MapEngine for NowcastEngine {
     }
 }
 
+/// Build one cell feature: lon/lat from the grid geometry plus the served
+/// property set. Shared by `get_features` and `get_feature` so the two
+/// paths cannot drift (and the by-id path needn't materialize every cell).
+fn cell_feature(
+    t: &CellTrack,
+    g: GridGeom,
+    kx: f64,
+    ky: f64,
+    anchor: DateTime<Utc>,
+) -> (f64, f64, Feature) {
+    let lon = g.west + (f64::from(t.blob.centroid.0) / f64::from(g.width)) * (g.east - g.west);
+    let lat = g.north - (f64::from(t.blob.centroid.1) / f64::from(g.height)) * (g.north - g.south);
+    let mut props = std::collections::HashMap::new();
+    props.insert(
+        "severity".into(),
+        PropertyValue::String(t.severity.as_str().into()),
+    );
+    props.insert(
+        "max_dbz".into(),
+        PropertyValue::Float(f64::from(t.blob.max_value)),
+    );
+    props.insert(
+        "area_km2".into(),
+        PropertyValue::Float(t.blob.area as f64 * kx * ky),
+    );
+    props.insert("track_age".into(), PropertyValue::Integer(t.age as i64));
+    props.insert("deviant_mover".into(), PropertyValue::Bool(t.deviant()));
+    props.insert(
+        "speed_ms".into(),
+        t.speed_ms()
+            .map(|v| PropertyValue::Float(f64::from(v)))
+            .unwrap_or(PropertyValue::Null),
+    );
+    props.insert(
+        "bearing_deg".into(),
+        t.bearing_deg()
+            .map(PropertyValue::Float)
+            .unwrap_or(PropertyValue::Null),
+    );
+    props.insert(
+        "observed".into(),
+        PropertyValue::String(anchor.to_rfc3339()),
+    );
+    (
+        lon,
+        lat,
+        Feature {
+            id: t.id.to_string(),
+            geometry: Arc::new(Geometry::Point { x: lon, y: lat }),
+            properties: Arc::new(props),
+        },
+    )
+}
+
 impl FeatureEngine for NowcastEngine {
     /// Tracked cells of the latest analysis frame as Point features (#544).
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
@@ -1070,51 +1124,13 @@ impl FeatureEngine for NowcastEngine {
             .cells
             .iter()
             .filter_map(|t| {
-                let lon = g.west
-                    + (f64::from(t.blob.centroid.0) / f64::from(g.width)) * (g.east - g.west);
-                let lat = g.north
-                    - (f64::from(t.blob.centroid.1) / f64::from(g.height)) * (g.north - g.south);
+                let (lon, lat, feature) = cell_feature(t, g, kx, ky, anchor);
                 if let Some(b) = &query.bbox {
                     if !b.contains(lon, lat) {
                         return None;
                     }
                 }
-                let mut props = std::collections::HashMap::new();
-                props.insert(
-                    "severity".into(),
-                    PropertyValue::String(t.severity.as_str().into()),
-                );
-                props.insert(
-                    "max_dbz".into(),
-                    PropertyValue::Float(f64::from(t.blob.max_value)),
-                );
-                props.insert(
-                    "area_km2".into(),
-                    PropertyValue::Float(t.blob.area as f64 * kx * ky),
-                );
-                props.insert("track_age".into(), PropertyValue::Integer(t.age as i64));
-                props.insert("deviant_mover".into(), PropertyValue::Bool(t.deviant()));
-                props.insert(
-                    "speed_ms".into(),
-                    t.speed_ms()
-                        .map(|v| PropertyValue::Float(f64::from(v)))
-                        .unwrap_or(PropertyValue::Null),
-                );
-                props.insert(
-                    "bearing_deg".into(),
-                    t.bearing_deg()
-                        .map(PropertyValue::Float)
-                        .unwrap_or(PropertyValue::Null),
-                );
-                props.insert(
-                    "observed".into(),
-                    PropertyValue::String(anchor.to_rfc3339()),
-                );
-                Some(Feature {
-                    id: t.id.to_string(),
-                    geometry: Arc::new(Geometry::Point { x: lon, y: lat }),
-                    properties: Arc::new(props),
-                })
+                Some(feature)
             })
             .collect();
         let number_matched = matched.len();
@@ -1141,14 +1157,19 @@ impl FeatureEngine for NowcastEngine {
     }
 
     fn get_feature(&self, feature_id: &str) -> Result<Feature, DataServerError> {
-        self.get_features(&FeatureQuery {
-            limit: usize::MAX,
-            ..Default::default()
-        })?
-        .features
-        .into_iter()
-        .find(|f| f.id == feature_id)
-        .ok_or_else(|| DataServerError::FeatureNotFound(feature_id.to_string()))
+        let state = self.state.load();
+        let not_found = || DataServerError::FeatureNotFound(feature_id.to_string());
+        let (&anchor, latest) = state.generations.iter().next_back().ok_or_else(not_found)?;
+        let id: u64 = feature_id.parse().map_err(|_| not_found())?;
+        let track = state
+            .cells
+            .iter()
+            .find(|t| t.id == id)
+            .ok_or_else(not_found)?;
+        let g = latest.geom;
+        let (kx, ky) =
+            crate::lonlat_grid_km_per_px([g.west, g.south, g.east, g.north], g.width, g.height);
+        Ok(cell_feature(track, g, kx, ky, anchor).2)
     }
 
     fn spatial_extent(&self) -> Option<[f64; 4]> {

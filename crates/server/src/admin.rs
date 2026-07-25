@@ -4260,11 +4260,10 @@ mod tests {
 
     #[test]
     fn nowcast_wires_into_registries_and_boots_degraded() {
+        let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
+        nc.apis = vec!["wms".to_string(), "features".to_string()];
         let result = super::load_collections(
-            &[
-                tm35_source_collection("radar"),
-                nowcast_test_collection("nc", "nowcast", Some("radar")),
-            ],
+            &[tm35_source_collection("radar"), nc],
             &[],
             "http://x",
             false,
@@ -4272,6 +4271,10 @@ mod tests {
             super::ReusableCaches::default(),
         );
         assert!(result.wms_state.engines.contains_key("nc"));
+        assert!(
+            result.features_state.engines.contains_key("nc"),
+            "features API must be wired when listed in apis"
+        );
         assert_eq!(result.nowcast_engines.len(), 1);
         assert_eq!(result.nowcast_engines[0].source_id(), "radar");
         let h = health_of(&result, "nc");
