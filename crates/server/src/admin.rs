@@ -936,6 +936,10 @@ pub fn load_collections(
     let mut cap_engines: Vec<Arc<engine_cap::CapEngine>> = Vec::new();
     let mut postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>> = Vec::new();
     let mut nowcast_engines: Vec<Arc<engine_nowcast::NowcastEngine>> = Vec::new();
+    // Point-event sources (#549): events-shape postgis collections, keyed
+    // by collection id — the nowcast second pass looks up its
+    // `lightning_source` here.
+    let mut event_sources: HashMap<String, Arc<dyn ds_core::events::EventSource>> = HashMap::new();
     // Derived collections wire in a second pass, after every base engine
     // exists (#522). Collected here during the main loop.
     let mut nowcast_pending: Vec<&CollectionConfig> = Vec::new();
@@ -2195,6 +2199,12 @@ pub fn load_collections(
                     validated.clone(),
                     pool,
                 ));
+                if validated.events().is_some() {
+                    event_sources.insert(
+                        collection.id.clone(),
+                        engine.clone() as Arc<dyn ds_core::events::EventSource>,
+                    );
+                }
 
                 // Bootstrap metadata synchronously. Failure ⇒ degraded status;
                 // the engine still gets wired in so requests can retry once
@@ -2375,12 +2385,29 @@ pub fn load_collections(
             source.clone(),
             nowcast_config,
         ) {
-            Ok(e) => Arc::new(e),
+            Ok(e) => e,
             Err(e) => {
                 fail(format!("failed to initialize nowcast engine: {e}"));
                 continue;
             }
         };
+        // Lightning join (#549): a named source must exist and be an
+        // events-shape postgis collection in the same config — failing the
+        // collection beats silently serving cells without flash data.
+        let engine = match nowcast_config.lightning_source.as_deref() {
+            Some(src_id) => match event_sources.get(src_id) {
+                Some(events) => engine.with_lightning_source(events.clone()),
+                None => {
+                    fail(format!(
+                        "lightning_source '{src_id}' not found or not an events-shape postgis \
+                         collection (it must be defined in the same config)"
+                    ));
+                    continue;
+                }
+            },
+            None => engine,
+        };
+        let engine = Arc::new(engine);
         nowcast_engines.push(engine.clone());
 
         if collection.apis.contains(&"wms".to_string()) {
@@ -4170,6 +4197,7 @@ mod tests {
                 max_pixels: 500_000,
                 min_echo: 10.0,
                 growth_decay: false,
+                lightning_source: None,
             }),
             preview: None,
         }
@@ -4231,6 +4259,38 @@ mod tests {
             h.error
         );
         assert!(!result.wms_state.engines.contains_key("nc"));
+    }
+
+    #[test]
+    fn nowcast_missing_lightning_source_fails_that_collection() {
+        // The #549 safety property: a lightning_source that names no
+        // events-shape collection fails the nowcast collection at load —
+        // never silently serving cells without flash data. (A station-
+        // shape postgis collection takes the same path: it is never
+        // entered into the event-source registry, so the lookup misses.)
+        let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
+        nc.nowcast.as_mut().unwrap().lightning_source = Some("no-such-lightning".into());
+        let result = super::load_collections(
+            &[tm35_source_collection("radar"), nc],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+        );
+        let h = health_of(&result, "nc");
+        assert_eq!(h.status, super::CollectionStatus::Failed);
+        assert!(
+            h.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("lightning_source"),
+            "error should name the missing lightning source: {:?}",
+            h.error
+        );
+        assert!(!result.wms_state.engines.contains_key("nc"));
+        // The base collection is unaffected.
+        assert!(result.wms_state.engines.contains_key("radar"));
     }
 
     #[test]

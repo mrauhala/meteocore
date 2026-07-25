@@ -29,9 +29,9 @@ use crate::config::PostgisEngineConfig;
 use crate::health::{Health, HealthSnapshot, HealthStatus};
 use crate::metadata::{CollectionMeta, MetadataCache};
 use crate::query::{
-    build_events_area, build_location, build_position, build_stations_in_polygon, params_as_refs,
-    BuiltQuery, DEFAULT_POSITION_RADIUS_M, MAX_AREA_QUERIES, MAX_OBSERVATION_ROWS,
-    MAX_RESPONSE_VALUES, MAX_STATIONS_IN_POLYGON,
+    build_events_area, build_events_window, build_location, build_position,
+    build_stations_in_polygon, params_as_refs, BuiltQuery, DEFAULT_POSITION_RADIUS_M,
+    MAX_AREA_QUERIES, MAX_OBSERVATION_ROWS, MAX_RESPONSE_VALUES, MAX_STATIONS_IN_POLYGON,
 };
 use crate::schema::{EventsShape, ObservationSchema};
 
@@ -309,6 +309,54 @@ impl PostgisEngine {
             &key_refs,
             events,
         )))
+    }
+}
+
+// ─── EventSource (#549): recent point events for cross-engine joins ─────────
+
+impl ds_core::events::EventSource for PostgisEngine {
+    /// Events-shape window fetch for consumers in OTHER engines (the
+    /// nowcast per-cell lightning join): the half-open window `(start,
+    /// end]` across the whole table extent, ascending by time, NEWEST kept
+    /// when `limit` truncates. Reuses the #504 window SQL and the engine's
+    /// sync bridge — the ds-storage calling rules apply (multi-thread
+    /// runtime worker only; the background poll runtime qualifies).
+    fn recent_events(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<ds_core::events::EventPoint>, DataServerError> {
+        let Some(shape) = self.config.events() else {
+            return Err(DataServerError::Engine(
+                "recent_events requires an events-shape postgis collection".into(),
+            ));
+        };
+        let built = build_events_window(shape, (start, end), limit)
+            .map_err(|e| DataServerError::Engine(format!("build_events_window: {e}")))?;
+        let rows = run_single_query_sync(&self.pool, built)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let time: DateTime<Utc> = row
+                .try_get("time")
+                .map_err(|e| DataServerError::Engine(format!("decode event time: {e}")))?;
+            let lon: Option<f64> = row
+                .try_get("lon")
+                .map_err(|e| DataServerError::Engine(format!("decode event lon: {e}")))?;
+            let lat: Option<f64> = row
+                .try_get("lat")
+                .map_err(|e| DataServerError::Engine(format!("decode event lat: {e}")))?;
+            // Degenerate geometries (ST_X of POINT EMPTY) skip the event,
+            // mirroring the EDR decode path.
+            let (Some(lon), Some(lat)) = (lon, lat) else {
+                continue;
+            };
+            out.push(ds_core::events::EventPoint { time, lon, lat });
+        }
+        // Window SQL orders newest-first (so truncation keeps the newest);
+        // the trait contract is ascending.
+        out.reverse();
+        Ok(out)
     }
 }
 

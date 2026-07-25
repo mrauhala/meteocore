@@ -103,8 +103,21 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   never forecast) ⇒ 0 features. The collection's temporal extent
   advertises the retained span; by-id GET serves the latest snapshot's
   version of a track.
-- Lightning join (flash counts/jump per track) is part 2 — needs a ds-core
-  event-source trait + engine-postgis impl.
+- **Lightning join (#549, part 2):** `[collections.nowcast]
+  lightning_source = "<id>"` names an events-shape engine-postgis
+  collection in the same config (wired second-pass via the
+  `ds_core::events::EventSource` trait — engine-nowcast never depends on
+  engine-postgis; a missing/non-events id FAILS the collection at load).
+  Each generation makes ONE bounded window fetch `(prev anchor, anchor]`
+  on the poll runtime (the postgis sync bridge is legal there and only
+  there), bins strikes onto cells via the label map (unlabeled strikes
+  fall back to the nearest centroid within `LIGHTNING_JOIN_RADIUS_KM`),
+  and updates per-track flash stats + the Schultz-style 2σ jump flag
+  (`MIN_JUMP_RATE_PER_MIN` floor — revisit against Nordic storm data if
+  jumps never fire). Feature properties `flash_count` /
+  `flash_rate_per_min` / `lightning_jump` exist ONLY when a source is
+  wired; null means "join skipped this generation" (source error — the
+  generation itself never fails), 0 means measured-quiet.
 
 ## Gotchas
 

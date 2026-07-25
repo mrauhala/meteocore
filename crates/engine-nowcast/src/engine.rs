@@ -41,7 +41,9 @@ use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile, RasterVa
 use ds_core::resample::ProjectionGrid;
 
 use crate::advect::TrajectoryIntegrator;
-use crate::cells2d::{advance_tracks, CellTrack, CELL_MIN_AREA_PX, CELL_THRESHOLD_DBZ};
+use crate::cells2d::{
+    advance_tracks, apply_lightning, CellTrack, CELL_MIN_AREA_PX, CELL_THRESHOLD_DBZ,
+};
 use crate::motion::{estimate_motion_multi, MotionField, MotionOptions};
 use crate::objects::{segment_cells_labeled, PixelScale};
 use crate::tendency::EFOLD_INTERVALS;
@@ -71,6 +73,11 @@ const MAX_LEADS: usize = 96;
 /// Hard cap on `history_frames`: each is one sequential blocking source
 /// fetch per generation, and pair-averaging saturates after a few pairs.
 const MAX_HISTORY_FRAMES: usize = 8;
+/// Row cap on the per-generation lightning fetch (#549) — a safety valve
+/// mirroring engine-postgis's own window cap; an extreme Nordic storm day
+/// peaks around 10⁴ strikes per 5-minute window, well under it. Hitting
+/// the cap logs possible truncation instead of failing the generation.
+const MAX_JOIN_STRIKES: usize = 200_000;
 
 /// Parsed, validated engine configuration.
 struct EngineCfg {
@@ -200,6 +207,9 @@ pub struct NowcastEngine {
     lead_persistence_csi_permille: AtomicU64,
     /// Monotonic id source for cell tracks (#544).
     next_track_id: AtomicU64,
+    /// Optional point-event source joined onto tracked cells per
+    /// generation (#549) — lightning, wired by the server's second pass.
+    lightning: Option<Arc<dyn ds_core::events::EventSource>>,
 }
 
 impl NowcastEngine {
@@ -288,6 +298,7 @@ impl NowcastEngine {
             lead_csi_permille: AtomicU64::new(u64::MAX),
             lead_persistence_csi_permille: AtomicU64::new(u64::MAX),
             next_track_id: AtomicU64::new(1),
+            lightning: None,
         })
     }
 
@@ -342,6 +353,15 @@ impl NowcastEngine {
     /// Signal the poll loop to exit (server reload/shutdown).
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
+    }
+
+    /// Attach a point-event source whose strikes are joined onto tracked
+    /// cells each generation (#549). Called by the server's second-pass
+    /// wiring before the engine is shared; the Feature layer only emits
+    /// the flash properties when a source is attached.
+    pub fn with_lightning_source(mut self, source: Arc<dyn ds_core::events::EventSource>) -> Self {
+        self.lightning = Some(source);
+        self
     }
 
     /// Poll the source for a new frame; spawn on the BACKGROUND runtime only.
@@ -660,7 +680,7 @@ impl NowcastEngine {
             Some((_, prev)) if prev.geom == geom => &prev.cells,
             _ => &[],
         };
-        let cells = Arc::new(advance_tracks(
+        let mut cells = advance_tracks(
             previous_cells,
             blobs,
             scale,
@@ -668,7 +688,49 @@ impl NowcastEngine {
             displacement_secs,
             interval.num_seconds() as f32,
             || self.next_track_id.fetch_add(1, Ordering::Relaxed),
-        ));
+        );
+        // Lightning join (#549): one bounded event fetch per generation
+        // (we are ON the background poll runtime — the EventSource sync
+        // bridge is legal here, root rule 7), binned onto cells via the
+        // label map. A source error degrades to "no flash data this
+        // generation" (fields stay None), never a failed generation.
+        if let Some(source) = &self.lightning {
+            let window_secs = displacement_secs.max(1.0);
+            let start = anchor - Duration::seconds(window_secs as i64);
+            match source.recent_events(start, anchor, MAX_JOIN_STRIKES) {
+                Ok(events) => {
+                    if events.len() >= MAX_JOIN_STRIKES {
+                        tracing::warn!(
+                            collection = %self.collection_id,
+                            "lightning window hit the {MAX_JOIN_STRIKES}-row cap; flash counts may undercount this generation"
+                        );
+                    }
+                    let strikes_px: Vec<(f32, f32)> = events
+                        .iter()
+                        .filter_map(|e| geom.frac_px(e.lon, e.lat))
+                        .map(|(x, y)| (x as f32, y as f32))
+                        .collect();
+                    apply_lightning(
+                        &mut cells,
+                        &strikes_px,
+                        &labels,
+                        geom.width as usize,
+                        scale,
+                        window_secs,
+                    );
+                    tracing::debug!(
+                        collection = %self.collection_id,
+                        strikes = strikes_px.len(),
+                        "lightning join complete"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    collection = %self.collection_id,
+                    "lightning join skipped this generation: {e}"
+                ),
+            }
+        }
+        let cells = Arc::new(cells);
 
         // Per-pixel LABEL map + per-cell tendency table (#546 iteration 1
         // pivot): each pixel of tracked cell L gets L's OWN EMA'd intensity
@@ -1129,6 +1191,7 @@ fn cell_feature(
     kx: f64,
     ky: f64,
     anchor: DateTime<Utc>,
+    lightning: bool,
 ) -> (f64, f64, Feature) {
     let lon = g.west + (f64::from(t.blob.centroid.0) / f64::from(g.width)) * (g.east - g.west);
     let lat = g.north - (f64::from(t.blob.centroid.1) / f64::from(g.height)) * (g.north - g.south);
@@ -1183,6 +1246,34 @@ fn cell_feature(
             PropertyValue::Null
         },
     );
+    // Flash properties exist only when a lightning source is wired —
+    // absent means "not measured", null means "join skipped this
+    // generation" (source error), values mean measured (0 = quiet cell).
+    if lightning {
+        props.insert(
+            "flash_count".into(),
+            t.flash_count
+                .map(|n| PropertyValue::Integer(i64::from(n)))
+                .unwrap_or(PropertyValue::Null),
+        );
+        props.insert(
+            "flash_rate_per_min".into(),
+            t.flash_rate_per_min
+                .map(|r| PropertyValue::Float(f64::from(r)))
+                .unwrap_or(PropertyValue::Null),
+        );
+        props.insert(
+            "lightning_jump".into(),
+            // Same tri-state as the counts: a skipped join is "unknown",
+            // not "no jump" — flash_count doubles as the joined-this-
+            // generation marker.
+            if t.flash_count.is_some() {
+                PropertyValue::Bool(t.lightning_jump)
+            } else {
+                PropertyValue::Null
+            },
+        );
+    }
     (
         lon,
         lat,
@@ -1227,7 +1318,8 @@ impl FeatureEngine for NowcastEngine {
             .cells
             .iter()
             .filter_map(|t| {
-                let (lon, lat, feature) = cell_feature(t, g, kx, ky, anchor);
+                let (lon, lat, feature) =
+                    cell_feature(t, g, kx, ky, anchor, self.lightning.is_some());
                 if let Some(b) = &query.bbox {
                     if !b.contains(lon, lat) {
                         return None;
@@ -1279,7 +1371,7 @@ impl FeatureEngine for NowcastEngine {
         let g = snapshot.geom;
         let (kx, ky) =
             crate::lonlat_grid_km_per_px([g.west, g.south, g.east, g.north], g.width, g.height);
-        Ok(cell_feature(track, g, kx, ky, snapshot.anchor).2)
+        Ok(cell_feature(track, g, kx, ky, snapshot.anchor, self.lightning.is_some()).2)
     }
 
     /// Bumps every generation, so any future consumer keying caches/ETags on

@@ -97,6 +97,195 @@ impl MapEngine for MockSource {
     }
 }
 
+/// Lightning join (#549): a mock event source dropping a fixed burst on
+/// the disc each window must surface flash properties on the cell —
+/// and an engine WITHOUT a source must not emit them at all.
+#[test]
+fn lightning_join_exposes_flash_properties() {
+    use ds_core::events::{EventPoint, EventSource};
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+
+    struct DiscStrikes;
+    impl EventSource for DiscStrikes {
+        fn recent_events(
+            &self,
+            _start: DateTime<Utc>,
+            end: DateTime<Utc>,
+            _limit: usize,
+        ) -> Result<Vec<EventPoint>, ds_core::error::DataServerError> {
+            // disc_center is in grid PIXELS; strikes arrive in WGS84.
+            let (cx, cy) = disc_center(end);
+            let lon = EXTENT[0] + cx / f64::from(W) * (EXTENT[2] - EXTENT[0]);
+            let lat = EXTENT[3] - cy / f64::from(H) * (EXTENT[3] - EXTENT[1]);
+            Ok(vec![
+                EventPoint {
+                    time: end,
+                    lon,
+                    lat
+                };
+                30
+            ])
+        }
+    }
+
+    let anchor1 = t0() + Duration::minutes(5);
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let config = NowcastConfig {
+        source: "mock".into(),
+        horizon: "PT30M".into(),
+        step: None,
+        history_frames: 2,
+        poll_interval_secs: 30,
+        max_generations: 4,
+        max_pixels: 4_000_000,
+        min_echo: 10.0,
+        growth_decay: false,
+        lightning_source: Some("mock-lightning".into()),
+    };
+    let engine = NowcastEngine::new("lj-nowcast", "mock", source.clone(), &config)
+        .expect("engine builds")
+        .with_lightning_source(Arc::new(DiscStrikes));
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+    assert!(matches!(
+        f.properties.get("flash_count"),
+        Some(PropertyValue::Integer(30))
+    ));
+    // 30 strikes over the 5-min window = 6 flashes/min — measured, but
+    // under the 10/min jump floor: never a jump, even with a baseline.
+    assert!(matches!(
+        f.properties.get("flash_rate_per_min"),
+        Some(PropertyValue::Float(r)) if (r - 6.0).abs() < 1e-6
+    ));
+    assert!(matches!(
+        f.properties.get("lightning_jump"),
+        Some(PropertyValue::Bool(false))
+    ));
+
+    let anchor2 = anchor1 + Duration::minutes(5);
+    source.times.write().unwrap().push(anchor2);
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+    assert!(matches!(
+        f.properties.get("flash_count"),
+        Some(PropertyValue::Integer(30))
+    ));
+    assert!(matches!(
+        f.properties.get("lightning_jump"),
+        Some(PropertyValue::Bool(false))
+    ));
+
+    // No source wired ⇒ the flash properties do not exist (absent, not
+    // null — "not measured" is a different statement than "no strikes").
+    let (_s2, plain) = build("PT30M", &[t0(), anchor1]);
+    plain.poll_once();
+    let page = plain.get_features(&FeatureQuery::default()).unwrap();
+    assert!(!page.features[0].properties.contains_key("flash_count"));
+    assert!(!page.features[0].properties.contains_key("lightning_jump"));
+}
+
+/// A failing event source degrades to null flash fields for that
+/// generation — the generation itself, and the properties' presence,
+/// survive (#549 contract: present-but-null = "join skipped").
+#[test]
+fn lightning_source_error_degrades_to_null_fields() {
+    use ds_core::events::{EventPoint, EventSource};
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FlakyStrikes {
+        fail: AtomicBool,
+    }
+    impl EventSource for FlakyStrikes {
+        fn recent_events(
+            &self,
+            _start: DateTime<Utc>,
+            end: DateTime<Utc>,
+            _limit: usize,
+        ) -> Result<Vec<EventPoint>, ds_core::error::DataServerError> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(ds_core::error::DataServerError::Engine(
+                    "lightning db unreachable".into(),
+                ));
+            }
+            let (cx, cy) = disc_center(end);
+            let lon = EXTENT[0] + cx / f64::from(W) * (EXTENT[2] - EXTENT[0]);
+            let lat = EXTENT[3] - cy / f64::from(H) * (EXTENT[3] - EXTENT[1]);
+            Ok(vec![
+                EventPoint {
+                    time: end,
+                    lon,
+                    lat
+                };
+                10
+            ])
+        }
+    }
+
+    let anchor1 = t0() + Duration::minutes(5);
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let config = NowcastConfig {
+        source: "mock".into(),
+        horizon: "PT30M".into(),
+        step: None,
+        history_frames: 2,
+        poll_interval_secs: 30,
+        max_generations: 4,
+        max_pixels: 4_000_000,
+        min_echo: 10.0,
+        growth_decay: false,
+        lightning_source: Some("mock-lightning".into()),
+    };
+    let strikes = Arc::new(FlakyStrikes {
+        fail: AtomicBool::new(false),
+    });
+    let engine = NowcastEngine::new("flaky-nowcast", "mock", source.clone(), &config)
+        .expect("engine builds")
+        .with_lightning_source(strikes.clone());
+
+    // Healthy generation: measured values.
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    assert!(matches!(
+        page.features[0].properties.get("flash_count"),
+        Some(PropertyValue::Integer(10))
+    ));
+
+    // Source down for the next generation: it still completes, the track
+    // persists, and every flash field reads null — including the jump
+    // flag (unknown ≠ false).
+    strikes.fail.store(true, Ordering::Relaxed);
+    let anchor2 = anchor1 + Duration::minutes(5);
+    source.times.write().unwrap().push(anchor2);
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+    assert!(matches!(
+        f.properties.get("track_age"),
+        Some(PropertyValue::Integer(2))
+    ));
+    assert!(matches!(
+        f.properties.get("flash_count"),
+        Some(PropertyValue::Null)
+    ));
+    assert!(matches!(
+        f.properties.get("flash_rate_per_min"),
+        Some(PropertyValue::Null)
+    ));
+    assert!(matches!(
+        f.properties.get("lightning_jump"),
+        Some(PropertyValue::Null)
+    ));
+}
+
 fn build(horizon: &str, source_times: &[DateTime<Utc>]) -> (Arc<MockSource>, NowcastEngine) {
     build_with_history(horizon, source_times, 2)
 }
@@ -119,6 +308,7 @@ fn build_with_history(
         max_pixels: 4_000_000,
         min_echo: 10.0,
         growth_decay: false,
+        lightning_source: None,
     };
     let engine =
         NowcastEngine::new("mock-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -340,6 +530,7 @@ fn excessive_lead_count_is_rejected_at_construction() {
         max_pixels: 4_000_000,
         min_echo: 10.0,
         growth_decay: false,
+        lightning_source: None,
     };
     let err = NowcastEngine::new("mock-nowcast", "mock", source, &config)
         .err()
@@ -381,6 +572,7 @@ fn oversized_history_frames_is_rejected() {
         max_pixels: 4_000_000,
         min_echo: 10.0,
         growth_decay: false,
+        lightning_source: None,
     };
     let err = NowcastEngine::new("mock-nowcast", "mock", source, &config)
         .err()
@@ -501,6 +693,7 @@ fn dry_scene_leaves_both_skill_gauges_unset() {
         max_pixels: 4_000_000,
         min_echo: 10.0,
         growth_decay: false,
+        lightning_source: None,
     };
     let engine =
         NowcastEngine::new("dry-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -651,6 +844,7 @@ fn geometry_change_resets_cell_tracks() {
         max_pixels: 4_000_000,
         min_echo: 10.0,
         growth_decay: false,
+        lightning_source: None,
     };
     let engine =
         NowcastEngine::new("mv-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -743,6 +937,7 @@ fn growth_decay_dims_decaying_echo() {
             max_pixels: 4_000_000,
             min_echo: 10.0,
             growth_decay,
+            lightning_source: None,
         };
         let engine = NowcastEngine::new("fade", "mock", source.clone(), &config).expect("builds");
         engine.poll_once();

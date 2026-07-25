@@ -220,6 +220,13 @@ pub struct NowcastConfig {
     /// object-harness gate has passed for that source.
     #[serde(default)]
     pub growth_decay: bool,
+    /// Collection id of a point-event collection (engine-postgis `events`
+    /// shape, e.g. lightning strikes) to join onto tracked cells as
+    /// per-cell flash counts/rates and a lightning-jump flag (#549). Must
+    /// exist in the same config; a missing or non-event collection fails
+    /// this collection at load.
+    #[serde(default)]
+    pub lightning_source: Option<String>,
 }
 
 fn default_nowcast_horizon() -> String {
