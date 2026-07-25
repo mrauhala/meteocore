@@ -21,6 +21,7 @@ use ds_core::config::GeoTiffConfig;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterValues};
 use engine_geotiff::GeoTiffEngine;
 use engine_nowcast::advect::advect_u8;
+use engine_nowcast::cells2d::{advance_tracks, CellTrack};
 use engine_nowcast::motion::{estimate_motion, MotionOptions};
 use engine_nowcast::objects::{
     classify_growth, match_cells, score_objects, segment_cells, segment_cells_labeled, CellBlob,
@@ -367,6 +368,10 @@ fn main() -> ExitCode {
     let mut obj_now = vec![[ObjectScores::default(); 3]; max_lead];
     let mut obj_pers = vec![[ObjectScores::default(); 3]; max_lead];
 
+    // Chained track state for the --growth-decay arm (engine parity).
+    let mut tracks: Vec<CellTrack> = Vec::new();
+    let mut next_track_id: u64 = 0;
+
     for i in 1..frames.len() - 1 {
         let started = Instant::now();
         let field = estimate_motion(&frames[i - 1], &frames[i], &opts);
@@ -384,12 +389,20 @@ fn main() -> ExitCode {
         // then chained forward through observed-track matches per lead.
         let mut classes = classify_growth(&obs_cells[i - 1], &obs_cells[i], scale, gate_km);
 
-        // Per-cell growth/decay (#546 iteration 1 pivot): each tracked
-        // cell's own mean-exceedance trend (prev→anchor matched blobs),
-        // applied to its advected footprint; background = pure advection.
+        // Per-cell growth/decay (#546): ENGINE-PARITY tendencies — the
+        // same `advance_tracks` production runs (two-hypothesis motion-
+        // compensated matching + tendency EMA), chained across anchors, so
+        // the gate measures what the server would actually apply. The first
+        // anchor has no track history ⇒ zero tendencies (pure advection),
+        // exactly like a fresh engine boot.
         let gd = args.growth_decay.then(|| {
             let (blobs, labels) =
                 segment_cells_labeled(&frames[i], args.object_threshold, args.min_area);
+            let elapsed = (info.times[i] - info.times[i - 1]).num_seconds() as f32;
+            tracks = advance_tracks(&tracks, blobs, scale, &field, elapsed, elapsed, || {
+                next_track_id += 1;
+                next_track_id
+            });
             // Labels beyond the u8 range fall back to 0 = pure advection
             // (mirrors the engine; clamping onto 255 would borrow cell
             // #254's tendency for every overflow cell).
@@ -398,13 +411,9 @@ fn main() -> ExitCode {
                 .map(|&l| if l <= 254 { l as u8 } else { 0 })
                 .collect();
             let mut tend = [0f32; 256];
-            for (pi, ci) in match_cells(&obs_cells[i - 1], &blobs, scale, gate_km) {
-                if ci < 254 {
-                    let mean_now = blobs[ci].volume / blobs[ci].area.max(1) as f32;
-                    let p = &obs_cells[i - 1][pi];
-                    let mean_prev = p.volume / p.area.max(1) as f32;
-                    tend[ci + 1] = (mean_now - mean_prev).clamp(-2.0, 2.0);
-                }
+            for (k, t) in tracks.iter().take(254).enumerate() {
+                // Per-interval units to pair with the lead damp below.
+                tend[k + 1] = t.intensity_tendency * elapsed;
             }
             (tend, label_map)
         });
