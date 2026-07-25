@@ -1172,6 +1172,15 @@ impl FeatureEngine for NowcastEngine {
         Ok(cell_feature(track, g, kx, ky, anchor).2)
     }
 
+    /// Bumps every generation, so any future consumer keying caches/ETags on
+    /// the feature snapshot (e.g. MVT serving of tracked cells) invalidates
+    /// correctly — cells are rebuilt per generation. Currently only the
+    /// plain Features path is wired, which doesn't read this; overriding
+    /// anyway removes the stale-tile trap before it can exist.
+    fn data_version(&self) -> u64 {
+        self.generations_total.load(Ordering::Relaxed)
+    }
+
     fn spatial_extent(&self) -> Option<[f64; 4]> {
         self.state.load().info.spatial_extent
     }
