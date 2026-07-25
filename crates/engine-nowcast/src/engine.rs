@@ -702,7 +702,7 @@ impl NowcastEngine {
                     if events.len() >= MAX_JOIN_STRIKES {
                         tracing::warn!(
                             collection = %self.collection_id,
-                            "lightning window hit the {MAX_JOIN_STRIKES}-row cap;                              flash counts may undercount this generation"
+                            "lightning window hit the {MAX_JOIN_STRIKES}-row cap; flash counts may undercount this generation"
                         );
                     }
                     let strikes_px: Vec<(f32, f32)> = events
@@ -1264,7 +1264,14 @@ fn cell_feature(
         );
         props.insert(
             "lightning_jump".into(),
-            PropertyValue::Bool(t.lightning_jump),
+            // Same tri-state as the counts: a skipped join is "unknown",
+            // not "no jump" — flash_count doubles as the joined-this-
+            // generation marker.
+            if t.flash_count.is_some() {
+                PropertyValue::Bool(t.lightning_jump)
+            } else {
+                PropertyValue::Null
+            },
         );
     }
     (

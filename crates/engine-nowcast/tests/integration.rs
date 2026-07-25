@@ -189,6 +189,103 @@ fn lightning_join_exposes_flash_properties() {
     assert!(!page.features[0].properties.contains_key("lightning_jump"));
 }
 
+/// A failing event source degrades to null flash fields for that
+/// generation — the generation itself, and the properties' presence,
+/// survive (#549 contract: present-but-null = "join skipped").
+#[test]
+fn lightning_source_error_degrades_to_null_fields() {
+    use ds_core::events::{EventPoint, EventSource};
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FlakyStrikes {
+        fail: AtomicBool,
+    }
+    impl EventSource for FlakyStrikes {
+        fn recent_events(
+            &self,
+            _start: DateTime<Utc>,
+            end: DateTime<Utc>,
+            _limit: usize,
+        ) -> Result<Vec<EventPoint>, ds_core::error::DataServerError> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(ds_core::error::DataServerError::Engine(
+                    "lightning db unreachable".into(),
+                ));
+            }
+            let (cx, cy) = disc_center(end);
+            let lon = EXTENT[0] + cx / f64::from(W) * (EXTENT[2] - EXTENT[0]);
+            let lat = EXTENT[3] - cy / f64::from(H) * (EXTENT[3] - EXTENT[1]);
+            Ok(vec![
+                EventPoint {
+                    time: end,
+                    lon,
+                    lat
+                };
+                10
+            ])
+        }
+    }
+
+    let anchor1 = t0() + Duration::minutes(5);
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let config = NowcastConfig {
+        source: "mock".into(),
+        horizon: "PT30M".into(),
+        step: None,
+        history_frames: 2,
+        poll_interval_secs: 30,
+        max_generations: 4,
+        max_pixels: 4_000_000,
+        min_echo: 10.0,
+        growth_decay: false,
+        lightning_source: Some("mock-lightning".into()),
+    };
+    let strikes = Arc::new(FlakyStrikes {
+        fail: AtomicBool::new(false),
+    });
+    let engine = NowcastEngine::new("flaky-nowcast", "mock", source.clone(), &config)
+        .expect("engine builds")
+        .with_lightning_source(strikes.clone());
+
+    // Healthy generation: measured values.
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    assert!(matches!(
+        page.features[0].properties.get("flash_count"),
+        Some(PropertyValue::Integer(10))
+    ));
+
+    // Source down for the next generation: it still completes, the track
+    // persists, and every flash field reads null — including the jump
+    // flag (unknown ≠ false).
+    strikes.fail.store(true, Ordering::Relaxed);
+    let anchor2 = anchor1 + Duration::minutes(5);
+    source.times.write().unwrap().push(anchor2);
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+    assert!(matches!(
+        f.properties.get("track_age"),
+        Some(PropertyValue::Integer(2))
+    ));
+    assert!(matches!(
+        f.properties.get("flash_count"),
+        Some(PropertyValue::Null)
+    ));
+    assert!(matches!(
+        f.properties.get("flash_rate_per_min"),
+        Some(PropertyValue::Null)
+    ));
+    assert!(matches!(
+        f.properties.get("lightning_jump"),
+        Some(PropertyValue::Null)
+    ));
+}
+
 fn build(horizon: &str, source_times: &[DateTime<Utc>]) -> (Arc<MockSource>, NowcastEngine) {
     build_with_history(horizon, source_times, 2)
 }

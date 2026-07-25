@@ -2399,7 +2399,8 @@ pub fn load_collections(
                 Some(events) => engine.with_lightning_source(events.clone()),
                 None => {
                     fail(format!(
-                        "lightning_source '{src_id}' not found or not an events-shape                          postgis collection (it must be defined in the same config)"
+                        "lightning_source '{src_id}' not found or not an events-shape postgis \
+                         collection (it must be defined in the same config)"
                     ));
                     continue;
                 }
