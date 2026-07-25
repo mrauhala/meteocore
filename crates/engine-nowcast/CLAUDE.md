@@ -108,6 +108,11 @@ follow-up (full frames only for the latest generation) is scoped in #523.
 
 ## Gotchas
 
+- `growth_decay = true` (experimental, default OFF — gate verdict on #546
+  says it stays off) adds a SECOND full-grid `sample_u8` per lead (the
+  advected label map, in both the U8 and f32 arms) — roughly 2× per-lead
+  sampling cost, against the grain of #528's linear-cheap-leads work.
+  Budget for it before ever flipping the flag on.
 - Advection is Lagrangian persistence: no growth/decay; 35+ dBZ convective
   cores lose skill beyond ~1 h (phase-4 territory). Inflow boundaries
   become nodata — never echo.

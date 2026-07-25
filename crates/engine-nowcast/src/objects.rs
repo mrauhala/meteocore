@@ -407,6 +407,48 @@ mod tests {
     }
 
     #[test]
+    fn label_map_is_one_based_compacted_and_drops_specks() {
+        // The label-map contract is load-bearing for the growth/decay
+        // tendency application (label k ⇔ blobs[k-1]): raw component labels
+        // are compacted to 1-based retained-blob indices in creation
+        // (row-major first-encounter) order; background and sub-min_area
+        // components are 0. An off-by-one here silently applies one cell's
+        // tendency to another's pixels.
+        let g = grid_with_discs(
+            60,
+            30,
+            &[
+                (10.0, 10.0, 4.0, 45.0), // blob 1 (encountered first)
+                (40.0, 20.0, 3.0, 40.0), // blob 2
+                (55.0, 5.0, 0.8, 50.0),  // speck, dropped by min_area
+            ],
+        );
+        let (blobs, labels) = segment_cells_labeled(&g, 35.0, 5);
+        assert_eq!(blobs.len(), 2);
+        assert_eq!(labels.len(), 60 * 30);
+        // Every pixel of blobs[k] carries label k+1; the speck and the
+        // background are 0.
+        for (i, &l) in labels.iter().enumerate() {
+            let (x, y) = ((i % 60) as f32 + 0.5, (i / 60) as f32 + 0.5);
+            let expect = if (x - 10.0).powi(2) + (y - 10.0).powi(2) <= 16.0 {
+                1
+            } else if (x - 40.0).powi(2) + (y - 20.0).powi(2) <= 9.0 {
+                2
+            } else {
+                0 // background AND the dropped speck
+            };
+            assert_eq!(l, expect, "pixel ({x}, {y})");
+        }
+        // Consistency with the blob list: label areas match blob areas and
+        // blobs come back in creation order.
+        assert!(blobs[0].centroid.0 < blobs[1].centroid.0);
+        for (k, b) in blobs.iter().enumerate() {
+            let count = labels.iter().filter(|&&l| l == (k + 1) as u32).count();
+            assert_eq!(count, b.area);
+        }
+    }
+
+    #[test]
     fn matching_respects_gate_and_prefers_nearest() {
         let a = grid_with_discs(200, 100, &[(50.0, 50.0, 8.0, 45.0)]);
         let b = grid_with_discs(
