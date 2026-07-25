@@ -17,8 +17,10 @@ use crate::objects::{match_cells, CellBlob, PixelScale};
 /// Cell threshold (dBZ) for intelligence tracking — the Ritvanen-style
 /// convective contour, matching the verification harness default.
 pub const CELL_THRESHOLD_DBZ: f32 = 35.0;
-/// Minimum component size in pixels.
-pub const CELL_MIN_AREA_PX: usize = 5;
+/// Minimum component size in pixels. 10 px ≈ 2.5 km² on the FMI 500 m
+/// grid — below that, 35 dBZ specks churn between generations and flood
+/// the Features layer with unmatched one-generation "cells".
+pub const CELL_MIN_AREA_PX: usize = 10;
 /// Matching gate (km) for track continuity between generations, per
 /// [`TRACK_GATE_BASE_SECS`] of elapsed time — the gate scales linearly
 /// with the actual span (a skipped generation doubles the distance a
@@ -33,6 +35,9 @@ pub const DEVIANT_MIN_CELL_SPEED_MS: f32 = 3.0;
 /// Consecutive deviant generations before the flag is raised (single-scan
 /// residuals are mostly track noise).
 pub const DEVIANT_STREAK: u32 = 2;
+/// Per-second clamp on a cell's measured intensity tendency (±2 dBZ per
+/// 5-minute interval at the usual cadence).
+pub const MAX_CELL_TENDENCY_PER_S: f32 = 2.0 / 300.0;
 
 /// TRT-lite severity rank from 2D attributes (documented heuristic v1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -92,6 +97,14 @@ pub struct CellTrack {
     /// deviant gates.
     pub deviant_streak: u32,
     pub severity: Severity,
+    /// Volume-proxy trend vs the previous observation: `Some(true)` =
+    /// growing, `Some(false)` = decaying, `None` = newborn (#546 iter 1).
+    pub growing: Option<bool>,
+    /// EMA'd mean-intensity trend of THIS cell (physical units per second,
+    /// clamped): the tracker-level growth/decay signal — immune to the
+    /// per-pixel motion-residual contamination that poisoned field-level
+    /// profiles. 0.0 until the second observation.
+    pub intensity_tendency: f32,
 }
 
 impl CellTrack {
@@ -135,11 +148,45 @@ pub fn advance_tracks(
     field_interval_secs: f32,
     mut next_id: impl FnMut() -> u64,
 ) -> Vec<CellTrack> {
-    let prev_blobs: Vec<CellBlob> = previous.iter().map(|t| t.blob.clone()).collect();
+    // Two-hypothesis matching: pass 1 uses TITAN-style motion-compensated
+    // first guesses (fixes fast movers pairing with the wrong upstream
+    // cell — the against-flow client bug, 2026-07-25); pass 2 rematches the
+    // leftovers at their RAW positions, so a genuine counter-flow cell —
+    // whose first guess is displaced the WRONG way and may leave the gate —
+    // still finds its true successor instead of being dropped by the very
+    // detector built to flag it.
+    let ratio = displacement_secs.max(1.0) / field_interval_secs.max(1.0);
+    let displaced: Vec<CellBlob> = previous
+        .iter()
+        .map(|t| {
+            let mut b = t.blob.clone();
+            let (fu, fv) = field.sample(b.centroid.0, b.centroid.1);
+            b.centroid.0 += fu * ratio;
+            b.centroid.1 += fv * ratio;
+            b
+        })
+        .collect();
     let gate = TRACK_GATE_KM * (displacement_secs / TRACK_GATE_BASE_SECS).max(1.0);
     let mut matched_prev: Vec<Option<usize>> = vec![None; blobs.len()];
-    for (pi, ci) in match_cells(&prev_blobs, &blobs, scale, gate) {
+    let mut prev_taken = vec![false; previous.len()];
+    for (pi, ci) in match_cells(&displaced, &blobs, scale, gate) {
         matched_prev[ci] = Some(pi);
+        prev_taken[pi] = true;
+    }
+    {
+        // Pass 2 on leftovers, raw positions.
+        let free_prev: Vec<usize> = (0..previous.len()).filter(|&i| !prev_taken[i]).collect();
+        let free_cur: Vec<usize> = (0..blobs.len())
+            .filter(|&i| matched_prev[i].is_none())
+            .collect();
+        let prev_raw: Vec<CellBlob> = free_prev
+            .iter()
+            .map(|&i| previous[i].blob.clone())
+            .collect();
+        let cur_raw: Vec<CellBlob> = free_cur.iter().map(|&i| blobs[i].clone()).collect();
+        for (a, b) in match_cells(&prev_raw, &cur_raw, scale, gate) {
+            matched_prev[free_cur[b]] = Some(free_prev[a]);
+        }
     }
 
     blobs
@@ -156,6 +203,8 @@ pub fn advance_tracks(
                     velocity_kms: None,
                     deviant_streak: 0,
                     severity,
+                    growing: None,
+                    intensity_tendency: 0.0,
                 },
                 Some(pi) => {
                     let prev = &previous[pi];
@@ -181,10 +230,21 @@ pub fn advance_tracks(
                     let deviant_now = residual_ms > DEVIANT_RESIDUAL_MS
                         && cell_speed_ms > DEVIANT_MIN_CELL_SPEED_MS;
 
+                    let growing = Some(blob.volume >= prev.blob.volume);
+                    // Mean-exceedance trend, per second, EMA'd with the
+                    // track's history (newborns start at 0 ⇒ first
+                    // measurement is halved — mild warm-up damping).
+                    let mean_now = blob.volume / blob.area.max(1) as f32;
+                    let mean_prev = prev.blob.volume / prev.blob.area.max(1) as f32;
+                    let raw_tendency = ((mean_now - mean_prev) / ds)
+                        .clamp(-MAX_CELL_TENDENCY_PER_S, MAX_CELL_TENDENCY_PER_S);
+                    let intensity_tendency = 0.5 * raw_tendency + 0.5 * prev.intensity_tendency;
                     CellTrack {
                         id: prev.id,
                         blob,
                         age: prev.age + 1,
+                        growing,
+                        intensity_tendency,
                         velocity_kms: Some((vx_km, vy_km)),
                         deviant_streak: if deviant_now {
                             prev.deviant_streak + 1
@@ -202,9 +262,61 @@ pub fn advance_tracks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::motion::{estimate_motion, MotionOptions};
+    use crate::motion::{estimate_motion, MotionField, MotionOptions};
     use crate::objects::segment_cells;
     use crate::Grid;
+
+    #[test]
+    fn counter_flow_cell_matches_via_raw_position_pass() {
+        // The against-flow fix (two-hypothesis matching): a strong ambient
+        // flow displaces the pass-1 hypothesis of a STATIONARY cell far
+        // outside the gate. Pass 2 must still match it at its raw position —
+        // otherwise the matcher drops exactly the counter-flow cells the
+        // deviant-mover detector exists to flag.
+        let blob = CellBlob {
+            centroid: (50.0, 50.0),
+            area: 20,
+            volume: 800.0,
+            max_value: 42.0,
+        };
+        let previous = vec![CellTrack {
+            id: 7,
+            blob: blob.clone(),
+            age: 1,
+            velocity_kms: None,
+            deviant_streak: 0,
+            severity: Severity::Weak,
+            growing: None,
+            intensity_tendency: 0.0,
+        }];
+        // Uniform 30 px/interval eastward flow; at 1 km/px the compensated
+        // hypothesis lands 30 km from the stationary successor — outside
+        // the 20 km base gate, so pass 1 alone would orphan the track.
+        let field = MotionField {
+            block: 16,
+            bw: 2,
+            bh: 2,
+            u: vec![30.0; 4],
+            v: vec![0.0; 4],
+            measured: vec![true; 4],
+        };
+        let scale = PixelScale { x: 1.0, y: 1.0 };
+        let mut next = 100u64;
+        let tracks = advance_tracks(&previous, vec![blob], scale, &field, 300.0, 300.0, || {
+            next += 1;
+            next
+        });
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(
+            tracks[0].id, 7,
+            "raw-position pass must rescue the counter-flow match"
+        );
+        assert_eq!(tracks[0].age, 2);
+        // Velocity comes from ORIGINAL (non-displaced) centroids: the cell
+        // is stationary, so the track velocity must be ~zero, not the flow.
+        let (vx, vy) = tracks[0].velocity_kms.unwrap();
+        assert!(vx.abs() < 1e-6 && vy.abs() < 1e-6);
+    }
 
     fn disc(w: usize, h: usize, cx: f32, cy: f32, r: f32, v: f32) -> Grid {
         let mut data = vec![0.0f32; w * h];

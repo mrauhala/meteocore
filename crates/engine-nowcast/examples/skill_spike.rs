@@ -20,13 +20,15 @@ use std::time::Instant;
 use ds_core::config::GeoTiffConfig;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterValues};
 use engine_geotiff::GeoTiffEngine;
+use engine_nowcast::advect::advect_u8;
+use engine_nowcast::cells2d::{advance_tracks, CellTrack};
 use engine_nowcast::motion::{estimate_motion, MotionOptions};
 use engine_nowcast::objects::{
-    classify_growth, match_cells, score_objects, segment_cells, CellBlob, GrowthClass,
-    ObjectScores, PixelScale,
+    classify_growth, match_cells, score_objects, segment_cells, segment_cells_labeled, CellBlob,
+    GrowthClass, ObjectScores, PixelScale,
 };
 use engine_nowcast::skill::{score, Contingency};
-use engine_nowcast::tendency::GrowthProfile;
+use engine_nowcast::tendency::EFOLD_INTERVALS;
 use engine_nowcast::{advect::advect, Grid};
 
 /// Keep the working grid at most this many pixels (halve dims until it fits).
@@ -366,6 +368,10 @@ fn main() -> ExitCode {
     let mut obj_now = vec![[ObjectScores::default(); 3]; max_lead];
     let mut obj_pers = vec![[ObjectScores::default(); 3]; max_lead];
 
+    // Chained track state for the --growth-decay arm (engine parity).
+    let mut tracks: Vec<CellTrack> = Vec::new();
+    let mut next_track_id: u64 = 0;
+
     for i in 1..frames.len() - 1 {
         let started = Instant::now();
         let field = estimate_motion(&frames[i - 1], &frames[i], &opts);
@@ -383,20 +389,52 @@ fn main() -> ExitCode {
         // then chained forward through observed-track matches per lead.
         let mut classes = classify_growth(&obs_cells[i - 1], &obs_cells[i], scale, gate_km);
 
-        // Growth/decay profile for this anchor (#546): advect the previous
-        // frame one interval, measure per-band tendencies vs the anchor.
-        let profile = args.growth_decay.then(|| {
-            let advected_prev = advect(&frames[i - 1], &field, 1.0, args.substeps);
-            GrowthProfile::measure(&advected_prev, &frames[i], args.min_echo)
+        // Per-cell growth/decay (#546): ENGINE-PARITY tendencies — the
+        // same `advance_tracks` production runs (two-hypothesis motion-
+        // compensated matching + tendency EMA), chained across anchors, so
+        // the gate measures what the server would actually apply. The first
+        // anchor has no track history ⇒ zero tendencies (pure advection),
+        // exactly like a fresh engine boot.
+        let gd = args.growth_decay.then(|| {
+            let (blobs, labels) =
+                segment_cells_labeled(&frames[i], args.object_threshold, args.min_area);
+            let elapsed = (info.times[i] - info.times[i - 1]).num_seconds() as f32;
+            tracks = advance_tracks(&tracks, blobs, scale, &field, elapsed, elapsed, || {
+                next_track_id += 1;
+                next_track_id
+            });
+            // Labels beyond the u8 range fall back to 0 = pure advection
+            // (mirrors the engine; clamping onto 255 would borrow cell
+            // #254's tendency for every overflow cell).
+            let label_map: Vec<u8> = labels
+                .iter()
+                .map(|&l| if l <= 254 { l as u8 } else { 0 })
+                .collect();
+            let mut tend = [0f32; 256];
+            for (k, t) in tracks.iter().take(254).enumerate() {
+                // Per-interval units to pair with the lead damp below.
+                tend[k + 1] = t.intensity_tendency * elapsed;
+            }
+            (tend, label_map)
         });
 
         for lead in 1..=(frames.len() - 1 - i) {
             let started = Instant::now();
             let mut forecast = advect(&frames[i], &field, lead as f32, args.substeps);
-            if let Some(p) = &profile {
-                for v in forecast.data.iter_mut() {
-                    if v.is_finite() {
-                        *v = p.apply(*v, lead as f32);
+            if let Some((tend, label_map)) = &gd {
+                let moved = advect_u8(
+                    label_map,
+                    w as usize,
+                    h as usize,
+                    0,
+                    &field,
+                    lead as f32,
+                    args.substeps,
+                );
+                let damp = EFOLD_INTERVALS * (1.0 - (-(lead as f32) / EFOLD_INTERVALS).exp());
+                for (v, k) in forecast.data.iter_mut().zip(&moved) {
+                    if v.is_finite() && *k > 0 {
+                        *v += tend[*k as usize] * damp;
                     }
                 }
             }

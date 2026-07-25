@@ -94,11 +94,25 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   ≥5 m/s residual between the track and the ambient motion field (the
   estimator-disagreement right-mover detector). Served as Point features
   via `FeatureEngine` when the collection lists `features` in `apis`.
+- **Cell-snapshot HISTORY (#548):** one snapshot per generation is
+  retained, `CELL_HISTORY_SNAPSHOTS = 48` deep (~4 h at 5-min cadence,
+  ~100 B/track). `?datetime=` on the items endpoint selects the NEWEST
+  snapshot inside the interval — animating clients query the exact cell
+  situation per rendered frame. No `datetime` ⇒ latest snapshot; instants
+  before the retained range (or in the future — cells are analysis-only,
+  never forecast) ⇒ 0 features. The collection's temporal extent
+  advertises the retained span; by-id GET serves the latest snapshot's
+  version of a track.
 - Lightning join (flash counts/jump per track) is part 2 — needs a ds-core
   event-source trait + engine-postgis impl.
 
 ## Gotchas
 
+- `growth_decay = true` (experimental, default OFF — gate verdict on #546
+  says it stays off) adds a SECOND full-grid `sample_u8` per lead (the
+  advected label map, in both the U8 and f32 arms) — roughly 2× per-lead
+  sampling cost, against the grain of #528's linear-cheap-leads work.
+  Budget for it before ever flipping the flag on.
 - Advection is Lagrangian persistence: no growth/decay; 35+ dBZ convective
   cores lose skill beyond ~1 h (phase-4 territory). Inflow boundaries
   become nodata — never echo.

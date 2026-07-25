@@ -32,9 +32,22 @@ pub struct CellBlob {
 /// Segment `grid` into cells: 8-connected components of pixels with
 /// `value ≥ threshold`, keeping components of at least `min_area` pixels.
 pub fn segment_cells(grid: &Grid, threshold: f32, min_area: usize) -> Vec<CellBlob> {
+    segment_cells_labeled(grid, threshold, min_area).0
+}
+
+/// Like [`segment_cells`], also returning a per-pixel label map: `0` =
+/// no retained cell, `i+1` = member of the i-th returned blob. Used by the
+/// per-cell tendency application (#546), which needs cell footprint
+/// masks, not just centroids.
+pub fn segment_cells_labeled(
+    grid: &Grid,
+    threshold: f32,
+    min_area: usize,
+) -> (Vec<CellBlob>, Vec<u32>) {
     let (w, h) = (grid.width, grid.height);
     let mut labels = vec![0u32; w * h];
     let mut cells: Vec<CellBlob> = Vec::new();
+    let mut retained: Vec<u32> = Vec::new();
     let mut stack: Vec<usize> = Vec::new();
     let mut next_label = 0u32;
 
@@ -84,9 +97,18 @@ pub fn segment_cells(grid: &Grid, threshold: f32, min_area: usize) -> Vec<CellBl
                 volume,
                 max_value,
             });
+            retained.push(next_label);
         }
     }
-    cells
+    // Compact retained raw labels to 1-based blob indices; drop the rest.
+    let mut remap = vec![0u32; next_label as usize + 1];
+    for (i, &raw) in retained.iter().enumerate() {
+        remap[raw as usize] = i as u32 + 1;
+    }
+    for l in labels.iter_mut() {
+        *l = remap[*l as usize];
+    }
+    (cells, labels)
 }
 
 /// Per-axis pixel scale for distance computations. A regular lat/lon grid
@@ -382,6 +404,48 @@ mod tests {
         // A speck below min_area disappears.
         let speck = grid_with_discs(64, 64, &[(30.0, 30.0, 1.0, 50.0)]);
         assert!(segment_cells(&speck, 35.0, 8).is_empty());
+    }
+
+    #[test]
+    fn label_map_is_one_based_compacted_and_drops_specks() {
+        // The label-map contract is load-bearing for the growth/decay
+        // tendency application (label k ⇔ blobs[k-1]): raw component labels
+        // are compacted to 1-based retained-blob indices in creation
+        // (row-major first-encounter) order; background and sub-min_area
+        // components are 0. An off-by-one here silently applies one cell's
+        // tendency to another's pixels.
+        let g = grid_with_discs(
+            60,
+            30,
+            &[
+                (10.0, 10.0, 4.0, 45.0), // blob 1 (encountered first)
+                (40.0, 20.0, 3.0, 40.0), // blob 2
+                (55.0, 5.0, 0.8, 50.0),  // speck, dropped by min_area
+            ],
+        );
+        let (blobs, labels) = segment_cells_labeled(&g, 35.0, 5);
+        assert_eq!(blobs.len(), 2);
+        assert_eq!(labels.len(), 60 * 30);
+        // Every pixel of blobs[k] carries label k+1; the speck and the
+        // background are 0.
+        for (i, &l) in labels.iter().enumerate() {
+            let (x, y) = ((i % 60) as f32 + 0.5, (i / 60) as f32 + 0.5);
+            let expect = if (x - 10.0).powi(2) + (y - 10.0).powi(2) <= 16.0 {
+                1
+            } else if (x - 40.0).powi(2) + (y - 20.0).powi(2) <= 9.0 {
+                2
+            } else {
+                0 // background AND the dropped speck
+            };
+            assert_eq!(l, expect, "pixel ({x}, {y})");
+        }
+        // Consistency with the blob list: label areas match blob areas and
+        // blobs come back in creation order.
+        assert!(blobs[0].centroid.0 < blobs[1].centroid.0);
+        for (k, b) in blobs.iter().enumerate() {
+            let count = labels.iter().filter(|&&l| l == (k + 1) as u32).count();
+            assert_eq!(count, b.area);
+        }
     }
 
     #[test]
