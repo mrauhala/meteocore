@@ -555,10 +555,11 @@ fn cell_features_are_served_and_tracks_persist() {
     assert!(engine.get_feature(&id1).is_ok());
     assert!(engine.get_feature("9999").is_err());
 
-    // datetime filter: excluding the anchor matches nothing; including it
-    // matches; count accessor is O(1)-consistent with the page.
-    use ds_core::feature::DatetimeInterval;
-    let excl = engine
+    // History (#548): an interval before the latest snapshot selects the
+    // OLDER retained snapshot (age-1 cells, observed at anchor1); an
+    // interval before all snapshots matches nothing.
+    use ds_core::feature::{DatetimeInterval, PropertyValue as PV};
+    let hist = engine
         .get_features(&FeatureQuery {
             datetime: Some(DatetimeInterval {
                 start: None,
@@ -567,7 +568,21 @@ fn cell_features_are_served_and_tracks_persist() {
             ..Default::default()
         })
         .unwrap();
-    assert_eq!(excl.number_matched, 0);
+    assert_eq!(hist.number_matched, 1, "older snapshot must serve history");
+    assert!(matches!(
+        hist.features[0].properties.get("track_age"),
+        Some(PV::Integer(1))
+    ));
+    let none = engine
+        .get_features(&FeatureQuery {
+            datetime: Some(DatetimeInterval {
+                start: None,
+                end: Some(t0() - Duration::minutes(1)),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(none.number_matched, 0, "before all snapshots: nothing");
     assert_eq!(engine.feature_count(), 1);
 }
 

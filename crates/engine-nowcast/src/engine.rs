@@ -146,11 +146,23 @@ struct Generation {
     /// The (blended) motion field this generation advected along — the
     /// EMA history for the NEXT generation (#524).
     field: MotionField,
-    /// Per-band growth/decay profile (measured + EMA'd) — the history for
-    /// the NEXT generation (#546).
     /// Tracked cells of this generation's analysis frame (#544/#546).
     cells: Arc<Vec<CellTrack>>,
 }
+
+/// One retained cell snapshot: the tracked cells of a past analysis frame,
+/// with the geometry needed to serve them (#548 history — the client
+/// animates source frames and asks for the exact cell situation per frame).
+#[derive(Clone)]
+struct CellSnapshot {
+    anchor: DateTime<Utc>,
+    geom: GridGeom,
+    cells: Arc<Vec<CellTrack>>,
+}
+
+/// Cell-history retention: 48 snapshots = 4 h at the 5-min cadence. Cells
+/// are a few hundred tracks × ~100 B per snapshot — retention is ~free.
+const CELL_HISTORY_SNAPSHOTS: usize = 48;
 
 /// Atomically swapped engine state.
 struct NowcastState {
@@ -158,8 +170,10 @@ struct NowcastState {
     generations: BTreeMap<DateTime<Utc>, Arc<Generation>>,
     /// Pre-built snapshot for the O(1) `raster_info()` contract.
     info: RasterInfo,
-    /// Tracked cells of the latest generation's analysis frame (#544).
-    cells: Arc<Vec<CellTrack>>,
+    /// Tracked-cell snapshots, oldest → newest (#544/#548). The last entry
+    /// is the latest analysis frame's cells; earlier entries serve
+    /// `?datetime=` history for animating clients.
+    cell_history: Vec<CellSnapshot>,
 }
 
 pub struct NowcastEngine {
@@ -263,7 +277,7 @@ impl NowcastEngine {
             state: ArcSwap::from_pointee(NowcastState {
                 generations: BTreeMap::new(),
                 info: empty_info(&source_info),
-                cells: Arc::new(Vec::new()),
+                cell_history: Vec::new(),
             }),
             shutdown_tx,
             generations_total: AtomicU64::new(0),
@@ -382,15 +396,21 @@ impl NowcastEngine {
                     generations.remove(&oldest);
                 }
                 let info = build_info(&source_info, &generations);
-                let cells = generations
-                    .get(&anchor)
-                    .expect("just inserted")
-                    .cells
-                    .clone();
+                let generation_ref = generations.get(&anchor).expect("just inserted");
+                let mut cell_history = old.cell_history.clone();
+                cell_history.push(CellSnapshot {
+                    anchor,
+                    geom: generation_ref.geom,
+                    cells: generation_ref.cells.clone(),
+                });
+                if cell_history.len() > CELL_HISTORY_SNAPSHOTS {
+                    let excess = cell_history.len() - CELL_HISTORY_SNAPSHOTS;
+                    cell_history.drain(..excess);
+                }
                 self.state.store(Arc::new(NowcastState {
                     generations,
                     info,
-                    cells,
+                    cell_history,
                 }));
                 self.generations_total.fetch_add(1, Ordering::Relaxed);
                 self.last_generation_ms.store(elapsed_ms, Ordering::Relaxed);
@@ -656,9 +676,15 @@ impl NowcastEngine {
         // background and newborns get 0 = pure advection. Labels are capped
         // at 255 to ride the u8 trajectory sampler — cells beyond that (rare;
         // FMI convective days run ~150) fall back to pure advection.
-        let label_map: Vec<u8> = labels.iter().map(|&l| l.min(255) as u8).collect();
+        // Labels above 254 fall back to 0 (pure advection) — clamping onto
+        // 255 would silently borrow cell #254's tendency for every overflow
+        // cell.
+        let label_map: Vec<u8> = labels
+            .iter()
+            .map(|&l| if l <= 254 { l as u8 } else { 0 })
+            .collect();
         let mut cell_tendency = [0f32; 256];
-        for (i, t) in cells.iter().take(255).enumerate() {
+        for (i, t) in cells.iter().take(254).enumerate() {
             // Per-interval units to pair with lead_intervals below.
             cell_tendency[i + 1] = t.intensity_tendency * interval.num_seconds() as f32;
         }
@@ -1142,6 +1168,14 @@ fn cell_feature(
     // measured trend is still valuable client-side ("intensifying" /
     // "weakening" badges).
     props.insert(
+        "volume_trend".into(),
+        match t.growing {
+            Some(true) => PropertyValue::String("growing".into()),
+            Some(false) => PropertyValue::String("decaying".into()),
+            None => PropertyValue::Null,
+        },
+    );
+    props.insert(
         "intensity_trend_dbz_min".into(),
         if t.age >= 2 {
             PropertyValue::Float(f64::from(t.intensity_tendency) * 60.0)
@@ -1161,36 +1195,35 @@ fn cell_feature(
 }
 
 impl FeatureEngine for NowcastEngine {
-    /// Tracked cells of the latest analysis frame as Point features (#544).
+    /// Tracked cells as Point features (#544/#548). With no `datetime`,
+    /// the latest snapshot is served; `datetime` selects the NEWEST retained
+    /// snapshot whose analysis instant falls inside the interval (history
+    /// spans ~4 h), so an animating client can query the exact situation
+    /// for each frame it shows. Outside the retained range ⇒ 0 features.
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         let state = self.state.load();
-        let Some((&anchor, latest)) = state.generations.iter().next_back() else {
-            return Ok(FeaturePage {
+        let empty = || {
+            Ok(FeaturePage {
                 features: Vec::new(),
                 number_matched: 0,
                 number_returned: 0,
                 next_offset: None,
-            });
+            })
         };
-        // Cells exist only at the latest analysis instant: a datetime
-        // filter that excludes the anchor matches nothing (engine-cap
-        // precedent for honoring `?datetime=`).
-        if let Some(dt) = &query.datetime {
-            let after_start = dt.start.is_none_or(|s| anchor >= s);
-            let before_end = dt.end.is_none_or(|e| anchor <= e);
-            if !(after_start && before_end) {
-                return Ok(FeaturePage {
-                    features: Vec::new(),
-                    number_matched: 0,
-                    number_returned: 0,
-                    next_offset: None,
-                });
-            }
-        }
-        let g = latest.geom;
+        let snapshot = match &query.datetime {
+            None => state.cell_history.last(),
+            Some(dt) => state.cell_history.iter().rev().find(|s| {
+                dt.start.is_none_or(|st| s.anchor >= st) && dt.end.is_none_or(|e| s.anchor <= e)
+            }),
+        };
+        let Some(snapshot) = snapshot else {
+            return empty();
+        };
+        let anchor = snapshot.anchor;
+        let g = snapshot.geom;
         let (kx, ky) =
             crate::lonlat_grid_km_per_px([g.west, g.south, g.east, g.north], g.width, g.height);
-        let matched: Vec<Feature> = state
+        let matched: Vec<Feature> = snapshot
             .cells
             .iter()
             .filter_map(|t| {
@@ -1223,23 +1256,30 @@ impl FeatureEngine for NowcastEngine {
     /// O(1) from the snapshot — the default would build every feature just
     /// to count them, on every collection-metadata request.
     fn feature_count(&self) -> usize {
-        self.state.load().cells.len()
+        self.state
+            .load()
+            .cell_history
+            .last()
+            .map(|s| s.cells.len())
+            .unwrap_or(0)
     }
 
+    /// By-id lookup serves the LATEST snapshot's version of the track
+    /// (history is reachable via `get_features` + `datetime`).
     fn get_feature(&self, feature_id: &str) -> Result<Feature, DataServerError> {
         let state = self.state.load();
         let not_found = || DataServerError::FeatureNotFound(feature_id.to_string());
-        let (&anchor, latest) = state.generations.iter().next_back().ok_or_else(not_found)?;
+        let snapshot = state.cell_history.last().ok_or_else(not_found)?;
         let id: u64 = feature_id.parse().map_err(|_| not_found())?;
-        let track = state
+        let track = snapshot
             .cells
             .iter()
             .find(|t| t.id == id)
             .ok_or_else(not_found)?;
-        let g = latest.geom;
+        let g = snapshot.geom;
         let (kx, ky) =
             crate::lonlat_grid_km_per_px([g.west, g.south, g.east, g.north], g.width, g.height);
-        Ok(cell_feature(track, g, kx, ky, anchor).2)
+        Ok(cell_feature(track, g, kx, ky, snapshot.anchor).2)
     }
 
     /// Bumps every generation, so any future consumer keying caches/ETags on
@@ -1255,8 +1295,13 @@ impl FeatureEngine for NowcastEngine {
         self.state.load().info.spatial_extent
     }
 
+    /// Span of the retained cell history (~4 h) — the datetime range an
+    /// animating client can query snapshots for.
     fn temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
         let state = self.state.load();
-        state.generations.iter().next_back().map(|(&a, _)| (a, a))
+        match (state.cell_history.first(), state.cell_history.last()) {
+            (Some(first), Some(last)) => Some((first.anchor, last.anchor)),
+            _ => None,
+        }
     }
 }

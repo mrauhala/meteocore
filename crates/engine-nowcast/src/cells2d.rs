@@ -148,13 +148,15 @@ pub fn advance_tracks(
     field_interval_secs: f32,
     mut next_id: impl FnMut() -> u64,
 ) -> Vec<CellTrack> {
-    // Motion-compensated first-guess matching (TITAN-style): displace each
-    // previous centroid along the ambient field before matching. Without
-    // this, a fast mover's true successor sits downstream and the nearest
-    // raw match is often a DIFFERENT upstream cell — producing systematic
-    // against-flow track velocities (the client-visible bug, 2026-07-25).
+    // Two-hypothesis matching: pass 1 uses TITAN-style motion-compensated
+    // first guesses (fixes fast movers pairing with the wrong upstream
+    // cell — the against-flow client bug, 2026-07-25); pass 2 rematches the
+    // leftovers at their RAW positions, so a genuine counter-flow cell —
+    // whose first guess is displaced the WRONG way and may leave the gate —
+    // still finds its true successor instead of being dropped by the very
+    // detector built to flag it.
     let ratio = displacement_secs.max(1.0) / field_interval_secs.max(1.0);
-    let prev_blobs: Vec<CellBlob> = previous
+    let displaced: Vec<CellBlob> = previous
         .iter()
         .map(|t| {
             let mut b = t.blob.clone();
@@ -166,8 +168,25 @@ pub fn advance_tracks(
         .collect();
     let gate = TRACK_GATE_KM * (displacement_secs / TRACK_GATE_BASE_SECS).max(1.0);
     let mut matched_prev: Vec<Option<usize>> = vec![None; blobs.len()];
-    for (pi, ci) in match_cells(&prev_blobs, &blobs, scale, gate) {
+    let mut prev_taken = vec![false; previous.len()];
+    for (pi, ci) in match_cells(&displaced, &blobs, scale, gate) {
         matched_prev[ci] = Some(pi);
+        prev_taken[pi] = true;
+    }
+    {
+        // Pass 2 on leftovers, raw positions.
+        let free_prev: Vec<usize> = (0..previous.len()).filter(|&i| !prev_taken[i]).collect();
+        let free_cur: Vec<usize> = (0..blobs.len())
+            .filter(|&i| matched_prev[i].is_none())
+            .collect();
+        let prev_raw: Vec<CellBlob> = free_prev
+            .iter()
+            .map(|&i| previous[i].blob.clone())
+            .collect();
+        let cur_raw: Vec<CellBlob> = free_cur.iter().map(|&i| blobs[i].clone()).collect();
+        for (a, b) in match_cells(&prev_raw, &cur_raw, scale, gate) {
+            matched_prev[free_cur[b]] = Some(free_prev[a]);
+        }
     }
 
     blobs
