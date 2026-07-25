@@ -1,7 +1,7 @@
 {
   "uid": "meteocore-overview",
   "title": "MeteoCore",
-  "description": "MeteoCore OGC server \u2014 traffic, render pipeline, caches, storage, PostGIS, logs. Panel descriptions explain what each signal means and what 'bad' looks like.",
+  "description": "MeteoCore OGC server — traffic, render pipeline, caches, storage, PostGIS, logs. Panel descriptions explain what each signal means and what 'bad' looks like.",
   "tags": [
     "meteocore"
   ],
@@ -253,7 +253,7 @@
     {
       "type": "stat",
       "title": "5xx in last hour",
-      "description": "Server errors in the last hour. Should be 0 \u2014 any value is worth a look at the Errors log panel.",
+      "description": "Server errors in the last hour. Should be 0 — any value is worth a look at the Errors log panel.",
       "id": 6,
       "gridPos": {
         "h": 4,
@@ -303,7 +303,7 @@
     {
       "type": "stat",
       "title": "Render permits in use",
-      "description": "Render-semaphore permits currently held (of total, 2\u00d7cores). Pinned at max = renders queueing \u2192 latency tail.",
+      "description": "Render-semaphore permits currently held (of total, 2×cores). Pinned at max = renders queueing → latency tail.",
       "id": 7,
       "gridPos": {
         "h": 4,
@@ -401,7 +401,7 @@
     },
     {
       "type": "row",
-      "title": "HTTP \u2014 traffic & latency",
+      "title": "HTTP — traffic & latency",
       "id": 9,
       "collapsed": false,
       "gridPos": {
@@ -414,7 +414,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Requests per second \u2014 by API",
+      "title": "Requests per second — by API",
       "description": "Traffic split by API family. WMS dominates in this deployment; a sudden shape change usually means a client-side config change.",
       "id": 10,
       "gridPos": {
@@ -490,8 +490,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Errors per second \u2014 4xx vs 5xx",
-      "description": "4xx = client mistakes (bad params \u2014 e.g. a map client sending ELEVATION to a layer without that dimension). 5xx = our bugs; correlate with the Errors log panel below.",
+      "title": "Errors per second — 4xx vs 5xx",
+      "description": "4xx = client mistakes (bad params — e.g. a map client sending ELEVATION to a layer without that dimension). 5xx = our bugs; correlate with the Errors log panel below.",
       "id": 11,
       "gridPos": {
         "h": 8,
@@ -541,8 +541,8 @@
     },
     {
       "type": "timeseries",
-      "title": "WMS GetMap latency \u2014 p50 / p95 / p99",
-      "description": "The hot path. p50 \u2248 warm cache hits (~20 ms); the p99 tail is cold renders. Sustained p99 > 1 s: check 'Cold tile renders /s' and the slow-render log panel.",
+      "title": "WMS GetMap latency — p50 / p95 / p99",
+      "description": "The hot path. p50 ≈ warm cache hits (~20 ms); the p99 tail is cold renders. Sustained p99 > 1 s: check 'Cold tile renders /s' and the slow-render log panel.",
       "id": 12,
       "gridPos": {
         "h": 8,
@@ -597,8 +597,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Latency p95 \u2014 by API",
-      "description": "Per-API p95. NOTE: quantiles are unreliable below ~0.1 req/s (they interpolate to bucket tops from single samples) \u2014 check the request rate before believing a spike on a quiet API.",
+      "title": "Latency p95 — by API",
+      "description": "Per-API p95. NOTE: quantiles are unreliable below ~0.1 req/s (they interpolate to bucket tops from single samples) — check the request rate before believing a spike on a quiet API.",
       "id": 13,
       "gridPos": {
         "h": 8,
@@ -710,8 +710,8 @@
     },
     {
       "type": "timeseries",
-      "title": "EDR position queries \u2014 rate and p95",
-      "description": "Point/time-series queries (map click / hover). Cheap since #463 (decoded-chunk cache) \u2014 a rising p95 here with PVOL collections in play suggests pixel-cache eviction (#476).",
+      "title": "EDR position queries — rate and p95",
+      "description": "Point/time-series queries (map click / hover). Cheap since #463 (decoded-chunk cache) — a rising p95 here with PVOL collections in play suggests pixel-cache eviction (#476).",
       "id": 15,
       "gridPos": {
         "h": 8,
@@ -775,7 +775,7 @@
     {
       "type": "timeseries",
       "title": "Cold tile renders per second",
-      "description": "Meta-tile cache misses = tiles actually rendered (decode + resample + colorize). This is the render COST signal: p99 spikes track this, not request rate. Animation scrubbing is always cold here (TIME is in the tile key) \u2014 the rendered-output cache is what serves repeat loops. Declines = requests whose covering tile count exceeded the pixel-proportional budget (#491) and fell back to an UNCACHED direct render; a sustained rate means clients send viewports outside the cacheable envelope (extreme bbox/pixel aspect mismatch) and re-render every frame.",
+      "description": "Meta-tile cache misses = tiles actually rendered (decode + resample + colorize). This is the render COST signal: p99 spikes track this, not request rate. Animation scrubbing is always cold here (TIME is in the tile key) — the rendered-output cache is what serves repeat loops. Declines = requests whose covering tile count exceeded the pixel-proportional budget (#491) and fell back to an UNCACHED direct render; a sustained rate means clients send viewports outside the cacheable envelope (extreme bbox/pixel aspect mismatch) and re-render every frame.",
       "id": 17,
       "gridPos": {
         "h": 8,
@@ -831,7 +831,7 @@
     {
       "type": "timeseries",
       "title": "Render semaphore",
-      "description": "Permits in use vs total (2\u00d7cores, min 8). Flat-topped at total = renders queueing; brief touches are normal during animation bursts.",
+      "description": "Permits in use vs total (2×cores, min 8). Flat-topped at total = renders queueing; brief touches are normal during animation bursts.",
       "id": 18,
       "gridPos": {
         "h": 8,
@@ -882,8 +882,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Meta-tile cache \u2014 hit ratio and fill",
-      "description": "The pan substrate: adjacent/overlapping viewports at the same TIME reuse tiles. Healthy: \u226580% hits. Fill pinned at 100% = evicting; consider raising the metatile cache size if the hit ratio sags with it.",
+      "title": "Meta-tile cache — hit ratio and fill",
+      "description": "The pan substrate: adjacent/overlapping viewports at the same TIME reuse tiles. Healthy: ≥80% hits. Fill pinned at 100% = evicting; consider raising the metatile cache size if the hit ratio sags with it.",
       "id": 19,
       "gridPos": {
         "h": 8,
@@ -935,8 +935,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Rendered-output cache \u2014 hit ratio and fill",
-      "description": "Exact-request repeats (fixed-viewport animation loops). Low hit% is EXPECTED with diverse clients \u2014 it only pays for loopers. Bimodal by design (#202).",
+      "title": "Rendered-output cache — hit ratio and fill",
+      "description": "Exact-request repeats (fixed-viewport animation loops). Low hit% is EXPECTED with diverse clients — it only pays for loopers. Bimodal by design (#202).",
       "id": 20,
       "gridPos": {
         "h": 8,
@@ -988,7 +988,7 @@
     },
     {
       "type": "logs",
-      "title": "Slow renders (>0.5 s) \u2014 from logs",
+      "title": "Slow renders (>0.5 s) — from logs",
       "description": "Every `slow WMS meta-tile render` line: which layer, how long, how many tiles, and whether time went to the semaphore (sem_wait) or the tile loop. This panel is how the #472 night spikes and the #476 eviction bursts were diagnosed.",
       "id": 21,
       "gridPos": {
@@ -1021,7 +1021,7 @@
     },
     {
       "type": "row",
-      "title": "Caches \u2014 all families",
+      "title": "Caches — all families",
       "id": 22,
       "collapsed": false,
       "gridPos": {
@@ -1034,7 +1034,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Hit ratio \u2014 every cache",
+      "title": "Hit ratio — every cache",
       "description": "One line per cache family. A family sagging while its fill (right panel) is pinned at 100% = working set no longer fits. Families with no traffic show no line.",
       "id": 23,
       "gridPos": {
@@ -1134,8 +1134,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Miss rate \u2014 every cache (work per second)",
-      "description": "Misses are actual work: decodes, renders, S3 fetches. Watch for a family whose misses jump while traffic is flat \u2014 that is churn, not load.",
+      "title": "Miss rate — every cache (work per second)",
+      "description": "Misses are actual work: decodes, renders, S3 fetches. Watch for a family whose misses jump while traffic is flat — that is churn, not load.",
       "id": 24,
       "gridPos": {
         "h": 8,
@@ -1232,7 +1232,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Fill \u2014 % of configured capacity",
+      "title": "Fill — % of configured capacity",
       "description": "Bytes resident vs configured cap. Pinned at 100% is fine ONLY if the hit ratio holds; 100% + sagging hits + rising inserts = raise the env cap (see PVOL panel below for the worked example).",
       "id": 25,
       "gridPos": {
@@ -1332,8 +1332,8 @@
     },
     {
       "type": "timeseries",
-      "title": "PVOL pixel cache \u2014 eviction pressure (#476)",
-      "description": "The #461/#472 pre-warm keeps every advertised timestep's lowest sweep resident \u2014 IF it fits. Sustained inserts/s while entries stay flat at capacity = LRU churn: pre-warmed frames evicted, and the next animation pays burst S3/disk re-reads (the 11 s fikan renders). Fix: raise MC_PVOL_PIXEL_CACHE_MB above the working set (sites \u00d7 window/cadence \u00d7 ~4 MB).",
+      "title": "PVOL pixel cache — eviction pressure (#476)",
+      "description": "The #461/#472 pre-warm keeps every advertised timestep's lowest sweep resident — IF it fits. Sustained inserts/s while entries stay flat at capacity = LRU churn: pre-warmed frames evicted, and the next animation pays burst S3/disk re-reads (the 11 s fikan renders). Fix: raise MC_PVOL_PIXEL_CACHE_MB above the working set (sites × window/cadence × ~4 MB).",
       "id": 26,
       "gridPos": {
         "h": 8,
@@ -1388,7 +1388,7 @@
     },
     {
       "type": "timeseries",
-      "title": "PVOL pixel cache \u2014 resident vs capacity",
+      "title": "PVOL pixel cache — resident vs capacity",
       "description": "Resident bytes against MC_PVOL_PIXEL_CACHE_MB, plus entry count (right side, thousands).",
       "id": 27,
       "gridPos": {
@@ -1474,7 +1474,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Egress \u2014 by API",
+      "title": "Egress — by API",
       "description": "PNG/JSON bytes served per second.",
       "id": 29,
       "gridPos": {
@@ -1540,7 +1540,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Remote storage reads \u2014 by collection",
+      "title": "Remote storage reads — by collection",
       "description": "Bytes fetched from S3/HTTP sources (cold COG tiles, PVOL volumes, GRIB messages). Local-file collections read ~0 here. A burst on a pvol collection = pixel-cache misses being refetched (see #476 panel).",
       "id": 30,
       "gridPos": {
@@ -1805,7 +1805,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Health pings & metadata refreshes \u2014 failures",
+      "title": "Health pings & metadata refreshes — failures",
       "description": "Failed pings flip /health; failed refreshes keep the previous snapshot (locations go stale). Both should be flat 0.",
       "id": 36,
       "gridPos": {
@@ -1874,8 +1874,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Lead-1 skill \u2014 nowcast vs persistence CSI",
-      "description": "Realized 5-min skill (#542): each generation scores the PREVIOUS one's lead-1 prediction against the fresh analysis, next to the persistence baseline. The nowcast line must sit above its baseline; a collapsing gap = motion or source-data regression \u2014 check here before blaming the client.",
+      "title": "Lead-1 skill — nowcast vs persistence CSI",
+      "description": "Realized 5-min skill (#542): each generation scores the PREVIOUS one's lead-1 prediction against the fresh analysis, next to the persistence baseline. The nowcast line must sit above its baseline; a collapsing gap = motion or source-data regression — check here before blaming the client.",
       "id": 42,
       "gridPos": {
         "h": 8,
@@ -1916,19 +1916,19 @@
         {
           "expr": "nowcast_lead1_csi_permille / 1000",
           "refId": "A",
-          "legendFormat": "{{collection}} \u2014 nowcast"
+          "legendFormat": "{{collection}} — nowcast"
         },
         {
           "expr": "nowcast_lead1_persistence_csi_permille / 1000",
           "refId": "B",
-          "legendFormat": "{{collection}} \u2014 persistence"
+          "legendFormat": "{{collection}} — persistence"
         }
       ]
     },
     {
       "type": "timeseries",
       "title": "Generation duration vs 5-min cadence",
-      "description": "Wall-clock of the newest generation. Must stay comfortably under the source cadence (300 s for the FMI composite, marked) \u2014 above it, generations queue and the served TIME axis lags reality.",
+      "description": "Wall-clock of the newest generation. Must stay comfortably under the source cadence (300 s for the FMI composite, marked) — above it, generations queue and the served TIME axis lags reality.",
       "id": 43,
       "gridPos": {
         "h": 8,
@@ -1990,8 +1990,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Generations & failures \u2014 per hour",
-      "description": "Steady ~12/h per collection at a 5-min source cadence; dips = skipped/missed source frames. Any nonzero failure rate deserves a log read (source fetch or extrapolation error \u2014 the engine serves the previous generation meanwhile).",
+      "title": "Generations & failures — per hour",
+      "description": "Steady ~12/h per collection at a 5-min source cadence; dips = skipped/missed source frames. Any nonzero failure rate deserves a log read (source fetch or extrapolation error — the engine serves the previous generation meanwhile).",
       "id": 44,
       "gridPos": {
         "h": 8,
@@ -2030,19 +2030,19 @@
         {
           "expr": "rate(nowcast_generations_total[$__rate_interval]) * 3600",
           "refId": "A",
-          "legendFormat": "{{collection}} \u2014 generations/h"
+          "legendFormat": "{{collection}} — generations/h"
         },
         {
           "expr": "rate(nowcast_generation_failures_total[$__rate_interval]) * 3600",
           "refId": "B",
-          "legendFormat": "{{collection}} \u2014 failures/h"
+          "legendFormat": "{{collection}} — failures/h"
         }
       ]
     },
     {
       "type": "timeseries",
       "title": "Source lag",
-      "description": "Age of the source anchor frame when the generation finished \u2014 upstream feed latency plus generation time. Sustained growth = the source stalled; the nowcast keeps serving but its anchor (and every future frame) goes stale with it.",
+      "description": "Age of the source anchor frame when the generation finished — upstream feed latency plus generation time. Sustained growth = the source stalled; the nowcast keeps serving but its anchor (and every future frame) goes stale with it.",
       "id": 45,
       "gridPos": {
         "h": 8,
@@ -2088,8 +2088,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Retention \u2014 generations & frames",
-      "description": "Retained generations (the DIM_REFERENCE_TIME pinning window \u2014 resident memory multiplies with it, see the engine-nowcast sizing rule) and frames (analysis + leads) in the newest generation.",
+      "title": "Retention — generations & frames",
+      "description": "Retained generations (the DIM_REFERENCE_TIME pinning window — resident memory multiplies with it, see the engine-nowcast sizing rule) and frames (analysis + leads) in the newest generation.",
       "id": 46,
       "gridPos": {
         "h": 8,
@@ -2128,12 +2128,12 @@
         {
           "expr": "nowcast_retained_generations",
           "refId": "A",
-          "legendFormat": "{{collection}} \u2014 generations"
+          "legendFormat": "{{collection}} — generations"
         },
         {
           "expr": "nowcast_frames",
           "refId": "B",
-          "legendFormat": "{{collection}} \u2014 frames"
+          "legendFormat": "{{collection}} — frames"
         }
       ]
     },
@@ -2152,7 +2152,7 @@
     },
     {
       "type": "logs",
-      "title": "Errors \u2014 4xx / 5xx",
+      "title": "Errors — 4xx / 5xx",
       "description": "Structured request logs filtered to error statuses.",
       "id": 38,
       "gridPos": {
@@ -2177,7 +2177,7 @@
       },
       "targets": [
         {
-          "expr": "{job=\"meteocore\", status_class=~\"4xx|5xx\"} | json | line_format \"{{.method}} {{.path}} \u2192 {{.status}} ({{.duration_ms}}ms) {{.error}} {{if .query}}?{{.query}}{{end}}\"",
+          "expr": "{job=\"meteocore\", status_class=~\"4xx|5xx\"} | json | line_format \"{{.method}} {{.path}} → {{.status}} ({{.duration_ms}}ms) {{.error}} {{if .query}}?{{.query}}{{end}}\"",
           "refId": "A",
           "maxLines": 200
         }
@@ -2210,7 +2210,7 @@
       },
       "targets": [
         {
-          "expr": "{job=\"meteocore\"} | json | line_format \"{{.method}} {{.path}} \u2192 {{.status}} ({{.duration_ms}}ms) rid={{.request_id}} {{if .query}}?{{.query}}{{end}}\"",
+          "expr": "{job=\"meteocore\"} | json | line_format \"{{.method}} {{.path}} → {{.status}} ({{.duration_ms}}ms) rid={{.request_id}} {{if .query}}?{{.query}}{{end}}\"",
           "refId": "A",
           "maxLines": 200
         }
@@ -2218,8 +2218,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Process memory \u2014 RSS, swap & allocator accounting",
-      "description": "Verifies the #493 fix (jemalloc). Healthy: process RSS \u2248 jemalloc resident, and resident within ~1.5\u00d7 of allocated (live application bytes). resident \u226b allocated = allocator retention/fragmentation (the glibc failure mode was ~3\u00d7). RSS \u226b jemalloc resident = memory outside the allocator (mmap'd files, thread stacks). Sustained process swap > 0 = host memory pressure \u2014 check what else grew on the box. 'live cache bytes' is the sum of every byte-bounded cache family, the floor the process can't go below.",
+      "title": "Process memory — RSS, swap & allocator accounting",
+      "description": "Verifies the #493 fix (jemalloc). Healthy: process RSS ≈ jemalloc resident, and resident within ~1.5× of allocated (live application bytes). resident ≫ allocated = allocator retention/fragmentation (the glibc failure mode was ~3×). RSS ≫ jemalloc resident = memory outside the allocator (mmap'd files, thread stacks). Sustained process swap > 0 = host memory pressure — check what else grew on the box. 'live cache bytes' is the sum of every byte-bounded cache family, the floor the process can't go below.",
       "id": 40,
       "gridPos": {
         "h": 8,
