@@ -403,6 +403,8 @@ apis = ["wms", "maps", "tiles"]
 source = "radar"        # collection id to extrapolate
 horizon = "PT2H"        # how far into the future (default PT2H)
 # step = "PT5M"         # timestep spacing (default: source cadence)
+# lightning_source = "lightning"  # events-shape postgis collection: per-cell
+                                  # flash_count/rate + lightning_jump (#549)
 
 [collections.wms]
 colormap = "radar_dbz"

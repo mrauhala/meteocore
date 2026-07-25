@@ -38,6 +38,19 @@ pub const DEVIANT_STREAK: u32 = 2;
 /// Per-second clamp on a cell's measured intensity tendency (±2 dBZ per
 /// 5-minute interval at the usual cadence).
 pub const MAX_CELL_TENDENCY_PER_S: f32 = 2.0 / 300.0;
+/// Lightning join (#549): a strike outside every cell footprint joins the
+/// nearest cell centroid within this many km (anvil and adjacent flashes
+/// belong to the storm even when they miss the 35 dBZ contour).
+pub const LIGHTNING_JOIN_RADIUS_KM: f32 = 10.0;
+/// Per-generation flash-rate history depth for the jump baseline
+/// (6 generations ≈ 30 min at 5-min cadence — the scale of the Schultz
+/// lightning-jump verification window).
+pub const FLASH_HISTORY_LEN: usize = 6;
+/// Absolute flash-rate floor (flashes/min) for the jump flag — the
+/// published Schultz operational threshold. Suppresses 2σ triggers on
+/// near-zero baselines, where a single extra strike is "2σ". Revisit
+/// against live Nordic storm data if jumps never fire.
+pub const MIN_JUMP_RATE_PER_MIN: f32 = 10.0;
 
 /// TRT-lite severity rank from 2D attributes (documented heuristic v1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -105,6 +118,18 @@ pub struct CellTrack {
     /// per-pixel motion-residual contamination that poisoned field-level
     /// profiles. 0.0 until the second observation.
     pub intensity_tendency: f32,
+    /// Lightning join (#549): strikes attributed to this cell over the
+    /// last inter-generation window. `None` = no event source configured,
+    /// or the join was skipped this generation (source error).
+    pub flash_count: Option<u32>,
+    /// The same window's strikes per minute.
+    pub flash_rate_per_min: Option<f32>,
+    /// Recent per-generation flash rates (ascending age, newest LAST,
+    /// ≤ [`FLASH_HISTORY_LEN`]) — the jump detector's baseline, carried
+    /// across generations by the track id.
+    pub flash_history: Vec<f32>,
+    /// Schultz-style 2σ lightning jump fired this generation.
+    pub lightning_jump: bool,
 }
 
 impl CellTrack {
@@ -205,6 +230,10 @@ pub fn advance_tracks(
                     severity,
                     growing: None,
                     intensity_tendency: 0.0,
+                    flash_count: None,
+                    flash_rate_per_min: None,
+                    flash_history: Vec::new(),
+                    lightning_jump: false,
                 },
                 Some(pi) => {
                     let prev = &previous[pi];
@@ -252,11 +281,89 @@ pub fn advance_tracks(
                             0
                         },
                         severity,
+                        // The join (apply_lightning) fills this generation's
+                        // stats after matching; the baseline history rides
+                        // the track.
+                        flash_count: None,
+                        flash_rate_per_min: None,
+                        flash_history: prev.flash_history.clone(),
+                        lightning_jump: false,
                     }
                 }
             }
         })
         .collect()
+}
+
+/// Join one generation's lightning strikes onto the tracked cells (#549)
+/// and update each track's flash statistics and jump flag.
+///
+/// `strikes_px` are strike positions in WORKING-GRID pixel coordinates —
+/// the caller projects lon/lat and drops off-grid strikes. `labels` is the
+/// analysis label map on the same grid (`0` background, `k+1` ⇔
+/// `tracks[k]`, the `segment_cells_labeled` contract — `advance_tracks`
+/// returns tracks in blob order, which preserves it). A strike lands on
+/// its footprint's cell when labeled, else on the nearest cell centroid
+/// within [`LIGHTNING_JOIN_RADIUS_KM`] (anisotropic km), else nowhere.
+///
+/// The jump flag is the Schultz-style detector: the window's rate exceeds
+/// the track's recent baseline mean by 2σ, with ≥ 2 baseline rates and the
+/// [`MIN_JUMP_RATE_PER_MIN`] absolute floor.
+pub fn apply_lightning(
+    tracks: &mut [CellTrack],
+    strikes_px: &[(f32, f32)],
+    labels: &[u32],
+    width: usize,
+    scale: PixelScale,
+    window_secs: f32,
+) {
+    let mut counts = vec![0u32; tracks.len()];
+    for &(sx, sy) in strikes_px {
+        // In-grid by contract; `as usize` saturates negatives to 0 and
+        // `labels.get` bounds the rest.
+        let idx = (sy as usize) * width + sx as usize;
+        let label = labels.get(idx).copied().unwrap_or(0) as usize;
+        if (1..=tracks.len()).contains(&label) {
+            counts[label - 1] += 1;
+            continue;
+        }
+        let gate2 = LIGHTNING_JOIN_RADIUS_KM * LIGHTNING_JOIN_RADIUS_KM;
+        let mut best: Option<(usize, f32)> = None;
+        for (k, t) in tracks.iter().enumerate() {
+            let dx = (sx - t.blob.centroid.0) * scale.x;
+            let dy = (sy - t.blob.centroid.1) * scale.y;
+            let d2 = dx * dx + dy * dy;
+            if d2 <= gate2 && best.is_none_or(|(_, b)| d2 < b) {
+                best = Some((k, d2));
+            }
+        }
+        if let Some((k, _)) = best {
+            counts[k] += 1;
+        }
+    }
+
+    let window_min = (window_secs / 60.0).max(f32::EPSILON);
+    for (t, &n) in tracks.iter_mut().zip(&counts) {
+        let rate = n as f32 / window_min;
+        let jump = t.flash_history.len() >= 2 && rate >= MIN_JUMP_RATE_PER_MIN && {
+            let count = t.flash_history.len() as f32;
+            let mean = t.flash_history.iter().sum::<f32>() / count;
+            let var = t
+                .flash_history
+                .iter()
+                .map(|r| (r - mean).powi(2))
+                .sum::<f32>()
+                / count;
+            rate > mean + 2.0 * var.sqrt()
+        };
+        t.flash_count = Some(n);
+        t.flash_rate_per_min = Some(rate);
+        t.lightning_jump = jump;
+        t.flash_history.push(rate);
+        if t.flash_history.len() > FLASH_HISTORY_LEN {
+            t.flash_history.remove(0);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -265,6 +372,96 @@ mod tests {
     use crate::motion::{estimate_motion, MotionField, MotionOptions};
     use crate::objects::segment_cells;
     use crate::Grid;
+
+    fn bare_track(id: u64, cx: f32, cy: f32) -> CellTrack {
+        CellTrack {
+            id,
+            blob: CellBlob {
+                centroid: (cx, cy),
+                area: 10,
+                volume: 400.0,
+                max_value: 40.0,
+            },
+            age: 1,
+            velocity_kms: None,
+            deviant_streak: 0,
+            severity: Severity::Weak,
+            growing: None,
+            intensity_tendency: 0.0,
+            flash_count: None,
+            flash_rate_per_min: None,
+            flash_history: Vec::new(),
+            lightning_jump: false,
+        }
+    }
+
+    #[test]
+    fn lightning_attributes_by_label_then_radius_and_ignores_far_strikes() {
+        // 40×20 grid at 1 km/px. Track 1 has a labeled footprint around
+        // (3,3); track 2 sits at (30,10) with no labeled pixels (its
+        // strikes must come via the radius fallback).
+        let (w, h) = (40usize, 20usize);
+        let mut labels = vec![0u32; w * h];
+        for y in 2..5 {
+            for x in 2..5 {
+                labels[y * w + x] = 1;
+            }
+        }
+        let mut tracks = vec![bare_track(1, 3.0, 3.0), bare_track(2, 30.0, 10.0)];
+        let scale = PixelScale { x: 1.0, y: 1.0 };
+        let strikes = [
+            (3.5, 3.5),   // labeled footprint → track 1
+            (30.0, 10.0), // unlabeled px → nearest centroid (track 2, 0 km)
+            (30.0, 2.0),  // 8 km north of track 2 — inside the 10 km gate
+            (39.5, 19.5), // ~13.4 km from track 2 — outside the gate, dropped
+        ];
+        apply_lightning(&mut tracks, &strikes, &labels, w, scale, 300.0);
+        assert_eq!(tracks[0].flash_count, Some(1));
+        assert_eq!(tracks[1].flash_count, Some(2));
+        let r0 = tracks[0].flash_rate_per_min.unwrap();
+        let r1 = tracks[1].flash_rate_per_min.unwrap();
+        assert!(
+            (r0 - 0.2).abs() < 1e-6,
+            "1 strike / 5 min = 0.2/min, got {r0}"
+        );
+        assert!((r1 - 0.4).abs() < 1e-6);
+        assert!(!tracks[0].lightning_jump, "no baseline yet");
+        assert_eq!(tracks[0].flash_history.len(), 1);
+    }
+
+    #[test]
+    fn lightning_jump_needs_baseline_floor_and_two_sigma() {
+        let (w, h) = (10usize, 10usize);
+        let labels = vec![0u32; w * h];
+        let scale = PixelScale { x: 1.0, y: 1.0 };
+        let strike = (5.0f32, 5.0f32); // radius-joins the only track
+        let mut tracks = vec![bare_track(1, 5.0, 5.0)];
+
+        // A burst with NO baseline never jumps (history < 2). Fresh track:
+        // a burst entering the history would raise the later 2σ bar (the
+        // detector deliberately distrusts cells that JUST burst).
+        let burst: Vec<(f32, f32)> = vec![strike; 60]; // 12 fl/min
+        apply_lightning(&mut tracks, &burst, &labels, w, scale, 300.0);
+        assert!(!tracks[0].lightning_jump, "no jump without a baseline");
+
+        // Quiet-baseline track: quiet, quiet, sub-floor uptick (4 fl/min
+        // < the 10 fl/min floor — no jump, baseline [0,0,4]), then a real
+        // burst: 12 ≥ floor and > mean+2σ ≈ 5.1 ⇒ jump.
+        let mut tracks = vec![bare_track(2, 5.0, 5.0)];
+        apply_lightning(&mut tracks, &[], &labels, w, scale, 300.0);
+        apply_lightning(&mut tracks, &[], &labels, w, scale, 300.0);
+        let uptick: Vec<(f32, f32)> = vec![strike; 20]; // 4 fl/min < floor
+        apply_lightning(&mut tracks, &uptick, &labels, w, scale, 300.0);
+        assert!(!tracks[0].lightning_jump, "below the absolute floor");
+        apply_lightning(&mut tracks, &burst, &labels, w, scale, 300.0);
+        assert!(tracks[0].lightning_jump, "burst over quiet baseline");
+
+        // History stays bounded.
+        for _ in 0..10 {
+            apply_lightning(&mut tracks, &[], &labels, w, scale, 300.0);
+        }
+        assert!(tracks[0].flash_history.len() <= FLASH_HISTORY_LEN);
+    }
 
     #[test]
     fn counter_flow_cell_matches_via_raw_position_pass() {
@@ -288,6 +485,10 @@ mod tests {
             severity: Severity::Weak,
             growing: None,
             intensity_tendency: 0.0,
+            flash_count: None,
+            flash_rate_per_min: None,
+            flash_history: Vec::new(),
+            lightning_jump: false,
         }];
         // Uniform 30 px/interval eastward flow; at 1 km/px the compensated
         // hypothesis lands 30 km from the stationary successor — outside
