@@ -77,8 +77,9 @@ impl GrowthProfile {
                 continue;
             }
             if let Some(b) = profile.band(a) {
-                // Treat sub-base actuals as the base floor so decay out of
-                // the band is measured rather than skipped.
+                // Floor sub-base actuals one band BELOW base (not at base
+                // itself) so decay out of the lowest band still registers
+                // as roughly one band's worth of loss instead of zero.
                 sums[b] += f64::from(o.max(base - BAND_WIDTH) - a);
                 counts[b] += 1;
             }
