@@ -4169,6 +4169,7 @@ mod tests {
                 max_generations: 2,
                 max_pixels: 500_000,
                 min_echo: 10.0,
+                growth_decay: false,
             }),
             preview: None,
         }

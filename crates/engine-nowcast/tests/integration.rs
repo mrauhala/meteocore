@@ -118,6 +118,7 @@ fn build_with_history(
         max_generations: 4,
         max_pixels: 4_000_000,
         min_echo: 10.0,
+        growth_decay: false,
     };
     let engine =
         NowcastEngine::new("mock-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -338,6 +339,7 @@ fn excessive_lead_count_is_rejected_at_construction() {
         max_generations: 4,
         max_pixels: 4_000_000,
         min_echo: 10.0,
+        growth_decay: false,
     };
     let err = NowcastEngine::new("mock-nowcast", "mock", source, &config)
         .err()
@@ -378,6 +380,7 @@ fn oversized_history_frames_is_rejected() {
         max_generations: 4,
         max_pixels: 4_000_000,
         min_echo: 10.0,
+        growth_decay: false,
     };
     let err = NowcastEngine::new("mock-nowcast", "mock", source, &config)
         .err()
@@ -497,6 +500,7 @@ fn dry_scene_leaves_both_skill_gauges_unset() {
         max_generations: 4,
         max_pixels: 4_000_000,
         min_echo: 10.0,
+        growth_decay: false,
     };
     let engine =
         NowcastEngine::new("dry-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -631,6 +635,7 @@ fn geometry_change_resets_cell_tracks() {
         max_generations: 4,
         max_pixels: 4_000_000,
         min_echo: 10.0,
+        growth_decay: false,
     };
     let engine =
         NowcastEngine::new("mv-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -652,5 +657,90 @@ fn geometry_change_resets_cell_tracks() {
             Some(PropertyValue::Integer(1))
         ),
         "track must restart as newborn after a geometry change"
+    );
+}
+
+/// Growth/decay application (#546): a source whose echo fades every frame
+/// must produce dimmer lead frames than pure advection when enabled.
+#[test]
+fn growth_decay_dims_decaying_echo() {
+    struct FadingSource {
+        times: RwLock<Vec<DateTime<Utc>>>,
+    }
+    impl MapEngine for FadingSource {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            // Static disc fading 1 dBZ (2.5 raw) per 5-min frame.
+            let t = time.unwrap();
+            let steps = ((t - t0()).num_seconds() / 300) as f64;
+            let raw_val = (175.0 - 2.5 * steps).max(100.0) as u8;
+            let data: Vec<u8> = truth_frame(t0())
+                .into_iter()
+                .map(|r| if r == ECHO_RAW { raw_val } else { r })
+                .collect();
+            Ok(RasterTile {
+                width,
+                height,
+                values: RasterValues::U8 {
+                    data,
+                    nodata: Some(NODATA),
+                    gain: 0.4,
+                    offset: -30.0,
+                },
+            })
+        }
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some(EXTENT),
+                times: self.times.read().unwrap().clone(),
+                parameter: "reflectivity".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: Some([W, H]),
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+    }
+    let run = |growth_decay: bool| -> f32 {
+        let anchor = t0() + Duration::minutes(5);
+        let source = Arc::new(FadingSource {
+            times: RwLock::new(vec![t0(), anchor]),
+        });
+        let config = NowcastConfig {
+            source: "mock".into(),
+            horizon: "PT1H".into(),
+            step: None,
+            history_frames: 2,
+            poll_interval_secs: 30,
+            max_generations: 4,
+            max_pixels: 4_000_000,
+            min_echo: 10.0,
+            growth_decay,
+        };
+        let engine = NowcastEngine::new("fade", "mock", source, &config).expect("builds");
+        engine.poll_once();
+        let raw = render_raw(&engine, anchor + Duration::minutes(30));
+        raw.iter()
+            .filter(|&&r| r != NODATA && r > 0)
+            .map(|&r| r as f32 * 0.4 - 30.0)
+            .fold(f32::MIN, f32::max)
+    };
+    let plain = run(false);
+    let adjusted = run(true);
+    assert!(
+        adjusted < plain - 1.0,
+        "growth/decay must dim a fading echo at +30 min: {adjusted} vs {plain}"
     );
 }

@@ -215,6 +215,11 @@ pub struct NowcastConfig {
     /// field.
     #[serde(default = "default_nowcast_min_echo")]
     pub min_echo: f64,
+    /// Apply intensity-based growth/decay profiles along the leads (#546,
+    /// NowPrecip-2 lineage). Default off — flip per collection once the
+    /// object-harness gate has passed for that source.
+    #[serde(default)]
+    pub growth_decay: bool,
 }
 
 fn default_nowcast_horizon() -> String {

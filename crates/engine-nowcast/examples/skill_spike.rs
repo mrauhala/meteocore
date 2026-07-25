@@ -26,6 +26,7 @@ use engine_nowcast::objects::{
     ObjectScores, PixelScale,
 };
 use engine_nowcast::skill::{score, Contingency};
+use engine_nowcast::tendency::GrowthProfile;
 use engine_nowcast::{advect::advect, Grid};
 
 /// Keep the working grid at most this many pixels (halve dims until it fits).
@@ -46,6 +47,7 @@ struct Args {
     object_threshold: f32,
     min_area: usize,
     gate_km: f64,
+    growth_decay: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -64,6 +66,7 @@ fn parse_args() -> Result<Args, String> {
         object_threshold: 35.0,
         min_area: 5,
         gate_km: 20.0,
+        growth_decay: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -138,6 +141,7 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|e: std::num::ParseFloatError| e.to_string())?
             }
+            "--growth-decay" => args.growth_decay = true,
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -379,9 +383,23 @@ fn main() -> ExitCode {
         // then chained forward through observed-track matches per lead.
         let mut classes = classify_growth(&obs_cells[i - 1], &obs_cells[i], scale, gate_km);
 
+        // Growth/decay profile for this anchor (#546): advect the previous
+        // frame one interval, measure per-band tendencies vs the anchor.
+        let profile = args.growth_decay.then(|| {
+            let advected_prev = advect(&frames[i - 1], &field, 1.0, args.substeps);
+            GrowthProfile::measure(&advected_prev, &frames[i], args.min_echo)
+        });
+
         for lead in 1..=(frames.len() - 1 - i) {
             let started = Instant::now();
-            let forecast = advect(&frames[i], &field, lead as f32, args.substeps);
+            let mut forecast = advect(&frames[i], &field, lead as f32, args.substeps);
+            if let Some(p) = &profile {
+                for v in forecast.data.iter_mut() {
+                    if v.is_finite() {
+                        *v = p.apply(*v, lead as f32);
+                    }
+                }
+            }
             let advect_ms = started.elapsed().as_millis();
             println!("  lead +{lead}: advection {advect_ms}ms");
             for (k, &thr) in args.thresholds.iter().enumerate() {
