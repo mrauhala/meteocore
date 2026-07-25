@@ -837,7 +837,8 @@
             "lineWidth": 2,
             "showPoints": "never"
           },
-          "min": 0
+          "min": 0,
+          "unit": "reqps"
         },
         "overrides": []
       },
