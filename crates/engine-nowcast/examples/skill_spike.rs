@@ -390,10 +390,16 @@ fn main() -> ExitCode {
         let gd = args.growth_decay.then(|| {
             let (blobs, labels) =
                 segment_cells_labeled(&frames[i], args.object_threshold, args.min_area);
-            let label_map: Vec<u8> = labels.iter().map(|&l| l.min(255) as u8).collect();
+            // Labels beyond the u8 range fall back to 0 = pure advection
+            // (mirrors the engine; clamping onto 255 would borrow cell
+            // #254's tendency for every overflow cell).
+            let label_map: Vec<u8> = labels
+                .iter()
+                .map(|&l| if l <= 254 { l as u8 } else { 0 })
+                .collect();
             let mut tend = [0f32; 256];
             for (pi, ci) in match_cells(&obs_cells[i - 1], &blobs, scale, gate_km) {
-                if ci < 255 {
+                if ci < 254 {
                     let mean_now = blobs[ci].volume / blobs[ci].area.max(1) as f32;
                     let p = &obs_cells[i - 1][pi];
                     let mean_prev = p.volume / p.area.max(1) as f32;

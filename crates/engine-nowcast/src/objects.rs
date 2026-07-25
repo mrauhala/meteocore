@@ -37,8 +37,8 @@ pub fn segment_cells(grid: &Grid, threshold: f32, min_area: usize) -> Vec<CellBl
 
 /// Like [`segment_cells`], also returning a per-pixel label map: `0` =
 /// no retained cell, `i+1` = member of the i-th returned blob. Used by the
-/// class-conditioned growth/decay profiles (#546 iteration 1), which need
-/// cell footprint masks, not just centroids.
+/// per-cell tendency application (#546), which needs cell footprint
+/// masks, not just centroids.
 pub fn segment_cells_labeled(
     grid: &Grid,
     threshold: f32,
