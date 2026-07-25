@@ -20,13 +20,14 @@ use std::time::Instant;
 use ds_core::config::GeoTiffConfig;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterValues};
 use engine_geotiff::GeoTiffEngine;
+use engine_nowcast::advect::advect_u8;
 use engine_nowcast::motion::{estimate_motion, MotionOptions};
 use engine_nowcast::objects::{
-    classify_growth, match_cells, score_objects, segment_cells, CellBlob, GrowthClass,
-    ObjectScores, PixelScale,
+    classify_growth, match_cells, score_objects, segment_cells, segment_cells_labeled, CellBlob,
+    GrowthClass, ObjectScores, PixelScale,
 };
 use engine_nowcast::skill::{score, Contingency};
-use engine_nowcast::tendency::GrowthProfile;
+use engine_nowcast::tendency::EFOLD_INTERVALS;
 use engine_nowcast::{advect::advect, Grid};
 
 /// Keep the working grid at most this many pixels (halve dims until it fits).
@@ -383,20 +384,42 @@ fn main() -> ExitCode {
         // then chained forward through observed-track matches per lead.
         let mut classes = classify_growth(&obs_cells[i - 1], &obs_cells[i], scale, gate_km);
 
-        // Growth/decay profile for this anchor (#546): advect the previous
-        // frame one interval, measure per-band tendencies vs the anchor.
-        let profile = args.growth_decay.then(|| {
-            let advected_prev = advect(&frames[i - 1], &field, 1.0, args.substeps);
-            GrowthProfile::measure(&advected_prev, &frames[i], args.min_echo)
+        // Per-cell growth/decay (#546 iteration 1 pivot): each tracked
+        // cell's own mean-exceedance trend (prev→anchor matched blobs),
+        // applied to its advected footprint; background = pure advection.
+        let gd = args.growth_decay.then(|| {
+            let (blobs, labels) =
+                segment_cells_labeled(&frames[i], args.object_threshold, args.min_area);
+            let label_map: Vec<u8> = labels.iter().map(|&l| l.min(255) as u8).collect();
+            let mut tend = [0f32; 256];
+            for (pi, ci) in match_cells(&obs_cells[i - 1], &blobs, scale, gate_km) {
+                if ci < 255 {
+                    let mean_now = blobs[ci].volume / blobs[ci].area.max(1) as f32;
+                    let p = &obs_cells[i - 1][pi];
+                    let mean_prev = p.volume / p.area.max(1) as f32;
+                    tend[ci + 1] = (mean_now - mean_prev).clamp(-2.0, 2.0);
+                }
+            }
+            (tend, label_map)
         });
 
         for lead in 1..=(frames.len() - 1 - i) {
             let started = Instant::now();
             let mut forecast = advect(&frames[i], &field, lead as f32, args.substeps);
-            if let Some(p) = &profile {
-                for v in forecast.data.iter_mut() {
-                    if v.is_finite() {
-                        *v = p.apply(*v, lead as f32);
+            if let Some((tend, label_map)) = &gd {
+                let moved = advect_u8(
+                    label_map,
+                    w as usize,
+                    h as usize,
+                    0,
+                    &field,
+                    lead as f32,
+                    args.substeps,
+                );
+                let damp = EFOLD_INTERVALS * (1.0 - (-(lead as f32) / EFOLD_INTERVALS).exp());
+                for (v, k) in forecast.data.iter_mut().zip(&moved) {
+                    if v.is_finite() && *k > 0 {
+                        *v += tend[*k as usize] * damp;
                     }
                 }
             }

@@ -33,6 +33,9 @@ pub const DEVIANT_MIN_CELL_SPEED_MS: f32 = 3.0;
 /// Consecutive deviant generations before the flag is raised (single-scan
 /// residuals are mostly track noise).
 pub const DEVIANT_STREAK: u32 = 2;
+/// Per-second clamp on a cell's measured intensity tendency (±2 dBZ per
+/// 5-minute interval at the usual cadence).
+pub const MAX_CELL_TENDENCY_PER_S: f32 = 2.0 / 300.0;
 
 /// TRT-lite severity rank from 2D attributes (documented heuristic v1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -92,6 +95,14 @@ pub struct CellTrack {
     /// deviant gates.
     pub deviant_streak: u32,
     pub severity: Severity,
+    /// Volume-proxy trend vs the previous observation: `Some(true)` =
+    /// growing, `Some(false)` = decaying, `None` = newborn (#546 iter 1).
+    pub growing: Option<bool>,
+    /// EMA'd mean-intensity trend of THIS cell (physical units per second,
+    /// clamped): the tracker-level growth/decay signal — immune to the
+    /// per-pixel motion-residual contamination that poisoned field-level
+    /// profiles. 0.0 until the second observation.
+    pub intensity_tendency: f32,
 }
 
 impl CellTrack {
@@ -156,6 +167,8 @@ pub fn advance_tracks(
                     velocity_kms: None,
                     deviant_streak: 0,
                     severity,
+                    growing: None,
+                    intensity_tendency: 0.0,
                 },
                 Some(pi) => {
                     let prev = &previous[pi];
@@ -181,10 +194,21 @@ pub fn advance_tracks(
                     let deviant_now = residual_ms > DEVIANT_RESIDUAL_MS
                         && cell_speed_ms > DEVIANT_MIN_CELL_SPEED_MS;
 
+                    let growing = Some(blob.volume >= prev.blob.volume);
+                    // Mean-exceedance trend, per second, EMA'd with the
+                    // track's history (newborns start at 0 ⇒ first
+                    // measurement is halved — mild warm-up damping).
+                    let mean_now = blob.volume / blob.area.max(1) as f32;
+                    let mean_prev = prev.blob.volume / prev.blob.area.max(1) as f32;
+                    let raw_tendency = ((mean_now - mean_prev) / ds)
+                        .clamp(-MAX_CELL_TENDENCY_PER_S, MAX_CELL_TENDENCY_PER_S);
+                    let intensity_tendency = 0.5 * raw_tendency + 0.5 * prev.intensity_tendency;
                     CellTrack {
                         id: prev.id,
                         blob,
                         age: prev.age + 1,
+                        growing,
+                        intensity_tendency,
                         velocity_kms: Some((vx_km, vy_km)),
                         deviant_streak: if deviant_now {
                             prev.deviant_streak + 1

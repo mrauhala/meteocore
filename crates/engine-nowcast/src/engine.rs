@@ -43,8 +43,8 @@ use ds_core::resample::ProjectionGrid;
 use crate::advect::TrajectoryIntegrator;
 use crate::cells2d::{advance_tracks, CellTrack, CELL_MIN_AREA_PX, CELL_THRESHOLD_DBZ};
 use crate::motion::{estimate_motion_multi, MotionField, MotionOptions};
-use crate::objects::{segment_cells, PixelScale};
-use crate::tendency::{GrowthProfile, PROFILE_EMA_ALPHA};
+use crate::objects::{segment_cells_labeled, PixelScale};
+use crate::tendency::EFOLD_INTERVALS;
 use crate::Grid;
 
 /// Fastest cell motion the search window must cover (m/s). 40 m/s ≈ 144 km/h
@@ -146,11 +146,10 @@ struct Generation {
     /// The (blended) motion field this generation advected along — the
     /// EMA history for the NEXT generation (#524).
     field: MotionField,
-    /// Source interval (s) the field's vectors span.
-    interval_secs: f32,
     /// Per-band growth/decay profile (measured + EMA'd) — the history for
     /// the NEXT generation (#546).
-    profile: GrowthProfile,
+    /// Tracked cells of this generation's analysis frame (#544/#546).
+    cells: Arc<Vec<CellTrack>>,
 }
 
 /// Atomically swapped engine state.
@@ -383,50 +382,11 @@ impl NowcastEngine {
                     generations.remove(&oldest);
                 }
                 let info = build_info(&source_info, &generations);
-                // Cell intelligence (#544): segment the fresh analysis frame
-                // and advance the track set against the ambient motion field.
-                let cells = {
-                    let generation = generations.get(&anchor).expect("just inserted");
-                    let g = &generation.geom;
-                    let analysis =
-                        frame_to_grid(&generation.frames[0], g.width as usize, g.height as usize);
-                    let blobs = segment_cells(&analysis, CELL_THRESHOLD_DBZ, CELL_MIN_AREA_PX);
-                    let (kx, ky) = crate::lonlat_grid_km_per_px(
-                        [g.west, g.south, g.east, g.north],
-                        g.width,
-                        g.height,
-                    );
-                    // Displacement spans the previous generation's anchor →
-                    // this one (2× cadence after a skipped generation); field
-                    // vectors span the source interval.
-                    let displacement_secs = old
-                        .generations
-                        .iter()
-                        .next_back()
-                        .map(|(&p, _)| (anchor - p).num_seconds() as f32)
-                        .unwrap_or(generation.interval_secs);
-                    // Track continuity is only meaningful on an unchanged
-                    // grid: a source geometry change would silently
-                    // reinterpret previous pixel centroids on the new grid
-                    // (same class as the skill-scoring geometry guard), so
-                    // the track set resets and cells start as newborns.
-                    let previous_cells: &[CellTrack] = match old.generations.iter().next_back() {
-                        Some((_, prev)) if prev.geom == generation.geom => &old.cells,
-                        _ => &[],
-                    };
-                    Arc::new(advance_tracks(
-                        previous_cells,
-                        blobs,
-                        PixelScale {
-                            x: kx as f32,
-                            y: ky as f32,
-                        },
-                        &generation.field,
-                        displacement_secs,
-                        generation.interval_secs,
-                        || self.next_track_id.fetch_add(1, Ordering::Relaxed),
-                    ))
-                };
+                let cells = generations
+                    .get(&anchor)
+                    .expect("just inserted")
+                    .cells
+                    .clone();
                 self.state.store(Arc::new(NowcastState {
                     generations,
                     info,
@@ -654,21 +614,53 @@ impl NowcastEngine {
             }
         }
 
-        // Growth/decay profile (#546): advect the previous frame one
-        // interval and measure per-band tendencies against the analysis in
-        // the Lagrangian frame; EMA with the previous generation's profile.
-        // Measured even when application is disabled, so flipping the config
-        // on starts from a warmed profile.
-        let mut profile = {
-            let prev_f32 = &motion_frames[motion_frames.len() - 2].1;
-            let advected_prev = crate::advect::advect(prev_f32, &field, 1.0, SUBSTEPS);
-            GrowthProfile::measure(&advected_prev, analysis_f32, self.cfg.min_echo)
+        // Cell tracking (#544) — now inside generate() so the growth/decay
+        // measurement (#546 iteration 1) can condition on per-cell classes.
+        let (blobs, labels) =
+            segment_cells_labeled(analysis_f32, CELL_THRESHOLD_DBZ, CELL_MIN_AREA_PX);
+        let (kx, ky) = crate::lonlat_grid_km_per_px(
+            [geom.west, geom.south, geom.east, geom.north],
+            geom.width,
+            geom.height,
+        );
+        let scale = PixelScale {
+            x: kx as f32,
+            y: ky as f32,
         };
-        {
-            let state = self.state.load();
-            if let Some((_, latest)) = state.generations.iter().next_back() {
-                profile.blend_with_previous(&latest.profile, PROFILE_EMA_ALPHA);
-            }
+        let prev_state = self.state.load();
+        let prev_latest = prev_state.generations.iter().next_back();
+        // Displacement spans the previous generation's anchor → this one
+        // (2× cadence after a skipped generation); field vectors span the
+        // source interval. Track continuity requires an unchanged grid
+        // (geometry change ⇒ reset, cells restart as newborns).
+        let displacement_secs = prev_latest
+            .map(|(&p, _)| (anchor - p).num_seconds() as f32)
+            .unwrap_or_else(|| interval.num_seconds() as f32);
+        let previous_cells: &[CellTrack] = match prev_latest {
+            Some((_, prev)) if prev.geom == geom => &prev.cells,
+            _ => &[],
+        };
+        let cells = Arc::new(advance_tracks(
+            previous_cells,
+            blobs,
+            scale,
+            &field,
+            displacement_secs,
+            interval.num_seconds() as f32,
+            || self.next_track_id.fetch_add(1, Ordering::Relaxed),
+        ));
+
+        // Per-pixel LABEL map + per-cell tendency table (#546 iteration 1
+        // pivot): each pixel of tracked cell L gets L's OWN EMA'd intensity
+        // tendency (a tracker-level signal, robust to pixel misalignment);
+        // background and newborns get 0 = pure advection. Labels are capped
+        // at 255 to ride the u8 trajectory sampler — cells beyond that (rare;
+        // FMI convective days run ~150) fall back to pure advection.
+        let label_map: Vec<u8> = labels.iter().map(|&l| l.min(255) as u8).collect();
+        let mut cell_tendency = [0f32; 256];
+        for (i, t) in cells.iter().take(255).enumerate() {
+            // Per-interval units to pair with lead_intervals below.
+            cell_tendency[i + 1] = t.intensity_tendency * interval.num_seconds() as f32;
         }
 
         // Lead schedule. An explicit step was validated against MAX_LEADS at
@@ -721,12 +713,15 @@ impl NowcastEngine {
                 } => {
                     let mut sampled = trajectories.sample_u8(data, *nodata);
                     if self.cfg.growth_decay {
-                        for raw in sampled.iter_mut() {
-                            if *raw == *nodata {
+                        let moved = trajectories.sample_u8(&label_map, 0);
+                        let damp =
+                            EFOLD_INTERVALS * (1.0 - (-lead_intervals / EFOLD_INTERVALS).exp());
+                        for (raw, k) in sampled.iter_mut().zip(&moved) {
+                            if *raw == *nodata || *k == 0 {
                                 continue;
                             }
                             let v = (f64::from(*raw) * *gain + *offset) as f32;
-                            let adjusted = profile.apply(v, lead_intervals);
+                            let adjusted = v + cell_tendency[*k as usize] * damp;
                             if adjusted != v {
                                 let mut r = ((f64::from(adjusted) - *offset) / *gain)
                                     .round()
@@ -753,9 +748,12 @@ impl NowcastEngine {
                 FrameData::F32(_) => {
                     let mut sampled = trajectories.sample(analysis_f32).data;
                     if self.cfg.growth_decay {
-                        for v in sampled.iter_mut() {
-                            if v.is_finite() {
-                                *v = profile.apply(*v, lead_intervals);
+                        let moved = trajectories.sample_u8(&label_map, 0);
+                        let damp =
+                            EFOLD_INTERVALS * (1.0 - (-lead_intervals / EFOLD_INTERVALS).exp());
+                        for (v, k) in sampled.iter_mut().zip(&moved) {
+                            if v.is_finite() && *k > 0 {
+                                *v += cell_tendency[*k as usize] * damp;
                             }
                         }
                     }
@@ -773,8 +771,7 @@ impl NowcastEngine {
             frames,
             geom,
             field,
-            interval_secs: interval.num_seconds() as f32,
-            profile,
+            cells,
         })
     }
 

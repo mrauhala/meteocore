@@ -19,6 +19,11 @@ pub const N_BANDS: usize = 32;
 /// Minimum pixels in a band for its tendency to be trusted; sparser bands
 /// keep tendency 0 (pure advection).
 pub const MIN_BAND_SAMPLES: u32 = 200;
+/// Lower per-band floor for the CELL buckets of [`ClassedProfiles`]:
+/// convective cells are small (tens to hundreds of pixels total), and the
+/// scene-wide floor would gate their tendencies to zero — the cross-
+/// generation EMA supplies the noise damping instead.
+pub const MIN_CELL_BAND_SAMPLES: u32 = 20;
 /// Per-interval tendency clamp — a band never brightens/dims faster than
 /// this, keeping one noisy scene from painting extremes.
 pub const MAX_TENDENCY: f32 = 2.0;
@@ -84,10 +89,20 @@ impl GrowthProfile {
                 counts[b] += 1;
             }
         }
+        Self::from_stats(base, &sums, &counts, MIN_BAND_SAMPLES)
+    }
+
+    /// Band stats → profile (min-sample gate, clamp, sparse-neighbour fill).
+    fn from_stats(
+        base: f32,
+        sums: &[f64; N_BANDS],
+        counts: &[u32; N_BANDS],
+        min_samples: u32,
+    ) -> Self {
         let mut tendency = [0f32; N_BANDS];
         let mut measured = [false; N_BANDS];
         for b in 0..N_BANDS {
-            if counts[b] >= MIN_BAND_SAMPLES {
+            if counts[b] >= min_samples {
                 tendency[b] =
                     ((sums[b] / f64::from(counts[b])) as f32).clamp(-MAX_TENDENCY, MAX_TENDENCY);
                 measured[b] = true;
@@ -141,6 +156,79 @@ impl GrowthProfile {
         let hi = (lo + 1).min(N_BANDS - 1);
         let t = self.tendency[lo] * (1.0 - frac) + self.tendency[hi] * frac;
         value + t * EFOLD_INTERVALS * (1.0 - (-lead / EFOLD_INTERVALS).exp())
+    }
+}
+
+/// Class-conditioned profile set (#546 iteration 1): background / growing
+/// cells / decaying cells, measured in one pass over a per-pixel bucket
+/// map (`0`/`1`/`2`) built from the tracked-cell footprints at the anchor.
+/// Motivated by the scene-wide gate failure: the scene mean drains the
+/// whole field; conditioning on the TRACKER's per-cell volume trend (a
+/// signal robust to pixel misalignment) confines decay to cells that are
+/// actually dying and leaves the stratiform background alone.
+#[derive(Debug, Clone)]
+pub struct ClassedProfiles {
+    pub profiles: [GrowthProfile; 3],
+}
+
+impl ClassedProfiles {
+    pub fn zero(base: f32) -> Self {
+        Self {
+            profiles: [
+                GrowthProfile::zero(base),
+                GrowthProfile::zero(base),
+                GrowthProfile::zero(base),
+            ],
+        }
+    }
+
+    /// Measure all three buckets in one pass. `bucket[i]` classifies pixel
+    /// `i` of the ACTUAL (anchor) frame; per-bucket band statistics follow
+    /// the single-profile rules (min samples, clamp, sparse fill).
+    pub fn measure(advected_prev: &Grid, actual: &Grid, base: f32, bucket: &[u8]) -> Self {
+        debug_assert_eq!(bucket.len(), actual.data.len());
+        let mut sums = [[0f64; N_BANDS]; 3];
+        let mut counts = [[0u32; N_BANDS]; 3];
+        let probe = GrowthProfile::zero(base);
+        for ((&a, &o), &k) in advected_prev.data.iter().zip(&actual.data).zip(bucket) {
+            if !a.is_finite() || !o.is_finite() {
+                continue;
+            }
+            if let Some(b) = probe.band(a) {
+                let k = (k as usize).min(2);
+                sums[k][b] += f64::from(o.max(base - BAND_WIDTH) - a);
+                counts[k][b] += 1;
+            }
+        }
+        let mut out = Self::zero(base);
+        for k in 0..3 {
+            let min = if k == 0 {
+                MIN_BAND_SAMPLES
+            } else {
+                MIN_CELL_BAND_SAMPLES
+            };
+            out.profiles[k] = GrowthProfile::from_stats(base, &sums[k], &counts[k], min);
+        }
+        out
+    }
+
+    pub fn blend_with_previous(&mut self, prev: &ClassedProfiles, alpha: f32) {
+        for (p, q) in self.profiles.iter_mut().zip(&prev.profiles) {
+            p.blend_with_previous(q, alpha);
+        }
+    }
+
+    /// Adjusted value for a pixel in bucket `k` at `lead` intervals.
+    /// Bucket 0 (background/newborn) passes through UNCHANGED — the SMHI
+    /// gate showed the background profile still drains stratiform fields
+    /// (motion-residual contamination); the point of this iteration is to
+    /// evolve classified cells and leave the bulk field to pure advection.
+    #[inline]
+    pub fn apply(&self, bucket: u8, value: f32, lead: f32) -> f32 {
+        match bucket {
+            1 | 2 => self.profiles[bucket as usize].apply(value, lead),
+            _ => value,
+        }
     }
 }
 

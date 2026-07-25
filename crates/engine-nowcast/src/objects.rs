@@ -32,9 +32,22 @@ pub struct CellBlob {
 /// Segment `grid` into cells: 8-connected components of pixels with
 /// `value ≥ threshold`, keeping components of at least `min_area` pixels.
 pub fn segment_cells(grid: &Grid, threshold: f32, min_area: usize) -> Vec<CellBlob> {
+    segment_cells_labeled(grid, threshold, min_area).0
+}
+
+/// Like [`segment_cells`], also returning a per-pixel label map: `0` =
+/// no retained cell, `i+1` = member of the i-th returned blob. Used by the
+/// class-conditioned growth/decay profiles (#546 iteration 1), which need
+/// cell footprint masks, not just centroids.
+pub fn segment_cells_labeled(
+    grid: &Grid,
+    threshold: f32,
+    min_area: usize,
+) -> (Vec<CellBlob>, Vec<u32>) {
     let (w, h) = (grid.width, grid.height);
     let mut labels = vec![0u32; w * h];
     let mut cells: Vec<CellBlob> = Vec::new();
+    let mut retained: Vec<u32> = Vec::new();
     let mut stack: Vec<usize> = Vec::new();
     let mut next_label = 0u32;
 
@@ -84,9 +97,18 @@ pub fn segment_cells(grid: &Grid, threshold: f32, min_area: usize) -> Vec<CellBl
                 volume,
                 max_value,
             });
+            retained.push(next_label);
         }
     }
-    cells
+    // Compact retained raw labels to 1-based blob indices; drop the rest.
+    let mut remap = vec![0u32; next_label as usize + 1];
+    for (i, &raw) in retained.iter().enumerate() {
+        remap[raw as usize] = i as u32 + 1;
+    }
+    for l in labels.iter_mut() {
+        *l = remap[*l as usize];
+    }
+    (cells, labels)
 }
 
 /// Per-axis pixel scale for distance computations. A regular lat/lon grid

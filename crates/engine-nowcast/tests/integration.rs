@@ -729,9 +729,13 @@ fn growth_decay_dims_decaying_echo() {
             min_echo: 10.0,
             growth_decay,
         };
-        let engine = NowcastEngine::new("fade", "mock", source, &config).expect("builds");
+        let engine = NowcastEngine::new("fade", "mock", source.clone(), &config).expect("builds");
         engine.poll_once();
-        let raw = render_raw(&engine, anchor + Duration::minutes(30));
+        // Per-cell tendencies need a matched predecessor: second generation.
+        let anchor2 = anchor + Duration::minutes(5);
+        source.times.write().unwrap().push(anchor2);
+        engine.poll_once();
+        let raw = render_raw(&engine, anchor2 + Duration::minutes(30));
         raw.iter()
             .filter(|&&r| r != NODATA && r > 0)
             .map(|&r| r as f32 * 0.4 - 30.0)
