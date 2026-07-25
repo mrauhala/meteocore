@@ -733,8 +733,11 @@ impl NowcastEngine {
                                     .clamp(0.0, 255.0)
                                     as u8;
                                 if r == *nodata {
-                                    // Never collide with the nodata byte.
-                                    r = r.saturating_sub(1);
+                                    // Never collide with the nodata byte —
+                                    // step AWAY from it in whichever
+                                    // direction exists (nodata = 0 sources
+                                    // can't step down).
+                                    r = if r == 0 { 1 } else { r - 1 };
                                 }
                                 *raw = r;
                             }
