@@ -967,7 +967,7 @@ pub fn load_collections(
             "odim-volume" => &["edr", "wms", "maps", "tiles", "3dtiles", "features"],
             "cap" => &["features", "wms", "maps", "tiles"],
             "postgis" => &["edr", "features", "tiles", "wms", "maps"],
-            "nowcast" => &["wms", "maps", "tiles"],
+            "nowcast" => &["wms", "maps", "tiles", "features"],
             _ => &[],
         };
         let unsupported: Vec<&str> = collection
@@ -2418,6 +2418,15 @@ pub fn load_collections(
                 build_styles(collection, &bundle_index),
             );
             info!("Collection '{}': wired to Tiles API", collection.id);
+        }
+
+        if collection.apis.contains(&"features".to_string()) {
+            feature_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::feature_engine::FeatureEngine>,
+            );
+            feature_collections.insert(collection.id.clone(), collection.clone());
+            info!("Collection '{}': wired to Features API", collection.id);
         }
 
         // A nowcast starts degraded: the first generation needs the source's
@@ -4251,11 +4260,10 @@ mod tests {
 
     #[test]
     fn nowcast_wires_into_registries_and_boots_degraded() {
+        let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
+        nc.apis = vec!["wms".to_string(), "features".to_string()];
         let result = super::load_collections(
-            &[
-                tm35_source_collection("radar"),
-                nowcast_test_collection("nc", "nowcast", Some("radar")),
-            ],
+            &[tm35_source_collection("radar"), nc],
             &[],
             "http://x",
             false,
@@ -4263,6 +4271,10 @@ mod tests {
             super::ReusableCaches::default(),
         );
         assert!(result.wms_state.engines.contains_key("nc"));
+        assert!(
+            result.features_state.engines.contains_key("nc"),
+            "features API must be wired when listed in apis"
+        );
         assert_eq!(result.nowcast_engines.len(), 1);
         assert_eq!(result.nowcast_engines[0].source_id(), "radar");
         let h = health_of(&result, "nc");

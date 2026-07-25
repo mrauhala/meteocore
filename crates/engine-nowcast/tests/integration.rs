@@ -514,3 +514,143 @@ fn dry_scene_leaves_both_skill_gauges_unset() {
         "a dry scene must leave the gauge pair unset"
     );
 }
+
+/// V2.2 (#544): after a generation, tracked cells serve as Point features
+/// with severity/motion/deviant properties; ids persist across generations.
+#[test]
+fn cell_features_are_served_and_tracks_persist() {
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+
+    let anchor1 = t0() + Duration::minutes(5);
+    let (source, engine) = build("PT30M", &[t0(), anchor1]);
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    assert_eq!(page.number_matched, 1, "one disc, one cell");
+    let f = &page.features[0];
+    assert!(matches!(
+        f.properties.get("severity"),
+        Some(PropertyValue::String(s)) if s == "moderate"
+    ));
+    assert!(matches!(
+        f.properties.get("deviant_mover"),
+        Some(PropertyValue::Bool(false))
+    ));
+    let id1 = f.id.clone();
+
+    let anchor2 = anchor1 + Duration::minutes(5);
+    source.times.write().unwrap().push(anchor2);
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+    assert_eq!(f.id, id1, "track id persists across generations");
+    assert!(matches!(
+        f.properties.get("track_age"),
+        Some(PropertyValue::Integer(2))
+    ));
+    assert!(engine.get_feature(&id1).is_ok());
+    assert!(engine.get_feature("9999").is_err());
+
+    // datetime filter: excluding the anchor matches nothing; including it
+    // matches; count accessor is O(1)-consistent with the page.
+    use ds_core::feature::DatetimeInterval;
+    let excl = engine
+        .get_features(&FeatureQuery {
+            datetime: Some(DatetimeInterval {
+                start: None,
+                end: Some(anchor2 - Duration::minutes(1)),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(excl.number_matched, 0);
+    assert_eq!(engine.feature_count(), 1);
+}
+
+/// Geometry-change reset (#545 round 3/4): a source that changes its
+/// advertised extent mid-run must restart tracks as newborns instead of
+/// matching centroids reinterpreted on the new grid.
+#[test]
+fn geometry_change_resets_cell_tracks() {
+    struct MovableSource {
+        times: RwLock<Vec<DateTime<Utc>>>,
+        extent: RwLock<[f64; 4]>,
+    }
+    impl MapEngine for MovableSource {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            Ok(RasterTile {
+                width,
+                height,
+                values: RasterValues::U8 {
+                    data: truth_frame(time.unwrap()),
+                    nodata: Some(NODATA),
+                    gain: 0.4,
+                    offset: -30.0,
+                },
+            })
+        }
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some(*self.extent.read().unwrap()),
+                times: self.times.read().unwrap().clone(),
+                parameter: "reflectivity".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: Some([W, H]),
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+    }
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+
+    let anchor1 = t0() + Duration::minutes(5);
+    let source = Arc::new(MovableSource {
+        times: RwLock::new(vec![t0(), anchor1]),
+        extent: RwLock::new(EXTENT),
+    });
+    let config = NowcastConfig {
+        source: "mock".into(),
+        horizon: "PT30M".into(),
+        step: None,
+        history_frames: 2,
+        poll_interval_secs: 30,
+        max_generations: 4,
+        max_pixels: 4_000_000,
+        min_echo: 10.0,
+    };
+    let engine =
+        NowcastEngine::new("mv-nowcast", "mock", source.clone(), &config).expect("engine builds");
+    engine.poll_once();
+
+    // Extent shifts (source footprint change) before the next frame.
+    *source.extent.write().unwrap() = [1.0, 51.0, 11.0, 61.0];
+    source
+        .times
+        .write()
+        .unwrap()
+        .push(anchor1 + Duration::minutes(5));
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    assert_eq!(page.number_matched, 1);
+    assert!(
+        matches!(
+            page.features[0].properties.get("track_age"),
+            Some(PropertyValue::Integer(1))
+        ),
+        "track must restart as newborn after a geometry change"
+    );
+}

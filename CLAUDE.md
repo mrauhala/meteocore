@@ -323,7 +323,7 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
 | ODIM PVOL | `EdrEngine` + `MapEngine` + `VolumeEngine` (per-site views) + `FeatureEngine` (network engine) | EDR (position, locations, area, trajectory), WMS, Maps, Tiles, 3D Tiles, Features (site inventory) |
 | QueryData | `EdrEngine` + `MapEngine` | EDR (position only), WMS, Maps, Tiles |
 | Zarr | `EdrEngine` + `MapEngine` | EDR (position), WMS, Maps, Tiles; local + S3/HTTP |
-| Nowcast | `MapEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated frames with future TIME values (EDR + instances = phase 2, #523) |
+| Nowcast | `MapEngine` + `FeatureEngine` (derived: wraps another collection's engine) | WMS, Maps, Tiles — motion-extrapolated future frames; Features — tracked cell intelligence (severity, deviant movers, #544). EDR + instances = #523 |
 | PostGIS | `EdrEngine` + `FeatureEngine` + `MapEngine` (events shape only) | EDR (position, locations, area), Features; events shape: EDR (area) + WMS/Maps/Tiles (age-colored strike layer) |
 
 ## Config Format

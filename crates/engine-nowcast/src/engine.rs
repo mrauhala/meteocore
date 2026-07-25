@@ -35,11 +35,15 @@ use tokio::sync::watch;
 use ds_core::config::NowcastConfig;
 use ds_core::datetime::parse_iso8601_duration;
 use ds_core::error::DataServerError;
+use ds_core::feature::{Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue};
+use ds_core::feature_engine::FeatureEngine;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile, RasterValues};
 use ds_core::resample::ProjectionGrid;
 
 use crate::advect::TrajectoryIntegrator;
+use crate::cells2d::{advance_tracks, CellTrack, CELL_MIN_AREA_PX, CELL_THRESHOLD_DBZ};
 use crate::motion::{estimate_motion_multi, MotionField, MotionOptions};
+use crate::objects::{segment_cells, PixelScale};
 use crate::Grid;
 
 /// Fastest cell motion the search window must cover (m/s). 40 m/s ≈ 144 km/h
@@ -140,6 +144,8 @@ struct Generation {
     /// The (blended) motion field this generation advected along — the
     /// EMA history for the NEXT generation (#524).
     field: MotionField,
+    /// Source interval (s) the field's vectors span.
+    interval_secs: f32,
 }
 
 /// Atomically swapped engine state.
@@ -148,6 +154,8 @@ struct NowcastState {
     generations: BTreeMap<DateTime<Utc>, Arc<Generation>>,
     /// Pre-built snapshot for the O(1) `raster_info()` contract.
     info: RasterInfo,
+    /// Tracked cells of the latest generation's analysis frame (#544).
+    cells: Arc<Vec<CellTrack>>,
 }
 
 pub struct NowcastEngine {
@@ -172,6 +180,8 @@ pub struct NowcastEngine {
     /// baseline. `u64::MAX` = not yet measured.
     lead_csi_permille: AtomicU64,
     lead_persistence_csi_permille: AtomicU64,
+    /// Monotonic id source for cell tracks (#544).
+    next_track_id: AtomicU64,
 }
 
 impl NowcastEngine {
@@ -248,6 +258,7 @@ impl NowcastEngine {
             state: ArcSwap::from_pointee(NowcastState {
                 generations: BTreeMap::new(),
                 info: empty_info(&source_info),
+                cells: Arc::new(Vec::new()),
             }),
             shutdown_tx,
             generations_total: AtomicU64::new(0),
@@ -257,6 +268,7 @@ impl NowcastEngine {
             lead_cap_warned: std::sync::atomic::AtomicBool::new(false),
             lead_csi_permille: AtomicU64::new(u64::MAX),
             lead_persistence_csi_permille: AtomicU64::new(u64::MAX),
+            next_track_id: AtomicU64::new(1),
         })
     }
 
@@ -365,8 +377,55 @@ impl NowcastEngine {
                     generations.remove(&oldest);
                 }
                 let info = build_info(&source_info, &generations);
-                self.state
-                    .store(Arc::new(NowcastState { generations, info }));
+                // Cell intelligence (#544): segment the fresh analysis frame
+                // and advance the track set against the ambient motion field.
+                let cells = {
+                    let generation = generations.get(&anchor).expect("just inserted");
+                    let g = &generation.geom;
+                    let analysis =
+                        frame_to_grid(&generation.frames[0], g.width as usize, g.height as usize);
+                    let blobs = segment_cells(&analysis, CELL_THRESHOLD_DBZ, CELL_MIN_AREA_PX);
+                    let (kx, ky) = crate::lonlat_grid_km_per_px(
+                        [g.west, g.south, g.east, g.north],
+                        g.width,
+                        g.height,
+                    );
+                    // Displacement spans the previous generation's anchor →
+                    // this one (2× cadence after a skipped generation); field
+                    // vectors span the source interval.
+                    let displacement_secs = old
+                        .generations
+                        .iter()
+                        .next_back()
+                        .map(|(&p, _)| (anchor - p).num_seconds() as f32)
+                        .unwrap_or(generation.interval_secs);
+                    // Track continuity is only meaningful on an unchanged
+                    // grid: a source geometry change would silently
+                    // reinterpret previous pixel centroids on the new grid
+                    // (same class as the skill-scoring geometry guard), so
+                    // the track set resets and cells start as newborns.
+                    let previous_cells: &[CellTrack] = match old.generations.iter().next_back() {
+                        Some((_, prev)) if prev.geom == generation.geom => &old.cells,
+                        _ => &[],
+                    };
+                    Arc::new(advance_tracks(
+                        previous_cells,
+                        blobs,
+                        PixelScale {
+                            x: kx as f32,
+                            y: ky as f32,
+                        },
+                        &generation.field,
+                        displacement_secs,
+                        generation.interval_secs,
+                        || self.next_track_id.fetch_add(1, Ordering::Relaxed),
+                    ))
+                };
+                self.state.store(Arc::new(NowcastState {
+                    generations,
+                    info,
+                    cells,
+                }));
                 self.generations_total.fetch_add(1, Ordering::Relaxed);
                 self.last_generation_ms.store(elapsed_ms, Ordering::Relaxed);
                 let lag = (Utc::now() - anchor).num_seconds().max(0) as u64;
@@ -654,6 +713,7 @@ impl NowcastEngine {
             frames,
             geom,
             field,
+            interval_secs: interval.num_seconds() as f32,
         })
     }
 
@@ -973,5 +1033,160 @@ impl MapEngine for NowcastEngine {
         Self::select_generation(&state, reference_time)
             .map(|g| Some(g.reference_time))
             .unwrap_or(reference_time)
+    }
+}
+
+/// Build one cell feature: lon/lat from the grid geometry plus the served
+/// property set. Shared by `get_features` and `get_feature` so the two
+/// paths cannot drift (and the by-id path needn't materialize every cell).
+fn cell_feature(
+    t: &CellTrack,
+    g: GridGeom,
+    kx: f64,
+    ky: f64,
+    anchor: DateTime<Utc>,
+) -> (f64, f64, Feature) {
+    let lon = g.west + (f64::from(t.blob.centroid.0) / f64::from(g.width)) * (g.east - g.west);
+    let lat = g.north - (f64::from(t.blob.centroid.1) / f64::from(g.height)) * (g.north - g.south);
+    let mut props = std::collections::HashMap::new();
+    props.insert(
+        "severity".into(),
+        PropertyValue::String(t.severity.as_str().into()),
+    );
+    props.insert(
+        "max_dbz".into(),
+        PropertyValue::Float(f64::from(t.blob.max_value)),
+    );
+    props.insert(
+        "area_km2".into(),
+        PropertyValue::Float(t.blob.area as f64 * kx * ky),
+    );
+    props.insert("track_age".into(), PropertyValue::Integer(t.age as i64));
+    props.insert("deviant_mover".into(), PropertyValue::Bool(t.deviant()));
+    props.insert(
+        "speed_ms".into(),
+        t.speed_ms()
+            .map(|v| PropertyValue::Float(f64::from(v)))
+            .unwrap_or(PropertyValue::Null),
+    );
+    props.insert(
+        "bearing_deg".into(),
+        t.bearing_deg()
+            .map(PropertyValue::Float)
+            .unwrap_or(PropertyValue::Null),
+    );
+    props.insert(
+        "observed".into(),
+        PropertyValue::String(anchor.to_rfc3339()),
+    );
+    (
+        lon,
+        lat,
+        Feature {
+            id: t.id.to_string(),
+            geometry: Arc::new(Geometry::Point { x: lon, y: lat }),
+            properties: Arc::new(props),
+        },
+    )
+}
+
+impl FeatureEngine for NowcastEngine {
+    /// Tracked cells of the latest analysis frame as Point features (#544).
+    fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+        let state = self.state.load();
+        let Some((&anchor, latest)) = state.generations.iter().next_back() else {
+            return Ok(FeaturePage {
+                features: Vec::new(),
+                number_matched: 0,
+                number_returned: 0,
+                next_offset: None,
+            });
+        };
+        // Cells exist only at the latest analysis instant: a datetime
+        // filter that excludes the anchor matches nothing (engine-cap
+        // precedent for honoring `?datetime=`).
+        if let Some(dt) = &query.datetime {
+            let after_start = dt.start.is_none_or(|s| anchor >= s);
+            let before_end = dt.end.is_none_or(|e| anchor <= e);
+            if !(after_start && before_end) {
+                return Ok(FeaturePage {
+                    features: Vec::new(),
+                    number_matched: 0,
+                    number_returned: 0,
+                    next_offset: None,
+                });
+            }
+        }
+        let g = latest.geom;
+        let (kx, ky) =
+            crate::lonlat_grid_km_per_px([g.west, g.south, g.east, g.north], g.width, g.height);
+        let matched: Vec<Feature> = state
+            .cells
+            .iter()
+            .filter_map(|t| {
+                let (lon, lat, feature) = cell_feature(t, g, kx, ky, anchor);
+                if let Some(b) = &query.bbox {
+                    if !b.contains(lon, lat) {
+                        return None;
+                    }
+                }
+                Some(feature)
+            })
+            .collect();
+        let number_matched = matched.len();
+        let page: Vec<Feature> = matched
+            .into_iter()
+            .skip(query.offset)
+            .take(query.limit)
+            .collect();
+        let number_returned = page.len();
+        let next_offset = (query.offset + number_returned < number_matched)
+            .then(|| query.offset + number_returned);
+        Ok(FeaturePage {
+            features: page,
+            number_matched,
+            number_returned,
+            next_offset,
+        })
+    }
+
+    /// O(1) from the snapshot — the default would build every feature just
+    /// to count them, on every collection-metadata request.
+    fn feature_count(&self) -> usize {
+        self.state.load().cells.len()
+    }
+
+    fn get_feature(&self, feature_id: &str) -> Result<Feature, DataServerError> {
+        let state = self.state.load();
+        let not_found = || DataServerError::FeatureNotFound(feature_id.to_string());
+        let (&anchor, latest) = state.generations.iter().next_back().ok_or_else(not_found)?;
+        let id: u64 = feature_id.parse().map_err(|_| not_found())?;
+        let track = state
+            .cells
+            .iter()
+            .find(|t| t.id == id)
+            .ok_or_else(not_found)?;
+        let g = latest.geom;
+        let (kx, ky) =
+            crate::lonlat_grid_km_per_px([g.west, g.south, g.east, g.north], g.width, g.height);
+        Ok(cell_feature(track, g, kx, ky, anchor).2)
+    }
+
+    /// Bumps every generation, so any future consumer keying caches/ETags on
+    /// the feature snapshot (e.g. MVT serving of tracked cells) invalidates
+    /// correctly — cells are rebuilt per generation. Currently only the
+    /// plain Features path is wired, which doesn't read this; overriding
+    /// anyway removes the stale-tile trap before it can exist.
+    fn data_version(&self) -> u64 {
+        self.generations_total.load(Ordering::Relaxed)
+    }
+
+    fn spatial_extent(&self) -> Option<[f64; 4]> {
+        self.state.load().info.spatial_extent
+    }
+
+    fn temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        let state = self.state.load();
+        state.generations.iter().next_back().map(|(&a, _)| (a, a))
     }
 }
