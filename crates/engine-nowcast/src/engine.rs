@@ -1137,6 +1137,18 @@ fn cell_feature(
         "observed".into(),
         PropertyValue::String(anchor.to_rfc3339()),
     );
+    // Lifecycle as DATA, not field modification: three gate runs showed
+    // tendency extrapolation loses to pure advection (#546), but the
+    // measured trend is still valuable client-side ("intensifying" /
+    // "weakening" badges).
+    props.insert(
+        "intensity_trend_dbz_min".into(),
+        if t.age >= 2 {
+            PropertyValue::Float(f64::from(t.intensity_tendency) * 60.0)
+        } else {
+            PropertyValue::Null
+        },
+    );
     (
         lon,
         lat,
