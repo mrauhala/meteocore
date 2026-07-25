@@ -724,7 +724,7 @@
     {
       "type": "timeseries",
       "title": "EDR data queries — rate by route",
-      "description": "Every EDR data route, one series each: position = radar probes + obs point queries, area = lightning windows, locations = station time series, trajectory/corridor = vertical cross-sections. Metadata routes excluded.",
+      "description": "Every registered EDR data route, one series each: position = radar probes + obs point queries (incl. instance-scoped), area = lightning windows, locations = station time series, trajectory = vertical cross-sections. Metadata routes excluded.",
       "id": 48,
       "gridPos": {
         "h": 8,
@@ -762,7 +762,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (path) (rate(http_requests_total{path=~\"/edr/.+/(position|area|radius|trajectory|corridor|cube|locations.*)\"}[$__rate_interval]))",
+          "expr": "sum by (path) (rate(http_requests_total{path=~\"/edr/.+/(position|area|trajectory|locations.*)\"}[$__rate_interval]))",
           "refId": "A",
           "legendFormat": "{{path}}"
         }
@@ -771,7 +771,7 @@
     {
       "type": "timeseries",
       "title": "EDR latency — p95 by route",
-      "description": "p95 per EDR data route. Position on a PVOL collection resamples polar volumes (expect tens of ms warm, seconds after an S3 fetch); lightning area is a single indexed SQL window (ms). A route drifting up under steady rate = engine or DB regression, not client load.",
+      "description": "p95 per EDR data route. Position on a PVOL collection (cross-sections ride the trajectory route) resamples polar volumes (expect tens of ms warm, seconds after an S3 fetch); lightning area is a single indexed SQL window (ms). A route drifting up under steady rate = engine or DB regression, not client load.",
       "id": 49,
       "gridPos": {
         "h": 8,
@@ -809,7 +809,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le, path) (rate(http_request_duration_seconds_bucket{path=~\"/edr/.+/(position|area|radius|trajectory|corridor|cube|locations.*)\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, path) (rate(http_request_duration_seconds_bucket{path=~\"/edr/.+/(position|area|trajectory|locations.*)\"}[$__rate_interval])))",
           "refId": "A",
           "legendFormat": "{{path}}"
         }
@@ -855,12 +855,12 @@
       },
       "targets": [
         {
-          "expr": "sum by (path) (rate(http_requests_total{path=~\"/edr/.+/(position|area|radius|trajectory|corridor|cube|locations.*)\", status=~\"4..\"}[$__rate_interval]))",
+          "expr": "sum by (path) (rate(http_requests_total{path=~\"/edr/.+/(position|area|trajectory|locations.*)\", status=~\"4..\"}[$__rate_interval]))",
           "refId": "A",
           "legendFormat": "4xx {{path}}"
         },
         {
-          "expr": "sum by (path) (rate(http_requests_total{path=~\"/edr/.+/(position|area|radius|trajectory|corridor|cube|locations.*)\", status=~\"5..\"}[$__rate_interval]))",
+          "expr": "sum by (path) (rate(http_requests_total{path=~\"/edr/.+/(position|area|trajectory|locations.*)\", status=~\"5..\"}[$__rate_interval]))",
           "refId": "B",
           "legendFormat": "5xx {{path}}"
         }
