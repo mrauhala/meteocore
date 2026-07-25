@@ -4262,6 +4262,38 @@ mod tests {
     }
 
     #[test]
+    fn nowcast_missing_lightning_source_fails_that_collection() {
+        // The #549 safety property: a lightning_source that names no
+        // events-shape collection fails the nowcast collection at load —
+        // never silently serving cells without flash data. (A station-
+        // shape postgis collection takes the same path: it is never
+        // entered into the event-source registry, so the lookup misses.)
+        let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
+        nc.nowcast.as_mut().unwrap().lightning_source = Some("no-such-lightning".into());
+        let result = super::load_collections(
+            &[tm35_source_collection("radar"), nc],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+        );
+        let h = health_of(&result, "nc");
+        assert_eq!(h.status, super::CollectionStatus::Failed);
+        assert!(
+            h.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("lightning_source"),
+            "error should name the missing lightning source: {:?}",
+            h.error
+        );
+        assert!(!result.wms_state.engines.contains_key("nc"));
+        // The base collection is unaffected.
+        assert!(result.wms_state.engines.contains_key("radar"));
+    }
+
+    #[test]
     fn nowcast_of_nowcast_is_rejected() {
         let result = super::load_collections(
             &[
