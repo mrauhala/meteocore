@@ -262,9 +262,61 @@ pub fn advance_tracks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::motion::{estimate_motion, MotionOptions};
+    use crate::motion::{estimate_motion, MotionField, MotionOptions};
     use crate::objects::segment_cells;
     use crate::Grid;
+
+    #[test]
+    fn counter_flow_cell_matches_via_raw_position_pass() {
+        // The against-flow fix (two-hypothesis matching): a strong ambient
+        // flow displaces the pass-1 hypothesis of a STATIONARY cell far
+        // outside the gate. Pass 2 must still match it at its raw position —
+        // otherwise the matcher drops exactly the counter-flow cells the
+        // deviant-mover detector exists to flag.
+        let blob = CellBlob {
+            centroid: (50.0, 50.0),
+            area: 20,
+            volume: 800.0,
+            max_value: 42.0,
+        };
+        let previous = vec![CellTrack {
+            id: 7,
+            blob: blob.clone(),
+            age: 1,
+            velocity_kms: None,
+            deviant_streak: 0,
+            severity: Severity::Weak,
+            growing: None,
+            intensity_tendency: 0.0,
+        }];
+        // Uniform 30 px/interval eastward flow; at 1 km/px the compensated
+        // hypothesis lands 30 km from the stationary successor — outside
+        // the 20 km base gate, so pass 1 alone would orphan the track.
+        let field = MotionField {
+            block: 16,
+            bw: 2,
+            bh: 2,
+            u: vec![30.0; 4],
+            v: vec![0.0; 4],
+            measured: vec![true; 4],
+        };
+        let scale = PixelScale { x: 1.0, y: 1.0 };
+        let mut next = 100u64;
+        let tracks = advance_tracks(&previous, vec![blob], scale, &field, 300.0, 300.0, || {
+            next += 1;
+            next
+        });
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(
+            tracks[0].id, 7,
+            "raw-position pass must rescue the counter-flow match"
+        );
+        assert_eq!(tracks[0].age, 2);
+        // Velocity comes from ORIGINAL (non-displaced) centroids: the cell
+        // is stationary, so the track velocity must be ~zero, not the flow.
+        let (vx, vy) = tracks[0].velocity_kms.unwrap();
+        assert!(vx.abs() < 1e-6 && vy.abs() < 1e-6);
+    }
 
     fn disc(w: usize, h: usize, cx: f32, cy: f32, r: f32, v: f32) -> Grid {
         let mut data = vec![0.0f32; w * h];
