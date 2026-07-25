@@ -673,11 +673,11 @@ impl NowcastEngine {
         // Per-pixel LABEL map + per-cell tendency table (#546 iteration 1
         // pivot): each pixel of tracked cell L gets L's OWN EMA'd intensity
         // tendency (a tracker-level signal, robust to pixel misalignment);
-        // background and newborns get 0 = pure advection. Labels are capped
-        // at 255 to ride the u8 trajectory sampler — cells beyond that (rare;
-        // FMI convective days run ~150) fall back to pure advection.
-        // Labels above 254 fall back to 0 (pure advection) — clamping onto
-        // 255 would silently borrow cell #254's tendency for every overflow
+        // background and newborns get 0 = pure advection. Labels ride the
+        // u8 trajectory sampler, so only cells 1..=254 carry tendencies:
+        // labels above 254 (rare; FMI convective days run ~150 cells) fall
+        // back to 0 = pure advection rather than clamping onto 255, which
+        // would silently borrow cell #254's tendency for every overflow
         // cell.
         let label_map: Vec<u8> = labels
             .iter()

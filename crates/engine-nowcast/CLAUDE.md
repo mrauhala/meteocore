@@ -94,6 +94,15 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   ≥5 m/s residual between the track and the ambient motion field (the
   estimator-disagreement right-mover detector). Served as Point features
   via `FeatureEngine` when the collection lists `features` in `apis`.
+- **Cell-snapshot HISTORY (#548):** one snapshot per generation is
+  retained, `CELL_HISTORY_SNAPSHOTS = 48` deep (~4 h at 5-min cadence,
+  ~100 B/track). `?datetime=` on the items endpoint selects the NEWEST
+  snapshot inside the interval — animating clients query the exact cell
+  situation per rendered frame. No `datetime` ⇒ latest snapshot; instants
+  before the retained range (or in the future — cells are analysis-only,
+  never forecast) ⇒ 0 features. The collection's temporal extent
+  advertises the retained span; by-id GET serves the latest snapshot's
+  version of a track.
 - Lightning join (flash counts/jump per track) is part 2 — needs a ds-core
   event-source trait + engine-postgis impl.
 
