@@ -17,8 +17,10 @@ use crate::objects::{match_cells, CellBlob, PixelScale};
 /// Cell threshold (dBZ) for intelligence tracking — the Ritvanen-style
 /// convective contour, matching the verification harness default.
 pub const CELL_THRESHOLD_DBZ: f32 = 35.0;
-/// Minimum component size in pixels.
-pub const CELL_MIN_AREA_PX: usize = 5;
+/// Minimum component size in pixels. 10 px ≈ 2.5 km² on the FMI 500 m
+/// grid — below that, 35 dBZ specks churn between generations and flood
+/// the Features layer with unmatched one-generation "cells".
+pub const CELL_MIN_AREA_PX: usize = 10;
 /// Matching gate (km) for track continuity between generations, per
 /// [`TRACK_GATE_BASE_SECS`] of elapsed time — the gate scales linearly
 /// with the actual span (a skipped generation doubles the distance a
@@ -146,7 +148,22 @@ pub fn advance_tracks(
     field_interval_secs: f32,
     mut next_id: impl FnMut() -> u64,
 ) -> Vec<CellTrack> {
-    let prev_blobs: Vec<CellBlob> = previous.iter().map(|t| t.blob.clone()).collect();
+    // Motion-compensated first-guess matching (TITAN-style): displace each
+    // previous centroid along the ambient field before matching. Without
+    // this, a fast mover's true successor sits downstream and the nearest
+    // raw match is often a DIFFERENT upstream cell — producing systematic
+    // against-flow track velocities (the client-visible bug, 2026-07-25).
+    let ratio = displacement_secs.max(1.0) / field_interval_secs.max(1.0);
+    let prev_blobs: Vec<CellBlob> = previous
+        .iter()
+        .map(|t| {
+            let mut b = t.blob.clone();
+            let (fu, fv) = field.sample(b.centroid.0, b.centroid.1);
+            b.centroid.0 += fu * ratio;
+            b.centroid.1 += fv * ratio;
+            b
+        })
+        .collect();
     let gate = TRACK_GATE_KM * (displacement_secs / TRACK_GATE_BASE_SECS).max(1.0);
     let mut matched_prev: Vec<Option<usize>> = vec![None; blobs.len()];
     for (pi, ci) in match_cells(&prev_blobs, &blobs, scale, gate) {
