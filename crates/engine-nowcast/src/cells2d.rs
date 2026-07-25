@@ -309,6 +309,13 @@ pub fn advance_tracks(
 /// The jump flag is the Schultz-style detector: the window's rate exceeds
 /// the track's recent baseline mean by 2σ, with ≥ 2 baseline rates and the
 /// [`MIN_JUMP_RATE_PER_MIN`] absolute floor.
+///
+/// The radius fallback is a deliberate brute-force O(unmatched strikes ×
+/// tracks) scan: the worst real Nordic window (~10⁴ strikes × ~150 cells)
+/// is ~10⁶ distance checks once per generation on the background runtime
+/// — milliseconds. Even the MAX_JOIN_STRIKES cap × the 255-track label
+/// ceiling stays in the tens of ms. A spatial index earns its complexity
+/// only if either bound grows by orders of magnitude.
 pub fn apply_lightning(
     tracks: &mut [CellTrack],
     strikes_px: &[(f32, f32)],
