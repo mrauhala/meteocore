@@ -44,6 +44,7 @@ use crate::advect::TrajectoryIntegrator;
 use crate::cells2d::{advance_tracks, CellTrack, CELL_MIN_AREA_PX, CELL_THRESHOLD_DBZ};
 use crate::motion::{estimate_motion_multi, MotionField, MotionOptions};
 use crate::objects::{segment_cells, PixelScale};
+use crate::tendency::{GrowthProfile, PROFILE_EMA_ALPHA};
 use crate::Grid;
 
 /// Fastest cell motion the search window must cover (m/s). 40 m/s ≈ 144 km/h
@@ -81,6 +82,7 @@ struct EngineCfg {
     max_generations: usize,
     max_pixels: usize,
     min_echo: f32,
+    growth_decay: bool,
 }
 
 /// The regular WGS84 grid every stored frame lives on.
@@ -146,6 +148,9 @@ struct Generation {
     field: MotionField,
     /// Source interval (s) the field's vectors span.
     interval_secs: f32,
+    /// Per-band growth/decay profile (measured + EMA'd) — the history for
+    /// the NEXT generation (#546).
+    profile: GrowthProfile,
 }
 
 /// Atomically swapped engine state.
@@ -254,6 +259,7 @@ impl NowcastEngine {
                 max_generations: config.max_generations.max(1),
                 max_pixels: config.max_pixels.clamp(65_536, 16_000_000),
                 min_echo: config.min_echo as f32,
+                growth_decay: config.growth_decay,
             },
             state: ArcSwap::from_pointee(NowcastState {
                 generations: BTreeMap::new(),
@@ -648,6 +654,23 @@ impl NowcastEngine {
             }
         }
 
+        // Growth/decay profile (#546): advect the previous frame one
+        // interval and measure per-band tendencies against the analysis in
+        // the Lagrangian frame; EMA with the previous generation's profile.
+        // Measured even when application is disabled, so flipping the config
+        // on starts from a warmed profile.
+        let mut profile = {
+            let prev_f32 = &motion_frames[motion_frames.len() - 2].1;
+            let advected_prev = crate::advect::advect(prev_f32, &field, 1.0, SUBSTEPS);
+            GrowthProfile::measure(&advected_prev, analysis_f32, self.cfg.min_echo)
+        };
+        {
+            let state = self.state.load();
+            if let Some((_, latest)) = state.generations.iter().next_back() {
+                profile.blend_with_previous(&latest.profile, PROFILE_EMA_ALPHA);
+            }
+        }
+
         // Lead schedule. An explicit step was validated against MAX_LEADS at
         // construction; the source-cadence default can still exceed it (a
         // fast-cadence source under a long horizon), so make the truncation
@@ -688,19 +711,53 @@ impl NowcastEngine {
         for i in 1..=k {
             let lead_time = anchor + step * (i as i32);
             trajectories.advance(delta, SUBSTEPS);
+            let lead_intervals = delta * i as f32;
             let frame = match &frames[0] {
                 FrameData::U8 {
                     data,
                     nodata,
                     gain,
                     offset,
-                } => FrameData::U8 {
-                    data: trajectories.sample_u8(data, *nodata),
-                    nodata: *nodata,
-                    gain: *gain,
-                    offset: *offset,
-                },
-                FrameData::F32(_) => FrameData::F32(trajectories.sample(analysis_f32).data),
+                } => {
+                    let mut sampled = trajectories.sample_u8(data, *nodata);
+                    if self.cfg.growth_decay {
+                        for raw in sampled.iter_mut() {
+                            if *raw == *nodata {
+                                continue;
+                            }
+                            let v = (f64::from(*raw) * *gain + *offset) as f32;
+                            let adjusted = profile.apply(v, lead_intervals);
+                            if adjusted != v {
+                                let mut r = ((f64::from(adjusted) - *offset) / *gain)
+                                    .round()
+                                    .clamp(0.0, 255.0)
+                                    as u8;
+                                if r == *nodata {
+                                    // Never collide with the nodata byte.
+                                    r = r.saturating_sub(1);
+                                }
+                                *raw = r;
+                            }
+                        }
+                    }
+                    FrameData::U8 {
+                        data: sampled,
+                        nodata: *nodata,
+                        gain: *gain,
+                        offset: *offset,
+                    }
+                }
+                FrameData::F32(_) => {
+                    let mut sampled = trajectories.sample(analysis_f32).data;
+                    if self.cfg.growth_decay {
+                        for v in sampled.iter_mut() {
+                            if v.is_finite() {
+                                *v = profile.apply(*v, lead_intervals);
+                            }
+                        }
+                    }
+                    FrameData::F32(sampled)
+                }
             };
             times.push(lead_time);
             frames.push(frame);
@@ -714,6 +771,7 @@ impl NowcastEngine {
             geom,
             field,
             interval_secs: interval.num_seconds() as f32,
+            profile,
         })
     }
 

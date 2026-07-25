@@ -26,6 +26,7 @@ pub mod engine;
 pub mod motion;
 pub mod objects;
 pub mod skill;
+pub mod tendency;
 
 pub use engine::NowcastEngine;
 
