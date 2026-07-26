@@ -1182,9 +1182,6 @@ impl MapEngine for NowcastEngine {
     }
 }
 
-/// Build one cell feature: lon/lat from the grid geometry plus the served
-/// property set. Shared by `get_features` and `get_feature` so the two
-/// paths cannot drift (and the by-id path needn't materialize every cell).
 /// Round to `places` decimals — serde's shortest-roundtrip float printing
 /// then emits the short form (`14.3`, not `14.300000000000001`).
 fn round_to(v: f64, places: i32) -> f64 {
@@ -1192,6 +1189,9 @@ fn round_to(v: f64, places: i32) -> f64 {
     (v * f).round() / f
 }
 
+/// Build one cell feature: lon/lat from the grid geometry plus the served
+/// property set. Shared by `get_features` and `get_feature` so the two
+/// paths cannot drift (and the by-id path needn't materialize every cell).
 fn cell_feature(
     t: &CellTrack,
     g: GridGeom,
@@ -1215,7 +1215,9 @@ fn cell_feature(
     );
     props.insert(
         "max_dbz".into(),
-        PropertyValue::Float(f64::from(t.blob.max_value)),
+        // f32→f64 promotion of a gain-scaled byte prints noise for gains
+        // that aren't binary-exact (SMHI 0.4 ⇒ 36.400001525878906).
+        PropertyValue::Float(round_to(f64::from(t.blob.max_value), 1)),
     );
     props.insert(
         "area_km2".into(),
