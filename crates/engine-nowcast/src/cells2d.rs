@@ -21,12 +21,21 @@ pub const CELL_THRESHOLD_DBZ: f32 = 35.0;
 /// grid — below that, 35 dBZ specks churn between generations and flood
 /// the Features layer with unmatched one-generation "cells".
 pub const CELL_MIN_AREA_PX: usize = 10;
-/// Matching gate (km) for track continuity between generations, per
-/// [`TRACK_GATE_BASE_SECS`] of elapsed time — the gate scales linearly
-/// with the actual span (a skipped generation doubles the distance a
-/// storm legitimately covers), never below one base gate.
-pub const TRACK_GATE_KM: f32 = 20.0;
-pub const TRACK_GATE_BASE_SECS: f32 = 300.0;
+/// Speed-based matching gates (like `ds_core::cells::track_cells`):
+/// `gate_km = speed × elapsed + BASE_GATE_KM`, so the implied velocity of
+/// ANY accepted match is physically bounded. The old flat 20 km / 5 min
+/// gate allowed 66 m/s implied cell speeds — gate-edge mismatches read as
+/// 200+ km/h storms on the client (observed live 2026-07-26).
+///
+/// Fastest real cell motion (extreme bow echoes) ≈ 35 m/s — the raw-
+/// position gate uses [`MAX_CELL_SPEED_MS`]. After pass-1 motion
+/// compensation the prediction has already absorbed advection, so only a
+/// small residual is legitimate ([`COMPENSATED_RESIDUAL_SPEED_MS`]).
+/// [`BASE_GATE_KM`] absorbs centroid jitter from footprint changes at
+/// small elapsed times.
+pub const MAX_CELL_SPEED_MS: f32 = 35.0;
+pub const COMPENSATED_RESIDUAL_SPEED_MS: f32 = 10.0;
+pub const BASE_GATE_KM: f32 = 3.0;
 /// Residual speed (m/s) between cell track and ambient field that counts
 /// as deviant, provided the cell itself moves faster than
 /// [`DEVIANT_MIN_CELL_SPEED_MS`].
@@ -191,10 +200,14 @@ pub fn advance_tracks(
             b
         })
         .collect();
-    let gate = TRACK_GATE_KM * (displacement_secs / TRACK_GATE_BASE_SECS).max(1.0);
+    let ds = displacement_secs.max(1.0);
+    // Pass 1 gate: residual around the motion-compensated prediction.
+    let gate_compensated = BASE_GATE_KM + COMPENSATED_RESIDUAL_SPEED_MS * ds / 1000.0;
+    // Pass 2 gate: full physical speed bound around the raw position.
+    let gate_raw = BASE_GATE_KM + MAX_CELL_SPEED_MS * ds / 1000.0;
     let mut matched_prev: Vec<Option<usize>> = vec![None; blobs.len()];
     let mut prev_taken = vec![false; previous.len()];
-    for (pi, ci) in match_cells(&displaced, &blobs, scale, gate) {
+    for (pi, ci) in match_cells(&displaced, &blobs, scale, gate_compensated) {
         matched_prev[ci] = Some(pi);
         prev_taken[pi] = true;
     }
@@ -209,7 +222,7 @@ pub fn advance_tracks(
             .map(|&i| previous[i].blob.clone())
             .collect();
         let cur_raw: Vec<CellBlob> = free_cur.iter().map(|&i| blobs[i].clone()).collect();
-        for (a, b) in match_cells(&prev_raw, &cur_raw, scale, gate) {
+        for (a, b) in match_cells(&prev_raw, &cur_raw, scale, gate_raw) {
             matched_prev[free_cur[b]] = Some(free_prev[a]);
         }
     }
@@ -239,8 +252,22 @@ pub fn advance_tracks(
                     let prev = &previous[pi];
                     // Track displacement over one interval, km in grid axes.
                     let ds = displacement_secs.max(1.0);
-                    let dx = (blob.centroid.0 - prev.blob.centroid.0) * scale.x / ds;
-                    let dy = (blob.centroid.1 - prev.blob.centroid.1) * scale.y / ds;
+                    let mut dx = (blob.centroid.0 - prev.blob.centroid.0) * scale.x / ds;
+                    let mut dy = (blob.centroid.1 - prev.blob.centroid.1) * scale.y / ds;
+                    // Physical clamp before the EMA fold: a centroid jump
+                    // past MAX_CELL_SPEED_MS (merge/split shifting the
+                    // intensity-weighted centroid, or a residual mismatch)
+                    // is not cell MOTION — cap the magnitude, keep the
+                    // direction, and let the EMA absorb the remainder.
+                    // Without this, one bad displacement reads as 200+ km/h
+                    // and pollutes speed/bearing for several generations.
+                    let speed_kms = (dx * dx + dy * dy).sqrt();
+                    let max_kms = MAX_CELL_SPEED_MS / 1000.0;
+                    if speed_kms > max_kms {
+                        let f = max_kms / speed_kms;
+                        dx *= f;
+                        dy *= f;
+                    }
                     let (vx_km, vy_km) = match prev.velocity_kms {
                         // EMA keeps single-scan centroid jitter out of the
                         // deviant residual.
@@ -471,6 +498,63 @@ mod tests {
     }
 
     #[test]
+    fn gates_and_clamp_bound_implied_track_velocity() {
+        // The 2026-07-26 client bug: gate-edge mismatches read as 200+
+        // km/h storms. With speed-based gates, a blob whose association
+        // would imply > MAX_CELL_SPEED_MS (+ base) never matches; and a
+        // legal-but-fast displacement folds into the EMA magnitude-
+        // clamped, direction preserved.
+        let still = MotionField {
+            block: 16,
+            bw: 2,
+            bh: 2,
+            u: vec![0.0; 4],
+            v: vec![0.0; 4],
+            measured: vec![true; 4],
+        };
+        let scale = PixelScale { x: 1.0, y: 1.0 };
+
+        // 15 km jump in 300 s (50 m/s implied): outside the 13.5 km raw
+        // gate — the track dies and the blob is born fresh.
+        let previous = vec![bare_track(1, 0.0, 0.0)];
+        let far = CellBlob {
+            centroid: (15.0, 0.0),
+            area: 20,
+            volume: 800.0,
+            max_value: 42.0,
+        };
+        let mut next = 100u64;
+        let tracks = advance_tracks(&previous, vec![far], scale, &still, 300.0, 300.0, || {
+            next += 1;
+            next
+        });
+        assert_eq!(tracks[0].age, 1, "50 m/s implied match must be rejected");
+        assert_ne!(tracks[0].id, 1);
+
+        // 12 km in 300 s (40 m/s): inside the 13.5 km raw gate, but the
+        // folded velocity is clamped to MAX_CELL_SPEED_MS with the
+        // direction (due east) preserved.
+        let near = CellBlob {
+            centroid: (12.0, 0.0),
+            area: 20,
+            volume: 800.0,
+            max_value: 42.0,
+        };
+        let previous = vec![bare_track(1, 0.0, 0.0)];
+        let tracks = advance_tracks(&previous, vec![near], scale, &still, 300.0, 300.0, || {
+            next += 1;
+            next
+        });
+        assert_eq!(tracks[0].id, 1);
+        let speed = tracks[0].speed_ms().unwrap();
+        assert!(
+            (speed - MAX_CELL_SPEED_MS).abs() < 0.01,
+            "clamped to the physical cap, got {speed}"
+        );
+        assert!((tracks[0].bearing_deg().unwrap() - 90.0).abs() < 0.5);
+    }
+
+    #[test]
     fn counter_flow_cell_matches_via_raw_position_pass() {
         // The against-flow fix (two-hypothesis matching): a strong ambient
         // flow displaces the pass-1 hypothesis of a STATIONARY cell far
@@ -498,8 +582,10 @@ mod tests {
             lightning_jump: false,
         }];
         // Uniform 30 px/interval eastward flow; at 1 km/px the compensated
-        // hypothesis lands 30 km from the stationary successor — outside
-        // the 20 km base gate, so pass 1 alone would orphan the track.
+        // hypothesis lands 30 km from the stationary successor — far
+        // outside the pass-1 residual gate (6 km at 300 s), so pass 1
+        // alone would orphan the track; the raw-position pass rescues it
+        // (0 km ≤ the 13.5 km raw gate).
         let field = MotionField {
             block: 16,
             bw: 2,
