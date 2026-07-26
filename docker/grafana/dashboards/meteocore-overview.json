@@ -6,7 +6,7 @@
     "meteocore"
   ],
   "schemaVersion": 39,
-  "version": 2,
+  "version": 3,
   "refresh": "30s",
   "time": {
     "from": "now-3h",
@@ -668,7 +668,7 @@
       "id": 14,
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 24,
         "x": 0,
         "y": 22
       },
@@ -709,15 +709,28 @@
       ]
     },
     {
+      "type": "row",
+      "title": "EDR — hot path (probes, cross-sections, obs, lightning)",
+      "id": 47,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      },
+      "panels": []
+    },
+    {
       "type": "timeseries",
-      "title": "EDR position queries — rate and p95",
-      "description": "Point/time-series queries (map click / hover). Cheap since #463 (decoded-chunk cache) — a rising p95 here with PVOL collections in play suggests pixel-cache eviction (#476).",
-      "id": 15,
+      "title": "EDR data queries — rate by route",
+      "description": "Every registered EDR data route, one series each: position = radar probes + obs point queries (incl. instance-scoped), area = lightning windows, locations = station time series, trajectory = vertical cross-sections. Metadata routes excluded.",
+      "id": 48,
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 22
+        "w": 8,
+        "x": 0,
+        "y": 31
       },
       "datasource": {
         "type": "prometheus",
@@ -725,12 +738,13 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
           "custom": {
             "fillOpacity": 10,
             "lineWidth": 2,
             "showPoints": "never"
-          }
+          },
+          "unit": "reqps",
+          "min": 0
         },
         "overrides": []
       },
@@ -748,14 +762,108 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(http_requests_total{path=\"/edr/collections/{id}/position\"}[5m]))",
+          "expr": "sum by (path) (rate(http_requests_total{path=~\"/edr/.+/(position|area|trajectory|locations.*)\"}[$__rate_interval]))",
           "refId": "A",
-          "legendFormat": "req/s"
+          "legendFormat": "{{path}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "EDR latency — p95 by route",
+      "description": "p95 per EDR data route. Position on a PVOL collection (cross-sections ride the trajectory route) resamples polar volumes (expect tens of ms warm, seconds after an S3 fetch); lightning area is a single indexed SQL window (ms). A route drifting up under steady rate = engine or DB regression, not client load.",
+      "id": 49,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 31
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, path) (rate(http_request_duration_seconds_bucket{path=~\"/edr/.+/(position|area|trajectory|locations.*)\"}[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "{{path}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "EDR errors — 4xx / 5xx by route",
+      "description": "4xx on area routes includes the PostGIS response-value budget rejection (QueryTooLarge 400) — a rise usually means a client widening its area x parameters x time window, not a server fault. Any 5xx is ours: read the logs.",
+      "id": 50,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 31
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "min": 0,
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (path) (rate(http_requests_total{path=~\"/edr/.+/(position|area|trajectory|locations.*)\", status=~\"4..\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "4xx {{path}}"
         },
         {
-          "expr": "histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket{path=\"/edr/collections/{id}/position\"}[5m])))",
+          "expr": "sum by (path) (rate(http_requests_total{path=~\"/edr/.+/(position|area|trajectory|locations.*)\", status=~\"5..\"}[$__rate_interval]))",
           "refId": "B",
-          "legendFormat": "p95 (s)"
+          "legendFormat": "5xx {{path}}"
         }
       ]
     },
@@ -768,7 +876,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 30
+        "y": 39
       },
       "panels": []
     },
@@ -781,7 +889,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 31
+        "y": 40
       },
       "datasource": {
         "type": "prometheus",
@@ -837,7 +945,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 31
+        "y": 40
       },
       "datasource": {
         "type": "prometheus",
@@ -889,7 +997,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 39
+        "y": 48
       },
       "datasource": {
         "type": "prometheus",
@@ -942,7 +1050,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 39
+        "y": 48
       },
       "datasource": {
         "type": "prometheus",
@@ -995,7 +1103,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 47
+        "y": 56
       },
       "datasource": {
         "type": "loki",
@@ -1028,7 +1136,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 56
+        "y": 65
       },
       "panels": []
     },
@@ -1041,7 +1149,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 57
+        "y": 66
       },
       "datasource": {
         "type": "prometheus",
@@ -1141,7 +1249,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 57
+        "y": 66
       },
       "datasource": {
         "type": "prometheus",
@@ -1239,7 +1347,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 57
+        "y": 66
       },
       "datasource": {
         "type": "prometheus",
@@ -1339,7 +1447,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 65
+        "y": 74
       },
       "datasource": {
         "type": "prometheus",
@@ -1395,7 +1503,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 65
+        "y": 74
       },
       "datasource": {
         "type": "prometheus",
@@ -1468,7 +1576,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 81
+        "y": 90
       },
       "panels": []
     },
@@ -1481,7 +1589,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 82
+        "y": 91
       },
       "datasource": {
         "type": "prometheus",
@@ -1547,7 +1655,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 82
+        "y": 91
       },
       "datasource": {
         "type": "prometheus",
@@ -1593,7 +1701,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 90
+        "y": 99
       },
       "datasource": {
         "type": "prometheus",
@@ -1640,7 +1748,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 90
+        "y": 99
       },
       "datasource": {
         "type": "prometheus",
@@ -1687,7 +1795,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 94
+        "y": 103
       },
       "panels": []
     },
@@ -1700,7 +1808,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 95
+        "y": 104
       },
       "datasource": {
         "type": "prometheus",
@@ -1751,7 +1859,7 @@
         "h": 8,
         "w": 10,
         "x": 4,
-        "y": 95
+        "y": 104
       },
       "datasource": {
         "type": "prometheus",
@@ -1806,13 +1914,13 @@
     {
       "type": "timeseries",
       "title": "Health pings & metadata refreshes — failures",
-      "description": "Failed pings flip /health; failed refreshes keep the previous snapshot (locations go stale). Both should be flat 0.",
+      "description": "Failed pings flip /health; failed refreshes keep the previous snapshot (locations go stale). Both should be flat 0. Success rates included so a flat zero failure line is distinguishable from nothing running at all.",
       "id": 36,
       "gridPos": {
         "h": 8,
         "w": 10,
         "x": 14,
-        "y": 95
+        "y": 104
       },
       "datasource": {
         "type": "prometheus",
@@ -1856,6 +1964,294 @@
           "expr": "max(postgis_metadata_refresh_seconds)",
           "refId": "C",
           "legendFormat": "last refresh duration (s)"
+        },
+        {
+          "expr": "sum(rate(postgis_pings_total[$__rate_interval]))",
+          "refId": "D",
+          "legendFormat": "pings/s (all pools)"
+        },
+        {
+          "expr": "sum(rate(postgis_metadata_refreshes_total[$__rate_interval]))",
+          "refId": "E",
+          "legendFormat": "refreshes/s (all pools)"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Nowcast (derived collections)",
+      "id": 41,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 112
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Lead-1 skill — nowcast vs persistence CSI",
+      "description": "Realized 5-min skill (#542): each generation scores the PREVIOUS one's lead-1 prediction against the fresh analysis, next to the persistence baseline. The nowcast line must sit above its baseline; a collapsing gap = motion or source-data regression — check here before blaming the client.",
+      "id": 42,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 113
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "percentunit",
+          "max": 1,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "nowcast_lead1_csi_permille / 1000",
+          "refId": "A",
+          "legendFormat": "{{collection}} — nowcast"
+        },
+        {
+          "expr": "nowcast_lead1_persistence_csi_permille / 1000",
+          "refId": "B",
+          "legendFormat": "{{collection}} — persistence"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Generation duration vs 5-min cadence",
+      "description": "Wall-clock of the newest generation. Must stay comfortably under the source cadence (300 s for the FMI composite, marked) — above it, generations queue and the served TIME axis lags reality.",
+      "id": 43,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 113
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "unit": "s",
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 300
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "nowcast_last_generation_duration_ms / 1000",
+          "refId": "A",
+          "legendFormat": "{{collection}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Generations & failures — per hour",
+      "description": "Steady ~12/h per collection at a 5-min source cadence; dips = skipped/missed source frames. Any nonzero failure rate deserves a log read (source fetch or extrapolation error — the engine serves the previous generation meanwhile).",
+      "id": 44,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 121
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(nowcast_generations_total[$__rate_interval]) * 3600",
+          "refId": "A",
+          "legendFormat": "{{collection}} — generations/h"
+        },
+        {
+          "expr": "rate(nowcast_generation_failures_total[$__rate_interval]) * 3600",
+          "refId": "B",
+          "legendFormat": "{{collection}} — failures/h"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Source lag",
+      "description": "Age of the source anchor frame when the generation finished — upstream feed latency plus generation time. Sustained growth = the source stalled; the nowcast keeps serving but its anchor (and every future frame) goes stale with it.",
+      "id": 45,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 121
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "nowcast_source_lag_seconds",
+          "refId": "A",
+          "legendFormat": "{{collection}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Retention — generations & frames",
+      "description": "Retained generations (the DIM_REFERENCE_TIME pinning window — resident memory multiplies with it, see the engine-nowcast sizing rule) and frames (analysis + leads) in the newest generation.",
+      "id": 46,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 121
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "nowcast_retained_generations",
+          "refId": "A",
+          "legendFormat": "{{collection}} — generations"
+        },
+        {
+          "expr": "nowcast_frames",
+          "refId": "B",
+          "legendFormat": "{{collection}} — frames"
         }
       ]
     },
@@ -1868,7 +2264,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 103
+        "y": 129
       },
       "panels": []
     },
@@ -1881,7 +2277,7 @@
         "h": 9,
         "w": 24,
         "x": 0,
-        "y": 104
+        "y": 130
       },
       "datasource": {
         "type": "loki",
@@ -1914,7 +2310,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 113
+        "y": 139
       },
       "datasource": {
         "type": "loki",
@@ -1941,13 +2337,13 @@
     {
       "type": "timeseries",
       "title": "Process memory — RSS, swap & allocator accounting",
-      "description": "Verifies the #493 fix (jemalloc). Healthy: process RSS ≈ jemalloc resident, and resident within ~1.5× of allocated (live application bytes). resident ≫ allocated = allocator retention/fragmentation (the glibc failure mode was ~3×). RSS ≫ jemalloc resident = memory outside the allocator (mmap'd files, thread stacks). Sustained process swap > 0 = host memory pressure — check what else grew on the box. 'live cache bytes' is the sum of every byte-bounded cache family, the floor the process can't go below.",
+      "description": "Verifies the #493 fix (jemalloc). Healthy: process RSS ≈ jemalloc resident, and resident within ~1.5× of allocated (live application bytes). resident ≫ allocated = allocator retention/fragmentation (the glibc failure mode was ~3×). RSS ≫ jemalloc resident = memory outside the allocator (mmap'd files, thread stacks). Sustained process swap > 0 = host memory pressure — check what else grew on the box. 'live cache bytes' is the sum of every byte-bounded cache family, the floor the process can't go below. mapped-resident = returned to the OS; retained growing without allocated = arena fragmentation (the 2026-07-06 incident signature, MALLOC_ARENA/jemalloc watch).",
       "id": 40,
       "gridPos": {
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 73
+        "y": 82
       },
       "datasource": {
         "type": "prometheus",
@@ -2003,6 +2399,21 @@
           "expr": "sum({__name__=~\".+_cache_bytes\"})",
           "refId": "E",
           "legendFormat": "live cache bytes"
+        },
+        {
+          "expr": "jemalloc_mapped_bytes",
+          "refId": "F",
+          "legendFormat": "jemalloc mapped"
+        },
+        {
+          "expr": "jemalloc_retained_bytes",
+          "refId": "G",
+          "legendFormat": "jemalloc retained"
+        },
+        {
+          "expr": "jemalloc_active_bytes",
+          "refId": "H",
+          "legendFormat": "jemalloc active"
         }
       ]
     }
