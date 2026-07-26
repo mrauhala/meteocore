@@ -1185,6 +1185,13 @@ impl MapEngine for NowcastEngine {
 /// Build one cell feature: lon/lat from the grid geometry plus the served
 /// property set. Shared by `get_features` and `get_feature` so the two
 /// paths cannot drift (and the by-id path needn't materialize every cell).
+/// Round to `places` decimals — serde's shortest-roundtrip float printing
+/// then emits the short form (`14.3`, not `14.300000000000001`).
+fn round_to(v: f64, places: i32) -> f64 {
+    let f = 10f64.powi(places);
+    (v * f).round() / f
+}
+
 fn cell_feature(
     t: &CellTrack,
     g: GridGeom,
@@ -1193,8 +1200,14 @@ fn cell_feature(
     anchor: DateTime<Utc>,
     lightning: bool,
 ) -> (f64, f64, Feature) {
+    // Emit each value at its MEANINGFUL precision, not the f64 bit depth:
+    // the working grid is ~500 m (5 lon/lat decimals ≈ 1 m), centroids
+    // jitter tenths of km², velocities tenths of m/s, bearings whole
+    // degrees. Raw f64s roughly double the GeoJSON payload for noise.
     let lon = g.west + (f64::from(t.blob.centroid.0) / f64::from(g.width)) * (g.east - g.west);
     let lat = g.north - (f64::from(t.blob.centroid.1) / f64::from(g.height)) * (g.north - g.south);
+    let lon = round_to(lon, 5);
+    let lat = round_to(lat, 5);
     let mut props = std::collections::HashMap::new();
     props.insert(
         "severity".into(),
@@ -1206,20 +1219,20 @@ fn cell_feature(
     );
     props.insert(
         "area_km2".into(),
-        PropertyValue::Float(t.blob.area as f64 * kx * ky),
+        PropertyValue::Float(round_to(t.blob.area as f64 * kx * ky, 1)),
     );
     props.insert("track_age".into(), PropertyValue::Integer(t.age as i64));
     props.insert("deviant_mover".into(), PropertyValue::Bool(t.deviant()));
     props.insert(
         "speed_ms".into(),
         t.speed_ms()
-            .map(|v| PropertyValue::Float(f64::from(v)))
+            .map(|v| PropertyValue::Float(round_to(f64::from(v), 1)))
             .unwrap_or(PropertyValue::Null),
     );
     props.insert(
         "bearing_deg".into(),
         t.bearing_deg()
-            .map(PropertyValue::Float)
+            .map(|b| PropertyValue::Float(round_to(b, 0) % 360.0))
             .unwrap_or(PropertyValue::Null),
     );
     props.insert(
@@ -1241,7 +1254,7 @@ fn cell_feature(
     props.insert(
         "intensity_trend_dbz_min".into(),
         if t.age >= 2 {
-            PropertyValue::Float(f64::from(t.intensity_tendency) * 60.0)
+            PropertyValue::Float(round_to(f64::from(t.intensity_tendency) * 60.0, 3))
         } else {
             PropertyValue::Null
         },
@@ -1259,7 +1272,7 @@ fn cell_feature(
         props.insert(
             "flash_rate_per_min".into(),
             t.flash_rate_per_min
-                .map(|r| PropertyValue::Float(f64::from(r)))
+                .map(|r| PropertyValue::Float(round_to(f64::from(r), 2)))
                 .unwrap_or(PropertyValue::Null),
         );
         props.insert(

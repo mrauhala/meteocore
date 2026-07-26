@@ -748,6 +748,29 @@ fn cell_features_are_served_and_tracks_persist() {
     assert!(engine.get_feature(&id1).is_ok());
     assert!(engine.get_feature("9999").is_err());
 
+    // Precision contract: values are emitted at meaningful precision,
+    // not f64 bit depth (speed 0.1 m/s, bearing whole degrees in
+    // [0, 360), area 0.1 km², coordinates 1e-5 deg).
+    let frac_ok = |v: f64, f: f64| (v * f - (v * f).round()).abs() < 1e-9;
+    match f.properties.get("speed_ms") {
+        Some(PropertyValue::Float(v)) => assert!(frac_ok(*v, 10.0), "speed {v}"),
+        other => panic!("age-2 cell must report speed, got {other:?}"),
+    }
+    match f.properties.get("bearing_deg") {
+        Some(PropertyValue::Float(b)) => {
+            assert!(frac_ok(*b, 1.0) && (0.0..360.0).contains(b), "bearing {b}")
+        }
+        other => panic!("age-2 cell must report bearing, got {other:?}"),
+    }
+    match f.properties.get("area_km2") {
+        Some(PropertyValue::Float(a)) => assert!(frac_ok(*a, 10.0), "area {a}"),
+        other => panic!("missing area, got {other:?}"),
+    }
+    let ds_core::feature::Geometry::Point { x, y } = *f.geometry else {
+        panic!("cell geometry must be a Point");
+    };
+    assert!(frac_ok(x, 1e5) && frac_ok(y, 1e5), "coords {x},{y}");
+
     // History (#548): an interval before the latest snapshot selects the
     // OLDER retained snapshot (age-1 cells, observed at anchor1); an
     // interval before all snapshots matches nothing.
