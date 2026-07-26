@@ -27,13 +27,13 @@ pub const CELL_MIN_AREA_PX: usize = 10;
 /// gate allowed 66 m/s implied cell speeds — gate-edge mismatches read as
 /// 200+ km/h storms on the client (observed live 2026-07-26).
 ///
-/// Fastest real cell motion (extreme bow echoes) ≈ 35 m/s; the raw-
+/// Fastest real cell motion (extreme bow echoes) ≈ 35 m/s — the raw-
 /// position gate uses [`MAX_CELL_SPEED_MS`]. After pass-1 motion
 /// compensation the prediction has already absorbed advection, so only a
 /// small residual is legitimate ([`COMPENSATED_RESIDUAL_SPEED_MS`]).
 /// [`BASE_GATE_KM`] absorbs centroid jitter from footprint changes at
 /// small elapsed times.
-pub const MAX_CELL_SPEED_MS: f32 = 30.0;
+pub const MAX_CELL_SPEED_MS: f32 = 35.0;
 pub const COMPENSATED_RESIDUAL_SPEED_MS: f32 = 10.0;
 pub const BASE_GATE_KM: f32 = 3.0;
 /// Residual speed (m/s) between cell track and ambient field that counts
@@ -514,7 +514,7 @@ mod tests {
         };
         let scale = PixelScale { x: 1.0, y: 1.0 };
 
-        // 15 km jump in 300 s (50 m/s implied): outside the 12 km raw
+        // 15 km jump in 300 s (50 m/s implied): outside the 13.5 km raw
         // gate — the track dies and the blob is born fresh.
         let previous = vec![bare_track(1, 0.0, 0.0)];
         let far = CellBlob {
@@ -531,11 +531,11 @@ mod tests {
         assert_eq!(tracks[0].age, 1, "50 m/s implied match must be rejected");
         assert_ne!(tracks[0].id, 1);
 
-        // 10 km in 300 s (33.3 m/s): inside the raw gate, but the folded
-        // velocity is clamped to MAX_CELL_SPEED_MS with the direction
-        // (due east) preserved.
+        // 12 km in 300 s (40 m/s): inside the 13.5 km raw gate, but the
+        // folded velocity is clamped to MAX_CELL_SPEED_MS with the
+        // direction (due east) preserved.
         let near = CellBlob {
-            centroid: (10.0, 0.0),
+            centroid: (12.0, 0.0),
             area: 20,
             volume: 800.0,
             max_value: 42.0,
@@ -585,7 +585,7 @@ mod tests {
         // hypothesis lands 30 km from the stationary successor — far
         // outside the pass-1 residual gate (6 km at 300 s), so pass 1
         // alone would orphan the track; the raw-position pass rescues it
-        // (0 km ≤ the 12 km raw gate).
+        // (0 km ≤ the 13.5 km raw gate).
         let field = MotionField {
             block: 16,
             bw: 2,
