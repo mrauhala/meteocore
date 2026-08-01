@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use ds_core::model::{CoverageResponse, DomainDescription, Location, QueryResult, VerticalCoord};
 use serde_json::{json, Map, Number, Value};
 
@@ -129,9 +131,21 @@ fn build_ndarray(ndarray: &ds_core::model::NdArray) -> Value {
     Value::Object(obj)
 }
 
+/// Iterate a per-query `HashMap` in sorted key order. This workspace's
+/// serde_json is built with `preserve_order` (pulled in by zarrs), so
+/// insertion order IS the wire order — and a fresh `HashMap`'s iteration
+/// order differs per instance. Without sorting, byte-identical queries would
+/// serialize in different key orders and the content-derived ETag would
+/// never revalidate (#499).
+fn sorted<V>(map: &HashMap<String, V>) -> Vec<(&String, &V)> {
+    let mut entries: Vec<_> = map.iter().collect();
+    entries.sort_by_key(|(name, _)| *name);
+    entries
+}
+
 fn build_parameters(result: &QueryResult) -> Map<String, Value> {
     let mut parameters = Map::with_capacity(result.parameters.len());
-    for (name, desc) in &result.parameters {
+    for (name, desc) in sorted(&result.parameters) {
         parameters.insert(
             name.clone(),
             build_parameter(&desc.label, &desc.unit, &desc.observed_property),
@@ -142,7 +156,7 @@ fn build_parameters(result: &QueryResult) -> Map<String, Value> {
 
 fn build_ranges(result: &QueryResult) -> Map<String, Value> {
     let mut ranges = Map::with_capacity(result.ranges.len());
-    for (name, ndarray) in &result.ranges {
+    for (name, ndarray) in sorted(&result.ranges) {
         ranges.insert(name.clone(), build_ndarray(ndarray));
     }
     ranges

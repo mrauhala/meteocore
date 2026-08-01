@@ -1,3 +1,4 @@
+pub mod caching;
 pub mod handlers;
 pub mod params;
 pub(crate) mod plot_convert;
@@ -42,5 +43,7 @@ pub fn router(state: AppState) -> Router {
             "/collections/{id}/instances/{instanceId}/area",
             get(handlers::instance_area_query),
         )
+        // Cache-Control + ETag/If-None-Match on every 200 (#499).
+        .layer(axum::middleware::from_fn(caching::conditional_get))
         .with_state(state)
 }

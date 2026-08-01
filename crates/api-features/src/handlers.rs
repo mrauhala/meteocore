@@ -691,6 +691,16 @@ pub async fn items(
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = params.offset.unwrap_or(0);
 
+    // Cache-Control policy (#499): a settled window (closed datetime interval
+    // entirely in the past) gets the long policy, everything else the short
+    // one — captured before `datetime` moves into the query.
+    let (window_start, window_end) = datetime
+        .as_ref()
+        .map(|d| (d.start, d.end))
+        .unwrap_or((None, None));
+    let cache_control =
+        ds_core::http_cache::data_cache_control(window_start, window_end, Utc::now());
+
     let query = FeatureQuery {
         bbox,
         limit,
@@ -705,15 +715,36 @@ pub async fn items(
         )
     })?;
 
-    let timestamp = Utc::now().to_rfc3339();
-    Ok(GeoJsonResponse(feature_page_to_geojson(
+    // Hash the ETag over the document with an empty `timeStamp` placeholder:
+    // the field is the response *generation* time, so a hash over the final
+    // body would change on every request and `If-None-Match` would never
+    // match. The `caching::conditional_get` middleware honours this
+    // precomputed ETag instead of hashing the body.
+    let mut doc = feature_page_to_geojson(
         &page,
         &id,
         limit,
         offset,
-        &timestamp,
+        "",
         &request_base_url(&state, &headers),
-    )))
+    );
+    let etag = ds_core::http_cache::etag_of(
+        serde_json::to_string(&doc)
+            .expect("GeoJSON Value serializes")
+            .as_bytes(),
+    );
+    doc["timeStamp"] = json!(Utc::now().to_rfc3339());
+
+    let mut resp = GeoJsonResponse(doc).into_response();
+    resp.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&etag).expect("quoted-hex etag is a valid header value"),
+    );
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
+    Ok(resp)
 }
 
 pub async fn item(
