@@ -550,7 +550,10 @@ fn str_list(items: &[String]) -> PropertyValue {
 
 fn insert_time(p: &mut HashMap<String, PropertyValue>, key: &str, t: Option<DateTime<Utc>>) {
     if let Some(t) = t {
-        p.insert(key.to_string(), PropertyValue::String(t.to_rfc3339()));
+        p.insert(
+            key.to_string(),
+            PropertyValue::String(t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        );
     }
 }
 
