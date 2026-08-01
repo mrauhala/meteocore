@@ -24,6 +24,9 @@ use bytes::Bytes;
 use chrono::{DateTime, SecondsFormat, Utc};
 use ds_core::config::CollectionConfig;
 use ds_core::geo::geodetic_to_ecef;
+// Strong content-derived ETag; shared with api-edr/api-features so the
+// implementations cannot drift (#499).
+use ds_core::http_cache::etag_of;
 use ds_core::volume::VolumeEngine;
 use ds_render::{BuiltinColormap, ColorMap, ColorStop, LutColorMap};
 use serde::Deserialize;
@@ -394,20 +397,6 @@ fn parse_datetime(s: &str) -> Result<DateTime<Utc>, Tiles3dError> {
         .map_err(|_| Tiles3dError::BadRequest(format!("invalid datetime: {s:?}")))
 }
 
-/// Strong content-derived ETag — quoted hex with no `W/` prefix (the bytes are
-/// exact, so byte-equal responses are equivalent per RFC 7232 §2.1). FNV-1a
-/// 64-bit — stable across Rust versions and instances (unlike `DefaultHasher`),
-/// so a toolchain upgrade or a mixed-version fleet doesn't silently invalidate
-/// ETags.
-fn etag_of(bytes: &[u8]) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("\"{h:016x}\"")
-}
-
 /// The `Cache-Control` for a response: content pinned to an **exactly
 /// advertised** volume time is an archived volume that never changes, so let
 /// browsers hold it for a day without revalidating (`immutable`) — exactly the
@@ -453,7 +442,7 @@ fn binary_response(
     let not_modified = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|h| h.to_str().ok())
-        .is_some_and(|v| v == "*" || v.split(',').any(|t| t.trim() == etag));
+        .is_some_and(|v| ds_core::http_cache::if_none_match_matches(v, etag));
     if not_modified {
         return (
             StatusCode::NOT_MODIFIED,

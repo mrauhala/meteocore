@@ -9,6 +9,7 @@ pub mod feature;
 pub mod feature_engine;
 pub mod geo;
 pub mod html;
+pub mod http_cache;
 pub mod instances;
 pub mod map_engine;
 pub mod model;

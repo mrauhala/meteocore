@@ -64,3 +64,27 @@ owns the instance-id string form:
   → 404 (an empty PointSeries would fail schema validation).
 - When adding endpoints or params, update `api_definition()` in
   `src/handlers.rs` (OpenAPI).
+
+## Caching headers (#499)
+
+Every 200 carries `Cache-Control` + a strong content-derived ETag, and a
+matching `If-None-Match` short-circuits to 304 — added by the
+`caching::conditional_get` middleware wrapping the whole router (an
+intentional near-twin of `api-features/src/caching.rs`; the pure pieces are
+shared via `ds_core::http_cache`). Policy:
+
+- Default (metadata, "latest"/open-ended queries): `public, max-age=60`.
+- *Settled* data queries — closed `datetime` interval whose end is ≥1 h in
+  the past — get `public, max-age=86400` via `with_data_cache_control` in the
+  data-query handlers. Never `immutable`: observations back-fill and rolling
+  retention prunes, so the response can still change; expiry + ETag
+  revalidation bounds the staleness to a day.
+- A 304 still recomputes the query (no content cache at this layer — EDR
+  query keys barely repeat, #202); it saves the transfer, and `max-age`
+  saves the request.
+
+A new handler needs no caching code unless its 200 body embeds a per-request
+value (a generation timestamp, a random id): a body-hash ETag then never
+matches, so precompute the ETag over the body with that field blanked and
+set the `ETag` header yourself — the middleware honours it (see the
+Features `items` handler).

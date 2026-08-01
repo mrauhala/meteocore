@@ -98,6 +98,33 @@ fn with_vary(mut resp: Response) -> Response {
     resp
 }
 
+/// Attach the data-query `Cache-Control` policy (#499) to a success response:
+/// a settled window (closed `datetime` interval entirely in the past) gets the
+/// long policy, everything else the short one. `datetime` is the parsed
+/// request interval; the `parse_datetime_interval` open-bound sentinels
+/// (`MIN_UTC`/`MAX_UTC`) map back to "open" for
+/// [`ds_core::http_cache::data_cache_control`]. Metadata endpoints don't call
+/// this — they fall through to the middleware's short default
+/// (`caching::conditional_get`).
+fn with_data_cache_control(
+    mut resp: Response,
+    datetime: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+) -> Response {
+    let (start, end) = match datetime {
+        Some((s, e)) => (
+            (s != chrono::DateTime::<chrono::Utc>::MIN_UTC).then_some(s),
+            (e != chrono::DateTime::<chrono::Utc>::MAX_UTC).then_some(e),
+        ),
+        None => (None, None),
+    };
+    let cc = ds_core::http_cache::data_cache_control(start, end, chrono::Utc::now());
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static(cc),
+    );
+    resp
+}
+
 /// Shared state for the EDR API: a registry of collection engines + metadata.
 #[derive(Clone)]
 pub struct EdrState {
@@ -1177,6 +1204,7 @@ pub async fn location_query(
 
     let format = parse_edr_format(params.f.as_deref()).map_err(|e| bad_request(&e))?;
     render_coverage_response(result, format, params.width, params.height)
+        .map(|r| with_data_cache_control(r, datetime))
 }
 
 pub async fn position_query(
@@ -1272,7 +1300,8 @@ async fn run_position_query(
                 reference_time,
             )
             .map_err(|e| map_engine_error(&e))?;
-        return render_coverage_response(result, format, params.width, params.height);
+        return render_coverage_response(result, format, params.width, params.height)
+            .map(|r| with_data_cache_control(r, datetime));
     }
 
     // MULTIPOINT — fan out one query per point and flatten every point's
@@ -1300,6 +1329,7 @@ async fn run_position_query(
         params.width,
         params.height,
     )
+    .map(|r| with_data_cache_control(r, datetime))
 }
 
 pub async fn area_query(
@@ -1395,9 +1425,13 @@ async fn run_area_query(
         tracing::error!("Area CoverageJSON serialise error: {e}");
         server_error()
     })?;
-    Ok((
-        [(header::CONTENT_TYPE, "application/prs.coverage+json")],
-        body,
+    Ok(with_data_cache_control(
+        (
+            [(header::CONTENT_TYPE, "application/prs.coverage+json")],
+            body,
+        )
+            .into_response(),
+        datetime,
     ))
 }
 
@@ -1510,11 +1544,14 @@ pub async fn trajectory_query(
                 tracing::error!("Trajectory CoverageJSON serialise error: {e}");
                 server_error()
             })?;
-            Ok((
-                [(header::CONTENT_TYPE, "application/prs.coverage+json")],
-                body,
-            )
-                .into_response())
+            Ok(with_data_cache_control(
+                (
+                    [(header::CONTENT_TYPE, "application/prs.coverage+json")],
+                    body,
+                )
+                    .into_response(),
+                datetime,
+            ))
         }
         EdrFormat::Png => {
             // Render the cross-section as a colour-mapped heatmap using
@@ -1534,7 +1571,10 @@ pub async fn trajectory_query(
                 tracing::error!("Trajectory PNG render error: {e}");
                 server_error()
             })?;
-            Ok(([(header::CONTENT_TYPE, "image/png")], png).into_response())
+            Ok(with_data_cache_control(
+                ([(header::CONTENT_TYPE, "image/png")], png).into_response(),
+                datetime,
+            ))
         }
     }
 }
@@ -1632,8 +1672,15 @@ fn build_collection_metadata(
         extent.insert("vertical".to_string(), json!(vertical_obj));
     }
 
-    let parameter_names: serde_json::Map<String, serde_json::Value> = param_descs
-        .iter()
+    // Sorted iteration: serde_json's workspace-enabled `preserve_order` makes
+    // insertion order the wire order, and `get_parameter_descriptions` builds
+    // a fresh HashMap per call — unsorted, byte-identical requests would
+    // serialize differently and the content-derived ETag would never
+    // revalidate (#499).
+    let mut sorted_descs: Vec<_> = param_descs.iter().collect();
+    sorted_descs.sort_by_key(|(name, _)| *name);
+    let parameter_names: serde_json::Map<String, serde_json::Value> = sorted_descs
+        .into_iter()
         .map(|(name, desc)| {
             let mut param = json!({
                 "type": "Parameter",

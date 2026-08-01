@@ -55,9 +55,15 @@ fn geometry_to_json(g: &Geometry) -> Value {
 }
 
 pub fn feature_to_geojson(feature: &Feature, collection_id: &str, base_url: &str) -> Value {
-    let properties: serde_json::Map<String, Value> = feature
-        .properties
-        .iter()
+    // Sorted iteration: serde_json's workspace-enabled `preserve_order` makes
+    // insertion order the wire order, and engines build each feature's
+    // property HashMap fresh per request — unsorted, byte-identical requests
+    // would serialize differently and the content-derived ETag would never
+    // revalidate (#499).
+    let mut entries: Vec<_> = feature.properties.iter().collect();
+    entries.sort_by_key(|(k, _)| *k);
+    let properties: serde_json::Map<String, Value> = entries
+        .into_iter()
         .map(|(k, v)| (k.clone(), property_value_to_json(v)))
         .collect();
 
