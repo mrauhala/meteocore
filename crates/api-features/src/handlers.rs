@@ -733,7 +733,11 @@ pub async fn items(
             .expect("GeoJSON Value serializes")
             .as_bytes(),
     );
-    doc["timeStamp"] = json!(Utc::now().to_rfc3339());
+    // Seconds precision with a `Z` suffix (2026-08-01T20:26:39Z) — sub-second
+    // precision is noise for a response-generation stamp, and `Z` matches the
+    // temporal-extent formatting elsewhere. Caching-neutral: the ETag above is
+    // computed with `timeStamp` blanked.
+    doc["timeStamp"] = json!(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
 
     let mut resp = GeoJsonResponse(doc).into_response();
     resp.headers_mut().insert(
