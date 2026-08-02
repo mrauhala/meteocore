@@ -3247,7 +3247,9 @@ impl PolarVolumeEngine {
             "latest_volume_time".into(),
             meta.times
                 .last()
-                .map(|t| PropertyValue::String(t.to_rfc3339()))
+                .map(|t| {
+                    PropertyValue::String(t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                })
                 .unwrap_or(PropertyValue::Null),
         );
         props.insert(

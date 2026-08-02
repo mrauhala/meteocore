@@ -1239,7 +1239,7 @@ fn cell_feature(
     );
     props.insert(
         "observed".into(),
-        PropertyValue::String(anchor.to_rfc3339()),
+        PropertyValue::String(anchor.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
     );
     // Lifecycle as DATA, not field modification: three gate runs showed
     // tendency extrapolation loses to pure advection (#546), but the
