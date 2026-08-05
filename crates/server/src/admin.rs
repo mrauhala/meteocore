@@ -2893,12 +2893,12 @@ fn build_colormap_from_wms_config(
 
     // Fall back to built-in colormap name
     let name = colormap_name.unwrap_or("viridis");
-    if let Some(builtin) = ds_render::colormap::resolve_builtin(name) {
-        let stops = ds_render::colormap::builtin_stops(&builtin);
+    if let Some(palette) = ds_render::builtin_palette(name) {
+        let stops = &palette.stops;
         let min = min_override.unwrap_or_else(|| stops.first().map(|s| s.value).unwrap_or(0.0));
         let max = max_override.unwrap_or_else(|| stops.last().map(|s| s.value).unwrap_or(1.0));
         let cmap: Arc<dyn ds_render::ColorMap> =
-            Arc::new(ds_render::LutColorMap::from_builtin(builtin, min, max));
+            Arc::new(ds_render::LutColorMap::from_palette(palette, min, max));
         return (maybe_wrap_integer_lut(cmap, min, max), min, max);
     }
 

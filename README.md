@@ -1217,15 +1217,21 @@ Styles live under each collection's `[wms]` block — Maps and Tiles read the sa
 | Name | Description | Default range |
 |------|-------------|---------------|
 | `radar_dbz` | Standard radar reflectivity ramp | 0–70 dBZ |
-| `radar_smhi` | SMHI radar reflectivity ramp | 0–70 dBZ |
-| `radar_fmi` | FMI radar reflectivity ramp | 0–70 dBZ |
-| `radar_bookbinder` | Bookbinder radar ramp | 0–70 dBZ |
+| `radar_smhi` | SMHI radar reflectivity ramp (gray below-threshold) | -30–70 dBZ |
+| `radar_fmi` | FMI summer radar reflectivity ramp | -32–58 dBZ |
+| `radar_bookbinder` | Bookbinder 8-bit Z curve | -32–94.5 dBZ |
+| `radial_velocity` | Doppler radial velocity, diverging blue → white → red | ±48 m/s |
 | `grayscale` | Linear black → white | 0–1 |
 | `viridis` | Perceptually uniform (good default) | 0–1 |
 | `temperature` | Purple → blue → cyan → green → yellow → red | -40 to 50 °C |
 | `precipitation` | Transparent → blue → purple → white | 0–50 mm |
-| `precipitation_rate` | Precipitation-rate ramp | 0–50 mm/h |
+| `precipitation_rate` | Precipitation-rate ramp | 0–30 mm/h |
 | `wind_speed` | Green → yellow → orange → red → purple | 0–50 m/s |
+| `pressure` | Mean sea-level pressure, purple low → neutral → red high | 950–1050 hPa |
+| `humidity` | Relative humidity, dry brown → pale → green → blue | 0–100 % |
+| `cloud_cover` | White overlay with increasing opacity | 0–100 % |
+| `cap_severity` | CAP alert severity codes, grey/green/yellow/orange/red | 0–4 |
+| `lightning_age` | Lightning strike age, near-white → orange → dark violet | 0–60 min |
 
 **Custom color stops** override the built-in colormap:
 

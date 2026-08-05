@@ -261,8 +261,8 @@ fn section_colormap(
         }
         // Then a named built-in.
         if let Some(name) = w.colormap.as_deref() {
-            if let Some(builtin) = ds_render::colormap::resolve_builtin(name) {
-                let stops = ds_render::colormap::builtin_stops(&builtin);
+            if let Some(palette) = ds_render::builtin_palette(name) {
+                let stops = &palette.stops;
                 let min = w
                     .min
                     .unwrap_or_else(|| stops.first().map(|s| s.value).unwrap_or(0.0));
@@ -270,7 +270,7 @@ fn section_colormap(
                     .max
                     .unwrap_or_else(|| stops.last().map(|s| s.value).unwrap_or(1.0));
                 return (
-                    Box::new(ds_render::LutColorMap::from_builtin(builtin, min, max)),
+                    Box::new(ds_render::LutColorMap::from_palette(palette, min, max)),
                     min,
                     max,
                 );
