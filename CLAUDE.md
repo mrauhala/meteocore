@@ -402,8 +402,9 @@ time_window = "-PT2H"
 max_files = 24
 
 [collections.wms]
-# Either attach a named style_bundle (defined above), or set colormap/styles
-# inline — mixing the two in one [wms] block is rejected at config load.
+# Attach a shared style_bundle and/or set inline fields — they merge
+# slot-wise (bundles v2), inline winning each slot it defines (palette
+# source, min, max; named styles union with inline winning name clashes).
 style_bundle = "radar_multi"
 # colormap = "radar_dbz"
 
@@ -467,8 +468,13 @@ Rules:
 - `[[style_bundles]]` is NOT allowed in per-collection files — only in
   `config.toml`. Referencing a bundle from a per-collection `[wms]` is fine;
   defining one is rejected with an explicit error.
-- A `style_bundle` cannot coexist with inline `[[wms.parameters]]` defaults on
-  the same collection (rejected at config load).
+- A `style_bundle` MERGES with inline `[wms]` fields (bundles v2): per
+  parameter and per slot (palette source / min / max), the chain is inline
+  `[[wms.parameters]]` → bundle `[[style_bundles.parameters]]` → inline
+  `[wms]` fields → bundle default. Named styles are the union of bundle
+  extras and inline `[[wms.styles]]`, inline winning name clashes. A bundle
+  carries shared per-parameter defaults via `[[style_bundles.parameters]]`
+  (same fields as `[[wms.parameters]]`; names must be unique per bundle).
 - Inside a bundle, an `[[style_bundles.extras]]` entry with a `parameter`
   field is scoped to that parameter's layer only; untagged extras are shared
   across every parameter layer.

@@ -1285,7 +1285,7 @@ Or attach a reusable `[[style_bundles]]` block defined in top-level `config.toml
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `style_bundle` | no | — | Name of a shared `[[style_bundles]]` block. Cannot coexist with the inline fields below. |
+| `style_bundle` | no | — | Name of a shared `[[style_bundles]]` block. Merges with the inline fields below (bundles v2): inline wins slot-wise (palette source / min / max), per parameter; named styles union with inline winning name clashes. Bundles can carry shared `[[style_bundles.parameters]]` blocks. |
 | `colormap` | no | `viridis` | Built-in colormap for the default style |
 | `color_stops` | no | — | Array of `{value, color}` entries. Overrides `colormap` for the default style. |
 | `min` | no | from colormap | Minimum value for the default style's range |

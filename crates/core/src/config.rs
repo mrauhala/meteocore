@@ -445,6 +445,13 @@ pub struct StyleBundle {
     /// collection that references this bundle.
     #[serde(default)]
     pub extras: Vec<StyleBundleExtra>,
+    /// Per-parameter default styles shared by every collection bound to
+    /// this bundle (bundles v2) — same shape as `[[wms.parameters]]`. An
+    /// inline `[[wms.parameters]]` entry with the same name wins slot-wise.
+    /// This is what lets N radar-volume collections share one ~500-line
+    /// per-moment style block instead of copy-pasting it.
+    #[serde(default)]
+    pub parameters: Vec<WmsParameterConfig>,
 }
 
 /// Default style inside a `StyleBundle`.
@@ -2118,6 +2125,23 @@ impl ServerConfig {
                     )));
                 }
             }
+            // Bundle per-parameter defaults (bundles v2): non-empty, unique
+            // names — duplicates would silently overwrite each other.
+            let mut param_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for p in &bundle.parameters {
+                if p.name.is_empty() {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Style bundle '{}': parameters entry has an empty 'name' field",
+                        bundle.id
+                    )));
+                }
+                if !param_names.insert(p.name.as_str()) {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Style bundle '{}': duplicate parameters entry '{}'",
+                        bundle.id, p.name
+                    )));
+                }
+            }
         }
 
         // Check for duplicate collection IDs
@@ -2525,25 +2549,17 @@ impl ServerConfig {
                 }
             }
 
-            // style_bundle: reference must resolve, must not mix with inline WMS style fields
+            // style_bundle: reference must resolve. Inline [wms] fields are
+            // ALLOWED next to a bundle since bundles v2 — they merge
+            // slot-wise, inline winning per slot (see
+            // ds_render::StyleContext), so a collection can e.g. bind a
+            // shared bundle and override only min/max or one parameter.
             if let Some(wms) = &collection.wms {
                 if let Some(bundle_ref) = &wms.style_bundle {
                     if !bundle_ids.contains(bundle_ref.as_str()) {
                         return Err(crate::error::DataServerError::Config(format!(
                             "Collection '{id}': style_bundle '{bundle_ref}' is not defined \
                              in [[style_bundles]]"
-                        )));
-                    }
-                    if wms.colormap.is_some()
-                        || !wms.color_stops.is_empty()
-                        || !wms.styles.is_empty()
-                        || !wms.parameters.is_empty()
-                        || wms.min.is_some()
-                        || wms.max.is_some()
-                    {
-                        return Err(crate::error::DataServerError::Config(format!(
-                            "Collection '{id}': style_bundle cannot be combined with inline \
-                             colormap/color_stops/min/max/styles/parameters in [wms]"
                         )));
                     }
                 }
@@ -3473,7 +3489,10 @@ style_bundle = "missing"
     }
 
     #[test]
-    fn style_bundle_cannot_be_mixed_with_inline_wms_fields() {
+    fn style_bundle_merges_with_inline_fields() {
+        // Bundles v2: inline [wms] fields and [[wms.styles]]/[[wms.parameters]]
+        // are allowed next to style_bundle — they merge slot-wise at style
+        // resolution (inline wins). The old mutual-exclusion error is gone.
         let tmp = TempDir::new().unwrap();
         let config_toml = format!(
             r#"
@@ -3497,60 +3516,69 @@ data_path = "/tmp"
 
 [collections.wms]
 style_bundle = "radar_multi"
-colormap = "viridis"
-"#,
-            bundle = radar_bundle_toml()
-        );
-        let path = write_config(tmp.path(), "config.toml", &config_toml);
-        let err = ServerConfig::from_file(path.to_str().unwrap())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("style_bundle cannot be combined with inline"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn style_bundle_cannot_be_mixed_with_inline_styles_array() {
-        let tmp = TempDir::new().unwrap();
-        let config_toml = format!(
-            r#"
-[server]
-host = "127.0.0.1"
-port = 8000
-
-{bundle}
-
-[[collections]]
-id = "radar-dwd"
-title = "DWD"
-description = "DWD"
-engine_type = "geotiff"
-
-[collections.geotiff]
-filename_template = "radar_%Y%m%dT%H%MZ.tif"
-parameter = "reflectivity"
-unit = "dBZ"
-data_path = "/tmp"
-
-[collections.wms]
-style_bundle = "radar_multi"
+min = -10.0
+max = 80.0
 
 [[collections.wms.styles]]
 name = "extra"
 colormap = "viridis"
+
+[[collections.wms.parameters]]
+name = "DBZH"
+colormap = "viridis"
 "#,
             bundle = radar_bundle_toml()
         );
         let path = write_config(tmp.path(), "config.toml", &config_toml);
+        ServerConfig::from_file(path.to_str().unwrap())
+            .expect("bundle + inline fields is valid since bundles v2");
+    }
+
+    #[test]
+    fn bundle_parameters_validated() {
+        let tmp = TempDir::new().unwrap();
+        // Duplicate parameter names within a bundle are rejected.
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[style_bundles]]
+id = "vol"
+[style_bundles.default]
+colormap = "radar_dbz"
+[[style_bundles.parameters]]
+name = "VRADH"
+colormap = "radial_velocity"
+[[style_bundles.parameters]]
+name = "VRADH"
+colormap = "viridis"
+"#;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
         let err = ServerConfig::from_file(path.to_str().unwrap())
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("style_bundle cannot be combined with inline"),
-            "got: {err}"
-        );
+        assert!(err.contains("duplicate parameters entry"), "got: {err}");
+
+        // Empty parameter name rejected.
+        let config_toml = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[style_bundles]]
+id = "vol"
+[style_bundles.default]
+colormap = "radar_dbz"
+[[style_bundles.parameters]]
+name = ""
+colormap = "viridis"
+"#;
+        let path = write_config(tmp.path(), "config2.toml", config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty 'name' field"), "got: {err}");
     }
 
     #[test]
