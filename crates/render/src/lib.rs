@@ -1,4 +1,5 @@
 pub mod colormap;
+pub mod defaults;
 mod encode;
 /// 5×7 bitmap font for in-image text (legend labels). Crate-internal — an
 /// implementation detail of the legend renderer, not part of the public API.

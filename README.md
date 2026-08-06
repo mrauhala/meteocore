@@ -1234,6 +1234,19 @@ Styles live under each collection's `[wms]` block — Maps and Tiles read the sa
 | `cap_severity` | CAP alert severity codes, grey/green/yellow/orange/red | 0–4 |
 | `lightning_age` | Lightning strike age, near-white → orange → dark violet | 0–60 min |
 
+**Per-parameter default styles** (#320) — parameters of multi-parameter
+collections (GRIB, QueryData, Zarr, radar volumes) with no explicit style
+are matched against a built-in defaults table by normalized name/title plus
+the collection's unit: `t2m`/`2t`/`TMP` (unit K or C) → `temperature`,
+`msl`/`mslp` (Pa or hPa) → `pressure`, `DBZH`/`dbz` → `radar_dbz`,
+`VRADH` → `radial_velocity`, humidity/cloud/wind/precipitation likewise.
+Unit-gated rules never guess (a temperature with no unit hint stays on the
+collection style). Defaults win over the collection-level colormap for
+those parameters; opt out per collection with
+`[wms] parameter_defaults = false`, or add/override rules globally with
+top-level `[[parameter_defaults]]` blocks (`names`/`contains`, `colormap`,
+`min`/`max` or `[[parameter_defaults.unit_ranges]]`).
+
 **Named custom colormaps** — define once, reference anywhere a built-in
 name works (`[wms] colormap`, `[[wms.styles]]`, `[[wms.parameters]]`, style
 bundles). Only in top-level `config.toml` (like `[[style_bundles]]`), or as

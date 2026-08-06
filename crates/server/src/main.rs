@@ -368,12 +368,17 @@ async fn main() {
     if let Err(e) = admin::validate_style_colormaps(
         &config.collections,
         &config.style_bundles,
+        &config.parameter_defaults,
         &palette_registry,
     ) {
         tracing::error!("Invalid style configuration: {e}");
         std::process::exit(1);
     }
-    let style_ctx = ds_render::StyleContext::new(palette_registry);
+    let style_ctx = ds_render::StyleContext::new(palette_registry).with_defaults(
+        ds_render::defaults::ParameterDefaults::with_overrides(
+            colormaps::config_default_overrides(&config.parameter_defaults),
+        ),
+    );
 
     // Apply --collections filter if provided. Unknown IDs are a hard error —
     // typing `--collections noa-gfs` should not silently load nothing.

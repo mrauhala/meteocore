@@ -360,6 +360,21 @@ color_stops = [
   { value = 60.0, color = "#FF0000" },
 ]
 
+# Optional per-parameter default-style override rules, checked before the
+# EMBEDDED defaults table (#320: parameters of multi-parameter collections
+# with no explicit style match built-in defaults — temperature palette for
+# t2m/2t/TMP by unit K|C, pressure for msl by unit Pa|hPa, radar_dbz for
+# DBZH, etc. — BEFORE the collection-level colormap; opt out per collection
+# with `[wms] parameter_defaults = false`). Top-level config.toml only.
+[[parameter_defaults]]
+names = ["td", "dewpoint_2m"]   # exact matches (normalized: lowercase alnum)
+contains = ["dew_point"]        # substring matches vs name and title
+colormap = "temperature"
+[[parameter_defaults.unit_ranges]]
+unit = "K"
+min = 233.15
+max = 323.15
+
 # Optional shared WMS style bundles. MUST live in top-level config.toml —
 # a [[style_bundles]] block inside a collections_dir file is silently
 # dropped by serde and any collection referencing it will fail validation.

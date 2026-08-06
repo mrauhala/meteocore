@@ -1208,6 +1208,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &[],
+                        None,
                         &bundle_index,
                     ));
                 }
@@ -1223,6 +1224,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &[],
+                        None,
                         &bundle_index,
                     ));
 
@@ -1240,6 +1242,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &[],
+                        None,
                         &bundle_index,
                     ));
 
@@ -1257,6 +1260,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &[],
+                        None,
                         &bundle_index,
                     ));
 
@@ -1332,8 +1336,9 @@ pub fn load_collections(
                 querydata_engines.push(engine.clone());
 
                 // Get parameter list for per-parameter-layer styles
-                let raster_params =
-                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+                let raster_info = ds_core::map_engine::MapEngine::raster_info(engine.as_ref());
+                let raster_params = raster_info.parameters;
+                let raster_unit = raster_info.unit;
 
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
@@ -1346,6 +1351,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &raster_params,
+                        Some(raster_unit.as_str()),
                         &bundle_index,
                     ));
                 }
@@ -1361,6 +1367,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &raster_params,
+                        Some(raster_unit.as_str()),
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to WMS API", collection.id);
@@ -1376,6 +1383,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &raster_params,
+                        Some(raster_unit.as_str()),
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to Maps API", collection.id);
@@ -1391,6 +1399,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &raster_params,
+                        Some(raster_unit.as_str()),
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to Tiles API", collection.id);
@@ -1460,8 +1469,9 @@ pub fn load_collections(
                 grib_engines.push(engine.clone());
 
                 // Get parameter list for per-parameter-layer styles
-                let raster_params =
-                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+                let raster_info = ds_core::map_engine::MapEngine::raster_info(engine.as_ref());
+                let raster_params = raster_info.parameters;
+                let raster_unit = raster_info.unit;
 
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
@@ -1474,6 +1484,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &raster_params,
+                        Some(raster_unit.as_str()),
                         &bundle_index,
                     ));
                 }
@@ -1489,6 +1500,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &raster_params,
+                        Some(raster_unit.as_str()),
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to WMS API", collection.id);
@@ -1504,6 +1516,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &raster_params,
+                        Some(raster_unit.as_str()),
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to Maps API", collection.id);
@@ -1519,6 +1532,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &raster_params,
+                        Some(raster_unit.as_str()),
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to Tiles API", collection.id);
@@ -1590,8 +1604,9 @@ pub fn load_collections(
 
                 // Per-parameter-layer styles (one WMS/Maps/Tiles layer per Zarr
                 // variable).
-                let raster_params =
-                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+                let raster_info = ds_core::map_engine::MapEngine::raster_info(engine.as_ref());
+                let raster_params = raster_info.parameters;
+                let raster_unit = raster_info.unit;
 
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
@@ -1604,6 +1619,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &raster_params,
+                        Some(raster_unit.as_str()),
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to EDR API", collection.id);
@@ -1620,6 +1636,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &raster_params,
+                        Some(raster_unit.as_str()),
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to WMS API", collection.id);
@@ -1635,6 +1652,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &raster_params,
+                        Some(raster_unit.as_str()),
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to Maps API", collection.id);
@@ -1650,6 +1668,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &raster_params,
+                        Some(raster_unit.as_str()),
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to Tiles API", collection.id);
@@ -1712,8 +1731,9 @@ pub fn load_collections(
 
                 odim_engines.push(engine.clone());
 
-                let raster_params =
-                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+                let raster_info = ds_core::map_engine::MapEngine::raster_info(engine.as_ref());
+                let raster_params = raster_info.parameters;
+                let raster_unit = raster_info.unit;
 
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
@@ -1726,6 +1746,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &raster_params,
+                        Some(raster_unit.as_str()),
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to EDR API", collection.id);
@@ -1742,6 +1763,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &raster_params,
+                        Some(raster_unit.as_str()),
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to WMS API", collection.id);
@@ -1757,6 +1779,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &raster_params,
+                        Some(raster_unit.as_str()),
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to Maps API", collection.id);
@@ -1772,6 +1795,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &raster_params,
+                        Some(raster_unit.as_str()),
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to Tiles API", collection.id);
@@ -1909,8 +1933,9 @@ pub fn load_collections(
                         format!("{} (radar site {label} / {nod})", collection.description);
 
                     // Per-site, multi-parameter: one layer per bare quantity.
-                    let raster_params =
-                        ds_core::map_engine::MapEngine::raster_info(view.as_ref()).parameters;
+                    let raster_info = ds_core::map_engine::MapEngine::raster_info(view.as_ref());
+                    let raster_params = raster_info.parameters;
+                    let raster_unit = raster_info.unit;
 
                     if collection.apis.contains(&"edr".to_string()) {
                         edr_engines.insert(
@@ -1923,6 +1948,7 @@ pub fn load_collections(
                             &mut styles_cache,
                             &site_cfg,
                             &raster_params,
+                            Some(raster_unit.as_str()),
                             &bundle_index,
                         ));
                     }
@@ -1938,6 +1964,7 @@ pub fn load_collections(
                             &mut styles_cache,
                             &site_cfg,
                             &raster_params,
+                            Some(raster_unit.as_str()),
                             &bundle_index,
                         ));
                     }
@@ -1952,6 +1979,7 @@ pub fn load_collections(
                             &mut styles_cache,
                             &site_cfg,
                             &raster_params,
+                            Some(raster_unit.as_str()),
                             &bundle_index,
                         ));
                     }
@@ -1966,6 +1994,7 @@ pub fn load_collections(
                             &mut styles_cache,
                             &site_cfg,
                             &raster_params,
+                            Some(raster_unit.as_str()),
                             &bundle_index,
                         ));
                     }
@@ -2110,6 +2139,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &[],
+                        None,
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to WMS API", collection.id);
@@ -2125,6 +2155,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &[],
+                        None,
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to Maps API", collection.id);
@@ -2140,6 +2171,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &[],
+                        None,
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to Tiles API", collection.id);
@@ -2300,6 +2332,7 @@ pub fn load_collections(
                             &mut styles_cache,
                             collection,
                             &[],
+                            None,
                             &bundle_index,
                         ));
                     }
@@ -2322,6 +2355,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &[],
+                        None,
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to WMS API", collection.id);
@@ -2337,6 +2371,7 @@ pub fn load_collections(
                         &mut styles_cache,
                         collection,
                         &[],
+                        None,
                         &bundle_index,
                     ));
                     info!("Collection '{}': wired to Maps API", collection.id);
@@ -2353,6 +2388,7 @@ pub fn load_collections(
                             &mut styles_cache,
                             collection,
                             &[],
+                            None,
                             &bundle_index,
                         ));
                         info!(
@@ -2484,6 +2520,7 @@ pub fn load_collections(
                 &mut styles_cache,
                 collection,
                 &[],
+                None,
                 &bundle_index,
             ));
             info!("Collection '{}': wired to WMS API", collection.id);
@@ -2499,6 +2536,7 @@ pub fn load_collections(
                 &mut styles_cache,
                 collection,
                 &[],
+                None,
                 &bundle_index,
             ));
             info!("Collection '{}': wired to Maps API", collection.id);
@@ -2514,6 +2552,7 @@ pub fn load_collections(
                 &mut styles_cache,
                 collection,
                 &[],
+                None,
                 &bundle_index,
             ));
             info!("Collection '{}': wired to Tiles API", collection.id);
@@ -2700,6 +2739,7 @@ fn collection_layer_styles(
     cache: &mut HashMap<String, HashMap<String, HashMap<String, ds_render::StyleInfo>>>,
     collection: &CollectionConfig,
     param_names: &[(String, String)],
+    unit: Option<&str>,
     bundles: &HashMap<&str, &StyleBundle>,
 ) -> HashMap<String, HashMap<String, ds_render::StyleInfo>> {
     if let Some(hit) = cache.get(&collection.id) {
@@ -2726,6 +2766,29 @@ fn collection_layer_styles(
     let mut layers = HashMap::new();
     match ctx.collection_styles(collection, bundle) {
         Ok(styles) => {
+            // #320: make the generic fallback visible. Only when the
+            // collection genuinely configures nothing (no inline colormap/
+            // stops and no bundle) — a deliberate viridis is not warned.
+            let unstyled = bundle.is_none()
+                && collection
+                    .wms
+                    .as_ref()
+                    .is_none_or(|w| w.colormap.is_none() && w.color_stops.is_empty());
+            if unstyled {
+                if let Some(d) = styles.get("default") {
+                    if d.palette.normalized {
+                        tracing::warn!(
+                            "Collection '{}': no colormap configured — collection layer \
+                             renders generic {} {:.0}..{:.0} (parameter layers may still \
+                             match built-in defaults)",
+                            collection.id,
+                            d.palette.name,
+                            d.min,
+                            d.max
+                        );
+                    }
+                }
+            }
             layers.insert(collection.id.clone(), styles);
         }
         Err(e) => {
@@ -2740,7 +2803,7 @@ fn collection_layer_styles(
         }
     }
     if !param_names.is_empty() {
-        match ctx.parameter_layer_styles(collection, bundle, param_names, &wrap) {
+        match ctx.parameter_layer_styles(collection, bundle, param_names, unit, &wrap) {
             Ok(maps) => layers.extend(maps),
             Err(e) => tracing::error!(
                 "Collection '{}': parameter style resolution failed ({e})",
@@ -2782,6 +2845,7 @@ fn resolve_bundle<'a>(
 pub fn validate_style_colormaps(
     collections: &[CollectionConfig],
     style_bundles: &[StyleBundle],
+    parameter_defaults: &[ds_core::config::ParameterDefault],
     registry: &ds_render::PaletteRegistry,
 ) -> Result<(), ds_core::error::DataServerError> {
     let check = |owner: &str, name: Option<&str>| -> Result<(), ds_core::error::DataServerError> {
@@ -2795,11 +2859,23 @@ pub fn validate_style_colormaps(
         }
         Ok(())
     };
+    for (i, rule) in parameter_defaults.iter().enumerate() {
+        check(
+            &format!("[[parameter_defaults]] entry {}", i + 1),
+            Some(rule.colormap.as_str()),
+        )?;
+    }
     for b in style_bundles {
         check(
             &format!("style_bundle '{}'", b.id),
             b.default.colormap.as_deref(),
         )?;
+        for p in &b.parameters {
+            check(
+                &format!("style_bundle '{}' parameter '{}'", b.id, p.name),
+                p.colormap.as_deref(),
+            )?;
+        }
         for e in &b.extras {
             check(
                 &format!("style_bundle '{}' extra '{}'", b.id, e.name),
@@ -2988,13 +3064,18 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     validate_style_colormaps(
         &config.collections,
         &config.style_bundles,
+        &config.parameter_defaults,
         &palette_registry,
     )
     .map_err(|e| {
         tracing::error!("Reload failed: {e}");
         ReloadError::ConfigRead(format!("{e}"))
     })?;
-    let style_ctx = ds_render::StyleContext::new(palette_registry);
+    let style_ctx = ds_render::StyleContext::new(palette_registry).with_defaults(
+        ds_render::defaults::ParameterDefaults::with_overrides(
+            crate::colormaps::config_default_overrides(&config.parameter_defaults),
+        ),
+    );
 
     let base_url = config.server.base_url();
 
@@ -4131,7 +4212,7 @@ mod tests {
     ) -> HashMap<String, HashMap<String, ds_render::StyleInfo>> {
         let ctx = ds_render::StyleContext::with_builtins();
         let mut cache = HashMap::new();
-        collection_layer_styles(&ctx, &mut cache, collection, param_names, bundles)
+        collection_layer_styles(&ctx, &mut cache, collection, param_names, None, bundles)
     }
 
     // --- nowcast second-pass wiring (#522) ---
@@ -4811,6 +4892,7 @@ colormap = "virids"
         let err = super::validate_style_colormaps(
             std::slice::from_ref(&bad),
             &[],
+            &[],
             &ds_render::PaletteRegistry::with_builtins(),
         )
         .expect_err("typo'd colormap must be rejected");
@@ -4823,6 +4905,7 @@ colormap = "virids"
         ok.wms.as_mut().unwrap().colormap = Some("radar_dbz".into());
         super::validate_style_colormaps(
             std::slice::from_ref(&ok),
+            &[],
             &[],
             &ds_render::PaletteRegistry::with_builtins(),
         )
@@ -4845,6 +4928,7 @@ colormap = "no_such_map"
         let err = super::validate_style_colormaps(
             &[],
             std::slice::from_ref(&bundle),
+            &[],
             &ds_render::PaletteRegistry::with_builtins(),
         )
         .expect_err("unknown bundle extra colormap must be rejected");
