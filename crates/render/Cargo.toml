@@ -12,6 +12,7 @@ quick_cache = "0.6"
 ds-cache = { path = "../ds-cache" }
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
+serde_json = "1"
 
 [dev-dependencies]
 toml = "0.8"

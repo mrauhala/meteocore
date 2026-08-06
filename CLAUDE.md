@@ -145,7 +145,10 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   toml). Keep it that way. Use the `PropertyValue` enum, not
   `serde_json::Value`, for feature properties. CRS math and `GeoTransform`
   live in `ds_core::geo`, shared by all engines.
-- **`ds-render` has no framework dependencies** (only ds-core and `png`).
+- **`ds-render` has no framework dependencies** (no axum/tokio/http —
+  encoders and codecs only: `png`, `jpeg-encoder`, `webp`, plus
+  `serde_json` for the shared machine-readable legend document builder
+  `legend_json`, kept in ds-render so WMS/Maps/Tiles can't drift apart).
   `ds-mvt` and `ds-3dtiles` are likewise framework-free byte encoders,
   mirroring `ds-render`.
 - **Byte-bounded LRU caches go through `ds-cache`** (#480):

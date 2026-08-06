@@ -13,7 +13,7 @@ use ds_core::map_engine::MapEngine;
 use ds_render::{CacheKey, RenderedCache, StyleInfo};
 
 use crate::error::MapsError;
-use crate::params::{self, MapQueryParams};
+use crate::params::{self, LegendFormat, LegendQueryParams, MapQueryParams};
 
 /// Shared state for the OGC API Maps service.
 #[derive(Clone)]
@@ -101,6 +101,24 @@ fn with_vary(mut resp: Response) -> Response {
     resp
 }
 
+/// The link entries advertised for one style: the styled-map endpoint and the
+/// machine-readable legend. One builder so the `/collections/{id}` and
+/// `/collections/{id}/styles` representations can't drift.
+fn style_links(collection_id: &str, style_name: &str, base_url: &str) -> serde_json::Value {
+    json!([
+        {
+            "href": format!("{base_url}/maps/collections/{collection_id}/styles/{style_name}/map"),
+            "rel": "map",
+            "type": "image/png"
+        },
+        {
+            "href": format!("{base_url}/maps/collections/{collection_id}/styles/{style_name}/legend"),
+            "rel": "legend",
+            "type": "application/json"
+        }
+    ])
+}
+
 fn build_collection_metadata(
     config: &CollectionConfig,
     info: &ds_core::map_engine::RasterInfo,
@@ -139,13 +157,7 @@ fn build_collection_metadata(
                 style_list.push(json!({
                     "id": s.name,
                     "title": s.title,
-                    "links": [
-                        {
-                            "href": format!("{base_url}/maps/collections/{}/styles/{}/map", config.id, s.name),
-                            "rel": "map",
-                            "type": "image/png"
-                        }
-                    ]
+                    "links": style_links(&config.id, &s.name, base_url)
                 }));
             }
         }
@@ -473,6 +485,48 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                 }
             }
         });
+
+        // GET /maps/collections/{id}/styles/{styleId}/legend
+        let legend_path = format!("/maps/collections/{id}/styles/{{styleId}}/legend");
+        collection_paths[&legend_path] = json!({
+            "get": {
+                "summary": format!("Get style legend for {}", config.title),
+                "operationId": format!("getStyleLegend_{id}"),
+                "tags": [id],
+                "parameters": [
+                    {
+                        "name": "styleId",
+                        "in": "path",
+                        "required": true,
+                        "schema": {"type": "string"},
+                        "description": "Style identifier"
+                    },
+                    {
+                        "name": "f",
+                        "in": "query",
+                        "required": false,
+                        "schema": {"type": "string", "default": "json", "enum": ["json", "application/json", "png", "image/png"]},
+                        "description": "Legend representation: the machine-readable description (default) or a rendered legend image."
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Legend description or image",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/legend"}
+                            },
+                            "image/png": {
+                                "schema": {"type": "string", "format": "binary"}
+                            }
+                        }
+                    },
+                    "400": {"description": "Bad request"},
+                    "404": {"description": "Collection or style not found"},
+                    "500": {"description": "Server error"}
+                }
+            }
+        });
     }
 
     let mut paths = json!({
@@ -625,6 +679,33 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "id": {"type": "string"},
                         "title": {"type": "string"},
                         "links": {"type": "array", "items": {"$ref": "#/components/schemas/link"}}
+                    }
+                },
+                "legend": {
+                    "type": "object",
+                    "required": ["style", "title", "min", "max", "interpolation", "stops"],
+                    "properties": {
+                        "style": {"type": "string", "description": "Style identifier"},
+                        "title": {"type": "string", "description": "Human-readable style title"},
+                        "parameter": {"type": "string", "description": "Data parameter the style renders. Omitted when unknown."},
+                        "unit": {"type": "string", "description": "Unit of the rendered values. Omitted when unknown."},
+                        "min": {"type": "number", "description": "Low end of the value range the colours span"},
+                        "max": {"type": "number", "description": "High end of the value range the colours span"},
+                        "interpolation": {"type": "string", "enum": ["linear", "step"],
+                                          "description": "How colours are produced between stops"},
+                        "nodataColor": {"type": "string", "description": "Colour for no-data pixels, when the palette defines one."},
+                        "stops": {
+                            "type": "array",
+                            "description": "Palette colour stops, ascending by value",
+                            "items": {
+                                "type": "object",
+                                "required": ["value", "color"],
+                                "properties": {
+                                    "value": {"type": "number"},
+                                    "color": {"type": "string", "description": "#RRGGBB, or #RRGGBBAA when not fully opaque"}
+                                }
+                            }
+                        }
                     }
                 },
                 "link": {
@@ -929,13 +1010,7 @@ pub async fn styles(
                 style_list.push(json!({
                     "id": s.name,
                     "title": s.title,
-                    "links": [
-                        {
-                            "href": format!("{base}/maps/collections/{}/styles/{}/map", config.id, s.name),
-                            "rel": "map",
-                            "type": "image/png"
-                        }
-                    ]
+                    "links": style_links(&config.id, &s.name, base)
                 }));
             }
         }
@@ -951,6 +1026,84 @@ pub async fn styles(
             }
         ]
     })))
+}
+
+/// GET /maps/collections/{id}/styles/{styleId}/legend
+///
+/// `?f=json` (the default) returns the machine-readable legend — palette
+/// stops, value range, interpolation — so a client can draw its own legend;
+/// `?f=png` returns the rendered legend image. Cacheable for a day but NOT
+/// immutable: palettes are hot-reloadable.
+pub async fn style_legend(
+    Path((id, style_id)): Path<(String, String)>,
+    Query(params): Query<LegendQueryParams>,
+    State(state): State<AppState>,
+) -> Result<Response, MapsError> {
+    let state = state.load_full();
+    let (engine, _config) = lookup_engine(&state, &id)?;
+    let format = params.validate()?;
+
+    let layer_styles = state
+        .styles
+        .get(&id)
+        .ok_or_else(|| MapsError::NotFound(format!("Collection '{id}' not found")))?;
+    let style_info = layer_styles.get(&style_id).ok_or_else(|| {
+        MapsError::NotFound(format!(
+            "Style '{style_id}' not found for collection '{id}'. Available: {}",
+            layer_styles.keys().cloned().collect::<Vec<_>>().join(", ")
+        ))
+    })?;
+
+    let info = engine.raster_info();
+    let (parameter, unit) = ds_render::legend_parameter_unit(style_info, &info);
+
+    match format {
+        LegendFormat::Json => {
+            let body = ds_render::legend_json(style_info, parameter.as_deref(), unit.as_deref());
+            let mut response = Json(body).into_response();
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static(ds_render::LEGEND_CACHE_CONTROL),
+            );
+            response.headers_mut().insert(
+                header::HeaderName::from_static("x-content-type-options"),
+                axum::http::HeaderValue::from_static("nosniff"),
+            );
+            Ok(response)
+        }
+        LegendFormat::Png => {
+            let colormap = style_info.colormap.clone();
+            let (min, max) = (style_info.min, style_info.max);
+            let title = ds_render::legend_title(style_info, parameter.as_deref(), unit.as_deref());
+            let bytes = tokio::task::spawn_blocking(move || {
+                ds_render::render_legend(
+                    colormap.as_ref(),
+                    min,
+                    max,
+                    ds_render::LEGEND_DEFAULT_WIDTH,
+                    ds_render::LEGEND_DEFAULT_HEIGHT,
+                    ds_render::ImageFormat::Png,
+                    title.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| MapsError::Internal(format!("Legend render failed: {e}")))?
+            .map_err(|e| MapsError::Internal(format!("Legend render error: {e}")))?;
+
+            Ok((
+                [
+                    (header::CONTENT_TYPE, "image/png"),
+                    (header::CACHE_CONTROL, ds_render::LEGEND_CACHE_CONTROL),
+                    (
+                        header::HeaderName::from_static("x-content-type-options"),
+                        "nosniff",
+                    ),
+                ],
+                bytes,
+            )
+                .into_response())
+        }
+    }
 }
 
 /// GET /maps/collections/{id}/map — render map with default style

@@ -1282,6 +1282,131 @@ mod styled_tile {
 }
 
 // ---------------------------------------------------------------------------
+// Style legend tests
+// ---------------------------------------------------------------------------
+
+mod style_legend {
+    use super::*;
+
+    /// `?f=` defaults to the machine-readable legend: value range,
+    /// interpolation mode and one entry per palette stop.
+    #[tokio::test]
+    async fn defaults_to_json_description() {
+        let (status, json) = get("/collections/radar/styles/default/legend").await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_eq!(json["style"], "default");
+        assert_eq!(json["title"], "Default");
+        // Resolved from the engine's raster_info().
+        assert_eq!(json["parameter"], "reflectivity");
+        assert_eq!(json["unit"], "dBZ");
+        assert_eq!(json["min"], 0.0);
+        assert_eq!(json["max"], 1.0);
+        assert_eq!(json["interpolation"], "linear");
+
+        let palette = ds_render::builtin_palette("viridis").unwrap();
+        let stops = json["stops"].as_array().unwrap();
+        assert_eq!(stops.len(), palette.stops.len());
+        assert_eq!(stops[0]["value"], palette.stops[0].value);
+        assert_eq!(stops[0]["color"], "#440154");
+        // Builtin palettes define no explicit nodata colour — omitted, not null.
+        assert!(json.get("nodataColor").is_none());
+    }
+
+    /// A named style describes its own palette, not the default's.
+    #[tokio::test]
+    async fn named_style_describes_its_own_palette() {
+        let (status, json) = get("/collections/radar/styles/grayscale/legend").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["style"], "grayscale");
+        assert_eq!(json["title"], "Grayscale");
+        let stops = json["stops"].as_array().unwrap();
+        assert_eq!(
+            stops.len(),
+            ds_render::builtin_palette("grayscale").unwrap().stops.len()
+        );
+        assert_eq!(stops[0]["color"], "#000000");
+        assert_eq!(stops[stops.len() - 1]["color"], "#FFFFFF");
+    }
+
+    #[tokio::test]
+    async fn png_returns_a_rendered_legend_image() {
+        let (status, headers, body) =
+            get_raw("/collections/radar/styles/default/legend?f=png").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-type").unwrap(), "image/png");
+        // Cacheable for a day, but NOT immutable — palettes are hot-reloadable.
+        assert_eq!(
+            headers.get("cache-control").unwrap(),
+            "public, max-age=86400"
+        );
+        assert!(
+            body.starts_with(&[0x89, b'P', b'N', b'G']),
+            "not a PNG: {:?}",
+            &body[..4.min(body.len())]
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_style_returns_404() {
+        let (status, _) = get("/collections/radar/styles/nope/legend").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn unknown_collection_returns_404() {
+        let (status, _) = get("/collections/nonexistent/styles/default/legend").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn unsupported_format_returns_400() {
+        let (status, _) = get("/collections/radar/styles/default/legend?f=mvt").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// The collection metadata links every style's legend, so a client that
+    /// read `/collections/{id}` can fetch the palette without guessing a URL.
+    #[tokio::test]
+    async fn collection_metadata_styles_link_their_legends() {
+        let (_, json) = get("/collections/radar").await;
+        let styles = json["styles"].as_array().unwrap();
+        assert!(!styles.is_empty());
+        for style in styles {
+            let id = style["id"].as_str().unwrap();
+            let legend = style["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|l| l["rel"] == "legend")
+                .unwrap_or_else(|| panic!("style {id} has no legend link"));
+            assert_eq!(
+                legend["href"],
+                format!("/tiles/collections/radar/styles/{id}/legend")
+            );
+            assert_eq!(legend["type"], "application/json");
+        }
+    }
+
+    /// The OpenAPI document advertises the endpoint (repo rule: every new
+    /// endpoint updates `api_definition()`).
+    #[tokio::test]
+    async fn is_advertised_in_the_api_definition() {
+        let (_, json) = get("/api").await;
+        let path = &json["paths"]["/tiles/collections/radar/styles/{styleId}/legend"]["get"];
+        assert!(
+            path.is_object(),
+            "legend path missing from the OpenAPI spec"
+        );
+        assert_eq!(
+            path["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/legend"
+        );
+        assert!(json["components"]["schemas"]["legend"].is_object());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Vector tile (MVT) tests
 // ---------------------------------------------------------------------------
 

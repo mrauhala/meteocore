@@ -47,6 +47,42 @@ pub struct MapQueryParams {
     pub elevation: Option<String>,
 }
 
+/// Query parameters for the style legend endpoint.
+#[derive(Debug, Deserialize)]
+pub struct LegendQueryParams {
+    #[serde(rename = "f")]
+    pub format: Option<String>,
+}
+
+/// Representation a legend request asked for.
+pub enum LegendFormat {
+    /// Machine-readable description: palette stops, range, interpolation.
+    Json,
+    /// The rendered legend image.
+    Png,
+}
+
+impl LegendQueryParams {
+    /// Resolve `?f=`; JSON is the default because the legend endpoint exists
+    /// for clients that draw their own legend. Both the short token and the
+    /// media type are accepted, mirroring how `f=` is spelled elsewhere in
+    /// this API (`image/png`) and in the other OGC metadata endpoints (`json`).
+    pub fn validate(&self) -> Result<LegendFormat, MapsError> {
+        match self
+            .format
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None | Some("json") | Some("application/json") => Ok(LegendFormat::Json),
+            Some("png") | Some("image/png") => Ok(LegendFormat::Png),
+            Some(other) => Err(MapsError::BadRequest(format!(
+                "Format '{other}' is not supported for a legend. Supported: json, png"
+            ))),
+        }
+    }
+}
+
 /// Validated map request parameters.
 pub struct ValidatedMapParams {
     pub bbox: [f64; 4],

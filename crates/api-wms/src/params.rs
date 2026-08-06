@@ -44,6 +44,33 @@ pub fn parse_image_format(format: Option<&str>) -> Result<ds_render::ImageFormat
     }
 }
 
+/// MIME type selecting the machine-readable legend from `GetLegendGraphic`.
+pub const LEGEND_JSON_FORMAT: &str = "application/json";
+
+/// What a `GetLegendGraphic` request asked for: a rendered image, or the
+/// machine-readable legend description (palette stops + value range) that lets
+/// a client draw its own legend.
+pub enum LegendFormat {
+    Image(ds_render::ImageFormat),
+    Json,
+}
+
+/// Parse `FORMAT=` for `GetLegendGraphic`.
+///
+/// `application/json` (case-insensitive) selects the machine-readable legend;
+/// every other value — including an omitted one — goes through
+/// [`parse_image_format`] unchanged, so image requests and their errors behave
+/// exactly as before. `GetMap` keeps using `parse_image_format` directly and
+/// therefore still rejects `application/json`.
+pub fn parse_legend_format(format: Option<&str>) -> Result<LegendFormat, WmsError> {
+    if let Some(f) = format {
+        if f.trim().eq_ignore_ascii_case(LEGEND_JSON_FORMAT) {
+            return Ok(LegendFormat::Json);
+        }
+    }
+    parse_image_format(format).map(LegendFormat::Image)
+}
+
 /// Raw WMS query parameters (case-insensitive keys handled by axum).
 #[derive(Debug, Deserialize)]
 pub struct WmsQuery {

@@ -90,6 +90,29 @@ impl Palette {
     pub fn sample(&self, value: f64) -> [u8; 4] {
         sample_stops(&self.stops, value, self.interpolation)
     }
+
+    /// Hex-encode a stop color for machine-readable legends: `#RRGGBB`,
+    /// or `#RRGGBBAA` when the alpha channel is not fully opaque.
+    pub fn color_hex(color: [u8; 4]) -> String {
+        if color[3] == 255 {
+            format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2])
+        } else {
+            format!(
+                "#{:02X}{:02X}{:02X}{:02X}",
+                color[0], color[1], color[2], color[3]
+            )
+        }
+    }
+}
+
+impl Interpolation {
+    /// The config / legend-JSON string form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Interpolation::Linear => "linear",
+            Interpolation::Step => "step",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

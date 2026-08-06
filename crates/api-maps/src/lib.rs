@@ -21,5 +21,9 @@ pub fn router(state: AppState) -> Router {
             "/collections/{id}/styles/{styleId}/map",
             get(handlers::get_styled_map),
         )
+        .route(
+            "/collections/{id}/styles/{styleId}/legend",
+            get(handlers::style_legend),
+        )
         .with_state(state)
 }
