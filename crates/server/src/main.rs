@@ -1,6 +1,8 @@
 mod admin;
 mod auto;
+mod colormaps;
 mod preview;
+mod sld;
 mod watcher;
 
 use std::sync::{Arc, OnceLock, RwLock};
@@ -329,12 +331,28 @@ async fn main() {
         tracing::warn!("{warning}");
     }
 
-    // Reject unknown colormap names up front — a typo'd `colormap = "..."`
-    // must fail startup, not silently render viridis.
-    if let Err(e) = admin::validate_style_colormaps(&config.collections, &config.style_bundles) {
+    // Build the palette registry (built-ins + [[colormaps]] + colormaps_dir)
+    // and reject unknown colormap names up front — a typo'd `colormap = "..."`
+    // or a broken palette file must fail startup, not silently render viridis.
+    let config_dir = std::path::Path::new(&config_path)
+        .parent()
+        .map(std::path::Path::to_path_buf);
+    let palette_registry = match colormaps::build_palette_registry(&config, config_dir.as_deref()) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Invalid colormap configuration: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = admin::validate_style_colormaps(
+        &config.collections,
+        &config.style_bundles,
+        &palette_registry,
+    ) {
         tracing::error!("Invalid style configuration: {e}");
         std::process::exit(1);
     }
+    let style_ctx = ds_render::StyleContext::new(palette_registry);
 
     // Auto-discover collections from any --auto-collections directories (#411)
     // and merge them with the config-file collections. The merged set goes
@@ -442,6 +460,7 @@ async fn main() {
     info!("Socket bound to {addr} — loading collections, not yet serving");
 
     let result = admin::load_collections(
+        &style_ctx,
         &config.collections,
         &config.style_bundles,
         &base_url,
@@ -618,6 +637,10 @@ async fn main() {
         nowcast_engines: RwLock::new(result.nowcast_engines),
         reload_lock: tokio::sync::Mutex::new(()),
         admin_token,
+        style_fingerprint: std::sync::atomic::AtomicU64::new(colormaps::style_config_fingerprint(
+            &config,
+            config_dir.as_deref(),
+        )),
     });
 
     // Start the collections_dir watcher (issue #318) if enabled. Best-effort:

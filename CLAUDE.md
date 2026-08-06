@@ -337,6 +337,28 @@ port = 8000
 # collections_dir = "collections.d"     # optional, directory of per-collection .toml files
 # watch_collections_dir = true          # optional, auto-reload on collections_dir changes (default false)
 # watch_debounce_ms = 500               # optional, coalesce-window for the watcher (default 500)
+# colormaps_dir = "colormaps.d"  # optional, directory of palette files loaded as
+                                 # named colormaps (name = file stem). Formats:
+                                 # .toml (ColormapDef), GMT .cpt, GDAL color-relief
+                                 # .txt/.clr, SLD .sld (ColorMap). Re-read on reload;
+                                 # missing dir = hard error; other extensions skipped.
+
+# Optional named colormaps. Like [[style_bundles]], MUST live in top-level
+# config.toml (rejected in per-collection files). Registered next to the
+# built-ins; the name works anywhere a built-in colormap name does ([wms]
+# colormap, styles, parameters, bundle defaults/extras). A user colormap may
+# shadow a built-in name (replaces it deployment-wide, logged WARN);
+# duplicate user names are a config error. Unknown colormap name references
+# anywhere in config are a LOAD ERROR (no silent viridis fallback).
+[[colormaps]]
+name = "radar_nssl2"
+title = "NSSL Reflectivity 2"
+# interpolation = "step"        # "linear" (default) | "step" (discrete classes)
+# nodata_color = "#00000000"    # optional
+color_stops = [
+  { value = 5.0,  color = "#414141" },
+  { value = 60.0, color = "#FF0000" },
+]
 
 # Optional shared WMS style bundles. MUST live in top-level config.toml —
 # a [[style_bundles]] block inside a collections_dir file is silently

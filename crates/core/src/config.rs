@@ -8,6 +8,12 @@ pub struct ServerConfig {
     /// Shared style bundles referenced by collections via `[wms] style_bundle`.
     #[serde(default)]
     pub style_bundles: Vec<StyleBundle>,
+    /// Named, reusable colormaps (`[[colormaps]]`). Registered alongside the
+    /// built-ins; referencable anywhere a built-in colormap name is accepted
+    /// (`[wms] colormap`, styles, parameters, bundle defaults/extras). Only
+    /// allowed in the top-level config.toml, like `[[style_bundles]]`.
+    #[serde(default)]
+    pub colormaps: Vec<ColormapDef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -25,6 +31,13 @@ pub struct ServerSettings {
     /// Resolved relative to the parent directory of the main config file.
     /// Each file defines one collection using `CollectionConfig` fields directly.
     pub collections_dir: Option<String>,
+    /// Directory of palette files loaded as named colormaps (one palette per
+    /// file, name = file stem). Supported: `.toml` (`ColormapDef` fields),
+    /// GMT `.cpt`, GDAL color-relief `.txt`/`.clr`, SLD `.sld` (ColorMap).
+    /// Resolved relative to the parent directory of the main config file,
+    /// like `collections_dir`. Re-read on reload.
+    #[serde(default)]
+    pub colormaps_dir: Option<String>,
     /// Size in MB of the global Web Mercator meta-tile (decoded-RGBA) cache
     /// (#202). A single server-wide cache, not per-collection. Currently
     /// consumed only by the WMS GetMap path; api-maps/api-tiles still render
@@ -85,6 +98,7 @@ impl ServerConfig {
                 base_url: None,
                 admin_token: None,
                 collections_dir: None,
+                colormaps_dir: None,
                 metatile_cache_mb: default_metatile_cache_mb(),
                 watch_collections_dir: false,
                 watch_debounce_ms: default_watch_debounce_ms(),
@@ -92,6 +106,7 @@ impl ServerConfig {
             },
             collections: Vec::new(),
             style_bundles: Vec::new(),
+            colormaps: Vec::new(),
         }
     }
 }
@@ -453,6 +468,90 @@ pub struct StyleBundleExtra {
     pub min: Option<f64>,
     pub max: Option<f64>,
     pub parameter: Option<String>,
+}
+
+/// A named, reusable colormap (`[[colormaps]]` in the top-level config, or
+/// one `.toml` file in `colormaps_dir`). Registered next to the built-in
+/// palettes; the name is then valid anywhere a built-in name is accepted.
+/// A user colormap may shadow a built-in name (replacing it deployment-wide,
+/// logged as a warning); duplicate user names are a config error.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ColormapDef {
+    /// Registry name referenced by `colormap = "<name>"`. In a
+    /// `colormaps_dir` file this may be omitted — it defaults to the file
+    /// stem (a mismatch logs a warning, mirroring per-collection files).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Human-readable title (legends/UI).
+    pub title: Option<String>,
+    /// `"linear"` (default) — gradient between stops — or `"step"` —
+    /// discrete classes, each value taking the highest stop at or below it.
+    #[serde(default)]
+    pub interpolation: Option<String>,
+    /// The palette stops (`#RRGGBB` / `#RRGGBBAA`), at least one required.
+    #[serde(default)]
+    pub color_stops: Vec<ColorStop>,
+    /// Optional color for nodata pixels (default fully transparent).
+    pub nodata_color: Option<String>,
+}
+
+impl ColormapDef {
+    /// Validate one definition. `owner` names the source (config.toml index
+    /// or a colormaps_dir filename) in error messages; `name` is the
+    /// resolved registry name.
+    pub fn validate(&self, owner: &str, name: &str) -> Result<(), crate::error::DataServerError> {
+        if name.is_empty() {
+            return Err(crate::error::DataServerError::Config(format!(
+                "{owner}: colormap has an empty name"
+            )));
+        }
+        match self.interpolation.as_deref() {
+            None | Some("linear") | Some("step") => {}
+            Some(other) => {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "{owner}: colormap '{name}': interpolation must be \
+                     \"linear\" or \"step\", got \"{other}\""
+                )));
+            }
+        }
+        if self.color_stops.is_empty() {
+            return Err(crate::error::DataServerError::Config(format!(
+                "{owner}: colormap '{name}' has no color_stops"
+            )));
+        }
+        for stop in &self.color_stops {
+            if !stop.value.is_finite() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "{owner}: colormap '{name}': non-finite stop value"
+                )));
+            }
+            validate_hex_color(&stop.color).map_err(|e| {
+                crate::error::DataServerError::Config(format!("{owner}: colormap '{name}': {e}"))
+            })?;
+        }
+        if let Some(nd) = &self.nodata_color {
+            validate_hex_color(nd).map_err(|e| {
+                crate::error::DataServerError::Config(format!(
+                    "{owner}: colormap '{name}': nodata_color: {e}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Minimal `#RRGGBB` / `#RRGGBBAA` shape check. The authoritative parser
+/// lives in ds-render (which depends on this crate, so it can't be called
+/// from here); this catches typos at config load with a clear message.
+fn validate_hex_color(s: &str) -> Result<(), String> {
+    let digits = s.strip_prefix('#').unwrap_or(s);
+    if (digits.len() == 6 || digits.len() == 8) && digits.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid hex color '{s}' (expected #RRGGBB or #RRGGBBAA)"
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1915,13 +2014,19 @@ impl ServerConfig {
             let raw: toml::Table = toml::from_str(&content).map_err(|e| {
                 crate::error::DataServerError::Config(format!("Failed to parse {filename}: {e}"))
             })?;
-            // style_bundles must live in config.toml; serde silently drops
-            // them on CollectionConfig, which makes the later "not defined"
-            // error confusing.
+            // style_bundles and colormaps must live in config.toml; serde
+            // silently drops them on CollectionConfig, which makes the later
+            // "not defined" / "unknown colormap" error confusing.
             if raw.contains_key("style_bundles") {
                 return Err(crate::error::DataServerError::Config(format!(
                     "{filename}: [[style_bundles]] is not allowed in per-collection files — \
                      move the block to the top-level config.toml"
+                )));
+            }
+            if raw.contains_key("colormaps") {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "{filename}: [[colormaps]] is not allowed in per-collection files — \
+                     move the block to the top-level config.toml (or a colormaps_dir file)"
                 )));
             }
             let collection: CollectionConfig = raw.try_into().map_err(|e| {
@@ -1945,6 +2050,27 @@ impl ServerConfig {
 
     /// Validate configuration for common errors before starting the server.
     pub fn validate(&self) -> Result<(), crate::error::DataServerError> {
+        // Validate [[colormaps]]: each definition well-formed, names present
+        // and unique. (Whether a name shadows a built-in is decided by the
+        // server layer, which owns the palette registry.)
+        let mut colormap_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (i, def) in self.colormaps.iter().enumerate() {
+            let owner = format!("[[colormaps]] entry {}", i + 1);
+            let name = def.name.as_deref().unwrap_or("");
+            if def.name.is_none() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "{owner}: 'name' is required in config.toml colormaps \
+                     (it is only optional in colormaps_dir files)"
+                )));
+            }
+            def.validate(&owner, name)?;
+            if !colormap_names.insert(name) {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Duplicate colormap name '{name}' in [[colormaps]]"
+                )));
+            }
+        }
+
         // Check for duplicate style_bundle IDs + validate each bundle's extras.
         let mut bundle_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for bundle in &self.style_bundles {

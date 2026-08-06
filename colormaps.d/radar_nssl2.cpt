@@ -1,0 +1,9 @@
+# NSSL-inspired reflectivity ramp (example palette for colormaps_dir).
+# Format: GMT color palette table — z0 R G B z1 R G B per segment.
+5   65  65  65   15  100 100 100
+15  65  182 255  25  30  110 235
+25  60  200 60   35  255 230 0
+35  255 160 0    45  235 50  20
+45  200 0   90   55  145 20  145
+55  235 120 235  70  255 255 255
+N 0 0 0

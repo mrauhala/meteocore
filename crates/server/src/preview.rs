@@ -998,6 +998,7 @@ mod tests {
             nowcast_engines: RwLock::new(Vec::new()),
             reload_lock: tokio::sync::Mutex::new(()),
             admin_token: None,
+            style_fingerprint: std::sync::atomic::AtomicU64::new(0),
         })
     }
 

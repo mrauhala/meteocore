@@ -4076,6 +4076,7 @@ dependencies = [
  "http-body-util",
  "notify",
  "prometheus",
+ "quick-xml 0.37.5",
  "rust-embed",
  "serde",
  "serde_json",
