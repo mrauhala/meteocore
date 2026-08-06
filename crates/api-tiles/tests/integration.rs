@@ -2274,3 +2274,274 @@ async fn tile_re_renders_when_a_new_run_lands() {
         "new latest run must miss the run-1 cache entry and re-render"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Per-parameter style layers
+// ---------------------------------------------------------------------------
+
+/// A multi-parameter engine, so `parameter-name=` passes the handler's
+/// validation against `raster_info().parameters` and the request exercises the
+/// real multi-parameter shape. Pixels are the same 0..1 ramp `MockMapEngine`
+/// produces, independent of the parameter — the point of these tests is which
+/// COLORMAP the handler picks, not which data.
+struct MultiParamMockMapEngine;
+
+impl MapEngine for MultiParamMockMapEngine {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        Ok(ramp_tile(width, height))
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            parameters: vec![
+                ("T".to_string(), "Temperature".to_string()),
+                ("RH".to_string(), "Relative humidity".to_string()),
+            ],
+            ..MockMapEngine::make_info()
+        }
+    }
+}
+
+/// The tile `MultiParamMockMapEngine` returns, rebuilt so a test can render a
+/// reference image through `ds-render` and compare bytes.
+fn ramp_tile(width: u32, height: u32) -> RasterTile {
+    let pixel_count = (width * height) as usize;
+    let values: Vec<Option<f64>> = (0..pixel_count)
+        .map(|i| Some(i as f64 / pixel_count as f64))
+        .collect();
+    RasterTile {
+        width,
+        height,
+        values: values.into(),
+    }
+}
+
+/// A `StyleInfo` over a named built-in palette, resolved through the same
+/// `StyleContext` the server uses so `colormap` and `palette` agree.
+fn palette_style(name: &str, palette: &str, parameter: Option<&str>) -> StyleInfo {
+    let resolved = ds_render::StyleContext::with_builtins()
+        .build_colormap(&ds_render::StyleSpec {
+            colormap: Some(palette),
+            ..Default::default()
+        })
+        .expect("built-in palette resolves");
+    StyleInfo {
+        name: name.to_string(),
+        title: format!("{palette} over {name}"),
+        colormap: resolved.colormap,
+        palette: resolved.palette,
+        min: resolved.min,
+        max: resolved.max,
+        parameter: parameter.map(str::to_string),
+    }
+}
+
+/// The PNG a tile request must return when rendered with `palette`.
+fn reference_tile_png(palette: &str) -> Vec<u8> {
+    let style = palette_style("ref", palette, None);
+    ds_render::render_tile(
+        &ramp_tile(256, 256),
+        style.colormap.as_ref(),
+        ds_render::ImageFormat::Png,
+    )
+    .expect("reference render succeeds")
+}
+
+/// Router whose "radar" collection registers a per-parameter style layer for
+/// `T` (as the server does for `[[wms.parameters]]`, bundle parameter entries
+/// and built-in parameter defaults) but not for `RH`.
+fn build_param_layer_router() -> axum::Router {
+    let engine: Arc<dyn MapEngine> = Arc::new(MultiParamMockMapEngine);
+    let mut engines = HashMap::new();
+    engines.insert("radar".to_string(), engine);
+
+    let mut collections = HashMap::new();
+    collections.insert(
+        "radar".to_string(),
+        CollectionConfig {
+            id: "radar".to_string(),
+            title: "Test Radar".to_string(),
+            description: "Test radar data".to_string(),
+            data_path: None,
+            apis: vec!["tiles".to_string()],
+            engine_type: "grib".to_string(),
+            keywords: Vec::new(),
+            license: None,
+            geotiff: None,
+            querydata: None,
+            wms: None,
+            grib: None,
+            zarr: None,
+            odim: None,
+            cap: None,
+            postgis: None,
+            nowcast: None,
+            preview: None,
+        },
+    );
+
+    let mut styles_map = HashMap::new();
+    styles_map.insert(
+        "radar".to_string(),
+        HashMap::from([
+            (
+                "default".to_string(),
+                palette_style("default", "viridis", None),
+            ),
+            ("alt".to_string(), palette_style("alt", "radar_dbz", None)),
+        ]),
+    );
+    styles_map.insert(
+        "radar/T".to_string(),
+        HashMap::from([
+            (
+                "default".to_string(),
+                palette_style("default", "grayscale", Some("T")),
+            ),
+            (
+                "alt".to_string(),
+                palette_style("alt", "temperature", Some("T")),
+            ),
+        ]),
+    );
+
+    let state = Arc::new(ArcSwap::from_pointee(TilesState {
+        map_engines: engines,
+        collections,
+        styles: styles_map,
+        feature_engines: HashMap::new(),
+        feature_collections: HashMap::new(),
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        vector_tile_cache: Arc::new(VectorTileCache::new(16)),
+        base_url: String::new(),
+        trust_proxy_headers: false,
+    }));
+    api_tiles::router(state)
+}
+
+mod parameter_styles {
+    use super::*;
+
+    const TILE: &str = "/collections/radar/tiles/WebMercatorQuad/0/0/0";
+
+    async fn fetch(uri: &str) -> (StatusCode, Vec<u8>) {
+        let app = build_param_layer_router();
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        (status, body)
+    }
+
+    async fn fetch_json(uri: &str) -> (StatusCode, Value) {
+        let (status, body) = fetch(uri).await;
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// The gap this fixes: `parameter-name=T` renders with the `radar/T`
+    /// layer's colormap, not the collection-level default. Before the fix the
+    /// per-parameter palette was unreachable through Tiles entirely.
+    #[tokio::test]
+    async fn tile_with_parameter_name_uses_the_parameter_layer_style() {
+        let (status, body) = fetch(&format!("{TILE}?parameter-name=T")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            reference_tile_png("grayscale"),
+            "parameter-name=T must render with the radar/T layer's grayscale palette"
+        );
+        assert_ne!(
+            body,
+            reference_tile_png("viridis"),
+            "the collection-level palette must not win over the parameter layer's"
+        );
+    }
+
+    /// No `parameter-name` → the collection-level style, unchanged.
+    #[tokio::test]
+    async fn tile_without_parameter_name_keeps_the_collection_style() {
+        let (status, body) = fetch(TILE).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, reference_tile_png("viridis"));
+    }
+
+    /// A parameter with no registered style layer falls back to the
+    /// collection-level map (single-parameter engines rely on this too).
+    #[tokio::test]
+    async fn parameter_without_a_style_layer_falls_back_to_the_collection() {
+        let (status, body) = fetch(&format!("{TILE}?parameter-name=RH")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, reference_tile_png("viridis"));
+    }
+
+    /// The styled route resolves the same way — a named style is taken from
+    /// the parameter layer when the request selects that parameter.
+    #[tokio::test]
+    async fn styled_tile_route_resolves_the_parameter_layer() {
+        let (status, body) =
+            fetch("/collections/radar/styles/alt/tiles/WebMercatorQuad/0/0/0?parameter-name=T")
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, reference_tile_png("temperature"));
+        assert_ne!(body, reference_tile_png("radar_dbz"));
+    }
+
+    /// The legend follows the same resolution, so a client's drawn legend
+    /// matches the pixels it gets for that parameter.
+    #[tokio::test]
+    async fn legend_with_parameter_name_describes_the_parameter_style() {
+        let (status, json) =
+            fetch_json("/collections/radar/styles/default/legend?parameter-name=T").await;
+        assert_eq!(status, StatusCode::OK);
+        let grayscale = ds_render::builtin_palette("grayscale").unwrap();
+        let stops = json["stops"].as_array().unwrap();
+        assert_eq!(stops.len(), grayscale.stops.len());
+        assert_eq!(stops[0]["color"], "#000000");
+        assert_eq!(stops[stops.len() - 1]["color"], "#FFFFFF");
+        // The parameter comes from the style layer, not the engine default.
+        assert_eq!(json["parameter"], "T");
+    }
+
+    #[tokio::test]
+    async fn legend_without_parameter_name_describes_the_collection_style() {
+        let (status, json) = fetch_json("/collections/radar/styles/default/legend").await;
+        assert_eq!(status, StatusCode::OK);
+        let viridis = ds_render::builtin_palette("viridis").unwrap();
+        assert_eq!(json["stops"].as_array().unwrap().len(), viridis.stops.len());
+        assert_eq!(json["stops"][0]["color"], "#440154");
+        assert_eq!(json["parameter"], "reflectivity");
+    }
+
+    /// The new legend query parameter is advertised (repo rule: every new
+    /// query param updates `api_definition()`).
+    #[tokio::test]
+    async fn legend_parameter_name_is_advertised_in_the_api_definition() {
+        let (status, json) = fetch_json("/api").await;
+        assert_eq!(status, StatusCode::OK);
+        let params = json["paths"]["/tiles/collections/radar/styles/{styleId}/legend"]["get"]
+            ["parameters"]
+            .as_array()
+            .unwrap();
+        assert!(
+            params.iter().any(|p| p["name"] == "parameter-name"),
+            "legend must advertise parameter-name; got {params:?}"
+        );
+    }
+}

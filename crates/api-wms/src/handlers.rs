@@ -613,11 +613,19 @@ pub async fn wms_handler(
                 style_name
             };
 
-            // Support "collection/parameter" layer names for legend
+            // Support "collection/parameter" layer names for legend. Resolve
+            // the FULL layer key first, exactly as GetMap does: a
+            // "{collection}/{param}" layer carries its own style map (the
+            // parameter's colormap from `[[wms.parameters]]`, a bundle
+            // parameter entry, or a built-in default), and the collection map
+            // only has the collection default. Falling straight through to the
+            // collection made the legend describe a different palette than the
+            // GetMap of the same LAYER rendered.
             let legend_collection_id = layer_name.split('/').next().unwrap_or(layer_name);
             let layer_styles = state
                 .styles
-                .get(legend_collection_id)
+                .get(layer_name)
+                .or_else(|| state.styles.get(legend_collection_id))
                 .ok_or_else(|| WmsError::layer_not_found(layer_name))?;
 
             let style_info = layer_styles.get(style_name).ok_or_else(|| {

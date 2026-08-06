@@ -86,6 +86,32 @@ fn lookup_engine<'a>(
     Ok((engine, config))
 }
 
+/// Resolve the style map a request should be styled from.
+///
+/// Multi-parameter collections register one style map per parameter under
+/// `"{collection}/{param}"` alongside the collection-level map, and only the
+/// per-parameter map carries that parameter's colormap (from
+/// `[[wms.parameters]]`, a bundle parameter entry, or a built-in parameter
+/// default). A request that names a parameter must therefore resolve its
+/// style there first, falling back to the collection map when the collection
+/// has no such layer (single-parameter engines, unknown parameter names that
+/// the engine ignores). Mirrors how WMS GetMap resolves `LAYERS=coll/param`.
+fn layer_style_map<'a>(
+    styles: &'a HashMap<String, HashMap<String, StyleInfo>>,
+    collection_id: &str,
+    parameter: Option<&str>,
+) -> Option<(String, &'a HashMap<String, StyleInfo>)> {
+    if let Some(p) = parameter {
+        let key = format!("{collection_id}/{p}");
+        if let Some(m) = styles.get(&key) {
+            return Some((key, m));
+        }
+    }
+    styles
+        .get(collection_id)
+        .map(|m| (collection_id.to_string(), m))
+}
+
 fn cache_control_value(has_explicit_time: bool) -> &'static str {
     if has_explicit_time {
         // Tiles at fixed z/x/y + timestamp are truly immutable
@@ -551,6 +577,13 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                             "required": false,
                             "schema": {"type": "string", "default": "json", "enum": ["json", "application/json", "png", "image/png"]},
                             "description": "Legend representation: the machine-readable description (default) or a rendered legend image."
+                        },
+                        {
+                            "name": "parameter-name",
+                            "in": "query",
+                            "required": false,
+                            "schema": {"type": "string"},
+                            "description": "Describe the style of this parameter's layer, matching `parameter-name` on the tile routes. Falls back to the collection-level style when the collection has no per-parameter layer."
                         }
                     ],
                     "responses": {
@@ -1371,10 +1404,12 @@ pub async fn style_legend(
     let (engine, _config) = lookup_engine(&state, &id)?;
     let format = params.validate()?;
 
-    let layer_styles = state
-        .styles
-        .get(&id)
-        .ok_or_else(|| TilesError::NotFound(format!("Collection '{id}' not found")))?;
+    // `?parameter-name=` selects the per-parameter style layer, so the legend
+    // a client draws matches the pixels the tile routes render for that same
+    // parameter.
+    let (_, layer_styles) =
+        layer_style_map(&state.styles, &id, params.parameter_name.as_deref())
+            .ok_or_else(|| TilesError::NotFound(format!("Collection '{id}' not found")))?;
     let style_info = layer_styles.get(&style_id).ok_or_else(|| {
         TilesError::NotFound(format!(
             "Style '{style_id}' not found for collection '{id}'. Available: {}",
@@ -1515,11 +1550,16 @@ async fn render_tile(
     // Validate query params
     let validated = params.validate()?;
 
-    // Look up style
-    let layer_styles = state
-        .styles
-        .get(collection_id)
-        .ok_or_else(|| TilesError::NotFound(format!("Collection '{collection_id}' not found")))?;
+    // Look up style. A `?parameter-name=` request styles from that
+    // parameter's own layer when the collection registers one — otherwise a
+    // per-parameter colormap would be unreachable through Tiles and every
+    // parameter would render with the collection-level default.
+    let (style_layer_key, layer_styles) = layer_style_map(
+        &state.styles,
+        collection_id,
+        validated.parameter_name.as_deref(),
+    )
+    .ok_or_else(|| TilesError::NotFound(format!("Collection '{collection_id}' not found")))?;
 
     let style_info = layer_styles.get(style_name).ok_or_else(|| {
         TilesError::NotFound(format!(
@@ -1598,7 +1638,9 @@ async fn render_tile(
 
     // Build cache key
     let cache_key = CacheKey {
-        layer: collection_id.to_string(),
+        // The RESOLVED style-layer key — see api-maps render_map: prevents a
+        // parameter-layer style aliasing a same-named collection style.
+        layer: style_layer_key,
         style: style_name.to_string(),
         format: match validated.format {
             ds_render::ImageFormat::Png => 0,

@@ -64,6 +64,11 @@ impl TileQueryParams {
 pub struct LegendQueryParams {
     #[serde(rename = "f")]
     pub format: Option<String>,
+    /// Selects the per-parameter style layer, matching `parameter-name` on
+    /// the tile routes — without it the legend would describe the
+    /// collection-level colormap while the tile renders the parameter's own.
+    #[serde(rename = "parameter-name")]
+    pub parameter_name: Option<String>,
 }
 
 /// Representation a legend request asked for.
