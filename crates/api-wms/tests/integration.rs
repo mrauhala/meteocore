@@ -2289,7 +2289,7 @@ async fn legend_graphic_defaults_to_labelled_size() {
     assert_eq!(headers.get("content-type").unwrap(), "image/png");
     assert_eq!(
         headers.get("cache-control").unwrap(),
-        "public, max-age=86400, immutable"
+        "public, max-age=86400" /* no immutable: palettes hot-reload */
     );
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(

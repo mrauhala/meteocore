@@ -730,7 +730,7 @@ pub async fn wms_handler(
                         "nosniff",
                     ),
                     // Legends are static — cache for 24h
-                    (header::CACHE_CONTROL, "public, max-age=86400, immutable"),
+                    (header::CACHE_CONTROL, ds_render::LEGEND_CACHE_CONTROL),
                 ],
                 legend_bytes,
             )

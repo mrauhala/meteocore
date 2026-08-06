@@ -1419,6 +1419,11 @@ pub async fn style_legend(
 
     let info = engine.raster_info();
     let (parameter, unit) = ds_render::legend_parameter_unit(style_info, &info);
+    // A ?parameter-name= request labels the legend with the REQUESTED
+    // parameter even when no dedicated "{coll}/{param}" style layer exists
+    // and the style fell back to the collection map — the rendered data is
+    // that parameter's either way (the same query param drives the engine).
+    let parameter = params.parameter_name.clone().or(parameter);
 
     match format {
         LegendFormat::Json => {
