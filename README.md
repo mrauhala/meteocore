@@ -352,6 +352,7 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `port` | yes | — | Bind port |
 | `base_url` | no | `http://{host}:{port}` | External base URL for absolute links (set when behind a reverse proxy) |
 | `collections_dir` | no | — | Directory of per-collection `.toml` config files (see [Per-File Collection Configs](#per-file-collection-configs)) |
+| `colormaps_dir` | no | — | Directory of palette files loaded as named colormaps (one per file, name = file stem). Formats: `.toml` (colormap fields), GMT `.cpt`, GDAL color-relief `.txt`/`.clr`, SLD `.sld` (ColorMap). Resolved relative to the config file's directory; re-read on reload. Missing directory is a hard error; other extensions are skipped (`.disabled` works). |
 | `watch_collections_dir` | no | `false` | Auto-reload when files in `collections_dir` are added, changed, or removed. Debounced; runs on the background runtime. See trust-model note in [Per-File Collection Configs](#per-file-collection-configs). |
 | `watch_debounce_ms` | no | `500` | Coalesce-window in milliseconds for the filesystem watcher (only used when `watch_collections_dir = true`). |
 | `metatile_cache_mb` | no | `1024` | Size (MB) of the global Web Mercator meta-tile cache. Server-wide, not per-collection. `0` disables meta-tiling (EPSG:3857 GetMap reverts to a direct render; reload-reversible). Consumed by WMS today; Maps/Tiles will share it when meta-tiling extends to them. |
@@ -1232,6 +1233,28 @@ Styles live under each collection's `[wms]` block — Maps and Tiles read the sa
 | `cloud_cover` | White overlay with increasing opacity | 0–100 % |
 | `cap_severity` | CAP alert severity codes, grey/green/yellow/orange/red | 0–4 |
 | `lightning_age` | Lightning strike age, near-white → orange → dark violet | 0–60 min |
+
+**Named custom colormaps** — define once, reference anywhere a built-in
+name works (`[wms] colormap`, `[[wms.styles]]`, `[[wms.parameters]]`, style
+bundles). Only in top-level `config.toml` (like `[[style_bundles]]`), or as
+files in `colormaps_dir`:
+
+```toml
+[[colormaps]]
+name = "radar_house"
+title = "House Radar Style"
+# interpolation = "step"      # "linear" (default) | "step" (discrete classes)
+# nodata_color = "#00000000"  # optional
+color_stops = [
+  { value = 5.0,  color = "#414141" },
+  { value = 60.0, color = "#FF0000" },
+]
+```
+
+A user colormap may shadow a built-in name (replacing it server-wide; logged
+as a warning). Duplicate user names and unknown `colormap = "..."`
+references anywhere in config are load errors — a typo fails startup/reload
+instead of silently rendering viridis.
 
 **Custom color stops** override the built-in colormap:
 

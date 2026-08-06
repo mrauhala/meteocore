@@ -237,7 +237,12 @@ mod tests {
     /// Build a live `AdminState` over `config_path`, mirroring `main.rs`.
     fn build_state(config_path: &Path) -> AdminState {
         let (config, _) = ServerConfig::from_file(config_path.to_str().unwrap()).unwrap();
+        let style_ctx = ds_render::StyleContext::new(
+            crate::colormaps::build_palette_registry(&config, config_path.parent())
+                .expect("test config palette registry builds"),
+        );
         let result = load_collections(
+            &style_ctx,
             &config.collections,
             &config.style_bundles,
             &config.server.base_url(),
@@ -265,6 +270,9 @@ mod tests {
             nowcast_engines: RwLock::new(result.nowcast_engines),
             reload_lock: tokio::sync::Mutex::new(()),
             admin_token: None,
+            style_fingerprint: std::sync::atomic::AtomicU64::new(
+                crate::colormaps::style_config_fingerprint(&config, config_path.parent()),
+            ),
         })
     }
 

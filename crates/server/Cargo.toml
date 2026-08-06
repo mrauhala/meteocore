@@ -9,6 +9,7 @@ edition = "2021"
 icechunk = ["engine-zarr/icechunk"]
 
 [dependencies]
+toml = "0.8"
 ds-core = { path = "../core" }
 engine-csv = { path = "../engine-csv" }
 engine-geojson = { path = "../engine-geojson" }
@@ -36,6 +37,7 @@ http-body = "1"
 notify = "8"
 rust-embed = { version = "8", features = ["include-exclude"] }
 prometheus = "0.13"
+quick-xml = "0.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

@@ -1,0 +1,9 @@
+# Example named colormap as a colormaps_dir file. `name` defaults to the
+# file stem ("pressure_wide").
+title = "MSLP wide range"
+color_stops = [
+  { value = 930.0,  color = "#3B0F70" },
+  { value = 980.0,  color = "#3060D0" },
+  { value = 1013.0, color = "#DCDCD2" },
+  { value = 1050.0, color = "#B01E1E" },
+]

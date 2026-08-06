@@ -848,6 +848,15 @@ pub struct ServerState {
     /// Bearer token for admin endpoint authentication.
     /// If None, admin endpoints are disabled (return 403).
     pub admin_token: Option<String>,
+    /// Fingerprint of all style-affecting config (colormaps, bundles,
+    /// per-collection [wms] blocks, colormaps_dir file bytes) at the last
+    /// successful load. A reload whose fingerprint differs drops the
+    /// rendered/meta-tile caches instead of reusing them — their keys carry
+    /// no style content, so reusing them would serve the OLD colors for
+    /// every already-cached tile (as verified live: edit palette → reload →
+    /// X-Cache: HIT with stale pixels). A spurious watcher reload leaves
+    /// the fingerprint unchanged and keeps the warm caches (#202).
+    pub style_fingerprint: std::sync::atomic::AtomicU64,
 }
 
 pub type AdminState = Arc<ServerState>;
@@ -889,6 +898,7 @@ pub struct ReusableCaches {
 }
 
 pub fn load_collections(
+    style_ctx: &ds_render::StyleContext,
     collections: &[CollectionConfig],
     style_bundles: &[StyleBundle],
     base_url: &str,
@@ -899,9 +909,9 @@ pub fn load_collections(
     let bundle_index: HashMap<&str, &StyleBundle> =
         style_bundles.iter().map(|b| (b.id.as_str(), b)).collect();
     // The single config→style resolution path (phase 2 of the styling
-    // revamp): every API's style map is resolved through one StyleContext,
-    // computed once per collection and shared via `styles_cache`.
-    let style_ctx = ds_render::StyleContext::with_builtins();
+    // revamp): every API's style map is resolved through the caller's
+    // StyleContext (built-ins + user [[colormaps]]), computed once per
+    // collection and shared via `styles_cache`.
     let mut styles_cache: HashMap<String, HashMap<String, HashMap<String, ds_render::StyleInfo>>> =
         HashMap::new();
     let mut edr_engines: HashMap<String, Arc<dyn ds_core::edr_engine::EdrEngine>> = HashMap::new();
@@ -1194,7 +1204,7 @@ pub fn load_collections(
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
                     edr_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &[],
@@ -1209,7 +1219,7 @@ pub fn load_collections(
                     map_collections.insert(collection.id.clone(), collection.clone());
 
                     map_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &[],
@@ -1226,7 +1236,7 @@ pub fn load_collections(
                     maps_collections.insert(collection.id.clone(), collection.clone());
 
                     maps_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &[],
@@ -1243,7 +1253,7 @@ pub fn load_collections(
                     tiles_collections.insert(collection.id.clone(), collection.clone());
 
                     tiles_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &[],
@@ -1332,7 +1342,7 @@ pub fn load_collections(
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
                     edr_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &raster_params,
@@ -1347,7 +1357,7 @@ pub fn load_collections(
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &raster_params,
@@ -1362,7 +1372,7 @@ pub fn load_collections(
                     );
                     maps_collections.insert(collection.id.clone(), collection.clone());
                     maps_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &raster_params,
@@ -1377,7 +1387,7 @@ pub fn load_collections(
                     );
                     tiles_collections.insert(collection.id.clone(), collection.clone());
                     tiles_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &raster_params,
@@ -1460,7 +1470,7 @@ pub fn load_collections(
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
                     edr_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &raster_params,
@@ -1475,7 +1485,7 @@ pub fn load_collections(
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &raster_params,
@@ -1490,7 +1500,7 @@ pub fn load_collections(
                     );
                     maps_collections.insert(collection.id.clone(), collection.clone());
                     maps_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &raster_params,
@@ -1505,7 +1515,7 @@ pub fn load_collections(
                     );
                     tiles_collections.insert(collection.id.clone(), collection.clone());
                     tiles_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &raster_params,
@@ -1590,7 +1600,7 @@ pub fn load_collections(
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
                     edr_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &raster_params,
@@ -1606,7 +1616,7 @@ pub fn load_collections(
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &raster_params,
@@ -1621,7 +1631,7 @@ pub fn load_collections(
                     );
                     maps_collections.insert(collection.id.clone(), collection.clone());
                     maps_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &raster_params,
@@ -1636,7 +1646,7 @@ pub fn load_collections(
                     );
                     tiles_collections.insert(collection.id.clone(), collection.clone());
                     tiles_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &raster_params,
@@ -1712,7 +1722,7 @@ pub fn load_collections(
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
                     edr_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &raster_params,
@@ -1728,7 +1738,7 @@ pub fn load_collections(
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &raster_params,
@@ -1743,7 +1753,7 @@ pub fn load_collections(
                     );
                     maps_collections.insert(collection.id.clone(), collection.clone());
                     maps_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &raster_params,
@@ -1758,7 +1768,7 @@ pub fn load_collections(
                     );
                     tiles_collections.insert(collection.id.clone(), collection.clone());
                     tiles_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &raster_params,
@@ -1909,7 +1919,7 @@ pub fn load_collections(
                         );
                         edr_collections.insert(site_id.clone(), site_cfg.clone());
                         edr_styles.extend(collection_layer_styles(
-                            &style_ctx,
+                            style_ctx,
                             &mut styles_cache,
                             &site_cfg,
                             &raster_params,
@@ -1924,7 +1934,7 @@ pub fn load_collections(
                         );
                         map_collections.insert(site_id.clone(), site_cfg.clone());
                         map_styles.extend(collection_layer_styles(
-                            &style_ctx,
+                            style_ctx,
                             &mut styles_cache,
                             &site_cfg,
                             &raster_params,
@@ -1938,7 +1948,7 @@ pub fn load_collections(
                         );
                         maps_collections.insert(site_id.clone(), site_cfg.clone());
                         maps_styles.extend(collection_layer_styles(
-                            &style_ctx,
+                            style_ctx,
                             &mut styles_cache,
                             &site_cfg,
                             &raster_params,
@@ -1952,7 +1962,7 @@ pub fn load_collections(
                         );
                         tiles_collections.insert(site_id.clone(), site_cfg.clone());
                         tiles_styles.extend(collection_layer_styles(
-                            &style_ctx,
+                            style_ctx,
                             &mut styles_cache,
                             &site_cfg,
                             &raster_params,
@@ -2096,7 +2106,7 @@ pub fn load_collections(
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &[],
@@ -2111,7 +2121,7 @@ pub fn load_collections(
                     );
                     maps_collections.insert(collection.id.clone(), collection.clone());
                     maps_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &[],
@@ -2126,7 +2136,7 @@ pub fn load_collections(
                     );
                     tiles_collections.insert(collection.id.clone(), collection.clone());
                     tiles_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &[],
@@ -2286,7 +2296,7 @@ pub fn load_collections(
                     edr_collections.insert(collection.id.clone(), collection.clone());
                     if is_events {
                         edr_styles.extend(collection_layer_styles(
-                            &style_ctx,
+                            style_ctx,
                             &mut styles_cache,
                             collection,
                             &[],
@@ -2308,7 +2318,7 @@ pub fn load_collections(
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
                     map_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &[],
@@ -2323,7 +2333,7 @@ pub fn load_collections(
                     );
                     maps_collections.insert(collection.id.clone(), collection.clone());
                     maps_styles.extend(collection_layer_styles(
-                        &style_ctx,
+                        style_ctx,
                         &mut styles_cache,
                         collection,
                         &[],
@@ -2339,7 +2349,7 @@ pub fn load_collections(
                         );
                         tiles_collections.insert(collection.id.clone(), collection.clone());
                         tiles_styles.extend(collection_layer_styles(
-                            &style_ctx,
+                            style_ctx,
                             &mut styles_cache,
                             collection,
                             &[],
@@ -2470,7 +2480,7 @@ pub fn load_collections(
             );
             map_collections.insert(collection.id.clone(), collection.clone());
             map_styles.extend(collection_layer_styles(
-                &style_ctx,
+                style_ctx,
                 &mut styles_cache,
                 collection,
                 &[],
@@ -2485,7 +2495,7 @@ pub fn load_collections(
             );
             maps_collections.insert(collection.id.clone(), collection.clone());
             maps_styles.extend(collection_layer_styles(
-                &style_ctx,
+                style_ctx,
                 &mut styles_cache,
                 collection,
                 &[],
@@ -2500,7 +2510,7 @@ pub fn load_collections(
             );
             tiles_collections.insert(collection.id.clone(), collection.clone());
             tiles_styles.extend(collection_layer_styles(
-                &style_ctx,
+                style_ctx,
                 &mut styles_cache,
                 collection,
                 &[],
@@ -2772,14 +2782,14 @@ fn resolve_bundle<'a>(
 pub fn validate_style_colormaps(
     collections: &[CollectionConfig],
     style_bundles: &[StyleBundle],
+    registry: &ds_render::PaletteRegistry,
 ) -> Result<(), ds_core::error::DataServerError> {
-    let registry = ds_render::PaletteRegistry::with_builtins();
     let check = |owner: &str, name: Option<&str>| -> Result<(), ds_core::error::DataServerError> {
         if let Some(n) = name {
             if !registry.contains(n) {
                 return Err(ds_core::error::DataServerError::Config(format!(
-                    "{owner}: unknown colormap '{n}' (built-ins: {})",
-                    ds_render::palette::builtin_names().join(", ")
+                    "{owner}: unknown colormap '{n}' (available: {})",
+                    registry.names().join(", ")
                 )));
             }
         }
@@ -2963,12 +2973,28 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         tracing::warn!("{warning}");
     }
 
-    // Same colormap-name validation as startup: an unknown name rejects the
-    // reload and keeps the old registry serving.
-    validate_style_colormaps(&config.collections, &config.style_bundles).map_err(|e| {
+    // Rebuild the palette registry (built-ins + [[colormaps]] +
+    // colormaps_dir) and run the same colormap-name validation as startup:
+    // an unknown name or a broken palette file rejects the reload and keeps
+    // the old registry serving.
+    let config_dir = std::path::Path::new(&state.config_path)
+        .parent()
+        .map(std::path::Path::to_path_buf);
+    let palette_registry = crate::colormaps::build_palette_registry(&config, config_dir.as_deref())
+        .map_err(|e| {
+            tracing::error!("Reload failed: {e}");
+            ReloadError::ConfigRead(format!("{e}"))
+        })?;
+    validate_style_colormaps(
+        &config.collections,
+        &config.style_bundles,
+        &palette_registry,
+    )
+    .map_err(|e| {
         tracing::error!("Reload failed: {e}");
         ReloadError::ConfigRead(format!("{e}"))
     })?;
+    let style_ctx = ds_render::StyleContext::new(palette_registry);
 
     let base_url = config.server.base_url();
 
@@ -2982,15 +3008,30 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     // cache instead of rebuilding it empty — a spurious `collections_dir`
     // watcher event must not dump a multi-GB meta-tile cache. `load_collections`
     // reuses each one iff its configured size is unchanged.
+    //
+    // EXCEPT when style-affecting config changed (palettes, bundles, [wms]
+    // blocks, colormaps_dir files): the rendered / meta-tile keys carry no
+    // style content, so reusing those caches would keep serving the OLD
+    // colors as X-Cache HITs. The (style-independent) vector-tile cache is
+    // always safe to reuse.
+    let new_style_fp = crate::colormaps::style_config_fingerprint(&config, config_dir.as_deref());
+    let styles_changed = state
+        .style_fingerprint
+        .load(std::sync::atomic::Ordering::Relaxed)
+        != new_style_fp;
+    if styles_changed {
+        info!("Style configuration changed — dropping rendered and meta-tile caches");
+    }
     let reuse = {
         let wms = state.wms.load();
         ReusableCaches {
-            rendered: Some(wms.rendered_cache.clone()),
-            tile: Some(wms.tile_cache.clone()),
+            rendered: (!styles_changed).then(|| wms.rendered_cache.clone()),
+            tile: (!styles_changed).then(|| wms.tile_cache.clone()),
             vector: Some(state.tiles.load().vector_tile_cache.clone()),
         }
     };
     let mut result = load_collections(
+        &style_ctx,
         &config.collections,
         &config.style_bundles,
         &base_url,
@@ -3029,6 +3070,12 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
             configured: config.collections.len(),
         });
     }
+
+    // Reload accepted: remember the style fingerprint so the NEXT reload
+    // can tell whether style config changed again.
+    state
+        .style_fingerprint
+        .store(new_style_fp, std::sync::atomic::Ordering::Relaxed);
 
     // Surface a vanished per-site radar in `/health`. A site that was
     // `Ready` in the live registry but is absent from the new scan (its
@@ -4169,6 +4216,7 @@ mod tests {
     #[test]
     fn nowcast_unknown_source_fails_that_collection_only() {
         let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
             &[nowcast_test_collection("nc", "nowcast", Some("no-such"))],
             &[],
             "http://x",
@@ -4196,6 +4244,7 @@ mod tests {
         let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
         nc.nowcast.as_mut().unwrap().lightning_source = Some("no-such-lightning".into());
         let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
             &[tm35_source_collection("radar"), nc],
             &[],
             "http://x",
@@ -4221,6 +4270,7 @@ mod tests {
     #[test]
     fn nowcast_of_nowcast_is_rejected() {
         let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
             &[
                 tm35_source_collection("radar"),
                 nowcast_test_collection("nc1", "nowcast", Some("radar")),
@@ -4249,6 +4299,7 @@ mod tests {
         let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
         nc.apis = vec!["wms".to_string(), "features".to_string()];
         let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
             &[tm35_source_collection("radar"), nc],
             &[],
             "http://x",
@@ -4282,6 +4333,7 @@ mod tests {
         // Startup-equivalent: fresh caches (empty collections is fine — the
         // render caches are built unconditionally).
         let first = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
             &[],
             &[],
             "http://x",
@@ -4296,6 +4348,7 @@ mod tests {
         // Reload with the SAME meta-tile size → every cache is reused (same
         // `Arc`), so a warm cache survives a reload instead of being dumped.
         let second = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
             &[],
             &[],
             "http://x",
@@ -4324,6 +4377,7 @@ mod tests {
         // differently-sized cache can't be reused); the unchanged rendered/
         // vector caches are still reused.
         let third = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
             &[],
             &[],
             "http://x",
@@ -4716,6 +4770,7 @@ colormap = "radar_dbz"
         let mut c = tm35_source_collection("radar");
         c.apis = vec!["edr".to_string(), "wms".to_string()];
         let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
             &[c],
             &[],
             "http://x",
@@ -4753,8 +4808,12 @@ colormap = "virids"
 "#,
         )
         .unwrap();
-        let err = super::validate_style_colormaps(std::slice::from_ref(&bad), &[])
-            .expect_err("typo'd colormap must be rejected");
+        let err = super::validate_style_colormaps(
+            std::slice::from_ref(&bad),
+            &[],
+            &ds_render::PaletteRegistry::with_builtins(),
+        )
+        .expect_err("typo'd colormap must be rejected");
         let msg = format!("{err}");
         assert!(msg.contains("virids"), "error names the typo: {msg}");
         assert!(msg.contains("radar"), "error names the collection: {msg}");
@@ -4762,7 +4821,12 @@ colormap = "virids"
         // A valid name (and no wms at all) passes.
         let mut ok = bad.clone();
         ok.wms.as_mut().unwrap().colormap = Some("radar_dbz".into());
-        super::validate_style_colormaps(std::slice::from_ref(&ok), &[]).expect("valid name passes");
+        super::validate_style_colormaps(
+            std::slice::from_ref(&ok),
+            &[],
+            &ds_render::PaletteRegistry::with_builtins(),
+        )
+        .expect("valid name passes");
 
         // A bundle extra with an unknown name is rejected too.
         let bundle: StyleBundle = toml::from_str(
@@ -4778,8 +4842,12 @@ colormap = "no_such_map"
 "#,
         )
         .unwrap();
-        let err = super::validate_style_colormaps(&[], std::slice::from_ref(&bundle))
-            .expect_err("unknown bundle extra colormap must be rejected");
+        let err = super::validate_style_colormaps(
+            &[],
+            std::slice::from_ref(&bundle),
+            &ds_render::PaletteRegistry::with_builtins(),
+        )
+        .expect_err("unknown bundle extra colormap must be rejected");
         assert!(format!("{err}").contains("no_such_map"));
     }
 }
