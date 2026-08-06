@@ -898,8 +898,15 @@ pub fn load_collections(
 ) -> LoadResult {
     let bundle_index: HashMap<&str, &StyleBundle> =
         style_bundles.iter().map(|b| (b.id.as_str(), b)).collect();
+    // The single config→style resolution path (phase 2 of the styling
+    // revamp): every API's style map is resolved through one StyleContext,
+    // computed once per collection and shared via `styles_cache`.
+    let style_ctx = ds_render::StyleContext::with_builtins();
+    let mut styles_cache: HashMap<String, HashMap<String, HashMap<String, ds_render::StyleInfo>>> =
+        HashMap::new();
     let mut edr_engines: HashMap<String, Arc<dyn ds_core::edr_engine::EdrEngine>> = HashMap::new();
     let mut edr_collections: HashMap<String, CollectionConfig> = HashMap::new();
+    let mut edr_styles: HashMap<String, HashMap<String, ds_render::StyleInfo>> = HashMap::new();
     let mut feature_engines: HashMap<String, Arc<dyn ds_core::feature_engine::FeatureEngine>> =
         HashMap::new();
     let mut feature_collections: HashMap<String, CollectionConfig> = HashMap::new();
@@ -1186,6 +1193,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
+                    edr_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &[],
+                        &bundle_index,
+                    ));
                 }
                 if collection.apis.contains(&"wms".to_string()) {
                     map_engines.insert(
@@ -1194,9 +1208,13 @@ pub fn load_collections(
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
 
-                    // Build styles from config
-                    let styles = build_styles(collection, &bundle_index);
-                    map_styles.insert(collection.id.clone(), styles);
+                    map_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &[],
+                        &bundle_index,
+                    ));
 
                     info!("Collection '{}': wired to WMS API", collection.id);
                 }
@@ -1207,8 +1225,13 @@ pub fn load_collections(
                     );
                     maps_collections.insert(collection.id.clone(), collection.clone());
 
-                    let styles = build_styles(collection, &bundle_index);
-                    maps_styles.insert(collection.id.clone(), styles);
+                    maps_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &[],
+                        &bundle_index,
+                    ));
 
                     info!("Collection '{}': wired to Maps API", collection.id);
                 }
@@ -1219,8 +1242,13 @@ pub fn load_collections(
                     );
                     tiles_collections.insert(collection.id.clone(), collection.clone());
 
-                    let styles = build_styles(collection, &bundle_index);
-                    tiles_styles.insert(collection.id.clone(), styles);
+                    tiles_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &[],
+                        &bundle_index,
+                    ));
 
                     info!("Collection '{}': wired to Tiles API", collection.id);
                 }
@@ -1293,16 +1321,24 @@ pub fn load_collections(
 
                 querydata_engines.push(engine.clone());
 
+                // Get parameter list for per-parameter-layer styles
+                let raster_params =
+                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
+                    edr_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
                 }
-                // Get parameter list for per-parameter-layer styles
-                let raster_params =
-                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
 
                 if collection.apis.contains(&"wms".to_string()) {
                     map_engines.insert(
@@ -1310,16 +1346,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    map_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut map_styles,
-                            &bundle_index,
-                        );
-                    }
+                    map_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to WMS API", collection.id);
                 }
                 if collection.apis.contains(&"maps".to_string()) {
@@ -1328,16 +1361,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     maps_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    maps_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut maps_styles,
-                            &bundle_index,
-                        );
-                    }
+                    maps_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to Maps API", collection.id);
                 }
                 if collection.apis.contains(&"tiles".to_string()) {
@@ -1346,16 +1376,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     tiles_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    tiles_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut tiles_styles,
-                            &bundle_index,
-                        );
-                    }
+                    tiles_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to Tiles API", collection.id);
                 }
 
@@ -1422,16 +1449,24 @@ pub fn load_collections(
 
                 grib_engines.push(engine.clone());
 
+                // Get parameter list for per-parameter-layer styles
+                let raster_params =
+                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
+                    edr_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
                 }
-                // Get parameter list for per-parameter-layer styles
-                let raster_params =
-                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
 
                 if collection.apis.contains(&"wms".to_string()) {
                     map_engines.insert(
@@ -1439,16 +1474,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    map_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut map_styles,
-                            &bundle_index,
-                        );
-                    }
+                    map_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to WMS API", collection.id);
                 }
                 if collection.apis.contains(&"maps".to_string()) {
@@ -1457,16 +1489,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     maps_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    maps_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut maps_styles,
-                            &bundle_index,
-                        );
-                    }
+                    maps_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to Maps API", collection.id);
                 }
                 if collection.apis.contains(&"tiles".to_string()) {
@@ -1475,16 +1504,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     tiles_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    tiles_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut tiles_styles,
-                            &bundle_index,
-                        );
-                    }
+                    tiles_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to Tiles API", collection.id);
                 }
 
@@ -1552,19 +1578,26 @@ pub fn load_collections(
 
                 zarr_engines.push(engine.clone());
 
+                // Per-parameter-layer styles (one WMS/Maps/Tiles layer per Zarr
+                // variable).
+                let raster_params =
+                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
+                    edr_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to EDR API", collection.id);
                 }
-
-                // Per-parameter-layer styles (one WMS/Maps/Tiles layer per Zarr
-                // variable).
-                let raster_params =
-                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
 
                 if collection.apis.contains(&"wms".to_string()) {
                     map_engines.insert(
@@ -1572,16 +1605,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    map_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut map_styles,
-                            &bundle_index,
-                        );
-                    }
+                    map_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to WMS API", collection.id);
                 }
                 if collection.apis.contains(&"maps".to_string()) {
@@ -1590,16 +1620,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     maps_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    maps_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut maps_styles,
-                            &bundle_index,
-                        );
-                    }
+                    maps_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to Maps API", collection.id);
                 }
                 if collection.apis.contains(&"tiles".to_string()) {
@@ -1608,16 +1635,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     tiles_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    tiles_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut tiles_styles,
-                            &bundle_index,
-                        );
-                    }
+                    tiles_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to Tiles API", collection.id);
                 }
 
@@ -1678,17 +1702,24 @@ pub fn load_collections(
 
                 odim_engines.push(engine.clone());
 
+                let raster_params =
+                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
+                    edr_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to EDR API", collection.id);
                 }
-
-                let raster_params =
-                    ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
 
                 if collection.apis.contains(&"wms".to_string()) {
                     map_engines.insert(
@@ -1696,16 +1727,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    map_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut map_styles,
-                            &bundle_index,
-                        );
-                    }
+                    map_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to WMS API", collection.id);
                 }
                 if collection.apis.contains(&"maps".to_string()) {
@@ -1714,16 +1742,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     maps_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    maps_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut maps_styles,
-                            &bundle_index,
-                        );
-                    }
+                    maps_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to Maps API", collection.id);
                 }
                 if collection.apis.contains(&"tiles".to_string()) {
@@ -1732,16 +1757,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     tiles_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    tiles_styles.insert(collection.id.clone(), styles);
-                    if !raster_params.is_empty() {
-                        register_parameter_layer_styles(
-                            collection,
-                            &raster_params,
-                            &mut tiles_styles,
-                            &bundle_index,
-                        );
-                    }
+                    tiles_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &raster_params,
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to Tiles API", collection.id);
                 }
 
@@ -1876,17 +1898,24 @@ pub fn load_collections(
                     site_cfg.description =
                         format!("{} (radar site {label} / {nod})", collection.description);
 
+                    // Per-site, multi-parameter: one layer per bare quantity.
+                    let raster_params =
+                        ds_core::map_engine::MapEngine::raster_info(view.as_ref()).parameters;
+
                     if collection.apis.contains(&"edr".to_string()) {
                         edr_engines.insert(
                             site_id.clone(),
                             view.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
                         );
                         edr_collections.insert(site_id.clone(), site_cfg.clone());
+                        edr_styles.extend(collection_layer_styles(
+                            &style_ctx,
+                            &mut styles_cache,
+                            &site_cfg,
+                            &raster_params,
+                            &bundle_index,
+                        ));
                     }
-
-                    // Per-site, multi-parameter: one layer per bare quantity.
-                    let raster_params =
-                        ds_core::map_engine::MapEngine::raster_info(view.as_ref()).parameters;
 
                     if collection.apis.contains(&"wms".to_string()) {
                         map_engines.insert(
@@ -1894,16 +1923,13 @@ pub fn load_collections(
                             view.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                         );
                         map_collections.insert(site_id.clone(), site_cfg.clone());
-                        let styles = build_styles(&site_cfg, &bundle_index);
-                        map_styles.insert(site_id.clone(), styles);
-                        if !raster_params.is_empty() {
-                            register_parameter_layer_styles(
-                                &site_cfg,
-                                &raster_params,
-                                &mut map_styles,
-                                &bundle_index,
-                            );
-                        }
+                        map_styles.extend(collection_layer_styles(
+                            &style_ctx,
+                            &mut styles_cache,
+                            &site_cfg,
+                            &raster_params,
+                            &bundle_index,
+                        ));
                     }
                     if collection.apis.contains(&"maps".to_string()) {
                         maps_engines.insert(
@@ -1911,16 +1937,13 @@ pub fn load_collections(
                             view.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                         );
                         maps_collections.insert(site_id.clone(), site_cfg.clone());
-                        let styles = build_styles(&site_cfg, &bundle_index);
-                        maps_styles.insert(site_id.clone(), styles);
-                        if !raster_params.is_empty() {
-                            register_parameter_layer_styles(
-                                &site_cfg,
-                                &raster_params,
-                                &mut maps_styles,
-                                &bundle_index,
-                            );
-                        }
+                        maps_styles.extend(collection_layer_styles(
+                            &style_ctx,
+                            &mut styles_cache,
+                            &site_cfg,
+                            &raster_params,
+                            &bundle_index,
+                        ));
                     }
                     if collection.apis.contains(&"tiles".to_string()) {
                         tiles_engines.insert(
@@ -1928,16 +1951,13 @@ pub fn load_collections(
                             view.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                         );
                         tiles_collections.insert(site_id.clone(), site_cfg.clone());
-                        let styles = build_styles(&site_cfg, &bundle_index);
-                        tiles_styles.insert(site_id.clone(), styles);
-                        if !raster_params.is_empty() {
-                            register_parameter_layer_styles(
-                                &site_cfg,
-                                &raster_params,
-                                &mut tiles_styles,
-                                &bundle_index,
-                            );
-                        }
+                        tiles_styles.extend(collection_layer_styles(
+                            &style_ctx,
+                            &mut styles_cache,
+                            &site_cfg,
+                            &raster_params,
+                            &bundle_index,
+                        ));
                     }
                     if collection.apis.contains(&"3dtiles".to_string()) {
                         volume_engines.insert(
@@ -2075,10 +2095,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
-                    map_styles.insert(
-                        collection.id.clone(),
-                        build_styles(collection, &bundle_index),
-                    );
+                    map_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &[],
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to WMS API", collection.id);
                 }
                 if collection.apis.contains(&"maps".to_string()) {
@@ -2087,10 +2110,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     maps_collections.insert(collection.id.clone(), collection.clone());
-                    maps_styles.insert(
-                        collection.id.clone(),
-                        build_styles(collection, &bundle_index),
-                    );
+                    maps_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &[],
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to Maps API", collection.id);
                 }
                 if collection.apis.contains(&"tiles".to_string()) {
@@ -2099,10 +2125,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     tiles_collections.insert(collection.id.clone(), collection.clone());
-                    tiles_styles.insert(
-                        collection.id.clone(),
-                        build_styles(collection, &bundle_index),
-                    );
+                    tiles_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &[],
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to Tiles API", collection.id);
                 }
 
@@ -2244,12 +2273,26 @@ pub fn load_collections(
                     }
                 };
 
+                // The events shape has a raster surface (#504: the
+                // age-colored lightning layer) — wire the MapEngine into the
+                // raster APIs. Station shapes keep the MVT feature-tile
+                // path; config validation rejects wms/maps for them.
+                let is_events = validated.events().is_some();
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
                     );
                     edr_collections.insert(collection.id.clone(), collection.clone());
+                    if is_events {
+                        edr_styles.extend(collection_layer_styles(
+                            &style_ctx,
+                            &mut styles_cache,
+                            collection,
+                            &[],
+                            &bundle_index,
+                        ));
+                    }
                 }
                 if collection.apis.contains(&"features".to_string()) {
                     feature_engines.insert(
@@ -2258,19 +2301,19 @@ pub fn load_collections(
                     );
                     feature_collections.insert(collection.id.clone(), collection.clone());
                 }
-                // The events shape has a raster surface (#504: the
-                // age-colored lightning layer) — wire the MapEngine into the
-                // raster APIs. Station shapes keep the MVT feature-tile
-                // path; config validation rejects wms/maps for them.
-                let is_events = validated.events().is_some();
                 if collection.apis.contains(&"wms".to_string()) && is_events {
                     map_engines.insert(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     map_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    map_styles.insert(collection.id.clone(), styles);
+                    map_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &[],
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to WMS API", collection.id);
                 }
                 if collection.apis.contains(&"maps".to_string()) && is_events {
@@ -2279,8 +2322,13 @@ pub fn load_collections(
                         engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                     );
                     maps_collections.insert(collection.id.clone(), collection.clone());
-                    let styles = build_styles(collection, &bundle_index);
-                    maps_styles.insert(collection.id.clone(), styles);
+                    maps_styles.extend(collection_layer_styles(
+                        &style_ctx,
+                        &mut styles_cache,
+                        collection,
+                        &[],
+                        &bundle_index,
+                    ));
                     info!("Collection '{}': wired to Maps API", collection.id);
                 }
                 if collection.apis.contains(&"tiles".to_string()) {
@@ -2290,8 +2338,13 @@ pub fn load_collections(
                             engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
                         );
                         tiles_collections.insert(collection.id.clone(), collection.clone());
-                        let styles = build_styles(collection, &bundle_index);
-                        tiles_styles.insert(collection.id.clone(), styles);
+                        tiles_styles.extend(collection_layer_styles(
+                            &style_ctx,
+                            &mut styles_cache,
+                            collection,
+                            &[],
+                            &bundle_index,
+                        ));
                         info!(
                             "Collection '{}': wired to Tiles API (raster)",
                             collection.id
@@ -2416,10 +2469,13 @@ pub fn load_collections(
                 engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
             );
             map_collections.insert(collection.id.clone(), collection.clone());
-            map_styles.insert(
-                collection.id.clone(),
-                build_styles(collection, &bundle_index),
-            );
+            map_styles.extend(collection_layer_styles(
+                &style_ctx,
+                &mut styles_cache,
+                collection,
+                &[],
+                &bundle_index,
+            ));
             info!("Collection '{}': wired to WMS API", collection.id);
         }
         if collection.apis.contains(&"maps".to_string()) {
@@ -2428,10 +2484,13 @@ pub fn load_collections(
                 engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
             );
             maps_collections.insert(collection.id.clone(), collection.clone());
-            maps_styles.insert(
-                collection.id.clone(),
-                build_styles(collection, &bundle_index),
-            );
+            maps_styles.extend(collection_layer_styles(
+                &style_ctx,
+                &mut styles_cache,
+                collection,
+                &[],
+                &bundle_index,
+            ));
             info!("Collection '{}': wired to Maps API", collection.id);
         }
         if collection.apis.contains(&"tiles".to_string()) {
@@ -2440,10 +2499,13 @@ pub fn load_collections(
                 engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
             );
             tiles_collections.insert(collection.id.clone(), collection.clone());
-            tiles_styles.insert(
-                collection.id.clone(),
-                build_styles(collection, &bundle_index),
-            );
+            tiles_styles.extend(collection_layer_styles(
+                &style_ctx,
+                &mut styles_cache,
+                collection,
+                &[],
+                &bundle_index,
+            ));
             info!("Collection '{}': wired to Tiles API", collection.id);
         }
 
@@ -2530,6 +2592,7 @@ pub fn load_collections(
         edr_state: EdrState {
             engines: edr_engines,
             collections: edr_collections,
+            styles: edr_styles,
             base_url: base_url.to_string(),
             trust_proxy_headers,
         },
@@ -2594,82 +2657,89 @@ pub fn load_collections(
     }
 }
 
-/// Build all styles for a WMS-enabled collection (bundle if bound, inline otherwise).
-fn build_styles(
-    collection: &CollectionConfig,
-    bundles: &HashMap<&str, &StyleBundle>,
-) -> HashMap<String, ds_render::StyleInfo> {
-    build_styles_inner(collection, resolve_bundle(collection, bundles))
-}
-
-fn build_styles_inner(
-    collection: &CollectionConfig,
-    bundle: Option<&StyleBundle>,
-) -> HashMap<String, ds_render::StyleInfo> {
+/// Legacy-behavior fallback when style resolution fails despite config
+/// validation: a default-only style map on viridis 0..1.
+fn fallback_default_styles(ctx: &ds_render::StyleContext) -> HashMap<String, ds_render::StyleInfo> {
+    let r = ctx
+        .build_colormap(&ds_render::StyleSpec::default())
+        .expect("viridis is always registered");
     let mut styles = HashMap::new();
-
-    // Build default style (either from the bundle or from inline wms config)
-    let (default_colormap, default_min, default_max) =
-        build_collection_default_colormap(collection, bundle);
     styles.insert(
         "default".to_string(),
         ds_render::StyleInfo {
             name: "default".to_string(),
             title: "Default".to_string(),
-            colormap: default_colormap,
-            min: default_min,
-            max: default_max,
+            colormap: r.colormap,
+            palette: r.palette,
+            min: r.min,
+            max: r.max,
             parameter: None,
         },
     );
+    styles
+}
 
-    // Build additional named styles — prefer bundle extras when bound
-    if let Some(bundle) = bundle {
-        for extra in &bundle.extras {
-            let (colormap, min, max) = build_colormap_from_wms_config(
-                extra.colormap.as_deref(),
-                &extra.color_stops,
-                extra.min,
-                extra.max,
-            );
-            styles.insert(
-                extra.name.clone(),
-                ds_render::StyleInfo {
-                    name: extra.name.clone(),
-                    title: extra.title.clone().unwrap_or_else(|| extra.name.clone()),
-                    colormap,
-                    min,
-                    max,
-                    parameter: extra.parameter.clone(),
-                },
-            );
+/// Compute (once per collection) the full style-layer map: the collection
+/// key plus one "{id}/{param}" key per parameter, resolved through the
+/// shared StyleContext. Cached so the WMS, Maps and Tiles registries (and
+/// EDR) share identical StyleInfo instances instead of re-resolving per
+/// API (previously 3×). The ODIM CELLS overlay wrap is injected here —
+/// engine-specific logic that stays out of ds-render (#410).
+fn collection_layer_styles(
+    ctx: &ds_render::StyleContext,
+    cache: &mut HashMap<String, HashMap<String, HashMap<String, ds_render::StyleInfo>>>,
+    collection: &CollectionConfig,
+    param_names: &[(String, String)],
+    bundles: &HashMap<&str, &StyleBundle>,
+) -> HashMap<String, HashMap<String, ds_render::StyleInfo>> {
+    if let Some(hit) = cache.get(&collection.id) {
+        return hit.clone();
+    }
+    let bundle = resolve_bundle(collection, bundles);
+    // The derived storm-cell overlay (#367) paints cell outlines at their
+    // dBZ value and track trails at a reserved sentinel; wrap whatever
+    // colormap CELLS resolves to so the sentinel renders one neutral
+    // colour. Scoped to `odim-volume` — without the engine-type gate a
+    // non-ODIM collection with a band coincidentally named `CELLS` would
+    // get -9999.0 hijacked to grey (#410 removes this via an OverlaySpec).
+    let wrap = |short: &str, cmap: Arc<dyn ds_render::ColorMap>| -> Arc<dyn ds_render::ColorMap> {
+        if collection.engine_type == "odim-volume" && short == engine_odim::cells::CELLS_PARAMETER {
+            Arc::new(ds_render::OverlayColorMap::new(
+                cmap,
+                engine_odim::cells::CELLS_TRACK_SENTINEL,
+                engine_odim::cells::CELLS_TRACK_COLOR,
+            ))
+        } else {
+            cmap
         }
-    } else if let Some(wms_config) = &collection.wms {
-        for style_config in &wms_config.styles {
-            let (colormap, min, max) = build_colormap_from_wms_config(
-                style_config.colormap.as_deref(),
-                &style_config.color_stops,
-                style_config.min,
-                style_config.max,
+    };
+    let mut layers = HashMap::new();
+    match ctx.collection_styles(collection, bundle) {
+        Ok(styles) => {
+            layers.insert(collection.id.clone(), styles);
+        }
+        Err(e) => {
+            // Unknown colormap names are rejected at config validation
+            // (validate_style_colormaps); reaching this is a bug. Keep the
+            // legacy viridis fallback so the collection still renders.
+            tracing::error!(
+                "Collection '{}': style resolution failed ({e}); using viridis fallback",
+                collection.id
             );
-            styles.insert(
-                style_config.name.clone(),
-                ds_render::StyleInfo {
-                    name: style_config.name.clone(),
-                    title: style_config
-                        .title
-                        .clone()
-                        .unwrap_or_else(|| style_config.name.clone()),
-                    colormap,
-                    min,
-                    max,
-                    parameter: style_config.parameter.clone(),
-                },
-            );
+            layers.insert(collection.id.clone(), fallback_default_styles(ctx));
         }
     }
-
-    styles
+    if !param_names.is_empty() {
+        match ctx.parameter_layer_styles(collection, bundle, param_names, &wrap) {
+            Ok(maps) => layers.extend(maps),
+            Err(e) => tracing::error!(
+                "Collection '{}': parameter style resolution failed ({e})",
+                collection.id
+            ),
+        }
+    }
+    cache.insert(collection.id.clone(), layers.clone());
+    layers
 }
 
 /// Resolve a collection's bound bundle; None if unset (validation rejects unresolved refs).
@@ -2694,223 +2764,58 @@ fn resolve_bundle<'a>(
     }
 }
 
-/// Build the collection-level default colormap from the bundle or inline `[wms]` fields.
-fn build_collection_default_colormap(
-    collection: &CollectionConfig,
-    bundle: Option<&StyleBundle>,
-) -> (Arc<dyn ds_render::ColorMap>, f64, f64) {
-    if let Some(bundle) = bundle {
-        return build_colormap_from_wms_config(
-            bundle.default.colormap.as_deref(),
-            &bundle.default.color_stops,
-            bundle.default.min,
-            bundle.default.max,
-        );
-    }
-    build_colormap_from_wms_config(
-        collection.wms.as_ref().and_then(|w| w.colormap.as_deref()),
-        collection
-            .wms
-            .as_ref()
-            .map(|w| &w.color_stops[..])
-            .unwrap_or(&[]),
-        collection.wms.as_ref().and_then(|w| w.min),
-        collection.wms.as_ref().and_then(|w| w.max),
-    )
-}
-
-/// Register per-parameter-layer styles for multi-parameter engines.
-///
-/// For each parameter in `param_names`, creates a style set under the layer
-/// name `"collection-id/param-short-name"`. The default style uses the
-/// per-parameter colormap from `[[collections.wms.parameters]]` if configured,
-/// or falls back to the collection-level default. Named styles are shared
-/// across all parameter layers.
-fn register_parameter_layer_styles(
-    collection: &CollectionConfig,
-    param_names: &[(String, String)],
-    style_map: &mut HashMap<String, HashMap<String, ds_render::StyleInfo>>,
-    bundles: &HashMap<&str, &StyleBundle>,
-) {
-    let wms_config = match &collection.wms {
-        Some(c) => c,
-        None => return,
+/// Reject unknown `colormap = "..."` names at config load. A typo'd name
+/// previously fell back to viridis silently — the config "worked" but
+/// rendered wrong. Runs against the same palette registry the styles are
+/// built from (built-ins today; [[colormaps]] entries join in a later
+/// phase).
+pub fn validate_style_colormaps(
+    collections: &[CollectionConfig],
+    style_bundles: &[StyleBundle],
+) -> Result<(), ds_core::error::DataServerError> {
+    let registry = ds_render::PaletteRegistry::with_builtins();
+    let check = |owner: &str, name: Option<&str>| -> Result<(), ds_core::error::DataServerError> {
+        if let Some(n) = name {
+            if !registry.contains(n) {
+                return Err(ds_core::error::DataServerError::Config(format!(
+                    "{owner}: unknown colormap '{n}' (built-ins: {})",
+                    ds_render::palette::builtin_names().join(", ")
+                )));
+            }
+        }
+        Ok(())
     };
-
-    let bundle = resolve_bundle(collection, bundles);
-    let shared_named_styles = build_styles_inner(collection, bundle);
-
-    // When a bundle is bound, inline per-parameter overrides are rejected by validation.
-    let param_configs: HashMap<&str, &ds_core::config::WmsParameterConfig> = wms_config
-        .parameters
-        .iter()
-        .map(|p| (p.name.as_str(), p))
-        .collect();
-
-    let (fallback_colormap, fallback_min, fallback_max) =
-        build_collection_default_colormap(collection, bundle);
-
-    for (short_name, _title) in param_names {
-        let layer_key = format!("{}/{}", collection.id, short_name);
-        let mut layer_styles = HashMap::new();
-
-        // The derived storm-cell overlay (#367) paints cell outlines/markers
-        // at their dBZ value and track trails at a reserved sentinel; wrap
-        // whatever colormap it resolves to so the sentinel renders one neutral
-        // colour (distinct from the dBZ-coloured outlines) regardless of the
-        // base colormap (inherited or overridden). Scoped to `odim-volume` —
-        // this generic helper runs for every engine, and only the ODIM PVOL
-        // engine produces a CELLS overlay; without the engine-type gate a
-        // non-ODIM collection with a band coincidentally named `CELLS` would
-        // get `-9999.0` hijacked to grey (#410 will remove the engine-specific
-        // branch entirely via an `OverlaySpec` on `StyleInfo`).
-        let is_cells = collection.engine_type == "odim-volume"
-            && short_name == engine_odim::cells::CELLS_PARAMETER;
-        let wrap_cells = |cmap: Arc<dyn ds_render::ColorMap>| -> Arc<dyn ds_render::ColorMap> {
-            if is_cells {
-                Arc::new(ds_render::OverlayColorMap::new(
-                    cmap,
-                    engine_odim::cells::CELLS_TRACK_SENTINEL,
-                    engine_odim::cells::CELLS_TRACK_COLOR,
-                ))
-            } else {
-                cmap
-            }
-        };
-
-        // Build this parameter's default style
-        let (colormap, min, max) = if let Some(pc) = param_configs.get(short_name.as_str()) {
-            build_colormap_from_wms_config(pc.colormap.as_deref(), &pc.color_stops, pc.min, pc.max)
-        } else {
-            (fallback_colormap.clone(), fallback_min, fallback_max)
-        };
-
-        layer_styles.insert(
-            "default".to_string(),
-            ds_render::StyleInfo {
-                name: "default".to_string(),
-                title: "Default".to_string(),
-                colormap: wrap_cells(colormap),
-                min,
-                max,
-                parameter: Some(short_name.clone()),
-            },
-        );
-
-        // Add shared named styles (excluding "default" which we just built).
-        // Styles tagged with a specific `parameter` are scoped to that layer only —
-        // otherwise a bundle extra with `parameter = "wind_speed"` would leak into
-        // every parameter layer's style map.
-        for (name, style) in &shared_named_styles {
-            if name == "default" {
-                continue;
-            }
-            if let Some(p) = style.parameter.as_deref() {
-                if p != short_name {
-                    continue;
-                }
-            }
-            // A CELLS-scoped named style still needs the trail sentinel handled.
-            if is_cells {
-                layer_styles.insert(
-                    name.clone(),
-                    ds_render::StyleInfo {
-                        colormap: wrap_cells(style.colormap.clone()),
-                        ..style.clone()
-                    },
-                );
-            } else {
-                layer_styles.insert(name.clone(), style.clone());
-            }
-        }
-
-        style_map.insert(layer_key, layer_styles);
-    }
-}
-
-/// Wrap `cmap` in [`ds_render::IntegerLutColorMap`] when the value range fits
-/// a small precomputed LUT (#207). Skipped for non-finite/inverted bounds,
-/// spans below 16 integer steps (≥1-unit-per-stop is too coarse for sub-unit
-/// gradients like viridis 0..1), or spans over the 65 536-entry cap.
-fn maybe_wrap_integer_lut(
-    cmap: Arc<dyn ds_render::ColorMap>,
-    min: f64,
-    max: f64,
-) -> Arc<dyn ds_render::ColorMap> {
-    if !min.is_finite() || !max.is_finite() {
-        return cmap;
-    }
-    let lo = min.floor() as i64;
-    let hi = max.ceil() as i64;
-    let span = match hi.checked_sub(lo) {
-        Some(s) if (16..65_536).contains(&s) => s,
-        _ => return cmap,
-    };
-    match ds_render::IntegerLutColorMap::from_colormap(cmap.as_ref(), lo, hi) {
-        Some(lut) => {
-            tracing::debug!(
-                "Wired IntegerLutColorMap [{lo}..{hi}] ({} entries) for colorize",
-                span + 1
-            );
-            Arc::new(lut)
-        }
-        // Currently unreachable given the (16..65_536) gate above (max span 65 535
-        // → range 65 536, which `from_colormap` accepts since its check is
-        // `range > MAX_INTEGER_LUT_SIZE`). Kept as a safe fallback for the day
-        // either bound is loosened.
-        None => cmap,
-    }
-}
-
-/// Build a colormap and value range from WMS config fields.
-fn build_colormap_from_wms_config(
-    colormap_name: Option<&str>,
-    color_stops: &[ds_core::config::ColorStop],
-    min_override: Option<f64>,
-    max_override: Option<f64>,
-) -> (Arc<dyn ds_render::ColorMap>, f64, f64) {
-    // Custom color stops take priority
-    if !color_stops.is_empty() {
-        let stops: Vec<ds_render::ColorStop> = color_stops
-            .iter()
-            .filter_map(|s| {
-                ds_render::parse_hex_color(&s.color)
-                    .ok()
-                    .map(|c| ds_render::ColorStop {
-                        value: s.value,
-                        color: c,
-                    })
-            })
-            .collect();
-        if !stops.is_empty() {
-            let min = min_override.unwrap_or_else(|| stops.first().map(|s| s.value).unwrap_or(0.0));
-            let max = max_override.unwrap_or_else(|| stops.last().map(|s| s.value).unwrap_or(1.0));
-            let cmap: Arc<dyn ds_render::ColorMap> =
-                Arc::new(ds_render::LinearColorMap::new(stops));
-            return (maybe_wrap_integer_lut(cmap, min, max), min, max);
+    for b in style_bundles {
+        check(
+            &format!("style_bundle '{}'", b.id),
+            b.default.colormap.as_deref(),
+        )?;
+        for e in &b.extras {
+            check(
+                &format!("style_bundle '{}' extra '{}'", b.id, e.name),
+                e.colormap.as_deref(),
+            )?;
         }
     }
-
-    // Fall back to built-in colormap name
-    let name = colormap_name.unwrap_or("viridis");
-    if let Some(palette) = ds_render::builtin_palette(name) {
-        let stops = &palette.stops;
-        let min = min_override.unwrap_or_else(|| stops.first().map(|s| s.value).unwrap_or(0.0));
-        let max = max_override.unwrap_or_else(|| stops.last().map(|s| s.value).unwrap_or(1.0));
-        let cmap: Arc<dyn ds_render::ColorMap> =
-            Arc::new(ds_render::LutColorMap::from_palette(palette, min, max));
-        return (maybe_wrap_integer_lut(cmap, min, max), min, max);
+    for c in collections {
+        if let Some(w) = &c.wms {
+            let owner = format!("collection '{}'", c.id);
+            check(&owner, w.colormap.as_deref())?;
+            for s in &w.styles {
+                check(
+                    &format!("{owner} style '{}'", s.name),
+                    s.colormap.as_deref(),
+                )?;
+            }
+            for p in &w.parameters {
+                check(
+                    &format!("{owner} parameter '{}'", p.name),
+                    p.colormap.as_deref(),
+                )?;
+            }
+        }
     }
-
-    // Default: viridis 0..1
-    let min = min_override.unwrap_or(0.0);
-    let max = max_override.unwrap_or(1.0);
-    let cmap: Arc<dyn ds_render::ColorMap> = Arc::new(ds_render::LutColorMap::from_builtin(
-        ds_render::BuiltinColormap::Viridis,
-        min,
-        max,
-    ));
-    (maybe_wrap_integer_lut(cmap, min, max), min, max)
+    Ok(())
 }
 
 /// Update the health gauges from the current health vector.
@@ -3057,6 +2962,13 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     for warning in &config_warnings {
         tracing::warn!("{warning}");
     }
+
+    // Same colormap-name validation as startup: an unknown name rejects the
+    // reload and keeps the old registry serving.
+    validate_style_colormaps(&config.collections, &config.style_bundles).map_err(|e| {
+        tracing::error!("Reload failed: {e}");
+        ReloadError::ConfigRead(format!("{e}"))
+    })?;
 
     let base_url = config.server.base_url();
 
@@ -4157,10 +4069,23 @@ pub async fn request_logging_middleware(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_styles, classify_route, is_safe_request_id, maybe_wrap_integer_lut};
+    use super::{classify_route, collection_layer_styles, is_safe_request_id};
     use ds_core::config::{CollectionConfig, StyleBundle};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// Resolve a collection's full style-layer map through a fresh
+    /// [`ds_render::StyleContext`] + empty cache — the test-side stand-in for
+    /// the per-load resolution `load_collections` performs.
+    fn layer_styles(
+        collection: &CollectionConfig,
+        param_names: &[(String, String)],
+        bundles: &HashMap<&str, &StyleBundle>,
+    ) -> HashMap<String, HashMap<String, ds_render::StyleInfo>> {
+        let ctx = ds_render::StyleContext::with_builtins();
+        let mut cache = HashMap::new();
+        collection_layer_styles(&ctx, &mut cache, collection, param_names, bundles)
+    }
 
     // --- nowcast second-pass wiring (#522) ---
 
@@ -4424,87 +4349,8 @@ mod tests {
         );
     }
 
-    // --- maybe_wrap_integer_lut (#207) ---
-
-    #[test]
-    fn integer_lut_wraps_when_range_fits_and_is_wide_enough() {
-        let src: Arc<dyn ds_render::ColorMap> = Arc::new(ds_render::LutColorMap::from_builtin(
-            ds_render::BuiltinColormap::RadarDbz,
-            -32.0,
-            95.0,
-        ));
-        let wrapped = maybe_wrap_integer_lut(src.clone(), -32.0, 95.0);
-        // It was replaced (no longer the same Arc).
-        assert!(
-            !Arc::ptr_eq(&src, &wrapped),
-            "expected wrap on the radar_dbz -32..95 range"
-        );
-        // Colour at integer values matches the source — the LUT just precomputes.
-        for v in [-32i64, -16, 0, 25, 50, 95] {
-            assert_eq!(
-                wrapped.color(Some(v as f64)),
-                src.color(Some(v as f64)),
-                "colour mismatch at v={v}"
-            );
-        }
-        // Out-of-range saturates to the boundary entry (not transparent),
-        // matching the float path's clamp — at integer endpoints we CAN
-        // compare to src by construction.
-        assert_eq!(wrapped.color(Some(-100.0)), src.color(Some(-32.0)));
-        assert_eq!(wrapped.color(Some(200.0)), src.color(Some(95.0)));
-        // (The non-integer rounding direction — round-nearest, not toward
-        // zero — is pinned in ds-render's IntegerLutColorMap tests where the
-        // colormap has distinct colours per integer. radar_dbz's low end is
-        // transparent so it can't distinguish the directions here.)
-    }
-
-    #[test]
-    fn integer_lut_skips_narrow_range() {
-        // viridis 0..1 → only 2 integer entries → truncation would collapse the
-        // gradient. Must NOT wrap.
-        let src: Arc<dyn ds_render::ColorMap> = Arc::new(ds_render::LutColorMap::from_builtin(
-            ds_render::BuiltinColormap::Viridis,
-            0.0,
-            1.0,
-        ));
-        let wrapped = maybe_wrap_integer_lut(src.clone(), 0.0, 1.0);
-        assert!(
-            Arc::ptr_eq(&src, &wrapped),
-            "expected no wrap for a narrow (<16-entry) range"
-        );
-    }
-
-    #[test]
-    fn integer_lut_skips_huge_range() {
-        // > 65 535 entries can't fit the integer LUT; fall back to the source.
-        let src: Arc<dyn ds_render::ColorMap> = Arc::new(ds_render::LutColorMap::from_builtin(
-            ds_render::BuiltinColormap::Viridis,
-            -100_000.0,
-            100_000.0,
-        ));
-        let wrapped = maybe_wrap_integer_lut(src.clone(), -100_000.0, 100_000.0);
-        assert!(
-            Arc::ptr_eq(&src, &wrapped),
-            "expected no wrap for an over-cap range"
-        );
-    }
-
-    #[test]
-    fn integer_lut_skips_non_finite_bounds() {
-        let src: Arc<dyn ds_render::ColorMap> = Arc::new(ds_render::LutColorMap::from_builtin(
-            ds_render::BuiltinColormap::Viridis,
-            0.0,
-            1.0,
-        ));
-        assert!(Arc::ptr_eq(
-            &src,
-            &maybe_wrap_integer_lut(src.clone(), f64::NAN, 1.0)
-        ));
-        assert!(Arc::ptr_eq(
-            &src,
-            &maybe_wrap_integer_lut(src.clone(), 0.0, f64::INFINITY)
-        ));
-    }
+    // (The maybe_wrap_integer_lut (#207) unit tests moved with the function
+    // into ds-render — see crates/render/src/style.rs.)
 
     #[test]
     fn accepts_typical_uuid() {
@@ -4608,7 +4454,7 @@ mod tests {
     }
 
     #[test]
-    fn build_styles_expands_bundle_into_default_plus_extras() {
+    fn collection_styles_expand_bundle_into_default_plus_extras() {
         let collection: CollectionConfig = toml::from_str(
             r#"
 id = "radar-dwd"
@@ -4652,7 +4498,9 @@ colormap = "radar_fmi"
         let index: HashMap<&str, &StyleBundle> =
             bundles.iter().map(|b| (b.id.as_str(), b)).collect();
 
-        let styles = build_styles(&collection, &index);
+        let layers = layer_styles(&collection, &[], &index);
+        assert_eq!(layers.len(), 1, "no params → collection layer only");
+        let styles = &layers["radar-dwd"];
         assert_eq!(styles.len(), 3, "default + 2 extras expected");
         assert!(styles.contains_key("default"));
         assert_eq!(styles["default"].name, "default");
@@ -4663,7 +4511,7 @@ colormap = "radar_fmi"
     }
 
     #[test]
-    fn build_styles_falls_back_to_inline_when_no_bundle_referenced() {
+    fn collection_styles_fall_back_to_inline_when_no_bundle_referenced() {
         let collection: CollectionConfig = toml::from_str(
             r#"
 id = "radar-fmi"
@@ -4690,15 +4538,20 @@ colormap = "grayscale"
 
         let index: HashMap<&str, &StyleBundle> = HashMap::new();
 
-        let styles = build_styles(&collection, &index);
+        let styles = &layer_styles(&collection, &[], &index)["radar-fmi"];
         assert_eq!(styles.len(), 2);
         assert!(styles.contains_key("default"));
+        assert_eq!(
+            (styles["default"].min, styles["default"].max),
+            (0.0, 70.0),
+            "default min/max come from the radar_dbz stops"
+        );
         assert!(styles.contains_key("alt"));
         assert_eq!(styles["alt"].title, "Alt");
     }
 
     #[test]
-    fn build_styles_falls_back_when_bundle_ref_unknown() {
+    fn collection_styles_fall_back_when_bundle_ref_unknown() {
         // Exercises the defensive path in resolve_bundle: validate() normally
         // rejects unresolved refs, but if a caller skips validation the
         // collection must still load with the inline default (viridis) rather
@@ -4723,18 +4576,20 @@ style_bundle = "does_not_exist"
         .unwrap();
 
         let index: HashMap<&str, &StyleBundle> = HashMap::new();
-        let styles = build_styles(&collection, &index);
+        let styles = &layer_styles(&collection, &[], &index)["radar-x"];
 
         // Only the default; no extras; the bundle was silently skipped.
         assert_eq!(styles.len(), 1);
         assert!(styles.contains_key("default"));
+        assert_eq!(styles["default"].palette.name, "viridis");
+        assert_eq!((styles["default"].min, styles["default"].max), (0.0, 1.0));
     }
 
     #[test]
-    fn build_styles_parameter_tagged_extras_stay_in_map() {
-        // build_styles itself returns every extra — scoping by parameter
-        // happens downstream in register_parameter_layer_styles. This test
-        // locks the current behaviour so the bundle surface stays stable.
+    fn collection_styles_parameter_tagged_extras_stay_in_collection_map() {
+        // The collection-level map returns every extra — scoping by
+        // parameter happens in the per-parameter layer maps. This locks the
+        // bundle surface stable AND pins the scoping outcome.
         let collection: CollectionConfig = toml::from_str(
             r#"
 id = "multi"
@@ -4772,10 +4627,159 @@ colormap = "grayscale"
         let bundles = [bundle];
         let index: HashMap<&str, &StyleBundle> =
             bundles.iter().map(|b| (b.id.as_str(), b)).collect();
-        let styles = build_styles(&collection, &index);
+        let params = vec![
+            ("wind_speed".to_string(), "Wind speed".to_string()),
+            ("t2m".to_string(), "Temperature".to_string()),
+        ];
+        let layers = layer_styles(&collection, &params, &index);
 
+        let styles = &layers["multi"];
         assert_eq!(styles.len(), 3);
         assert_eq!(styles["wind_only"].parameter.as_deref(), Some("wind_speed"));
         assert!(styles["global"].parameter.is_none());
+
+        // Parameter scoping: the tagged extra only reaches its own layer;
+        // the untagged extra reaches every layer.
+        let wind = &layers["multi/wind_speed"];
+        assert!(wind.contains_key("wind_only"));
+        assert!(wind.contains_key("global"));
+        let t2m = &layers["multi/t2m"];
+        assert!(!t2m.contains_key("wind_only"));
+        assert!(t2m.contains_key("global"));
+    }
+
+    #[test]
+    fn odim_volume_cells_layer_gets_track_overlay_wrap() {
+        // The derived storm-cell overlay (#367): for an odim-volume
+        // collection, the CELLS parameter layer's colormaps must render the
+        // reserved track sentinel as the fixed neutral colour.
+        let collection: CollectionConfig = toml::from_str(
+            r#"
+id = "pvol-fivih"
+title = "Vihti"
+description = "Vihti PVOL"
+engine_type = "odim-volume"
+
+[odim]
+
+[wms]
+colormap = "radar_dbz"
+"#,
+        )
+        .unwrap();
+        let index: HashMap<&str, &StyleBundle> = HashMap::new();
+        let params = vec![(
+            engine_odim::cells::CELLS_PARAMETER.to_string(),
+            "Storm cells".to_string(),
+        )];
+        let layers = layer_styles(&collection, &params, &index);
+        let cells_default = &layers["pvol-fivih/CELLS"]["default"];
+        assert_eq!(
+            cells_default
+                .colormap
+                .color(Some(engine_odim::cells::CELLS_TRACK_SENTINEL)),
+            engine_odim::cells::CELLS_TRACK_COLOR,
+            "CELLS layer must render the track sentinel as the overlay colour"
+        );
+
+        // A non-ODIM collection with a band coincidentally named CELLS must
+        // NOT get the overlay wrap (#410 gate).
+        let plain: CollectionConfig = toml::from_str(
+            r#"
+id = "qd"
+title = "QD"
+description = "QD"
+engine_type = "querydata"
+
+[querydata]
+
+[wms]
+colormap = "radar_dbz"
+"#,
+        )
+        .unwrap();
+        let layers = layer_styles(&plain, &params, &index);
+        let cells_default = &layers["qd/CELLS"]["default"];
+        assert_ne!(
+            cells_default
+                .colormap
+                .color(Some(engine_odim::cells::CELLS_TRACK_SENTINEL)),
+            engine_odim::cells::CELLS_TRACK_COLOR,
+            "non-ODIM engines must not hijack the sentinel value"
+        );
+    }
+
+    #[test]
+    fn edr_state_gets_the_same_resolved_styles() {
+        // Task-level wiring pin: a wms+edr collection's resolved styles land
+        // in the EDR state (the f=png trajectory plot consumes them).
+        let mut c = tm35_source_collection("radar");
+        c.apis = vec!["edr".to_string(), "wms".to_string()];
+        let result = super::load_collections(
+            &[c],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+        );
+        let edr = &result.edr_state.styles["radar"];
+        let wms = &result.wms_state.styles["radar"];
+        assert!(edr.contains_key("default"));
+        assert_eq!(edr.len(), wms.len(), "EDR and WMS share one resolution");
+        assert_eq!(edr["default"].min, wms["default"].min);
+        assert_eq!(edr["default"].max, wms["default"].max);
+    }
+
+    #[test]
+    fn validate_style_colormaps_rejects_unknown_names() {
+        // A typo'd colormap name is a config error at load, not a silent
+        // viridis fallback.
+        let bad: CollectionConfig = toml::from_str(
+            r#"
+id = "radar"
+title = "R"
+description = "R"
+engine_type = "geotiff"
+
+[geotiff]
+filename_template = "radar_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+data_path = "/tmp"
+
+[wms]
+colormap = "virids"
+"#,
+        )
+        .unwrap();
+        let err = super::validate_style_colormaps(std::slice::from_ref(&bad), &[])
+            .expect_err("typo'd colormap must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("virids"), "error names the typo: {msg}");
+        assert!(msg.contains("radar"), "error names the collection: {msg}");
+
+        // A valid name (and no wms at all) passes.
+        let mut ok = bad.clone();
+        ok.wms.as_mut().unwrap().colormap = Some("radar_dbz".into());
+        super::validate_style_colormaps(std::slice::from_ref(&ok), &[]).expect("valid name passes");
+
+        // A bundle extra with an unknown name is rejected too.
+        let bundle: StyleBundle = toml::from_str(
+            r#"
+id = "b"
+
+[default]
+colormap = "viridis"
+
+[[extras]]
+name = "x"
+colormap = "no_such_map"
+"#,
+        )
+        .unwrap();
+        let err = super::validate_style_colormaps(&[], std::slice::from_ref(&bundle))
+            .expect_err("unknown bundle extra colormap must be rejected");
+        assert!(format!("{err}").contains("no_such_map"));
     }
 }

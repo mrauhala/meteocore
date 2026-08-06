@@ -170,6 +170,7 @@ fn build_router() -> axum::Router {
     api_edr::router(Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
         collections,
+        styles: HashMap::new(),
         base_url: String::new(),
         trust_proxy_headers: false,
     })))

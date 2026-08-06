@@ -1069,6 +1069,7 @@ dependencies = [
  "jpeg-encoder",
  "png",
  "quick_cache",
+ "toml",
  "webp",
 ]
 

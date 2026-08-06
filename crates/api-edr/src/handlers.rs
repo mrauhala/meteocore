@@ -130,6 +130,12 @@ fn with_data_cache_control(
 pub struct EdrState {
     pub engines: HashMap<String, Arc<dyn EdrEngine>>,
     pub collections: HashMap<String, CollectionConfig>,
+    /// Resolved style maps per collection (same `StyleInfo` instances the
+    /// WMS/Maps/Tiles registries hold — resolved once by the server through
+    /// `ds_render::StyleContext`). The `f=png` cross-section plot uses the
+    /// collection's `default` style; raw `[wms]` config is never re-resolved
+    /// here.
+    pub styles: HashMap<String, HashMap<String, ds_render::StyleInfo>>,
     /// Static fallback base URL for absolute links (e.g. "https://api.example.com").
     /// Used as-is unless `trust_proxy_headers` resolves a per-request value.
     pub base_url: String,
@@ -1441,7 +1447,7 @@ pub async fn trajectory_query(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let state = state.load_full();
-    let (engine, config) = lookup_collection(&state, &id)?;
+    let (engine, _config) = lookup_collection(&state, &id)?;
 
     // An engine that doesn't advertise `trajectory` has no cross-section
     // capability. Return 404 (the resource doesn't exist for this
@@ -1555,17 +1561,18 @@ pub async fn trajectory_query(
         }
         EdrFormat::Png => {
             // Render the cross-section as a colour-mapped heatmap using
-            // the collection's WMS colormap (or a data-scaled viridis
-            // fallback).
+            // the collection's resolved default style (or a data-scaled
+            // viridis fallback when the collection has none).
             // A failure here is an internal inconsistency (the engine
             // already returned a Section for this trajectory query), not
             // a client mistake — log it and return a generic 500 rather
             // than leaking the internal message in a 400.
-            let (heatmaps, colormap) = section_response_to_heatmaps(&result, config.wms.as_ref())
-                .map_err(|e| {
-                tracing::error!("Trajectory PNG section conversion error: {e}");
-                server_error()
-            })?;
+            let style = state.styles.get(&id).and_then(|m| m.get("default"));
+            let (heatmaps, colormap) =
+                section_response_to_heatmaps(&result, style).map_err(|e| {
+                    tracing::error!("Trajectory PNG section conversion error: {e}");
+                    server_error()
+                })?;
             let (w, h) = plot_dimensions(params.width, params.height);
             let png = render_heatmap(&heatmaps, colormap.as_ref(), w, h).map_err(|e| {
                 tracing::error!("Trajectory PNG render error: {e}");

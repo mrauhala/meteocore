@@ -101,6 +101,7 @@ fn make_styles() -> HashMap<String, StyleInfo> {
         StyleInfo {
             name: "default".to_string(),
             title: "Default".to_string(),
+            palette: ds_render::builtin_palette_arc("viridis").unwrap(),
             colormap: Arc::new(LutColorMap::from_builtin(
                 BuiltinColormap::Viridis,
                 0.0,

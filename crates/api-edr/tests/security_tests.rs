@@ -123,6 +123,7 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
     Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
         collections,
+        styles: HashMap::new(),
         base_url: String::new(),
         trust_proxy_headers: false,
     }))

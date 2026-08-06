@@ -232,6 +232,7 @@ fn state() -> api_edr::handlers::AppState {
     Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
         collections,
+        styles: HashMap::new(),
         base_url: String::new(),
         trust_proxy_headers: false,
     }))
