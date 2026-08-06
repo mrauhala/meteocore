@@ -3614,7 +3614,7 @@ colormap = "radar_dbz"
     fn wms_without_colormap_or_bundle_defaults_to_none() {
         // Verifies the Option<String> migration: omitting `colormap` no longer
         // forces a default at parse time — the default "viridis" is applied
-        // later by build_colormap_from_wms_config. Previously this field was a
+        // later by ds-render's StyleContext resolution. Previously this field was a
         // required String with a serde default.
         let tmp = TempDir::new().unwrap();
         let config_toml = r#"

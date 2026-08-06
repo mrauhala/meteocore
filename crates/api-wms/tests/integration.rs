@@ -109,6 +109,7 @@ fn build_empty_router() -> axum::Router {
         StyleInfo {
             name: "default".to_string(),
             title: "Default".to_string(),
+            palette: ds_render::builtin_palette_arc("viridis").unwrap(),
             colormap: cmap,
             min: 0.0,
             max: 1.0,
@@ -123,6 +124,7 @@ fn build_empty_router() -> axum::Router {
         StyleInfo {
             name: "radar_fmi".to_string(),
             title: "FMI Radar".to_string(),
+            palette: ds_render::builtin_palette_arc("radar_dbz").unwrap(),
             colormap: Arc::new(LutColorMap::from_builtin(
                 BuiltinColormap::RadarDbz,
                 -32.0,
@@ -285,6 +287,7 @@ fn build_failing_router() -> axum::Router {
         StyleInfo {
             name: "default".to_string(),
             title: "Default".to_string(),
+            palette: ds_render::builtin_palette_arc("viridis").unwrap(),
             colormap: cmap,
             min: 0.0,
             max: 1.0,
@@ -434,6 +437,7 @@ fn build_populated_router() -> axum::Router {
         StyleInfo {
             name: "default".to_string(),
             title: "Default".to_string(),
+            palette: ds_render::builtin_palette_arc("viridis").unwrap(),
             colormap: cmap,
             min: 0.0,
             max: 1.0,
@@ -800,6 +804,7 @@ fn build_counting_router(
         StyleInfo {
             name: "default".to_string(),
             title: "Default".to_string(),
+            palette: ds_render::builtin_palette_arc("viridis").unwrap(),
             colormap: cmap,
             min: 0.0,
             max: 1.0,
@@ -976,6 +981,7 @@ fn build_snapping_router(initial_times: &[&str]) -> SnappingRouter {
         StyleInfo {
             name: "default".to_string(),
             title: "Default".to_string(),
+            palette: ds_render::builtin_palette_arc("viridis").unwrap(),
             colormap: cmap,
             min: 0.0,
             max: 1.0,
@@ -1515,6 +1521,7 @@ fn build_forecast_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router
         StyleInfo {
             name: "default".to_string(),
             title: "Default".to_string(),
+            palette: ds_render::builtin_palette_arc("viridis").unwrap(),
             colormap: cmap,
             min: 0.0,
             max: 1.0,
@@ -1974,6 +1981,7 @@ fn build_run_swap_router(initial_runs: &[&str]) -> RunSwapRouter {
         StyleInfo {
             name: "default".to_string(),
             title: "Default".to_string(),
+            palette: ds_render::builtin_palette_arc("viridis").unwrap(),
             colormap: cmap,
             min: 0.0,
             max: 1.0,
@@ -2158,6 +2166,7 @@ fn build_advancing_router() -> AdvancingFixture {
         StyleInfo {
             name: "default".to_string(),
             title: "Default".to_string(),
+            palette: ds_render::builtin_palette_arc("viridis").unwrap(),
             colormap: cmap,
             min: 0.0,
             max: 1.0,

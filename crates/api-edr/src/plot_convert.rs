@@ -10,7 +10,6 @@
 
 use chrono::{DateTime, Utc};
 
-use ds_core::config::WmsConfig;
 use ds_core::error::DataServerError;
 use ds_core::model::{
     CoverageResponse, DomainDescription, ParameterDescription, QueryResult, VerticalCoord,
@@ -215,83 +214,16 @@ fn haversine_km(lon0: f64, lat0: f64, lon1: f64, lat1: f64) -> f64 {
     EARTH_RADIUS_M * c / 1000.0
 }
 
-/// Build the colormap (and its value range) for a cross-section PNG from
-/// the collection's optional `[wms]` style config. Mirrors the server's
-/// `build_colormap_from_wms_config` priority — inline `color_stops`, then
-/// a built-in `colormap` name, then a fallback — using only `ds_render`
-/// public APIs.
-///
-/// The fallback is viridis stretched to `data_range` (the finite min/max
-/// of the values being rendered) so a collection with no usable colormap
-/// config still produces a readable image rather than a flat one clamped
-/// to 0..1.
-fn section_colormap(
-    wms: Option<&WmsConfig>,
-    data_range: (f64, f64),
-) -> (Box<dyn ColorMap>, f64, f64) {
-    if let Some(w) = wms {
-        // Inline custom stops win.
-        if !w.color_stops.is_empty() {
-            let mut stops: Vec<ds_render::ColorStop> = w
-                .color_stops
-                .iter()
-                .filter_map(|s| {
-                    ds_render::parse_hex_color(&s.color)
-                        .ok()
-                        .map(|color| ds_render::ColorStop {
-                            value: s.value,
-                            color,
-                        })
-                })
-                .collect();
-            // Sort ascending by value: config stops may be authored
-            // highest-first (a natural radar-dBZ legend order), which
-            // would otherwise give `min > max` (reversed colour-bar
-            // labels) and a broken `LinearColorMap` bracket lookup.
-            stops.sort_by(|a, b| a.value.total_cmp(&b.value));
-            if !stops.is_empty() {
-                let min = w
-                    .min
-                    .unwrap_or_else(|| stops.first().map(|s| s.value).unwrap_or(0.0));
-                let max = w
-                    .max
-                    .unwrap_or_else(|| stops.last().map(|s| s.value).unwrap_or(1.0));
-                return (Box::new(ds_render::LinearColorMap::new(stops)), min, max);
-            }
-        }
-        // Then a named built-in.
-        if let Some(name) = w.colormap.as_deref() {
-            if let Some(palette) = ds_render::builtin_palette(name) {
-                let stops = &palette.stops;
-                let min = w
-                    .min
-                    .unwrap_or_else(|| stops.first().map(|s| s.value).unwrap_or(0.0));
-                let max = w
-                    .max
-                    .unwrap_or_else(|| stops.last().map(|s| s.value).unwrap_or(1.0));
-                return (
-                    Box::new(ds_render::LutColorMap::from_palette(palette, min, max)),
-                    min,
-                    max,
-                );
-            }
-        }
+/// Adapter: a shared Arc colormap behind the Box<dyn ColorMap> interface
+/// this module returns.
+struct ArcColorMap(std::sync::Arc<dyn ColorMap>);
+impl ColorMap for ArcColorMap {
+    fn color(&self, value: Option<f64>) -> [u8; 4] {
+        self.0.color(value)
     }
-    // Fallback: viridis stretched to the data's own finite range.
-    let (mut min, mut max) = data_range;
-    if !(min.is_finite() && max.is_finite()) || max <= min {
-        min = 0.0;
-        max = 1.0;
+    fn nodata_color(&self) -> [u8; 4] {
+        self.0.nodata_color()
     }
-    (
-        Box::new(ds_render::LutColorMap::from_builtin(
-            ds_render::BuiltinColormap::Viridis,
-            min,
-            max,
-        )),
-        min,
-        max,
-    )
 }
 
 /// Convert a cross-section (`Section`) coverage response into stacked
@@ -302,11 +234,13 @@ fn section_colormap(
 /// single snapshot, and the newest scan is the right default for radar
 /// imagery). The x axis is cumulative great-circle distance (km) along
 /// the path; the y axis is the vertical coordinate (height above antenna,
-/// m). All quantities share the collection colormap; for a correctly-
-/// scaled single panel, filter with `parameter-name`.
+/// m). All quantities share the collection's resolved `style` (the same
+/// `StyleInfo` the raster APIs render with); with no style, viridis is
+/// stretched to the data's own finite range. For a correctly-scaled
+/// single panel, filter with `parameter-name`.
 pub fn section_response_to_heatmaps(
     resp: &CoverageResponse,
-    wms: Option<&WmsConfig>,
+    style: Option<&ds_render::StyleInfo>,
 ) -> Result<(Vec<Heatmap>, Box<dyn ColorMap>), DataServerError> {
     let qr = match resp {
         CoverageResponse::Single(q) => q,
@@ -362,7 +296,27 @@ pub fn section_response_to_heatmaps(
         }
     }
 
-    let (colormap, vmin, vmax) = section_colormap(wms, (dmin, dmax));
+    let (colormap, vmin, vmax): (Box<dyn ColorMap>, f64, f64) = match style {
+        Some(s) => (Box::new(ArcColorMap(s.colormap.clone())), s.min, s.max),
+        None => {
+            // Fallback: viridis stretched to the data's own finite range so a
+            // collection with no style config still produces a readable image.
+            let (mut min, mut max) = (dmin, dmax);
+            if !(min.is_finite() && max.is_finite()) || max <= min {
+                min = 0.0;
+                max = 1.0;
+            }
+            (
+                Box::new(ds_render::LutColorMap::from_builtin(
+                    ds_render::BuiltinColormap::Viridis,
+                    min,
+                    max,
+                )),
+                min,
+                max,
+            )
+        }
+    };
 
     let y_label = axis_caption(z.kind.default_label(), z.kind.default_unit());
     let mut heatmaps = Vec::with_capacity(params.len());
@@ -644,30 +598,41 @@ mod tests {
         assert_eq!(hm.value_label, "dBZ");
     }
 
+    /// Build a resolved `StyleInfo` through the same `StyleContext` path the
+    /// server uses, so these tests pin the api-edr-facing contract.
+    fn resolved_style(spec: &ds_render::StyleSpec) -> ds_render::StyleInfo {
+        let ctx = ds_render::StyleContext::with_builtins();
+        let r = ctx.build_colormap(spec).unwrap();
+        ds_render::StyleInfo {
+            name: "default".into(),
+            title: "Default".into(),
+            colormap: r.colormap,
+            palette: r.palette,
+            min: r.min,
+            max: r.max,
+            parameter: None,
+        }
+    }
+
     #[test]
-    fn section_colormap_uses_builtin_when_configured() {
-        use ds_core::config::WmsConfig;
-        let wms = WmsConfig {
-            style_bundle: None,
-            colormap: Some("radar_dbz".into()),
-            color_stops: vec![],
+    fn section_style_uses_builtin_when_configured() {
+        let style = resolved_style(&ds_render::StyleSpec {
+            colormap: Some("radar_dbz"),
+            color_stops: &[],
             min: Some(-32.0),
             max: Some(95.0),
-            styles: vec![],
-            parameters: vec![],
-            rendered_cache_mb: 0,
-        };
+        });
         let qr = section("DBZH", "dBZ");
         let (heatmaps, _cmap) =
-            section_response_to_heatmaps(&CoverageResponse::Single(qr), Some(&wms)).unwrap();
-        // Config min/max drive the colour-bar bounds.
+            section_response_to_heatmaps(&CoverageResponse::Single(qr), Some(&style)).unwrap();
+        // Style min/max drive the colour-bar bounds.
         assert_eq!(heatmaps[0].value_min, -32.0);
         assert_eq!(heatmaps[0].value_max, 95.0);
     }
 
     #[test]
     fn section_colormap_falls_back_to_data_range() {
-        // No WMS config → viridis stretched to the data's finite range
+        // No resolved style → viridis stretched to the data's finite range
         // (5..25 in the fixture).
         let qr = section("DBZH", "dBZ");
         let (heatmaps, _cmap) =
@@ -684,37 +649,39 @@ mod tests {
 
     /// Descending-order `color_stops` (a natural radar-dBZ legend order)
     /// must still yield `value_min < value_max` — the colour bar would
-    /// otherwise label max→min top-to-bottom against the gradient.
+    /// otherwise label max→min top-to-bottom against the gradient. The stop
+    /// sorting itself now lives in `ds_render::StyleContext` (pinned there
+    /// by `inline_stops_win_over_name_and_sort_descending_input`); this
+    /// keeps the api-edr-level pin by resolving descending stops through
+    /// the same path a config would take.
     #[test]
-    fn section_colormap_sorts_descending_color_stops() {
-        use ds_core::config::{ColorStop, WmsConfig};
-        let wms = WmsConfig {
-            style_bundle: None,
+    fn section_style_from_descending_color_stops_sorts_range() {
+        use ds_core::config::ColorStop;
+        // Authored highest-value-first.
+        let stops = vec![
+            ColorStop {
+                value: 60.0,
+                color: "#ff0000".into(),
+            },
+            ColorStop {
+                value: 30.0,
+                color: "#00ff00".into(),
+            },
+            ColorStop {
+                value: 0.0,
+                color: "#0000ff".into(),
+            },
+        ];
+        let style = resolved_style(&ds_render::StyleSpec {
             colormap: None,
-            // Authored highest-value-first.
-            color_stops: vec![
-                ColorStop {
-                    value: 60.0,
-                    color: "#ff0000".into(),
-                },
-                ColorStop {
-                    value: 30.0,
-                    color: "#00ff00".into(),
-                },
-                ColorStop {
-                    value: 0.0,
-                    color: "#0000ff".into(),
-                },
-            ],
+            color_stops: &stops,
             min: None,
             max: None,
-            styles: vec![],
-            parameters: vec![],
-            rendered_cache_mb: 0,
-        };
+        });
+        assert!(style.min < style.max, "resolved style must sort the range");
         let qr = section("DBZH", "dBZ");
         let (heatmaps, _cmap) =
-            section_response_to_heatmaps(&CoverageResponse::Single(qr), Some(&wms)).unwrap();
+            section_response_to_heatmaps(&CoverageResponse::Single(qr), Some(&style)).unwrap();
         assert_eq!(heatmaps[0].value_min, 0.0, "min from the lowest stop");
         assert_eq!(heatmaps[0].value_max, 60.0, "max from the highest stop");
     }

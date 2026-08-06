@@ -538,6 +538,41 @@ mod tests {
         assert_eq!(cmap.color(Some(200.0)), [255, 255, 255, 255]);
     }
 
+    /// Pin the enum↔table invariant: EVERY `BuiltinColormap` variant has a
+    /// non-empty row in the palette table (`builtin_stops` would panic
+    /// otherwise) and its `name()` resolves back to the variant through
+    /// `resolve_builtin`. A variant added without a table row — or a rename
+    /// on either side — fails here instead of panicking at style-build time.
+    #[test]
+    fn every_builtin_variant_round_trips_through_the_palette_table() {
+        let variants = [
+            BuiltinColormap::RadarDbz,
+            BuiltinColormap::RadarSmhi,
+            BuiltinColormap::RadarFmi,
+            BuiltinColormap::RadarBookbinder,
+            BuiltinColormap::Grayscale,
+            BuiltinColormap::Viridis,
+            BuiltinColormap::Temperature,
+            BuiltinColormap::Precipitation,
+            BuiltinColormap::PrecipitationRate,
+            BuiltinColormap::WindSpeed,
+            BuiltinColormap::CapSeverity,
+            BuiltinColormap::LightningAge,
+        ];
+        assert_eq!(variants.len(), 12, "the legacy shim covers 12 palettes");
+        for v in &variants {
+            let stops = builtin_stops(v);
+            assert!(!stops.is_empty(), "{} has no stops in the table", v.name());
+            let resolved = resolve_builtin(v.name())
+                .unwrap_or_else(|| panic!("{} does not resolve back to a variant", v.name()));
+            assert_eq!(
+                resolved.name(),
+                v.name(),
+                "resolve_builtin must map the name back to the same variant"
+            );
+        }
+    }
+
     #[test]
     fn test_cap_severity_ramp_resolves_and_colours_codes() {
         let builtin = resolve_builtin("cap_severity").expect("cap_severity is a builtin");

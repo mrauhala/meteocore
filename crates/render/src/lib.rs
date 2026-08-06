@@ -7,6 +7,7 @@ pub mod metatile;
 pub mod palette;
 pub mod plot;
 pub mod rasterize;
+pub mod style;
 
 pub use colormap::{
     parse_hex_color, BuiltinColormap, ColorMap, ColorStop, IntegerLutColorMap, LinearColorMap,
@@ -15,10 +16,12 @@ pub use colormap::{
 pub use encode::{encode_jpeg, encode_png, encode_webp};
 pub use metatile::{render_metatiled, MetaTile, MetaTileStats, TileKeyPrefix, TilePixelCache};
 pub use palette::{
-    builtin_palette, builtin_palettes, Interpolation, Palette, PaletteInsert, PaletteRegistry,
+    builtin_palette, builtin_palette_arc, builtin_palettes, Interpolation, Palette, PaletteInsert,
+    PaletteRegistry,
 };
 pub use plot::{render_chart, render_heatmap, Heatmap, Panel, Series};
 pub use rasterize::{fill_polygon, Combine};
+pub use style::{ResolvedColormap, StyleContext, StyleSpec};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,6 +71,11 @@ pub struct StyleInfo {
     pub name: String,
     pub title: String,
     pub colormap: Arc<dyn ColorMap>,
+    /// The palette the colormap was built from — stops, interpolation mode
+    /// and title, kept for machine-readable legends. `colormap` is the
+    /// render-ready (possibly integer-LUT-wrapped, possibly overlay-wrapped)
+    /// form of this palette sampled over `min..max`.
+    pub palette: Arc<Palette>,
     pub min: f64,
     pub max: f64,
     /// Data parameter to render. For multi-parameter engines, selects which

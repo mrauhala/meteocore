@@ -433,6 +433,19 @@ pub fn builtin_names() -> &'static [&'static str] {
     NAMES.as_slice()
 }
 
+/// Arc-wrapped built-in lookup. The `Arc`s are process-global, so cloning
+/// one is refcount-cheap — this is the way to stamp a builtin into a
+/// [`crate::StyleInfo`] without copying stop data.
+pub fn builtin_palette_arc(name: &str) -> Option<Arc<Palette>> {
+    static ARCS: LazyLock<HashMap<&'static str, Arc<Palette>>> = LazyLock::new(|| {
+        BUILTIN_DEFS
+            .iter()
+            .map(|d| (d.name, Arc::new(materialize(d))))
+            .collect()
+    });
+    ARCS.get(name).cloned()
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -460,11 +473,16 @@ pub struct PaletteRegistry {
 }
 
 impl PaletteRegistry {
-    /// A registry pre-populated with every built-in palette.
+    /// A registry pre-populated with every built-in palette (sharing the
+    /// process-global `Arc`s — no stop data is copied).
     pub fn with_builtins() -> Self {
         let map = builtin_palettes()
             .iter()
-            .map(|p| (p.name.clone(), Arc::new(p.clone())))
+            .map(|p| {
+                let arc = builtin_palette_arc(&p.name)
+                    .expect("builtin_palette_arc covers every table row");
+                (p.name.clone(), arc)
+            })
             .collect();
         Self {
             map,

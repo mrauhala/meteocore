@@ -909,6 +909,7 @@ mod tests {
         api_edr::handlers::EdrState {
             engines: HashMap::new(),
             collections: HashMap::new(),
+            styles: HashMap::new(),
             base_url: String::new(),
             trust_proxy_headers: false,
         }
@@ -1512,6 +1513,7 @@ mod tests {
             ds_render::StyleInfo {
                 name: "default".to_string(),
                 title: "Default".to_string(),
+                palette: ds_render::builtin_palette_arc("viridis").unwrap(),
                 colormap: Arc::new(ds_render::LutColorMap::from_builtin(
                     ds_render::BuiltinColormap::Viridis,
                     0.0,
@@ -2137,6 +2139,7 @@ mod tests {
             ds_render::StyleInfo {
                 name: "rainbow".to_string(),
                 title: "Rainbow".to_string(),
+                palette: ds_render::builtin_palette_arc("viridis").unwrap(),
                 colormap: Arc::new(ds_render::LutColorMap::from_builtin(
                     ds_render::BuiltinColormap::Viridis,
                     0.0,

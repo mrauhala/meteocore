@@ -329,6 +329,13 @@ async fn main() {
         tracing::warn!("{warning}");
     }
 
+    // Reject unknown colormap names up front — a typo'd `colormap = "..."`
+    // must fail startup, not silently render viridis.
+    if let Err(e) = admin::validate_style_colormaps(&config.collections, &config.style_bundles) {
+        tracing::error!("Invalid style configuration: {e}");
+        std::process::exit(1);
+    }
+
     // Auto-discover collections from any --auto-collections directories (#411)
     // and merge them with the config-file collections. The merged set goes
     // through the same validate() as TOML collections (so duplicate ids across

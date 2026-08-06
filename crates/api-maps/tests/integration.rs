@@ -155,6 +155,7 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
         StyleInfo {
             name: "default".to_string(),
             title: "Default".to_string(),
+            palette: ds_render::builtin_palette_arc("viridis").unwrap(),
             colormap: cmap,
             min: 0.0,
             max: 1.0,
@@ -216,6 +217,7 @@ fn build_router_with_apis(apis: Vec<String>) -> axum::Router {
         StyleInfo {
             name: "default".to_string(),
             title: "Default".to_string(),
+            palette: ds_render::builtin_palette_arc("viridis").unwrap(),
             colormap: cmap.clone(),
             min: 0.0,
             max: 1.0,
@@ -227,6 +229,7 @@ fn build_router_with_apis(apis: Vec<String>) -> axum::Router {
         StyleInfo {
             name: "grayscale".to_string(),
             title: "Grayscale".to_string(),
+            palette: ds_render::builtin_palette_arc("grayscale").unwrap(),
             colormap: Arc::new(LutColorMap::from_builtin(
                 BuiltinColormap::Grayscale,
                 0.0,
@@ -1289,6 +1292,7 @@ fn build_empty_router() -> axum::Router {
         StyleInfo {
             name: "default".to_string(),
             title: "Default".to_string(),
+            palette: ds_render::builtin_palette_arc("viridis").unwrap(),
             colormap: cmap,
             min: 0.0,
             max: 1.0,
@@ -1408,6 +1412,7 @@ fn build_multi_param_router() -> axum::Router {
         StyleInfo {
             name: "default".to_string(),
             title: "Default".to_string(),
+            palette: ds_render::builtin_palette_arc("viridis").unwrap(),
             colormap: cmap,
             min: 0.0,
             max: 1.0,
