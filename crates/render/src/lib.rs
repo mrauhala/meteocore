@@ -4,6 +4,7 @@ mod encode;
 /// implementation detail of the legend renderer, not part of the public API.
 pub(crate) mod font;
 pub mod metatile;
+pub mod palette;
 pub mod plot;
 pub mod rasterize;
 
@@ -13,6 +14,9 @@ pub use colormap::{
 };
 pub use encode::{encode_jpeg, encode_png, encode_webp};
 pub use metatile::{render_metatiled, MetaTile, MetaTileStats, TileKeyPrefix, TilePixelCache};
+pub use palette::{
+    builtin_palette, builtin_palettes, Interpolation, Palette, PaletteInsert, PaletteRegistry,
+};
 pub use plot::{render_chart, render_heatmap, Heatmap, Panel, Series};
 pub use rasterize::{fill_polygon, Combine};
 

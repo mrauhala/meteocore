@@ -12,12 +12,19 @@ pub trait ColorMap: Send + Sync {
 }
 
 /// A color stop for defining gradient colormaps.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ColorStop {
     pub value: f64,
     pub color: [u8; 4],
 }
 
 /// Built-in colormap names.
+///
+/// Legacy shim: the authoritative palette data lives in the
+/// [`crate::palette`] builtin table; this enum only covers the original 12
+/// palettes and exists for `LutColorMap::from_builtin` callers. New code
+/// (and the newer builtins like `radial_velocity`) should resolve by name
+/// via [`crate::palette::builtin_palette`] or a `PaletteRegistry`.
 pub enum BuiltinColormap {
     /// Standard radar reflectivity (blue → green → yellow → red).
     RadarDbz,
@@ -37,7 +44,7 @@ pub enum BuiltinColormap {
     Precipitation,
     /// Precipitation rate palette (transparent → cyan → blue → green → yellow → red). 0–30 mm/h.
     PrecipitationRate,
-    /// Wind speed palette (calm green → yellow → orange → red ��� purple).
+    /// Wind speed palette (calm green → yellow → orange → red → purple).
     WindSpeed,
     /// CAP (Common Alerting Protocol) severity ramp. Integer severity codes
     /// 0–4 → grey/green/yellow/orange/red with a semi-transparent alpha so the
@@ -50,6 +57,27 @@ pub enum BuiltinColormap {
     /// (default 0–60 min). Fully opaque symbols — strikes are sparse point
     /// splats over a basemap, not an area fill.
     LightningAge,
+}
+
+impl BuiltinColormap {
+    /// The palette-table name of this variant (the string accepted in
+    /// `colormap = "..."` config).
+    pub fn name(&self) -> &'static str {
+        match self {
+            BuiltinColormap::RadarDbz => "radar_dbz",
+            BuiltinColormap::RadarSmhi => "radar_smhi",
+            BuiltinColormap::RadarFmi => "radar_fmi",
+            BuiltinColormap::RadarBookbinder => "radar_bookbinder",
+            BuiltinColormap::Grayscale => "grayscale",
+            BuiltinColormap::Viridis => "viridis",
+            BuiltinColormap::Temperature => "temperature",
+            BuiltinColormap::Precipitation => "precipitation",
+            BuiltinColormap::PrecipitationRate => "precipitation_rate",
+            BuiltinColormap::WindSpeed => "wind_speed",
+            BuiltinColormap::CapSeverity => "cap_severity",
+            BuiltinColormap::LightningAge => "lightning_age",
+        }
+    }
 }
 
 /// Lookup-table colormap. O(1) per pixel.
@@ -68,8 +96,23 @@ impl LutColorMap {
     /// Values in the stops define which colors appear at which physical values.
     /// The LUT samples the stops across the min..max range.
     pub fn from_builtin(builtin: BuiltinColormap, min: f64, max: f64) -> Self {
-        let stops = builtin_stops(&builtin);
-        Self::from_stops(&stops, min, max)
+        let palette = crate::palette::builtin_palette(builtin.name())
+            .expect("builtin palette table covers every BuiltinColormap variant");
+        Self::from_palette(palette, min, max)
+    }
+
+    /// Create a LUT colormap from a [`Palette`](crate::palette::Palette),
+    /// honouring its interpolation mode and explicit nodata color.
+    ///
+    /// Note: a `Step` palette is sampled onto the 4096-entry LUT, so class
+    /// thresholds land within LUT resolution — `(max - min) / 4095` — of
+    /// their exact stop values.
+    pub fn from_palette(palette: &crate::palette::Palette, min: f64, max: f64) -> Self {
+        let mut lut = Self::from_stops_interp(&palette.stops, min, max, palette.interpolation);
+        if let Some(nodata) = palette.nodata_color {
+            lut.nodata_color = nodata;
+        }
+        lut
     }
 
     /// Pre-compute an integer LUT from this colormap over `[min_val, max_val]`.
@@ -85,13 +128,24 @@ impl LutColorMap {
     /// which colors appear at which values within (or beyond) that range.
     /// The LUT has 4096 entries for better precision with wide value ranges.
     pub fn from_stops(stops: &[ColorStop], min: f64, max: f64) -> Self {
+        Self::from_stops_interp(stops, min, max, crate::palette::Interpolation::Linear)
+    }
+
+    /// Like [`from_stops`](Self::from_stops), with an explicit
+    /// interpolation mode.
+    pub fn from_stops_interp(
+        stops: &[ColorStop],
+        min: f64,
+        max: f64,
+        interp: crate::palette::Interpolation,
+    ) -> Self {
         let lut_size = 4096;
         let mut lut = Vec::with_capacity(lut_size);
 
         for i in 0..lut_size {
             let t = i as f64 / (lut_size - 1) as f64;
             let value = min + t * (max - min);
-            lut.push(interpolate_stops(stops, value));
+            lut.push(sample_stops(stops, value, interp));
         }
 
         Self {
@@ -298,6 +352,37 @@ impl ColorMap for LinearColorMap {
     }
 }
 
+/// Sample color stops at a value with the given interpolation mode.
+pub(crate) fn sample_stops(
+    stops: &[ColorStop],
+    value: f64,
+    interp: crate::palette::Interpolation,
+) -> [u8; 4] {
+    match interp {
+        crate::palette::Interpolation::Linear => interpolate_stops(stops, value),
+        crate::palette::Interpolation::Step => step_stops(stops, value),
+    }
+}
+
+/// Discrete-class sampling: the color of the highest stop at or below
+/// `value`. Below the first stop clamps to the first stop's color, matching
+/// [`interpolate_stops`]' clamp semantics; empty stops likewise match its
+/// black fallback.
+fn step_stops(stops: &[ColorStop], value: f64) -> [u8; 4] {
+    if stops.is_empty() {
+        return [0, 0, 0, 255];
+    }
+    let mut color = stops[0].color;
+    for stop in stops {
+        if stop.value <= value {
+            color = stop.color;
+        } else {
+            break;
+        }
+    }
+    color
+}
+
 /// Interpolate between color stops to find the color for a given value.
 fn interpolate_stops(stops: &[ColorStop], value: f64) -> [u8; 4] {
     if stops.is_empty() {
@@ -360,419 +445,22 @@ pub fn parse_hex_color(s: &str) -> Result<[u8; 4], String> {
 }
 
 /// Get built-in color stops for a named colormap.
+///
+/// Legacy shim over the [`crate::palette`] builtin table (the single
+/// source of palette data).
 pub fn builtin_stops(builtin: &BuiltinColormap) -> Vec<ColorStop> {
-    match builtin {
-        BuiltinColormap::Grayscale => vec![
-            ColorStop {
-                value: 0.0,
-                color: [0, 0, 0, 255],
-            },
-            ColorStop {
-                value: 1.0,
-                color: [255, 255, 255, 255],
-            },
-        ],
-        BuiltinColormap::RadarDbz => vec![
-            ColorStop {
-                value: 0.0,
-                color: [0, 0, 0, 0],
-            }, // transparent (no echo)
-            ColorStop {
-                value: 5.0,
-                color: [0, 0, 0, 0],
-            }, // transparent (below threshold)
-            ColorStop {
-                value: 5.1,
-                color: [0, 128, 255, 255],
-            }, // light blue
-            ColorStop {
-                value: 15.0,
-                color: [0, 200, 255, 255],
-            }, // cyan
-            ColorStop {
-                value: 25.0,
-                color: [0, 200, 0, 255],
-            }, // green
-            ColorStop {
-                value: 30.0,
-                color: [0, 255, 0, 255],
-            }, // bright green
-            ColorStop {
-                value: 35.0,
-                color: [255, 255, 0, 255],
-            }, // yellow
-            ColorStop {
-                value: 40.0,
-                color: [255, 200, 0, 255],
-            }, // orange-yellow
-            ColorStop {
-                value: 45.0,
-                color: [255, 128, 0, 255],
-            }, // orange
-            ColorStop {
-                value: 50.0,
-                color: [255, 0, 0, 255],
-            }, // red
-            ColorStop {
-                value: 55.0,
-                color: [200, 0, 0, 255],
-            }, // dark red
-            ColorStop {
-                value: 60.0,
-                color: [180, 0, 180, 255],
-            }, // magenta
-            ColorStop {
-                value: 70.0,
-                color: [255, 255, 255, 255],
-            }, // white (extreme)
-        ],
-        BuiltinColormap::RadarSmhi => {
-            // SMHI radar reflectivity colormap with per-dBZ colors.
-            // Gray tones below 5 dBZ, then blue → green → yellow → orange → red → magenta → cyan.
-            let data: &[(f64, [u8; 4])] = &[
-                (-30.0, [0, 0, 0, 0]), // below range: transparent
-                (-29.1, [0, 0, 0, 0]),
-                (-29.0, [54, 54, 54, 255]), // gray ramp starts
-                (-20.0, [63, 63, 63, 255]),
-                (-10.0, [73, 73, 73, 255]),
-                (-6.0, [87, 87, 87, 255]),
-                (-1.0, [139, 139, 139, 255]),
-                (0.0, [150, 150, 150, 255]),
-                (4.0, [192, 192, 192, 255]),
-                (5.0, [0, 50, 255, 255]), // blue ramp
-                (8.0, [0, 110, 255, 255]),
-                (11.0, [0, 170, 255, 255]),
-                (12.0, [0, 128, 0, 255]), // green ramp
-                (15.0, [0, 163, 0, 255]),
-                (19.0, [0, 178, 0, 255]),
-                (20.0, [10, 208, 10, 255]), // bright green
-                (24.0, [10, 248, 10, 255]),
-                (25.0, [255, 255, 15, 255]), // yellow ramp
-                (29.0, [255, 220, 15, 255]),
-                (30.0, [255, 200, 0, 255]), // orange ramp
-                (34.0, [255, 120, 0, 255]),
-                (35.0, [255, 35, 35, 255]), // red ramp
-                (37.0, [255, 0, 0, 255]),
-                (40.0, [195, 0, 0, 255]),
-                (44.0, [115, 0, 0, 255]),
-                (45.0, [175, 0, 175, 255]), // magenta ramp
-                (50.0, [219, 0, 219, 255]),
-                (54.0, [255, 0, 255, 255]),
-                (55.0, [0, 255, 255, 255]), // cyan ramp
-                (60.0, [64, 255, 255, 255]),
-                (65.0, [128, 255, 255, 255]),
-                (70.0, [192, 255, 255, 255]),
-            ];
-            data.iter()
-                .map(|(v, c)| ColorStop {
-                    value: *v,
-                    color: *c,
-                })
-                .collect()
-        }
-        BuiltinColormap::RadarFmi => {
-            // FMI summer radar reflectivity. Converted from SLD raw values
-            // to dBZ via: dBZ = raw * 0.5 - 32. Below 5 dBZ is transparent.
-            let data: &[(f64, [u8; 4])] = &[
-                (-32.0, [0, 0, 0, 0]),       // below range: transparent
-                (5.0, [0, 0, 0, 0]),         // raw 74: below threshold
-                (8.0, [108, 235, 243, 255]), // raw 80: light cyan
-                (12.0, [88, 199, 151, 255]), // raw 88: green
-                (18.0, [64, 152, 87, 255]),  // raw 100: dark green
-                (24.0, [241, 243, 90, 255]), // raw 112: yellow
-                (30.0, [223, 196, 10, 255]), // raw 124: gold
-                (34.0, [235, 149, 26, 255]), // raw 132: orange
-                (40.0, [232, 86, 22, 255]),  // raw 144: red-orange
-                (46.0, [206, 2, 2, 255]),    // raw 156: red
-                (52.0, [131, 10, 70, 255]),  // raw 168: dark magenta
-                (58.0, [250, 81, 165, 255]), // raw 180: pink
-            ];
-            data.iter()
-                .map(|(v, c)| ColorStop {
-                    value: *v,
-                    color: *c,
-                })
-                .collect()
-        }
-        BuiltinColormap::RadarBookbinder => {
-            // Bookbinder 8-bit Z curve (Evan Bookbinder, WFO SGF).
-            // Converted from SLD raw values to dBZ via: dBZ = raw * 0.5 - 32.
-            let data: &[(f64, [u8; 4])] = &[
-                (-32.0, [0, 0, 0, 0]),        // raw 0: transparent
-                (-31.5, [96, 96, 96, 77]),    // raw 1: faint gray
-                (4.5, [96, 96, 96, 77]),      // raw 73: gray
-                (5.0, [32, 96, 128, 179]),    // raw 74: dark cyan
-                (19.5, [48, 208, 255, 255]),  // raw 103: bright cyan
-                (20.0, [0, 255, 0, 255]),     // raw 104: bright green
-                (39.5, [0, 76, 0, 255]),      // raw 143: dark green
-                (40.0, [255, 230, 0, 255]),   // raw 144: yellow
-                (49.5, [255, 128, 0, 255]),   // raw 163: orange
-                (50.0, [255, 0, 0, 255]),     // raw 164: red
-                (59.5, [96, 0, 0, 255]),      // raw 183: dark red
-                (60.0, [255, 255, 255, 255]), // raw 184: white
-                (64.5, [255, 255, 255, 255]), // raw 193: white
-                (65.0, [144, 48, 208, 255]),  // raw 194: purple
-                (69.5, [144, 48, 208, 255]),  // raw 203: purple
-                (70.0, [255, 32, 255, 255]),  // raw 204: magenta
-                (74.5, [255, 32, 255, 255]),  // raw 213: magenta
-                (75.0, [255, 0, 128, 255]),   // raw 214: hot pink
-                (79.5, [255, 0, 128, 255]),   // raw 223: hot pink
-                (80.0, [255, 0, 150, 255]),   // raw 224: deep pink
-                (94.5, [255, 0, 150, 255]),   // raw 253: deep pink
-            ];
-            data.iter()
-                .map(|(v, c)| ColorStop {
-                    value: *v,
-                    color: *c,
-                })
-                .collect()
-        }
-        BuiltinColormap::Viridis => vec![
-            ColorStop {
-                value: 0.0,
-                color: [68, 1, 84, 255],
-            },
-            ColorStop {
-                value: 0.125,
-                color: [72, 36, 117, 255],
-            },
-            ColorStop {
-                value: 0.25,
-                color: [56, 88, 140, 255],
-            },
-            ColorStop {
-                value: 0.375,
-                color: [38, 130, 142, 255],
-            },
-            ColorStop {
-                value: 0.5,
-                color: [31, 158, 137, 255],
-            },
-            ColorStop {
-                value: 0.625,
-                color: [78, 178, 101, 255],
-            },
-            ColorStop {
-                value: 0.75,
-                color: [148, 197, 56, 255],
-            },
-            ColorStop {
-                value: 0.875,
-                color: [220, 215, 30, 255],
-            },
-            ColorStop {
-                value: 1.0,
-                color: [253, 231, 37, 255],
-            },
-        ],
-        BuiltinColormap::Temperature => vec![
-            ColorStop {
-                value: -40.0,
-                color: [40, 0, 120, 255],
-            }, // deep purple (extreme cold)
-            ColorStop {
-                value: -30.0,
-                color: [0, 0, 180, 255],
-            }, // dark blue
-            ColorStop {
-                value: -20.0,
-                color: [0, 60, 255, 255],
-            }, // blue
-            ColorStop {
-                value: -10.0,
-                color: [0, 160, 255, 255],
-            }, // light blue
-            ColorStop {
-                value: 0.0,
-                color: [0, 220, 220, 255],
-            }, // cyan
-            ColorStop {
-                value: 10.0,
-                color: [0, 200, 0, 255],
-            }, // green
-            ColorStop {
-                value: 20.0,
-                color: [200, 200, 0, 255],
-            }, // yellow
-            ColorStop {
-                value: 30.0,
-                color: [255, 128, 0, 255],
-            }, // orange
-            ColorStop {
-                value: 40.0,
-                color: [255, 0, 0, 255],
-            }, // red
-            ColorStop {
-                value: 50.0,
-                color: [180, 0, 0, 255],
-            }, // dark red
-        ],
-        BuiltinColormap::Precipitation => vec![
-            ColorStop {
-                value: 0.0,
-                color: [0, 0, 0, 0],
-            }, // transparent (no precip)
-            ColorStop {
-                value: 0.1,
-                color: [170, 220, 255, 255],
-            }, // very light blue
-            ColorStop {
-                value: 0.5,
-                color: [100, 180, 255, 255],
-            }, // light blue
-            ColorStop {
-                value: 1.0,
-                color: [50, 130, 255, 255],
-            }, // blue
-            ColorStop {
-                value: 2.0,
-                color: [0, 80, 255, 255],
-            }, // medium blue
-            ColorStop {
-                value: 5.0,
-                color: [0, 40, 200, 255],
-            }, // dark blue
-            ColorStop {
-                value: 10.0,
-                color: [120, 0, 200, 255],
-            }, // purple
-            ColorStop {
-                value: 20.0,
-                color: [200, 0, 150, 255],
-            }, // magenta
-            ColorStop {
-                value: 50.0,
-                color: [255, 255, 255, 255],
-            }, // white (extreme)
-        ],
-        BuiltinColormap::PrecipitationRate => vec![
-            ColorStop {
-                value: 0.0,
-                color: [0, 0, 0, 0],
-            }, // transparent (no rain)
-            ColorStop {
-                value: 0.1,
-                color: [200, 240, 255, 200],
-            }, // very light cyan (drizzle)
-            ColorStop {
-                value: 0.5,
-                color: [100, 210, 255, 255],
-            }, // light cyan
-            ColorStop {
-                value: 1.0,
-                color: [30, 170, 255, 255],
-            }, // cyan-blue
-            ColorStop {
-                value: 2.0,
-                color: [0, 120, 200, 255],
-            }, // blue
-            ColorStop {
-                value: 4.0,
-                color: [0, 180, 80, 255],
-            }, // green
-            ColorStop {
-                value: 8.0,
-                color: [200, 220, 0, 255],
-            }, // yellow
-            ColorStop {
-                value: 15.0,
-                color: [255, 140, 0, 255],
-            }, // orange
-            ColorStop {
-                value: 30.0,
-                color: [220, 0, 0, 255],
-            }, // red (heavy)
-        ],
-        BuiltinColormap::WindSpeed => vec![
-            ColorStop {
-                value: 0.0,
-                color: [0, 160, 0, 255],
-            }, // calm green
-            ColorStop {
-                value: 5.0,
-                color: [100, 200, 0, 255],
-            }, // yellow-green
-            ColorStop {
-                value: 10.0,
-                color: [200, 200, 0, 255],
-            }, // yellow
-            ColorStop {
-                value: 15.0,
-                color: [255, 180, 0, 255],
-            }, // orange-yellow
-            ColorStop {
-                value: 20.0,
-                color: [255, 100, 0, 255],
-            }, // orange
-            ColorStop {
-                value: 25.0,
-                color: [255, 0, 0, 255],
-            }, // red
-            ColorStop {
-                value: 30.0,
-                color: [200, 0, 80, 255],
-            }, // crimson
-            ColorStop {
-                value: 40.0,
-                color: [150, 0, 150, 255],
-            }, // purple
-            ColorStop {
-                value: 50.0,
-                color: [100, 0, 200, 255],
-            }, // violet
-        ],
-        BuiltinColormap::CapSeverity => vec![
-            ColorStop {
-                value: 0.0,
-                color: [120, 120, 120, 200],
-            }, // Unknown — grey
-            ColorStop {
-                value: 1.0,
-                color: [38, 166, 91, 200],
-            }, // Minor — green
-            ColorStop {
-                value: 2.0,
-                color: [241, 196, 15, 200],
-            }, // Moderate — yellow
-            ColorStop {
-                value: 3.0,
-                color: [230, 126, 34, 200],
-            }, // Severe — orange
-            ColorStop {
-                value: 4.0,
-                color: [192, 57, 43, 200],
-            }, // Extreme — red
-        ],
-        BuiltinColormap::LightningAge => vec![
-            ColorStop {
-                value: 0.0,
-                color: [255, 255, 240, 255],
-            }, // just struck — near-white
-            ColorStop {
-                value: 5.0,
-                color: [255, 236, 80, 255],
-            }, // ≤5 min — bright yellow
-            ColorStop {
-                value: 15.0,
-                color: [255, 160, 40, 255],
-            }, // orange
-            ColorStop {
-                value: 30.0,
-                color: [225, 60, 50, 255],
-            }, // red
-            ColorStop {
-                value: 45.0,
-                color: [160, 40, 120, 255],
-            }, // magenta
-            ColorStop {
-                value: 60.0,
-                color: [90, 30, 130, 255],
-            }, // window edge — dark violet
-        ],
-    }
+    crate::palette::builtin_palette(builtin.name())
+        .expect("builtin palette table covers every BuiltinColormap variant")
+        .stops
+        .clone()
 }
 
 /// Resolve a built-in colormap name to its enum variant.
+///
+/// Legacy shim: only covers the original 12 palettes that have enum
+/// variants. Prefer [`crate::palette::builtin_palette`], which also
+/// resolves the newer builtins (`radial_velocity`, `pressure`, `humidity`,
+/// `cloud_cover`).
 pub fn resolve_builtin(name: &str) -> Option<BuiltinColormap> {
     match name {
         "radar_dbz" => Some(BuiltinColormap::RadarDbz),
@@ -791,22 +479,10 @@ pub fn resolve_builtin(name: &str) -> Option<BuiltinColormap> {
     }
 }
 
-/// List all available built-in colormap names.
+/// List all available built-in colormap names (including the newer
+/// palettes that have no `BuiltinColormap` variant).
 pub fn builtin_names() -> &'static [&'static str] {
-    &[
-        "radar_dbz",
-        "radar_smhi",
-        "radar_fmi",
-        "radar_bookbinder",
-        "grayscale",
-        "viridis",
-        "temperature",
-        "precipitation",
-        "precipitation_rate",
-        "wind_speed",
-        "cap_severity",
-        "lightning_age",
-    ]
+    crate::palette::builtin_names()
 }
 
 #[cfg(test)]
