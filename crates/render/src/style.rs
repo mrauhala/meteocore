@@ -116,28 +116,41 @@ impl StyleContext {
         })
     }
 
-    /// The collection-level default colormap: the bundle default when a
-    /// bundle is bound, else the inline `[wms]` fields.
+    /// The collection-level default colormap: the inline `[wms]` fields
+    /// merged slot-wise over the bundle default (bundles v2) — inline wins
+    /// each slot it defines, so a collection can bind a shared bundle and
+    /// override only e.g. `min`/`max`.
     pub fn collection_default(
         &self,
         collection: &CollectionConfig,
         bundle: Option<&StyleBundle>,
     ) -> Result<ResolvedColormap, String> {
-        if let Some(bundle) = bundle {
-            return self.build_colormap(&StyleSpec {
-                colormap: bundle.default.colormap.as_deref(),
-                color_stops: &bundle.default.color_stops,
-                min: bundle.default.min,
-                max: bundle.default.max,
-            });
-        }
+        self.build_colormap(&self.collection_default_spec(collection, bundle))
+    }
+
+    /// The merged (inline-over-bundle) spec behind [`collection_default`].
+    fn collection_default_spec<'a>(
+        &self,
+        collection: &'a CollectionConfig,
+        bundle: Option<&'a StyleBundle>,
+    ) -> StyleSpec<'a> {
         let wms = collection.wms.as_ref();
-        self.build_colormap(&StyleSpec {
+        let inline = StyleSpec {
             colormap: wms.and_then(|w| w.colormap.as_deref()),
             color_stops: wms.map(|w| &w.color_stops[..]).unwrap_or(&[]),
             min: wms.and_then(|w| w.min),
             max: wms.and_then(|w| w.max),
-        })
+        };
+        let Some(bundle) = bundle else { return inline };
+        merge_specs(
+            inline,
+            StyleSpec {
+                colormap: bundle.default.colormap.as_deref(),
+                color_stops: &bundle.default.color_stops,
+                min: bundle.default.min,
+                max: bundle.default.max,
+            },
+        )
     }
 
     /// All styles for a collection's base layer: `default` plus named
@@ -164,6 +177,9 @@ impl StyleContext {
             },
         );
 
+        // Named styles: union of bundle extras and inline [[wms.styles]]
+        // (bundles v2) — inline wins on a name clash because it is inserted
+        // second into the same map.
         if let Some(bundle) = bundle {
             for extra in &bundle.extras {
                 let r = self.build_colormap(&StyleSpec {
@@ -185,7 +201,8 @@ impl StyleContext {
                     },
                 );
             }
-        } else if let Some(wms_config) = &collection.wms {
+        }
+        if let Some(wms_config) = &collection.wms {
             for style_config in &wms_config.styles {
                 let r = self.build_colormap(&StyleSpec {
                     colormap: style_config.colormap.as_deref(),
@@ -239,27 +256,48 @@ impl StyleContext {
 
         let shared_named_styles = self.collection_styles(collection, bundle)?;
 
-        // When a bundle is bound, inline per-parameter overrides are
-        // rejected by validation (bundles v2 will merge them instead).
+        // Per-parameter chain (bundles v2), each slot resolved
+        // independently, first level that defines it wins:
+        //   1. inline [[wms.parameters]] entry
+        //   2. bundle [[style_bundles.parameters]] entry
+        //   3. inline [wms] collection fields
+        //   4. bundle default
         let param_configs: HashMap<&str, &WmsParameterConfig> = wms_config
             .parameters
             .iter()
             .map(|p| (p.name.as_str(), p))
             .collect();
+        let bundle_params: HashMap<&str, &WmsParameterConfig> = bundle
+            .map(|b| b.parameters.iter().map(|p| (p.name.as_str(), p)).collect())
+            .unwrap_or_default();
 
-        let fallback = self.collection_default(collection, bundle)?;
+        let collection_spec = self.collection_default_spec(collection, bundle);
+        let fallback = self.build_colormap(&collection_spec)?;
+
+        fn param_spec(pc: &WmsParameterConfig) -> StyleSpec<'_> {
+            StyleSpec {
+                colormap: pc.colormap.as_deref(),
+                color_stops: &pc.color_stops,
+                min: pc.min,
+                max: pc.max,
+            }
+        }
 
         for (short_name, _title) in param_names {
             let layer_key = format!("{}/{}", collection.id, short_name);
             let mut layer_styles = HashMap::new();
 
-            let r = if let Some(pc) = param_configs.get(short_name.as_str()) {
-                self.build_colormap(&StyleSpec {
-                    colormap: pc.colormap.as_deref(),
-                    color_stops: &pc.color_stops,
-                    min: pc.min,
-                    max: pc.max,
-                })?
+            let inline_pc = param_configs.get(short_name.as_str());
+            let bundle_pc = bundle_params.get(short_name.as_str());
+            let r = if inline_pc.is_some() || bundle_pc.is_some() {
+                let mut spec = collection_spec;
+                if let Some(pc) = bundle_pc {
+                    spec = merge_specs(param_spec(pc), spec);
+                }
+                if let Some(pc) = inline_pc {
+                    spec = merge_specs(param_spec(pc), spec);
+                }
+                self.build_colormap(&spec)?
             } else {
                 fallback.clone()
             };
@@ -299,6 +337,26 @@ impl StyleContext {
         }
 
         Ok(out)
+    }
+}
+
+/// Slot-wise merge (bundles v2): `primary` wins every slot it defines. The
+/// palette source — the (colormap name, color_stops) pair — is ONE slot: if
+/// primary defines either, primary's whole pair is taken (mixing primary
+/// stops with a fallback name would be incoherent); `min` and `max` merge
+/// independently, so an override of just the range inherits the palette.
+fn merge_specs<'a>(primary: StyleSpec<'a>, fallback: StyleSpec<'a>) -> StyleSpec<'a> {
+    let primary_has_palette = primary.colormap.is_some() || !primary.color_stops.is_empty();
+    let (colormap, color_stops) = if primary_has_palette {
+        (primary.colormap, primary.color_stops)
+    } else {
+        (fallback.colormap, fallback.color_stops)
+    };
+    StyleSpec {
+        colormap,
+        color_stops,
+        min: primary.min.or(fallback.min),
+        max: primary.max.or(fallback.max),
     }
 }
 
@@ -531,6 +589,141 @@ mod tests {
             &src,
             &maybe_wrap_integer_lut(src.clone(), 0.0, f64::INFINITY)
         ));
+    }
+
+    fn bundle(toml_src: &str) -> StyleBundle {
+        toml::from_str(toml_src).expect("test bundle parses")
+    }
+
+    /// Bundles v2: a bundle carries per-parameter defaults; collections
+    /// inherit them with zero inline config (the nexus radar-volume case
+    /// that previously required ~525 copy-pasted lines per file).
+    #[test]
+    fn bundle_parameters_shared_across_collections() {
+        let ctx = StyleContext::with_builtins();
+        let b = bundle(
+            r#"
+            id = "radar_volume"
+            [default]
+            colormap = "radar_dbz"
+            [[parameters]]
+            name = "VRADH"
+            colormap = "radial_velocity"
+            min = -48.0
+            max = 48.0
+            [[extras]]
+            name = "gray"
+            colormap = "grayscale"
+            min = 0.0
+            max = 70.0
+            "#,
+        );
+        let params = vec![
+            ("DBZH".to_string(), "Z".to_string()),
+            ("VRADH".to_string(), "V".to_string()),
+        ];
+        for id in ["c1", "c2"] {
+            let mut c = coll("style_bundle = \"radar_volume\"\n");
+            c.id = id.to_string();
+            let maps = ctx
+                .parameter_layer_styles(&c, Some(&b), &params, &|_, cm| cm)
+                .unwrap();
+            let dbzh = &maps[&format!("{id}/DBZH")]["default"];
+            assert_eq!(dbzh.palette.name, "radar_dbz");
+            let vradh = &maps[&format!("{id}/VRADH")]["default"];
+            assert_eq!(vradh.palette.name, "radial_velocity");
+            assert_eq!((vradh.min, vradh.max), (-48.0, 48.0));
+            // Bundle extras present on parameter layers too.
+            assert!(maps[&format!("{id}/VRADH")].contains_key("gray"));
+        }
+    }
+
+    /// Slot-wise merge: inline defines only min/max → palette inherited
+    /// from the bundle; an inline parameter entry overrides the bundle's
+    /// parameter entry per slot.
+    #[test]
+    fn slot_wise_merge_inline_over_bundle() {
+        let ctx = StyleContext::with_builtins();
+        let b = bundle(
+            r#"
+            id = "vol"
+            [default]
+            colormap = "radar_dbz"
+            [[parameters]]
+            name = "VRADH"
+            colormap = "radial_velocity"
+            min = -48.0
+            max = 48.0
+            "#,
+        );
+        // Collection overrides ONLY the range of the default style…
+        let c = coll(
+            r#"
+            style_bundle = "vol"
+            min = -10.0
+            max = 80.0
+            [[wms.parameters]]
+            name = "VRADH"
+            min = -24.0
+            max = 24.0
+            "#,
+        );
+        let default = ctx.collection_default(&c, Some(&b)).unwrap();
+        // …palette slot inherited from the bundle, range from inline.
+        assert_eq!(default.palette.name, "radar_dbz");
+        assert_eq!((default.min, default.max), (-10.0, 80.0));
+
+        let params = vec![("VRADH".to_string(), "V".to_string())];
+        let maps = ctx
+            .parameter_layer_styles(&c, Some(&b), &params, &|_, cm| cm)
+            .unwrap();
+        let vradh = &maps["c1/VRADH"]["default"];
+        // Inline param defines only min/max → narrows the range, inherits
+        // the bundle parameter's palette.
+        assert_eq!(vradh.palette.name, "radial_velocity");
+        assert_eq!((vradh.min, vradh.max), (-24.0, 24.0));
+    }
+
+    /// Named styles are the union of bundle extras and inline styles;
+    /// inline wins a name clash.
+    #[test]
+    fn named_styles_union_inline_wins() {
+        let ctx = StyleContext::with_builtins();
+        let b = bundle(
+            r#"
+            id = "vol"
+            [default]
+            colormap = "radar_dbz"
+            [[extras]]
+            name = "gray"
+            colormap = "grayscale"
+            min = 0.0
+            max = 1.0
+            [[extras]]
+            name = "fmi"
+            colormap = "radar_fmi"
+            "#,
+        );
+        let c = coll(
+            r#"
+            style_bundle = "vol"
+            [[wms.styles]]
+            name = "gray"
+            title = "Wide gray"
+            colormap = "grayscale"
+            min = -32.0
+            max = 95.0
+            [[wms.styles]]
+            name = "local_extra"
+            colormap = "viridis"
+            "#,
+        );
+        let styles = ctx.collection_styles(&c, Some(&b)).unwrap();
+        assert_eq!(styles.len(), 4); // default + gray + fmi + local_extra
+        assert_eq!((styles["gray"].min, styles["gray"].max), (-32.0, 95.0));
+        assert_eq!(styles["gray"].title, "Wide gray");
+        assert!(styles.contains_key("fmi"));
+        assert!(styles.contains_key("local_extra"));
     }
 
     #[test]
