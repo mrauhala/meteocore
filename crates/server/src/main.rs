@@ -344,16 +344,6 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    if let Err(e) = admin::validate_style_colormaps(
-        &config.collections,
-        &config.style_bundles,
-        &palette_registry,
-    ) {
-        tracing::error!("Invalid style configuration: {e}");
-        std::process::exit(1);
-    }
-    let style_ctx = ds_render::StyleContext::new(palette_registry);
-
     // Auto-discover collections from any --auto-collections directories (#411)
     // and merge them with the config-file collections. The merged set goes
     // through the same validate() as TOML collections (so duplicate ids across
@@ -371,6 +361,19 @@ async fn main() {
             std::process::exit(1);
         }
     }
+
+    // Colormap-name validation runs AFTER the auto-collections merge so every
+    // collection source is checked uniformly (auto configs carry no [wms]
+    // block today, but the ordering must not silently exempt them).
+    if let Err(e) = admin::validate_style_colormaps(
+        &config.collections,
+        &config.style_bundles,
+        &palette_registry,
+    ) {
+        tracing::error!("Invalid style configuration: {e}");
+        std::process::exit(1);
+    }
+    let style_ctx = ds_render::StyleContext::new(palette_registry);
 
     // Apply --collections filter if provided. Unknown IDs are a hard error —
     // typing `--collections noa-gfs` should not silently load nothing.
