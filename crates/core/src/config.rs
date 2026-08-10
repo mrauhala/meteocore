@@ -14,6 +14,42 @@ pub struct ServerConfig {
     /// allowed in the top-level config.toml, like `[[style_bundles]]`.
     #[serde(default)]
     pub colormaps: Vec<ColormapDef>,
+    /// Per-parameter default-style override rules (`[[parameter_defaults]]`),
+    /// checked before the embedded defaults table (#320). Top-level
+    /// config.toml only.
+    #[serde(default)]
+    pub parameter_defaults: Vec<ParameterDefault>,
+}
+
+/// One `[[parameter_defaults]]` rule: match parameters by exact (normalized)
+/// short name and/or substring, and style them with a palette + range. The
+/// embedded table in ds-render has the same semantics; config rules run
+/// first.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ParameterDefault {
+    /// Exact short-name matches (normalized: lowercase alphanumerics).
+    #[serde(default)]
+    pub names: Vec<String>,
+    /// Substring matches against the normalized short name and title.
+    #[serde(default)]
+    pub contains: Vec<String>,
+    /// Palette name (built-in or `[[colormaps]]`).
+    pub colormap: String,
+    /// Range when no `unit_ranges` entry matches. With `unit_ranges` set
+    /// and no `min`/`max`, an unmatched unit means the rule does not apply.
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    /// Unit-gated ranges, matched against the collection's unit hint.
+    #[serde(default)]
+    pub unit_ranges: Vec<UnitRange>,
+}
+
+/// One unit-alias → range entry inside `[[parameter_defaults]]`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnitRange {
+    pub unit: String,
+    pub min: f64,
+    pub max: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +143,7 @@ impl ServerConfig {
             collections: Vec::new(),
             style_bundles: Vec::new(),
             colormaps: Vec::new(),
+            parameter_defaults: Vec::new(),
         }
     }
 }
@@ -350,8 +387,18 @@ pub struct PreviewConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WmsConfig {
-    /// Named bundle; mixing with inline colormap/styles/etc. is a config error.
+    /// Named bundle; merges slot-wise with the inline fields (bundles v2),
+    /// inline winning each slot it defines.
     pub style_bundle: Option<String>,
+    /// Opt out of the built-in per-parameter default styles (#320) for this
+    /// collection. Default `true`: parameters of a multi-parameter
+    /// collection with no explicit style match the built-in /
+    /// `[[parameter_defaults]]` table (temperature → temperature palette,
+    /// MSLP → pressure, …) BEFORE falling back to the collection-level
+    /// colormap. Set `false` to paint every parameter with the
+    /// collection-level style, as before.
+    #[serde(default)]
+    pub parameter_defaults: Option<bool>,
     /// Built-in colormap name for the default style (e.g., "radar_dbz", "viridis").
     /// Ignored if color_stops are provided. Falls back to "viridis" if not set.
     pub colormap: Option<String>,
@@ -382,7 +429,7 @@ pub struct WmsConfig {
 /// Per-parameter default colormap configuration for WMS.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WmsParameterConfig {
-    /// Parameter short name (e.g., "2t", "msl"). Matched via param_index_by_name().
+    /// Parameter short name (e.g., "2t", "msl"). Matched exactly (case-sensitive) against the engine's parameter short names.
     pub name: String,
     /// Built-in colormap name for this parameter's default style.
     pub colormap: Option<String>,
@@ -2036,6 +2083,12 @@ impl ServerConfig {
                      move the block to the top-level config.toml (or a colormaps_dir file)"
                 )));
             }
+            if raw.contains_key("parameter_defaults") {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "{filename}: [[parameter_defaults]] is not allowed in per-collection \
+                     files — move the block to the top-level config.toml"
+                )));
+            }
             let collection: CollectionConfig = raw.try_into().map_err(|e| {
                 crate::error::DataServerError::Config(format!("Failed to parse {filename}: {e}"))
             })?;
@@ -2057,6 +2110,25 @@ impl ServerConfig {
 
     /// Validate configuration for common errors before starting the server.
     pub fn validate(&self) -> Result<(), crate::error::DataServerError> {
+        // Validate [[parameter_defaults]] rules: a rule must be matchable
+        // and name a palette (existence is checked by the server against the
+        // full registry, which includes [[colormaps]]).
+        for (i, rule) in self.parameter_defaults.iter().enumerate() {
+            let owner = format!("[[parameter_defaults]] entry {}", i + 1);
+            if rule.colormap.is_empty() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "{owner}: 'colormap' must not be empty"
+                )));
+            }
+            if rule.names.iter().all(|n| n.trim().is_empty())
+                && rule.contains.iter().all(|c| c.trim().is_empty())
+            {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "{owner}: at least one of 'names' or 'contains' must be non-empty"
+                )));
+            }
+        }
+
         // Validate [[colormaps]]: each definition well-formed, names present
         // and unique. (Whether a name shadows a built-in is decided by the
         // server layer, which owns the palette registry.)

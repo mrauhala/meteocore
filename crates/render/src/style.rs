@@ -48,16 +48,27 @@ pub struct ResolvedColormap {
 /// consumes the resolved [`StyleInfo`] maps, never raw config.
 pub struct StyleContext {
     registry: PaletteRegistry,
+    defaults: crate::defaults::ParameterDefaults,
 }
 
 impl StyleContext {
     pub fn new(registry: PaletteRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            defaults: crate::defaults::ParameterDefaults::default(),
+        }
     }
 
     /// A context with only the built-in palettes (no user `[[colormaps]]`).
     pub fn with_builtins() -> Self {
         Self::new(PaletteRegistry::with_builtins())
+    }
+
+    /// Attach config `[[parameter_defaults]]` override rules (checked
+    /// before the embedded table).
+    pub fn with_defaults(mut self, defaults: crate::defaults::ParameterDefaults) -> Self {
+        self.defaults = defaults;
+        self
     }
 
     pub fn registry(&self) -> &PaletteRegistry {
@@ -247,29 +258,38 @@ impl StyleContext {
         collection: &CollectionConfig,
         bundle: Option<&StyleBundle>,
         param_names: &[(String, String)],
+        unit: Option<&str>,
         wrap: &dyn Fn(&str, Arc<dyn ColorMap>) -> Arc<dyn ColorMap>,
     ) -> Result<HashMap<String, HashMap<String, StyleInfo>>, String> {
         let mut out = HashMap::new();
-        let Some(wms_config) = &collection.wms else {
-            return Ok(out);
-        };
 
         let shared_named_styles = self.collection_styles(collection, bundle)?;
 
-        // Per-parameter chain (bundles v2), each slot resolved
-        // independently, first level that defines it wins:
+        // Per-parameter chain (bundles v2 + parameter defaults #320), each
+        // slot resolved independently, first level that defines it wins:
         //   1. inline [[wms.parameters]] entry
         //   2. bundle [[style_bundles.parameters]] entry
-        //   3. inline [wms] collection fields
-        //   4. bundle default
-        let param_configs: HashMap<&str, &WmsParameterConfig> = wms_config
-            .parameters
-            .iter()
-            .map(|p| (p.name.as_str(), p))
-            .collect();
+        //   3. built-in / [[parameter_defaults]] match (multi-param
+        //      collections; the match REPLACES levels 4-5 as one atomic
+        //      base so a default palette can't pick up an unrelated
+        //      collection-level min/max)
+        //   4. inline [wms] collection fields
+        //   5. bundle default
+        // A collection can opt out of level 3 with
+        // `[wms] parameter_defaults = false`.
+        let param_configs: HashMap<&str, &WmsParameterConfig> = collection
+            .wms
+            .as_ref()
+            .map(|w| w.parameters.iter().map(|p| (p.name.as_str(), p)).collect())
+            .unwrap_or_default();
         let bundle_params: HashMap<&str, &WmsParameterConfig> = bundle
             .map(|b| b.parameters.iter().map(|p| (p.name.as_str(), p)).collect())
             .unwrap_or_default();
+        let defaults_enabled = collection
+            .wms
+            .as_ref()
+            .and_then(|w| w.parameter_defaults)
+            .unwrap_or(true);
 
         let collection_spec = self.collection_default_spec(collection, bundle);
         let fallback = self.build_colormap(&collection_spec)?;
@@ -283,14 +303,28 @@ impl StyleContext {
             }
         }
 
-        for (short_name, _title) in param_names {
+        for (short_name, title) in param_names {
             let layer_key = format!("{}/{}", collection.id, short_name);
             let mut layer_styles = HashMap::new();
 
             let inline_pc = param_configs.get(short_name.as_str());
             let bundle_pc = bundle_params.get(short_name.as_str());
-            let r = if inline_pc.is_some() || bundle_pc.is_some() {
-                let mut spec = collection_spec;
+            let matched = if defaults_enabled {
+                self.defaults.match_default(short_name, title, unit)
+            } else {
+                None
+            };
+            let r = if inline_pc.is_some() || bundle_pc.is_some() || matched.is_some() {
+                let base = match &matched {
+                    Some(d) => StyleSpec {
+                        colormap: Some(&d.palette),
+                        color_stops: &[],
+                        min: d.range.map(|r| r.0),
+                        max: d.range.map(|r| r.1),
+                    },
+                    None => collection_spec,
+                };
+                let mut spec = base;
                 if let Some(pc) = bundle_pc {
                     spec = merge_specs(param_spec(pc), spec);
                 }
@@ -626,7 +660,7 @@ mod tests {
             let mut c = coll("style_bundle = \"radar_volume\"\n");
             c.id = id.to_string();
             let maps = ctx
-                .parameter_layer_styles(&c, Some(&b), &params, &|_, cm| cm)
+                .parameter_layer_styles(&c, Some(&b), &params, None, &|_, cm| cm)
                 .unwrap();
             let dbzh = &maps[&format!("{id}/DBZH")]["default"];
             assert_eq!(dbzh.palette.name, "radar_dbz");
@@ -675,7 +709,7 @@ mod tests {
 
         let params = vec![("VRADH".to_string(), "V".to_string())];
         let maps = ctx
-            .parameter_layer_styles(&c, Some(&b), &params, &|_, cm| cm)
+            .parameter_layer_styles(&c, Some(&b), &params, None, &|_, cm| cm)
             .unwrap();
         let vradh = &maps["c1/VRADH"]["default"];
         // Inline param defines only min/max → narrows the range, inherits
@@ -726,6 +760,87 @@ mod tests {
         assert!(styles.contains_key("local_extra"));
     }
 
+    /// #320: parameters of a multi-parameter collection match built-in
+    /// defaults BEFORE the collection-level colormap (the meps-surface fix).
+    #[test]
+    fn parameter_defaults_beat_collection_colormap_on_multi_param() {
+        let ctx = StyleContext::with_builtins();
+        let c = coll("colormap = \"temperature\"\n");
+        let params = vec![
+            ("t2m".to_string(), "2 m temperature".to_string()),
+            ("msl".to_string(), "Mean sea-level pressure".to_string()),
+            ("zzz".to_string(), "Mystery".to_string()),
+        ];
+        let maps = ctx
+            .parameter_layer_styles(&c, None, &params, Some("hPa"), &|_, cm| cm)
+            .unwrap();
+        // msl matches the pressure default despite the collection colormap.
+        let msl = &maps["c1/msl"]["default"];
+        assert_eq!(msl.palette.name, "pressure");
+        assert_eq!((msl.min, msl.max), (950.0, 1050.0));
+        // Unmatched parameter falls back to the collection colormap.
+        assert_eq!(maps["c1/zzz"]["default"].palette.name, "temperature");
+        // t2m: the collection-level unit hint is hPa; the temperature rule
+        // is unit-gated (never guess K vs C) → no default, collection wins.
+        assert_eq!(maps["c1/t2m"]["default"].palette.name, "temperature");
+    }
+
+    #[test]
+    fn parameter_defaults_opt_out_and_inline_override() {
+        let ctx = StyleContext::with_builtins();
+        let params = vec![("msl".to_string(), "MSLP".to_string())];
+
+        // Opt-out: collection colormap paints everything, as before.
+        let c = coll("colormap = \"temperature\"\nparameter_defaults = false\n");
+        let maps = ctx
+            .parameter_layer_styles(&c, None, &params, Some("hPa"), &|_, cm| cm)
+            .unwrap();
+        assert_eq!(maps["c1/msl"]["default"].palette.name, "temperature");
+
+        // Inline [[wms.parameters]] beats the default.
+        let c = coll(
+            "colormap = \"temperature\"\n[[wms.parameters]]\nname = \"msl\"\ncolormap = \"viridis\"\nmin = 980.0\nmax = 1040.0\n",
+        );
+        let maps = ctx
+            .parameter_layer_styles(&c, None, &params, Some("hPa"), &|_, cm| cm)
+            .unwrap();
+        assert_eq!(maps["c1/msl"]["default"].palette.name, "viridis");
+        assert_eq!(
+            (maps["c1/msl"]["default"].min, maps["c1/msl"]["default"].max),
+            (980.0, 1040.0)
+        );
+
+        // Inline param with only a range narrows the DEFAULT palette.
+        let c = coll("[[wms.parameters]]\nname = \"msl\"\nmin = 990.0\nmax = 1030.0\n");
+        let maps = ctx
+            .parameter_layer_styles(&c, None, &params, Some("hPa"), &|_, cm| cm)
+            .unwrap();
+        let msl = &maps["c1/msl"]["default"];
+        assert_eq!(msl.palette.name, "pressure");
+        assert_eq!((msl.min, msl.max), (990.0, 1030.0));
+    }
+
+    /// Zero-config (#320): a multi-parameter collection with NO [wms] block
+    /// still gets sensibly-styled parameter layers.
+    #[test]
+    fn no_wms_block_multi_param_gets_default_layers() {
+        let ctx = StyleContext::with_builtins();
+        let c: CollectionConfig =
+            toml::from_str("id = \"c1\"\ntitle = \"t\"\ndescription = \"d\"\n").unwrap();
+        let params = vec![("DBZH".to_string(), "Reflectivity".to_string())];
+        let maps = ctx
+            .parameter_layer_styles(&c, None, &params, Some("dBZ"), &|_, cm| cm)
+            .unwrap();
+        assert_eq!(maps["c1/DBZH"]["default"].palette.name, "radar_dbz");
+        assert_eq!(
+            (
+                maps["c1/DBZH"]["default"].min,
+                maps["c1/DBZH"]["default"].max
+            ),
+            (0.0, 70.0)
+        );
+    }
+
     #[test]
     fn parameter_layer_styles_use_param_config_and_wrap_hook() {
         let ctx = StyleContext::with_builtins();
@@ -743,7 +858,7 @@ mod tests {
         ];
         let wrapped_for: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
         let maps = ctx
-            .parameter_layer_styles(&c, None, &params, &|short, cmap| {
+            .parameter_layer_styles(&c, None, &params, None, &|short, cmap| {
                 wrapped_for.borrow_mut().push(short.to_string());
                 cmap
             })

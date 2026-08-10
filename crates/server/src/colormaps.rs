@@ -151,6 +151,30 @@ fn load_colormaps_dir(registry: &mut PaletteRegistry, dir: &Path) -> Result<(), 
     Ok(())
 }
 
+/// Convert `[[parameter_defaults]]` config rules into the ds-render
+/// override form (checked before the embedded defaults table).
+pub fn config_default_overrides(
+    rules: &[ds_core::config::ParameterDefault],
+) -> Vec<ds_render::defaults::DefaultOverride> {
+    rules
+        .iter()
+        .map(|r| ds_render::defaults::DefaultOverride {
+            names: r.names.clone(),
+            contains: r.contains.clone(),
+            palette: r.colormap.clone(),
+            unit_ranges: r
+                .unit_ranges
+                .iter()
+                .map(|u| (vec![u.unit.clone()], u.min, u.max))
+                .collect(),
+            fallback_range: match (r.min, r.max) {
+                (Some(min), Some(max)) => Some((min, max)),
+                _ => None,
+            },
+        })
+        .collect()
+}
+
 /// Fingerprint of everything that can change how styles resolve: the
 /// `[[colormaps]]` definitions, style bundles, per-collection `[wms]`
 /// blocks, and the raw bytes of every `colormaps_dir` palette file (sorted
@@ -164,6 +188,7 @@ pub fn style_config_fingerprint(config: &ServerConfig, config_dir: Option<&Path>
     let mut h = std::collections::hash_map::DefaultHasher::new();
     format!("{:?}", config.colormaps).hash(&mut h);
     format!("{:?}", config.style_bundles).hash(&mut h);
+    format!("{:?}", config.parameter_defaults).hash(&mut h);
     for c in &config.collections {
         c.id.hash(&mut h);
         format!("{:?}", c.wms).hash(&mut h);
