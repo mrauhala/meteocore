@@ -472,9 +472,407 @@ fn parse_gdal_color(tokens: &[&str], lineno: usize, line: &str) -> Result<[u8; 4
     }
 }
 
+// ---------------------------------------------------------------------------
+// GRLevelX / GR2Analyst color table (.pal)
+// ---------------------------------------------------------------------------
+
+/// Parse a GRLevelX-style radar color table (`.pal`) — the de-facto
+/// community format for radar product palettes.
+///
+/// Supported lines (keys case-insensitive, `;` starts a comment):
+/// - `Color: v R G B [R2 G2 B2]` — color at threshold `v`; with the second
+///   triple, the bin from `v` to the next threshold is a gradient from the
+///   first to the second color (a discontinuity at the next threshold);
+///   without it, the bin blends toward the NEXT entry's color.
+/// - `Color4: v R G B A [R2 G2 B2 A2]` — same with alpha.
+/// - `SolidColor[4]: v ...` — one constant color for the whole bin.
+/// - `Product:` / `Units:` — recorded in the palette title.
+/// - `Step:` — legend tick spacing in the GR apps; parsed and ignored
+///   here (it does not affect the palette).
+/// - `Scale:` / `Offset:` — value transform `v*scale + offset`, applied
+///   when present (some products ship raw-unit tables).
+/// - `RF:` (range-folded) and other directives are ignored.
+///
+/// Entries may appear in any order (typically highest-first); the result is
+/// sorted ascending. Values must be finite.
+pub fn parse_pal(name: &str, text: &str) -> Result<Palette, String> {
+    struct Entry {
+        value: f64,
+        color: [u8; 4],
+        second: Option<[u8; 4]>,
+        solid: bool,
+        /// RadarScope product-condition mask (RAIN/MIX/SNOW/TOPPED, …):
+        /// duplicate value ranges per condition. A single color ramp keeps
+        /// only one group — unmasked entries when any exist, else the
+        /// first-seen mask.
+        mask: Option<String>,
+    }
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut product: Option<String> = None;
+    let mut units: Option<String> = None;
+    let mut step: Option<f64> = None;
+    let mut scale: f64 = 1.0;
+    let mut offset: f64 = 0.0;
+    let mut nodata: Option<[u8; 4]> = None;
+
+    let pal_err = |lineno: usize, line: &str, msg: &str| -> String {
+        format!("pal line {lineno}: {msg} in '{line}'")
+    };
+
+    /// (threshold value, first color, optional second color)
+    type PalComponents = (f64, [u8; 4], Option<[u8; 4]>);
+    fn parse_components(
+        tokens: &[&str],
+        with_alpha: bool,
+        lineno: usize,
+        line: &str,
+        pal_err: &dyn Fn(usize, &str, &str) -> String,
+    ) -> Result<PalComponents, String> {
+        let n = if with_alpha { 4 } else { 3 };
+        if tokens.len() != 1 + n && tokens.len() != 1 + 2 * n {
+            return Err(pal_err(
+                lineno,
+                line,
+                &format!("expected {} or {} numbers", 1 + n, 1 + 2 * n),
+            ));
+        }
+        // (tokens arrive with any trailing RadarScope mask already split off)
+        let value: f64 = tokens[0]
+            .parse()
+            .map_err(|_| pal_err(lineno, line, "invalid threshold value"))?;
+        if !value.is_finite() {
+            return Err(pal_err(lineno, line, "non-finite threshold value"));
+        }
+        let comp = |t: &str| -> Result<u8, String> {
+            let v: i64 = t
+                .parse()
+                .map_err(|_| pal_err(lineno, line, "invalid color component"))?;
+            if !(0..=255).contains(&v) {
+                return Err(pal_err(lineno, line, "color component out of 0-255"));
+            }
+            Ok(v as u8)
+        };
+        let mut first = [0u8, 0, 0, 255];
+        for (i, t) in tokens[1..1 + n].iter().enumerate() {
+            first[i] = comp(t)?;
+        }
+        let second = if tokens.len() == 1 + 2 * n {
+            let mut c = [0u8, 0, 0, 255];
+            for (i, t) in tokens[1 + n..].iter().enumerate() {
+                c[i] = comp(t)?;
+            }
+            Some(c)
+        } else {
+            None
+        };
+        Ok((value, first, second))
+    }
+
+    for (idx, raw) in text.lines().enumerate() {
+        let lineno = idx + 1;
+        let line = raw.split(';').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, rest)) = line.split_once(':') else {
+            continue; // not a key:value line — ignore like GR does
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let rest = rest.trim();
+        let tokens: Vec<&str> = rest.split_whitespace().collect();
+        match key.as_str() {
+            "product" => product = Some(rest.to_string()),
+            "units" | "unit" => units = Some(rest.to_string()),
+            "step" => step = rest.parse().ok().filter(|v: &f64| v.is_finite()),
+            "scale" => {
+                scale = rest
+                    .parse()
+                    .ok()
+                    .filter(|v: &f64| v.is_finite() && *v != 0.0)
+                    .ok_or_else(|| pal_err(lineno, line, "invalid Scale"))?;
+            }
+            "offset" => {
+                offset = rest
+                    .parse()
+                    .ok()
+                    .filter(|v: &f64| v.is_finite())
+                    .ok_or_else(|| pal_err(lineno, line, "invalid Offset"))?;
+            }
+            "color" | "color4" | "solidcolor" | "solidcolor4" => {
+                let with_alpha = key.ends_with('4');
+                let solid = key.starts_with("solid");
+                // RadarScope: an optional trailing non-numeric token is a
+                // product-condition mask (RAIN/MIX/SNOW/TOPPED, …).
+                let (nums, mask) = match tokens.split_last() {
+                    Some((last, rest)) if last.parse::<f64>().is_err() => {
+                        (rest, Some(last.to_string()))
+                    }
+                    _ => (&tokens[..], None),
+                };
+                let (value, first, second) =
+                    parse_components(nums, with_alpha, lineno, line, &pal_err)?;
+                entries.push(Entry {
+                    value,
+                    color: first,
+                    second,
+                    solid,
+                    mask,
+                });
+            }
+            // ND (no data): community palettes carry it even though the GR
+            // apps ignore it — it maps directly onto our nodata color.
+            "nd" => {
+                if tokens.len() != 3 && tokens.len() != 4 {
+                    return Err(pal_err(lineno, line, "ND expects 3 or 4 components"));
+                }
+                let mut c = [0u8, 0, 0, 255];
+                for (i, t) in tokens.iter().enumerate() {
+                    match t.parse::<i64>() {
+                        Ok(v) if (0..=255).contains(&v) => c[i] = v as u8,
+                        _ => {
+                            return Err(pal_err(lineno, line, "invalid ND color component"));
+                        }
+                    }
+                }
+                nodata = Some(c);
+            }
+            // RF (range folded), Decimals, and any other directives: not
+            // physical value stops — ignore.
+            _ => {}
+        }
+    }
+
+    if entries.is_empty() {
+        return Err("no Color/SolidColor entries found in pal file".to_string());
+    }
+    // Collapse RadarScope mask groups to one ramp: prefer unmasked entries;
+    // when every entry is masked (e.g. a precipitation-depiction palette
+    // with RAIN/MIX/SNOW ranges), keep the first-seen mask's group.
+    if entries.iter().any(|e| e.mask.is_some()) {
+        if entries.iter().any(|e| e.mask.is_none()) {
+            entries.retain(|e| e.mask.is_none());
+        } else {
+            let first = entries[0].mask.clone();
+            entries.retain(|e| e.mask == first);
+        }
+    }
+    // Convert to physical (data) units BEFORE sorting: a negative Scale
+    // inverts the order, and the bin-end logic below assumes ascending
+    // physical thresholds.
+    for e in &mut entries {
+        e.value = (e.value - offset) / scale;
+    }
+    entries.sort_by(|a, b| a.value.total_cmp(&b.value));
+
+    // (Entry values are already physical/data units and sorted ascending.)
+    let mut stops: Vec<ColorStop> = Vec::new();
+    for i in 0..entries.len() {
+        let e = &entries[i];
+        let v = e.value;
+        let next_v = entries.get(i + 1).map(|n| n.value);
+        stops.push(ColorStop {
+            value: v,
+            color: e.color,
+        });
+        // The end color of this bin: a solid band repeats its color to the
+        // next threshold (the spec defines SolidColor as `Color v RGB RGB`);
+        // a two-color entry runs its gradient to the second color. A
+        // single-color entry blends toward the next entry's color — plain
+        // linear interpolation, no extra stop needed. The bin-end stop sits
+        // one ULP below the next threshold: per spec a color "starts at"
+        // its value, so the threshold itself belongs to the NEXT bin.
+        // (Step: is legend tick spacing only — no bin sizing. A trailing
+        // band's color simply clamps upward from its threshold stop.)
+        let end_color = if e.solid { Some(e.color) } else { e.second };
+        if let (Some(c), Some(nv)) = (end_color, next_v) {
+            if nv > v {
+                stops.push(ColorStop {
+                    value: nv.next_down(),
+                    color: c,
+                });
+            }
+        }
+    }
+    let _ = step; // legend-tick spacing; not used for the palette itself
+
+    let mut palette = Palette::new(name, stops, Interpolation::Linear);
+    palette.nodata_color = nodata;
+    palette.title = match (product, units) {
+        (Some(p), Some(u)) => Some(format!("{p} ({u})")),
+        (Some(p), None) => Some(p),
+        (None, Some(u)) => Some(format!("{name} ({u})")),
+        (None, None) => None,
+    };
+    Ok(palette)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    // --- GRLevelX .pal ---
+
+    /// The GRLevelX manual's own reflectivity example parses and samples
+    /// per spec (smoothing-friendly two-color bins, trailing single color).
+    #[test]
+    fn pal_spec_example_table() {
+        let src = "\
+; Reflectivity Color Table (smoothing-friendly)\n\
+Units: DBZ\n\
+Step: 5\n\
+Color:  10   164  164  255    100 100 192\n\
+Color:  20    64  128  255     32  64 128\n\
+Color:  30     0  255    0      0 128   0\n\
+Color:  40   255  255    0    255 128   0\n\
+Color:  50   255    0    0    160   0   0\n\
+Color:  60   255    0  255    128   0 128\n\
+Color:  70   255  255  255    128 128 128\n\
+Color:  80   128  128  128\n";
+        let p = parse_pal("br", src).unwrap();
+        // 7 two-color bins → 14 stops, plus the trailing single → 15.
+        assert_eq!(p.stops.len(), 15);
+        // Bin starts take the entry color exactly at the threshold.
+        assert_eq!(p.sample(10.0), [164, 164, 255, 255]);
+        assert_eq!(p.sample(30.0), [0, 255, 0, 255]);
+        // In-bin runs the entry's own gradient (30→40: green → dark green;
+        // probe at t=0.2 to avoid the half-step rounding ambiguity at the
+        // exact midpoint).
+        assert_eq!(p.sample(32.0), [0, 230, 0, 255]);
+        // Above the last threshold clamps to its color.
+        assert_eq!(p.sample(90.0), [128, 128, 128, 255]);
+        assert_eq!(p.title.as_deref(), Some("br (DBZ)"));
+        // Below the first stop clamps to the first color.
+        assert_eq!(p.sample(0.0), [164, 164, 255, 255]);
+    }
+
+    /// RadarScope dialect: trailing mask tokens define per-condition
+    /// duplicate ranges — a single ramp keeps unmasked entries, or the
+    /// first mask group when everything is masked; ND sets the nodata
+    /// color.
+    #[test]
+    fn pal_radarscope_masks_and_nd() {
+        // All-masked (precipitation depiction): keep the RAIN group.
+        let p = parse_pal(
+            "pm",
+            "Product: PM\nUnits: DBZ\nND: 12 34 56\n\
+             Color: 20 0 200 0 RAIN\nColor: 52.0 229 0 0 RAIN\n\
+             Color: 20 100 100 160 MIX\nColor: 52.0 121 55 60 MIX\n\
+             Color: 20 180 180 255 SNOW\nColor: 52.0 0 0 135 SNOW\n",
+        )
+        .unwrap();
+        assert_eq!(p.stops.len(), 2);
+        assert_eq!(p.stops[0].color, [0, 200, 0, 255]); // RAIN, not MIX/SNOW
+        assert_eq!(p.nodata_color, Some([12, 34, 56, 255]));
+
+        // Mixed: unmasked entries win over masked duplicates.
+        let p = parse_pal(
+            "x",
+            "Color: 10 1 1 1\nColor: 10 9 9 9 TOPPED\nColor: 20 2 2 2\n",
+        )
+        .unwrap();
+        assert_eq!(p.stops.iter().filter(|s| s.value == 10.0).count(), 1);
+        assert_eq!(p.stops[0].color, [1, 1, 1, 255]);
+    }
+
+    #[test]
+    fn pal_basic_blended_table() {
+        let p = parse_pal(
+            "nws_br",
+            "; NWS reflectivity\nProduct: BR\nUnits: DBZ\nStep: 5\n\nColor: 75 235 235 235\nColor: 65 255 0 255\nColor: 45 255 0 0\nColor: 5 4 233 231\n",
+        )
+        .unwrap();
+        assert_eq!(p.title.as_deref(), Some("BR (DBZ)"));
+        // Sorted ascending, one stop per single-color entry.
+        let values: Vec<f64> = p.stops.iter().map(|s| s.value).collect();
+        assert_eq!(values, vec![5.0, 45.0, 65.0, 75.0]);
+        assert_eq!(p.stops[1].color, [255, 0, 0, 255]);
+        // Single-color entries blend toward the next entry: midpoint of
+        // 45..65 is halfway red → magenta.
+        assert_eq!(p.sample(55.0), [255, 0, 128, 255]);
+    }
+
+    #[test]
+    fn pal_two_color_gradient_and_discontinuity() {
+        let p = parse_pal("x", "Color: 10 0 0 0 100 100 100\nColor: 20 200 0 0\n").unwrap();
+        // Bin 10..20 runs black → gray; the threshold itself starts the
+        // new (red) bin.
+        assert_eq!(p.sample(10.0), [0, 0, 0, 255]);
+        assert_eq!(p.sample(15.0), [50, 50, 50, 255]);
+        assert_eq!(p.sample(19.9999), [100, 100, 100, 255]);
+        assert_eq!(p.sample(20.0), [200, 0, 0, 255]);
+        assert_eq!(p.sample(21.0), [200, 0, 0, 255]);
+    }
+
+    #[test]
+    fn pal_solidcolor_is_constant_within_bin() {
+        let p = parse_pal(
+            "x",
+            "SolidColor: 0 10 20 30\nSolidColor: 10 40 50 60\nStep: 10\n",
+        )
+        .unwrap();
+        assert_eq!(p.sample(0.0), [10, 20, 30, 255]);
+        assert_eq!(p.sample(9.9), [10, 20, 30, 255]);
+        // The threshold starts the new band; above the last stop clamps.
+        assert_eq!(p.sample(10.0), [40, 50, 60, 255]);
+        assert_eq!(p.sample(19.0), [40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn pal_color4_alpha_and_rf_ignored() {
+        let p = parse_pal(
+            "x",
+            "Color4: 0 255 0 0 128\nColor4: 10 0 255 0 255\nRF: 255 0 255\n",
+        )
+        .unwrap();
+        assert_eq!(p.stops[0].color, [255, 0, 0, 128]);
+        assert_eq!(p.stops.len(), 2); // RF produced no stop
+    }
+
+    #[test]
+    fn pal_scale_offset_transform_values() {
+        // A raw-byte dBZ table: raw = dbz*2 + 64 (i.e. dbz = raw*0.5 - 32).
+        // Scale/Offset are the data→table transform, so stops come out in
+        // data units: (64-64)/2 = 0 dBZ, (128-64)/2 = 32 dBZ.
+        let p = parse_pal(
+            "x",
+            "Scale: 2\nOffset: 64\nColor: 64 0 0 0\nColor: 128 255 255 255\n",
+        )
+        .unwrap();
+        let values: Vec<f64> = p.stops.iter().map(|s| s.value).collect();
+        assert_eq!(values, vec![0.0, 32.0]);
+    }
+
+    /// A negative Scale inverts the table→data order; stops must still
+    /// come out ascending in data units with correct bin-end placement.
+    #[test]
+    fn pal_negative_scale_reorders_correctly() {
+        // table = data * -1  → data = -table. SolidColor bands exercise
+        // the bin-end stops.
+        let p = parse_pal(
+            "x",
+            "Scale: -1\nSolidColor: -20 1 1 1\nSolidColor: -10 2 2 2\nSolidColor: 0 3 3 3\n",
+        )
+        .unwrap();
+        let values: Vec<f64> = p.stops.iter().map(|s| s.value).collect();
+        assert!(
+            values.windows(2).all(|w| w[0] <= w[1]),
+            "ascending: {values:?}"
+        );
+        // data 0..10 = band from table 0 entry (3,3,3); 10..20 from -10; 20+ from -20.
+        assert_eq!(p.sample(5.0), [3, 3, 3, 255]);
+        assert_eq!(p.sample(15.0), [2, 2, 2, 255]);
+        assert_eq!(p.sample(25.0), [1, 1, 1, 255]);
+    }
+
+    #[test]
+    fn pal_errors() {
+        assert!(parse_pal("x", "Product: BR\n").is_err()); // no color entries
+        assert!(parse_pal("x", "Color: nan 0 0 0\n").is_err());
+        assert!(parse_pal("x", "Color: 10 300 0 0\n").is_err()); // component range
+        assert!(parse_pal("x", "Color: 10 0 0\n").is_err()); // wrong arity
+        assert!(parse_pal("x", "Scale: 0\nColor: 1 0 0 0\n").is_err()); // zero scale
+        assert!(parse_pal("x", "ND: 1 2\nColor: 1 0 0 0\n").is_err()); // ND arity
+        assert!(parse_pal("x", "ND: 300 0 0\nColor: 1 0 0 0\n").is_err()); // ND range
+    }
 
     #[test]
     fn non_finite_values_rejected() {
