@@ -33,5 +33,9 @@ pub fn router(state: AppState) -> Router {
             "/collections/{id}/styles/{styleId}/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",
             get(handlers::get_styled_tile),
         )
+        .route(
+            "/collections/{id}/styles/{styleId}/legend",
+            get(handlers::style_legend),
+        )
         .with_state(state)
 }

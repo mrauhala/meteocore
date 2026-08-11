@@ -2383,6 +2383,126 @@ async fn legend_graphic_honours_explicit_size() {
     assert_eq!(png_dims(&body), (20, 120));
 }
 
+/// `GetLegendGraphic&FORMAT=application/json` returns the machine-readable
+/// legend instead of a picture: the style's range, interpolation mode, and one
+/// entry per palette stop, so a client can draw its own legend.
+#[tokio::test]
+async fn legend_graphic_json_describes_the_style_palette() {
+    let app = build_empty_router();
+    let req = Request::builder()
+        .uri(
+            "/?SERVICE=WMS&REQUEST=GetLegendGraphic&VERSION=1.3.0\
+             &LAYER=empty&FORMAT=application/json",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    // A day is fine, but not `immutable` — palettes are hot-reloadable.
+    assert_eq!(
+        resp.headers().get("cache-control").unwrap(),
+        "public, max-age=86400"
+    );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["style"], "default");
+    assert_eq!(json["title"], "Default");
+    // Resolved from the engine's raster_info(), as the legend image title is.
+    assert_eq!(json["parameter"], "reflectivity");
+    assert_eq!(json["unit"], "dBZ");
+    assert_eq!(json["min"], 0.0);
+    assert_eq!(json["max"], 1.0);
+    assert_eq!(json["interpolation"], "linear");
+
+    let stops = json["stops"].as_array().unwrap();
+    let palette = ds_render::builtin_palette("viridis").unwrap();
+    assert_eq!(
+        stops.len(),
+        palette.stops.len(),
+        "every palette stop must be described"
+    );
+    assert_eq!(stops[0]["value"], palette.stops[0].value);
+    assert_eq!(stops[0]["color"], "#440154");
+}
+
+/// The JSON legend follows `STYLES=` just like the rendered one: the named
+/// style's palette, range, and title — not the default's.
+#[tokio::test]
+async fn legend_graphic_json_reflects_selected_style() {
+    let app = build_empty_router();
+    let req = Request::builder()
+        .uri(
+            "/?SERVICE=WMS&REQUEST=GetLegendGraphic&VERSION=1.3.0\
+             &LAYER=empty&FORMAT=application/json&STYLES=radar_fmi",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["style"], "radar_fmi");
+    assert_eq!(json["title"], "FMI Radar");
+    assert_eq!(json["min"], -32.0);
+    assert_eq!(json["max"], 95.0);
+    assert_eq!(
+        json["stops"].as_array().unwrap().len(),
+        ds_render::builtin_palette("radar_dbz").unwrap().stops.len()
+    );
+    // Fully transparent stops keep their alpha channel in the hex string.
+    assert_eq!(json["stops"][0]["color"], "#00000000");
+}
+
+/// `FORMAT=APPLICATION/JSON` is matched case-insensitively, and the image
+/// formats are untouched: a PNG request still returns PNG bytes, and an
+/// unsupported FORMAT is still a ServiceException.
+#[tokio::test]
+async fn legend_graphic_json_format_is_case_insensitive_and_images_unchanged() {
+    let app = build_empty_router();
+    let fetch = |format: &str| {
+        let uri = format!(
+            "/?SERVICE=WMS&REQUEST=GetLegendGraphic&VERSION=1.3.0\
+             &LAYER=empty&FORMAT={format}"
+        );
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .map(|v| v.to_str().unwrap().to_string());
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, content_type, body)
+        }
+    };
+
+    let (status, content_type, _) = fetch("APPLICATION/JSON").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type.as_deref(), Some("application/json"));
+
+    let (status, content_type, body) = fetch("image/png").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type.as_deref(), Some("image/png"));
+    assert_eq!(png_dims(&body), (180, 300));
+
+    let (status, _, _) = fetch("text/html").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unsupported FORMAT must still be rejected"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Explicit pin of the current latest run keeps fallback-tolerant resolution
 // ---------------------------------------------------------------------------

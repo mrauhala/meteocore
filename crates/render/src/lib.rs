@@ -465,6 +465,120 @@ fn format_tick(v: f64) -> String {
     }
 }
 
+/// Default legend image size — large enough for the title and the value-tick
+/// labels (#371). Shared by every service that renders one (WMS
+/// `GetLegendGraphic` without WIDTH/HEIGHT, the Maps/Tiles legend endpoints)
+/// so a legend looks the same whichever API served it.
+pub const LEGEND_DEFAULT_WIDTH: u32 = 180;
+pub const LEGEND_DEFAULT_HEIGHT: u32 = 300;
+
+/// `Cache-Control` for a legend response (image or JSON). A day is plenty for
+/// a palette, but deliberately NOT `immutable`: colormaps and styles are
+/// hot-reloadable, so a client must be able to revalidate.
+pub const LEGEND_CACHE_CONTROL: &str = "public, max-age=86400";
+
+/// Machine-readable legend description for a style, so a map client can draw
+/// its own legend instead of embedding the rendered PNG.
+///
+/// One builder shared by WMS `GetLegendGraphic&FORMAT=application/json`, OGC
+/// API Maps and OGC API Tiles — the three services must emit the identical
+/// shape, and a copy per API layer would drift.
+///
+/// `parameter` and `unit` are resolved by the caller (the API layer knows its
+/// own layer-name conventions and holds the engine's `RasterInfo`); empty or
+/// absent values are omitted from the payload rather than emitted as `""`.
+/// `nodataColor` appears only when the palette carries an explicit one.
+pub fn legend_json(
+    style: &StyleInfo,
+    parameter: Option<&str>,
+    unit: Option<&str>,
+) -> serde_json::Value {
+    let stops: Vec<serde_json::Value> = style
+        .palette
+        .stops
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "value": s.value,
+                "color": Palette::color_hex(s.color),
+            })
+        })
+        .collect();
+
+    let mut legend = serde_json::json!({
+        "style": style.name,
+        "title": style.title,
+        "min": style.min,
+        "max": style.max,
+        "interpolation": style.palette.interpolation.as_str(),
+        "stops": stops,
+    });
+
+    if let Some(p) = parameter.map(str::trim).filter(|p| !p.is_empty()) {
+        legend["parameter"] = serde_json::json!(p);
+    }
+    if let Some(u) = unit.map(str::trim).filter(|u| !u.is_empty()) {
+        legend["unit"] = serde_json::json!(u);
+    }
+    if let Some(nodata) = style.palette.nodata_color {
+        legend["nodataColor"] = serde_json::json!(Palette::color_hex(nodata));
+    }
+
+    legend
+}
+
+/// Resolve the `(parameter, unit)` a legend describes from a style plus the
+/// engine's raster metadata: the style's configured parameter (set for
+/// per-parameter styles) falling back to the collection's default parameter,
+/// and the collection-level unit. Empty strings mean "unknown" and become
+/// `None`, so the pair can be handed straight to [`legend_json`] /
+/// [`legend_title`].
+///
+/// WMS resolves the parameter itself — a WMS layer name may carry it as a
+/// `collection/parameter` segment, which takes precedence over the engine
+/// default. Maps and Tiles have no such layer syntax and use this directly.
+pub fn legend_parameter_unit(
+    style: &StyleInfo,
+    info: &ds_core::map_engine::RasterInfo,
+) -> (Option<String>, Option<String>) {
+    let parameter = style
+        .parameter
+        .clone()
+        .or_else(|| Some(info.parameter.clone()).filter(|p| !p.is_empty()));
+    let unit = Some(info.unit.clone()).filter(|u| !u.is_empty());
+    (parameter, unit)
+}
+
+/// The title for a rendered legend image: `"<parameter> (<unit>)"`, with the
+/// style's own title on a second line for non-default styles.
+///
+/// Shared by every service that renders a legend PNG (WMS, Maps, Tiles) so the
+/// three cannot drift. `parameter`/`unit` are resolved by the caller, as for
+/// [`legend_json`]. `None` when nothing informative is known.
+pub fn legend_title(
+    style: &StyleInfo,
+    parameter: Option<&str>,
+    unit: Option<&str>,
+) -> Option<String> {
+    let parameter = parameter.map(str::trim).filter(|p| !p.is_empty());
+    let unit = unit.map(str::trim).filter(|u| !u.is_empty());
+    let param_unit = match (parameter, unit) {
+        (Some(p), Some(u)) => Some(format!("{p} ({u})")),
+        (Some(s), None) | (None, Some(s)) => Some(s.to_string()),
+        (None, None) => None,
+    };
+    // "default"/"Default" carries no information — the colours already come
+    // from the selected style, so only a named style earns the second line.
+    let style_line = (style.name != "default")
+        .then(|| style.title.trim().to_string())
+        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("default"));
+    match (param_unit, style_line) {
+        (Some(pu), Some(sl)) => Some(format!("{pu}\n{sl}")),
+        (Some(s), None) | (None, Some(s)) => Some(s),
+        (None, None) => None,
+    }
+}
+
 /// Render a legend image showing the colormap scale.
 ///
 /// Produces a vertical colour gradient (top = `max`, bottom = `min`) with a
@@ -717,6 +831,110 @@ pub(crate) fn colorize(tile: &RasterTile, colormap: &dyn ColorMap) -> Vec<u8> {
 mod tests {
     use super::*;
     use ds_core::map_engine::RasterTile;
+
+    /// Build a `StyleInfo` over a builtin palette for the legend tests.
+    fn style_over(palette: &str, name: &str, title: &str, min: f64, max: f64) -> StyleInfo {
+        let palette = builtin_palette_arc(palette).expect("builtin palette");
+        StyleInfo {
+            name: name.to_string(),
+            title: title.to_string(),
+            colormap: Arc::new(LinearColorMap::new(palette.stops.clone())),
+            palette,
+            min,
+            max,
+            parameter: None,
+        }
+    }
+
+    #[test]
+    fn legend_json_carries_every_palette_stop_and_range() {
+        let style = style_over("radar_dbz", "default", "Default", -32.0, 94.5);
+        let legend = legend_json(&style, Some("DBZH"), Some("dBZ"));
+
+        assert_eq!(legend["style"], "default");
+        assert_eq!(legend["title"], "Default");
+        assert_eq!(legend["parameter"], "DBZH");
+        assert_eq!(legend["unit"], "dBZ");
+        assert_eq!(legend["min"], -32.0);
+        assert_eq!(legend["max"], 94.5);
+        assert_eq!(legend["interpolation"], "linear");
+        // No explicit nodata colour on a builtin → the key is omitted, not null.
+        assert!(legend.get("nodataColor").is_none());
+
+        let stops = legend["stops"].as_array().expect("stops array");
+        assert_eq!(stops.len(), style.palette.stops.len());
+        // First radar_dbz stop is fully transparent → 8-digit hex; a solid
+        // stop is 6-digit.
+        assert_eq!(stops[0]["value"], 0.0);
+        assert_eq!(stops[0]["color"], "#00000000");
+        assert_eq!(stops[2]["value"], 5.1);
+        assert_eq!(stops[2]["color"], "#0080FF");
+    }
+
+    #[test]
+    fn legend_json_omits_unknown_parameter_and_unit() {
+        let style = style_over("viridis", "default", "Default", 0.0, 1.0);
+        let legend = legend_json(&style, None, Some("   "));
+        assert!(legend.get("parameter").is_none());
+        assert!(legend.get("unit").is_none(), "blank unit must be omitted");
+    }
+
+    #[test]
+    fn legend_json_emits_step_interpolation_and_nodata_colour() {
+        let mut palette = Palette::new(
+            "classes",
+            vec![
+                ColorStop {
+                    value: 0.0,
+                    color: [0, 0, 0, 255],
+                },
+                ColorStop {
+                    value: 1.0,
+                    color: [255, 255, 255, 255],
+                },
+            ],
+            Interpolation::Step,
+        );
+        palette.nodata_color = Some([0, 0, 0, 0]);
+        let palette = Arc::new(palette);
+        let style = StyleInfo {
+            name: "classes".to_string(),
+            title: "Classes".to_string(),
+            colormap: Arc::new(LinearColorMap::new(palette.stops.clone())),
+            palette,
+            min: 0.0,
+            max: 1.0,
+            parameter: Some("class".to_string()),
+        };
+        let legend = legend_json(&style, style.parameter.as_deref(), None);
+        assert_eq!(legend["interpolation"], "step");
+        assert_eq!(legend["nodataColor"], "#00000000");
+        assert_eq!(legend["parameter"], "class");
+    }
+
+    #[test]
+    fn legend_title_combines_parameter_unit_and_named_style() {
+        let default = style_over("radar_dbz", "default", "Default", 0.0, 70.0);
+        assert_eq!(
+            legend_title(&default, Some("DBZH"), Some("dBZ")).as_deref(),
+            Some("DBZH (dBZ)")
+        );
+        assert_eq!(
+            legend_title(&default, Some("DBZH"), None).as_deref(),
+            Some("DBZH")
+        );
+        assert_eq!(legend_title(&default, None, None), None);
+
+        let named = style_over("radar_fmi", "radar_fmi", "FMI Radar", 0.0, 70.0);
+        assert_eq!(
+            legend_title(&named, Some("DBZH"), Some("dBZ")).as_deref(),
+            Some("DBZH (dBZ)\nFMI Radar"),
+            "a named style adds its own title on a second line"
+        );
+        // A named style whose title is still "Default" adds nothing.
+        let noise = style_over("viridis", "viridis", "Default", 0.0, 1.0);
+        assert_eq!(legend_title(&noise, Some("t"), None).as_deref(), Some("t"));
+    }
 
     #[test]
     fn empty_tile_is_deterministic_and_memoized() {

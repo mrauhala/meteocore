@@ -230,9 +230,19 @@ fn cpt_err(lineno: usize, line: &str, msg: &str) -> String {
 }
 
 fn parse_cpt_z(token: &str, lineno: usize, line: &str) -> Result<f64, String> {
-    token
+    let z = token
         .parse::<f64>()
-        .map_err(|_| cpt_err(lineno, line, &format!("invalid z value '{token}'")))
+        .map_err(|_| cpt_err(lineno, line, &format!("invalid z value '{token}'")))?;
+    // f64::from_str accepts "nan"/"inf"; a non-finite stop would silently
+    // poison the sort order / default range / LUT bounds — fail at load.
+    if !z.is_finite() {
+        return Err(cpt_err(
+            lineno,
+            line,
+            &format!("non-finite z value '{token}'"),
+        ));
+    }
+    Ok(z)
 }
 
 /// Parse a `.cpt` color from either 1 token (hex, packed triplet, or gray)
@@ -389,6 +399,13 @@ pub fn parse_gdal_txt(name: &str, text: &str) -> Result<Palette, String> {
         let value = tokens[0]
             .parse::<f64>()
             .map_err(|_| cpt_err(lineno, trimmed, &format!("invalid value '{head}'")))?;
+        if !value.is_finite() {
+            return Err(cpt_err(
+                lineno,
+                trimmed,
+                &format!("non-finite value '{head}'"),
+            ));
+        }
         stops.push(ColorStop { value, color });
     }
 
@@ -458,6 +475,14 @@ fn parse_gdal_color(tokens: &[&str], lineno: usize, line: &str) -> Result<[u8; 4
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_finite_values_rejected() {
+        assert!(parse_cpt("x", "nan 0 0 0 10 255 255 255\n").is_err());
+        assert!(parse_cpt("x", "0 0 0 0 inf 255 255 255\n").is_err());
+        assert!(parse_gdal_txt("x", "nan 255 0 0\n").is_err());
+        assert!(parse_gdal_txt("x", "-inf 255 0 0\n").is_err());
+    }
 
     /// `(value, color)` view of a palette's stops, for compact assertions.
     fn stops_of(p: &Palette) -> Vec<(f64, [u8; 4])> {

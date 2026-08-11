@@ -169,6 +169,7 @@ dependencies = [
  "http-body-util",
  "quick-xml 0.37.5",
  "serde",
+ "serde_json",
  "tokio",
  "tower",
  "tracing",
@@ -1069,6 +1070,7 @@ dependencies = [
  "jpeg-encoder",
  "png",
  "quick_cache",
+ "serde_json",
  "toml",
  "webp",
 ]

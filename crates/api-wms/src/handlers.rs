@@ -626,34 +626,16 @@ pub async fn wms_handler(
                 ))
             })?;
 
-            // Default to a size that fits the value-tick labels + title (#371);
-            // a client can still request a smaller thumbnail, where the renderer
-            // degrades to a bare swatch.
-            let width: u32 = query
-                .width
-                .as_deref()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(180);
-            let height: u32 = query
-                .height
-                .as_deref()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(300);
-            let width = width.clamp(1, 512);
-            let height = height.clamp(1, 1024);
+            let format = crate::params::parse_legend_format(query.format.as_deref())?;
 
-            let format = crate::params::parse_image_format(query.format.as_deref())?;
-
-            let colormap = style_info.colormap.clone();
-            let min = style_info.min;
-            let max = style_info.max;
-
-            // Resolve a title ("<parameter> (<unit>)") for the legend from the
+            // Resolve the parameter + unit the legend describes from the
             // engine's raster metadata (#371). The parameter is the style's
             // configured one (set for per-parameter layers), falling back to the
             // "collection/param" layer segment, then the engine's default
             // parameter. The unit is the collection-level unit; multi-unit
             // sources (e.g. radar polar volumes) report none, so it's omitted.
+            // Both feed the rendered legend's title and the JSON legend, so the
+            // two representations describe the same thing.
             let info = state
                 .engines
                 .get(legend_collection_id)
@@ -671,23 +653,51 @@ pub async fn wms_handler(
                 .as_ref()
                 .map(|i| i.unit.clone())
                 .filter(|u| !u.is_empty());
-            let param_unit = match (param, unit) {
-                (Some(p), Some(u)) => Some(format!("{p} ({u})")),
-                (Some(s), None) | (None, Some(s)) => Some(s),
-                (None, None) => None,
+
+            // Machine-readable legend: palette stops + range, for clients that
+            // draw their own legend.
+            let format = match format {
+                crate::params::LegendFormat::Json => {
+                    let body =
+                        ds_render::legend_json(style_info, param.as_deref(), unit.as_deref());
+                    let mut response = axum::Json(body).into_response();
+                    let headers = response.headers_mut();
+                    headers.insert(
+                        header::CACHE_CONTROL,
+                        axum::http::HeaderValue::from_static(ds_render::LEGEND_CACHE_CONTROL),
+                    );
+                    headers.insert(
+                        header::HeaderName::from_static("x-content-type-options"),
+                        axum::http::HeaderValue::from_static("nosniff"),
+                    );
+                    return Ok(response);
+                }
+                crate::params::LegendFormat::Image(format) => format,
             };
-            // For a non-default style, show its name on a second line so the
-            // legend identifies which of a layer's styles it depicts (the colours
-            // already come from this style's colormap). "default"/"Default" carry
-            // no information, so they're omitted.
-            let style_line = (style_name != "default")
-                .then(|| style_info.title.trim().to_string())
-                .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("default"));
-            let title = match (param_unit, style_line) {
-                (Some(pu), Some(sl)) => Some(format!("{pu}\n{sl}")),
-                (Some(s), None) | (None, Some(s)) => Some(s),
-                (None, None) => None,
-            };
+
+            // Default to a size that fits the value-tick labels + title (#371);
+            // a client can still request a smaller thumbnail, where the renderer
+            // degrades to a bare swatch.
+            let width: u32 = query
+                .width
+                .as_deref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(ds_render::LEGEND_DEFAULT_WIDTH);
+            let height: u32 = query
+                .height
+                .as_deref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(ds_render::LEGEND_DEFAULT_HEIGHT);
+            let width = width.clamp(1, 512);
+            let height = height.clamp(1, 1024);
+
+            let colormap = style_info.colormap.clone();
+            let min = style_info.min;
+            let max = style_info.max;
+
+            // Title shared with the Maps/Tiles legend endpoints so the three
+            // services label the same style identically.
+            let title = ds_render::legend_title(style_info, param.as_deref(), unit.as_deref());
 
             let legend_bytes = tokio::task::spawn_blocking(move || {
                 ds_render::render_legend(
