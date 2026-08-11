@@ -410,9 +410,11 @@ fn merge_specs<'a>(primary: StyleSpec<'a>, fallback: StyleSpec<'a>) -> StyleSpec
     }
 }
 
-/// `min`/`max` overrides fall back to the palette's first/last stop values
-/// (and to 0..1 when the palette somehow has no stops), matching the
-/// legacy resolution exactly.
+/// `min`/`max` overrides fall back to the palette's stop values — `max`
+/// from the last stop, `min` from [`Palette::domain_min_stop`] (the first
+/// stop, except a `.pal` display-threshold guard sitting one ULP below
+/// the real threshold) — and to 0..1 when the palette somehow has no
+/// stops.
 fn range_for(
     palette: &Palette,
     min_override: Option<f64>,
