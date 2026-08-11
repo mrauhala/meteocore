@@ -2661,6 +2661,20 @@ impl ServerConfig {
             // ds_render::StyleContext), so a collection can e.g. bind a
             // shared bundle and override only min/max or one parameter.
             if let Some(wms) = &collection.wms {
+                // Same rule as bundle extras: a [[wms.styles]] entry needs a
+                // name or a colormap to derive one from — otherwise the
+                // resolver would silently drop it.
+                for style in &wms.styles {
+                    match style.effective_name() {
+                        Some(n) if !n.is_empty() => {}
+                        _ => {
+                            return Err(crate::error::DataServerError::Config(format!(
+                                "Collection '{id}': [[wms.styles]] entry needs a 'name' \
+                                 (or a 'colormap' reference to default the name from)"
+                            )));
+                        }
+                    }
+                }
                 if let Some(bundle_ref) = &wms.style_bundle {
                     if !bundle_ids.contains(bundle_ref.as_str()) {
                         return Err(crate::error::DataServerError::Config(format!(
@@ -3638,6 +3652,36 @@ colormap = "viridis"
         let path = write_config(tmp.path(), "config.toml", &config_toml);
         ServerConfig::from_file(path.to_str().unwrap())
             .expect("bundle + inline fields is valid since bundles v2");
+    }
+
+    #[test]
+    fn inline_style_needs_name_or_colormap() {
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r##"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "c"
+title = "t"
+description = "d"
+engine_type = "geotiff"
+
+[collections.geotiff]
+filename_template = "x_%Y.tif"
+parameter = "p"
+unit = "u"
+data_path = "/tmp"
+
+[[collections.wms.styles]]
+color_stops = [ { value = 0.0, color = "#000000" } ]
+"##;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs a 'name'"), "got: {err}");
     }
 
     #[test]
