@@ -2506,6 +2506,19 @@ mod parameter_styles {
     /// The legend follows the same resolution, so a client's drawn legend
     /// matches the pixels it gets for that parameter.
     #[tokio::test]
+    async fn legend_with_unknown_parameter_name_is_a_400() {
+        // Mirrors render_tile: an unknown parameter must not fall back and
+        // emit a legend labelled with a parameter that doesn't exist.
+        let (status, json) =
+            fetch_json("/collections/radar/styles/default/legend?parameter-name=BOGUS").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(json["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("BOGUS"));
+    }
+
+    #[tokio::test]
     async fn legend_with_parameter_name_describes_the_parameter_style() {
         let (status, json) =
             fetch_json("/collections/radar/styles/default/legend?parameter-name=T").await;
