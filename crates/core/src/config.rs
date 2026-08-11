@@ -2661,18 +2661,36 @@ impl ServerConfig {
             // ds_render::StyleContext), so a collection can e.g. bind a
             // shared bundle and override only min/max or one parameter.
             if let Some(wms) = &collection.wms {
-                // Same rule as bundle extras: a [[wms.styles]] entry needs a
-                // name or a colormap to derive one from — otherwise the
-                // resolver would silently drop it.
+                // Same rules as bundle extras: a [[wms.styles]] entry needs
+                // a non-empty effective name (explicit or derived from its
+                // colormap), may not be called "default", and effective
+                // names must be unique — with names defaulting from the
+                // colormap, two unnamed entries referencing the same palette
+                // (e.g. at different ranges) would otherwise silently
+                // overwrite each other; give at least one an explicit name.
+                let mut style_names: std::collections::HashSet<&str> =
+                    std::collections::HashSet::new();
                 for style in &wms.styles {
-                    match style.effective_name() {
-                        Some(n) if !n.is_empty() => {}
+                    let name = match style.effective_name() {
+                        Some(n) if !n.is_empty() => n,
                         _ => {
                             return Err(crate::error::DataServerError::Config(format!(
                                 "Collection '{id}': [[wms.styles]] entry needs a 'name' \
                                  (or a 'colormap' reference to default the name from)"
                             )));
                         }
+                    };
+                    if name == "default" {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': [[wms.styles]] entry cannot be named \
+                             'default' (reserved for the collection's default style)"
+                        )));
+                    }
+                    if !style_names.insert(name) {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': duplicate [[wms.styles]] name '{name}' \
+                             (set an explicit 'name' when reusing a colormap)"
+                        )));
                     }
                 }
                 if let Some(bundle_ref) = &wms.style_bundle {
@@ -3682,6 +3700,47 @@ color_stops = [ { value = 0.0, color = "#000000" } ]
             .unwrap_err()
             .to_string();
         assert!(err.contains("needs a 'name'"), "got: {err}");
+    }
+
+    #[test]
+    fn inline_style_duplicate_and_default_names_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let base = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "c"
+title = "t"
+description = "d"
+engine_type = "geotiff"
+
+[collections.geotiff]
+filename_template = "x_%Y.tif"
+parameter = "p"
+unit = "u"
+data_path = "/tmp"
+"#;
+        // Two unnamed entries deriving the same name from one colormap.
+        let dup = format!(
+            "{base}\n[[collections.wms.styles]]\ncolormap = \"viridis\"\nmax = 10.0\n\n[[collections.wms.styles]]\ncolormap = \"viridis\"\nmax = 50.0\n"
+        );
+        let path = write_config(tmp.path(), "config.toml", &dup);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate [[wms.styles]] name"), "got: {err}");
+
+        // Effective name "default" is reserved.
+        let reserved = format!(
+            "{base}\n[[collections.wms.styles]]\nname = \"default\"\ncolormap = \"viridis\"\n"
+        );
+        let path = write_config(tmp.path(), "config2.toml", &reserved);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be named"), "got: {err}");
     }
 
     #[test]
