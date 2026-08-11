@@ -386,9 +386,8 @@ id = "radar_multi"
 [style_bundles.default]
 colormap = "radar_dbz"
 [[style_bundles.extras]]
-name = "radar_fmi"
-title = "FMI Radar"
-colormap = "radar_fmi"
+colormap = "radar_fmi"   # name defaults to the colormap name, title to the
+                         # palette's title; both can be set explicitly
 
 [[collections]]
 id = "weather"

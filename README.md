@@ -1281,7 +1281,10 @@ value = 50.0
 color = "#FF0000"
 ```
 
-**Named styles** add alternatives next to `default`:
+**Named styles** add alternatives next to `default`. `name` defaults to
+the `colormap` reference and `title` to the referenced palette's title, so
+a pure palette reference is a one-liner (`colormap = "x"`); set either
+field to override:
 
 ```toml
 [[collections.wms.styles]]

@@ -445,7 +445,12 @@ pub struct WmsParameterConfig {
 /// A named WMS style with its own colormap configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WmsStyle {
-    pub name: String,
+    /// Style name. Optional when `colormap` is set — defaults to the
+    /// colormap name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Style title. Defaults to the referenced palette's title, then to
+    /// the style name.
     pub title: Option<String>,
     /// Built-in colormap name.
     pub colormap: Option<String>,
@@ -514,7 +519,12 @@ pub struct StyleBundleDefault {
 /// Named extra style inside a `StyleBundle`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StyleBundleExtra {
-    pub name: String,
+    /// Style name. Optional when `colormap` is set — it then defaults to
+    /// the colormap name, so a pure palette reference is one line.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Style title. Defaults to the referenced palette's title, then to
+    /// the style name.
     pub title: Option<String>,
     pub colormap: Option<String>,
     #[serde(default)]
@@ -605,6 +615,20 @@ fn validate_hex_color(s: &str) -> Result<(), String> {
         Err(format!(
             "invalid hex color '{s}' (expected #RRGGBB or #RRGGBBAA)"
         ))
+    }
+}
+
+impl StyleBundleExtra {
+    /// The style's registry name: explicit `name`, else the colormap name.
+    pub fn effective_name(&self) -> Option<&str> {
+        self.name.as_deref().or(self.colormap.as_deref())
+    }
+}
+
+impl WmsStyle {
+    /// The style's registry name: explicit `name`, else the colormap name.
+    pub fn effective_name(&self) -> Option<&str> {
+        self.name.as_deref().or(self.colormap.as_deref())
     }
 }
 
@@ -2171,29 +2195,39 @@ impl ServerConfig {
             // would silently overwrite each other in the same HashMap.
             let mut extra_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
             for extra in &bundle.extras {
-                if extra.name.is_empty() {
-                    return Err(crate::error::DataServerError::Config(format!(
-                        "Style bundle '{}': extra has an empty 'name' field",
-                        bundle.id
-                    )));
-                }
-                if extra.name == "default" {
+                let name = match extra.effective_name() {
+                    Some(n) if !n.is_empty() => n,
+                    Some(_) => {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Style bundle '{}': extra has an empty 'name' field",
+                            bundle.id
+                        )));
+                    }
+                    None => {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Style bundle '{}': extra needs a 'name' (or a 'colormap' \
+                             reference to default the name from)",
+                            bundle.id
+                        )));
+                    }
+                };
+                if name == "default" {
                     return Err(crate::error::DataServerError::Config(format!(
                         "Style bundle '{}': extra cannot be named 'default' \
                          (reserved for the bundle's default style)",
                         bundle.id
                     )));
                 }
-                if !extra_names.insert(extra.name.as_str()) {
+                if !extra_names.insert(name) {
                     return Err(crate::error::DataServerError::Config(format!(
-                        "Style bundle '{}': duplicate extra name '{}'",
-                        bundle.id, extra.name
+                        "Style bundle '{}': duplicate extra name '{name}'",
+                        bundle.id
                     )));
                 }
                 if extra.parameter.as_deref() == Some("") {
                     return Err(crate::error::DataServerError::Config(format!(
-                        "Style bundle '{}': extra '{}' has an empty 'parameter' field",
-                        bundle.id, extra.name
+                        "Style bundle '{}': extra '{name}' has an empty 'parameter' field",
+                        bundle.id
                     )));
                 }
             }
@@ -2627,6 +2661,38 @@ impl ServerConfig {
             // ds_render::StyleContext), so a collection can e.g. bind a
             // shared bundle and override only min/max or one parameter.
             if let Some(wms) = &collection.wms {
+                // Same rules as bundle extras: a [[wms.styles]] entry needs
+                // a non-empty effective name (explicit or derived from its
+                // colormap), may not be called "default", and effective
+                // names must be unique — with names defaulting from the
+                // colormap, two unnamed entries referencing the same palette
+                // (e.g. at different ranges) would otherwise silently
+                // overwrite each other; give at least one an explicit name.
+                let mut style_names: std::collections::HashSet<&str> =
+                    std::collections::HashSet::new();
+                for style in &wms.styles {
+                    let name = match style.effective_name() {
+                        Some(n) if !n.is_empty() => n,
+                        _ => {
+                            return Err(crate::error::DataServerError::Config(format!(
+                                "Collection '{id}': [[wms.styles]] entry needs a 'name' \
+                                 (or a 'colormap' reference to default the name from)"
+                            )));
+                        }
+                    };
+                    if name == "default" {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': [[wms.styles]] entry cannot be named \
+                             'default' (reserved for the collection's default style)"
+                        )));
+                    }
+                    if !style_names.insert(name) {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Collection '{id}': duplicate [[wms.styles]] name '{name}' \
+                             (set an explicit 'name' when reusing a colormap)"
+                        )));
+                    }
+                }
                 if let Some(bundle_ref) = &wms.style_bundle {
                     if !bundle_ids.contains(bundle_ref.as_str()) {
                         return Err(crate::error::DataServerError::Config(format!(
@@ -3604,6 +3670,99 @@ colormap = "viridis"
         let path = write_config(tmp.path(), "config.toml", &config_toml);
         ServerConfig::from_file(path.to_str().unwrap())
             .expect("bundle + inline fields is valid since bundles v2");
+    }
+
+    #[test]
+    fn inline_style_needs_name_or_colormap() {
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r##"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "c"
+title = "t"
+description = "d"
+engine_type = "geotiff"
+
+[collections.geotiff]
+filename_template = "x_%Y.tif"
+parameter = "p"
+unit = "u"
+data_path = "/tmp"
+
+[[collections.wms.styles]]
+color_stops = [ { value = 0.0, color = "#000000" } ]
+"##;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs a 'name'"), "got: {err}");
+    }
+
+    #[test]
+    fn inline_style_duplicate_and_default_names_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let base = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "c"
+title = "t"
+description = "d"
+engine_type = "geotiff"
+
+[collections.geotiff]
+filename_template = "x_%Y.tif"
+parameter = "p"
+unit = "u"
+data_path = "/tmp"
+"#;
+        // Two unnamed entries deriving the same name from one colormap.
+        let dup = format!(
+            "{base}\n[[collections.wms.styles]]\ncolormap = \"viridis\"\nmax = 10.0\n\n[[collections.wms.styles]]\ncolormap = \"viridis\"\nmax = 50.0\n"
+        );
+        let path = write_config(tmp.path(), "config.toml", &dup);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate [[wms.styles]] name"), "got: {err}");
+
+        // Effective name "default" is reserved.
+        let reserved = format!(
+            "{base}\n[[collections.wms.styles]]\nname = \"default\"\ncolormap = \"viridis\"\n"
+        );
+        let path = write_config(tmp.path(), "config2.toml", &reserved);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be named"), "got: {err}");
+    }
+
+    #[test]
+    fn bundle_extra_needs_name_or_colormap() {
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r##"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[style_bundles]]
+id = "b"
+[style_bundles.default]
+colormap = "viridis"
+[[style_bundles.extras]]
+color_stops = [ { value = 0.0, color = "#000000" } ]
+"##;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs a 'name'"), "got: {err}");
     }
 
     #[test]

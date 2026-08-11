@@ -2878,7 +2878,11 @@ pub fn validate_style_colormaps(
         }
         for e in &b.extras {
             check(
-                &format!("style_bundle '{}' extra '{}'", b.id, e.name),
+                &format!(
+                    "style_bundle '{}' extra '{}'",
+                    b.id,
+                    e.effective_name().unwrap_or("<unnamed>")
+                ),
                 e.colormap.as_deref(),
             )?;
         }
@@ -2889,7 +2893,10 @@ pub fn validate_style_colormaps(
             check(&owner, w.colormap.as_deref())?;
             for s in &w.styles {
                 check(
-                    &format!("{owner} style '{}'", s.name),
+                    &format!(
+                        "{owner} style '{}'",
+                        s.effective_name().unwrap_or("<unnamed>")
+                    ),
                     s.colormap.as_deref(),
                 )?;
             }
