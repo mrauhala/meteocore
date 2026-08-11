@@ -1090,6 +1090,21 @@ pub async fn style_legend(
     })?;
 
     let info = engine.raster_info();
+    // Mirror the render path's validation: an unknown `parameter-name` must
+    // 400 with the available list, not fall back to the collection style and
+    // emit a legend labelled with a parameter that doesn't exist.
+    if let Some(pname) = params.parameter_name.as_deref() {
+        if !info.parameters.is_empty() && !info.parameters.iter().any(|(name, _)| name == pname) {
+            let mut supported: Vec<&str> =
+                info.parameters.iter().map(|(n, _)| n.as_str()).collect();
+            supported.sort_unstable();
+            return Err(MapsError::BadRequest(format!(
+                "parameter-name '{pname}' is not available for collection '{id}'. \
+                 Available: {}",
+                supported.join(", ")
+            )));
+        }
+    }
     let (parameter, unit) = ds_render::legend_parameter_unit(style_info, &info);
     // A ?parameter-name= request labels the legend with the REQUESTED
     // parameter even when no dedicated "{coll}/{param}" style layer exists
