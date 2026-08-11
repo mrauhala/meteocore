@@ -487,8 +487,8 @@ fn parse_gdal_color(tokens: &[&str], lineno: usize, line: &str) -> Result<[u8; 4
 /// - `Color4: v R G B A [R2 G2 B2 A2]` — same with alpha.
 /// - `SolidColor[4]: v ...` — one constant color for the whole bin.
 /// - `Product:` / `Units:` — recorded in the palette title.
-/// - `Step:` — used to size the terminal bin of a two-color/solid last
-///   entry (GR apps use it for legend ticks).
+/// - `Step:` — legend tick spacing in the GR apps; parsed and ignored
+///   here (it does not affect the palette).
 /// - `Scale:` / `Offset:` — value transform `v*scale + offset`, applied
 ///   when present (some products ship raw-unit tables).
 /// - `RF:` (range-folded) and other directives are ignored.
@@ -621,18 +621,20 @@ pub fn parse_pal(name: &str, text: &str) -> Result<Palette, String> {
             }
             // ND (no data): community palettes carry it even though the GR
             // apps ignore it — it maps directly onto our nodata color.
-            "nd" if tokens.len() == 3 || tokens.len() == 4 => {
+            "nd" => {
+                if tokens.len() != 3 && tokens.len() != 4 {
+                    return Err(pal_err(lineno, line, "ND expects 3 or 4 components"));
+                }
                 let mut c = [0u8, 0, 0, 255];
-                let mut ok = true;
                 for (i, t) in tokens.iter().enumerate() {
                     match t.parse::<i64>() {
                         Ok(v) if (0..=255).contains(&v) => c[i] = v as u8,
-                        _ => ok = false,
+                        _ => {
+                            return Err(pal_err(lineno, line, "invalid ND color component"));
+                        }
                     }
                 }
-                if ok {
-                    nodata = Some(c);
-                }
+                nodata = Some(c);
             }
             // RF (range folded), Decimals, and any other directives: not
             // physical value stops — ignore.
@@ -654,18 +656,20 @@ pub fn parse_pal(name: &str, text: &str) -> Result<Palette, String> {
             entries.retain(|e| e.mask == first);
         }
     }
+    // Convert to physical (data) units BEFORE sorting: a negative Scale
+    // inverts the order, and the bin-end logic below assumes ascending
+    // physical thresholds.
+    for e in &mut entries {
+        e.value = (e.value - offset) / scale;
+    }
     entries.sort_by(|a, b| a.value.total_cmp(&b.value));
 
-    // Scale/Offset convert the program's internal (data) units to the
-    // table's units: table = data * scale + offset (e.g. a knots-valued BV
-    // table over m/s data carries Scale: 1.9426). Our palettes live in
-    // DATA units, so invert.
-    let phys = |v: f64| (v - offset) / scale;
+    // (Entry values are already physical/data units and sorted ascending.)
     let mut stops: Vec<ColorStop> = Vec::new();
     for i in 0..entries.len() {
         let e = &entries[i];
-        let v = phys(e.value);
-        let next_v = entries.get(i + 1).map(|n| phys(n.value));
+        let v = e.value;
+        let next_v = entries.get(i + 1).map(|n| n.value);
         stops.push(ColorStop {
             value: v,
             color: e.color,
@@ -837,6 +841,28 @@ Color:  80   128  128  128\n";
         assert_eq!(values, vec![0.0, 32.0]);
     }
 
+    /// A negative Scale inverts the table→data order; stops must still
+    /// come out ascending in data units with correct bin-end placement.
+    #[test]
+    fn pal_negative_scale_reorders_correctly() {
+        // table = data * -1  → data = -table. SolidColor bands exercise
+        // the bin-end stops.
+        let p = parse_pal(
+            "x",
+            "Scale: -1\nSolidColor: -20 1 1 1\nSolidColor: -10 2 2 2\nSolidColor: 0 3 3 3\n",
+        )
+        .unwrap();
+        let values: Vec<f64> = p.stops.iter().map(|s| s.value).collect();
+        assert!(
+            values.windows(2).all(|w| w[0] <= w[1]),
+            "ascending: {values:?}"
+        );
+        // data 0..10 = band from table 0 entry (3,3,3); 10..20 from -10; 20+ from -20.
+        assert_eq!(p.sample(5.0), [3, 3, 3, 255]);
+        assert_eq!(p.sample(15.0), [2, 2, 2, 255]);
+        assert_eq!(p.sample(25.0), [1, 1, 1, 255]);
+    }
+
     #[test]
     fn pal_errors() {
         assert!(parse_pal("x", "Product: BR\n").is_err()); // no color entries
@@ -844,6 +870,8 @@ Color:  80   128  128  128\n";
         assert!(parse_pal("x", "Color: 10 300 0 0\n").is_err()); // component range
         assert!(parse_pal("x", "Color: 10 0 0\n").is_err()); // wrong arity
         assert!(parse_pal("x", "Scale: 0\nColor: 1 0 0 0\n").is_err()); // zero scale
+        assert!(parse_pal("x", "ND: 1 2\nColor: 1 0 0 0\n").is_err()); // ND arity
+        assert!(parse_pal("x", "ND: 300 0 0\nColor: 1 0 0 0\n").is_err()); // ND range
     }
 
     #[test]
