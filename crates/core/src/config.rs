@@ -445,7 +445,12 @@ pub struct WmsParameterConfig {
 /// A named WMS style with its own colormap configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WmsStyle {
-    pub name: String,
+    /// Style name. Optional when `colormap` is set — defaults to the
+    /// colormap name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Style title. Defaults to the referenced palette's title, then to
+    /// the style name.
     pub title: Option<String>,
     /// Built-in colormap name.
     pub colormap: Option<String>,
@@ -514,7 +519,12 @@ pub struct StyleBundleDefault {
 /// Named extra style inside a `StyleBundle`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StyleBundleExtra {
-    pub name: String,
+    /// Style name. Optional when `colormap` is set — it then defaults to
+    /// the colormap name, so a pure palette reference is one line.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Style title. Defaults to the referenced palette's title, then to
+    /// the style name.
     pub title: Option<String>,
     pub colormap: Option<String>,
     #[serde(default)]
@@ -605,6 +615,20 @@ fn validate_hex_color(s: &str) -> Result<(), String> {
         Err(format!(
             "invalid hex color '{s}' (expected #RRGGBB or #RRGGBBAA)"
         ))
+    }
+}
+
+impl StyleBundleExtra {
+    /// The style's registry name: explicit `name`, else the colormap name.
+    pub fn effective_name(&self) -> Option<&str> {
+        self.name.as_deref().or(self.colormap.as_deref())
+    }
+}
+
+impl WmsStyle {
+    /// The style's registry name: explicit `name`, else the colormap name.
+    pub fn effective_name(&self) -> Option<&str> {
+        self.name.as_deref().or(self.colormap.as_deref())
     }
 }
 
@@ -2171,29 +2195,39 @@ impl ServerConfig {
             // would silently overwrite each other in the same HashMap.
             let mut extra_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
             for extra in &bundle.extras {
-                if extra.name.is_empty() {
-                    return Err(crate::error::DataServerError::Config(format!(
-                        "Style bundle '{}': extra has an empty 'name' field",
-                        bundle.id
-                    )));
-                }
-                if extra.name == "default" {
+                let name = match extra.effective_name() {
+                    Some(n) if !n.is_empty() => n,
+                    Some(_) => {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Style bundle '{}': extra has an empty 'name' field",
+                            bundle.id
+                        )));
+                    }
+                    None => {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "Style bundle '{}': extra needs a 'name' (or a 'colormap' \
+                             reference to default the name from)",
+                            bundle.id
+                        )));
+                    }
+                };
+                if name == "default" {
                     return Err(crate::error::DataServerError::Config(format!(
                         "Style bundle '{}': extra cannot be named 'default' \
                          (reserved for the bundle's default style)",
                         bundle.id
                     )));
                 }
-                if !extra_names.insert(extra.name.as_str()) {
+                if !extra_names.insert(name) {
                     return Err(crate::error::DataServerError::Config(format!(
-                        "Style bundle '{}': duplicate extra name '{}'",
-                        bundle.id, extra.name
+                        "Style bundle '{}': duplicate extra name '{name}'",
+                        bundle.id
                     )));
                 }
                 if extra.parameter.as_deref() == Some("") {
                     return Err(crate::error::DataServerError::Config(format!(
-                        "Style bundle '{}': extra '{}' has an empty 'parameter' field",
-                        bundle.id, extra.name
+                        "Style bundle '{}': extra '{name}' has an empty 'parameter' field",
+                        bundle.id
                     )));
                 }
             }
@@ -3604,6 +3638,28 @@ colormap = "viridis"
         let path = write_config(tmp.path(), "config.toml", &config_toml);
         ServerConfig::from_file(path.to_str().unwrap())
             .expect("bundle + inline fields is valid since bundles v2");
+    }
+
+    #[test]
+    fn bundle_extra_needs_name_or_colormap() {
+        let tmp = TempDir::new().unwrap();
+        let config_toml = r##"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[style_bundles]]
+id = "b"
+[style_bundles.default]
+colormap = "viridis"
+[[style_bundles.extras]]
+color_stops = [ { value = 0.0, color = "#000000" } ]
+"##;
+        let path = write_config(tmp.path(), "config.toml", config_toml);
+        let err = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs a 'name'"), "got: {err}");
     }
 
     #[test]

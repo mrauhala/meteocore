@@ -193,17 +193,28 @@ impl StyleContext {
         // second into the same map.
         if let Some(bundle) = bundle {
             for extra in &bundle.extras {
+                // Name defaults to the colormap reference (validated to
+                // exist); title falls back to the palette's own title, so a
+                // pure palette reference needs only `colormap = "..."`.
+                let Some(name) = extra.effective_name().map(str::to_string) else {
+                    continue; // rejected by validation; defensive
+                };
                 let r = self.build_colormap(&StyleSpec {
                     colormap: extra.colormap.as_deref(),
                     color_stops: &extra.color_stops,
                     min: extra.min,
                     max: extra.max,
                 })?;
+                let title = extra
+                    .title
+                    .clone()
+                    .or_else(|| r.palette.title.clone())
+                    .unwrap_or_else(|| name.clone());
                 styles.insert(
-                    extra.name.clone(),
+                    name.clone(),
                     StyleInfo {
-                        name: extra.name.clone(),
-                        title: extra.title.clone().unwrap_or_else(|| extra.name.clone()),
+                        name,
+                        title,
                         colormap: r.colormap,
                         palette: r.palette,
                         min: r.min,
@@ -215,20 +226,25 @@ impl StyleContext {
         }
         if let Some(wms_config) = &collection.wms {
             for style_config in &wms_config.styles {
+                let Some(name) = style_config.effective_name().map(str::to_string) else {
+                    continue; // no name and no colormap to derive one from
+                };
                 let r = self.build_colormap(&StyleSpec {
                     colormap: style_config.colormap.as_deref(),
                     color_stops: &style_config.color_stops,
                     min: style_config.min,
                     max: style_config.max,
                 })?;
+                let title = style_config
+                    .title
+                    .clone()
+                    .or_else(|| r.palette.title.clone())
+                    .unwrap_or_else(|| name.clone());
                 styles.insert(
-                    style_config.name.clone(),
+                    name.clone(),
                     StyleInfo {
-                        name: style_config.name.clone(),
-                        title: style_config
-                            .title
-                            .clone()
-                            .unwrap_or_else(|| style_config.name.clone()),
+                        name,
+                        title,
                         colormap: r.colormap,
                         palette: r.palette,
                         min: r.min,
@@ -716,6 +732,37 @@ mod tests {
         // the bundle parameter's palette.
         assert_eq!(vradh.palette.name, "radial_velocity");
         assert_eq!((vradh.min, vradh.max), (-24.0, 24.0));
+    }
+
+    /// A pure palette reference needs only `colormap = "..."`: the style
+    /// name defaults to the colormap name, the title to the palette's title.
+    #[test]
+    fn one_line_extra_defaults_name_and_title_from_palette() {
+        let ctx = StyleContext::with_builtins();
+        let b = bundle(
+            r#"
+            id = "b"
+            [default]
+            colormap = "radar_bookbinder"
+            [[extras]]
+            colormap = "radar_dbz"
+            [[extras]]
+            title = "House gray"
+            colormap = "grayscale"
+            "#,
+        );
+        let c = coll("style_bundle = \"b\"\n");
+        let styles = ctx.collection_styles(&c, Some(&b)).unwrap();
+        let dbz = &styles["radar_dbz"];
+        assert_eq!(dbz.name, "radar_dbz");
+        assert_eq!(dbz.title, "Radar reflectivity (dBZ)"); // palette title
+                                                           // Explicit title still wins over the palette's.
+        assert_eq!(styles["grayscale"].title, "House gray");
+
+        // Inline [[wms.styles]] one-liner behaves identically.
+        let c = coll("colormap = \"viridis\"\n[[wms.styles]]\ncolormap = \"temperature\"\n");
+        let styles = ctx.collection_styles(&c, None).unwrap();
+        assert_eq!(styles["temperature"].title, "Temperature (°C)");
     }
 
     /// Named styles are the union of bundle extras and inline styles;
