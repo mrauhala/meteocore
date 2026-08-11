@@ -494,7 +494,10 @@ fn parse_gdal_color(tokens: &[&str], lineno: usize, line: &str) -> Result<[u8; 4
 /// - `RF:` (range-folded) and other directives are ignored.
 ///
 /// Entries may appear in any order (typically highest-first); the result is
-/// sorted ascending. Values must be finite.
+/// sorted ascending. Values must be finite. Matching the source
+/// applications' display-threshold behavior, values below the lowest entry
+/// render transparent (a guard stop is inserted unless the first entry is
+/// already transparent); values above the highest clamp to its color.
 pub fn parse_pal(name: &str, text: &str) -> Result<Palette, String> {
     struct Entry {
         value: f64,
@@ -695,6 +698,22 @@ pub fn parse_pal(name: &str, text: &str) -> Result<Palette, String> {
     }
     let _ = step; // legend-tick spacing; not used for the palette itself
 
+    // GR display-threshold semantics: values BELOW the lowest entry are
+    // not drawn at all in the source applications — the table's minimum is
+    // the visibility threshold. Our palettes clamp below the first stop,
+    // so guard with a transparent stop one ULP under the threshold (skip
+    // when the first entry is already transparent).
+    stops.sort_by(|a, b| a.value.total_cmp(&b.value));
+    if let Some(first) = stops.first() {
+        if first.color[3] != 0 {
+            let guard = ColorStop {
+                value: first.value.next_down(),
+                color: [0, 0, 0, 0],
+            };
+            stops.insert(0, guard);
+        }
+    }
+
     let mut palette = Palette::new(name, stops, Interpolation::Linear);
     palette.nodata_color = nodata;
     palette.title = match (product, units) {
@@ -728,8 +747,9 @@ Color:  60   255    0  255    128   0 128\n\
 Color:  70   255  255  255    128 128 128\n\
 Color:  80   128  128  128\n";
         let p = parse_pal("br", src).unwrap();
-        // 7 two-color bins → 14 stops, plus the trailing single → 15.
-        assert_eq!(p.stops.len(), 15);
+        // 7 two-color bins → 14 stops, plus the trailing single → 15,
+        // plus the below-minimum transparency guard → 16.
+        assert_eq!(p.stops.len(), 16);
         // Bin starts take the entry color exactly at the threshold.
         assert_eq!(p.sample(10.0), [164, 164, 255, 255]);
         assert_eq!(p.sample(30.0), [0, 255, 0, 255]);
@@ -740,8 +760,10 @@ Color:  80   128  128  128\n";
         // Above the last threshold clamps to its color.
         assert_eq!(p.sample(90.0), [128, 128, 128, 255]);
         assert_eq!(p.title.as_deref(), Some("br (DBZ)"));
-        // Below the first stop clamps to the first color.
-        assert_eq!(p.sample(0.0), [164, 164, 255, 255]);
+        // Below the lowest entry nothing is drawn (GR display threshold)…
+        assert_eq!(p.sample(0.0), [0, 0, 0, 0]);
+        assert_eq!(p.sample(9.99), [0, 0, 0, 0]);
+        // …while the threshold itself is fully visible (checked above).
     }
 
     /// RadarScope dialect: trailing mask tokens define per-condition
@@ -759,8 +781,8 @@ Color:  80   128  128  128\n";
              Color: 20 180 180 255 SNOW\nColor: 52.0 0 0 135 SNOW\n",
         )
         .unwrap();
-        assert_eq!(p.stops.len(), 2);
-        assert_eq!(p.stops[0].color, [0, 200, 0, 255]); // RAIN, not MIX/SNOW
+        assert_eq!(p.stops.len(), 3); // guard + 2 RAIN stops
+        assert_eq!(p.stops[1].color, [0, 200, 0, 255]); // RAIN, not MIX/SNOW
         assert_eq!(p.nodata_color, Some([12, 34, 56, 255]));
 
         // Mixed: unmasked entries win over masked duplicates.
@@ -770,7 +792,7 @@ Color:  80   128  128  128\n";
         )
         .unwrap();
         assert_eq!(p.stops.iter().filter(|s| s.value == 10.0).count(), 1);
-        assert_eq!(p.stops[0].color, [1, 1, 1, 255]);
+        assert_eq!(p.sample(10.0), [1, 1, 1, 255]);
     }
 
     #[test]
@@ -781,10 +803,13 @@ Color:  80   128  128  128\n";
         )
         .unwrap();
         assert_eq!(p.title.as_deref(), Some("BR (DBZ)"));
-        // Sorted ascending, one stop per single-color entry.
-        let values: Vec<f64> = p.stops.iter().map(|s| s.value).collect();
+        // Sorted ascending, one stop per single-color entry, plus the
+        // below-minimum guard.
+        let values: Vec<f64> = p.stops.iter().skip(1).map(|s| s.value).collect();
         assert_eq!(values, vec![5.0, 45.0, 65.0, 75.0]);
-        assert_eq!(p.stops[1].color, [255, 0, 0, 255]);
+        assert_eq!(p.stops[2].color, [255, 0, 0, 255]);
+        // Below 5 dBZ nothing is drawn.
+        assert_eq!(p.sample(4.0), [0, 0, 0, 0]);
         // Single-color entries blend toward the next entry: midpoint of
         // 45..65 is halfway red → magenta.
         assert_eq!(p.sample(55.0), [255, 0, 128, 255]);
@@ -823,8 +848,8 @@ Color:  80   128  128  128\n";
             "Color4: 0 255 0 0 128\nColor4: 10 0 255 0 255\nRF: 255 0 255\n",
         )
         .unwrap();
-        assert_eq!(p.stops[0].color, [255, 0, 0, 128]);
-        assert_eq!(p.stops.len(), 2); // RF produced no stop
+        assert_eq!(p.stops[1].color, [255, 0, 0, 128]);
+        assert_eq!(p.stops.len(), 3); // guard + 2; RF produced no stop
     }
 
     #[test]
@@ -837,7 +862,7 @@ Color:  80   128  128  128\n";
             "Scale: 2\nOffset: 64\nColor: 64 0 0 0\nColor: 128 255 255 255\n",
         )
         .unwrap();
-        let values: Vec<f64> = p.stops.iter().map(|s| s.value).collect();
+        let values: Vec<f64> = p.stops.iter().skip(1).map(|s| s.value).collect();
         assert_eq!(values, vec![0.0, 32.0]);
     }
 
