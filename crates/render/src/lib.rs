@@ -493,9 +493,13 @@ pub fn legend_json(
     parameter: Option<&str>,
     unit: Option<&str>,
 ) -> serde_json::Value {
+    // domain_stops: a .pal display-threshold guard (one ULP below the
+    // real minimum) is excluded so stops[0].value equals the reported
+    // "min" — below-min values are simply absent from a legend client's
+    // colormap, which reproduces the threshold behavior.
     let stops: Vec<serde_json::Value> = style
         .palette
-        .stops
+        .domain_stops()
         .iter()
         .map(|s| {
             serde_json::json!({
@@ -844,6 +848,40 @@ mod tests {
             max,
             parameter: None,
         }
+    }
+
+    /// A .pal-guarded palette emits a self-consistent legend: stops start
+    /// at the reported min (the guard is filtered), no ULP artifact.
+    #[test]
+    fn legend_json_filters_pal_guard_stop() {
+        // Build the StyleInfo the way the resolver does, from a registry
+        // holding a guarded .pal palette.
+        let mut reg = crate::PaletteRegistry::with_builtins();
+        reg.insert(crate::parse_pal("x", "Color: 10 1 2 3\nColor: 50 4 5 6\n").unwrap())
+            .unwrap();
+        let r = crate::StyleContext::new(reg)
+            .build_colormap(&crate::StyleSpec {
+                colormap: Some("x"),
+                color_stops: &[],
+                min: None,
+                max: None,
+            })
+            .unwrap();
+        let style = StyleInfo {
+            name: "default".into(),
+            title: "Default".into(),
+            colormap: r.colormap,
+            palette: r.palette,
+            min: r.min,
+            max: r.max,
+            parameter: None,
+        };
+        let json = legend_json(&style, None, None);
+        assert_eq!(json["min"], 10.0);
+        let stops = json["stops"].as_array().unwrap();
+        assert_eq!(stops.len(), 2);
+        assert_eq!(stops[0]["value"], 10.0); // == min, guard filtered
+        assert_eq!(stops[0]["color"], "#010203");
     }
 
     #[test]

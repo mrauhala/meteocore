@@ -101,13 +101,21 @@ impl Palette {
     /// transparent segments (e.g. radar_dbz 0→5 dBZ) are NOT skipped —
     /// the discriminator is the exact one-ULP placement.
     pub fn domain_min_stop(&self) -> Option<&ColorStop> {
+        self.domain_stops().first()
+    }
+
+    /// The stops that define the palette's domain: all of them, minus a
+    /// leading display-threshold guard (see [`domain_min_stop`]). Legend
+    /// serialization uses this so the emitted stops start at the same
+    /// value the derived `min` reports.
+    pub fn domain_stops(&self) -> &[ColorStop] {
         match (self.stops.first(), self.stops.get(1)) {
             (Some(first), Some(second))
                 if first.color[3] == 0 && first.value == second.value.next_down() =>
             {
-                Some(second)
+                &self.stops[1..]
             }
-            _ => self.stops.first(),
+            _ => &self.stops,
         }
     }
 
