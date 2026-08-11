@@ -888,6 +888,21 @@ Color:  80   128  128  128\n";
         assert_eq!(p.sample(25.0), [1, 1, 1, 255]);
     }
 
+    /// The below-minimum guard must not leak into the derived range: a
+    /// table starting at 10 still reports min = 10, and a first entry that
+    /// is already transparent gets no extra guard.
+    #[test]
+    fn pal_guard_skips_range_and_transparent_first_entry() {
+        let p = parse_pal("x", "Color: 10 1 2 3\nColor: 50 4 5 6\n").unwrap();
+        assert_eq!(p.default_range(), Some((10.0, 50.0)));
+
+        // Already-transparent first entry: no guard inserted.
+        let p = parse_pal("x", "Color4: 5 0 0 0 0\nColor: 20 9 9 9\n").unwrap();
+        assert_eq!(p.stops.len(), 2);
+        assert_eq!(p.stops[0].color[3], 0);
+        assert_eq!(p.sample(0.0), [0, 0, 0, 0]);
+    }
+
     #[test]
     fn pal_errors() {
         assert!(parse_pal("x", "Product: BR\n").is_err()); // no color entries

@@ -78,7 +78,8 @@ impl Palette {
         if self.normalized {
             return None;
         }
-        match (self.stops.first(), self.stops.last()) {
+        let first = self.domain_min_stop();
+        match (first, self.stops.last()) {
             (Some(first), Some(last)) if last.value > first.value => {
                 Some((first.value, last.value))
             }
@@ -89,6 +90,25 @@ impl Palette {
     /// Sample the palette color at a physical value (no range scaling).
     pub fn sample(&self, value: f64) -> [u8; 4] {
         sample_stops(&self.stops, value, self.interpolation)
+    }
+
+    /// The stop that defines the domain minimum. Normally the first stop —
+    /// EXCEPT when it is a display-threshold guard: a fully-transparent
+    /// stop sitting exactly one ULP below the following stop (the `.pal`
+    /// importer emits these so below-minimum values vanish). A guard is
+    /// not the domain edge; skipping it keeps derived ranges and legend
+    /// minima at the real threshold (10, not 9.999…). Wide intentional
+    /// transparent segments (e.g. radar_dbz 0→5 dBZ) are NOT skipped —
+    /// the discriminator is the exact one-ULP placement.
+    pub fn domain_min_stop(&self) -> Option<&ColorStop> {
+        match (self.stops.first(), self.stops.get(1)) {
+            (Some(first), Some(second))
+                if first.color[3] == 0 && first.value == second.value.next_down() =>
+            {
+                Some(second)
+            }
+            _ => self.stops.first(),
+        }
     }
 
     /// Hex-encode a stop color for machine-readable legends: `#RRGGBB`,

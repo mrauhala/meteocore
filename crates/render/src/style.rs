@@ -418,7 +418,10 @@ fn range_for(
     min_override: Option<f64>,
     max_override: Option<f64>,
 ) -> (f64, f64) {
-    let min = min_override.unwrap_or_else(|| palette.stops.first().map(|s| s.value).unwrap_or(0.0));
+    // The derived minimum skips a .pal display-threshold guard stop (one
+    // ULP below the real threshold) — see Palette::domain_min_stop.
+    let min =
+        min_override.unwrap_or_else(|| palette.domain_min_stop().map(|s| s.value).unwrap_or(0.0));
     let max = max_override.unwrap_or_else(|| palette.stops.last().map(|s| s.value).unwrap_or(1.0));
     (min, max)
 }
