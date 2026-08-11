@@ -21,7 +21,7 @@ pub use palette::{
     builtin_palette, builtin_palette_arc, builtin_palettes, Interpolation, Palette, PaletteInsert,
     PaletteRegistry,
 };
-pub use palette_formats::{parse_cpt, parse_gdal_txt};
+pub use palette_formats::{parse_cpt, parse_gdal_txt, parse_pal};
 pub use plot::{render_chart, render_heatmap, Heatmap, Panel, Series};
 pub use rasterize::{fill_polygon, Combine};
 pub use style::{ResolvedColormap, StyleContext, StyleSpec};

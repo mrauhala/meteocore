@@ -342,8 +342,8 @@ port = 8000
 # watch_debounce_ms = 500               # optional, coalesce-window for the watcher (default 500)
 # colormaps_dir = "colormaps.d"  # optional, directory of palette files loaded as
                                  # named colormaps (name = file stem). Formats:
-                                 # .toml (ColormapDef), GMT .cpt, GDAL color-relief
-                                 # .txt/.clr, SLD .sld (ColorMap). Re-read on reload;
+                                 # .toml (ColormapDef), GMT .cpt, GRLevelX .pal,
+                                 # GDAL color-relief .txt/.clr, SLD .sld (ColorMap). Re-read on reload;
                                  # missing dir = hard error; other extensions skipped.
 
 # Optional named colormaps. Like [[style_bundles]], MUST live in top-level

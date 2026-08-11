@@ -76,8 +76,8 @@ fn resolve_dir(dir: &str, config_dir: Option<&Path>) -> PathBuf {
 }
 
 /// Load every palette file in `dir` (non-recursive, sorted by filename).
-/// Extensions: `.toml` (ColormapDef), `.cpt` (GMT), `.txt`/`.clr` (GDAL
-/// color-relief), `.sld` (SLD ColorMap). Other extensions are skipped, so
+/// Extensions: `.toml` (ColormapDef), `.cpt` (GMT), `.pal` (GRLevelX
+/// color table), `.txt`/`.clr` (GDAL color-relief), `.sld` (SLD ColorMap). Other extensions are skipped, so
 /// `.disabled` works like it does for collections. A missing directory is a
 /// hard error (a typo'd path must not silently load nothing); an empty one
 /// logs a warning.
@@ -126,6 +126,10 @@ fn load_colormaps_dir(registry: &mut PaletteRegistry, dir: &Path) -> Result<(), 
                 def_to_palette(&format!("colormaps_dir {filename}"), &name, &def)?
             }
             "cpt" => parse("GMT cpt", ds_render::parse_cpt(&stem, &read(path)?))?,
+            "pal" => parse(
+                "GRLevelX color table",
+                ds_render::parse_pal(&stem, &read(path)?),
+            )?,
             "txt" | "clr" => parse(
                 "GDAL color-relief",
                 ds_render::parse_gdal_txt(&stem, &read(path)?),
@@ -142,7 +146,7 @@ fn load_colormaps_dir(registry: &mut PaletteRegistry, dir: &Path) -> Result<(), 
 
     if loaded == 0 {
         tracing::warn!(
-            "colormaps_dir '{}' contains no palette files (.toml/.cpt/.txt/.clr/.sld)",
+            "colormaps_dir '{}' contains no palette files (.toml/.cpt/.pal/.txt/.clr/.sld)",
             dir.display()
         );
     } else {
