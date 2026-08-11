@@ -50,16 +50,24 @@ pub fn get_capabilities_xml(
     // Individual layers (one per collection)
     for (id, config) in collections {
         if let Some(engine) = engines.get(id) {
-            let layer_styles = styles.get(id.as_str());
             let info = engine.raster_info();
 
             if info.parameters.len() > 1 {
                 // Multi-parameter engine: parent layer (not requestable) with
-                // nested child layers per parameter
-                write_parent_layer(&mut writer, id, config, &info, layer_styles, base_url);
+                // nested child layers per parameter. Each child resolves its
+                // own style map, so pass the whole registry down.
+                write_parent_layer(&mut writer, id, config, &info, styles, base_url);
             } else {
                 // Single-parameter engine: one requestable layer
-                write_layer(&mut writer, id, config, &info, layer_styles, base_url, None);
+                write_layer(
+                    &mut writer,
+                    id,
+                    config,
+                    &info,
+                    styles.get(id.as_str()),
+                    base_url,
+                    None,
+                );
             }
         }
     }
@@ -125,12 +133,18 @@ fn write_dcp_type(writer: &mut Writer<Vec<u8>>, base_url: &str) {
 
 /// Write a parent layer for a multi-parameter collection.
 /// The parent is not directly requestable — child layers per parameter are.
+///
+/// `styles` is the whole registry, not one collection's map: each child layer
+/// advertises the styles of its OWN `"{id}/{param}"` key when the collection
+/// registers one. Reusing the collection map for every child advertised
+/// parameter-scoped styles on layers that would reject them at GetMap time
+/// (and hid the ones that layer really has).
 fn write_parent_layer(
     writer: &mut Writer<Vec<u8>>,
     id: &str,
     config: &CollectionConfig,
     info: &RasterInfo,
-    layer_styles: Option<&HashMap<String, StyleInfo>>,
+    styles: &HashMap<String, HashMap<String, StyleInfo>>,
     base_url: &str,
 ) {
     let _ = writer.write_event(Event::Start(BytesStart::new("Layer")));
@@ -157,12 +171,16 @@ fn write_parent_layer(
             Some(subtitle) => format!("{subtitle} — {title}"),
             None => title.clone(),
         };
+        // The child's own style map when it has one (per-parameter defaults,
+        // parameter-scoped bundle extras); the collection's otherwise — which
+        // is what GetMap resolves for this LAYER.
+        let child_styles = styles.get(&child_layer_name).or_else(|| styles.get(id));
         write_layer(
             writer,
             &child_layer_name,
             config,
             info,
-            layer_styles,
+            child_styles,
             base_url,
             Some(&child_title),
         );
@@ -325,11 +343,14 @@ fn write_layer_styles(
                 write_text_element(writer, "Name", &style.name);
                 write_text_element(writer, "Title", &style.title);
 
-                // LegendURL — use the collection ID (before /) for the LAYER param
-                let legend_layer = layer_name.split('/').next().unwrap_or(layer_name);
+                // LegendURL — the FULL layer name, including any "/param"
+                // segment. GetLegendGraphic resolves that key to the same
+                // per-parameter style this layer advertises; using the bare
+                // collection id would hand back the collection default's
+                // legend for a parameter layer rendered with its own palette.
                 let _ = writer.write_event(Event::Start(BytesStart::new("LegendURL")));
                 let legend_url = format!(
-                    "{base_url}/wms?SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER={legend_layer}&STYLE={}&FORMAT=image/png",
+                    "{base_url}/wms?SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER={layer_name}&STYLE={}&FORMAT=image/png",
                     style.name
                 );
                 let mut or = BytesStart::new("OnlineResource");

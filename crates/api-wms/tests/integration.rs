@@ -2289,7 +2289,7 @@ async fn legend_graphic_defaults_to_labelled_size() {
     assert_eq!(headers.get("content-type").unwrap(), "image/png");
     assert_eq!(
         headers.get("cache-control").unwrap(),
-        "public, max-age=86400, immutable"
+        "public, max-age=86400" /* no immutable: palettes hot-reload */
     );
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(
@@ -2619,5 +2619,239 @@ async fn getmap_explicit_latest_pin_keeps_fallback_resolution() {
         calls.lock().unwrap().len(),
         1,
         "older-run pin must share the cache entry keyed on the fallback-resolved run"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-parameter styles: GetLegendGraphic + GetCapabilities
+// ---------------------------------------------------------------------------
+
+/// A `StyleInfo` over a named built-in palette, resolved through the same
+/// `StyleContext` the server uses so `colormap` and `palette` agree.
+fn param_palette_style(name: &str, palette: &str, parameter: Option<&str>) -> StyleInfo {
+    let resolved = ds_render::StyleContext::with_builtins()
+        .build_colormap(&ds_render::StyleSpec {
+            colormap: Some(palette),
+            ..Default::default()
+        })
+        .expect("built-in palette resolves");
+    StyleInfo {
+        name: name.to_string(),
+        title: format!("{palette} over {name}"),
+        colormap: resolved.colormap,
+        palette: resolved.palette,
+        min: resolved.min,
+        max: resolved.max,
+        parameter: parameter.map(str::to_string),
+    }
+}
+
+/// Style registry for a multi-parameter collection as the server builds it:
+/// the collection-level map plus a per-parameter map for VRADH only. DBZH has
+/// no layer of its own, so it must fall back to the collection map.
+fn param_layer_styles() -> HashMap<String, HashMap<String, StyleInfo>> {
+    let mut styles = HashMap::new();
+    styles.insert(
+        "radar-fivih".to_string(),
+        HashMap::from([
+            (
+                "default".to_string(),
+                param_palette_style("default", "viridis", None),
+            ),
+            (
+                "gray".to_string(),
+                param_palette_style("gray", "grayscale", None),
+            ),
+        ]),
+    );
+    styles.insert(
+        "radar-fivih/VRADH".to_string(),
+        HashMap::from([
+            (
+                "default".to_string(),
+                param_palette_style("default", "radial_velocity", Some("VRADH")),
+            ),
+            (
+                "vradh_only".to_string(),
+                param_palette_style("vradh_only", "temperature", Some("VRADH")),
+            ),
+        ]),
+    );
+    styles
+}
+
+fn build_param_layer_router() -> axum::Router {
+    let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+    engines.insert("radar-fivih".to_string(), Arc::new(SiteMockMapEngine));
+    let mut collections = HashMap::new();
+    collections.insert(
+        "radar-fivih".to_string(),
+        site_collection_config("radar-fivih"),
+    );
+
+    let state = Arc::new(ArcSwap::from_pointee(WmsState {
+        engines,
+        collections,
+        styles: param_layer_styles(),
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
+        base_url: String::new(),
+        trust_proxy_headers: false,
+    }));
+    api_wms::router(state)
+}
+
+async fn legend_json_for(layer: &str) -> serde_json::Value {
+    let app = build_param_layer_router();
+    let req = Request::builder()
+        .uri(format!(
+            "/?SERVICE=WMS&REQUEST=GetLegendGraphic&VERSION=1.3.0\
+             &LAYER={layer}&FORMAT=application/json"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "legend request for {layer}");
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// The gap this fixes: `LAYER=coll/param` resolves the parameter layer's own
+/// style, so the legend describes the palette GetMap renders for that same
+/// LAYER. Previously the "/param" segment was stripped and every parameter's
+/// legend showed the collection default.
+#[tokio::test]
+async fn legend_graphic_uses_the_full_layer_key() {
+    let json = legend_json_for("radar-fivih/VRADH").await;
+    let radial = ds_render::builtin_palette("radial_velocity").unwrap();
+    assert_eq!(json["min"], -48.0);
+    assert_eq!(json["max"], 48.0);
+    assert_eq!(json["stops"].as_array().unwrap().len(), radial.stops.len());
+    // The parameter still resolves — from the style, which the per-parameter
+    // layer tags.
+    assert_eq!(json["parameter"], "VRADH");
+
+    // Distinct from the collection-level default it used to serve.
+    let collection = legend_json_for("radar-fivih").await;
+    assert_eq!(collection["min"], 0.0);
+    assert_eq!(collection["max"], 1.0);
+    assert_ne!(
+        json["stops"], collection["stops"],
+        "the parameter layer's legend must differ from the collection default's"
+    );
+}
+
+/// A parameter with no style layer of its own still falls back to the
+/// collection map — the pre-existing behaviour for every single-parameter
+/// collection.
+#[tokio::test]
+async fn legend_graphic_falls_back_to_the_collection_style() {
+    let json = legend_json_for("radar-fivih/DBZH").await;
+    assert_eq!(json["min"], 0.0);
+    assert_eq!(json["max"], 1.0);
+    assert_eq!(
+        json["stops"].as_array().unwrap().len(),
+        ds_render::builtin_palette("viridis").unwrap().stops.len()
+    );
+    // The layer-name segment supplies the parameter when the style doesn't.
+    assert_eq!(json["parameter"], "DBZH");
+}
+
+/// A style defined only on a parameter layer is reachable through that layer.
+#[tokio::test]
+async fn legend_graphic_serves_a_parameter_scoped_style() {
+    let app = build_param_layer_router();
+    let req = Request::builder()
+        .uri(
+            "/?SERVICE=WMS&REQUEST=GetLegendGraphic&VERSION=1.3.0\
+             &LAYER=radar-fivih/VRADH&STYLES=vradh_only&FORMAT=application/json",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["style"], "vradh_only");
+    assert_eq!(json["min"], -40.0);
+    assert_eq!(json["max"], 50.0);
+}
+
+/// GetCapabilities XML for the multi-parameter site collection styled by
+/// [`param_layer_styles`].
+fn param_layer_capabilities_xml() -> String {
+    let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+    engines.insert("radar-fivih".to_string(), Arc::new(SiteMockMapEngine));
+    let mut collections = HashMap::new();
+    collections.insert(
+        "radar-fivih".to_string(),
+        site_collection_config("radar-fivih"),
+    );
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &param_layer_styles(),
+        "",
+    );
+    String::from_utf8(xml).expect("capabilities XML is UTF-8")
+}
+
+/// Slice one child `<Layer>` element out of the capabilities XML by its
+/// `<Name>`, so a test can assert what that layer alone advertises.
+fn child_layer_section<'a>(xml: &'a str, layer_name: &str) -> &'a str {
+    let name_tag = format!("<Name>{layer_name}</Name>");
+    let start = xml
+        .find(&name_tag)
+        .unwrap_or_else(|| panic!("no child layer named {layer_name} in:\n{xml}"));
+    let end = xml[start..]
+        .find("</Layer>")
+        .map(|i| start + i)
+        .unwrap_or(xml.len());
+    &xml[start..end]
+}
+
+/// Each child layer advertises ITS OWN styles. Reusing the collection map for
+/// every child advertised a parameter-scoped style on layers that would reject
+/// it at GetMap time, and hid the styles the layer really has.
+#[test]
+fn capabilities_advertise_per_child_layer_styles() {
+    let xml = param_layer_capabilities_xml();
+    let vradh = child_layer_section(&xml, "radar-fivih/VRADH");
+    let dbzh = child_layer_section(&xml, "radar-fivih/DBZH");
+
+    // The parameter-scoped style appears under its layer only.
+    assert!(
+        vradh.contains("<Name>vradh_only</Name>"),
+        "VRADH layer must advertise its own style; got:\n{vradh}"
+    );
+    assert!(
+        !dbzh.contains("<Name>vradh_only</Name>"),
+        "a VRADH-scoped style must not be advertised on the DBZH layer (GetMap \
+         would reject it); got:\n{dbzh}"
+    );
+    // DBZH has no layer of its own → the collection's styles, as before.
+    assert!(
+        dbzh.contains("<Name>gray</Name>"),
+        "DBZH must fall back to the collection styles; got:\n{dbzh}"
+    );
+    assert!(
+        !vradh.contains("<Name>gray</Name>"),
+        "the collection-only style must not leak onto a layer that defines its \
+         own style set; got:\n{vradh}"
+    );
+}
+
+/// A child layer's LegendURL points at the full layer name, so following it
+/// returns the legend for the palette that layer actually renders with.
+#[test]
+fn capabilities_legend_url_carries_the_full_layer_name() {
+    let xml = param_layer_capabilities_xml();
+    let vradh = child_layer_section(&xml, "radar-fivih/VRADH");
+
+    assert!(
+        vradh.contains("LAYER=radar-fivih/VRADH&amp;STYLE=default"),
+        "LegendURL must keep the /param segment (the key GetLegendGraphic \
+         resolves); got:\n{vradh}"
     );
 }

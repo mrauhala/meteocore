@@ -60,6 +60,32 @@ fn lookup_engine<'a>(
     Ok((engine, config))
 }
 
+/// Resolve the style map a request should be styled from.
+///
+/// Multi-parameter collections register one style map per parameter under
+/// `"{collection}/{param}"` alongside the collection-level map, and only the
+/// per-parameter map carries that parameter's colormap (from
+/// `[[wms.parameters]]`, a bundle parameter entry, or a built-in parameter
+/// default). A request that names a parameter must therefore resolve its
+/// style there first, falling back to the collection map when the collection
+/// has no such layer (single-parameter engines, unknown parameter names that
+/// the engine ignores). Mirrors how WMS GetMap resolves `LAYERS=coll/param`.
+fn layer_style_map<'a>(
+    styles: &'a HashMap<String, HashMap<String, StyleInfo>>,
+    collection_id: &str,
+    parameter: Option<&str>,
+) -> Option<(String, &'a HashMap<String, StyleInfo>)> {
+    if let Some(p) = parameter {
+        let key = format!("{collection_id}/{p}");
+        if let Some(m) = styles.get(&key) {
+            return Some((key, m));
+        }
+    }
+    styles
+        .get(collection_id)
+        .map(|m| (collection_id.to_string(), m))
+}
+
 /// Map CRS identifier to OGC URI for Content-Crs header.
 fn crs_to_uri(crs: &str) -> &'static str {
     match crs {
@@ -507,6 +533,13 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                         "required": false,
                         "schema": {"type": "string", "default": "json", "enum": ["json", "application/json", "png", "image/png"]},
                         "description": "Legend representation: the machine-readable description (default) or a rendered legend image."
+                    },
+                    {
+                        "name": "parameter-name",
+                        "in": "query",
+                        "required": false,
+                        "schema": {"type": "string"},
+                        "description": "Describe the style of this parameter's layer, matching `parameter-name` on the map routes. Falls back to the collection-level style when the collection has no per-parameter layer."
                     }
                 ],
                 "responses": {
@@ -1043,10 +1076,12 @@ pub async fn style_legend(
     let (engine, _config) = lookup_engine(&state, &id)?;
     let format = params.validate()?;
 
-    let layer_styles = state
-        .styles
-        .get(&id)
-        .ok_or_else(|| MapsError::NotFound(format!("Collection '{id}' not found")))?;
+    // `?parameter-name=` selects the per-parameter style layer, so the legend
+    // a client draws matches the pixels the map/tile routes render for that
+    // same parameter.
+    let (_, layer_styles) =
+        layer_style_map(&state.styles, &id, params.parameter_name.as_deref())
+            .ok_or_else(|| MapsError::NotFound(format!("Collection '{id}' not found")))?;
     let style_info = layer_styles.get(&style_id).ok_or_else(|| {
         MapsError::NotFound(format!(
             "Style '{style_id}' not found for collection '{id}'. Available: {}",
@@ -1056,6 +1091,11 @@ pub async fn style_legend(
 
     let info = engine.raster_info();
     let (parameter, unit) = ds_render::legend_parameter_unit(style_info, &info);
+    // A ?parameter-name= request labels the legend with the REQUESTED
+    // parameter even when no dedicated "{coll}/{param}" style layer exists
+    // and the style fell back to the collection map — the rendered data is
+    // that parameter's either way (the same query param drives the engine).
+    let parameter = params.parameter_name.clone().or(parameter);
 
     match format {
         LegendFormat::Json => {
@@ -1139,11 +1179,16 @@ async fn render_map(
 
     let validated = params.validate()?;
 
-    // Look up style
-    let layer_styles = state
-        .styles
-        .get(collection_id)
-        .ok_or_else(|| MapsError::NotFound(format!("Collection '{collection_id}' not found")))?;
+    // Look up style. A `?parameter-name=` request styles from that
+    // parameter's own layer when the collection registers one — otherwise a
+    // per-parameter colormap would be unreachable through Maps and every
+    // parameter would render with the collection-level default.
+    let (style_layer_key, layer_styles) = layer_style_map(
+        &state.styles,
+        collection_id,
+        validated.parameter_name.as_deref(),
+    )
+    .ok_or_else(|| MapsError::NotFound(format!("Collection '{collection_id}' not found")))?;
 
     let style_info = layer_styles.get(style_name).ok_or_else(|| {
         MapsError::NotFound(format!(
@@ -1224,7 +1269,10 @@ async fn render_map(
 
     // Build cache key
     let cache_key = CacheKey {
-        layer: collection_id.to_string(),
+        // The RESOLVED style-layer key ("{coll}" or "{coll}/{param}"), so a
+        // parameter-layer style and a collection style with the same name
+        // and data parameter can never alias one cached image.
+        layer: style_layer_key,
         style: style_name.to_string(),
         format: match validated.format {
             ds_render::ImageFormat::Png => 0,
