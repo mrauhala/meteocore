@@ -87,6 +87,12 @@ pub struct LutColorMap {
     min: f64,
     max: f64,
     nodata_color: [u8; 4],
+    /// Color for values strictly below `min`. Probed from the stops one
+    /// ULP under `min`, so it equals the clamp color for ordinary
+    /// palettes and transparent for palettes carrying a display-threshold
+    /// guard stop (the `.pal` importer) — below-minimum data then
+    /// disappears exactly like in the source applications.
+    underflow_color: [u8; 4],
 }
 
 impl LutColorMap {
@@ -153,6 +159,7 @@ impl LutColorMap {
             min,
             max,
             nodata_color: [0, 0, 0, 0],
+            underflow_color: sample_stops(stops, min.next_down(), interp),
         }
     }
 }
@@ -173,6 +180,10 @@ impl ColorMap for LutColorMap {
             // three colormap impls on `nodata_color`, which is what a NaN
             // pixel actually means.
             Some(v) if !v.is_finite() => self.nodata_color,
+            // Strictly below the domain: the probed underflow color (clamp
+            // color for ordinary palettes, transparent past a display-
+            // threshold guard).
+            Some(v) if v < self.min => self.underflow_color,
             Some(v) => {
                 if self.max <= self.min {
                     return self.lut[0];
@@ -193,13 +204,20 @@ impl ColorMap for LutColorMap {
 /// array. Per-pixel lookup is one subtract + one `.round()` + clamp + index —
 /// matching [`LutColorMap`]'s round-nearest + saturate-clamp semantics at
 /// integer entries, while replacing its `(v - min) / (max - min) * (len - 1)`
-/// normalisation with a single offset shift.
+/// normalisation with a single offset shift. Values strictly below the
+/// covered range return the source's color just under the range (the
+/// underflow probe — clamp color for ordinary sources, transparent past a
+/// display-threshold guard); values above saturate to the last entry.
 ///
 /// Maximum supported range: 65,536 entries (~256 KB for UInt16/Int16).
 pub struct IntegerLutColorMap {
     lut: Vec<[u8; 4]>,
     offset: i64,
     nodata_color: [u8; 4],
+    /// Color for values strictly below the covered range — probed from the
+    /// source just under `min_val`, mirroring [`LutColorMap`]'s underflow
+    /// semantics (clamp color normally, transparent past a guard).
+    underflow_color: [u8; 4],
 }
 
 /// Maximum number of entries in an integer LUT (covers full UInt16 / Int16 range).
@@ -214,11 +232,13 @@ impl IntegerLutColorMap {
     /// Returns `None` if the range exceeds 65,536 entries.
     pub fn from_colormap(source: &dyn ColorMap, min_val: i64, max_val: i64) -> Option<Self> {
         let nodata_color = source.nodata_color();
+        let underflow_color = source.color(Some((min_val as f64).next_down()));
         if max_val < min_val {
             return Some(Self {
                 lut: Vec::new(),
                 offset: 0,
                 nodata_color,
+                underflow_color,
             });
         }
         let range = (max_val - min_val + 1) as usize;
@@ -234,6 +254,7 @@ impl IntegerLutColorMap {
             lut,
             offset: min_val,
             nodata_color,
+            underflow_color,
         })
     }
 }
@@ -256,6 +277,12 @@ impl ColorMap for IntegerLutColorMap {
             Some(v) => {
                 if self.lut.is_empty() {
                     return self.nodata_color;
+                }
+                // Strictly below the covered range: the probed underflow
+                // color, BEFORE round-to-nearest — a display threshold at
+                // 10 must hide 9.7, not round it up into visibility.
+                if v < self.offset as f64 {
+                    return self.underflow_color;
                 }
                 let last = (self.lut.len() - 1) as i64;
                 let idx = (v - self.offset as f64).round() as i64;
@@ -811,8 +838,11 @@ mod tests {
         ]);
         let lut = IntegerLutColorMap::from_colormap(&linear, 50, 50).unwrap();
         assert_eq!(lut.color(Some(50.0)), linear.color(Some(50.0)));
-        // Out of range → saturate to the single available entry.
-        assert_eq!(lut.color(Some(49.0)), linear.color(Some(50.0)));
+        // Below range → the source's color just under the range (underflow
+        // probe; equals the clamp color whenever the source is constant
+        // below its domain, which every real render path is). Above range
+        // saturates to the last entry as before.
+        assert_eq!(lut.color(Some(49.0)), linear.color(Some(49.999)));
         assert_eq!(lut.color(Some(51.0)), linear.color(Some(50.0)));
     }
 
