@@ -410,15 +410,20 @@ fn merge_specs<'a>(primary: StyleSpec<'a>, fallback: StyleSpec<'a>) -> StyleSpec
     }
 }
 
-/// `min`/`max` overrides fall back to the palette's first/last stop values
-/// (and to 0..1 when the palette somehow has no stops), matching the
-/// legacy resolution exactly.
+/// `min`/`max` overrides fall back to the palette's stop values — `max`
+/// from the last stop, `min` from [`Palette::domain_min_stop`] (the first
+/// stop, except a `.pal` display-threshold guard sitting one ULP below
+/// the real threshold) — and to 0..1 when the palette somehow has no
+/// stops.
 fn range_for(
     palette: &Palette,
     min_override: Option<f64>,
     max_override: Option<f64>,
 ) -> (f64, f64) {
-    let min = min_override.unwrap_or_else(|| palette.stops.first().map(|s| s.value).unwrap_or(0.0));
+    // The derived minimum skips a .pal display-threshold guard stop (one
+    // ULP below the real threshold) — see Palette::domain_min_stop.
+    let min =
+        min_override.unwrap_or_else(|| palette.domain_min_stop().map(|s| s.value).unwrap_or(0.0));
     let max = max_override.unwrap_or_else(|| palette.stops.last().map(|s| s.value).unwrap_or(1.0));
     (min, max)
 }
@@ -732,6 +737,34 @@ mod tests {
         // the bundle parameter's palette.
         assert_eq!(vradh.palette.name, "radial_velocity");
         assert_eq!((vradh.min, vradh.max), (-24.0, 24.0));
+    }
+
+    /// The review-identified regression path: a guarded .pal palette used
+    /// as a NAMED colormap must paint below-threshold values transparent
+    /// through the built (and integer-LUT-wrapped — span 40 ≥ 16) render
+    /// colormap, while reporting min at the real threshold.
+    #[test]
+    fn named_pal_palette_paints_below_threshold_transparent() {
+        let mut reg = PaletteRegistry::with_builtins();
+        reg.insert(crate::parse_pal("x", "Color: 10 1 2 3\nColor: 50 4 5 6\n").unwrap())
+            .unwrap();
+        let ctx = StyleContext::new(reg);
+        let r = ctx
+            .build_colormap(&StyleSpec {
+                colormap: Some("x"),
+                color_stops: &[],
+                min: None,
+                max: None,
+            })
+            .unwrap();
+        assert_eq!((r.min, r.max), (10.0, 50.0));
+        // Below the threshold: invisible — including fractional values
+        // that would round UP to the threshold in the integer LUT.
+        assert_eq!(r.colormap.color(Some(5.0)), [0, 0, 0, 0]);
+        assert_eq!(r.colormap.color(Some(9.7)), [0, 0, 0, 0]);
+        // The threshold itself and above: visible.
+        assert_eq!(r.colormap.color(Some(10.0)), [1, 2, 3, 255]);
+        assert_ne!(r.colormap.color(Some(30.0))[3], 0);
     }
 
     /// A pure palette reference needs only `colormap = "..."`: the style
