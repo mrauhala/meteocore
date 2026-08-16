@@ -58,6 +58,29 @@ disk, no TOML needed.
 
 - `POST /admin/collections/reload` re-reads config and atomically swaps
   engines. Shared core: `admin::do_reload`.
+- **Reload is incremental (#574).** Validation stays all-or-nothing (any
+  config error rejects the whole reload, live registry untouched), but the
+  build phase diffs per collection id against the last accepted config
+  (`ServerState::last_collections`, derived `PartialEq` on
+  `CollectionConfig`):
+  - **Unchanged → the live engine `Arc` is reused verbatim** (from
+    `ServerState::engine_handles` via `EngineReuse`): poll loop keeps
+    running, catalog/caches stay warm, no remote re-bootstrap. Poll-loop
+    rotation is by `Arc` identity (`diff_by_identity`): reused engines are
+    neither `shutdown()` nor re-spawned (either would break — #442).
+  - **Exceptions:** `csv`/`geojson` always rebuild (no poll loop — a reload
+    is the only way they re-read a changed data file). A `nowcast` reuses
+    only if its `source` and `lightning_source` collections are reused too
+    (`reusable_collections` encodes the dependency).
+  - **Cache hygiene:** previously-live collections that were NOT reused get
+    their entries evicted from the rendered/meta-tile/vector-tile caches
+    (`evict_collection`; matches `{id}`, `{id}/param`, `{id}-derived`).
+    Global style inputs ([[colormaps]], bundles, parameter_defaults,
+    colormaps_dir bytes) still drop the rendered/meta-tile caches wholesale
+    via `style_fingerprint`; per-collection `[wms]` edits are deliberately
+    NOT in that fingerprint — they rebuild + evict just their collection.
+  - Style-only global changes rebuild NO engines: styles re-resolve for every
+    collection on each load, reused engines included.
 - With `[server] watch_collections_dir = true` (default off), a filesystem
   watcher (`notify`) triggers the same reload on add/edit/remove — debounced
   (`watch_debounce_ms`, default 500), running on the background

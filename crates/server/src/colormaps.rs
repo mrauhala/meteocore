@@ -179,12 +179,16 @@ pub fn config_default_overrides(
         .collect()
 }
 
-/// Fingerprint of everything that can change how styles resolve: the
-/// `[[colormaps]]` definitions, style bundles, per-collection `[wms]`
-/// blocks, and the raw bytes of every `colormaps_dir` palette file (sorted
-/// by name). Compared across reloads to decide whether the rendered /
-/// meta-tile caches can be reused — their keys carry no style content, so
-/// reusing them across a style change serves stale colors. Only ever
+/// Fingerprint of every GLOBAL input that can change how styles resolve: the
+/// `[[colormaps]]` definitions, style bundles, `[[parameter_defaults]]`, and
+/// the raw bytes of every `colormaps_dir` palette file (sorted by name).
+/// Compared across reloads to decide whether the rendered / meta-tile caches
+/// can be reused — their keys carry no style content, so reusing them across
+/// a style change serves stale colors. Per-collection `[wms]` blocks are
+/// deliberately NOT hashed: a `[wms]` edit changes that collection's
+/// `CollectionConfig`, so the incremental reload (#574) rebuilds it and
+/// evicts only its cache entries — dropping every collection's warm tiles
+/// for a one-collection palette tweak was the pre-#574 cost. Only ever
 /// compared within one process (previous load vs reload), so `Debug`
 /// formatting and `DefaultHasher` are acceptable serializations.
 pub fn style_config_fingerprint(config: &ServerConfig, config_dir: Option<&Path>) -> u64 {
@@ -193,10 +197,6 @@ pub fn style_config_fingerprint(config: &ServerConfig, config_dir: Option<&Path>
     format!("{:?}", config.colormaps).hash(&mut h);
     format!("{:?}", config.style_bundles).hash(&mut h);
     format!("{:?}", config.parameter_defaults).hash(&mut h);
-    for c in &config.collections {
-        c.id.hash(&mut h);
-        format!("{:?}", c.wms).hash(&mut h);
-    }
     if let Some(dir) = &config.server.colormaps_dir {
         let dir_path = resolve_dir(dir, config_dir);
         if let Ok(entries) = std::fs::read_dir(&dir_path) {

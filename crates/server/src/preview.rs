@@ -999,6 +999,8 @@ mod tests {
             reload_lock: tokio::sync::Mutex::new(()),
             admin_token: None,
             style_fingerprint: std::sync::atomic::AtomicU64::new(0),
+            last_collections: RwLock::new(HashMap::new()),
+            engine_handles: RwLock::new(HashMap::new()),
         })
     }
 

@@ -381,6 +381,28 @@ impl RenderedCache {
     pub fn metrics(&self) -> ds_cache::CacheMetrics {
         self.cache.metrics()
     }
+
+    /// Drop every cached image belonging to `collection` — targeted
+    /// invalidation for a reload that rebuilt (or removed) one collection
+    /// while the rest of the cache stays warm. See
+    /// [`layer_belongs_to_collection`] for the layer-name match rule.
+    pub fn evict_collection(&self, collection: &str) {
+        self.cache
+            .retain(|k, _| !layer_belongs_to_collection(&k.layer, collection));
+    }
+}
+
+/// Whether a cached layer name belongs to `collection`, for per-collection
+/// eviction. Matches the exact id, a `{collection}/{parameter}` multi-parameter
+/// layer (WMS layer names carry the parameter after a `/`), and a
+/// `{collection}-{suffix}` derived id (odim-volume per-site collections are
+/// `{base}-{nod}`). The dash rule can catch a sibling collection that happens
+/// to share the id as a dash-prefix — over-eviction costs one re-render, while
+/// under-eviction serves stale pixels, so err on the broad side.
+pub(crate) fn layer_belongs_to_collection(layer: &str, collection: &str) -> bool {
+    layer
+        .strip_prefix(collection)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/') || rest.starts_with('-'))
 }
 
 /// Render a raster tile to image bytes using the given colormap and format.
@@ -848,6 +870,52 @@ mod tests {
             max,
             parameter: None,
         }
+    }
+
+    #[test]
+    fn layer_collection_match_covers_exact_parameter_and_derived_ids() {
+        // Exact id, `{id}/{parameter}` WMS layers, `{id}-{nod}` per-site ids.
+        assert!(layer_belongs_to_collection("radar", "radar"));
+        assert!(layer_belongs_to_collection("radar/DBZH", "radar"));
+        assert!(layer_belongs_to_collection("radar-fivih", "radar"));
+        // Unrelated ids and substring-but-not-boundary names stay.
+        assert!(!layer_belongs_to_collection("radar2", "radar"));
+        assert!(!layer_belongs_to_collection("lightning", "radar"));
+        assert!(!layer_belongs_to_collection("radar", "radar-fivih"));
+    }
+
+    #[test]
+    fn rendered_cache_evicts_one_collection_only() {
+        let key_for = |layer: &str| CacheKey {
+            layer: layer.to_string(),
+            style: "default".into(),
+            format: 0,
+            crs: "EPSG:4326".into(),
+            bbox: [0, 0, 1, 1],
+            width: 256,
+            height: 256,
+            time: None,
+            parameter: None,
+            z: None,
+            reference_time: None,
+        };
+        let cache = RenderedCache::new(1);
+        cache.insert(
+            key_for("radar"),
+            CachedRendered::new(Bytes::from_static(b"a")),
+        );
+        cache.insert(
+            key_for("radar/DBZH"),
+            CachedRendered::new(Bytes::from_static(b"b")),
+        );
+        cache.insert(
+            key_for("lightning"),
+            CachedRendered::new(Bytes::from_static(b"c")),
+        );
+        cache.evict_collection("radar");
+        assert!(cache.get(&key_for("radar")).is_none());
+        assert!(cache.get(&key_for("radar/DBZH")).is_none());
+        assert!(cache.get(&key_for("lightning")).is_some());
     }
 
     /// A .pal-guarded palette emits a self-consistent legend: stops start

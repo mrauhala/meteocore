@@ -218,6 +218,13 @@ impl TilePixelCache {
     pub fn metrics(&self) -> ds_cache::CacheMetrics {
         self.cache.metrics()
     }
+
+    /// Drop every cached tile belonging to `collection` — same match rule as
+    /// [`crate::RenderedCache::evict_collection`].
+    pub fn evict_collection(&self, collection: &str) {
+        self.cache
+            .retain(|k, _| !crate::layer_belongs_to_collection(&k.layer, collection));
+    }
 }
 
 /// Per-render phase timing, returned with [`MetaTile::Image`] so the caller can
@@ -536,6 +543,31 @@ fn sample_nearest(tiles: &Mosaic, gx: f64, gy: f64) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tile_pixel_cache_evicts_one_collection_only() {
+        let key_for = |layer: &str| TileKey {
+            layer: layer.to_string(),
+            parameter: None,
+            style: "default".into(),
+            time: None,
+            z: None,
+            reference_time: None,
+            level: 3,
+            col: 1,
+            row: 2,
+        };
+        let cache = TilePixelCache::new(16);
+        let marker = CachedTilePixels { rgba: None };
+        cache.cache.insert(key_for("radar"), marker.clone());
+        cache.cache.insert(key_for("radar-fivih"), marker.clone());
+        cache.cache.insert(key_for("lightning"), marker);
+        cache.evict_collection("radar");
+        // The per-site derived id is covered by the dash rule; unrelated ids stay.
+        assert!(!cache.cache.contains_key(&key_for("radar")));
+        assert!(!cache.cache.contains_key(&key_for("radar-fivih")));
+        assert!(cache.cache.contains_key(&key_for("lightning")));
+    }
 
     /// A 2×1-texel mosaic in one tile: texel (0,0)=`a`, texel (1,0)=`b`, rest
     /// `fill`. Lets us probe sampling exactly across a colour boundary.

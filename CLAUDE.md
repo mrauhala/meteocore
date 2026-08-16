@@ -522,7 +522,11 @@ a non-http(s) license URL are rejected.
 
 - **Reload:** `POST /admin/collections/reload` — re-reads config, atomically
   swaps engines. The shared core `admin::do_reload` is also driven by the
-  optional `collections_dir` watcher.
+  optional `collections_dir` watcher. Reload is **incremental** (#574):
+  collections whose `CollectionConfig` is unchanged keep their live engine
+  (poll loop untouched, no re-bootstrap); only added/changed/removed ones
+  rebuild, and their cached tiles are evicted per collection. See
+  `crates/server/CLAUDE.md` for the rules.
 - **Health:** `GET /health` — per-collection ready/degraded/failed status.
   HTTP 503 only when all collections failed.
 - **Metrics:** `GET /metrics` — Prometheus format. Path labels use route

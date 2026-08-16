@@ -168,6 +168,14 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         self.cache.insert(key, value);
     }
 
+    /// Keep only the entries for which `keep` returns `true`, dropping the
+    /// rest. Used for targeted invalidation (e.g. evicting one collection's
+    /// entries on an incremental reload) — visits every entry, so call it on
+    /// reload-frequency paths, not per request.
+    pub fn retain(&self, keep: impl Fn(&K, &V) -> bool) {
+        self.cache.retain(keep);
+    }
+
     /// Fetch `key` from the cache, or run `with` and insert its result.
     ///
     /// `quick_cache`'s placeholder guard is the single-flight: concurrent
