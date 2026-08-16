@@ -222,8 +222,19 @@ impl TilePixelCache {
     /// Drop every cached tile belonging to `collection` — same match rule as
     /// [`crate::RenderedCache::evict_collection`].
     pub fn evict_collection(&self, collection: &str) {
-        self.cache
-            .retain(|k, _| !crate::layer_belongs_to_collection(&k.layer, collection));
+        self.evict_collections(std::slice::from_ref(&collection));
+    }
+
+    /// Batch form: one `retain` pass over the cache for N collections.
+    pub fn evict_collections(&self, collections: &[&str]) {
+        if collections.is_empty() {
+            return;
+        }
+        self.cache.retain(|k, _| {
+            !collections
+                .iter()
+                .any(|c| crate::layer_belongs_to_collection(&k.layer, c))
+        });
     }
 }
 

@@ -253,6 +253,24 @@ impl PoolRegistry {
         Ok(pool)
     }
 
+    /// Pre-register a live pool for `dsn` without building anything —
+    /// incremental reload support (#574). A reused engine keeps its pool
+    /// across reloads; seeding it into the load's registry lets a REBUILT
+    /// collection on the same DSN join that existing pool instead of opening
+    /// a second one. Without this, repeated single-collection edits would
+    /// ratchet DSN-sharing collections toward one dedicated pool each (the
+    /// registry is per-load and only dedups among freshly built engines).
+    /// First registration wins — an existing entry for the key is kept.
+    pub fn seed(&mut self, dsn: &str, pool: Arc<Pool>) -> Result<(), RegistryError> {
+        let (_pg_config, key, password) = normalize_dsn(dsn)?;
+        self.pools.entry(key).or_insert_with(|| PoolEntry {
+            size_used: pool.status().max_size as u32,
+            pool,
+            password,
+        });
+        Ok(())
+    }
+
     pub fn len(&self) -> usize {
         self.pools.len()
     }
@@ -345,6 +363,22 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&p1, &p2));
         assert_eq!(r.len(), 1);
+    }
+
+    /// Incremental reload (#574): a fresh load's registry seeded with a
+    /// reused engine's pool hands that SAME pool to a rebuilt collection on
+    /// the same DSN, keeping per-DSN sharing a standing invariant.
+    #[test]
+    fn seed_makes_get_or_create_join_the_live_pool() {
+        let dsn = "postgres://alice:s@h:5432/d";
+        let mut old = PoolRegistry::new();
+        let live = old.get_or_create(dsn, nz(4)).unwrap();
+
+        let mut fresh = PoolRegistry::new();
+        fresh.seed(dsn, live.clone()).unwrap();
+        let joined = fresh.get_or_create(dsn, nz(4)).unwrap();
+        assert!(Arc::ptr_eq(&live, &joined));
+        assert_eq!(fresh.len(), 1);
     }
 
     #[test]

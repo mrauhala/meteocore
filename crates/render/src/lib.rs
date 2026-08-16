@@ -387,8 +387,21 @@ impl RenderedCache {
     /// while the rest of the cache stays warm. See
     /// [`layer_belongs_to_collection`] for the layer-name match rule.
     pub fn evict_collection(&self, collection: &str) {
-        self.cache
-            .retain(|k, _| !layer_belongs_to_collection(&k.layer, collection));
+        self.evict_collections(std::slice::from_ref(&collection));
+    }
+
+    /// [`Self::evict_collection`] for a batch of collections in ONE pass over
+    /// the cache — `retain` visits every entry, so evicting N collections
+    /// one-by-one would do N full scans.
+    pub fn evict_collections(&self, collections: &[&str]) {
+        if collections.is_empty() {
+            return;
+        }
+        self.cache.retain(|k, _| {
+            !collections
+                .iter()
+                .any(|c| layer_belongs_to_collection(&k.layer, c))
+        });
     }
 }
 

@@ -125,7 +125,16 @@ impl VectorTileCache {
     /// key. Exact id match: MVT keys carry real collection ids, never derived
     /// layer names.
     pub fn evict_collection(&self, collection: &str) {
-        self.cache.retain(|k, _| k.collection != collection);
+        self.evict_collections(std::slice::from_ref(&collection));
+    }
+
+    /// Batch form: one `retain` pass over the cache for N collections.
+    pub fn evict_collections(&self, collections: &[&str]) {
+        if collections.is_empty() {
+            return;
+        }
+        self.cache
+            .retain(|k, _| !collections.iter().any(|c| k.collection == *c));
     }
 }
 

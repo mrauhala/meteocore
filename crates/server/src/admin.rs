@@ -975,6 +975,17 @@ impl EngineReuse {
 /// themselves — a rebuilt source engine must propagate into a rebuilt nowcast
 /// wrapper even when the nowcast's own TOML is untouched. `csv`/`geojson`
 /// never reuse (no poll loop; see [`EngineHandle`]).
+///
+/// Two deliberate edges of the equality basis:
+/// - Values resolved from env vars (the postgis DSN) are NOT re-compared: a
+///   process's environment cannot change after exec, so `resolve()` on a
+///   reload always yields what it yielded at the last build — rotating a
+///   DB credential has always required a process restart, before and after
+///   #574.
+/// - A config that sets an `f64` field to TOML `nan` compares unequal to
+///   itself, so that collection falls back to rebuild-on-every-reload —
+///   the pre-#574 behavior, correct but slow. NaN in min/max/color stops
+///   is meaningless for styling; don't do that.
 pub(crate) fn reusable_collections(
     old: &HashMap<String, CollectionConfig>,
     new: &[CollectionConfig],
@@ -1074,9 +1085,24 @@ pub fn load_collections(
     // exists (#522). Collected here during the main loop.
     let mut nowcast_pending: Vec<&CollectionConfig> = Vec::new();
     // Pool registry is local to this load: collections sharing a DSN share a
-    // pool via Arc<Pool>. Across reloads, pools are rebuilt — documented
-    // v1 trade-off; reuse-by-identity across reloads is a follow-up.
+    // pool via Arc<Pool>. Seed it with the pools of every REUSED postgis
+    // engine (#574) so a rebuilt collection on a shared DSN joins the live
+    // pool instead of opening a second one — without this, repeated
+    // single-collection edits would ratchet DSN-sharing collections toward
+    // one dedicated pool each, with no reload path left to re-coalesce.
     let mut pool_registry = engine_postgis::pool::PoolRegistry::new();
+    for handle in engine_reuse.engines.values() {
+        if let EngineHandle::Postgis(engine) = handle {
+            if let Err(e) = pool_registry.seed(&engine.config().dsn, engine.pool().clone()) {
+                // Seeding is an optimization; a failure only costs pool
+                // sharing, never the collection.
+                tracing::warn!(
+                    "Collection '{}': could not seed pool registry from reused engine: {e}",
+                    engine.collection_id()
+                );
+            }
+        }
+    }
     let mut health: Vec<CollectionHealth> = Vec::new();
     // Reuse pool for the NEXT reload: every poll-loop engine that made it
     // into this load, whether freshly built or taken from `engine_reuse`.
@@ -2461,11 +2487,10 @@ pub fn load_collections(
                             }
                         };
 
-                        // NOTE: the pool registry only dedups DSNs among the
-                        // engines built in THIS load — a new collection on a
-                        // DSN whose other collections were all reused opens
-                        // its own pool. Acceptable: pools are per-DSN small,
-                        // and the next full rebuild re-coalesces them.
+                        // The registry was seeded with every reused postgis
+                        // engine's pool above, so a rebuilt collection on a
+                        // shared DSN joins the live pool instead of opening
+                        // a second one.
                         let pool_size = std::num::NonZeroU32::new(validated.pool_size)
                             .unwrap_or_else(engine_postgis::pool::default_pool_size);
                         let pool = match pool_registry.get_or_create(&validated.dsn, pool_size) {
@@ -3591,15 +3616,16 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     // sweep and its completion — the same narrow window the previous
     // drop-everything behavior had; closing it would need config-versioned
     // cache keys.)
-    let stale: Vec<&String> = old_collections
+    let stale: Vec<&str> = old_collections
         .keys()
         .filter(|id| !reusable.contains(id.as_str()))
+        .map(String::as_str)
         .collect();
-    for id in &stale {
-        rendered_cache.evict_collection(id);
-        tile_cache.evict_collection(id);
-        vector_cache.evict_collection(id);
-    }
+    // Batch form: `retain` visits every cache entry, so one combined pass
+    // per cache instead of one pass per stale collection.
+    rendered_cache.evict_collections(&stale);
+    tile_cache.evict_collections(&stale);
+    vector_cache.evict_collections(&stale);
     if !stale.is_empty() {
         info!(
             "Evicted cached tiles for {} rebuilt/removed collection(s)",
