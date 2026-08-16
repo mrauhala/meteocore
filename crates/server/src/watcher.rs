@@ -228,7 +228,9 @@ mod tests {
 
     // -- End-to-end: a collections.d add/remove auto-reloads the registry -----
 
-    use crate::admin::{load_collections, CollectionStatus, ReusableCaches, ServerState};
+    use crate::admin::{
+        load_collections, CollectionStatus, EngineReuse, ReusableCaches, ServerState,
+    };
     use arc_swap::ArcSwap;
     use ds_core::config::ServerConfig;
     use std::fs;
@@ -249,6 +251,7 @@ mod tests {
             config.server.trust_proxy_headers,
             config.server.metatile_cache_mb,
             ReusableCaches::default(),
+            EngineReuse::default(),
         );
         Arc::new(ServerState {
             edr: Arc::new(ArcSwap::from_pointee(result.edr_state)),
@@ -273,6 +276,14 @@ mod tests {
             style_fingerprint: std::sync::atomic::AtomicU64::new(
                 crate::colormaps::style_config_fingerprint(&config, config_path.parent()),
             ),
+            last_collections: RwLock::new(
+                config
+                    .collections
+                    .iter()
+                    .map(|c| (c.id.clone(), c.clone()))
+                    .collect(),
+            ),
+            engine_handles: RwLock::new(result.engines_by_id),
         })
     }
 

@@ -476,6 +476,8 @@ async fn main() {
         config.server.metatile_cache_mb,
         // Startup builds the render caches fresh; reloads reuse them.
         admin::ReusableCaches::default(),
+        // Startup has no live engines to reuse; incremental reloads do (#574).
+        admin::EngineReuse::default(),
     );
 
     let loaded = result
@@ -649,6 +651,17 @@ async fn main() {
             &config,
             config_dir.as_deref(),
         )),
+        // Diff basis + reuse pool for the first incremental reload (#574):
+        // the EFFECTIVE startup config (post --collections filter and
+        // --auto-collections merge) and the engines built from it.
+        last_collections: RwLock::new(
+            config
+                .collections
+                .iter()
+                .map(|c| (c.id.clone(), c.clone()))
+                .collect(),
+        ),
+        engine_handles: RwLock::new(result.engines_by_id),
     });
 
     // Start the collections_dir watcher (issue #318) if enabled. Best-effort:

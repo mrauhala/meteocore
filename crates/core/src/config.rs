@@ -185,7 +185,7 @@ where
     Ok(Option::<String>::deserialize(d)?.map(|s| s.trim().to_string()))
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct CollectionConfig {
     pub id: String,
     pub title: String,
@@ -235,7 +235,7 @@ pub struct CollectionConfig {
 /// Configuration for the nowcast derived-collection engine (#522): wraps an
 /// already-configured raster collection and serves motion-extrapolated
 /// frames with TIME values in the future.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct NowcastConfig {
     /// Collection id of the raster collection to extrapolate. Must be a
     /// non-derived collection defined in the same config (load order is
@@ -375,7 +375,7 @@ impl LicenseConfig {
 
 /// Preview-SPA tuning knobs. Only affects what `/preview/manifest.json`
 /// emits — does NOT constrain the underlying engine.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 pub struct PreviewConfig {
     /// ISO 8601 positive duration (e.g. `"PT12H"`, `"P1D"`). When set, the
     /// manifest's `temporal_extent.values` is filtered to entries within
@@ -385,7 +385,7 @@ pub struct PreviewConfig {
     pub time_window: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct WmsConfig {
     /// Named bundle; merges slot-wise with the inline fields (bundles v2),
     /// inline winning each slot it defines.
@@ -427,7 +427,7 @@ pub struct WmsConfig {
 }
 
 /// Per-parameter default colormap configuration for WMS.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct WmsParameterConfig {
     /// Parameter short name (e.g., "2t", "msl"). Matched exactly (case-sensitive) against the engine's parameter short names.
     pub name: String,
@@ -443,7 +443,7 @@ pub struct WmsParameterConfig {
 }
 
 /// A named WMS style with its own colormap configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct WmsStyle {
     /// Style name. Optional when `colormap` is set — defaults to the
     /// colormap name.
@@ -467,7 +467,7 @@ pub struct WmsStyle {
     pub parameter: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ColorStop {
     pub value: f64,
     /// Color in "#RRGGBB" or "#RRGGBBAA" hex format.
@@ -632,7 +632,7 @@ impl WmsStyle {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct GeoTiffConfig {
     /// Simple filename template with strftime placeholders.
     /// E.g. `"OPERA@%Y%m%dT%H%M@0@ACRR.tiff"` or `"radar_%Y%m%dT%H%MZ.tif"`
@@ -744,7 +744,7 @@ fn default_apis() -> Vec<String> {
     vec!["edr".to_string()]
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct QueryDataConfig {
     /// Parameter to expose for WMS/Maps rendering. Must match a parameter name
     /// in the querydata file. If not set, the first parameter is used.
@@ -797,7 +797,7 @@ fn default_status_filter() -> Vec<String> {
 /// becomes one OGC API Features feature and is rendered into the WMS/Maps/Tiles
 /// alert layer as a severity-shaded polygon. See the "CAP Engine Notes" section
 /// in `CLAUDE.md`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct CapConfig {
     /// Local directory of CAP `.xml` files. Mutually exclusive with `feed_url`.
     #[serde(default, deserialize_with = "de_trimmed_opt_string")]
@@ -889,7 +889,7 @@ pub enum ResamplingMethod {
 /// directory or an S3-compatible bucket. STAC sources land in
 /// Phase 2; PVOL polar-volume EDR trajectory queries land in Phase 3.
 /// See [[project_odim_engine_plan]] for the full multi-phase roadmap.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct OdimConfig {
     /// Strftime filename template. ODIM files typically encode time
     /// in the filename (e.g. `"202503251200_radar_fi.h5"` or
@@ -1023,7 +1023,7 @@ fn default_grid_cache_mb() -> u64 {
     256
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct GribConfig {
     /// Local directory of `.grib2` + index sidecar files. Mutually exclusive
     /// with `endpoint`/`bucket` (S3). When set, the engine lists this directory
@@ -1116,7 +1116,7 @@ fn default_zarr_cache_mb() -> u64 {
 /// metadata from a **local** store (`data_path`) or a remote **S3/HTTP** store
 /// (`endpoint` + `bucket` + `path`, or an `s3://`/`http(s)://` URL in
 /// `data_path`). The grid must be geographic (WGS84 lat/lon).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ZarrConfig {
     /// Local path to the Zarr store root directory (the `.zarr` directory), or
     /// an `s3://` / `http(s)://` URL. Mutually exclusive with the S3
@@ -1178,7 +1178,7 @@ impl ZarrConfig {
 ///
 /// At most one of `branch` / `tag` / `snapshot` may be set; the default is the
 /// HEAD of branch `main`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct IcechunkConfig {
     /// Read the HEAD of this branch (default: `main`).
     pub branch: Option<String>,
@@ -1203,7 +1203,7 @@ pub struct IcechunkConfig {
 /// - `wide` — one row per (station, time), each parameter mapped to its own
 ///   column via `[[columns]]`.
 /// - `per_parameter` — one table per parameter, listed under `[[tables]]`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct PostgisConfig {
     /// Either the name of an env var holding the DSN, or — when
     /// `MC_ALLOW_INLINE_DB_URL=1` is set at config-load — a literal
@@ -1227,7 +1227,7 @@ pub struct PostgisConfig {
     pub parameters: Vec<PostgisParameterConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct PostgisStationsConfig {
     /// Qualified table name (`schema.table` or bare `table`).
     pub table: String,
@@ -1241,7 +1241,7 @@ pub struct PostgisStationsConfig {
     pub where_clause: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct PostgisObservationsConfig {
     /// One of `"long"`, `"wide"`, `"per_parameter"`.
     pub shape: String,
@@ -1316,13 +1316,13 @@ impl PostgisObservationsConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct PostgisObservationColumn {
     pub parameter: String,
     pub column: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct PostgisObservationTable {
     pub parameter: String,
     pub table: String,
@@ -1333,7 +1333,7 @@ pub struct PostgisObservationTable {
     pub geom_col: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct PostgisParameterConfig {
     pub name: String,
     pub label: String,

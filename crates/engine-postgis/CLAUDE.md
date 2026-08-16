@@ -75,7 +75,10 @@ Derivation rules (hard-won from production timeouts):
   role-setup SQL is operationally mandatory, not optional.
 - **Per-URL pool** shared across collections on the same
   `(host, port, db, user, sslmode)` tuple; first-caller-wins on size;
-  `HARD_POOL_CAP = 32`. Per-load only (no reuse across reloads in v1).
+  `HARD_POOL_CAP = 32`. Across incremental reloads (#574) a reused engine
+  keeps its pool, and `PoolRegistry::seed` pre-registers those pools into
+  each load so rebuilt collections on the same DSN join them — DSN sharing
+  is a standing invariant, not load-time-only.
 
 ## Metadata cache & health (#110, #441, #445)
 

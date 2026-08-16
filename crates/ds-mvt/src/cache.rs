@@ -117,6 +117,25 @@ impl VectorTileCache {
     pub fn misses(&self) -> u64 {
         self.cache.stats().1
     }
+
+    /// Drop every cached tile belonging to `collection` — targeted
+    /// invalidation for a reload that rebuilt (or removed) one collection. A
+    /// rebuilt engine restarts its `data_version` counter, so old entries
+    /// could otherwise collide with (and shadow) fresh content under the same
+    /// key. Exact id match: MVT keys carry real collection ids, never derived
+    /// layer names.
+    pub fn evict_collection(&self, collection: &str) {
+        self.evict_collections(std::slice::from_ref(&collection));
+    }
+
+    /// Batch form: one `retain` pass over the cache for N collections.
+    pub fn evict_collections(&self, collections: &[&str]) {
+        if collections.is_empty() {
+            return;
+        }
+        self.cache
+            .retain(|k, _| !collections.iter().any(|c| k.collection == *c));
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +189,22 @@ mod tests {
         let a = CachedTile::new(Bytes::from_static(b"hello"));
         let b = CachedTile::new(Bytes::from_static(b"world"));
         assert_ne!(a.etag, b.etag);
+    }
+
+    #[test]
+    fn evict_collection_removes_only_that_collection() {
+        let cache = VectorTileCache::new(1);
+        let mine = key(0, 0, 0); // collection "demo"
+        let other = VectorTileKey {
+            collection: "demo-2".into(),
+            ..key(0, 0, 0)
+        };
+        cache.insert(mine.clone(), CachedTile::new(Bytes::from_static(b"a")));
+        cache.insert(other.clone(), CachedTile::new(Bytes::from_static(b"b")));
+        cache.evict_collection("demo");
+        // Exact id match: "demo-2" is a different collection and stays warm.
+        assert!(cache.get(&mine).is_none());
+        assert!(cache.get(&other).is_some());
     }
 
     #[test]

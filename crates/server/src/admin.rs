@@ -848,15 +848,26 @@ pub struct ServerState {
     /// Bearer token for admin endpoint authentication.
     /// If None, admin endpoints are disabled (return 403).
     pub admin_token: Option<String>,
-    /// Fingerprint of all style-affecting config (colormaps, bundles,
-    /// per-collection [wms] blocks, colormaps_dir file bytes) at the last
-    /// successful load. A reload whose fingerprint differs drops the
-    /// rendered/meta-tile caches instead of reusing them — their keys carry
-    /// no style content, so reusing them would serve the OLD colors for
-    /// every already-cached tile (as verified live: edit palette → reload →
-    /// X-Cache: HIT with stale pixels). A spurious watcher reload leaves
-    /// the fingerprint unchanged and keeps the warm caches (#202).
+    /// Fingerprint of the GLOBAL style-affecting config ([[colormaps]],
+    /// [[style_bundles]], [[parameter_defaults]], colormaps_dir file bytes)
+    /// at the last successful load. A reload whose fingerprint differs drops
+    /// the rendered/meta-tile caches instead of reusing them — their keys
+    /// carry no style content, so reusing them would serve the OLD colors
+    /// for every already-cached tile (as verified live: edit palette →
+    /// reload → X-Cache: HIT with stale pixels). Per-collection `[wms]`
+    /// edits are NOT part of the fingerprint: they change that collection's
+    /// `CollectionConfig`, so the incremental reload (#574) rebuilds the
+    /// collection and evicts only its cache entries, keeping every other
+    /// collection's warm. A spurious watcher reload leaves the fingerprint
+    /// unchanged and keeps the warm caches (#202).
     pub style_fingerprint: std::sync::atomic::AtomicU64,
+    /// Per-collection config of the last ACCEPTED load, keyed by collection
+    /// id — the diff basis for incremental reload (#574). A rejected reload
+    /// leaves it untouched, matching the untouched live registry.
+    pub last_collections: RwLock<HashMap<String, CollectionConfig>>,
+    /// Live poll-loop engines by collection id — the reuse pool the next
+    /// incremental reload draws from (#574).
+    pub engine_handles: RwLock<HashMap<String, EngineHandle>>,
 }
 
 pub type AdminState = Arc<ServerState>;
@@ -882,6 +893,9 @@ pub struct LoadResult {
     pub cap_engines: Vec<Arc<engine_cap::CapEngine>>,
     pub postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>>,
     pub nowcast_engines: Vec<Arc<engine_nowcast::NowcastEngine>>,
+    /// Every successfully built (or reused) poll-loop engine, keyed by
+    /// collection id — the reuse pool for the NEXT incremental reload (#574).
+    pub engines_by_id: HashMap<String, EngineHandle>,
 }
 
 /// Render caches carried across a reload so a config reload **preserves** the
@@ -897,6 +911,115 @@ pub struct ReusableCaches {
     pub vector: Option<Arc<ds_mvt::VectorTileCache>>,
 }
 
+/// A live engine, keyed by collection id in [`LoadResult::engines_by_id`] /
+/// [`ServerState::engine_handles`], so an incremental reload (#574) can hand
+/// unchanged collections' engines back to [`load_collections`] for reuse.
+///
+/// Only engine types with a poll loop appear here: their catalogs stay fresh
+/// without a rebuild. `csv`/`geojson` have NO poll loop — a reload is the only
+/// way they re-read a changed data file — so they always rebuild and are
+/// deliberately absent.
+#[derive(Clone)]
+pub enum EngineHandle {
+    Geotiff(Arc<engine_geotiff::GeoTiffEngine>),
+    QueryData(Arc<engine_querydata::QueryDataEngine>),
+    Grib(Arc<engine_grib::GribEngine>),
+    Zarr(Arc<engine_zarr::ZarrEngine>),
+    Odim(Arc<engine_odim::OdimEngine>),
+    OdimVolume(Arc<engine_odim::PolarVolumeEngine>),
+    Cap(Arc<engine_cap::CapEngine>),
+    Postgis(Arc<engine_postgis::PostgisEngine>),
+    Nowcast(Arc<engine_nowcast::NowcastEngine>),
+}
+
+/// Live engines an incremental reload may reuse, keyed by collection id.
+/// [`do_reload`] populates it with exactly the collections
+/// [`reusable_collections`] deemed unchanged; [`load_collections`] takes an
+/// entry instead of rebuilding when the id and engine type match. `Default`
+/// (empty, used at startup and in tests) rebuilds everything.
+#[derive(Default)]
+pub struct EngineReuse {
+    pub engines: HashMap<String, EngineHandle>,
+}
+
+macro_rules! reuse_take {
+    ($fn_name:ident, $variant:ident, $ty:ty) => {
+        fn $fn_name(&mut self, id: &str) -> Option<Arc<$ty>> {
+            if matches!(self.engines.get(id), Some(EngineHandle::$variant(_))) {
+                if let Some(EngineHandle::$variant(e)) = self.engines.remove(id) {
+                    return Some(e);
+                }
+            }
+            None
+        }
+    };
+}
+
+impl EngineReuse {
+    reuse_take!(take_geotiff, Geotiff, engine_geotiff::GeoTiffEngine);
+    reuse_take!(take_querydata, QueryData, engine_querydata::QueryDataEngine);
+    reuse_take!(take_grib, Grib, engine_grib::GribEngine);
+    reuse_take!(take_zarr, Zarr, engine_zarr::ZarrEngine);
+    reuse_take!(take_odim, Odim, engine_odim::OdimEngine);
+    reuse_take!(take_odim_volume, OdimVolume, engine_odim::PolarVolumeEngine);
+    reuse_take!(take_cap, Cap, engine_cap::CapEngine);
+    reuse_take!(take_postgis, Postgis, engine_postgis::PostgisEngine);
+    reuse_take!(take_nowcast, Nowcast, engine_nowcast::NowcastEngine);
+}
+
+/// Decide which collections of the NEW config may reuse their live engine
+/// (#574): the collection's full `CollectionConfig` is unchanged (derived
+/// `PartialEq` — any field difference, including `[wms]`, forces a rebuild)
+/// AND a live engine exists for it. Derived nowcast collections additionally
+/// require their `source` (and `lightning_source`, when set) to be reusable
+/// themselves — a rebuilt source engine must propagate into a rebuilt nowcast
+/// wrapper even when the nowcast's own TOML is untouched. `csv`/`geojson`
+/// never reuse (no poll loop; see [`EngineHandle`]).
+///
+/// Two deliberate edges of the equality basis:
+/// - Values resolved from env vars (the postgis DSN) are NOT re-compared: a
+///   process's environment cannot change after exec, so `resolve()` on a
+///   reload always yields what it yielded at the last build — rotating a
+///   DB credential has always required a process restart, before and after
+///   #574.
+/// - A config that sets an `f64` field to TOML `nan` compares unequal to
+///   itself, so that collection falls back to rebuild-on-every-reload —
+///   the pre-#574 behavior, correct but slow. NaN in min/max/color stops
+///   is meaningless for styling; don't do that.
+pub(crate) fn reusable_collections(
+    old: &HashMap<String, CollectionConfig>,
+    new: &[CollectionConfig],
+    live: &HashMap<String, EngineHandle>,
+) -> std::collections::HashSet<String> {
+    let unchanged =
+        |c: &CollectionConfig| old.get(&c.id).is_some_and(|o| o == c) && live.contains_key(&c.id);
+    let base: std::collections::HashSet<String> = new
+        .iter()
+        .filter(|c| !matches!(c.engine_type.as_str(), "nowcast" | "csv" | "geojson"))
+        .filter(|c| unchanged(c))
+        .map(|c| c.id.clone())
+        .collect();
+    let mut out = base.clone();
+    for c in new.iter().filter(|c| c.engine_type == "nowcast") {
+        if !unchanged(c) {
+            continue;
+        }
+        let Some(nc) = c.nowcast.as_ref() else {
+            continue;
+        };
+        if base.contains(&nc.source)
+            && nc
+                .lightning_source
+                .as_deref()
+                .is_none_or(|ls| base.contains(ls))
+        {
+            out.insert(c.id.clone());
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)] // config + style inputs + the two reload reuse pools are all distinct concerns
 pub fn load_collections(
     style_ctx: &ds_render::StyleContext,
     collections: &[CollectionConfig],
@@ -905,6 +1028,7 @@ pub fn load_collections(
     trust_proxy_headers: bool,
     metatile_cache_mb: u64,
     reuse: ReusableCaches,
+    mut engine_reuse: EngineReuse,
 ) -> LoadResult {
     let bundle_index: HashMap<&str, &StyleBundle> =
         style_bundles.iter().map(|b| (b.id.as_str(), b)).collect();
@@ -961,10 +1085,28 @@ pub fn load_collections(
     // exists (#522). Collected here during the main loop.
     let mut nowcast_pending: Vec<&CollectionConfig> = Vec::new();
     // Pool registry is local to this load: collections sharing a DSN share a
-    // pool via Arc<Pool>. Across reloads, pools are rebuilt — documented
-    // v1 trade-off; reuse-by-identity across reloads is a follow-up.
+    // pool via Arc<Pool>. Seed it with the pools of every REUSED postgis
+    // engine (#574) so a rebuilt collection on a shared DSN joins the live
+    // pool instead of opening a second one — without this, repeated
+    // single-collection edits would ratchet DSN-sharing collections toward
+    // one dedicated pool each, with no reload path left to re-coalesce.
     let mut pool_registry = engine_postgis::pool::PoolRegistry::new();
+    for handle in engine_reuse.engines.values() {
+        if let EngineHandle::Postgis(engine) = handle {
+            if let Err(e) = pool_registry.seed(&engine.config().dsn, engine.pool().clone()) {
+                // Seeding is an optimization; a failure only costs pool
+                // sharing, never the collection.
+                tracing::warn!(
+                    "Collection '{}': could not seed pool registry from reused engine: {e}",
+                    engine.collection_id()
+                );
+            }
+        }
+    }
     let mut health: Vec<CollectionHealth> = Vec::new();
+    // Reuse pool for the NEXT reload: every poll-loop engine that made it
+    // into this load, whether freshly built or taken from `engine_reuse`.
+    let mut engines_by_id: HashMap<String, EngineHandle> = HashMap::new();
 
     for collection in collections {
         let data_path_display = collection
@@ -1164,27 +1306,37 @@ pub fn load_collections(
                     }
                 };
 
-                let engine = match engine_geotiff::GeoTiffEngine::new(
-                    &collection.id,
-                    collection.data_path.as_deref(),
-                    geotiff_config,
-                ) {
-                    Ok(e) => Arc::new(e),
-                    Err(e) => {
-                        tracing::error!(
-                            "Collection '{}': failed to initialize GeoTIFF engine: {}",
-                            collection.id,
-                            e
+                let engine = match engine_reuse.take_geotiff(&collection.id) {
+                    Some(e) => {
+                        info!(
+                            "Collection '{}': config unchanged — reusing live engine",
+                            collection.id
                         );
-                        health.push(CollectionHealth {
-                            id: collection.id.clone(),
-                            engine_type: "geotiff".into(),
-                            status: CollectionStatus::Failed,
-                            error: Some(format!("{e}")),
-                        });
-                        continue;
+                        e
                     }
+                    None => match engine_geotiff::GeoTiffEngine::new(
+                        &collection.id,
+                        collection.data_path.as_deref(),
+                        geotiff_config,
+                    ) {
+                        Ok(e) => Arc::new(e),
+                        Err(e) => {
+                            tracing::error!(
+                                "Collection '{}': failed to initialize GeoTIFF engine: {}",
+                                collection.id,
+                                e
+                            );
+                            health.push(CollectionHealth {
+                                id: collection.id.clone(),
+                                engine_type: "geotiff".into(),
+                                status: CollectionStatus::Failed,
+                                error: Some(format!("{e}")),
+                            });
+                            continue;
+                        }
+                    },
                 };
+                engines_by_id.insert(collection.id.clone(), EngineHandle::Geotiff(engine.clone()));
 
                 if let Some((start, end)) =
                     ds_core::edr_engine::EdrEngine::get_temporal_extent(engine.as_ref())
@@ -1309,29 +1461,42 @@ pub fn load_collections(
                 let poll_secs = qd_config.map_or(30, |c| c.poll_interval_secs);
                 let max_runs = qd_config.map_or(4, |c| c.max_runs);
 
-                let engine = match engine_querydata::QueryDataEngine::new(
-                    std::path::Path::new(data_path),
-                    &collection.id,
-                    wms_param,
-                    poll_secs,
-                    max_runs,
-                ) {
-                    Ok(e) => Arc::new(e),
-                    Err(e) => {
-                        tracing::error!(
-                            "Collection '{}': failed to initialize QueryData engine: {}",
-                            collection.id,
-                            e
+                let engine = match engine_reuse.take_querydata(&collection.id) {
+                    Some(e) => {
+                        info!(
+                            "Collection '{}': config unchanged — reusing live engine",
+                            collection.id
                         );
-                        health.push(CollectionHealth {
-                            id: collection.id.clone(),
-                            engine_type: "querydata".into(),
-                            status: CollectionStatus::Failed,
-                            error: Some(format!("{e}")),
-                        });
-                        continue;
+                        e
                     }
+                    None => match engine_querydata::QueryDataEngine::new(
+                        std::path::Path::new(data_path),
+                        &collection.id,
+                        wms_param,
+                        poll_secs,
+                        max_runs,
+                    ) {
+                        Ok(e) => Arc::new(e),
+                        Err(e) => {
+                            tracing::error!(
+                                "Collection '{}': failed to initialize QueryData engine: {}",
+                                collection.id,
+                                e
+                            );
+                            health.push(CollectionHealth {
+                                id: collection.id.clone(),
+                                engine_type: "querydata".into(),
+                                status: CollectionStatus::Failed,
+                                error: Some(format!("{e}")),
+                            });
+                            continue;
+                        }
+                    },
                 };
+                engines_by_id.insert(
+                    collection.id.clone(),
+                    EngineHandle::QueryData(engine.clone()),
+                );
 
                 querydata_engines.push(engine.clone());
 
@@ -1439,23 +1604,33 @@ pub fn load_collections(
                     }
                 };
 
-                let engine = match engine_grib::GribEngine::new(&collection.id, grib_config) {
-                    Ok(e) => Arc::new(e),
-                    Err(e) => {
-                        tracing::error!(
-                            "Collection '{}': failed to initialize GRIB engine: {}",
-                            collection.id,
-                            e
+                let engine = match engine_reuse.take_grib(&collection.id) {
+                    Some(e) => {
+                        info!(
+                            "Collection '{}': config unchanged — reusing live engine",
+                            collection.id
                         );
-                        health.push(CollectionHealth {
-                            id: collection.id.clone(),
-                            engine_type: "grib".into(),
-                            status: CollectionStatus::Failed,
-                            error: Some(format!("{e}")),
-                        });
-                        continue;
+                        e
                     }
+                    None => match engine_grib::GribEngine::new(&collection.id, grib_config) {
+                        Ok(e) => Arc::new(e),
+                        Err(e) => {
+                            tracing::error!(
+                                "Collection '{}': failed to initialize GRIB engine: {}",
+                                collection.id,
+                                e
+                            );
+                            health.push(CollectionHealth {
+                                id: collection.id.clone(),
+                                engine_type: "grib".into(),
+                                status: CollectionStatus::Failed,
+                                error: Some(format!("{e}")),
+                            });
+                            continue;
+                        }
+                    },
                 };
+                engines_by_id.insert(collection.id.clone(), EngineHandle::Grib(engine.clone()));
 
                 if let Some((start, end)) =
                     ds_core::edr_engine::EdrEngine::get_temporal_extent(engine.as_ref())
@@ -1573,23 +1748,33 @@ pub fn load_collections(
                     }
                 };
 
-                let engine = match engine_zarr::ZarrEngine::new(&collection.id, zarr_config) {
-                    Ok(e) => Arc::new(e),
-                    Err(e) => {
-                        tracing::error!(
-                            "Collection '{}': failed to initialize Zarr engine: {}",
-                            collection.id,
-                            e
+                let engine = match engine_reuse.take_zarr(&collection.id) {
+                    Some(e) => {
+                        info!(
+                            "Collection '{}': config unchanged — reusing live engine",
+                            collection.id
                         );
-                        health.push(CollectionHealth {
-                            id: collection.id.clone(),
-                            engine_type: "zarr".into(),
-                            status: CollectionStatus::Failed,
-                            error: Some(format!("{e}")),
-                        });
-                        continue;
+                        e
                     }
+                    None => match engine_zarr::ZarrEngine::new(&collection.id, zarr_config) {
+                        Ok(e) => Arc::new(e),
+                        Err(e) => {
+                            tracing::error!(
+                                "Collection '{}': failed to initialize Zarr engine: {}",
+                                collection.id,
+                                e
+                            );
+                            health.push(CollectionHealth {
+                                id: collection.id.clone(),
+                                engine_type: "zarr".into(),
+                                status: CollectionStatus::Failed,
+                                error: Some(format!("{e}")),
+                            });
+                            continue;
+                        }
+                    },
                 };
+                engines_by_id.insert(collection.id.clone(), EngineHandle::Zarr(engine.clone()));
 
                 let temporal_extent =
                     ds_core::edr_engine::EdrEngine::get_temporal_extent(engine.as_ref());
@@ -1707,27 +1892,37 @@ pub fn load_collections(
                         continue;
                     }
                 };
-                let engine = match engine_odim::OdimEngine::new(
-                    &collection.id,
-                    collection.data_path.as_deref(),
-                    odim_cfg,
-                ) {
-                    Ok(e) => Arc::new(e),
-                    Err(e) => {
-                        tracing::error!(
-                            "Collection '{}': failed to initialize ODIM engine: {}",
-                            collection.id,
-                            e
+                let engine = match engine_reuse.take_odim(&collection.id) {
+                    Some(e) => {
+                        info!(
+                            "Collection '{}': config unchanged — reusing live engine",
+                            collection.id
                         );
-                        health.push(CollectionHealth {
-                            id: collection.id.clone(),
-                            engine_type: "odim".into(),
-                            status: CollectionStatus::Failed,
-                            error: Some(format!("{e}")),
-                        });
-                        continue;
+                        e
                     }
+                    None => match engine_odim::OdimEngine::new(
+                        &collection.id,
+                        collection.data_path.as_deref(),
+                        odim_cfg,
+                    ) {
+                        Ok(e) => Arc::new(e),
+                        Err(e) => {
+                            tracing::error!(
+                                "Collection '{}': failed to initialize ODIM engine: {}",
+                                collection.id,
+                                e
+                            );
+                            health.push(CollectionHealth {
+                                id: collection.id.clone(),
+                                engine_type: "odim".into(),
+                                status: CollectionStatus::Failed,
+                                error: Some(format!("{e}")),
+                            });
+                            continue;
+                        }
+                    },
                 };
+                engines_by_id.insert(collection.id.clone(), EngineHandle::Odim(engine.clone()));
 
                 odim_engines.push(engine.clone());
 
@@ -1825,27 +2020,44 @@ pub fn load_collections(
                         continue;
                     }
                 };
-                let engine = match engine_odim::PolarVolumeEngine::new(
-                    &collection.id,
-                    collection.data_path.as_deref(),
-                    odim_cfg,
-                ) {
-                    Ok(e) => Arc::new(e),
-                    Err(e) => {
-                        tracing::error!(
-                            "Collection '{}': failed to initialize ODIM polar-volume engine: {}",
-                            collection.id,
-                            e
+                // Reuse skips the expensive synchronous bootstrap scan (a full
+                // re-parse of every retained volume); the per-site expansion
+                // below still re-runs against the live catalog, so radar sites
+                // that appeared since the last load surface on this reload.
+                let engine = match engine_reuse.take_odim_volume(&collection.id) {
+                    Some(e) => {
+                        info!(
+                            "Collection '{}': config unchanged — reusing live engine",
+                            collection.id
                         );
-                        health.push(CollectionHealth {
-                            id: collection.id.clone(),
-                            engine_type: "odim-volume".into(),
-                            status: CollectionStatus::Failed,
-                            error: Some(format!("{e}")),
-                        });
-                        continue;
+                        e
                     }
+                    None => match engine_odim::PolarVolumeEngine::new(
+                        &collection.id,
+                        collection.data_path.as_deref(),
+                        odim_cfg,
+                    ) {
+                        Ok(e) => Arc::new(e),
+                        Err(e) => {
+                            tracing::error!(
+                                "Collection '{}': failed to initialize ODIM polar-volume engine: {}",
+                                collection.id,
+                                e
+                            );
+                            health.push(CollectionHealth {
+                                id: collection.id.clone(),
+                                engine_type: "odim-volume".into(),
+                                status: CollectionStatus::Failed,
+                                error: Some(format!("{e}")),
+                            });
+                            continue;
+                        }
+                    },
                 };
+                engines_by_id.insert(
+                    collection.id.clone(),
+                    EngineHandle::OdimVolume(engine.clone()),
+                );
 
                 odim_volume_engines.push(engine.clone());
 
@@ -2100,23 +2312,33 @@ pub fn load_collections(
                     }
                 };
 
-                let engine = match engine_cap::CapEngine::new(cap_config, &collection.id) {
-                    Ok(e) => Arc::new(e),
-                    Err(e) => {
-                        tracing::error!(
-                            "Collection '{}': failed to initialize CAP engine: {}",
-                            collection.id,
-                            e
+                let engine = match engine_reuse.take_cap(&collection.id) {
+                    Some(e) => {
+                        info!(
+                            "Collection '{}': config unchanged — reusing live engine",
+                            collection.id
                         );
-                        health.push(CollectionHealth {
-                            id: collection.id.clone(),
-                            engine_type: "cap".into(),
-                            status: CollectionStatus::Failed,
-                            error: Some(format!("{e}")),
-                        });
-                        continue;
+                        e
                     }
+                    None => match engine_cap::CapEngine::new(cap_config, &collection.id) {
+                        Ok(e) => Arc::new(e),
+                        Err(e) => {
+                            tracing::error!(
+                                "Collection '{}': failed to initialize CAP engine: {}",
+                                collection.id,
+                                e
+                            );
+                            health.push(CollectionHealth {
+                                id: collection.id.clone(),
+                                engine_type: "cap".into(),
+                                status: CollectionStatus::Failed,
+                                error: Some(format!("{e}")),
+                            });
+                            continue;
+                        }
+                    },
                 };
+                engines_by_id.insert(collection.id.clone(), EngineHandle::Cap(engine.clone()));
 
                 cap_engines.push(engine.clone());
 
@@ -2215,111 +2437,139 @@ pub fn load_collections(
                     }
                 };
 
-                let validated = match engine_postgis::config::PostgisEngineConfig::resolve(
-                    postgis_cfg,
-                ) {
-                    Ok(v) => {
-                        if v.dsn_was_literal {
-                            tracing::warn!(
-                                collection = %collection.id,
-                                "postgis DSN is a literal URL in config (MC_ALLOW_INLINE_DB_URL=1); \
-                                 use an env var in production — literal URLs end up in config \
-                                 artifacts and git history."
-                            );
-                        }
-                        Arc::new(v)
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Collection '{}': postgis config resolve failed: {}",
-                            collection.id,
-                            e
+                let (engine, status, status_err) = match engine_reuse.take_postgis(&collection.id) {
+                    Some(engine) => {
+                        info!(
+                            "Collection '{}': config unchanged — reusing live engine",
+                            collection.id
                         );
-                        health.push(CollectionHealth {
-                            id: collection.id.clone(),
-                            engine_type: "postgis".into(),
-                            status: CollectionStatus::Failed,
-                            error: Some(format!("{e}")),
-                        });
-                        continue;
+                        // No bootstrap probe on reuse: the engine's background
+                        // ping owns liveness. `None` (no ping completed yet)
+                        // keeps the optimistic seed — the engine was accepted
+                        // by a previous load.
+                        let (status, err) = match engine.live_health() {
+                            Some(engine_postgis::HealthStatus::Degraded) => (
+                                CollectionStatus::Degraded,
+                                Some("database unreachable (live health)".to_string()),
+                            ),
+                            _ => (CollectionStatus::Ready, None),
+                        };
+                        (engine, status, err)
+                    }
+                    None => {
+                        let validated = match engine_postgis::config::PostgisEngineConfig::resolve(
+                            postgis_cfg,
+                        ) {
+                            Ok(v) => {
+                                if v.dsn_was_literal {
+                                    tracing::warn!(
+                                        collection = %collection.id,
+                                        "postgis DSN is a literal URL in config (MC_ALLOW_INLINE_DB_URL=1); \
+                                         use an env var in production — literal URLs end up in config \
+                                         artifacts and git history."
+                                    );
+                                }
+                                Arc::new(v)
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Collection '{}': postgis config resolve failed: {}",
+                                    collection.id,
+                                    e
+                                );
+                                health.push(CollectionHealth {
+                                    id: collection.id.clone(),
+                                    engine_type: "postgis".into(),
+                                    status: CollectionStatus::Failed,
+                                    error: Some(format!("{e}")),
+                                });
+                                continue;
+                            }
+                        };
+
+                        // The registry was seeded with every reused postgis
+                        // engine's pool above, so a rebuilt collection on a
+                        // shared DSN joins the live pool instead of opening
+                        // a second one.
+                        let pool_size = std::num::NonZeroU32::new(validated.pool_size)
+                            .unwrap_or_else(engine_postgis::pool::default_pool_size);
+                        let pool = match pool_registry.get_or_create(&validated.dsn, pool_size) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::error!(
+                                    "Collection '{}': pool acquire failed: {}",
+                                    collection.id,
+                                    e
+                                );
+                                health.push(CollectionHealth {
+                                    id: collection.id.clone(),
+                                    engine_type: "postgis".into(),
+                                    status: CollectionStatus::Failed,
+                                    error: Some(format!("{e}")),
+                                });
+                                continue;
+                            }
+                        };
+
+                        let engine = Arc::new(engine_postgis::PostgisEngine::new(
+                            collection.id.clone(),
+                            validated.clone(),
+                            pool,
+                        ));
+
+                        // Bootstrap metadata synchronously. Failure ⇒ degraded
+                        // status; the engine still gets wired in so requests
+                        // can retry once the DB is reachable.
+                        let refresh_result = match tokio::runtime::Handle::try_current() {
+                            Ok(handle) => {
+                                let e = engine.clone();
+                                tokio::task::block_in_place(|| {
+                                    handle.block_on(async move { e.refresh_metadata().await })
+                                })
+                            }
+                            Err(_) => tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("build tokio runtime")
+                                .block_on(async { engine.refresh_metadata().await }),
+                        };
+
+                        let (status, status_err) = match &refresh_result {
+                            Ok(()) => {
+                                use ds_core::edr_engine::EdrEngine as _;
+                                info!(
+                                    "Collection '{}': postgis engine ready ({} stations, {} parameters)",
+                                    collection.id,
+                                    engine.get_locations().map(|l| l.len()).unwrap_or(0),
+                                    engine.get_parameters().len()
+                                );
+                                (CollectionStatus::Ready, None)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Collection '{}': initial metadata refresh failed: {} (serving degraded)",
+                                    collection.id,
+                                    e
+                                );
+                                (CollectionStatus::Degraded, Some(format!("{e}")))
+                            }
+                        };
+                        (engine, status, status_err)
                     }
                 };
-
-                let pool_size = std::num::NonZeroU32::new(validated.pool_size)
-                    .unwrap_or_else(engine_postgis::pool::default_pool_size);
-                let pool = match pool_registry.get_or_create(&validated.dsn, pool_size) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!(
-                            "Collection '{}': pool acquire failed: {}",
-                            collection.id,
-                            e
-                        );
-                        health.push(CollectionHealth {
-                            id: collection.id.clone(),
-                            engine_type: "postgis".into(),
-                            status: CollectionStatus::Failed,
-                            error: Some(format!("{e}")),
-                        });
-                        continue;
-                    }
-                };
-
-                let engine = Arc::new(engine_postgis::PostgisEngine::new(
-                    collection.id.clone(),
-                    validated.clone(),
-                    pool,
-                ));
-                if validated.events().is_some() {
+                engines_by_id.insert(collection.id.clone(), EngineHandle::Postgis(engine.clone()));
+                if engine.config().events().is_some() {
                     event_sources.insert(
                         collection.id.clone(),
                         engine.clone() as Arc<dyn ds_core::events::EventSource>,
                     );
                 }
 
-                // Bootstrap metadata synchronously. Failure ⇒ degraded status;
-                // the engine still gets wired in so requests can retry once
-                // the DB is reachable.
-                let refresh_result = match tokio::runtime::Handle::try_current() {
-                    Ok(handle) => {
-                        let e = engine.clone();
-                        tokio::task::block_in_place(|| {
-                            handle.block_on(async move { e.refresh_metadata().await })
-                        })
-                    }
-                    Err(_) => tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("build tokio runtime")
-                        .block_on(async { engine.refresh_metadata().await }),
-                };
-
-                let (status, status_err) = match &refresh_result {
-                    Ok(()) => {
-                        use ds_core::edr_engine::EdrEngine as _;
-                        info!(
-                            "Collection '{}': postgis engine ready ({} stations, {} parameters)",
-                            collection.id,
-                            engine.get_locations().map(|l| l.len()).unwrap_or(0),
-                            engine.get_parameters().len()
-                        );
-                        (CollectionStatus::Ready, None)
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Collection '{}': initial metadata refresh failed: {} (serving degraded)",
-                            collection.id,
-                            e
-                        );
-                        (CollectionStatus::Degraded, Some(format!("{e}")))
-                    }
-                };
-
                 // The events shape has a raster surface (#504: the
                 // age-colored lightning layer) — wire the MapEngine into the
                 // raster APIs. Station shapes keep the MVT feature-tile
                 // path; config validation rejects wms/maps for them.
-                let is_events = validated.events().is_some();
+                let is_events = engine.config().events().is_some();
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
                         collection.id.clone(),
@@ -2478,35 +2728,51 @@ pub fn load_collections(
             ));
             continue;
         };
-        let engine = match engine_nowcast::NowcastEngine::new(
-            &collection.id,
-            &nowcast_config.source,
-            source.clone(),
-            nowcast_config,
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                fail(format!("failed to initialize nowcast engine: {e}"));
-                continue;
+        // Reuse only reaches here when the nowcast's own config AND its
+        // source (and lightning_source) collections are unchanged — see
+        // `reusable_collections` — so the reused wrapper keeps extrapolating
+        // the same live source engine that was re-registered above.
+        let engine = match engine_reuse.take_nowcast(&collection.id) {
+            Some(e) => {
+                info!(
+                    "Collection '{}': config unchanged — reusing live engine",
+                    collection.id
+                );
+                e
+            }
+            None => {
+                let engine = match engine_nowcast::NowcastEngine::new(
+                    &collection.id,
+                    &nowcast_config.source,
+                    source.clone(),
+                    nowcast_config,
+                ) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        fail(format!("failed to initialize nowcast engine: {e}"));
+                        continue;
+                    }
+                };
+                // Lightning join (#549): a named source must exist and be an
+                // events-shape postgis collection in the same config — failing the
+                // collection beats silently serving cells without flash data.
+                let engine = match nowcast_config.lightning_source.as_deref() {
+                    Some(src_id) => match event_sources.get(src_id) {
+                        Some(events) => engine.with_lightning_source(events.clone()),
+                        None => {
+                            fail(format!(
+                                "lightning_source '{src_id}' not found or not an events-shape postgis \
+                                 collection (it must be defined in the same config)"
+                            ));
+                            continue;
+                        }
+                    },
+                    None => engine,
+                };
+                Arc::new(engine)
             }
         };
-        // Lightning join (#549): a named source must exist and be an
-        // events-shape postgis collection in the same config — failing the
-        // collection beats silently serving cells without flash data.
-        let engine = match nowcast_config.lightning_source.as_deref() {
-            Some(src_id) => match event_sources.get(src_id) {
-                Some(events) => engine.with_lightning_source(events.clone()),
-                None => {
-                    fail(format!(
-                        "lightning_source '{src_id}' not found or not an events-shape postgis \
-                         collection (it must be defined in the same config)"
-                    ));
-                    continue;
-                }
-            },
-            None => engine,
-        };
-        let engine = Arc::new(engine);
+        engines_by_id.insert(collection.id.clone(), EngineHandle::Nowcast(engine.clone()));
         nowcast_engines.push(engine.clone());
 
         if collection.apis.contains(&"wms".to_string()) {
@@ -2567,13 +2833,23 @@ pub fn load_collections(
             info!("Collection '{}': wired to Features API", collection.id);
         }
 
-        // A nowcast starts degraded: the first generation needs the source's
-        // initial data plus one poll cycle.
+        // A fresh nowcast starts degraded: the first generation needs the
+        // source's initial data plus one poll cycle. A reused engine keeps
+        // its generated frames and stays Ready.
+        let has_data = engine.has_data();
         health.push(CollectionHealth {
             id: collection.id.clone(),
             engine_type: "nowcast".into(),
-            status: CollectionStatus::Degraded,
-            error: Some("waiting for first nowcast generation".into()),
+            status: if has_data {
+                CollectionStatus::Ready
+            } else {
+                CollectionStatus::Degraded
+            },
+            error: if has_data {
+                None
+            } else {
+                Some("waiting for first nowcast generation".into())
+            },
         });
         info!(
             "Collection '{}': nowcast wrapping '{}'",
@@ -2703,6 +2979,7 @@ pub fn load_collections(
         cap_engines,
         postgis_engines,
         nowcast_engines,
+        engines_by_id,
     }
 }
 
@@ -3031,8 +3308,27 @@ pub(crate) enum ReloadError {
     NoReadyCollections { configured: usize },
 }
 
-/// Re-read the config from `state.config_path`, rebuild every engine, and
-/// atomically swap them into the live registries — the shared core behind both
+/// Split old/new engine lists by `Arc` identity: engines only in `old` were
+/// removed or rebuilt by this reload (candidates for `shutdown()`), engines
+/// only in `new` were freshly built (need their poll loop spawned). Engines
+/// in BOTH lists were reused verbatim and must get neither (#574).
+fn diff_by_identity<T>(old: &[Arc<T>], new: &[Arc<T>]) -> (Vec<Arc<T>>, Vec<Arc<T>>) {
+    let removed = old
+        .iter()
+        .filter(|o| !new.iter().any(|n| Arc::ptr_eq(n, o)))
+        .cloned()
+        .collect();
+    let added = new
+        .iter()
+        .filter(|n| !old.iter().any(|o| Arc::ptr_eq(o, n)))
+        .cloned()
+        .collect();
+    (removed, added)
+}
+
+/// Re-read the config from `state.config_path`, rebuild only the collections
+/// whose config changed (#574 — unchanged ones reuse their live engines), and
+/// atomically swap the registries — the shared core behind both
 /// `POST /admin/collections/reload` and the `collections_dir` watcher.
 ///
 /// The caller serializes reloads via `state.reload_lock` (the HTTP handler
@@ -3097,11 +3393,13 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     // watcher event must not dump a multi-GB meta-tile cache. `load_collections`
     // reuses each one iff its configured size is unchanged.
     //
-    // EXCEPT when style-affecting config changed (palettes, bundles, [wms]
-    // blocks, colormaps_dir files): the rendered / meta-tile keys carry no
-    // style content, so reusing those caches would keep serving the OLD
-    // colors as X-Cache HITs. The (style-independent) vector-tile cache is
-    // always safe to reuse.
+    // EXCEPT when GLOBAL style config changed (palettes, bundles,
+    // parameter_defaults, colormaps_dir files): the rendered / meta-tile keys
+    // carry no style content, so reusing those caches would keep serving the
+    // OLD colors as X-Cache HITs. A per-collection [wms] edit is handled more
+    // surgically: it changes that collection's config, so the incremental
+    // diff below rebuilds it and the post-swap sweep evicts only its entries.
+    // The (style-independent) vector-tile cache is always safe to reuse.
     let new_style_fp = crate::colormaps::style_config_fingerprint(&config, config_dir.as_deref());
     let styles_changed = state
         .style_fingerprint
@@ -3118,6 +3416,37 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
             vector: Some(state.tiles.load().vector_tile_cache.clone()),
         }
     };
+
+    // Incremental reload (#574): diff the new config against the last
+    // accepted one, per collection id, and hand the unchanged collections'
+    // live engines to `load_collections` for verbatim reuse — their poll
+    // loops keep running, their catalogs stay warm, no remote re-bootstrap.
+    // Validation stays all-or-nothing (above); only the build phase is
+    // incremental.
+    let old_collections = state
+        .last_collections
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let live_handles = state
+        .engine_handles
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let reusable = reusable_collections(&old_collections, &config.collections, &live_handles);
+    let engine_reuse = EngineReuse {
+        engines: live_handles
+            .iter()
+            .filter(|(id, _)| reusable.contains(id.as_str()))
+            .map(|(id, e)| (id.clone(), e.clone()))
+            .collect(),
+    };
+    info!(
+        "Incremental reload: {} of {} configured collection(s) unchanged — reusing their live engines",
+        reusable.len(),
+        config.collections.len()
+    );
+
     let mut result = load_collections(
         &style_ctx,
         &config.collections,
@@ -3126,6 +3455,7 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         config.server.trust_proxy_headers,
         config.server.metatile_cache_mb,
         reuse,
+        engine_reuse,
     );
 
     // Reload protection counts *fully working* (`Ready`) collections, not
@@ -3215,145 +3545,57 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
         }
     }
 
-    // Reload accepted — now shut down the old poll loops (the new ones are
-    // spawned just below, then state is swapped atomically).
-    {
-        for engine in state
-            .geotiff_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
-            engine.shutdown();
-        }
-        for engine in state
-            .querydata_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
-            engine.shutdown();
-        }
-        for engine in state
-            .grib_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
-            engine.shutdown();
-        }
-        for engine in state
-            .zarr_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
-            engine.shutdown();
-        }
-        for engine in state
-            .odim_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
-            engine.shutdown();
-        }
-        for engine in state
-            .odim_volume_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
-            engine.shutdown();
-        }
-        for engine in state
-            .cap_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
-            engine.shutdown();
-        }
-        for engine in state
-            .postgis_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
-            engine.shutdown();
-        }
-        for engine in state
-            .nowcast_engines
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
-            engine.shutdown();
-        }
+    // Reload accepted — rotate poll loops by Arc identity (#574): an engine
+    // present in the OLD list but not the new was removed or rebuilt — shut
+    // it down. One present only in the NEW list was freshly built — spawn its
+    // poll loop on the dedicated background runtime so its blocking I/O never
+    // parks a request-serving worker (#221; the postgis metadata loop and the
+    // nowcast generation loop have the same requirement — Critical Rule 7).
+    // A REUSED engine appears in both lists and gets NEITHER: shutting it
+    // down would kill its live loop, respawning would double-poll (#442).
+    let mut shut_down = 0usize;
+    let mut spawned = 0usize;
+    macro_rules! rotate_poll_loops {
+        ($field:ident) => {{
+            let old = state
+                .$field
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let (removed, added) = diff_by_identity(&old, &result.$field);
+            shut_down += removed.len();
+            spawned += added.len();
+            for engine in &removed {
+                engine.shutdown();
+            }
+            for engine in &added {
+                let poller = engine.clone();
+                crate::poll_runtime().spawn(async move {
+                    poller.poll_loop().await;
+                });
+            }
+        }};
     }
+    rotate_poll_loops!(geotiff_engines);
+    rotate_poll_loops!(querydata_engines);
+    rotate_poll_loops!(grib_engines);
+    rotate_poll_loops!(zarr_engines);
+    rotate_poll_loops!(odim_engines);
+    rotate_poll_loops!(odim_volume_engines);
+    rotate_poll_loops!(cap_engines);
+    rotate_poll_loops!(postgis_engines);
+    rotate_poll_loops!(nowcast_engines);
+    info!(
+        "Incremental reload: {shut_down} old poll engine(s) shut down, {spawned} new spawned, \
+         {} reused",
+        reusable.len()
+    );
 
-    // Spawn poll loops for new engines on the dedicated background runtime
-    // so their blocking I/O never parks a request-serving worker (#221).
-    for engine in &result.geotiff_engines {
-        let poller = engine.clone();
-        crate::poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    for engine in &result.querydata_engines {
-        let poller = engine.clone();
-        crate::poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    for engine in &result.grib_engines {
-        let poller = engine.clone();
-        crate::poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    for engine in &result.zarr_engines {
-        let poller = engine.clone();
-        crate::poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    for engine in &result.odim_engines {
-        let poller = engine.clone();
-        crate::poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    for engine in &result.odim_volume_engines {
-        let poller = engine.clone();
-        crate::poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    for engine in &result.cap_engines {
-        let poller = engine.clone();
-        crate::poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    // PostGIS metadata refresh loop (location list / extents / the
-    // `locations_window` "currently reporting" set). Async DB I/O on its own
-    // deadpool pool — runs on the background runtime, not a request worker.
-    for engine in &result.postgis_engines {
-        let poller = engine.clone();
-        crate::poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    // Nowcast generation loop: watches the source engine and regenerates
-    // extrapolated frames. Source fetches do blocking storage I/O internally,
-    // so this must stay on the background runtime (#221, Critical Rule 7).
-    for engine in &result.nowcast_engines {
-        let poller = engine.clone();
-        crate::poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
+    // Keep handles to the shared render caches for the post-swap eviction
+    // below (the states are moved into the swap).
+    let rendered_cache = result.wms_state.rendered_cache.clone();
+    let tile_cache = result.wms_state.tile_cache.clone();
+    let vector_cache = result.tiles_state.vector_tile_cache.clone();
 
     // Atomically swap state
     state.edr.store(Arc::new(result.edr_state));
@@ -3362,6 +3604,49 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     state.maps.store(Arc::new(result.maps_state));
     state.tiles.store(Arc::new(result.tiles_state));
     state.tiles_3d.store(Arc::new(result.tiles_3d_state));
+
+    // Cache hygiene for the incremental path (#574): a collection that was
+    // live before this reload but was NOT reused (config changed, removed,
+    // or rebuilt via a dependency) can produce different bytes under its old
+    // cache keys — the keys carry no config/palette content. Evict exactly
+    // those collections' entries; every reused collection stays warm. When
+    // the style fingerprint changed, the rendered/tile caches were already
+    // rebuilt empty above and this is a no-op for them. (A render already in
+    // flight on the old registry can still insert a stale entry between this
+    // sweep and its completion — the same narrow window the previous
+    // drop-everything behavior had; closing it would need config-versioned
+    // cache keys.)
+    let stale: Vec<&str> = old_collections
+        .keys()
+        .filter(|id| !reusable.contains(id.as_str()))
+        .map(String::as_str)
+        .collect();
+    // Batch form: `retain` visits every cache entry, so one combined pass
+    // per cache instead of one pass per stale collection.
+    rendered_cache.evict_collections(&stale);
+    tile_cache.evict_collections(&stale);
+    vector_cache.evict_collections(&stale);
+    if !stale.is_empty() {
+        info!(
+            "Evicted cached tiles for {} rebuilt/removed collection(s)",
+            stale.len()
+        );
+    }
+
+    // Remember this load's config + engines as the diff basis and reuse pool
+    // for the NEXT incremental reload.
+    *state
+        .last_collections
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = config
+        .collections
+        .iter()
+        .map(|c| (c.id.clone(), c.clone()))
+        .collect();
+    *state
+        .engine_handles
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut result.engines_by_id);
 
     // Update health
     update_health_gauges(&result.health);
@@ -4311,6 +4596,7 @@ mod tests {
             false,
             0,
             super::ReusableCaches::default(),
+            super::EngineReuse::default(),
         );
         let h = health_of(&result, "nc");
         assert_eq!(h.status, super::CollectionStatus::Failed);
@@ -4339,6 +4625,7 @@ mod tests {
             false,
             0,
             super::ReusableCaches::default(),
+            super::EngineReuse::default(),
         );
         let h = health_of(&result, "nc");
         assert_eq!(h.status, super::CollectionStatus::Failed);
@@ -4369,6 +4656,7 @@ mod tests {
             false,
             0,
             super::ReusableCaches::default(),
+            super::EngineReuse::default(),
         );
         let h = health_of(&result, "nc2");
         assert_eq!(h.status, super::CollectionStatus::Failed);
@@ -4394,6 +4682,7 @@ mod tests {
             false,
             0,
             super::ReusableCaches::default(),
+            super::EngineReuse::default(),
         );
         assert!(result.wms_state.engines.contains_key("nc"));
         assert!(
@@ -4428,6 +4717,7 @@ mod tests {
             false,
             64,
             super::ReusableCaches::default(),
+            super::EngineReuse::default(),
         );
         let tile0 = first.wms_state.tile_cache.clone();
         let rendered0 = first.wms_state.rendered_cache.clone();
@@ -4447,6 +4737,7 @@ mod tests {
                 tile: Some(tile0.clone()),
                 vector: Some(vector0.clone()),
             },
+            super::EngineReuse::default(),
         );
         assert!(
             Arc::ptr_eq(&tile0, &second.wms_state.tile_cache),
@@ -4476,6 +4767,7 @@ mod tests {
                 tile: Some(tile0.clone()),
                 vector: Some(vector0.clone()),
             },
+            super::EngineReuse::default(),
         );
         assert!(
             !Arc::ptr_eq(&tile0, &third.wms_state.tile_cache),
@@ -4489,6 +4781,199 @@ mod tests {
             Arc::ptr_eq(&vector0, &third.tiles_state.vector_tile_cache),
             "vector cache unchanged → reused"
         );
+    }
+
+    // --- incremental reload: engine reuse by config diff (#574) ---
+
+    /// Run `load_collections` over `configs` handing it `reuse` engines.
+    fn load_with_reuse(
+        configs: &[CollectionConfig],
+        reuse: super::EngineReuse,
+    ) -> super::LoadResult {
+        super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            configs,
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            reuse,
+        )
+    }
+
+    /// The reuse pool a reload would build: previous load's engines filtered
+    /// to the ids `reusable_collections` accepted (mirrors `do_reload`).
+    fn reuse_pool(
+        old: &[CollectionConfig],
+        new: &[CollectionConfig],
+        live: &HashMap<String, super::EngineHandle>,
+    ) -> super::EngineReuse {
+        let old_map: HashMap<String, CollectionConfig> =
+            old.iter().map(|c| (c.id.clone(), c.clone())).collect();
+        let eligible = super::reusable_collections(&old_map, new, live);
+        super::EngineReuse {
+            engines: live
+                .iter()
+                .filter(|(id, _)| eligible.contains(id.as_str()))
+                .map(|(id, e)| (id.clone(), e.clone()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn diff_by_identity_splits_removed_added_reused() {
+        let a = Arc::new(1);
+        let b = Arc::new(2);
+        let c = Arc::new(3);
+        let (removed, added) =
+            super::diff_by_identity(&[a.clone(), b.clone()], &[b.clone(), c.clone()]);
+        assert_eq!(removed.len(), 1);
+        assert!(Arc::ptr_eq(&removed[0], &a));
+        assert_eq!(added.len(), 1);
+        assert!(Arc::ptr_eq(&added[0], &c));
+    }
+
+    #[test]
+    fn unchanged_collection_reuses_the_live_engine_arc() {
+        let configs = vec![tm35_source_collection("radar")];
+        let first = load_with_reuse(&configs, super::EngineReuse::default());
+        assert_eq!(first.geotiff_engines.len(), 1);
+        assert!(first.engines_by_id.contains_key("radar"));
+
+        // Same config → the second load hands back the SAME engine Arc.
+        let second = load_with_reuse(
+            &configs,
+            reuse_pool(&configs, &configs, &first.engines_by_id),
+        );
+        assert!(
+            Arc::ptr_eq(&first.geotiff_engines[0], &second.geotiff_engines[0]),
+            "unchanged collection must reuse the live engine by identity"
+        );
+        // The reused engine is re-registered for the NEXT reload's pool.
+        assert!(second.engines_by_id.contains_key("radar"));
+
+        // Any config field difference (here: title) → rebuild.
+        let mut changed = configs.clone();
+        changed[0].title = "renamed".to_string();
+        let third = load_with_reuse(
+            &changed,
+            reuse_pool(&configs, &changed, &second.engines_by_id),
+        );
+        assert!(
+            !Arc::ptr_eq(&second.geotiff_engines[0], &third.geotiff_engines[0]),
+            "changed collection must be rebuilt"
+        );
+    }
+
+    #[test]
+    fn nowcast_reuses_only_when_source_is_reused_too() {
+        let configs = vec![
+            tm35_source_collection("radar"),
+            nowcast_test_collection("nc", "nowcast", Some("radar")),
+        ];
+        let first = load_with_reuse(&configs, super::EngineReuse::default());
+        assert_eq!(first.nowcast_engines.len(), 1);
+
+        // Nothing changed → both the source and the derived wrapper reuse.
+        let second = load_with_reuse(
+            &configs,
+            reuse_pool(&configs, &configs, &first.engines_by_id),
+        );
+        assert!(Arc::ptr_eq(
+            &first.geotiff_engines[0],
+            &second.geotiff_engines[0]
+        ));
+        assert!(Arc::ptr_eq(
+            &first.nowcast_engines[0],
+            &second.nowcast_engines[0]
+        ));
+
+        // Source config changed → the nowcast's own TOML is untouched but its
+        // wrapped engine was rebuilt, so the wrapper must rebuild with it.
+        let mut changed = configs.clone();
+        changed[0].title = "renamed".to_string();
+        let third = load_with_reuse(
+            &changed,
+            reuse_pool(&configs, &changed, &second.engines_by_id),
+        );
+        assert!(!Arc::ptr_eq(
+            &second.geotiff_engines[0],
+            &third.geotiff_engines[0]
+        ));
+        assert!(
+            !Arc::ptr_eq(&second.nowcast_engines[0], &third.nowcast_engines[0]),
+            "nowcast must rebuild when its source engine was rebuilt"
+        );
+    }
+
+    #[test]
+    fn reusable_collections_diff_rules() {
+        let radar = tm35_source_collection("radar");
+        let built = load_with_reuse(std::slice::from_ref(&radar), super::EngineReuse::default());
+        let handle = built
+            .engines_by_id
+            .get("radar")
+            .expect("live engine")
+            .clone();
+
+        let old: HashMap<String, CollectionConfig> =
+            [("radar".to_string(), radar.clone())].into_iter().collect();
+        let live_of = |ids: &[&str]| -> HashMap<String, super::EngineHandle> {
+            ids.iter()
+                .map(|id| (id.to_string(), handle.clone()))
+                .collect()
+        };
+
+        // Unchanged + live → reusable.
+        let r =
+            super::reusable_collections(&old, std::slice::from_ref(&radar), &live_of(&["radar"]));
+        assert!(r.contains("radar"));
+
+        // Unchanged but NOT live (previous build failed) → rebuild.
+        let r = super::reusable_collections(&old, std::slice::from_ref(&radar), &live_of(&[]));
+        assert!(r.is_empty());
+
+        // Changed config → rebuild.
+        let mut changed = radar.clone();
+        changed.title = "renamed".to_string();
+        let r = super::reusable_collections(&old, &[changed], &live_of(&["radar"]));
+        assert!(r.is_empty());
+
+        // Added collection (no old entry) → build.
+        let added = tm35_source_collection("radar2");
+        let r = super::reusable_collections(&old, &[added], &live_of(&["radar", "radar2"]));
+        assert!(r.is_empty());
+
+        // csv/geojson never reuse: no poll loop keeps their data fresh.
+        let mut csv = nowcast_test_collection("obs", "csv", None);
+        csv.apis = vec!["edr".to_string()];
+        let old_csv: HashMap<String, CollectionConfig> =
+            [("obs".to_string(), csv.clone())].into_iter().collect();
+        let r = super::reusable_collections(&old_csv, &[csv], &live_of(&["obs"]));
+        assert!(r.is_empty());
+
+        // Nowcast with a lightning_source: reusable only when BOTH deps are.
+        let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
+        if let Some(n) = nc.nowcast.as_mut() {
+            n.lightning_source = Some("lightning".to_string());
+        }
+        let mut lightning = nowcast_test_collection("lightning", "postgis", None);
+        lightning.apis = vec!["edr".to_string()];
+        let old: HashMap<String, CollectionConfig> = [
+            ("radar".to_string(), radar.clone()),
+            ("lightning".to_string(), lightning.clone()),
+            ("nc".to_string(), nc.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let new = vec![radar.clone(), lightning.clone(), nc.clone()];
+        let r = super::reusable_collections(&old, &new, &live_of(&["radar", "lightning", "nc"]));
+        assert!(r.contains("nc"), "all deps unchanged → nowcast reusable");
+        // Lightning source engine gone from the live pool → nowcast rebuilds.
+        let r = super::reusable_collections(&old, &new, &live_of(&["radar", "nc"]));
+        assert!(!r.contains("nc"));
+        assert!(r.contains("radar"));
     }
 
     // (The maybe_wrap_integer_lut (#207) unit tests moved with the function
@@ -4865,6 +5350,7 @@ colormap = "radar_dbz"
             false,
             0,
             super::ReusableCaches::default(),
+            super::EngineReuse::default(),
         );
         let edr = &result.edr_state.styles["radar"];
         let wms = &result.wms_state.styles["radar"];
