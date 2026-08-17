@@ -250,7 +250,12 @@ pub fn section_response_to_heatmaps(
             DataServerError::InvalidParameter("no cross-section data to plot".into())
         })?,
     };
-    let DomainDescription::Section { nodes, z } = &qr.domain else {
+    let DomainDescription::Section {
+        nodes,
+        z,
+        coverage_floor,
+    } = &qr.domain
+    else {
         return Err(DataServerError::InvalidParameter(
             "PNG cross-section requires a Section domain".into(),
         ));
@@ -318,6 +323,24 @@ pub fn section_response_to_heatmaps(
         }
     };
 
+    // Lowest-beam coverage floor (#514) as an overlay polyline on every
+    // panel: x = along-path km, y = floor metres (raw — ds-render clips
+    // the below-axis / above-ceiling reaches). The hatch below the line
+    // marks the unobserved region as distinct from in-beam nodata.
+    let overlays: Vec<ds_render::OverlayLine> = match coverage_floor {
+        Some(floor) if floor.len() == nodes.len() => vec![ds_render::OverlayLine {
+            label: "lowest beam".to_string(),
+            color: [0x20, 0x20, 0x20],
+            points: x_values
+                .iter()
+                .copied()
+                .zip(floor.iter().copied())
+                .collect(),
+            hatch_below: Some([0xb4, 0xb4, 0xb4]),
+        }],
+        _ => vec![],
+    };
+
     let y_label = axis_caption(z.kind.default_label(), z.kind.default_unit());
     let mut heatmaps = Vec::with_capacity(params.len());
     for p in params {
@@ -340,6 +363,7 @@ pub fn section_response_to_heatmaps(
             values: nd.values.clone(),
             value_min: vmin,
             value_max: vmax,
+            overlays: overlays.clone(),
         });
     }
 
@@ -574,6 +598,7 @@ mod tests {
                     kind: VerticalKind::HeightAboveAntenna,
                     values: vec![0.0, 1000.0],
                 },
+                coverage_floor: Some(vec![50.0, 400.0, 900.0]),
             },
             parameters,
             ranges,
@@ -639,6 +664,43 @@ mod tests {
             section_response_to_heatmaps(&CoverageResponse::Single(qr), None).unwrap();
         assert_eq!(heatmaps[0].value_min, 5.0);
         assert_eq!(heatmaps[0].value_max, 25.0);
+    }
+
+    /// The coverage floor becomes one overlay polyline per panel (#514):
+    /// x = the cumulative along-path km axis, y = the raw floor metres,
+    /// hatched below. A floor whose length mismatches the nodes is
+    /// dropped rather than plotted misaligned.
+    #[test]
+    fn section_floor_maps_to_overlay() {
+        let qr = section("DBZH", "dBZ");
+        let (heatmaps, _cmap) =
+            section_response_to_heatmaps(&CoverageResponse::Single(qr), None).unwrap();
+        let hm = &heatmaps[0];
+        assert_eq!(hm.overlays.len(), 1);
+        let ov = &hm.overlays[0];
+        assert_eq!(ov.points.len(), 3);
+        assert!(ov.hatch_below.is_some(), "unobserved region is hatched");
+        // x from the distance axis, y the raw floor metres.
+        for (i, &(x, y)) in ov.points.iter().enumerate() {
+            assert_eq!(x, hm.x_values[i]);
+            assert_eq!(y, [50.0, 400.0, 900.0][i]);
+        }
+
+        let mut qr = section("DBZH", "dBZ");
+        if let DomainDescription::Section { coverage_floor, .. } = &mut qr.domain {
+            *coverage_floor = Some(vec![1.0]); // wrong length
+        }
+        let (heatmaps, _cmap) =
+            section_response_to_heatmaps(&CoverageResponse::Single(qr), None).unwrap();
+        assert!(heatmaps[0].overlays.is_empty());
+
+        let mut qr = section("DBZH", "dBZ");
+        if let DomainDescription::Section { coverage_floor, .. } = &mut qr.domain {
+            *coverage_floor = None;
+        }
+        let (heatmaps, _cmap) =
+            section_response_to_heatmaps(&CoverageResponse::Single(qr), None).unwrap();
+        assert!(heatmaps[0].overlays.is_empty());
     }
 
     #[test]

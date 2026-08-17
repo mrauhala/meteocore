@@ -59,9 +59,17 @@ pub enum DomainDescription {
     /// per along-path output column and is serialised as the mandatory
     /// composite axis with `coordinates: ["t", "x", "y"]`; `z` carries
     /// the vertical levels. The ndarray range shape is `[N_nodes, N_z]`.
+    ///
+    /// `coverage_floor`, when present, is one value per node: the height
+    /// (in `z`'s unit, metres above the antenna for radar) of the lowest
+    /// surveyed beam at that node's ground distance. Below the floor the
+    /// volume is *unobserved* — not "no echo" (#514). Length must equal
+    /// `nodes.len()`; values are raw (may dip below 0 near the radar or
+    /// exceed the `z` axis top far out).
     Section {
         nodes: Vec<(DateTime<Utc>, f64, f64)>,
         z: VerticalCoord,
+        coverage_floor: Option<Vec<f64>>,
     },
 }
 

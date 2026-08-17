@@ -1606,8 +1606,12 @@ fn pvol_edr_query_trajectory_returns_section() {
         }
     };
 
-    let (nodes, z) = match &qr.domain {
-        DomainDescription::Section { nodes, z } => (nodes, z),
+    let (nodes, z, coverage_floor) = match &qr.domain {
+        DomainDescription::Section {
+            nodes,
+            z,
+            coverage_floor,
+        } => (nodes, z, coverage_floor),
         other => panic!("expected Section domain, got {other:?}"),
     };
     assert!(
@@ -1615,6 +1619,18 @@ fn pvol_edr_query_trajectory_returns_section() {
         "Section path must keep ≥2 along-path nodes"
     );
     assert!(z.values.len() >= 2, "Section z axis must have ≥2 levels");
+
+    // Lowest-beam coverage floor (#514): one finite value per node. The
+    // path passes over the radar, so the floor is a shallow "V" — both
+    // endpoints sit above its minimum.
+    let floor = coverage_floor.as_ref().expect("PVOL section carries floor");
+    assert_eq!(floor.len(), nodes.len());
+    assert!(floor.iter().all(|h| h.is_finite() && *h >= 0.0));
+    let fmin = floor.iter().cloned().fold(f64::INFINITY, f64::min);
+    assert!(
+        floor[0] > fmin && floor[nodes.len() - 1] > fmin,
+        "floor must dip near the radar and rise toward both path ends"
+    );
 
     let dbzh = qr.ranges.get("DBZH").expect("DBZH range");
     assert_eq!(dbzh.shape, vec![nodes.len(), z.values.len()]);

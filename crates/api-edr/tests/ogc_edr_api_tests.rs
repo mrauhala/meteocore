@@ -1363,6 +1363,7 @@ mod unimplemented_queries {
                             kind: VerticalKind::HeightAboveAntenna,
                             values: vec![0.0, 1000.0],
                         },
+                        coverage_floor: Some(vec![50.0, 420.0, 1150.0]),
                     },
                     parameters,
                     ranges,

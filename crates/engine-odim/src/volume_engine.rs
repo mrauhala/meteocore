@@ -2674,6 +2674,26 @@ fn height_axis(hi_angle_deg: f64, max_ground_dist_m: f64) -> Vec<f64> {
     (0..n).map(|i| i as f64 * step).collect()
 }
 
+/// Height (m above antenna) of the `elangle_deg` beam over a point
+/// `ground_distance_m` from the radar — the per-node coverage-floor
+/// evaluation (#514). Converts ground → slant range with the same
+/// `ground / cos(el)` one-step [`height_axis`] uses (see its comment for
+/// why that beats using the ground distance directly).
+///
+/// The angle is deliberately NOT clamped to `>= 0` (unlike `height_axis`,
+/// whose clamp only sizes the axis ceiling): the sampling mask
+/// (`sample_polar_slant_class`) compares raw angles against the envelope,
+/// and real networks run a slightly negative lowest tilt from
+/// terrain-elevated sites — clamping here would draw the floor above
+/// cells the volume actually observed. A negative-tilt floor correctly
+/// dips below antenna level before effective-Earth curvature lifts it.
+fn beam_height_at_ground(elangle_deg: f64, ground_distance_m: f64) -> f64 {
+    let cos_el = elangle_deg.to_radians().cos().max(1e-3);
+    let r = ground_distance_m / cos_el;
+    let (_, h) = slant_to_ground_height(r, elangle_deg);
+    h
+}
+
 /// Tolerance (degrees) for the sweep-envelope guard in
 /// `sample_polar_slant`. ~Half a typical beam width — wide enough that
 /// cells slightly outside the surveyed angle still snap to the nearest
@@ -2848,6 +2868,17 @@ fn volume_section(
         .map(|&(lon, lat)| ground_distance_bearing(site.lon, site.lat, lon, lat))
         .collect();
 
+    // Lowest-beam coverage floor per node (#514): the height of the
+    // *effective* lowest surveyed angle (window ∩ this volume's envelope,
+    // so a `z`-narrowed request gets the floor of the band actually
+    // shown) over each node's ground distance. Below it the volume is
+    // unobserved, not echo-free. Raw metres — a path through the radar
+    // dips to 0 at the antenna and rises both ways for free.
+    let coverage_floor: Vec<f64> = geom
+        .iter()
+        .map(|&(d, _)| beam_height_at_ground(envelope.0, d))
+        .collect();
+
     let mut ranges = HashMap::new();
     let mut param_descs = HashMap::new();
     let nz = heights_m.len();
@@ -2888,6 +2919,7 @@ fn volume_section(
                 kind: VerticalKind::HeightAboveAntenna,
                 values: heights_m.to_vec(),
             },
+            coverage_floor: Some(coverage_floor),
         },
         parameters: param_descs,
         ranges,
@@ -4598,6 +4630,50 @@ mod tests {
             (h - 1_020.0).abs() < 10.0,
             "el=1 r=50km: h={h} should be ~1020"
         );
+    }
+
+    /// `beam_height_at_ground` (#514, the cross-section coverage floor):
+    /// zero at the antenna, strictly rising with ground distance, exactly
+    /// the `ground/cos(el)` one-step over `slant_to_ground_height`, and
+    /// matching the 0.3°-lowest-beam reference table from the issue
+    /// (~0.4 km @ 50 km, ~1.1 km @ 100 km, ~5.0 km @ 250 km).
+    #[test]
+    fn beam_height_at_ground_matches_reference_and_rises() {
+        assert_eq!(beam_height_at_ground(0.3, 0.0), 0.0);
+
+        // Strictly monotonic in range.
+        let mut prev = 0.0;
+        for d in [10, 50, 100, 150, 200, 250] {
+            let h = beam_height_at_ground(0.3, d as f64 * 1000.0);
+            assert!(h > prev, "floor must rise with range: {h} at {d} km");
+            prev = h;
+        }
+
+        // Absolute pins (4/3-Earth, el = 0.3°).
+        let h50 = beam_height_at_ground(0.3, 50_000.0);
+        let h100 = beam_height_at_ground(0.3, 100_000.0);
+        let h250 = beam_height_at_ground(0.3, 250_000.0);
+        assert!((h50 - 409.0).abs() < 10.0, "50 km: {h50} ≈ 409 m");
+        assert!((h100 - 1_112.0).abs() < 10.0, "100 km: {h100} ≈ 1112 m");
+        assert!((h250 - 4_986.0).abs() < 20.0, "250 km: {h250} ≈ 4986 m");
+
+        // Consistency by construction with `slant_to_ground_height`.
+        let el = 0.3_f64;
+        let r = 100_000.0 / el.to_radians().cos();
+        let (_, h_ref) = slant_to_ground_height(r, el);
+        assert_eq!(h100, h_ref);
+
+        // A negative lowest tilt (terrain-elevated site) must NOT be
+        // clamped to 0° — the floor dips below antenna level near the
+        // radar (≈ −115 m at 50 km for −0.3°) before effective-Earth
+        // curvature lifts it (≈ +65 m at 100 km), staying strictly below
+        // the 0.3° floor throughout. Clamping drew the floor above cells
+        // the sampler actually observed (claude-review on PR #581).
+        let hn50 = beam_height_at_ground(-0.3, 50_000.0);
+        let hn100 = beam_height_at_ground(-0.3, 100_000.0);
+        assert!((hn50 - -114.6).abs() < 5.0, "-0.3° @ 50 km: {hn50}");
+        assert!((hn100 - 65.0).abs() < 5.0, "-0.3° @ 100 km: {hn100}");
+        assert!(hn50 < h50 && hn100 < h100, "lower tilt ⇒ lower floor");
     }
 
     /// `sample_polar_slant` returns `None` for malformed sweep geometry

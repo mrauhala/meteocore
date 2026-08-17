@@ -773,6 +773,7 @@ fn section_coverage_validates_against_schema() {
                 kind: VerticalKind::HeightAboveAntenna,
                 values: heights,
             },
+            coverage_floor: None,
         },
         parameters,
         ranges,
@@ -787,6 +788,65 @@ fn section_coverage_validates_against_schema() {
     let first = &composite["values"][0];
     assert_eq!(first.as_array().unwrap().len(), 3);
     assert!(json["domain"]["axes"]["z"]["values"].is_array());
+    assert!(
+        json["domain"].get("meteocore:beamCoverage").is_none(),
+        "no floor → no foreign member"
+    );
+
+    validate(&json, &schema);
+}
+
+/// The lowest-beam coverage floor (#514) rides on the `Section` domain as
+/// the `meteocore:beamCoverage` foreign member — one raw metres value per
+/// composite-axis node — and the document must STILL validate against the
+/// CoverageJSON schema (foreign members are tolerated on the domain; extra
+/// *axes* are not, which is why it is not an axis).
+#[test]
+fn section_coverage_floor_foreign_member_validates() {
+    let schema = load_schema();
+    let t = make_time(12);
+    let nodes = vec![(t, 24.0, 60.0), (t, 24.5, 60.25), (t, 25.0, 60.5)];
+    let heights = vec![0.0, 1000.0, 5000.0];
+    let floor = vec![-12.5, 431.0, 5150.0]; // raw: below 0 and above axis top
+
+    let mut parameters = HashMap::new();
+    parameters.insert(
+        "DBZH".to_string(),
+        ParameterDescription {
+            label: "Reflectivity".to_string(),
+            unit: "dBZ".to_string(),
+            observed_property: "DBZH".to_string(),
+        },
+    );
+    let mut ranges = HashMap::new();
+    ranges.insert(
+        "DBZH".to_string(),
+        NdArray {
+            shape: vec![nodes.len(), heights.len()],
+            axis_names: vec!["composite".to_string(), "z".to_string()],
+            values: vec![Some(1.0); nodes.len() * heights.len()],
+        },
+    );
+
+    let result = QueryResult {
+        domain: DomainDescription::Section {
+            nodes,
+            z: VerticalCoord {
+                kind: VerticalKind::HeightAboveAntenna,
+                values: heights,
+            },
+            coverage_floor: Some(floor.clone()),
+        },
+        parameters,
+        ranges,
+    };
+
+    let json = query_result_to_coverage_json(&result);
+    assert_eq!(
+        json["domain"]["meteocore:beamCoverage"]["floor"],
+        serde_json::json!(floor),
+        "floor emitted verbatim (raw metres) on the domain"
+    );
 
     validate(&json, &schema);
 }

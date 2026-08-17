@@ -22,7 +22,7 @@ pub use palette::{
     PaletteRegistry,
 };
 pub use palette_formats::{parse_cpt, parse_gdal_txt, parse_pal};
-pub use plot::{render_chart, render_heatmap, Heatmap, Panel, Series};
+pub use plot::{render_chart, render_heatmap, Heatmap, OverlayLine, Panel, Series};
 pub use rasterize::{fill_polygon, Combine};
 pub use style::{ResolvedColormap, StyleContext, StyleSpec};
 
