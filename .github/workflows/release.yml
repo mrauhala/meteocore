@@ -398,6 +398,25 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.resolve-target.outputs.tag }}
             type=raw,value=latest
 
+      # Gate BEFORE the multi-arch publish: build the native-arch image
+      # into the local daemon and boot it (scripts/docker_boot_smoke.sh).
+      # The push below reuses the buildx cache for the amd64 half. A
+      # runtime-broken image (the #582 glibc mismatch class) must never
+      # take the `:latest` / version tags.
+      - name: Build image for boot smoke (linux/amd64)
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: meteocore-smoke:release
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Boot-smoke the image
+        run: scripts/docker_boot_smoke.sh meteocore-smoke:release
+
       - name: Build and push (linux/amd64, linux/arm64)
         id: build-and-push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7
