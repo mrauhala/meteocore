@@ -89,13 +89,21 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      # `load: true` puts the image in the local daemon so the boot gate
+      # can actually exec it — a build alone cannot catch runtime-stage
+      # breakage (glibc mismatch #582, missing .so, broken CMD).
       - name: Build Docker image (no push)
         uses: docker/build-push-action@v7
         with:
           context: .
           push: false
+          load: true
+          tags: meteocore-smoke:pr
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Boot-smoke the image
+        run: scripts/docker_boot_smoke.sh meteocore-smoke:pr
 
   docker:
     name: Docker
@@ -141,6 +149,24 @@ jobs:
           # commit without colliding with the stable channel.
           flavor: |
             latest=false
+
+      # Gate BEFORE publish: build into the local daemon and boot it.
+      # The push step below reuses the buildx cache, so the double build
+      # costs seconds — and a runtime-broken image never reaches ghcr
+      # (the #582 glibc mismatch shipped precisely because nothing ever
+      # exec'd the image between build and production).
+      - name: Build image for boot smoke
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: meteocore-smoke:main
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Boot-smoke the image
+        run: scripts/docker_boot_smoke.sh meteocore-smoke:main
 
       - name: Build and push Docker image
         id: build-and-push
