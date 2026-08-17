@@ -5,13 +5,23 @@
 
 ### Features
 
+* **api-edr:** CoverageJSON Point domain type for scattered events ([#505](https://github.com/mrauhala/meteocore/issues/505)) ([a7f452e](https://github.com/mrauhala/meteocore/commit/a7f452e))
+* **api:** Cache-Control + ETag/If-None-Match on EDR and Features responses ([#555](https://github.com/mrauhala/meteocore/issues/555)) ([d4a5cf7](https://github.com/mrauhala/meteocore/commit/d4a5cf7))
+* **api:** machine-readable legend JSON — WMS FORMAT=application/json, Maps/Tiles /legend ([#563](https://github.com/mrauhala/meteocore/issues/563)) ([074d883](https://github.com/mrauhala/meteocore/commit/074d883))
+* **core,render:** bundles v2 — per-parameter styles in bundles, slot-wise merge ([#561](https://github.com/mrauhala/meteocore/issues/561)) ([646ea2f](https://github.com/mrauhala/meteocore/commit/646ea2f))
 * **core,render:** style name defaults to colormap reference, title to palette title ([#569](https://github.com/mrauhala/meteocore/issues/569)) ([f616828](https://github.com/mrauhala/meteocore/commit/f61682850627154e40fd93ac7f2a3955cb86335b))
 * **edr:** draw the PVOL cross-section lowest-beam coverage floor ([#514](https://github.com/mrauhala/meteocore/issues/514)) ([#581](https://github.com/mrauhala/meteocore/issues/581)) ([21ad6d8](https://github.com/mrauhala/meteocore/commit/21ad6d89f04c9b5d3489017e8d9c54dc826fda0f))
 * **engine-nowcast:** cell intelligence — severity rank, tracks, deviant-mover flag ([#545](https://github.com/mrauhala/meteocore/issues/545)) ([0d68208](https://github.com/mrauhala/meteocore/commit/0d68208a269228028b21976defea82754024b1cb))
 * **engine-nowcast:** growth/decay profile mechanism (off by default — scene-wide gate failed) ([#547](https://github.com/mrauhala/meteocore/issues/547)) ([ae4a20c](https://github.com/mrauhala/meteocore/commit/ae4a20c6e5105f00ceb5f4d70dc304bb429cde02))
+* **engine-nowcast:** motion stabilization — multi-pair estimation + cross-generation EMA ([#530](https://github.com/mrauhala/meteocore/issues/530)) ([9e140f8](https://github.com/mrauhala/meteocore/commit/9e140f8))
 * **engine-nowcast:** object-based verification harness + per-generation skill logging ([#543](https://github.com/mrauhala/meteocore/issues/543)) ([a0e7316](https://github.com/mrauhala/meteocore/commit/a0e7316d059b0de8290d9536eba316055bc83bfb))
+* **engine-nowcast:** per-cell growth/decay tendencies (v2.3 iteration 1, draft) ([#548](https://github.com/mrauhala/meteocore/issues/548)) ([b9c2ab8](https://github.com/mrauhala/meteocore/commit/b9c2ab8))
+* **engine-nowcast:** phase-0 motion + advection + skill core ([#525](https://github.com/mrauhala/meteocore/issues/525)) ([7e41a83](https://github.com/mrauhala/meteocore/commit/7e41a83))
 * **engine-nowcast:** phase-1 derived-collection engine — WMS/Maps/Tiles serving ([#527](https://github.com/mrauhala/meteocore/issues/527)) ([b96fa44](https://github.com/mrauhala/meteocore/commit/b96fa446bc22c43b2bec9e5bc98bb14c852ea3f6))
 * **engine-postgis:** age-colored lightning WMS/Maps/Tiles layer for the events shape ([#509](https://github.com/mrauhala/meteocore/issues/509)) ([353dc9c](https://github.com/mrauhala/meteocore/commit/353dc9c2314edce0d5e35214020d6ba70356b956))
+* **engine-postgis:** events shape — EDR area queries for non-station event tables ([#506](https://github.com/mrauhala/meteocore/issues/506)) ([fe027af](https://github.com/mrauhala/meteocore/commit/fe027af))
+* **engine-postgis:** response-value budget replaces the 500-station area cap ([#500](https://github.com/mrauhala/meteocore/issues/500)) ([08953ac](https://github.com/mrauhala/meteocore/commit/08953ac))
+* **grafana:** Nowcast + EDR hot-path rows; memory & postgis panel upgrades ([#552](https://github.com/mrauhala/meteocore/issues/552)) ([9cdc42c](https://github.com/mrauhala/meteocore/commit/9cdc42c))
 * **nowcast:** per-cell lightning join — flash rate + Schultz jump flag ([#550](https://github.com/mrauhala/meteocore/issues/550)) ([fef1e71](https://github.com/mrauhala/meteocore/commit/fef1e719aa331829607f760dc9797c71e8f94fde))
 * **observability:** redesigned Grafana dashboard + PVOL pixel-cache eviction metrics ([#469](https://github.com/mrauhala/meteocore/issues/469), [#476](https://github.com/mrauhala/meteocore/issues/476)) ([#477](https://github.com/mrauhala/meteocore/issues/477)) ([39e5b8e](https://github.com/mrauhala/meteocore/commit/39e5b8e699577e13f31df8a011e45045f00b58ef))
 * **render,core,server:** built-in per-parameter default styles ([#320](https://github.com/mrauhala/meteocore/issues/320)) ([#562](https://github.com/mrauhala/meteocore/issues/562)) ([11e36e4](https://github.com/mrauhala/meteocore/commit/11e36e4788b6f151abc53e8c5a00367622d2feee))
@@ -22,11 +32,32 @@
 * **server:** user-defined colormaps — [[colormaps]], colormaps_dir, cpt/GDAL/SLD import ([#560](https://github.com/mrauhala/meteocore/issues/560)) ([361d692](https://github.com/mrauhala/meteocore/commit/361d6923b45b4919476f86a40d11c5c28c0662fc))
 
 
+### Bug Fixes
+
+* **api-edr:** 500 instead of request-path panic on registry divergence ([#479](https://github.com/mrauhala/meteocore/issues/479)) ([#483](https://github.com/mrauhala/meteocore/issues/483)) ([1e7929c](https://github.com/mrauhala/meteocore/commit/1e7929c))
+* **api-edr:** breached postgis area/row caps are HTTP 400, not opaque 500 ([#497](https://github.com/mrauhala/meteocore/issues/497)) ([6fda38e](https://github.com/mrauhala/meteocore/commit/6fda38e))
+* **api-features:** emit items timeStamp at seconds precision with Z suffix ([#556](https://github.com/mrauhala/meteocore/issues/556)) ([673859d](https://github.com/mrauhala/meteocore/commit/673859d))
+* **api:** 400 on unknown parameter-name in Maps/Tiles legend endpoints ([#568](https://github.com/mrauhala/meteocore/issues/568)) ([b7dff62](https://github.com/mrauhala/meteocore/commit/b7dff62))
+* **api:** key rendered/meta-tile caches on the concrete latest run, not None ([#526](https://github.com/mrauhala/meteocore/issues/526)) ([99e7c6a](https://github.com/mrauhala/meteocore/commit/99e7c6a))
+* **api:** per-parameter styles reach Maps/Tiles, WMS legends and GetCapabilities ([#566](https://github.com/mrauhala/meteocore/issues/566)) ([7a117b6](https://github.com/mrauhala/meteocore/commit/7a117b6))
+* **ci:** cut release tags deterministically from the manifest ([#220](https://github.com/mrauhala/meteocore/issues/220)) ([#489](https://github.com/mrauhala/meteocore/issues/489)) ([ee14d1f](https://github.com/mrauhala/meteocore/commit/ee14d1f))
+* **engine-nowcast:** emit cell-feature values at meaningful precision ([#554](https://github.com/mrauhala/meteocore/issues/554)) ([effdb0f](https://github.com/mrauhala/meteocore/commit/effdb0f))
+* **engine-nowcast:** speed-based track gates + velocity clamp — kills 200 km/h phantom cells ([#553](https://github.com/mrauhala/meteocore/issues/553)) ([f019bb0](https://github.com/mrauhala/meteocore/commit/f019bb0))
+* **engine-odim:** clear air is a measurement — z-pinned EDR series no longer 404s ([#495](https://github.com/mrauhala/meteocore/issues/495)) ([b8c4b34](https://github.com/mrauhala/meteocore/commit/b8c4b34))
+* **engine-postgis:** surface the real DB error in metadata refresh ([#436](https://github.com/mrauhala/meteocore/issues/436)) ([#484](https://github.com/mrauhala/meteocore/issues/484)) ([94af4d1](https://github.com/mrauhala/meteocore/commit/94af4d1))
+* **engines:** emit feature-property timestamps at seconds precision with Z suffix ([#557](https://github.com/mrauhala/meteocore/issues/557)) ([53aa465](https://github.com/mrauhala/meteocore/commit/53aa465))
+* **render:** key raster caches on the RESOLVED timestep, not the requested time ([#508](https://github.com/mrauhala/meteocore/issues/508)) ([67c62f3](https://github.com/mrauhala/meteocore/commit/67c62f3))
+* **render:** pal values below the lowest entry render transparent ([#572](https://github.com/mrauhala/meteocore/issues/572)) ([7c848c0](https://github.com/mrauhala/meteocore/commit/7c848c0))
+* geo/XML safety tripwire in CI + three leftover Web Mercator copies ([#482](https://github.com/mrauhala/meteocore/issues/482)) ([#485](https://github.com/mrauhala/meteocore/issues/485)) ([61e1f2f](https://github.com/mrauhala/meteocore/commit/61e1f2f))
+
+
 ### Performance Improvements
 
+* **engine-nowcast:** O(leads) trajectory integration — 6-12× faster generations ([#529](https://github.com/mrauhala/meteocore/issues/529)) ([2b9c03c](https://github.com/mrauhala/meteocore/commit/2b9c03c))
 * **render:** pixel-proportional meta-tile budget instead of fixed 256-tile cap ([#491](https://github.com/mrauhala/meteocore/issues/491)) ([#492](https://github.com/mrauhala/meteocore/issues/492)) ([db87f90](https://github.com/mrauhala/meteocore/commit/db87f90f976e7cc5cb7f46fa5284c8813777b20e))
 * **server:** incremental reload — rebuild only changed collections, keep unchanged engines live ([#576](https://github.com/mrauhala/meteocore/issues/576)) ([26ca8c6](https://github.com/mrauhala/meteocore/commit/26ca8c6ec387e0503896a8faf1763ffbbd407991))
 * **server:** jemalloc global allocator + process/allocator memory gauges ([#493](https://github.com/mrauhala/meteocore/issues/493)) ([#494](https://github.com/mrauhala/meteocore/issues/494)) ([eab5447](https://github.com/mrauhala/meteocore/commit/eab5447ca869ef1b8c15085bc1f91a0cade1c9d7))
+
 
 ## [0.7.0](https://github.com/mrauhala/meteocore/compare/v0.6.0...v0.7.0) (2026-07-05)
 
