@@ -55,19 +55,3 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
-
-# Interim patch (icechunk feature only). Tracked for removal in #340.
-#
-# `zarrs_icechunk`'s feature-forwarding fix (zarrs/zarrs_icechunk#13) shipped in
-# 0.5.1 (2026-06-08), so that patch is gone — engine-zarr now depends on the
-# published crate directly.
-#
-# `icechunk`'s one-line build fix (earth-mover/icechunk#2190: a bare `?` on a
-# FromUtf8Error only convertible under the `s3`/aws-sdk feature, in
-# virtual_chunks.rs) is merged upstream but NOT yet in a crates.io release (latest
-# is 2.0.6, cut before the merge). Until icechunk releases > 2.0.6 with the fix,
-# patch to the upstream merge commit so the `object-store-s3`-without-`s3` build
-# compiles. Pinned to an immutable `rev` (not the branch) so a future
-# `cargo update` can't silently follow a moved branch tip.
-[patch.crates-io]
-icechunk = { git = "https://github.com/earth-mover/icechunk.git", rev = "5f56b13605745ea06ec6558bcd8ed4a8f5805a3e" }

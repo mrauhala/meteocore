@@ -82,8 +82,7 @@ errors clearly if the table is set without the feature.
   ds-storage; safe because retrieval is `concurrent_target(1)`).
 - **S3 backend = icechunk's `object_store` backend, NOT `aws-sdk-s3`** (deps
   use `default-features = false, features = ["object-store-s3",
-  "object-store-fs"]`; saves ~20 MB binary). `icechunk` still needs one
-  interim `[patch.crates-io]` in root `Cargo.toml` (#340).
+  "object-store-fs"]`; saves ~20 MB binary).
 - **Anonymous access is `S3Options::with_anonymous(true)`** — the
   object_store backend keys skip-signing off `S3Options.anonymous`, NOT the
   `S3Credentials` arg. Without it, it falls through to the AWS credential

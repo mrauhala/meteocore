@@ -35,10 +35,10 @@ thiserror = "2"
 # Select only the `object_store`-based S3 backend (+ local filesystem), NOT
 # icechunk's default `s3` backend which pulls the full `aws-sdk-s3` tree — we
 # reuse the same `object_store` crate `ds-storage` already links. The
-# backend-forwarding features were published in zarrs_icechunk 0.5.1; `icechunk`
-# still needs the workspace-root `[patch]` until a release > 2.0.6 carries the
-# `object-store-s3`-without-`s3` build fix (earth-mover/icechunk#2190).
-icechunk = { version = "2", optional = true, default-features = false, features = [
+# backend-forwarding features were published in zarrs_icechunk 0.5.1; 2.1.0 is
+# the first release carrying the `object-store-s3`-without-`s3` build fix
+# (earth-mover/icechunk#2190).
+icechunk = { version = "2.1", optional = true, default-features = false, features = [
     "object-store-s3",
     "object-store-fs",
 ] }

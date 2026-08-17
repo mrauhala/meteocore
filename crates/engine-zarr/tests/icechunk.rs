@@ -201,6 +201,8 @@ async fn probe_aifs_schema() {
         "dynamical-ecmwf-aifs-single".to_string(),
         Some("ecmwf-aifs-single-forecast/v0.1.0.icechunk".to_string()),
         None, // anonymity is `with_anonymous(true)` above; matches build_storage
+        Vec::new(),
+        Vec::new(),
     )
     .await
     .expect("s3 storage");
