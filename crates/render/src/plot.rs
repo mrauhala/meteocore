@@ -12,6 +12,7 @@
 use chrono::DateTime;
 
 use ds_core::error::DataServerError;
+use ds_core::raster_paint::clip_segment;
 
 use crate::colormap::ColorMap;
 use crate::encode_png;
@@ -471,7 +472,7 @@ fn draw_heatmap_overlays(
             let (Some(a), Some(b)) = (w[0], w[1]) else {
                 continue;
             };
-            if let Some((c, d)) = clip_segment(a, b, (x0 as f64, x1 as f64), (y0 as f64, y1 as f64))
+            if let Some((c, d)) = clip_segment(a, b, (x0 as f64, y0 as f64), (x1 as f64, y1 as f64))
             {
                 let (ax, ay) = (c.0.round() as i32, c.1.round() as i32);
                 let (bx, by) = (d.0.round() as i32, d.1.round() as i32);
@@ -490,57 +491,19 @@ fn draw_heatmap_overlays(
             if let Some(&(lx, ly)) = inside {
                 let label = ov.label.to_ascii_uppercase();
                 let tw = text_width(&label, 1);
-                let tx = (lx as i32 - tw - 4).clamp(x0 + 2, x1 - tw - 2);
-                let ty = (ly as i32 - 10).clamp(y0 + 2, y1 - 8);
-                cv.text(tx, ty, &label, ov.color, 1);
+                // Skip the label when the plot can't fit it — the clamp
+                // bounds below invert on a too-small plot and
+                // `i32::clamp` panics on `min > max` (a client picking a
+                // small width/height or many stacked panels must never
+                // panic the render path).
+                if x1 - x0 >= tw + 4 && y1 - y0 >= 10 {
+                    let tx = (lx as i32 - tw - 4).clamp(x0 + 2, x1 - tw - 2);
+                    let ty = (ly as i32 - 10).clamp(y0 + 2, y1 - 8);
+                    cv.text(tx, ty, &label, ov.color, 1);
+                }
             }
         }
     }
-}
-
-/// Liang–Barsky clip of segment `a..b` to the axis-aligned rect
-/// `[xmin, xmax] × [ymin, ymax]`. `None` = entirely outside.
-fn clip_segment(
-    a: (f64, f64),
-    b: (f64, f64),
-    (xmin, xmax): (f64, f64),
-    (ymin, ymax): (f64, f64),
-) -> Option<((f64, f64), (f64, f64))> {
-    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-    let mut t0 = 0.0_f64;
-    let mut t1 = 1.0_f64;
-    for (p, q) in [
-        (-dx, a.0 - xmin),
-        (dx, xmax - a.0),
-        (-dy, a.1 - ymin),
-        (dy, ymax - a.1),
-    ] {
-        if p == 0.0 {
-            if q < 0.0 {
-                return None;
-            }
-        } else {
-            let r = q / p;
-            if p < 0.0 {
-                if r > t1 {
-                    return None;
-                }
-                t0 = t0.max(r);
-            } else {
-                if r < t0 {
-                    return None;
-                }
-                t1 = t1.min(r);
-            }
-        }
-    }
-    if t0 > t1 {
-        return None;
-    }
-    Some((
-        (a.0 + t0 * dx, a.1 + t0 * dy),
-        (a.0 + t1 * dx, a.1 + t1 * dy),
-    ))
 }
 
 /// Vertical colour bar just right of the plot frame, with min/mid/max
@@ -1282,26 +1245,31 @@ mod tests {
         assert_eq!(clipped, plain, "fully-outside line clips away entirely");
     }
 
+    /// A labelled overlay on a plot too small to fit the label must skip
+    /// the label, not panic: `i32::clamp` asserts `min <= max`, and both
+    /// clamp bounds invert on tiny plots (claude-review on PR #581).
+    /// Exercises the two failure axes separately: minimum-height stacked
+    /// panels (y bound inverts) and minimum width (x bound inverts —
+    /// 160px minus margins leaves 38px, narrower than the label).
     #[test]
-    fn clip_segment_cases() {
-        let rect = ((0.0, 10.0), (0.0, 10.0));
-        // Fully inside — unchanged.
-        assert_eq!(
-            clip_segment((1.0, 1.0), (9.0, 9.0), rect.0, rect.1),
-            Some(((1.0, 1.0), (9.0, 9.0)))
+    fn heatmap_overlay_label_on_tiny_plot_does_not_panic() {
+        let cmap = crate::colormap::LutColorMap::from_builtin(
+            crate::colormap::BuiltinColormap::Viridis,
+            0.0,
+            40.0,
         );
-        // Fully outside — rejected.
-        assert!(clip_segment((11.0, 0.0), (20.0, 5.0), rect.0, rect.1).is_none());
-        assert!(clip_segment((-5.0, -5.0), (-1.0, -1.0), rect.0, rect.1).is_none());
-        // Crossing — both endpoints land on the rect border.
-        let ((ax, ay), (bx, by)) = clip_segment((-10.0, 5.0), (20.0, 5.0), rect.0, rect.1).unwrap();
-        assert_eq!((ax, ay), (0.0, 5.0));
-        assert_eq!((bx, by), (10.0, 5.0));
-        // Diagonal entering one corner region.
-        let ((ax, ay), (bx, by)) =
-            clip_segment((-2.0, -2.0), (12.0, 12.0), rect.0, rect.1).unwrap();
-        assert!((ax - 0.0).abs() < 1e-12 && (ay - 0.0).abs() < 1e-12);
-        assert!((bx - 10.0).abs() < 1e-12 && (by - 10.0).abs() < 1e-12);
+        let mut hm = sample_heatmap();
+        hm.overlays.push(OverlayLine {
+            label: "lowest beam".into(),
+            color: [0x20, 0x20, 0x20],
+            points: vec![(0.0, 100.0), (30.0, 1500.0)],
+            hatch_below: Some([0xb0, 0xb0, 0xb0]),
+        });
+        // 3 stacked panels at the 64px-per-panel minimum height.
+        let three = vec![hm.clone(), hm.clone(), hm.clone()];
+        assert!(render_heatmap(&three, &cmap, 600, 192).is_ok());
+        // Minimum-width canvas.
+        assert!(render_heatmap(&[hm], &cmap, 160, 300).is_ok());
     }
 
     #[test]

@@ -134,7 +134,9 @@ impl<'a> Canvas<'a> {
 
 /// Liang–Barsky segment clip against an axis-aligned box. Returns the
 /// clipped endpoints, or `None` when the segment misses the box entirely.
-fn clip_segment(
+/// Public: also used by `ds-render`'s heatmap overlay polylines, so the
+/// workspace has exactly one implementation of this clip.
+pub fn clip_segment(
     (x0, y0): (f64, f64),
     (x1, y1): (f64, f64),
     (min_x, min_y): (f64, f64),
@@ -178,6 +180,27 @@ mod tests {
 
     fn painted(values: &[Option<f64>]) -> usize {
         values.iter().filter(|v| v.is_some()).count()
+    }
+
+    #[test]
+    fn clip_segment_cases() {
+        let (lo, hi) = ((0.0, 0.0), (10.0, 10.0));
+        // Fully inside — unchanged.
+        assert_eq!(
+            clip_segment((1.0, 1.0), (9.0, 9.0), lo, hi),
+            Some(((1.0, 1.0), (9.0, 9.0)))
+        );
+        // Fully outside — rejected.
+        assert!(clip_segment((11.0, 0.0), (20.0, 5.0), lo, hi).is_none());
+        assert!(clip_segment((-5.0, -5.0), (-1.0, -1.0), lo, hi).is_none());
+        // Crossing — both endpoints land on the box border.
+        let ((ax, ay), (bx, by)) = clip_segment((-10.0, 5.0), (20.0, 5.0), lo, hi).unwrap();
+        assert_eq!((ax, ay), (0.0, 5.0));
+        assert_eq!((bx, by), (10.0, 5.0));
+        // Diagonal through two corner regions.
+        let ((ax, ay), (bx, by)) = clip_segment((-2.0, -2.0), (12.0, 12.0), lo, hi).unwrap();
+        assert!((ax - 0.0).abs() < 1e-12 && (ay - 0.0).abs() < 1e-12);
+        assert!((bx - 10.0).abs() < 1e-12 && (by - 10.0).abs() < 1e-12);
     }
 
     #[test]
