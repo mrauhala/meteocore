@@ -8,6 +8,7 @@ fuzz = []
 
 [dependencies]
 ds-core = { path = "../core" }
+ds-poll = { path = "../ds-poll" }
 chrono = { version = "0.4", features = ["serde"] }
 tiff = "0.11"
 arc-swap = "1"

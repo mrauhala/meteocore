@@ -7,6 +7,7 @@ edition = "2021"
 # The algorithm modules (motion/advect/skill) are dependency-free pure
 # functions; these dependencies serve only the engine module (#522).
 ds-core = { path = "../core" }
+ds-poll = { path = "../ds-poll" }
 chrono = "0.4"
 arc-swap = "1"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }

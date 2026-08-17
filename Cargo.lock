@@ -1103,6 +1103,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ds-poll"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "ds-render"
 version = "0.1.0"
 dependencies = [
@@ -1168,6 +1175,7 @@ dependencies = [
  "arc-swap",
  "chrono",
  "ds-core",
+ "ds-poll",
  "ds-render",
  "ds-storage",
  "quick-xml 0.37.5",
@@ -1211,6 +1219,7 @@ dependencies = [
  "criterion",
  "ds-cache",
  "ds-core",
+ "ds-poll",
  "ds-storage",
  "flate2",
  "futures",
@@ -1235,6 +1244,7 @@ dependencies = [
  "chrono",
  "ds-cache",
  "ds-core",
+ "ds-poll",
  "ds-storage",
  "grib",
  "serde",
@@ -1251,6 +1261,7 @@ dependencies = [
  "arc-swap",
  "chrono",
  "ds-core",
+ "ds-poll",
  "engine-geotiff",
  "tokio",
  "tracing",
@@ -1265,6 +1276,7 @@ dependencies = [
  "ds-3dtiles",
  "ds-cache",
  "ds-core",
+ "ds-poll",
  "ds-render",
  "ds-storage",
  "hdf5-reader",
@@ -1287,6 +1299,7 @@ dependencies = [
  "deadpool-postgres",
  "ds-cache",
  "ds-core",
+ "ds-poll",
  "futures",
  "postgis",
  "serde",
@@ -1303,6 +1316,7 @@ dependencies = [
  "arc-swap",
  "chrono",
  "ds-core",
+ "ds-poll",
  "memmap2",
  "thiserror 2.0.18",
  "tokio",
@@ -1318,6 +1332,7 @@ dependencies = [
  "chrono",
  "ds-cache",
  "ds-core",
+ "ds-poll",
  "ds-storage",
  "icechunk",
  "serde",

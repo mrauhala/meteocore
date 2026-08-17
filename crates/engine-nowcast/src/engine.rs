@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Duration, Utc};
-use tokio::sync::watch;
+use ds_poll::{FirstTick, Shutdown};
 
 use ds_core::config::NowcastConfig;
 use ds_core::datetime::parse_iso8601_duration;
@@ -189,7 +189,8 @@ pub struct NowcastEngine {
     source: Arc<dyn MapEngine>,
     cfg: EngineCfg,
     state: ArcSwap<NowcastState>,
-    shutdown_tx: watch::Sender<()>,
+    /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
+    shutdown: Shutdown,
     // Metrics (read by the server's /metrics handler).
     generations_total: AtomicU64,
     generation_failures_total: AtomicU64,
@@ -268,7 +269,6 @@ impl NowcastEngine {
             )));
         }
 
-        let (shutdown_tx, _) = watch::channel(());
         let source_info = source.raster_info();
         Ok(Self {
             collection_id: collection_id.to_string(),
@@ -289,7 +289,7 @@ impl NowcastEngine {
                 info: empty_info(&source_info),
                 cell_history: Vec::new(),
             }),
-            shutdown_tx,
+            shutdown: Shutdown::new(),
             generations_total: AtomicU64::new(0),
             generation_failures_total: AtomicU64::new(0),
             last_generation_ms: AtomicU64::new(0),
@@ -352,7 +352,7 @@ impl NowcastEngine {
 
     /// Signal the poll loop to exit (server reload/shutdown).
     pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(());
+        self.shutdown.shutdown();
     }
 
     /// Attach a point-event source whose strikes are joined onto tracked
@@ -365,22 +365,16 @@ impl NowcastEngine {
     }
 
     /// Poll the source for a new frame; spawn on the BACKGROUND runtime only.
+    /// The first tick fires immediately so the first generation isn't delayed
+    /// by one poll interval.
     pub async fn poll_loop(&self) {
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        let mut ticker = tokio::time::interval(self.cfg.poll_interval);
-        // A generation can outlast the interval on big grids; don't replay
-        // missed ticks as a burst afterwards (#443 pattern).
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown_rx.changed() => {
-                    tracing::info!("[{}] nowcast poll loop shutting down", self.collection_id);
-                    break;
-                }
-                _ = ticker.tick() => self.poll_once(),
-            }
+        let mut ticker = self
+            .shutdown
+            .ticker(self.cfg.poll_interval, FirstTick::Immediate);
+        while ticker.tick().await {
+            self.poll_once();
         }
+        tracing::info!("[{}] nowcast poll loop shutting down", self.collection_id);
     }
 
     /// One poll cycle: regenerate iff the source's latest frame moved.

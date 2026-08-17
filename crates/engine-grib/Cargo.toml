@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 ds-core = { path = "../core" }
+ds-poll = { path = "../ds-poll" }
 ds-storage = { path = "../storage" }
 grib = { version = "0.15", default-features = false, features = ["ccsds-unpack-with-libaec"] }
 chrono = { version = "0.4", features = ["serde"] }
