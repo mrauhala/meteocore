@@ -44,6 +44,7 @@ pub fn spawn_config_watcher(
     // `send` is synchronous and callable from any thread.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
+    let collections_root = collections_dir.clone();
     let colormaps_root = colormaps_dir.clone();
     let mut watcher =
         notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
@@ -55,7 +56,11 @@ pub fn spawn_config_watcher(
             // self-sustaining loop (see [`is_read_only_event`]).
             Ok(event)
                 if !is_read_only_event(&event.kind)
-                    && is_relevant_event(&event, colormaps_root.as_deref()) =>
+                    && is_relevant_event(
+                        &event,
+                        collections_root.as_deref(),
+                        colormaps_root.as_deref(),
+                    ) =>
             {
                 // Ignore send errors — a closed receiver just means the task ended.
                 let _ = tx.send(());
@@ -167,17 +172,39 @@ pub fn spawn_config_watcher(
 /// Anything under `colormaps_dir` counts — palettes span many extensions
 /// (`.toml`/`.cpt`/`.pal`/`.txt`/`.clr`/`.sld`), `.disabled` renames must keep
 /// triggering, and the debounce absorbs editor noise, so that root gets no
-/// extension filter (#571). Any other path (a `collections_dir` event) must be
-/// `.toml`-ish — covers `.toml`, `.toml.disabled` (enable/disable renames),
+/// extension filter (#571). Every other path (a `collections_dir` event) must
+/// be `.toml`-ish — covers `.toml`, `.toml.disabled` (enable/disable renames),
 /// and editor temp/rename artifacts (`*.toml.swp`, `*.toml~`) — which keeps
 /// unrelated directory churn from reloading while still catching every real
 /// change; a stray non-toml file in that dir is ignored.
-fn is_relevant_event(event: &notify::Event, colormaps_dir: Option<&Path>) -> bool {
+///
+/// When one root is nested inside the other, a path under both is routed by
+/// its NEAREST enclosing root, so the `.toml` filter holds for a
+/// `collections_dir` nested inside `colormaps_dir` just as it does for
+/// disjoint roots (identical roots keep the permissive palette rule — palette
+/// files there must trigger).
+fn is_relevant_event(
+    event: &notify::Event,
+    collections_dir: Option<&Path>,
+    colormaps_dir: Option<&Path>,
+) -> bool {
     event.paths.iter().any(|p| {
-        colormaps_dir.is_some_and(|root| p.starts_with(root))
-            || p.file_name()
+        let is_toml = || {
+            p.file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.contains(".toml"))
+        };
+        match (
+            colormaps_dir.filter(|root| p.starts_with(root)),
+            collections_dir.filter(|root| p.starts_with(root)),
+        ) {
+            // Under both (one root nested in the other, or identical): the
+            // nearer — deeper — root's rule wins. Both roots are canonical,
+            // so component count is a valid depth measure.
+            (Some(cm), Some(cl)) => cm.components().count() >= cl.components().count() || is_toml(),
+            (Some(_), None) => true,
+            _ => is_toml(),
+        }
     })
 }
 
@@ -223,19 +250,26 @@ mod tests {
 
     #[test]
     fn toml_changes_trigger() {
-        assert!(is_relevant_event(&event_for("/c.d/radar.toml"), None));
+        let cl = Some(Path::new("/c.d"));
+        assert!(is_relevant_event(&event_for("/c.d/radar.toml"), cl, None));
         assert!(is_relevant_event(
             &event_for("/c.d/radar.toml.disabled"),
+            cl,
             None
         ));
         // Editor artifacts still contain ".toml" — fine, debounce coalesces.
-        assert!(is_relevant_event(&event_for("/c.d/.radar.toml.swp"), None));
+        assert!(is_relevant_event(
+            &event_for("/c.d/.radar.toml.swp"),
+            cl,
+            None
+        ));
     }
 
     #[test]
     fn non_toml_changes_ignored() {
-        assert!(!is_relevant_event(&event_for("/c.d/README.md"), None));
-        assert!(!is_relevant_event(&event_for("/c.d/notes.txt"), None));
+        let cl = Some(Path::new("/c.d"));
+        assert!(!is_relevant_event(&event_for("/c.d/README.md"), cl, None));
+        assert!(!is_relevant_event(&event_for("/c.d/notes.txt"), cl, None));
     }
 
     #[test]
@@ -243,17 +277,52 @@ mod tests {
         // Under the palette root there is NO extension filter (#571): palettes
         // span .toml/.cpt/.pal/.txt/.clr/.sld and `.disabled` renames must
         // keep triggering.
-        let root = Some(Path::new("/cm.d"));
-        assert!(is_relevant_event(&event_for("/cm.d/radar.pal"), root));
-        assert!(is_relevant_event(&event_for("/cm.d/ramp.cpt"), root));
-        assert!(is_relevant_event(&event_for("/cm.d/relief.txt"), root));
+        let cl = Some(Path::new("/c.d"));
+        let cm = Some(Path::new("/cm.d"));
+        assert!(is_relevant_event(&event_for("/cm.d/radar.pal"), cl, cm));
+        assert!(is_relevant_event(&event_for("/cm.d/ramp.cpt"), cl, cm));
+        assert!(is_relevant_event(&event_for("/cm.d/relief.txt"), cl, cm));
         assert!(is_relevant_event(
             &event_for("/cm.d/radar.pal.disabled"),
-            root
+            cl,
+            cm
         ));
         // Outside the palette root the .toml filter still applies.
-        assert!(!is_relevant_event(&event_for("/c.d/notes.txt"), root));
-        assert!(is_relevant_event(&event_for("/c.d/radar.toml"), root));
+        assert!(!is_relevant_event(&event_for("/c.d/notes.txt"), cl, cm));
+        assert!(is_relevant_event(&event_for("/c.d/radar.toml"), cl, cm));
+    }
+
+    #[test]
+    fn nested_roots_route_by_nearest_enclosing_root() {
+        // colormaps_dir nested inside collections_dir: palette files trigger
+        // unfiltered, the surrounding collections dir keeps the .toml filter.
+        let cl = Some(Path::new("/c.d"));
+        let cm = Some(Path::new("/c.d/cm"));
+        assert!(is_relevant_event(&event_for("/c.d/cm/radar.pal"), cl, cm));
+        assert!(is_relevant_event(&event_for("/c.d/a.toml"), cl, cm));
+        assert!(!is_relevant_event(&event_for("/c.d/README.md"), cl, cm));
+
+        // The INVERSE nesting (collections_dir inside colormaps_dir, e.g.
+        // colormaps_dir = "."): collections events must NOT lose the .toml
+        // filter just because they also sit under the palette root.
+        let cm = Some(Path::new("/root"));
+        let cl = Some(Path::new("/root/collections.d"));
+        assert!(is_relevant_event(&event_for("/root/radar.pal"), cl, cm));
+        assert!(is_relevant_event(
+            &event_for("/root/collections.d/a.toml"),
+            cl,
+            cm
+        ));
+        assert!(!is_relevant_event(
+            &event_for("/root/collections.d/README.md"),
+            cl,
+            cm
+        ));
+
+        // Identical roots: the permissive palette rule wins — palette files
+        // in the shared dir must keep triggering.
+        let both = Some(Path::new("/d"));
+        assert!(is_relevant_event(&event_for("/d/radar.pal"), both, both));
     }
 
     #[test]
