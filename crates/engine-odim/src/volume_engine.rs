@@ -2678,13 +2678,19 @@ fn height_axis(hi_angle_deg: f64, max_ground_dist_m: f64) -> Vec<f64> {
 /// `ground_distance_m` from the radar — the per-node coverage-floor
 /// evaluation (#514). Converts ground → slant range with the same
 /// `ground / cos(el)` one-step [`height_axis`] uses (see its comment for
-/// why that beats using the ground distance directly), so the floor is
-/// consistent with the height-axis ceiling by construction.
+/// why that beats using the ground distance directly).
+///
+/// The angle is deliberately NOT clamped to `>= 0` (unlike `height_axis`,
+/// whose clamp only sizes the axis ceiling): the sampling mask
+/// (`sample_polar_slant_class`) compares raw angles against the envelope,
+/// and real networks run a slightly negative lowest tilt from
+/// terrain-elevated sites — clamping here would draw the floor above
+/// cells the volume actually observed. A negative-tilt floor correctly
+/// dips below antenna level before effective-Earth curvature lifts it.
 fn beam_height_at_ground(elangle_deg: f64, ground_distance_m: f64) -> f64 {
-    let el = elangle_deg.max(0.0);
-    let cos_el = el.to_radians().cos().max(1e-3);
+    let cos_el = elangle_deg.to_radians().cos().max(1e-3);
     let r = ground_distance_m / cos_el;
-    let (_, h) = slant_to_ground_height(r, el);
+    let (_, h) = slant_to_ground_height(r, elangle_deg);
     h
 }
 
@@ -4656,6 +4662,18 @@ mod tests {
         let r = 100_000.0 / el.to_radians().cos();
         let (_, h_ref) = slant_to_ground_height(r, el);
         assert_eq!(h100, h_ref);
+
+        // A negative lowest tilt (terrain-elevated site) must NOT be
+        // clamped to 0° — the floor dips below antenna level near the
+        // radar (≈ −115 m at 50 km for −0.3°) before effective-Earth
+        // curvature lifts it (≈ +65 m at 100 km), staying strictly below
+        // the 0.3° floor throughout. Clamping drew the floor above cells
+        // the sampler actually observed (claude-review on PR #581).
+        let hn50 = beam_height_at_ground(-0.3, 50_000.0);
+        let hn100 = beam_height_at_ground(-0.3, 100_000.0);
+        assert!((hn50 - -114.6).abs() < 5.0, "-0.3° @ 50 km: {hn50}");
+        assert!((hn100 - 65.0).abs() < 5.0, "-0.3° @ 100 km: {hn100}");
+        assert!(hn50 < h50 && hn100 < h100, "lower tilt ⇒ lower floor");
     }
 
     /// `sample_polar_slant` returns `None` for malformed sweep geometry
