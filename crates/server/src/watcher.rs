@@ -29,9 +29,11 @@ use crate::admin::{do_reload, AdminState, ReloadError};
 /// caller — event-path routing matches them by prefix. At least one root
 /// should be `Some`; with both `None` the watcher watches nothing.
 ///
-/// Best-effort: returns the `notify` error if the watcher can't be created or
-/// can't start watching, so the caller can log it and continue running without
-/// auto-reload rather than fail to boot.
+/// Best-effort: returns the `notify` error only if the watcher can't be
+/// created or NO root can be watched, so the caller can log it and continue
+/// running without auto-reload rather than fail to boot. With two roots, a
+/// failure on one root disables auto-reload for it alone (logged WARN); the
+/// other keeps working.
 pub fn spawn_config_watcher(
     state: AdminState,
     collections_dir: Option<PathBuf>,
@@ -75,13 +77,40 @@ pub fn spawn_config_watcher(
             roots.push(("colormaps_dir", d));
         }
     }
+    // Register each root independently: a `?`-bail here would drop `watcher`,
+    // which unregisters every already-successful watch — so a failure on one
+    // root (an inotify watch/instance limit, a permission or removal race
+    // since the boot-time canonicalize) would silently kill auto-reload for
+    // the OTHER, perfectly watchable root too. Fail the whole spawn only when
+    // no root can be watched at all.
+    let mut last_err = None;
+    let mut watching = 0usize;
     for (what, dir) in &roots {
-        watcher.watch(dir, RecursiveMode::NonRecursive)?;
-        info!(
-            "Watching {what} '{}' for changes (debounce {}ms)",
-            dir.display(),
-            debounce.as_millis()
-        );
+        match watcher.watch(dir, RecursiveMode::NonRecursive) {
+            Ok(()) => {
+                watching += 1;
+                info!(
+                    "Watching {what} '{}' for changes (debounce {}ms)",
+                    dir.display(),
+                    debounce.as_millis()
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "cannot watch {what} '{}': {e} — auto-reload disabled for it",
+                    dir.display()
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    if watching == 0 {
+        // Zero roots watching: report the failure (or watch nothing quietly
+        // when no root was configured) instead of spawning an idle task.
+        return match last_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        };
     }
     if debounce.is_zero() {
         warn!(
