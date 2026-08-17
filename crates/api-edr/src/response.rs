@@ -319,7 +319,11 @@ fn build_domain(desc: &DomainDescription) -> Value {
                 "referencing": referencing
             })
         }
-        DomainDescription::Section { nodes, z } => {
+        DomainDescription::Section {
+            nodes,
+            z,
+            coverage_floor,
+        } => {
             // Each composite-axis entry is a 3-tuple `[t, x, y]`, exactly
             // matching the CoverageJSON 1.0 `Section` schema (the only
             // tuple shape it accepts).
@@ -338,12 +342,22 @@ fn build_domain(desc: &DomainDescription) -> Value {
             );
             axes.insert("z".into(), json!({ "values": z.values }));
             let referencing = vec![spatial_ref(), temporal_ref(), vertical_ref(z)];
-            json!({
-                "type": "Domain",
-                "domainType": "Section",
-                "axes": axes,
-                "referencing": referencing,
-            })
+            let mut domain = Map::new();
+            domain.insert("type".into(), Value::String("Domain".into()));
+            domain.insert("domainType".into(), Value::String("Section".into()));
+            domain.insert("axes".into(), Value::Object(axes));
+            domain.insert("referencing".into(), json!(referencing));
+            // Lowest-beam coverage floor (#514) as a CoverageJSON foreign
+            // member — one value per composite-axis node, in the z axis's
+            // unit (metres above antenna). A foreign member (not an axis
+            // or a parameter) because the schema forbids extra axes,
+            // and a derived-range encoding would surface in the parameter
+            // list where naive clients plot it as data. Raw values: they
+            // may dip below 0 near the radar or exceed the z-axis top.
+            if let Some(floor) = coverage_floor {
+                domain.insert("meteocore:beamCoverage".into(), json!({ "floor": floor }));
+            }
+            Value::Object(domain)
         }
     }
 }

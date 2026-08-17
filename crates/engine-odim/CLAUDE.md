@@ -87,6 +87,13 @@ around `ds-storage` calls (Critical Rules 6–7).
   (composite `[t,x,y]` axis + numeric `z` = height above antenna via the
   4/3-Earth beam model). `z` selects the elevation-angle band. Vertical axis
   is elevation angle (`VerticalKind::ElevationAngle`).
+- **Coverage floor (#514):** every `Section` carries `coverage_floor` — per
+  node, the height of the *effective* lowest surveyed beam (`window ∩` the
+  volume's sweep envelope, so a `z`-narrowed request gets the floor of the
+  band shown) via `beam_height_at_ground` (the same `ground/cos(el)`
+  one-step `height_axis` uses). Raw metres — may dip below 0 near the radar
+  and pierce the axis top far out; api-edr clips it in the PNG and emits it
+  verbatim as the `meteocore:beamCoverage` domain foreign member in JSON.
 
 ## VolumeEngine (3D Tiles) implementation
 

@@ -549,7 +549,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     ],
                     "responses": {
                         "200": {
-                            "description": "Coverage data — CoverageJSON Section domain or PNG heatmap",
+                            "description": "Coverage data — CoverageJSON Section domain or PNG heatmap. The Section domain carries the per-node lowest-beam coverage floor (metres above antenna) in the `meteocore:beamCoverage` foreign member; the PNG draws it as a hatched-below overlay line. Below the floor the volume is unobserved, not echo-free.",
                             "content": {
                                 "application/prs.coverage+json": {
                                     "schema": {"$ref": "#/components/schemas/coverageJSON"}

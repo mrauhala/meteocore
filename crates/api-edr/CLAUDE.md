@@ -57,7 +57,12 @@ owns the instance-id string form:
 ## Misc
 
 - Cross-section responses (`query_trajectory`, ODIM PVOL) are CoverageJSON
-  `Section` with a composite `[t,x,y]` axis + numeric `z` axis.
+  `Section` with a composite `[t,x,y]` axis + numeric `z` axis. When the
+  domain carries `coverage_floor` (#514), the JSON emits it as the
+  `meteocore:beamCoverage` **foreign member** on the domain (raw metres,
+  one per node) — NOT an axis (the schema forbids extra axes) and NOT a
+  parameter (naive clients would plot it as data); the `f=png` heatmap
+  draws it as a hatched-below "lowest beam" overlay line.
 - `f=png` time-series plots are why this crate (alone among API crates)
   depends on ds-render.
 - A location with no data in the requested window returns `LocationNotFound`

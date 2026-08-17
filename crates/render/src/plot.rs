@@ -46,6 +46,26 @@ pub struct Panel {
     pub series: Vec<Series>,
 }
 
+/// A polyline drawn over a [`Heatmap`]'s plot area in axis units — e.g.
+/// the radar lowest-beam coverage floor (#514), a freezing level, a
+/// tropopause. Segments are clipped to the plot frame, so points may
+/// legitimately run below the axis floor or above its ceiling.
+#[derive(Debug, Clone)]
+pub struct OverlayLine {
+    /// Small caption drawn near the line's right end (blank = none).
+    pub label: String,
+    /// Opaque line (and label) colour.
+    pub color: [u8; 3],
+    /// `(x, y)` vertices in the heatmap's axis units. A non-finite
+    /// coordinate breaks the polyline (a gap), like a plot series.
+    pub points: Vec<(f64, f64)>,
+    /// When set, the region between the polyline and the bottom of the
+    /// plot is hatched with this colour — a "not observed" texture that
+    /// stays visually distinct from nodata-white cells without hiding
+    /// any cell that does carry data. Assumes x-monotonic `points`.
+    pub hatch_below: Option<[u8; 3]>,
+}
+
 /// A 2-D colour-mapped field for [`render_heatmap`] — the EDR `Section`
 /// (radar cross-section) plot. `values` is row-major over the along-path
 /// axis then the vertical axis: `values[node * z_len + level]`, matching
@@ -71,6 +91,8 @@ pub struct Heatmap {
     /// Colour-bar lower / upper bounds (the colormap's value range).
     pub value_min: f64,
     pub value_max: f64,
+    /// Overlay polylines drawn on top of the cell fill.
+    pub overlays: Vec<OverlayLine>,
 }
 
 const BLACK: [u8; 3] = [0x20, 0x20, 0x20];
@@ -310,6 +332,7 @@ fn draw_heatmap_panel(
     }
 
     let (ymin, ymax) = (hm.y_values[0], hm.y_values[nz - 1]);
+    let (xmin, xmax) = (hm.x_values[0], hm.x_values[nx - 1]);
 
     // Fill the plot area. Each output pixel maps to a (node, level) cell:
     // the column is index-linear in node, the row is *value-linear* in the
@@ -346,6 +369,13 @@ fn draw_heatmap_panel(
             cv.put(x0 + sx, y0 + sy, rgb);
         }
     }
+    draw_heatmap_overlays(
+        cv,
+        &hm.overlays,
+        (x0, x1, y0, y1),
+        (xmin, xmax),
+        (ymin, ymax),
+    );
     cv.rect(x0, y0, x1, y1, FRAME);
 
     // Y ticks (height) — value grows up, so the top is the max.
@@ -365,7 +395,6 @@ fn draw_heatmap_panel(
     }
 
     // X ticks (distance).
-    let (xmin, xmax) = (hm.x_values[0], hm.x_values[nx - 1]);
     let px = |x: f64| -> i32 {
         let frac = (x - xmin) / (xmax - xmin).max(f64::EPSILON);
         x0 + (frac * (x1 - x0) as f64).round() as i32
@@ -383,6 +412,135 @@ fn draw_heatmap_panel(
 
     draw_colorbar(cv, hm, colormap, x1, y0, y1);
     draw_heatmap_captions(cv, hm, x0, x1, y1, top);
+}
+
+/// Draw a heatmap's [`OverlayLine`]s over the plot area `(x0..x1, y0..y1)`
+/// — hatch-below first, then the polyline (2 px, clipped), then the
+/// label — mapping axis units to screen with the same value-linear
+/// transform the tick placement uses.
+fn draw_heatmap_overlays(
+    cv: &mut Canvas,
+    overlays: &[OverlayLine],
+    (x0, x1, y0, y1): (i32, i32, i32, i32),
+    (xmin, xmax): (f64, f64),
+    (ymin, ymax): (f64, f64),
+) {
+    let xspan = (xmax - xmin).max(f64::EPSILON);
+    let yspan = (ymax - ymin).max(f64::EPSILON);
+    let pxf = |x: f64| x0 as f64 + (x - xmin) / xspan * (x1 - x0) as f64;
+    let pyf = |y: f64| y1 as f64 - (y - ymin) / yspan * (y1 - y0) as f64;
+
+    for ov in overlays {
+        // Screen-space vertices; a non-finite coordinate breaks the line.
+        let pts: Vec<Option<(f64, f64)>> = ov
+            .points
+            .iter()
+            .map(|&(x, y)| (x.is_finite() && y.is_finite()).then(|| (pxf(x), pyf(y))))
+            .collect();
+
+        if let Some(hatch) = ov.hatch_below {
+            // Diagonal hatch between the line and the plot floor. Per
+            // screen column the line height is interpolated between the
+            // adjacent vertices; a line above the plot ceiling hatches
+            // the whole column, one below the floor hatches nothing.
+            for w in pts.windows(2) {
+                let (Some(a), Some(b)) = (w[0], w[1]) else {
+                    continue;
+                };
+                let (a, b) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+                let sx_lo = (a.0.max(x0 as f64)).ceil() as i32;
+                let sx_hi = (b.0.min(x1 as f64)).floor() as i32;
+                for sx in sx_lo..=sx_hi {
+                    let t = if b.0 > a.0 {
+                        (sx as f64 - a.0) / (b.0 - a.0)
+                    } else {
+                        0.0
+                    };
+                    let line_y = a.1 + t * (b.1 - a.1);
+                    let from = (line_y.max(y0 as f64) as i32 + 1).max(y0 + 1);
+                    for sy in from..y1 {
+                        if (sx + sy) % 4 == 0 {
+                            cv.put(sx, sy, hatch);
+                        }
+                    }
+                }
+            }
+        }
+
+        for w in pts.windows(2) {
+            let (Some(a), Some(b)) = (w[0], w[1]) else {
+                continue;
+            };
+            if let Some((c, d)) = clip_segment(a, b, (x0 as f64, x1 as f64), (y0 as f64, y1 as f64))
+            {
+                let (ax, ay) = (c.0.round() as i32, c.1.round() as i32);
+                let (bx, by) = (d.0.round() as i32, d.1.round() as i32);
+                cv.line(ax, ay, bx, by, ov.color);
+                // Second pass one row down: a 2 px stroke reads over the
+                // cell fill where 1 px vanishes.
+                cv.line(ax, ay + 1, bx, by + 1, ov.color);
+            }
+        }
+
+        if !ov.label.is_empty() {
+            // Anchor at the last vertex that sits inside the plot frame.
+            let inside = pts.iter().rev().flatten().find(|(px, py)| {
+                *px >= x0 as f64 && *px <= x1 as f64 && *py >= y0 as f64 && *py <= y1 as f64
+            });
+            if let Some(&(lx, ly)) = inside {
+                let label = ov.label.to_ascii_uppercase();
+                let tw = text_width(&label, 1);
+                let tx = (lx as i32 - tw - 4).clamp(x0 + 2, x1 - tw - 2);
+                let ty = (ly as i32 - 10).clamp(y0 + 2, y1 - 8);
+                cv.text(tx, ty, &label, ov.color, 1);
+            }
+        }
+    }
+}
+
+/// Liang–Barsky clip of segment `a..b` to the axis-aligned rect
+/// `[xmin, xmax] × [ymin, ymax]`. `None` = entirely outside.
+fn clip_segment(
+    a: (f64, f64),
+    b: (f64, f64),
+    (xmin, xmax): (f64, f64),
+    (ymin, ymax): (f64, f64),
+) -> Option<((f64, f64), (f64, f64))> {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let mut t0 = 0.0_f64;
+    let mut t1 = 1.0_f64;
+    for (p, q) in [
+        (-dx, a.0 - xmin),
+        (dx, xmax - a.0),
+        (-dy, a.1 - ymin),
+        (dy, ymax - a.1),
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None;
+            }
+        } else {
+            let r = q / p;
+            if p < 0.0 {
+                if r > t1 {
+                    return None;
+                }
+                t0 = t0.max(r);
+            } else {
+                if r < t0 {
+                    return None;
+                }
+                t1 = t1.min(r);
+            }
+        }
+    }
+    if t0 > t1 {
+        return None;
+    }
+    Some((
+        (a.0 + t0 * dx, a.1 + t0 * dy),
+        (a.0 + t1 * dx, a.1 + t1 * dy),
+    ))
 }
 
 /// Vertical colour bar just right of the plot frame, with min/mid/max
@@ -965,6 +1123,7 @@ mod tests {
             values,
             value_min: 0.0,
             value_max: 40.0,
+            overlays: vec![],
         }
     }
 
@@ -1019,6 +1178,7 @@ mod tests {
             values: vec![Some(1.0)], // should be 4
             value_min: 0.0,
             value_max: 1.0,
+            overlays: vec![],
         };
         let png = render_heatmap(&[bad], &cmap, 300, 200).unwrap();
         assert_eq!(decode_dims(&png), (300, 200));
@@ -1077,9 +1237,71 @@ mod tests {
             ],
             value_min: 0.0,
             value_max: 30.0,
+            overlays: vec![],
         };
         let png = render_heatmap(&[hm], &cmap, 600, 400).unwrap();
         assert_eq!(decode_dims(&png), (600, 400));
+    }
+
+    /// An overlay polyline changes rendered pixels, is deterministic, and
+    /// out-of-range vertices are clipped rather than panicking or drawing
+    /// outside the frame (#514: the coverage floor may dip below the axis
+    /// near the radar and pierce the ceiling far out).
+    #[test]
+    fn heatmap_overlay_draws_and_clips() {
+        let cmap = crate::colormap::LutColorMap::from_builtin(
+            crate::colormap::BuiltinColormap::Viridis,
+            0.0,
+            40.0,
+        );
+        let plain = render_heatmap(&[sample_heatmap()], &cmap, 400, 300).unwrap();
+
+        let mut hm = sample_heatmap();
+        hm.overlays.push(OverlayLine {
+            label: "lowest beam".into(),
+            color: [0x20, 0x20, 0x20],
+            // Runs from below the axis floor to above its ceiling.
+            points: vec![(0.0, -500.0), (10.0, 400.0), (20.0, 1500.0), (30.0, 3000.0)],
+            hatch_below: Some([0xb0, 0xb0, 0xb0]),
+        });
+        let with = render_heatmap(&[hm.clone()], &cmap, 400, 300).unwrap();
+        assert_eq!(decode_dims(&with), (400, 300));
+        assert_ne!(plain, with, "overlay must change rendered pixels");
+        let again = render_heatmap(&[hm], &cmap, 400, 300).unwrap();
+        assert_eq!(with, again, "overlay render is deterministic");
+
+        // A fully-outside overlay must not disturb the plot.
+        let mut out = sample_heatmap();
+        out.overlays.push(OverlayLine {
+            label: String::new(),
+            color: [0xff, 0x00, 0x00],
+            points: vec![(0.0, 90_000.0), (30.0, 95_000.0)],
+            hatch_below: None,
+        });
+        let clipped = render_heatmap(&[out], &cmap, 400, 300).unwrap();
+        assert_eq!(clipped, plain, "fully-outside line clips away entirely");
+    }
+
+    #[test]
+    fn clip_segment_cases() {
+        let rect = ((0.0, 10.0), (0.0, 10.0));
+        // Fully inside — unchanged.
+        assert_eq!(
+            clip_segment((1.0, 1.0), (9.0, 9.0), rect.0, rect.1),
+            Some(((1.0, 1.0), (9.0, 9.0)))
+        );
+        // Fully outside — rejected.
+        assert!(clip_segment((11.0, 0.0), (20.0, 5.0), rect.0, rect.1).is_none());
+        assert!(clip_segment((-5.0, -5.0), (-1.0, -1.0), rect.0, rect.1).is_none());
+        // Crossing — both endpoints land on the rect border.
+        let ((ax, ay), (bx, by)) = clip_segment((-10.0, 5.0), (20.0, 5.0), rect.0, rect.1).unwrap();
+        assert_eq!((ax, ay), (0.0, 5.0));
+        assert_eq!((bx, by), (10.0, 5.0));
+        // Diagonal entering one corner region.
+        let ((ax, ay), (bx, by)) =
+            clip_segment((-2.0, -2.0), (12.0, 12.0), rect.0, rect.1).unwrap();
+        assert!((ax - 0.0).abs() < 1e-12 && (ay - 0.0).abs() < 1e-12);
+        assert!((bx - 10.0).abs() < 1e-12 && (by - 10.0).abs() < 1e-12);
     }
 
     #[test]
