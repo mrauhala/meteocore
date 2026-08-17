@@ -596,35 +596,45 @@ async fn main() {
         }
     }
 
-    // Resolve the collections_dir to watch (issue #318) before `config_path` is
-    // moved into `server_state` below. `from_file` already canonicalized and
-    // validated the dir at config load, so it exists here.
-    let watch_dir: Option<std::path::PathBuf> = if config.server.watch_collections_dir {
-        match config.server.collections_dir.as_deref() {
-            Some(dir) => {
-                let parent = std::path::Path::new(&config_path)
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new("."));
-                match parent.join(dir).canonicalize() {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        tracing::warn!(
-                            "watch_collections_dir: cannot resolve collections_dir '{dir}': {e} \
-                             — auto-reload disabled"
-                        );
-                        None
-                    }
-                }
-            }
-            None => {
+    // Resolve the directories to watch (issues #318, #571) before
+    // `config_path` is moved into `server_state` below. Config load already
+    // validated both dirs (from_file canonicalizes collections_dir; the
+    // palette-registry build errors on an unreadable colormaps_dir), so they
+    // exist here. Both are resolved once at boot: changing either dir path
+    // via config edit + reload does not re-root the watcher.
+    let (watch_collections, watch_colormaps) = if config.server.watch_collections_dir {
+        let parent = std::path::Path::new(&config_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let resolve = |what: &str, dir: &str| match parent.join(dir).canonicalize() {
+            Ok(p) => Some(p),
+            Err(e) => {
                 tracing::warn!(
-                    "watch_collections_dir is set but collections_dir is not — nothing to watch"
+                    "watch_collections_dir: cannot resolve {what} '{dir}': {e} \
+                     — auto-reload disabled for it"
                 );
                 None
             }
+        };
+        let collections = config
+            .server
+            .collections_dir
+            .as_deref()
+            .and_then(|d| resolve("collections_dir", d));
+        let colormaps = config
+            .server
+            .colormaps_dir
+            .as_deref()
+            .and_then(|d| resolve("colormaps_dir", d));
+        if collections.is_none() && colormaps.is_none() {
+            tracing::warn!(
+                "watch_collections_dir is set but neither collections_dir nor colormaps_dir \
+                 is — nothing to watch"
+            );
         }
+        (collections, colormaps)
     } else {
-        None
+        (None, None)
     };
 
     let server_state: AdminState = Arc::new(ServerState {
@@ -664,24 +674,39 @@ async fn main() {
         engine_handles: RwLock::new(result.engines_by_id),
     });
 
-    // Start the collections_dir watcher (issue #318) if enabled. Best-effort:
-    // a watcher init failure logs and the server runs without auto-reload.
-    if let Some(dir) = watch_dir {
-        // Trust-model note: watch-triggered reloads are gated by write access to
-        // `collections_dir` (a local-filesystem control plane), NOT the HTTP
-        // `ADMIN_TOKEN` that gates `POST /admin/collections/reload`. Make the
-        // asymmetry explicit when both are in play (e.g. a shared/NFS dir).
+    // Start the config-directory watcher (issues #318, #571) if enabled.
+    // Best-effort: a watcher init failure logs and the server runs without
+    // auto-reload.
+    if watch_collections.is_some() || watch_colormaps.is_some() {
+        // Trust-model note: watch-triggered reloads are gated by write access
+        // to the watched directories (a local-filesystem control plane), NOT
+        // the HTTP `ADMIN_TOKEN` that gates `POST /admin/collections/reload`.
+        // Make the asymmetry explicit when both are in play (e.g. a shared/NFS
+        // dir).
         if server_state.admin_token.is_some() {
+            let dirs: Vec<&str> = [
+                watch_collections.as_ref().map(|_| "collections_dir"),
+                watch_colormaps.as_ref().map(|_| "colormaps_dir"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
             tracing::warn!(
-                "collections_dir watcher is enabled and an admin token is set: \
+                "config-directory watcher is enabled and an admin token is set: \
                  filesystem-triggered reloads do NOT require the token — they are \
-                 authorized by write access to collections_dir. Ensure only trusted \
-                 principals can write there."
+                 authorized by write access to {}. Ensure only trusted principals \
+                 can write there.",
+                dirs.join(" and ")
             );
         }
         let debounce = std::time::Duration::from_millis(config.server.watch_debounce_ms);
-        if let Err(e) = watcher::spawn_collections_watcher(server_state.clone(), dir, debounce) {
-            tracing::warn!("Failed to start collections_dir watcher: {e}");
+        if let Err(e) = watcher::spawn_config_watcher(
+            server_state.clone(),
+            watch_collections,
+            watch_colormaps,
+            debounce,
+        ) {
+            tracing::warn!("Failed to start config-directory watcher: {e}");
         }
     }
 

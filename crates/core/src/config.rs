@@ -83,13 +83,15 @@ pub struct ServerSettings {
     /// render), reversible via config reload.
     #[serde(default = "default_metatile_cache_mb")]
     pub metatile_cache_mb: u64,
-    /// Watch `collections_dir` for changes and auto-reload (add/remove/update
-    /// collections) when `.toml` files are added, edited, or removed — no manual
-    /// `POST /admin/collections/reload` needed. Opt-in; default `false`. Has no
-    /// effect unless `collections_dir` is also set.
+    /// Watch the config directories for changes and auto-reload — no manual
+    /// `POST /admin/collections/reload` needed: `collections_dir` when `.toml`
+    /// files are added, edited, or removed, and `colormaps_dir` when palette
+    /// files change (#571; any extension — palettes span
+    /// .toml/.cpt/.pal/.txt/.clr/.sld). Opt-in; default `false`. Has no effect
+    /// unless `collections_dir` or `colormaps_dir` is also set.
     #[serde(default)]
     pub watch_collections_dir: bool,
-    /// Debounce window (milliseconds) for the `collections_dir` watcher: rapid
+    /// Debounce window (milliseconds) for the config-directory watcher: rapid
     /// or multi-event file changes (an editor's write-then-rename) within this
     /// window coalesce into a single reload. Default: 500.
     #[serde(default = "default_watch_debounce_ms")]
