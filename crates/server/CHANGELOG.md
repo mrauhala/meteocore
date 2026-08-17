@@ -6,6 +6,7 @@
 ### Features
 
 * **core,render:** style name defaults to colormap reference, title to palette title ([#569](https://github.com/mrauhala/meteocore/issues/569)) ([f616828](https://github.com/mrauhala/meteocore/commit/f61682850627154e40fd93ac7f2a3955cb86335b))
+* **edr:** draw the PVOL cross-section lowest-beam coverage floor ([#514](https://github.com/mrauhala/meteocore/issues/514)) ([#581](https://github.com/mrauhala/meteocore/issues/581)) ([21ad6d8](https://github.com/mrauhala/meteocore/commit/21ad6d89f04c9b5d3489017e8d9c54dc826fda0f))
 * **engine-nowcast:** cell intelligence — severity rank, tracks, deviant-mover flag ([#545](https://github.com/mrauhala/meteocore/issues/545)) ([0d68208](https://github.com/mrauhala/meteocore/commit/0d68208a269228028b21976defea82754024b1cb))
 * **engine-nowcast:** growth/decay profile mechanism (off by default — scene-wide gate failed) ([#547](https://github.com/mrauhala/meteocore/issues/547)) ([ae4a20c](https://github.com/mrauhala/meteocore/commit/ae4a20c6e5105f00ceb5f4d70dc304bb429cde02))
 * **engine-nowcast:** object-based verification harness + per-generation skill logging ([#543](https://github.com/mrauhala/meteocore/issues/543)) ([a0e7316](https://github.com/mrauhala/meteocore/commit/a0e7316d059b0de8290d9536eba316055bc83bfb))
@@ -17,6 +18,7 @@
 * **render:** GRLevelX / RadarScope .pal palette import ([#570](https://github.com/mrauhala/meteocore/issues/570)) ([7a4e219](https://github.com/mrauhala/meteocore/commit/7a4e219597ef0622d702d6f23309f82c185cd224))
 * **render:** named Palette model + single builtin colormap table ([#558](https://github.com/mrauhala/meteocore/issues/558)) ([c97ddb1](https://github.com/mrauhala/meteocore/commit/c97ddb170dccaaae7edb1af2357f33b717bcd3cb))
 * **render:** single StyleContext resolver, styles built once for WMS/Maps/Tiles/EDR ([#559](https://github.com/mrauhala/meteocore/issues/559)) ([e201bca](https://github.com/mrauhala/meteocore/commit/e201bca2a4083c1aef36529769c575b415bc6a68))
+* **server:** extend the filesystem watcher to colormaps_dir ([#571](https://github.com/mrauhala/meteocore/issues/571)) ([#579](https://github.com/mrauhala/meteocore/issues/579)) ([d43d920](https://github.com/mrauhala/meteocore/commit/d43d92069dd8a821ba42f8c4b02214f12f21cd8a))
 * **server:** user-defined colormaps — [[colormaps]], colormaps_dir, cpt/GDAL/SLD import ([#560](https://github.com/mrauhala/meteocore/issues/560)) ([361d692](https://github.com/mrauhala/meteocore/commit/361d6923b45b4919476f86a40d11c5c28c0662fc))
 
 
