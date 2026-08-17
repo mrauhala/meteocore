@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.8.0](https://github.com/mrauhala/meteocore/compare/v0.7.0...v0.8.0) (2026-08-17)
+
+
+### Features
+
+* **core,render:** style name defaults to colormap reference, title to palette title ([#569](https://github.com/mrauhala/meteocore/issues/569)) ([f616828](https://github.com/mrauhala/meteocore/commit/f61682850627154e40fd93ac7f2a3955cb86335b))
+* **engine-nowcast:** cell intelligence — severity rank, tracks, deviant-mover flag ([#545](https://github.com/mrauhala/meteocore/issues/545)) ([0d68208](https://github.com/mrauhala/meteocore/commit/0d68208a269228028b21976defea82754024b1cb))
+* **engine-nowcast:** growth/decay profile mechanism (off by default — scene-wide gate failed) ([#547](https://github.com/mrauhala/meteocore/issues/547)) ([ae4a20c](https://github.com/mrauhala/meteocore/commit/ae4a20c6e5105f00ceb5f4d70dc304bb429cde02))
+* **engine-nowcast:** object-based verification harness + per-generation skill logging ([#543](https://github.com/mrauhala/meteocore/issues/543)) ([a0e7316](https://github.com/mrauhala/meteocore/commit/a0e7316d059b0de8290d9536eba316055bc83bfb))
+* **engine-nowcast:** phase-1 derived-collection engine — WMS/Maps/Tiles serving ([#527](https://github.com/mrauhala/meteocore/issues/527)) ([b96fa44](https://github.com/mrauhala/meteocore/commit/b96fa446bc22c43b2bec9e5bc98bb14c852ea3f6))
+* **engine-postgis:** age-colored lightning WMS/Maps/Tiles layer for the events shape ([#509](https://github.com/mrauhala/meteocore/issues/509)) ([353dc9c](https://github.com/mrauhala/meteocore/commit/353dc9c2314edce0d5e35214020d6ba70356b956))
+* **nowcast:** per-cell lightning join — flash rate + Schultz jump flag ([#550](https://github.com/mrauhala/meteocore/issues/550)) ([fef1e71](https://github.com/mrauhala/meteocore/commit/fef1e719aa331829607f760dc9797c71e8f94fde))
+* **observability:** redesigned Grafana dashboard + PVOL pixel-cache eviction metrics ([#469](https://github.com/mrauhala/meteocore/issues/469), [#476](https://github.com/mrauhala/meteocore/issues/476)) ([#477](https://github.com/mrauhala/meteocore/issues/477)) ([39e5b8e](https://github.com/mrauhala/meteocore/commit/39e5b8e699577e13f31df8a011e45045f00b58ef))
+* **render,core,server:** built-in per-parameter default styles ([#320](https://github.com/mrauhala/meteocore/issues/320)) ([#562](https://github.com/mrauhala/meteocore/issues/562)) ([11e36e4](https://github.com/mrauhala/meteocore/commit/11e36e4788b6f151abc53e8c5a00367622d2feee))
+* **render:** GRLevelX / RadarScope .pal palette import ([#570](https://github.com/mrauhala/meteocore/issues/570)) ([7a4e219](https://github.com/mrauhala/meteocore/commit/7a4e219597ef0622d702d6f23309f82c185cd224))
+* **render:** named Palette model + single builtin colormap table ([#558](https://github.com/mrauhala/meteocore/issues/558)) ([c97ddb1](https://github.com/mrauhala/meteocore/commit/c97ddb170dccaaae7edb1af2357f33b717bcd3cb))
+* **render:** single StyleContext resolver, styles built once for WMS/Maps/Tiles/EDR ([#559](https://github.com/mrauhala/meteocore/issues/559)) ([e201bca](https://github.com/mrauhala/meteocore/commit/e201bca2a4083c1aef36529769c575b415bc6a68))
+* **server:** user-defined colormaps — [[colormaps]], colormaps_dir, cpt/GDAL/SLD import ([#560](https://github.com/mrauhala/meteocore/issues/560)) ([361d692](https://github.com/mrauhala/meteocore/commit/361d6923b45b4919476f86a40d11c5c28c0662fc))
+
+
+### Performance Improvements
+
+* **render:** pixel-proportional meta-tile budget instead of fixed 256-tile cap ([#491](https://github.com/mrauhala/meteocore/issues/491)) ([#492](https://github.com/mrauhala/meteocore/issues/492)) ([db87f90](https://github.com/mrauhala/meteocore/commit/db87f90f976e7cc5cb7f46fa5284c8813777b20e))
+* **server:** incremental reload — rebuild only changed collections, keep unchanged engines live ([#576](https://github.com/mrauhala/meteocore/issues/576)) ([26ca8c6](https://github.com/mrauhala/meteocore/commit/26ca8c6ec387e0503896a8faf1763ffbbd407991))
+* **server:** jemalloc global allocator + process/allocator memory gauges ([#493](https://github.com/mrauhala/meteocore/issues/493)) ([#494](https://github.com/mrauhala/meteocore/issues/494)) ([eab5447](https://github.com/mrauhala/meteocore/commit/eab5447ca869ef1b8c15085bc1f91a0cade1c9d7))
+
 ## [0.7.0](https://github.com/mrauhala/meteocore/compare/v0.6.0...v0.7.0) (2026-07-05)
 
 
