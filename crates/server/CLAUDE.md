@@ -85,19 +85,26 @@ disk, no TOML needed.
   watcher (`notify`) triggers the same reload on add/edit/remove — debounced
   (`watch_debounce_ms`, default 500), running on the background
   `poll_runtime`, keeping the live registry if the new config is
-  invalid/empty.
+  invalid/empty. The same flag also watches `colormaps_dir` when set (#571):
+  a palette edit runs the full reload, which rebuilds the palette registry
+  and drops the rendered/meta-tile caches via `style_fingerprint`. Under
+  `colormaps_dir` there is NO extension filter (palettes span
+  .toml/.cpt/.pal/.txt/.clr/.sld and `.disabled` renames must retrigger);
+  `collections_dir` events keep the `.toml`-name filter. Watch roots are
+  resolved once at boot — re-pointing either dir needs a restart.
 - **Filter watcher events by `event.kind`, not path alone.** notify's inotify
-  mask includes IN_OPEN; do_reload itself reads every `.toml`, so a path-only
-  filter creates a self-sustaining reload loop (#424). Drop
-  `Access(Open/Read/Close(Read))` and `Modify(Metadata)`; keep
+  mask includes IN_OPEN; do_reload itself reads every `.toml` and every
+  palette file, so a path-only filter creates a self-sustaining reload loop
+  (#424). Drop `Access(Open/Read/Close(Read))` and `Modify(Metadata)`; keep
   create/remove/rename/data-write/CLOSE_WRITE.
 - **Trust model:** the watcher's reload is authorized by filesystem write
-  access to `collections_dir`, NOT the HTTP `ADMIN_TOKEN` that gates the
-  reload endpoint — different control planes. Anyone who can write a
-  collection file already controls what the server serves. When the watcher
-  is enabled and `ADMIN_TOKEN` is set, a startup WARN makes the asymmetry
-  explicit. Keep `collections_dir` writable only by trusted principals; avoid
-  shared/NFS mounts for it.
+  access to the watched directories (`collections_dir`, `colormaps_dir`), NOT
+  the HTTP `ADMIN_TOKEN` that gates the reload endpoint — different control
+  planes. Anyone who can write a collection file already controls what the
+  server serves; anyone who can write a palette file controls served styles.
+  When the watcher is enabled and `ADMIN_TOKEN` is set, a startup WARN makes
+  the asymmetry explicit, naming the watched dirs. Keep them writable only by
+  trusted principals; avoid shared/NFS mounts for them.
 
 ## Reverse-proxy base URL (`trust_proxy_headers`, #12)
 
