@@ -130,6 +130,9 @@ async fn build_storage(
             // rather than a vestigial `Some(Anonymous)` to avoid implying it has
             // an effect. See #335 if private-repo credentials are added.
             None,
+            // No extra read/write headers.
+            Vec::new(),
+            Vec::new(),
         )
         .await
         .map_err(|e| cfg_err(format!("failed to build Icechunk S3 storage: {e}")))
