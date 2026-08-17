@@ -5,7 +5,15 @@
 # workspace source changes. Replaces the previous hand-enumerated stub-lib
 # trick (which silently omitted `engine-postgis` when the workspace grew)
 # with a self-maintaining mechanism that picks up new crates automatically.
-FROM rust:1.94-slim AS chef
+# The builder and runtime stages MUST share one Debian release: the binary
+# picks up versioned glibc symbols from the BUILDER's distro, and a newer
+# builder glibc than the runtime's fails at startup ("GLIBC_X.YY not
+# found"). `rust:1.94-slim` silently rebased bookworm→trixie upstream on
+# 2026-04-10; the mismatch stayed latent until a dependency first used a
+# glibc-2.38 symbol (icechunk 2.1, #578) and then broke production. Pin
+# the distro in BOTH stages' tags so a base-image rebase can never split
+# the pair again.
+FROM rust:1.94-slim-trixie AS chef
 WORKDIR /build
 RUN cargo install cargo-chef --locked --version 0.1.71
 
@@ -87,7 +95,7 @@ RUN cargo build --release --locked -p server \
         ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 
 # Stage 2: Runtime
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
