@@ -257,7 +257,15 @@ jobs:
           # A tag the cut step just created via the API is not in the
           # checkout — fetch so `--bumped-version` sees it.
           git fetch --force --tags -q origin
-          current_tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD)
+          # Bootstrap guard: this pipeline assumes at least one reachable
+          # v-tag (true here since v0.2.0). On a fresh repo or after a tag
+          # wipe, fail with instructions instead of git's opaque
+          # "cannot describe anything" — minting a first version
+          # automatically is not worth an untestable code path.
+          if ! current_tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>&1); then
+            echo "::error::No v* tag reachable from HEAD (${current_tag}). Bootstrap manually: set crates/server/Cargo.toml's version, tag that commit v<version>, push the tag, then re-run."
+            exit 1
+          fi
           # Contract this step depends on (git-cliff 2.13.1, pinned in the
           # install step above): with no releasable commits since the last
           # tag, `--bumped-version` exits 0 and prints the CURRENT tag —
