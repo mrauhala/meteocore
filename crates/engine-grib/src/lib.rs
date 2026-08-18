@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Datelike, Utc};
-use tokio::sync::watch;
+use ds_poll::{FirstTick, Shutdown};
 
 use ds_core::config::GribConfig;
 use ds_core::edr_engine::EdrEngine;
@@ -117,8 +117,8 @@ pub struct GribEngine {
     store: ds_storage::DataStore,
     scan_mode: ScanMode,
     grid_cache: Option<GridCache>,
-    /// Shutdown signal for the poll loop.
-    shutdown_tx: watch::Sender<bool>,
+    /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
+    shutdown: Shutdown,
     /// Allowed parameters (None = all).
     param_filter: Option<Vec<String>>,
     /// Index files already downloaded and parsed (by S3 path). Avoids
@@ -215,8 +215,6 @@ impl GribEngine {
 
         let grid_cache = GridCache::new(config.grid_cache_mb);
 
-        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-
         let index_format = index::IndexFormat::from_config(config.index_format.as_deref())
             .ok_or_else(|| {
                 DataServerError::Config(format!(
@@ -231,7 +229,7 @@ impl GribEngine {
             store,
             scan_mode,
             grid_cache,
-            shutdown_tx,
+            shutdown: Shutdown::new(),
             param_filter: config.parameters.clone(),
             known_indexes: Mutex::new(HashSet::new()),
             settled_prefixes: Mutex::new(HashSet::new()),
@@ -254,33 +252,26 @@ impl GribEngine {
 
     /// Run the poll loop. Call from a spawned tokio task.
     pub async fn poll_loop(&self) {
-        let mut rx = self.shutdown_tx.subscribe();
         let interval = std::time::Duration::from_secs(self.config.poll_interval_secs);
-
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {
-                    if let Err(e) = self.scan_once() {
-                        tracing::warn!(
-                            "Collection '{}': GRIB poll failed: {}",
-                            self.collection_id, e
-                        );
-                    }
-                }
-                _ = rx.changed() => {
-                    tracing::info!(
-                        "Collection '{}': GRIB poll loop shutting down",
-                        self.collection_id
-                    );
-                    return;
-                }
+        let mut ticker = self.shutdown.ticker(interval, FirstTick::Skip);
+        while ticker.tick().await {
+            if let Err(e) = self.scan_once() {
+                tracing::warn!(
+                    "Collection '{}': GRIB poll failed: {}",
+                    self.collection_id,
+                    e
+                );
             }
         }
+        tracing::info!(
+            "Collection '{}': GRIB poll loop shutting down",
+            self.collection_id
+        );
     }
 
     /// Signal the poll loop to stop.
     pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown.shutdown();
     }
 
     /// Perform one scan cycle: list index files across multiple dates and

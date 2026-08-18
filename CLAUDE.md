@@ -8,6 +8,9 @@ Crates: `ds-core` (traits + types + shared utilities, directory `crates/core`),
 `ds-storage` (S3/HTTP/local object store, directory `crates/storage`),
 `ds-render` (raster colorization + PNG encoding, directory `crates/render`),
 `ds-cache` (shared byte-bounded LRU cache plumbing),
+`ds-poll` (shared poll-loop lifecycle: the `Shutdown` handle + `PollTicker`
+every engine's background poll loop uses — never hand-roll a
+`tokio::select!` shutdown signal, #481),
 `ds-mvt` (Mapbox Vector Tile encoder + LRU tile cache), `ds-3dtiles`
 (OGC 3D Tiles encoder), engines (`engine-csv`, `engine-geojson`,
 `engine-geotiff`, `engine-grib`, `engine-odim`, `engine-querydata`,

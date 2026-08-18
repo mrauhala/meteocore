@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 ds-core = { path = "../core" }
+ds-poll = { path = "../ds-poll" }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"

@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
-use tokio::sync::watch;
+use ds_poll::{FirstTick, Shutdown};
 
 use ds_core::config::ZarrConfig;
 use ds_core::edr_engine::EdrEngine;
@@ -55,7 +55,8 @@ pub struct ZarrEngine {
     /// Variable filter from config (`None` = expose all).
     param_filter: Option<Vec<String>>,
     poll_interval: Duration,
-    shutdown_tx: watch::Sender<()>,
+    /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
+    shutdown: Shutdown,
 }
 
 impl ZarrEngine {
@@ -69,14 +70,13 @@ impl ZarrEngine {
 
         log_loaded(collection_id, &catalog);
 
-        let (shutdown_tx, _) = watch::channel(());
         Ok(Self {
             collection_id: collection_id.to_string(),
             store,
             catalog: ArcSwap::from_pointee(catalog),
             param_filter,
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
-            shutdown_tx,
+            shutdown: Shutdown::new(),
         })
     }
 
@@ -86,24 +86,16 @@ impl ZarrEngine {
     /// Must run on the dedicated background poll runtime — the rebuild does
     /// blocking store I/O (see the engine concurrency rules in CLAUDE.md).
     pub async fn poll_loop(&self) {
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        let mut interval = tokio::time::interval(self.poll_interval);
-        interval.tick().await; // skip the immediate first tick
-
-        loop {
-            tokio::select! {
-                _ = interval.tick() => self.poll_once(),
-                _ = shutdown_rx.changed() => {
-                    tracing::info!("[{}] Zarr poll loop shutting down", self.collection_id);
-                    break;
-                }
-            }
+        let mut ticker = self.shutdown.ticker(self.poll_interval, FirstTick::Skip);
+        while ticker.tick().await {
+            self.poll_once();
         }
+        tracing::info!("[{}] Zarr poll loop shutting down", self.collection_id);
     }
 
     /// Signal the poll loop to stop.
     pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(());
+        self.shutdown.shutdown();
     }
 
     /// The collection ID this engine serves.

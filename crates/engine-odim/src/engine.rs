@@ -39,9 +39,7 @@ use ds_core::error::DataServerError;
 use ds_core::geo::Crs;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::resample::ProjectionGrid;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use tokio::sync::Notify;
+use ds_poll::{FirstTick, Shutdown};
 
 use ds_storage::discovery::{expand_prefix_for_dates, expand_prefix_pattern, TimeWindow};
 
@@ -435,20 +433,12 @@ pub struct OdimEngine {
     matcher: FilenameMatcher,
     max_files: Option<usize>,
     poll_interval: Duration,
-    /// Shutdown coordination. `shutdown` is the authoritative flag —
-    /// every poll-loop iteration checks it at the top. `notify` is
-    /// a wake-up signal so `shutdown()` doesn't have to wait for
-    /// the next `interval.tick()` to take effect.
-    ///
-    /// **Why not `watch::Sender<()>`** (the original design): if
-    /// `shutdown()` fires before `poll_loop()` calls `subscribe()`,
-    /// `watch::send` returns `Err` (no receivers) and silently
-    /// drops the signal — the version doesn't bump, so a later
-    /// `subscribe()`-then-`changed().await` would block forever.
-    /// `AtomicBool` is edge-triggered: once set, every future
-    /// iteration sees it regardless of timing.
-    shutdown: AtomicBool,
-    shutdown_notify: Notify,
+    /// Edge-triggered stop signal for `poll_loop`. The shared
+    /// [`ds_poll::Shutdown`] (#481) is the `AtomicBool` + `Notify`
+    /// design this engine pioneered: a `watch`-channel signal fired
+    /// before the loop subscribes is silently lost, a set-once flag
+    /// is observed regardless of timing.
+    shutdown: Shutdown,
 }
 
 /// Errors from [`OdimEngine::new`]. Per-tile errors are mapped to
@@ -673,8 +663,7 @@ impl OdimEngine {
             matcher,
             max_files,
             poll_interval: Duration::from_secs(poll_interval_secs.max(1)),
-            shutdown: AtomicBool::new(false),
-            shutdown_notify: Notify::new(),
+            shutdown: Shutdown::new(),
         })
     }
 
@@ -768,47 +757,18 @@ impl OdimEngine {
     /// timeout) are logged at WARN and otherwise ignored — the
     /// previous catalog stays in place so live requests keep working.
     pub async fn poll_loop(&self) {
-        let mut interval = tokio::time::interval(self.poll_interval);
-        interval.tick().await; // skip immediate first tick (already loaded at boot)
-
-        loop {
-            // Authoritative check — catches a `shutdown()` that fired
-            // before `poll_loop()` started, or between two ticks.
-            if self.shutdown.load(Ordering::Acquire) {
-                tracing::info!("[{}] ODIM poll loop shutting down", self.collection_id);
-                break;
-            }
-            tokio::select! {
-                _ = interval.tick() => {
-                    // Recheck inside the branch: `shutdown()` may have
-                    // fired between the load above and the tick
-                    // returning, and we don't want to do extra I/O on
-                    // the way out.
-                    if !self.shutdown.load(Ordering::Acquire) {
-                        self.poll_once();
-                    }
-                }
-                _ = self.shutdown_notify.notified() => {
-                    // `shutdown()` was just called. The flag is set;
-                    // top-of-loop check on the next iteration handles
-                    // the actual exit.
-                }
-            }
+        let mut ticker = self.shutdown.ticker(self.poll_interval, FirstTick::Skip);
+        while ticker.tick().await {
+            self.poll_once();
         }
+        tracing::info!("[{}] ODIM poll loop shutting down", self.collection_id);
     }
 
-    /// Signal the polling loop to stop. Idempotent — the first call
-    /// transitions the flag and wakes any waiter; subsequent calls are
-    /// no-ops. Safe to call before `poll_loop()` has started: the flag
-    /// persists and the next `poll_loop()` invocation will exit on its
-    /// first iteration.
+    /// Signal the polling loop to stop. Idempotent; safe to call before
+    /// `poll_loop()` has started — the flag persists and the loop exits
+    /// on its first tick.
     pub fn shutdown(&self) {
-        if !self.shutdown.swap(true, Ordering::Release) {
-            // We just transitioned false → true. Wake any pending
-            // `notified()` waiter. If no waiter exists, the
-            // top-of-loop flag check on the next iteration covers it.
-            self.shutdown_notify.notify_waiters();
-        }
+        self.shutdown.shutdown();
     }
 
     fn poll_once(&self) {
@@ -1671,53 +1631,23 @@ mod tests {
         assert!(matches!(source, Source::Local { .. }));
     }
 
-    /// `shutdown()` called before `poll_loop()` ever starts must
-    /// still cause the loop to exit on its first iteration. The
-    /// earlier `watch::Sender<()>`-based implementation lost this
-    /// signal because `send()` returns `Err` when there are no
-    /// receivers, and the initial receiver was dropped at
-    /// `let (tx, _) = watch::channel(())`. The `AtomicBool`-based
-    /// flag is edge-triggered and persists across the
-    /// before-/after-subscribe boundary.
+    /// `shutdown()` called before `poll_loop()` ever starts must still
+    /// cause the loop to exit on its first iteration. The full race
+    /// coverage (this scenario plus wake-while-parked) lives with the
+    /// shared handle in `ds-poll` (#481); this pins that the engine's
+    /// loop shape — `while ticker.tick().await` — honours a pre-fired
+    /// signal.
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_before_poll_loop_takes_effect() {
-        // Build the smallest possible OdimEngine-like setup. We
-        // don't need a real catalog or filesystem — just the
-        // shutdown coordination. Use a synthetic loop mirroring
-        // `poll_loop`'s structure exactly.
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let notify = Arc::new(Notify::new());
+        let shutdown = Shutdown::new();
+        shutdown.shutdown();
 
-        // Pre-fire the shutdown signal *before* the loop starts —
-        // simulating the race the reviewer flagged. The
-        // `notify_waiters` call here has no live waiters and is
-        // discarded, mirroring the worst-case timing: the loop
-        // must exit anyway via the AtomicBool flag check.
-        shutdown.store(true, Ordering::Release);
-        notify.notify_waiters();
-
-        let shutdown_loop = shutdown.clone();
-        let notify_loop = notify.clone();
-        let handle = tokio::spawn(async move {
-            // Long interval so the timer can't accidentally rescue
-            // us if the flag check is buggy — the test would have
-            // to hit the 1-second timeout below instead.
-            let mut interval = tokio::time::interval(Duration::from_secs(3600));
-            interval.tick().await;
-            loop {
-                if shutdown_loop.load(Ordering::Acquire) {
-                    return;
-                }
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    _ = notify_loop.notified() => {}
-                }
-            }
-        });
-
-        tokio::time::timeout(Duration::from_secs(1), handle)
+        // Hour-long period so a buggy flag check would have to hit the
+        // 1-second timeout below instead of being rescued by the timer.
+        let mut ticker = shutdown.ticker(Duration::from_secs(3600), FirstTick::Skip);
+        let ticked = tokio::time::timeout(Duration::from_secs(1), ticker.tick())
             .await
-            .expect("poll loop must exit on the first iteration when shutdown is pre-set")
-            .unwrap();
+            .expect("poll loop must exit on the first iteration when shutdown is pre-set");
+        assert!(!ticked);
     }
 }

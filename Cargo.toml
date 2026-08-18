@@ -15,6 +15,7 @@ members = [
     "crates/storage",
     "crates/render",
     "crates/ds-cache",
+    "crates/ds-poll",
     "crates/ds-mvt",
     "crates/ds-3dtiles",
     "crates/api-edr",

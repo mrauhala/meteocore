@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 ds-core = { path = "../core" }
+ds-poll = { path = "../ds-poll" }
 # Strike-window LRU for the events map layer (#504) — byte-bounded caches go
 # through ds-cache (#480).
 ds-cache = { path = "../ds-cache" }

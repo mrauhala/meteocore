@@ -26,9 +26,9 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
+use ds_poll::Shutdown;
 use regex::Regex;
 use std::sync::Arc;
-use tokio::sync::watch;
 
 use ds_core::config::GeoTiffConfig;
 use ds_core::edr_engine::EdrEngine;
@@ -177,8 +177,8 @@ pub struct GeoTiffEngine {
     override_nodata: Option<f64>,
     override_scale: Option<f64>,
     override_offset: Option<f64>,
-    /// Shutdown signal for the polling loop.
-    shutdown_tx: watch::Sender<()>,
+    /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
+    shutdown: Shutdown,
     /// Consecutive poll failures/empty results (for escalating warnings).
     consecutive_poll_failures: AtomicU32,
     /// Tracks STAC entries currently being loaded to prevent concurrent loads.
@@ -463,8 +463,6 @@ impl GeoTiffEngine {
 
         let band_index = (config.band.max(1) - 1) as usize; // 1-based config → 0-based index
 
-        let (shutdown_tx, _) = watch::channel(());
-
         let engine = GeoTiffEngine {
             collection_id: collection_id.to_string(),
             catalog: ArcSwap::from_pointee(Catalog::empty()),
@@ -495,7 +493,7 @@ impl GeoTiffEngine {
             override_nodata: config.nodata,
             override_scale: config.scale,
             override_offset: config.offset,
-            shutdown_tx,
+            shutdown: Shutdown::new(),
             consecutive_poll_failures: AtomicU32::new(0),
             loading_in_flight: InFlightLoads::new(),
             stac_consecutive_failures: AtomicU32::new(0),
@@ -934,7 +932,6 @@ impl GeoTiffEngine {
     /// (2×, 4×, 8×, up to 16× the base interval) to avoid hammering a
     /// failing remote. Resets to base interval on first success.
     pub async fn poll_loop(&self) {
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
         let base = self.poll_interval;
 
         loop {
@@ -944,21 +941,19 @@ impl GeoTiffEngine {
             } else {
                 (1u32 << failures.min(4)).min(16) // 2, 4, 8, 16 cap
             };
-            let sleep_duration = base * backoff_multiplier;
-
-            tokio::select! {
-                _ = tokio::time::sleep(sleep_duration) => self.poll_once(),
-                _ = shutdown_rx.changed() => {
-                    tracing::info!("[{}] Poll loop shutting down", self.collection_id);
-                    break;
-                }
+            // Per-iteration delay (backoff), so an interruptible sleep rather
+            // than the fixed-cadence ticker the other engines use.
+            if !self.shutdown.sleep(base * backoff_multiplier).await {
+                break;
             }
+            self.poll_once();
         }
+        tracing::info!("[{}] Poll loop shutting down", self.collection_id);
     }
 
     /// Signal the polling loop to stop.
     pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(());
+        self.shutdown.shutdown();
     }
 
     fn poll_once(&self) {

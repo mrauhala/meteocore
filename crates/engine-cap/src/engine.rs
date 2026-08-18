@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
-use tokio::sync::watch;
+use ds_poll::{FirstTick, Shutdown};
 
 use ds_core::config::CapConfig;
 use ds_core::datetime::parse_iso8601_duration;
@@ -34,12 +34,9 @@ pub struct CapEngine {
     build_cfg: BuildConfig,
     collection_id: String,
     poll_interval: Duration,
-    shutdown_tx: watch::Sender<()>,
-    /// The initial receiver, retained (never polled) so the channel always has a
-    /// recipient and `poll_loop` can `clone()` a receiver pinned at version 0 —
-    /// otherwise a `shutdown()` racing ahead of `poll_loop`'s subscribe (rapid
-    /// reload) would be lost and the loop would run forever.
-    shutdown_rx: watch::Receiver<()>,
+    /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481);
+    /// safe even when `shutdown()` races ahead of the loop's spawn.
+    shutdown: Shutdown,
     /// Set once the first `refresh()` succeeds — even with **zero** records. A
     /// healthy CAP source can legitimately have no active alerts, so "loaded"
     /// (not "non-empty") is the readiness signal; see [`Self::is_loaded`].
@@ -96,16 +93,13 @@ impl CapEngine {
             CAP_PARAMETER,
             Utc::now(),
         )));
-        let (shutdown_tx, shutdown_rx) = watch::channel(());
-
         let engine = CapEngine {
             catalog,
             source: Arc::new(source),
             build_cfg,
             collection_id: collection_id.to_string(),
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
-            shutdown_tx,
-            shutdown_rx,
+            shutdown: Shutdown::new(),
             loaded: AtomicBool::new(false),
         };
 
@@ -159,31 +153,18 @@ impl CapEngine {
 
     /// Run the poll loop on the background runtime. Exits on [`Self::shutdown`].
     pub async fn poll_loop(&self) {
-        // Clone the retained (unpolled, version-0) receiver — NOT a fresh
-        // `subscribe()`, which would start at the channel's current version and
-        // miss a `shutdown()` that already fired before this loop ran.
-        let mut shutdown_rx = self.shutdown_rx.clone();
-        let mut interval = tokio::time::interval(self.poll_interval);
-        interval.tick().await; // skip the immediate tick — new() already loaded
-
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    if let Err(e) = self.refresh() {
-                        tracing::warn!("[{}] cap: poll refresh failed: {e}", self.collection_id);
-                    }
-                }
-                _ = shutdown_rx.changed() => {
-                    tracing::info!("[{}] cap: poll loop shutting down", self.collection_id);
-                    break;
-                }
+        let mut ticker = self.shutdown.ticker(self.poll_interval, FirstTick::Skip);
+        while ticker.tick().await {
+            if let Err(e) = self.refresh() {
+                tracing::warn!("[{}] cap: poll refresh failed: {e}", self.collection_id);
             }
         }
+        tracing::info!("[{}] cap: poll loop shutting down", self.collection_id);
     }
 
     /// Signal the poll loop to stop.
     pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(());
+        self.shutdown.shutdown();
     }
 
     fn snapshot(&self) -> arc_swap::Guard<Arc<Catalog>> {

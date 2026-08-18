@@ -22,7 +22,7 @@ use ds_core::feature::Bbox;
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, NdArray, ParameterDescription, QueryResult,
 };
-use tokio::sync::watch;
+use ds_poll::Shutdown;
 use tokio_postgres::Row;
 
 use crate::config::PostgisEngineConfig;
@@ -56,13 +56,10 @@ pub struct PostgisEngine {
     health: Health,
     /// `<user>@<host>:<port>/<db>` (or `pool_label`) — the `/metrics` pool label.
     pool_key_label: String,
-    /// Stops the background metadata-refresh loop on reload.
-    shutdown_tx: watch::Sender<()>,
-    /// The version-0 receiver retained from `watch::channel`. `poll_loop` clones
-    /// this rather than calling `shutdown_tx.subscribe()` — a fresh `subscribe()`
-    /// starts at the channel's *current* version and would miss a `shutdown()`
-    /// that fired before the spawned loop began (a rapid-reload race).
-    shutdown_rx: watch::Receiver<()>,
+    /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481);
+    /// a `shutdown()` that fires before the spawned loop began (rapid-reload
+    /// race) is still observed.
+    shutdown: Shutdown,
 }
 
 impl std::fmt::Debug for PostgisEngine {
@@ -89,7 +86,6 @@ impl PostgisEngine {
                 .map(|(_, key, _)| key.to_string())
                 .unwrap_or_else(|_| "unknown".to_string())
         });
-        let (shutdown_tx, shutdown_rx) = watch::channel(());
         Self {
             collection_id,
             config,
@@ -97,8 +93,7 @@ impl PostgisEngine {
             cache: Arc::new(MetadataCache::new_empty()),
             health: Health::new(),
             pool_key_label,
-            shutdown_tx,
-            shutdown_rx,
+            shutdown: Shutdown::new(),
         }
     }
 
@@ -208,18 +203,23 @@ impl PostgisEngine {
     /// already refreshed), but the ping fires immediately so `/health` is
     /// accurate within ~2 s of boot.
     pub async fn poll_loop(&self) {
-        // Clone the retained version-0 receiver — NOT `subscribe()`, which would
-        // start at the channel's current version and miss a `shutdown()` that
-        // already fired before this loop ran (rapid-reload race).
-        let mut shutdown_rx = self.shutdown_rx.clone();
+        // Two cadences in one task, so this keeps its own `select!` over the
+        // shared [`Shutdown`] rather than using a single `PollTicker`.
         let mut refresh_iv = tokio::time::interval(Duration::from_secs(
             self.config.metadata_refresh_secs.max(1),
         ));
+        refresh_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         refresh_iv.tick().await; // boot already refreshed — skip the immediate tick
         let mut ping_iv = tokio::time::interval(PING_INTERVAL); // first tick fires now
+        ping_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
+                biased;
+                _ = self.shutdown.wait() => {
+                    tracing::info!(collection = %self.collection_id, "postgis: poll loop shutting down");
+                    break;
+                }
                 _ = ping_iv.tick() => {
                     // Log only on a transition (not every tick) so log-based
                     // alerting sees DB down/recovery without spam.
@@ -244,10 +244,6 @@ impl PostgisEngine {
                         );
                     }
                 }
-                _ = shutdown_rx.changed() => {
-                    tracing::info!(collection = %self.collection_id, "postgis: poll loop shutting down");
-                    break;
-                }
             }
         }
     }
@@ -255,7 +251,7 @@ impl PostgisEngine {
     /// Signal [`poll_loop`] to stop (called on reload before the engine is
     /// replaced).
     pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(());
+        self.shutdown.shutdown();
     }
 
     fn load_meta(&self) -> Arc<CollectionMeta> {

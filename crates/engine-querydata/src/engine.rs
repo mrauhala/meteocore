@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
-use tokio::sync::watch;
+use ds_poll::{FirstTick, Shutdown};
 
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
@@ -59,8 +59,8 @@ pub struct QueryDataEngine {
     poll_interval: Duration,
     /// How many recent runs to retain (>= 1).
     max_runs: usize,
-    /// Shutdown signal.
-    shutdown_tx: watch::Sender<()>,
+    /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
+    shutdown: Shutdown,
     /// Tracks when data was last successfully loaded/updated.
     data_updated_at: Mutex<Option<DateTime<Utc>>>,
 }
@@ -87,8 +87,6 @@ impl QueryDataEngine {
             )));
         }
 
-        let (shutdown_tx, _) = watch::channel(());
-
         Ok(Self {
             runs: ArcSwap::from_pointee(runset),
             data_dir: data_dir.to_path_buf(),
@@ -96,31 +94,23 @@ impl QueryDataEngine {
             collection_id: collection_id.to_string(),
             poll_interval: Duration::from_secs(poll_interval_secs.max(1)),
             max_runs,
-            shutdown_tx,
+            shutdown: Shutdown::new(),
             data_updated_at: Mutex::new(Some(Utc::now())),
         })
     }
 
     /// Run the directory poll loop. Exits when `shutdown()` is called.
     pub async fn poll_loop(&self) {
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        let mut interval = tokio::time::interval(self.poll_interval);
-        interval.tick().await; // skip immediate first tick
-
-        loop {
-            tokio::select! {
-                _ = interval.tick() => self.poll_once(),
-                _ = shutdown_rx.changed() => {
-                    tracing::info!("[{}] Poll loop shutting down", self.collection_id);
-                    break;
-                }
-            }
+        let mut ticker = self.shutdown.ticker(self.poll_interval, FirstTick::Skip);
+        while ticker.tick().await {
+            self.poll_once();
         }
+        tracing::info!("[{}] Poll loop shutting down", self.collection_id);
     }
 
     /// Signal the polling loop to stop.
     pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(());
+        self.shutdown.shutdown();
     }
 
     fn poll_once(&self) {

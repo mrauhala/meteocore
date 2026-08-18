@@ -49,7 +49,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -74,7 +73,7 @@ use ds_core::vertical::{VerticalDimension, VerticalKind};
 use ds_core::volume::{
     CellProduct, CellQuery, VolumeEngine, VolumeInfo, VolumePoint, VolumePointCloud, VoxelGrid,
 };
-use tokio::sync::Notify;
+use ds_poll::{FirstTick, Shutdown};
 
 use ds_storage::discovery::{expand_prefix_for_dates, expand_prefix_pattern, TimeWindow};
 
@@ -1650,8 +1649,8 @@ pub struct PolarVolumeEngine {
     /// pixel cache for a freshly-fetched **remote** volume (`OdimConfig.
     /// prewarm_sweeps`; `0` disables). See [`prewarm_pixels`].
     prewarm_sweeps: usize,
-    shutdown: AtomicBool,
-    shutdown_notify: Notify,
+    /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
+    shutdown: Shutdown,
 }
 
 impl PolarVolumeEngine {
@@ -1745,32 +1744,19 @@ impl PolarVolumeEngine {
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
             resampling: config.resampling,
             prewarm_sweeps: config.prewarm_sweeps,
-            shutdown: AtomicBool::new(false),
-            shutdown_notify: Notify::new(),
+            shutdown: Shutdown::new(),
         })
     }
 
     /// Re-scan the source and atomically swap the catalog. Exits
     /// when [`shutdown`](Self::shutdown) is called. Mirrors
-    /// `OdimEngine::poll_loop` — `AtomicBool` flag + `Notify` wake-up.
+    /// `OdimEngine::poll_loop` — the shared [`ds_poll::Shutdown`] ticker.
     pub async fn poll_loop(&self) {
-        let mut interval = tokio::time::interval(self.poll_interval);
-        interval.tick().await; // skip immediate first tick (scanned at boot)
-
-        loop {
-            if self.shutdown.load(Ordering::Acquire) {
-                tracing::info!("[{}] PVOL poll loop shutting down", self.collection_id);
-                break;
-            }
-            tokio::select! {
-                _ = interval.tick() => {
-                    if !self.shutdown.load(Ordering::Acquire) {
-                        self.poll_once().await;
-                    }
-                }
-                _ = self.shutdown_notify.notified() => {}
-            }
+        let mut ticker = self.shutdown.ticker(self.poll_interval, FirstTick::Skip);
+        while ticker.tick().await {
+            self.poll_once().await;
         }
+        tracing::info!("[{}] PVOL poll loop shutting down", self.collection_id);
     }
 
     /// Build an engine over a pre-constructed object store, bypassing
@@ -1815,17 +1801,14 @@ impl PolarVolumeEngine {
             poll_interval: Duration::from_secs(30),
             resampling: ResamplingMethod::default(),
             prewarm_sweeps: 1,
-            shutdown: AtomicBool::new(false),
-            shutdown_notify: Notify::new(),
+            shutdown: Shutdown::new(),
         })
     }
 
     /// Signal the poll loop to stop. Idempotent; safe to call before
     /// `poll_loop` starts.
     pub fn shutdown(&self) {
-        if !self.shutdown.swap(true, Ordering::Release) {
-            self.shutdown_notify.notify_waiters();
-        }
+        self.shutdown.shutdown();
     }
 
     /// Re-scan the source and atomically swap the catalog.
@@ -6864,8 +6847,7 @@ mod tests {
             poll_interval: Duration::from_secs(30),
             resampling: ResamplingMethod::default(),
             prewarm_sweeps: 1,
-            shutdown: AtomicBool::new(false),
-            shutdown_notify: Notify::new(),
+            shutdown: Shutdown::new(),
         }
     }
 
