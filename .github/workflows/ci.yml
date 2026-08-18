@@ -77,6 +77,43 @@ jobs:
         cargo clippy -p engine-zarr --features icechunk --all-targets -- -D warnings
         cargo test -p engine-zarr --features icechunk --test icechunk
 
+  # RustSec advisory gate (#584). Deliberately a separate job from `check`:
+  # it needs no compilation (it reads Cargo.lock), finishes in well under a
+  # minute, and — unlike `check` — it also runs on the weekly `schedule`.
+  # That schedule is the point of the gate: an advisory published against a
+  # dependency we already ship turns CI red without anyone touching the code,
+  # so the lockfile gets refreshed instead of quietly rotting.
+  audit:
+    name: Security Audit (RustSec)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Composite action (no Node runtime): fetches a prebuilt cargo-audit
+      # binary in seconds rather than `cargo install`-ing it from source.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # `cargo audit` inspects Cargo.lock, not Cargo.toml. A lockfile that
+      # disagrees with the manifests would make the gate below meaningless,
+      # so fail loudly instead: `--locked` errors out rather than rewriting.
+      - name: Verify Cargo.lock is in sync with the manifests
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      # Policy lives in `.cargo/audit.toml` — deliberately NOT in flags here —
+      # so a bare `cargo audit` run locally gives the identical verdict. It
+      # sets `deny = ["warnings"]`, which fails on vulnerabilities *and* on
+      # unmaintained/unsound/yanked crates, minus the ignores documented with
+      # reachability analysis in that file.
+      - name: cargo audit
+        run: cargo audit
+
   docker-check:
     name: Docker Build (PR)
     needs: check
@@ -107,11 +144,15 @@ jobs:
 
   docker:
     name: Docker
-    needs: check
-    # Only push Docker on main, tags, and scheduled runs — skip on PRs
+    needs: [check, audit]
+    # Only push Docker on main, tags, and scheduled runs — skip on PRs.
+    # `audit` is a hard gate on *publishing*: the weekly run exists to pick up
+    # base-image security patches, so it must not republish `:main` while the
+    # Rust dependency tree has a known advisory (#584).
     if: >-
       always() &&
       (needs.check.result == 'success' || github.event_name == 'schedule') &&
+      needs.audit.result == 'success' &&
       github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:

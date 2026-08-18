@@ -36,8 +36,13 @@ chrono = { version = "0.4", features = ["serde"] }
 http-body = "1"
 notify = "8"
 rust-embed = { version = "8", features = ["include-exclude"] }
-prometheus = "0.13"
-quick-xml = "0.37"
+# `default-features = false` drops the `protobuf` feature — we only ever emit
+# the Prometheus text exposition format (`TextEncoder` in admin.rs), and the
+# default feature drags in `protobuf 2.x`, which is stuck on RUSTSEC-2024-0437
+# (uncontrolled recursion; fixed only in protobuf 3.x, which prometheus 0.13
+# does not use).
+prometheus = { version = "0.13", default-features = false }
+quick-xml = "0.41"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

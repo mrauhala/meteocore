@@ -14,7 +14,7 @@
 //! wrong silently places alerts in the wrong hemisphere.
 
 use chrono::{DateTime, Utc};
-use quick_xml::events::Event;
+use quick_xml::events::{BytesRef, Event};
 use quick_xml::Reader;
 
 use ds_core::error::DataServerError;
@@ -85,8 +85,11 @@ pub struct CapCircle {
 /// as `Err`.
 pub fn parse_document(xml: &str) -> Result<Vec<CapAlert>, DataServerError> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-
+    // Deliberately NOT `trim_text(true)`: since quick-xml 0.38 an entity
+    // reference ends the surrounding text event, so trimming per event would
+    // eat the spaces around it and turn `Weather &amp; Flood` into
+    // `Weather&Flood`. Every leaf below is already trimmed once, whole, via
+    // `text.trim()` at the closing tag — which is where trimming belongs.
     let mut alerts: Vec<CapAlert> = Vec::new();
     let mut path: Vec<String> = Vec::new();
     let mut text = String::new();
@@ -117,10 +120,11 @@ pub fn parse_document(xml: &str) -> Result<Vec<CapAlert>, DataServerError> {
             }
             Ok(Event::Text(e)) => {
                 let chunk = e
-                    .unescape()
+                    .xml10_content()
                     .map_err(|err| DataServerError::Engine(format!("CAP XML text error: {err}")))?;
                 text.push_str(&chunk);
             }
+            Ok(Event::GeneralRef(r)) => push_general_ref(&mut text, &r),
             Ok(Event::CData(e)) => {
                 // CAP `<description>`/`<instruction>` are sometimes CDATA-wrapped.
                 text.push_str(&String::from_utf8_lossy(e.as_ref()));
@@ -234,6 +238,39 @@ pub fn parse_document(xml: &str) -> Result<Vec<CapAlert>, DataServerError> {
 /// `local_name()` removes the prefix; this only turns the bytes into a `String`).
 fn decode_name(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Append what a general entity reference stands for to the text buffer.
+///
+/// Up to quick-xml 0.37 the reader folded `&amp;` into the surrounding
+/// `Event::Text` and `BytesText::unescape()` resolved it. Since 0.38 a
+/// reference terminates the text event and arrives as its own
+/// `Event::GeneralRef`, so a loop that only handles `Event::Text` silently
+/// **drops** every `&`, `<` and `>` in a CAP headline or description — and
+/// silently, because the document is still well-formed.
+///
+/// Numeric character references (`&#38;`, `&#x26;`) resolve directly. Of the
+/// named ones, only the five XML predefined entities are meaningful without a
+/// DTD; anything else is passed through in its original `&name;` form, which
+/// is both closer to the source text and more debuggable than dropping it.
+pub(crate) fn push_general_ref(text: &mut String, r: &BytesRef) {
+    if let Ok(Some(c)) = r.resolve_char_ref() {
+        text.push(c);
+        return;
+    }
+    let Ok(name) = r.decode() else { return };
+    match name.as_ref() {
+        "amp" => text.push('&'),
+        "lt" => text.push('<'),
+        "gt" => text.push('>'),
+        "apos" => text.push('\''),
+        "quot" => text.push('"'),
+        other => {
+            text.push('&');
+            text.push_str(other);
+            text.push(';');
+        }
+    }
 }
 
 /// Apply `f` to the in-progress container if present.
@@ -403,6 +440,65 @@ mod tests {
         assert_eq!(ar.area_desc.as_deref(), Some("Test County"));
         assert_eq!(ar.polygons.len(), 1);
         assert_eq!(ar.geocodes, vec![("UGC".to_string(), "FIC001".to_string())]);
+    }
+
+    #[test]
+    fn entity_references_survive_with_surrounding_spacing() {
+        // Regression guard for the quick-xml 0.38+ reader split (#584): an
+        // entity reference terminates the text event and arrives as its own
+        // `Event::GeneralRef`. A loop that handles only `Event::Text` drops the
+        // `&` silently — the document stays well-formed, so nothing errors — and
+        // per-event `trim_text` additionally eats the spaces on either side.
+        let xml = r#"<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+  <identifier>URN:TEST:2</identifier>
+  <info>
+    <headline>Wind &amp; Flood warning</headline>
+    <description>Gusts &gt; 25 m/s, visibility &lt; 200 m &#8212; stay inside.</description>
+    <web>https://example.org/a?x=1&amp;y=2</web>
+    <area><areaDesc>K&#246;ping</areaDesc></area>
+  </info>
+</alert>"#;
+        let alerts = parse_document(xml).unwrap();
+        let i = &alerts[0].infos[0];
+        assert_eq!(i.headline.as_deref(), Some("Wind & Flood warning"));
+        assert_eq!(
+            i.description.as_deref(),
+            Some("Gusts > 25 m/s, visibility < 200 m — stay inside.")
+        );
+        assert_eq!(i.web.as_deref(), Some("https://example.org/a?x=1&y=2"));
+        assert_eq!(i.areas[0].area_desc.as_deref(), Some("Köping"));
+    }
+
+    #[test]
+    fn leaf_text_is_still_trimmed_without_reader_side_trim_text() {
+        // Dropping `trim_text(true)` is only safe because every leaf is trimmed
+        // whole at its closing tag. Pin that: pretty-printed CAP puts newlines
+        // and indentation inside multi-line elements.
+        let xml = r#"<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+  <identifier>
+      URN:TEST:3
+  </identifier>
+  <info>
+    <headline>
+      Spaced out
+    </headline>
+  </info>
+</alert>"#;
+        let alerts = parse_document(xml).unwrap();
+        assert_eq!(alerts[0].identifier, "URN:TEST:3");
+        assert_eq!(alerts[0].infos[0].headline.as_deref(), Some("Spaced out"));
+    }
+
+    #[test]
+    fn unknown_entity_is_passed_through_not_dropped() {
+        // Without a DTD an unrecognised general entity has no expansion. Keeping
+        // the original `&name;` beats silently deleting a chunk of the headline.
+        let xml = r#"<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+  <identifier>URN:TEST:4</identifier>
+  <info><headline>a &nbsp; b</headline></info>
+</alert>"#;
+        let alerts = parse_document(xml).unwrap();
+        assert_eq!(alerts[0].infos[0].headline.as_deref(), Some("a &nbsp; b"));
     }
 
     #[test]

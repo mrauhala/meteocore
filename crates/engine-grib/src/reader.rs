@@ -33,7 +33,7 @@ pub fn read_message(
                     entry.param
                 ))
             })?;
-            let file_size = meta.size as u64;
+            let file_size = meta.size;
             if file_size <= entry.offset {
                 return Err(DataServerError::Storage(format!(
                     "File {path} size {file_size} <= tail offset {}; \

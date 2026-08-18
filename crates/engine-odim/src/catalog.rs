@@ -278,7 +278,7 @@ pub fn scan_remote(
             }
         };
         for obj in listed {
-            if obj.size as u64 > MAX_REMOTE_FILE_SIZE {
+            if obj.size > MAX_REMOTE_FILE_SIZE {
                 warn!(
                     "[catalog] skipping oversized remote object `{}` ({} bytes)",
                     obj.location, obj.size

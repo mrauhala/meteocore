@@ -16,7 +16,7 @@
 //! parse instead. Nothing here unwraps on document content.
 
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 
 use ds_render::{parse_hex_color, ColorStop, Interpolation, Palette};
 
@@ -192,8 +192,13 @@ fn attribute(e: &BytesStart, want: &[u8]) -> Result<Option<String>, String> {
         }
         if local.as_ref() == want {
             let name = String::from_utf8_lossy(want);
+            // `normalized_value` replaces the deprecated `unescape_value` and
+            // additionally applies XML attribute-value normalization (§3.3.3:
+            // tabs/newlines collapse to spaces). `Implicit1_0` — we never read
+            // the XML declaration here, and 1.0 is the assumed default; only
+            // 1.1 normalizes differently.
             let value = attr
-                .unescape_value()
+                .normalized_value(XmlVersion::Implicit1_0)
                 .map_err(|err| format!("attribute '{name}' has an unusable value: {err}"))?;
             return Ok(Some(value.into_owned()));
         }
