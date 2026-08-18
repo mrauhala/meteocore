@@ -29,13 +29,13 @@ members = [
 exclude = ["fuzz"]
 
 # Per-crate `version` + `edition` are declared inline in each member's
-# `[package]` block on purpose. We tried hoisting them to
-# `[workspace.package]` (Rust's canonical inheritance shape) but
-# `release-please-action`'s Rust updater can't parse
-# `package.version.workspace = true` — it expects a literal string and
-# fails the release-PR with `value at path package.version is not tagged`.
-# Until that's fixed upstream, leaving versions inline lets release-please
-# walk the workspace members and bump each one to the same value.
+# `[package]` block on purpose: the release pipeline (#220,
+# .github/workflows/release.yml) reads and rewrites the LITERAL
+# `version = "x.y.z"` line in crates/server/Cargo.toml with sed — no Rust
+# toolchain runs in that job, so `package.version.workspace = true`
+# inheritance would break both the version grep in the cut step and the
+# bump in the release-PR step. Only crates/server's version is released;
+# the other members stay wherever they are.
 
 # Dev/test build-speed tuning. The dominant cost of `cargo test` here is not
 # test execution (every binary finishes in <0.5s) but linking — writing and
