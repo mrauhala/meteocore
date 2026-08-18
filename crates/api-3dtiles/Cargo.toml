@@ -22,4 +22,4 @@ tracing = "0.1"
 tower = "0.5"
 http-body-util = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-toml = "0.8"
+toml = "1.1"

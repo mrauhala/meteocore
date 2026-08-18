@@ -9,7 +9,7 @@ edition = "2021"
 icechunk = ["engine-zarr/icechunk"]
 
 [dependencies]
-toml = "0.8"
+toml = "1.1"
 ds-core = { path = "../core" }
 engine-csv = { path = "../engine-csv" }
 engine-geojson = { path = "../engine-geojson" }
@@ -55,7 +55,7 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 http-body-util = "0.1"
 tempfile = "3"
-toml = "0.8"
+toml = "1.1"
 tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
