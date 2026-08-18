@@ -117,6 +117,34 @@ cargo +nightly fuzz run fuzz_tiff_metadata -- -max_total_time=60  # Fuzz TIFF pa
 cargo +nightly fuzz run fuzz_geo_transform -- -max_total_time=60  # Fuzz CRS transforms
 ```
 
+### Dependency security (RustSec)
+
+`cargo audit` is a **CI gate** — the `audit` job in `.github/workflows/ci.yml`
+(#584). It runs on PRs, on `main`, and on the weekly `schedule`, so an
+advisory published against a crate we already ship turns CI red with no code
+change; on `main` it also blocks the Docker publish.
+
+The policy lives in `.cargo/audit.toml` rather than in workflow flags, so a
+local run gives the identical verdict:
+
+```bash
+cargo install cargo-audit --locked   # one-time
+cargo audit                          # exactly what CI enforces
+```
+
+- `deny = ["warnings"]` — unmaintained / unsound / yanked crates fail the
+  gate too, not just vulnerabilities. Letting those accumulate is how #584
+  reached 11 vulnerabilities before anyone looked.
+- Fix by bumping: `cargo update` for transitive crates, a manifest bump for
+  direct ones. Most of #584 was `cargo update` alone.
+- Adding an `ignore` entry is the last resort. Each one needs the reachability
+  analysis *and* a tracking issue written in the comment above it (#594).
+- CI additionally runs `cargo metadata --locked` — a Cargo.lock that disagrees
+  with the manifests would make the audit meaningless, since it reads the lock.
+- Dependabot (`.github/dependabot.yml`) proposes weekly bumps for direct
+  crates and for GitHub Actions; purely transitive crates are refreshed by
+  `cargo update`, prompted by the scheduled audit run.
+
 ## Project Tracking
 
 Backlog is in GitHub Issues: https://github.com/mrauhala/meteocore/issues

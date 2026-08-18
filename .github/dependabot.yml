@@ -1,0 +1,59 @@
+# Dependency freshness (#584). Pairs with the `audit` job in ci.yml:
+# cargo-audit is the gate that fails when the tree is vulnerable, Dependabot
+# is the mechanism that keeps it from getting there.
+#
+# Division of labour — worth knowing before wondering why a bump did not
+# appear: Dependabot's *version* updates only touch dependencies declared in
+# a manifest (our `crates/*/Cargo.toml` entries) and the GitHub Actions in
+# `.github/workflows/`. Purely transitive crates — which is where nearly all
+# of #584's advisories lived — are refreshed by `cargo update`, prompted by
+# the weekly scheduled `audit` run going red. Repo-level "Dependabot security
+# updates" additionally opens PRs for transitive crates that have a fix.
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Europe/Helsinki
+    # Small cap on purpose: a 570-crate lockfile can produce a wall of PRs,
+    # and a wall of PRs gets ignored — which is the failure mode this config
+    # is meant to prevent.
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+    commit-message:
+      # Conventional-commit prefixes: the release pipeline (#220) feeds
+      # git-cliff, which buckets by type. `chore` keeps dep bumps out of the
+      # user-facing Features/Fixes sections of the changelog.
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps-dev)"
+    groups:
+      # One PR for the routine churn, separate PRs for majors — a major bump
+      # usually needs code changes and deserves its own review.
+      cargo-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Europe/Helsinki
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

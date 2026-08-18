@@ -213,7 +213,7 @@ impl ListableStorageTraits for DsStore {
             .store
             .list(&self.object_path(prefix.as_str()))
             .map_err(io_err)?;
-        Ok(metas.iter().map(|m| m.size as u64).sum())
+        Ok(metas.iter().map(|m| m.size).sum())
     }
 }
 

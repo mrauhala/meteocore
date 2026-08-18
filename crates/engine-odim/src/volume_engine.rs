@@ -1044,7 +1044,7 @@ fn enumerate_remote(
                     continue;
                 }
             }
-            if obj.size as u64 > MAX_REMOTE_FILE_SIZE {
+            if obj.size > MAX_REMOTE_FILE_SIZE {
                 tracing::warn!(
                     "[{collection_id}] skipping oversized PVOL object `{key}` ({} bytes)",
                     obj.size

@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use quick_xml::events::Event;
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 use url::Url;
 
 use ds_core::error::DataServerError;
@@ -314,8 +314,9 @@ fn is_allowed_entry(u: &Url, feed_origin: &str, allowlist: &[String]) -> bool {
 /// relative) — the caller resolves them against the feed base.
 pub fn extract_feed_links(xml: &str) -> Vec<String> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-
+    // No `trim_text(true)` — see `parser::parse_document` for why per-event
+    // trimming is wrong once entity references split a text node. Each leaf is
+    // trimmed whole below.
     let mut links: Vec<String> = Vec::new();
     let mut in_entry = false;
     // Per-entry candidate state.
@@ -332,8 +333,11 @@ pub fn extract_feed_links(xml: &str) -> Vec<String> {
         let mut rel: Option<String> = None;
         for attr in e.attributes().flatten() {
             let key = String::from_utf8_lossy(attr.key.local_name().as_ref()).into_owned();
+            // Replaces the deprecated `unescape_value`; also applies XML
+            // attribute-value normalization. `Implicit1_0` — the declaration is
+            // not inspected and 1.0 is the assumed default (see `parser`).
             let val = attr
-                .unescape_value()
+                .normalized_value(XmlVersion::Implicit1_0)
                 .map(|v| v.into_owned())
                 .unwrap_or_default();
             match key.as_str() {
@@ -375,10 +379,13 @@ pub fn extract_feed_links(xml: &str) -> Vec<String> {
                 }
             }
             Ok(Event::Text(e)) => {
-                if let Ok(t) = e.unescape() {
+                if let Ok(t) = e.xml10_content() {
                     text.push_str(&t);
                 }
             }
+            // A `<link>https://host/a&amp;b</link>` arrives as three events
+            // since quick-xml 0.38; without this the URL loses its `&`.
+            Ok(Event::GeneralRef(r)) => crate::parser::push_general_ref(&mut text, &r),
             Ok(Event::End(e)) => {
                 let name = local(e.local_name().as_ref());
                 if in_entry {
@@ -431,6 +438,21 @@ mod tests {
         assert_eq!(
             links,
             vec!["https://example.org/alerts/1.cap.xml".to_string()]
+        );
+    }
+
+    #[test]
+    fn rss_link_text_keeps_escaped_ampersands() {
+        // Same quick-xml 0.38+ split as in `parser` (#584). A feed whose item
+        // link carries a query string is the common case, and losing the `&`
+        // turns a working CAP URL into a 404 — the failure would surface far
+        // downstream as "feed yields no alerts".
+        let rss = r#"<rss version="2.0"><channel>
+          <item><link>https://example.org/cap?id=9&amp;fmt=xml</link></item>
+        </channel></rss>"#;
+        assert_eq!(
+            extract_feed_links(rss),
+            vec!["https://example.org/cap?id=9&fmt=xml".to_string()]
         );
     }
 

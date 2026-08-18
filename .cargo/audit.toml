@@ -1,0 +1,51 @@
+# cargo-audit configuration (RustSec advisory gate, #584).
+#
+# CI runs a bare `cargo audit` from the repo root, so this file IS the gate:
+# whatever a developer sees locally is exactly what CI enforces. Keep the
+# policy here, not in the workflow.
+
+[output]
+# Fail on *everything* the advisory DB reports — vulnerabilities plus the
+# informational classes (unmaintained / unsound / yanked). A plain
+# `cargo audit` only errors on vulnerabilities and lets unmaintained and
+# unsound crates accumulate silently; that is how #584 built up to 11
+# vulnerabilities and 7 warnings before anyone looked.
+#
+# The escape hatch is the documented `ignore` list below, not a weaker gate.
+#
+# This also covers *yanked* crates, which needs the crates.io index and so is
+# the one class that can turn CI red without any advisory being published. That
+# is the intended behaviour: a yank is upstream saying "do not use this
+# version", and `cargo update` is usually the whole fix.
+deny = ["warnings"]
+
+# Print the dependency path to each affected crate. When the gate trips on a
+# transitive dep, the first question is always "who pulls this in?".
+show_tree = true
+
+# `[output]` has no serde defaults — every field must be spelled out or
+# cargo-audit rejects the file with `missing field ...`.
+format = "terminal"
+quiet = false
+
+[advisories]
+# Accepted risks. EVERY entry needs: what it is, why it is not actionable
+# here, and the follow-up that removes it. Anything that can be fixed by
+# bumping a version is fixed, not ignored.
+ignore = [
+    # RUSTSEC-2024-0436 — `paste` is unmaintained (no vulnerability).
+    # Pulled in only as a proc-macro by `tikv-jemalloc-ctl` and the `zarrs`
+    # family. It expands to token pasting at compile time and is absent from
+    # the runtime binary, so there is no attack surface. Not fixable from
+    # here — both upstreams have to migrate. Tracked in #594.
+    "RUSTSEC-2024-0436",
+
+    # RUSTSEC-2026-0253 — `lru` <= 0.16.4: `LruCache::pop()` is not panic
+    # safe, so a payload whose `Drop`/`Hash`/`Eq` impl panics can leave a
+    # dangling entry. Reached only through `hdf5-reader` and `zarrs`, whose
+    # cache payloads are plain byte buffers and POD structs with no
+    # user-supplied `Drop`, `Hash` or `Eq` — none of them can panic in the
+    # window the advisory describes. No patched release exists yet.
+    # Tracked in #594.
+    "RUSTSEC-2026-0253",
+]

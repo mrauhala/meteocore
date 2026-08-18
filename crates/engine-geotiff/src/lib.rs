@@ -717,11 +717,11 @@ impl GeoTiffEngine {
             file_size
         };
 
-        if actual_size > catalog::MAX_REMOTE_FILE_SIZE as u64 {
+        if actual_size > catalog::MAX_REMOTE_FILE_SIZE {
             return Err(DataServerError::Engine(format!(
                 "File too large ({} > {} max)",
                 format_bytes(actual_size),
-                format_bytes(catalog::MAX_REMOTE_FILE_SIZE as u64)
+                format_bytes(catalog::MAX_REMOTE_FILE_SIZE)
             )));
         }
 

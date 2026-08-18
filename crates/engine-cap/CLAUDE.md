@@ -31,8 +31,9 @@ as a property.
   prefix; others are dropped with a WARN. Stops a compromised feed pivoting
   the server to `http://169.254.169.254/…` or internal hosts.
 - Known limitation: the allowlist constrains request URLs, not redirect
-  responses (object_store's reqwest client follows redirects; no disable
-  knob in object_store 0.11). A proper fix belongs in ds-storage (#431).
+  responses (object_store's reqwest client follows redirects; still no
+  disable knob as of object_store 0.14). A proper fix belongs in
+  ds-storage (#431).
 - Config (`CapConfig` in ds-core) validated at load: `data_path` XOR
   `feed_url`, `feed_url` http(s), non-empty `language`,
   `poll_interval_secs > 0`, positive ISO 8601 `default_ttl`,

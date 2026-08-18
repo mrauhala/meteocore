@@ -8,7 +8,7 @@ ds-core = { path = "../core" }
 ds-poll = { path = "../ds-poll" }
 ds-storage = { path = "../storage" }
 ds-render = { path = "../render" }
-quick-xml = "0.37"
+quick-xml = "0.41"
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 arc-swap = "1"

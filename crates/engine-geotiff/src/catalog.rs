@@ -528,7 +528,9 @@ fn is_excluded(filename: &str, patterns: &[String]) -> bool {
 }
 
 /// Maximum file size for remote downloads (50 MB).
-pub(crate) const MAX_REMOTE_FILE_SIZE: usize = 50 * 1024 * 1024;
+/// `u64` to match `ObjectMeta::size`, which object_store widened from `usize`
+/// in 0.14 so 32-bit targets can still describe large objects.
+pub(crate) const MAX_REMOTE_FILE_SIZE: u64 = 50 * 1024 * 1024;
 
 /// Scan a remote object store for GeoTIFF files matching a filename pattern.
 ///
@@ -563,7 +565,7 @@ pub fn scan_remote_with_limit(
                 }
                 let key = obj.location.to_string();
                 let filename = key.rsplit('/').next().unwrap_or(&key).to_string();
-                Some((key, filename, obj.size as u64, obj.location.clone()))
+                Some((key, filename, obj.size, obj.location.clone()))
             })
             .collect();
 

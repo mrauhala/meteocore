@@ -335,7 +335,7 @@ fn discover_template_at(
     {
         match result {
             Ok(Some(meta)) => {
-                if meta.size as u64 > crate::catalog::MAX_REMOTE_FILE_SIZE {
+                if meta.size > crate::catalog::MAX_REMOTE_FILE_SIZE {
                     tracing::warn!(
                         "[odim-template] skipping oversized object `{key}` ({} bytes)",
                         meta.size
@@ -388,7 +388,7 @@ fn fetch_bytes(location: &Location) -> Result<Vec<u8>, DataServerError> {
         Location::Remote { store, key } => {
             let object = ds_storage::object_store::path::Path::from(key.as_str());
             let meta = store.head(&object)?;
-            if meta.size as u64 > crate::catalog::MAX_REMOTE_FILE_SIZE {
+            if meta.size > crate::catalog::MAX_REMOTE_FILE_SIZE {
                 return Err(DataServerError::Engine(format!(
                     "ODIM object `{key}` is {} bytes — exceeds the {}-byte limit",
                     meta.size,

@@ -13,11 +13,25 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ds_core::error::DataServerError;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectMeta, ObjectStore};
+// `get` / `head` / `get_range` are convenience wrappers over `get_opts`, and
+// object_store 0.14 moved them out of the `ObjectStore` trait itself into this
+// extension trait (keeping `dyn ObjectStore` object-safe with fewer methods).
+// They must be in scope even though we only ever hold an `Arc<dyn ObjectStore>`.
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 
 pub use bytes;
 pub use error::StorageError;
 pub use object_store;
+
+/// Widen a byte range for `object_store`, which switched `get_range` from
+/// `Range<usize>` to `Range<u64>` in 0.12 so 32-bit targets can still address
+/// large objects. `DataStore`'s own signatures stay `Range<usize>` — every
+/// caller computes offsets in `usize` from in-memory structures (COG tile
+/// offsets, GRIB message extents), and the widening is lossless on every
+/// platform this server builds for.
+fn to_u64(range: Range<usize>) -> Range<u64> {
+    range.start as u64..range.end as u64
+}
 
 /// Synchronous wrapper around an `ObjectStore`.
 ///
@@ -58,7 +72,8 @@ impl DataStore {
         path: &ObjectPath,
         range: Range<usize>,
     ) -> Result<Bytes, DataServerError> {
-        let result = self.block_on(async { Ok(self.inner.get_range(path, range).await?) })?;
+        let result =
+            self.block_on(async { Ok(self.inner.get_range(path, to_u64(range)).await?) })?;
         self.bytes_read
             .fetch_add(result.len() as u64, Ordering::Relaxed);
         Ok(result)
@@ -79,7 +94,7 @@ impl DataStore {
         handle: &tokio::runtime::Handle,
     ) -> Result<Bytes, DataServerError> {
         let result = self.block_on_with(Some(handle), async {
-            self.inner.get_range(path, range).await
+            self.inner.get_range(path, to_u64(range)).await
         })?;
         self.bytes_read
             .fetch_add(result.len() as u64, Ordering::Relaxed);
@@ -202,7 +217,7 @@ impl DataStore {
                                     .head(p)
                                     .await
                                     .map_err(|e| DataServerError::from(StorageError::from(e)))?;
-                                if meta.size as u64 > cap {
+                                if meta.size > cap {
                                     return Err(DataServerError::Storage(format!(
                                         "object `{p}` is {} bytes — exceeds the {cap}-byte limit",
                                         meta.size

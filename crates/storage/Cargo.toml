@@ -5,7 +5,12 @@ edition = "2021"
 
 [dependencies]
 ds-core = { path = "../core" }
-object_store = { version = "0.11", features = ["aws", "http"] }
+# 0.14.1 is the first release built on `quick-xml >= 0.41`, which is what
+# RUSTSEC-2026-0194/0195 require (#584) — object_store is the only thing that
+# was still pulling the vulnerable 0.37 line. It is also the version
+# `icechunk` already links under the `engine-zarr/icechunk` feature, so this
+# collapses what used to be two copies of object_store in the tree into one.
+object_store = { version = "0.14.1", features = ["aws", "http"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 chrono = "0.4"
 bytes = "1"
