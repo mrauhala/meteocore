@@ -13,13 +13,21 @@ concurrency:
 
 jobs:
   claude-review:
-    # Skip machine-generated release PRs (branch `release-pr/main`,
-    # authored by github-actions[bot] — see release.yml): a version bump +
-    # changelog has nothing to review, and claude-code-action hard-fails
-    # on non-human actors anyway ("Workflow initiated by non-human
-    # actor"), which showed as a misleading red X on every release PR.
-    # A skipped job reports neutral instead.
-    if: github.event.pull_request.head.ref != 'release-pr/main'
+    # Skip machine-generated PRs, which report a misleading red X rather
+    # than anything actionable. A skipped job reports neutral instead.
+    #
+    # - Release PRs (branch `release-pr/main`, authored by
+    #   github-actions[bot] — see release.yml): a version bump + changelog
+    #   has nothing to review, and claude-code-action hard-fails on
+    #   non-human actors anyway ("Workflow initiated by non-human actor").
+    # - Dependabot PRs (#584): GitHub withholds repository secrets from the
+    #   `dependabot` actor — they live in a separate secrets scope — so
+    #   `secrets.CLAUDE_CODE_OAUTH_TOKEN` arrives EMPTY and the action dies
+    #   on startup. Nothing in the workflow can fix that from this side, and
+    #   a dependency bump is reviewed by the CI + audit gates regardless.
+    if: >-
+      github.event.pull_request.head.ref != 'release-pr/main' &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: read
