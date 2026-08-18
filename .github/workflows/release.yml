@@ -1,31 +1,47 @@
-# Release pipeline driven by release-please (https://github.com/googleapis/release-please).
+# Release pipeline driven by git-cliff (https://git-cliff.org) + deterministic
+# shell — see cliff.toml for the changelog/bump configuration and #220 for the
+# migration rationale.
 #
 # Use Conventional Commit subject lines on PR merges into main:
-#   feat: new …
-#   fix: stop crashing on …
-#   chore: bump dependencies
-#   feat!: breaking …            # or include `BREAKING CHANGE:` in the body
+#   feat: new …                  → minor bump, "Features" section
+#   fix: stop crashing on …      → patch bump, "Bug Fixes"
+#   perf: / revert: / deps:      → patch bump, their sections
+#   feat!: breaking …            → minor while pre-1.0 (bump-minor-pre-major)
+#   refactor:/docs:/chore:/test:/build:/ci:/style: → never trigger a release
 #
-# release-please watches commits to main and opens a PR titled
-# "chore: release main" with the bumped version + CHANGELOG. Merging
-# that PR bumps `.release-please-manifest.json` on main; the
-# "Cut release from manifest" step below then creates the git tag and
-# GitHub Release, which gates the build + publish jobs.
+# Two halves in one `release` job:
+#   1. "Cut release from Cargo.toml": if crates/server/Cargo.toml names a
+#      version with no v<version> tag, tag the commit that introduced that
+#      version (a release-PR squash-merge — enforced by a subject-line
+#      guard) and publish the matching CHANGELOG section as the GitHub
+#      release. Idempotent (tag exists → no-op) and self-healing (any later
+#      push to main cures a missed cut). This is the #489 design that ended
+#      the v0.4.0–v0.7.0 missed-tag streak, ported verbatim except that the
+#      version source moved from .release-please-manifest.json into
+#      Cargo.toml itself.
+#   2. "Propose release PR": git-cliff computes the bumped version and
+#      renders the unreleased changelog section from ALL Conventional
+#      Commits since the last tag — whatever paths they touch. If anything
+#      is releasable, the job regenerates branch `release-pr/main` (version
+#      bump in Cargo.toml + Cargo.lock, CHANGELOG section prepended) and
+#      opens/updates a PR titled "chore: release X.Y.Z". Merging that PR is
+#      what half 1 reacts to on the next push. Nothing releasable → no PR.
 #
-# Division of labour (deliberate, see #220): release-please ONLY
-# manages the release PR (`skip-github-release: true`). It is NOT
-# trusted to cut the tag/release. Its release pass re-parses the
-# merged PR and requires the PR head branch's component to match the
-# configured `component` ("PR component: undefined does not match
-# configured component" in strategies/base.ts). A grouped manifest PR
-# lives on `release-please--branches--main` — no component in the
-# branch name — so with `component: meteocore` configured that match
-# can never succeed, and the tag was silently skipped on EVERY release
-# since the cargo-workspace merge plugin landed in #168: v0.4.0,
-# v0.5.0, v0.6.0 and v0.7.0 all had to be cut by hand. The PR half has
-# never failed, so it stays; the tagging half is deterministic shell
-# on repo state alone (manifest version + CHANGELOG), which is also
-# self-healing: any push to main cures a previously missed release.
+# Why not release-please (#220, evaluated 2026-08-18): it attributed commits
+# strictly by paths under crates/server/, so a fix confined to another
+# crate, the Dockerfile or CI never appeared in the notes — and could not
+# even trigger the release that would ship it (the #582 hotfix class); its
+# parser also silently dropped commits whose BODY it could not tokenize
+# (nested parens — 28 entries hand-restored for v0.8.0). release-plz was
+# evaluated and rejected: per-crate cargo-publish model, root-level files
+# structurally invisible, spurious perpetual bumps with this workspace's
+# de-synchronised member versions. git-cliff parses only the subject line
+# and attributes repo-wide.
+#
+# Hand-edits to the release PR (polishing notes) survive only until the
+# next push to main regenerates the branch — merge promptly. PRs opened
+# with GITHUB_TOKEN do not trigger `pull_request` workflows (same
+# limitation the release-please PRs had).
 #
 # Single workflow on purpose: a tag pushed by GITHUB_TOKEN does NOT
 # trigger other workflows, so a separate `on: push tags` workflow would
@@ -36,7 +52,7 @@
 # (re-)build artifacts for an existing tag — useful when the release
 # went through but build jobs were skipped due to a workflow bug. The
 # resolve-target job picks the tag from the dispatch input or from
-# release-please's output as appropriate.
+# the release job's output as appropriate.
 #
 # Security:
 #   - No workflow-level `permissions:` — each job grants itself the
@@ -55,7 +71,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to (re-)build artifacts for (e.g. v0.2.0). Skips release-please.'
+        description: 'Existing tag to (re-)build artifacts for (e.g. v0.2.0). Skips the release job.'
         required: true
         type: string
 
@@ -65,20 +81,19 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  release-please:
+  release:
     # Skip on workflow_dispatch — that path explicitly targets an
-    # existing tag and bypasses release-please.
+    # existing tag and bypasses the release halves.
     if: github.event_name == 'push'
-    # Serialise release-please across overlapping pushes. Two runs racing
-    # on the shared `release-please--branches--main` branch and the
-    # `autorelease:*` labels is a known way to leave release-please
-    # half-done. `cancel-in-progress: false` queues instead of cancelling
-    # so a release in flight is never interrupted. Scoped to this job
-    # only — the build/publish jobs operate on an immutable tag, share no
-    # mutable state, and must not be made to queue behind a release run
-    # (a workflow_dispatch artifact rebuild especially).
+    # Serialise across overlapping pushes. Two runs racing on the shared
+    # `release-pr/main` branch and the tag-cut check is a known way to
+    # end up half-done. `cancel-in-progress: false` queues instead of
+    # cancelling so a release in flight is never interrupted. Scoped to
+    # this job only — the build/publish jobs operate on an immutable
+    # tag, share no mutable state, and must not be made to queue behind
+    # a release run (a workflow_dispatch artifact rebuild especially).
     concurrency:
-      group: release-please
+      group: release
       cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
@@ -88,82 +103,95 @@ jobs:
       releases_created: ${{ steps.cut.outputs.created }}
       tag_name: ${{ steps.cut.outputs.tag }}
     steps:
-      # PR management only — `skip-github-release` keeps release-please
-      # away from tags/releases so it can never race (or silently skip)
-      # the deterministic cut step below. See the header comment for why.
-      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7  # v5
-        id: release
-        with:
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
-          skip-github-release: true
-
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          # Full history + tags: git-cliff walks commits since the last
+          # v-tag, and the cut step resolves version-introducing commits
+          # and ancestor Cargo.toml contents locally.
+          fetch-depth: 0
+
+      # Direct pinned-checksum download, deliberately not an action:
+      # every third-party action in a `contents: write` job is a
+      # credential-exfil vector (see the header Security note).
+      - name: Install git-cliff
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "${RUNNER_TEMP}/git-cliff.tar.gz" \
+            https://github.com/orhun/git-cliff/releases/download/v2.13.1/git-cliff-2.13.1-x86_64-unknown-linux-gnu.tar.gz
+          # Pinned to the checksum git-cliff itself publishes as the
+          # `…x86_64-unknown-linux-gnu.tar.gz.sha512` release asset —
+          # auditable by diffing against the upstream release page.
+          echo "e716cce3a07dda41b1e370d6afbd7a59eb3d4739509fb7856aeec8da2be28c0396584e29e106141c1a1c535c1827dbc1f60417524f5cfb1da9e11f700bd00f30  ${RUNNER_TEMP}/git-cliff.tar.gz" | sha512sum -c -
+          tar -xzf "${RUNNER_TEMP}/git-cliff.tar.gz" -C "${RUNNER_TEMP}"
+          sudo install "${RUNNER_TEMP}/git-cliff-2.13.1/git-cliff" /usr/local/bin/git-cliff
+          git-cliff --version
 
       # Deterministic tag + GitHub release from committed repo state
-      # alone: if `.release-please-manifest.json`'s version has no
-      # v<version> tag yet, tag the commit that last changed the
-      # manifest (the squash-merge of the release PR) and publish the
-      # matching CHANGELOG section as the release notes. No PR-body
-      # parsing, no component matching, no label state machine.
+      # alone: if crates/server/Cargo.toml's version has no v<version>
+      # tag yet, tag the commit that introduced that version (the
+      # squash-merge of the release PR) and publish the matching
+      # CHANGELOG section as the release notes. No PR-body parsing, no
+      # label state machine.
       #
       # Idempotent: tag already exists → clean no-op (every ordinary
       # push to main takes this path). Self-healing: if a release-merge
       # run ever fails before tagging, the next push to main cuts the
-      # same release — the manifest still names an untagged version and
-      # the tag target is looked up from the manifest's history, not
-      # taken from HEAD. This step replaces the old "guard" that only
-      # alarmed on a missed release (#216); a real failure here (API
-      # error, races) fails the job loudly instead.
-      - name: Cut release from manifest
+      # same release — the version still has no tag and the tag target
+      # is looked up from history, not taken from HEAD. A real failure
+      # here (API error, races) fails the job loudly.
+      - name: Cut release from Cargo.toml
         id: cut
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          version=$(jq -r '."crates/server"' .release-please-manifest.json)
-          if [ -z "$version" ] || [ "$version" = "null" ]; then
-            echo "::error::No crates/server version in .release-please-manifest.json"
+          # Same single-version-line invariant the "Propose release PR"
+          # step guards before editing — fail loudly on drift rather
+          # than silently reading the wrong line into a tag name.
+          if [ "$(grep -c '^version = "' crates/server/Cargo.toml)" != "1" ]; then
+            echo "::error::Expected exactly one version line in crates/server/Cargo.toml"
+            exit 1
+          fi
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/server/Cargo.toml)
+          if [ -z "$version" ]; then
+            echo "::error::No literal version line in crates/server/Cargo.toml"
             exit 1
           fi
           tag="v${version}"
-          # Branch on 404 specifically — any other API failure (rate
-          # limit, 5xx) must fail loudly here, not masquerade as "tag
-          # missing" and produce a confusing error downstream.
+          # Remote check on purpose (the authoritative state a previous
+          # run's API-created tag lives in). Branch on 404 specifically —
+          # any other API failure (rate limit, 5xx) must fail loudly
+          # here, not masquerade as "tag missing" and produce a
+          # confusing error downstream.
           if out=$(gh api "repos/${REPO}/git/ref/tags/${tag}" 2>&1); then
-            echo "Tag ${tag} already exists — nothing to release."
+            echo "Tag ${tag} already exists — nothing to cut."
             echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
           elif ! grep -q "HTTP 404" <<<"$out"; then
             echo "::error::Failed to check for tag ${tag}: ${out}"
             exit 1
           fi
-          # The commit that introduced this manifest version is the
-          # release-PR merge. Tag that commit, NOT ${HEAD_SHA} — on a
-          # self-heal run HEAD has already moved past the release
-          # commit. Scoped to HEAD's history so a rerun of an old run
-          # can't pick a newer release commit than its own HEAD.
-          release_sha=$(gh api \
-            "repos/${REPO}/commits?path=.release-please-manifest.json&sha=${HEAD_SHA}&per_page=1" \
-            --jq '.[0].sha')
-          # jq prints the literal string "null" for an empty result —
-          # catch both so this can never reach `--target null`.
-          if [ -z "$release_sha" ] || [ "$release_sha" = "null" ]; then
-            echo "::error::Could not resolve the commit that last changed the manifest."
+          # The commit that INTRODUCED this version string is the
+          # release-PR merge. Tag that commit, NOT HEAD — on a self-heal
+          # run HEAD has already moved past the release commit. -S
+          # pickaxe scoped to HEAD's history: while ${version} is
+          # current and untagged, the most recent commit changing the
+          # occurrence count of its version line is its introduction.
+          release_sha=$(git log -1 --format=%H -S "version = \"${version}\"" -- crates/server/Cargo.toml)
+          if [ -z "$release_sha" ]; then
+            echo "::error::Could not resolve the commit that introduced ${version}."
             exit 1
           fi
-          # Only a release-please merge may introduce an untagged
-          # version. Checked on the RESOLVED commit, not the triggering
-          # one — self-healing runs are triggered by ordinary commits.
-          # Anything else means the manifest was edited by hand to a
+          # Only a release-PR merge may introduce an untagged version.
+          # Checked on the RESOLVED commit, not the triggering one —
+          # self-healing runs are triggered by ordinary commits.
+          # Anything else means Cargo.toml was edited by hand to a
           # version that was never released: fail loudly rather than
           # mint a public release from an accidental edit.
-          meta=$(gh api "repos/${REPO}/commits/${release_sha}")
-          subject=$(jq -r '.commit.message' <<<"$meta" | head -n1)
+          subject=$(git log -1 --format=%s "$release_sha")
           if ! printf '%s' "$subject" | grep -qE '^chore(\(.+\))?: release '; then
-            echo "::error::Manifest names untagged ${version}, but the commit that set it ('${subject}', ${release_sha}) is not a release-PR merge. Fix the manifest or tag manually."
+            echo "::error::Cargo.toml names untagged ${version}, but the commit that set it ('${subject}', ${release_sha}) is not a release-PR merge. Fix the version or tag manually."
             exit 1
           fi
           # Backstop against stacked misses: if the version this one
@@ -171,32 +199,17 @@ jobs:
           # (every push in between retried it and failed red — but a
           # green run here would bury it for good). Refuse to leapfrog;
           # recover the older release first, then re-run this workflow.
-          parent=$(jq -r '.parents[0].sha' <<<"$meta")
           prev_version=""
-          if [ -n "$parent" ] && [ "$parent" != "null" ]; then
-            # 404 = manifest didn't exist at the ancestor (legitimate:
-            # first ever release) — anything else must fail loudly, or
-            # a transient error would silently skip the guard below.
-            if prev_manifest=$(gh api -H "Accept: application/vnd.github.raw" \
-                "repos/${REPO}/contents/.release-please-manifest.json?ref=${parent}" 2>&1); then
-              prev_version=$(jq -r '."crates/server"' <<<"$prev_manifest")
-            elif ! grep -q "HTTP 404" <<<"$prev_manifest"; then
-              echo "::error::Failed to read the manifest at ${parent}: ${prev_manifest}"
-              exit 1
-            fi
+          if prev_toml=$(git show "${release_sha}^:crates/server/Cargo.toml" 2>/dev/null); then
+            prev_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' <<<"$prev_toml" | head -n1)
           fi
-          if [ -n "$prev_version" ] && [ "$prev_version" != "null" ] \
-              && [ "$prev_version" != "$version" ]; then
-            if ! out=$(gh api "repos/${REPO}/git/ref/tags/v${prev_version}" 2>&1); then
-              if grep -q "HTTP 404" <<<"$out"; then
-                echo "::error::Previous version v${prev_version} is untagged — refusing to leapfrog a missed release. Recover v${prev_version}, then re-run this run:"
-                echo "  1. sha=\$(gh api 'repos/${REPO}/commits?path=.release-please-manifest.json&sha=${parent}&per_page=1' --jq '.[0].sha')"
-                echo "  2. extract the ${prev_version} section of crates/server/CHANGELOG.md into notes.md"
-                echo "  3. gh release create v${prev_version} --target \"\$sha\" --title v${prev_version} --notes-file notes.md"
-                echo "  4. gh workflow run release.yml -f tag=v${prev_version}   # build + publish its artifacts"
-              else
-                echo "::error::Failed to check for tag v${prev_version}: ${out}"
-              fi
+          if [ -n "$prev_version" ] && [ "$prev_version" != "$version" ]; then
+            if ! git rev-parse -q --verify "refs/tags/v${prev_version}" >/dev/null; then
+              echo "::error::Previous version v${prev_version} is untagged — refusing to leapfrog a missed release. Recover v${prev_version}, then re-run this run:"
+              echo "  1. sha=\$(git log -1 --format=%H -S 'version = \"${prev_version}\"' -- crates/server/Cargo.toml)"
+              echo "  2. extract the ${prev_version} section of crates/server/CHANGELOG.md into notes.md"
+              echo "  3. gh release create v${prev_version} --target \"\$sha\" --title v${prev_version} --notes-file notes.md"
+              echo "  4. gh workflow run release.yml -f tag=v${prev_version}   # build + publish its artifacts"
               exit 1
             fi
           fi
@@ -218,8 +231,7 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           # Cosmetic bookkeeping so the release PR reads as released in
           # the GitHub UI. The squash-merge subject ends in "(#N)".
-          # Non-fatal: nothing downstream reads these labels now that
-          # release-please's release pass is skipped.
+          # Non-fatal: nothing downstream reads these labels.
           pr=$(printf '%s' "$subject" | grep -oE '\(#[0-9]+\)$' | tr -dc '0-9') || true
           if [ -n "${pr}" ]; then
             gh pr edit "$pr" --repo "$REPO" \
@@ -230,15 +242,89 @@ jobs:
             echo "::warning::Could not find a PR number in '${subject}' — label not flipped."
           fi
 
+      # Whole-repo release proposal (#220): git-cliff decides both
+      # WHETHER to release (skipped types — refactor/docs/chore/test/
+      # build/ci/style — are excluded from the bump, so a window of only
+      # those proposes nothing) and WHAT (feat → minor, breaking → minor
+      # while pre-1.0, everything else visible → patch). The branch is
+      # regenerated from main on every push, so the PR always reflects
+      # main's full unreleased window.
+      - name: Propose release PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A tag the cut step just created via the API is not in the
+          # checkout — fetch so `--bumped-version` sees it.
+          git fetch --force --tags -q origin
+          # Bootstrap guard: this pipeline assumes at least one reachable
+          # v-tag (true here since v0.2.0). On a fresh repo or after a tag
+          # wipe, fail with instructions instead of git's opaque
+          # "cannot describe anything" — minting a first version
+          # automatically is not worth an untestable code path.
+          if ! current_tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>&1); then
+            echo "::error::No v* tag reachable from HEAD (${current_tag}). Bootstrap manually: set crates/server/Cargo.toml's version, tag that commit v<version>, push the tag, then re-run."
+            exit 1
+          fi
+          # Contract this step depends on (git-cliff 2.13.1, pinned in the
+          # install step above): with no releasable commits since the last
+          # tag, `--bumped-version` exits 0 and prints the CURRENT tag —
+          # that is what makes the equality check below a clean no-op on
+          # ordinary pushes. If a future git-cliff bump ever turns
+          # "nothing to bump" into a non-zero exit, `set -e` fails this
+          # step on every push to main — loud on purpose; re-verify the
+          # contract when bumping the pin.
+          next_tag=$(git-cliff --bumped-version)
+          if [ "$next_tag" = "$current_tag" ]; then
+            echo "No releasable commits since ${current_tag} — no release PR."
+            exit 0
+          fi
+          next="${next_tag#v}"
+          echo "Proposing ${current_tag} → ${next_tag}"
+          # [package] version is the only line-anchored `version = "` in
+          # crates/server/Cargo.toml (path deps carry no version reqs).
+          # Guard the assumption instead of silently editing the wrong
+          # line.
+          if [ "$(grep -c '^version = "' crates/server/Cargo.toml)" != "1" ]; then
+            echo "::error::Expected exactly one version line in crates/server/Cargo.toml"
+            exit 1
+          fi
+          sed -i 's/^version = ".*"$/version = "'"${next}"'"/' crates/server/Cargo.toml
+          # Cargo.lock's `server` entry must match or `cargo build
+          # --locked` fails at the tag. Deterministic text edit — no
+          # Rust toolchain in this job.
+          perl -0pi -e 's/(\[\[package\]\]\nname = "server"\nversion = ")[^"]+/${1}'"${next}"'/' Cargo.lock
+          if ! grep -A2 '^name = "server"$' Cargo.lock | grep -q "version = \"${next}\""; then
+            echo "::error::Cargo.lock server entry was not updated"
+            exit 1
+          fi
+          git-cliff --unreleased --tag "${next_tag}" --prepend crates/server/CHANGELOG.md
+          git-cliff --unreleased --tag "${next_tag}" --strip all > "${RUNNER_TEMP}/pr-body.md"
+          printf '\n---\nMerging this PR releases **%s**: the next push to main tags it, publishes the notes above, and builds the binaries + container image (.github/workflows/release.yml, #220).\n' "${next_tag}" >> "${RUNNER_TEMP}/pr-body.md"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B release-pr/main
+          git add crates/server/Cargo.toml Cargo.lock crates/server/CHANGELOG.md
+          git commit -m "chore: release ${next}"
+          git push --force origin release-pr/main
+          pr=$(gh pr list --head release-pr/main --state open --json number --jq '.[0].number' || true)
+          if [ -n "$pr" ] && [ "$pr" != "null" ]; then
+            gh pr edit "$pr" --title "chore: release ${next}" --body-file "${RUNNER_TEMP}/pr-body.md"
+          else
+            gh pr create --head release-pr/main --base main \
+              --title "chore: release ${next}" --body-file "${RUNNER_TEMP}/pr-body.md" \
+              --label "autorelease: pending"
+          fi
+
   # Resolve the tag for the build matrix from whichever entry path
   # fired this run. Centralising the resolution here means the build
   # jobs don't need to branch on `github.event_name`.
   resolve-target:
-    needs: release-please
+    needs: release
     if: |
       always() &&
       (github.event_name == 'workflow_dispatch' ||
-        needs.release-please.outputs.releases_created == 'true')
+        needs.release.outputs.releases_created == 'true')
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.r.outputs.tag }}
@@ -247,7 +333,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           DISPATCH_TAG: ${{ inputs.tag }}
-          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag_name }}
         run: |
           if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
             echo "tag=${DISPATCH_TAG}" >> "$GITHUB_OUTPUT"
@@ -259,10 +345,10 @@ jobs:
     name: binary ${{ matrix.target }}
     needs: resolve-target
     # `always() &&` is mandatory, not stylistic: on the
-    # `workflow_dispatch` backfill path `release-please` is skipped,
+    # `workflow_dispatch` backfill path the `release` job is skipped,
     # and GitHub Actions propagates that skip *transitively* through
     # the dependency chain. Without `always()`, this job inherits the
-    # original release-please skip even though its direct dep
+    # original release-job skip even though its direct dep
     # (`resolve-target`) succeeded — and every build job sits out.
     if: always() && needs.resolve-target.result == 'success'
     permissions:
@@ -309,9 +395,8 @@ jobs:
         # `--locked` enforces that the lockfile committed at the tag
         # exactly matches Cargo.toml — so a release tag can't silently
         # pick up a new transitive dep version. This works because
-        # release-please's `cargo-workspace` plugin rewrites
-        # `Cargo.lock` alongside the `Cargo.toml` version bump in the
-        # release PR (see `release-please-config.json::plugins`).
+        # the "Propose release PR" step rewrites `Cargo.lock`
+        # alongside the `Cargo.toml` version bump in the release PR.
         # If a future release PR ever lands without a matching
         # `Cargo.lock` bump, this step fails loudly rather than
         # producing a release built against a drifted lockfile.
@@ -360,7 +445,7 @@ jobs:
     name: container image
     needs: resolve-target
     # See build-binary above — `always()` defeats transitive skip
-    # propagation from the dispatch-path-skipped `release-please` job.
+    # propagation from the dispatch-path-skipped `release` job.
     if: always() && needs.resolve-target.result == 'success'
     permissions:
       contents: read
@@ -444,7 +529,7 @@ jobs:
     # GitHub Release are still useful and should ship.
     needs: [resolve-target, build-binary]
     # See build-binary above — `always()` defeats transitive skip
-    # propagation from the dispatch-path-skipped `release-please` job.
+    # propagation from the dispatch-path-skipped `release` job.
     if: always() && needs.resolve-target.result == 'success' && needs.build-binary.result == 'success'
     permissions:
       contents: write

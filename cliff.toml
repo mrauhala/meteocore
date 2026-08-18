@@ -1,0 +1,84 @@
+# git-cliff configuration — generates the release-PR changelog section and
+# computes the next version (`git cliff --bumped-version`) for release.yml.
+#
+# Whole-repo attribution on purpose (#220): unlike release-please, which only
+# counted commits touching crates/server/ (and silently dropped commits whose
+# body its parser could not tokenize), every conventional commit on main is
+# considered, whatever paths it touches — a Dockerfile-only fix(docker) both
+# appears in the notes and produces the patch release it needs.
+#
+# The rendered section format deliberately mirrors what release-please wrote
+# to crates/server/CHANGELOG.md ("## [x.y.z](compare-url) (date)" headings,
+# "* **scope:** subject (links)" bullets): the "Cut release from Cargo.toml"
+# step in release.yml extracts release notes from the CHANGELOG with an awk
+# match on the "## [" heading, and the file should stay visually consistent
+# across the migration.
+
+[changelog]
+# Everything above the first version section in CHANGELOG.md. Used by
+# `--prepend` to find the insertion point: new sections land after it.
+header = "# Changelog\n"
+body = """
+{%- if version %}
+## [{{ version | trim_start_matches(pat="v") }}]({{ self::remote() }}/compare/{{ previous.version }}...{{ version }}) ({{ timestamp | date(format="%Y-%m-%d") }})
+{%- else %}
+## [unreleased]
+{%- endif %}
+{% for group, commits in commits | group_by(attribute="group") %}
+
+### {{ group | striptags | trim }}
+
+{% for commit in commits -%}
+* {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message }} ([{{ commit.id | truncate(length=7, end="") }}]({{ self::remote() }}/commit/{{ commit.id }}))
+{% endfor -%}
+{% endfor %}
+
+{%- macro remote() -%}
+https://github.com/mrauhala/meteocore
+{%- endmacro -%}
+"""
+trim = true
+# Rewrite "#123" PR/issue references into markdown links, matching the
+# release-please bullet style already in the CHANGELOG (also inside
+# multi-ref parens like "(#469, #476)").
+postprocessors = [
+  { pattern = '#([0-9]+)', replace = "[#${1}](https://github.com/mrauhala/meteocore/issues/${1})" },
+]
+
+[git]
+conventional_commits = true
+# Non-conventional commits are dropped from the notes (same policy as
+# release-please) — but unlike release-please the parser only reads the
+# subject line, so prose in the body (nested parens etc.) can never
+# silently drop a commit (#220 drop-class 2).
+filter_unconventional = true
+protect_breaking_commits = true
+# The visible groups mirror release-please-config.json's changelog-sections.
+# <!-- N --> prefixes force the section order (stripped in the template).
+# skip = true types are both hidden from notes AND excluded from
+# --bumped-version, so a window of only chores/refactors/ci proposes no
+# release — release.yml gates on the rendered section being non-empty.
+commit_parsers = [
+  { message = '^[a-z]+(\(.*\))?!:', group = "<!-- 0 -->⚠ Breaking Changes" },
+  # A footer-only `BREAKING CHANGE:` (no `!` in the subject) must ALSO land
+  # in the breaking section — without this rule such a commit of a skipped
+  # type is protected from the skip (protect_breaking_commits) but would
+  # render under a bare `### <type>` heading. The version bump itself reads
+  # the breaking flag directly and is right either way.
+  { footer = "^BREAKING CHANGE:", group = "<!-- 0 -->⚠ Breaking Changes" },
+  { message = "^feat", group = "<!-- 1 -->Features" },
+  { message = "^fix", group = "<!-- 2 -->Bug Fixes" },
+  { message = "^perf", group = "<!-- 3 -->Performance Improvements" },
+  { message = "^revert", group = "<!-- 4 -->Reverts" },
+  { message = "^deps", group = "<!-- 5 -->Dependencies" },
+  { message = "^(refactor|docs|chore|test|build|ci|style)", skip = true },
+]
+# Only whole-workspace release tags count as version baselines.
+tag_pattern = "^v[0-9]"
+
+[bump]
+# Pre-1.0 semantics, matching release-please's bump-minor-pre-major: a
+# breaking change bumps minor while <1.0.0 (semver "next breaking"), feat
+# bumps minor, everything else visible bumps patch.
+features_always_bump_minor = true
+breaking_always_bump_major = false
