@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/mrauhala/meteocore/compare/v0.8.0...v0.8.1) (2026-08-18)
+
+
+### Bug Fixes
+
+* **docker:** pin builder+runtime to one Debian release (trixie) — glibc mismatch ([#582](https://github.com/mrauhala/meteocore/issues/582)) ([ea32212](https://github.com/mrauhala/meteocore/commit/ea32212a137a1d7ff6d1a4846794eadeef137877))
+
 ## [0.8.0](https://github.com/mrauhala/meteocore/compare/v0.7.0...v0.8.0) (2026-08-17)
 
 
