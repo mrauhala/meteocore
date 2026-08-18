@@ -60,6 +60,12 @@ protect_breaking_commits = true
 # release — release.yml gates on the rendered section being non-empty.
 commit_parsers = [
   { message = '^[a-z]+(\(.*\))?!:', group = "<!-- 0 -->⚠ Breaking Changes" },
+  # A footer-only `BREAKING CHANGE:` (no `!` in the subject) must ALSO land
+  # in the breaking section — without this rule such a commit of a skipped
+  # type is protected from the skip (protect_breaking_commits) but would
+  # render under a bare `### <type>` heading. The version bump itself reads
+  # the breaking flag directly and is right either way.
+  { footer = "^BREAKING CHANGE:", group = "<!-- 0 -->⚠ Breaking Changes" },
   { message = "^feat", group = "<!-- 1 -->Features" },
   { message = "^fix", group = "<!-- 2 -->Bug Fixes" },
   { message = "^perf", group = "<!-- 3 -->Performance Improvements" },

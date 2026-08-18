@@ -258,6 +258,14 @@ jobs:
           # checkout — fetch so `--bumped-version` sees it.
           git fetch --force --tags -q origin
           current_tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD)
+          # Contract this step depends on (git-cliff 2.13.1, pinned in the
+          # install step above): with no releasable commits since the last
+          # tag, `--bumped-version` exits 0 and prints the CURRENT tag —
+          # that is what makes the equality check below a clean no-op on
+          # ordinary pushes. If a future git-cliff bump ever turns
+          # "nothing to bump" into a non-zero exit, `set -e` fails this
+          # step on every push to main — loud on purpose; re-verify the
+          # contract when bumping the pin.
           next_tag=$(git-cliff --bumped-version)
           if [ "$next_tag" = "$current_tag" ]; then
             echo "No releasable commits since ${current_tag} — no release PR."
