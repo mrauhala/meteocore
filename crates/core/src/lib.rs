@@ -1,3 +1,4 @@
+pub mod cell_facts;
 pub mod cells;
 pub mod collection_search;
 pub mod config;
@@ -18,6 +19,7 @@ pub mod openapi;
 pub mod proxy;
 pub mod raster_paint;
 pub mod resample;
+pub mod significance;
 pub mod vertical;
 pub mod volume;
 pub mod web_mercator;

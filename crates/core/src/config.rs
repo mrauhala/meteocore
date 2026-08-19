@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -281,6 +283,16 @@ pub struct NowcastConfig {
     /// this collection at load.
     #[serde(default)]
     pub lightning_source: Option<String>,
+    /// Per-term overrides for storm-cell significance ranking, keyed by term
+    /// name (see `ds_core::cell_facts::DEFAULT_CELL_WEIGHTS`). Omitted terms
+    /// keep their default weight; an unknown term name fails this collection
+    /// at load rather than silently leaving the default in place.
+    ///
+    /// A term the cell has no data for drops out of the weighted mean
+    /// entirely, so the same table works before and after a new data source
+    /// (volume attributes, impact geometry) is wired.
+    #[serde(default)]
+    pub significance: BTreeMap<String, f64>,
 }
 
 fn default_nowcast_horizon() -> String {

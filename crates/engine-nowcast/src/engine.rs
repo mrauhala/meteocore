@@ -32,6 +32,7 @@ use arc_swap::ArcSwap;
 use chrono::{DateTime, Duration, Utc};
 use ds_poll::{FirstTick, Shutdown};
 
+use ds_core::cell_facts::{CellFactSheet, LightningFacts, ScoredCell, Trend, DEFAULT_CELL_WEIGHTS};
 use ds_core::config::NowcastConfig;
 use ds_core::datetime::parse_iso8601_duration;
 use ds_core::error::DataServerError;
@@ -39,6 +40,7 @@ use ds_core::feature::{Feature, FeaturePage, FeatureQuery, Geometry, PropertyVal
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile, RasterValues};
 use ds_core::resample::ProjectionGrid;
+use ds_core::significance::WeightedScorer;
 
 use crate::advect::TrajectoryIntegrator;
 use crate::cells2d::{
@@ -163,8 +165,11 @@ struct Generation {
 #[derive(Clone)]
 struct CellSnapshot {
     anchor: DateTime<Utc>,
-    geom: GridGeom,
-    cells: Arc<Vec<CellTrack>>,
+    /// Fact sheets with their significance scores, built ONCE per generation
+    /// rather than per request. Replaces a raw `Vec<CellTrack>` deliberately:
+    /// one vector, no parallel arrays to drift, and the served properties,
+    /// the ranking and any future narrative all read the same facts.
+    cells: Arc<Vec<ScoredCell>>,
 }
 
 /// Cell-history retention: 48 snapshots = 4 h at the 5-min cadence. Cells
@@ -211,6 +216,11 @@ pub struct NowcastEngine {
     /// Optional point-event source joined onto tracked cells per
     /// generation (#549) — lightning, wired by the server's second pass.
     lightning: Option<Arc<dyn ds_core::events::EventSource>>,
+    /// Significance ranking for tracked cells: the default weight table with
+    /// any per-collection overrides applied. Validated at construction, so a
+    /// typo in a weight name fails the collection at load rather than
+    /// silently ranking by defaults nobody chose.
+    scorer: WeightedScorer,
 }
 
 impl NowcastEngine {
@@ -269,6 +279,12 @@ impl NowcastEngine {
             )));
         }
 
+        let scorer = WeightedScorer::new(DEFAULT_CELL_WEIGHTS)
+            .with_overrides(&config.significance)
+            .map_err(|e| {
+                DataServerError::Config(format!("[nowcast.significance] for {collection_id}: {e}"))
+            })?;
+
         let source_info = source.raster_info();
         Ok(Self {
             collection_id: collection_id.to_string(),
@@ -299,6 +315,7 @@ impl NowcastEngine {
             lead_persistence_csi_permille: AtomicU64::new(u64::MAX),
             next_track_id: AtomicU64::new(1),
             lightning: None,
+            scorer,
         })
     }
 
@@ -414,8 +431,12 @@ impl NowcastEngine {
                 let mut cell_history = old.cell_history.clone();
                 cell_history.push(CellSnapshot {
                     anchor,
-                    geom: generation_ref.geom,
-                    cells: generation_ref.cells.clone(),
+                    cells: Arc::new(score_cells(
+                        &generation_ref.cells,
+                        generation_ref.geom,
+                        anchor,
+                        &self.scorer,
+                    )),
                 });
                 if cell_history.len() > CELL_HISTORY_SNAPSHOTS {
                     let excess = cell_history.len() - CELL_HISTORY_SNAPSHOTS;
@@ -1183,57 +1204,149 @@ fn round_to(v: f64, places: i32) -> f64 {
     (v * f).round() / f
 }
 
-/// Build one cell feature: lon/lat from the grid geometry plus the served
-/// property set. Shared by `get_features` and `get_feature` so the two
-/// paths cannot drift (and the by-id path needn't materialize every cell).
-fn cell_feature(
-    t: &CellTrack,
+/// Project tracked cells into fact sheets and score them, once per
+/// generation.
+///
+/// The fact sheet is the widest description of a cell and has four consumers
+/// (feature properties, ranking, narrative, learned models) — building it here
+/// means all four see identical numbers by construction.
+///
+/// Input order is the track order, which `advance_tracks` derives
+/// deterministically; the scorer breaks score ties by that order, so repeated
+/// generations over unchanged data produce byte-identical rankings.
+fn score_cells(
+    cells: &[CellTrack],
     g: GridGeom,
-    kx: f64,
-    ky: f64,
     anchor: DateTime<Utc>,
-    lightning: bool,
-) -> (f64, f64, Feature) {
-    // Emit each value at its MEANINGFUL precision, not the f64 bit depth:
-    // the working grid is ~500 m (5 lon/lat decimals ≈ 1 m), centroids
-    // jitter tenths of km², velocities tenths of m/s, bearings whole
-    // degrees. Raw f64s roughly double the GeoJSON payload for noise.
-    let lon = g.west + (f64::from(t.blob.centroid.0) / f64::from(g.width)) * (g.east - g.west);
-    let lat = g.north - (f64::from(t.blob.centroid.1) / f64::from(g.height)) * (g.north - g.south);
-    let lon = round_to(lon, 5);
-    let lat = round_to(lat, 5);
+    scorer: &WeightedScorer,
+) -> Vec<ScoredCell> {
+    let (kx, ky) =
+        crate::lonlat_grid_km_per_px([g.west, g.south, g.east, g.north], g.width, g.height);
+    let facts: Vec<CellFactSheet> = cells
+        .iter()
+        .map(|t| {
+            let lon =
+                g.west + (f64::from(t.blob.centroid.0) / f64::from(g.width)) * (g.east - g.west);
+            let lat = g.north
+                - (f64::from(t.blob.centroid.1) / f64::from(g.height)) * (g.north - g.south);
+            CellFactSheet {
+                id: t.id,
+                observed: anchor,
+                // 5 decimals ≈ 1 m — the working grid is ~500 m, so raw f64s
+                // would roughly double the payload to carry pure noise.
+                lon: round_to(lon, 5),
+                lat: round_to(lat, 5),
+                severity: t.severity,
+                // f32→f64 promotion of a gain-scaled byte prints noise for
+                // gains that aren't binary-exact (SMHI 0.4 ⇒ 36.400001525878906).
+                max_dbz: round_to(f64::from(t.blob.max_value), 1),
+                area_km2: round_to(t.blob.area as f64 * kx * ky, 1),
+                age: t.age,
+                speed_ms: t.speed_ms().map(|v| round_to(f64::from(v), 1)),
+                bearing_deg: t.bearing_deg().map(|b| round_to(b, 0) % 360.0),
+                deviant_mover: t.deviant(),
+                trend: match t.growing {
+                    Some(true) => Some(Trend::Growing),
+                    Some(false) => Some(Trend::Decaying),
+                    None => None,
+                },
+                // A newborn has no measured tendency; emitting 0.0 would read
+                // as "steady" and score as such.
+                intensity_trend_dbz_min: (t.age >= 2)
+                    .then(|| round_to(f64::from(t.intensity_tendency) * 60.0, 3)),
+                // Tri-state preserved: None here covers both "no source
+                // wired" and "join skipped"; the served property set
+                // distinguishes them via the engine's `lightning` flag.
+                lightning: t.flash_count.map(|count| LightningFacts {
+                    flash_count: count,
+                    flash_rate_per_min: t
+                        .flash_rate_per_min
+                        .map(|r| round_to(f64::from(r), 2))
+                        .unwrap_or(0.0),
+                    jump: t.lightning_jump,
+                }),
+                // Wired by later phases: the 3-D volume join, impact
+                // geometry, and NWP environment sampling. Absent terms
+                // renormalize, so rankings stay meaningful until then.
+                volume: None,
+                impact: None,
+                environment: Vec::new(),
+            }
+        })
+        .collect();
+
+    let scores = scorer.rank(&facts);
+    facts
+        .into_iter()
+        .zip(scores)
+        .map(|(facts, significance)| ScoredCell {
+            facts,
+            significance,
+        })
+        .collect()
+}
+
+/// Build one cell feature from its fact sheet and score. Shared by
+/// `get_features` and `get_feature` so the two paths cannot drift (and the
+/// by-id path needn't materialize every cell).
+fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
+    let t = &cell.facts;
+    // Values were rounded to their MEANINGFUL precision when the fact sheet
+    // was built (the working grid is ~500 m, so 5 lon/lat decimals ≈ 1 m;
+    // raw f64s roughly double the GeoJSON payload to carry noise).
+    let (lon, lat) = (t.lon, t.lat);
     let mut props = std::collections::HashMap::new();
     props.insert(
         "severity".into(),
         PropertyValue::String(t.severity.as_str().into()),
     );
-    props.insert(
-        "max_dbz".into(),
-        // f32→f64 promotion of a gain-scaled byte prints noise for gains
-        // that aren't binary-exact (SMHI 0.4 ⇒ 36.400001525878906).
-        PropertyValue::Float(round_to(f64::from(t.blob.max_value), 1)),
-    );
-    props.insert(
-        "area_km2".into(),
-        PropertyValue::Float(round_to(t.blob.area as f64 * kx * ky, 1)),
-    );
+    props.insert("max_dbz".into(), PropertyValue::Float(t.max_dbz));
+    props.insert("area_km2".into(), PropertyValue::Float(t.area_km2));
     props.insert("track_age".into(), PropertyValue::Integer(t.age as i64));
-    props.insert("deviant_mover".into(), PropertyValue::Bool(t.deviant()));
+    props.insert("deviant_mover".into(), PropertyValue::Bool(t.deviant_mover));
     props.insert(
         "speed_ms".into(),
-        t.speed_ms()
-            .map(|v| PropertyValue::Float(round_to(f64::from(v), 1)))
+        t.speed_ms
+            .map(PropertyValue::Float)
             .unwrap_or(PropertyValue::Null),
     );
     props.insert(
         "bearing_deg".into(),
-        t.bearing_deg()
-            .map(|b| PropertyValue::Float(round_to(b, 0) % 360.0))
+        t.bearing_deg
+            .map(PropertyValue::Float)
             .unwrap_or(PropertyValue::Null),
     );
     props.insert(
         "observed".into(),
-        PropertyValue::String(anchor.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        PropertyValue::String(
+            t.observed
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ),
+    );
+    // Significance (0..=1) and its 1-based rank within this snapshot: what
+    // makes ~150 tracked cells tractable for a client that wants the handful
+    // that matter. Served whether or not any narrative layer is wired.
+    props.insert(
+        "significance".into(),
+        PropertyValue::Float(round_to(cell.significance.score, 4)),
+    );
+    props.insert(
+        "significance_rank".into(),
+        PropertyValue::Integer(cell.significance.rank as i64),
+    );
+    // WHY it ranked there, biggest reason first — an unexplainable ranking
+    // is one nobody can argue with, and a weight table with no ground truth
+    // has to be arguable to be tunable.
+    props.insert(
+        "significance_reasons".into(),
+        PropertyValue::List(
+            cell.significance
+                .contributions
+                .iter()
+                .take(3)
+                .map(|c| PropertyValue::String(c.term.into()))
+                .collect(),
+        ),
     );
     // Lifecycle as DATA, not field modification: three gate runs showed
     // tendency extrapolation loses to pure advection (#546), but the
@@ -1241,19 +1354,15 @@ fn cell_feature(
     // "weakening" badges).
     props.insert(
         "volume_trend".into(),
-        match t.growing {
-            Some(true) => PropertyValue::String("growing".into()),
-            Some(false) => PropertyValue::String("decaying".into()),
-            None => PropertyValue::Null,
-        },
+        t.trend
+            .map(|v| PropertyValue::String(v.as_str().into()))
+            .unwrap_or(PropertyValue::Null),
     );
     props.insert(
         "intensity_trend_dbz_min".into(),
-        if t.age >= 2 {
-            PropertyValue::Float(round_to(f64::from(t.intensity_tendency) * 60.0, 3))
-        } else {
-            PropertyValue::Null
-        },
+        t.intensity_trend_dbz_min
+            .map(PropertyValue::Float)
+            .unwrap_or(PropertyValue::Null),
     );
     // Flash properties exist only when a lightning source is wired —
     // absent means "not measured", null means "join skipped this
@@ -1261,26 +1370,24 @@ fn cell_feature(
     if lightning {
         props.insert(
             "flash_count".into(),
-            t.flash_count
-                .map(|n| PropertyValue::Integer(i64::from(n)))
+            t.lightning
+                .map(|l| PropertyValue::Integer(i64::from(l.flash_count)))
                 .unwrap_or(PropertyValue::Null),
         );
         props.insert(
             "flash_rate_per_min".into(),
-            t.flash_rate_per_min
-                .map(|r| PropertyValue::Float(round_to(f64::from(r), 2)))
+            t.lightning
+                .map(|l| PropertyValue::Float(l.flash_rate_per_min))
                 .unwrap_or(PropertyValue::Null),
         );
         props.insert(
             "lightning_jump".into(),
             // Same tri-state as the counts: a skipped join is "unknown",
-            // not "no jump" — flash_count doubles as the joined-this-
-            // generation marker.
-            if t.flash_count.is_some() {
-                PropertyValue::Bool(t.lightning_jump)
-            } else {
-                PropertyValue::Null
-            },
+            // not "no jump" — the lightning group doubles as the
+            // joined-this-generation marker.
+            t.lightning
+                .map(|l| PropertyValue::Bool(l.jump))
+                .unwrap_or(PropertyValue::Null),
         );
     }
     (
@@ -1319,16 +1426,11 @@ impl FeatureEngine for NowcastEngine {
         let Some(snapshot) = snapshot else {
             return empty();
         };
-        let anchor = snapshot.anchor;
-        let g = snapshot.geom;
-        let (kx, ky) =
-            crate::lonlat_grid_km_per_px([g.west, g.south, g.east, g.north], g.width, g.height);
         let matched: Vec<Feature> = snapshot
             .cells
             .iter()
             .filter_map(|t| {
-                let (lon, lat, feature) =
-                    cell_feature(t, g, kx, ky, anchor, self.lightning.is_some());
+                let (lon, lat, feature) = cell_feature(t, self.lightning.is_some());
                 if let Some(b) = &query.bbox {
                     if !b.contains(lon, lat) {
                         return None;
@@ -1375,12 +1477,9 @@ impl FeatureEngine for NowcastEngine {
         let track = snapshot
             .cells
             .iter()
-            .find(|t| t.id == id)
+            .find(|t| t.facts.id == id)
             .ok_or_else(not_found)?;
-        let g = snapshot.geom;
-        let (kx, ky) =
-            crate::lonlat_grid_km_per_px([g.west, g.south, g.east, g.north], g.width, g.height);
-        Ok(cell_feature(track, g, kx, ky, snapshot.anchor, self.lightning.is_some()).2)
+        Ok(cell_feature(track, self.lightning.is_some()).2)
     }
 
     /// Bumps every generation, so any future consumer keying caches/ETags on

@@ -337,6 +337,19 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
   (HTTP 400). The ODIM PVOL engine uses it for radar elevation angle.
 - **`ds_core::cells`** — storm-cell segmentation and tracking over
   `VoxelGrid` (see `crates/engine-odim/CLAUDE.md`).
+- **`ds_core::significance`** — domain-agnostic scoring/ranking: normalized
+  `Term`s → a weighted mean with per-term `contributions` for
+  explainability. Absent terms renormalize (so wiring a new data source
+  needs no config flag day) and weights may be negative (a data-quality
+  discount must be able to demote). `WeightedScorer` is the baseline a
+  learned ranker has to beat; a GBDT/ONNX model is another
+  `impl Significance<T>` behind the same interface. Reusable for CAP alert
+  urgency and impact-event priority — do not fork it per domain.
+- **`ds_core::cell_facts`** — `CellFactSheet`: the one wide description of a
+  tracked storm cell, plus `Severity` (owned here so the tracker, the
+  ranking and any narrative cannot drift) and `DEFAULT_CELL_WEIGHTS`. Built
+  once per generation; read by feature properties, ranking, narratives and
+  the #541 V2.4 model feature row.
 - **`ds_render::rasterize::fill_polygon`** — the shared vector→raster fill
   primitive (#397), fed by `ds_core::geo::geometry_to_pixels` (vertices
   projected via `OutputCrs::world_to_fraction`, never per pixel). Vector
@@ -476,6 +489,17 @@ horizon = "PT2H"        # how far into the future (default PT2H)
 # step = "PT5M"         # timestep spacing (default: source cadence)
 # lightning_source = "lightning"  # events-shape postgis collection: per-cell
                                   # flash_count/rate + lightning_jump (#549)
+
+# Optional per-term significance weight overrides for tracked storm cells.
+# Defaults live in ds_core::cell_facts::DEFAULT_CELL_WEIGHTS; omitted terms
+# keep theirs. An unknown term name is a LOAD ERROR (no silent fallback).
+# A term the cell has no data for drops out of the weighted mean entirely,
+# so the same table works before and after a new source is wired.
+[collections.nowcast.significance]
+impact = 1.5        # deliberately the largest by default: a moderate cell
+                    # closing on a town outranks a very severe cell at sea
+severity = 1.0
+lightning_jump = 0.9
 
 [collections.wms]
 colormap = "radar_dbz"

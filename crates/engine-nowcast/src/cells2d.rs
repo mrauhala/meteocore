@@ -14,6 +14,11 @@
 use crate::motion::MotionField;
 use crate::objects::{match_cells, CellBlob, PixelScale};
 
+/// Severity lives in ds-core so the tracker, the significance ranking and the
+/// narrative cannot drift to different meanings of "severe". Re-exported here
+/// because this module owns the heuristic that assigns it.
+pub use ds_core::cell_facts::Severity;
+
 /// Cell threshold (dBZ) for intelligence tracking — the Ritvanen-style
 /// convective contour, matching the verification harness default.
 pub const CELL_THRESHOLD_DBZ: f32 = 35.0;
@@ -60,26 +65,6 @@ pub const FLASH_HISTORY_LEN: usize = 6;
 /// near-zero baselines, where a single extra strike is "2σ". Revisit
 /// against live Nordic storm data if jumps never fire.
 pub const MIN_JUMP_RATE_PER_MIN: f32 = 10.0;
-
-/// TRT-lite severity rank from 2D attributes (documented heuristic v1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Severity {
-    Weak,
-    Moderate,
-    Severe,
-    VerySevere,
-}
-
-impl Severity {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Severity::Weak => "weak",
-            Severity::Moderate => "moderate",
-            Severity::Severe => "severe",
-            Severity::VerySevere => "very_severe",
-        }
-    }
-}
 
 /// Rank a cell from max intensity and area: one point per crossed max-dBZ
 /// step (45/50/55) plus one for area ≥ 50 km² — 0 ⇒ weak … 3+ ⇒ very
