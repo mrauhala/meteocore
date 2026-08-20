@@ -23,6 +23,7 @@
 pub mod advect;
 pub mod cells2d;
 pub mod engine;
+pub mod impact;
 pub mod motion;
 pub mod objects;
 pub mod skill;

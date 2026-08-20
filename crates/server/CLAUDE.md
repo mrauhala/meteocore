@@ -70,8 +70,10 @@ disk, no TOML needed.
     neither `shutdown()` nor re-spawned (either would break — #442).
   - **Exceptions:** `csv`/`geojson` always rebuild (no poll loop — a reload
     is the only way they re-read a changed data file). A `nowcast` reuses
-    only if its `source` and `lightning_source` collections are reused too
-    (`reusable_collections` encodes the dependency).
+    only if EVERY second-pass dependency — `source`, `lightning_source`,
+    `impact_source` — is reused too (`reusable_collections` encodes them).
+    A dependency missing from that list would be rebuilt while the wrapper
+    kept an `Arc` to the old one, so add new second-pass deps in both places.
   - **Cache hygiene:** previously-live collections that were NOT reused get
     their entries evicted from the rendered/meta-tile/vector-tile caches
     (`evict_collection`; matches `{id}`, `{id}/param`, `{id}-derived`).

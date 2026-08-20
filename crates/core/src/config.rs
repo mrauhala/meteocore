@@ -293,6 +293,27 @@ pub struct NowcastConfig {
     /// (volume attributes, impact geometry) is wired.
     #[serde(default)]
     pub significance: BTreeMap<String, f64>,
+    /// Collection id of a polygon `features` collection naming the areas a
+    /// storm can affect (municipalities, catchments, service regions). Joined
+    /// onto tracked cells per generation as `over` / `approaching` /
+    /// `eta_minutes`, and as the `impact` significance term. Must exist in
+    /// the same config and support the Features API; a missing or
+    /// non-Features collection fails this collection at load.
+    #[serde(default)]
+    pub impact_source: Option<String>,
+    /// Feature property holding each area's display name (default `"name"`).
+    #[serde(default = "default_impact_name_property")]
+    pub impact_name_property: String,
+    /// Optional numeric feature property (population, households, insured
+    /// value) weighting an area's exposure on a log scale. Without it,
+    /// exposure is purely geometric — every area counts the same, which is
+    /// honest but cannot rank a city above a village.
+    #[serde(default)]
+    pub impact_weight_property: Option<String>,
+}
+
+fn default_impact_name_property() -> String {
+    "name".to_string()
 }
 
 fn default_nowcast_horizon() -> String {

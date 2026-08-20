@@ -1,0 +1,40 @@
+id = "radar-fi-nowcast"
+title = "Finnish Radar Nowcast (0–2 h)"
+description = """
+Motion-extrapolated reflectivity from the FMI radar composite, with tracked
+storm cells ranked by significance and joined to municipality impact context.
+"""
+engine_type = "nowcast"
+apis = ["wms", "maps", "tiles", "features"]
+keywords = ["radar", "nowcast", "storm cells", "Finland"]
+
+[collections.license]
+title = "CC-BY-4.0"
+
+[nowcast]
+source = "radar-fi-composite-dbzh-s3-cog"
+horizon = "PT2H"
+# Two generations is the production setting: retention multiplies memory
+# (max_pixels x (leads+1) x max_generations x bytes/px).
+max_generations = 2
+
+# Impact context: which municipality each cell is over or heading toward.
+# `population` was joined into the GeoJSON from Statistics Finland
+# (vaestoalue:kunta_vaki2025), so exposure is people-weighted on a log scale
+# rather than treating every municipality alike.
+impact_source = "municipalities"
+impact_name_property = "nimi"
+impact_weight_property = "population"
+
+# Significance weight overrides. Defaults live in
+# ds_core::cell_facts::DEFAULT_CELL_WEIGHTS; omitted terms keep theirs, and an
+# unknown term name fails this collection at load. Terms a cell has no data
+# for drop out of the weighted mean, so this table is already correct for the
+# volume/environment attributes that later phases add.
+[nowcast.significance]
+impact = 1.5
+severity = 1.0
+lightning_jump = 0.9
+
+[wms]
+colormap = "radar_dbz"

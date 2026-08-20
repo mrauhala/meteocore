@@ -145,6 +145,9 @@ fn lightning_join_exposes_flash_properties() {
         growth_decay: false,
         lightning_source: Some("mock-lightning".into()),
         significance: Default::default(),
+        impact_source: None,
+        impact_name_property: "name".into(),
+        impact_weight_property: None,
     };
     let engine = NowcastEngine::new("lj-nowcast", "mock", source.clone(), &config)
         .expect("engine builds")
@@ -245,6 +248,9 @@ fn lightning_source_error_degrades_to_null_fields() {
         growth_decay: false,
         lightning_source: Some("mock-lightning".into()),
         significance: Default::default(),
+        impact_source: None,
+        impact_name_property: "name".into(),
+        impact_weight_property: None,
     };
     let strikes = Arc::new(FlakyStrikes {
         fail: AtomicBool::new(false),
@@ -312,6 +318,9 @@ fn build_with_history(
         growth_decay: false,
         lightning_source: None,
         significance: Default::default(),
+        impact_source: None,
+        impact_name_property: "name".into(),
+        impact_weight_property: None,
     };
     let engine =
         NowcastEngine::new("mock-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -535,6 +544,9 @@ fn excessive_lead_count_is_rejected_at_construction() {
         growth_decay: false,
         lightning_source: None,
         significance: Default::default(),
+        impact_source: None,
+        impact_name_property: "name".into(),
+        impact_weight_property: None,
     };
     let err = NowcastEngine::new("mock-nowcast", "mock", source, &config)
         .err()
@@ -578,6 +590,9 @@ fn oversized_history_frames_is_rejected() {
         growth_decay: false,
         lightning_source: None,
         significance: Default::default(),
+        impact_source: None,
+        impact_name_property: "name".into(),
+        impact_weight_property: None,
     };
     let err = NowcastEngine::new("mock-nowcast", "mock", source, &config)
         .err()
@@ -700,6 +715,9 @@ fn dry_scene_leaves_both_skill_gauges_unset() {
         growth_decay: false,
         lightning_source: None,
         significance: Default::default(),
+        impact_source: None,
+        impact_name_property: "name".into(),
+        impact_weight_property: None,
     };
     let engine =
         NowcastEngine::new("dry-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -875,6 +893,9 @@ fn geometry_change_resets_cell_tracks() {
         growth_decay: false,
         lightning_source: None,
         significance: Default::default(),
+        impact_source: None,
+        impact_name_property: "name".into(),
+        impact_weight_property: None,
     };
     let engine =
         NowcastEngine::new("mv-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -969,6 +990,9 @@ fn growth_decay_dims_decaying_echo() {
             growth_decay,
             lightning_source: None,
             significance: Default::default(),
+            impact_source: None,
+            impact_name_property: "name".into(),
+            impact_weight_property: None,
         };
         let engine = NowcastEngine::new("fade", "mock", source.clone(), &config).expect("builds");
         engine.poll_once();
@@ -1169,5 +1193,180 @@ fn base_config() -> NowcastConfig {
         growth_decay: false,
         lightning_source: None,
         significance: Default::default(),
+        impact_source: None,
+        impact_name_property: "name".into(),
+        impact_weight_property: None,
     }
+}
+
+/// Impact context (Phase 2): a weaker cell over a populated area must
+/// outrank a stronger one over nothing.
+///
+/// This is the whole point of the impact term — radar attributes answer "how
+/// intense", only impact answers "does anyone care". If this inverts, the
+/// ranking has regressed to sorting by reflectivity.
+#[test]
+fn impact_context_lifts_a_populated_cell_above_a_stronger_one() {
+    use ds_core::feature::{Feature, FeaturePage, FeatureQuery, Geometry, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+    use std::collections::HashMap;
+
+    /// ~57 dBZ under gain 0.4 / offset −30; `ECHO_RAW` is ~40 dBZ.
+    const STRONG_RAW: u8 = 218;
+
+    struct TwoCellSource;
+    impl MapEngine for TwoCellSource {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            let mut data = vec![0u8; (width * height) as usize];
+            for (i, cell) in data.iter_mut().enumerate() {
+                let x = (i % width as usize) as f64 + 0.5;
+                let y = (i / width as usize) as f64 + 0.5;
+                // Weak cell at px (40, 50) => lon 2.0, lat 57.5.
+                if (x - 40.0).powi(2) + (y - 50.0).powi(2) <= 8.0 * 8.0 {
+                    *cell = ECHO_RAW;
+                }
+                // Strong cell at px (140, 140) => lon 7.0, lat 53.0.
+                if (x - 140.0).powi(2) + (y - 140.0).powi(2) <= 20.0 * 20.0 {
+                    *cell = STRONG_RAW;
+                }
+            }
+            Ok(RasterTile {
+                width,
+                height,
+                values: RasterValues::U8 {
+                    data,
+                    nodata: Some(NODATA),
+                    gain: 0.4,
+                    offset: -30.0,
+                },
+            })
+        }
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some(EXTENT),
+                times: vec![t0(), t0() + Duration::minutes(5)],
+                parameter: "reflectivity".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: Some([W, H]),
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+    }
+
+    /// One populated area, covering the WEAK cell only.
+    struct Areas;
+    impl FeatureEngine for Areas {
+        fn get_features(&self, _q: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+            let mut props = HashMap::new();
+            props.insert("name".to_string(), PropertyValue::String("Bigtown".into()));
+            props.insert("population".to_string(), PropertyValue::Integer(694_392));
+            let f = Feature {
+                id: "1".into(),
+                geometry: Arc::new(Geometry::Polygon {
+                    exterior: vec![
+                        [1.0, 57.0],
+                        [3.0, 57.0],
+                        [3.0, 58.0],
+                        [1.0, 58.0],
+                        [1.0, 57.0],
+                    ],
+                    holes: vec![],
+                }),
+                properties: Arc::new(props),
+            };
+            Ok(FeaturePage {
+                number_matched: 1,
+                number_returned: 1,
+                features: vec![f],
+                next_offset: None,
+            })
+        }
+        fn get_feature(&self, _id: &str) -> Result<Feature, DataServerError> {
+            unreachable!("impact index only calls get_features")
+        }
+    }
+
+    let severity_of = |f: &Feature| match f.properties.get("severity") {
+        Some(PropertyValue::String(s)) => s.clone(),
+        other => panic!("missing severity: {other:?}"),
+    };
+    let rank_of = |f: &Feature| match f.properties.get("significance_rank") {
+        Some(PropertyValue::Integer(v)) => *v,
+        other => panic!("missing significance_rank: {other:?}"),
+    };
+
+    // Baseline: no impact source at all. Intensity wins, as it must.
+    let plain = NowcastEngine::new("plain", "mock", Arc::new(TwoCellSource), &base_config())
+        .expect("engine builds");
+    plain.poll_once();
+    let page = plain.get_features(&FeatureQuery::default()).unwrap();
+    assert_eq!(page.number_matched, 2);
+    let strong = page
+        .features
+        .iter()
+        .find(|f| severity_of(f) == "very_severe")
+        .unwrap();
+    assert_eq!(
+        rank_of(strong),
+        1,
+        "without impact context, the strongest cell ranks first"
+    );
+    assert!(
+        strong.properties.get("impact_over").is_none(),
+        "impact properties must be ABSENT when no source is wired, not null"
+    );
+
+    // Same scene, with a populated area over the WEAK cell only.
+    let mut config = base_config();
+    config.impact_source = Some("areas".into());
+    config.impact_weight_property = Some("population".into());
+    let engine = NowcastEngine::new("impacted", "mock", Arc::new(TwoCellSource), &config)
+        .expect("engine builds")
+        .with_impact_source(Arc::new(Areas), "name", Some("population"));
+    engine.poll_once();
+
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    assert_eq!(page.number_matched, 2);
+    let weak = page
+        .features
+        .iter()
+        .find(|f| severity_of(f) == "moderate")
+        .unwrap();
+    let strong = page
+        .features
+        .iter()
+        .find(|f| severity_of(f) == "very_severe")
+        .unwrap();
+
+    assert!(matches!(
+        weak.properties.get("impact_over"),
+        Some(PropertyValue::String(s)) if s == "Bigtown"
+    ));
+    assert!(
+        matches!(
+            strong.properties.get("impact_over"),
+            Some(PropertyValue::Null)
+        ),
+        "a cell over nothing reports null, not a missing key"
+    );
+    assert_eq!(
+        rank_of(weak),
+        1,
+        "a moderate cell over a city must outrank a very severe cell over nothing"
+    );
+    assert_eq!(rank_of(strong), 2);
 }
