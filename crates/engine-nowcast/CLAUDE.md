@@ -119,6 +119,40 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   wired; null means "join skipped this generation" (source error — the
   generation itself never fails), 0 means measured-quiet.
 
+## Fact sheets + significance ranking
+
+- **`ds_core::cell_facts::CellFactSheet` is the one description of a cell.**
+  `score_cells()` builds it ONCE per generation from `CellTrack` + grid
+  geometry and stores it (with its score) in `CellSnapshot.cells` as
+  `ScoredCell`. Four consumers read it — served feature properties, the
+  ranking, any future narrative, and the #541 V2.4 learned-model feature row
+  — so all four see identical numbers by construction. Do NOT reconstruct
+  cell attributes at request time; that is how two of them drift.
+- Rounding to meaningful precision happens in `score_cells`, not in
+  `cell_feature`: the working grid is ~500 m, so 5 lon/lat decimals ≈ 1 m,
+  and raw f64s roughly double the GeoJSON payload to carry noise.
+- **Ranking is `ds_core::significance`** (domain-agnostic: it sees normalized
+  `Term`s, never a storm cell). Weights come from
+  `cell_facts::DEFAULT_CELL_WEIGHTS`, overridable per collection via
+  `[nowcast.significance]`; an unknown term name FAILS the collection at
+  load rather than silently keeping a default nobody chose.
+- Served as `significance` (0..=1), `significance_rank` (1-based within the
+  snapshot) and `significance_reasons` (top 3 contributing terms). The
+  reasons field is load-bearing: a weight table with no ground truth has to
+  be arguable to be tunable.
+- **Absent terms renormalize.** A cell with no volume/impact/lightning data
+  simply omits those terms. That is why wiring a new source later needs no
+  config flag day — but it also means `measured-quiet` ranks BELOW
+  `unknown`, which is correct (measured zero is information) and worth
+  remembering when a newly wired source appears to demote everything.
+- Term normalization ceilings live in `cell_facts` (`DBZ_CEILING` 60,
+  `VIL_CEILING_KG_M2` 50, …). Volume-derived terms are scaled by
+  `beam_coverage`, so a far-range cell cannot ride an inflated VIL to the
+  top of the list.
+- NOT yet wired: `?sortby=-significance` / `min_significance` on the items
+  endpoint (clients sort client-side today), and the `volume` / `impact` /
+  `environment` fact groups.
+
 ## Gotchas
 
 - `growth_decay = true` (experimental, default OFF — gate verdict on #546
@@ -135,4 +169,5 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   composites). A unit-converted source (e.g. K) needs it overridden.
 - Config: `horizon` (default PT2H), `step` (default source cadence),
   `history_frames` ≥ 2, `poll_interval_secs` (30), `max_generations` (6),
-  `max_pixels` (4 M), `min_echo` (10.0).
+  `max_pixels` (4 M), `min_echo` (10.0), `[nowcast.significance]` weight
+  overrides (all optional; unknown names rejected).

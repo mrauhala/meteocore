@@ -4543,6 +4543,7 @@ mod tests {
                 min_echo: 10.0,
                 growth_decay: false,
                 lightning_source: None,
+                significance: Default::default(),
             }),
             preview: None,
         }

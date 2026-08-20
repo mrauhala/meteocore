@@ -1,0 +1,504 @@
+//! Storm-cell fact sheets — the fused, structured description of one tracked
+//! cell that every downstream consumer reads.
+//!
+//! This is deliberately the *widest* domain type in the cell pipeline, and it
+//! has four consumers by design:
+//!
+//! 1. **Feature properties** — what OGC API - Features serves today.
+//! 2. **Significance scoring** — via [`SignificanceTerms`], so ranking reads
+//!    the same facts clients see rather than a private parallel structure.
+//! 3. **Narrative rendering** — a template today, an LLM prompt later. Because
+//!    the prompt is built from this struct alone, every number in a generated
+//!    narrative is traceable to a field here.
+//! 4. **Learned models** — the feature row a gradient-boosted hazard model
+//!    consumes (#541 V2.4). Building the row once and serving all four is the
+//!    reason this type exists instead of four ad-hoc projections.
+//!
+//! Optional groups (`lightning`, `volume`, `impact`, `environment`) follow the
+//! same tri-state discipline as the lightning feature properties: `None` means
+//! "no source wired or the join was skipped", never "measured zero". Scoring
+//! renormalizes around absent groups, so wiring a new source later changes
+//! rankings without needing a config flag day.
+
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+
+use crate::significance::{SignificanceScore, SignificanceTerms, Term};
+
+/// TRT-lite severity rank from 2-D attributes (documented heuristic v1).
+///
+/// Lives in ds-core rather than in the nowcast engine so the ranking, the
+/// narrative and the engine cannot drift to different meanings of "severe".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Weak,
+    Moderate,
+    Severe,
+    VerySevere,
+}
+
+impl Severity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Severity::Weak => "weak",
+            Severity::Moderate => "moderate",
+            Severity::Severe => "severe",
+            Severity::VerySevere => "very_severe",
+        }
+    }
+
+    /// 0..=3, for scoring and for ordering.
+    pub fn rank(&self) -> u8 {
+        match self {
+            Severity::Weak => 0,
+            Severity::Moderate => 1,
+            Severity::Severe => 2,
+            Severity::VerySevere => 3,
+        }
+    }
+}
+
+/// Volume-proxy lifecycle vs the previous observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Trend {
+    Growing,
+    Decaying,
+}
+
+impl Trend {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Trend::Growing => "growing",
+            Trend::Decaying => "decaying",
+        }
+    }
+}
+
+/// Per-cell lightning attribution (#549). `None` on the fact sheet means no
+/// event source is wired or the join was skipped this generation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct LightningFacts {
+    pub flash_count: u32,
+    pub flash_rate_per_min: f64,
+    /// Schultz-style 2σ jump fired this generation.
+    pub jump: bool,
+}
+
+/// Attributes derived from the 3-D polar volume, joined onto a 2-D track.
+///
+/// `beam_coverage` is the honesty field and it is not optional: a cell at
+/// long range has its lowest surveyed beam kilometres above ground, so
+/// `vil_kg_m2`, `base_m` and `volume_km3` are systematically biased. Reporting
+/// them without their sampling quality — or letting them rank a cell highly —
+/// launders a fabrication through a real number.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct VolumeFacts {
+    pub vil_kg_m2: f64,
+    pub echo_top_m: f64,
+    pub base_m: f64,
+    pub volume_km3: f64,
+    /// Distance from the contributing radar to the cell centroid.
+    pub range_km: f64,
+    /// How well the volume was actually sampled, 0.0 (unusable) ..= 1.0
+    /// (fully surveyed to the surface).
+    pub beam_coverage: f64,
+    /// How many per-site cells were aggregated into this record — a composite
+    /// mosaic cell can span several. 1 = clean one-to-one.
+    pub contributing_cells: u32,
+}
+
+/// Where the cell is and what it is heading toward.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ImpactFacts {
+    /// Named area currently under the cell, if any.
+    pub over: Option<String>,
+    /// Named area the cell reaches next along its motion vector.
+    pub approaching: Option<String>,
+    /// Minutes until it reaches `approaching`.
+    pub eta_minutes: Option<f64>,
+    /// Pre-normalized 0..=1 exposure, so the scorer stays domain-agnostic
+    /// about how "how much does this matter to people" was computed.
+    pub exposure: f64,
+}
+
+/// One sampled NWP environment value at the cell centroid.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EnvironmentFact {
+    pub name: String,
+    pub value: f64,
+    pub unit: String,
+}
+
+/// Everything known about one tracked cell at one instant.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CellFactSheet {
+    /// Stable track id, monotonic across generations.
+    pub id: u64,
+    /// The analysis instant this describes.
+    pub observed: DateTime<Utc>,
+    pub lon: f64,
+    pub lat: f64,
+    pub severity: Severity,
+    pub max_dbz: f64,
+    pub area_km2: f64,
+    /// Generations observed; 1 = newborn.
+    pub age: u32,
+    pub speed_ms: Option<f64>,
+    /// Compass bearing the cell moves toward.
+    pub bearing_deg: Option<f64>,
+    pub deviant_mover: bool,
+    pub trend: Option<Trend>,
+    /// Measured intensity tendency, dBZ per minute.
+    pub intensity_trend_dbz_min: Option<f64>,
+    pub lightning: Option<LightningFacts>,
+    pub volume: Option<VolumeFacts>,
+    pub impact: Option<ImpactFacts>,
+    /// Empty when no environment source is wired.
+    pub environment: Vec<EnvironmentFact>,
+}
+
+/// Upper end of each scoring term's useful range. Values at or above these
+/// saturate at 1.0 — the difference between a 65 and a 70 dBZ core is not
+/// what should decide a ranking.
+const DBZ_FLOOR: f64 = 35.0;
+const DBZ_CEILING: f64 = 60.0;
+const AREA_CEILING_KM2: f64 = 200.0;
+const FLASH_RATE_CEILING_PER_MIN: f64 = 60.0;
+const VIL_CEILING_KG_M2: f64 = 50.0;
+const ECHO_TOP_CEILING_M: f64 = 15_000.0;
+const INTENSITY_TREND_CEILING_DBZ_MIN: f64 = 2.0;
+
+/// Default significance weights for storm cells.
+///
+/// `impact` is deliberately the largest. A moderate cell reaching a populated
+/// area in fifteen minutes matters more than a very severe cell drifting over
+/// open sea, and any ranker that sorts on reflectivity alone is wrong in
+/// exactly the way that matters operationally.
+///
+/// These are a defensible starting point, not a calibrated model — they are
+/// the baseline a learned ranker has to beat on the object-verification
+/// harness before it replaces them.
+pub const DEFAULT_CELL_WEIGHTS: &[(&str, f64)] = &[
+    ("severity", 1.0),
+    ("max_dbz", 0.6),
+    ("area", 0.3),
+    ("trend", 0.5),
+    ("deviant_mover", 0.4),
+    ("lightning_jump", 0.9),
+    ("flash_rate", 0.5),
+    ("vil", 0.7),
+    ("echo_top", 0.5),
+    ("beam_coverage", 0.4),
+    ("impact", 1.5),
+];
+
+/// Map `value` onto 0..=1 across `floor..=ceiling`, saturating at both ends.
+fn ramp(value: f64, floor: f64, ceiling: f64) -> f64 {
+    if !value.is_finite() || ceiling <= floor {
+        return 0.0;
+    }
+    ((value - floor) / (ceiling - floor)).clamp(0.0, 1.0)
+}
+
+impl SignificanceTerms for CellFactSheet {
+    fn terms(&self) -> Vec<Term> {
+        let mut terms = vec![
+            Term::new("severity", f64::from(self.severity.rank()) / 3.0),
+            Term::new("max_dbz", ramp(self.max_dbz, DBZ_FLOOR, DBZ_CEILING)),
+            Term::new("area", ramp(self.area_km2, 0.0, AREA_CEILING_KM2)),
+            Term::flag("deviant_mover", self.deviant_mover),
+        ];
+
+        // Prefer the measured tendency over the coarse growing/decaying flag;
+        // fall back to the flag, and emit nothing for a newborn track (no
+        // trend exists yet, so it should not be scored as "not growing").
+        if let Some(trend) = self.intensity_trend_dbz_min {
+            terms.push(Term::new(
+                "trend",
+                ramp(
+                    trend,
+                    -INTENSITY_TREND_CEILING_DBZ_MIN,
+                    INTENSITY_TREND_CEILING_DBZ_MIN,
+                ),
+            ));
+        } else if let Some(trend) = self.trend {
+            terms.push(Term::flag("trend", trend == Trend::Growing));
+        }
+
+        if let Some(lightning) = self.lightning {
+            terms.push(Term::flag("lightning_jump", lightning.jump));
+            terms.push(Term::new(
+                "flash_rate",
+                ramp(
+                    lightning.flash_rate_per_min,
+                    0.0,
+                    FLASH_RATE_CEILING_PER_MIN,
+                ),
+            ));
+        }
+
+        if let Some(volume) = self.volume {
+            // Scale the volume-derived terms by how well the volume was
+            // actually sampled, so a far-range cell cannot ride an inflated
+            // VIL to the top of the list.
+            let coverage = volume.beam_coverage.clamp(0.0, 1.0);
+            terms.push(Term::new(
+                "vil",
+                ramp(volume.vil_kg_m2, 0.0, VIL_CEILING_KG_M2) * coverage,
+            ));
+            terms.push(Term::new(
+                "echo_top",
+                ramp(volume.echo_top_m, 0.0, ECHO_TOP_CEILING_M) * coverage,
+            ));
+            terms.push(Term::new("beam_coverage", coverage));
+        }
+
+        if let Some(impact) = &self.impact {
+            terms.push(Term::new("impact", impact.exposure));
+        }
+
+        terms
+    }
+}
+
+/// A fact sheet with its computed score. Kept as a pair rather than a field on
+/// [`CellFactSheet`] so that scoring reads facts and never its own output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredCell {
+    pub facts: CellFactSheet,
+    pub significance: SignificanceScore,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::significance::WeightedScorer;
+    use chrono::TimeZone;
+
+    fn scorer() -> WeightedScorer {
+        WeightedScorer::new(DEFAULT_CELL_WEIGHTS)
+    }
+
+    fn cell(id: u64) -> CellFactSheet {
+        CellFactSheet {
+            id,
+            observed: Utc.with_ymd_and_hms(2026, 8, 19, 12, 0, 0).unwrap(),
+            lon: 24.94,
+            lat: 60.17,
+            severity: Severity::Moderate,
+            max_dbz: 47.0,
+            area_km2: 40.0,
+            age: 5,
+            speed_ms: Some(14.0),
+            bearing_deg: Some(45.0),
+            deviant_mover: false,
+            trend: None,
+            intensity_trend_dbz_min: None,
+            lightning: None,
+            volume: None,
+            impact: None,
+            environment: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn default_weights_cover_every_term_the_facts_emit() {
+        // A term with no weight is silently ignored by the scorer, so a typo
+        // or a newly added term would vanish without this check.
+        let mut full = cell(1);
+        full.trend = Some(Trend::Growing);
+        full.intensity_trend_dbz_min = Some(0.4);
+        full.lightning = Some(LightningFacts {
+            flash_count: 12,
+            flash_rate_per_min: 4.0,
+            jump: true,
+        });
+        full.volume = Some(VolumeFacts {
+            vil_kg_m2: 20.0,
+            echo_top_m: 9000.0,
+            base_m: 500.0,
+            volume_km3: 30.0,
+            range_km: 60.0,
+            beam_coverage: 0.9,
+            contributing_cells: 1,
+        });
+        full.impact = Some(ImpactFacts {
+            over: None,
+            approaching: Some("Hyvinkää".into()),
+            eta_minutes: Some(18.0),
+            exposure: 0.6,
+        });
+
+        let weighted: Vec<&str> = DEFAULT_CELL_WEIGHTS.iter().map(|(n, _)| *n).collect();
+        for term in full.terms() {
+            assert!(
+                weighted.contains(&term.name),
+                "term '{}' has no default weight",
+                term.name
+            );
+        }
+        // And the reverse: no weight names a term that is never emitted.
+        let emitted: Vec<&str> = full.terms().iter().map(|t| t.name).collect();
+        for name in &weighted {
+            assert!(emitted.contains(name), "weight '{name}' matches no term");
+        }
+    }
+
+    #[test]
+    fn newborn_track_emits_no_trend_term() {
+        // A track with no measured trend must not be scored as "not growing".
+        let newborn = cell(1);
+        assert!(!newborn.terms().iter().any(|t| t.name == "trend"));
+
+        let mut aged = cell(2);
+        aged.trend = Some(Trend::Decaying);
+        assert!(aged.terms().iter().any(|t| t.name == "trend"));
+    }
+
+    #[test]
+    fn absent_groups_renormalize_rather_than_penalize() {
+        // Wiring a lightning source must not make quiet cells score lower
+        // than they did when no source existed.
+        let bare = cell(1);
+        let mut quiet = cell(1);
+        quiet.lightning = Some(LightningFacts {
+            flash_count: 0,
+            flash_rate_per_min: 0.0,
+            jump: false,
+        });
+        let s = scorer();
+        let bare_score = s.score_one(&bare).score;
+        let quiet_score = s.score_one(&quiet).score;
+        assert!(
+            quiet_score < bare_score,
+            "measured-quiet is real information and should rank below unknown"
+        );
+        assert!(quiet_score > 0.0);
+    }
+
+    #[test]
+    fn poor_beam_coverage_demotes_an_otherwise_identical_cell() {
+        let volume = VolumeFacts {
+            vil_kg_m2: 40.0,
+            echo_top_m: 12_000.0,
+            base_m: 300.0,
+            volume_km3: 80.0,
+            range_km: 40.0,
+            beam_coverage: 1.0,
+            contributing_cells: 1,
+        };
+        let mut near = cell(1);
+        near.volume = Some(volume);
+        let mut far = cell(2);
+        far.volume = Some(VolumeFacts {
+            range_km: 210.0,
+            beam_coverage: 0.2,
+            ..volume
+        });
+
+        let s = scorer();
+        assert!(
+            s.score_one(&far).score < s.score_one(&near).score,
+            "a far-range cell with identical raw attributes must rank lower"
+        );
+    }
+
+    #[test]
+    fn impact_outranks_raw_intensity() {
+        // The operational case: a moderate cell closing on a town beats a
+        // very severe cell over open water.
+        let mut over_sea = cell(1);
+        over_sea.severity = Severity::VerySevere;
+        over_sea.max_dbz = 58.0;
+        over_sea.area_km2 = 120.0;
+        over_sea.impact = Some(ImpactFacts {
+            over: None,
+            approaching: None,
+            eta_minutes: None,
+            exposure: 0.0,
+        });
+
+        let mut closing = cell(2);
+        closing.severity = Severity::Moderate;
+        closing.max_dbz = 47.0;
+        closing.impact = Some(ImpactFacts {
+            over: None,
+            approaching: Some("Hyvinkää".into()),
+            eta_minutes: Some(15.0),
+            exposure: 1.0,
+        });
+
+        let s = scorer();
+        assert!(
+            s.score_one(&closing).score > s.score_one(&over_sea).score,
+            "impact must dominate raw intensity"
+        );
+    }
+
+    #[test]
+    fn lightning_jump_lifts_a_cell() {
+        let mut quiet = cell(1);
+        quiet.lightning = Some(LightningFacts {
+            flash_count: 2,
+            flash_rate_per_min: 1.0,
+            jump: false,
+        });
+        let mut jumping = cell(2);
+        jumping.lightning = Some(LightningFacts {
+            flash_count: 2,
+            flash_rate_per_min: 1.0,
+            jump: true,
+        });
+        let s = scorer();
+        assert!(s.score_one(&jumping).score > s.score_one(&quiet).score);
+    }
+
+    #[test]
+    fn ranking_a_realistic_set_puts_the_dangerous_cell_first() {
+        let mut ordinary = cell(1);
+        ordinary.severity = Severity::Moderate;
+
+        let mut dangerous = cell(2);
+        dangerous.severity = Severity::VerySevere;
+        dangerous.max_dbz = 57.0;
+        dangerous.area_km2 = 90.0;
+        dangerous.deviant_mover = true;
+        dangerous.intensity_trend_dbz_min = Some(1.2);
+        dangerous.lightning = Some(LightningFacts {
+            flash_count: 40,
+            flash_rate_per_min: 25.0,
+            jump: true,
+        });
+        dangerous.impact = Some(ImpactFacts {
+            over: Some("Nurmijärvi".into()),
+            approaching: Some("Hyvinkää".into()),
+            eta_minutes: Some(12.0),
+            exposure: 0.85,
+        });
+
+        let mut weak = cell(3);
+        weak.severity = Severity::Weak;
+        weak.max_dbz = 36.0;
+        weak.area_km2 = 5.0;
+
+        let scores = scorer().rank(&[ordinary, dangerous, weak]);
+        assert_eq!(scores[1].rank, 1, "the dangerous cell must rank first");
+        assert_eq!(scores[0].rank, 2);
+        assert_eq!(scores[2].rank, 3);
+        assert_eq!(
+            scores[1].contributions[0].term, "impact",
+            "the top reason should be the one a forecaster would lead with"
+        );
+    }
+
+    #[test]
+    fn ramp_saturates_and_survives_garbage() {
+        assert_eq!(ramp(10.0, 0.0, 100.0), 0.1);
+        assert_eq!(ramp(-5.0, 0.0, 100.0), 0.0);
+        assert_eq!(ramp(500.0, 0.0, 100.0), 1.0);
+        assert_eq!(ramp(f64::NAN, 0.0, 100.0), 0.0);
+        assert_eq!(ramp(1.0, 5.0, 5.0), 0.0);
+    }
+}

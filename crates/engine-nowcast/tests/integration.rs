@@ -144,6 +144,7 @@ fn lightning_join_exposes_flash_properties() {
         min_echo: 10.0,
         growth_decay: false,
         lightning_source: Some("mock-lightning".into()),
+        significance: Default::default(),
     };
     let engine = NowcastEngine::new("lj-nowcast", "mock", source.clone(), &config)
         .expect("engine builds")
@@ -243,6 +244,7 @@ fn lightning_source_error_degrades_to_null_fields() {
         min_echo: 10.0,
         growth_decay: false,
         lightning_source: Some("mock-lightning".into()),
+        significance: Default::default(),
     };
     let strikes = Arc::new(FlakyStrikes {
         fail: AtomicBool::new(false),
@@ -309,6 +311,7 @@ fn build_with_history(
         min_echo: 10.0,
         growth_decay: false,
         lightning_source: None,
+        significance: Default::default(),
     };
     let engine =
         NowcastEngine::new("mock-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -531,6 +534,7 @@ fn excessive_lead_count_is_rejected_at_construction() {
         min_echo: 10.0,
         growth_decay: false,
         lightning_source: None,
+        significance: Default::default(),
     };
     let err = NowcastEngine::new("mock-nowcast", "mock", source, &config)
         .err()
@@ -573,6 +577,7 @@ fn oversized_history_frames_is_rejected() {
         min_echo: 10.0,
         growth_decay: false,
         lightning_source: None,
+        significance: Default::default(),
     };
     let err = NowcastEngine::new("mock-nowcast", "mock", source, &config)
         .err()
@@ -694,6 +699,7 @@ fn dry_scene_leaves_both_skill_gauges_unset() {
         min_echo: 10.0,
         growth_decay: false,
         lightning_source: None,
+        significance: Default::default(),
     };
     let engine =
         NowcastEngine::new("dry-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -868,6 +874,7 @@ fn geometry_change_resets_cell_tracks() {
         min_echo: 10.0,
         growth_decay: false,
         lightning_source: None,
+        significance: Default::default(),
     };
     let engine =
         NowcastEngine::new("mv-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -961,6 +968,7 @@ fn growth_decay_dims_decaying_echo() {
             min_echo: 10.0,
             growth_decay,
             lightning_source: None,
+            significance: Default::default(),
         };
         let engine = NowcastEngine::new("fade", "mock", source.clone(), &config).expect("builds");
         engine.poll_once();
@@ -980,4 +988,186 @@ fn growth_decay_dims_decaying_echo() {
         adjusted < plain - 1.0,
         "growth/decay must dim a fading echo at +30 min: {adjusted} vs {plain}"
     );
+}
+
+/// Significance ranking: a scene with two very different cells must serve
+/// both, rank the dangerous one first, and say WHY.
+///
+/// The scene is the operationally interesting one — a big intense core and a
+/// small weak blob — because a ranking that cannot separate those is not
+/// worth serving.
+#[test]
+fn cells_are_ranked_by_significance_with_reasons() {
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+
+    /// Raw byte for ~57 dBZ under gain 0.4 / offset −30 (crosses all three
+    /// severity steps); `ECHO_RAW` is ~40 dBZ and crosses none.
+    const STRONG_RAW: u8 = 218;
+
+    struct TwoCellSource {
+        times: RwLock<Vec<DateTime<Utc>>>,
+    }
+
+    impl MapEngine for TwoCellSource {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            let mut data = vec![0u8; (width * height) as usize];
+            for (i, cell) in data.iter_mut().enumerate() {
+                let x = (i % width as usize) as f64 + 0.5;
+                let y = (i / width as usize) as f64 + 0.5;
+                // Weak, small.
+                if (x - 40.0).powi(2) + (y - 50.0).powi(2) <= 8.0 * 8.0 {
+                    *cell = ECHO_RAW;
+                }
+                // Intense, large — and far enough away to stay a separate
+                // connected component.
+                if (x - 140.0).powi(2) + (y - 140.0).powi(2) <= 20.0 * 20.0 {
+                    *cell = STRONG_RAW;
+                }
+            }
+            Ok(RasterTile {
+                width,
+                height,
+                values: RasterValues::U8 {
+                    data,
+                    nodata: Some(NODATA),
+                    gain: 0.4,
+                    offset: -30.0,
+                },
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some(EXTENT),
+                times: self.times.read().unwrap().clone(),
+                parameter: "reflectivity".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: Some([W, H]),
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+    }
+
+    let anchor1 = t0() + Duration::minutes(5);
+    let source = Arc::new(TwoCellSource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let engine = NowcastEngine::new("ranked", "mock", source, &base_config())
+        .expect("engine builds with default weights");
+    engine.poll_once();
+
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    assert_eq!(page.number_matched, 2, "two discs, two cells");
+
+    let cell = |severity: &str| {
+        page.features
+            .iter()
+            .find(|f| {
+                matches!(f.properties.get("severity"),
+                    Some(PropertyValue::String(s)) if s == severity)
+            })
+            .unwrap_or_else(|| panic!("no {severity} cell in {:?}", page.features))
+    };
+    let strong = cell("very_severe");
+    let weak = cell("moderate");
+
+    let score = |f: &ds_core::feature::Feature| match f.properties.get("significance") {
+        Some(PropertyValue::Float(v)) => *v,
+        other => panic!("missing significance, got {other:?}"),
+    };
+    let rank = |f: &ds_core::feature::Feature| match f.properties.get("significance_rank") {
+        Some(PropertyValue::Integer(v)) => *v,
+        other => panic!("missing significance_rank, got {other:?}"),
+    };
+
+    assert_eq!(rank(strong), 1, "the intense cell must rank first");
+    assert_eq!(rank(weak), 2);
+    assert!(
+        score(strong) > score(weak),
+        "scores must order the same way as ranks: {} vs {}",
+        score(strong),
+        score(weak)
+    );
+    for f in &page.features {
+        let s = score(f);
+        assert!((0.0..=1.0).contains(&s), "significance out of range: {s}");
+    }
+
+    // A ranking nobody can argue with is one nobody can tune.
+    match strong.properties.get("significance_reasons") {
+        Some(PropertyValue::List(reasons)) => {
+            assert!(!reasons.is_empty(), "ranked cell must explain itself");
+            assert!(
+                reasons.len() <= 3,
+                "reasons are a summary, not the whole table"
+            );
+            assert!(reasons
+                .iter()
+                .all(|r| matches!(r, PropertyValue::String(_))));
+        }
+        other => panic!("missing significance_reasons, got {other:?}"),
+    }
+}
+
+/// A typo in a `[nowcast.significance]` weight name must fail the collection
+/// at load, not silently rank by defaults the operator never chose.
+#[test]
+fn unknown_significance_weight_fails_the_collection() {
+    let mut config = base_config();
+    config.significance.insert("max_dbzz".into(), 2.0);
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0()]),
+    });
+    let err = match NowcastEngine::new("bad-weights", "mock", source, &config) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a misspelled weight must be rejected"),
+    };
+    assert!(
+        err.contains("max_dbzz"),
+        "error should name the typo: {err}"
+    );
+    assert!(
+        err.contains("max_dbz"),
+        "error should list valid names: {err}"
+    );
+
+    // And the correctly spelled one is accepted.
+    let mut good = base_config();
+    good.significance.insert("max_dbz".into(), 2.0);
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0()]),
+    });
+    assert!(NowcastEngine::new("good-weights", "mock", source, &good).is_ok());
+}
+
+/// Shared default config for the ranking tests.
+fn base_config() -> NowcastConfig {
+    NowcastConfig {
+        source: "mock".into(),
+        horizon: "PT30M".into(),
+        step: None,
+        history_frames: 2,
+        poll_interval_secs: 30,
+        max_generations: 4,
+        max_pixels: 4_000_000,
+        min_echo: 10.0,
+        growth_decay: false,
+        lightning_source: None,
+        significance: Default::default(),
+    }
 }
