@@ -5035,6 +5035,116 @@ mod tests {
         let r = super::reusable_collections(&old, &new, &live_of(&["radar", "nc"]));
         assert!(!r.contains("nc"));
         assert!(r.contains("radar"));
+
+        // Same rule for impact_source: a rebuilt impact collection must
+        // force the nowcast to rebuild too, or the wrapper keeps an Arc to
+        // the OLD areas engine and silently serves stale impact context.
+        let mut nc_impact = nowcast_test_collection("nci", "nowcast", Some("radar"));
+        if let Some(n) = nc_impact.nowcast.as_mut() {
+            n.impact_source = Some("areas".to_string());
+        }
+        let mut areas = nowcast_test_collection("areas", "postgis", None);
+        areas.apis = vec!["features".to_string()];
+        let old: HashMap<String, CollectionConfig> = [
+            ("radar".to_string(), radar.clone()),
+            ("areas".to_string(), areas.clone()),
+            ("nci".to_string(), nc_impact.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let new = vec![radar.clone(), areas.clone(), nc_impact.clone()];
+        let r = super::reusable_collections(&old, &new, &live_of(&["radar", "areas", "nci"]));
+        assert!(r.contains("nci"), "all deps unchanged → nowcast reusable");
+        let r = super::reusable_collections(&old, &new, &live_of(&["radar", "nci"]));
+        assert!(
+            !r.contains("nci"),
+            "impact source not reused → nowcast must rebuild"
+        );
+
+        // Consequence worth pinning: geojson ALWAYS rebuilds (no poll loop —
+        // reload is the only way it re-reads its file), so the typical
+        // municipality impact source makes its nowcast rebuild on every
+        // reload. Correct per the dependency rule, but not free.
+        let mut geo_areas = nowcast_test_collection("areas", "geojson", None);
+        geo_areas.apis = vec!["features".to_string()];
+        let old: HashMap<String, CollectionConfig> = [
+            ("radar".to_string(), radar.clone()),
+            ("areas".to_string(), geo_areas.clone()),
+            ("nci".to_string(), nc_impact.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let new = vec![radar.clone(), geo_areas, nc_impact.clone()];
+        let r = super::reusable_collections(&old, &new, &live_of(&["radar", "areas", "nci"]));
+        assert!(
+            !r.contains("nci"),
+            "a geojson impact source always rebuilds, so its nowcast must too"
+        );
+    }
+
+    #[test]
+    fn nowcast_missing_impact_source_fails_that_collection() {
+        // Same safety property as lightning_source: an impact_source naming
+        // no Features collection fails the nowcast at load rather than
+        // silently serving cells with an inert `impact` ranking term.
+        let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
+        nc.nowcast.as_mut().unwrap().impact_source = Some("no-such-areas".into());
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &[tm35_source_collection("radar"), nc],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        let h = health_of(&result, "nc");
+        assert_eq!(h.status, super::CollectionStatus::Failed);
+        assert!(
+            h.error.as_deref().unwrap_or("").contains("impact_source"),
+            "error should name the missing impact source: {:?}",
+            h.error
+        );
+        assert!(!result.wms_state.engines.contains_key("nc"));
+        assert!(result.wms_state.engines.contains_key("radar"));
+    }
+
+    #[test]
+    fn nowcast_impact_source_resolution_is_declaration_order_independent() {
+        // Regression guard for the ordering bug: nowcast engines are
+        // themselves FeatureEngines inserted DURING the second pass, so
+        // resolving against the live map made this succeed or fail purely on
+        // which collection was declared first. Both orders must now agree.
+        let build = |nowcast_first: bool| {
+            let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
+            nc.nowcast.as_mut().unwrap().impact_source = Some("other-nc".into());
+            let other = nowcast_test_collection("other-nc", "nowcast", Some("radar"));
+            let radar = tm35_source_collection("radar");
+            let collections = if nowcast_first {
+                vec![radar, nc, other]
+            } else {
+                vec![radar, other, nc]
+            };
+            let result = super::load_collections(
+                &ds_render::StyleContext::with_builtins(),
+                &collections,
+                &[],
+                "http://x",
+                false,
+                0,
+                super::ReusableCaches::default(),
+                super::EngineReuse::default(),
+            );
+            health_of(&result, "nc").status
+        };
+        assert_eq!(
+            build(true),
+            build(false),
+            "impact_source resolution must not depend on config declaration order"
+        );
+        // And a nowcast is never a valid impact source: cells are points.
+        assert_eq!(build(true), super::CollectionStatus::Failed);
     }
 
     // (The maybe_wrap_integer_lut (#207) unit tests moved with the function

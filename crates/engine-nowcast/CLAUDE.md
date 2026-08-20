@@ -159,6 +159,12 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   collection (municipalities, catchments, service regions). Wired
   second-pass in `admin.rs`; a missing id or one not wired to the Features
   API FAILS the collection at load.
+- **A geojson impact source makes its nowcast rebuild on every reload.**
+  `csv`/`geojson` are always rebuilt (reload is the only way they re-read a
+  changed file), and `reusable_collections` requires every second-pass
+  dependency to be reused — so the typical `municipalities` source costs a
+  nowcast re-bootstrap per reload. Correct, but not free; use a postgis
+  areas collection if that matters.
 - Unlike `lightning_source` (postgis only, all built in the first pass),
   impact sources are resolved against a **snapshot of `feature_engines`
   taken before the nowcast pass** (`base_feature_engines`). Nowcast engines

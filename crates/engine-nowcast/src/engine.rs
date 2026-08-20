@@ -1296,12 +1296,20 @@ fn score_cells(
                 g.west + (f64::from(t.blob.centroid.0) / f64::from(g.width)) * (g.east - g.west);
             let lat = g.north
                 - (f64::from(t.blob.centroid.1) / f64::from(g.height)) * (g.north - g.south);
+            // Keep the RAW motion for the impact lookahead and round only for
+            // the served payload. The rounding below was calibrated to cut
+            // JSON size, not for geometric accuracy: a whole-degree bearing
+            // error displaces the end of a ~126 km sweep by over a kilometre,
+            // which is enough to flip which area a cell is reported as
+            // approaching when it passes near a boundary.
+            let speed_raw = t.speed_ms().map(f64::from);
+            let bearing_raw = t.bearing_deg();
+            let impact_facts = impact.map(|idx| idx.resolve(lon, lat, speed_raw, bearing_raw));
+
             // 5 decimals ≈ 1 m — the working grid is ~500 m, so raw f64s
             // would roughly double the payload to carry pure noise.
             let lon = round_to(lon, 5);
             let lat = round_to(lat, 5);
-            let speed_ms = t.speed_ms().map(|v| round_to(f64::from(v), 1));
-            let bearing_deg = t.bearing_deg().map(|b| round_to(b, 0) % 360.0);
             CellFactSheet {
                 id: t.id,
                 observed: anchor,
@@ -1313,8 +1321,8 @@ fn score_cells(
                 max_dbz: round_to(f64::from(t.blob.max_value), 1),
                 area_km2: round_to(t.blob.area as f64 * kx * ky, 1),
                 age: t.age,
-                speed_ms,
-                bearing_deg,
+                speed_ms: speed_raw.map(|v| round_to(v, 1)),
+                bearing_deg: bearing_raw.map(|b| round_to(b, 0) % 360.0),
                 deviant_mover: t.deviant(),
                 trend: match t.growing {
                     Some(true) => Some(Trend::Growing),
@@ -1339,7 +1347,7 @@ fn score_cells(
                 // Absent when no impact source is wired — the term then
                 // renormalizes out rather than scoring every cell as
                 // unexposed.
-                impact: impact.map(|idx| idx.resolve(lon, lat, speed_ms, bearing_deg)),
+                impact: impact_facts,
                 // Wired by later phases: the 3-D volume join and NWP
                 // environment sampling.
                 volume: None,
