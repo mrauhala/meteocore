@@ -230,9 +230,19 @@ impl ImpactIndex {
 /// Longitude padding widens with latitude (meridians converge), computed at
 /// whichever edge is nearer the pole, and is capped so a high-latitude domain
 /// cannot ask for a whole hemisphere.
+///
+/// Longitude WRAPS rather than clamping: `Bbox` supports antimeridian-crossing
+/// boxes (`west > east`, OGC API Features §7.15.3), and clamping at ±180°
+/// would truncate a dateline-adjacent domain's reach — reintroducing on the
+/// antimeridian exactly the silent miss this function exists to prevent at the
+/// composite edge. Latitude still clamps: the poles do not wrap.
 fn pad_for_lookahead(bbox: [f64; 4]) -> [f64; 4] {
     const MAX_LON_PAD_DEG: f64 = 20.0;
     const KM_PER_DEG_LAT: f64 = 111.32;
+    /// Wrap a longitude into (−180, 180].
+    fn wrap_lon(v: f64) -> f64 {
+        (v + 180.0).rem_euclid(360.0) - 180.0
+    }
 
     let [west, south, east, north] = bbox;
     if !bbox.iter().all(|v| v.is_finite()) {
@@ -245,10 +255,23 @@ fn pad_for_lookahead(bbox: [f64; 4]) -> [f64; 4] {
     let lon_pad =
         (reach_km / (KM_PER_DEG_LAT * worst_lat.to_radians().cos()).max(1e-6)).min(MAX_LON_PAD_DEG);
 
+    // Unroll an already-crossing input onto a monotonic span before padding,
+    // so the width is the true width in both cases.
+    let unrolled_east = if east < west { east + 360.0 } else { east };
+    let padded_west = west - lon_pad;
+    let padded_east = unrolled_east + lon_pad;
+    let (out_west, out_east) = if padded_east - padded_west >= 360.0 {
+        // The pad swallowed the globe; a crossing box would be ambiguous, so
+        // ask for everything explicitly.
+        (-180.0, 180.0)
+    } else {
+        (wrap_lon(padded_west), wrap_lon(padded_east))
+    };
+
     [
-        (west - lon_pad).max(-180.0),
+        out_west,
         (south - lat_pad).max(-90.0),
-        (east + lon_pad).min(180.0),
+        out_east,
         (north + lat_pad).min(90.0),
     ]
 }
@@ -491,11 +514,42 @@ mod tests {
             grid[1] - s
         );
 
-        // Bounded at the poles and antimeridian rather than overflowing.
+        // Latitude clamps at the poles; longitude here spans nearly the
+        // globe already, so the pad asks for everything rather than an
+        // ambiguous crossing box.
         let [w, s, e, n] = pad_for_lookahead([-179.0, 88.0, 179.0, 89.5]);
-        assert!(w >= -180.0 && e <= 180.0 && s >= -90.0 && n <= 90.0);
+        assert_eq!((w, e), (-180.0, 180.0));
+        assert!(s >= -90.0 && n <= 90.0);
 
         // Garbage in, garbage out — but unchanged, so Bbox::new rejects it.
         assert!(pad_for_lookahead([f64::NAN, 0.0, 1.0, 1.0])[0].is_nan());
+    }
+
+    #[test]
+    fn padding_wraps_across_the_antimeridian_instead_of_truncating() {
+        // A dateline-adjacent domain: clamping at +180 would silently drop
+        // the reach just past it — the same failure this padding exists to
+        // prevent at the composite edge.
+        let [w, _, e, _] = pad_for_lookahead([170.0, 60.0, 179.0, 65.0]);
+        assert!(w > 160.0 && w < 170.0, "west should pad westward, got {w}");
+        assert!(
+            e < 0.0,
+            "east should wrap past the antimeridian to a negative lon, got {e}"
+        );
+        assert!(
+            w > e,
+            "the result must be a crossing bbox (west > east), got {w}..{e}"
+        );
+        // Bbox accepts it (OGC API Features 7.15.3), so the query is valid.
+        assert!(Bbox::new(w, 60.0, e, 65.0).is_ok());
+    }
+
+    #[test]
+    fn padding_an_already_crossing_bbox_stays_crossing() {
+        // Input already spans the dateline: 175E .. 175W.
+        let [w, _, e, _] = pad_for_lookahead([175.0, 60.0, -175.0, 65.0]);
+        assert!(w < 175.0 || w > 0.0, "west padded westward, got {w}");
+        assert!(w > e, "must remain a crossing bbox, got {w}..{e}");
+        assert!(Bbox::new(w, 60.0, e, 65.0).is_ok());
     }
 }
