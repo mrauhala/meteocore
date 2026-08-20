@@ -46,6 +46,7 @@ use crate::advect::TrajectoryIntegrator;
 use crate::cells2d::{
     advance_tracks, apply_lightning, CellTrack, CELL_MIN_AREA_PX, CELL_THRESHOLD_DBZ,
 };
+use crate::impact::ImpactIndex;
 use crate::motion::{estimate_motion_multi, MotionField, MotionOptions};
 use crate::objects::{segment_cells_labeled, PixelScale};
 use crate::tendency::EFOLD_INTERVALS;
@@ -172,6 +173,13 @@ struct CellSnapshot {
     cells: Arc<Vec<ScoredCell>>,
 }
 
+/// The impact source plus the property names to read from it.
+struct ImpactCfg {
+    source: Arc<dyn FeatureEngine>,
+    name_property: String,
+    weight_property: Option<String>,
+}
+
 /// Cell-history retention: 48 snapshots = 4 h at the 5-min cadence. Cells
 /// are a few hundred tracks × ~100 B per snapshot — retention is ~free.
 const CELL_HISTORY_SNAPSHOTS: usize = 48;
@@ -216,6 +224,11 @@ pub struct NowcastEngine {
     /// Optional point-event source joined onto tracked cells per
     /// generation (#549) — lightning, wired by the server's second pass.
     lightning: Option<Arc<dyn ds_core::events::EventSource>>,
+    /// Optional polygon source naming the areas a cell is over or heading
+    /// toward, wired by the server's second pass like `lightning`. Feeds the
+    /// `impact` significance term — the one that makes a ranking
+    /// operational rather than merely meteorological.
+    impact: Option<ImpactCfg>,
     /// Significance ranking for tracked cells: the default weight table with
     /// any per-collection overrides applied. Validated at construction, so a
     /// typo in a weight name fails the collection at load rather than
@@ -315,6 +328,7 @@ impl NowcastEngine {
             lead_persistence_csi_permille: AtomicU64::new(u64::MAX),
             next_track_id: AtomicU64::new(1),
             lightning: None,
+            impact: None,
             scorer,
         })
     }
@@ -381,6 +395,23 @@ impl NowcastEngine {
         self
     }
 
+    /// Attach the polygon source naming affected areas (second pass, like
+    /// `with_lightning_source` — the impact collection's own engine must
+    /// exist first).
+    pub fn with_impact_source(
+        mut self,
+        source: Arc<dyn FeatureEngine>,
+        name_property: &str,
+        weight_property: Option<&str>,
+    ) -> Self {
+        self.impact = Some(ImpactCfg {
+            source,
+            name_property: name_property.to_string(),
+            weight_property: weight_property.map(str::to_string),
+        });
+        self
+    }
+
     /// Poll the source for a new frame; spawn on the BACKGROUND runtime only.
     /// The first tick fires immediately so the first generation isn't delayed
     /// by one poll interval.
@@ -428,6 +459,40 @@ impl NowcastEngine {
                 }
                 let info = build_info(&source_info, &generations);
                 let generation_ref = generations.get(&anchor).expect("just inserted");
+                // Impact areas: ONE bounded fetch per generation covering the
+                // whole working grid, never one per cell (the `EventSource`
+                // contract — an impact source may be a sync bridge over a
+                // database, and we are on the poll runtime where that is
+                // legal). A source error degrades to "no impact context this
+                // generation", never a failed generation.
+                let impact_index = self.impact.as_ref().and_then(|cfg| {
+                    let g = generation_ref.geom;
+                    match ImpactIndex::build(
+                        cfg.source.as_ref(),
+                        [g.west, g.south, g.east, g.north],
+                        &cfg.name_property,
+                        cfg.weight_property.as_deref(),
+                    ) {
+                        Ok(index) => {
+                            if index.is_empty() {
+                                tracing::warn!(
+                                    collection = %self.collection_id,
+                                    name_property = %cfg.name_property,
+                                    "impact source returned no usable named areas over the \
+                                     nowcast grid; check impact_name_property"
+                                );
+                            }
+                            Some(index)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                collection = %self.collection_id,
+                                "impact join skipped this generation: {e}"
+                            );
+                            None
+                        }
+                    }
+                });
                 let mut cell_history = old.cell_history.clone();
                 cell_history.push(CellSnapshot {
                     anchor,
@@ -436,6 +501,7 @@ impl NowcastEngine {
                         generation_ref.geom,
                         anchor,
                         &self.scorer,
+                        impact_index.as_ref(),
                     )),
                 });
                 if cell_history.len() > CELL_HISTORY_SNAPSHOTS {
@@ -1219,6 +1285,7 @@ fn score_cells(
     g: GridGeom,
     anchor: DateTime<Utc>,
     scorer: &WeightedScorer,
+    impact: Option<&ImpactIndex>,
 ) -> Vec<ScoredCell> {
     let (kx, ky) =
         crate::lonlat_grid_km_per_px([g.west, g.south, g.east, g.north], g.width, g.height);
@@ -1229,21 +1296,25 @@ fn score_cells(
                 g.west + (f64::from(t.blob.centroid.0) / f64::from(g.width)) * (g.east - g.west);
             let lat = g.north
                 - (f64::from(t.blob.centroid.1) / f64::from(g.height)) * (g.north - g.south);
+            // 5 decimals ≈ 1 m — the working grid is ~500 m, so raw f64s
+            // would roughly double the payload to carry pure noise.
+            let lon = round_to(lon, 5);
+            let lat = round_to(lat, 5);
+            let speed_ms = t.speed_ms().map(|v| round_to(f64::from(v), 1));
+            let bearing_deg = t.bearing_deg().map(|b| round_to(b, 0) % 360.0);
             CellFactSheet {
                 id: t.id,
                 observed: anchor,
-                // 5 decimals ≈ 1 m — the working grid is ~500 m, so raw f64s
-                // would roughly double the payload to carry pure noise.
-                lon: round_to(lon, 5),
-                lat: round_to(lat, 5),
+                lon,
+                lat,
                 severity: t.severity,
                 // f32→f64 promotion of a gain-scaled byte prints noise for
                 // gains that aren't binary-exact (SMHI 0.4 ⇒ 36.400001525878906).
                 max_dbz: round_to(f64::from(t.blob.max_value), 1),
                 area_km2: round_to(t.blob.area as f64 * kx * ky, 1),
                 age: t.age,
-                speed_ms: t.speed_ms().map(|v| round_to(f64::from(v), 1)),
-                bearing_deg: t.bearing_deg().map(|b| round_to(b, 0) % 360.0),
+                speed_ms,
+                bearing_deg,
                 deviant_mover: t.deviant(),
                 trend: match t.growing {
                     Some(true) => Some(Trend::Growing),
@@ -1265,11 +1336,13 @@ fn score_cells(
                         .unwrap_or(0.0),
                     jump: t.lightning_jump,
                 }),
-                // Wired by later phases: the 3-D volume join, impact
-                // geometry, and NWP environment sampling. Absent terms
-                // renormalize, so rankings stay meaningful until then.
+                // Absent when no impact source is wired — the term then
+                // renormalizes out rather than scoring every cell as
+                // unexposed.
+                impact: impact.map(|idx| idx.resolve(lon, lat, speed_ms, bearing_deg)),
+                // Wired by later phases: the 3-D volume join and NWP
+                // environment sampling.
                 volume: None,
-                impact: None,
                 environment: Vec::new(),
             }
         })
@@ -1348,6 +1421,34 @@ fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
                 .collect(),
         ),
     );
+    // Impact context. Present only when an impact source is wired — same
+    // tri-state discipline as the flash properties: absent means "not
+    // measured", null within the group means "nothing there".
+    if let Some(impact) = &t.impact {
+        props.insert(
+            "impact_over".into(),
+            impact
+                .over
+                .as_ref()
+                .map(|n| PropertyValue::String(n.clone()))
+                .unwrap_or(PropertyValue::Null),
+        );
+        props.insert(
+            "impact_approaching".into(),
+            impact
+                .approaching
+                .as_ref()
+                .map(|n| PropertyValue::String(n.clone()))
+                .unwrap_or(PropertyValue::Null),
+        );
+        props.insert(
+            "impact_eta_minutes".into(),
+            impact
+                .eta_minutes
+                .map(PropertyValue::Float)
+                .unwrap_or(PropertyValue::Null),
+        );
+    }
     // Lifecycle as DATA, not field modification: three gate runs showed
     // tendency extrapolation loses to pure advection (#546), but the
     // measured trend is still valuable client-side ("intensifying" /

@@ -489,6 +489,12 @@ horizon = "PT2H"        # how far into the future (default PT2H)
 # step = "PT5M"         # timestep spacing (default: source cadence)
 # lightning_source = "lightning"  # events-shape postgis collection: per-cell
                                   # flash_count/rate + lightning_jump (#549)
+# impact_source = "municipalities"     # any polygon `features` collection:
+                                       # per-cell impact_over / _approaching /
+                                       # _eta_minutes + the `impact` rank term
+# impact_name_property = "name"        # display-name property (default "name")
+# impact_weight_property = "population" # optional numeric property; log-weights
+                                        # exposure. Omit ⇒ purely geometric
 
 # Optional per-term significance weight overrides for tracked storm cells.
 # Defaults live in ds_core::cell_facts::DEFAULT_CELL_WEIGHTS; omitted terms

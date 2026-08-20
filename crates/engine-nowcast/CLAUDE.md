@@ -150,8 +150,44 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   `beam_coverage`, so a far-range cell cannot ride an inflated VIL to the
   top of the list.
 - NOT yet wired: `?sortby=-significance` / `min_significance` on the items
-  endpoint (clients sort client-side today), and the `volume` / `impact` /
+  endpoint (clients sort client-side today), and the `volume` /
   `environment` fact groups.
+
+## Impact context (`impact.rs`)
+
+- `[nowcast] impact_source = "<id>"` names any polygon **Features**
+  collection (municipalities, catchments, service regions). Wired
+  second-pass in `admin.rs` exactly like `lightning_source`; a missing id or
+  one not wired to the Features API FAILS the collection at load.
+- `impact_name_property` (default `"name"`) is the display name;
+  `impact_weight_property` is an optional numeric property (population,
+  households, insured value) that log-weights exposure. Without it, scoring
+  is purely geometric — honest, but it cannot rank a city above a village.
+- **ONE bounded `get_features` call per generation** covering the whole
+  working grid, then all point-in-polygon locally — never one call per cell
+  (an impact source may be a sync bridge over a database; the `EventSource`
+  contract, same reasoning). A source error degrades to "no impact context
+  this generation", never a failed generation.
+- Resolution: `over` = the area under the centroid; `approaching` = the
+  first *different* area along the motion vector within `LOOKAHEAD_MIN`
+  (60 min, sampled every `STEP_MIN` = 2 min — 30 probes per cell, bbox
+  prefiltered). A track with no velocity gets `over` only; inventing an ETA
+  from no velocity is worse than no ETA.
+- Exposure: `over` ⇒ the area's weight; `approaching` ⇒ weight × linear ETA
+  decay × `APPROACHING_FACTOR` (0.7). Weight is log-scaled between
+  `WEIGHT_FLOOR` (100) and `WEIGHT_REFERENCE` (700 000 ≈ a capital) —
+  **linear population weighting would collapse everything but the capital
+  to ~0**, which is why the log ramp is load-bearing rather than cosmetic.
+- A feature missing the weight property falls back to weight 1.0, NOT 0.0 —
+  treating a missing value as zero would silently erase that area from
+  every ranking.
+- Feature properties `impact_over` / `impact_approaching` /
+  `impact_eta_minutes` exist ONLY when a source is wired (same tri-state
+  discipline as the flash properties); `null` inside the group means
+  "nothing there".
+- `testdata/municipalities.geojson` carries a `population` property joined
+  from Statistics Finland (`vaestoalue:kunta_vaki2025`, 308 municipalities,
+  2025 figures) — that's what makes the example config's weighting real.
 
 ## Gotchas
 
@@ -170,4 +206,5 @@ follow-up (full frames only for the latest generation) is scoped in #523.
 - Config: `horizon` (default PT2H), `step` (default source cadence),
   `history_frames` ≥ 2, `poll_interval_secs` (30), `max_generations` (6),
   `max_pixels` (4 M), `min_echo` (10.0), `[nowcast.significance]` weight
-  overrides (all optional; unknown names rejected).
+  overrides (all optional; unknown names rejected), `impact_source` +
+  `impact_name_property` (default `"name"`) + `impact_weight_property`.

@@ -80,6 +80,29 @@ impl Geometry {
             Geometry::Null => None,
         }
     }
+
+    /// Whether a point (lon, lat) lies inside this geometry.
+    ///
+    /// Ray-casting on exterior rings with holes excluded — the same
+    /// [`point_in_ring`] primitive [`QueryPolygon::contains`] uses, so
+    /// feature geometry and WKT query geometry can never disagree about what
+    /// "inside" means. A `Point` geometry contains nothing (an exact float
+    /// match would be meaningless); `Null` contains nothing.
+    ///
+    /// Callers testing many points against many geometries should prefilter
+    /// on [`Geometry::bbox`] — this walks every ring on every call.
+    pub fn contains(&self, x: f64, y: f64) -> bool {
+        let in_polygon = |exterior: &Vec<[f64; 2]>, holes: &Vec<Vec<[f64; 2]>>| {
+            point_in_ring(x, y, exterior) && !holes.iter().any(|h| point_in_ring(x, y, h))
+        };
+        match self {
+            Geometry::Polygon { exterior, holes } => in_polygon(exterior, holes),
+            Geometry::MultiPolygon { polygons } => polygons
+                .iter()
+                .any(|(exterior, holes)| in_polygon(exterior, holes)),
+            Geometry::Point { .. } | Geometry::Null => false,
+        }
+    }
 }
 
 fn ring_bbox(ring: &[[f64; 2]]) -> [f64; 4] {
@@ -502,6 +525,32 @@ pub enum PropertyValue {
     List(Vec<PropertyValue>),
 }
 
+impl PropertyValue {
+    /// The string value, or `None` for any other variant.
+    ///
+    /// Deliberately strict — it does NOT stringify numbers. An engine reading
+    /// a config-named property from a foreign collection wants a wrong
+    /// property name to produce nothing (visible, diagnosable) rather than a
+    /// plausible-looking rendering of the wrong field.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            PropertyValue::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The numeric value. Accepts both `Float` and `Integer`, since which one
+    /// a JSON property decodes to depends on whether the source wrote a
+    /// decimal point.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            PropertyValue::Float(v) => Some(*v),
+            PropertyValue::Integer(v) => Some(*v as f64),
+            _ => None,
+        }
+    }
+}
+
 /// A single feature with geometry and properties.
 /// Geometry and properties are wrapped in `Arc` for cheap cloning
 /// (pagination returns owned features, so clone cost matters at scale).
@@ -895,5 +944,106 @@ mod tests {
         // A LINESTRING with *some* duplicates but a non-zero length is
         // accepted — the resample step handles the geometry fine.
         assert!(parse_linestring_coords("LINESTRING(1 2, 1 2, 2 3)").is_ok());
+    }
+
+    /// Square (0,0)-(10,10) with a square hole (4,4)-(6,6).
+    fn holed() -> Geometry {
+        Geometry::Polygon {
+            exterior: vec![
+                [0.0, 0.0],
+                [10.0, 0.0],
+                [10.0, 10.0],
+                [0.0, 10.0],
+                [0.0, 0.0],
+            ],
+            holes: vec![vec![
+                [4.0, 4.0],
+                [6.0, 4.0],
+                [6.0, 6.0],
+                [4.0, 6.0],
+                [4.0, 4.0],
+            ]],
+        }
+    }
+
+    #[test]
+    fn geometry_contains_respects_holes() {
+        let g = holed();
+        assert!(g.contains(1.0, 1.0), "inside the exterior");
+        assert!(
+            !g.contains(5.0, 5.0),
+            "inside the hole is outside the polygon"
+        );
+        assert!(!g.contains(20.0, 20.0), "outside entirely");
+    }
+
+    #[test]
+    fn geometry_contains_handles_multipolygon_and_degenerate_cases() {
+        let multi = Geometry::MultiPolygon {
+            polygons: vec![
+                (
+                    vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]],
+                    vec![],
+                ),
+                (
+                    vec![[5.0, 5.0], [6.0, 5.0], [6.0, 6.0], [5.0, 6.0], [5.0, 5.0]],
+                    vec![],
+                ),
+            ],
+        };
+        assert!(multi.contains(0.5, 0.5));
+        assert!(multi.contains(5.5, 5.5), "any member polygon counts");
+        assert!(!multi.contains(3.0, 3.0), "the gap between them is outside");
+
+        // A Point contains nothing: an exact float match would be meaningless.
+        assert!(!Geometry::Point { x: 1.0, y: 2.0 }.contains(1.0, 2.0));
+        assert!(!Geometry::Null.contains(0.0, 0.0));
+    }
+
+    #[test]
+    fn geometry_contains_agrees_with_query_polygon() {
+        // The two containment paths must never disagree about "inside".
+        let g = holed();
+        let Geometry::Polygon { exterior, holes } = g.clone() else {
+            unreachable!()
+        };
+        let bbox = Bbox::new(0.0, 0.0, 10.0, 10.0).unwrap();
+        let q = QueryPolygon {
+            exterior,
+            holes,
+            bbox,
+        };
+        for (x, y) in [(1.0, 1.0), (5.0, 5.0), (9.9, 9.9), (-1.0, 5.0), (4.5, 5.5)] {
+            assert_eq!(
+                g.contains(x, y),
+                q.contains(x, y),
+                "disagreement at ({x}, {y})"
+            );
+        }
+    }
+
+    #[test]
+    fn property_accessors_are_strict_about_types() {
+        assert_eq!(
+            PropertyValue::String("Vantaa".into()).as_str(),
+            Some("Vantaa")
+        );
+        assert_eq!(
+            PropertyValue::Integer(5).as_str(),
+            None,
+            "no stringifying numbers"
+        );
+        assert_eq!(PropertyValue::Null.as_str(), None);
+
+        // Both numeric variants read as f64: which one a JSON property
+        // decodes to depends on whether the source wrote a decimal point.
+        assert_eq!(PropertyValue::Integer(694_392).as_f64(), Some(694_392.0));
+        assert_eq!(PropertyValue::Float(1.5).as_f64(), Some(1.5));
+        assert_eq!(
+            PropertyValue::String("5".into()).as_f64(),
+            None,
+            "no parsing strings"
+        );
+        assert_eq!(PropertyValue::Bool(true).as_f64(), None);
     }
 }

@@ -1007,11 +1007,18 @@ pub(crate) fn reusable_collections(
         let Some(nc) = c.nowcast.as_ref() else {
             continue;
         };
+        // Every second-pass dependency must be reusable too, or a rebuilt
+        // dependency would never propagate into the wrapper engine that
+        // holds an Arc to the OLD one.
         if base.contains(&nc.source)
             && nc
                 .lightning_source
                 .as_deref()
                 .is_none_or(|ls| base.contains(ls))
+            && nc
+                .impact_source
+                .as_deref()
+                .is_none_or(|is| base.contains(is))
         {
             out.insert(c.id.clone());
         }
@@ -2763,6 +2770,29 @@ pub fn load_collections(
                             fail(format!(
                                 "lightning_source '{src_id}' not found or not an events-shape postgis \
                                  collection (it must be defined in the same config)"
+                            ));
+                            continue;
+                        }
+                    },
+                    None => engine,
+                };
+                // Impact context (named areas a cell is over / heading
+                // toward): a named source must exist and be wired to the
+                // Features API in the same config. Same stance as the
+                // lightning join — failing the collection beats silently
+                // serving cells with an inert `impact` significance term.
+                let engine = match nowcast_config.impact_source.as_deref() {
+                    Some(src_id) => match feature_engines.get(src_id) {
+                        Some(areas) => engine.with_impact_source(
+                            areas.clone(),
+                            &nowcast_config.impact_name_property,
+                            nowcast_config.impact_weight_property.as_deref(),
+                        ),
+                        None => {
+                            fail(format!(
+                                "impact_source '{src_id}' not found or not wired to the Features \
+                                 API (it must be defined in the same config with \"features\" in \
+                                 its apis)"
                             ));
                             continue;
                         }
@@ -4544,6 +4574,9 @@ mod tests {
                 growth_decay: false,
                 lightning_source: None,
                 significance: Default::default(),
+                impact_source: None,
+                impact_name_property: "name".into(),
+                impact_weight_property: None,
             }),
             preview: None,
         }
