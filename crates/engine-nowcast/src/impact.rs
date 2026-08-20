@@ -14,10 +14,14 @@
 //! scoring degrades to purely geometric, which is honest rather than broken —
 //! it simply cannot rank Helsinki above a rural municipality.
 
+use std::sync::Arc;
+
 use ds_core::cell_facts::ImpactFacts;
 use ds_core::feature::{Bbox, FeatureQuery, Geometry};
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::geo::destination_point;
+
+use crate::cells2d::MAX_CELL_SPEED_MS;
 
 /// How far ahead along the motion vector to look for the next affected area.
 ///
@@ -51,8 +55,17 @@ const MAX_IMPACT_AREAS: usize = 5_000;
 
 /// One named area a cell can affect.
 struct Area {
+    /// Source feature id. Arrival is decided on THIS, not on `name`: the
+    /// module is generic over the polygon source, and names are not unique in
+    /// every plausible one (service areas or postal regions repeating a name
+    /// under different parents). Comparing names would silently suppress a
+    /// real transition between two same-named polygons.
+    id: String,
     name: String,
-    geometry: Geometry,
+    /// `Arc`-shared with the source feature — these rings are re-fetched every
+    /// generation, and deep-copying up to `MAX_IMPACT_AREAS` of them would be
+    /// pure waste (`contains` only needs `&self`).
+    geometry: Arc<Geometry>,
     bbox: [f64; 4],
     /// Pre-normalized 0..=1 from the configured weight property; 1.0 when no
     /// property is configured (purely geometric scoring).
@@ -84,8 +97,15 @@ impl ImpactIndex {
         name_property: &str,
         weight_property: Option<&str>,
     ) -> Result<Self, ds_core::error::DataServerError> {
+        let [west, south, east, north] = pad_for_lookahead(bbox);
+        // A malformed bbox must FAIL this generation's join, not silently
+        // become `None` — an unfiltered query would pull the source's entire
+        // catalog every generation, quietly, forever.
+        let bbox = Bbox::new(west, south, east, north).map_err(|e| {
+            ds_core::error::DataServerError::Engine(format!("impact query bbox invalid: {e}"))
+        })?;
         let query = FeatureQuery {
-            bbox: Bbox::new(bbox[0], bbox[1], bbox[2], bbox[3]).ok(),
+            bbox: Some(bbox),
             limit: MAX_IMPACT_AREAS,
             ..Default::default()
         };
@@ -113,8 +133,9 @@ impl ImpactIndex {
                     // zero would silently erase an area from the ranking.
                     .unwrap_or(1.0);
                 Some(Area {
+                    id: f.id.clone(),
                     name,
-                    geometry: (*f.geometry).clone(),
+                    geometry: Arc::clone(&f.geometry),
                     bbox,
                     weight,
                 })
@@ -163,8 +184,9 @@ impl ImpactIndex {
                     let (plon, plat) = destination_point(lon, lat, speed * minutes * 60.0, bearing);
                     if let Some(area) = self.area_at(plon, plat) {
                         // The first area that isn't the one it's already
-                        // over: staying put is not an arrival.
-                        if over.is_none_or(|o| o.name != area.name) {
+                        // over: staying put is not an arrival. Compared by
+                        // id, not name — see `Area::id`.
+                        if over.is_none_or(|o| o.id != area.id) {
                             approaching = Some(area);
                             eta_minutes = Some(minutes);
                             break;
@@ -196,6 +218,41 @@ impl ImpactIndex {
     }
 }
 
+/// Grow a bbox by the furthest a cell could travel within the lookahead.
+///
+/// The working grid is the radar composite's extent, but a cell near its edge
+/// moving outward can reach an area that lies entirely OUTSIDE that extent —
+/// and outside it is exactly where a coastal or border radar's cells go. A
+/// fetch bounded by the grid alone would report `approaching: null` for the
+/// real, imminent arrival, which is worse than reporting nothing at all
+/// because it looks like an answer.
+///
+/// Longitude padding widens with latitude (meridians converge), computed at
+/// whichever edge is nearer the pole, and is capped so a high-latitude domain
+/// cannot ask for a whole hemisphere.
+fn pad_for_lookahead(bbox: [f64; 4]) -> [f64; 4] {
+    const MAX_LON_PAD_DEG: f64 = 20.0;
+    const KM_PER_DEG_LAT: f64 = 111.32;
+
+    let [west, south, east, north] = bbox;
+    if !bbox.iter().all(|v| v.is_finite()) {
+        return bbox;
+    }
+    let reach_km = f64::from(MAX_CELL_SPEED_MS) * LOOKAHEAD_MIN * 60.0 / 1000.0;
+    let lat_pad = reach_km / KM_PER_DEG_LAT;
+
+    let worst_lat = south.abs().max(north.abs()).min(89.0);
+    let lon_pad =
+        (reach_km / (KM_PER_DEG_LAT * worst_lat.to_radians().cos()).max(1e-6)).min(MAX_LON_PAD_DEG);
+
+    [
+        (west - lon_pad).max(-180.0),
+        (south - lat_pad).max(-90.0),
+        (east + lon_pad).min(180.0),
+        (north + lat_pad).min(90.0),
+    ]
+}
+
 /// Log-scale a raw weight (population, households, …) onto 0..=1.
 ///
 /// Linear would make everything below a capital city indistinguishable from
@@ -215,7 +272,6 @@ mod tests {
     use super::*;
     use ds_core::feature::{Feature, PropertyValue};
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     /// A unit square from (x, y) to (x+1, y+1).
     fn square(name: &str, x: f64, y: f64, population: Option<f64>) -> Feature {
@@ -375,5 +431,71 @@ mod tests {
         let idx = index(vec![nameless, null_geom], None);
         assert!(idx.is_empty());
         assert_eq!(idx.resolve(0.5, 0.5, None, None).exposure, 0.0);
+    }
+
+    #[test]
+    fn same_named_but_distinct_areas_still_count_as_an_arrival() {
+        // Generic sources (service areas, postal regions) do not guarantee
+        // unique names. Comparing names would read this as "still in the same
+        // place" and suppress a real transition.
+        let mut a = square("Keskusta", 0.0, 0.0, None);
+        a.id = "a".into();
+        let mut b = square("Keskusta", 0.0, 1.0, None);
+        b.id = "b".into();
+        let idx = index(vec![a, b], None);
+        let facts = idx.resolve(0.5, 0.95, Some(20.0), Some(0.0));
+        assert_eq!(facts.over.as_deref(), Some("Keskusta"));
+        assert_eq!(
+            facts.approaching.as_deref(),
+            Some("Keskusta"),
+            "crossing into a DIFFERENT polygon is an arrival even when the names match"
+        );
+        assert!(facts.eta_minutes.is_some());
+    }
+
+    #[test]
+    fn a_malformed_bbox_fails_the_join_instead_of_querying_everything() {
+        // Silently dropping the filter would pull the source's whole catalog
+        // every generation, with no log line to notice it by.
+        let err = ImpactIndex::build(
+            &MockAreas(vec![square("Town", 0.0, 0.0, None)]),
+            [f64::NAN, 0.0, 10.0, 10.0],
+            "name",
+            None,
+        );
+        assert!(err.is_err(), "a non-finite bbox must fail the join");
+
+        // south > north is equally malformed and equally must not degrade.
+        assert!(ImpactIndex::build(
+            &MockAreas(vec![square("Town", 0.0, 0.0, None)]),
+            [0.0, 60.0, 10.0, 50.0],
+            "name",
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_fetch_bbox_covers_where_cells_can_travel_not_just_the_grid() {
+        // A cell at the domain edge moving outward reaches areas OUTSIDE the
+        // radar composite — coastal and border radars do this constantly.
+        let grid = [20.0, 60.0, 25.0, 65.0];
+        let [w, s, e, n] = pad_for_lookahead(grid);
+        assert!(w < grid[0] && s < grid[1] && e > grid[2] && n > grid[3]);
+
+        // The pad must cover the furthest a cell could actually get.
+        let reach_deg = f64::from(MAX_CELL_SPEED_MS) * LOOKAHEAD_MIN * 60.0 / 1000.0 / 111.32;
+        assert!(
+            grid[1] - s >= reach_deg - 1e-9,
+            "latitude pad {} must cover the {reach_deg} deg reach",
+            grid[1] - s
+        );
+
+        // Bounded at the poles and antimeridian rather than overflowing.
+        let [w, s, e, n] = pad_for_lookahead([-179.0, 88.0, 179.0, 89.5]);
+        assert!(w >= -180.0 && e <= 180.0 && s >= -90.0 && n <= 90.0);
+
+        // Garbage in, garbage out — but unchanged, so Bbox::new rejects it.
+        assert!(pad_for_lookahead([f64::NAN, 0.0, 1.0, 1.0])[0].is_nan());
     }
 }

@@ -157,17 +157,38 @@ follow-up (full frames only for the latest generation) is scoped in #523.
 
 - `[nowcast] impact_source = "<id>"` names any polygon **Features**
   collection (municipalities, catchments, service regions). Wired
-  second-pass in `admin.rs` exactly like `lightning_source`; a missing id or
-  one not wired to the Features API FAILS the collection at load.
+  second-pass in `admin.rs`; a missing id or one not wired to the Features
+  API FAILS the collection at load.
+- Unlike `lightning_source` (postgis only, all built in the first pass),
+  impact sources are resolved against a **snapshot of `feature_engines`
+  taken before the nowcast pass** (`base_feature_engines`). Nowcast engines
+  are themselves `FeatureEngine`s and get inserted as that loop runs, so
+  resolving against the live map would make `impact_source = "<another
+  nowcast>"` succeed or fail purely on config declaration order. Pointing at
+  a nowcast collection now fails deterministically, with a message that says
+  why.
 - `impact_name_property` (default `"name"`) is the display name;
   `impact_weight_property` is an optional numeric property (population,
   households, insured value) that log-weights exposure. Without it, scoring
   is purely geometric — honest, but it cannot rank a city above a village.
-- **ONE bounded `get_features` call per generation** covering the whole
-  working grid, then all point-in-polygon locally — never one call per cell
-  (an impact source may be a sync bridge over a database; the `EventSource`
-  contract, same reasoning). A source error degrades to "no impact context
-  this generation", never a failed generation.
+- **ONE bounded `get_features` call per generation**, then all
+  point-in-polygon locally — never one call per cell (an impact source may be
+  a sync bridge over a database; the `EventSource` contract, same reasoning).
+  A source error degrades to "no impact context this generation", never a
+  failed generation.
+- The fetch bbox is the working grid **padded by `pad_for_lookahead`** —
+  `MAX_CELL_SPEED_MS × LOOKAHEAD_MIN` (~126 km), longitude widened by
+  latitude and capped at 20°. Without the pad, a cell at the composite edge
+  moving outward — which is what coastal and border radars produce
+  constantly — reports `approaching: null` for a real imminent arrival,
+  which is worse than reporting nothing because it looks like an answer.
+- A malformed grid bbox **fails the join**, it does not fall back to an
+  unfiltered query. Dropping the filter would pull the source's whole
+  catalog every generation, silently.
+- Arrival is decided on the source feature **id, not the display name**.
+  Names are not unique in every plausible source (service areas, postal
+  regions), and a name comparison would suppress a genuine transition
+  between two same-named polygons.
 - Resolution: `over` = the area under the centroid; `approaching` = the
   first *different* area along the motion vector within `LOOKAHEAD_MIN`
   (60 min, sampled every `STEP_MIN` = 2 min — 30 probes per cell, bbox

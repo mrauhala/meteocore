@@ -2703,6 +2703,17 @@ pub fn load_collections(
         .chain(tiles_engines.iter())
         .map(|(id, e)| (id.clone(), e.clone()))
         .collect();
+    // Same reasoning for impact sources: snapshot BEFORE the loop, so
+    // resolution cannot depend on config declaration order. Nowcast engines
+    // are themselves `FeatureEngine`s and get inserted into `feature_engines`
+    // as this loop runs — resolving against the live map would make
+    // `impact_source = "<another nowcast>"` succeed or fail depending purely
+    // on which collection happened to be declared first.
+    let base_feature_engines: HashMap<String, Arc<dyn ds_core::feature_engine::FeatureEngine>> =
+        feature_engines
+            .iter()
+            .map(|(id, e)| (id.clone(), e.clone()))
+            .collect();
     for collection in nowcast_pending {
         let mut fail = |error: String| {
             tracing::error!("Collection '{}': {error}, skipping", collection.id);
@@ -2782,12 +2793,28 @@ pub fn load_collections(
                 // lightning join — failing the collection beats silently
                 // serving cells with an inert `impact` significance term.
                 let engine = match nowcast_config.impact_source.as_deref() {
-                    Some(src_id) => match feature_engines.get(src_id) {
+                    Some(src_id) => match base_feature_engines.get(src_id) {
                         Some(areas) => engine.with_impact_source(
                             areas.clone(),
                             &nowcast_config.impact_name_property,
                             nowcast_config.impact_weight_property.as_deref(),
                         ),
+                        // Name the nowcast case specifically: resolving
+                        // against the pre-pass snapshot makes it fail
+                        // deterministically, but "not found" would be a
+                        // baffling message for a collection the operator can
+                        // see in their own config.
+                        None if collections
+                            .iter()
+                            .any(|c| c.id == src_id && c.engine_type == "nowcast") =>
+                        {
+                            fail(format!(
+                                "impact_source '{src_id}' is a nowcast collection; impact areas \
+                                 must be a non-derived Features collection (tracked cells are \
+                                 points, not areas)"
+                            ));
+                            continue;
+                        }
                         None => {
                             fail(format!(
                                 "impact_source '{src_id}' not found or not wired to the Features \
