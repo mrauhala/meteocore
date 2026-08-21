@@ -1535,7 +1535,7 @@ impl FeatureEngine for NowcastEngine {
         let Some(snapshot) = snapshot else {
             return empty();
         };
-        let matched: Vec<Feature> = snapshot
+        let mut matched: Vec<Feature> = snapshot
             .cells
             .iter()
             .filter_map(|t| {
@@ -1548,6 +1548,10 @@ impl FeatureEngine for NowcastEngine {
                 Some(feature)
             })
             .collect();
+        // BEFORE paging: slicing first and sorting the slice would return the
+        // wrong rows entirely, which is the failure this whole parameter
+        // exists to make impossible.
+        ds_core::feature::sort_features(&mut matched, &query.sortby);
         let number_matched = matched.len();
         let page: Vec<Feature> = matched
             .into_iter()
@@ -1563,6 +1567,29 @@ impl FeatureEngine for NowcastEngine {
             number_returned,
             next_offset,
         })
+    }
+
+    /// Sortable cell properties (#605). Every cell in a snapshot is already
+    /// materialized, so sorting before paging costs one `sort_by` — the
+    /// condition `sortables()` documents for opting in.
+    ///
+    /// `severity` is deliberately ABSENT: as a string it orders
+    /// `moderate < severe < very_severe < weak`, which looks almost right and
+    /// puts the weakest cells last. `significance` already incorporates it.
+    fn sortables(&self) -> &[&'static str] {
+        &[
+            "significance",
+            "significance_rank",
+            "max_dbz",
+            "area_km2",
+            "track_age",
+            "speed_ms",
+            "bearing_deg",
+            "intensity_trend_dbz_min",
+            "flash_count",
+            "flash_rate_per_min",
+            "impact_eta_minutes",
+        ]
     }
 
     /// O(1) from the snapshot — the default would build every feature just

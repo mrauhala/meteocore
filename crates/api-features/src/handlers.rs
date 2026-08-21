@@ -13,7 +13,9 @@ use ds_core::config::CollectionConfig;
 use ds_core::feature::FeatureQuery;
 use ds_core::feature_engine::FeatureEngine;
 
-use crate::params::{parse_bbox, parse_datetime, ItemsQueryParams, DEFAULT_LIMIT, MAX_LIMIT};
+use crate::params::{
+    parse_bbox, parse_datetime, parse_sortby, ItemsQueryParams, DEFAULT_LIMIT, MAX_LIMIT,
+};
 use crate::response::{feature_page_to_geojson, feature_to_geojson};
 
 /// Shared state for the Features API: a registry of collection engines + metadata.
@@ -285,7 +287,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     {"$ref": "#/components/parameters/bbox"},
                     {"$ref": "#/components/parameters/limit"},
                     {"$ref": "#/components/parameters/offset"},
-                    {"$ref": "#/components/parameters/datetime"}
+                    {"$ref": "#/components/parameters/datetime"},
+                    {"$ref": "#/components/parameters/sortby"}
                 ],
                 "responses": {
                     "200": {
@@ -422,6 +425,26 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
                     "required": false,
                     "schema": {"type": "string"},
                     "description": "RFC 3339 datetime or interval (start/end, ../end, start/..)"
+                },
+                // Schema reproduced verbatim from OGC API - Features Part 8:
+                // Sorting (draft 24-030). Do not "simplify" it to a plain
+                // string: `style: form` + `explode: false` is what makes the
+                // comma-separated form normative rather than incidental.
+                "sortby": {
+                    "name": "sortby",
+                    "in": "query",
+                    "required": false,
+                    "schema": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "string",
+                            "pattern": "[+|-]?[A-Za-z_].*"
+                        }
+                    },
+                    "style": "form",
+                    "explode": false,
+                    "description": "Comma-separated sort properties, '-' for descending ('+' or no prefix for ascending). Valid properties are collection-specific; an unsupported one is rejected with 400."
                 }
             },
             "schemas": {
@@ -688,6 +711,22 @@ pub async fn items(
             )
         })?;
 
+    // Validated against what this engine can actually sort on, so an unknown
+    // property is a 400 naming the valid ones rather than a parameter that
+    // quietly does nothing (OGC API - Features Part 8, draft 24-030).
+    let sortby = params
+        .sortby
+        .as_deref()
+        .map(|s| parse_sortby(s, engine.sortables()))
+        .transpose()
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "code": "BadRequest", "description": e.to_string() })),
+            )
+        })?
+        .unwrap_or_default();
+
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = params.offset.unwrap_or(0);
 
@@ -706,6 +745,7 @@ pub async fn items(
         limit,
         offset,
         datetime,
+        sortby,
     };
 
     let page = engine.get_features(&query).map_err(|_| {

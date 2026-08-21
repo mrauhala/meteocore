@@ -149,8 +149,16 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   `VIL_CEILING_KG_M2` 50, …). Volume-derived terms are scaled by
   `beam_coverage`, so a far-range cell cannot ride an inflated VIL to the
   top of the list.
-- NOT yet wired: `?sortby=-significance` / `min_significance` on the items
-  endpoint (clients sort client-side today), and the `volume` /
+- **Sortable via `?sortby=`** (#605): `significance`, `significance_rank`,
+  `max_dbz`, `area_km2`, `track_age`, `speed_ms`, `bearing_deg`,
+  `intensity_trend_dbz_min`, `flash_count`, `flash_rate_per_min`,
+  `impact_eta_minutes`. `severity` is deliberately NOT sortable — as a
+  string it orders `moderate < severe < very_severe < weak`, which looks
+  almost right and buries the weakest cells at the end; use `significance`,
+  which already incorporates it.
+- Sorting happens in `get_features` **before** the offset/limit slice, via
+  `ds_core::feature::sort_features`. Do not reorder those two steps.
+- NOT yet wired: a `min_significance` filter, and the `volume` /
   `environment` fact groups.
 
 ## Impact context (`impact.rs`)

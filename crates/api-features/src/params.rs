@@ -1,5 +1,5 @@
 use ds_core::error::DataServerError;
-use ds_core::feature::{Bbox, DatetimeInterval};
+use ds_core::feature::{Bbox, DatetimeInterval, SortDirection, SortKey};
 use serde::Deserialize;
 
 pub const DEFAULT_LIMIT: usize = 100;
@@ -11,6 +11,76 @@ pub struct ItemsQueryParams {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub datetime: Option<String>,
+    pub sortby: Option<String>,
+}
+
+/// Parse an OGC API – Features Part 8 `sortby` value.
+///
+/// Comma-separated `[+|-]?<property>`; `+` (or no prefix) is ascending, `-` is
+/// descending. Validated against the collection's advertised `sortables`, so an
+/// unknown or unsupported property is a 400 rather than a silently ignored
+/// parameter — which is the behaviour this replaces.
+///
+/// **A literal `+` in a query string decodes to a space**, so `sortby=+id`
+/// arrives here as `" id"`. A leading space is therefore treated as the
+/// ascending marker it actually is; clients that percent-encode it as `%2B`
+/// (as the spec's own example does) land on the same result.
+pub fn parse_sortby(s: &str, sortables: &[&str]) -> Result<Vec<SortKey>, DataServerError> {
+    let invalid = |msg: String| DataServerError::InvalidParameter(msg);
+    let valid_list = || sortables.join(", ");
+
+    let mut keys: Vec<SortKey> = Vec::new();
+    for raw in s.split(',') {
+        let (direction, rest) = match raw.strip_prefix('-') {
+            Some(rest) => (SortDirection::Descending, rest),
+            None => (
+                SortDirection::Ascending,
+                raw.strip_prefix('+')
+                    .unwrap_or_else(|| raw.strip_prefix(' ').unwrap_or(raw)),
+            ),
+        };
+        let property = rest.trim();
+        if property.is_empty() {
+            return Err(invalid(format!(
+                "sortby: empty sort term in '{s}' (expected [+|-]<property>, comma-separated)"
+            )));
+        }
+        // Part 8 pattern `[+|-]?[A-Za-z_].*`.
+        if !property
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        {
+            return Err(invalid(format!(
+                "sortby: property '{property}' must start with a letter or underscore"
+            )));
+        }
+        if !sortables.contains(&property) {
+            return Err(invalid(if sortables.is_empty() {
+                "sortby: this collection does not support sorting".to_string()
+            } else {
+                format!(
+                    "sortby: unknown sort property '{property}' (valid: {})",
+                    valid_list()
+                )
+            }));
+        }
+        if keys.iter().any(|k| k.property == property) {
+            return Err(invalid(format!(
+                "sortby: property '{property}' listed more than once"
+            )));
+        }
+        keys.push(SortKey {
+            property: property.to_string(),
+            direction,
+        });
+    }
+    if keys.is_empty() {
+        return Err(invalid(
+            "sortby: at least one sort property is required".into(),
+        ));
+    }
+    Ok(keys)
 }
 
 pub fn parse_bbox(s: &str) -> Result<Bbox, DataServerError> {

@@ -20,6 +20,25 @@ pub trait FeatureEngine: Send + Sync {
         .unwrap_or(0)
     }
 
+    /// Feature properties this engine can sort on, in the order they should be
+    /// advertised. Empty (the default) means sorting is not supported and the
+    /// API layer rejects `sortby` with a 400.
+    ///
+    /// Opt-in rather than universal on purpose: sorting must happen before
+    /// pagination, so an engine that streams or pages lazily would have to
+    /// materialize its whole collection to honour it (the cost #532 exists to
+    /// avoid). An engine advertises a property here only if it can sort on it
+    /// without that.
+    ///
+    /// A property whose natural order differs from its serialized order must
+    /// NOT be listed. `severity` is the live example: sorted as a string it
+    /// reads `moderate < severe < very_severe < weak`, putting the weakest
+    /// cells last and looking almost right — sort on `significance` instead,
+    /// which already incorporates it.
+    fn sortables(&self) -> &[&'static str] {
+        &[]
+    }
+
     /// Spatial extent as [west, south, east, north], if available.
     fn spatial_extent(&self) -> Option<[f64; 4]> {
         None

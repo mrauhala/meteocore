@@ -247,6 +247,18 @@ Same pattern for api-edr, api-features, api-maps, api-tiles:
    in `params.rs`, new response formats in `response.rs`.
 2. **Always update `api_definition()` in `handlers.rs`** so the OpenAPI spec
    includes the new path.
+3. **An unknown query parameter must not be silently ignored.** serde drops
+   unrecognized fields, so a parameter that is parsed but never validated
+   returns 200 having done nothing — indistinguishable from success at the
+   call site. That was the `sortby` bug (#605): validate against what the
+   engine actually supports and return 400 naming the valid options.
+4. **When a parameter comes from a standard, copy its schema verbatim** into
+   `api_definition()` — including `style`/`explode` for array parameters,
+   which is what makes the comma-separated form normative rather than
+   incidental. `api-features` pins this with a test that validates `/api`
+   against the bundled OpenAPI 3.0 meta-schema (`schemas/openapi-3.0.json`);
+   the definition is hand-written `serde_json::json!`, so nothing else
+   catches a typo in it.
 
 ## Performance & Concurrency Rules
 

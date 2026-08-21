@@ -659,6 +659,124 @@ pub struct FeatureQuery {
     pub limit: usize,
     pub offset: usize,
     pub datetime: Option<DatetimeInterval>,
+    /// Sort terms in precedence order, empty for the engine's natural order.
+    ///
+    /// Engines that advertise sortables via [`crate::feature_engine::
+    /// FeatureEngine::sortables`] MUST apply this BEFORE `offset`/`limit` —
+    /// sorting a page after slicing it silently returns the wrong rows.
+    /// [`sort_features`] does it correctly; call that rather than hand-rolling.
+    pub sortby: Vec<SortKey>,
+}
+
+/// Sort direction for one [`SortKey`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+/// One sort term: a feature property and a direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortKey {
+    pub property: String,
+    pub direction: SortDirection,
+}
+
+impl SortKey {
+    pub fn ascending(property: impl Into<String>) -> Self {
+        Self {
+            property: property.into(),
+            direction: SortDirection::Ascending,
+        }
+    }
+
+    pub fn descending(property: impl Into<String>) -> Self {
+        Self {
+            property: property.into(),
+            direction: SortDirection::Descending,
+        }
+    }
+}
+
+/// Where a value type sorts relative to other types, so a mixed-type property
+/// still yields a total order instead of an inconsistent comparator (which
+/// would make `sort_by` misbehave rather than merely look odd).
+fn type_rank(v: &PropertyValue) -> u8 {
+    match v {
+        PropertyValue::Bool(_) => 0,
+        PropertyValue::Integer(_) | PropertyValue::Float(_) => 1,
+        PropertyValue::String(_) => 2,
+        PropertyValue::List(_) => 3,
+        PropertyValue::Null => 4,
+    }
+}
+
+/// Compare two present, non-null property values.
+fn compare_present(a: &PropertyValue, b: &PropertyValue) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        // Integer and Float are one numeric domain: which one a value decodes
+        // to depends on whether the source wrote a decimal point, and that
+        // must not affect ordering.
+        (PropertyValue::Integer(_) | PropertyValue::Float(_), _)
+            if matches!(b, PropertyValue::Integer(_) | PropertyValue::Float(_)) =>
+        {
+            match (a.as_f64(), b.as_f64()) {
+                // NaN can't participate in an ordering; treat as equal so the
+                // comparator stays consistent and the id tie-break decides.
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+                _ => Ordering::Equal,
+            }
+        }
+        (PropertyValue::String(x), PropertyValue::String(y)) => x.cmp(y),
+        (PropertyValue::Bool(x), PropertyValue::Bool(y)) => x.cmp(y),
+        (PropertyValue::List(x), PropertyValue::List(y)) => x.len().cmp(&y.len()),
+        _ => type_rank(a).cmp(&type_rank(b)),
+    }
+}
+
+/// Sort features by `sortby`, in place.
+///
+/// Two behaviours worth knowing, both deliberate:
+///
+/// - **Missing and null values sort last in BOTH directions.** A descending
+///   sort on `significance` must not put the cells that have no score at the
+///   top; "unknown" is not "highest". This means the direction flip applies
+///   only to values that are actually present.
+/// - **Ties break on feature id**, so paging over a sorted result set is
+///   stable — without it, two equal-scoring features can swap places between
+///   requests and a client paging through them would skip one and see the
+///   other twice.
+pub fn sort_features(features: &mut [Feature], sortby: &[SortKey]) {
+    use std::cmp::Ordering;
+    if sortby.is_empty() {
+        return;
+    }
+    features.sort_by(|a, b| {
+        for key in sortby {
+            let av = a.properties.get(&key.property);
+            let bv = b.properties.get(&key.property);
+            let a_absent = matches!(av, None | Some(PropertyValue::Null));
+            let b_absent = matches!(bv, None | Some(PropertyValue::Null));
+            let ord = match (a_absent, b_absent) {
+                (true, true) => Ordering::Equal,
+                // Not reversed for descending: absent always sinks.
+                (true, false) => return Ordering::Greater,
+                (false, true) => return Ordering::Less,
+                (false, false) => {
+                    let o = compare_present(av.expect("present"), bv.expect("present"));
+                    match key.direction {
+                        SortDirection::Ascending => o,
+                        SortDirection::Descending => o.reverse(),
+                    }
+                }
+            };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        a.id.cmp(&b.id)
+    });
 }
 
 impl Default for FeatureQuery {
@@ -668,6 +786,7 @@ impl Default for FeatureQuery {
             limit: 100,
             offset: 0,
             datetime: None,
+            sortby: Vec::new(),
         }
     }
 }
@@ -1045,5 +1164,147 @@ mod tests {
             "no parsing strings"
         );
         assert_eq!(PropertyValue::Bool(true).as_f64(), None);
+    }
+
+    fn feat(id: &str, props: Vec<(&str, PropertyValue)>) -> Feature {
+        Feature {
+            id: id.into(),
+            geometry: Arc::new(Geometry::Null),
+            properties: Arc::new(props.into_iter().map(|(k, v)| (k.to_string(), v)).collect()),
+        }
+    }
+
+    fn ids(fs: &[Feature]) -> Vec<&str> {
+        fs.iter().map(|f| f.id.as_str()).collect()
+    }
+
+    #[test]
+    fn sorts_ascending_and_descending() {
+        let mut fs = vec![
+            feat("b", vec![("score", PropertyValue::Float(0.5))]),
+            feat("a", vec![("score", PropertyValue::Float(0.9))]),
+            feat("c", vec![("score", PropertyValue::Float(0.1))]),
+        ];
+        sort_features(&mut fs, &[SortKey::ascending("score")]);
+        assert_eq!(ids(&fs), ["c", "b", "a"]);
+        sort_features(&mut fs, &[SortKey::descending("score")]);
+        assert_eq!(ids(&fs), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn missing_and_null_sort_last_in_both_directions() {
+        // The operational case: "top cells by significance, descending" must
+        // not surface the ones with no score. Unknown is not highest.
+        let mut fs = vec![
+            feat("null", vec![("score", PropertyValue::Null)]),
+            feat("high", vec![("score", PropertyValue::Float(0.9))]),
+            feat("absent", vec![]),
+            feat("low", vec![("score", PropertyValue::Float(0.1))]),
+        ];
+        sort_features(&mut fs, &[SortKey::descending("score")]);
+        assert_eq!(ids(&fs)[..2], ["high", "low"]);
+        assert!(ids(&fs)[2..].contains(&"null") && ids(&fs)[2..].contains(&"absent"));
+
+        sort_features(&mut fs, &[SortKey::ascending("score")]);
+        assert_eq!(ids(&fs)[..2], ["low", "high"]);
+        assert!(ids(&fs)[2..].contains(&"null") && ids(&fs)[2..].contains(&"absent"));
+    }
+
+    #[test]
+    fn integer_and_float_share_one_numeric_order() {
+        // Which variant a JSON property decodes to depends on whether the
+        // source wrote a decimal point; it must not affect ordering.
+        let mut fs = vec![
+            feat("f", vec![("n", PropertyValue::Float(2.5))]),
+            feat("i", vec![("n", PropertyValue::Integer(2))]),
+            feat("g", vec![("n", PropertyValue::Float(10.0))]),
+        ];
+        sort_features(&mut fs, &[SortKey::ascending("n")]);
+        assert_eq!(ids(&fs), ["i", "f", "g"]);
+    }
+
+    #[test]
+    fn ties_break_on_id_so_paging_is_stable() {
+        let mut fs = vec![
+            feat("c", vec![("n", PropertyValue::Integer(1))]),
+            feat("a", vec![("n", PropertyValue::Integer(1))]),
+            feat("b", vec![("n", PropertyValue::Integer(1))]),
+        ];
+        sort_features(&mut fs, &[SortKey::descending("n")]);
+        assert_eq!(
+            ids(&fs),
+            ["a", "b", "c"],
+            "equal keys must order by id, not arbitrarily"
+        );
+        // Idempotent: re-sorting cannot reshuffle, or paging skips/duplicates.
+        let first = ids(&fs).join(",");
+        sort_features(&mut fs, &[SortKey::descending("n")]);
+        assert_eq!(ids(&fs).join(","), first);
+    }
+
+    #[test]
+    fn multi_key_precedence_is_left_to_right() {
+        let mut fs = vec![
+            feat(
+                "x",
+                vec![
+                    ("a", PropertyValue::Integer(1)),
+                    ("b", PropertyValue::Integer(2)),
+                ],
+            ),
+            feat(
+                "y",
+                vec![
+                    ("a", PropertyValue::Integer(1)),
+                    ("b", PropertyValue::Integer(1)),
+                ],
+            ),
+            feat(
+                "z",
+                vec![
+                    ("a", PropertyValue::Integer(0)),
+                    ("b", PropertyValue::Integer(9)),
+                ],
+            ),
+        ];
+        sort_features(
+            &mut fs,
+            &[SortKey::ascending("a"), SortKey::descending("b")],
+        );
+        assert_eq!(ids(&fs), ["z", "x", "y"]);
+    }
+
+    #[test]
+    fn mixed_types_yield_a_total_order_not_a_panic() {
+        // An inconsistent comparator makes sort_by misbehave, so every pair
+        // must compare deterministically even when types differ.
+        let mut fs = vec![
+            feat("s", vec![("v", PropertyValue::String("a".into()))]),
+            feat("n", vec![("v", PropertyValue::Integer(1))]),
+            feat("b", vec![("v", PropertyValue::Bool(true))]),
+            feat("l", vec![("v", PropertyValue::List(vec![]))]),
+        ];
+        sort_features(&mut fs, &[SortKey::ascending("v")]);
+        assert_eq!(ids(&fs), ["b", "n", "s", "l"]);
+    }
+
+    #[test]
+    fn nan_does_not_destabilize_the_comparator() {
+        let mut fs = vec![
+            feat("nan", vec![("n", PropertyValue::Float(f64::NAN))]),
+            feat("one", vec![("n", PropertyValue::Float(1.0))]),
+        ];
+        sort_features(&mut fs, &[SortKey::ascending("n")]);
+        assert_eq!(fs.len(), 2);
+    }
+
+    #[test]
+    fn empty_sortby_leaves_order_untouched() {
+        let mut fs = vec![
+            feat("c", vec![("n", PropertyValue::Integer(1))]),
+            feat("a", vec![("n", PropertyValue::Integer(2))]),
+        ];
+        sort_features(&mut fs, &[]);
+        assert_eq!(ids(&fs), ["c", "a"]);
     }
 }
