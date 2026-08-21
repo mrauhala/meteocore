@@ -570,10 +570,12 @@ mod tests {
             20 + json_len + 8
         };
         let floats: Vec<f32> = glb[bin_start..bin_start + pos_len]
-            .chunks_exact(4)
-            .map(|w| f32::from_le_bytes(w.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| f32::from_le_bytes(*w))
             .collect();
-        for v in floats.chunks_exact(3) {
+        for v in floats.as_chunks::<3>().0 {
             // Invert the Y-up flip: glTF (x,y,z) → ECEF offset (x,−z,y).
             let off = [v[0] as f64, -(v[2] as f64), v[1] as f64];
             let h = off[0] * up[0] + off[1] * up[1] + off[2] * up[2];
@@ -606,7 +608,7 @@ mod tests {
             20 + json_len + 8
         };
         let mut min_h = f64::INFINITY;
-        for w in glb[bin_start..bin_start + pos_len].chunks_exact(12) {
+        for w in glb[bin_start..bin_start + pos_len].as_chunks::<12>().0 {
             let v = [
                 f32::from_le_bytes(w[0..4].try_into().unwrap()),
                 f32::from_le_bytes(w[4..8].try_into().unwrap()),

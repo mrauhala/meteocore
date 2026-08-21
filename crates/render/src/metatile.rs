@@ -584,7 +584,7 @@ mod tests {
     /// `fill`. Lets us probe sampling exactly across a colour boundary.
     fn two_color_tile(a: [u8; 4], b: [u8; 4], fill: [u8; 4]) -> Mosaic {
         let mut tile = vec![0u8; TILE_PX as usize * TILE_PX as usize * 4];
-        for px in tile.chunks_exact_mut(4) {
+        for px in tile.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&fill);
         }
         tile[0..4].copy_from_slice(&a); // texel (0,0)

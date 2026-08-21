@@ -481,8 +481,10 @@ mod tests {
         // sentinel — so every (smoothed) cell stays ≥ the floor and CesiumJS's
         // interpolation has no razor-sharp wall toward -9999.
         let vals: Vec<f32> = bin
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert!(
             vals.iter().all(|&v| v >= NO_ECHO_FLOOR_DBZ - 1e-3),
