@@ -1279,6 +1279,10 @@ async fn render_vector_tile(
         limit: params::MAX_FEATURES_PER_TILE + 1,
         offset: 0,
         datetime: None,
+        // Vector tiles carry the whole tile's features and are rendered by
+        // the client; a server-side order would cost a sort per tile and
+        // change nothing the client can observe.
+        sortby: Vec::new(),
     };
 
     let page = engine

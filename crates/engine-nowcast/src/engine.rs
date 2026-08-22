@@ -82,6 +82,22 @@ const MAX_HISTORY_FRAMES: usize = 8;
 /// the cap logs possible truncation instead of failing the generation.
 const MAX_JOIN_STRIKES: usize = 200_000;
 
+/// Cell properties every nowcast instance can sort on (#605).
+const SORTABLES_BASE: &[&str] = &[
+    "significance",
+    "significance_rank",
+    "max_dbz",
+    "area_km2",
+    "track_age",
+    "speed_ms",
+    "bearing_deg",
+    "intensity_trend_dbz_min",
+];
+/// Extras that exist only with `lightning_source` wired.
+const SORTABLES_LIGHTNING_EXTRAS: &[&str] = &["flash_count", "flash_rate_per_min"];
+/// Extras that exist only with `impact_source` wired.
+const SORTABLES_IMPACT_EXTRAS: &[&str] = &["impact_eta_minutes"];
+
 /// Parsed, validated engine configuration.
 struct EngineCfg {
     horizon: Duration,
@@ -229,6 +245,11 @@ pub struct NowcastEngine {
     /// `impact` significance term — the one that makes a ranking
     /// operational rather than merely meteorological.
     impact: Option<ImpactCfg>,
+    /// Sortable properties for THIS instance, resolved once whenever a
+    /// source is wired. Stored rather than recomputed so the per-request
+    /// accessor is a borrow — same effect as the four-constant version it
+    /// replaces, with one source of truth instead of four to keep in step.
+    sortables: Vec<&'static str>,
     /// Significance ranking for tracked cells: the default weight table with
     /// any per-collection overrides applied. Validated at construction, so a
     /// typo in a weight name fails the collection at load rather than
@@ -329,6 +350,7 @@ impl NowcastEngine {
             next_track_id: AtomicU64::new(1),
             lightning: None,
             impact: None,
+            sortables: SORTABLES_BASE.to_vec(),
             scorer,
         })
     }
@@ -392,6 +414,7 @@ impl NowcastEngine {
     /// the flash properties when a source is attached.
     pub fn with_lightning_source(mut self, source: Arc<dyn ds_core::events::EventSource>) -> Self {
         self.lightning = Some(source);
+        self.recompute_sortables();
         self
     }
 
@@ -409,7 +432,26 @@ impl NowcastEngine {
             name_property: name_property.to_string(),
             weight_property: weight_property.map(str::to_string),
         });
+        self.recompute_sortables();
         self
+    }
+
+    /// Rebuild the sortable set from whichever sources are wired.
+    ///
+    /// A property absent from every feature sorts to a no-op: `sort_features`
+    /// finds the key missing on every cell and falls through to the id
+    /// tie-break, so the request answers 200 in id order — the
+    /// silently-ignored-parameter failure this surface exists to remove.
+    /// Advertise only what this instance can actually order by.
+    fn recompute_sortables(&mut self) {
+        let mut v = SORTABLES_BASE.to_vec();
+        if self.lightning.is_some() {
+            v.extend(SORTABLES_LIGHTNING_EXTRAS);
+        }
+        if self.impact.is_some() {
+            v.extend(SORTABLES_IMPACT_EXTRAS);
+        }
+        self.sortables = v;
     }
 
     /// Poll the source for a new frame; spawn on the BACKGROUND runtime only.
@@ -1535,7 +1577,7 @@ impl FeatureEngine for NowcastEngine {
         let Some(snapshot) = snapshot else {
             return empty();
         };
-        let matched: Vec<Feature> = snapshot
+        let mut matched: Vec<Feature> = snapshot
             .cells
             .iter()
             .filter_map(|t| {
@@ -1548,6 +1590,10 @@ impl FeatureEngine for NowcastEngine {
                 Some(feature)
             })
             .collect();
+        // BEFORE paging: slicing first and sorting the slice would return the
+        // wrong rows entirely, which is the failure this whole parameter
+        // exists to make impossible.
+        ds_core::feature::sort_features(&mut matched, &query.sortby);
         let number_matched = matched.len();
         let page: Vec<Feature> = matched
             .into_iter()
@@ -1563,6 +1609,17 @@ impl FeatureEngine for NowcastEngine {
             number_returned,
             next_offset,
         })
+    }
+
+    /// Sortable cell properties (#605), resolved per instance — see
+    /// `recompute_sortables`. A borrow of the stored list, so this stays a
+    /// cheap per-request accessor.
+    ///
+    /// `severity` is deliberately ABSENT: as a string it orders
+    /// `moderate < severe < very_severe < weak`, which looks almost right and
+    /// puts the weakest cells last. `significance` already incorporates it.
+    fn sortables(&self) -> &[&'static str] {
+        &self.sortables
     }
 
     /// O(1) from the snapshot — the default would build every feature just

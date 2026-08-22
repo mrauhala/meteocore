@@ -1,4 +1,6 @@
-use ds_core::feature::{Feature, FeaturePage, Geometry, PropertyValue};
+use ds_core::feature::{
+    Bbox, DatetimeInterval, Feature, FeaturePage, Geometry, PropertyValue, SortDirection, SortKey,
+};
 use serde_json::{json, Value};
 
 fn property_value_to_json(v: &PropertyValue) -> Value {
@@ -87,11 +89,70 @@ pub fn feature_to_geojson(feature: &Feature, collection_id: &str, base_url: &str
     })
 }
 
+/// Rebuild the filter/sort part of the query string for pagination links.
+///
+/// Built from the PARSED values rather than echoed from the raw input, which
+/// makes the links canonical and sidesteps re-encoding: a client that sent
+/// `sortby=+score` gave us `" score"` after form decoding, and echoing that
+/// back would emit a literal space into a URL.
+///
+/// Returns either an empty string or a fragment starting with `&`.
+pub fn preserved_query(
+    bbox: Option<&Bbox>,
+    datetime: Option<&DatetimeInterval>,
+    sortby: &[SortKey],
+) -> String {
+    let mut q = String::new();
+    if let Some(b) = bbox {
+        q.push_str(&format!(
+            "&bbox={},{},{},{}",
+            b.west, b.south, b.east, b.north
+        ));
+    }
+    if let Some(d) = datetime {
+        // AutoSi, not Secs: truncating `.500Z` would make the next link apply
+        // a DIFFERENT time window than page 1 and return a different row set
+        // — the pagination-drops-your-query bug this function exists to fix,
+        // reintroduced at sub-second scale. Collections with sub-second
+        // timestamps (the PostGIS events shape) hit this.
+        let fmt = |t: chrono::DateTime<chrono::Utc>| {
+            t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+        };
+        let value = match (d.start, d.end) {
+            (Some(s), Some(e)) if s == e => fmt(s),
+            (s, e) => format!(
+                "{}/{}",
+                s.map(fmt).unwrap_or_else(|| "..".into()),
+                e.map(fmt).unwrap_or_else(|| "..".into())
+            ),
+        };
+        q.push_str(&format!("&datetime={value}"));
+    }
+    if !sortby.is_empty() {
+        let terms: Vec<String> = sortby
+            .iter()
+            .map(|k| match k.direction {
+                // Ascending is emitted bare, never as `+`: an unencoded `+`
+                // decodes back to a space on the next request.
+                SortDirection::Ascending => k.property.clone(),
+                SortDirection::Descending => format!("-{}", k.property),
+            })
+            .collect();
+        q.push_str(&format!("&sortby={}", terms.join(",")));
+    }
+    q
+}
+
+#[allow(clippy::too_many_arguments)] // pagination links need every query axis
 pub fn feature_page_to_geojson(
     page: &FeaturePage,
     collection_id: &str,
     limit: usize,
     offset: usize,
+    // Filter/sort fragment from `preserved_query`, carried onto every
+    // pagination link. Without it, following `rel="next"` — the pattern OGC
+    // recommends — silently drops the caller's filters and ordering.
+    filters: &str,
     timestamp: &str,
     base_url: &str,
 ) -> Value {
@@ -102,14 +163,14 @@ pub fn feature_page_to_geojson(
         .collect();
 
     let mut links = vec![json!({
-        "href": format!("{base_url}/features/collections/{}/items?offset={}&limit={}", collection_id, offset, limit),
+        "href": format!("{base_url}/features/collections/{}/items?offset={}&limit={}{}", collection_id, offset, limit, filters),
         "rel": "self",
         "type": "application/geo+json"
     })];
 
     if let Some(next) = page.next_offset {
         links.push(json!({
-            "href": format!("{base_url}/features/collections/{}/items?offset={}&limit={}", collection_id, next, limit),
+            "href": format!("{base_url}/features/collections/{}/items?offset={}&limit={}{}", collection_id, next, limit, filters),
             "rel": "next",
             "type": "application/geo+json"
         }));
@@ -118,7 +179,7 @@ pub fn feature_page_to_geojson(
     if offset > 0 {
         let prev_offset = offset.saturating_sub(limit);
         links.push(json!({
-            "href": format!("{base_url}/features/collections/{}/items?offset={}&limit={}", collection_id, prev_offset, limit),
+            "href": format!("{base_url}/features/collections/{}/items?offset={}&limit={}{}", collection_id, prev_offset, limit, filters),
             "rel": "prev",
             "type": "application/geo+json"
         }));
@@ -189,7 +250,7 @@ mod tests {
             number_returned: 1,
             next_offset: Some(1),
         };
-        let json = feature_page_to_geojson(&page, "weather", 1, 0, "2024-01-01T00:00:00Z", "");
+        let json = feature_page_to_geojson(&page, "weather", 1, 0, "", "2024-01-01T00:00:00Z", "");
 
         assert_eq!(json["type"], "FeatureCollection");
         assert_eq!(json["numberMatched"], 3);
@@ -210,7 +271,7 @@ mod tests {
             number_returned: 1,
             next_offset: None,
         };
-        let json = feature_page_to_geojson(&page, "weather", 10, 0, "2024-01-01T00:00:00Z", "");
+        let json = feature_page_to_geojson(&page, "weather", 10, 0, "", "2024-01-01T00:00:00Z", "");
 
         let links = json["links"].as_array().unwrap();
         assert!(links.iter().any(|l| l["rel"] == "self"));
@@ -225,7 +286,7 @@ mod tests {
             number_returned: 1,
             next_offset: Some(2),
         };
-        let json = feature_page_to_geojson(&page, "weather", 1, 1, "2024-01-01T00:00:00Z", "");
+        let json = feature_page_to_geojson(&page, "weather", 1, 1, "", "2024-01-01T00:00:00Z", "");
 
         let links = json["links"].as_array().unwrap();
         assert!(links.iter().any(|l| l["rel"] == "prev"));
@@ -239,7 +300,7 @@ mod tests {
             number_returned: 0,
             next_offset: None,
         };
-        let json = feature_page_to_geojson(&page, "weather", 10, 0, "2024-01-01T00:00:00Z", "");
+        let json = feature_page_to_geojson(&page, "weather", 10, 0, "", "2024-01-01T00:00:00Z", "");
 
         assert_eq!(json["type"], "FeatureCollection");
         assert_eq!(json["numberMatched"], 0);

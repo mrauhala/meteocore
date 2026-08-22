@@ -112,6 +112,7 @@ dependencies = [
  "chrono",
  "ds-core",
  "http-body-util",
+ "jsonschema",
  "serde",
  "serde_json",
  "tokio",
