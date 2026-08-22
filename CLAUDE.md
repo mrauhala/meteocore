@@ -414,6 +414,8 @@ port = 8000
 enabled = true
 token_env = "MCP_TOKEN"     # env var holding the bearer token (never inline)
 rate_limit_per_min = 60     # across the whole endpoint; 0 disables (loopback only)
+# enabled flips on reload (a disabled endpoint 404s); token_env and
+# rate_limit_per_min are read once at boot — changing either needs a restart.
 
 # Optional named colormaps. Like [[style_bundles]], MUST live in top-level
 # config.toml (rejected in per-collection files). Registered next to the

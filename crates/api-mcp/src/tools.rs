@@ -42,6 +42,9 @@ const DEFAULT_CELLS: usize = 10;
 /// retains ~48 (4 h at 5-minute cadence), and each step materializes that
 /// snapshot's whole cell set.
 const MAX_TRACK_SAMPLES: usize = 48;
+/// Hard cap on backward probes, which exceed the sample count when frames are
+/// empty. Bounds the loop regardless of how quiet the radar was.
+const MAX_TRACK_PROBES: usize = 200;
 const DEFAULT_TRACK_SAMPLES: usize = 24;
 
 #[derive(Clone)]
@@ -193,16 +196,23 @@ impl MeteoCoreMcp {
             "engine_type": config.engine_type,
             "serves_storm_cells": config.engine_type == CELL_ENGINE_TYPE,
         });
-        if let Some(engine) = state.engines.get(&collection) {
-            doc["tracked_cells"] = json!(engine.feature_count());
-            if let Some((start, end)) = engine.temporal_extent() {
-                doc["retained_frames"] = json!({
-                    "from": rfc3339(start),
-                    "to": rfc3339(end),
-                });
-            }
-            if !engine.sortables().is_empty() {
-                doc["sortable_properties"] = json!(engine.sortables());
+        // Engine methods ONLY for cells collections. `feature_count()` on a
+        // postgis engine issues a COUNT against the database — a sync bridge
+        // called from a request handler, which parks a worker (Critical Rule
+        // 7). The module doc claims every data-touching tool gates on this;
+        // it has to be true here too, not just in the cell tools.
+        if config.engine_type == CELL_ENGINE_TYPE {
+            if let Some(engine) = state.engines.get(&collection) {
+                doc["tracked_cells"] = json!(engine.feature_count());
+                if let Some((start, end)) = engine.temporal_extent() {
+                    doc["retained_frames"] = json!({
+                        "from": rfc3339(start),
+                        "to": rfc3339(end),
+                    });
+                }
+                if !engine.sortables().is_empty() {
+                    doc["sortable_properties"] = json!(engine.sortables());
+                }
             }
         }
         Ok(doc.to_string())
@@ -298,9 +308,16 @@ impl MeteoCoreMcp {
         // t", then stepping to just before whatever that frame's instant was.
         // No cadence is assumed — the engine's own retention decides the
         // steps, so a source that changes interval still walks correctly.
+        // A frame with no cells at all (a quiet radar period) carries no
+        // `observed` to step from, so the walk needs its own probe budget:
+        // stepping back a minute and retrying finds the next older frame
+        // instead of stopping and silently reporting a truncated history.
         let mut history = Vec::new();
         let mut cursor = extent_end;
-        for _ in 0..samples {
+        let max_probes = samples.saturating_mul(4).min(MAX_TRACK_PROBES);
+        let mut probes = 0;
+        while history.len() < samples && probes < max_probes {
+            probes += 1;
             let page = engine
                 .get_features(&FeatureQuery {
                     bbox: None,
@@ -314,15 +331,22 @@ impl MeteoCoreMcp {
                 })
                 .map_err(|e| ErrorData::internal_error(format!("Query failed: {e}"), None))?;
 
-            let Some(frame_time) = page
+            let frame_time = page
                 .features
                 .first()
                 .and_then(|f| f.properties.get("observed"))
                 .and_then(|v| v.as_str())
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|t| t.with_timezone(&Utc))
-            else {
-                break;
+                .map(|t| t.with_timezone(&Utc));
+
+            let Some(frame_time) = frame_time else {
+                // Empty frame: probe further back rather than concluding the
+                // history ends here.
+                if cursor <= extent_start {
+                    break;
+                }
+                cursor -= Duration::minutes(1);
+                continue;
             };
             if let Some(f) = page.features.iter().find(|f| f.id == cell_id) {
                 history.push(cell_json(f));
@@ -336,7 +360,7 @@ impl MeteoCoreMcp {
         Ok(json!({
             "collection": collection,
             "cell_id": cell_id,
-            "frames_walked": samples,
+            "frames_walked": history.len(),
             "history": history,
             "note": if history.is_empty() {
                 "This cell id is not present in any retained frame. Track ids restart when the \

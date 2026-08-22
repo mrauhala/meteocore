@@ -406,6 +406,7 @@ mod tests {
         Arc::new(ServerState {
             edr: Arc::new(ArcSwap::from_pointee(result.edr_state)),
             mcp: None,
+            mcp_auth: None,
             features: Arc::new(ArcSwap::from_pointee(result.features_state)),
             wms: Arc::new(ArcSwap::from_pointee(result.wms_state)),
             maps: Arc::new(ArcSwap::from_pointee(result.maps_state)),

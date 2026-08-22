@@ -435,3 +435,57 @@ async fn cell_track_walks_frames_and_says_so_when_the_id_is_gone() {
         .unwrap_or_default()
         .contains("restart when the server reloads"));
 }
+
+#[tokio::test]
+async fn a_disabled_endpoint_looks_absent() {
+    // Reload can flip this; the route stays nested from boot, so without the
+    // flag an operator turning MCP off would leave it live and reachable.
+    let auth = Arc::new(McpAuth::new(TOKEN.to_string(), 0));
+    auth.set_enabled(false);
+    let mut engines: HashMap<String, Arc<dyn FeatureEngine>> = HashMap::new();
+    engines.insert("cells".into(), Arc::new(CellEngine));
+    let mut collections = HashMap::new();
+    collections.insert("cells".to_string(), collection("cells", "nowcast"));
+    let app = api_mcp::router(
+        Arc::new(ArcSwap::from_pointee(McpState {
+            engines,
+            collections,
+        })),
+        auth,
+    );
+
+    // 404, not 401: a disabled endpoint should look absent rather than
+    // advertise that a credential would help.
+    let (status, _, _) = call(&app, Some(TOKEN), None, initialize()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn collection_info_does_not_touch_a_non_cells_engine() {
+    // feature_count()/temporal_extent() on a postgis engine hit the database
+    // — a sync bridge from a request handler (Critical Rule 7). The tool must
+    // return config metadata only for anything that isn't a cells collection.
+    let app = app();
+    let sid = handshake(&app).await;
+    let out = call_tool(
+        &app,
+        &sid,
+        "get_collection_info",
+        json!({"collection": "places"}),
+    )
+    .await;
+    assert_eq!(out["serves_storm_cells"], false);
+    assert!(
+        out.get("tracked_cells").is_none() && out.get("retained_frames").is_none(),
+        "engine-derived fields must be absent for a non-cells collection: {out}"
+    );
+    // A cells collection still gets them.
+    let cells = call_tool(
+        &app,
+        &sid,
+        "get_collection_info",
+        json!({"collection": "cells"}),
+    )
+    .await;
+    assert_eq!(cells["tracked_cells"], 3);
+}

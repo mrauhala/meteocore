@@ -25,6 +25,13 @@ to anyone who finds the URL. Rules, all tested:
 - **`router()` returns a Router, not the bare transport**, because the guard
   has to wrap it. Mounting `StreamableHttpService` directly would publish an
   unauthenticated endpoint; that's why the signature is shaped this way.
+- **Disable takes effect on reload.** The route is nested once at boot, so
+  `McpAuth` carries an `enabled` flag that `do_reload` flips from config; a
+  disabled endpoint answers 404 (absent, not "wrong credential"). The **token
+  and rate limit are still fixed at boot** — rotating either needs a restart.
+- **The configured token is trimmed**, matching the presented one. An env var
+  set from a file or a here-doc carries a trailing newline, and without this
+  the two never compare equal and every request 401s with no clue why.
 - **Rate limiting is global, not per-client.** One shared token means there is
   no client identity to key on, so it caps blast radius rather than
   apportioning fairly. Fixed window, so a burst across a boundary can briefly
@@ -42,6 +49,11 @@ nowcast collection. That is two rules at once:
    (Critical Rule 7). **Widening the tool set means solving that first**, not
    adding a match arm.
 
+`get_collection_info` is included in that rule: it returns config metadata for
+any collection but only calls engine methods (`feature_count`,
+`temporal_extent`, `sortables`) for cells collections. `feature_count()` on a
+postgis engine issues a COUNT against the database.
+
 ## Tools
 
 `list_collections`, `get_collection_info`, `get_storm_cells`,
@@ -54,7 +66,10 @@ nowcast collection. That is two rules at once:
   before t", then stepping to just before that frame's instant. **No cadence
   is assumed** — the engine's retention decides the steps, so a source that
   changes interval still walks correctly. Capped at `MAX_TRACK_SAMPLES`,
-  because each step materializes that frame's whole cell set.
+  because each step materializes that frame's whole cell set. A frame with
+  **zero** cells carries no `observed` to step from, so the walk probes a
+  minute further back rather than concluding the history ends there — bounded
+  separately by `MAX_TRACK_PROBES`.
 
 ## Writing for a model, not a person
 

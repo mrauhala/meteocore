@@ -833,6 +833,10 @@ pub struct ServerState {
     /// `FeatureEngine`s, so a second source would only be a way for the two
     /// to disagree after a reload.
     pub mcp: Option<Arc<ArcSwap<api_mcp::McpState>>>,
+    /// The guard for `/mcp`, so a reload can disable it. The route is nested
+    /// once at boot; without this handle, turning MCP off in config would
+    /// leave the endpoint live until the process restarted.
+    pub mcp_auth: Option<Arc<api_mcp::McpAuth>>,
     pub wms: Arc<ArcSwap<WmsState>>,
     pub maps: Arc<ArcSwap<MapsState>>,
     pub tiles: Arc<ArcSwap<TilesState>>,
@@ -3675,6 +3679,19 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     // state rather than poll loops).
     if let Some(mcp) = &state.mcp {
         mcp.store(Arc::new(mcp_state_from(&state.features.load())));
+    }
+    // Honour an enable/disable flip from the reloaded config. The token and
+    // rate limit are still fixed at boot — rotating either needs a restart,
+    // which is stated in the config docs.
+    if let Some(auth) = &state.mcp_auth {
+        let enabled = config.mcp.as_ref().is_some_and(|m| m.enabled);
+        if enabled != auth.is_enabled() {
+            tracing::warn!(
+                "MCP endpoint {} by reload",
+                if enabled { "re-enabled" } else { "disabled" }
+            );
+        }
+        auth.set_enabled(enabled);
     }
     state.wms.store(Arc::new(result.wms_state));
     state.maps.store(Arc::new(result.maps_state));

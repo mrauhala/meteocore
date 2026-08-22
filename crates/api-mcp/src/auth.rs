@@ -67,15 +67,34 @@ impl RateLimiter {
 
 pub struct McpAuth {
     token: String,
+    /// Flipped by reload. The route itself is nested at boot, so without this
+    /// a config change disabling MCP would leave `/mcp` live and reachable
+    /// with the original token until the process restarted — an operator
+    /// turning it off would reasonably expect it to be off.
+    enabled: std::sync::atomic::AtomicBool,
     pub limiter: RateLimiter,
 }
 
 impl McpAuth {
     pub fn new(token: String, rate_limit_per_min: u64) -> Self {
         Self {
-            token,
+            // Trimmed to match the presented token, which is also trimmed.
+            // An env var set from a file or a here-doc commonly carries a
+            // trailing newline; without this the two never compare equal and
+            // every request 401s with no indication why.
+            token: token.trim().to_string(),
+            enabled: std::sync::atomic::AtomicBool::new(true),
             limiter: RateLimiter::new(rate_limit_per_min),
         }
+    }
+
+    /// Serve requests at all. Set from config on every reload.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
     }
 
     /// Constant-time token comparison.
@@ -114,6 +133,12 @@ pub async fn guard(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    // Checked before auth: a disabled endpoint should look absent, not
+    // "wrong credential".
+    if !auth.is_enabled() {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "Not found" }))).into_response();
+    }
+
     let presented = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -152,6 +177,21 @@ mod tests {
         );
         assert!(!auth.token_matches("S3CRET-TOKEN"), "case matters");
         assert!(!auth.token_matches(""));
+    }
+
+    #[test]
+    fn a_token_with_surrounding_whitespace_still_matches() {
+        // `MCP_TOKEN=$(cat secret)` and docker secrets both leave a newline.
+        let auth = McpAuth::new("s3cret-token\n".into(), 0);
+        assert!(auth.token_matches("s3cret-token"));
+    }
+
+    #[test]
+    fn disabling_takes_effect_without_a_restart() {
+        let auth = McpAuth::new("t".into(), 0);
+        assert!(auth.is_enabled());
+        auth.set_enabled(false);
+        assert!(!auth.is_enabled());
     }
 
     #[test]
