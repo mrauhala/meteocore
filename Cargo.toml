@@ -20,6 +20,7 @@ members = [
     "crates/ds-3dtiles",
     "crates/api-edr",
     "crates/api-features",
+    "crates/api-mcp",
     "crates/api-wms",
     "crates/api-maps",
     "crates/api-tiles",

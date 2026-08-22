@@ -5,6 +5,10 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
     pub server: ServerSettings,
+    /// Model Context Protocol endpoint (`[mcp]`), disabled unless present and
+    /// `enabled = true`. Top-level only, like `[[style_bundles]]`.
+    #[serde(default)]
+    pub mcp: Option<McpConfig>,
     #[serde(default)]
     pub collections: Vec<CollectionConfig>,
     /// Shared style bundles referenced by collections via `[wms] style_bundle`.
@@ -132,6 +136,7 @@ impl ServerConfig {
     /// style bundles start empty and can be added via reload.
     pub fn default_for_auto() -> Self {
         ServerConfig {
+            mcp: None,
             server: ServerSettings {
                 host: "127.0.0.1".to_string(),
                 port: 8000,
@@ -310,6 +315,39 @@ pub struct NowcastConfig {
     /// honest but cannot rank a city above a village.
     #[serde(default)]
     pub impact_weight_property: Option<String>,
+}
+
+/// MCP endpoint configuration.
+///
+/// There is deliberately no default token. `enabled = true` with no
+/// resolvable token is a load error rather than an open endpoint — the
+/// opposite default would let a typo publish an unauthenticated tool surface
+/// that can read every collection.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct McpConfig {
+    /// Serve `/mcp` at all. Off unless explicitly set.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Environment variable holding the bearer token. Indirection rather than
+    /// an inline value, matching `[postgis] dsn_env`: config files get
+    /// committed, secrets should not.
+    #[serde(default = "default_mcp_token_env")]
+    pub token_env: String,
+    /// Requests per minute, applied to authenticated requests and to failed
+    /// auth attempts as two SEPARATE budgets — so the endpoint total is up to
+    /// twice this. Separate on purpose: a shared bucket would let guessing
+    /// exhaust the legitimate caller's allowance. 0 disables both, which is
+    /// only sensible when the port is not publicly reachable.
+    #[serde(default = "default_mcp_rate_limit")]
+    pub rate_limit_per_min: u64,
+}
+
+fn default_mcp_token_env() -> String {
+    "MCP_TOKEN".to_string()
+}
+
+fn default_mcp_rate_limit() -> u64 {
+    60
 }
 
 fn default_impact_name_property() -> String {
@@ -2142,6 +2180,12 @@ impl ServerConfig {
                      move the block to the top-level config.toml (or a colormaps_dir file)"
                 )));
             }
+            if raw.contains_key("mcp") {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "{filename}: [mcp] is not allowed in per-collection files — \
+                     move the block to the top-level config.toml"
+                )));
+            }
             if raw.contains_key("parameter_defaults") {
                 return Err(crate::error::DataServerError::Config(format!(
                     "{filename}: [[parameter_defaults]] is not allowed in per-collection \
@@ -2169,6 +2213,30 @@ impl ServerConfig {
 
     /// Validate configuration for common errors before starting the server.
     pub fn validate(&self) -> Result<(), crate::error::DataServerError> {
+        // [mcp]: an enabled endpoint MUST have a resolvable token. Failing
+        // the load is the point — the alternative is a typo publishing an
+        // unauthenticated tool surface over every collection, which nothing
+        // downstream would notice.
+        if let Some(mcp) = &self.mcp {
+            if mcp.enabled {
+                if mcp.token_env.trim().is_empty() {
+                    return Err(crate::error::DataServerError::Config(
+                        "[mcp] token_env must name an environment variable".into(),
+                    ));
+                }
+                match std::env::var(&mcp.token_env) {
+                    Ok(v) if !v.trim().is_empty() => {}
+                    _ => {
+                        return Err(crate::error::DataServerError::Config(format!(
+                            "[mcp] enabled = true but ${} is unset or empty; \
+                             set it or remove [mcp] — /mcp is never served unauthenticated",
+                            mcp.token_env
+                        )))
+                    }
+                }
+            }
+        }
+
         // Validate [[parameter_defaults]] rules: a rule must be matchable
         // and name a palette (existence is checked by the server against the
         // full registry, which includes [[colormaps]]).
@@ -2745,6 +2813,51 @@ impl ServerConfig {
 
 #[cfg(test)]
 mod tests {
+    /// The security invariant the MCP work rests on: an enabled endpoint
+    /// without a resolvable token must fail the load, so a typo cannot
+    /// publish an unauthenticated tool surface over every collection.
+    ///
+    /// Serialized, because it mutates process-wide env.
+    #[test]
+    fn mcp_enabled_without_a_token_fails_validation() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let cfg = |var: &str| ServerConfig {
+            mcp: Some(McpConfig {
+                enabled: true,
+                token_env: var.to_string(),
+                rate_limit_per_min: 60,
+            }),
+            ..ServerConfig::default_for_auto()
+        };
+
+        let var = "MC_TEST_TOKEN_VALIDATE";
+        std::env::remove_var(var);
+        let err = cfg(var).validate().expect_err("unset token must fail");
+        assert!(err.to_string().contains(var), "error should name it: {err}");
+
+        // Whitespace-only is not a token either.
+        std::env::set_var(var, "   ");
+        assert!(cfg(var).validate().is_err(), "blank token must fail");
+
+        std::env::set_var(var, "an-actual-token");
+        assert!(cfg(var).validate().is_ok(), "a real token loads");
+
+        // Disabled needs no token at all.
+        std::env::remove_var(var);
+        let mut disabled = cfg(var);
+        disabled.mcp.as_mut().unwrap().enabled = false;
+        assert!(disabled.validate().is_ok());
+
+        // An empty token_env is rejected regardless.
+        let mut blank = cfg(var);
+        blank.mcp.as_mut().unwrap().token_env = "  ".into();
+        assert!(blank.validate().is_err());
+        std::env::remove_var(var);
+    }
+
     use super::*;
     use std::fs;
     use tempfile::TempDir;

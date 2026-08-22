@@ -828,6 +828,14 @@ pub enum CollectionStatus {
 pub struct ServerState {
     pub edr: Arc<ArcSwap<EdrState>>,
     pub features: Arc<ArcSwap<FeaturesState>>,
+    /// MCP tool state, present only when `[mcp] enabled = true`. Derived from
+    /// the Features registry rather than loaded separately — the tools read
+    /// `FeatureEngine`s, so a second source would only be a way for the two
+    /// to disagree after a reload.
+    /// Present only when MCP was wired at boot. One field rather than two
+    /// parallel `Option`s: the state and its guard must always exist
+    /// together, and nothing in the type system was enforcing that.
+    pub mcp: Option<McpWiring>,
     pub wms: Arc<ArcSwap<WmsState>>,
     pub maps: Arc<ArcSwap<MapsState>>,
     pub tiles: Arc<ArcSwap<TilesState>>,
@@ -1024,6 +1032,23 @@ pub(crate) fn reusable_collections(
         }
     }
     out
+}
+
+/// MCP state plus the guard that protects it.
+pub struct McpWiring {
+    pub state: Arc<ArcSwap<api_mcp::McpState>>,
+    /// The guard for `/mcp`, so a reload can disable it. The route is nested
+    /// once at boot; without this handle, turning MCP off in config would
+    /// leave the endpoint live until the process restarted.
+    pub auth: Arc<api_mcp::McpAuth>,
+}
+
+/// Project the Features registry into MCP tool state.
+pub fn mcp_state_from(features: &FeaturesState) -> api_mcp::McpState {
+    api_mcp::McpState {
+        engines: features.engines.clone(),
+        collections: features.collections.clone(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // config + style inputs + the two reload reuse pools are all distinct concerns
@@ -3657,6 +3682,37 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     // Atomically swap state
     state.edr.store(Arc::new(result.edr_state));
     state.features.store(Arc::new(result.features_state));
+    // Re-derive MCP state from the freshly swapped Features registry, so a
+    // reloaded collection reaches the tools too (the #442 lesson, applied to
+    // state rather than poll loops).
+    if let Some(mcp) = &state.mcp {
+        mcp.state
+            .store(Arc::new(mcp_state_from(&state.features.load())));
+    }
+    // Honour an enable/disable flip from the reloaded config. The token and
+    // rate limit are still fixed at boot — rotating either needs a restart,
+    // which is stated in the config docs.
+    // One-directional by construction: the /mcp route and its guard are built
+    // once at boot, so a reload can turn MCP OFF (and back on again), but
+    // cannot introduce it on a server that started without it. Enabling for
+    // the first time needs a restart — say so rather than let the reload
+    // report success and change nothing.
+    match (&state.mcp, config.mcp.as_ref().is_some_and(|m| m.enabled)) {
+        (Some(McpWiring { auth, .. }), enabled) => {
+            if enabled != auth.is_enabled() {
+                tracing::warn!(
+                    "MCP endpoint {} by reload",
+                    if enabled { "re-enabled" } else { "disabled" }
+                );
+            }
+            auth.set_enabled(enabled);
+        }
+        (None, true) => tracing::warn!(
+            "[mcp] enabled = true but MCP was not wired at startup; \
+             enabling it requires a restart, not a reload"
+        ),
+        (None, false) => {}
+    }
     state.wms.store(Arc::new(result.wms_state));
     state.maps.store(Arc::new(result.maps_state));
     state.tiles.store(Arc::new(result.tiles_state));
