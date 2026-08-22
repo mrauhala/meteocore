@@ -663,3 +663,114 @@ async fn the_track_walk_says_why_it_stopped() {
     // existing", so the reason is always reported.
     assert_eq!(out["stopped_because"], "samples_reached");
 }
+
+/// An engine whose frames are retained but contain no cells — engine-nowcast
+/// pushes a snapshot every generation regardless of cell count.
+struct QuietEngine;
+
+impl FeatureEngine for QuietEngine {
+    fn get_features(&self, _q: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+        Ok(FeaturePage {
+            features: vec![],
+            number_matched: 0,
+            number_returned: 0,
+            next_offset: None,
+        })
+    }
+    fn get_feature(&self, id: &str) -> Result<Feature, DataServerError> {
+        Err(DataServerError::FeatureNotFound(id.into()))
+    }
+    fn temporal_extent(
+        &self,
+    ) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+        Some((
+            "2026-08-21T14:20:00Z".parse().unwrap(),
+            "2026-08-21T14:25:00Z".parse().unwrap(),
+        ))
+    }
+}
+
+/// The distinction the flag exists for. Deriving it from an empty page — as
+/// the first version did — labels a genuinely quiet frame "no frame for that
+/// time", which is a different and false statement.
+#[tokio::test]
+async fn a_quiet_frame_inside_retention_is_not_reported_as_missing() {
+    let mut engines: HashMap<String, Arc<dyn FeatureEngine>> = HashMap::new();
+    engines.insert("cells".into(), Arc::new(QuietEngine));
+    let mut collections = HashMap::new();
+    collections.insert("cells".to_string(), collection("cells", "nowcast"));
+    let app = api_mcp::router(
+        Arc::new(ArcSwap::from_pointee(McpState {
+            engines,
+            collections,
+        })),
+        Arc::new(McpAuth::new(TOKEN.to_string(), 0)),
+    );
+    let sid = handshake(&app).await;
+
+    // Inside the retained window, zero cells: quiet, not missing.
+    let quiet = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "at": "2026-08-21T14:22:00Z"}),
+    )
+    .await;
+    assert_eq!(quiet["returned"], 0);
+    assert_eq!(
+        quiet["no_frame_for_requested_time"], false,
+        "a quiet frame is an answer, not an absence: {quiet}"
+    );
+
+    // Before the window: genuinely missing.
+    let missing = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "at": "2020-01-01T00:00:00Z"}),
+    )
+    .await;
+    assert_eq!(missing["no_frame_for_requested_time"], true);
+}
+
+/// `frames += 1` runs before the boundary check, so a walk that reaches
+/// retention start on its samples-th frame was relabelled "samples_reached".
+#[tokio::test]
+async fn reaching_retention_start_is_not_relabelled_as_samples_reached() {
+    let app = app();
+    let sid = handshake(&app).await;
+    // The mock retains exactly two frames; asking for two walks both and hits
+    // the boundary on the second.
+    let out = call_tool(
+        &app,
+        &sid,
+        "get_cell_track",
+        json!({"collection": "cells", "cell_id": "42", "samples": 2}),
+    )
+    .await;
+    assert_eq!(
+        out["stopped_because"], "reached_retention_start",
+        "the real reason must survive the post-loop default: {out}"
+    );
+}
+
+/// A model guessing a wrong argument name must be told, not silently given
+/// the default.
+#[tokio::test]
+async fn unknown_arguments_are_rejected() {
+    let app = app();
+    let sid = handshake(&app).await;
+    let (_, _, body) = call(
+        &app,
+        Some(TOKEN),
+        Some(&sid),
+        json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+               "params": {"name": "get_storm_cells",
+                          "arguments": {"collection": "cells", "count": 5}}}),
+    )
+    .await;
+    assert!(
+        body.contains("count") || body.contains("unknown field"),
+        "a misspelled argument should be named, not ignored: {body}"
+    );
+}

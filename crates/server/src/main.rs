@@ -68,7 +68,7 @@ use tower::Layer;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::normalize_path::NormalizePathLayer;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use admin::{AdminState, ServerState};
@@ -579,13 +579,23 @@ async fn main() {
     // MCP (#605 follow-up): served only when configured AND a token resolves.
     // ServerConfig::validate already rejected enabled-without-token, so an
     // unauthenticated /mcp cannot be reached from here.
-    let mcp_wiring = config.mcp.as_ref().filter(|m| m.enabled).map(|m| {
+    let mcp_wiring = config.mcp.as_ref().filter(|m| m.enabled).and_then(|m| {
+        // validate() already proved this resolves, but it read the env
+        // independently — so re-check rather than let `unwrap_or_default()`
+        // install an empty token that an empty `Bearer ` would match.
         let token = std::env::var(&m.token_env).unwrap_or_default();
+        if token.trim().is_empty() {
+            error!(
+                "MCP not enabled: ${} is unset or empty at wiring time",
+                m.token_env
+            );
+            return None;
+        }
         let swap = Arc::new(ArcSwap::from_pointee(admin::mcp_state_from(
             &features_swap.load(),
         )));
         let auth = Arc::new(api_mcp::McpAuth::new(token, m.rate_limit_per_min));
-        (swap, auth)
+        Some((swap, auth))
     });
 
     // Resolve admin token: ADMIN_TOKEN env var takes priority over config

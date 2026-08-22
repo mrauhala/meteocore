@@ -112,6 +112,14 @@ impl McpAuth {
     /// is not the secret. The contents are compared with a fixed-cost fold so
     /// the time taken does not depend on how many leading bytes matched.
     fn token_matches(&self, presented: &str) -> bool {
+        // Defence in depth. ServerConfig::validate() already refuses to boot
+        // an enabled endpoint without a token, but the boot path re-reads the
+        // env var independently, and `unwrap_or_default()` on a var that
+        // vanished in between would leave an empty token here — which an
+        // empty `Bearer ` would then match.
+        if self.token.is_empty() {
+            return false;
+        }
         let expected = self.token.as_bytes();
         let got = presented.as_bytes();
         if expected.len() != got.len() {
@@ -194,6 +202,14 @@ mod tests {
         );
         assert!(!auth.token_matches("S3CRET-TOKEN"), "case matters");
         assert!(!auth.token_matches(""));
+    }
+
+    #[test]
+    fn an_empty_configured_token_authenticates_nothing() {
+        let auth = McpAuth::new(String::new(), 0);
+        assert!(!auth.token_matches(""));
+        assert!(!auth.token_matches(" "));
+        assert!(!auth.token_matches("anything"));
     }
 
     #[test]

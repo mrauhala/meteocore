@@ -53,7 +53,7 @@ const MAX_TRACK_PROBES: usize = 200;
 /// Deliberately unlike `get_storm_cells`, which IS a bounded top-K. A
 /// `get_feature(id, datetime)` would remove the asymmetry; until then the cap
 /// keeps a pathological frame from being unbounded.
-const MAX_CELLS_PER_PROBED_FRAME: usize = 5_000;
+const MAX_CELLS_PER_PROBED_FRAME: usize = 1_000;
 const DEFAULT_TRACK_SAMPLES: usize = 24;
 
 #[derive(Clone)]
@@ -111,13 +111,18 @@ impl McpState {
 // Parameters
 // ---------------------------------------------------------------------------
 
+// deny_unknown_fields on all three: a model guessing `count` for `limit` or
+// `time` for `at` would otherwise silently get the default, which is the
+// silently-wrong-answer failure this crate is built to avoid.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CollectionParam {
     /// Collection id, e.g. "fmi-radar-nowcast".
     pub collection: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StormCellsParams {
     /// Collection id serving tracked storm cells.
     pub collection: String,
@@ -129,6 +134,7 @@ pub struct StormCellsParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CellTrackParams {
     /// Collection id serving tracked storm cells.
     pub collection: String,
@@ -257,7 +263,8 @@ impl MeteoCoreMcp {
             Some(n) => n.min(MAX_CELLS),
             None => DEFAULT_CELLS,
         };
-        let datetime = at.as_deref().map(parse_instant).transpose()?.map(|t| {
+        let requested_at = at.as_deref().map(parse_instant).transpose()?;
+        let datetime = requested_at.map(|t| {
             // Newest frame at or before `at` — the same "which frame am I
             // looking at" semantic the Features endpoint uses.
             DatetimeInterval {
@@ -285,12 +292,15 @@ impl MeteoCoreMcp {
             .and_then(|v| v.as_str())
             .map(str::to_string);
 
-        // An `at` outside the retained window returns the same empty shape as
-        // a genuinely quiet frame. A model reading that as "no storms right
-        // now" would be stating something it does not know.
+        // Compare the REQUESTED instant against the retained window. Deriving
+        // this from an empty page would be wrong: engine-nowcast retains a
+        // snapshot for every generation even when it tracked zero cells, so
+        // an empty page means "quiet frame" as often as "no frame at all",
+        // and a model reading either as "no storms" states what it does not
+        // know.
         let retained = engine.temporal_extent();
-        let outside_retention = match (at.is_some(), observed.is_none(), retained) {
-            (true, true, Some((start, end))) => Some(json!({
+        let outside_retention = match (requested_at, retained) {
+            (Some(t), Some((start, end))) if t < start => Some(json!({
                 "from": rfc3339(start),
                 "to": rfc3339(end),
             })),
@@ -364,7 +374,10 @@ impl MeteoCoreMcp {
         let mut cursor = extent_end;
         let mut frames = 0;
         let mut empty_probes = 0;
-        let mut stopped = "budget_exhausted";
+        // Option, so a reason set on the way out survives: `frames += 1`
+        // happens before the boundary check, so a walk that reaches retention
+        // start on its samples-th frame would otherwise be relabelled.
+        let mut stopped: Option<&str> = None;
         while frames < samples && empty_probes < MAX_TRACK_PROBES {
             let page = engine
                 .get_features(&FeatureQuery {
@@ -391,7 +404,7 @@ impl MeteoCoreMcp {
                 // Empty frame: probe further back rather than concluding the
                 // history ends here. Does not count against `samples`.
                 if cursor <= extent_start {
-                    stopped = "reached_retention_start";
+                    stopped = Some("reached_retention_start");
                     break;
                 }
                 empty_probes += 1;
@@ -403,16 +416,18 @@ impl MeteoCoreMcp {
                 history.push(cell_json(f));
             }
             if frame_time <= extent_start {
-                stopped = "reached_retention_start";
+                stopped = Some("reached_retention_start");
                 break;
             }
             cursor = frame_time - Duration::seconds(1);
         }
-        if frames >= samples {
-            stopped = "samples_reached";
+        let stopped = stopped.unwrap_or(if frames >= samples {
+            "samples_reached"
         } else if empty_probes >= MAX_TRACK_PROBES {
-            stopped = "gave_up_in_empty_gap";
-        }
+            "gave_up_in_empty_gap"
+        } else {
+            "budget_exhausted"
+        });
 
         Ok(json!({
             "collection": collection,

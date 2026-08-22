@@ -333,7 +333,10 @@ pub struct McpConfig {
     /// committed, secrets should not.
     #[serde(default = "default_mcp_token_env")]
     pub token_env: String,
-    /// Requests per minute across the whole endpoint. 0 disables the limit —
+    /// Requests per minute, applied to authenticated requests and to failed
+    /// auth attempts as two SEPARATE budgets — so the endpoint total is up to
+    /// twice this. Separate on purpose: a shared bucket would let guessing
+    /// exhaust the legitimate caller's allowance. 0 disables both, which is
     /// only sensible when the port is not publicly reachable.
     #[serde(default = "default_mcp_rate_limit")]
     pub rate_limit_per_min: u64,

@@ -413,7 +413,9 @@ port = 8000
 [mcp]
 enabled = true
 token_env = "MCP_TOKEN"     # env var holding the bearer token (never inline)
-rate_limit_per_min = 60     # across the whole endpoint; 0 disables (loopback only)
+rate_limit_per_min = 60     # PER BUCKET — authenticated requests and failed
+                            # auth attempts are budgeted separately, so the
+                            # endpoint total is up to 2x this. 0 disables both.
 # A reload can turn MCP OFF (a disabled endpoint 404s) and back on again, but
 # cannot introduce it on a server that started without it — the route is built
 # at boot. Enabling for the first time, and changing token_env or
