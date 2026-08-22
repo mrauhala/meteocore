@@ -15,7 +15,8 @@ every engine's background poll loop uses — never hand-roll a
 (OGC 3D Tiles encoder), engines (`engine-csv`, `engine-geojson`,
 `engine-geotiff`, `engine-grib`, `engine-odim`, `engine-querydata`,
 `engine-zarr`, `engine-postgis`, `engine-cap`), API layers (`api-edr`,
-`api-features`, `api-maps`, `api-tiles`, `api-wms`, `api-3dtiles`), and
+`api-features`, `api-maps`, `api-tiles`, `api-wms`, `api-3dtiles`,
+`api-mcp` — Model Context Protocol tools over the storm-cell surface), and
 `server` (the binary).
 
 **Per-crate notes live in `crates/<crate>/CLAUDE.md`.** Before working on one
@@ -28,6 +29,8 @@ of these crates, read its file — it holds that crate's rules and gotchas:
 - `crates/api-edr/CLAUDE.md` — CoverageJSON schema compliance, domain types,
   instances.
 - `crates/api-3dtiles/CLAUDE.md` — routes, representations, caching, viewer.
+- `crates/api-mcp/CLAUDE.md` — MCP tools, the auth boundary, why the tool
+  set is restricted to nowcast collections.
 - `crates/ds-3dtiles/CLAUDE.md` — .pnts / isosurface / echo-top / voxel
   encoders and their CesiumJS gotchas.
 - `crates/engine-odim/CLAUDE.md` — PVOL per-site model, pixel pre-warm,
@@ -401,6 +404,16 @@ port = 8000
                                  # .toml (ColormapDef), GMT .cpt, GRLevelX .pal,
                                  # GDAL color-relief .txt/.clr, SLD .sld (ColorMap). Re-read on reload;
                                  # missing dir = hard error; other extensions skipped.
+
+# Optional Model Context Protocol endpoint at /mcp (off unless present and
+# enabled). Top-level config.toml only. There is deliberately no default
+# token: `enabled = true` with no resolvable token is a LOAD ERROR, because
+# the alternative default would let a typo publish an unauthenticated tool
+# surface over every Features collection.
+[mcp]
+enabled = true
+token_env = "MCP_TOKEN"     # env var holding the bearer token (never inline)
+rate_limit_per_min = 60     # across the whole endpoint; 0 disables (loopback only)
 
 # Optional named colormaps. Like [[style_bundles]], MUST live in top-level
 # config.toml (rejected in per-collection files). Registered next to the

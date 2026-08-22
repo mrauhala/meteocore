@@ -576,6 +576,18 @@ async fn main() {
     let tiles_swap = Arc::new(ArcSwap::from_pointee(result.tiles_state));
     let tiles_3d_swap = Arc::new(ArcSwap::from_pointee(result.tiles_3d_state));
 
+    // MCP (#605 follow-up): served only when configured AND a token resolves.
+    // ServerConfig::validate already rejected enabled-without-token, so an
+    // unauthenticated /mcp cannot be reached from here.
+    let mcp_wiring = config.mcp.as_ref().filter(|m| m.enabled).map(|m| {
+        let token = std::env::var(&m.token_env).unwrap_or_default();
+        let swap = Arc::new(ArcSwap::from_pointee(admin::mcp_state_from(
+            &features_swap.load(),
+        )));
+        let auth = Arc::new(api_mcp::McpAuth::new(token, m.rate_limit_per_min));
+        (swap, auth)
+    });
+
     // Resolve admin token: ADMIN_TOKEN env var takes priority over config
     let admin_token = std::env::var("ADMIN_TOKEN")
         .ok()
@@ -640,6 +652,7 @@ async fn main() {
     let server_state: AdminState = Arc::new(ServerState {
         edr: edr_swap.clone(),
         features: features_swap.clone(),
+        mcp: mcp_wiring.as_ref().map(|(swap, _)| swap.clone()),
         wms: wms_swap.clone(),
         maps: maps_swap.clone(),
         tiles: tiles_swap.clone(),
@@ -713,7 +726,7 @@ async fn main() {
     let root_state = server_state.clone();
 
     // Public routes get permissive CORS (OGC APIs, health, metrics)
-    let public = Router::new()
+    let mut public = Router::new()
         .route(
             "/",
             get(move |headers: axum::http::HeaderMap| {
@@ -767,6 +780,15 @@ async fn main() {
         .route("/preview/{*path}", get(preview::asset_handler));
 
     // Admin routes (protected by bearer token auth, not CORS)
+    // /mcp last and conditionally: `api_mcp::router` wraps the transport in
+    // the bearer guard, so nesting the service directly would publish it
+    // unauthenticated. CORS stays permissive like the rest — the token is the
+    // control, not the origin.
+    if let Some((swap, auth)) = &mcp_wiring {
+        public = public.nest("/mcp", api_mcp::router(swap.clone(), auth.clone()));
+        info!("MCP endpoint enabled at /mcp (bearer auth required)");
+    }
+
     let admin_routes = Router::new().route(
         "/admin/collections/reload",
         post(admin::reload_handler).with_state(server_state.clone()),

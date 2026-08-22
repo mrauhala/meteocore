@@ -828,6 +828,11 @@ pub enum CollectionStatus {
 pub struct ServerState {
     pub edr: Arc<ArcSwap<EdrState>>,
     pub features: Arc<ArcSwap<FeaturesState>>,
+    /// MCP tool state, present only when `[mcp] enabled = true`. Derived from
+    /// the Features registry rather than loaded separately — the tools read
+    /// `FeatureEngine`s, so a second source would only be a way for the two
+    /// to disagree after a reload.
+    pub mcp: Option<Arc<ArcSwap<api_mcp::McpState>>>,
     pub wms: Arc<ArcSwap<WmsState>>,
     pub maps: Arc<ArcSwap<MapsState>>,
     pub tiles: Arc<ArcSwap<TilesState>>,
@@ -1024,6 +1029,14 @@ pub(crate) fn reusable_collections(
         }
     }
     out
+}
+
+/// Project the Features registry into MCP tool state.
+pub fn mcp_state_from(features: &FeaturesState) -> api_mcp::McpState {
+    api_mcp::McpState {
+        engines: features.engines.clone(),
+        collections: features.collections.clone(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // config + style inputs + the two reload reuse pools are all distinct concerns
@@ -3657,6 +3670,12 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     // Atomically swap state
     state.edr.store(Arc::new(result.edr_state));
     state.features.store(Arc::new(result.features_state));
+    // Re-derive MCP state from the freshly swapped Features registry, so a
+    // reloaded collection reaches the tools too (the #442 lesson, applied to
+    // state rather than poll loops).
+    if let Some(mcp) = &state.mcp {
+        mcp.store(Arc::new(mcp_state_from(&state.features.load())));
+    }
     state.wms.store(Arc::new(result.wms_state));
     state.maps.store(Arc::new(result.maps_state));
     state.tiles.store(Arc::new(result.tiles_state));

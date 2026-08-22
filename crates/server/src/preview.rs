@@ -973,6 +973,7 @@ mod tests {
     ) -> AdminState {
         Arc::new(ServerState {
             edr: Arc::new(ArcSwap::from_pointee(edr)),
+            mcp: None,
             features: Arc::new(ArcSwap::from_pointee(features)),
             wms: Arc::new(ArcSwap::from_pointee(wms)),
             maps: Arc::new(ArcSwap::from_pointee(maps)),

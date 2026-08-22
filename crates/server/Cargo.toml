@@ -23,6 +23,7 @@ engine-postgis = { path = "../engine-postgis" }
 engine-nowcast = { path = "../engine-nowcast" }
 api-edr = { path = "../api-edr" }
 api-features = { path = "../api-features" }
+api-mcp = { path = "../api-mcp" }
 api-wms = { path = "../api-wms" }
 api-maps = { path = "../api-maps" }
 api-tiles = { path = "../api-tiles" }
