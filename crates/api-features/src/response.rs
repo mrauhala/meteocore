@@ -110,8 +110,14 @@ pub fn preserved_query(
         ));
     }
     if let Some(d) = datetime {
-        let fmt =
-            |t: chrono::DateTime<chrono::Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        // AutoSi, not Secs: truncating `.500Z` would make the next link apply
+        // a DIFFERENT time window than page 1 and return a different row set
+        // — the pagination-drops-your-query bug this function exists to fix,
+        // reintroduced at sub-second scale. Collections with sub-second
+        // timestamps (the PostGIS events shape) hit this.
+        let fmt = |t: chrono::DateTime<chrono::Utc>| {
+            t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+        };
         let value = match (d.start, d.end) {
             (Some(s), Some(e)) if s == e => fmt(s),
             (s, e) => format!(

@@ -730,7 +730,17 @@ fn compare_present(a: &PropertyValue, b: &PropertyValue) -> std::cmp::Ordering {
         }
         (PropertyValue::String(x), PropertyValue::String(y)) => x.cmp(y),
         (PropertyValue::Bool(x), PropertyValue::Bool(y)) => x.cmp(y),
-        (PropertyValue::List(x), PropertyValue::List(y)) => x.len().cmp(&y.len()),
+        // Lexicographic, not by length: same-length lists with different
+        // contents would otherwise compare Equal and fall through to the
+        // tie-break, which reads as "sorting silently did nothing" — the
+        // failure this module is trying to eliminate. No engine advertises a
+        // List sortable today, but this is the shared helper they all reuse.
+        (PropertyValue::List(x), PropertyValue::List(y)) => x
+            .iter()
+            .zip(y.iter())
+            .map(|(a, b)| compare_present(a, b))
+            .find(|o| *o != Ordering::Equal)
+            .unwrap_or_else(|| x.len().cmp(&y.len())),
         _ => type_rank(a).cmp(&type_rank(b)),
     }
 }
@@ -1296,6 +1306,46 @@ mod tests {
         ];
         sort_features(&mut fs, &[SortKey::ascending("n")]);
         assert_eq!(fs.len(), 2);
+    }
+
+    #[test]
+    fn lists_compare_lexicographically_not_by_length() {
+        // Same length, different contents must not collapse to Equal — that
+        // reads as "sorting did nothing".
+        let mut fs = vec![
+            feat(
+                "b",
+                vec![(
+                    "l",
+                    PropertyValue::List(vec![PropertyValue::Integer(1), PropertyValue::Integer(9)]),
+                )],
+            ),
+            feat(
+                "a",
+                vec![(
+                    "l",
+                    PropertyValue::List(vec![PropertyValue::Integer(1), PropertyValue::Integer(2)]),
+                )],
+            ),
+        ];
+        sort_features(&mut fs, &[SortKey::ascending("l")]);
+        assert_eq!(ids(&fs), ["a", "b"]);
+        // A shorter prefix still orders before its extension.
+        let mut fs = vec![
+            feat(
+                "long",
+                vec![(
+                    "l",
+                    PropertyValue::List(vec![PropertyValue::Integer(1), PropertyValue::Integer(1)]),
+                )],
+            ),
+            feat(
+                "short",
+                vec![("l", PropertyValue::List(vec![PropertyValue::Integer(1)]))],
+            ),
+        ];
+        sort_features(&mut fs, &[SortKey::ascending("l")]);
+        assert_eq!(ids(&fs), ["short", "long"]);
     }
 
     #[test]

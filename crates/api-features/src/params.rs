@@ -31,12 +31,19 @@ pub fn parse_sortby(s: &str, sortables: &[&str]) -> Result<Vec<SortKey>, DataSer
 
     let mut keys: Vec<SortKey> = Vec::new();
     for raw in s.split(',') {
-        let (direction, rest) = match raw.strip_prefix('-') {
+        // Trim BEFORE reading the direction marker. A decoded `+` arrives as
+        // a leading space, but so does cosmetic whitespace after a comma
+        // (`sortby=score, -size`, or `%20` from a client that encodes it) —
+        // reading the marker first would see the space, take the ascending
+        // branch, and then reject the legitimate `-size` as a malformed
+        // property name. Trimming first makes both cases fall out: with the
+        // space gone, a bare property is ascending by default anyway.
+        let trimmed = raw.trim();
+        let (direction, rest) = match trimmed.strip_prefix('-') {
             Some(rest) => (SortDirection::Descending, rest),
             None => (
                 SortDirection::Ascending,
-                raw.strip_prefix('+')
-                    .unwrap_or_else(|| raw.strip_prefix(' ').unwrap_or(raw)),
+                trimmed.strip_prefix('+').unwrap_or(trimmed),
             ),
         };
         let property = rest.trim();

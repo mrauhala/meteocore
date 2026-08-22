@@ -196,6 +196,53 @@ fn parses_directions_including_plus_decoded_as_space() {
 }
 
 #[test]
+fn whitespace_around_terms_does_not_swallow_the_direction() {
+    // `sortby=score, -size` (a space after the comma, or `%20` from a client
+    // that encodes it) must still read as descending. Reading the direction
+    // marker before trimming saw the space, took the ascending branch, and
+    // rejected "-size" as a malformed property name.
+    assert_eq!(
+        parse_sortby("score, -size", SORTABLES).unwrap(),
+        vec![SortKey::ascending("score"), SortKey::descending("size")]
+    );
+    assert_eq!(
+        parse_sortby("  -score  ", SORTABLES).unwrap(),
+        vec![SortKey::descending("score")]
+    );
+    // A decoded `+` is still just a leading space, and still ascending.
+    assert_eq!(
+        parse_sortby("score, +size", SORTABLES).unwrap(),
+        vec![SortKey::ascending("score"), SortKey::ascending("size")]
+    );
+}
+
+#[tokio::test]
+async fn pagination_links_keep_sub_second_datetime_precision() {
+    // Truncating `.500Z` would make the next link apply a different window
+    // than page 1 and return a different row set — the same
+    // pagination-drops-your-query bug, at sub-second scale. Collections with
+    // sub-second timestamps (the PostGIS events shape) hit this.
+    let (status, body) = get(
+        "/collections/sortable/items?datetime=2024-01-01T00:00:00.500Z/2024-01-01T00:00:01.500Z&limit=1",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let self_href = body["links"]
+        .as_array()
+        .expect("links")
+        .iter()
+        .find(|l| l["rel"] == "self")
+        .expect("self link")["href"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        self_href.contains("00:00:00.500Z") && self_href.contains("00:00:01.500Z"),
+        "sub-second precision must survive the round trip: {self_href}"
+    );
+}
+
+#[test]
 fn parses_multiple_terms_in_precedence_order() {
     assert_eq!(
         parse_sortby("-score,size", SORTABLES).unwrap(),
