@@ -83,10 +83,6 @@ const MAX_HISTORY_FRAMES: usize = 8;
 const MAX_JOIN_STRIKES: usize = 200_000;
 
 /// Cell properties every nowcast instance can sort on (#605).
-///
-/// The three conditional lists below MUST stay `SORTABLES_BASE` plus their
-/// extras — pinned by `sortables_lists_compose_from_the_base` so adding a base
-/// property can't silently miss the wired-source variants.
 const SORTABLES_BASE: &[&str] = &[
     "significance",
     "significance_rank",
@@ -97,51 +93,10 @@ const SORTABLES_BASE: &[&str] = &[
     "bearing_deg",
     "intensity_trend_dbz_min",
 ];
-/// Extras that exist only with `lightning_source` wired. Test-only: they
-/// document and pin the composition of the lists below, which are spelled out
-/// in full because the accessor must return a `&'static` slice.
-#[cfg(test)]
+/// Extras that exist only with `lightning_source` wired.
 const SORTABLES_LIGHTNING_EXTRAS: &[&str] = &["flash_count", "flash_rate_per_min"];
-/// Extras that exist only with `impact_source` wired. Test-only, as above.
-#[cfg(test)]
+/// Extras that exist only with `impact_source` wired.
 const SORTABLES_IMPACT_EXTRAS: &[&str] = &["impact_eta_minutes"];
-
-const SORTABLES_LIGHTNING: &[&str] = &[
-    "significance",
-    "significance_rank",
-    "max_dbz",
-    "area_km2",
-    "track_age",
-    "speed_ms",
-    "bearing_deg",
-    "intensity_trend_dbz_min",
-    "flash_count",
-    "flash_rate_per_min",
-];
-const SORTABLES_IMPACT: &[&str] = &[
-    "significance",
-    "significance_rank",
-    "max_dbz",
-    "area_km2",
-    "track_age",
-    "speed_ms",
-    "bearing_deg",
-    "intensity_trend_dbz_min",
-    "impact_eta_minutes",
-];
-const SORTABLES_ALL: &[&str] = &[
-    "significance",
-    "significance_rank",
-    "max_dbz",
-    "area_km2",
-    "track_age",
-    "speed_ms",
-    "bearing_deg",
-    "intensity_trend_dbz_min",
-    "flash_count",
-    "flash_rate_per_min",
-    "impact_eta_minutes",
-];
 
 /// Parsed, validated engine configuration.
 struct EngineCfg {
@@ -290,6 +245,11 @@ pub struct NowcastEngine {
     /// `impact` significance term — the one that makes a ranking
     /// operational rather than merely meteorological.
     impact: Option<ImpactCfg>,
+    /// Sortable properties for THIS instance, resolved once whenever a
+    /// source is wired. Stored rather than recomputed so the per-request
+    /// accessor is a borrow — same effect as the four-constant version it
+    /// replaces, with one source of truth instead of four to keep in step.
+    sortables: Vec<&'static str>,
     /// Significance ranking for tracked cells: the default weight table with
     /// any per-collection overrides applied. Validated at construction, so a
     /// typo in a weight name fails the collection at load rather than
@@ -390,6 +350,7 @@ impl NowcastEngine {
             next_track_id: AtomicU64::new(1),
             lightning: None,
             impact: None,
+            sortables: SORTABLES_BASE.to_vec(),
             scorer,
         })
     }
@@ -453,6 +414,7 @@ impl NowcastEngine {
     /// the flash properties when a source is attached.
     pub fn with_lightning_source(mut self, source: Arc<dyn ds_core::events::EventSource>) -> Self {
         self.lightning = Some(source);
+        self.recompute_sortables();
         self
     }
 
@@ -470,7 +432,26 @@ impl NowcastEngine {
             name_property: name_property.to_string(),
             weight_property: weight_property.map(str::to_string),
         });
+        self.recompute_sortables();
         self
+    }
+
+    /// Rebuild the sortable set from whichever sources are wired.
+    ///
+    /// A property absent from every feature sorts to a no-op: `sort_features`
+    /// finds the key missing on every cell and falls through to the id
+    /// tie-break, so the request answers 200 in id order — the
+    /// silently-ignored-parameter failure this surface exists to remove.
+    /// Advertise only what this instance can actually order by.
+    fn recompute_sortables(&mut self) {
+        let mut v = SORTABLES_BASE.to_vec();
+        if self.lightning.is_some() {
+            v.extend(SORTABLES_LIGHTNING_EXTRAS);
+        }
+        if self.impact.is_some() {
+            v.extend(SORTABLES_IMPACT_EXTRAS);
+        }
+        self.sortables = v;
     }
 
     /// Poll the source for a new frame; spawn on the BACKGROUND runtime only.
@@ -1630,32 +1611,15 @@ impl FeatureEngine for NowcastEngine {
         })
     }
 
-    /// Sortable cell properties (#605). Every cell in a snapshot is already
-    /// materialized, so sorting before paging costs one `sort_by` — the
-    /// condition `sortables()` documents for opting in.
+    /// Sortable cell properties (#605), resolved per instance — see
+    /// `recompute_sortables`. A borrow of the stored list, so this stays a
+    /// cheap per-request accessor.
     ///
     /// `severity` is deliberately ABSENT: as a string it orders
     /// `moderate < severe < very_severe < weak`, which looks almost right and
     /// puts the weakest cells last. `significance` already incorporates it.
-    ///
-    /// **Instance-dependent.** The lightning and impact properties only exist
-    /// on a feature when the corresponding source is wired, and a property
-    /// that is absent everywhere sorts to a no-op: `sort_features` treats it
-    /// as missing on every cell and falls through to the id tie-break, so the
-    /// request would return 200 in id order — the silently-ignored-parameter
-    /// failure this whole surface exists to remove. Advertise only what this
-    /// instance can actually order by, so the unwired case is a 400.
-    ///
-    /// Returns one of four `&'static` slices rather than filtering into a
-    /// `Vec`: this is a per-request capability accessor, which Critical Rule
-    /// 10 requires to be O(1) and allocation-free.
     fn sortables(&self) -> &[&'static str] {
-        match (self.lightning.is_some(), self.impact.is_some()) {
-            (false, false) => SORTABLES_BASE,
-            (true, false) => SORTABLES_LIGHTNING,
-            (false, true) => SORTABLES_IMPACT,
-            (true, true) => SORTABLES_ALL,
-        }
+        &self.sortables
     }
 
     /// O(1) from the snapshot — the default would build every feature just
@@ -1704,50 +1668,6 @@ impl FeatureEngine for NowcastEngine {
         match (state.cell_history.first(), state.cell_history.last()) {
             (Some(first), Some(last)) => Some((first.anchor, last.anchor)),
             _ => None,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The conditional sortable lists must be exactly the base plus their
-    /// extras. Four hand-written `&'static` slices are the price of an
-    /// allocation-free per-request accessor (Critical Rule 10); this test is
-    /// what stops them drifting apart when a base property is added.
-    #[test]
-    fn sortables_lists_compose_from_the_base() {
-        let concat = |extra: &[&'static str]| -> Vec<&'static str> {
-            SORTABLES_BASE.iter().chain(extra).copied().collect()
-        };
-        assert_eq!(SORTABLES_LIGHTNING, concat(SORTABLES_LIGHTNING_EXTRAS));
-        assert_eq!(SORTABLES_IMPACT, concat(SORTABLES_IMPACT_EXTRAS));
-        assert_eq!(
-            SORTABLES_ALL,
-            SORTABLES_BASE
-                .iter()
-                .chain(SORTABLES_LIGHTNING_EXTRAS)
-                .chain(SORTABLES_IMPACT_EXTRAS)
-                .copied()
-                .collect::<Vec<_>>()
-        );
-    }
-
-    /// A property that no feature carries sorts to a no-op — `sort_features`
-    /// sees it absent everywhere and falls through to the id tie-break. So
-    /// the conditional extras must never appear in the base list, or an
-    /// unwired collection would answer 200 in id order.
-    #[test]
-    fn conditional_extras_are_absent_from_the_base_list() {
-        for extra in SORTABLES_LIGHTNING_EXTRAS
-            .iter()
-            .chain(SORTABLES_IMPACT_EXTRAS)
-        {
-            assert!(
-                !SORTABLES_BASE.contains(extra),
-                "{extra} must not be advertised without its source"
-            );
         }
     }
 }

@@ -158,9 +158,9 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   no-op (`sort_features` sees it missing everywhere and falls through to
   the id tie-break), so advertising an unwired one would answer 200 in id
   order — the silently-ignored-parameter failure the whole surface exists
-  to remove. Four `&'static` slices, selected by a match: this is a
-  per-request capability accessor, so Critical Rule 10 forbids allocating.
-  `sortables_lists_compose_from_the_base` pins them against drift.
+  to remove. Resolved once by `recompute_sortables()` whenever a source is
+  wired and stored on the engine, so the accessor is a borrow and there is
+  one list to maintain rather than one per source combination.
 - `severity` is deliberately NOT sortable — as a string it orders
   `moderate < severe < very_severe < weak`, which looks almost right and
   buries the weakest cells at the end; use `significance`, which already
