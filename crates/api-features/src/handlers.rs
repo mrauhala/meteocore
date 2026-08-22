@@ -16,7 +16,7 @@ use ds_core::feature_engine::FeatureEngine;
 use crate::params::{
     parse_bbox, parse_datetime, parse_sortby, ItemsQueryParams, DEFAULT_LIMIT, MAX_LIMIT,
 };
-use crate::response::{feature_page_to_geojson, feature_to_geojson};
+use crate::response::{feature_page_to_geojson, feature_to_geojson, preserved_query};
 
 /// Shared state for the Features API: a registry of collection engines + metadata.
 #[derive(Clone)]
@@ -760,11 +760,16 @@ pub async fn items(
     // body would change on every request and `If-None-Match` would never
     // match. The `caching::conditional_get` middleware honours this
     // precomputed ETag instead of hashing the body.
+    // Carry the caller's filters and ordering onto the pagination links:
+    // following `rel="next"` is the OGC-recommended pattern, and a next link
+    // that drops them silently serves page 2 unfiltered and unsorted.
+    let filters = preserved_query(query.bbox.as_ref(), query.datetime.as_ref(), &query.sortby);
     let mut doc = feature_page_to_geojson(
         &page,
         &id,
         limit,
         offset,
+        &filters,
         "",
         &request_base_url(&state, &headers),
     );

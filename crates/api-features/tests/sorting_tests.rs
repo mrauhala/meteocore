@@ -260,6 +260,79 @@ async fn sorting_is_applied_before_pagination() {
     assert_eq!(ids(&body), ["low", "nul"]);
 }
 
+/// Reconstructing page 2's URL by hand is not the test that matters: real
+/// clients follow `rel="next"`, which is the pattern OGC recommends. A next
+/// link that drops `sortby` serves page 2 in natural order while looking
+/// entirely successful — the same failure this parameter exists to remove,
+/// moved one hop later.
+#[tokio::test]
+async fn following_the_next_link_preserves_the_sort() {
+    let (_, page1) = get("/collections/sortable/items?sortby=-score&limit=2").await;
+    assert_eq!(ids(&page1), ["top", "mid"]);
+
+    let next = page1["links"]
+        .as_array()
+        .expect("links")
+        .iter()
+        .find(|l| l["rel"] == "next")
+        .expect("a next link on a truncated page")["href"]
+        .as_str()
+        .expect("href string")
+        .to_string();
+    assert!(
+        next.contains("sortby=-score"),
+        "next link must carry the sort: {next}"
+    );
+
+    // Follow it exactly as a client would, path and query verbatim.
+    let path = next
+        .split_once("/features")
+        .map(|(_, p)| p)
+        .unwrap_or(&next);
+    let (status, page2) = get(path).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        ids(&page2),
+        ["low", "nul"],
+        "page 2 must continue the sorted order, not restart in natural order"
+    );
+}
+
+/// bbox and datetime had the same gap; a next link that drops them serves an
+/// unfiltered page 2, which is worse than sorting because the row set changes.
+#[tokio::test]
+async fn pagination_links_preserve_every_query_axis() {
+    let (_, body) = get(
+        "/collections/sortable/items?sortby=-score,size&bbox=20,50,30,70&datetime=2026-08-21T14:00:00Z&limit=1",
+    )
+    .await;
+    let hrefs: Vec<String> = body["links"]
+        .as_array()
+        .expect("links")
+        .iter()
+        .map(|l| l["href"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(!hrefs.is_empty());
+    for href in &hrefs {
+        assert!(
+            href.contains("sortby=-score,size"),
+            "sortby missing: {href}"
+        );
+        assert!(href.contains("bbox=20,50,30,70"), "bbox missing: {href}");
+        assert!(
+            href.contains("datetime=2026-08-21T14:00:00Z"),
+            "datetime missing: {href}"
+        );
+        // An ascending term must never be emitted as `+`, which would decode
+        // back to a space when the client follows the link.
+        assert!(
+            !href.contains("sortby=+"),
+            "'+' would decode to a space: {href}"
+        );
+        assert!(!href.contains(' '), "raw space in a URL: {href}");
+    }
+}
+
 #[tokio::test]
 async fn multi_key_sort_end_to_end() {
     let (_, body) = get("/collections/sortable/items?sortby=-score,size").await;
