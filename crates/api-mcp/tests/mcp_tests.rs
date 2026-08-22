@@ -64,6 +64,11 @@ impl FeatureEngine for CellEngine {
             Self::cell("42", 0.88, 58.0, frame),
             Self::cell("13", 0.55, 51.0, frame),
         ];
+        // Cell "old-only" exists solely in the older frame, so a walk that
+        // stops too early misses it.
+        if frame == older {
+            all.push(Self::cell("old-only", 0.42, 49.0, frame));
+        }
         sort_features(&mut all, &query.sortby);
         let matched = all.len();
         let end = query.offset.saturating_add(query.limit).min(matched);
@@ -548,4 +553,26 @@ async fn an_engine_failure_does_not_leak_internal_detail() {
         body.contains("Query failed"),
         "the client should still learn the query failed: {body}"
     );
+}
+
+/// `samples` bounds frames WALKED, not frames containing the cell — a cell
+/// present only in an older frame must still be found when the budget covers
+/// that many frames.
+#[tokio::test]
+async fn samples_counts_frames_walked_not_matches() {
+    let app = app();
+    let sid = handshake(&app).await;
+    let out = call_tool(
+        &app,
+        &sid,
+        "get_cell_track",
+        json!({"collection": "cells", "cell_id": "old-only", "samples": 2}),
+    )
+    .await;
+    assert_eq!(
+        out["history"].as_array().unwrap().len(),
+        1,
+        "a cell absent from the newest frame must still be found in the second: {out}"
+    );
+    assert_eq!(out["frames_walked"], 2, "both frames were walked");
 }

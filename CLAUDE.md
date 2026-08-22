@@ -510,7 +510,9 @@ time_window = "PT12H"
 [[collections]]
 id = "radar-nowcast"
 engine_type = "nowcast"
-apis = ["wms", "maps", "tiles"]
+# "features" is what serves the tracked-cell layer — and what makes the
+# collection visible to the MCP tools, which read the Features registry.
+apis = ["wms", "maps", "tiles", "features"]
 
 [collections.nowcast]
 source = "radar"        # collection id to extrapolate

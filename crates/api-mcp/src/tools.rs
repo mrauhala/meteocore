@@ -63,7 +63,8 @@ impl McpState {
         let Some(config) = self.collections.get(id) else {
             return Err(ErrorData::invalid_params(
                 format!(
-                    "Unknown collection '{id}'. Collections serving storm cells: {}",
+                    "Unknown collection '{id}'. Collections serving storm cells: {}. \
+                     (A collection is only visible here if its `apis` includes \"features\".)",
                     self.cell_collection_ids().join(", ")
                 ),
                 None,
@@ -312,12 +313,16 @@ impl MeteoCoreMcp {
         // `observed` to step from, so the walk needs its own probe budget:
         // stepping back a minute and retrying finds the next older frame
         // instead of stopping and silently reporting a truncated history.
+        // `samples` bounds frames WALKED, which is what the parameter says it
+        // does. Counting only frames that contained the cell would let a
+        // small `samples` be consumed by frames the cell is simply absent
+        // from, and report "not tracked" for a cell that is two frames older.
+        // Empty frames get their own allowance so they cannot do that either.
         let mut history = Vec::new();
         let mut cursor = extent_end;
-        let max_probes = samples.saturating_mul(4).min(MAX_TRACK_PROBES);
-        let mut probes = 0;
-        while history.len() < samples && probes < max_probes {
-            probes += 1;
+        let mut frames = 0;
+        let mut empty_probes = 0;
+        while frames < samples && empty_probes < MAX_TRACK_PROBES {
             let page = engine
                 .get_features(&FeatureQuery {
                     bbox: None,
@@ -341,13 +346,15 @@ impl MeteoCoreMcp {
 
             let Some(frame_time) = frame_time else {
                 // Empty frame: probe further back rather than concluding the
-                // history ends here.
+                // history ends here. Does not count against `samples`.
                 if cursor <= extent_start {
                     break;
                 }
+                empty_probes += 1;
                 cursor -= Duration::minutes(1);
                 continue;
             };
+            frames += 1;
             if let Some(f) = page.features.iter().find(|f| f.id == cell_id) {
                 history.push(cell_json(f));
             }
@@ -360,7 +367,7 @@ impl MeteoCoreMcp {
         Ok(json!({
             "collection": collection,
             "cell_id": cell_id,
-            "frames_walked": history.len(),
+            "frames_walked": frames,
             "history": history,
             "note": if history.is_empty() {
                 "This cell id is not present in any retained frame. Track ids restart when the \
