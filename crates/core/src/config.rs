@@ -2810,6 +2810,51 @@ impl ServerConfig {
 
 #[cfg(test)]
 mod tests {
+    /// The security invariant the MCP work rests on: an enabled endpoint
+    /// without a resolvable token must fail the load, so a typo cannot
+    /// publish an unauthenticated tool surface over every collection.
+    ///
+    /// Serialized, because it mutates process-wide env.
+    #[test]
+    fn mcp_enabled_without_a_token_fails_validation() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let cfg = |var: &str| ServerConfig {
+            mcp: Some(McpConfig {
+                enabled: true,
+                token_env: var.to_string(),
+                rate_limit_per_min: 60,
+            }),
+            ..ServerConfig::default_for_auto()
+        };
+
+        let var = "MC_TEST_TOKEN_VALIDATE";
+        std::env::remove_var(var);
+        let err = cfg(var).validate().expect_err("unset token must fail");
+        assert!(err.to_string().contains(var), "error should name it: {err}");
+
+        // Whitespace-only is not a token either.
+        std::env::set_var(var, "   ");
+        assert!(cfg(var).validate().is_err(), "blank token must fail");
+
+        std::env::set_var(var, "an-actual-token");
+        assert!(cfg(var).validate().is_ok(), "a real token loads");
+
+        // Disabled needs no token at all.
+        std::env::remove_var(var);
+        let mut disabled = cfg(var);
+        disabled.mcp.as_mut().unwrap().enabled = false;
+        assert!(disabled.validate().is_ok());
+
+        // An empty token_env is rejected regardless.
+        let mut blank = cfg(var);
+        blank.mcp.as_mut().unwrap().token_env = "  ".into();
+        assert!(blank.validate().is_err());
+        std::env::remove_var(var);
+    }
+
     use super::*;
     use std::fs;
     use tempfile::TempDir;

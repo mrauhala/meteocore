@@ -652,8 +652,10 @@ async fn main() {
     let server_state: AdminState = Arc::new(ServerState {
         edr: edr_swap.clone(),
         features: features_swap.clone(),
-        mcp: mcp_wiring.as_ref().map(|(swap, _)| swap.clone()),
-        mcp_auth: mcp_wiring.as_ref().map(|(_, auth)| auth.clone()),
+        mcp: mcp_wiring.as_ref().map(|(swap, auth)| admin::McpWiring {
+            state: swap.clone(),
+            auth: auth.clone(),
+        }),
         wms: wms_swap.clone(),
         maps: maps_swap.clone(),
         tiles: tiles_swap.clone(),

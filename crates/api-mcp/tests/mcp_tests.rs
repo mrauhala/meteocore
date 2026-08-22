@@ -55,6 +55,17 @@ impl FeatureEngine for CellEngine {
         let newest = "2026-08-21T14:25:00Z";
         let older = "2026-08-21T14:20:00Z";
         let cutoff = query.datetime.as_ref().and_then(|d| d.end);
+        let oldest = older.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+        // Like the real engine: an instant before the retained window matches
+        // no snapshot and returns nothing at all.
+        if cutoff.is_some_and(|t| t < oldest) {
+            return Ok(FeaturePage {
+                features: vec![],
+                number_matched: 0,
+                number_returned: 0,
+                next_offset: None,
+            });
+        }
         let frame = match cutoff {
             Some(t) if t < newest.parse::<chrono::DateTime<chrono::Utc>>().unwrap() => older,
             _ => newest,
@@ -575,4 +586,80 @@ async fn samples_counts_frames_walked_not_matches() {
         "a cell absent from the newest frame must still be found in the second: {out}"
     );
     assert_eq!(out["frames_walked"], 2, "both frames were walked");
+}
+
+#[tokio::test]
+async fn zero_limits_are_rejected_rather_than_coerced() {
+    // A model asking for 0 means none; handing back 1 is a silently-wrong
+    // answer, which is the failure mode this crate is built to avoid.
+    let app = app();
+    let sid = handshake(&app).await;
+    for (tool, args) in [
+        (
+            "get_storm_cells",
+            json!({"collection": "cells", "limit": 0}),
+        ),
+        (
+            "get_cell_track",
+            json!({"collection": "cells", "cell_id": "42", "samples": 0}),
+        ),
+    ] {
+        let (_, _, body) = call(
+            &app,
+            Some(TOKEN),
+            Some(&sid),
+            json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                   "params": {"name": tool, "arguments": args}}),
+        )
+        .await;
+        assert!(
+            body.contains("must be between"),
+            "{tool} should reject 0 with a range: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_time_outside_retention_is_distinguishable_from_a_quiet_frame() {
+    // Both return zero cells. A model must not read the first as "no storms".
+    let app = app();
+    let sid = handshake(&app).await;
+    let out = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "at": "2020-01-01T00:00:00Z"}),
+    )
+    .await;
+    assert_eq!(out["no_frame_for_requested_time"], true);
+    assert!(
+        out["retained_frames"]["from"].is_string(),
+        "and it should say what window IS available: {out}"
+    );
+
+    // The latest frame is a real answer, so the flag stays false.
+    let now = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells"}),
+    )
+    .await;
+    assert_eq!(now["no_frame_for_requested_time"], false);
+}
+
+#[tokio::test]
+async fn the_track_walk_says_why_it_stopped() {
+    let app = app();
+    let sid = handshake(&app).await;
+    let out = call_tool(
+        &app,
+        &sid,
+        "get_cell_track",
+        json!({"collection": "cells", "cell_id": "42", "samples": 1}),
+    )
+    .await;
+    // "gave_up_in_empty_gap" must never be mistaken for "the cell stopped
+    // existing", so the reason is always reported.
+    assert_eq!(out["stopped_because"], "samples_reached");
 }

@@ -832,11 +832,10 @@ pub struct ServerState {
     /// the Features registry rather than loaded separately — the tools read
     /// `FeatureEngine`s, so a second source would only be a way for the two
     /// to disagree after a reload.
-    pub mcp: Option<Arc<ArcSwap<api_mcp::McpState>>>,
-    /// The guard for `/mcp`, so a reload can disable it. The route is nested
-    /// once at boot; without this handle, turning MCP off in config would
-    /// leave the endpoint live until the process restarted.
-    pub mcp_auth: Option<Arc<api_mcp::McpAuth>>,
+    /// Present only when MCP was wired at boot. One field rather than two
+    /// parallel `Option`s: the state and its guard must always exist
+    /// together, and nothing in the type system was enforcing that.
+    pub mcp: Option<McpWiring>,
     pub wms: Arc<ArcSwap<WmsState>>,
     pub maps: Arc<ArcSwap<MapsState>>,
     pub tiles: Arc<ArcSwap<TilesState>>,
@@ -1033,6 +1032,15 @@ pub(crate) fn reusable_collections(
         }
     }
     out
+}
+
+/// MCP state plus the guard that protects it.
+pub struct McpWiring {
+    pub state: Arc<ArcSwap<api_mcp::McpState>>,
+    /// The guard for `/mcp`, so a reload can disable it. The route is nested
+    /// once at boot; without this handle, turning MCP off in config would
+    /// leave the endpoint live until the process restarted.
+    pub auth: Arc<api_mcp::McpAuth>,
 }
 
 /// Project the Features registry into MCP tool state.
@@ -3678,7 +3686,8 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     // reloaded collection reaches the tools too (the #442 lesson, applied to
     // state rather than poll loops).
     if let Some(mcp) = &state.mcp {
-        mcp.store(Arc::new(mcp_state_from(&state.features.load())));
+        mcp.state
+            .store(Arc::new(mcp_state_from(&state.features.load())));
     }
     // Honour an enable/disable flip from the reloaded config. The token and
     // rate limit are still fixed at boot — rotating either needs a restart,
@@ -3688,11 +3697,8 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     // cannot introduce it on a server that started without it. Enabling for
     // the first time needs a restart — say so rather than let the reload
     // report success and change nothing.
-    match (
-        &state.mcp_auth,
-        config.mcp.as_ref().is_some_and(|m| m.enabled),
-    ) {
-        (Some(auth), enabled) => {
+    match (&state.mcp, config.mcp.as_ref().is_some_and(|m| m.enabled)) {
+        (Some(McpWiring { auth, .. }), enabled) => {
             if enabled != auth.is_enabled() {
                 tracing::warn!(
                     "MCP endpoint {} by reload",

@@ -45,6 +45,15 @@ const MAX_TRACK_SAMPLES: usize = 48;
 /// Hard cap on backward probes, which exceed the sample count when frames are
 /// empty. Bounds the loop regardless of how quiet the radar was.
 const MAX_TRACK_PROBES: usize = 200;
+/// Cap on cells fetched per probed frame.
+///
+/// The whole frame is needed: `FeatureEngine` has no by-id query at a past
+/// instant (`get_feature` serves only the latest snapshot), so finding one
+/// cell in an older frame means materializing that frame and searching it.
+/// Deliberately unlike `get_storm_cells`, which IS a bounded top-K. A
+/// `get_feature(id, datetime)` would remove the asymmetry; until then the cap
+/// keeps a pathological frame from being unbounded.
+const MAX_CELLS_PER_PROBED_FRAME: usize = 5_000;
 const DEFAULT_TRACK_SAMPLES: usize = 24;
 
 #[derive(Clone)]
@@ -235,7 +244,19 @@ impl MeteoCoreMcp {
     ) -> Result<String, ErrorData> {
         let state = self.state.load();
         let engine = state.cells_engine(&collection)?;
-        let limit = limit.unwrap_or(DEFAULT_CELLS).clamp(1, MAX_CELLS);
+        let limit = match limit {
+            // Coercing 0 to 1 would hand back a cell to a model that asked
+            // for none — this crate's whole error style is "say what was
+            // wrong so the next call is right".
+            Some(0) => {
+                return Err(ErrorData::invalid_params(
+                    format!("limit must be between 1 and {MAX_CELLS}"),
+                    None,
+                ))
+            }
+            Some(n) => n.min(MAX_CELLS),
+            None => DEFAULT_CELLS,
+        };
         let datetime = at.as_deref().map(parse_instant).transpose()?.map(|t| {
             // Newest frame at or before `at` — the same "which frame am I
             // looking at" semantic the Features endpoint uses.
@@ -264,9 +285,23 @@ impl MeteoCoreMcp {
             .and_then(|v| v.as_str())
             .map(str::to_string);
 
+        // An `at` outside the retained window returns the same empty shape as
+        // a genuinely quiet frame. A model reading that as "no storms right
+        // now" would be stating something it does not know.
+        let retained = engine.temporal_extent();
+        let outside_retention = match (at.is_some(), observed.is_none(), retained) {
+            (true, true, Some((start, end))) => Some(json!({
+                "from": rfc3339(start),
+                "to": rfc3339(end),
+            })),
+            _ => None,
+        };
+
         Ok(json!({
             "collection": collection,
             "observed": observed,
+            "no_frame_for_requested_time": outside_retention.is_some(),
+            "retained_frames": outside_retention,
             "returned": page.number_returned,
             "total_tracked": page.number_matched,
             "cells": page.features.iter().map(cell_json).collect::<Vec<_>>(),
@@ -291,9 +326,16 @@ impl MeteoCoreMcp {
     ) -> Result<String, ErrorData> {
         let state = self.state.load();
         let engine = state.cells_engine(&collection)?;
-        let samples = samples
-            .unwrap_or(DEFAULT_TRACK_SAMPLES)
-            .clamp(1, MAX_TRACK_SAMPLES);
+        let samples = match samples {
+            Some(0) => {
+                return Err(ErrorData::invalid_params(
+                    format!("samples must be between 1 and {MAX_TRACK_SAMPLES}"),
+                    None,
+                ))
+            }
+            Some(n) => n.min(MAX_TRACK_SAMPLES),
+            None => DEFAULT_TRACK_SAMPLES,
+        };
 
         let Some((extent_start, extent_end)) = engine.temporal_extent() else {
             return Ok(json!({
@@ -322,11 +364,12 @@ impl MeteoCoreMcp {
         let mut cursor = extent_end;
         let mut frames = 0;
         let mut empty_probes = 0;
+        let mut stopped = "budget_exhausted";
         while frames < samples && empty_probes < MAX_TRACK_PROBES {
             let page = engine
                 .get_features(&FeatureQuery {
                     bbox: None,
-                    limit: usize::MAX,
+                    limit: MAX_CELLS_PER_PROBED_FRAME,
                     offset: 0,
                     datetime: Some(DatetimeInterval {
                         start: None,
@@ -348,6 +391,7 @@ impl MeteoCoreMcp {
                 // Empty frame: probe further back rather than concluding the
                 // history ends here. Does not count against `samples`.
                 if cursor <= extent_start {
+                    stopped = "reached_retention_start";
                     break;
                 }
                 empty_probes += 1;
@@ -359,15 +403,24 @@ impl MeteoCoreMcp {
                 history.push(cell_json(f));
             }
             if frame_time <= extent_start {
+                stopped = "reached_retention_start";
                 break;
             }
             cursor = frame_time - Duration::seconds(1);
+        }
+        if frames >= samples {
+            stopped = "samples_reached";
+        } else if empty_probes >= MAX_TRACK_PROBES {
+            stopped = "gave_up_in_empty_gap";
         }
 
         Ok(json!({
             "collection": collection,
             "cell_id": cell_id,
             "frames_walked": frames,
+            // Which of the three exits happened. "gave_up_in_empty_gap" in
+            // particular must not be read as "the cell stopped existing".
+            "stopped_because": stopped,
             "history": history,
             "note": if history.is_empty() {
                 "This cell id is not present in any retained frame. Track ids restart when the \

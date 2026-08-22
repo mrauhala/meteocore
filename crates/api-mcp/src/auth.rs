@@ -235,8 +235,9 @@ mod tests {
 
     #[test]
     fn zero_means_unlimited() {
-        // The config validator rejects a missing limit, but 0 is an explicit
-        // opt-out for a loopback-only deployment.
+        // An omitted `rate_limit_per_min` defaults to 60 in config; validate()
+        // never inspects it. 0 is an explicit opt-out for a deployment where
+        // the port is not publicly reachable.
         let limiter = RateLimiter::new(0);
         for _ in 0..1000 {
             assert!(limiter.allow());
