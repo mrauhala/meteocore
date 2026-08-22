@@ -40,6 +40,11 @@ to anyone who finds the URL. Rules, all tested:
 - **The configured token is trimmed**, matching the presented one. An env var
   set from a file or a here-doc carries a trailing newline, and without this
   the two never compare equal and every request 401s with no clue why.
+- **Failed auth has its own budget.** Two buckets, not one check before auth:
+  a single shared bucket consulted first would let unauthenticated traffic
+  exhaust it and lock out the legitimate client — trading a brute-force hole
+  for a denial of service. As originally written the limiter only ever saw
+  requests that had *already* authenticated, leaving guessing unmetered.
 - **Rate limiting is global, not per-client.** One shared token means there is
   no client identity to key on, so it caps blast radius rather than
   apportioning fairly. Fixed window, so a burst across a boundary can briefly

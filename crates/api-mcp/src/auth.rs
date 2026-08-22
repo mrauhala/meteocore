@@ -67,6 +67,14 @@ impl RateLimiter {
 
 pub struct McpAuth {
     token: String,
+    /// Separate budget for FAILED auth attempts.
+    ///
+    /// Two buckets rather than one check before auth: a single shared bucket
+    /// consulted first would let unauthenticated traffic exhaust it and lock
+    /// out the legitimate client — trading a brute-force hole for a denial of
+    /// service. Separate budgets throttle guessing without letting a stranger
+    /// spend the real caller's allowance.
+    failure_limiter: RateLimiter,
     /// Flipped by reload. The route itself is nested at boot, so without this
     /// a config change disabling MCP would leave `/mcp` live and reachable
     /// with the original token until the process restarted — an operator
@@ -84,6 +92,7 @@ impl McpAuth {
             // every request 401s with no indication why.
             token: token.trim().to_string(),
             enabled: std::sync::atomic::AtomicBool::new(true),
+            failure_limiter: RateLimiter::new(rate_limit_per_min),
             limiter: RateLimiter::new(rate_limit_per_min),
         }
     }
@@ -127,6 +136,14 @@ fn unauthorized(msg: &str) -> Response {
         .into_response()
 }
 
+fn too_many_requests() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({ "error": "Rate limit exceeded; retry in under a minute" })),
+    )
+        .into_response()
+}
+
 /// Bearer check plus rate limit, applied to the whole `/mcp` subtree.
 pub async fn guard(
     State(auth): State<Arc<McpAuth>>,
@@ -146,18 +163,18 @@ pub async fn guard(
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim);
 
-    let Some(presented) = presented else {
-        return unauthorized("Authorization: Bearer <token> required");
-    };
-    if !auth.token_matches(presented) {
+    let authenticated = presented.is_some_and(|p| auth.token_matches(p));
+    if !authenticated {
+        // Throttle guessing on its own budget. Without this the limiter only
+        // ever saw requests that had ALREADY authenticated, leaving the one
+        // kind of traffic it most needs to bound completely unmetered.
+        if !auth.failure_limiter.allow() {
+            return too_many_requests();
+        }
         return unauthorized("Authorization: Bearer <token> required");
     }
     if !auth.limiter.allow() {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({ "error": "Rate limit exceeded; retry in under a minute" })),
-        )
-            .into_response();
+        return too_many_requests();
     }
     next.run(request).await
 }
@@ -201,6 +218,19 @@ mod tests {
         assert!(limiter.allow());
         assert!(limiter.allow());
         assert!(!limiter.allow(), "the 4th request in the window is refused");
+    }
+
+    #[test]
+    fn failed_auth_has_its_own_budget() {
+        // Guessing must be throttled, but a stranger must not be able to
+        // exhaust the legitimate caller's allowance by failing on purpose.
+        let auth = McpAuth::new("right".into(), 2);
+        assert!(auth.failure_limiter.allow());
+        assert!(auth.failure_limiter.allow());
+        assert!(!auth.failure_limiter.allow(), "guessing is throttled");
+        // The authenticated budget is untouched by those failures.
+        assert!(auth.limiter.allow());
+        assert!(auth.limiter.allow());
     }
 
     #[test]

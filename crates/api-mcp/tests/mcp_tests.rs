@@ -489,3 +489,63 @@ async fn collection_info_does_not_touch_a_non_cells_engine() {
     .await;
     assert_eq!(cells["tracked_cells"], 3);
 }
+
+/// An engine whose queries fail with a message carrying internal detail.
+struct FailingEngine;
+
+impl FeatureEngine for FailingEngine {
+    fn get_features(&self, _q: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+        Err(DataServerError::Storage(
+            "/meteo/data/secret-path/db.sqlite: connection refused from 10.0.0.7".into(),
+        ))
+    }
+    fn get_feature(&self, id: &str) -> Result<Feature, DataServerError> {
+        Err(DataServerError::FeatureNotFound(id.into()))
+    }
+}
+
+/// Critical Rule 11: engine errors must not reach the client. The mock above
+/// carries a filesystem path and an internal host, which is exactly the shape
+/// of `DataServerError::Storage` in production.
+#[tokio::test]
+async fn an_engine_failure_does_not_leak_internal_detail() {
+    let mut engines: HashMap<String, Arc<dyn FeatureEngine>> = HashMap::new();
+    engines.insert("cells".into(), Arc::new(FailingEngine));
+    let mut collections = HashMap::new();
+    collections.insert("cells".to_string(), collection("cells", "nowcast"));
+    let app = api_mcp::router(
+        Arc::new(ArcSwap::from_pointee(McpState {
+            engines,
+            collections,
+        })),
+        Arc::new(McpAuth::new(TOKEN.to_string(), 0)),
+    );
+    let sid = handshake(&app).await;
+
+    let (status, _, body) = call(
+        &app,
+        Some(TOKEN),
+        Some(&sid),
+        json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+               "params": {"name": "get_storm_cells", "arguments": {"collection": "cells"}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    for leaked in [
+        "/meteo/data",
+        "secret-path",
+        "db.sqlite",
+        "10.0.0.7",
+        "connection refused",
+    ] {
+        assert!(
+            !body.contains(leaked),
+            "internal detail {leaked:?} reached the client: {body}"
+        );
+    }
+    assert!(
+        body.contains("Query failed"),
+        "the client should still learn the query failed: {body}"
+    );
+}
