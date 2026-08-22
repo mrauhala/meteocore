@@ -25,10 +25,18 @@ to anyone who finds the URL. Rules, all tested:
 - **`router()` returns a Router, not the bare transport**, because the guard
   has to wrap it. Mounting `StreamableHttpService` directly would publish an
   unauthenticated endpoint; that's why the signature is shaped this way.
-- **Disable takes effect on reload.** The route is nested once at boot, so
-  `McpAuth` carries an `enabled` flag that `do_reload` flips from config; a
-  disabled endpoint answers 404 (absent, not "wrong credential"). The **token
-  and rate limit are still fixed at boot** — rotating either needs a restart.
+- **Disable takes effect on reload; first-time enable does not.** The route
+  is nested once at boot, so `McpAuth` carries an `enabled` flag that
+  `do_reload` flips; a disabled endpoint answers 404 (absent, not "wrong
+  credential"). A server that booted *without* MCP cannot gain it by reload —
+  `do_reload` logs a warning saying so rather than reporting success and
+  changing nothing. Token and rate limit are fixed at boot too.
+- **Engine errors never reach the client** (Critical Rule 11).
+  `DataServerError`'s Display carries `Storage`/`Io` detail — filesystem
+  paths, backend messages — so `query_failed()` logs it and returns a fixed
+  string, exactly as api-features does at the equivalent site. *Parameter*
+  errors are different and deliberately verbose: they describe the caller's
+  own input and are what lets a model self-correct.
 - **The configured token is trimmed**, matching the presented one. An env var
   set from a file or a here-doc carries a trailing newline, and without this
   the two never compare equal and every request 401s with no clue why.

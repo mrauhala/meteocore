@@ -254,7 +254,7 @@ impl MeteoCoreMcp {
                 datetime,
                 sortby: vec![SortKey::descending("significance")],
             })
-            .map_err(|e| ErrorData::internal_error(format!("Query failed: {e}"), None))?;
+            .map_err(query_failed)?;
 
         let observed = page
             .features
@@ -329,7 +329,7 @@ impl MeteoCoreMcp {
                     }),
                     sortby: Vec::new(),
                 })
-                .map_err(|e| ErrorData::internal_error(format!("Query failed: {e}"), None))?;
+                .map_err(query_failed)?;
 
             let frame_time = page
                 .features
@@ -392,6 +392,17 @@ impl ServerHandler for MeteoCoreMcp {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Generic client-facing error for an engine query failure.
+///
+/// Critical Rule 11: `DataServerError`'s Display carries `Storage(String)` and
+/// `Io` detail — filesystem paths, backend messages — which must not reach a
+/// client. api-features discards it the same way at the equivalent site; the
+/// detail goes to the log instead, where it is actually useful.
+fn query_failed(e: ds_core::error::DataServerError) -> ErrorData {
+    tracing::error!("MCP feature query failed: {e}");
+    ErrorData::internal_error("Query failed", None)
+}
 
 fn rfc3339(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)

@@ -3683,15 +3683,29 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     // Honour an enable/disable flip from the reloaded config. The token and
     // rate limit are still fixed at boot — rotating either needs a restart,
     // which is stated in the config docs.
-    if let Some(auth) = &state.mcp_auth {
-        let enabled = config.mcp.as_ref().is_some_and(|m| m.enabled);
-        if enabled != auth.is_enabled() {
-            tracing::warn!(
-                "MCP endpoint {} by reload",
-                if enabled { "re-enabled" } else { "disabled" }
-            );
+    // One-directional by construction: the /mcp route and its guard are built
+    // once at boot, so a reload can turn MCP OFF (and back on again), but
+    // cannot introduce it on a server that started without it. Enabling for
+    // the first time needs a restart — say so rather than let the reload
+    // report success and change nothing.
+    match (
+        &state.mcp_auth,
+        config.mcp.as_ref().is_some_and(|m| m.enabled),
+    ) {
+        (Some(auth), enabled) => {
+            if enabled != auth.is_enabled() {
+                tracing::warn!(
+                    "MCP endpoint {} by reload",
+                    if enabled { "re-enabled" } else { "disabled" }
+                );
+            }
+            auth.set_enabled(enabled);
         }
-        auth.set_enabled(enabled);
+        (None, true) => tracing::warn!(
+            "[mcp] enabled = true but MCP was not wired at startup; \
+             enabling it requires a restart, not a reload"
+        ),
+        (None, false) => {}
     }
     state.wms.store(Arc::new(result.wms_state));
     state.maps.store(Arc::new(result.maps_state));
