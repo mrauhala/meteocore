@@ -340,6 +340,15 @@ pub struct McpConfig {
     /// only sensible when the port is not publicly reachable.
     #[serde(default = "default_mcp_rate_limit")]
     pub rate_limit_per_min: u64,
+    /// Host headers the MCP transport accepts (DNS-rebinding protection).
+    ///
+    /// Empty (the default) derives the list: loopback names plus the host
+    /// from `base_url`. Set this explicitly only when the proxy presents a
+    /// Host the server doesn't otherwise know about — several hostnames for
+    /// one deployment, say. Getting it wrong is a 403 on every request, so
+    /// the derived default is what most deployments should use.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 fn default_mcp_token_env() -> String {
@@ -2829,6 +2838,7 @@ mod tests {
                 enabled: true,
                 token_env: var.to_string(),
                 rate_limit_per_min: 60,
+                allowed_hosts: Vec::new(),
             }),
             ..ServerConfig::default_for_auto()
         };

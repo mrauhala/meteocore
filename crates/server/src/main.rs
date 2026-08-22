@@ -595,7 +595,13 @@ async fn main() {
             &features_swap.load(),
         )));
         let auth = Arc::new(api_mcp::McpAuth::new(token, m.rate_limit_per_min));
-        Some((swap, auth))
+        // rmcp rejects any Host it doesn't recognise (DNS-rebinding
+        // protection) and defaults to loopback only — so behind a reverse
+        // proxy every request 403s unless the public host is added. Derived
+        // from base_url so a correctly-configured deployment just works.
+        let hosts = api_mcp::allowed_hosts(&base_url, &m.allowed_hosts);
+        info!("MCP accepts Host: {}", hosts.join(", "));
+        Some((swap, auth, hosts))
     });
 
     // Resolve admin token: ADMIN_TOKEN env var takes priority over config
@@ -662,7 +668,7 @@ async fn main() {
     let server_state: AdminState = Arc::new(ServerState {
         edr: edr_swap.clone(),
         features: features_swap.clone(),
-        mcp: mcp_wiring.as_ref().map(|(swap, auth)| admin::McpWiring {
+        mcp: mcp_wiring.as_ref().map(|(swap, auth, _)| admin::McpWiring {
             state: swap.clone(),
             auth: auth.clone(),
         }),
@@ -797,8 +803,11 @@ async fn main() {
     // the bearer guard, so nesting the service directly would publish it
     // unauthenticated. CORS stays permissive like the rest — the token is the
     // control, not the origin.
-    if let Some((swap, auth)) = &mcp_wiring {
-        public = public.nest("/mcp", api_mcp::router(swap.clone(), auth.clone()));
+    if let Some((swap, auth, hosts)) = &mcp_wiring {
+        public = public.nest(
+            "/mcp",
+            api_mcp::router(swap.clone(), auth.clone(), hosts.clone()),
+        );
         info!("MCP endpoint enabled at /mcp (bearer auth required)");
     }
 

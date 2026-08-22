@@ -413,6 +413,11 @@ port = 8000
 [mcp]
 enabled = true
 token_env = "MCP_TOKEN"     # env var holding the bearer token (never inline)
+# allowed_hosts = ["alt.example.com"]  # Host headers to accept BEYOND the
+                            # loopback names and base_url's host. The
+                            # transport 403s any Host it doesn't recognise
+                            # (DNS-rebinding protection), so behind a proxy
+                            # base_url must be correct or nothing works.
 rate_limit_per_min = 60     # PER BUCKET — authenticated requests and failed
                             # auth attempts are budgeted separately, so the
                             # endpoint total is up to 2x this. 0 disables both.

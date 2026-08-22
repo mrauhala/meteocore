@@ -21,6 +21,11 @@ use ds_core::feature::*;
 use ds_core::feature_engine::FeatureEngine;
 
 const TOKEN: &str = "test-token-abc123";
+/// Deliberately not loopback. rmcp's default allowlist is localhost-only, so
+/// testing through 127.0.0.1 passes while every request behind a real proxy
+/// 403s — which is exactly how that shipped.
+const HOST: &str = "meteocore.example.fi";
+const BASE_URL: &str = "https://meteocore.example.fi";
 
 struct CellEngine;
 
@@ -147,6 +152,7 @@ fn app() -> axum::Router {
             collections,
         })),
         Arc::new(McpAuth::new(TOKEN.to_string(), 0)),
+        api_mcp::allowed_hosts(BASE_URL, &[]),
     )
 }
 
@@ -167,7 +173,7 @@ async fn call(
         .header("content-type", "application/json")
         // The transport requires Host (DNS-rebinding protection) — a request
         // without it is refused before reaching a tool.
-        .header("host", "localhost")
+        .header("host", HOST)
         .header("accept", "application/json, text/event-stream");
     if let Some(t) = token {
         req = req.header("authorization", format!("Bearer {t}"));
@@ -468,6 +474,7 @@ async fn a_disabled_endpoint_looks_absent() {
             collections,
         })),
         auth,
+        api_mcp::allowed_hosts(BASE_URL, &[]),
     );
 
     // 404, not 401: a disabled endpoint should look absent rather than
@@ -535,6 +542,7 @@ async fn an_engine_failure_does_not_leak_internal_detail() {
             collections,
         })),
         Arc::new(McpAuth::new(TOKEN.to_string(), 0)),
+        api_mcp::allowed_hosts(BASE_URL, &[]),
     );
     let sid = handshake(&app).await;
 
@@ -705,6 +713,7 @@ async fn a_quiet_frame_inside_retention_is_not_reported_as_missing() {
             collections,
         })),
         Arc::new(McpAuth::new(TOKEN.to_string(), 0)),
+        api_mcp::allowed_hosts(BASE_URL, &[]),
     );
     let sid = handshake(&app).await;
 
@@ -773,4 +782,64 @@ async fn unknown_arguments_are_rejected() {
         body.contains("count") || body.contains("unknown field"),
         "a misspelled argument should be named, not ignored: {body}"
     );
+}
+
+/// The bug this fixes: rmcp's Host allowlist defaults to loopback, so a
+/// deployment behind any reverse proxy 403s every request. Every other test
+/// here now speaks to a public hostname for exactly this reason.
+#[tokio::test]
+async fn a_public_host_is_accepted_and_an_unknown_one_is_not() {
+    let app = app();
+    // The configured host works — the whole point.
+    let (status, _, _) = call(&app, Some(TOKEN), None, initialize()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the deployment's own host must work"
+    );
+
+    // An unrecognised Host is still refused: the protection stays on.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/json")
+                .header("host", "evil.example.com")
+                .header("accept", "application/json, text/event-stream")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::from(initialize().to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "DNS-rebinding protection must stay on for unknown hosts"
+    );
+}
+
+#[test]
+fn allowed_hosts_derives_from_base_url() {
+    let hosts = api_mcp::allowed_hosts("https://meteocore.app.meteo.fi", &[]);
+    assert!(hosts.contains(&"meteocore.app.meteo.fi".to_string()));
+    // Loopback stays, so a local smoke test still works.
+    assert!(hosts.contains(&"localhost".to_string()));
+    assert!(hosts.contains(&"127.0.0.1".to_string()));
+
+    // A non-default port appears both with and without it, since the Host
+    // header carries the port only when it is non-default for the scheme.
+    let hosts = api_mcp::allowed_hosts("http://example.org:8000", &[]);
+    assert!(hosts.contains(&"example.org:8000".to_string()));
+    assert!(hosts.contains(&"example.org".to_string()));
+
+    // Explicit extras are added, for a proxy presenting another name.
+    let hosts = api_mcp::allowed_hosts("https://a.test", &["b.test".to_string()]);
+    assert!(hosts.contains(&"a.test".to_string()) && hosts.contains(&"b.test".to_string()));
+
+    // A malformed base_url degrades to loopback rather than panicking.
+    let hosts = api_mcp::allowed_hosts("not-a-url", &[]);
+    assert!(hosts.contains(&"localhost".to_string()));
 }
