@@ -1370,3 +1370,86 @@ fn impact_context_lifts_a_populated_cell_above_a_stronger_one() {
     );
     assert_eq!(rank_of(strong), 2);
 }
+
+/// #605 / review: an unwired collection must not advertise properties its
+/// features don't carry — sorting on one would return 200 in id order.
+#[test]
+fn unwired_sources_are_not_advertised_as_sortable() {
+    use ds_core::feature_engine::FeatureEngine;
+
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0()]),
+    });
+    let plain = NowcastEngine::new("plain", "mock", source, &base_config()).unwrap();
+    let base: Vec<&str> = plain.sortables().to_vec();
+
+    // Not wired ⇒ the conditional properties must NOT be advertised. A
+    // property absent from every feature sorts to a no-op, so advertising it
+    // would return 200 in id order — the silent-ignore this surface removes.
+    for absent in ["flash_count", "flash_rate_per_min", "impact_eta_minutes"] {
+        assert!(
+            !base.contains(&absent),
+            "{absent} must not be sortable without its source"
+        );
+    }
+    assert!(base.contains(&"significance"));
+}
+
+/// Wiring a source makes exactly its properties sortable, and nothing else.
+#[test]
+fn wiring_a_source_adds_exactly_its_sortables() {
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+    use std::collections::HashMap;
+
+    struct Areas;
+    impl FeatureEngine for Areas {
+        fn get_features(
+            &self,
+            _q: &FeatureQuery,
+        ) -> Result<ds_core::feature::FeaturePage, DataServerError> {
+            let mut props = HashMap::new();
+            props.insert("name".to_string(), PropertyValue::String("X".into()));
+            Ok(ds_core::feature::FeaturePage {
+                features: vec![ds_core::feature::Feature {
+                    id: "1".into(),
+                    geometry: Arc::new(ds_core::feature::Geometry::Polygon {
+                        exterior: vec![
+                            [0.0, 50.0],
+                            [10.0, 50.0],
+                            [10.0, 60.0],
+                            [0.0, 60.0],
+                            [0.0, 50.0],
+                        ],
+                        holes: vec![],
+                    }),
+                    properties: Arc::new(props),
+                }],
+                number_matched: 1,
+                number_returned: 1,
+                next_offset: None,
+            })
+        }
+        fn get_feature(&self, _id: &str) -> Result<ds_core::feature::Feature, DataServerError> {
+            unreachable!()
+        }
+    }
+
+    let mk = || {
+        Arc::new(MockSource {
+            times: RwLock::new(vec![t0()]),
+        })
+    };
+    let plain = NowcastEngine::new("p", "mock", mk(), &base_config()).unwrap();
+    let n = plain.sortables().len();
+
+    let with_impact = NowcastEngine::new("i", "mock", mk(), &base_config())
+        .unwrap()
+        .with_impact_source(Arc::new(Areas), "name", None);
+    assert_eq!(with_impact.sortables().len(), n + 1);
+    assert!(with_impact.sortables().contains(&"impact_eta_minutes"));
+    assert!(
+        !with_impact.sortables().contains(&"flash_count"),
+        "an impact source must not advertise lightning properties"
+    );
+}

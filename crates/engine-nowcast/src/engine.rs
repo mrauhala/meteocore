@@ -82,6 +82,67 @@ const MAX_HISTORY_FRAMES: usize = 8;
 /// the cap logs possible truncation instead of failing the generation.
 const MAX_JOIN_STRIKES: usize = 200_000;
 
+/// Cell properties every nowcast instance can sort on (#605).
+///
+/// The three conditional lists below MUST stay `SORTABLES_BASE` plus their
+/// extras — pinned by `sortables_lists_compose_from_the_base` so adding a base
+/// property can't silently miss the wired-source variants.
+const SORTABLES_BASE: &[&str] = &[
+    "significance",
+    "significance_rank",
+    "max_dbz",
+    "area_km2",
+    "track_age",
+    "speed_ms",
+    "bearing_deg",
+    "intensity_trend_dbz_min",
+];
+/// Extras that exist only with `lightning_source` wired. Test-only: they
+/// document and pin the composition of the lists below, which are spelled out
+/// in full because the accessor must return a `&'static` slice.
+#[cfg(test)]
+const SORTABLES_LIGHTNING_EXTRAS: &[&str] = &["flash_count", "flash_rate_per_min"];
+/// Extras that exist only with `impact_source` wired. Test-only, as above.
+#[cfg(test)]
+const SORTABLES_IMPACT_EXTRAS: &[&str] = &["impact_eta_minutes"];
+
+const SORTABLES_LIGHTNING: &[&str] = &[
+    "significance",
+    "significance_rank",
+    "max_dbz",
+    "area_km2",
+    "track_age",
+    "speed_ms",
+    "bearing_deg",
+    "intensity_trend_dbz_min",
+    "flash_count",
+    "flash_rate_per_min",
+];
+const SORTABLES_IMPACT: &[&str] = &[
+    "significance",
+    "significance_rank",
+    "max_dbz",
+    "area_km2",
+    "track_age",
+    "speed_ms",
+    "bearing_deg",
+    "intensity_trend_dbz_min",
+    "impact_eta_minutes",
+];
+const SORTABLES_ALL: &[&str] = &[
+    "significance",
+    "significance_rank",
+    "max_dbz",
+    "area_km2",
+    "track_age",
+    "speed_ms",
+    "bearing_deg",
+    "intensity_trend_dbz_min",
+    "flash_count",
+    "flash_rate_per_min",
+    "impact_eta_minutes",
+];
+
 /// Parsed, validated engine configuration.
 struct EngineCfg {
     horizon: Duration,
@@ -1576,20 +1637,25 @@ impl FeatureEngine for NowcastEngine {
     /// `severity` is deliberately ABSENT: as a string it orders
     /// `moderate < severe < very_severe < weak`, which looks almost right and
     /// puts the weakest cells last. `significance` already incorporates it.
+    ///
+    /// **Instance-dependent.** The lightning and impact properties only exist
+    /// on a feature when the corresponding source is wired, and a property
+    /// that is absent everywhere sorts to a no-op: `sort_features` treats it
+    /// as missing on every cell and falls through to the id tie-break, so the
+    /// request would return 200 in id order — the silently-ignored-parameter
+    /// failure this whole surface exists to remove. Advertise only what this
+    /// instance can actually order by, so the unwired case is a 400.
+    ///
+    /// Returns one of four `&'static` slices rather than filtering into a
+    /// `Vec`: this is a per-request capability accessor, which Critical Rule
+    /// 10 requires to be O(1) and allocation-free.
     fn sortables(&self) -> &[&'static str] {
-        &[
-            "significance",
-            "significance_rank",
-            "max_dbz",
-            "area_km2",
-            "track_age",
-            "speed_ms",
-            "bearing_deg",
-            "intensity_trend_dbz_min",
-            "flash_count",
-            "flash_rate_per_min",
-            "impact_eta_minutes",
-        ]
+        match (self.lightning.is_some(), self.impact.is_some()) {
+            (false, false) => SORTABLES_BASE,
+            (true, false) => SORTABLES_LIGHTNING,
+            (false, true) => SORTABLES_IMPACT,
+            (true, true) => SORTABLES_ALL,
+        }
     }
 
     /// O(1) from the snapshot — the default would build every feature just
@@ -1638,6 +1704,50 @@ impl FeatureEngine for NowcastEngine {
         match (state.cell_history.first(), state.cell_history.last()) {
             (Some(first), Some(last)) => Some((first.anchor, last.anchor)),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The conditional sortable lists must be exactly the base plus their
+    /// extras. Four hand-written `&'static` slices are the price of an
+    /// allocation-free per-request accessor (Critical Rule 10); this test is
+    /// what stops them drifting apart when a base property is added.
+    #[test]
+    fn sortables_lists_compose_from_the_base() {
+        let concat = |extra: &[&'static str]| -> Vec<&'static str> {
+            SORTABLES_BASE.iter().chain(extra).copied().collect()
+        };
+        assert_eq!(SORTABLES_LIGHTNING, concat(SORTABLES_LIGHTNING_EXTRAS));
+        assert_eq!(SORTABLES_IMPACT, concat(SORTABLES_IMPACT_EXTRAS));
+        assert_eq!(
+            SORTABLES_ALL,
+            SORTABLES_BASE
+                .iter()
+                .chain(SORTABLES_LIGHTNING_EXTRAS)
+                .chain(SORTABLES_IMPACT_EXTRAS)
+                .copied()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A property that no feature carries sorts to a no-op — `sort_features`
+    /// sees it absent everywhere and falls through to the id tie-break. So
+    /// the conditional extras must never appear in the base list, or an
+    /// unwired collection would answer 200 in id order.
+    #[test]
+    fn conditional_extras_are_absent_from_the_base_list() {
+        for extra in SORTABLES_LIGHTNING_EXTRAS
+            .iter()
+            .chain(SORTABLES_IMPACT_EXTRAS)
+        {
+            assert!(
+                !SORTABLES_BASE.contains(extra),
+                "{extra} must not be advertised without its source"
+            );
         }
     }
 }
