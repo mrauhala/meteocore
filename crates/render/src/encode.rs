@@ -119,7 +119,7 @@ fn encode_png_indexed(
     let mut table_key = [0u32; PALETTE_TABLE_SLOTS];
     let mut last: Option<(u32, u8)> = None;
 
-    for pixel in rgba.chunks_exact(4) {
+    for pixel in rgba.as_chunks::<4>().0 {
         let key = u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
         if let Some((last_key, last_idx)) = last {
             if last_key == key {
@@ -219,7 +219,7 @@ pub fn encode_jpeg(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Data
 
     // Convert RGBA to RGB (drop alpha)
     let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-    for pixel in rgba.chunks_exact(4) {
+    for pixel in rgba.as_chunks::<4>().0 {
         // Premultiply alpha onto white background for non-opaque pixels
         let a = pixel[3] as f32 / 255.0;
         let r = (pixel[0] as f32 * a + 255.0 * (1.0 - a)) as u8;

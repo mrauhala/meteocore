@@ -278,7 +278,7 @@ impl MeshBuilder {
     /// falls back to +Y rather than emitting a zero/NaN normal (invalid glTF).
     fn smooth_normals(&self) -> Vec<f32> {
         let mut out = Vec::with_capacity(self.normal_acc.len());
-        for acc in self.normal_acc.chunks_exact(3) {
+        for acc in self.normal_acc.as_chunks::<3>().0 {
             let len = (acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]).sqrt();
             if len > 0.0 {
                 out.extend_from_slice(&[
@@ -883,12 +883,12 @@ mod tests {
 
         // Every position/normal float is finite (no NaN leaked from nodata)…
         let float_bytes = (count as usize) * 3 * 4 * 2;
-        for w in bin[..float_bytes].chunks_exact(4) {
-            assert!(f32::from_le_bytes(w.try_into().unwrap()).is_finite());
+        for w in bin[..float_bytes].as_chunks::<4>().0 {
+            assert!(f32::from_le_bytes(*w).is_finite());
         }
         // …and every index points at a real vertex.
-        for w in bin[float_bytes..].chunks_exact(4) {
-            assert!(u64::from(u32::from_le_bytes(w.try_into().unwrap())) < count);
+        for w in bin[float_bytes..].as_chunks::<4>().0 {
+            assert!(u64::from(u32::from_le_bytes(*w)) < count);
         }
     }
 
@@ -917,11 +917,13 @@ mod tests {
         };
         let pos_len = json["bufferViews"][0]["byteLength"].as_u64().unwrap() as usize;
         let floats: Vec<f32> = bin[..pos_len]
-            .chunks_exact(4)
-            .map(|w| f32::from_le_bytes(w.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| f32::from_le_bytes(*w))
             .collect();
         assert!(!floats.is_empty(), "surface has vertices");
-        for v in floats.chunks_exact(3) {
+        for v in floats.as_chunks::<3>().0 {
             // Invert the stored Z-up→Y-up flip: glTF (x,y,z) → ECEF offset
             // (x,−z,y); height above antenna = offset · up.
             let offset = [v[0] as f64, -(v[2] as f64), v[1] as f64];
@@ -947,11 +949,13 @@ mod tests {
         let nrm_off = json["bufferViews"][1]["byteOffset"].as_u64().unwrap() as usize;
         let nrm_len = json["bufferViews"][1]["byteLength"].as_u64().unwrap() as usize;
         let normals: Vec<f32> = bin[nrm_off..nrm_off + nrm_len]
-            .chunks_exact(4)
-            .map(|w| f32::from_le_bytes(w.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| f32::from_le_bytes(*w))
             .collect();
         assert!(!normals.is_empty(), "surface has normals");
-        for n in normals.chunks_exact(3) {
+        for n in normals.as_chunks::<3>().0 {
             // Invert the Y-up flip: glTF normal (x,y,z) → ECEF (x,−z,y).
             let ne = [n[0] as f64, -(n[2] as f64), n[1] as f64];
             let up_comp = ne[0] * up[0] + ne[1] * up[1] + ne[2] * up[2];

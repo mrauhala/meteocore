@@ -360,7 +360,7 @@ mod tests {
         let mut rgba = vec![255u8; (w * h * 4) as usize];
         draw_text(&mut rgba, w, h, 1, 1, "Hi", [0, 0, 0, 255], 1);
         // At least one pixel was darkened.
-        let any_black = rgba.chunks_exact(4).any(|p| p == [0, 0, 0, 255]);
+        let any_black = rgba.as_chunks::<4>().0.contains(&[0, 0, 0, 255]);
         assert!(any_black, "expected some glyph pixels to be drawn");
         // The buffer length is unchanged (no out-of-bounds writes panicked).
         assert_eq!(rgba.len(), (w * h * 4) as usize);

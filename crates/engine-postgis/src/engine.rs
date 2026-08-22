@@ -983,7 +983,7 @@ fn area_to_bbox(coords: &str) -> Result<Bbox, DataServerError> {
         f64::NEG_INFINITY,
         f64::NEG_INFINITY,
     );
-    for pair in nums.chunks_exact(2) {
+    for pair in nums.as_chunks::<2>().0 {
         let (lon, lat) = (pair[0], pair[1]);
         w = w.min(lon);
         e = e.max(lon);
