@@ -100,8 +100,15 @@ postgis engine issues a COUNT against the database.
 
 ## Gotchas
 
-- The transport requires a `Host` header (DNS-rebinding protection) — a
-  request without one is refused before reaching a tool.
+- **The transport validates the `Host` header against an allowlist**, not
+  merely requires one — rmcp defaults to `localhost`/`127.0.0.1`/`::1`, so a
+  deployment behind ANY reverse proxy answers 403 to every request until its
+  public host is added. `allowed_hosts()` derives it from `base_url`;
+  `[mcp] allowed_hosts` overrides for a proxy presenting another name.
+  **This shipped broken**, because the smoke test ran against `127.0.0.1` —
+  which the default allows. The integration tests now speak to a public
+  hostname for exactly that reason; do not "simplify" them back to
+  localhost.
 - Responses are SSE-framed (`data: {...}`) whenever the client accepts
   `text/event-stream`, which MCP clients must. Tests unwrap it.
 - MCP requires an `initialize` handshake plus the `initialized` notification

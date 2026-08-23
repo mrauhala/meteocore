@@ -25,14 +25,45 @@ pub type AppState = Arc<ArcSwap<McpState>>;
 /// Returned as a `Router` for `nest`ing, rather than a bare service, because
 /// the guard has to wrap it — mounting the transport directly would publish an
 /// unauthenticated endpoint.
-pub fn router(state: AppState, auth: Arc<McpAuth>) -> Router {
+/// Host headers the transport should accept.
+///
+/// rmcp defaults to loopback only as DNS-rebinding protection, which means a
+/// server behind ANY reverse proxy 403s every request until its public host
+/// is added. Loopback stays in the list so a local smoke test still works —
+/// and note that testing only via loopback is precisely what hides this.
+pub fn allowed_hosts(base_url: &str, extra: &[String]) -> Vec<String> {
+    let mut hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
+    // The authority from base_url, with and without an explicit port: the
+    // Host header carries a port only when it is non-default for the scheme.
+    if let Some(authority) = base_url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .filter(|a| !a.is_empty())
+    {
+        hosts.push(authority.to_string());
+        if let Some((host, _port)) = authority.rsplit_once(':') {
+            if !host.is_empty() {
+                hosts.push(host.to_string());
+            }
+        }
+    }
+    hosts.extend(extra.iter().cloned());
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+pub fn router(state: AppState, auth: Arc<McpAuth>, allowed_hosts: Vec<String>) -> Router {
     let service = StreamableHttpService::new(
         {
             let state = state.clone();
             move || Ok(MeteoCoreMcp::new(state.clone()))
         },
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default().with_json_response(true),
+        StreamableHttpServerConfig::default()
+            .with_json_response(true)
+            .with_allowed_hosts(allowed_hosts),
     );
 
     Router::new()
