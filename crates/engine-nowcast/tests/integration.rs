@@ -122,7 +122,8 @@ fn lightning_join_exposes_flash_properties() {
                 EventPoint {
                     time: end,
                     lon,
-                    lat
+                    lat,
+                    attrs: Default::default(),
                 };
                 30
             ])
@@ -193,6 +194,105 @@ fn lightning_join_exposes_flash_properties() {
     assert!(!page.features[0].properties.contains_key("lightning_jump"));
 }
 
+/// #616 part 2 end-to-end: a network that reports the discriminator columns
+/// produces per-cell IC/CG counts and a positive-CG share, and every property
+/// the engine advertises as sortable is actually present on the feature.
+#[test]
+fn lightning_attributes_reach_the_feature_and_match_the_sortables() {
+    use ds_core::events::{EventAttrs, EventPoint, EventSource};
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+
+    /// 30 strikes: 20 CG (5 of them positive) and 10 IC.
+    struct MixedStrikes;
+    impl EventSource for MixedStrikes {
+        fn recent_events(
+            &self,
+            _start: DateTime<Utc>,
+            end: DateTime<Utc>,
+            _limit: usize,
+        ) -> Result<Vec<EventPoint>, ds_core::error::DataServerError> {
+            let (cx, cy) = disc_center(end);
+            let lon = EXTENT[0] + cx / f64::from(W) * (EXTENT[2] - EXTENT[0]);
+            let lat = EXTENT[3] - cy / f64::from(H) * (EXTENT[3] - EXTENT[1]);
+            let mk = |cloud, current| EventPoint {
+                time: end,
+                lon,
+                lat,
+                attrs: EventAttrs {
+                    cloud_indicator: Some(cloud),
+                    peak_current_ka: Some(current),
+                    multiplicity: None,
+                },
+            };
+            let mut v = vec![mk(0, -20.0); 15];
+            v.extend(vec![mk(0, 35.0); 5]);
+            v.extend(vec![mk(1, -8.0); 10]);
+            Ok(v)
+        }
+    }
+
+    let anchor1 = t0() + Duration::minutes(5);
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let config = NowcastConfig {
+        source: "mock".into(),
+        horizon: "PT30M".into(),
+        step: None,
+        history_frames: 2,
+        poll_interval_secs: 30,
+        max_generations: 4,
+        max_pixels: 4_000_000,
+        min_echo: 10.0,
+        growth_decay: false,
+        lightning_source: Some("mock-lightning".into()),
+        significance: Default::default(),
+        impact_source: None,
+        impact_name_property: "name".into(),
+        impact_weight_property: None,
+    };
+    let engine = NowcastEngine::new("attr-nowcast", "mock", source, &config)
+        .expect("engine builds")
+        .with_lightning_source(Arc::new(MixedStrikes));
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+
+    assert!(matches!(
+        f.properties.get("flash_count"),
+        Some(PropertyValue::Integer(30))
+    ));
+    assert!(matches!(
+        f.properties.get("cg_count"),
+        Some(PropertyValue::Integer(20))
+    ));
+    assert!(matches!(
+        f.properties.get("ic_count"),
+        Some(PropertyValue::Integer(10))
+    ));
+    // 5 of 20 CG are positive — a share of the CG flashes, NOT of all 30.
+    assert!(
+        matches!(
+            f.properties.get("positive_cg_fraction"),
+            Some(PropertyValue::Float(v)) if (v - 0.25).abs() < 1e-9
+        ),
+        "got {:?}",
+        f.properties.get("positive_cg_fraction")
+    );
+    assert!(f.properties.get("first_flash").is_some());
+
+    // Drift catcher: advertising a sortable the features don't carry makes
+    // `sortby` a silent no-op, which is the failure this surface exists to
+    // remove. Part 1 shipped three properties without extending the list.
+    for key in engine.sortables() {
+        assert!(
+            f.properties.contains_key(*key),
+            "advertised sortable `{key}` is not a property of the feature"
+        );
+    }
+}
+
 /// A failing event source degrades to null flash fields for that
 /// generation — the generation itself, and the properties' presence,
 /// survive (#549 contract: present-but-null = "join skipped").
@@ -225,7 +325,8 @@ fn lightning_source_error_degrades_to_null_fields() {
                 EventPoint {
                     time: end,
                     lon,
-                    lat
+                    lat,
+                    attrs: Default::default(),
                 };
                 10
             ])
@@ -1386,7 +1487,17 @@ fn unwired_sources_are_not_advertised_as_sortable() {
     // Not wired ⇒ the conditional properties must NOT be advertised. A
     // property absent from every feature sorts to a no-op, so advertising it
     // would return 200 in id order — the silent-ignore this surface removes.
-    for absent in ["flash_count", "flash_rate_per_min", "impact_eta_minutes"] {
+    for absent in [
+        "flash_count",
+        "flash_rate_per_min",
+        "flash_density_per_km2",
+        "jump_sigma",
+        "first_flash",
+        "cg_count",
+        "ic_count",
+        "positive_cg_fraction",
+        "impact_eta_minutes",
+    ] {
         assert!(
             !base.contains(&absent),
             "{absent} must not be sortable without its source"

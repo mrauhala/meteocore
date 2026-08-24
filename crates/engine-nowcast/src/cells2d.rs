@@ -12,6 +12,7 @@
 //! first.
 
 use chrono::{DateTime, Utc};
+use ds_core::events::EventAttrs;
 
 use crate::motion::MotionField;
 use crate::objects::{match_cells, CellBlob, PixelScale};
@@ -142,6 +143,16 @@ pub struct CellTrack {
     /// enough history (≥ 2 generations) to have a baseline at all — not 0.0,
     /// which would read as "measured, no anomaly".
     pub jump_sigma: Option<f32>,
+    /// Cloud-to-ground flashes this window, when the source reports the
+    /// discriminator. `None` = not reported, distinct from zero measured.
+    pub cg_count: Option<u32>,
+    /// Intra-cloud flashes this window. Total lightning rises before CG in
+    /// developing storms, so the split is an intensification cue a single
+    /// count cannot express.
+    pub ic_count: Option<u32>,
+    /// Positive-polarity cloud-to-ground flashes. A high positive fraction is
+    /// a well-established severe-storm signal.
+    pub cg_positive_count: Option<u32>,
     /// When this track was first attributed a flash. Electrification age is
     /// context a raw count cannot carry: a cell producing its first flash
     /// now is a different situation from one that has been active an hour.
@@ -255,6 +266,9 @@ pub fn advance_tracks(
                     flash_history: Vec::new(),
                     lightning_jump: false,
                     jump_sigma: None,
+                    cg_count: None,
+                    ic_count: None,
+                    cg_positive_count: None,
                     first_flash: None,
                 },
                 Some(pi) => {
@@ -325,6 +339,9 @@ pub fn advance_tracks(
                         flash_history: prev.flash_history.clone(),
                         lightning_jump: false,
                         jump_sigma: None,
+                        cg_count: None,
+                        ic_count: None,
+                        cg_positive_count: None,
                         // Carried, not reset: it is the track's first flash
                         // ever, not its first this generation.
                         first_flash: prev.first_flash,
@@ -356,9 +373,41 @@ pub fn advance_tracks(
 /// — milliseconds. Even the MAX_JOIN_STRIKES cap × the 255-track label
 /// ceiling stays in the tens of ms. A spatial index earns its complexity
 /// only if either bound grows by orders of magnitude.
+/// Add one strike to a track's attribute tallies.
+///
+/// `any_attrs` records whether ANY strike carried a discriminator, which is
+/// what decides between reporting zeros and reporting nothing.
+#[allow(clippy::too_many_arguments)]
+fn tally(
+    cg: &mut [u32],
+    ic: &mut [u32],
+    cg_pos: &mut [u32],
+    any_attrs: &mut bool,
+    idx: usize,
+    attrs: EventAttrs,
+) {
+    let Some(is_cg) = attrs.is_cloud_to_ground() else {
+        return;
+    };
+    *any_attrs = true;
+    if is_cg {
+        cg[idx] += 1;
+        // Polarity is independent of the IC/CG split and may be missing even
+        // when the split is present.
+        if attrs.is_positive() == Some(true) {
+            cg_pos[idx] += 1;
+        }
+    } else {
+        ic[idx] += 1;
+    }
+}
+
 pub fn apply_lightning(
     tracks: &mut [CellTrack],
-    strikes_px: &[(f32, f32)],
+    // Position plus the reported attributes, parallel per strike. A slice of
+    // pairs rather than a richer per-strike type keeps this allocation-free
+    // at MAX_JOIN_STRIKES.
+    strikes_px: &[((f32, f32), EventAttrs)],
     labels: &[u32],
     width: usize,
     scale: PixelScale,
@@ -367,13 +416,27 @@ pub fn apply_lightning(
     observed: DateTime<Utc>,
 ) {
     let mut counts = vec![0u32; tracks.len()];
-    for &(sx, sy) in strikes_px {
+    // Attribute tallies run alongside the plain count, indexed like `counts`.
+    let mut cg = vec![0u32; tracks.len()];
+    let mut ic = vec![0u32; tracks.len()];
+    let mut cg_pos = vec![0u32; tracks.len()];
+    let mut any_attrs = false;
+
+    for &((sx, sy), attrs) in strikes_px {
         // In-grid by contract; `as usize` saturates negatives to 0 and
         // `labels.get` bounds the rest.
         let idx = (sy as usize) * width + sx as usize;
         let label = labels.get(idx).copied().unwrap_or(0) as usize;
         if (1..=tracks.len()).contains(&label) {
             counts[label - 1] += 1;
+            tally(
+                &mut cg,
+                &mut ic,
+                &mut cg_pos,
+                &mut any_attrs,
+                label - 1,
+                attrs,
+            );
             continue;
         }
         let gate2 = LIGHTNING_JOIN_RADIUS_KM * LIGHTNING_JOIN_RADIUS_KM;
@@ -388,11 +451,12 @@ pub fn apply_lightning(
         }
         if let Some((k, _)) = best {
             counts[k] += 1;
+            tally(&mut cg, &mut ic, &mut cg_pos, &mut any_attrs, k, attrs);
         }
     }
 
     let window_min = (window_secs / 60.0).max(f32::EPSILON);
-    for (t, &n) in tracks.iter_mut().zip(&counts) {
+    for (idx, (t, &n)) in tracks.iter_mut().zip(&counts).enumerate() {
         let rate = n as f32 / window_min;
         // Keep the magnitude instead of collapsing it to the threshold test.
         // None while there is no baseline to measure against — 0.0 would
@@ -424,6 +488,13 @@ pub fn apply_lightning(
 
         if n > 0 && t.first_flash.is_none() {
             t.first_flash = Some(observed);
+        }
+        // Only surfaced when the source actually reports the discriminator;
+        // otherwise these stay None, so "not reported" never reads as zero.
+        if any_attrs {
+            t.cg_count = Some(cg[idx]);
+            t.ic_count = Some(ic[idx]);
+            t.cg_positive_count = Some(cg_pos[idx]);
         }
         t.flash_count = Some(n);
         t.flash_rate_per_min = Some(rate);
@@ -467,6 +538,9 @@ mod tests {
             flash_history: Vec::new(),
             lightning_jump: false,
             jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            cg_positive_count: None,
             first_flash: None,
         }
     }
@@ -485,12 +559,15 @@ mod tests {
         }
         let mut tracks = vec![bare_track(1, 3.0, 3.0), bare_track(2, 30.0, 10.0)];
         let scale = PixelScale { x: 1.0, y: 1.0 };
-        let strikes = [
+        let strikes: Vec<((f32, f32), EventAttrs)> = [
             (3.5, 3.5),   // labeled footprint → track 1
             (30.0, 10.0), // unlabeled px → nearest centroid (track 2, 0 km)
             (30.0, 2.0),  // 8 km north of track 2 — inside the 10 km gate
             (39.5, 19.5), // ~13.4 km from track 2 — outside the gate, dropped
-        ];
+        ]
+        .into_iter()
+        .map(|p| (p, EventAttrs::default()))
+        .collect();
         apply_lightning(
             &mut tracks,
             &strikes,
@@ -524,7 +601,7 @@ mod tests {
         // A burst with NO baseline never jumps (history < 2). Fresh track:
         // a burst entering the history would raise the later 2σ bar (the
         // detector deliberately distrusts cells that JUST burst).
-        let burst: Vec<(f32, f32)> = vec![strike; 60]; // 12 fl/min
+        let burst: Vec<((f32, f32), EventAttrs)> = vec![(strike, EventAttrs::default()); 60]; // 12 fl/min
         apply_lightning(
             &mut tracks,
             &burst,
@@ -542,7 +619,7 @@ mod tests {
         let mut tracks = vec![bare_track(2, 5.0, 5.0)];
         apply_lightning(&mut tracks, &[], &labels, w, scale, 300.0, test_instant());
         apply_lightning(&mut tracks, &[], &labels, w, scale, 300.0, test_instant());
-        let uptick: Vec<(f32, f32)> = vec![strike; 20]; // 4 fl/min < floor
+        let uptick: Vec<((f32, f32), EventAttrs)> = vec![(strike, EventAttrs::default()); 20]; // 4 fl/min < floor
         apply_lightning(
             &mut tracks,
             &uptick,
@@ -655,6 +732,9 @@ mod tests {
             flash_history: Vec::new(),
             lightning_jump: false,
             jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            cg_positive_count: None,
             first_flash: None,
         }];
         // Uniform 30 px/interval eastward flow; at 1 km/px the compensated
@@ -808,7 +888,9 @@ mod tests {
         // With a flat, quiet history a surge is extreme but finite.
         t.flash_history = vec![0.0, 0.0, 0.0];
         let mut tracks = vec![t.clone()];
-        let strikes: Vec<(f32, f32)> = (0..50).map(|_| (0.5, 0.5)).collect();
+        let strikes: Vec<((f32, f32), EventAttrs)> = (0..50)
+            .map(|_| ((0.5, 0.5), EventAttrs::default()))
+            .collect();
         apply_lightning(
             &mut tracks,
             &strikes,
@@ -838,16 +920,81 @@ mod tests {
         assert_eq!(tracks[0].first_flash, None);
 
         let first = test_instant();
-        apply_lightning(&mut tracks, &[(0.5, 0.5)], &[1], 1, scale, 60.0, first);
+        apply_lightning(
+            &mut tracks,
+            &[((0.5, 0.5), EventAttrs::default())],
+            &[1],
+            1,
+            scale,
+            60.0,
+            first,
+        );
         assert_eq!(tracks[0].first_flash, Some(first));
 
         // A later flash must NOT overwrite it — it is the first ever.
         let later = first + chrono::Duration::minutes(30);
-        apply_lightning(&mut tracks, &[(0.5, 0.5)], &[1], 1, scale, 60.0, later);
+        apply_lightning(
+            &mut tracks,
+            &[((0.5, 0.5), EventAttrs::default())],
+            &[1],
+            1,
+            scale,
+            60.0,
+            later,
+        );
         assert_eq!(
             tracks[0].first_flash,
             Some(first),
             "first_flash is the first, not the latest"
         );
+    }
+
+    #[test]
+    fn ic_cg_and_polarity_are_tallied_per_cell() {
+        use ds_core::events::EventAttrs;
+        let mut t = bare_track(1, 0.5, 0.5);
+        t.flash_history = vec![1.0];
+        let mut tracks = vec![t];
+        let scale = PixelScale { x: 1.0, y: 1.0 };
+        let at = |cloud, current| EventAttrs {
+            cloud_indicator: Some(cloud),
+            peak_current_ka: Some(current),
+            multiplicity: None,
+        };
+        let strikes = vec![
+            ((0.5, 0.5), at(0, -15.0)), // CG negative
+            ((0.5, 0.5), at(0, 22.0)),  // CG positive
+            ((0.5, 0.5), at(0, 30.0)),  // CG positive
+            ((0.5, 0.5), at(1, -5.0)),  // IC
+        ];
+        apply_lightning(&mut tracks, &strikes, &[1], 1, scale, 60.0, test_instant());
+        assert_eq!(tracks[0].flash_count, Some(4));
+        assert_eq!(tracks[0].cg_count, Some(3));
+        assert_eq!(tracks[0].ic_count, Some(1));
+        assert_eq!(tracks[0].cg_positive_count, Some(2));
+    }
+
+    #[test]
+    fn a_source_reporting_no_discriminator_leaves_the_split_unreported() {
+        use ds_core::events::EventAttrs;
+        // Not zero: "this network doesn't say" and "no CG flashes" are
+        // different facts, and only one of them licenses a statement.
+        let mut t = bare_track(1, 0.5, 0.5);
+        t.flash_history = vec![1.0];
+        let mut tracks = vec![t];
+        let strikes = vec![((0.5, 0.5), EventAttrs::default()); 3];
+        apply_lightning(
+            &mut tracks,
+            &strikes,
+            &[1],
+            1,
+            PixelScale { x: 1.0, y: 1.0 },
+            60.0,
+            test_instant(),
+        );
+        assert_eq!(tracks[0].flash_count, Some(3), "the count still works");
+        assert_eq!(tracks[0].cg_count, None);
+        assert_eq!(tracks[0].ic_count, None);
+        assert_eq!(tracks[0].cg_positive_count, None);
     }
 }

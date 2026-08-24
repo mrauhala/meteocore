@@ -306,6 +306,11 @@ id_col = "id"                 # ORDER BY time DESC, id tiebreak
 default_datetime = "PT1H"     # window when the query has no datetime (default PT1H)
 extent_bbox = [4.0, 54.0, 42.0, 72.0]   # REQUIRED: the only spatial-extent source; never ST_Extent
 
+# Optional per-event attributes for the storm-cell join (#616) — see below.
+cloud_indicator_col = "cloud_indicator"   # 0 = cloud-to-ground, 1 = intra-cloud
+peak_current_col = "peak_current"         # signed kA; the SIGN is the polarity
+multiplicity_col = "multiplicity"         # return strokes per flash
+
 [[postgis.parameters]]
 name = "peak_current"         # source_key defaults to name = the column name
 label = "Peak current"
@@ -352,6 +357,34 @@ Behaviour:
   frames are fresh to the minute; TIME-omitted requests track the latest
   advertised step (metadata refresh cadence) — live clients should pass
   explicit TIME.
+
+### Event attributes for the cell join (#616)
+
+The three optional `*_col` fields above populate `ds_core::events::EventAttrs`
+on every `EventPoint` returned by the `EventSource` trait, which is how
+engine-nowcast derives a cell's IC/CG split and positive-CG fraction. They
+affect **only** that trait — the EDR/WMS paths are unchanged, and a column
+you want in the EDR response still needs its own `[[postgis.parameters]]`
+entry (declaring it in both is fine, and normal: `peak_current` is a useful
+EDR parameter *and* the polarity source).
+
+- Entirely opt-in. A network that doesn't report a discriminator declares
+  nothing, nothing is selected, and the consumer reports `null` rather than
+  guessing. Do NOT declare `cloud_indicator_col` pointing at a column whose
+  encoding differs from 0=CG/1=IC — the join would silently invert.
+- Identifiers are validated at config load and emitted through
+  `quote_ident` (Critical Rule 8), same as every other column name.
+- Cast `::double precision` in SQL (like the EDR parameter columns), so
+  `smallint`, `numeric(p,s)` and `real` source columns all work without
+  config. A NULL row value decodes to `None` — "not reported for this
+  flash", distinct from a reported zero.
+- A name that is valid but wrong (no such column, or a `text` column that
+  won't cast) fails the whole window fetch, loudly, rather than yielding
+  `None` forever. That is deliberate: a silent `None` is indistinguishable
+  from "this network doesn't report polarity", so a misconfiguration would
+  otherwise look exactly like a correct configuration. The nowcast join
+  treats the failed fetch as "join skipped this generation" and the
+  generation itself still succeeds.
 
 ## Optional stations / orphan locations
 

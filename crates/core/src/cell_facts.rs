@@ -97,6 +97,16 @@ pub struct LightningFacts {
     /// which would claim "measured, no anomaly". A 4σ surge and a 2.1σ nudge
     /// are different facts that `jump` alone cannot distinguish.
     pub jump_sigma: Option<f64>,
+    /// Cloud-to-ground and intra-cloud counts, when the source reports the
+    /// discriminator. `None` = not reported, never a defaulted zero.
+    pub cg_count: Option<u32>,
+    pub ic_count: Option<u32>,
+    /// Share of cloud-to-ground flashes with positive polarity, 0..=1.
+    ///
+    /// `None` when polarity is not reported **or when the cell had no CG
+    /// flashes at all** — 0 of 0 is not 0%, and reporting it as 0% would
+    /// invite "no positive strikes" about a cell with no strikes to classify.
+    pub positive_cg_fraction: Option<f64>,
     /// When this track was first attributed a flash.
     ///
     /// Electrification age: a cell producing its first flash now is a
@@ -248,6 +258,9 @@ pub const DEFAULT_CELL_WEIGHTS: &[(&str, f64)] = &[
     ("deviant_mover", 0.4),
     ("lightning_jump", 0.9),
     ("flash_rate", 0.5),
+    // A high positive-CG share is a well-established severe-storm signal,
+    // independent of how MUCH lightning there is.
+    ("positive_cg", 0.6),
     ("vil", 0.7),
     ("echo_top", 0.5),
     ("beam_coverage", 0.4),
@@ -306,6 +319,9 @@ impl SignificanceTerms for CellFactSheet {
                     _ => 0.0,
                 },
             ));
+            if let Some(frac) = lightning.positive_cg_fraction {
+                terms.push(Term::new("positive_cg", frac));
+            }
             terms.push(Term::new(
                 "flash_rate",
                 ramp(
@@ -389,6 +405,9 @@ mod tests {
         full.trend = Some(Trend::Growing);
         full.intensity_trend_dbz_min = Some(0.4);
         full.lightning = Some(LightningFacts {
+            cg_count: Some(8),
+            ic_count: Some(4),
+            positive_cg_fraction: Some(0.25),
             flash_count: 12,
             flash_rate_per_min: 4.0,
             flash_density_per_km2: 0.0,
@@ -449,6 +468,9 @@ mod tests {
             flash_rate_per_min: 0.0,
             flash_density_per_km2: 0.0,
             jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            positive_cg_fraction: None,
             first_flash: None,
             jump: false,
         });
@@ -529,6 +551,9 @@ mod tests {
             flash_rate_per_min: 1.0,
             flash_density_per_km2: 0.0,
             jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            positive_cg_fraction: None,
             first_flash: None,
             jump: false,
         });
@@ -538,6 +563,9 @@ mod tests {
             flash_rate_per_min: 1.0,
             flash_density_per_km2: 0.0,
             jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            positive_cg_fraction: None,
             first_flash: None,
             jump: true,
         });
@@ -561,6 +589,9 @@ mod tests {
             flash_rate_per_min: 25.0,
             flash_density_per_km2: 0.0,
             jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            positive_cg_fraction: None,
             first_flash: None,
             jump: true,
         });
@@ -670,6 +701,9 @@ mod tests {
             flash_density_per_km2: 0.5,
             jump: true,
             jump_sigma: Some(2.1),
+            cg_count: None,
+            ic_count: None,
+            positive_cg_fraction: None,
             first_flash: None,
         });
         let mut big = cell(2);
@@ -695,6 +729,9 @@ mod tests {
             flash_density_per_km2: 1.0,
             jump: true,
             jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            positive_cg_fraction: None,
             first_flash: None,
         });
         let mut quiet = c.clone();
@@ -704,5 +741,55 @@ mod tests {
         });
         let s = scorer();
         assert!(s.score_one(&c).score > s.score_one(&quiet).score);
+    }
+
+    #[test]
+    fn a_high_positive_cg_share_raises_significance() {
+        let base = LightningFacts {
+            flash_count: 20,
+            flash_rate_per_min: 8.0,
+            flash_density_per_km2: 0.5,
+            jump: false,
+            jump_sigma: Some(0.5),
+            cg_count: Some(20),
+            ic_count: Some(0),
+            positive_cg_fraction: Some(0.05),
+            first_flash: None,
+        };
+        let mut ordinary = cell(1);
+        ordinary.lightning = Some(base);
+        let mut anomalous = cell(2);
+        anomalous.lightning = Some(LightningFacts {
+            positive_cg_fraction: Some(0.75),
+            ..base
+        });
+        let s = scorer();
+        assert!(
+            s.score_one(&anomalous).score > s.score_one(&ordinary).score,
+            "a positive-CG-dominated cell is the severe signal"
+        );
+    }
+
+    #[test]
+    fn an_unreported_polarity_share_is_not_scored_as_zero() {
+        // None must drop the term (renormalizing), not contribute 0.0 —
+        // otherwise wiring a network that omits polarity would silently
+        // penalize every cell.
+        let mut unknown = cell(1);
+        unknown.lightning = Some(LightningFacts {
+            flash_count: 20,
+            flash_rate_per_min: 8.0,
+            flash_density_per_km2: 0.5,
+            jump: false,
+            jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            positive_cg_fraction: None,
+            first_flash: None,
+        });
+        assert!(
+            !unknown.terms().iter().any(|t| t.name == "positive_cg"),
+            "an unreported share must emit no term at all"
+        );
     }
 }
