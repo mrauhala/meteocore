@@ -82,8 +82,26 @@ impl Trend {
 pub struct LightningFacts {
     pub flash_count: u32,
     pub flash_rate_per_min: f64,
-    /// Schultz-style 2σ jump fired this generation.
+    /// Flashes per km² of cell footprint.
+    ///
+    /// Normalizes for size: a small intense cell and a large diffuse one can
+    /// share a flash count while meaning quite different things.
+    pub flash_density_per_km2: f64,
+    /// Schultz-style 2σ jump fired this generation. Derived from `jump_sigma`
+    /// so the two cannot disagree.
     pub jump: bool,
+    /// How far above its own recent baseline this cell's flash rate sits, in
+    /// standard deviations.
+    ///
+    /// `None` until there is enough history to have a baseline — not 0.0,
+    /// which would claim "measured, no anomaly". A 4σ surge and a 2.1σ nudge
+    /// are different facts that `jump` alone cannot distinguish.
+    pub jump_sigma: Option<f64>,
+    /// When this track was first attributed a flash.
+    ///
+    /// Electrification age: a cell producing its first flash now is a
+    /// different situation from one active for an hour.
+    pub first_flash: Option<DateTime<Utc>>,
 }
 
 /// Attributes derived from the 3-D polar volume, joined onto a 2-D track.
@@ -172,6 +190,10 @@ const FLASH_RATE_CEILING_PER_MIN: f64 = 60.0;
 const VIL_CEILING_KG_M2: f64 = 50.0;
 const ECHO_TOP_CEILING_M: f64 = 15_000.0;
 const INTENSITY_TREND_CEILING_DBZ_MIN: f64 = 2.0;
+/// A jump only counts from the 2σ test threshold up; 6σ saturates, since the
+/// difference between a 6σ and a 9σ surge is not what should decide a rank.
+const JUMP_SIGMA_FLOOR: f64 = 2.0;
+const JUMP_SIGMA_CEILING: f64 = 6.0;
 
 /// Speed below which an echo is "not going anywhere" (m/s).
 ///
@@ -271,7 +293,19 @@ impl SignificanceTerms for CellFactSheet {
         }
 
         if let Some(lightning) = self.lightning {
-            terms.push(Term::flag("lightning_jump", lightning.jump));
+            // Scaled by magnitude rather than a flag: a 5σ surge should
+            // outrank a cell that merely crossed the threshold. Falls back to
+            // the boolean when there is no baseline yet.
+            terms.push(Term::new(
+                "lightning_jump",
+                match lightning.jump_sigma {
+                    Some(sigma) if lightning.jump => {
+                        ramp(sigma, JUMP_SIGMA_FLOOR, JUMP_SIGMA_CEILING)
+                    }
+                    _ if lightning.jump => 1.0,
+                    _ => 0.0,
+                },
+            ));
             terms.push(Term::new(
                 "flash_rate",
                 ramp(
@@ -357,6 +391,9 @@ mod tests {
         full.lightning = Some(LightningFacts {
             flash_count: 12,
             flash_rate_per_min: 4.0,
+            flash_density_per_km2: 0.0,
+            jump_sigma: None,
+            first_flash: None,
             jump: true,
         });
         full.volume = Some(VolumeFacts {
@@ -410,6 +447,9 @@ mod tests {
         quiet.lightning = Some(LightningFacts {
             flash_count: 0,
             flash_rate_per_min: 0.0,
+            flash_density_per_km2: 0.0,
+            jump_sigma: None,
+            first_flash: None,
             jump: false,
         });
         let s = scorer();
@@ -487,12 +527,18 @@ mod tests {
         quiet.lightning = Some(LightningFacts {
             flash_count: 2,
             flash_rate_per_min: 1.0,
+            flash_density_per_km2: 0.0,
+            jump_sigma: None,
+            first_flash: None,
             jump: false,
         });
         let mut jumping = cell(2);
         jumping.lightning = Some(LightningFacts {
             flash_count: 2,
             flash_rate_per_min: 1.0,
+            flash_density_per_km2: 0.0,
+            jump_sigma: None,
+            first_flash: None,
             jump: true,
         });
         let s = scorer();
@@ -513,6 +559,9 @@ mod tests {
         dangerous.lightning = Some(LightningFacts {
             flash_count: 40,
             flash_rate_per_min: 25.0,
+            flash_density_per_km2: 0.0,
+            jump_sigma: None,
+            first_flash: None,
             jump: true,
         });
         dangerous.impact = Some(ImpactFacts {
@@ -608,5 +657,52 @@ mod tests {
             "and the clutter term should be the reason: {:?}",
             scores[0].contributions
         );
+    }
+
+    #[test]
+    fn jump_magnitude_outranks_a_bare_threshold_crossing() {
+        // The point of keeping sigma: a 5σ surge and a 2.1σ nudge both set
+        // `jump`, but they are not the same fact.
+        let mut small = cell(1);
+        small.lightning = Some(LightningFacts {
+            flash_count: 30,
+            flash_rate_per_min: 12.0,
+            flash_density_per_km2: 0.5,
+            jump: true,
+            jump_sigma: Some(2.1),
+            first_flash: None,
+        });
+        let mut big = cell(2);
+        big.lightning = Some(LightningFacts {
+            jump_sigma: Some(5.5),
+            ..small.lightning.unwrap()
+        });
+        let s = scorer();
+        assert!(
+            s.score_one(&big).score > s.score_one(&small).score,
+            "a larger jump must score higher"
+        );
+    }
+
+    #[test]
+    fn a_jump_without_a_baseline_still_counts() {
+        // sigma is None until there is history. The cell still jumped; it
+        // just cannot be graded, so it must not score as if it had not.
+        let mut c = cell(1);
+        c.lightning = Some(LightningFacts {
+            flash_count: 40,
+            flash_rate_per_min: 20.0,
+            flash_density_per_km2: 1.0,
+            jump: true,
+            jump_sigma: None,
+            first_flash: None,
+        });
+        let mut quiet = c.clone();
+        quiet.lightning = Some(LightningFacts {
+            jump: false,
+            ..c.lightning.unwrap()
+        });
+        let s = scorer();
+        assert!(s.score_one(&c).score > s.score_one(&quiet).score);
     }
 }

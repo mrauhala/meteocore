@@ -119,6 +119,27 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   wired; null means "join skipped this generation" (source error — the
   generation itself never fails), 0 means measured-quiet.
 
+## Lightning metrics (#616, part 1)
+
+- **`jump_sigma` replaces a bare boolean as the scoring input.** The 2σ test
+  already computed the magnitude and discarded it; a 5σ surge and a 2.1σ
+  nudge both set `lightning_jump` but are not the same fact. The bool stays,
+  now DERIVED from the magnitude so the two cannot disagree.
+- `jump_sigma` is `None` until there are ≥2 generations of history — **not
+  0.0**, which would claim "measured, no anomaly". A jump with no baseline
+  still scores (it happened; it just can't be graded).
+- A perfectly flat history has zero spread, making the true sigma infinite.
+  Clamped to `JUMP_SIGMA_FLAT_HISTORY` so it stays a renderable number.
+- `flash_density_per_km2` normalizes for cell size; guarded against a
+  degenerate zero-area cell producing `inf`.
+- `first_flash` is the track's FIRST ever, carried across generations, never
+  overwritten by a later one — electrification age, not "most recent".
+- Scoring ramps the jump between `JUMP_SIGMA_FLOOR` (2.0, the test
+  threshold) and `JUMP_SIGMA_CEILING` (6.0); beyond that the difference
+  shouldn't decide a ranking.
+- **Not yet:** IC/CG split and CG polarity (#616 part 2) need `EventPoint`
+  to carry attributes, which it deliberately does not.
+
 ## Fact sheets + significance ranking
 
 - **`ds_core::cell_facts::CellFactSheet` is the one description of a cell.**
