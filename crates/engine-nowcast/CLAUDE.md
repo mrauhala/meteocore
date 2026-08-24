@@ -119,7 +119,7 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   wired; null means "join skipped this generation" (source error — the
   generation itself never fails), 0 means measured-quiet.
 
-## Lightning metrics (#616, part 1)
+## Lightning metrics (#616)
 
 - **`jump_sigma` replaces a bare boolean as the scoring input.** The 2σ test
   already computed the magnitude and discarded it; a 5σ surge and a 2.1σ
@@ -137,8 +137,26 @@ follow-up (full frames only for the latest generation) is scoped in #523.
 - Scoring ramps the jump between `JUMP_SIGMA_FLOOR` (2.0, the test
   threshold) and `JUMP_SIGMA_CEILING` (6.0); beyond that the difference
   shouldn't decide a ranking.
-- **Not yet:** IC/CG split and CG polarity (#616 part 2) need `EventPoint`
-  to carry attributes, which it deliberately does not.
+### IC/CG split and polarity (part 2)
+
+- `EventPoint.attrs` (`ds_core::events::EventAttrs`) carries the per-event
+  scalars. **Flat and `Copy`** — up to `MAX_JOIN_STRIKES` (200k) events cross
+  this seam per generation, so a map or `Vec` per event would allocate 200k
+  times per cycle on the poll runtime.
+- The columns are **opt-in per source**: `[postgis.events]`
+  `cloud_indicator_col` / `peak_current_col` / `multiplicity_col`. A network
+  that doesn't report them declares nothing and nothing is selected.
+- **A three-way distinction, not two.** `cg_count`/`ic_count`/
+  `positive_cg_fraction` are absent when no source is wired, `null` when the
+  source reports no discriminator, and a number when measured. "This network
+  doesn't say" and "no CG flashes" are different facts and only one of them
+  licenses a statement.
+- **`positive_cg_fraction` is `None` when `cg_count == 0`**, never 0.0 — 0/0
+  is not 0%. A cell with only IC flashes has no CG polarity to report.
+- Polarity comes from the SIGN of `peak_current`, not its magnitude. A zero
+  current yields `None` (no polarity) rather than "positive".
+- `positive_cg` is weighted at 0.6 and ramps 0.05→0.5: a few +CG flashes are
+  normal background, a +CG-dominated cell is the severe-storm signal.
 
 ## Fact sheets + significance ranking
 

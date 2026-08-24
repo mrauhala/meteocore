@@ -39,7 +39,7 @@ use tokio_postgres::Row;
 
 use crate::engine::PostgisEngine;
 use crate::metadata::CollectionMeta;
-use crate::query::{build_events_window, params_as_refs, BuiltQuery};
+use crate::query::{build_events_window, params_as_refs, BuiltQuery, WindowAttrs};
 use crate::schema::EventsShape;
 
 /// One strike ready to splat.
@@ -187,8 +187,13 @@ fn fetch_window(
 ) -> Result<Arc<Vec<Strike>>, DataServerError> {
     let key: WindowKey = (window_key_source(engine, shape), start, end);
     strike_window_cache().get_or_insert_with(&key, || {
-        let built = build_events_window(shape, (start, end), MAX_WINDOW_STRIKES + 1)
-            .map_err(|e| DataServerError::Engine(format!("build_events_window: {e}")))?;
+        let built = build_events_window(
+            shape,
+            (start, end),
+            MAX_WINDOW_STRIKES + 1,
+            WindowAttrs::Omit,
+        )
+        .map_err(|e| DataServerError::Engine(format!("build_events_window: {e}")))?;
         let rows = run_query_from_blocking(engine.pool(), &built)?;
         let truncated = rows.len() > MAX_WINDOW_STRIKES;
         let mut strikes = Vec::with_capacity(rows.len().min(MAX_WINDOW_STRIKES));

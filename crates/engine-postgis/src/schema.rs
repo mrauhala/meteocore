@@ -184,6 +184,12 @@ pub struct EventsShape {
     pub geom_col: String,
     /// Unique/tiebreak column for deterministic `ORDER BY time DESC, id`.
     pub id_col: String,
+    /// Optional per-event attribute columns (#616). Absent means the
+    /// attribute is simply not populated — never a default value, so a
+    /// consumer can tell "not reported" from "reported as zero".
+    pub cloud_indicator_col: Option<String>,
+    pub peak_current_col: Option<String>,
+    pub multiplicity_col: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -350,6 +356,12 @@ impl EventsShape {
                 "'events' does not allow station_fk_col / param_col / value_col".into(),
             ));
         }
+        let attr_col = |v: &Option<String>| -> Option<String> {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
         if !cfg.columns.is_empty() || !cfg.tables.is_empty() {
             return Err(SchemaError::ShapeMismatch(
                 "'events' does not allow [[observations.columns]] / [[observations.tables]]".into(),
@@ -362,6 +374,17 @@ impl EventsShape {
             time_col_tz: cfg.time_col_tz.clone(),
             geom_col: check_identifier(geom_col, "observations.geom_col")?,
             id_col: check_identifier(id_col, "observations.id_col")?,
+            // Same identifier validation as every other column: these reach
+            // SQL, so they go through the same gate (Critical Rule 8).
+            cloud_indicator_col: attr_col(&cfg.cloud_indicator_col)
+                .map(|c| check_identifier(&c, "observations.cloud_indicator_col"))
+                .transpose()?,
+            peak_current_col: attr_col(&cfg.peak_current_col)
+                .map(|c| check_identifier(&c, "observations.peak_current_col"))
+                .transpose()?,
+            multiplicity_col: attr_col(&cfg.multiplicity_col)
+                .map(|c| check_identifier(&c, "observations.multiplicity_col"))
+                .transpose()?,
         })
     }
 }
@@ -513,6 +536,9 @@ mod tests {
             geom_col: None,
             locations_window: None,
             id_col: None,
+            cloud_indicator_col: None,
+            peak_current_col: None,
+            multiplicity_col: None,
             default_datetime: None,
             extent_bbox: None,
             columns: vec![],
@@ -548,6 +574,9 @@ mod tests {
             geom_col: None,
             locations_window: None,
             id_col: None,
+            cloud_indicator_col: None,
+            peak_current_col: None,
+            multiplicity_col: None,
             default_datetime: None,
             extent_bbox: None,
             columns: vec![
@@ -585,6 +614,9 @@ mod tests {
             geom_col: Some("the_geom".into()),
             locations_window: None,
             id_col: None,
+            cloud_indicator_col: None,
+            peak_current_col: None,
+            multiplicity_col: None,
             default_datetime: None,
             extent_bbox: None,
             columns: vec![],
@@ -637,6 +669,9 @@ mod tests {
             geom_col: None,
             locations_window: None,
             id_col: None,
+            cloud_indicator_col: None,
+            peak_current_col: None,
+            multiplicity_col: None,
             default_datetime: None,
             extent_bbox: None,
             columns: vec![],
@@ -668,6 +703,9 @@ mod tests {
             columns: vec![],
             tables: vec![],
             id_col: Some("id".into()),
+            cloud_indicator_col: None,
+            peak_current_col: None,
+            multiplicity_col: None,
             default_datetime: Some("PT1H".into()),
             extent_bbox: Some([4.0, 54.0, 42.0, 72.0]),
         }
@@ -703,6 +741,35 @@ mod tests {
         cfg.geom_col = None;
         let err = ObservationSchema::from_config(&cfg).unwrap_err();
         assert!(matches!(err, SchemaError::ShapeMismatch(msg) if msg.contains("geom_col")));
+    }
+
+    #[test]
+    fn events_attribute_columns_go_through_the_identifier_gate() {
+        // These reach SQL, so a bad name must die at load — not at the DB,
+        // and not quietly inside a quoted identifier (Critical Rule 8).
+        let mut cfg = minimal_events();
+        cfg.peak_current_col = Some("peak_current; DROP TABLE x".into());
+        let err = ObservationSchema::from_config(&cfg).unwrap_err();
+        assert!(
+            matches!(err, SchemaError::InvalidIdentifier { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn events_attribute_columns_are_optional_and_blank_means_undeclared() {
+        let mut cfg = minimal_events();
+        cfg.cloud_indicator_col = Some("  ".into());
+        cfg.peak_current_col = Some(" peak_current ".into());
+        match ObservationSchema::from_config(&cfg).unwrap() {
+            ObservationSchema::Events(s) => {
+                // Whitespace-only is "not declared", not a column named "  ".
+                assert_eq!(s.cloud_indicator_col, None);
+                assert_eq!(s.peak_current_col.as_deref(), Some("peak_current"));
+                assert_eq!(s.multiplicity_col, None);
+            }
+            _ => panic!("expected Events"),
+        }
     }
 
     #[test]

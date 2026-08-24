@@ -14,6 +14,51 @@ pub struct EventPoint {
     pub time: DateTime<Utc>,
     pub lon: f64,
     pub lat: f64,
+    /// Optional per-event scalars, populated only when the source declares
+    /// the columns they come from.
+    pub attrs: EventAttrs,
+}
+
+/// Per-event scalars a detection network may report alongside position.
+///
+/// **Flat and `Copy` on purpose.** A consumer fetches up to
+/// `MAX_JOIN_STRIKES` (200k) events per cycle, so anything with a heap
+/// allocation per event — a map, a `Vec` — would allocate 200k times per
+/// generation on the poll runtime. This is 12 bytes and never allocates.
+///
+/// The fields are named for lightning because lightning is what reports
+/// them. Inventing neutral names (`kind`, `magnitude`) would buy a
+/// generality nothing is asking for while making both sides harder to read;
+/// a source with nothing to say leaves them `None`. Rename if a second kind
+/// of event source ever appears.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct EventAttrs {
+    /// 0 = cloud-to-ground, 1 = intra-cloud.
+    pub cloud_indicator: Option<i16>,
+    /// Signed peak current in kA — **polarity is its sign**. A positive
+    /// cloud-to-ground flash is the severe-storm signal, so the sign carries
+    /// more meaning here than the magnitude.
+    pub peak_current_ka: Option<f32>,
+    /// Return strokes in the flash.
+    pub multiplicity: Option<i16>,
+}
+
+impl EventAttrs {
+    /// Cloud-to-ground, if known.
+    pub fn is_cloud_to_ground(&self) -> Option<bool> {
+        self.cloud_indicator.map(|c| c == 0)
+    }
+
+    /// Positive polarity, if known. `None` for a zero current, which carries
+    /// no polarity rather than a positive one.
+    pub fn is_positive(&self) -> Option<bool> {
+        self.peak_current_ka
+            .and_then(|c| match c.partial_cmp(&0.0) {
+                Some(std::cmp::Ordering::Greater) => Some(true),
+                Some(std::cmp::Ordering::Less) => Some(false),
+                _ => None,
+            })
+    }
 }
 
 /// A source of recent point events.

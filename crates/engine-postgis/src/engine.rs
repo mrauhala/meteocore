@@ -30,7 +30,7 @@ use crate::health::{Health, HealthSnapshot, HealthStatus};
 use crate::metadata::{CollectionMeta, MetadataCache};
 use crate::query::{
     build_events_area, build_events_window, build_location, build_position,
-    build_stations_in_polygon, params_as_refs, BuiltQuery, DEFAULT_POSITION_RADIUS_M,
+    build_stations_in_polygon, params_as_refs, BuiltQuery, WindowAttrs, DEFAULT_POSITION_RADIUS_M,
     MAX_AREA_QUERIES, MAX_OBSERVATION_ROWS, MAX_RESPONSE_VALUES, MAX_STATIONS_IN_POLYGON,
 };
 use crate::schema::{EventsShape, ObservationSchema};
@@ -328,7 +328,7 @@ impl ds_core::events::EventSource for PostgisEngine {
                 "recent_events requires an events-shape postgis collection".into(),
             ));
         };
-        let built = build_events_window(shape, (start, end), limit)
+        let built = build_events_window(shape, (start, end), limit, WindowAttrs::Include)
             .map_err(|e| DataServerError::Engine(format!("build_events_window: {e}")))?;
         let rows = run_single_query_sync(&self.pool, built)?;
         let mut out = Vec::with_capacity(rows.len());
@@ -347,7 +347,23 @@ impl ds_core::events::EventSource for PostgisEngine {
             let (Some(lon), Some(lat)) = (lon, lat) else {
                 continue;
             };
-            out.push(ds_core::events::EventPoint { time, lon, lat });
+            // Attribute columns are optional AND nullable, so a missing
+            // column and a NULL row both land on None — "not reported",
+            // distinct from a reported zero.
+            // All three are cast to `double precision` in SQL, so one decode
+            // covers smallint / numeric / real source columns alike.
+            let num = |name| row.try_get::<_, Option<f64>>(name).ok().flatten();
+            let attrs = ds_core::events::EventAttrs {
+                cloud_indicator: num("cloud_indicator").map(|v| v as i16),
+                peak_current_ka: num("peak_current").map(|v| v as f32),
+                multiplicity: num("multiplicity").map(|v| v as i16),
+            };
+            out.push(ds_core::events::EventPoint {
+                time,
+                lon,
+                lat,
+                attrs,
+            });
         }
         // Window SQL orders newest-first (so truncation keeps the newest);
         // the trait contract is ascending.
@@ -1619,6 +1635,9 @@ mod tests {
                 time_col_tz: Some("UTC".into()),
                 geom_col: "the_geom".into(),
                 id_col: "id".into(),
+                cloud_indicator_col: None,
+                peak_current_col: None,
+                multiplicity_col: None,
             }),
             parameters: vec![ValidatedParameter {
                 name: "peak_current".into(),
@@ -1678,6 +1697,9 @@ mod tests {
                 time_col_tz: Some("UTC".into()),
                 geom_col: "the_geom".into(),
                 id_col: "id".into(),
+                cloud_indicator_col: None,
+                peak_current_col: None,
+                multiplicity_col: None,
             }),
             parameters: vec![ValidatedParameter {
                 name: "peak_current".into(),
