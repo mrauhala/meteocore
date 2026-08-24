@@ -356,7 +356,6 @@ impl ds_core::events::EventSource for PostgisEngine {
             let attrs = ds_core::events::EventAttrs {
                 cloud_indicator: num("cloud_indicator").map(|v| v as i16),
                 peak_current_ka: num("peak_current").map(|v| v as f32),
-                multiplicity: num("multiplicity").map(|v| v as i16),
             };
             out.push(ds_core::events::EventPoint {
                 time,
@@ -1637,7 +1636,6 @@ mod tests {
                 id_col: "id".into(),
                 cloud_indicator_col: None,
                 peak_current_col: None,
-                multiplicity_col: None,
             }),
             parameters: vec![ValidatedParameter {
                 name: "peak_current".into(),
@@ -1699,7 +1697,6 @@ mod tests {
                 id_col: "id".into(),
                 cloud_indicator_col: None,
                 peak_current_col: None,
-                multiplicity_col: None,
             }),
             parameters: vec![ValidatedParameter {
                 name: "peak_current".into(),

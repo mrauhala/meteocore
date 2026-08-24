@@ -1372,8 +1372,6 @@ pub struct PostgisObservationsConfig {
     pub cloud_indicator_col: Option<String>,
     #[serde(default)]
     pub peak_current_col: Option<String>,
-    #[serde(default)]
-    pub multiplicity_col: Option<String>,
     /// `events` shape: window applied when a query carries no `datetime`
     /// (ISO 8601 duration, e.g. `"PT1H"`; that is also the default). Event
     /// tables are never scanned over full history by an unqualified query.

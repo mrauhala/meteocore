@@ -144,20 +144,31 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   this seam per generation, so a map or `Vec` per event would allocate 200k
   times per cycle on the poll runtime.
 - The columns are **opt-in per source**: `[postgis.events]`
-  `cloud_indicator_col` / `peak_current_col` / `multiplicity_col`. A network
-  that doesn't report them declares nothing and nothing is selected.
+  `cloud_indicator_col` / `peak_current_col`. A network that doesn't report
+  them declares nothing and nothing is selected. Do NOT add a column here
+  without a consumer — `multiplicity_col` was wired end-to-end in the first
+  draft of #618 and read by nothing, paying SQL and decode cost per strike
+  for a config knob that silently did nothing.
 - **A three-way distinction, not two.** `cg_count`/`ic_count`/
   `positive_cg_fraction` are absent when no source is wired, `null` when the
   source reports no discriminator, and a number when measured. "This network
   doesn't say" and "no CG flashes" are different facts and only one of them
   licenses a statement.
-- **The split and the polarity are gated INDEPENDENTLY** (`any_attrs` vs
-  `any_polarity` in `apply_lightning`), because `cloud_indicator_col` and
-  `peak_current_col` are independently optional. Gating both on the split
-  made a split-only network report `positive_cg_fraction: 0.0` for every
-  CG-producing cell — "we checked and found no positive flashes" about a
-  question it never asked. Caught in review on #618; the two flags exist
-  solely to keep that from returning.
+- **Presence flags must be exactly as fine-grained as the fact they gate.**
+  `Tallies` carries `saw_split` and `saw_polarity` PER TRACK. Review on #618
+  found the same mistake twice at two granularities:
+  - One flag for both facts made a split-only network report
+    `positive_cg_fraction: 0.0` for every CG-producing cell — "we checked and
+    found no positive flashes" about a question it never asked.
+  - A generation-global flag let a cell whose OWN strikes were all
+    unclassified report `Some(0)` because some OTHER cell's strikes were
+    classified. Degraded detections cluster by cell, so this is not exotic.
+- **`positive_cg_fraction`'s denominator is `cg_polarity_known`, not
+  `cg_count`.** Peak-current estimation fails on weak signals, so a network
+  can classify only part of its CG population; dividing 4 positives by all 10
+  CG flashes reports 0.4 where the measured share is 0.8. The denominator is
+  served as its own property so the sample size behind the share is visible —
+  "3 of 4" and "300 of 400" are the same fraction and not the same evidence.
 - **`positive_cg_fraction` is `None` when `cg_count == 0`**, never 0.0 — 0/0
   is not 0%. A cell with only IC flashes has no CG polarity to report.
 - Polarity comes from the SIGN of `peak_current`, not its magnitude. A zero

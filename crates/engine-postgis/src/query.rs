@@ -606,7 +606,6 @@ pub fn build_events_window(
         for (col, alias) in [
             (&shape.cloud_indicator_col, "cloud_indicator"),
             (&shape.peak_current_col, "peak_current"),
-            (&shape.multiplicity_col, "multiplicity"),
         ] {
             if let Some(name) = col {
                 attr_cols.push_str(&format!(
@@ -1156,7 +1155,6 @@ mod tests {
             id_col: None,
             cloud_indicator_col: None,
             peak_current_col: None,
-            multiplicity_col: None,
             default_datetime: None,
             extent_bbox: None,
             columns: vec![],
@@ -1455,7 +1453,6 @@ mod tests {
         EventsShape {
             cloud_indicator_col: cloud.map(str::to_string),
             peak_current_col: current.map(str::to_string),
-            multiplicity_col: None,
             table: QualifiedTable {
                 schema: "public".into(),
                 table: "lightning".into(),
@@ -1567,8 +1564,16 @@ mod tests {
         assert!(q
             .sql
             .contains("\"peak_current\"::double precision AS peak_current"));
-        // Undeclared column is absent entirely, not selected as NULL.
-        assert!(!q.sql.contains("multiplicity"));
+        // An undeclared column is absent entirely, not selected as NULL.
+        let partial = build_events_window(
+            &lightning_shape_with(Some("cloud_indicator"), None),
+            (t(2026, 7, 11, 17), t(2026, 7, 11, 18)),
+            1000,
+            WindowAttrs::Include,
+        )
+        .unwrap();
+        assert!(partial.sql.contains("cloud_indicator"));
+        assert!(!partial.sql.contains("peak_current"));
         // Half-open window and newest-first truncation are unchanged.
         assert!(q.sql.contains("\"time\" > ($1 AT TIME ZONE 'UTC')"));
         assert!(q.sql.contains("ORDER BY \"time\" DESC"));

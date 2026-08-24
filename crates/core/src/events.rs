@@ -39,8 +39,6 @@ pub struct EventAttrs {
     /// cloud-to-ground flash is the severe-storm signal, so the sign carries
     /// more meaning here than the magnitude.
     pub peak_current_ka: Option<f32>,
-    /// Return strokes in the flash.
-    pub multiplicity: Option<i16>,
 }
 
 impl EventAttrs {
@@ -83,4 +81,47 @@ pub trait EventSource: Send + Sync {
         end: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<EventPoint>, DataServerError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_attrs_stays_small_and_allocation_free() {
+        // The whole design rationale is "flat and Copy so 200k events per
+        // generation cost nothing to carry". A field that reintroduced a heap
+        // allocation — a String, a Vec, a HashMap — would break that silently,
+        // since it still compiles and still passes every behavioural test.
+        assert_eq!(std::mem::size_of::<EventAttrs>(), 12);
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<EventAttrs>();
+        assert_copy::<EventPoint>();
+    }
+
+    #[test]
+    fn polarity_comes_from_the_sign_and_zero_carries_none() {
+        let at = |c: f32| EventAttrs {
+            cloud_indicator: None,
+            peak_current_ka: Some(c),
+        };
+        assert_eq!(at(30.0).is_positive(), Some(true));
+        assert_eq!(at(-30.0).is_positive(), Some(false));
+        // Zero current has no polarity — reporting it as positive would
+        // inflate the severe-storm signal from a non-measurement.
+        assert_eq!(at(0.0).is_positive(), None);
+        assert_eq!(at(f32::NAN).is_positive(), None);
+        assert_eq!(EventAttrs::default().is_positive(), None);
+    }
+
+    #[test]
+    fn cloud_indicator_maps_zero_to_cloud_to_ground() {
+        let at = |c: i16| EventAttrs {
+            cloud_indicator: Some(c),
+            peak_current_ka: None,
+        };
+        assert_eq!(at(0).is_cloud_to_ground(), Some(true));
+        assert_eq!(at(1).is_cloud_to_ground(), Some(false));
+        assert_eq!(EventAttrs::default().is_cloud_to_ground(), None);
+    }
 }

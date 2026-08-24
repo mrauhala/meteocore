@@ -101,11 +101,20 @@ pub struct LightningFacts {
     /// discriminator. `None` = not reported, never a defaulted zero.
     pub cg_count: Option<u32>,
     pub ic_count: Option<u32>,
-    /// Share of cloud-to-ground flashes with positive polarity, 0..=1.
+    /// How many CG flashes had their polarity reported — the DENOMINATOR
+    /// behind `positive_cg_fraction`, and the sample size behind it.
     ///
-    /// `None` when polarity is not reported **or when the cell had no CG
-    /// flashes at all** — 0 of 0 is not 0%, and reporting it as 0% would
-    /// invite "no positive strikes" about a cell with no strikes to classify.
+    /// Exposed rather than kept private for the same reason `beam_coverage`
+    /// is: a share whose denominator is invisible invites confident statements
+    /// it cannot support. "3 of 4 positive" and "300 of 400 positive" are the
+    /// same fraction and not the same evidence.
+    pub cg_polarity_known: Option<u32>,
+    /// Share of POLARITY-KNOWN cloud-to-ground flashes that were positive,
+    /// 0..=1.
+    ///
+    /// `None` when polarity is not reported **or when no CG flash was
+    /// classifiable** — 0 of 0 is not 0%, and reporting it as 0% would invite
+    /// "no positive strikes" about a cell with no strikes to classify.
     pub positive_cg_fraction: Option<f64>,
     /// When this track was first attributed a flash.
     ///
@@ -420,6 +429,7 @@ mod tests {
         full.lightning = Some(LightningFacts {
             cg_count: Some(8),
             ic_count: Some(4),
+            cg_polarity_known: None,
             positive_cg_fraction: Some(0.25),
             flash_count: 12,
             flash_rate_per_min: 4.0,
@@ -483,6 +493,7 @@ mod tests {
             jump_sigma: None,
             cg_count: None,
             ic_count: None,
+            cg_polarity_known: None,
             positive_cg_fraction: None,
             first_flash: None,
             jump: false,
@@ -566,6 +577,7 @@ mod tests {
             jump_sigma: None,
             cg_count: None,
             ic_count: None,
+            cg_polarity_known: None,
             positive_cg_fraction: None,
             first_flash: None,
             jump: false,
@@ -578,6 +590,7 @@ mod tests {
             jump_sigma: None,
             cg_count: None,
             ic_count: None,
+            cg_polarity_known: None,
             positive_cg_fraction: None,
             first_flash: None,
             jump: true,
@@ -604,6 +617,7 @@ mod tests {
             jump_sigma: None,
             cg_count: None,
             ic_count: None,
+            cg_polarity_known: None,
             positive_cg_fraction: None,
             first_flash: None,
             jump: true,
@@ -716,6 +730,7 @@ mod tests {
             jump_sigma: Some(2.1),
             cg_count: None,
             ic_count: None,
+            cg_polarity_known: None,
             positive_cg_fraction: None,
             first_flash: None,
         });
@@ -744,6 +759,7 @@ mod tests {
             jump_sigma: None,
             cg_count: None,
             ic_count: None,
+            cg_polarity_known: None,
             positive_cg_fraction: None,
             first_flash: None,
         });
@@ -766,6 +782,7 @@ mod tests {
             jump_sigma: Some(0.5),
             cg_count: Some(20),
             ic_count: Some(0),
+            cg_polarity_known: None,
             positive_cg_fraction: Some(0.05),
             first_flash: None,
         };
@@ -773,6 +790,7 @@ mod tests {
         ordinary.lightning = Some(base);
         let mut anomalous = cell(2);
         anomalous.lightning = Some(LightningFacts {
+            cg_polarity_known: None,
             positive_cg_fraction: Some(0.75),
             ..base
         });
@@ -797,6 +815,7 @@ mod tests {
             jump_sigma: None,
             cg_count: None,
             ic_count: None,
+            cg_polarity_known: None,
             positive_cg_fraction: None,
             first_flash: None,
         });
@@ -820,6 +839,7 @@ mod tests {
                 jump_sigma: None,
                 cg_count: Some(20),
                 ic_count: Some(0),
+                cg_polarity_known: None,
                 positive_cg_fraction: Some(frac),
                 first_flash: None,
             });
