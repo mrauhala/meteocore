@@ -368,10 +368,11 @@ you want in the EDR response still needs its own `[[postgis.parameters]]`
 entry (declaring it in both is fine, and normal: `peak_current` is a useful
 EDR parameter *and* the polarity source).
 
-- Entirely opt-in. A network that doesn't report a discriminator declares
-  nothing, nothing is selected, and the consumer reports `null` rather than
-  guessing. Do NOT declare `cloud_indicator_col` pointing at a column whose
-  encoding differs from 0=CG/1=IC — the join would silently invert.
+- Entirely opt-in, and **independently** so. Declaring `cloud_indicator_col`
+  without `peak_current_col` yields the IC/CG split with polarity reported as
+  `null`, not as "no positive flashes"; declaring the reverse yields polarity
+  without the split. Do NOT declare `cloud_indicator_col` pointing at a column
+  whose encoding differs from 0=CG/1=IC — the join would silently invert.
 - Identifiers are validated at config load and emitted through
   `quote_ident` (Critical Rule 8), same as every other column name.
 - Cast `::double precision` in SQL (like the EDR parameter columns), so
