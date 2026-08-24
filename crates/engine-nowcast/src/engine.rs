@@ -1366,6 +1366,10 @@ fn score_cells(
                 speed_ms: speed_raw.map(|v| round_to(v, 1)),
                 bearing_deg: bearing_raw.map(|b| round_to(b, 0) % 360.0),
                 deviant_mover: t.deviant(),
+                // From the RAW speed, like the impact lookahead: the rounded
+                // value is for display and a threshold comparison should not
+                // depend on it.
+                likely_clutter: ds_core::cell_facts::is_likely_clutter(speed_raw, t.age),
                 trend: match t.growing {
                     Some(true) => Some(Trend::Growing),
                     Some(false) => Some(Trend::Decaying),
@@ -1427,6 +1431,13 @@ fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
     props.insert("area_km2".into(), PropertyValue::Float(t.area_km2));
     props.insert("track_age".into(), PropertyValue::Integer(t.age as i64));
     props.insert("deviant_mover".into(), PropertyValue::Bool(t.deviant_mover));
+    // Surfaced, not hidden: a demoted cell stays inspectable so a client can
+    // say "persistent stationary echo, probably a wind farm" rather than
+    // either "severe storm" or nothing at all.
+    props.insert(
+        "likely_clutter".into(),
+        PropertyValue::Bool(t.likely_clutter),
+    );
     props.insert(
         "speed_ms".into(),
         t.speed_ms

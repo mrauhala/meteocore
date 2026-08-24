@@ -360,6 +360,9 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
   learned ranker has to beat; a GBDT/ONNX model is another
   `impl Significance<T>` behind the same interface. Reusable for CAP alert
   urgency and impact-event priority — do not fork it per domain.
+- **`ds_core::cell_facts`** — also `is_likely_clutter` (#614): a persistent
+  near-stationary echo is flagged and demoted, because no other significance
+  term asks whether an echo is meteorological at all.
 - **`ds_core::cell_facts`** — `CellFactSheet`: the one wide description of a
   tracked storm cell, plus `Severity` (owned here so the tracker, the
   ranking and any narrative cannot drift) and `DEFAULT_CELL_WEIGHTS`. Built

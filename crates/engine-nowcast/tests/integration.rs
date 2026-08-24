@@ -1453,3 +1453,107 @@ fn wiring_a_source_adds_exactly_its_sortables() {
         "an impact source must not advertise lightning properties"
     );
 }
+
+/// #614: a fixed echo (wind turbine clutter) outranked real weather on a
+/// quiet day. A stationary source produces a cell that never moves, so after
+/// enough frames it must be flagged and demoted — while a moving cell of the
+/// same intensity is untouched.
+#[test]
+fn a_stationary_echo_is_flagged_and_demoted() {
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+
+    /// Same disc every frame, never moving — a mast or turbine farm.
+    struct FixedEchoSource {
+        times: RwLock<Vec<DateTime<Utc>>>,
+    }
+    impl MapEngine for FixedEchoSource {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            let mut data = vec![0u8; (width * height) as usize];
+            for (i, cell) in data.iter_mut().enumerate() {
+                let x = (i % width as usize) as f64 + 0.5;
+                let y = (i / width as usize) as f64 + 0.5;
+                if (x - 100.0).powi(2) + (y - 100.0).powi(2) <= 9.0 * 9.0 {
+                    *cell = 218; // ~57 dBZ: bright, like real clutter
+                }
+            }
+            Ok(RasterTile {
+                width,
+                height,
+                values: RasterValues::U8 {
+                    data,
+                    nodata: Some(NODATA),
+                    gain: 0.4,
+                    offset: -30.0,
+                },
+            })
+        }
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some(EXTENT),
+                times: self.times.read().unwrap().clone(),
+                parameter: "reflectivity".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: Some([W, H]),
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+    }
+
+    let source = Arc::new(FixedEchoSource {
+        times: RwLock::new(vec![t0(), t0() + Duration::minutes(5)]),
+    });
+    let engine =
+        NowcastEngine::new("fixed", "mock", source.clone(), &base_config()).expect("builds");
+
+    // Walk enough generations for the track to become persistent.
+    let mut t = t0() + Duration::minutes(5);
+    for _ in 0..8 {
+        engine.poll_once();
+        t += Duration::minutes(5);
+        source.times.write().unwrap().push(t);
+    }
+    engine.poll_once();
+
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = page.features.first().expect("the fixed echo is tracked");
+    let p = &f.properties;
+
+    // It never moved, so it is not weather.
+    match p.get("speed_ms") {
+        Some(PropertyValue::Float(v)) => assert!(*v < 3.0, "should be stationary, got {v}"),
+        other => panic!("expected a measured speed by now, got {other:?}"),
+    }
+    assert!(
+        matches!(p.get("likely_clutter"), Some(PropertyValue::Bool(true))),
+        "a persistent stationary echo must be flagged: {p:?}"
+    );
+
+    // Flagged, but still present and inspectable — never silently dropped.
+    assert_eq!(page.number_matched, 1);
+    assert!(matches!(p.get("max_dbz"), Some(PropertyValue::Float(_))));
+
+    // And the demotion actually applied.
+    match p.get("significance_reasons") {
+        Some(PropertyValue::List(r)) => assert!(
+            r.iter()
+                .any(|x| matches!(x, PropertyValue::String(s) if s == "clutter")),
+            "clutter should be among the top reasons: {r:?}"
+        ),
+        other => panic!("missing reasons: {other:?}"),
+    }
+}

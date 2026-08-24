@@ -149,6 +149,9 @@ pub struct CellFactSheet {
     /// Compass bearing the cell moves toward.
     pub bearing_deg: Option<f64>,
     pub deviant_mover: bool,
+    /// Persistent, near-stationary echo — most likely ground clutter (wind
+    /// turbines, masts) rather than weather. See [`is_likely_clutter`].
+    pub likely_clutter: bool,
     pub trend: Option<Trend>,
     /// Measured intensity tendency, dBZ per minute.
     pub intensity_trend_dbz_min: Option<f64>,
@@ -169,6 +172,41 @@ const FLASH_RATE_CEILING_PER_MIN: f64 = 60.0;
 const VIL_CEILING_KG_M2: f64 = 50.0;
 const ECHO_TOP_CEILING_M: f64 = 15_000.0;
 const INTENSITY_TREND_CEILING_DBZ_MIN: f64 = 2.0;
+
+/// Speed below which an echo is "not going anywhere" (m/s).
+///
+/// Finnish convection typically tracks 5–20 m/s. Observed clutter sat at 0.1
+/// and 2.4 m/s while every real cell in the same frame ran 8.6–12.9 m/s on a
+/// single coherent bearing, so the populations separate cleanly here. Matches
+/// `DEVIANT_MIN_CELL_SPEED_MS` in cells2d, which already treats motion below
+/// this as too small to reason about.
+const CLUTTER_MAX_SPEED_MS: f64 = 3.0;
+
+/// Frames a cell must have been stationary for before it is called clutter.
+///
+/// Persistence is what separates clutter from weather, not slowness alone: a
+/// genuine cell can crawl for a few minutes in weak flow, but one that has
+/// held both position AND high reflectivity for half an hour is a fixed
+/// object. Six frames ≈ 30 min at the 5-minute cadence.
+const CLUTTER_MIN_AGE: u32 = 6;
+
+/// Whether a cell looks like ground clutter rather than weather.
+///
+/// **Mitigation, not detection.** Wind turbine clutter is a genuinely hard
+/// upstream QC problem; this only stops a fixed echo dominating a ranking on
+/// a quiet day. It will miss clutter that happens to sit under moving weather
+/// and could in principle flag a truly stalled storm — which is why the
+/// result is surfaced as a fact and demoted, never dropped.
+///
+/// A newborn track has no velocity yet. `None` means "not known", so it is
+/// never treated as stationary — the opposite reading would flag every cell
+/// for the first frames after a reload.
+pub fn is_likely_clutter(speed_ms: Option<f64>, age: u32) -> bool {
+    match speed_ms {
+        Some(speed) => speed < CLUTTER_MAX_SPEED_MS && age >= CLUTTER_MIN_AGE,
+        None => false,
+    }
+}
 
 /// Default significance weights for storm cells.
 ///
@@ -192,6 +230,10 @@ pub const DEFAULT_CELL_WEIGHTS: &[(&str, f64)] = &[
     ("echo_top", 0.5),
     ("beam_coverage", 0.4),
     ("impact", 1.5),
+    // Negative, and as large as the biggest positive term: a fixed echo
+    // maximizes severity, max_dbz and impact at once (it is bright, compact
+    // and usually over a town), so anything smaller leaves it near the top.
+    ("clutter", -1.5),
 ];
 
 /// Map `value` onto 0..=1 across `floor..=ceiling`, saturating at both ends.
@@ -209,6 +251,7 @@ impl SignificanceTerms for CellFactSheet {
             Term::new("max_dbz", ramp(self.max_dbz, DBZ_FLOOR, DBZ_CEILING)),
             Term::new("area", ramp(self.area_km2, 0.0, AREA_CEILING_KM2)),
             Term::flag("deviant_mover", self.deviant_mover),
+            Term::flag("clutter", self.likely_clutter),
         ];
 
         // Prefer the measured tendency over the coarse growing/decaying flag;
@@ -294,6 +337,7 @@ mod tests {
             speed_ms: Some(14.0),
             bearing_deg: Some(45.0),
             deviant_mover: false,
+            likely_clutter: false,
             trend: None,
             intensity_trend_dbz_min: None,
             lightning: None,
@@ -500,5 +544,69 @@ mod tests {
         assert_eq!(ramp(500.0, 0.0, 100.0), 1.0);
         assert_eq!(ramp(f64::NAN, 0.0, 100.0), 0.0);
         assert_eq!(ramp(1.0, 5.0, 5.0), 0.0);
+    }
+
+    #[test]
+    fn a_persistent_stationary_echo_is_flagged_as_clutter() {
+        // The reported case: wind turbine clutter near Oulu outranked real
+        // weather on a quiet day. Observed 0.1 and 2.4 m/s while every real
+        // cell in the same frame ran 8.6-12.9 m/s.
+        assert!(is_likely_clutter(Some(0.1), 10));
+        assert!(is_likely_clutter(Some(2.4), 6));
+    }
+
+    #[test]
+    fn clutter_needs_both_stationary_and_persistent() {
+        // Slow but young: a cell can crawl briefly in weak flow.
+        assert!(!is_likely_clutter(Some(0.1), 2));
+        // Persistent but moving: an ordinary long-lived storm.
+        assert!(!is_likely_clutter(Some(9.7), 20));
+    }
+
+    #[test]
+    fn a_newborn_track_is_never_clutter() {
+        // speed is None until the second observation. Reading that as
+        // "stationary" would flag every cell for the first frames after a
+        // reload, when every track is new.
+        assert!(!is_likely_clutter(None, 1));
+        assert!(!is_likely_clutter(None, 50));
+    }
+
+    #[test]
+    fn flagging_clutter_sinks_it_below_real_weather() {
+        // A bright, compact, well-placed fixed echo maximizes severity,
+        // max_dbz and impact at once — the demotion has to overcome all of
+        // them together.
+        let mut clutter = cell(1);
+        clutter.severity = Severity::Severe;
+        clutter.max_dbz = 54.5;
+        clutter.likely_clutter = true;
+        clutter.impact = Some(ImpactFacts {
+            over: Some("Oulu".into()),
+            approaching: None,
+            eta_minutes: None,
+            exposure: 0.9,
+        });
+
+        let mut weather = cell(2);
+        weather.severity = Severity::Moderate;
+        weather.max_dbz = 47.5;
+        weather.impact = Some(ImpactFacts {
+            over: Some("Tampere".into()),
+            approaching: None,
+            eta_minutes: None,
+            exposure: 0.7,
+        });
+
+        let scores = scorer().rank(&[clutter, weather]);
+        assert_eq!(
+            scores[1].rank, 1,
+            "real weather must outrank a brighter fixed echo"
+        );
+        assert!(
+            scores[0].significance_is_demoted(),
+            "and the clutter term should be the reason: {:?}",
+            scores[0].contributions
+        );
     }
 }
