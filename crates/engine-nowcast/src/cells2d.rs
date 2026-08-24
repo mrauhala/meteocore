@@ -375,28 +375,37 @@ pub fn advance_tracks(
 /// only if either bound grows by orders of magnitude.
 /// Add one strike to a track's attribute tallies.
 ///
-/// `any_attrs` records whether ANY strike carried a discriminator, which is
-/// what decides between reporting zeros and reporting nothing.
+/// `any_attrs` records whether ANY strike carried the IC/CG discriminator and
+/// `any_polarity` whether ANY carried a usable peak current. They are tracked
+/// SEPARATELY because `cloud_indicator_col` and `peak_current_col` are
+/// independently optional: a network that reports the split but not the
+/// current would otherwise hand back `cg_pos = 0` for every track, which reads
+/// as "measured: no positive flashes" when the truth is "never measured".
 #[allow(clippy::too_many_arguments)]
 fn tally(
     cg: &mut [u32],
     ic: &mut [u32],
     cg_pos: &mut [u32],
     any_attrs: &mut bool,
+    any_polarity: &mut bool,
     idx: usize,
     attrs: EventAttrs,
 ) {
+    // Polarity is independent of the IC/CG split — note this is recorded even
+    // for a strike whose split is unknown, since the question "does this
+    // network report current at all" is answered by any strike.
+    if let Some(positive) = attrs.is_positive() {
+        *any_polarity = true;
+        if positive && attrs.is_cloud_to_ground() == Some(true) {
+            cg_pos[idx] += 1;
+        }
+    }
     let Some(is_cg) = attrs.is_cloud_to_ground() else {
         return;
     };
     *any_attrs = true;
     if is_cg {
         cg[idx] += 1;
-        // Polarity is independent of the IC/CG split and may be missing even
-        // when the split is present.
-        if attrs.is_positive() == Some(true) {
-            cg_pos[idx] += 1;
-        }
     } else {
         ic[idx] += 1;
     }
@@ -421,6 +430,7 @@ pub fn apply_lightning(
     let mut ic = vec![0u32; tracks.len()];
     let mut cg_pos = vec![0u32; tracks.len()];
     let mut any_attrs = false;
+    let mut any_polarity = false;
 
     for &((sx, sy), attrs) in strikes_px {
         // In-grid by contract; `as usize` saturates negatives to 0 and
@@ -434,6 +444,7 @@ pub fn apply_lightning(
                 &mut ic,
                 &mut cg_pos,
                 &mut any_attrs,
+                &mut any_polarity,
                 label - 1,
                 attrs,
             );
@@ -451,7 +462,15 @@ pub fn apply_lightning(
         }
         if let Some((k, _)) = best {
             counts[k] += 1;
-            tally(&mut cg, &mut ic, &mut cg_pos, &mut any_attrs, k, attrs);
+            tally(
+                &mut cg,
+                &mut ic,
+                &mut cg_pos,
+                &mut any_attrs,
+                &mut any_polarity,
+                k,
+                attrs,
+            );
         }
     }
 
@@ -491,9 +510,14 @@ pub fn apply_lightning(
         }
         // Only surfaced when the source actually reports the discriminator;
         // otherwise these stay None, so "not reported" never reads as zero.
+        // The split and the polarity are reported independently, so they are
+        // gated independently. Collapsing them would make a split-only
+        // network report "no positive flashes" it never looked for.
         if any_attrs {
             t.cg_count = Some(cg[idx]);
             t.ic_count = Some(ic[idx]);
+        }
+        if any_polarity {
             t.cg_positive_count = Some(cg_pos[idx]);
         }
         t.flash_count = Some(n);
@@ -996,5 +1020,75 @@ mod tests {
         assert_eq!(tracks[0].cg_count, None);
         assert_eq!(tracks[0].ic_count, None);
         assert_eq!(tracks[0].cg_positive_count, None);
+    }
+
+    #[test]
+    fn a_split_only_network_reports_no_polarity_rather_than_zero() {
+        use ds_core::events::EventAttrs;
+        // cloud_indicator_col and peak_current_col are independently optional.
+        // A network reporting the split but no current must leave the positive
+        // count unreported — 0 would claim "we looked and found none".
+        let mut t = bare_track(1, 0.5, 0.5);
+        t.flash_history = vec![1.0];
+        let mut tracks = vec![t];
+        let split_only = |cloud| EventAttrs {
+            cloud_indicator: Some(cloud),
+            peak_current_ka: None,
+            multiplicity: None,
+        };
+        let strikes = vec![
+            ((0.5, 0.5), split_only(0)),
+            ((0.5, 0.5), split_only(0)),
+            ((0.5, 0.5), split_only(1)),
+        ];
+        apply_lightning(
+            &mut tracks,
+            &strikes,
+            &[1],
+            1,
+            PixelScale { x: 1.0, y: 1.0 },
+            60.0,
+            test_instant(),
+        );
+        assert_eq!(tracks[0].cg_count, Some(2), "the split IS reported");
+        assert_eq!(tracks[0].ic_count, Some(1));
+        assert_eq!(
+            tracks[0].cg_positive_count, None,
+            "polarity was never reported, so it must not read as zero"
+        );
+    }
+
+    #[test]
+    fn a_polarity_only_network_reports_polarity_without_the_split() {
+        use ds_core::events::EventAttrs;
+        // The mirror case: current but no discriminator. The positive count is
+        // gated on a KNOWN cloud-to-ground flash, so it stays 0 here — but it
+        // is reported, because the network does answer the polarity question.
+        let mut t = bare_track(1, 0.5, 0.5);
+        t.flash_history = vec![1.0];
+        let mut tracks = vec![t];
+        let strikes = vec![
+            (
+                (0.5, 0.5),
+                EventAttrs {
+                    cloud_indicator: None,
+                    peak_current_ka: Some(30.0),
+                    multiplicity: None,
+                },
+            );
+            3
+        ];
+        apply_lightning(
+            &mut tracks,
+            &strikes,
+            &[1],
+            1,
+            PixelScale { x: 1.0, y: 1.0 },
+            60.0,
+            test_instant(),
+        );
+        assert_eq!(tracks[0].cg_count, None);
+        assert_eq!(tracks[0].ic_count, None);
+        assert_eq!(tracks[0].cg_positive_count, Some(0));
     }
 }

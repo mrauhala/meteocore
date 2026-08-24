@@ -204,6 +204,13 @@ const INTENSITY_TREND_CEILING_DBZ_MIN: f64 = 2.0;
 /// difference between a 6σ and a 9σ surge is not what should decide a rank.
 const JUMP_SIGMA_FLOOR: f64 = 2.0;
 const JUMP_SIGMA_CEILING: f64 = 6.0;
+/// Positive-CG share ramp. Roughly 10-20% of CG flashes are positive in
+/// ordinary storms, so a floor at 5% keeps normal background from scoring at
+/// all; a CG population half positive is already the anomalous severe-storm
+/// signature, so the term saturates there rather than reserving its top half
+/// for fractions that essentially never occur.
+const POSITIVE_CG_FLOOR: f64 = 0.05;
+const POSITIVE_CG_CEILING: f64 = 0.5;
 
 /// Speed below which an echo is "not going anywhere" (m/s).
 ///
@@ -320,7 +327,13 @@ impl SignificanceTerms for CellFactSheet {
                 },
             ));
             if let Some(frac) = lightning.positive_cg_fraction {
-                terms.push(Term::new("positive_cg", frac));
+                // Ramped like every other term: the raw fraction would let an
+                // ordinary 10% background share carry real weight while a 50%
+                // share — already the severe signature — scored only half.
+                terms.push(Term::new(
+                    "positive_cg",
+                    ramp(frac, POSITIVE_CG_FLOOR, POSITIVE_CG_CEILING),
+                ));
             }
             terms.push(Term::new(
                 "flash_rate",
@@ -791,5 +804,42 @@ mod tests {
             !unknown.terms().iter().any(|t| t.name == "positive_cg"),
             "an unreported share must emit no term at all"
         );
+    }
+
+    #[test]
+    fn positive_cg_saturates_at_the_documented_ceiling() {
+        // Pins the RAMP, which relative ordering alone cannot: a raw fraction
+        // and a ramped one both put 0.75 above 0.05.
+        let facts = |frac: f64| {
+            let mut c = cell(1);
+            c.lightning = Some(LightningFacts {
+                flash_count: 20,
+                flash_rate_per_min: 8.0,
+                flash_density_per_km2: 0.5,
+                jump: false,
+                jump_sigma: None,
+                cg_count: Some(20),
+                ic_count: Some(0),
+                positive_cg_fraction: Some(frac),
+                first_flash: None,
+            });
+            c
+        };
+        let term = |c: &CellFactSheet| {
+            c.terms()
+                .iter()
+                .find(|t| t.name == "positive_cg")
+                .expect("term present")
+                .value
+        };
+        // Background share sits at the floor and contributes nothing.
+        assert_eq!(term(&facts(0.05)), 0.0);
+        assert_eq!(term(&facts(0.02)), 0.0);
+        // A half-positive CG population is already maximal, and anything
+        // beyond it stays there rather than needing 100% to saturate.
+        assert_eq!(term(&facts(0.5)), 1.0);
+        assert_eq!(term(&facts(0.9)), 1.0);
+        // Midpoint of the ramp, not of 0..1.
+        assert!((term(&facts(0.275)) - 0.5).abs() < 1e-9);
     }
 }

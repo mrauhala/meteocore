@@ -151,12 +151,24 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   source reports no discriminator, and a number when measured. "This network
   doesn't say" and "no CG flashes" are different facts and only one of them
   licenses a statement.
+- **The split and the polarity are gated INDEPENDENTLY** (`any_attrs` vs
+  `any_polarity` in `apply_lightning`), because `cloud_indicator_col` and
+  `peak_current_col` are independently optional. Gating both on the split
+  made a split-only network report `positive_cg_fraction: 0.0` for every
+  CG-producing cell — "we checked and found no positive flashes" about a
+  question it never asked. Caught in review on #618; the two flags exist
+  solely to keep that from returning.
 - **`positive_cg_fraction` is `None` when `cg_count == 0`**, never 0.0 — 0/0
   is not 0%. A cell with only IC flashes has no CG polarity to report.
 - Polarity comes from the SIGN of `peak_current`, not its magnitude. A zero
   current yields `None` (no polarity) rather than "positive".
-- `positive_cg` is weighted at 0.6 and ramps 0.05→0.5: a few +CG flashes are
-  normal background, a +CG-dominated cell is the severe-storm signal.
+- `positive_cg` is weighted at 0.6 and ramps `POSITIVE_CG_FLOOR` 0.05 →
+  `POSITIVE_CG_CEILING` 0.5: a few +CG flashes are normal background, and a
+  CG population half positive is already the severe signature, so the term
+  saturates there rather than reserving its top half for shares that
+  essentially never occur. Test the RAMP, not just the ordering — a relative
+  `assert!(a > b)` passes with no ramp at all, which is how the missing one
+  reached review.
 
 ## Fact sheets + significance ranking
 
