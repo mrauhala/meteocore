@@ -92,6 +92,11 @@ const SORTABLES_BASE: &[&str] = &[
     "speed_ms",
     "bearing_deg",
     "intensity_trend_dbz_min",
+    "net_displacement_km",
+    "path_straightness",
+    // #630: served, therefore sortable. A field a client can see but cannot
+    // order by is a capability announced and withheld.
+    "likely_clutter",
 ];
 /// Extras that exist only with `lightning_source` wired.
 ///
@@ -1392,6 +1397,12 @@ fn score_cells(
                 // cannot be shown to move with the flow or against it, and
                 // `false` would assert non-deviance from unknown motion.
                 deviant_mover: t.velocity_kms.map(|_| t.deviant()),
+                // Only meaningful once there is a track: a newborn has not
+                // had the chance to go anywhere, which is not the same as
+                // having failed to.
+                net_displacement_km: (t.age > 1)
+                    .then(|| round_to(f64::from(t.net_displacement_km), 1)),
+                path_straightness: t.path_straightness().map(|v| round_to(f64::from(v), 2)),
                 // From the RAW speed, like the impact lookahead: the rounded
                 // value is for display and a threshold comparison should not
                 // depend on it.
@@ -1487,6 +1498,17 @@ fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
     props.insert("max_dbz".into(), PropertyValue::Float(t.max_dbz));
     props.insert("area_km2".into(), PropertyValue::Float(t.area_km2));
     props.insert("track_age".into(), PropertyValue::Integer(t.age as i64));
+    for (key, value) in [
+        ("net_displacement_km", t.net_displacement_km),
+        ("path_straightness", t.path_straightness),
+    ] {
+        props.insert(
+            key.into(),
+            value
+                .map(PropertyValue::Float)
+                .unwrap_or(PropertyValue::Null),
+        );
+    }
     props.insert(
         "deviant_mover".into(),
         t.deviant_mover

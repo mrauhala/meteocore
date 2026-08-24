@@ -188,6 +188,35 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   `assert!(a > b)` passes with no ramp at all, which is how the missing one
   reached review.
 
+## Path straightness, and why `track_age` is not evidence (#629)
+
+Observed 2026-08-24: one track id ping-ponging between two fixed echoes 6.3 km
+apart reported `track_age: 12`. An hour-long track reads as "definitely real";
+this one was two stationary ground echoes and an association failure.
+
+- **`track_age` can be manufactured. Displacement cannot.**
+  `net_displacement_km` is measured from `first_centroid` every frame, so an
+  association jump cannot inflate it — the jump moves the cell back and forth
+  around the same origin.
+- **`path_straightness` = net / path-integrated.** Real advection sits near 1;
+  the reported track scored ~0.2. The metric works because an association
+  failure inflates the PATH without inflating the NET, and nothing else in the
+  payload exposes that asymmetry.
+- **The two fields answer different questions and both are needed.** A
+  *wandering* track has a long path and a short net, so straightness catches
+  it. A *perfectly stationary* echo has both near zero, so the ratio is 0/0 and
+  straightness is `None` — `net_displacement_km` is what speaks there. Do not
+  collapse them into one field.
+- **`deviant_mover` is gated on coherence** (`DEVIANT_MIN_STRAIGHTNESS`).
+  A track whose own displacement is incoherent has motion estimates that
+  measure association noise, and the reported track's spurious
+  `deviant_mover: true` reached `significance_reasons` and inflated its rank.
+  Unknown straightness does NOT qualify: this awards a bonus, and an
+  unverifiable claim should not earn one.
+- Path length uses `PixelScale::distance`, the same anisotropy-aware helper
+  the matcher uses for its gates. A second hand-rolled copy is how the
+  Critical Rule 4 drift happened.
+
 ## Severity and trend hysteresis (#623)
 
 Both fields flapped on coherent tracks. Reported 2026-08-24: one clean

@@ -202,6 +202,19 @@ pub struct CellFactSheet {
     /// re-detected fixed echo is always a newborn. The payload must not claim
     /// what it doesn't know; the scorer must not reward not knowing.
     pub deviant_mover: Option<bool>,
+    /// Straight-line distance from where this track was first detected, km.
+    ///
+    /// The answer to "has it actually gone anywhere", which `track_age` is
+    /// routinely mistaken for. An association failure can manufacture a long
+    /// track out of stationary echoes; it cannot manufacture displacement.
+    pub net_displacement_km: Option<f64>,
+    /// Net displacement over path-integrated distance, 0..=1 (#629).
+    ///
+    /// Real advection sits near 1. A track that wanders without arriving —
+    /// the signature of an association failure swapping between co-located
+    /// fixed echoes — sits near 0. `None` when the path is too short to have
+    /// a direction; read `net_displacement_km` for that case.
+    pub path_straightness: Option<f64>,
     /// Persistent, near-stationary echo — most likely ground clutter (wind
     /// turbines, masts) rather than weather. See [`is_likely_clutter`].
     pub likely_clutter: bool,
@@ -427,6 +440,8 @@ mod tests {
             speed_ms: Some(14.0),
             bearing_deg: Some(45.0),
             deviant_mover: Some(false),
+            net_displacement_km: None,
+            path_straightness: None,
             likely_clutter: false,
             trend: None,
             intensity_trend_dbz_min: None,
