@@ -126,11 +126,21 @@ pub struct CollectionParam {
 pub struct StormCellsParams {
     /// Collection id serving tracked storm cells.
     pub collection: String,
-    /// How many cells to return, most significant first (default 10, max 50).
+    /// How many cells to return (default 10, max 50).
     pub limit: Option<usize>,
     /// RFC 3339 instant. Returns the cell situation at the newest analysis
     /// frame at or before this time. Omit for the latest frame.
     pub at: Option<String>,
+    /// Property to order by. Omit for significance, which is almost always
+    /// what you want. Must be one of the collection's sortable_properties
+    /// (get_collection_info lists them); anything else is an error naming the
+    /// valid options rather than a silently different ordering.
+    pub sort_by: Option<String>,
+    /// "desc" (default) or "asc". Ignored unless sort_by is given.
+    pub order: Option<String>,
+    /// Drop cells below this significance, 0..=1. Applied after ordering, so
+    /// it narrows the result rather than changing what ranks first.
+    pub min_significance: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -246,6 +256,9 @@ impl MeteoCoreMcp {
             collection,
             limit,
             at,
+            sort_by,
+            order,
+            min_significance,
         }): Parameters<StormCellsParams>,
     ) -> Result<String, ErrorData> {
         let state = self.state.load();
@@ -263,6 +276,43 @@ impl MeteoCoreMcp {
             Some(n) => n.min(MAX_CELLS),
             None => DEFAULT_CELLS,
         };
+        // Validated against what the engine can actually order by, and the
+        // error names the alternatives — an unknown key must not degrade to a
+        // different-but-plausible ordering (#605, #630).
+        let sortby = match sort_by.as_deref() {
+            None => vec![SortKey::descending("significance")],
+            Some(key) => {
+                let sortables = engine.sortables();
+                if !sortables.contains(&key) {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "Cannot sort by '{key}' on collection '{collection}'. \
+                             Sortable properties: {}",
+                            sortables.join(", ")
+                        ),
+                        None,
+                    ));
+                }
+                match order.as_deref() {
+                    None | Some("desc") => vec![SortKey::descending(key)],
+                    Some("asc") => vec![SortKey::ascending(key)],
+                    Some(other) => {
+                        return Err(ErrorData::invalid_params(
+                            format!("order must be \"asc\" or \"desc\", got '{other}'"),
+                            None,
+                        ))
+                    }
+                }
+            }
+        };
+        if let Some(min) = min_significance {
+            if !(0.0..=1.0).contains(&min) {
+                return Err(ErrorData::invalid_params(
+                    format!("min_significance must be between 0 and 1, got {min}"),
+                    None,
+                ));
+            }
+        }
         let requested_at = at.as_deref().map(parse_instant).transpose()?;
         let datetime = requested_at.map(|t| {
             // Newest frame at or before `at` — the same "which frame am I
@@ -281,9 +331,32 @@ impl MeteoCoreMcp {
                 limit,
                 offset: 0,
                 datetime,
-                sortby: vec![SortKey::descending("significance")],
+                sortby,
             })
             .map_err(query_failed)?;
+
+        // Applied AFTER the bounded page, so it narrows what was returned
+        // rather than reaching deeper into the ranking. The count of what it
+        // removed is reported: a model that asked for 10 and got 3 must be
+        // able to tell "only 3 cells exist" from "7 were below your floor".
+        let (cells, below_floor) = match min_significance {
+            None => (page.features.clone(), 0usize),
+            Some(min) => {
+                let kept: Vec<_> = page
+                    .features
+                    .iter()
+                    .filter(|f| {
+                        f.properties
+                            .get("significance")
+                            .and_then(|v| v.as_f64())
+                            .is_some_and(|v| v >= min)
+                    })
+                    .cloned()
+                    .collect();
+                let removed = page.features.len() - kept.len();
+                (kept, removed)
+            }
+        };
 
         let observed = page
             .features
@@ -316,9 +389,12 @@ impl MeteoCoreMcp {
             "observed": observed,
             "no_frame_for_requested_time": outside_retention,
             "retained_frames": retained_frames,
-            "returned": page.number_returned,
+            "returned": cells.len(),
             "total_tracked": page.number_matched,
-            "cells": page.features.iter().map(cell_json).collect::<Vec<_>>(),
+            // Present only when a floor was applied, so its absence cannot be
+            // read as "nothing was filtered" on a call that set no floor.
+            "below_min_significance": min_significance.map(|_| below_floor),
+            "cells": cells.iter().map(cell_json).collect::<Vec<_>>(),
             "note": "Ranking heuristic, not an official warning. Issued warnings come from \
                      the CAP alert collections.",
         })
