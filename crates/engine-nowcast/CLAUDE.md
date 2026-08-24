@@ -188,6 +188,54 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   `assert!(a > b)` passes with no ramp at all, which is how the missing one
   reached review.
 
+## Severity and trend hysteresis (#623)
+
+Both fields flapped on coherent tracks. Reported 2026-08-24: one clean
+50-minute track, growing monotonically the whole time, changed `severity` nine
+times and alternated `volume_trend` six times. A client animates that as a
+storm exploding and collapsing every five minutes.
+
+- **Cause was hard binning, not bad data.** `max_dbz` noise runs about +/-2 dB
+  and the bins are steps at 45/50/55, so a cell parked near a boundary crosses
+  it every frame without changing physically. `volume_trend` was a bare
+  `volume >= prev.volume`, which forces an answer even when nothing moved and
+  lets noise pick it.
+- **Severity hysteresis is ASYMMETRIC and that is the point.** Rising is
+  immediate; falling must clear `SEVERITY_DOWNGRADE_DEADBAND_DBZ` below the
+  step. Under-calling a strengthening storm while a filter waits for
+  confirmation is the one failure mode worth avoiding, so the damping only
+  ever applies downward. A genuine collapse still drops in a single frame,
+  because the relaxed test is re-evaluated rather than a dwell counter.
+- **Cost: severity is now path-dependent.** Two cells with identical current
+  pixels can report different severity if they arrived from different
+  directions. Inherent to hysteresis, and the intended trade against a value
+  that changes for reasons unrelated to the weather. `severity()` stays
+  memoryless for cells with no history; `severity_hysteretic()` is for tracked
+  ones.
+- **`volume_trend` holds its previous verdict inside `TREND_FLIP_DEADBAND`,
+  measured from an ANCHOR — not from the previous frame.** The anchor is the
+  volume at which the current verdict was last confirmed, carried on the track
+  as `trend_anchor_volume` and reset only when the verdict is confirmed.
+  - Holding, not recomputing, is what stops the alternation.
+  - Anchoring is what stops the hold from becoming a trap. Measuring against
+    the previous frame meant a real trend whose per-frame change never cleared
+    the band could never flip the verdict — 5% growth per frame for twenty
+    frames is a 165% increase that would still have reported "decaying".
+    Caught in review on #627. Genuine noise oscillates around the anchor and
+    never accumulates; a real trend accrues until it clears the band.
+  - `TREND_MIN_VOLUME_CHANGE` is an absolute floor alongside the relative one.
+    A marginal cell has volume near zero, so 10% of it is also near zero and
+    any wobble flips the verdict. **Uncalibrated** — picked from the units,
+    not from measured marginal-cell traces.
+  - With no previous verdict AND a change too small to call, it stays `None` —
+    unknown beats a coin flip presented as a measurement.
+  - Test trend behaviour by WALKING a series, not with single steps. The
+    single-step tests in the first draft passed while the trap was present.
+- Severity feeds significance at weight 1.0, so stabilising it stabilises the
+  ranking too. Tests pin that the raw binner flaps 7 times on a sequence where
+  the hysteretic one flaps 0 — without that precondition assertion the fix
+  could be passing for the wrong reason.
+
 ## The null contract, and why the scorer does not follow it
 
 Reported by a model consuming the live `/mcp` surface on 2026-08-24 (#620-#623;
