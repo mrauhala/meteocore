@@ -89,7 +89,13 @@ pub struct LightningFacts {
     pub flash_density_per_km2: f64,
     /// Schultz-style 2σ jump fired this generation. Derived from `jump_sigma`
     /// so the two cannot disagree.
-    pub jump: bool,
+    /// Schultz-style 2σ jump fired this generation.
+    ///
+    /// `None` when there is no baseline to test against (fewer than two
+    /// generations of flash history) — a jump is not computable from a single
+    /// frame, and `false` would assert one was ruled out. Same
+    /// no-bonus-but-no-claim treatment as `deviant_mover`.
+    pub jump: Option<bool>,
     /// How far above its own recent baseline this cell's flash rate sits, in
     /// standard deviations.
     ///
@@ -185,7 +191,18 @@ pub struct CellFactSheet {
     pub speed_ms: Option<f64>,
     /// Compass bearing the cell moves toward.
     pub bearing_deg: Option<f64>,
-    pub deviant_mover: bool,
+    /// Sustained motion off the ambient flow.
+    ///
+    /// `None` when the track has no velocity yet — a newborn cannot be shown
+    /// to move with the flow OR against it, and `false` would assert
+    /// non-deviance from unknown motion.
+    ///
+    /// **Scoring treats `None` as "no bonus" (0.0), NOT as an absent term.**
+    /// Absent would renormalize the denominator, making every other term
+    /// weigh more and handing every newborn a systematic score boost — and a
+    /// re-detected fixed echo is always a newborn. The payload must not claim
+    /// what it doesn't know; the scorer must not reward not knowing.
+    pub deviant_mover: Option<bool>,
     /// Persistent, near-stationary echo — most likely ground clutter (wind
     /// turbines, masts) rather than weather. See [`is_likely_clutter`].
     pub likely_clutter: bool,
@@ -301,7 +318,10 @@ impl SignificanceTerms for CellFactSheet {
             Term::new("severity", f64::from(self.severity.rank()) / 3.0),
             Term::new("max_dbz", ramp(self.max_dbz, DBZ_FLOOR, DBZ_CEILING)),
             Term::new("area", ramp(self.area_km2, 0.0, AREA_CEILING_KM2)),
-            Term::flag("deviant_mover", self.deviant_mover),
+            // unwrap_or(false) = "no deviant-mover bonus", which is the
+            // right default for unknown motion. See the field docs for why
+            // this is NOT `if let Some(..)` like the trend term below.
+            Term::flag("deviant_mover", self.deviant_mover.unwrap_or(false)),
             Term::flag("clutter", self.likely_clutter),
         ];
 
@@ -323,15 +343,14 @@ impl SignificanceTerms for CellFactSheet {
 
         if let Some(lightning) = self.lightning {
             // Scaled by magnitude rather than a flag: a 5σ surge should
-            // outrank a cell that merely crossed the threshold. Falls back to
-            // the boolean when there is no baseline yet.
+            // outrank a cell that merely crossed the threshold. A jump with
+            // no sigma still scores full — it happened, it just can't be
+            // graded. An UNKNOWN jump scores 0: no bonus, no claim.
             terms.push(Term::new(
                 "lightning_jump",
-                match lightning.jump_sigma {
-                    Some(sigma) if lightning.jump => {
-                        ramp(sigma, JUMP_SIGMA_FLOOR, JUMP_SIGMA_CEILING)
-                    }
-                    _ if lightning.jump => 1.0,
+                match (lightning.jump, lightning.jump_sigma) {
+                    (Some(true), Some(sigma)) => ramp(sigma, JUMP_SIGMA_FLOOR, JUMP_SIGMA_CEILING),
+                    (Some(true), None) => 1.0,
                     _ => 0.0,
                 },
             ));
@@ -408,7 +427,7 @@ mod tests {
             age: 5,
             speed_ms: Some(14.0),
             bearing_deg: Some(45.0),
-            deviant_mover: false,
+            deviant_mover: Some(false),
             likely_clutter: false,
             trend: None,
             intensity_trend_dbz_min: None,
@@ -436,7 +455,7 @@ mod tests {
             flash_density_per_km2: 0.0,
             jump_sigma: None,
             first_flash: None,
-            jump: true,
+            jump: Some(true),
         });
         full.volume = Some(VolumeFacts {
             vil_kg_m2: 20.0,
@@ -496,7 +515,7 @@ mod tests {
             cg_polarity_known: None,
             positive_cg_fraction: None,
             first_flash: None,
-            jump: false,
+            jump: Some(false),
         });
         let s = scorer();
         let bare_score = s.score_one(&bare).score;
@@ -580,7 +599,7 @@ mod tests {
             cg_polarity_known: None,
             positive_cg_fraction: None,
             first_flash: None,
-            jump: false,
+            jump: Some(false),
         });
         let mut jumping = cell(2);
         jumping.lightning = Some(LightningFacts {
@@ -593,7 +612,7 @@ mod tests {
             cg_polarity_known: None,
             positive_cg_fraction: None,
             first_flash: None,
-            jump: true,
+            jump: Some(true),
         });
         let s = scorer();
         assert!(s.score_one(&jumping).score > s.score_one(&quiet).score);
@@ -608,7 +627,7 @@ mod tests {
         dangerous.severity = Severity::VerySevere;
         dangerous.max_dbz = 57.0;
         dangerous.area_km2 = 90.0;
-        dangerous.deviant_mover = true;
+        dangerous.deviant_mover = Some(true);
         dangerous.intensity_trend_dbz_min = Some(1.2);
         dangerous.lightning = Some(LightningFacts {
             flash_count: 40,
@@ -620,7 +639,7 @@ mod tests {
             cg_polarity_known: None,
             positive_cg_fraction: None,
             first_flash: None,
-            jump: true,
+            jump: Some(true),
         });
         dangerous.impact = Some(ImpactFacts {
             over: Some("Nurmijärvi".into()),
@@ -726,7 +745,7 @@ mod tests {
             flash_count: 30,
             flash_rate_per_min: 12.0,
             flash_density_per_km2: 0.5,
-            jump: true,
+            jump: Some(true),
             jump_sigma: Some(2.1),
             cg_count: None,
             ic_count: None,
@@ -755,7 +774,7 @@ mod tests {
             flash_count: 40,
             flash_rate_per_min: 20.0,
             flash_density_per_km2: 1.0,
-            jump: true,
+            jump: Some(true),
             jump_sigma: None,
             cg_count: None,
             ic_count: None,
@@ -765,7 +784,7 @@ mod tests {
         });
         let mut quiet = c.clone();
         quiet.lightning = Some(LightningFacts {
-            jump: false,
+            jump: Some(false),
             ..c.lightning.unwrap()
         });
         let s = scorer();
@@ -778,7 +797,7 @@ mod tests {
             flash_count: 20,
             flash_rate_per_min: 8.0,
             flash_density_per_km2: 0.5,
-            jump: false,
+            jump: Some(false),
             jump_sigma: Some(0.5),
             cg_count: Some(20),
             ic_count: Some(0),
@@ -811,7 +830,7 @@ mod tests {
             flash_count: 20,
             flash_rate_per_min: 8.0,
             flash_density_per_km2: 0.5,
-            jump: false,
+            jump: Some(false),
             jump_sigma: None,
             cg_count: None,
             ic_count: None,
@@ -835,7 +854,7 @@ mod tests {
                 flash_count: 20,
                 flash_rate_per_min: 8.0,
                 flash_density_per_km2: 0.5,
-                jump: false,
+                jump: Some(false),
                 jump_sigma: None,
                 cg_count: Some(20),
                 ic_count: Some(0),
@@ -861,5 +880,80 @@ mod tests {
         assert_eq!(term(&facts(0.9)), 1.0);
         // Midpoint of the ramp, not of 0..1.
         assert!((term(&facts(0.275)) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unknown_motion_scores_as_no_bonus_not_as_an_absent_term() {
+        // The subtle one. Making an unknown flag ABSENT looks like the right
+        // application of "absent terms renormalize", but that rule is for a
+        // source nobody has wired — it affects every cell equally. For
+        // per-cell missingness, dropping the term shrinks the denominator, so
+        // every OTHER term weighs more and the cell scores HIGHER. A
+        // re-detected fixed echo is always a newborn, so renormalizing on
+        // unknown motion would promote exactly the clutter we demote.
+        let mut unknown = cell(1);
+        unknown.deviant_mover = None;
+        let mut known_not_deviant = cell(2);
+        known_not_deviant.deviant_mover = Some(false);
+
+        let terms_of = |c: &CellFactSheet| {
+            c.terms()
+                .iter()
+                .find(|t| t.name == "deviant_mover")
+                .map(|t| t.value)
+        };
+        assert_eq!(terms_of(&unknown), Some(0.0), "present, contributing zero");
+        assert_eq!(terms_of(&known_not_deviant), Some(0.0));
+
+        let s = scorer();
+        assert_eq!(
+            s.score_one(&unknown).score,
+            s.score_one(&known_not_deviant).score,
+            "not knowing must not out-score knowing the answer is no"
+        );
+    }
+
+    #[test]
+    fn a_deviant_mover_still_earns_its_bonus() {
+        let mut plain = cell(1);
+        plain.deviant_mover = Some(false);
+        let mut deviant = cell(2);
+        deviant.deviant_mover = Some(true);
+        let s = scorer();
+        assert!(s.score_one(&deviant).score > s.score_one(&plain).score);
+    }
+
+    #[test]
+    fn an_unknown_lightning_jump_scores_zero_but_a_baseline_free_jump_scores_full() {
+        let facts = |jump, sigma| LightningFacts {
+            flash_count: 30,
+            flash_rate_per_min: 12.0,
+            flash_density_per_km2: 1.0,
+            jump,
+            jump_sigma: sigma,
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
+            first_flash: None,
+        };
+        let term_of = |l| {
+            let mut c = cell(1);
+            c.lightning = Some(l);
+            c.terms()
+                .iter()
+                .find(|t| t.name == "lightning_jump")
+                .map(|t| t.value)
+                .expect("term present")
+        };
+        // Unknown: no baseline existed, so the test never ran.
+        assert_eq!(term_of(facts(None, None)), 0.0);
+        // Known-no-jump: the test ran and said no.
+        assert_eq!(term_of(facts(Some(false), Some(0.5))), 0.0);
+        // A jump with no sigma still scores full — it happened, it just
+        // cannot be graded.
+        assert_eq!(term_of(facts(Some(true), None)), 1.0);
+        // Graded by magnitude once there is a baseline.
+        assert!(term_of(facts(Some(true), Some(6.0))) > term_of(facts(Some(true), Some(2.5))));
     }
 }
