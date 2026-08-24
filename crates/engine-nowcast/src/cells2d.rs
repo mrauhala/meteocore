@@ -74,25 +74,114 @@ pub const MIN_JUMP_RATE_PER_MIN: f32 = 10.0;
 /// a number a client can render and compare, while still reading as extreme.
 pub const JUMP_SIGMA_FLAT_HISTORY: f32 = 10.0;
 
-/// Rank a cell from max intensity and area: one point per crossed max-dBZ
-/// step (45/50/55) plus one for area ≥ 50 km² — 0 ⇒ weak … 3+ ⇒ very
-/// severe. Deliberately simple and monotone; a tree-based model replaces
-/// this in V2.4.
-pub fn severity(blob: &CellBlob, area_km2: f64) -> Severity {
+/// dBZ the peak must fall BELOW a step, beyond the step itself, before the
+/// severity is allowed to drop back through it (#623).
+///
+/// Frame-to-frame `max_dbz` noise on a real cell runs about ±2 dB while the
+/// bins are hard steps at 45/50/55, so a cell sitting near a boundary crosses
+/// it repeatedly without changing in any physical sense. Observed 2026-08-24:
+/// one coherent 50-minute track, growing monotonically the whole time,
+/// reported nine severity changes — a client animates that as a storm
+/// exploding and collapsing every five minutes.
+pub const SEVERITY_DOWNGRADE_DEADBAND_DBZ: f32 = 2.0;
+/// Same idea for the area point, relative because cell areas span orders of
+/// magnitude and a fixed km² slack would be meaningless at both ends.
+pub const SEVERITY_DOWNGRADE_DEADBAND_AREA: f64 = 0.15;
+
+/// Points behind the severity rank, with per-criterion slack applied.
+///
+/// `slack` is only ever non-zero when testing whether an ALREADY severe cell
+/// may drop; it makes each criterion easier to keep than to earn.
+fn severity_points(blob: &CellBlob, area_km2: f64, dbz_slack: f32, area_slack: f64) -> u32 {
     let mut points = 0u32;
     for step in [45.0f32, 50.0, 55.0] {
-        if blob.max_value >= step {
+        if blob.max_value >= step - dbz_slack {
             points += 1;
         }
     }
-    if area_km2 >= 50.0 {
+    if area_km2 >= 50.0 * (1.0 - area_slack) {
         points += 1;
     }
+    points
+}
+
+fn severity_from_points(points: u32) -> Severity {
     match points {
         0 => Severity::Weak,
         1 => Severity::Moderate,
         2 => Severity::Severe,
         _ => Severity::VerySevere,
+    }
+}
+
+/// Rank a cell from max intensity and area: one point per crossed max-dBZ
+/// step (45/50/55) plus one for area ≥ 50 km² — 0 ⇒ weak … 3+ ⇒ very
+/// severe. Deliberately simple and monotone; a tree-based model replaces
+/// this in V2.4.
+///
+/// This is the memoryless form, used for a cell with no history. Tracked
+/// cells go through [`severity_hysteretic`].
+pub fn severity(blob: &CellBlob, area_km2: f64) -> Severity {
+    severity_from_points(severity_points(blob, area_km2, 0.0, 0.0))
+}
+
+/// Severity for a tracked cell, damped against boundary flapping (#623).
+///
+/// **Deliberately asymmetric.** Rising is immediate: a strengthening storm
+/// must never be under-called while a filter waits for confirmation. Falling
+/// requires the peak to clear [`SEVERITY_DOWNGRADE_DEADBAND_DBZ`] below the
+/// step it earned, so noise alone cannot walk a cell back down.
+///
+/// The cost is that severity becomes path-dependent — two cells with
+/// identical current pixels can report different severity if they arrived
+/// from different directions. That is inherent to hysteresis and is the
+/// intended trade: the alternative is a value that changes every frame for
+/// reasons that are not about the weather.
+pub fn severity_hysteretic(blob: &CellBlob, area_km2: f64, prev: Option<Severity>) -> Severity {
+    let raw = severity(blob, area_km2);
+    let Some(prev) = prev else {
+        return raw;
+    };
+    if raw.rank() >= prev.rank() {
+        return raw;
+    }
+    // Falling. Re-test with the criteria relaxed; hold the old rank if the
+    // cell still clears them, and otherwise drop only as far as the relaxed
+    // test allows — a genuine collapse still registers in one frame.
+    let held = severity_from_points(severity_points(
+        blob,
+        area_km2,
+        SEVERITY_DOWNGRADE_DEADBAND_DBZ,
+        SEVERITY_DOWNGRADE_DEADBAND_AREA,
+    ));
+    if held.rank() >= prev.rank() {
+        prev
+    } else {
+        held
+    }
+}
+
+/// Relative volume change needed to flip the growing/decaying verdict (#623).
+///
+/// The old test was a bare `volume >= prev.volume`, so a cell that had not
+/// meaningfully changed still had to answer growing or decaying, and noise
+/// decided which. The same 50-minute track that flapped severity alternated
+/// this six times while growing monotonically.
+pub const TREND_FLIP_DEADBAND: f32 = 0.10;
+
+/// Growing / decaying, holding the previous verdict inside the deadband.
+///
+/// `None` propagates only when there was no previous verdict AND the change
+/// is too small to call — "no trend established yet" rather than a coin flip.
+fn volume_trend(volume_now: f32, volume_prev: f32, prev_verdict: Option<bool>) -> Option<bool> {
+    let base = volume_prev.abs().max(f32::EPSILON);
+    let change = (volume_now - volume_prev) / base;
+    if change > TREND_FLIP_DEADBAND {
+        Some(true)
+    } else if change < -TREND_FLIP_DEADBAND {
+        Some(false)
+    } else {
+        prev_verdict
     }
 }
 
@@ -255,15 +344,16 @@ pub fn advance_tracks(
         .zip(matched_prev)
         .map(|(blob, prev_idx)| {
             let area_km2 = blob.area as f64 * f64::from(scale.x) * f64::from(scale.y);
-            let severity = severity(&blob, area_km2);
+            // Severity is hysteretic for a tracked cell (#623), so it can only
+            // be computed once the predecessor is known — see each arm below.
             match prev_idx {
                 None => CellTrack {
                     id: next_id(),
+                    severity: severity(&blob, area_km2),
                     blob,
                     age: 1,
                     velocity_kms: None,
                     deviant_streak: 0,
-                    severity,
                     growing: None,
                     intensity_tendency: 0.0,
                     flash_count: None,
@@ -315,7 +405,9 @@ pub fn advance_tracks(
                     let deviant_now = residual_ms > DEVIANT_RESIDUAL_MS
                         && cell_speed_ms > DEVIANT_MIN_CELL_SPEED_MS;
 
-                    let growing = Some(blob.volume >= prev.blob.volume);
+                    // Held inside the deadband rather than recomputed from a
+                    // bare comparison, which made noise answer the question.
+                    let growing = volume_trend(blob.volume, prev.blob.volume, prev.growing);
                     // Mean-exceedance trend, per second, EMA'd with the
                     // track's history (newborns start at 0 ⇒ first
                     // measurement is halved — mild warm-up damping).
@@ -326,6 +418,7 @@ pub fn advance_tracks(
                     let intensity_tendency = 0.5 * raw_tendency + 0.5 * prev.intensity_tendency;
                     CellTrack {
                         id: prev.id,
+                        severity: severity_hysteretic(&blob, area_km2, Some(prev.severity)),
                         blob,
                         age: prev.age + 1,
                         growing,
@@ -336,7 +429,6 @@ pub fn advance_tracks(
                         } else {
                             0
                         },
-                        severity,
                         // The join (apply_lightning) fills this generation's
                         // stats after matching; the baseline history rides
                         // the track.
@@ -1194,5 +1286,110 @@ mod tests {
         // B is unaffected and reports what it actually measured.
         assert_eq!(tracks[1].cg_count, Some(1));
         assert_eq!(tracks[1].cg_positive_count, Some(1));
+    }
+
+    // ---- #623 severity hysteresis / trend deadband -----------------------
+
+    fn blob_at(max_dbz: f32, area: usize) -> CellBlob {
+        CellBlob {
+            centroid: (0.5, 0.5),
+            area,
+            volume: max_dbz * area as f32,
+            max_value: max_dbz,
+        }
+    }
+
+    #[test]
+    fn severity_rises_immediately_but_falls_only_past_the_deadband() {
+        // Rising: never damped. Under-calling a strengthening storm while a
+        // filter waits for confirmation is the one failure worth avoiding.
+        let strengthening = blob_at(50.5, 10);
+        assert_eq!(
+            severity_hysteretic(&strengthening, 10.0, Some(Severity::Weak)),
+            Severity::Severe,
+            "a jump upward is reported the frame it happens"
+        );
+
+        // Falling by less than the deadband: held.
+        let jitter = blob_at(49.4, 10);
+        assert_eq!(
+            severity_hysteretic(&jitter, 10.0, Some(Severity::Severe)),
+            Severity::Severe,
+            "0.6 dB under the step is noise, not a downgrade"
+        );
+
+        // Falling clear past it: drops, in one frame.
+        let collapsed = blob_at(47.0, 10);
+        assert_eq!(
+            severity_hysteretic(&collapsed, 10.0, Some(Severity::Severe)),
+            Severity::Moderate,
+            "a genuine collapse still registers immediately"
+        );
+    }
+
+    #[test]
+    fn a_cell_jittering_across_a_bin_edge_reports_one_severity() {
+        // The reported defect: max_dbz noise of about +/-1 dB either side of the
+        // 50 step produced moderate/severe/moderate/severe on a track that was
+        // not changing. Replay it.
+        let noise = [50.3f32, 49.6, 50.4, 49.5, 50.1, 49.7, 50.2, 49.4];
+        let mut sev = severity(&blob_at(noise[0], 10), 10.0);
+        let first = sev;
+        let mut changes = 0;
+        for &dbz in &noise[1..] {
+            let next = severity_hysteretic(&blob_at(dbz, 10), 10.0, Some(sev));
+            if next != sev {
+                changes += 1;
+            }
+            sev = next;
+        }
+        assert_eq!(changes, 0, "a cell that is not changing must not flap");
+        assert_eq!(sev, first);
+
+        // Without hysteresis the same sequence flaps on every sample, which is
+        // what makes this a fix rather than a coincidence.
+        let bare: Vec<Severity> = noise
+            .iter()
+            .map(|&d| severity(&blob_at(d, 10), 10.0))
+            .collect();
+        let bare_changes = bare.windows(2).filter(|w| w[0] != w[1]).count();
+        assert_eq!(bare_changes, 7, "precondition: the raw binner flaps here");
+    }
+
+    #[test]
+    fn volume_trend_holds_through_noise_but_follows_real_change() {
+        // Inside the deadband: keep the previous answer rather than letting
+        // noise pick one.
+        assert_eq!(volume_trend(102.0, 100.0, Some(true)), Some(true));
+        assert_eq!(volume_trend(98.0, 100.0, Some(true)), Some(true));
+        assert_eq!(volume_trend(102.0, 100.0, Some(false)), Some(false));
+
+        // Past it: follow the data, both directions.
+        assert_eq!(volume_trend(130.0, 100.0, Some(false)), Some(true));
+        assert_eq!(volume_trend(70.0, 100.0, Some(true)), Some(false));
+
+        // No previous verdict and too small to call is honestly unknown —
+        // not a coin flip dressed as a measurement.
+        assert_eq!(volume_trend(101.0, 100.0, None), None);
+
+        // A zero-volume predecessor must not divide by zero.
+        assert_eq!(volume_trend(5.0, 0.0, None), Some(true));
+    }
+
+    #[test]
+    fn a_monotonically_growing_cell_never_reports_decaying() {
+        // Cell 156 in the field report: 3.6 -> 18.9 km2 over ten frames, which
+        // flapped growing/decaying six times under the bare comparison.
+        let series = [3.6f32, 4.9, 6.2, 8.0, 9.1, 11.4, 13.0, 15.2, 16.8, 18.9];
+        let mut verdict = None;
+        for w in series.windows(2) {
+            verdict = volume_trend(w[1], w[0], verdict);
+            assert_ne!(
+                verdict,
+                Some(false),
+                "monotonic growth reported as decaying: {w:?}"
+            );
+        }
+        assert_eq!(verdict, Some(true));
     }
 }
