@@ -840,6 +840,7 @@ impl NowcastEngine {
                         geom.width as usize,
                         scale,
                         window_secs,
+                        anchor,
                     );
                     tracing::debug!(
                         collection = %self.collection_id,
@@ -1352,6 +1353,9 @@ fn score_cells(
             // would roughly double the payload to carry pure noise.
             let lon = round_to(lon, 5);
             let lat = round_to(lat, 5);
+            // Bound once: the fact sheet reports it and flash density
+            // divides by it, and the two must be the same number.
+            let area_km2 = round_to(t.blob.area as f64 * kx * ky, 1);
             CellFactSheet {
                 id: t.id,
                 observed: anchor,
@@ -1361,7 +1365,7 @@ fn score_cells(
                 // f32→f64 promotion of a gain-scaled byte prints noise for
                 // gains that aren't binary-exact (SMHI 0.4 ⇒ 36.400001525878906).
                 max_dbz: round_to(f64::from(t.blob.max_value), 1),
-                area_km2: round_to(t.blob.area as f64 * kx * ky, 1),
+                area_km2,
                 age: t.age,
                 speed_ms: speed_raw.map(|v| round_to(v, 1)),
                 bearing_deg: bearing_raw.map(|b| round_to(b, 0) % 360.0),
@@ -1388,7 +1392,17 @@ fn score_cells(
                         .flash_rate_per_min
                         .map(|r| round_to(f64::from(r), 2))
                         .unwrap_or(0.0),
+                    // Guard the divide: a degenerate zero-area cell would
+                    // otherwise produce inf and poison every downstream
+                    // comparison.
+                    flash_density_per_km2: if area_km2 > 0.0 {
+                        round_to(f64::from(count) / area_km2, 4)
+                    } else {
+                        0.0
+                    },
                     jump: t.lightning_jump,
+                    jump_sigma: t.jump_sigma.map(|v| round_to(f64::from(v), 2)),
+                    first_flash: t.first_flash,
                 }),
                 // Absent when no impact source is wired — the term then
                 // renormalizes out rather than scoring every cell as
@@ -1540,6 +1554,30 @@ fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
             "flash_rate_per_min".into(),
             t.lightning
                 .map(|l| PropertyValue::Float(l.flash_rate_per_min))
+                .unwrap_or(PropertyValue::Null),
+        );
+        props.insert(
+            "flash_density_per_km2".into(),
+            t.lightning
+                .map(|l| PropertyValue::Float(l.flash_density_per_km2))
+                .unwrap_or(PropertyValue::Null),
+        );
+        props.insert(
+            "jump_sigma".into(),
+            // Null covers both "no source this generation" and "no baseline
+            // yet" — in either case the magnitude is unknown, not zero.
+            t.lightning
+                .and_then(|l| l.jump_sigma)
+                .map(PropertyValue::Float)
+                .unwrap_or(PropertyValue::Null),
+        );
+        props.insert(
+            "first_flash".into(),
+            t.lightning
+                .and_then(|l| l.first_flash)
+                .map(|ts| {
+                    PropertyValue::String(ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                })
                 .unwrap_or(PropertyValue::Null),
         );
         props.insert(

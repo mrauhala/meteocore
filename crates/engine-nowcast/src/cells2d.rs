@@ -11,6 +11,8 @@
 //! deviant movers (right-movers etc.), the storms pure advection misplaces
 //! first.
 
+use chrono::{DateTime, Utc};
+
 use crate::motion::MotionField;
 use crate::objects::{match_cells, CellBlob, PixelScale};
 
@@ -65,6 +67,11 @@ pub const FLASH_HISTORY_LEN: usize = 6;
 /// near-zero baselines, where a single extra strike is "2σ". Revisit
 /// against live Nordic storm data if jumps never fire.
 pub const MIN_JUMP_RATE_PER_MIN: f32 = 10.0;
+/// Sigma reported when the baseline has zero spread and the rate rose.
+///
+/// A perfectly flat history makes the true value infinite; clamping keeps it
+/// a number a client can render and compare, while still reading as extreme.
+pub const JUMP_SIGMA_FLAT_HISTORY: f32 = 10.0;
 
 /// Rank a cell from max intensity and area: one point per crossed max-dBZ
 /// step (45/50/55) plus one for area ≥ 50 km² — 0 ⇒ weak … 3+ ⇒ very
@@ -123,7 +130,22 @@ pub struct CellTrack {
     /// across generations by the track id.
     pub flash_history: Vec<f32>,
     /// Schultz-style 2σ lightning jump fired this generation.
+    ///
+    /// Derived from [`Self::jump_sigma`] so the two cannot disagree; kept as
+    /// a field because existing consumers read it.
     pub lightning_jump: bool,
+    /// How far above the baseline this generation's flash rate sits, in
+    /// standard deviations of the recent history.
+    ///
+    /// The bool above answers "did it cross 2σ"; this answers "by how much",
+    /// which a 4σ surge and a 2.1σ nudge do not share. `None` until there is
+    /// enough history (≥ 2 generations) to have a baseline at all — not 0.0,
+    /// which would read as "measured, no anomaly".
+    pub jump_sigma: Option<f32>,
+    /// When this track was first attributed a flash. Electrification age is
+    /// context a raw count cannot carry: a cell producing its first flash
+    /// now is a different situation from one that has been active an hour.
+    pub first_flash: Option<DateTime<Utc>>,
 }
 
 impl CellTrack {
@@ -232,6 +254,8 @@ pub fn advance_tracks(
                     flash_rate_per_min: None,
                     flash_history: Vec::new(),
                     lightning_jump: false,
+                    jump_sigma: None,
+                    first_flash: None,
                 },
                 Some(pi) => {
                     let prev = &previous[pi];
@@ -300,6 +324,10 @@ pub fn advance_tracks(
                         flash_rate_per_min: None,
                         flash_history: prev.flash_history.clone(),
                         lightning_jump: false,
+                        jump_sigma: None,
+                        // Carried, not reset: it is the track's first flash
+                        // ever, not its first this generation.
+                        first_flash: prev.first_flash,
                     }
                 }
             }
@@ -335,6 +363,8 @@ pub fn apply_lightning(
     width: usize,
     scale: PixelScale,
     window_secs: f32,
+    // The generation's analysis instant, stamped on a track's first flash.
+    observed: DateTime<Utc>,
 ) {
     let mut counts = vec![0u32; tracks.len()];
     for &(sx, sy) in strikes_px {
@@ -364,19 +394,40 @@ pub fn apply_lightning(
     let window_min = (window_secs / 60.0).max(f32::EPSILON);
     for (t, &n) in tracks.iter_mut().zip(&counts) {
         let rate = n as f32 / window_min;
-        let jump = t.flash_history.len() >= 2 && rate >= MIN_JUMP_RATE_PER_MIN && {
+        // Keep the magnitude instead of collapsing it to the threshold test.
+        // None while there is no baseline to measure against — 0.0 would
+        // read as "measured, no anomaly", which is a different claim.
+        let sigma = if t.flash_history.len() >= 2 {
             let count = t.flash_history.len() as f32;
             let mean = t.flash_history.iter().sum::<f32>() / count;
-            let var = t
+            let sd = (t
                 .flash_history
                 .iter()
                 .map(|r| (r - mean).powi(2))
                 .sum::<f32>()
-                / count;
-            rate > mean + 2.0 * var.sqrt()
+                / count)
+                .sqrt();
+            // A flat history has zero spread, so any increase is infinitely
+            // many sigmas. Report the rise without letting it be inf.
+            Some(if sd > f32::EPSILON {
+                (rate - mean) / sd
+            } else if rate > mean {
+                JUMP_SIGMA_FLAT_HISTORY
+            } else {
+                0.0
+            })
+        } else {
+            None
         };
+        // The bool stays derived from the magnitude, so they cannot disagree.
+        let jump = rate >= MIN_JUMP_RATE_PER_MIN && sigma.is_some_and(|s| s > 2.0);
+
+        if n > 0 && t.first_flash.is_none() {
+            t.first_flash = Some(observed);
+        }
         t.flash_count = Some(n);
         t.flash_rate_per_min = Some(rate);
+        t.jump_sigma = sigma;
         t.lightning_jump = jump;
         t.flash_history.push(rate);
         if t.flash_history.len() > FLASH_HISTORY_LEN {
@@ -388,6 +439,10 @@ pub fn apply_lightning(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_instant() -> DateTime<Utc> {
+        "2026-08-24T12:00:00Z".parse().unwrap()
+    }
     use crate::motion::{estimate_motion, MotionField, MotionOptions};
     use crate::objects::segment_cells;
     use crate::Grid;
@@ -411,6 +466,8 @@ mod tests {
             flash_rate_per_min: None,
             flash_history: Vec::new(),
             lightning_jump: false,
+            jump_sigma: None,
+            first_flash: None,
         }
     }
 
@@ -434,7 +491,15 @@ mod tests {
             (30.0, 2.0),  // 8 km north of track 2 — inside the 10 km gate
             (39.5, 19.5), // ~13.4 km from track 2 — outside the gate, dropped
         ];
-        apply_lightning(&mut tracks, &strikes, &labels, w, scale, 300.0);
+        apply_lightning(
+            &mut tracks,
+            &strikes,
+            &labels,
+            w,
+            scale,
+            300.0,
+            test_instant(),
+        );
         assert_eq!(tracks[0].flash_count, Some(1));
         assert_eq!(tracks[1].flash_count, Some(2));
         let r0 = tracks[0].flash_rate_per_min.unwrap();
@@ -460,24 +525,48 @@ mod tests {
         // a burst entering the history would raise the later 2σ bar (the
         // detector deliberately distrusts cells that JUST burst).
         let burst: Vec<(f32, f32)> = vec![strike; 60]; // 12 fl/min
-        apply_lightning(&mut tracks, &burst, &labels, w, scale, 300.0);
+        apply_lightning(
+            &mut tracks,
+            &burst,
+            &labels,
+            w,
+            scale,
+            300.0,
+            test_instant(),
+        );
         assert!(!tracks[0].lightning_jump, "no jump without a baseline");
 
         // Quiet-baseline track: quiet, quiet, sub-floor uptick (4 fl/min
         // < the 10 fl/min floor — no jump, baseline [0,0,4]), then a real
         // burst: 12 ≥ floor and > mean+2σ ≈ 5.1 ⇒ jump.
         let mut tracks = vec![bare_track(2, 5.0, 5.0)];
-        apply_lightning(&mut tracks, &[], &labels, w, scale, 300.0);
-        apply_lightning(&mut tracks, &[], &labels, w, scale, 300.0);
+        apply_lightning(&mut tracks, &[], &labels, w, scale, 300.0, test_instant());
+        apply_lightning(&mut tracks, &[], &labels, w, scale, 300.0, test_instant());
         let uptick: Vec<(f32, f32)> = vec![strike; 20]; // 4 fl/min < floor
-        apply_lightning(&mut tracks, &uptick, &labels, w, scale, 300.0);
+        apply_lightning(
+            &mut tracks,
+            &uptick,
+            &labels,
+            w,
+            scale,
+            300.0,
+            test_instant(),
+        );
         assert!(!tracks[0].lightning_jump, "below the absolute floor");
-        apply_lightning(&mut tracks, &burst, &labels, w, scale, 300.0);
+        apply_lightning(
+            &mut tracks,
+            &burst,
+            &labels,
+            w,
+            scale,
+            300.0,
+            test_instant(),
+        );
         assert!(tracks[0].lightning_jump, "burst over quiet baseline");
 
         // History stays bounded.
         for _ in 0..10 {
-            apply_lightning(&mut tracks, &[], &labels, w, scale, 300.0);
+            apply_lightning(&mut tracks, &[], &labels, w, scale, 300.0, test_instant());
         }
         assert!(tracks[0].flash_history.len() <= FLASH_HISTORY_LEN);
     }
@@ -565,6 +654,8 @@ mod tests {
             flash_rate_per_min: None,
             flash_history: Vec::new(),
             lightning_jump: false,
+            jump_sigma: None,
+            first_flash: None,
         }];
         // Uniform 30 px/interval eastward flow; at 1 km/px the compensated
         // hypothesis lands 30 km from the stationary successor — far
@@ -687,5 +778,76 @@ mod tests {
         assert!((small.speed_ms().unwrap() - 13.3).abs() < 4.0);
         assert!((big.bearing_deg().unwrap() - 90.0).abs() < 20.0);
         assert!((small.bearing_deg().unwrap() - 270.0).abs() < 20.0);
+    }
+
+    #[test]
+    fn jump_sigma_is_none_without_a_baseline_and_a_value_with_one() {
+        let mut t = bare_track(1, 10.0, 10.0);
+        // No history: the magnitude is unknown, not zero.
+        apply_lightning(
+            &mut [t.clone()][..],
+            &[],
+            &[],
+            1,
+            PixelScale { x: 1.0, y: 1.0 },
+            60.0,
+            test_instant(),
+        );
+        let mut tracks = vec![t.clone()];
+        apply_lightning(
+            &mut tracks,
+            &[],
+            &[],
+            1,
+            PixelScale { x: 1.0, y: 1.0 },
+            60.0,
+            test_instant(),
+        );
+        assert_eq!(tracks[0].jump_sigma, None, "no baseline yet");
+
+        // With a flat, quiet history a surge is extreme but finite.
+        t.flash_history = vec![0.0, 0.0, 0.0];
+        let mut tracks = vec![t.clone()];
+        let strikes: Vec<(f32, f32)> = (0..50).map(|_| (0.5, 0.5)).collect();
+        apply_lightning(
+            &mut tracks,
+            &strikes,
+            &[1],
+            1,
+            PixelScale { x: 1.0, y: 1.0 },
+            60.0,
+            test_instant(),
+        );
+        let sigma = tracks[0].jump_sigma.expect("history exists");
+        assert!(sigma.is_finite(), "a flat baseline must not yield inf");
+        assert!(sigma > 2.0, "a surge from nothing is a large jump: {sigma}");
+        assert!(
+            tracks[0].lightning_jump,
+            "and the bool follows the magnitude"
+        );
+    }
+
+    #[test]
+    fn first_flash_is_stamped_once_and_carried() {
+        let mut t = bare_track(1, 0.5, 0.5);
+        t.flash_history = vec![1.0, 1.0];
+        let mut tracks = vec![t];
+        let scale = PixelScale { x: 1.0, y: 1.0 };
+        // No strikes: nothing to stamp.
+        apply_lightning(&mut tracks, &[], &[1], 1, scale, 60.0, test_instant());
+        assert_eq!(tracks[0].first_flash, None);
+
+        let first = test_instant();
+        apply_lightning(&mut tracks, &[(0.5, 0.5)], &[1], 1, scale, 60.0, first);
+        assert_eq!(tracks[0].first_flash, Some(first));
+
+        // A later flash must NOT overwrite it — it is the first ever.
+        let later = first + chrono::Duration::minutes(30);
+        apply_lightning(&mut tracks, &[(0.5, 0.5)], &[1], 1, scale, 60.0, later);
+        assert_eq!(
+            tracks[0].first_flash,
+            Some(first),
+            "first_flash is the first, not the latest"
+        );
     }
 }
