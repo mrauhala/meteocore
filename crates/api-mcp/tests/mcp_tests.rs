@@ -758,7 +758,7 @@ async fn reaching_retention_start_is_not_relabelled_as_samples_reached() {
     )
     .await;
     assert_eq!(
-        out["stopped_because"], "reached_retention_start",
+        out["stopped_because"], "reached_earliest_retained_frame",
         "the real reason must survive the post-loop default: {out}"
     );
 }
@@ -842,4 +842,45 @@ fn allowed_hosts_derives_from_base_url() {
     // A malformed base_url degrades to loopback rather than panicking.
     let hosts = api_mcp::allowed_hosts("not-a-url", &[]);
     assert!(hosts.contains(&"localhost".to_string()));
+}
+
+/// The retained window is published on every response, not only when the
+/// caller asked for a time outside it.
+///
+/// It was previously part of the out-of-range explanation, so a documented
+/// field read `null` in every successful response and a client had no way to
+/// learn how far back it could ask without first asking wrongly. Reported by
+/// a model consuming the live endpoint, 2026-08-24.
+#[tokio::test]
+async fn the_retained_window_is_published_on_successful_responses_too() {
+    let app = app();
+    let sid = handshake(&app).await;
+
+    let cells = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells"}),
+    )
+    .await;
+    assert_eq!(
+        cells["no_frame_for_requested_time"], false,
+        "this request is inside retention"
+    );
+    assert!(
+        cells["retained_frames"]["from"].is_string() && cells["retained_frames"]["to"].is_string(),
+        "the window must be present anyway: {cells}"
+    );
+
+    let track = call_tool(
+        &app,
+        &sid,
+        "get_cell_track",
+        json!({"collection": "cells", "cell_id": "42"}),
+    )
+    .await;
+    assert!(
+        track["retained_frames"]["from"].is_string(),
+        "a track walk must say how far back it could have gone: {track}"
+    );
 }

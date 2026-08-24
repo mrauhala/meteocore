@@ -181,6 +181,30 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   `assert!(a > b)` passes with no ramp at all, which is how the missing one
   reached review.
 
+## The null contract, and why the scorer does not follow it
+
+Reported by a model consuming the live `/mcp` surface on 2026-08-24 (#620-#623;
+see `docs/cell-intelligence-plan-amendment.md`).
+
+- **A flag that cannot be computed is `null`, not `false`.** `deviant_mover`
+  is null until the track has a velocity; `lightning_jump` is null until two
+  prior generations give the 2sigma test a baseline. `false` claims the test ran
+  and cleared the cell.
+- **`significance_reasons` must not name a term that contributed nothing.**
+  Every weighted term lands in `contributions`, including flags that are false
+  or unknown, so an unfiltered top-3 cited `deviant_mover` as a reason on a
+  cell whose motion was unknown. Negative contributions stay: "demoted as
+  likely clutter" is a real reason a cell ranked where it did.
+- **The SCORER treats unknown as 0.0, present — NOT as an absent term.** This
+  looks like a violation of "absent terms renormalize" and is deliberate. That
+  rule is for a source nobody wired, which affects every cell equally. For
+  per-cell missingness, dropping the term shrinks the denominator, every other
+  term weighs more, and the cell scores HIGHER. A re-detected fixed echo is
+  always a newborn, so renormalizing on unknown motion would promote exactly
+  the clutter #620 exists to demote. The payload must not claim what it does
+  not know; the scorer must not reward not knowing. Pinned by
+  `unknown_motion_scores_as_no_bonus_not_as_an_absent_term`.
+
 ## Fact sheets + significance ranking
 
 - **`ds_core::cell_facts::CellFactSheet` is the one description of a cell.**
