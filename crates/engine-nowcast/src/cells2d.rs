@@ -534,11 +534,23 @@ pub fn apply_lightning(
         // Only surfaced when THIS track's own strikes carried the
         // discriminator; otherwise these stay None, so "not reported" never
         // reads as zero. Gated per fact and per track — see `Tallies`.
-        if tallies.saw_split[idx] {
+        //
+        // A cell with NO strikes is the exception, and it is not a special
+        // case so much as arithmetic: the split of zero flashes is zero
+        // flashes, whether or not the network could have classified them.
+        // Gating on `saw_split` alone reported `flash_count: 0` beside
+        // `cg_count: null`, which claims ignorance about a total the same
+        // response asserts is zero.
+        //
+        // (This says nothing about coverage. Outside the lightning network's
+        // range `flash_count` should itself be null rather than 0 — #621 —
+        // and these follow it there.)
+        let nothing_to_classify = n == 0;
+        if nothing_to_classify || tallies.saw_split[idx] {
             t.cg_count = Some(tallies.cg[idx]);
             t.ic_count = Some(tallies.ic[idx]);
         }
-        if tallies.saw_polarity[idx] {
+        if nothing_to_classify || tallies.saw_polarity[idx] {
             t.cg_positive_count = Some(tallies.cg_pos[idx]);
             t.cg_polarity_known_count = Some(tallies.cg_polarity_known[idx]);
         }
@@ -1194,5 +1206,53 @@ mod tests {
         // B is unaffected and reports what it actually measured.
         assert_eq!(tracks[1].cg_count, Some(1));
         assert_eq!(tracks[1].cg_positive_count, Some(1));
+    }
+
+    #[test]
+    fn a_cell_with_no_strikes_reports_a_zero_split_not_an_unknown_one() {
+        // Reported from the 2026-08-24 deploy: cells carried `flash_count: 0`
+        // beside `cg_count: null`, claiming ignorance about a total the same
+        // response asserted was zero. The split of zero flashes is zero.
+        let mut t = bare_track(1, 0.5, 0.5);
+        t.flash_history = vec![1.0];
+        let mut tracks = vec![t];
+        apply_lightning(
+            &mut tracks,
+            &[],
+            &[1],
+            1,
+            PixelScale { x: 1.0, y: 1.0 },
+            60.0,
+            test_instant(),
+        );
+        assert_eq!(tracks[0].flash_count, Some(0));
+        assert_eq!(tracks[0].cg_count, Some(0), "zero of zero is zero");
+        assert_eq!(tracks[0].ic_count, Some(0));
+        assert_eq!(tracks[0].cg_polarity_known_count, Some(0));
+        assert_eq!(tracks[0].cg_positive_count, Some(0));
+    }
+
+    #[test]
+    fn strikes_that_carry_no_discriminator_still_report_an_unknown_split() {
+        // The distinction the zero case must not erase: strikes were seen and
+        // could not be classified, which is different from no strikes.
+        use ds_core::events::EventAttrs;
+        let mut t = bare_track(1, 0.5, 0.5);
+        t.flash_history = vec![1.0];
+        let mut tracks = vec![t];
+        let strikes = vec![((0.5, 0.5), EventAttrs::default()); 4];
+        apply_lightning(
+            &mut tracks,
+            &strikes,
+            &[1],
+            1,
+            PixelScale { x: 1.0, y: 1.0 },
+            60.0,
+            test_instant(),
+        );
+        assert_eq!(tracks[0].flash_count, Some(4));
+        assert_eq!(tracks[0].cg_count, None, "seen but unclassifiable");
+        assert_eq!(tracks[0].ic_count, None);
+        assert_eq!(tracks[0].cg_positive_count, None);
     }
 }
