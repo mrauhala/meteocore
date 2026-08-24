@@ -169,20 +169,48 @@ pub fn severity_hysteretic(blob: &CellBlob, area_km2: f64, prev: Option<Severity
 /// this six times while growing monotonically.
 pub const TREND_FLIP_DEADBAND: f32 = 0.10;
 
-/// Growing / decaying, holding the previous verdict inside the deadband.
+/// Absolute floor on the change, in the volume proxy's own units
+/// (summed dBZ above the cell threshold).
+///
+/// The deadband is relative, so on a marginal cell — ten pixels barely above
+/// 35 dBZ, volume near zero — ten percent is also near zero and any wobble
+/// flips the verdict. That would reintroduce the flapping this fix exists to
+/// remove, just for weak cells instead of ones near a severity edge.
+///
+/// One pixel-dBZ is below anything physically meaningful and binds only on
+/// cells whose volume is single digits; a real cell of any size clears it on
+/// the relative test first. **Uncalibrated** — chosen from the units rather
+/// than from measured marginal-cell traces, so revisit against real data.
+pub const TREND_MIN_VOLUME_CHANGE: f32 = 1.0;
+
+/// Growing / decaying, measured against the volume at which the current
+/// verdict was last confirmed rather than against the previous frame.
+///
+/// **The anchor is what makes this correct.** Comparing to the previous frame
+/// means a real trend whose per-frame change never clears the deadband can
+/// never flip the verdict, however large the cumulative change: 5% growth per
+/// frame for twenty frames is a 165% increase that would still report
+/// "decaying" if that is what the verdict happened to be. Anchoring accrues
+/// those small steps until they clear the band together, so slow-but-real
+/// drift eventually wins while genuine noise — which oscillates around the
+/// anchor instead of accumulating — never does.
+///
+/// Returns the verdict and the anchor to carry forward: unchanged while
+/// holding, reset to the current volume whenever the verdict is confirmed.
 ///
 /// `None` propagates only when there was no previous verdict AND the change
 /// is too small to call — "no trend established yet" rather than a coin flip.
-fn volume_trend(volume_now: f32, volume_prev: f32, prev_verdict: Option<bool>) -> Option<bool> {
-    let base = volume_prev.abs().max(f32::EPSILON);
-    let change = (volume_now - volume_prev) / base;
-    if change > TREND_FLIP_DEADBAND {
-        Some(true)
-    } else if change < -TREND_FLIP_DEADBAND {
-        Some(false)
-    } else {
-        prev_verdict
+fn volume_trend(volume_now: f32, anchor: f32, prev_verdict: Option<bool>) -> (Option<bool>, f32) {
+    let base = anchor.abs().max(f32::EPSILON);
+    let delta = volume_now - anchor;
+    let relative = delta / base;
+    // Both gates must clear: relative keeps large cells from tripping on
+    // trivial fractions, absolute keeps small ones from tripping on noise.
+    let significant = relative.abs() > TREND_FLIP_DEADBAND && delta.abs() > TREND_MIN_VOLUME_CHANGE;
+    if !significant {
+        return (prev_verdict, anchor);
     }
+    (Some(delta > 0.0), volume_now)
 }
 
 /// One tracked cell (current generation's snapshot plus track state).
@@ -204,6 +232,13 @@ pub struct CellTrack {
     /// Volume-proxy trend vs the previous observation: `Some(true)` =
     /// growing, `Some(false)` = decaying, `None` = newborn (#546 iter 1).
     pub growing: Option<bool>,
+    /// Volume at which [`Self::growing`] was last confirmed — the reference
+    /// the deadband is measured from, NOT the previous frame's volume.
+    ///
+    /// Carrying this is what lets a slow, sustained trend accumulate past the
+    /// deadband instead of being held forever by steps that are each
+    /// individually too small. Reset whenever the verdict is confirmed.
+    pub trend_anchor_volume: f32,
     /// EMA'd mean-intensity trend of THIS cell (physical units per second,
     /// clamped): the tracker-level growth/decay signal — immune to the
     /// per-pixel motion-residual contamination that poisoned field-level
@@ -350,6 +385,7 @@ pub fn advance_tracks(
                 None => CellTrack {
                     id: next_id(),
                     severity: severity(&blob, area_km2),
+                    trend_anchor_volume: blob.volume,
                     blob,
                     age: 1,
                     velocity_kms: None,
@@ -405,9 +441,12 @@ pub fn advance_tracks(
                     let deviant_now = residual_ms > DEVIANT_RESIDUAL_MS
                         && cell_speed_ms > DEVIANT_MIN_CELL_SPEED_MS;
 
-                    // Held inside the deadband rather than recomputed from a
-                    // bare comparison, which made noise answer the question.
-                    let growing = volume_trend(blob.volume, prev.blob.volume, prev.growing);
+                    // Measured from the anchor — the volume where the verdict
+                    // was last confirmed — not from the previous frame, so a
+                    // slow sustained trend accumulates instead of being held
+                    // forever by individually-small steps.
+                    let (growing, trend_anchor_volume) =
+                        volume_trend(blob.volume, prev.trend_anchor_volume, prev.growing);
                     // Mean-exceedance trend, per second, EMA'd with the
                     // track's history (newborns start at 0 ⇒ first
                     // measurement is halved — mild warm-up damping).
@@ -422,6 +461,7 @@ pub fn advance_tracks(
                         blob,
                         age: prev.age + 1,
                         growing,
+                        trend_anchor_volume,
                         intensity_tendency,
                         velocity_kms: Some((vx_km, vy_km)),
                         deviant_streak: if deviant_now {
@@ -670,6 +710,7 @@ mod tests {
             deviant_streak: 0,
             severity: Severity::Weak,
             growing: None,
+            trend_anchor_volume: 0.0,
             intensity_tendency: 0.0,
             flash_count: None,
             flash_rate_per_min: None,
@@ -865,6 +906,7 @@ mod tests {
             deviant_streak: 0,
             severity: Severity::Weak,
             growing: None,
+            trend_anchor_volume: 0.0,
             intensity_tendency: 0.0,
             flash_count: None,
             flash_rate_per_min: None,
@@ -1356,40 +1398,103 @@ mod tests {
         assert_eq!(bare_changes, 7, "precondition: the raw binner flaps here");
     }
 
+    /// Walk a volume series the way the tracker does, carrying the anchor.
+    fn walk_trend(start_volume: f32, series: &[f32]) -> Vec<Option<bool>> {
+        let mut verdict = None;
+        let mut anchor = start_volume;
+        series
+            .iter()
+            .map(|&v| {
+                let (nv, na) = volume_trend(v, anchor, verdict);
+                verdict = nv;
+                anchor = na;
+                verdict
+            })
+            .collect()
+    }
+
     #[test]
     fn volume_trend_holds_through_noise_but_follows_real_change() {
         // Inside the deadband: keep the previous answer rather than letting
         // noise pick one.
-        assert_eq!(volume_trend(102.0, 100.0, Some(true)), Some(true));
-        assert_eq!(volume_trend(98.0, 100.0, Some(true)), Some(true));
-        assert_eq!(volume_trend(102.0, 100.0, Some(false)), Some(false));
+        assert_eq!(volume_trend(102.0, 100.0, Some(true)).0, Some(true));
+        assert_eq!(volume_trend(98.0, 100.0, Some(true)).0, Some(true));
+        assert_eq!(volume_trend(102.0, 100.0, Some(false)).0, Some(false));
 
-        // Past it: follow the data, both directions.
-        assert_eq!(volume_trend(130.0, 100.0, Some(false)), Some(true));
-        assert_eq!(volume_trend(70.0, 100.0, Some(true)), Some(false));
+        // Past it: follow the data, both directions, and re-anchor.
+        assert_eq!(volume_trend(130.0, 100.0, Some(false)), (Some(true), 130.0));
+        assert_eq!(volume_trend(70.0, 100.0, Some(true)), (Some(false), 70.0));
 
         // No previous verdict and too small to call is honestly unknown —
         // not a coin flip dressed as a measurement.
-        assert_eq!(volume_trend(101.0, 100.0, None), None);
+        assert_eq!(volume_trend(101.0, 100.0, None).0, None);
 
         // A zero-volume predecessor must not divide by zero.
-        assert_eq!(volume_trend(5.0, 0.0, None), Some(true));
+        assert_eq!(volume_trend(5.0, 0.0, None).0, Some(true));
+    }
+
+    #[test]
+    fn a_slow_sustained_reversal_eventually_flips_the_verdict() {
+        // The gap found in review on #627. Measuring against the PREVIOUS
+        // FRAME meant a real trend whose per-frame change never cleared the
+        // deadband could never flip the verdict, however large the cumulative
+        // change. Here: an established "decaying", then twenty frames of 5%
+        // growth — a 165% increase, every step individually under the band.
+        let mut series = vec![88.0f32]; // -12%: establishes decaying
+        let mut v = 88.0f32;
+        for _ in 0..20 {
+            v *= 1.05;
+            series.push(v);
+        }
+        let verdicts = walk_trend(100.0, &series);
+        assert_eq!(verdicts[0], Some(false), "precondition: decaying is set");
+        assert_eq!(
+            verdicts.last().copied().flatten(),
+            Some(true),
+            "sustained growth must win: {verdicts:?}"
+        );
+        // And it should not take anywhere near all twenty frames — two steps
+        // of 5% clear 10% together.
+        let flipped_at = verdicts.iter().position(|v| *v == Some(true)).unwrap();
+        assert!(flipped_at <= 3, "flipped only at frame {flipped_at}");
+    }
+
+    #[test]
+    fn oscillation_around_the_anchor_never_accumulates_into_a_verdict() {
+        // The other half: noise must NOT accumulate. Wobbling +/-4% around a
+        // fixed level forever stays undecided, because each sample is
+        // measured from the same anchor rather than from its predecessor.
+        let series: Vec<f32> = (0..40)
+            .map(|i| if i % 2 == 0 { 104.0 } else { 96.0 })
+            .collect();
+        let verdicts = walk_trend(100.0, &series);
+        assert!(
+            verdicts.iter().all(|v| v.is_none()),
+            "noise produced a verdict: {verdicts:?}"
+        );
+    }
+
+    #[test]
+    fn a_marginal_cell_does_not_hair_trigger_on_a_tiny_absolute_change() {
+        // Secondary review finding: the deadband is relative, so a cell with
+        // volume near zero has a threshold near zero and any wobble flips it.
+        // 0.01 -> 0.02 is +100% relative and physically nothing.
+        assert_eq!(volume_trend(0.02, 0.01, None).0, None);
+        assert_eq!(volume_trend(0.005, 0.01, Some(true)).0, Some(true));
+        // A real cell still clears both gates.
+        assert_eq!(volume_trend(130.0, 100.0, None).0, Some(true));
     }
 
     #[test]
     fn a_monotonically_growing_cell_never_reports_decaying() {
         // Cell 156 in the field report: 3.6 -> 18.9 km2 over ten frames, which
         // flapped growing/decaying six times under the bare comparison.
-        let series = [3.6f32, 4.9, 6.2, 8.0, 9.1, 11.4, 13.0, 15.2, 16.8, 18.9];
-        let mut verdict = None;
-        for w in series.windows(2) {
-            verdict = volume_trend(w[1], w[0], verdict);
-            assert_ne!(
-                verdict,
-                Some(false),
-                "monotonic growth reported as decaying: {w:?}"
-            );
-        }
-        assert_eq!(verdict, Some(true));
+        let series = [4.9f32, 6.2, 8.0, 9.1, 11.4, 13.0, 15.2, 16.8, 18.9];
+        let verdicts = walk_trend(3.6, &series);
+        assert!(
+            !verdicts.contains(&Some(false)),
+            "monotonic growth reported as decaying: {verdicts:?}"
+        );
+        assert_eq!(verdicts.last().copied().flatten(), Some(true));
     }
 }

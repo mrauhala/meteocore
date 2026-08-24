@@ -205,10 +205,25 @@ storm exploding and collapsing every five minutes.
   that changes for reasons unrelated to the weather. `severity()` stays
   memoryless for cells with no history; `severity_hysteretic()` is for tracked
   ones.
-- **`volume_trend` holds its previous verdict inside `TREND_FLIP_DEADBAND`.**
-  Holding, not recomputing, is what stops the alternation. With no previous
-  verdict AND a change too small to call, it stays `None` — unknown beats a
-  coin flip presented as a measurement.
+- **`volume_trend` holds its previous verdict inside `TREND_FLIP_DEADBAND`,
+  measured from an ANCHOR — not from the previous frame.** The anchor is the
+  volume at which the current verdict was last confirmed, carried on the track
+  as `trend_anchor_volume` and reset only when the verdict is confirmed.
+  - Holding, not recomputing, is what stops the alternation.
+  - Anchoring is what stops the hold from becoming a trap. Measuring against
+    the previous frame meant a real trend whose per-frame change never cleared
+    the band could never flip the verdict — 5% growth per frame for twenty
+    frames is a 165% increase that would still have reported "decaying".
+    Caught in review on #627. Genuine noise oscillates around the anchor and
+    never accumulates; a real trend accrues until it clears the band.
+  - `TREND_MIN_VOLUME_CHANGE` is an absolute floor alongside the relative one.
+    A marginal cell has volume near zero, so 10% of it is also near zero and
+    any wobble flips the verdict. **Uncalibrated** — picked from the units,
+    not from measured marginal-cell traces.
+  - With no previous verdict AND a change too small to call, it stays `None` —
+    unknown beats a coin flip presented as a measurement.
+  - Test trend behaviour by WALKING a series, not with single steps. The
+    single-step tests in the first draft passed while the trap was present.
 - Severity feeds significance at weight 1.0, so stabilising it stabilises the
   ranking too. Tests pin that the raw binner flaps 7 times on a sequence where
   the hysteretic one flaps 0 — without that precondition assertion the fix
