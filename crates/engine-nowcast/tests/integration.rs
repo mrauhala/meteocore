@@ -1736,3 +1736,74 @@ fn a_newborn_asserts_nothing_it_cannot_know() {
         );
     }
 }
+
+/// A quiet cell reports a zero split, but still declines to invent a
+/// positive-CG share (#623 follow-up / D10).
+///
+/// From the 2026-08-24 deploy: cells carried `flash_count: 0` beside
+/// `cg_count: null`, claiming ignorance about a total the same response said
+/// was zero. The split of zero flashes is zero — but 0 of 0 CG flashes has no
+/// positive share, so that one field must stay null.
+#[test]
+fn a_quiet_cell_reports_a_zero_split_but_no_positive_share() {
+    use ds_core::events::{EventPoint, EventSource};
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+
+    struct NoStrikes;
+    impl EventSource for NoStrikes {
+        fn recent_events(
+            &self,
+            _start: DateTime<Utc>,
+            _end: DateTime<Utc>,
+            _limit: usize,
+        ) -> Result<Vec<EventPoint>, ds_core::error::DataServerError> {
+            Ok(vec![])
+        }
+    }
+
+    let anchor1 = t0() + Duration::minutes(5);
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let config = NowcastConfig {
+        source: "mock".into(),
+        horizon: "PT30M".into(),
+        step: None,
+        history_frames: 2,
+        poll_interval_secs: 30,
+        max_generations: 4,
+        max_pixels: 4_000_000,
+        min_echo: 10.0,
+        growth_decay: false,
+        lightning_source: Some("mock-lightning".into()),
+        significance: Default::default(),
+        impact_source: None,
+        impact_name_property: "name".into(),
+        impact_weight_property: None,
+    };
+    let engine = NowcastEngine::new("quiet", "mock", source, &config)
+        .expect("engine builds")
+        .with_lightning_source(Arc::new(NoStrikes));
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+
+    assert_eq!(
+        f.properties.get("flash_count"),
+        Some(&PropertyValue::Integer(0)),
+        "the join ran and attributed nothing"
+    );
+    for k in ["cg_count", "ic_count", "cg_polarity_known"] {
+        assert_eq!(
+            f.properties.get(k),
+            Some(&PropertyValue::Integer(0)),
+            "{k} must be a known zero, not null, when the total is a known zero"
+        );
+    }
+    assert_eq!(
+        f.properties.get("positive_cg_fraction"),
+        Some(&PropertyValue::Null),
+        "0 of 0 CG flashes has no positive share — this one stays null"
+    );
+}
