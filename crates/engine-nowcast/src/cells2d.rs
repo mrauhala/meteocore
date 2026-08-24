@@ -1758,4 +1758,35 @@ mod tests {
         let s = t.path_straightness().expect("path is long enough");
         assert!(s > 0.95, "straight-line advection scored {s}");
     }
+
+    #[test]
+    fn the_straightness_floor_costs_borderline_speed_movers_one_frame() {
+        // Raised in review on #631. The floor is an absolute distance while
+        // the deviant speed gate is per-interval, so they interact. Pin the
+        // band rather than discover it again later.
+        const CADENCE_S: f32 = 300.0;
+        let step_km = |speed_ms: f32| speed_ms * CADENCE_S / 1000.0;
+
+        // At the speed floor itself, one step is short of the path floor.
+        assert!(
+            step_km(DEVIANT_MIN_CELL_SPEED_MS) < MIN_PATH_FOR_STRAIGHTNESS_KM,
+            "precondition: 3 m/s covers {} km per frame",
+            step_km(DEVIANT_MIN_CELL_SPEED_MS)
+        );
+        // Two steps always clear it, so the cost is exactly one frame.
+        assert!(2.0 * step_km(DEVIANT_MIN_CELL_SPEED_MS) > MIN_PATH_FOR_STRAIGHTNESS_KM);
+
+        // The affected band is narrow and sits just above the speed floor.
+        let breakeven = MIN_PATH_FOR_STRAIGHTNESS_KM * 1000.0 / CADENCE_S;
+        assert!(
+            (3.3..3.4).contains(&breakeven),
+            "band top moved to {breakeven} m/s — re-check the doc on \
+             DEVIANT_MIN_STRAIGHTNESS"
+        );
+
+        // A real deviant mover clears the floor on its first step with room
+        // to spare: a 10 m/s storm covers exactly 3x it, a 20 m/s one 6x.
+        assert!(step_km(10.0) >= 3.0 * MIN_PATH_FOR_STRAIGHTNESS_KM);
+        assert!(step_km(20.0) >= 6.0 * MIN_PATH_FOR_STRAIGHTNESS_KM);
+    }
 }
