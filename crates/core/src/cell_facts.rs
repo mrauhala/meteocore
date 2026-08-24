@@ -89,7 +89,6 @@ pub struct LightningFacts {
     pub flash_density_per_km2: f64,
     /// Schultz-style 2σ jump fired this generation. Derived from `jump_sigma`
     /// so the two cannot disagree.
-    /// Schultz-style 2σ jump fired this generation.
     ///
     /// `None` when there is no baseline to test against (fewer than two
     /// generations of flash history) — a jump is not computable from a single
