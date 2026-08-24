@@ -80,7 +80,10 @@ postgis engine issues a COUNT against the database.
   announced and withheld, which is #605's silently-ignored-parameter bug
   inverted. `sort_by` is validated against `engine.sortables()` and an unknown
   key is an error NAMING the valid ones, never a plausible-but-different
-  ordering.
+  ordering. **`order` without `sort_by` is also an error**, not an ignored
+  field: on its own it has nothing to apply to, so accepting it would return
+  significance-descending to a caller who asked for ascending — the same
+  silent no-op in a smaller box.
 - **`min_significance` filters the bounded page, it does not reach deeper into
   the ranking.** Asking for 10 with a floor can return 3. The response carries
   `below_min_significance` so a model can tell "only 3 cells exist" from

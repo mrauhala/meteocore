@@ -1046,6 +1046,21 @@ async fn an_unknown_sort_key_is_rejected_with_the_valid_ones() {
     )
     .await;
     assert!(err.contains("sideways"), "{err}");
+
+    // `order` alone has nothing to apply to. Accepting it and returning the
+    // default ordering is the silent no-op this parameter set exists to
+    // prevent — the caller asked for ascending and would get descending.
+    let err = call_tool_expect_error(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "order": "asc"}),
+    )
+    .await;
+    assert!(
+        err.contains("sort_by"),
+        "the error must name what is missing: {err}"
+    );
 }
 
 /// A significance floor narrows the result, and says how much it removed —

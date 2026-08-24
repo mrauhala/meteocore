@@ -136,7 +136,8 @@ pub struct StormCellsParams {
     /// (get_collection_info lists them); anything else is an error naming the
     /// valid options rather than a silently different ordering.
     pub sort_by: Option<String>,
-    /// "desc" (default) or "asc". Ignored unless sort_by is given.
+    /// "desc" (default) or "asc". Requires sort_by — setting it alone is an
+    /// error, not a silent no-op.
     pub order: Option<String>,
     /// Drop cells below this significance, 0..=1. Applied after ordering, so
     /// it narrows the result rather than changing what ranks first.
@@ -280,6 +281,20 @@ impl MeteoCoreMcp {
         // error names the alternatives — an unknown key must not degrade to a
         // different-but-plausible ordering (#605, #630).
         let sortby = match sort_by.as_deref() {
+            // `order` alone cannot be honoured: there is nothing to order by
+            // except the default, and silently returning that default is the
+            // "plausible-but-different ordering with no way to notice"
+            // failure this whole parameter set exists to prevent. The caller
+            // asked for ascending and would have received descending.
+            None if order.is_some() => {
+                return Err(ErrorData::invalid_params(
+                    "order requires sort_by — on its own it has nothing to apply to. \
+                     Pass sort_by with one of the collection's sortable_properties, \
+                     or omit both for most-significant-first."
+                        .to_string(),
+                    None,
+                ))
+            }
             None => vec![SortKey::descending("significance")],
             Some(key) => {
                 let sortables = engine.sortables();
