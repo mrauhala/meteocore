@@ -161,6 +161,33 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   to remove. Resolved once by `recompute_sortables()` whenever a source is
   wired and stored on the engine, so the accessor is a borrow and there is
   one list to maintain rather than one per source combination.
+## Clutter mitigation (#614)
+
+- A **persistent, near-stationary** echo is flagged `likely_clutter` and
+  demoted by a negative `clutter` term. Reported from production: wind
+  turbine clutter near Oulu ranked #1 on a quiet day, because every
+  significance term measures intensity, size, trend or impact and **none
+  asks whether the echo is meteorological**. Clutter is bright, compact,
+  persistent and usually over a town, so it scores well on nearly
+  everything.
+- Thresholds in `ds_core::cell_facts`: speed < `CLUTTER_MAX_SPEED_MS` (3.0,
+  matching `DEVIANT_MIN_CELL_SPEED_MS`) **and** age ≥ `CLUTTER_MIN_AGE` (6
+  frames ≈ 30 min). Both conditions matter — a real cell can crawl briefly
+  in weak flow, but one holding position *and* high reflectivity for half an
+  hour is a fixed object.
+- **A newborn track is never flagged.** `speed_ms` is `None` until the
+  second observation; reading that as "stationary" would flag every cell for
+  the first frames after a reload.
+- **Demoted, never dropped.** The flag is a served property, so a client can
+  say "persistent stationary echo, probably a wind farm" instead of either
+  "severe storm" or nothing. Excluding would let a false positive delete
+  real weather with no trace — the opposite of the absent/null/value
+  discipline everywhere else here.
+- **Mitigation, not detection.** Wind turbine clutter is a hard upstream QC
+  problem; this only stops a fixed echo dominating a ranking. A known-site
+  clutter mask (option B in #614) is the precise complement and is not
+  built.
+
 - `severity` is deliberately NOT sortable — as a string it orders
   `moderate < severe < very_severe < weak`, which looks almost right and
   buries the weakest cells at the end; use `significance`, which already

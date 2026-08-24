@@ -98,6 +98,12 @@ pub struct SignificanceScore {
 }
 
 impl SignificanceScore {
+    /// Whether any term pulled this score DOWN — i.e. a discount actually
+    /// applied, rather than the object merely scoring low.
+    pub fn significance_is_demoted(&self) -> bool {
+        self.contributions.iter().any(|c| c.value < 0.0)
+    }
+
     /// The score an object gets when nothing about it could be evaluated.
     pub fn zero(rank: usize) -> Self {
         Self {
