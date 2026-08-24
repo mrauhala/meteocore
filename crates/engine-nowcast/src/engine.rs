@@ -94,7 +94,21 @@ const SORTABLES_BASE: &[&str] = &[
     "intensity_trend_dbz_min",
 ];
 /// Extras that exist only with `lightning_source` wired.
-const SORTABLES_LIGHTNING_EXTRAS: &[&str] = &["flash_count", "flash_rate_per_min"];
+///
+/// `first_flash` is sortable because it is emitted as fixed-width RFC 3339
+/// with a `Z` suffix, which makes the string order chronological. A property
+/// serialized with mixed offsets would NOT belong here.
+const SORTABLES_LIGHTNING_EXTRAS: &[&str] = &[
+    "flash_count",
+    "flash_rate_per_min",
+    "flash_density_per_km2",
+    "jump_sigma",
+    "first_flash",
+    "cg_count",
+    "ic_count",
+    "cg_polarity_known",
+    "positive_cg_fraction",
+];
 /// Extras that exist only with `impact_source` wired.
 const SORTABLES_IMPACT_EXTRAS: &[&str] = &["impact_eta_minutes"];
 
@@ -828,10 +842,15 @@ impl NowcastEngine {
                             "lightning window hit the {MAX_JOIN_STRIKES}-row cap; flash counts may undercount this generation"
                         );
                     }
-                    let strikes_px: Vec<(f32, f32)> = events
+                    // Carry each strike's reported attributes through the
+                    // projection, so the per-cell IC/CG and polarity tallies
+                    // have something to count (#616).
+                    let strikes_px: Vec<((f32, f32), ds_core::events::EventAttrs)> = events
                         .iter()
-                        .filter_map(|e| geom.frac_px(e.lon, e.lat))
-                        .map(|(x, y)| (x as f32, y as f32))
+                        .filter_map(|e| {
+                            geom.frac_px(e.lon, e.lat)
+                                .map(|(x, y)| ((x as f32, y as f32), e.attrs))
+                        })
                         .collect();
                     apply_lightning(
                         &mut cells,
@@ -1402,6 +1421,24 @@ fn score_cells(
                     },
                     jump: t.lightning_jump,
                     jump_sigma: t.jump_sigma.map(|v| round_to(f64::from(v), 2)),
+                    cg_count: t.cg_count,
+                    ic_count: t.ic_count,
+                    cg_polarity_known: t.cg_polarity_known_count,
+                    // Denominator is the CG flashes whose polarity was
+                    // REPORTED, not every CG flash. A network that classifies
+                    // only part of its CG population would otherwise have the
+                    // share divided by flashes it never looked at — 4 of 5
+                    // known positives reported as 0.4 instead of 0.8.
+                    //
+                    // Guarded against 0/0 either way: a cell with no
+                    // classifiable CG flashes has no positive share, which is
+                    // not the same as 0%.
+                    positive_cg_fraction: match (t.cg_polarity_known_count, t.cg_positive_count) {
+                        (Some(known), Some(pos)) if known > 0 => {
+                            Some(round_to(f64::from(pos) / f64::from(known), 3))
+                        }
+                        _ => None,
+                    },
                     first_flash: t.first_flash,
                 }),
                 // Absent when no impact source is wired — the term then
@@ -1554,6 +1591,30 @@ fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
             "flash_rate_per_min".into(),
             t.lightning
                 .map(|l| PropertyValue::Float(l.flash_rate_per_min))
+                .unwrap_or(PropertyValue::Null),
+        );
+        for (key, value) in [
+            ("cg_count", t.lightning.and_then(|l| l.cg_count)),
+            ("ic_count", t.lightning.and_then(|l| l.ic_count)),
+            // The denominator behind positive_cg_fraction. Served so a
+            // consumer can weigh "3 of 4" against "300 of 400".
+            (
+                "cg_polarity_known",
+                t.lightning.and_then(|l| l.cg_polarity_known),
+            ),
+        ] {
+            props.insert(
+                key.into(),
+                value
+                    .map(|v| PropertyValue::Integer(i64::from(v)))
+                    .unwrap_or(PropertyValue::Null),
+            );
+        }
+        props.insert(
+            "positive_cg_fraction".into(),
+            t.lightning
+                .and_then(|l| l.positive_cg_fraction)
+                .map(PropertyValue::Float)
                 .unwrap_or(PropertyValue::Null),
         );
         props.insert(

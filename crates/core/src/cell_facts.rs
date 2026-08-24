@@ -97,6 +97,25 @@ pub struct LightningFacts {
     /// which would claim "measured, no anomaly". A 4σ surge and a 2.1σ nudge
     /// are different facts that `jump` alone cannot distinguish.
     pub jump_sigma: Option<f64>,
+    /// Cloud-to-ground and intra-cloud counts, when the source reports the
+    /// discriminator. `None` = not reported, never a defaulted zero.
+    pub cg_count: Option<u32>,
+    pub ic_count: Option<u32>,
+    /// How many CG flashes had their polarity reported — the DENOMINATOR
+    /// behind `positive_cg_fraction`, and the sample size behind it.
+    ///
+    /// Exposed rather than kept private for the same reason `beam_coverage`
+    /// is: a share whose denominator is invisible invites confident statements
+    /// it cannot support. "3 of 4 positive" and "300 of 400 positive" are the
+    /// same fraction and not the same evidence.
+    pub cg_polarity_known: Option<u32>,
+    /// Share of POLARITY-KNOWN cloud-to-ground flashes that were positive,
+    /// 0..=1.
+    ///
+    /// `None` when polarity is not reported **or when no CG flash was
+    /// classifiable** — 0 of 0 is not 0%, and reporting it as 0% would invite
+    /// "no positive strikes" about a cell with no strikes to classify.
+    pub positive_cg_fraction: Option<f64>,
     /// When this track was first attributed a flash.
     ///
     /// Electrification age: a cell producing its first flash now is a
@@ -194,6 +213,13 @@ const INTENSITY_TREND_CEILING_DBZ_MIN: f64 = 2.0;
 /// difference between a 6σ and a 9σ surge is not what should decide a rank.
 const JUMP_SIGMA_FLOOR: f64 = 2.0;
 const JUMP_SIGMA_CEILING: f64 = 6.0;
+/// Positive-CG share ramp. Roughly 10-20% of CG flashes are positive in
+/// ordinary storms, so a floor at 5% keeps normal background from scoring at
+/// all; a CG population half positive is already the anomalous severe-storm
+/// signature, so the term saturates there rather than reserving its top half
+/// for fractions that essentially never occur.
+const POSITIVE_CG_FLOOR: f64 = 0.05;
+const POSITIVE_CG_CEILING: f64 = 0.5;
 
 /// Speed below which an echo is "not going anywhere" (m/s).
 ///
@@ -248,6 +274,9 @@ pub const DEFAULT_CELL_WEIGHTS: &[(&str, f64)] = &[
     ("deviant_mover", 0.4),
     ("lightning_jump", 0.9),
     ("flash_rate", 0.5),
+    // A high positive-CG share is a well-established severe-storm signal,
+    // independent of how MUCH lightning there is.
+    ("positive_cg", 0.6),
     ("vil", 0.7),
     ("echo_top", 0.5),
     ("beam_coverage", 0.4),
@@ -306,6 +335,15 @@ impl SignificanceTerms for CellFactSheet {
                     _ => 0.0,
                 },
             ));
+            if let Some(frac) = lightning.positive_cg_fraction {
+                // Ramped like every other term: the raw fraction would let an
+                // ordinary 10% background share carry real weight while a 50%
+                // share — already the severe signature — scored only half.
+                terms.push(Term::new(
+                    "positive_cg",
+                    ramp(frac, POSITIVE_CG_FLOOR, POSITIVE_CG_CEILING),
+                ));
+            }
             terms.push(Term::new(
                 "flash_rate",
                 ramp(
@@ -389,6 +427,10 @@ mod tests {
         full.trend = Some(Trend::Growing);
         full.intensity_trend_dbz_min = Some(0.4);
         full.lightning = Some(LightningFacts {
+            cg_count: Some(8),
+            ic_count: Some(4),
+            cg_polarity_known: None,
+            positive_cg_fraction: Some(0.25),
             flash_count: 12,
             flash_rate_per_min: 4.0,
             flash_density_per_km2: 0.0,
@@ -449,6 +491,10 @@ mod tests {
             flash_rate_per_min: 0.0,
             flash_density_per_km2: 0.0,
             jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
             first_flash: None,
             jump: false,
         });
@@ -529,6 +575,10 @@ mod tests {
             flash_rate_per_min: 1.0,
             flash_density_per_km2: 0.0,
             jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
             first_flash: None,
             jump: false,
         });
@@ -538,6 +588,10 @@ mod tests {
             flash_rate_per_min: 1.0,
             flash_density_per_km2: 0.0,
             jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
             first_flash: None,
             jump: true,
         });
@@ -561,6 +615,10 @@ mod tests {
             flash_rate_per_min: 25.0,
             flash_density_per_km2: 0.0,
             jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
             first_flash: None,
             jump: true,
         });
@@ -670,6 +728,10 @@ mod tests {
             flash_density_per_km2: 0.5,
             jump: true,
             jump_sigma: Some(2.1),
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
             first_flash: None,
         });
         let mut big = cell(2);
@@ -695,6 +757,10 @@ mod tests {
             flash_density_per_km2: 1.0,
             jump: true,
             jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
             first_flash: None,
         });
         let mut quiet = c.clone();
@@ -704,5 +770,96 @@ mod tests {
         });
         let s = scorer();
         assert!(s.score_one(&c).score > s.score_one(&quiet).score);
+    }
+
+    #[test]
+    fn a_high_positive_cg_share_raises_significance() {
+        let base = LightningFacts {
+            flash_count: 20,
+            flash_rate_per_min: 8.0,
+            flash_density_per_km2: 0.5,
+            jump: false,
+            jump_sigma: Some(0.5),
+            cg_count: Some(20),
+            ic_count: Some(0),
+            cg_polarity_known: None,
+            positive_cg_fraction: Some(0.05),
+            first_flash: None,
+        };
+        let mut ordinary = cell(1);
+        ordinary.lightning = Some(base);
+        let mut anomalous = cell(2);
+        anomalous.lightning = Some(LightningFacts {
+            cg_polarity_known: None,
+            positive_cg_fraction: Some(0.75),
+            ..base
+        });
+        let s = scorer();
+        assert!(
+            s.score_one(&anomalous).score > s.score_one(&ordinary).score,
+            "a positive-CG-dominated cell is the severe signal"
+        );
+    }
+
+    #[test]
+    fn an_unreported_polarity_share_is_not_scored_as_zero() {
+        // None must drop the term (renormalizing), not contribute 0.0 —
+        // otherwise wiring a network that omits polarity would silently
+        // penalize every cell.
+        let mut unknown = cell(1);
+        unknown.lightning = Some(LightningFacts {
+            flash_count: 20,
+            flash_rate_per_min: 8.0,
+            flash_density_per_km2: 0.5,
+            jump: false,
+            jump_sigma: None,
+            cg_count: None,
+            ic_count: None,
+            cg_polarity_known: None,
+            positive_cg_fraction: None,
+            first_flash: None,
+        });
+        assert!(
+            !unknown.terms().iter().any(|t| t.name == "positive_cg"),
+            "an unreported share must emit no term at all"
+        );
+    }
+
+    #[test]
+    fn positive_cg_saturates_at_the_documented_ceiling() {
+        // Pins the RAMP, which relative ordering alone cannot: a raw fraction
+        // and a ramped one both put 0.75 above 0.05.
+        let facts = |frac: f64| {
+            let mut c = cell(1);
+            c.lightning = Some(LightningFacts {
+                flash_count: 20,
+                flash_rate_per_min: 8.0,
+                flash_density_per_km2: 0.5,
+                jump: false,
+                jump_sigma: None,
+                cg_count: Some(20),
+                ic_count: Some(0),
+                cg_polarity_known: None,
+                positive_cg_fraction: Some(frac),
+                first_flash: None,
+            });
+            c
+        };
+        let term = |c: &CellFactSheet| {
+            c.terms()
+                .iter()
+                .find(|t| t.name == "positive_cg")
+                .expect("term present")
+                .value
+        };
+        // Background share sits at the floor and contributes nothing.
+        assert_eq!(term(&facts(0.05)), 0.0);
+        assert_eq!(term(&facts(0.02)), 0.0);
+        // A half-positive CG population is already maximal, and anything
+        // beyond it stays there rather than needing 100% to saturate.
+        assert_eq!(term(&facts(0.5)), 1.0);
+        assert_eq!(term(&facts(0.9)), 1.0);
+        // Midpoint of the ramp, not of 0..1.
+        assert!((term(&facts(0.275)) - 0.5).abs() < 1e-9);
     }
 }

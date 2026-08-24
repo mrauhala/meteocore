@@ -557,17 +557,31 @@ pub fn build_events_area(
     Ok(BuiltQuery::new(sql, params).with_row_limit(3, source_keys.len().max(1)))
 }
 
+/// Whether an events window selects the optional per-event attribute columns
+/// (#616). Only the `EventSource` join reads them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowAttrs {
+    Include,
+    Omit,
+}
+
 /// Events-shape strike fetch for the map layer (#504): every event in the
 /// half-open window `(start, end]` across the WHOLE table extent — the map
 /// path caches one window per timestep and filters per tile in memory, so
 /// there is no spatial predicate here. `ORDER BY time DESC, id` so a
 /// truncated fetch keeps the NEWEST strikes (the map-relevant ones); the
-/// caller reverses to ascending for paint order. Only time + coords are
-/// selected — the splat needs no parameter columns.
+/// caller reverses to ascending for paint order.
+///
+/// `attrs` decides whether the optional per-event attribute columns are
+/// selected. The two callers want opposite things from the same window: the
+/// map splat needs only time + coords (`Omit`), while the `EventSource` join
+/// needs the attributes (`Include`). Sharing the builder without the switch
+/// would make the per-frame map query pay for three columns it never reads.
 pub fn build_events_window(
     shape: &EventsShape,
     time_range: (DateTime<Utc>, DateTime<Utc>),
     row_limit: usize,
+    attrs: WindowAttrs,
 ) -> Result<BuiltQuery, BuildError> {
     let table = fq_table(&shape.table)?;
     let time_col = quote_ident(&shape.time_col)?;
@@ -578,9 +592,32 @@ pub fn build_events_window(
 
     let rhs_lo = time_filter_rhs("$1", tz);
     let rhs_hi = time_filter_rhs("$2", tz);
+    // Optional attribute columns (#616). Aliased to fixed names so the
+    // decoder never has to know the operator's column naming; every
+    // identifier goes through quote_ident (Critical Rule 8).
+    //
+    // Cast to `double precision` for the same reason the EDR parameter path
+    // does: these columns are `smallint` in one deployment and `numeric` or
+    // `real` in the next. Without the cast a typed decode of the wrong width
+    // returns None, and "this network doesn't report polarity" is exactly the
+    // answer a misconfiguration would forge. One numeric type in, one decode.
+    let mut attr_cols = String::new();
+    if attrs == WindowAttrs::Include {
+        for (col, alias) in [
+            (&shape.cloud_indicator_col, "cloud_indicator"),
+            (&shape.peak_current_col, "peak_current"),
+        ] {
+            if let Some(name) = col {
+                attr_cols.push_str(&format!(
+                    ", {}::double precision AS {alias}",
+                    quote_ident(name)?
+                ));
+            }
+        }
+    }
     let mut sql = String::from("SELECT ");
     sql.push_str(&format!(
-        "{time_select} AS time, ST_X({geom}) AS lon, ST_Y({geom}) AS lat \
+        "{time_select} AS time, ST_X({geom}) AS lon, ST_Y({geom}) AS lat{attr_cols} \
          FROM {table} \
          WHERE {time_col} > {rhs_lo} AND {time_col} <= {rhs_hi} \
          ORDER BY {time_col} DESC, {id} LIMIT $3"
@@ -1116,6 +1153,8 @@ mod tests {
             geom_col: Some("the_geom".into()), // shared default
             locations_window: None,
             id_col: None,
+            cloud_indicator_col: None,
+            peak_current_col: None,
             default_datetime: None,
             extent_bbox: None,
             columns: vec![],
@@ -1405,7 +1444,15 @@ mod tests {
     // ---- events ------------------------------------------------------------
 
     fn lightning_shape() -> EventsShape {
+        lightning_shape_with(None, None)
+    }
+
+    /// A shape with the optional attribute columns declared, so the SQL
+    /// builder's behaviour with and without them is both testable.
+    fn lightning_shape_with(cloud: Option<&str>, current: Option<&str>) -> EventsShape {
         EventsShape {
+            cloud_indicator_col: cloud.map(str::to_string),
+            peak_current_col: current.map(str::to_string),
             table: QualifiedTable {
                 schema: "public".into(),
                 table: "lightning".into(),
@@ -1496,5 +1543,80 @@ mod tests {
         assert!(matches!(err, BuildError::NoStations));
         let err = build_locations_from_observations(&cfg, None).unwrap_err();
         assert!(matches!(err, BuildError::NoStations));
+    }
+
+    #[test]
+    fn events_window_selects_declared_attribute_columns_cast() {
+        let shape = lightning_shape_with(Some("cloud_indicator"), Some("peak_current"));
+        let q = build_events_window(
+            &shape,
+            (t(2026, 7, 11, 17), t(2026, 7, 11, 18)),
+            1000,
+            WindowAttrs::Include,
+        )
+        .unwrap();
+
+        // Cast, not a bare column: the source may be smallint, numeric or
+        // real, and only the cast makes one decode cover all three.
+        assert!(q
+            .sql
+            .contains("\"cloud_indicator\"::double precision AS cloud_indicator"));
+        assert!(q
+            .sql
+            .contains("\"peak_current\"::double precision AS peak_current"));
+        // An undeclared column is absent entirely, not selected as NULL.
+        let partial = build_events_window(
+            &lightning_shape_with(Some("cloud_indicator"), None),
+            (t(2026, 7, 11, 17), t(2026, 7, 11, 18)),
+            1000,
+            WindowAttrs::Include,
+        )
+        .unwrap();
+        assert!(partial.sql.contains("cloud_indicator"));
+        assert!(!partial.sql.contains("peak_current"));
+        // Half-open window and newest-first truncation are unchanged.
+        assert!(q.sql.contains("\"time\" > ($1 AT TIME ZONE 'UTC')"));
+        assert!(q.sql.contains("ORDER BY \"time\" DESC"));
+    }
+
+    #[test]
+    fn events_window_for_the_map_omits_attributes_even_when_declared() {
+        // The map splat shares this builder but reads none of them; selecting
+        // three unread columns per strike on a per-frame query is pure cost.
+        let shape = lightning_shape_with(Some("cloud_indicator"), Some("peak_current"));
+        let q = build_events_window(
+            &shape,
+            (t(2026, 7, 11, 17), t(2026, 7, 11, 18)),
+            1000,
+            WindowAttrs::Omit,
+        )
+        .unwrap();
+        assert!(!q.sql.contains("cloud_indicator"));
+        assert!(!q.sql.contains("peak_current"));
+        assert!(q.sql.contains("ST_X(\"the_geom\") AS lon"));
+    }
+
+    #[test]
+    fn events_window_neutralizes_an_injecting_attribute_identifier() {
+        // Names are rejected at config load (`check_identifier`), so this can
+        // only be reached by constructing an EventsShape directly. Even then
+        // `quote_ident` escapes rather than concatenates: the payload becomes
+        // ONE quoted identifier that the DB rejects as unknown, never a second
+        // statement. Defense in depth, per Critical Rule 8.
+        let shape = lightning_shape_with(Some("bad\"; DROP TABLE x --"), None);
+        let q = build_events_window(
+            &shape,
+            (t(2026, 7, 11, 17), t(2026, 7, 11, 18)),
+            1000,
+            WindowAttrs::Include,
+        )
+        .unwrap();
+        assert!(
+            q.sql.contains("\"bad\"\"; DROP TABLE x --\""),
+            "the embedded quote must be doubled, not closed: {}",
+            q.sql
+        );
+        // The statement still ends at the single LIMIT bind — nothing escaped.
+        assert_eq!(q.sql.matches("SELECT").count(), 1);
     }
 }

@@ -1365,6 +1365,13 @@ pub struct PostgisObservationsConfig {
     /// (`ORDER BY time DESC, id`). Required for `events`, forbidden otherwise.
     #[serde(default)]
     pub id_col: Option<String>,
+    /// Optional per-event attribute columns, `events` shape only (#616).
+    /// Omitted means the attribute is not populated — never defaulted, so a
+    /// consumer can tell "not reported" from "reported as zero".
+    #[serde(default)]
+    pub cloud_indicator_col: Option<String>,
+    #[serde(default)]
+    pub peak_current_col: Option<String>,
     /// `events` shape: window applied when a query carries no `datetime`
     /// (ISO 8601 duration, e.g. `"PT1H"`; that is also the default). Event
     /// tables are never scanned over full history by an unqualified query.

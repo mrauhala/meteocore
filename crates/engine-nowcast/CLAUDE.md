@@ -119,7 +119,7 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   wired; null means "join skipped this generation" (source error — the
   generation itself never fails), 0 means measured-quiet.
 
-## Lightning metrics (#616, part 1)
+## Lightning metrics (#616)
 
 - **`jump_sigma` replaces a bare boolean as the scoring input.** The 2σ test
   already computed the magnitude and discarded it; a 5σ surge and a 2.1σ
@@ -137,8 +137,49 @@ follow-up (full frames only for the latest generation) is scoped in #523.
 - Scoring ramps the jump between `JUMP_SIGMA_FLOOR` (2.0, the test
   threshold) and `JUMP_SIGMA_CEILING` (6.0); beyond that the difference
   shouldn't decide a ranking.
-- **Not yet:** IC/CG split and CG polarity (#616 part 2) need `EventPoint`
-  to carry attributes, which it deliberately does not.
+### IC/CG split and polarity (part 2)
+
+- `EventPoint.attrs` (`ds_core::events::EventAttrs`) carries the per-event
+  scalars. **Flat and `Copy`** — up to `MAX_JOIN_STRIKES` (200k) events cross
+  this seam per generation, so a map or `Vec` per event would allocate 200k
+  times per cycle on the poll runtime.
+- The columns are **opt-in per source**: `[postgis.events]`
+  `cloud_indicator_col` / `peak_current_col`. A network that doesn't report
+  them declares nothing and nothing is selected. Do NOT add a column here
+  without a consumer — `multiplicity_col` was wired end-to-end in the first
+  draft of #618 and read by nothing, paying SQL and decode cost per strike
+  for a config knob that silently did nothing.
+- **A three-way distinction, not two.** `cg_count`/`ic_count`/
+  `positive_cg_fraction` are absent when no source is wired, `null` when the
+  source reports no discriminator, and a number when measured. "This network
+  doesn't say" and "no CG flashes" are different facts and only one of them
+  licenses a statement.
+- **Presence flags must be exactly as fine-grained as the fact they gate.**
+  `Tallies` carries `saw_split` and `saw_polarity` PER TRACK. Review on #618
+  found the same mistake twice at two granularities:
+  - One flag for both facts made a split-only network report
+    `positive_cg_fraction: 0.0` for every CG-producing cell — "we checked and
+    found no positive flashes" about a question it never asked.
+  - A generation-global flag let a cell whose OWN strikes were all
+    unclassified report `Some(0)` because some OTHER cell's strikes were
+    classified. Degraded detections cluster by cell, so this is not exotic.
+- **`positive_cg_fraction`'s denominator is `cg_polarity_known`, not
+  `cg_count`.** Peak-current estimation fails on weak signals, so a network
+  can classify only part of its CG population; dividing 4 positives by all 10
+  CG flashes reports 0.4 where the measured share is 0.8. The denominator is
+  served as its own property so the sample size behind the share is visible —
+  "3 of 4" and "300 of 400" are the same fraction and not the same evidence.
+- **`positive_cg_fraction` is `None` when `cg_count == 0`**, never 0.0 — 0/0
+  is not 0%. A cell with only IC flashes has no CG polarity to report.
+- Polarity comes from the SIGN of `peak_current`, not its magnitude. A zero
+  current yields `None` (no polarity) rather than "positive".
+- `positive_cg` is weighted at 0.6 and ramps `POSITIVE_CG_FLOOR` 0.05 →
+  `POSITIVE_CG_CEILING` 0.5: a few +CG flashes are normal background, and a
+  CG population half positive is already the severe signature, so the term
+  saturates there rather than reserving its top half for shares that
+  essentially never occur. Test the RAMP, not just the ordering — a relative
+  `assert!(a > b)` passes with no ramp at all, which is how the missing one
+  reached review.
 
 ## Fact sheets + significance ranking
 
