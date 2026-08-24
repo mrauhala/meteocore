@@ -309,7 +309,6 @@ extent_bbox = [4.0, 54.0, 42.0, 72.0]   # REQUIRED: the only spatial-extent sour
 # Optional per-event attributes for the storm-cell join (#616) — see below.
 cloud_indicator_col = "cloud_indicator"   # 0 = cloud-to-ground, 1 = intra-cloud
 peak_current_col = "peak_current"         # signed kA; the SIGN is the polarity
-multiplicity_col = "multiplicity"         # return strokes per flash
 
 [[postgis.parameters]]
 name = "peak_current"         # source_key defaults to name = the column name
@@ -360,7 +359,7 @@ Behaviour:
 
 ### Event attributes for the cell join (#616)
 
-The three optional `*_col` fields above populate `ds_core::events::EventAttrs`
+The two optional `*_col` fields above populate `ds_core::events::EventAttrs`
 on every `EventPoint` returned by the `EventSource` trait, which is how
 engine-nowcast derives a cell's IC/CG split and positive-CG fraction. They
 affect **only** that trait — the EDR/WMS paths are unchanged, and a column
@@ -373,8 +372,18 @@ EDR parameter *and* the polarity source).
   `null`, not as "no positive flashes"; declaring the reverse yields polarity
   without the split. Do NOT declare `cloud_indicator_col` pointing at a column
   whose encoding differs from 0=CG/1=IC — the join would silently invert.
+- **Partial coverage within a column is handled, not assumed away.**
+  Peak-current estimation fails on weak signals, so a NULL current on some
+  rows is normal. Those flashes are excluded from the positive-share
+  denominator rather than counted as non-positive, and the denominator is
+  published as `cg_polarity_known` so the sample size behind the share is
+  visible to a consumer.
 - Identifiers are validated at config load and emitted through
   `quote_ident` (Critical Rule 8), same as every other column name.
+- Only columns with an actual consumer belong here. Each one is selected and
+  decoded for every event in the window — up to 200k per nowcast generation —
+  so an unread column is pure cost, and a config knob that silently does
+  nothing is worse than an absent one.
 - Cast `::double precision` in SQL (like the EDR parameter columns), so
   `smallint`, `numeric(p,s)` and `real` source columns all work without
   config. A NULL row value decodes to `None` — "not reported for this

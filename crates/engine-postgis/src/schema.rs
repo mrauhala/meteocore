@@ -189,7 +189,6 @@ pub struct EventsShape {
     /// consumer can tell "not reported" from "reported as zero".
     pub cloud_indicator_col: Option<String>,
     pub peak_current_col: Option<String>,
-    pub multiplicity_col: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -382,9 +381,6 @@ impl EventsShape {
             peak_current_col: attr_col(&cfg.peak_current_col)
                 .map(|c| check_identifier(&c, "observations.peak_current_col"))
                 .transpose()?,
-            multiplicity_col: attr_col(&cfg.multiplicity_col)
-                .map(|c| check_identifier(&c, "observations.multiplicity_col"))
-                .transpose()?,
         })
     }
 }
@@ -538,7 +534,6 @@ mod tests {
             id_col: None,
             cloud_indicator_col: None,
             peak_current_col: None,
-            multiplicity_col: None,
             default_datetime: None,
             extent_bbox: None,
             columns: vec![],
@@ -576,7 +571,6 @@ mod tests {
             id_col: None,
             cloud_indicator_col: None,
             peak_current_col: None,
-            multiplicity_col: None,
             default_datetime: None,
             extent_bbox: None,
             columns: vec![
@@ -616,7 +610,6 @@ mod tests {
             id_col: None,
             cloud_indicator_col: None,
             peak_current_col: None,
-            multiplicity_col: None,
             default_datetime: None,
             extent_bbox: None,
             columns: vec![],
@@ -671,7 +664,6 @@ mod tests {
             id_col: None,
             cloud_indicator_col: None,
             peak_current_col: None,
-            multiplicity_col: None,
             default_datetime: None,
             extent_bbox: None,
             columns: vec![],
@@ -705,7 +697,6 @@ mod tests {
             id_col: Some("id".into()),
             cloud_indicator_col: None,
             peak_current_col: None,
-            multiplicity_col: None,
             default_datetime: Some("PT1H".into()),
             extent_bbox: Some([4.0, 54.0, 42.0, 72.0]),
         }
@@ -766,7 +757,6 @@ mod tests {
                 // Whitespace-only is "not declared", not a column named "  ".
                 assert_eq!(s.cloud_indicator_col, None);
                 assert_eq!(s.peak_current_col.as_deref(), Some("peak_current"));
-                assert_eq!(s.multiplicity_col, None);
             }
             _ => panic!("expected Events"),
         }

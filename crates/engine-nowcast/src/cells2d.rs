@@ -153,6 +153,11 @@ pub struct CellTrack {
     /// Positive-polarity cloud-to-ground flashes. A high positive fraction is
     /// a well-established severe-storm signal.
     pub cg_positive_count: Option<u32>,
+    /// CG flashes whose polarity was reported — the DENOMINATOR for the
+    /// positive share. Not the same as `cg_count`: peak-current estimation
+    /// fails on weak signals, so a network can classify only part of its CG
+    /// population, and dividing by the full count would understate the share.
+    pub cg_polarity_known_count: Option<u32>,
     /// When this track was first attributed a flash. Electrification age is
     /// context a raw count cannot carry: a cell producing its first flash
     /// now is a different situation from one that has been active an hour.
@@ -269,6 +274,7 @@ pub fn advance_tracks(
                     cg_count: None,
                     ic_count: None,
                     cg_positive_count: None,
+                    cg_polarity_known_count: None,
                     first_flash: None,
                 },
                 Some(pi) => {
@@ -342,6 +348,7 @@ pub fn advance_tracks(
                         cg_count: None,
                         ic_count: None,
                         cg_positive_count: None,
+                        cg_polarity_known_count: None,
                         // Carried, not reset: it is the track's first flash
                         // ever, not its first this generation.
                         first_flash: prev.first_flash,
@@ -373,41 +380,77 @@ pub fn advance_tracks(
 /// — milliseconds. Even the MAX_JOIN_STRIKES cap × the 255-track label
 /// ceiling stays in the tens of ms. A spatial index earns its complexity
 /// only if either bound grows by orders of magnitude.
-/// Add one strike to a track's attribute tallies.
+/// Per-track attribute tallies accumulated over one lightning join.
 ///
-/// `any_attrs` records whether ANY strike carried the IC/CG discriminator and
-/// `any_polarity` whether ANY carried a usable peak current. They are tracked
-/// SEPARATELY because `cloud_indicator_col` and `peak_current_col` are
-/// independently optional: a network that reports the split but not the
-/// current would otherwise hand back `cg_pos = 0` for every track, which reads
-/// as "measured: no positive flashes" when the truth is "never measured".
-#[allow(clippy::too_many_arguments)]
-fn tally(
-    cg: &mut [u32],
-    ic: &mut [u32],
-    cg_pos: &mut [u32],
-    any_attrs: &mut bool,
-    any_polarity: &mut bool,
-    idx: usize,
-    attrs: EventAttrs,
-) {
-    // Polarity is independent of the IC/CG split — note this is recorded even
-    // for a strike whose split is unknown, since the question "does this
-    // network report current at all" is answered by any strike.
-    if let Some(positive) = attrs.is_positive() {
-        *any_polarity = true;
-        if positive && attrs.is_cloud_to_ground() == Some(true) {
-            cg_pos[idx] += 1;
+/// Every field is PER TRACK, including the two "was this ever reported"
+/// flags. Two separate mistakes live here, both found in review on #618, and
+/// both the same shape — a presence flag coarser than the fact it gates:
+///
+/// 1. The split and the polarity are tracked separately, because
+///    `cloud_indicator_col` and `peak_current_col` are independently optional.
+///    One shared flag made a split-only network report "no positive flashes"
+///    for a question it never asked.
+/// 2. The flags are per track, not per generation. One batch can mix strikes
+///    that carry a discriminator with strikes that don't — degraded detections
+///    cluster by cell. A generation-global flag let a cell whose OWN strikes
+///    were all unclassified report `Some(0)` because some other cell's strikes
+///    were classified.
+struct Tallies {
+    cg: Vec<u32>,
+    ic: Vec<u32>,
+    cg_pos: Vec<u32>,
+    /// CG flashes whose polarity was ACTUALLY reported — the denominator for
+    /// the positive share, and deliberately not `cg`.
+    ///
+    /// Coverage can be partial within one network: peak-current estimation
+    /// fails on weak signals, so a cell can have 10 CG flashes of which only
+    /// 5 carry a current. Dividing 4 positives by all 10 would report 0.4
+    /// where the measured share is 0.8, halving the term for every deployment
+    /// with imperfect coverage and giving a consumer no way to see it.
+    cg_polarity_known: Vec<u32>,
+    /// Did THIS track see any strike carrying the IC/CG discriminator?
+    saw_split: Vec<bool>,
+    /// Did THIS track see any strike carrying a usable peak current?
+    saw_polarity: Vec<bool>,
+}
+
+impl Tallies {
+    fn new(n: usize) -> Self {
+        Self {
+            cg: vec![0; n],
+            ic: vec![0; n],
+            cg_pos: vec![0; n],
+            cg_polarity_known: vec![0; n],
+            saw_split: vec![false; n],
+            saw_polarity: vec![false; n],
         }
     }
-    let Some(is_cg) = attrs.is_cloud_to_ground() else {
-        return;
-    };
-    *any_attrs = true;
-    if is_cg {
-        cg[idx] += 1;
-    } else {
-        ic[idx] += 1;
+
+    /// Add one strike to track `idx`.
+    fn add(&mut self, idx: usize, attrs: EventAttrs) {
+        let is_cg = attrs.is_cloud_to_ground();
+        // Polarity is independent of the IC/CG split. Any strike with a
+        // current answers "is polarity reported for this cell" — but only a
+        // KNOWN cloud-to-ground flash joins the share, since the quantity is
+        // the positive share OF CG flashes.
+        if let Some(positive) = attrs.is_positive() {
+            self.saw_polarity[idx] = true;
+            if is_cg == Some(true) {
+                self.cg_polarity_known[idx] += 1;
+                if positive {
+                    self.cg_pos[idx] += 1;
+                }
+            }
+        }
+        let Some(is_cg) = is_cg else {
+            return;
+        };
+        self.saw_split[idx] = true;
+        if is_cg {
+            self.cg[idx] += 1;
+        } else {
+            self.ic[idx] += 1;
+        }
     }
 }
 
@@ -426,11 +469,7 @@ pub fn apply_lightning(
 ) {
     let mut counts = vec![0u32; tracks.len()];
     // Attribute tallies run alongside the plain count, indexed like `counts`.
-    let mut cg = vec![0u32; tracks.len()];
-    let mut ic = vec![0u32; tracks.len()];
-    let mut cg_pos = vec![0u32; tracks.len()];
-    let mut any_attrs = false;
-    let mut any_polarity = false;
+    let mut tallies = Tallies::new(tracks.len());
 
     for &((sx, sy), attrs) in strikes_px {
         // In-grid by contract; `as usize` saturates negatives to 0 and
@@ -439,15 +478,7 @@ pub fn apply_lightning(
         let label = labels.get(idx).copied().unwrap_or(0) as usize;
         if (1..=tracks.len()).contains(&label) {
             counts[label - 1] += 1;
-            tally(
-                &mut cg,
-                &mut ic,
-                &mut cg_pos,
-                &mut any_attrs,
-                &mut any_polarity,
-                label - 1,
-                attrs,
-            );
+            tallies.add(label - 1, attrs);
             continue;
         }
         let gate2 = LIGHTNING_JOIN_RADIUS_KM * LIGHTNING_JOIN_RADIUS_KM;
@@ -462,15 +493,7 @@ pub fn apply_lightning(
         }
         if let Some((k, _)) = best {
             counts[k] += 1;
-            tally(
-                &mut cg,
-                &mut ic,
-                &mut cg_pos,
-                &mut any_attrs,
-                &mut any_polarity,
-                k,
-                attrs,
-            );
+            tallies.add(k, attrs);
         }
     }
 
@@ -508,17 +531,16 @@ pub fn apply_lightning(
         if n > 0 && t.first_flash.is_none() {
             t.first_flash = Some(observed);
         }
-        // Only surfaced when the source actually reports the discriminator;
-        // otherwise these stay None, so "not reported" never reads as zero.
-        // The split and the polarity are reported independently, so they are
-        // gated independently. Collapsing them would make a split-only
-        // network report "no positive flashes" it never looked for.
-        if any_attrs {
-            t.cg_count = Some(cg[idx]);
-            t.ic_count = Some(ic[idx]);
+        // Only surfaced when THIS track's own strikes carried the
+        // discriminator; otherwise these stay None, so "not reported" never
+        // reads as zero. Gated per fact and per track — see `Tallies`.
+        if tallies.saw_split[idx] {
+            t.cg_count = Some(tallies.cg[idx]);
+            t.ic_count = Some(tallies.ic[idx]);
         }
-        if any_polarity {
-            t.cg_positive_count = Some(cg_pos[idx]);
+        if tallies.saw_polarity[idx] {
+            t.cg_positive_count = Some(tallies.cg_pos[idx]);
+            t.cg_polarity_known_count = Some(tallies.cg_polarity_known[idx]);
         }
         t.flash_count = Some(n);
         t.flash_rate_per_min = Some(rate);
@@ -565,6 +587,7 @@ mod tests {
             cg_count: None,
             ic_count: None,
             cg_positive_count: None,
+            cg_polarity_known_count: None,
             first_flash: None,
         }
     }
@@ -759,6 +782,7 @@ mod tests {
             cg_count: None,
             ic_count: None,
             cg_positive_count: None,
+            cg_polarity_known_count: None,
             first_flash: None,
         }];
         // Uniform 30 px/interval eastward flow; at 1 km/px the compensated
@@ -983,7 +1007,6 @@ mod tests {
         let at = |cloud, current| EventAttrs {
             cloud_indicator: Some(cloud),
             peak_current_ka: Some(current),
-            multiplicity: None,
         };
         let strikes = vec![
             ((0.5, 0.5), at(0, -15.0)), // CG negative
@@ -1034,7 +1057,6 @@ mod tests {
         let split_only = |cloud| EventAttrs {
             cloud_indicator: Some(cloud),
             peak_current_ka: None,
-            multiplicity: None,
         };
         let strikes = vec![
             ((0.5, 0.5), split_only(0)),
@@ -1073,7 +1095,6 @@ mod tests {
                 EventAttrs {
                     cloud_indicator: None,
                     peak_current_ka: Some(30.0),
-                    multiplicity: None,
                 },
             );
             3
@@ -1090,5 +1111,88 @@ mod tests {
         assert_eq!(tracks[0].cg_count, None);
         assert_eq!(tracks[0].ic_count, None);
         assert_eq!(tracks[0].cg_positive_count, Some(0));
+    }
+
+    #[test]
+    fn partial_polarity_coverage_divides_by_what_was_classified() {
+        use ds_core::events::EventAttrs;
+        // 4 CG with known polarity (3 positive) + 6 CG whose current was NULL.
+        // The share is 3/4, not 3/10: a network whose current estimation fails
+        // on weak signals must not have its positives divided by flashes it
+        // never classified.
+        let mut t = bare_track(1, 0.5, 0.5);
+        t.flash_history = vec![1.0];
+        let mut tracks = vec![t];
+        let cg = |current: Option<f32>| EventAttrs {
+            cloud_indicator: Some(0),
+            peak_current_ka: current,
+        };
+        let mut strikes = vec![((0.5, 0.5), cg(Some(20.0))); 3];
+        strikes.push(((0.5, 0.5), cg(Some(-20.0))));
+        strikes.extend(vec![((0.5, 0.5), cg(None)); 6]);
+        apply_lightning(
+            &mut tracks,
+            &strikes,
+            &[1],
+            1,
+            PixelScale { x: 1.0, y: 1.0 },
+            60.0,
+            test_instant(),
+        );
+        assert_eq!(
+            tracks[0].cg_count,
+            Some(10),
+            "every CG flash is still counted"
+        );
+        assert_eq!(
+            tracks[0].cg_polarity_known_count,
+            Some(4),
+            "only 4 carried a current"
+        );
+        assert_eq!(tracks[0].cg_positive_count, Some(3));
+    }
+
+    #[test]
+    fn one_cells_unclassified_strikes_do_not_borrow_anothers_discriminator() {
+        use ds_core::events::EventAttrs;
+        // Degraded detections cluster by cell. Track A's own strikes carry no
+        // discriminator; track B's do. A generation-global presence flag would
+        // hand A a "measured zero" built from B's evidence.
+        let mut tracks = vec![bare_track(1, 0.5, 0.5), bare_track(2, 1.5, 0.5)];
+        for t in &mut tracks {
+            t.flash_history = vec![1.0];
+        }
+        let strikes = vec![
+            // Track A (label 1): no discriminator at all.
+            ((0.5, 0.5), EventAttrs::default()),
+            ((0.5, 0.5), EventAttrs::default()),
+            // Track B (label 2): fully classified.
+            (
+                (1.5, 0.5),
+                EventAttrs {
+                    cloud_indicator: Some(0),
+                    peak_current_ka: Some(25.0),
+                },
+            ),
+        ];
+        apply_lightning(
+            &mut tracks,
+            &strikes,
+            &[1, 2],
+            2,
+            PixelScale { x: 1.0, y: 1.0 },
+            60.0,
+            test_instant(),
+        );
+        assert_eq!(tracks[0].flash_count, Some(2), "A still counts its strikes");
+        assert_eq!(
+            tracks[0].cg_count, None,
+            "A saw no discriminator, so it must report nothing — not zero"
+        );
+        assert_eq!(tracks[0].ic_count, None);
+        assert_eq!(tracks[0].cg_positive_count, None);
+        // B is unaffected and reports what it actually measured.
+        assert_eq!(tracks[1].cg_count, Some(1));
+        assert_eq!(tracks[1].cg_positive_count, Some(1));
     }
 }

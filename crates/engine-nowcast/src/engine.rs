@@ -106,6 +106,7 @@ const SORTABLES_LIGHTNING_EXTRAS: &[&str] = &[
     "first_flash",
     "cg_count",
     "ic_count",
+    "cg_polarity_known",
     "positive_cg_fraction",
 ];
 /// Extras that exist only with `impact_source` wired.
@@ -1422,11 +1423,19 @@ fn score_cells(
                     jump_sigma: t.jump_sigma.map(|v| round_to(f64::from(v), 2)),
                     cg_count: t.cg_count,
                     ic_count: t.ic_count,
-                    // Guarded against 0/0: a cell with no CG flashes has no
-                    // positive share, which is not the same as 0%.
-                    positive_cg_fraction: match (t.cg_count, t.cg_positive_count) {
-                        (Some(cg), Some(pos)) if cg > 0 => {
-                            Some(round_to(f64::from(pos) / f64::from(cg), 3))
+                    cg_polarity_known: t.cg_polarity_known_count,
+                    // Denominator is the CG flashes whose polarity was
+                    // REPORTED, not every CG flash. A network that classifies
+                    // only part of its CG population would otherwise have the
+                    // share divided by flashes it never looked at — 4 of 5
+                    // known positives reported as 0.4 instead of 0.8.
+                    //
+                    // Guarded against 0/0 either way: a cell with no
+                    // classifiable CG flashes has no positive share, which is
+                    // not the same as 0%.
+                    positive_cg_fraction: match (t.cg_polarity_known_count, t.cg_positive_count) {
+                        (Some(known), Some(pos)) if known > 0 => {
+                            Some(round_to(f64::from(pos) / f64::from(known), 3))
                         }
                         _ => None,
                     },
@@ -1587,6 +1596,12 @@ fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
         for (key, value) in [
             ("cg_count", t.lightning.and_then(|l| l.cg_count)),
             ("ic_count", t.lightning.and_then(|l| l.ic_count)),
+            // The denominator behind positive_cg_fraction. Served so a
+            // consumer can weigh "3 of 4" against "300 of 400".
+            (
+                "cg_polarity_known",
+                t.lightning.and_then(|l| l.cg_polarity_known),
+            ),
         ] {
             props.insert(
                 key.into(),

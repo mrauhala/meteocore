@@ -222,7 +222,6 @@ fn lightning_attributes_reach_the_feature_and_match_the_sortables() {
                 attrs: EventAttrs {
                     cloud_indicator: Some(cloud),
                     peak_current_ka: Some(current),
-                    multiplicity: None,
                 },
             };
             let mut v = vec![mk(0, -20.0); 15];
