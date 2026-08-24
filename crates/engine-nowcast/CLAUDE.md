@@ -149,6 +149,13 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   without a consumer — `multiplicity_col` was wired end-to-end in the first
   draft of #618 and read by nothing, paying SQL and decode cost per strike
   for a config knob that silently did nothing.
+- **A cell with NO strikes reports a zero split, not an unknown one.** The
+  split of zero flashes is zero flashes, whether or not the network could have
+  classified them. Gating on `saw_split` alone shipped `flash_count: 0` beside
+  `cg_count: null` — claiming ignorance about a total the same response
+  asserted was zero. `positive_cg_fraction` is the exception and stays null:
+  0 of 0 CG flashes has no share. (Coverage is separate: outside the network's
+  range `flash_count` should itself be null — #621 — and these follow it.)
 - **A three-way distinction, not two.** `cg_count`/`ic_count`/
   `positive_cg_fraction` are absent when no source is wired, `null` when the
   source reports no discriminator, and a number when measured. "This network
