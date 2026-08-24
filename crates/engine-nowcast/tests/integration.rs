@@ -166,10 +166,14 @@ fn lightning_join_exposes_flash_properties() {
         f.properties.get("flash_rate_per_min"),
         Some(PropertyValue::Float(r)) if (r - 6.0).abs() < 1e-6
     ));
-    assert!(matches!(
+    // Null after ONE generation: the jump test needs a baseline of at least
+    // two, so no jump has been ruled out yet. It becomes `false` below, once
+    // a second generation gives it something to compare against — the two
+    // states are different claims and the payload distinguishes them.
+    assert_eq!(
         f.properties.get("lightning_jump"),
-        Some(PropertyValue::Bool(false))
-    ));
+        Some(&PropertyValue::Null)
+    );
 
     let anchor2 = anchor1 + Duration::minutes(5);
     source.times.write().unwrap().push(anchor2);
@@ -180,10 +184,27 @@ fn lightning_join_exposes_flash_properties() {
         f.properties.get("flash_count"),
         Some(PropertyValue::Integer(30))
     ));
-    assert!(matches!(
+    // Still null: the baseline is built from PRIOR generations, so after two
+    // there is exactly one historical rate — not enough spread to test.
+    assert_eq!(
         f.properties.get("lightning_jump"),
-        Some(PropertyValue::Bool(false))
-    ));
+        Some(&PropertyValue::Null)
+    );
+
+    // Third generation: two prior rates now exist, the test can run, and it
+    // says no — 6 flashes/min is under the 10/min operational floor. This is
+    // the transition that matters: "not testable" became "tested, no jump",
+    // and those are different claims about the same cell.
+    let anchor3 = anchor2 + Duration::minutes(5);
+    source.times.write().unwrap().push(anchor3);
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+    assert_eq!(
+        f.properties.get("lightning_jump"),
+        Some(&PropertyValue::Bool(false)),
+        "with a baseline the flag becomes a measurement"
+    );
 
     // No source wired ⇒ the flash properties do not exist (absent, not
     // null — "not measured" is a different statement than "no strikes").
@@ -853,10 +874,13 @@ fn cell_features_are_served_and_tracks_persist() {
         f.properties.get("severity"),
         Some(PropertyValue::String(s)) if s == "moderate"
     ));
-    assert!(matches!(
+    // Null, not false: this is the first generation, so the track has no
+    // velocity and non-deviance cannot have been established. See
+    // `a_newborn_asserts_nothing_it_cannot_know`.
+    assert_eq!(
         f.properties.get("deviant_mover"),
-        Some(PropertyValue::Bool(false))
-    ));
+        Some(&PropertyValue::Null)
+    );
     let id1 = f.id.clone();
 
     let anchor2 = anchor1 + Duration::minutes(5);
@@ -1665,5 +1689,50 @@ fn a_stationary_echo_is_flagged_and_demoted() {
             "clutter should be among the top reasons: {r:?}"
         ),
         other => panic!("missing reasons: {other:?}"),
+    }
+}
+
+/// Reported by a model consuming the live `/mcp` surface on 2026-08-24:
+/// every `track_age: 1` cell carried `speed_ms: null` and `bearing_deg: null`
+/// but `deviant_mover: false` — asserting non-deviance from unknown motion —
+/// and `significance_reasons` could name `deviant_mover` while it was false.
+#[test]
+fn a_newborn_asserts_nothing_it_cannot_know() {
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+
+    // The first generation's cells are all newborns: they have been seen
+    // once, so no velocity has been estimated for any of them yet.
+    let (_s, engine) = build("PT30M", &[t0(), t0() + Duration::minutes(5)]);
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = page.features.first().expect("a cell was tracked");
+
+    assert_eq!(
+        f.properties.get("track_age"),
+        Some(&PropertyValue::Integer(1)),
+        "precondition: this is a newborn"
+    );
+    assert_eq!(f.properties.get("speed_ms"), Some(&PropertyValue::Null));
+    assert_eq!(f.properties.get("bearing_deg"), Some(&PropertyValue::Null));
+    // The point of the test: unknown motion cannot yield a motion verdict.
+    assert_eq!(
+        f.properties.get("deviant_mover"),
+        Some(&PropertyValue::Null),
+        "false would claim the cell was shown to move with the flow"
+    );
+
+    // And no reason may name a term that contributed nothing.
+    let Some(PropertyValue::List(reasons)) = f.properties.get("significance_reasons") else {
+        panic!("reasons must be a list");
+    };
+    for r in reasons {
+        let PropertyValue::String(name) = r else {
+            panic!("reason must be a string")
+        };
+        assert_ne!(
+            name, "deviant_mover",
+            "an explanation must not cite a flag that is null or false"
+        );
     }
 }

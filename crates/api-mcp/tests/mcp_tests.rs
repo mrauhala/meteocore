@@ -115,6 +115,35 @@ impl FeatureEngine for CellEngine {
     }
 }
 
+/// A cells engine with nothing retained yet — the state right after a boot or
+/// reload, before the first generation lands.
+struct EmptyCellEngine;
+
+impl FeatureEngine for EmptyCellEngine {
+    fn get_features(&self, _q: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+        Ok(FeaturePage {
+            features: vec![],
+            number_matched: 0,
+            number_returned: 0,
+            next_offset: None,
+        })
+    }
+
+    fn get_feature(&self, id: &str) -> Result<Feature, DataServerError> {
+        Err(DataServerError::FeatureNotFound(id.into()))
+    }
+
+    fn feature_count(&self) -> usize {
+        0
+    }
+
+    fn temporal_extent(
+        &self,
+    ) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+        None
+    }
+}
+
 fn collection(id: &str, engine_type: &str) -> CollectionConfig {
     CollectionConfig {
         id: id.to_string(),
@@ -142,9 +171,11 @@ fn app() -> axum::Router {
     let mut engines: HashMap<String, Arc<dyn FeatureEngine>> = HashMap::new();
     engines.insert("cells".into(), Arc::new(CellEngine));
     engines.insert("places".into(), Arc::new(CellEngine));
+    engines.insert("empty".into(), Arc::new(EmptyCellEngine));
     let mut collections = HashMap::new();
     collections.insert("cells".to_string(), collection("cells", "nowcast"));
     collections.insert("places".to_string(), collection("places", "geojson"));
+    collections.insert("empty".to_string(), collection("empty", "nowcast"));
 
     api_mcp::router(
         Arc::new(ArcSwap::from_pointee(McpState {
@@ -758,7 +789,7 @@ async fn reaching_retention_start_is_not_relabelled_as_samples_reached() {
     )
     .await;
     assert_eq!(
-        out["stopped_because"], "reached_retention_start",
+        out["stopped_because"], "reached_earliest_retained_frame",
         "the real reason must survive the post-loop default: {out}"
     );
 }
@@ -842,4 +873,77 @@ fn allowed_hosts_derives_from_base_url() {
     // A malformed base_url degrades to loopback rather than panicking.
     let hosts = api_mcp::allowed_hosts("not-a-url", &[]);
     assert!(hosts.contains(&"localhost".to_string()));
+}
+
+/// The retained window is published on every response, not only when the
+/// caller asked for a time outside it.
+///
+/// It was previously part of the out-of-range explanation, so a documented
+/// field read `null` in every successful response and a client had no way to
+/// learn how far back it could ask without first asking wrongly. Reported by
+/// a model consuming the live endpoint, 2026-08-24.
+#[tokio::test]
+async fn the_retained_window_is_published_on_successful_responses_too() {
+    let app = app();
+    let sid = handshake(&app).await;
+
+    let cells = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells"}),
+    )
+    .await;
+    assert_eq!(
+        cells["no_frame_for_requested_time"], false,
+        "this request is inside retention"
+    );
+    assert!(
+        cells["retained_frames"]["from"].is_string() && cells["retained_frames"]["to"].is_string(),
+        "the window must be present anyway: {cells}"
+    );
+
+    let track = call_tool(
+        &app,
+        &sid,
+        "get_cell_track",
+        json!({"collection": "cells", "cell_id": "42"}),
+    )
+    .await;
+    assert!(
+        track["retained_frames"]["from"].is_string(),
+        "a track walk must say how far back it could have gone: {track}"
+    );
+}
+
+/// Both cell tools carry `retained_frames` on EVERY response, including the
+/// paths where there is nothing to report.
+///
+/// Found in review on #626: `get_cell_track`'s early return for an engine with
+/// no retained frames omitted the key entirely, while `get_storm_cells`
+/// emitted an explicit null. A client testing key presence would have read the
+/// same situation two different ways depending on which tool it called.
+#[tokio::test]
+async fn retained_frames_is_present_even_when_nothing_is_retained() {
+    let app = app();
+    let sid = handshake(&app).await;
+
+    for (tool, args) in [
+        ("get_storm_cells", json!({"collection": "empty"})),
+        (
+            "get_cell_track",
+            json!({"collection": "empty", "cell_id": "42"}),
+        ),
+    ] {
+        let out = call_tool(&app, &sid, tool, args).await;
+        let obj = out.as_object().expect("object response");
+        assert!(
+            obj.contains_key("retained_frames"),
+            "{tool} dropped the key entirely: {out}"
+        );
+        assert!(
+            out["retained_frames"].is_null(),
+            "{tool} must report null, not a window: {out}"
+        );
+    }
 }

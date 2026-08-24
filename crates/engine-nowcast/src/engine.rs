@@ -1388,7 +1388,10 @@ fn score_cells(
                 age: t.age,
                 speed_ms: speed_raw.map(|v| round_to(v, 1)),
                 bearing_deg: bearing_raw.map(|b| round_to(b, 0) % 360.0),
-                deviant_mover: t.deviant(),
+                // Only knowable once the track has a velocity. A newborn
+                // cannot be shown to move with the flow or against it, and
+                // `false` would assert non-deviance from unknown motion.
+                deviant_mover: t.velocity_kms.map(|_| t.deviant()),
                 // From the RAW speed, like the impact lookahead: the rounded
                 // value is for display and a threshold comparison should not
                 // depend on it.
@@ -1419,7 +1422,10 @@ fn score_cells(
                     } else {
                         0.0
                     },
-                    jump: t.lightning_jump,
+                    // Not computable from a single frame: with no baseline
+                    // the test never runs, so `false` would claim a jump was
+                    // ruled out rather than never tested.
+                    jump: t.jump_sigma.map(|_| t.lightning_jump),
                     jump_sigma: t.jump_sigma.map(|v| round_to(f64::from(v), 2)),
                     cg_count: t.cg_count,
                     ic_count: t.ic_count,
@@ -1481,7 +1487,12 @@ fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
     props.insert("max_dbz".into(), PropertyValue::Float(t.max_dbz));
     props.insert("area_km2".into(), PropertyValue::Float(t.area_km2));
     props.insert("track_age".into(), PropertyValue::Integer(t.age as i64));
-    props.insert("deviant_mover".into(), PropertyValue::Bool(t.deviant_mover));
+    props.insert(
+        "deviant_mover".into(),
+        t.deviant_mover
+            .map(PropertyValue::Bool)
+            .unwrap_or(PropertyValue::Null),
+    );
     // Surfaced, not hidden: a demoted cell stays inspectable so a client can
     // say "persistent stationary echo, probably a wind farm" rather than
     // either "severe storm" or nothing at all.
@@ -1528,6 +1539,14 @@ fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
             cell.significance
                 .contributions
                 .iter()
+                // A term that contributed NOTHING is not a reason. Every
+                // weighted term appears in `contributions`, including flags
+                // that are false or unknown, so an unfiltered top-3 will
+                // name `deviant_mover` on a cell whose motion is unknown —
+                // an explanation citing a flag that is not set. Negative
+                // contributions stay: "demoted as likely clutter" is a real
+                // reason a cell ranked where it did.
+                .filter(|c| c.value != 0.0)
                 .take(3)
                 .map(|c| PropertyValue::String(c.term.into()))
                 .collect(),
@@ -1647,7 +1666,8 @@ fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
             // not "no jump" — the lightning group doubles as the
             // joined-this-generation marker.
             t.lightning
-                .map(|l| PropertyValue::Bool(l.jump))
+                .and_then(|l| l.jump)
+                .map(PropertyValue::Bool)
                 .unwrap_or(PropertyValue::Null),
         );
     }

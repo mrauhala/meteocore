@@ -299,19 +299,23 @@ impl MeteoCoreMcp {
         // and a model reading either as "no storms" states what it does not
         // know.
         let retained = engine.temporal_extent();
-        let outside_retention = match (requested_at, retained) {
-            (Some(t), Some((start, end))) if t < start => Some(json!({
-                "from": rfc3339(start),
-                "to": rfc3339(end),
-            })),
-            _ => None,
-        };
+        // The retained window is ALWAYS published, not only when a request
+        // fell outside it. It was previously part of the out-of-range
+        // explanation, which meant a documented field read `null` in every
+        // successful response — leaving a client no way to know how far back
+        // it may ask without first asking wrongly.
+        let retained_frames =
+            retained.map(|(start, end)| json!({ "from": rfc3339(start), "to": rfc3339(end) }));
+        let outside_retention = matches!(
+            (requested_at, retained),
+            (Some(t), Some((start, _))) if t < start
+        );
 
         Ok(json!({
             "collection": collection,
             "observed": observed,
-            "no_frame_for_requested_time": outside_retention.is_some(),
-            "retained_frames": outside_retention,
+            "no_frame_for_requested_time": outside_retention,
+            "retained_frames": retained_frames,
             "returned": page.number_returned,
             "total_tracked": page.number_matched,
             "cells": page.features.iter().map(cell_json).collect::<Vec<_>>(),
@@ -352,6 +356,12 @@ impl MeteoCoreMcp {
                 "collection": collection,
                 "cell_id": cell_id,
                 "history": [],
+                // Explicit null, not an omitted key. Both cell tools carry
+                // this key on every response so a client can read the field
+                // the same way each time; dropping it here would make key
+                // presence mean something on one path and nothing on the
+                // other.
+                "retained_frames": Value::Null,
                 "note": "No analysis frames are retained yet.",
             })
             .to_string());
@@ -404,7 +414,7 @@ impl MeteoCoreMcp {
                 // Empty frame: probe further back rather than concluding the
                 // history ends here. Does not count against `samples`.
                 if cursor <= extent_start {
-                    stopped = Some("reached_retention_start");
+                    stopped = Some("reached_earliest_retained_frame");
                     break;
                 }
                 empty_probes += 1;
@@ -416,7 +426,7 @@ impl MeteoCoreMcp {
                 history.push(cell_json(f));
             }
             if frame_time <= extent_start {
-                stopped = Some("reached_retention_start");
+                stopped = Some("reached_earliest_retained_frame");
                 break;
             }
             cursor = frame_time - Duration::seconds(1);
@@ -433,9 +443,18 @@ impl MeteoCoreMcp {
             "collection": collection,
             "cell_id": cell_id,
             "frames_walked": frames,
-            // Which of the three exits happened. "gave_up_in_empty_gap" in
-            // particular must not be read as "the cell stopped existing".
+            // Which exit happened. "gave_up_in_empty_gap" in particular must
+            // not be read as "the cell stopped existing", and
+            // "reached_earliest_retained_frame" deliberately does not claim a
+            // retention POLICY limit: this layer cannot tell a full buffer
+            // from a server that started an hour ago, and the old
+            // "reached_retention_start" made short walks early in an
+            // archive's life read as a policy boundary. Compare
+            // `retained_frames.from` to see which it was.
             "stopped_because": stopped,
+            "retained_frames": engine
+                .temporal_extent()
+                .map(|(start, end)| json!({ "from": rfc3339(start), "to": rfc3339(end) })),
             "history": history,
             "note": if history.is_empty() {
                 "This cell id is not present in any retained frame. Track ids restart when the \
