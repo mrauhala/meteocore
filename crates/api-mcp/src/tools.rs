@@ -356,6 +356,12 @@ impl MeteoCoreMcp {
                 "collection": collection,
                 "cell_id": cell_id,
                 "history": [],
+                // Explicit null, not an omitted key. Both cell tools carry
+                // this key on every response so a client can read the field
+                // the same way each time; dropping it here would make key
+                // presence mean something on one path and nothing on the
+                // other.
+                "retained_frames": Value::Null,
                 "note": "No analysis frames are retained yet.",
             })
             .to_string());
