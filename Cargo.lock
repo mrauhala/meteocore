@@ -4295,7 +4295,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "api-3dtiles",
  "api-edr",
