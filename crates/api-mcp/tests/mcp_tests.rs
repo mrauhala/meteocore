@@ -379,6 +379,31 @@ async fn call_tool(app: &axum::Router, sid: &str, name: &str, args: Value) -> Va
     serde_json::from_str(text).unwrap_or_else(|e| panic!("tool output is not JSON: {e}: {text}"))
 }
 
+/// Call a tool expecting a JSON-RPC error, returning its message.
+///
+/// Argument errors surface as `invalid_params` on the error channel rather
+/// than as `isError` tool content, so they need their own unwrapping.
+async fn call_tool_expect_error(app: &axum::Router, sid: &str, name: &str, args: Value) -> String {
+    let (status, _, body) = call(
+        app,
+        Some(TOKEN),
+        Some(sid),
+        json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+               "params": {"name": name, "arguments": args}}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "transport should still be 200: {body}"
+    );
+    let doc: Value = parse_rpc(&body);
+    doc["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a JSON-RPC error, got {doc}"))
+        .to_string()
+}
+
 #[tokio::test]
 async fn storm_cells_come_back_ranked_and_bounded() {
     let app = app();
@@ -946,4 +971,138 @@ async fn retained_frames_is_present_even_when_nothing_is_retained() {
             "{tool} must report null, not a window: {out}"
         );
     }
+}
+
+/// #630: `sortable_properties` was advertised while `get_storm_cells` had no
+/// way to use it — a capability announced and withheld.
+#[tokio::test]
+async fn storm_cells_can_be_ordered_by_an_advertised_property() {
+    let app = app();
+    let sid = handshake(&app).await;
+
+    // Default is unchanged: most significant first.
+    let out = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells"}),
+    )
+    .await;
+    let sig: Vec<f64> = out["cells"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["significance"].as_f64().unwrap())
+        .collect();
+    assert!(
+        sig.windows(2).all(|w| w[0] >= w[1]),
+        "default must stay significance-desc: {sig:?}"
+    );
+
+    // Ascending by an advertised key actually reorders.
+    let out = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "sort_by": "max_dbz", "order": "asc"}),
+    )
+    .await;
+    let dbz: Vec<f64> = out["cells"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["max_dbz"].as_f64().unwrap())
+        .collect();
+    assert!(
+        dbz.windows(2).all(|w| w[0] <= w[1]),
+        "ascending max_dbz was ignored: {dbz:?}"
+    );
+}
+
+/// An unsortable key is an error naming the alternatives, never a silently
+/// different ordering.
+#[tokio::test]
+async fn an_unknown_sort_key_is_rejected_with_the_valid_ones() {
+    let app = app();
+    let sid = handshake(&app).await;
+    let err = call_tool_expect_error(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "sort_by": "not_a_property"}),
+    )
+    .await;
+    assert!(err.contains("not_a_property"), "{err}");
+    assert!(
+        err.contains("significance") && err.contains("max_dbz"),
+        "the error must name what WOULD work: {err}"
+    );
+
+    let err = call_tool_expect_error(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "sort_by": "max_dbz", "order": "sideways"}),
+    )
+    .await;
+    assert!(err.contains("sideways"), "{err}");
+
+    // `order` alone has nothing to apply to. Accepting it and returning the
+    // default ordering is the silent no-op this parameter set exists to
+    // prevent — the caller asked for ascending and would get descending.
+    let err = call_tool_expect_error(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "order": "asc"}),
+    )
+    .await;
+    assert!(
+        err.contains("sort_by"),
+        "the error must name what is missing: {err}"
+    );
+}
+
+/// A significance floor narrows the result, and says how much it removed —
+/// "3 cells exist" and "7 were below your floor" are different answers.
+#[tokio::test]
+async fn a_significance_floor_reports_what_it_removed() {
+    let app = app();
+    let sid = handshake(&app).await;
+
+    let out = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells"}),
+    )
+    .await;
+    assert!(
+        out["below_min_significance"].is_null(),
+        "absent unless a floor was set, so it cannot read as 'nothing filtered'"
+    );
+
+    // The mock's cells are 0.88 / 0.55 / 0.31.
+    let out = call_tool(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "min_significance": 0.5}),
+    )
+    .await;
+    assert_eq!(out["returned"], 2);
+    assert_eq!(out["below_min_significance"], 1);
+    assert_eq!(
+        out["total_tracked"], 3,
+        "the frame still had three cells; the floor did not delete them"
+    );
+
+    let err = call_tool_expect_error(
+        &app,
+        &sid,
+        "get_storm_cells",
+        json!({"collection": "cells", "min_significance": 1.5}),
+    )
+    .await;
+    assert!(err.contains("between 0 and 1"), "{err}");
 }
