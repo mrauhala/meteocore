@@ -21,7 +21,7 @@ tokio = { version = "1", features = ["rt"] }
 # read the schema from disk and it has only internal `#/definitions` $refs. This
 # stops the whole async/HTTP stack (tokio/hyper/axum/tower) from being built a
 # second time with divergent features on a scoped `cargo test -p api-edr`.
-jsonschema = { version = "0.28", default-features = false }
+jsonschema = { version = "0.50", default-features = false }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
