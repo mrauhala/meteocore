@@ -1324,6 +1324,7 @@ dependencies = [
  "ds-core",
  "ds-poll",
  "engine-geotiff",
+ "serde_json",
  "tokio",
  "tracing",
 ]

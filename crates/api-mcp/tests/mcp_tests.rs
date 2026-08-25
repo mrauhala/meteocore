@@ -1106,3 +1106,71 @@ async fn a_significance_floor_reports_what_it_removed() {
     .await;
     assert!(err.contains("between 0 and 1"), "{err}");
 }
+
+/// The advertised input schema must match the parameters actually accepted.
+///
+/// Reported 2026-08-25: `get_storm_cells` was seen advertising only
+/// `collection`, `at` and `limit` with `additionalProperties: false`, while
+/// the server accepted `sort_by`, `order` and `min_significance`. A
+/// schema-conforming client can then only reach them by guessing a name its
+/// schema says is forbidden — and a NUMBER cannot survive that path at all,
+/// because an undeclared numeric gets serialised as a string and rejected.
+#[tokio::test]
+async fn the_storm_cells_schema_declares_every_parameter_it_accepts() {
+    let app = app();
+    let sid = handshake(&app).await;
+    let (_, _, body) = call(
+        &app,
+        Some(TOKEN),
+        Some(&sid),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+    )
+    .await;
+    let doc: Value = parse_rpc(&body);
+    let tool = doc["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|t| t["name"] == "get_storm_cells")
+        .expect("get_storm_cells advertised");
+    let props = tool["inputSchema"]["properties"]
+        .as_object()
+        .unwrap_or_else(|| panic!("no properties in {tool}"));
+
+    for p in [
+        "collection",
+        "at",
+        "limit",
+        "sort_by",
+        "order",
+        "min_significance",
+    ] {
+        assert!(
+            props.contains_key(p),
+            "`{p}` is accepted but not advertised: {}",
+            serde_json::to_string(&props).unwrap()
+        );
+    }
+
+    // The numeric one is the case that fails silently in the wild: an
+    // undeclared number is serialised as a string by the client and rejected
+    // by serde, so the filter reads as broken rather than undiscovered.
+    // An Option<f64> renders as `type: ["number", "null"]`, which is valid.
+    // What matters is that "number" appears at all: a client that cannot see
+    // a numeric type sends the value as a string, and serde then rejects it —
+    // the filter reads as broken rather than as undiscovered.
+    let ty = &props["min_significance"];
+    let mentions_number = ty["type"]
+        .as_str()
+        .map(|t| t == "number")
+        .or_else(|| {
+            ty["type"]
+                .as_array()
+                .map(|v| v.iter().any(|t| t == "number"))
+        })
+        .unwrap_or(false);
+    assert!(
+        mentions_number,
+        "min_significance must advertise a numeric type: {ty}"
+    );
+}
