@@ -128,7 +128,11 @@ impl PixelScale {
     pub const UNIT: PixelScale = PixelScale { x: 1.0, y: 1.0 };
 
     #[inline]
-    fn distance(&self, a: (f32, f32), b: (f32, f32)) -> f32 {
+    /// Anisotropy-aware distance between two pixel coordinates, in the
+    /// scale's unit. `pub(crate)` so the tracker measures path length the
+    /// same way matching measures gates — a second hand-rolled copy is how
+    /// this kind of thing drifts.
+    pub(crate) fn distance(&self, a: (f32, f32), b: (f32, f32)) -> f32 {
         let dx = (a.0 - b.0) * self.x;
         let dy = (a.1 - b.1) * self.y;
         (dx * dx + dy * dy).sqrt()

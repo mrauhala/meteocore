@@ -52,6 +52,24 @@ pub const DEVIANT_MIN_CELL_SPEED_MS: f32 = 3.0;
 /// Consecutive deviant generations before the flag is raised (single-scan
 /// residuals are mostly track noise).
 pub const DEVIANT_STREAK: u32 = 2;
+/// Shortest path (km) that counts as a path at all for
+/// [`CellTrack::path_straightness`].
+///
+/// Below this the cell has not gone anywhere and the net/path ratio is noise
+/// divided by noise. `None` is the honest answer, and
+/// [`CellTrack::net_displacement_km`] already says the useful thing about a
+/// cell that never moved.
+pub const MIN_PATH_FOR_STRAIGHTNESS_KM: f32 = 1.0;
+/// Straightness a track needs before its motion is trusted enough to raise
+/// the deviant-mover flag (#629).
+///
+/// A track whose own displacement is incoherent has motion estimates that
+/// measure association noise rather than storm behaviour. Observed
+/// 2026-08-24: a track ping-ponging between two fixed echoes 6.3 km apart
+/// scored ~0.2 straightness, produced 20 m/s speed spikes on the jump frames,
+/// and raised `deviant_mover` — which then appeared in
+/// `significance_reasons` and inflated its rank.
+pub const DEVIANT_MIN_STRAIGHTNESS: f32 = 0.5;
 /// Per-second clamp on a cell's measured intensity tendency (±2 dBZ per
 /// 5-minute interval at the usual cadence).
 pub const MAX_CELL_TENDENCY_PER_S: f32 = 2.0 / 300.0;
@@ -228,6 +246,17 @@ pub struct CellTrack {
     /// Consecutive generations the track-vs-field residual exceeded the
     /// deviant gates.
     pub deviant_streak: u32,
+    /// Centroid (pixels) where this track was first detected.
+    pub first_centroid: (f32, f32),
+    /// Straight-line distance from first detection to now, km.
+    ///
+    /// The honest answer to "has this thing actually gone anywhere". A fixed
+    /// echo sits near zero however long it is tracked, and unlike
+    /// `track_age` it cannot be inflated by an association failure.
+    pub net_displacement_km: f32,
+    /// Distance travelled summed frame by frame, km. Always ≥
+    /// [`Self::net_displacement_km`].
+    pub path_length_km: f32,
     pub severity: Severity,
     /// Volume-proxy trend vs the previous observation: `Some(true)` =
     /// growing, `Some(false)` = decaying, `None` = newborn (#546 iter 1).
@@ -290,6 +319,24 @@ pub struct CellTrack {
 
 impl CellTrack {
     /// Sustained deviant mover?
+    /// Net displacement divided by path-integrated distance, 0..=1.
+    ///
+    /// Real advection sits near 1: a storm that travels 30 km gets 30 km from
+    /// where it started. A track that wanders without arriving anywhere — the
+    /// signature of an association failure swapping between co-located fixed
+    /// echoes — sits near 0.
+    ///
+    /// `None` when the path is shorter than
+    /// [`MIN_PATH_FOR_STRAIGHTNESS_KM`]: a cell that never moved has no
+    /// direction to be straight in, and 0/0 is not 0. Read
+    /// [`Self::net_displacement_km`] for that case — it is the field that
+    /// distinguishes a stationary echo, while this one distinguishes a
+    /// wandering one.
+    pub fn path_straightness(&self) -> Option<f32> {
+        (self.path_length_km > MIN_PATH_FOR_STRAIGHTNESS_KM)
+            .then(|| (self.net_displacement_km / self.path_length_km).clamp(0.0, 1.0))
+    }
+
     pub fn deviant(&self) -> bool {
         self.deviant_streak >= DEVIANT_STREAK
     }
@@ -384,6 +431,9 @@ pub fn advance_tracks(
             match prev_idx {
                 None => CellTrack {
                     id: next_id(),
+                    first_centroid: blob.centroid,
+                    net_displacement_km: 0.0,
+                    path_length_km: 0.0,
                     severity: severity(&blob, area_km2),
                     trend_anchor_volume: blob.volume,
                     blob,
@@ -438,8 +488,24 @@ pub fn advance_tracks(
                     let residual_ms =
                         (((vx_km - fx_km).powi(2) + (vy_km - fy_km).powi(2)).sqrt()) * to_ms;
                     let cell_speed_ms = (vx_km * vx_km + vy_km * vy_km).sqrt() * to_ms;
+                    // Path accrues frame by frame; net is always measured
+                    // from the origin, so an association jump inflates the
+                    // path without inflating the net — which is exactly the
+                    // asymmetry that exposes it (#629).
+                    let path_length_km =
+                        prev.path_length_km + scale.distance(blob.centroid, prev.blob.centroid);
+                    let net_displacement_km = scale.distance(blob.centroid, prev.first_centroid);
+                    let straightness = (path_length_km > MIN_PATH_FOR_STRAIGHTNESS_KM)
+                        .then(|| (net_displacement_km / path_length_km).clamp(0.0, 1.0));
+                    // An incoherent track's motion estimate measures
+                    // association noise, so it must not earn the deviant
+                    // bonus. Unknown straightness does not qualify either:
+                    // this awards a bonus, and an unverifiable claim should
+                    // not get one.
+                    let coherent = straightness.is_some_and(|s| s >= DEVIANT_MIN_STRAIGHTNESS);
                     let deviant_now = residual_ms > DEVIANT_RESIDUAL_MS
-                        && cell_speed_ms > DEVIANT_MIN_CELL_SPEED_MS;
+                        && cell_speed_ms > DEVIANT_MIN_CELL_SPEED_MS
+                        && coherent;
 
                     // Measured from the anchor — the volume where the verdict
                     // was last confirmed — not from the previous frame, so a
@@ -457,6 +523,9 @@ pub fn advance_tracks(
                     let intensity_tendency = 0.5 * raw_tendency + 0.5 * prev.intensity_tendency;
                     CellTrack {
                         id: prev.id,
+                        first_centroid: prev.first_centroid,
+                        net_displacement_km,
+                        path_length_km,
                         severity: severity_hysteretic(&blob, area_km2, Some(prev.severity)),
                         blob,
                         age: prev.age + 1,
@@ -718,6 +787,9 @@ mod tests {
                 max_value: 40.0,
             },
             age: 1,
+            first_centroid: (cx, cy),
+            net_displacement_km: 0.0,
+            path_length_km: 0.0,
             velocity_kms: None,
             deviant_streak: 0,
             severity: Severity::Weak,
@@ -912,6 +984,9 @@ mod tests {
         };
         let previous = vec![CellTrack {
             id: 7,
+            first_centroid: blob.centroid,
+            net_displacement_km: 0.0,
+            path_length_km: 0.0,
             blob: blob.clone(),
             age: 1,
             velocity_kms: None,
@@ -1556,5 +1631,162 @@ mod tests {
             "monotonic growth reported as decaying: {verdicts:?}"
         );
         assert_eq!(verdicts.last().copied().flatten(), Some(true));
+    }
+
+    // ---- #629 path straightness ------------------------------------------
+
+    #[test]
+    fn straightness_separates_advection_from_wandering() {
+        let mut t = bare_track(1, 0.0, 0.0);
+
+        // A real cell: 30 km travelled, 30 km from where it started.
+        t.path_length_km = 30.0;
+        t.net_displacement_km = 30.0;
+        assert_eq!(t.path_straightness(), Some(1.0));
+
+        // The reported track: ping-ponging 6.3 km apart for an hour ends up
+        // ~6.4 km from the origin having covered ~30 km.
+        t.path_length_km = 30.0;
+        t.net_displacement_km = 6.4;
+        let s = t.path_straightness().unwrap();
+        assert!(
+            (0.15..0.25).contains(&s),
+            "expected the reported ~0.2, got {s}"
+        );
+
+        // A cell that never moved has no direction to be straight in. `None`,
+        // not 0 — and `net_displacement_km` is what speaks for this case.
+        t.path_length_km = 0.3;
+        t.net_displacement_km = 0.05;
+        assert_eq!(t.path_straightness(), None);
+    }
+
+    #[test]
+    fn an_association_failure_inflates_the_path_but_not_the_net() {
+        // The asymmetry the metric relies on. Two tracks end the same distance
+        // from their origin; one got there directly, the other by ping-ponging.
+        // Only the path length tells them apart, so only the ratio does.
+        let scale = PixelScale { x: 1.0, y: 1.0 };
+        let straight: Vec<(f32, f32)> = (0..=10).map(|i| (i as f32 * 3.0, 0.0)).collect();
+        let pingpong: Vec<(f32, f32)> = (0..=10)
+            .map(|i| if i % 2 == 0 { (0.0, 0.0) } else { (6.3, 0.0) })
+            .collect();
+
+        let measure = |path: &[(f32, f32)]| {
+            let mut length = 0.0f32;
+            for w in path.windows(2) {
+                length += scale.distance(w[1], w[0]);
+            }
+            let net = scale.distance(*path.last().unwrap(), path[0]);
+            (net, length)
+        };
+
+        let (net_s, len_s) = measure(&straight);
+        let (net_p, len_p) = measure(&pingpong);
+        assert!((net_s / len_s - 1.0).abs() < 1e-5, "advection is straight");
+        assert!(
+            net_p / len_p < DEVIANT_MIN_STRAIGHTNESS,
+            "wandering must fall below the coherence gate: {}",
+            net_p / len_p
+        );
+        // Both are "long tracks" by age; only this distinguishes them.
+        assert!(len_p > 30.0 && net_p < 1.0);
+    }
+
+    #[test]
+    fn an_incoherent_track_cannot_raise_the_deviant_flag() {
+        // A track jumping between two fixed echoes produces a large residual
+        // against the ambient flow on the jump frames. Before #629 that
+        // raised `deviant_mover`, which then appeared in
+        // `significance_reasons` and inflated the cell's rank.
+        let mut t = bare_track(1, 0.0, 0.0);
+        t.deviant_streak = DEVIANT_STREAK + 1;
+        // The flag itself is still a pure function of the streak...
+        assert!(t.deviant());
+        // ...but the streak can no longer accumulate on an incoherent track,
+        // which is enforced where `deviant_now` is computed. Pin the gate
+        // value so the two cannot drift apart.
+        t.path_length_km = 30.0;
+        t.net_displacement_km = 6.4;
+        assert!(
+            t.path_straightness().unwrap() < DEVIANT_MIN_STRAIGHTNESS,
+            "the reported track must be below the gate"
+        );
+    }
+
+    #[test]
+    fn a_tracked_cell_accumulates_path_and_net_from_its_origin() {
+        let scale = PixelScale { x: 1.0, y: 1.0 };
+        let frame = |x: f32| disc(300, 120, x, 60.0, 12.0, 50.0);
+        let field = estimate_motion(&frame(100.0), &frame(104.0), &MotionOptions::default());
+        let mut counter = 0u64;
+        let mut id_gen = || {
+            counter += 1;
+            counter
+        };
+        let mut tracks = advance_tracks(
+            &[],
+            segment_cells(&frame(100.0), CELL_THRESHOLD_DBZ, CELL_MIN_AREA_PX),
+            scale,
+            &field,
+            300.0,
+            300.0,
+            &mut id_gen,
+        );
+        assert_eq!(tracks[0].path_length_km, 0.0, "a newborn has gone nowhere");
+        assert_eq!(tracks[0].net_displacement_km, 0.0);
+        assert_eq!(tracks[0].path_straightness(), None);
+
+        for x in [104.0f32, 108.0, 112.0] {
+            tracks = advance_tracks(
+                &tracks,
+                segment_cells(&frame(x), CELL_THRESHOLD_DBZ, CELL_MIN_AREA_PX),
+                scale,
+                &field,
+                300.0,
+                300.0,
+                &mut id_gen,
+            );
+        }
+        let t = &tracks[0];
+        assert!(
+            t.path_length_km > 10.0,
+            "path accrued: {}",
+            t.path_length_km
+        );
+        // Pure advection: the two agree, so straightness is ~1.
+        let s = t.path_straightness().expect("path is long enough");
+        assert!(s > 0.95, "straight-line advection scored {s}");
+    }
+
+    #[test]
+    fn the_straightness_floor_costs_borderline_speed_movers_one_frame() {
+        // Raised in review on #631. The floor is an absolute distance while
+        // the deviant speed gate is per-interval, so they interact. Pin the
+        // band rather than discover it again later.
+        const CADENCE_S: f32 = 300.0;
+        let step_km = |speed_ms: f32| speed_ms * CADENCE_S / 1000.0;
+
+        // At the speed floor itself, one step is short of the path floor.
+        assert!(
+            step_km(DEVIANT_MIN_CELL_SPEED_MS) < MIN_PATH_FOR_STRAIGHTNESS_KM,
+            "precondition: 3 m/s covers {} km per frame",
+            step_km(DEVIANT_MIN_CELL_SPEED_MS)
+        );
+        // Two steps always clear it, so the cost is exactly one frame.
+        assert!(2.0 * step_km(DEVIANT_MIN_CELL_SPEED_MS) > MIN_PATH_FOR_STRAIGHTNESS_KM);
+
+        // The affected band is narrow and sits just above the speed floor.
+        let breakeven = MIN_PATH_FOR_STRAIGHTNESS_KM * 1000.0 / CADENCE_S;
+        assert!(
+            (3.3..3.4).contains(&breakeven),
+            "band top moved to {breakeven} m/s — re-check the doc on \
+             DEVIANT_MIN_STRAIGHTNESS"
+        );
+
+        // A real deviant mover clears the floor on its first step with room
+        // to spare: a 10 m/s storm covers exactly 3x it, a 20 m/s one 6x.
+        assert!(step_km(10.0) >= 3.0 * MIN_PATH_FOR_STRAIGHTNESS_KM);
+        assert!(step_km(20.0) >= 6.0 * MIN_PATH_FOR_STRAIGHTNESS_KM);
     }
 }
