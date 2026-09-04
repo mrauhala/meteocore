@@ -1807,3 +1807,53 @@ fn a_quiet_cell_reports_a_zero_split_but_no_positive_share() {
         "0 of 0 CG flashes has no positive share — this one stays null"
     );
 }
+
+/// Rank and serving order must break ties identically (#635 / spec D14).
+///
+/// Reported 2026-09-04: two cells shared `significance: 0.2595`; the page
+/// returned them in one order while their ranks ran the other way, so a
+/// `limit: 30` request came back holding ranks 1-29 and 31 — a hole where
+/// nothing had been skipped. Ties are common because the score is published to
+/// four decimals over a narrow range, so this is routine, not exotic.
+#[test]
+fn ranks_are_monotonic_in_the_order_cells_are_served() {
+    use ds_core::feature::{FeatureQuery, PropertyValue, SortDirection, SortKey};
+    use ds_core::feature_engine::FeatureEngine;
+
+    let anchor1 = t0() + Duration::minutes(5);
+    let (_s, engine) = build("PT30M", &[t0(), anchor1]);
+    engine.poll_once();
+
+    let page = engine
+        .get_features(&FeatureQuery {
+            sortby: vec![SortKey {
+                property: "significance".into(),
+                direction: SortDirection::Descending,
+            }],
+            limit: 1000,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let ranks: Vec<i64> = page
+        .features
+        .iter()
+        .map(|f| match f.properties.get("significance_rank") {
+            Some(PropertyValue::Integer(r)) => *r,
+            other => panic!("rank must be an integer, got {other:?}"),
+        })
+        .collect();
+
+    assert!(!ranks.is_empty(), "precondition: some cells were tracked");
+    assert!(
+        ranks.windows(2).all(|w| w[0] < w[1]),
+        "ranks must increase down the served page, got {ranks:?}"
+    );
+    // No gaps: a prefix of the page is a prefix of the ranking, which is what
+    // makes `limit` safe to paginate on.
+    let expected: Vec<i64> = (1..=ranks.len() as i64).collect();
+    assert_eq!(
+        ranks, expected,
+        "a full page must carry exactly ranks 1..=n with no holes"
+    );
+}

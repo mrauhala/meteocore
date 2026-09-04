@@ -1356,7 +1356,7 @@ fn score_cells(
 ) -> Vec<ScoredCell> {
     let (kx, ky) =
         crate::lonlat_grid_km_per_px([g.west, g.south, g.east, g.north], g.width, g.height);
-    let facts: Vec<CellFactSheet> = cells
+    let mut facts: Vec<CellFactSheet> = cells
         .iter()
         .map(|t| {
             let lon =
@@ -1406,7 +1406,13 @@ fn score_cells(
                 // From the RAW speed, like the impact lookahead: the rounded
                 // value is for display and a threshold comparison should not
                 // depend on it.
-                likely_clutter: ds_core::cell_facts::is_likely_clutter(speed_raw, t.age),
+                likely_clutter: ds_core::cell_facts::is_likely_clutter(
+                    speed_raw,
+                    t.age,
+                    // Only once there is a track; a newborn's zero is "has
+                    // not had the chance to move", not "did not move".
+                    (t.age > 1).then(|| f64::from(t.net_displacement_km)),
+                ),
                 trend: match t.growing {
                     Some(true) => Some(Trend::Growing),
                     Some(false) => Some(Trend::Decaying),
@@ -1470,6 +1476,14 @@ fn score_cells(
         })
         .collect();
 
+    // Rank ties break by input position, and the Features layer breaks ties by
+    // feature id STRING (`sort_features`). Ordering the input the same way is
+    // what makes the two agree — otherwise a limited page can return ranks
+    // 1–29 then 31, a hole where nothing was skipped (#635).
+    //
+    // Compared as strings, not as numbers, because that is what the serving
+    // comparator does; matching it matters more than being numerically tidy.
+    facts.sort_by_cached_key(|f| f.id.to_string());
     let scores = scorer.rank(&facts);
     facts
         .into_iter()
