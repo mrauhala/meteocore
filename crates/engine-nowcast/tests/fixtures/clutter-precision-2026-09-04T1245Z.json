@@ -1,0 +1,4374 @@
+{
+ "fixture": {
+  "id": "clutter-precision-2026-09-04T1245Z",
+  "purpose": "Precision counterpart to the all-negative frame: a widespread precipitation event, for measuring clutter FALSE POSITIVES.",
+  "observed": "2026-09-04T12:45:00Z",
+  "captured_from": "fmi-radar-nowcast /features items, trimmed to the fields the clutter test reads",
+  "ground_truth": {
+   "label": "PARTIAL - inferred, not operator-confirmed",
+   "basis": "110 of 274 cells moved faster than 5 m/s with median path_straightness 0.86, i.e. coherent advection. A cell whose NET displacement from first detection exceeds a few km cannot be a fixed ground target, whatever its instantaneous speed.",
+   "caveat": "Individual cells are NOT operator-labelled. Assertions below are limited to what net displacement alone establishes; do not treat this file as a labelled set."
+  },
+  "observed_behaviour_before_fix": {
+   "flagged_likely_clutter": 21,
+   "flagged_with_net_displacement_over_3km": 19,
+   "max_net_displacement_among_flagged_km": 18.2,
+   "note": "'clutter' led significance_reasons on these, demoting severe cells from a median rank of 20 to ranks 135-197."
+  }
+ },
+ "payload": {
+  "observed": "2026-09-04T12:45:00Z",
+  "returned": 274,
+  "cells": [
+   {
+    "speed_ms": 3.1,
+    "track_age": 2,
+    "net_displacement_km": 0.9,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 134,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40811"
+   },
+   {
+    "speed_ms": 6.4,
+    "track_age": 25,
+    "net_displacement_km": 45.5,
+    "path_straightness": 0.8,
+    "likely_clutter": false,
+    "max_dbz": 41.5,
+    "severity": "moderate",
+    "significance_rank": 70,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "trend"
+    ],
+    "id": "39390"
+   },
+   {
+    "speed_ms": 4.7,
+    "track_age": 5,
+    "net_displacement_km": 7.1,
+    "path_straightness": 0.93,
+    "likely_clutter": false,
+    "max_dbz": 38.0,
+    "severity": "weak",
+    "significance_rank": 126,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40630"
+   },
+   {
+    "speed_ms": 5.7,
+    "track_age": 7,
+    "net_displacement_km": 6.7,
+    "path_straightness": 0.83,
+    "likely_clutter": false,
+    "max_dbz": 39.5,
+    "severity": "weak",
+    "significance_rank": 195,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40501"
+   },
+   {
+    "speed_ms": 5.3,
+    "track_age": 15,
+    "net_displacement_km": 22.2,
+    "path_straightness": 0.77,
+    "likely_clutter": false,
+    "max_dbz": 38.5,
+    "severity": "weak",
+    "significance_rank": 122,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40010"
+   },
+   {
+    "speed_ms": 6.3,
+    "track_age": 5,
+    "net_displacement_km": 7.7,
+    "path_straightness": 0.99,
+    "likely_clutter": false,
+    "max_dbz": 37.5,
+    "severity": "weak",
+    "significance_rank": 131,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40631"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 39.0,
+    "severity": "weak",
+    "significance_rank": 237,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40877"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 35.5,
+    "severity": "weak",
+    "significance_rank": 178,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40878"
+   },
+   {
+    "speed_ms": 7.1,
+    "track_age": 2,
+    "net_displacement_km": 2.1,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 38.5,
+    "severity": "weak",
+    "significance_rank": 183,
+    "significance_reasons": [
+     "trend",
+     "impact",
+     "max_dbz"
+    ],
+    "id": "40812"
+   },
+   {
+    "speed_ms": 10.6,
+    "track_age": 8,
+    "net_displacement_km": 18.9,
+    "path_straightness": 0.81,
+    "likely_clutter": false,
+    "max_dbz": 41.0,
+    "severity": "weak",
+    "significance_rank": 64,
+    "significance_reasons": [
+     "impact",
+     "deviant_mover",
+     "trend"
+    ],
+    "id": "40441"
+   },
+   {
+    "speed_ms": 4.1,
+    "track_age": 16,
+    "net_displacement_km": 22.0,
+    "path_straightness": 0.74,
+    "likely_clutter": false,
+    "max_dbz": 41.0,
+    "severity": "moderate",
+    "significance_rank": 141,
+    "significance_reasons": [
+     "severity",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "39947"
+   },
+   {
+    "speed_ms": 9.5,
+    "track_age": 2,
+    "net_displacement_km": 2.8,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 39.0,
+    "severity": "weak",
+    "significance_rank": 152,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40813"
+   },
+   {
+    "speed_ms": 5.3,
+    "track_age": 4,
+    "net_displacement_km": 4.6,
+    "path_straightness": 0.79,
+    "likely_clutter": false,
+    "max_dbz": 38.0,
+    "severity": "weak",
+    "significance_rank": 179,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40690"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 35.5,
+    "severity": "weak",
+    "significance_rank": 261,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40879"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 36.0,
+    "severity": "weak",
+    "significance_rank": 257,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40880"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 43.0,
+    "severity": "weak",
+    "significance_rank": 230,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40881"
+   },
+   {
+    "speed_ms": 7.4,
+    "track_age": 3,
+    "net_displacement_km": 4.5,
+    "path_straightness": 0.41,
+    "likely_clutter": false,
+    "max_dbz": 37.5,
+    "severity": "weak",
+    "significance_rank": 171,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40745"
+   },
+   {
+    "speed_ms": 4.8,
+    "track_age": 3,
+    "net_displacement_km": 2.9,
+    "path_straightness": 0.96,
+    "likely_clutter": false,
+    "max_dbz": 39.0,
+    "severity": "weak",
+    "significance_rank": 203,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40744"
+   },
+   {
+    "speed_ms": 5.0,
+    "track_age": 4,
+    "net_displacement_km": 7.0,
+    "path_straightness": 0.63,
+    "likely_clutter": false,
+    "max_dbz": 41.5,
+    "severity": "weak",
+    "significance_rank": 72,
+    "significance_reasons": [
+     "impact",
+     "deviant_mover",
+     "trend"
+    ],
+    "id": "40691"
+   },
+   {
+    "speed_ms": 5.2,
+    "track_age": 8,
+    "net_displacement_km": 10.3,
+    "path_straightness": 0.88,
+    "likely_clutter": false,
+    "max_dbz": 38.5,
+    "severity": "weak",
+    "significance_rank": 123,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40443"
+   },
+   {
+    "speed_ms": 4.1,
+    "track_age": 4,
+    "net_displacement_km": 0.8,
+    "path_straightness": 0.11,
+    "likely_clutter": false,
+    "max_dbz": 37.5,
+    "severity": "weak",
+    "significance_rank": 216,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40692"
+   },
+   {
+    "speed_ms": 2.5,
+    "track_age": 4,
+    "net_displacement_km": 2.1,
+    "path_straightness": 0.56,
+    "likely_clutter": false,
+    "max_dbz": 51.0,
+    "severity": "severe",
+    "significance_rank": 76,
+    "significance_reasons": [
+     "severity",
+     "max_dbz",
+     "trend"
+    ],
+    "id": "40693"
+   },
+   {
+    "speed_ms": 2.7,
+    "track_age": 2,
+    "net_displacement_km": 0.8,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 52.5,
+    "severity": "severe",
+    "significance_rank": 50,
+    "significance_reasons": [
+     "severity",
+     "max_dbz",
+     "trend"
+    ],
+    "id": "40814"
+   },
+   {
+    "speed_ms": 6.6,
+    "track_age": 11,
+    "net_displacement_km": 13.1,
+    "path_straightness": 0.86,
+    "likely_clutter": false,
+    "max_dbz": 41.0,
+    "severity": "weak",
+    "significance_rank": 184,
+    "significance_reasons": [
+     "trend",
+     "impact",
+     "max_dbz"
+    ],
+    "id": "40258"
+   },
+   {
+    "speed_ms": 1.5,
+    "track_age": 6,
+    "net_displacement_km": 0.5,
+    "path_straightness": 0.09,
+    "likely_clutter": true,
+    "max_dbz": 45.5,
+    "severity": "moderate",
+    "significance_rank": 265,
+    "significance_reasons": [
+     "clutter",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40561"
+   },
+   {
+    "speed_ms": 5.5,
+    "track_age": 8,
+    "net_displacement_km": 5.9,
+    "path_straightness": 0.41,
+    "likely_clutter": false,
+    "max_dbz": 39.0,
+    "severity": "weak",
+    "significance_rank": 199,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40446"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 39.0,
+    "severity": "weak",
+    "significance_rank": 185,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40882"
+   },
+   {
+    "speed_ms": 3.9,
+    "track_age": 6,
+    "net_displacement_km": 5.5,
+    "path_straightness": 0.74,
+    "likely_clutter": false,
+    "max_dbz": 47.5,
+    "severity": "moderate",
+    "significance_rank": 79,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40563"
+   },
+   {
+    "speed_ms": 6.6,
+    "track_age": 2,
+    "net_displacement_km": 2.0,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 43.0,
+    "severity": "weak",
+    "significance_rank": 186,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40816"
+   },
+   {
+    "speed_ms": 4.0,
+    "track_age": 8,
+    "net_displacement_km": 10.3,
+    "path_straightness": 0.85,
+    "likely_clutter": false,
+    "max_dbz": 51.0,
+    "severity": "very_severe",
+    "significance_rank": 11,
+    "significance_reasons": [
+     "severity",
+     "impact",
+     "max_dbz"
+    ],
+    "id": "40448"
+   },
+   {
+    "speed_ms": 6.1,
+    "track_age": 13,
+    "net_displacement_km": 7.7,
+    "path_straightness": 0.13,
+    "likely_clutter": false,
+    "max_dbz": 47.5,
+    "severity": "severe",
+    "significance_rank": 33,
+    "significance_reasons": [
+     "severity",
+     "impact",
+     "max_dbz"
+    ],
+    "id": "40133"
+   },
+   {
+    "speed_ms": 7.6,
+    "track_age": 5,
+    "net_displacement_km": 8.6,
+    "path_straightness": 0.65,
+    "likely_clutter": false,
+    "max_dbz": 42.0,
+    "severity": "moderate",
+    "significance_rank": 67,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "trend"
+    ],
+    "id": "40635"
+   },
+   {
+    "speed_ms": 12.9,
+    "track_age": 3,
+    "net_displacement_km": 7.7,
+    "path_straightness": 0.64,
+    "likely_clutter": false,
+    "max_dbz": 39.0,
+    "severity": "weak",
+    "significance_rank": 61,
+    "significance_reasons": [
+     "impact",
+     "deviant_mover",
+     "trend"
+    ],
+    "id": "40747"
+   },
+   {
+    "speed_ms": 13.6,
+    "track_age": 12,
+    "net_displacement_km": 15.9,
+    "path_straightness": 0.36,
+    "likely_clutter": false,
+    "max_dbz": 48.5,
+    "severity": "moderate",
+    "significance_rank": 53,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40202"
+   },
+   {
+    "speed_ms": 8.3,
+    "track_age": 11,
+    "net_displacement_km": 22.8,
+    "path_straightness": 0.57,
+    "likely_clutter": false,
+    "max_dbz": 40.0,
+    "severity": "weak",
+    "significance_rank": 90,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40260"
+   },
+   {
+    "speed_ms": 9.5,
+    "track_age": 8,
+    "net_displacement_km": 20.7,
+    "path_straightness": 0.99,
+    "likely_clutter": false,
+    "max_dbz": 43.0,
+    "severity": "weak",
+    "significance_rank": 99,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40450"
+   },
+   {
+    "speed_ms": 12.2,
+    "track_age": 6,
+    "net_displacement_km": 13.6,
+    "path_straightness": 0.93,
+    "likely_clutter": false,
+    "max_dbz": 43.0,
+    "severity": "moderate",
+    "significance_rank": 74,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "trend"
+    ],
+    "id": "40564"
+   },
+   {
+    "speed_ms": 11.5,
+    "track_age": 40,
+    "net_displacement_km": 50.3,
+    "path_straightness": 0.35,
+    "likely_clutter": false,
+    "max_dbz": 38.5,
+    "severity": "weak",
+    "significance_rank": 120,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "38560"
+   },
+   {
+    "speed_ms": 4.5,
+    "track_age": 15,
+    "net_displacement_km": 30.5,
+    "path_straightness": 0.69,
+    "likely_clutter": false,
+    "max_dbz": 42.0,
+    "severity": "weak",
+    "significance_rank": 85,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40014"
+   },
+   {
+    "speed_ms": 5.1,
+    "track_age": 3,
+    "net_displacement_km": 3.1,
+    "path_straightness": 0.84,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 108,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40749"
+   },
+   {
+    "speed_ms": 6.4,
+    "track_age": 5,
+    "net_displacement_km": 7.9,
+    "path_straightness": 0.86,
+    "likely_clutter": false,
+    "max_dbz": 43.5,
+    "severity": "weak",
+    "significance_rank": 88,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40636"
+   },
+   {
+    "speed_ms": 16.1,
+    "track_age": 4,
+    "net_displacement_km": 12.6,
+    "path_straightness": 0.69,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 39,
+    "significance_reasons": [
+     "impact",
+     "deviant_mover",
+     "trend"
+    ],
+    "id": "40694"
+   },
+   {
+    "speed_ms": 10.6,
+    "track_age": 3,
+    "net_displacement_km": 6.4,
+    "path_straightness": 0.99,
+    "likely_clutter": false,
+    "max_dbz": 43.0,
+    "severity": "weak",
+    "significance_rank": 86,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40750"
+   },
+   {
+    "speed_ms": 8.5,
+    "track_age": 6,
+    "net_displacement_km": 14.0,
+    "path_straightness": 0.87,
+    "likely_clutter": false,
+    "max_dbz": 54.5,
+    "severity": "severe",
+    "significance_rank": 12,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40565"
+   },
+   {
+    "speed_ms": 14.0,
+    "track_age": 8,
+    "net_displacement_km": 20.4,
+    "path_straightness": 0.87,
+    "likely_clutter": false,
+    "max_dbz": 38.0,
+    "severity": "weak",
+    "significance_rank": 65,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40451"
+   },
+   {
+    "speed_ms": 10.8,
+    "track_age": 10,
+    "net_displacement_km": 33.1,
+    "path_straightness": 0.94,
+    "likely_clutter": false,
+    "max_dbz": 47.5,
+    "severity": "severe",
+    "significance_rank": 19,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40326"
+   },
+   {
+    "speed_ms": 11.2,
+    "track_age": 2,
+    "net_displacement_km": 3.4,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 40.0,
+    "severity": "weak",
+    "significance_rank": 59,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40818"
+   },
+   {
+    "speed_ms": 6.8,
+    "track_age": 4,
+    "net_displacement_km": 6.3,
+    "path_straightness": 0.97,
+    "likely_clutter": false,
+    "max_dbz": 49.5,
+    "severity": "severe",
+    "significance_rank": 8,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40695"
+   },
+   {
+    "speed_ms": 5.9,
+    "track_age": 3,
+    "net_displacement_km": 3.6,
+    "path_straightness": 0.91,
+    "likely_clutter": false,
+    "max_dbz": 46.0,
+    "severity": "moderate",
+    "significance_rank": 132,
+    "significance_reasons": [
+     "severity",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40751"
+   },
+   {
+    "speed_ms": 6.2,
+    "track_age": 8,
+    "net_displacement_km": 14.5,
+    "path_straightness": 0.93,
+    "likely_clutter": false,
+    "max_dbz": 48.5,
+    "severity": "moderate",
+    "significance_rank": 14,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40453"
+   },
+   {
+    "speed_ms": 1.7,
+    "track_age": 2,
+    "net_displacement_km": 0.5,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 39.5,
+    "severity": "weak",
+    "significance_rank": 196,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40819"
+   },
+   {
+    "speed_ms": 8.3,
+    "track_age": 3,
+    "net_displacement_km": 5.0,
+    "path_straightness": 0.92,
+    "likely_clutter": false,
+    "max_dbz": 37.5,
+    "severity": "weak",
+    "significance_rank": 162,
+    "significance_reasons": [
+     "deviant_mover",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40753"
+   },
+   {
+    "speed_ms": 12.4,
+    "track_age": 3,
+    "net_displacement_km": 7.5,
+    "path_straightness": 0.99,
+    "likely_clutter": false,
+    "max_dbz": 40.5,
+    "severity": "weak",
+    "significance_rank": 27,
+    "significance_reasons": [
+     "impact",
+     "deviant_mover",
+     "trend"
+    ],
+    "id": "40752"
+   },
+   {
+    "speed_ms": 9.1,
+    "track_age": 9,
+    "net_displacement_km": 24.9,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 37.5,
+    "severity": "weak",
+    "significance_rank": 133,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40390"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 39.5,
+    "severity": "weak",
+    "significance_rank": 161,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40883"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 36.0,
+    "severity": "weak",
+    "significance_rank": 119,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40884"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 35.5,
+    "severity": "weak",
+    "significance_rank": 127,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40885"
+   },
+   {
+    "speed_ms": 3.4,
+    "track_age": 3,
+    "net_displacement_km": 2.0,
+    "path_straightness": 0.98,
+    "likely_clutter": false,
+    "max_dbz": 39.5,
+    "severity": "weak",
+    "significance_rank": 82,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40754"
+   },
+   {
+    "speed_ms": 34.1,
+    "track_age": 2,
+    "net_displacement_km": 10.2,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 38.0,
+    "severity": "weak",
+    "significance_rank": 121,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40820"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 39.5,
+    "severity": "weak",
+    "significance_rank": 236,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40886"
+   },
+   {
+    "speed_ms": 10.9,
+    "track_age": 8,
+    "net_displacement_km": 16.9,
+    "path_straightness": 0.53,
+    "likely_clutter": false,
+    "max_dbz": 40.0,
+    "severity": "weak",
+    "significance_rank": 193,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40456"
+   },
+   {
+    "speed_ms": 8.0,
+    "track_age": 11,
+    "net_displacement_km": 24.9,
+    "path_straightness": 0.77,
+    "likely_clutter": false,
+    "max_dbz": 39.0,
+    "severity": "weak",
+    "significance_rank": 204,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40268"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 250,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40887"
+   },
+   {
+    "speed_ms": 11.8,
+    "track_age": 10,
+    "net_displacement_km": 21.6,
+    "path_straightness": 0.97,
+    "likely_clutter": false,
+    "max_dbz": 37.5,
+    "severity": "weak",
+    "significance_rank": 211,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40335"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 40.5,
+    "severity": "weak",
+    "significance_rank": 129,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40888"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 252,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40889"
+   },
+   {
+    "speed_ms": 1.6,
+    "track_age": 2,
+    "net_displacement_km": 0.5,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 42.0,
+    "severity": "weak",
+    "significance_rank": 91,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40822"
+   },
+   {
+    "speed_ms": 0.5,
+    "track_age": 2,
+    "net_displacement_km": 0.1,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 38.0,
+    "severity": "weak",
+    "significance_rank": 101,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40827"
+   },
+   {
+    "speed_ms": 3.0,
+    "track_age": 10,
+    "net_displacement_km": 4.6,
+    "path_straightness": 0.51,
+    "likely_clutter": true,
+    "max_dbz": 40.0,
+    "severity": "weak",
+    "significance_rank": 266,
+    "significance_reasons": [
+     "clutter",
+     "impact",
+     "trend"
+    ],
+    "id": "40339"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 59.0,
+    "severity": "very_severe",
+    "significance_rank": 4,
+    "significance_reasons": [
+     "severity",
+     "impact",
+     "max_dbz"
+    ],
+    "id": "40890"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 43.0,
+    "severity": "weak",
+    "significance_rank": 109,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40891"
+   },
+   {
+    "speed_ms": 1.3,
+    "track_age": 5,
+    "net_displacement_km": 2.8,
+    "path_straightness": 0.45,
+    "likely_clutter": false,
+    "max_dbz": 39.5,
+    "severity": "weak",
+    "significance_rank": 136,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40645"
+   },
+   {
+    "speed_ms": 4.5,
+    "track_age": 10,
+    "net_displacement_km": 8.8,
+    "path_straightness": 0.56,
+    "likely_clutter": false,
+    "max_dbz": 55.5,
+    "severity": "very_severe",
+    "significance_rank": 5,
+    "significance_reasons": [
+     "severity",
+     "impact",
+     "max_dbz"
+    ],
+    "id": "40340"
+   },
+   {
+    "speed_ms": 1.6,
+    "track_age": 6,
+    "net_displacement_km": 4.5,
+    "path_straightness": 0.9,
+    "likely_clutter": true,
+    "max_dbz": 44.0,
+    "severity": "moderate",
+    "significance_rank": 267,
+    "significance_reasons": [
+     "clutter",
+     "impact",
+     "severity"
+    ],
+    "id": "40577"
+   },
+   {
+    "speed_ms": 2.5,
+    "track_age": 4,
+    "net_displacement_km": 2.5,
+    "path_straightness": 0.99,
+    "likely_clutter": false,
+    "max_dbz": 46.5,
+    "severity": "moderate",
+    "significance_rank": 49,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40700"
+   },
+   {
+    "speed_ms": 10.0,
+    "track_age": 3,
+    "net_displacement_km": 6.0,
+    "path_straightness": 0.95,
+    "likely_clutter": false,
+    "max_dbz": 43.0,
+    "severity": "weak",
+    "significance_rank": 55,
+    "significance_reasons": [
+     "impact",
+     "deviant_mover",
+     "trend"
+    ],
+    "id": "40756"
+   },
+   {
+    "speed_ms": 6.1,
+    "track_age": 6,
+    "net_displacement_km": 5.5,
+    "path_straightness": 0.92,
+    "likely_clutter": false,
+    "max_dbz": 50.0,
+    "severity": "severe",
+    "significance_rank": 20,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40580"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 180,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40892"
+   },
+   {
+    "speed_ms": 2.1,
+    "track_age": 3,
+    "net_displacement_km": 1.3,
+    "path_straightness": 0.99,
+    "likely_clutter": false,
+    "max_dbz": 49.0,
+    "severity": "moderate",
+    "significance_rank": 116,
+    "significance_reasons": [
+     "max_dbz",
+     "severity",
+     "trend"
+    ],
+    "id": "40757"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 38.5,
+    "severity": "weak",
+    "significance_rank": 239,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40893"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 47.5,
+    "severity": "moderate",
+    "significance_rank": 173,
+    "significance_reasons": [
+     "severity",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40894"
+   },
+   {
+    "speed_ms": 0.8,
+    "track_age": 3,
+    "net_displacement_km": 0.5,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 49.5,
+    "severity": "severe",
+    "significance_rank": 17,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40760"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 47.0,
+    "severity": "moderate",
+    "significance_rank": 62,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40895"
+   },
+   {
+    "speed_ms": 4.0,
+    "track_age": 2,
+    "net_displacement_km": 1.2,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 49.5,
+    "severity": "moderate",
+    "significance_rank": 42,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "severity"
+    ],
+    "id": "40829"
+   },
+   {
+    "speed_ms": 3.2,
+    "track_age": 2,
+    "net_displacement_km": 1.0,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 43.0,
+    "severity": "weak",
+    "significance_rank": 106,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40830"
+   },
+   {
+    "speed_ms": 2.2,
+    "track_age": 4,
+    "net_displacement_km": 2.0,
+    "path_straightness": 0.87,
+    "likely_clutter": false,
+    "max_dbz": 48.0,
+    "severity": "moderate",
+    "significance_rank": 38,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40707"
+   },
+   {
+    "speed_ms": 0.6,
+    "track_age": 2,
+    "net_displacement_km": 0.2,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 44.5,
+    "severity": "moderate",
+    "significance_rank": 44,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "trend"
+    ],
+    "id": "40831"
+   },
+   {
+    "speed_ms": 4.0,
+    "track_age": 10,
+    "net_displacement_km": 9.2,
+    "path_straightness": 0.85,
+    "likely_clutter": false,
+    "max_dbz": 57.0,
+    "severity": "very_severe",
+    "significance_rank": 2,
+    "significance_reasons": [
+     "severity",
+     "impact",
+     "max_dbz"
+    ],
+    "id": "40349"
+   },
+   {
+    "speed_ms": 2.8,
+    "track_age": 13,
+    "net_displacement_km": 8.6,
+    "path_straightness": 0.67,
+    "likely_clutter": true,
+    "max_dbz": 46.5,
+    "severity": "moderate",
+    "significance_rank": 227,
+    "significance_reasons": [
+     "clutter",
+     "impact",
+     "severity"
+    ],
+    "id": "40149"
+   },
+   {
+    "speed_ms": 4.8,
+    "track_age": 6,
+    "net_displacement_km": 8.1,
+    "path_straightness": 0.98,
+    "likely_clutter": false,
+    "max_dbz": 37.5,
+    "severity": "weak",
+    "significance_rank": 215,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40585"
+   },
+   {
+    "speed_ms": 0.3,
+    "track_age": 25,
+    "net_displacement_km": 12.2,
+    "path_straightness": 0.62,
+    "likely_clutter": true,
+    "max_dbz": 50.5,
+    "severity": "severe",
+    "significance_rank": 135,
+    "significance_reasons": [
+     "clutter",
+     "impact",
+     "severity"
+    ],
+    "id": "39403"
+   },
+   {
+    "speed_ms": 4.7,
+    "track_age": 4,
+    "net_displacement_km": 4.4,
+    "path_straightness": 0.99,
+    "likely_clutter": false,
+    "max_dbz": 42.5,
+    "severity": "weak",
+    "significance_rank": 181,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "impact"
+    ],
+    "id": "40708"
+   },
+   {
+    "speed_ms": 5.8,
+    "track_age": 8,
+    "net_displacement_km": 9.3,
+    "path_straightness": 0.9,
+    "likely_clutter": false,
+    "max_dbz": 46.0,
+    "severity": "moderate",
+    "significance_rank": 58,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40461"
+   },
+   {
+    "speed_ms": 2.9,
+    "track_age": 6,
+    "net_displacement_km": 4.2,
+    "path_straightness": 0.52,
+    "likely_clutter": true,
+    "max_dbz": 41.5,
+    "severity": "weak",
+    "significance_rank": 268,
+    "significance_reasons": [
+     "clutter",
+     "impact",
+     "trend"
+    ],
+    "id": "40587"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 53.5,
+    "severity": "severe",
+    "significance_rank": 24,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40896"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 46.0,
+    "severity": "moderate",
+    "significance_rank": 177,
+    "significance_reasons": [
+     "severity",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40897"
+   },
+   {
+    "speed_ms": 4.1,
+    "track_age": 8,
+    "net_displacement_km": 7.5,
+    "path_straightness": 0.89,
+    "likely_clutter": false,
+    "max_dbz": 49.5,
+    "severity": "severe",
+    "significance_rank": 23,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40463"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 39.0,
+    "severity": "weak",
+    "significance_rank": 117,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40898"
+   },
+   {
+    "speed_ms": 4.5,
+    "track_age": 5,
+    "net_displacement_km": 13.0,
+    "path_straightness": 0.95,
+    "likely_clutter": false,
+    "max_dbz": 46.5,
+    "severity": "moderate",
+    "significance_rank": 57,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40649"
+   },
+   {
+    "speed_ms": 3.2,
+    "track_age": 4,
+    "net_displacement_km": 3.0,
+    "path_straightness": 0.57,
+    "likely_clutter": false,
+    "max_dbz": 48.0,
+    "severity": "moderate",
+    "significance_rank": 47,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40711"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 41.0,
+    "severity": "weak",
+    "significance_rank": 107,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40899"
+   },
+   {
+    "speed_ms": 2.9,
+    "track_age": 5,
+    "net_displacement_km": 2.7,
+    "path_straightness": 0.65,
+    "likely_clutter": false,
+    "max_dbz": 48.5,
+    "severity": "severe",
+    "significance_rank": 18,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40648"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 39.0,
+    "severity": "weak",
+    "significance_rank": 157,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40900"
+   },
+   {
+    "speed_ms": 3.0,
+    "track_age": 9,
+    "net_displacement_km": 6.7,
+    "path_straightness": 0.58,
+    "likely_clutter": false,
+    "max_dbz": 41.0,
+    "severity": "weak",
+    "significance_rank": 87,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40399"
+   },
+   {
+    "speed_ms": 4.6,
+    "track_age": 12,
+    "net_displacement_km": 15.5,
+    "path_straightness": 0.86,
+    "likely_clutter": false,
+    "max_dbz": 40.5,
+    "severity": "weak",
+    "significance_rank": 102,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40219"
+   },
+   {
+    "speed_ms": 8.6,
+    "track_age": 2,
+    "net_displacement_km": 2.6,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 40.0,
+    "severity": "weak",
+    "significance_rank": 97,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40833"
+   },
+   {
+    "speed_ms": 1.1,
+    "track_age": 2,
+    "net_displacement_km": 0.3,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 53.5,
+    "severity": "severe",
+    "significance_rank": 22,
+    "significance_reasons": [
+     "severity",
+     "impact",
+     "max_dbz"
+    ],
+    "id": "40832"
+   },
+   {
+    "speed_ms": 4.0,
+    "track_age": 6,
+    "net_displacement_km": 7.5,
+    "path_straightness": 0.99,
+    "likely_clutter": false,
+    "max_dbz": 46.5,
+    "severity": "moderate",
+    "significance_rank": 30,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40590"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 40.0,
+    "severity": "weak",
+    "significance_rank": 140,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40901"
+   },
+   {
+    "speed_ms": 5.2,
+    "track_age": 2,
+    "net_displacement_km": 1.6,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 42.0,
+    "severity": "moderate",
+    "significance_rank": 48,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "trend"
+    ],
+    "id": "40834"
+   },
+   {
+    "speed_ms": 2.7,
+    "track_age": 3,
+    "net_displacement_km": 1.6,
+    "path_straightness": 0.73,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 125,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40769"
+   },
+   {
+    "speed_ms": 6.2,
+    "track_age": 6,
+    "net_displacement_km": 7.5,
+    "path_straightness": 0.94,
+    "likely_clutter": false,
+    "max_dbz": 49.5,
+    "severity": "moderate",
+    "significance_rank": 46,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "severity"
+    ],
+    "id": "40591"
+   },
+   {
+    "speed_ms": 17.1,
+    "track_age": 3,
+    "net_displacement_km": 12.8,
+    "path_straightness": 0.93,
+    "likely_clutter": false,
+    "max_dbz": 42.5,
+    "severity": "weak",
+    "significance_rank": 94,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40770"
+   },
+   {
+    "speed_ms": 4.8,
+    "track_age": 14,
+    "net_displacement_km": 10.2,
+    "path_straightness": 0.41,
+    "likely_clutter": false,
+    "max_dbz": 55.0,
+    "severity": "very_severe",
+    "significance_rank": 7,
+    "significance_reasons": [
+     "severity",
+     "impact",
+     "max_dbz"
+    ],
+    "id": "40081"
+   },
+   {
+    "speed_ms": 4.0,
+    "track_age": 15,
+    "net_displacement_km": 14.9,
+    "path_straightness": 0.53,
+    "likely_clutter": false,
+    "max_dbz": 38.0,
+    "severity": "weak",
+    "significance_rank": 104,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40024"
+   },
+   {
+    "speed_ms": 2.2,
+    "track_age": 11,
+    "net_displacement_km": 11.7,
+    "path_straightness": 0.91,
+    "likely_clutter": true,
+    "max_dbz": 44.0,
+    "severity": "weak",
+    "significance_rank": 269,
+    "significance_reasons": [
+     "clutter",
+     "impact",
+     "trend"
+    ],
+    "id": "40275"
+   },
+   {
+    "speed_ms": 6.9,
+    "track_age": 2,
+    "net_displacement_km": 2.1,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 59.5,
+    "severity": "very_severe",
+    "significance_rank": 3,
+    "significance_reasons": [
+     "severity",
+     "impact",
+     "max_dbz"
+    ],
+    "id": "40837"
+   },
+   {
+    "speed_ms": 8.1,
+    "track_age": 9,
+    "net_displacement_km": 11.9,
+    "path_straightness": 0.75,
+    "likely_clutter": false,
+    "max_dbz": 45.5,
+    "severity": "moderate",
+    "significance_rank": 29,
+    "significance_reasons": [
+     "impact",
+     "deviant_mover",
+     "severity"
+    ],
+    "id": "40401"
+   },
+   {
+    "speed_ms": 2.0,
+    "track_age": 18,
+    "net_displacement_km": 18.2,
+    "path_straightness": 0.55,
+    "likely_clutter": true,
+    "max_dbz": 47.0,
+    "severity": "moderate",
+    "significance_rank": 270,
+    "significance_reasons": [
+     "clutter",
+     "impact",
+     "severity"
+    ],
+    "id": "39861"
+   },
+   {
+    "speed_ms": 1.1,
+    "track_age": 2,
+    "net_displacement_km": 0.3,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 50.5,
+    "severity": "severe",
+    "significance_rank": 15,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40838"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 36.0,
+    "severity": "weak",
+    "significance_rank": 174,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40902"
+   },
+   {
+    "speed_ms": 2.9,
+    "track_age": 7,
+    "net_displacement_km": 5.1,
+    "path_straightness": 0.6,
+    "likely_clutter": true,
+    "max_dbz": 44.5,
+    "severity": "moderate",
+    "significance_rank": 271,
+    "significance_reasons": [
+     "clutter",
+     "impact",
+     "severity"
+    ],
+    "id": "40518"
+   },
+   {
+    "speed_ms": 3.1,
+    "track_age": 4,
+    "net_displacement_km": 3.4,
+    "path_straightness": 0.8,
+    "likely_clutter": false,
+    "max_dbz": 41.5,
+    "severity": "weak",
+    "significance_rank": 98,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40714"
+   },
+   {
+    "speed_ms": 0.9,
+    "track_age": 3,
+    "net_displacement_km": 0.6,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 43.0,
+    "severity": "weak",
+    "significance_rank": 83,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40772"
+   },
+   {
+    "speed_ms": 1.9,
+    "track_age": 22,
+    "net_displacement_km": 7.8,
+    "path_straightness": 0.13,
+    "likely_clutter": true,
+    "max_dbz": 45.5,
+    "severity": "severe",
+    "significance_rank": 182,
+    "significance_reasons": [
+     "clutter",
+     "severity",
+     "impact"
+    ],
+    "id": "39596"
+   },
+   {
+    "speed_ms": 6.9,
+    "track_age": 2,
+    "net_displacement_km": 2.1,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 52.0,
+    "severity": "severe",
+    "significance_rank": 31,
+    "significance_reasons": [
+     "severity",
+     "impact",
+     "max_dbz"
+    ],
+    "id": "40840"
+   },
+   {
+    "speed_ms": 5.2,
+    "track_age": 5,
+    "net_displacement_km": 4.5,
+    "path_straightness": 0.84,
+    "likely_clutter": false,
+    "max_dbz": 40.5,
+    "severity": "weak",
+    "significance_rank": 89,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40654"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 42.0,
+    "severity": "weak",
+    "significance_rank": 154,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40903"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 47.5,
+    "severity": "moderate",
+    "significance_rank": 80,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40904"
+   },
+   {
+    "speed_ms": 5.5,
+    "track_age": 3,
+    "net_displacement_km": 3.3,
+    "path_straightness": 0.98,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 138,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40773"
+   },
+   {
+    "speed_ms": 2.4,
+    "track_age": 7,
+    "net_displacement_km": 4.3,
+    "path_straightness": 0.34,
+    "likely_clutter": true,
+    "max_dbz": 46.0,
+    "severity": "severe",
+    "significance_rank": 198,
+    "significance_reasons": [
+     "clutter",
+     "severity",
+     "impact"
+    ],
+    "id": "40521"
+   },
+   {
+    "speed_ms": 2.6,
+    "track_age": 8,
+    "net_displacement_km": 6.3,
+    "path_straightness": 0.35,
+    "likely_clutter": true,
+    "max_dbz": 50.0,
+    "severity": "severe",
+    "significance_rank": 190,
+    "significance_reasons": [
+     "clutter",
+     "severity",
+     "impact"
+    ],
+    "id": "40471"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 44.5,
+    "severity": "weak",
+    "significance_rank": 130,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40905"
+   },
+   {
+    "speed_ms": 8.4,
+    "track_age": 2,
+    "net_displacement_km": 2.5,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 39.0,
+    "severity": "weak",
+    "significance_rank": 142,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40842"
+   },
+   {
+    "speed_ms": 2.5,
+    "track_age": 2,
+    "net_displacement_km": 0.8,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 39.5,
+    "severity": "weak",
+    "significance_rank": 113,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40843"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 38.0,
+    "severity": "weak",
+    "significance_rank": 172,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40906"
+   },
+   {
+    "speed_ms": 0.8,
+    "track_age": 12,
+    "net_displacement_km": 4.5,
+    "path_straightness": 0.58,
+    "likely_clutter": true,
+    "max_dbz": 49.5,
+    "severity": "severe",
+    "significance_rank": 197,
+    "significance_reasons": [
+     "clutter",
+     "severity",
+     "impact"
+    ],
+    "id": "40227"
+   },
+   {
+    "speed_ms": 1.3,
+    "track_age": 3,
+    "net_displacement_km": 0.8,
+    "path_straightness": 0.45,
+    "likely_clutter": false,
+    "max_dbz": 42.5,
+    "severity": "weak",
+    "significance_rank": 45,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40775"
+   },
+   {
+    "speed_ms": 8.7,
+    "track_age": 10,
+    "net_displacement_km": 15.4,
+    "path_straightness": 0.76,
+    "likely_clutter": false,
+    "max_dbz": 39.0,
+    "severity": "weak",
+    "significance_rank": 118,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40353"
+   },
+   {
+    "speed_ms": 1.0,
+    "track_age": 11,
+    "net_displacement_km": 4.3,
+    "path_straightness": 0.49,
+    "likely_clutter": true,
+    "max_dbz": 46.0,
+    "severity": "moderate",
+    "significance_rank": 272,
+    "significance_reasons": [
+     "clutter",
+     "impact",
+     "severity"
+    ],
+    "id": "40280"
+   },
+   {
+    "speed_ms": 3.2,
+    "track_age": 7,
+    "net_displacement_km": 8.6,
+    "path_straightness": 0.88,
+    "likely_clutter": false,
+    "max_dbz": 45.0,
+    "severity": "moderate",
+    "significance_rank": 54,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "trend"
+    ],
+    "id": "40520"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 42.0,
+    "severity": "weak",
+    "significance_rank": 164,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40907"
+   },
+   {
+    "speed_ms": 2.9,
+    "track_age": 2,
+    "net_displacement_km": 0.9,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 47.0,
+    "severity": "moderate",
+    "significance_rank": 71,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40844"
+   },
+   {
+    "speed_ms": 2.5,
+    "track_age": 5,
+    "net_displacement_km": 2.7,
+    "path_straightness": 0.39,
+    "likely_clutter": false,
+    "max_dbz": 49.0,
+    "severity": "moderate",
+    "significance_rank": 52,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "severity"
+    ],
+    "id": "40659"
+   },
+   {
+    "speed_ms": 5.6,
+    "track_age": 2,
+    "net_displacement_km": 1.7,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 139,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40845"
+   },
+   {
+    "speed_ms": 5.3,
+    "track_age": 4,
+    "net_displacement_km": 5.6,
+    "path_straightness": 0.89,
+    "likely_clutter": false,
+    "max_dbz": 54.0,
+    "severity": "severe",
+    "significance_rank": 10,
+    "significance_reasons": [
+     "severity",
+     "impact",
+     "max_dbz"
+    ],
+    "id": "40715"
+   },
+   {
+    "speed_ms": 4.3,
+    "track_age": 2,
+    "net_displacement_km": 1.3,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 39.0,
+    "severity": "weak",
+    "significance_rank": 166,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40846"
+   },
+   {
+    "speed_ms": 14.6,
+    "track_age": 2,
+    "net_displacement_km": 4.4,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 37.5,
+    "severity": "weak",
+    "significance_rank": 170,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40847"
+   },
+   {
+    "speed_ms": 5.5,
+    "track_age": 18,
+    "net_displacement_km": 26.3,
+    "path_straightness": 0.5,
+    "likely_clutter": false,
+    "max_dbz": 38.5,
+    "severity": "weak",
+    "significance_rank": 158,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "39864"
+   },
+   {
+    "speed_ms": 2.2,
+    "track_age": 13,
+    "net_displacement_km": 13.6,
+    "path_straightness": 0.65,
+    "likely_clutter": true,
+    "max_dbz": 52.5,
+    "severity": "severe",
+    "significance_rank": 192,
+    "significance_reasons": [
+     "clutter",
+     "severity",
+     "impact"
+    ],
+    "id": "40166"
+   },
+   {
+    "speed_ms": 5.9,
+    "track_age": 5,
+    "net_displacement_km": 3.7,
+    "path_straightness": 0.22,
+    "likely_clutter": false,
+    "max_dbz": 46.0,
+    "severity": "moderate",
+    "significance_rank": 43,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40661"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 41.0,
+    "severity": "weak",
+    "significance_rank": 156,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40908"
+   },
+   {
+    "speed_ms": 3.4,
+    "track_age": 5,
+    "net_displacement_km": 4.0,
+    "path_straightness": 0.99,
+    "likely_clutter": false,
+    "max_dbz": 52.0,
+    "severity": "severe",
+    "significance_rank": 32,
+    "significance_reasons": [
+     "severity",
+     "impact",
+     "max_dbz"
+    ],
+    "id": "40663"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 38.0,
+    "severity": "weak",
+    "significance_rank": 78,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40909"
+   },
+   {
+    "speed_ms": 4.1,
+    "track_age": 4,
+    "net_displacement_km": 3.8,
+    "path_straightness": 0.83,
+    "likely_clutter": false,
+    "max_dbz": 38.5,
+    "severity": "weak",
+    "significance_rank": 115,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40718"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 41.5,
+    "severity": "weak",
+    "significance_rank": 150,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40910"
+   },
+   {
+    "speed_ms": 2.3,
+    "track_age": 9,
+    "net_displacement_km": 3.7,
+    "path_straightness": 0.4,
+    "likely_clutter": true,
+    "max_dbz": 46.0,
+    "severity": "moderate",
+    "significance_rank": 232,
+    "significance_reasons": [
+     "clutter",
+     "impact",
+     "severity"
+    ],
+    "id": "40409"
+   },
+   {
+    "speed_ms": 8.2,
+    "track_age": 5,
+    "net_displacement_km": 8.1,
+    "path_straightness": 0.97,
+    "likely_clutter": false,
+    "max_dbz": 41.5,
+    "severity": "weak",
+    "significance_rank": 146,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40665"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 40.5,
+    "severity": "weak",
+    "significance_rank": 234,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40911"
+   },
+   {
+    "speed_ms": 4.6,
+    "track_age": 13,
+    "net_displacement_km": 8.3,
+    "path_straightness": 0.34,
+    "likely_clutter": false,
+    "max_dbz": 39.0,
+    "severity": "weak",
+    "significance_rank": 124,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40170"
+   },
+   {
+    "speed_ms": 8.1,
+    "track_age": 3,
+    "net_displacement_km": 4.9,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 44.0,
+    "severity": "moderate",
+    "significance_rank": 149,
+    "significance_reasons": [
+     "severity",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40779"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 43.5,
+    "severity": "weak",
+    "significance_rank": 229,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40912"
+   },
+   {
+    "speed_ms": 0.9,
+    "track_age": 6,
+    "net_displacement_km": 1.1,
+    "path_straightness": 0.52,
+    "likely_clutter": true,
+    "max_dbz": 52.5,
+    "severity": "severe",
+    "significance_rank": 191,
+    "significance_reasons": [
+     "clutter",
+     "severity",
+     "impact"
+    ],
+    "id": "40603"
+   },
+   {
+    "speed_ms": 17.5,
+    "track_age": 6,
+    "net_displacement_km": 12.5,
+    "path_straightness": 0.73,
+    "likely_clutter": false,
+    "max_dbz": 41.5,
+    "severity": "weak",
+    "significance_rank": 112,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40602"
+   },
+   {
+    "speed_ms": 4.8,
+    "track_age": 3,
+    "net_displacement_km": 2.9,
+    "path_straightness": 0.99,
+    "likely_clutter": false,
+    "max_dbz": 40.5,
+    "severity": "weak",
+    "significance_rank": 110,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40780"
+   },
+   {
+    "speed_ms": 4.0,
+    "track_age": 19,
+    "net_displacement_km": 12.4,
+    "path_straightness": 0.37,
+    "likely_clutter": false,
+    "max_dbz": 39.0,
+    "severity": "weak",
+    "significance_rank": 128,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "39787"
+   },
+   {
+    "speed_ms": 1.3,
+    "track_age": 3,
+    "net_displacement_km": 0.8,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 44.5,
+    "severity": "weak",
+    "significance_rank": 95,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40782"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 38.5,
+    "severity": "weak",
+    "significance_rank": 159,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40913"
+   },
+   {
+    "speed_ms": 1.7,
+    "track_age": 3,
+    "net_displacement_km": 1.0,
+    "path_straightness": 0.45,
+    "likely_clutter": false,
+    "max_dbz": 48.0,
+    "severity": "severe",
+    "significance_rank": 26,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40783"
+   },
+   {
+    "speed_ms": 2.6,
+    "track_age": 9,
+    "net_displacement_km": 9.3,
+    "path_straightness": 0.64,
+    "likely_clutter": true,
+    "max_dbz": 43.5,
+    "severity": "moderate",
+    "significance_rank": 273,
+    "significance_reasons": [
+     "clutter",
+     "impact",
+     "severity"
+    ],
+    "id": "40413"
+   },
+   {
+    "speed_ms": 1.0,
+    "track_age": 5,
+    "net_displacement_km": 0.7,
+    "path_straightness": 0.18,
+    "likely_clutter": false,
+    "max_dbz": 58.5,
+    "severity": "very_severe",
+    "significance_rank": 6,
+    "significance_reasons": [
+     "severity",
+     "impact",
+     "max_dbz"
+    ],
+    "id": "40668"
+   },
+   {
+    "speed_ms": 4.2,
+    "track_age": 2,
+    "net_displacement_km": 1.3,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 49.0,
+    "severity": "moderate",
+    "significance_rank": 56,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "severity"
+    ],
+    "id": "40850"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 37.0,
+    "severity": "weak",
+    "significance_rank": 246,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40914"
+   },
+   {
+    "speed_ms": 9.1,
+    "track_age": 2,
+    "net_displacement_km": 2.7,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 36.0,
+    "severity": "weak",
+    "significance_rank": 226,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40851"
+   },
+   {
+    "speed_ms": 4.3,
+    "track_age": 4,
+    "net_displacement_km": 4.1,
+    "path_straightness": 0.97,
+    "likely_clutter": false,
+    "max_dbz": 44.5,
+    "severity": "moderate",
+    "significance_rank": 34,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "trend"
+    ],
+    "id": "40720"
+   },
+   {
+    "speed_ms": 35.0,
+    "track_age": 2,
+    "net_displacement_km": 11.2,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 37.0,
+    "severity": "weak",
+    "significance_rank": 144,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40849"
+   },
+   {
+    "speed_ms": 5.6,
+    "track_age": 9,
+    "net_displacement_km": 15.7,
+    "path_straightness": 0.3,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 217,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40415"
+   },
+   {
+    "speed_ms": 15.3,
+    "track_age": 2,
+    "net_displacement_km": 4.6,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 36.0,
+    "severity": "weak",
+    "significance_rank": 222,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40852"
+   },
+   {
+    "speed_ms": 11.9,
+    "track_age": 6,
+    "net_displacement_km": 17.4,
+    "path_straightness": 0.91,
+    "likely_clutter": false,
+    "max_dbz": 42.0,
+    "severity": "moderate",
+    "significance_rank": 73,
+    "significance_reasons": [
+     "deviant_mover",
+     "severity",
+     "trend"
+    ],
+    "id": "40606"
+   },
+   {
+    "speed_ms": 4.1,
+    "track_age": 2,
+    "net_displacement_km": 1.2,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 44.5,
+    "severity": "weak",
+    "significance_rank": 111,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40853"
+   },
+   {
+    "speed_ms": 4.0,
+    "track_age": 11,
+    "net_displacement_km": 8.9,
+    "path_straightness": 0.71,
+    "likely_clutter": false,
+    "max_dbz": 38.5,
+    "severity": "weak",
+    "significance_rank": 105,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40293"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 36.0,
+    "severity": "weak",
+    "significance_rank": 256,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40915"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 38.0,
+    "severity": "weak",
+    "significance_rank": 241,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40916"
+   },
+   {
+    "speed_ms": 3.7,
+    "track_age": 10,
+    "net_displacement_km": 8.9,
+    "path_straightness": 0.9,
+    "likely_clutter": false,
+    "max_dbz": 44.0,
+    "severity": "moderate",
+    "significance_rank": 77,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "trend"
+    ],
+    "id": "40364"
+   },
+   {
+    "speed_ms": 18.9,
+    "track_age": 17,
+    "net_displacement_km": 72.7,
+    "path_straightness": 0.74,
+    "likely_clutter": false,
+    "max_dbz": 37.0,
+    "severity": "weak",
+    "significance_rank": 169,
+    "significance_reasons": [
+     "deviant_mover",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "39928"
+   },
+   {
+    "speed_ms": 2.2,
+    "track_age": 2,
+    "net_displacement_km": 0.6,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 48.0,
+    "severity": "moderate",
+    "significance_rank": 21,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40855"
+   },
+   {
+    "speed_ms": 8.5,
+    "track_age": 5,
+    "net_displacement_km": 17.8,
+    "path_straightness": 0.9,
+    "likely_clutter": false,
+    "max_dbz": 43.5,
+    "severity": "moderate",
+    "significance_rank": 93,
+    "significance_reasons": [
+     "severity",
+     "area",
+     "trend"
+    ],
+    "id": "40670"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 37.5,
+    "severity": "weak",
+    "significance_rank": 242,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40917"
+   },
+   {
+    "speed_ms": 4.3,
+    "track_age": 8,
+    "net_displacement_km": 11.5,
+    "path_straightness": 0.64,
+    "likely_clutter": false,
+    "max_dbz": 40.5,
+    "severity": "weak",
+    "significance_rank": 68,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40483"
+   },
+   {
+    "speed_ms": 11.8,
+    "track_age": 7,
+    "net_displacement_km": 8.7,
+    "path_straightness": 0.81,
+    "likely_clutter": false,
+    "max_dbz": 40.0,
+    "severity": "weak",
+    "significance_rank": 66,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40534"
+   },
+   {
+    "speed_ms": 9.3,
+    "track_age": 5,
+    "net_displacement_km": 8.6,
+    "path_straightness": 0.62,
+    "likely_clutter": false,
+    "max_dbz": 42.5,
+    "severity": "moderate",
+    "significance_rank": 100,
+    "significance_reasons": [
+     "severity",
+     "area",
+     "trend"
+    ],
+    "id": "40669"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 35.5,
+    "severity": "weak",
+    "significance_rank": 262,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40918"
+   },
+   {
+    "speed_ms": 7.5,
+    "track_age": 3,
+    "net_displacement_km": 4.5,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 39.5,
+    "severity": "weak",
+    "significance_rank": 63,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40788"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 35.5,
+    "severity": "weak",
+    "significance_rank": 263,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40919"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 251,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40920"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 253,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40921"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 254,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40922"
+   },
+   {
+    "speed_ms": 6.4,
+    "track_age": 6,
+    "net_displacement_km": 6.6,
+    "path_straightness": 0.32,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 218,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40609"
+   },
+   {
+    "speed_ms": 11.2,
+    "track_age": 3,
+    "net_displacement_km": 6.7,
+    "path_straightness": 0.4,
+    "likely_clutter": false,
+    "max_dbz": 38.5,
+    "severity": "weak",
+    "significance_rank": 206,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40792"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 38.0,
+    "severity": "weak",
+    "significance_rank": 235,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40923"
+   },
+   {
+    "speed_ms": 12.9,
+    "track_age": 8,
+    "net_displacement_km": 19.8,
+    "path_straightness": 0.42,
+    "likely_clutter": false,
+    "max_dbz": 38.0,
+    "severity": "weak",
+    "significance_rank": 202,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40487"
+   },
+   {
+    "speed_ms": 21.4,
+    "track_age": 9,
+    "net_displacement_km": 14.4,
+    "path_straightness": 0.23,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 220,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40422"
+   },
+   {
+    "speed_ms": 17.1,
+    "track_age": 6,
+    "net_displacement_km": 17.3,
+    "path_straightness": 0.69,
+    "likely_clutter": false,
+    "max_dbz": 38.0,
+    "severity": "weak",
+    "significance_rank": 200,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40607"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 36.0,
+    "severity": "weak",
+    "significance_rank": 258,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40924"
+   },
+   {
+    "speed_ms": 8.8,
+    "track_age": 7,
+    "net_displacement_km": 27.6,
+    "path_straightness": 0.94,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 221,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40538"
+   },
+   {
+    "speed_ms": 16.0,
+    "track_age": 4,
+    "net_displacement_km": 15.9,
+    "path_straightness": 0.88,
+    "likely_clutter": false,
+    "max_dbz": 37.5,
+    "severity": "weak",
+    "significance_rank": 160,
+    "significance_reasons": [
+     "deviant_mover",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40729"
+   },
+   {
+    "speed_ms": 3.9,
+    "track_age": 7,
+    "net_displacement_km": 5.5,
+    "path_straightness": 0.79,
+    "likely_clutter": false,
+    "max_dbz": 43.5,
+    "severity": "moderate",
+    "significance_rank": 75,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "trend"
+    ],
+    "id": "40536"
+   },
+   {
+    "speed_ms": 13.3,
+    "track_age": 12,
+    "net_displacement_km": 47.5,
+    "path_straightness": 0.8,
+    "likely_clutter": false,
+    "max_dbz": 39.0,
+    "severity": "weak",
+    "significance_rank": 143,
+    "significance_reasons": [
+     "deviant_mover",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40240"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 35.0,
+    "severity": "weak",
+    "significance_rank": 264,
+    "significance_reasons": [
+     "area"
+    ],
+    "id": "40925"
+   },
+   {
+    "speed_ms": 14.6,
+    "track_age": 2,
+    "net_displacement_km": 4.4,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 37.5,
+    "severity": "weak",
+    "significance_rank": 201,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40857"
+   },
+   {
+    "speed_ms": 2.0,
+    "track_age": 4,
+    "net_displacement_km": 1.4,
+    "path_straightness": 0.61,
+    "likely_clutter": false,
+    "max_dbz": 40.5,
+    "severity": "weak",
+    "significance_rank": 60,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40728"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 47.5,
+    "severity": "moderate",
+    "significance_rank": 28,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40926"
+   },
+   {
+    "speed_ms": 9.9,
+    "track_age": 3,
+    "net_displacement_km": 5.9,
+    "path_straightness": 0.55,
+    "likely_clutter": false,
+    "max_dbz": 38.5,
+    "severity": "weak",
+    "significance_rank": 153,
+    "significance_reasons": [
+     "deviant_mover",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40795"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 37.0,
+    "severity": "weak",
+    "significance_rank": 247,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40927"
+   },
+   {
+    "speed_ms": 15.4,
+    "track_age": 9,
+    "net_displacement_km": 42.6,
+    "path_straightness": 0.97,
+    "likely_clutter": false,
+    "max_dbz": 37.5,
+    "severity": "weak",
+    "significance_rank": 168,
+    "significance_reasons": [
+     "deviant_mover",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40426"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 36.0,
+    "severity": "weak",
+    "significance_rank": 255,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40928"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 40.5,
+    "severity": "weak",
+    "significance_rank": 114,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40929"
+   },
+   {
+    "speed_ms": 16.3,
+    "track_age": 2,
+    "net_displacement_km": 4.9,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 42.0,
+    "severity": "weak",
+    "significance_rank": 189,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40858"
+   },
+   {
+    "speed_ms": 13.6,
+    "track_age": 3,
+    "net_displacement_km": 8.2,
+    "path_straightness": 0.99,
+    "likely_clutter": false,
+    "max_dbz": 37.0,
+    "severity": "weak",
+    "significance_rank": 167,
+    "significance_reasons": [
+     "deviant_mover",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40796"
+   },
+   {
+    "speed_ms": 13.4,
+    "track_age": 14,
+    "net_displacement_km": 30.2,
+    "path_straightness": 0.35,
+    "likely_clutter": false,
+    "max_dbz": 38.5,
+    "severity": "weak",
+    "significance_rank": 207,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40106"
+   },
+   {
+    "speed_ms": 16.5,
+    "track_age": 8,
+    "net_displacement_km": 37.4,
+    "path_straightness": 0.98,
+    "likely_clutter": false,
+    "max_dbz": 38.5,
+    "severity": "weak",
+    "significance_rank": 155,
+    "significance_reasons": [
+     "deviant_mover",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40495"
+   },
+   {
+    "speed_ms": 0.6,
+    "track_age": 15,
+    "net_displacement_km": 9.8,
+    "path_straightness": 0.29,
+    "likely_clutter": true,
+    "max_dbz": 42.0,
+    "severity": "weak",
+    "significance_rank": 274,
+    "significance_reasons": [
+     "clutter",
+     "impact",
+     "trend"
+    ],
+    "id": "40052"
+   },
+   {
+    "speed_ms": 22.9,
+    "track_age": 5,
+    "net_displacement_km": 25.7,
+    "path_straightness": 0.9,
+    "likely_clutter": false,
+    "max_dbz": 40.0,
+    "severity": "moderate",
+    "significance_rank": 84,
+    "significance_reasons": [
+     "deviant_mover",
+     "severity",
+     "trend"
+    ],
+    "id": "40678"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 41.5,
+    "severity": "weak",
+    "significance_rank": 92,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40930"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 36.0,
+    "severity": "weak",
+    "significance_rank": 260,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40931"
+   },
+   {
+    "speed_ms": 3.7,
+    "track_age": 13,
+    "net_displacement_km": 14.0,
+    "path_straightness": 0.74,
+    "likely_clutter": false,
+    "max_dbz": 43.0,
+    "severity": "moderate",
+    "significance_rank": 69,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "trend"
+    ],
+    "id": "40190"
+   },
+   {
+    "speed_ms": 5.4,
+    "track_age": 10,
+    "net_displacement_km": 12.9,
+    "path_straightness": 0.22,
+    "likely_clutter": false,
+    "max_dbz": 41.5,
+    "severity": "weak",
+    "significance_rank": 187,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40372"
+   },
+   {
+    "speed_ms": 10.7,
+    "track_age": 5,
+    "net_displacement_km": 10.8,
+    "path_straightness": 0.7,
+    "likely_clutter": false,
+    "max_dbz": 38.0,
+    "severity": "weak",
+    "significance_rank": 209,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40677"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 41.0,
+    "severity": "weak",
+    "significance_rank": 165,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40932"
+   },
+   {
+    "speed_ms": 10.8,
+    "track_age": 12,
+    "net_displacement_km": 34.3,
+    "path_straightness": 0.68,
+    "likely_clutter": false,
+    "max_dbz": 42.5,
+    "severity": "moderate",
+    "significance_rank": 137,
+    "significance_reasons": [
+     "severity",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40244"
+   },
+   {
+    "speed_ms": 3.8,
+    "track_age": 4,
+    "net_displacement_km": 3.2,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 41.0,
+    "severity": "weak",
+    "significance_rank": 81,
+    "significance_reasons": [
+     "impact",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40731"
+   },
+   {
+    "speed_ms": 4.3,
+    "track_age": 2,
+    "net_displacement_km": 1.3,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 46.5,
+    "severity": "moderate",
+    "significance_rank": 25,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40864"
+   },
+   {
+    "speed_ms": 4.5,
+    "track_age": 2,
+    "net_displacement_km": 1.3,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 48.0,
+    "severity": "moderate",
+    "significance_rank": 16,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40865"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 37.5,
+    "severity": "weak",
+    "significance_rank": 245,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40933"
+   },
+   {
+    "speed_ms": 10.0,
+    "track_age": 9,
+    "net_displacement_km": 6.2,
+    "path_straightness": 0.15,
+    "likely_clutter": false,
+    "max_dbz": 43.5,
+    "severity": "moderate",
+    "significance_rank": 103,
+    "significance_reasons": [
+     "severity",
+     "trend",
+     "area"
+    ],
+    "id": "40429"
+   },
+   {
+    "speed_ms": 20.5,
+    "track_age": 3,
+    "net_displacement_km": 12.3,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 175,
+    "significance_reasons": [
+     "deviant_mover",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40797"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 37.0,
+    "severity": "weak",
+    "significance_rank": 248,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40934"
+   },
+   {
+    "speed_ms": 4.5,
+    "track_age": 3,
+    "net_displacement_km": 2.7,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 47.0,
+    "severity": "moderate",
+    "significance_rank": 41,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40798"
+   },
+   {
+    "speed_ms": 4.6,
+    "track_age": 5,
+    "net_displacement_km": 8.9,
+    "path_straightness": 0.91,
+    "likely_clutter": false,
+    "max_dbz": 44.0,
+    "severity": "moderate",
+    "significance_rank": 35,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "trend"
+    ],
+    "id": "40680"
+   },
+   {
+    "speed_ms": 13.1,
+    "track_age": 3,
+    "net_displacement_km": 7.9,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 39.0,
+    "severity": "weak",
+    "significance_rank": 147,
+    "significance_reasons": [
+     "deviant_mover",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40800"
+   },
+   {
+    "speed_ms": 10.3,
+    "track_age": 10,
+    "net_displacement_km": 28.4,
+    "path_straightness": 0.87,
+    "likely_clutter": false,
+    "max_dbz": 38.0,
+    "severity": "weak",
+    "significance_rank": 208,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40378"
+   },
+   {
+    "speed_ms": 17.1,
+    "track_age": 3,
+    "net_displacement_km": 10.2,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 40.0,
+    "severity": "weak",
+    "significance_rank": 148,
+    "significance_reasons": [
+     "deviant_mover",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40801"
+   },
+   {
+    "speed_ms": 5.6,
+    "track_age": 2,
+    "net_displacement_km": 1.7,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 40.5,
+    "severity": "weak",
+    "significance_rank": 194,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40870"
+   },
+   {
+    "speed_ms": 14.9,
+    "track_age": 3,
+    "net_displacement_km": 9.0,
+    "path_straightness": 0.73,
+    "likely_clutter": false,
+    "max_dbz": 36.0,
+    "severity": "weak",
+    "significance_rank": 176,
+    "significance_reasons": [
+     "deviant_mover",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40802"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 37.5,
+    "severity": "weak",
+    "significance_rank": 244,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40935"
+   },
+   {
+    "speed_ms": 4.7,
+    "track_age": 2,
+    "net_displacement_km": 1.4,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 49.5,
+    "severity": "severe",
+    "significance_rank": 1,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40871"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 44.5,
+    "severity": "weak",
+    "significance_rank": 36,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40936"
+   },
+   {
+    "speed_ms": 0.6,
+    "track_age": 2,
+    "net_displacement_km": 0.2,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 36.0,
+    "severity": "weak",
+    "significance_rank": 225,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40872"
+   },
+   {
+    "speed_ms": 4.0,
+    "track_age": 5,
+    "net_displacement_km": 6.9,
+    "path_straightness": 0.34,
+    "likely_clutter": false,
+    "max_dbz": 51.0,
+    "severity": "severe",
+    "significance_rank": 13,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40682"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 44.5,
+    "severity": "weak",
+    "significance_rank": 40,
+    "significance_reasons": [
+     "impact",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40937"
+   },
+   {
+    "speed_ms": 7.1,
+    "track_age": 3,
+    "net_displacement_km": 4.2,
+    "path_straightness": 0.76,
+    "likely_clutter": false,
+    "max_dbz": 37.5,
+    "severity": "weak",
+    "significance_rank": 210,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40803"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 38.0,
+    "severity": "weak",
+    "significance_rank": 243,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40938"
+   },
+   {
+    "speed_ms": 2.3,
+    "track_age": 9,
+    "net_displacement_km": 7.8,
+    "path_straightness": 0.88,
+    "likely_clutter": true,
+    "max_dbz": 49.5,
+    "severity": "moderate",
+    "significance_rank": 233,
+    "significance_reasons": [
+     "clutter",
+     "impact",
+     "max_dbz"
+    ],
+    "id": "40430"
+   },
+   {
+    "speed_ms": 4.8,
+    "track_age": 5,
+    "net_displacement_km": 6.4,
+    "path_straightness": 0.94,
+    "likely_clutter": false,
+    "max_dbz": 45.5,
+    "severity": "moderate",
+    "significance_rank": 37,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40683"
+   },
+   {
+    "speed_ms": 7.2,
+    "track_age": 3,
+    "net_displacement_km": 4.3,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 47.0,
+    "severity": "moderate",
+    "significance_rank": 51,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40804"
+   },
+   {
+    "speed_ms": 14.7,
+    "track_age": 3,
+    "net_displacement_km": 8.8,
+    "path_straightness": 0.99,
+    "likely_clutter": false,
+    "max_dbz": 37.5,
+    "severity": "weak",
+    "significance_rank": 163,
+    "significance_reasons": [
+     "deviant_mover",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40806"
+   },
+   {
+    "speed_ms": 3.3,
+    "track_age": 4,
+    "net_displacement_km": 2.4,
+    "path_straightness": 0.76,
+    "likely_clutter": false,
+    "max_dbz": 50.5,
+    "severity": "severe",
+    "significance_rank": 9,
+    "significance_reasons": [
+     "impact",
+     "severity",
+     "max_dbz"
+    ],
+    "id": "40735"
+   },
+   {
+    "speed_ms": 2.1,
+    "track_age": 7,
+    "net_displacement_km": 3.7,
+    "path_straightness": 0.6,
+    "likely_clutter": true,
+    "max_dbz": 47.0,
+    "severity": "moderate",
+    "significance_rank": 205,
+    "significance_reasons": [
+     "clutter",
+     "impact",
+     "severity"
+    ],
+    "id": "40550"
+   },
+   {
+    "speed_ms": 7.5,
+    "track_age": 6,
+    "net_displacement_km": 4.9,
+    "path_straightness": 0.39,
+    "likely_clutter": false,
+    "max_dbz": 36.0,
+    "severity": "weak",
+    "significance_rank": 224,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40621"
+   },
+   {
+    "speed_ms": 22.7,
+    "track_age": 2,
+    "net_displacement_km": 6.8,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 219,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40874"
+   },
+   {
+    "speed_ms": 22.3,
+    "track_age": 3,
+    "net_displacement_km": 13.4,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 37.5,
+    "severity": "weak",
+    "significance_rank": 212,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40808"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 38.5,
+    "severity": "weak",
+    "significance_rank": 238,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40939"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 38.5,
+    "severity": "weak",
+    "significance_rank": 240,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40940"
+   },
+   {
+    "speed_ms": 11.7,
+    "track_age": 7,
+    "net_displacement_km": 23.6,
+    "path_straightness": 0.98,
+    "likely_clutter": false,
+    "max_dbz": 42.5,
+    "severity": "moderate",
+    "significance_rank": 96,
+    "significance_reasons": [
+     "severity",
+     "area",
+     "trend"
+    ],
+    "id": "40553"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 37.0,
+    "severity": "weak",
+    "significance_rank": 249,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40941"
+   },
+   {
+    "speed_ms": 15.2,
+    "track_age": 3,
+    "net_displacement_km": 9.1,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 41.0,
+    "severity": "weak",
+    "significance_rank": 188,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40810"
+   },
+   {
+    "speed_ms": 9.7,
+    "track_age": 22,
+    "net_displacement_km": 64.7,
+    "path_straightness": 0.88,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 223,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "39620"
+   },
+   {
+    "speed_ms": 13.6,
+    "track_age": 4,
+    "net_displacement_km": 12.6,
+    "path_straightness": 0.99,
+    "likely_clutter": false,
+    "max_dbz": 41.0,
+    "severity": "moderate",
+    "significance_rank": 145,
+    "significance_reasons": [
+     "severity",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40740"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 40.5,
+    "severity": "weak",
+    "significance_rank": 231,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40942"
+   },
+   {
+    "speed_ms": 35.0,
+    "track_age": 2,
+    "net_displacement_km": 12.4,
+    "path_straightness": 1.0,
+    "likely_clutter": false,
+    "max_dbz": 36.5,
+    "severity": "weak",
+    "significance_rank": 214,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40876"
+   },
+   {
+    "speed_ms": 13.6,
+    "track_age": 4,
+    "net_displacement_km": 9.6,
+    "path_straightness": 0.72,
+    "likely_clutter": false,
+    "max_dbz": 37.0,
+    "severity": "weak",
+    "significance_rank": 213,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40742"
+   },
+   {
+    "speed_ms": 4.9,
+    "track_age": 8,
+    "net_displacement_km": 7.3,
+    "path_straightness": 0.25,
+    "likely_clutter": false,
+    "max_dbz": 35.5,
+    "severity": "weak",
+    "significance_rank": 228,
+    "significance_reasons": [
+     "trend",
+     "max_dbz",
+     "area"
+    ],
+    "id": "40498"
+   },
+   {
+    "speed_ms": 9.5,
+    "track_age": 4,
+    "net_displacement_km": 8.7,
+    "path_straightness": 0.58,
+    "likely_clutter": false,
+    "max_dbz": 39.0,
+    "severity": "weak",
+    "significance_rank": 151,
+    "significance_reasons": [
+     "deviant_mover",
+     "trend",
+     "max_dbz"
+    ],
+    "id": "40741"
+   },
+   {
+    "speed_ms": null,
+    "track_age": 1,
+    "net_displacement_km": null,
+    "path_straightness": null,
+    "likely_clutter": false,
+    "max_dbz": 36.0,
+    "severity": "weak",
+    "significance_rank": 259,
+    "significance_reasons": [
+     "max_dbz",
+     "area"
+    ],
+    "id": "40943"
+   }
+  ]
+ }
+}
