@@ -1344,9 +1344,15 @@ fn round_to(v: f64, places: i32) -> f64 {
 /// (feature properties, ranking, narrative, learned models) — building it here
 /// means all four see identical numbers by construction.
 ///
-/// Input order is the track order, which `advance_tracks` derives
-/// deterministically; the scorer breaks score ties by that order, so repeated
-/// generations over unchanged data produce byte-identical rankings.
+/// Score ties break by **feature id string**, not by track order (#635). The
+/// scorer breaks ties by input position, so the input is sorted by id string
+/// first — matching `ds_core::feature::sort_features`, which is what serves
+/// these cells. When the two comparators disagreed, a limited page returned
+/// ranks 1-29 then 31: a hole where nothing had been skipped.
+///
+/// Determinism is unchanged — repeated generations over unchanged data still
+/// produce byte-identical rankings — but it now rests on the id ordering
+/// rather than on `advance_tracks`' track order.
 fn score_cells(
     cells: &[CellTrack],
     g: GridGeom,

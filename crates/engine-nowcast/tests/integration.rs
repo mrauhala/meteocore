@@ -1815,13 +1815,89 @@ fn a_quiet_cell_reports_a_zero_split_but_no_positive_share() {
 /// `limit: 30` request came back holding ranks 1-29 and 31 — a hole where
 /// nothing had been skipped. Ties are common because the score is published to
 /// four decimals over a narrow range, so this is routine, not exotic.
+///
+/// **The fixture must produce an actual tie.** Review on #637 caught the first
+/// version of this test using the single-disc mock: with one cell `ranks` is
+/// `[1]` whatever the code does, so it passed with and without the fix. Two
+/// IDENTICAL discs give identical terms, hence identical scores, hence a real
+/// tie for the two comparators to disagree about.
 #[test]
 fn ranks_are_monotonic_in_the_order_cells_are_served() {
     use ds_core::feature::{FeatureQuery, PropertyValue, SortDirection, SortKey};
     use ds_core::feature_engine::FeatureEngine;
 
+    /// A grid of identical discs — same size, same intensity, far enough apart
+    /// to stay separate connected components. Same area, same max dBZ, same
+    /// age, same everything the scorer reads, so their significance is equal
+    /// by construction rather than by luck.
+    struct TwinCellSource {
+        times: RwLock<Vec<DateTime<Utc>>>,
+    }
+
+    impl MapEngine for TwinCellSource {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            width: u32,
+            height: u32,
+            _time: Option<DateTime<Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<DateTime<Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            let mut data = vec![0u8; (width * height) as usize];
+            for (i, cell) in data.iter_mut().enumerate() {
+                let x = (i % width as usize) as f64 + 0.5;
+                let y = (i / width as usize) as f64 + 0.5;
+                // TWELVE identical discs, not two. Ten is the threshold that
+                // matters: with ids 1 and 2 the string order and the insertion
+                // order agree, so the two comparators cannot disagree and the
+                // bug stays invisible. Once id 10 exists, "10" sorts before
+                // "2" while being inserted after it — which is exactly the
+                // divergence #635 was about.
+                let hit = [25.0f64, 70.0, 115.0, 160.0].iter().any(|&cx| {
+                    [40.0f64, 100.0, 160.0]
+                        .iter()
+                        .any(|&cy| (x - cx).powi(2) + (y - cy).powi(2) <= 8.0 * 8.0)
+                });
+                if hit {
+                    *cell = ECHO_RAW;
+                }
+            }
+            Ok(RasterTile {
+                width,
+                height,
+                values: RasterValues::U8 {
+                    data,
+                    nodata: Some(NODATA),
+                    gain: 0.4,
+                    offset: -30.0,
+                },
+            })
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                native_crs: "CRS:84".into(),
+                spatial_extent: Some(EXTENT),
+                times: self.times.read().unwrap().clone(),
+                parameter: "reflectivity".into(),
+                unit: "dBZ".into(),
+                parameters: vec![],
+                vertical: None,
+                grid_size: Some([W, H]),
+                layer_subtitle: None,
+                reference_times: Vec::new(),
+            }
+        }
+    }
+
     let anchor1 = t0() + Duration::minutes(5);
-    let (_s, engine) = build("PT30M", &[t0(), anchor1]);
+    let source = Arc::new(TwinCellSource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let engine = NowcastEngine::new("twins", "mock", source, &base_config()).expect("builds");
     engine.poll_once();
 
     let page = engine
@@ -1835,6 +1911,30 @@ fn ranks_are_monotonic_in_the_order_cells_are_served() {
         })
         .unwrap();
 
+    let scores: Vec<f64> = page
+        .features
+        .iter()
+        .map(|f| match f.properties.get("significance") {
+            Some(PropertyValue::Float(v)) => *v,
+            other => panic!("significance must be a float, got {other:?}"),
+        })
+        .collect();
+    // Two preconditions, and BOTH are needed. Review on #637 caught the first
+    // version using a single-cell mock, where `ranks` was `[1]` whatever the
+    // code did. The second version used two tied cells and STILL passed with
+    // the fix removed: with ids "1" and "2", string order and insertion order
+    // agree, so the comparators had nothing to disagree about.
+    assert!(
+        scores.len() >= 10,
+        "PRECONDITION: need enough cells for a two-digit id, since the bug is \
+         that \"10\" sorts before \"2\" while being inserted after it; got {}",
+        scores.len()
+    );
+    assert!(
+        scores.windows(2).all(|w| w[0] == w[1]),
+        "PRECONDITION: every cell must tie, or there is no tie to break: {scores:?}"
+    );
+
     let ranks: Vec<i64> = page
         .features
         .iter()
@@ -1844,16 +1944,11 @@ fn ranks_are_monotonic_in_the_order_cells_are_served() {
         })
         .collect();
 
-    assert!(!ranks.is_empty(), "precondition: some cells were tracked");
-    assert!(
-        ranks.windows(2).all(|w| w[0] < w[1]),
-        "ranks must increase down the served page, got {ranks:?}"
-    );
-    // No gaps: a prefix of the page is a prefix of the ranking, which is what
-    // makes `limit` safe to paginate on.
+    // The bug: served order and rank order disagreed, so a prefix of the page
+    // was not a prefix of the ranking and `limit` produced a hole.
     let expected: Vec<i64> = (1..=ranks.len() as i64).collect();
     assert_eq!(
         ranks, expected,
-        "a full page must carry exactly ranks 1..=n with no holes"
+        "ranks must run 1..=n down the served page with no holes, got {ranks:?}"
     );
 }
