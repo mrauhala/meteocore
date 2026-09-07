@@ -361,9 +361,11 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
   `VoxelGrid` (see `crates/engine-odim/CLAUDE.md`).
 - **`ds_core::significance`** — domain-agnostic scoring/ranking: normalized
   `Term`s → a weighted mean with per-term `contributions` for
-  explainability. Absent terms renormalize (so wiring a new data source
-  needs no config flag day) and weights may be negative (a data-quality
-  discount must be able to demote). `WeightedScorer` is the baseline a
+  explainability. Graded terms form the denominator and absent ones
+  renormalize (so wiring a new data source needs no config flag day);
+  bonus terms (`Term::flag` / `Term::bonus`) add outside the denominator, so
+  a signal that did not fire dilutes nothing (#645); weights may be negative
+  (a data-quality discount must be able to demote). `WeightedScorer` is the baseline a
   learned ranker has to beat; a GBDT/ONNX model is another
   `impl Significance<T>` behind the same interface. Reusable for CAP alert
   urgency and impact-event priority — do not fork it per domain.

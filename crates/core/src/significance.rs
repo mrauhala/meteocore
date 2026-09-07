@@ -41,6 +41,28 @@ use crate::error::DataServerError;
 /// it needs to get. Values outside the range are clamped (and NaN maps to 0)
 /// rather than rejected — a scoring bug should degrade a ranking, never take
 /// down a poll cycle.
+/// How a term takes part in the weighted mean (#645).
+///
+/// A GRADED term measures how much of something an object has — intensity,
+/// size, exposure — and its weight is part of the denominator, so the score
+/// is a mean of what was measured. A BONUS term is a signal that either fires
+/// or does not — a deviant mover, a lightning jump, a clutter verdict, a
+/// trend — and its weight is NOT in the denominator: it adds to (or
+/// subtracts from) the mean of the graded terms, scaled by the same
+/// denominator so `contributions` still sum to `raw`.
+///
+/// Why the split exists: with every flag in the denominator, a plain cell
+/// with no flags set was divided by the weight of every flag it did not
+/// have. Two always-present flags (|0.4| + |1.5|) capped a non-clutter,
+/// non-deviant cell without lightning or impact at 0.51 and packed the whole
+/// weak class into a tenth of the range — the dynamic-range collapse of
+/// #636. A flag that did not fire is not a measurement of zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermKind {
+    Graded,
+    Bonus,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Term {
     /// Stable identifier, matched against the weight table. `&'static str`
@@ -48,19 +70,31 @@ pub struct Term {
     /// at compile time.
     pub name: &'static str,
     pub value: f64,
+    pub kind: TermKind,
 }
 
 impl Term {
+    /// A graded term: in the denominator.
     pub fn new(name: &'static str, value: f64) -> Self {
-        Self { name, value }
-    }
-
-    /// A boolean signal as a term: present or not.
-    pub fn flag(name: &'static str, set: bool) -> Self {
         Self {
             name,
-            value: if set { 1.0 } else { 0.0 },
+            value,
+            kind: TermKind::Graded,
         }
+    }
+
+    /// A bonus term with a magnitude in `0..=1`: outside the denominator.
+    pub fn bonus(name: &'static str, value: f64) -> Self {
+        Self {
+            name,
+            value,
+            kind: TermKind::Bonus,
+        }
+    }
+
+    /// A boolean signal as a bonus term: fires or does not.
+    pub fn flag(name: &'static str, set: bool) -> Self {
+        Self::bonus(name, if set { 1.0 } else { 0.0 })
     }
 
     /// Clamped to `0.0..=1.0`, NaN → 0.0.
@@ -195,13 +229,19 @@ impl WeightedScorer {
             if weight == 0.0 {
                 continue;
             }
-            denominator += weight.abs();
+            // Only graded terms shape the denominator; a bonus that did not
+            // fire must not dilute what was measured (#645).
+            if term.kind == TermKind::Graded {
+                denominator += weight.abs();
+            }
             contributions.push(Contribution {
                 term: term.name,
                 value: weight * term.normalized(),
             });
         }
 
+        // Nothing measured ⇒ nothing to rank, whatever flags fired: a bonus
+        // is relative to a mean that does not exist.
         if denominator == 0.0 {
             return SignificanceScore::zero(0);
         }
@@ -339,6 +379,42 @@ mod tests {
         );
         assert_eq!(q[0].score, q[1].score, "served scores are one number");
         assert!((q[1].raw - 0.500_001).abs() < 1e-9, "raw stays unrounded");
+    }
+
+    #[test]
+    fn bonus_terms_stay_out_of_the_denominator() {
+        // A flag that did not fire leaves the graded mean untouched; one that
+        // fired adds its weight relative to the graded mass (#645).
+        let s = WeightedScorer::new(&[("severity", 1.0), ("area", 0.5), ("deviant", 0.3)]);
+        let plain = Item(vec![Term::new("severity", 0.5), Term::new("area", 0.5)]);
+        let quiet = Item(vec![
+            Term::new("severity", 0.5),
+            Term::new("area", 0.5),
+            Term::flag("deviant", false),
+        ]);
+        let fired = Item(vec![
+            Term::new("severity", 0.5),
+            Term::new("area", 0.5),
+            Term::flag("deviant", true),
+        ]);
+        assert_eq!(s.score_one(&plain).score, s.score_one(&quiet).score);
+        assert!((s.score_one(&quiet).score - 0.5).abs() < 1e-12);
+        // + 0.3 / (1.0 + 0.5)
+        assert!((s.score_one(&fired).score - 0.7).abs() < 1e-12);
+        let sum: f64 = s
+            .score_one(&fired)
+            .contributions
+            .iter()
+            .map(|c| c.value)
+            .sum();
+        assert!((sum - s.score_one(&fired).raw).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_bonus_alone_cannot_score() {
+        let s = WeightedScorer::new(&[("deviant", 0.3)]);
+        let only_flag = Item(vec![Term::flag("deviant", true)]);
+        assert_eq!(s.score_one(&only_flag).score, 0.0);
     }
 
     #[test]
