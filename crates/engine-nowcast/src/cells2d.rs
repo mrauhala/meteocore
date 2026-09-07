@@ -429,17 +429,32 @@ pub fn advance_tracks_with_stats(
     // still finds its true successor instead of being dropped by the very
     // detector built to flag it.
     let ratio = displacement_secs.max(1.0) / field_interval_secs.max(1.0);
+    let ds = displacement_secs.max(1.0);
+    // First guess: a track that already has a velocity predicts with ITS
+    // OWN motion (TITAN-style constant velocity, the EMA is already
+    // smoothed); only a newborn borrows the ambient field. Displacing every
+    // track by the ambient flow is what manufactured the #639 tie: two
+    // stationary echoes both predicted downstream cost the same crossed as
+    // straight. Predicting a stationary track onto itself has no tie to
+    // break, whatever the echoes look like.
     let displaced: Vec<CellBlob> = previous
         .iter()
         .map(|t| {
             let mut b = t.blob.clone();
-            let (fu, fv) = field.sample(b.centroid.0, b.centroid.1);
-            b.centroid.0 += fu * ratio;
-            b.centroid.1 += fv * ratio;
+            match t.velocity_kms {
+                Some((vx, vy)) => {
+                    b.centroid.0 += vx * ds / scale.x;
+                    b.centroid.1 += vy * ds / scale.y;
+                }
+                None => {
+                    let (fu, fv) = field.sample(b.centroid.0, b.centroid.1);
+                    b.centroid.0 += fu * ratio;
+                    b.centroid.1 += fv * ratio;
+                }
+            }
             b
         })
         .collect();
-    let ds = displacement_secs.max(1.0);
     // Pass 1 gate: residual around the motion-compensated prediction.
     let gate_compensated = BASE_GATE_KM + COMPENSATED_RESIDUAL_SPEED_MS * ds / 1000.0;
     // Pass 2 gate: full physical speed bound around the raw position.
@@ -2046,5 +2061,69 @@ mod tests {
             advance_tracks_with_stats(&previous, vec![], scale, &still, 300.0, 300.0, &mut gen);
         assert_eq!(st.deaths, 1);
         assert_eq!(st.births, 0);
+    }
+
+    #[test]
+    fn identical_fixed_echoes_settle_instead_of_ping_ponging() {
+        // #639 follow-up: two IDENTICAL stationary echoes in a flow that
+        // puts both ambient predictions in gate. Similarity cannot tell them
+        // apart, so frame 2 may swap on the tie — but once each track has
+        // a velocity it predicts onto itself, the tie is gone, and the ids
+        // must settle rather than alternate every frame (the production
+        // ping-pong manufactured 10+ m/s speeds and 17 km of net
+        // displacement on a fixed target).
+        let scale = PixelScale::UNIT;
+        let field = MotionField {
+            block: 16,
+            bw: 8,
+            bh: 8,
+            u: vec![3.0; 64],
+            v: vec![0.0; 64],
+            measured: vec![true; 64],
+        };
+        let blob = |x: f32| CellBlob {
+            centroid: (x, 50.0),
+            area: 20,
+            volume: 300.0,
+            max_value: 48.0,
+        };
+        let blobs = || vec![blob(10.0), blob(12.0)];
+        let mut next = 0u64;
+        let mut gen = || {
+            next += 1;
+            next
+        };
+        let id_at = |tracks: &[CellTrack], x: f32| {
+            tracks
+                .iter()
+                .find(|t| (t.blob.centroid.0 - x).abs() < 1e-3)
+                .map(|t| t.id)
+                .expect("a track at each fixed spot")
+        };
+        let mut tracks = advance_tracks(&[], blobs(), scale, &field, 300.0, 300.0, &mut gen);
+        let mut changes = 0;
+        let mut last_change_frame = 0;
+        for frame in 1..=10 {
+            let before = id_at(&tracks, 10.0);
+            tracks = advance_tracks(&tracks, blobs(), scale, &field, 300.0, 300.0, &mut gen);
+            if id_at(&tracks, 10.0) != before {
+                changes += 1;
+                last_change_frame = frame;
+            }
+        }
+        assert_eq!(next, 2, "no newborn ids were issued");
+        assert!(changes <= 1, "ids alternated {changes} times");
+        assert!(
+            last_change_frame <= 2,
+            "a swap after frame 2 means the tie survived"
+        );
+        for t in &tracks {
+            assert_eq!(t.age, 11);
+            assert!(
+                t.speed_ms().unwrap() < 1.0,
+                "EMA must have decayed to stationary, got {} m/s",
+                t.speed_ms().unwrap()
+            );
+        }
     }
 }
