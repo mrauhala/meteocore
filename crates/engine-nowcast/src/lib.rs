@@ -26,6 +26,7 @@ pub mod engine;
 pub mod impact;
 pub mod motion;
 pub mod objects;
+pub mod radar;
 pub mod skill;
 pub mod tendency;
 

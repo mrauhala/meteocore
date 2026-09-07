@@ -25,7 +25,7 @@
 //!   happen only there, never on a request worker.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -264,6 +264,10 @@ pub struct NowcastEngine {
     track_pass1_matches_total: AtomicU64,
     track_pass2_matches_total: AtomicU64,
     track_velocity_clamps_total: AtomicU64,
+    /// Whether the "radar source advertised no sites" warning has fired
+    /// since the source last had sites. Logged on the transition, not every
+    /// 30 s generation while a volume engine bootstraps (#642 review).
+    radar_empty_warned: AtomicBool,
     /// Optional point-event source joined onto tracked cells per
     /// generation (#549) — lightning, wired by the server's second pass.
     lightning: Option<Arc<dyn ds_core::events::EventSource>>,
@@ -272,6 +276,10 @@ pub struct NowcastEngine {
     /// `impact` significance term — the one that makes a ranking
     /// operational rather than merely meteorological.
     impact: Option<ImpactCfg>,
+    /// Optional radar-site source for per-cell beam geometry (#642), wired
+    /// by the server's second pass like the two above. Data-only: one site
+    /// list per generation, no volume decoding.
+    radar: Option<Arc<dyn ds_core::radar_sites::RadarSiteSource>>,
     /// Sortable properties for THIS instance, resolved once whenever a
     /// source is wired. Stored rather than recomputed so the per-request
     /// accessor is a borrow — same effect as the four-constant version it
@@ -380,8 +388,10 @@ impl NowcastEngine {
             track_pass1_matches_total: AtomicU64::new(0),
             track_pass2_matches_total: AtomicU64::new(0),
             track_velocity_clamps_total: AtomicU64::new(0),
+            radar_empty_warned: AtomicBool::new(false),
             lightning: None,
             impact: None,
+            radar: None,
             sortables: SORTABLES_BASE.to_vec(),
             scorer,
         })
@@ -481,6 +491,17 @@ impl NowcastEngine {
         self
     }
 
+    /// Attach the radar-site source for per-cell beam geometry (#642),
+    /// second pass like the other two.
+    pub fn with_radar_source(
+        mut self,
+        source: Arc<dyn ds_core::radar_sites::RadarSiteSource>,
+    ) -> Self {
+        self.radar = Some(source);
+        self.recompute_sortables();
+        self
+    }
+
     /// Rebuild the sortable set from whichever sources are wired.
     ///
     /// A property absent from every feature sorts to a no-op: `sort_features`
@@ -495,6 +516,9 @@ impl NowcastEngine {
         }
         if self.impact.is_some() {
             v.extend(SORTABLES_IMPACT_EXTRAS);
+        }
+        if self.radar.is_some() {
+            v.extend(crate::radar::SORTABLES_RADAR_EXTRAS);
         }
         self.sortables = v;
     }
@@ -580,6 +604,25 @@ impl NowcastEngine {
                         }
                     }
                 });
+                // Radar sites (#642): a snapshot read, never I/O. An empty
+                // list (source not yet populated) serves the group as null.
+                let radar_sites = self.radar.as_ref().map(|r| r.radar_sites());
+                if let Some(sites) = &radar_sites {
+                    if sites.is_empty() {
+                        if !self.radar_empty_warned.swap(true, Ordering::Relaxed) {
+                            tracing::warn!(
+                                collection = %self.collection_id,
+                                "radar source advertised no sites; beam geometry skipped until it does"
+                            );
+                        }
+                    } else if self.radar_empty_warned.swap(false, Ordering::Relaxed) {
+                        tracing::info!(
+                            collection = %self.collection_id,
+                            sites = sites.len(),
+                            "radar source now advertises sites; beam geometry resumed"
+                        );
+                    }
+                }
                 let mut cell_history = old.cell_history.clone();
                 cell_history.push(CellSnapshot {
                     anchor,
@@ -589,6 +632,7 @@ impl NowcastEngine {
                         anchor,
                         &self.scorer,
                         impact_index.as_ref(),
+                        radar_sites.as_deref(),
                     )),
                 });
                 if cell_history.len() > CELL_HISTORY_SNAPSHOTS {
@@ -1372,7 +1416,7 @@ impl MapEngine for NowcastEngine {
 
 /// Round to `places` decimals — serde's shortest-roundtrip float printing
 /// then emits the short form (`14.3`, not `14.300000000000001`).
-fn round_to(v: f64, places: i32) -> f64 {
+pub(crate) fn round_to(v: f64, places: i32) -> f64 {
     let f = 10f64.powi(places);
     (v * f).round() / f
 }
@@ -1399,6 +1443,7 @@ fn score_cells(
     anchor: DateTime<Utc>,
     scorer: &WeightedScorer,
     impact: Option<&ImpactIndex>,
+    radar_sites: Option<&[ds_core::radar_sites::RadarSiteInfo]>,
 ) -> Vec<ScoredCell> {
     let (kx, ky) =
         crate::lonlat_grid_km_per_px([g.west, g.south, g.east, g.north], g.width, g.height);
@@ -1418,6 +1463,8 @@ fn score_cells(
             let speed_raw = t.speed_ms().map(f64::from);
             let bearing_raw = t.bearing_deg();
             let impact_facts = impact.map(|idx| idx.resolve(lon, lat, speed_raw, bearing_raw));
+            let radar_facts =
+                radar_sites.and_then(|sites| crate::radar::radar_facts(lon, lat, sites));
 
             // 5 decimals ≈ 1 m — the working grid is ~500 m, so raw f64s
             // would roughly double the payload to carry pure noise.
@@ -1518,6 +1565,7 @@ fn score_cells(
                 // environment sampling.
                 volume: None,
                 environment: Vec::new(),
+                radar: radar_facts,
             }
         })
         .collect();
@@ -1544,7 +1592,7 @@ fn score_cells(
 /// Build one cell feature from its fact sheet and score. Shared by
 /// `get_features` and `get_feature` so the two paths cannot drift (and the
 /// by-id path needn't materialize every cell).
-fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
+fn cell_feature(cell: &ScoredCell, lightning: bool, radar: bool) -> (f64, f64, Feature) {
     let t = &cell.facts;
     // Values were rounded to their MEANINGFUL precision when the fact sheet
     // was built (the working grid is ~500 m, so 5 lon/lat decimals ≈ 1 m;
@@ -1660,6 +1708,44 @@ fn cell_feature(cell: &ScoredCell, lightning: bool) -> (f64, f64, Feature) {
                 .eta_minutes
                 .map(PropertyValue::Float)
                 .unwrap_or(PropertyValue::Null),
+        );
+    }
+    // Beam geometry (#642). Same tri-state as the impact group: absent when
+    // no radar source is wired; every key null when the source advertised
+    // no sites this generation; inside coverage the beam fields are numbers,
+    // outside it they are null and `in_radar_coverage` says why.
+    if radar {
+        let r = t.radar.as_ref();
+        let opt_s = |v: Option<&String>| {
+            v.map(|s| PropertyValue::String(s.clone()))
+                .unwrap_or(PropertyValue::Null)
+        };
+        let opt_f = |v: Option<f64>| v.map(PropertyValue::Float).unwrap_or(PropertyValue::Null);
+        props.insert(
+            "nearest_radar_id".into(),
+            opt_s(r.map(|r| &r.nearest_radar_id)),
+        );
+        props.insert(
+            "nearest_radar_name".into(),
+            opt_s(r.and_then(|r| r.nearest_radar_name.as_ref())),
+        );
+        props.insert(
+            "nearest_radar_distance_km".into(),
+            opt_f(r.map(|r| r.nearest_radar_distance_km)),
+        );
+        props.insert(
+            "in_radar_coverage".into(),
+            r.and_then(|r| r.in_radar_coverage)
+                .map(PropertyValue::Bool)
+                .unwrap_or(PropertyValue::Null),
+        );
+        props.insert(
+            "beam_height_m".into(),
+            opt_f(r.and_then(|r| r.beam_height_m)),
+        );
+        props.insert(
+            "beam_elevation_deg".into(),
+            opt_f(r.and_then(|r| r.beam_elevation_deg)),
         );
     }
     // Lifecycle as DATA, not field modification: three gate runs showed
@@ -1793,7 +1879,8 @@ impl FeatureEngine for NowcastEngine {
             .cells
             .iter()
             .filter_map(|t| {
-                let (lon, lat, feature) = cell_feature(t, self.lightning.is_some());
+                let (lon, lat, feature) =
+                    cell_feature(t, self.lightning.is_some(), self.radar.is_some());
                 if let Some(b) = &query.bbox {
                     if !b.contains(lon, lat) {
                         return None;
@@ -1857,7 +1944,7 @@ impl FeatureEngine for NowcastEngine {
             .iter()
             .find(|t| t.facts.id == id)
             .ok_or_else(not_found)?;
-        Ok(cell_feature(track, self.lightning.is_some()).2)
+        Ok(cell_feature(track, self.lightning.is_some(), self.radar.is_some()).2)
     }
 
     /// Bumps every generation, so any future consumer keying caches/ETags on
