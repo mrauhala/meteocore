@@ -263,6 +263,13 @@ lightning, and `likely_clutter` flapping on alternate frames.
   displacement, so `CLUTTER_MAX_NET_DISPLACEMENT_KM` reads a fixed target as
   "travelled". Do not tune the clutter thresholds against a swapping track;
   fix the association.
+- **Aged tracks predict with their own EMA velocity; only newborns borrow
+  the ambient field.** Displacing every track by the flow is what created
+  the tie for stationary echoes in the first place; a stationary track that
+  predicts onto itself has no tie to break, so even IDENTICAL fixed echoes
+  settle after at most one frame-2 swap
+  (`identical_fixed_echoes_settle_instead_of_ping_ponging`). The counter-flow
+  rescue in pass 2 is still needed for newborns.
 - Still open in #639: the padding constant makes the optimiser maximise the
   NUMBER of in-gate matches before cost, so a gate-edge pairing beats a birth
   plus a death. Pricing "unmatched" is the follow-up — and note the naive
