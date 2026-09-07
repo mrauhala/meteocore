@@ -840,9 +840,13 @@ impl NowcastEngine {
         let displacement_secs = prev_latest
             .map(|(&p, _)| (anchor - p).num_seconds() as f32)
             .unwrap_or_else(|| interval.num_seconds() as f32);
-        let previous_cells: &[CellTrack] = match prev_latest {
-            Some((_, prev)) if prev.geom == geom => &prev.cells,
-            _ => &[],
+        // A geometry reset discards every live track (they restart as
+        // newborns). Those are deaths too, and the tracker cannot see them
+        // from an empty `previous`, so count them here (#643 review).
+        let (previous_cells, reset_deaths): (&[CellTrack], u64) = match prev_latest {
+            Some((_, prev)) if prev.geom == geom => (&prev.cells, 0),
+            Some((_, prev)) => (&[], prev.cells.len() as u64),
+            None => (&[], 0),
         };
         let (mut cells, track_stats) = advance_tracks_with_stats(
             previous_cells,
@@ -856,7 +860,7 @@ impl NowcastEngine {
         self.track_births_total
             .fetch_add(track_stats.births, Ordering::Relaxed);
         self.track_deaths_total
-            .fetch_add(track_stats.deaths, Ordering::Relaxed);
+            .fetch_add(track_stats.deaths + reset_deaths, Ordering::Relaxed);
         self.track_pass2_matches_total
             .fetch_add(track_stats.pass2_matches, Ordering::Relaxed);
         self.track_velocity_clamps_total
