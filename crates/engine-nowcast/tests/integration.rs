@@ -1420,6 +1420,37 @@ fn cells_are_ranked_by_significance_with_reasons() {
 
 /// A typo in a `[nowcast.significance]` weight name must fail the collection
 /// at load, not silently rank by defaults the operator never chose.
+/// Zeroing every graded term the tracker always emits leaves nothing for
+/// the bonus terms to scale (#645): every cell would score 0 with no reasons
+/// and rank by id, silently. That is a load error, not a ranking.
+#[test]
+fn zeroing_every_graded_weight_fails_the_collection() {
+    let mut config = base_config();
+    for term in ["severity", "max_dbz", "area"] {
+        config.significance.insert(term.into(), 0.0);
+    }
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0()]),
+    });
+    let err = match NowcastEngine::new("zeroed", "mock", source, &config) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("an all-zero graded table must be rejected"),
+    };
+    assert!(
+        err.contains("severity") && err.contains("area"),
+        "error should name the graded terms: {err}"
+    );
+
+    // Zeroing two of the three is a legitimate single-term ranking.
+    let mut one_left = base_config();
+    one_left.significance.insert("max_dbz".into(), 0.0);
+    one_left.significance.insert("area".into(), 0.0);
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0()]),
+    });
+    assert!(NowcastEngine::new("one-graded", "mock", source, &one_left).is_ok());
+}
+
 #[test]
 fn unknown_significance_weight_fails_the_collection() {
     let mut config = base_config();
