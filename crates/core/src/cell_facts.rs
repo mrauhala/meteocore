@@ -151,6 +151,33 @@ pub struct VolumeFacts {
     pub contributing_cells: u32,
 }
 
+/// Beam geometry at the cell from the nearest radar (#642).
+///
+/// The cheapest evidence about whether an echo is meteorological: how far the
+/// nearest radar is, and how high its lowest beam passes over the cell. A
+/// bright stationary echo under a beam a few hundred metres up is a fixed
+/// target; the same echo under a beam 3 km up is weather. Also the range
+/// context every other radar-derived number needs (Block A of #624).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RadarFacts {
+    /// Site id of the nearest radar (ODIM `NOD`).
+    pub nearest_radar_id: String,
+    /// Its place name, when known.
+    pub nearest_radar_name: Option<String>,
+    /// Great-circle distance from that radar to the cell centroid, km.
+    pub nearest_radar_distance_km: f64,
+    /// Whether the cell lies inside that radar's surveyed range. Outside it,
+    /// every per-cell radar number is a statement about a place the radar
+    /// does not see, so the beam fields below are `None` there.
+    pub in_radar_coverage: bool,
+    /// Height of the lowest beam's centre over the cell, metres above mean
+    /// sea level (antenna height + 4/3-Earth beam rise). There is no terrain
+    /// model, so this is not "above ground" in hilly country.
+    pub beam_height_m: Option<f64>,
+    /// Elevation angle of that lowest sweep, degrees.
+    pub beam_elevation_deg: Option<f64>,
+}
+
 /// Where the cell is and what it is heading toward.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ImpactFacts {
@@ -224,6 +251,9 @@ pub struct CellFactSheet {
     pub lightning: Option<LightningFacts>,
     pub volume: Option<VolumeFacts>,
     pub impact: Option<ImpactFacts>,
+    /// Nearest-radar beam geometry (#642). `None` when no radar source is
+    /// wired, or when the source has not advertised any site yet.
+    pub radar: Option<RadarFacts>,
     /// Empty when no environment source is wired.
     pub environment: Vec<EnvironmentFact>,
 }
@@ -480,6 +510,7 @@ mod tests {
             volume: None,
             impact: None,
             environment: Vec::new(),
+            radar: None,
         }
     }
 

@@ -315,6 +315,12 @@ pub struct NowcastConfig {
     /// honest but cannot rank a city above a village.
     #[serde(default)]
     pub impact_weight_property: Option<String>,
+    /// Collection id of a polar-volume (`odim-volume`) collection whose radar
+    /// sites give each tracked cell its nearest radar, range and lowest-beam
+    /// height (#642). Must exist in the same config; a missing or non-volume
+    /// collection fails this collection at load.
+    #[serde(default)]
+    pub radar_source: Option<String>,
 }
 
 /// MCP endpoint configuration.

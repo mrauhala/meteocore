@@ -26,6 +26,11 @@ impact_source = "municipalities"
 impact_name_property = "nimi"
 impact_weight_property = "population"
 
+# Beam geometry (#642): nearest radar, range and lowest-beam height per cell,
+# from the polar-volume network collection's site catalog. Data-only join —
+# no volume decoding per generation.
+radar_source = "radar-fi-volume-s3-h5"
+
 # Significance weight overrides. Defaults live in
 # ds_core::cell_facts::DEFAULT_CELL_WEIGHTS; omitted terms keep theirs, and an
 # unknown term name fails this collection at load. Terms a cell has no data

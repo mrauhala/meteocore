@@ -17,6 +17,7 @@ pub mod model;
 pub mod ogc_extent;
 pub mod openapi;
 pub mod proxy;
+pub mod radar_sites;
 pub mod raster_paint;
 pub mod resample;
 pub mod significance;

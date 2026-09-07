@@ -536,6 +536,8 @@ horizon = "PT2H"        # how far into the future (default PT2H)
 # impact_name_property = "name"        # display-name property (default "name")
 # impact_weight_property = "population" # optional numeric property; log-weights
                                         # exposure. Omit ⇒ purely geometric
+# radar_source = "fi-radar-pvol"  # odim-volume collection: per-cell nearest
+                                  # radar, range, lowest-beam height (#642)
 
 # Optional per-term significance weight overrides for tracked storm cells.
 # Defaults live in ds_core::cell_facts::DEFAULT_CELL_WEIGHTS; omitted terms

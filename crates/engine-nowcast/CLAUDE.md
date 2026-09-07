@@ -436,6 +436,30 @@ see `docs/cell-intelligence-plan-amendment.md`).
 - NOT yet wired: a `min_significance` filter, and the `volume` /
   `environment` fact groups.
 
+## Beam geometry (`radar.rs`, #642)
+
+- `[nowcast] radar_source = "<id>"` names an `odim-volume` collection in the
+  same config (its NETWORK engine, e.g. `radar-fi-volume-s3-h5`). Wired
+  second-pass via `ds_core::radar_sites::RadarSiteSource`, exactly like the
+  lightning join; a missing or non-volume id FAILS the collection at load.
+- **Data-only.** `radar_sites()` is one catalog snapshot per generation — no
+  volume decoding, no S3. That is what makes this shippable before the full
+  3-D cell join (#642 step 2, blocked on #293).
+- Per cell: `nearest_radar_id` / `nearest_radar_name` /
+  `nearest_radar_distance_km` (nearest by great-circle distance, whether or
+  not it covers the cell), `in_radar_coverage`, and — only inside coverage —
+  `beam_height_m` (lowest sweep's centre, metres above MEAN SEA LEVEL:
+  antenna height + 4/3-Earth rise; there is no terrain model) and
+  `beam_elevation_deg`. Tri-state like the other groups: absent when no
+  source is wired, all null when the source advertised no sites yet.
+- Why it exists: a bright stationary echo under a beam a few hundred metres
+  up is a wind farm; the same echo under a beam 3 km up is weather. This is
+  the frame-one clutter evidence #620 needs, and the range context every
+  radar-derived number needs (Block A of #624). Not a significance term yet.
+- The beam math has ONE home: `ds_core::geo::{slant_to_ground_height,
+  beam_height_at_ground, FOUR_THIRDS_EARTH_M}`; engine-odim's voxel sampler
+  re-exports it. Do not re-derive it here.
+
 ## Impact context (`impact.rs`)
 
 - `[nowcast] impact_source = "<id>"` names any polygon **Features**

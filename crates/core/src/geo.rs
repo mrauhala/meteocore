@@ -33,6 +33,51 @@ pub fn geodetic_to_ecef(lon_deg: f64, lat_deg: f64, h: f64) -> [f64; 3] {
 /// engines (e.g. the cylindrical voxel grid → isosurface mapping).
 pub const EARTH_RADIUS_M: f64 = 6_371_000.0;
 
+/// 4/3 of the mean Earth radius, in metres — the effective radius used to
+/// model standard atmospheric refraction of a radar beam.
+pub const FOUR_THIRDS_EARTH_M: f64 = 4.0 / 3.0 * EARTH_RADIUS_M;
+
+/// Forward beam map: `(slant_range_m, elevation_angle_deg)` →
+/// `(ground_distance_m, height_above_antenna_m)` under the 4/3-Earth model.
+///
+/// `h = sqrt(r² + R'² + 2·r·R'·sin(el)) − R'`,
+/// `s = R' · atan(r·cos(el) / (r·sin(el) + R'))`, with `R' = 4/3 · R_earth`.
+///
+/// The ONE home for this formula: engine-odim's voxel sampler and the
+/// nowcast's per-cell beam geometry (#642) both call it.
+pub fn slant_to_ground_height(slant_range_m: f64, elangle_deg: f64) -> (f64, f64) {
+    let r = slant_range_m;
+    let el = elangle_deg.to_radians();
+    let rp = FOUR_THIRDS_EARTH_M;
+    let h = (r * r + rp * rp + 2.0 * r * rp * el.sin()).sqrt() - rp;
+    let s = rp * (r * el.cos() / (r * el.sin() + rp)).atan();
+    (s, h)
+}
+
+/// Height of a beam's centre above the antenna at `ground_distance_m` along
+/// a sweep at `elangle_deg`, metres, under the 4/3-Earth model.
+///
+/// The angle is deliberately NOT clamped to `>= 0`: real networks run a
+/// slightly negative lowest tilt from terrain-elevated sites, and a
+/// negative-tilt floor correctly dips below antenna level before
+/// effective-Earth curvature lifts it.
+pub fn beam_height_at_ground(elangle_deg: f64, ground_distance_m: f64) -> f64 {
+    let cos_el = elangle_deg.to_radians().cos().max(1e-3);
+    let r = ground_distance_m / cos_el;
+    let (_, h) = slant_to_ground_height(r, elangle_deg);
+    h
+}
+
+/// Great-circle distance between two WGS84 points, metres (haversine on the
+/// mean Earth radius). Good to ~0.3% — fine for range and coverage tests.
+pub fn great_circle_distance_m(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let dp = (lat2 - lat1).to_radians();
+    let dl = (lon2 - lon1).to_radians();
+    let a = (dp / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
+    2.0 * EARTH_RADIUS_M * a.sqrt().atan2((1.0 - a).sqrt())
+}
+
 /// Great-circle **destination point** on a sphere: starting at
 /// (`lon_deg`, `lat_deg`), travel `distance_m` along the initial compass
 /// `bearing_deg` (0° = north, increasing clockwise). Returns
@@ -2172,5 +2217,28 @@ mod tests {
             Geometry::Polygon { exterior, .. } => exterior,
             _ => panic!("not a polygon"),
         }
+    }
+
+    #[test]
+    fn beam_height_rises_with_range_and_elevation() {
+        // 0.5° at 100 km: ~0.87 km geometric + ~0.59 km curvature ≈ 1.46 km
+        // (Doviak & Zrnić). Bracket generously; pin monotonicity exactly.
+        let h = beam_height_at_ground(0.5, 100_000.0);
+        assert!((1_300.0..1_600.0).contains(&h), "got {h}");
+        assert!(beam_height_at_ground(0.5, 200_000.0) > h);
+        assert!(beam_height_at_ground(1.5, 100_000.0) > h);
+        assert!(beam_height_at_ground(0.5, 0.0).abs() < 1e-6);
+        // A negative tilt dips below the antenna before curvature lifts it.
+        assert!(beam_height_at_ground(-0.2, 10_000.0) < 0.0);
+    }
+
+    #[test]
+    fn great_circle_distance_matches_known_pairs() {
+        // Helsinki → Vihti radar ≈ 45 km; one degree of latitude ≈ 111.2 km.
+        let d = great_circle_distance_m(24.94, 60.17, 24.50, 60.56);
+        assert!((44_000.0..50_000.0).contains(&d), "got {d}");
+        let one_deg = great_circle_distance_m(25.0, 60.0, 25.0, 61.0);
+        assert!((one_deg - 111_195.0).abs() < 200.0, "got {one_deg}");
+        assert_eq!(great_circle_distance_m(25.0, 60.0, 25.0, 60.0), 0.0);
     }
 }

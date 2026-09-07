@@ -346,26 +346,9 @@ pub fn destination_point(lon0: f64, lat0: f64, distance_m: f64, bearing_deg: f64
 // `polar_sample` (used by Map/WMS) stay on their ground-range interim —
 // migrating those is a separate ticket.
 
-/// 4/3 of the mean Earth radius, in metres — the effective radius used
-/// to model standard atmospheric refraction.
-pub(crate) const FOUR_THIRDS_EARTH_M: f64 = 4.0 / 3.0 * EARTH_RADIUS_M;
-
-/// Forward map: `(slant_range_m, elevation_angle_deg)` → `(ground_distance_m,
-/// height_above_antenna_m)` under the 4/3-Earth model.
-///
-/// `h = sqrt(r² + R'² + 2·r·R'·sin(el)) − R'`
-/// `s = R' · atan(r·cos(el) / (r·sin(el) + R'))`
-///
-/// where `R' = 4/3 · R_earth`. `r` is slant range in metres, `el` is in
-/// degrees.
-pub(crate) fn slant_to_ground_height(slant_range_m: f64, elangle_deg: f64) -> (f64, f64) {
-    let r = slant_range_m;
-    let el = elangle_deg.to_radians();
-    let rp = FOUR_THIRDS_EARTH_M;
-    let h = (r * r + rp * rp + 2.0 * r * rp * el.sin()).sqrt() - rp;
-    let s = rp * (r * el.cos() / (r * el.sin() + rp)).atan();
-    (s, h)
-}
+// The 4/3-Earth beam model lives in `ds_core::geo` (#642): the nowcast's
+// per-cell beam geometry and this sampler must use one formula.
+pub(crate) use ds_core::geo::{slant_to_ground_height, FOUR_THIRDS_EARTH_M};
 
 /// Inverse: `(ground_distance_m, height_above_antenna_m)` →
 /// `(slant_range_m, elevation_angle_deg)`. Closed-form companion to
@@ -2671,10 +2654,7 @@ fn height_axis(hi_angle_deg: f64, max_ground_dist_m: f64) -> Vec<f64> {
 /// cells the volume actually observed. A negative-tilt floor correctly
 /// dips below antenna level before effective-Earth curvature lifts it.
 fn beam_height_at_ground(elangle_deg: f64, ground_distance_m: f64) -> f64 {
-    let cos_el = elangle_deg.to_radians().cos().max(1e-3);
-    let r = ground_distance_m / cos_el;
-    let (_, h) = slant_to_ground_height(r, elangle_deg);
-    h
+    ds_core::geo::beam_height_at_ground(elangle_deg, ground_distance_m)
 }
 
 /// Tolerance (degrees) for the sweep-envelope guard in
@@ -3190,6 +3170,33 @@ impl PolarVolumeEngine {
         out
     }
 
+    /// Radar sites for the storm-cell beam-geometry join (#642): one
+    /// catalog snapshot, no decoding, sorted by `nod`.
+    fn radar_sites_snapshot(&self) -> Vec<ds_core::radar_sites::RadarSiteInfo> {
+        let catalog = self.catalog.load();
+        let mut sites: Vec<ds_core::radar_sites::RadarSiteInfo> = catalog
+            .by_site_meta
+            .iter()
+            .map(|(nod, meta)| ds_core::radar_sites::RadarSiteInfo {
+                id: nod.clone(),
+                name: meta.plc.clone(),
+                lon: meta.lon,
+                lat: meta.lat,
+                antenna_height_m: meta.height_m,
+                max_range_m: meta.coverage_radius_m,
+                lowest_elevation_deg: meta.vertical.as_ref().and_then(|v| {
+                    v.levels
+                        .iter()
+                        .copied()
+                        .filter(|x| x.is_finite())
+                        .min_by(f64::total_cmp)
+                }),
+            })
+            .collect();
+        sites.sort_by(|a, b| a.id.cmp(&b.id));
+        sites
+    }
+
     /// Build a [`PolarVolumeSiteView`] scoped to radar `nod`, sharing this
     /// engine's live catalog (`ArcSwap`) so the view tracks poll-loop
     /// updates without re-parsing. `collection_id` is the per-site OGC
@@ -3379,6 +3386,12 @@ fn feature_version_of(nods: &[String], by_site_meta: &HashMap<String, SiteMeta>)
         }
     }
     h
+}
+
+impl ds_core::radar_sites::RadarSiteSource for PolarVolumeEngine {
+    fn radar_sites(&self) -> Vec<ds_core::radar_sites::RadarSiteInfo> {
+        self.radar_sites_snapshot()
+    }
 }
 
 impl FeatureEngine for PolarVolumeEngine {

@@ -97,6 +97,136 @@ impl MapEngine for MockSource {
     }
 }
 
+/// Beam geometry (#642): a mock radar-site source must surface the
+/// nearest-radar group on every cell, an engine WITHOUT a source must not
+/// emit the keys at all, and a source that advertises no sites yet serves
+/// the group as null rather than absent.
+#[test]
+fn radar_source_exposes_beam_geometry() {
+    use ds_core::feature::{FeatureQuery, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+    use ds_core::radar_sites::{RadarSiteInfo, RadarSiteSource};
+
+    struct Sites(Vec<RadarSiteInfo>);
+    impl RadarSiteSource for Sites {
+        fn radar_sites(&self) -> Vec<RadarSiteInfo> {
+            self.0.clone()
+        }
+    }
+    // One radar at the grid's centre, 250 km range, 0.3° lowest tilt.
+    let centre_lon = (EXTENT[0] + EXTENT[2]) / 2.0;
+    let centre_lat = (EXTENT[1] + EXTENT[3]) / 2.0;
+    let site = RadarSiteInfo {
+        id: "mock1".into(),
+        name: Some("Mockville".into()),
+        lon: centre_lon,
+        lat: centre_lat,
+        antenna_height_m: 120.0,
+        max_range_m: Some(250_000.0),
+        lowest_elevation_deg: Some(0.3),
+    };
+    let config = NowcastConfig {
+        source: "mock".into(),
+        horizon: "PT30M".into(),
+        step: None,
+        history_frames: 2,
+        poll_interval_secs: 30,
+        max_generations: 4,
+        max_pixels: 4_000_000,
+        min_echo: 10.0,
+        growth_decay: false,
+        lightning_source: None,
+        significance: Default::default(),
+        impact_source: None,
+        impact_name_property: "name".into(),
+        impact_weight_property: None,
+        radar_source: Some("mock-pvol".into()),
+    };
+    let anchor1 = t0() + Duration::minutes(5);
+
+    // Wired, sites present.
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let engine = NowcastEngine::new("rs-nowcast", "mock", source, &config)
+        .expect("engine builds")
+        .with_radar_source(Arc::new(Sites(vec![site.clone()])));
+    engine.poll_once();
+    assert!(engine.sortables().contains(&"beam_height_m"));
+    assert!(engine.sortables().contains(&"nearest_radar_distance_km"));
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+    assert_eq!(
+        f.properties.get("nearest_radar_id"),
+        Some(&PropertyValue::String("mock1".into()))
+    );
+    assert_eq!(
+        f.properties.get("nearest_radar_name"),
+        Some(&PropertyValue::String("Mockville".into()))
+    );
+    assert_eq!(
+        f.properties.get("in_radar_coverage"),
+        Some(&PropertyValue::Bool(true))
+    );
+    let dist = match f.properties.get("nearest_radar_distance_km") {
+        Some(PropertyValue::Float(d)) => *d,
+        other => panic!("distance must be a number, got {other:?}"),
+    };
+    assert!((0.0..250.0).contains(&dist), "distance {dist}");
+    let beam = match f.properties.get("beam_height_m") {
+        Some(PropertyValue::Float(h)) => *h,
+        other => panic!("beam height must be a number in coverage, got {other:?}"),
+    };
+    assert!(
+        beam >= 120.0,
+        "beam height {beam} must sit above the antenna"
+    );
+    assert_eq!(
+        f.properties.get("beam_elevation_deg"),
+        Some(&PropertyValue::Float(0.3))
+    );
+
+    // Wired, but the source advertises no sites yet: the group is null,
+    // not absent — "join skipped", distinguishable from "not measured".
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let engine = NowcastEngine::new("rs-empty", "mock", source, &config)
+        .expect("engine builds")
+        .with_radar_source(Arc::new(Sites(Vec::new())));
+    engine.poll_once();
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+    assert_eq!(
+        f.properties.get("nearest_radar_id"),
+        Some(&PropertyValue::Null)
+    );
+    assert_eq!(
+        f.properties.get("in_radar_coverage"),
+        Some(&PropertyValue::Null)
+    );
+    assert_eq!(
+        f.properties.get("beam_height_m"),
+        Some(&PropertyValue::Null)
+    );
+
+    // Not wired: no keys at all, and no radar sortables advertised.
+    let source = Arc::new(MockSource {
+        times: RwLock::new(vec![t0(), anchor1]),
+    });
+    let unwired = NowcastConfig {
+        radar_source: None,
+        ..config.clone()
+    };
+    let engine = NowcastEngine::new("rs-none", "mock", source, &unwired).expect("engine builds");
+    engine.poll_once();
+    assert!(!engine.sortables().contains(&"beam_height_m"));
+    let page = engine.get_features(&FeatureQuery::default()).unwrap();
+    let f = &page.features[0];
+    assert!(!f.properties.contains_key("nearest_radar_id"));
+    assert!(!f.properties.contains_key("beam_height_m"));
+}
+
 /// Lightning join (#549): a mock event source dropping a fixed burst on
 /// the disc each window must surface flash properties on the cell —
 /// and an engine WITHOUT a source must not emit them at all.
@@ -149,6 +279,7 @@ fn lightning_join_exposes_flash_properties() {
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     };
     let engine = NowcastEngine::new("lj-nowcast", "mock", source.clone(), &config)
         .expect("engine builds")
@@ -271,6 +402,7 @@ fn lightning_attributes_reach_the_feature_and_match_the_sortables() {
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     };
     let engine = NowcastEngine::new("attr-nowcast", "mock", source, &config)
         .expect("engine builds")
@@ -372,6 +504,7 @@ fn lightning_source_error_degrades_to_null_fields() {
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     };
     let strikes = Arc::new(FlakyStrikes {
         fail: AtomicBool::new(false),
@@ -442,6 +575,7 @@ fn build_with_history(
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     };
     let engine =
         NowcastEngine::new("mock-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -668,6 +802,7 @@ fn excessive_lead_count_is_rejected_at_construction() {
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     };
     let err = NowcastEngine::new("mock-nowcast", "mock", source, &config)
         .err()
@@ -714,6 +849,7 @@ fn oversized_history_frames_is_rejected() {
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     };
     let err = NowcastEngine::new("mock-nowcast", "mock", source, &config)
         .err()
@@ -839,6 +975,7 @@ fn dry_scene_leaves_both_skill_gauges_unset() {
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     };
     let engine =
         NowcastEngine::new("dry-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -1020,6 +1157,7 @@ fn geometry_change_resets_cell_tracks() {
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     };
     let engine =
         NowcastEngine::new("mv-nowcast", "mock", source.clone(), &config).expect("engine builds");
@@ -1123,6 +1261,7 @@ fn growth_decay_dims_decaying_echo() {
             impact_source: None,
             impact_name_property: "name".into(),
             impact_weight_property: None,
+            radar_source: None,
         };
         let engine = NowcastEngine::new("fade", "mock", source.clone(), &config).expect("builds");
         engine.poll_once();
@@ -1326,6 +1465,7 @@ fn base_config() -> NowcastConfig {
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     }
 }
 
@@ -1787,6 +1927,7 @@ fn a_quiet_cell_reports_a_zero_split_but_no_positive_share() {
         impact_source: None,
         impact_name_property: "name".into(),
         impact_weight_property: None,
+        radar_source: None,
     };
     let engine = NowcastEngine::new("quiet", "mock", source, &config)
         .expect("engine builds")

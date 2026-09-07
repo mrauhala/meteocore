@@ -1096,6 +1096,10 @@ pub(crate) fn reusable_collections(
                 .impact_source
                 .as_deref()
                 .is_none_or(|is| base.contains(is))
+            && nc
+                .radar_source
+                .as_deref()
+                .is_none_or(|rs| base.contains(rs))
         {
             out.insert(c.id.clone());
         }
@@ -2808,6 +2812,20 @@ pub fn load_collections(
             .iter()
             .map(|(id, e)| (id.clone(), e.clone()))
             .collect();
+    // Radar-site sources for the beam-geometry join (#642): every
+    // polar-volume network engine, keyed by its base collection id. Built
+    // from `odim_volume_engines`, which both the fresh and the reuse arms
+    // fill, so a reload keeps the wiring resolvable.
+    let radar_site_sources: HashMap<String, Arc<dyn ds_core::radar_sites::RadarSiteSource>> =
+        odim_volume_engines
+            .iter()
+            .map(|e| {
+                (
+                    e.collection_id().to_string(),
+                    e.clone() as Arc<dyn ds_core::radar_sites::RadarSiteSource>,
+                )
+            })
+            .collect();
     for collection in nowcast_pending {
         let mut fail = |error: String| {
             tracing::error!("Collection '{}': {error}, skipping", collection.id);
@@ -2914,6 +2932,22 @@ pub fn load_collections(
                                 "impact_source '{src_id}' not found or not wired to the Features \
                                  API (it must be defined in the same config with \"features\" in \
                                  its apis)"
+                            ));
+                            continue;
+                        }
+                    },
+                    None => engine,
+                };
+                // Beam geometry (#642): a named radar source must be a
+                // polar-volume collection in the same config. Same stance as
+                // the other two joins.
+                let engine = match nowcast_config.radar_source.as_deref() {
+                    Some(src_id) => match radar_site_sources.get(src_id) {
+                        Some(sites) => engine.with_radar_source(sites.clone()),
+                        None => {
+                            fail(format!(
+                                "radar_source '{src_id}' not found or not an odim-volume \
+                                 collection (it must be defined in the same config)"
                             ));
                             continue;
                         }
@@ -4755,6 +4789,7 @@ mod tests {
                 impact_source: None,
                 impact_name_property: "name".into(),
                 impact_weight_property: None,
+                radar_source: None,
             }),
             preview: None,
         }
@@ -4851,6 +4886,34 @@ mod tests {
         );
         assert!(!result.wms_state.engines.contains_key("nc"));
         // The base collection is unaffected.
+        assert!(result.wms_state.engines.contains_key("radar"));
+    }
+
+    #[test]
+    fn nowcast_missing_radar_source_fails_that_collection() {
+        // #642: a radar_source that names no odim-volume collection fails
+        // the nowcast collection at load, never silently serving cells
+        // without beam geometry while advertising the sortables for it.
+        let mut nc = nowcast_test_collection("nc", "nowcast", Some("radar"));
+        nc.nowcast.as_mut().unwrap().radar_source = Some("no-such-pvol".into());
+        let result = super::load_collections(
+            &ds_render::StyleContext::with_builtins(),
+            &[tm35_source_collection("radar"), nc],
+            &[],
+            "http://x",
+            false,
+            0,
+            super::ReusableCaches::default(),
+            super::EngineReuse::default(),
+        );
+        let h = health_of(&result, "nc");
+        assert_eq!(h.status, super::CollectionStatus::Failed);
+        assert!(
+            h.error.as_deref().unwrap_or("").contains("radar_source"),
+            "error should name the missing radar source: {:?}",
+            h.error
+        );
+        assert!(!result.wms_state.engines.contains_key("nc"));
         assert!(result.wms_state.engines.contains_key("radar"));
     }
 
