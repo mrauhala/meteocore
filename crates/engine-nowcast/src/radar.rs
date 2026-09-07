@@ -33,7 +33,11 @@ pub fn radar_facts(lon: f64, lat: f64, sites: &[RadarSiteInfo]) -> Option<RadarF
     let in_radar_coverage = site.max_range_m.map(|r| dist_m <= r);
     // The lowest beam is only modelled as far as the lowest sweep reaches,
     // which can be shorter than the coverage radius (#642 review).
-    let lowest_reaches = site.lowest_sweep_range_m.is_some_and(|r| dist_m <= r);
+    // Gated on coverage EXPLICITLY, not on an ordering between the two ranges
+    // that the trait never promises: a second RadarSiteSource could advertise
+    // a lowest-sweep range without a coverage radius.
+    let lowest_reaches =
+        in_radar_coverage == Some(true) && site.lowest_sweep_range_m.is_some_and(|r| dist_m <= r);
     let (beam_height_m, beam_elevation_deg) = match (lowest_reaches, site.lowest_elevation_deg) {
         (true, Some(el)) => (
             Some(round_to(
@@ -127,6 +131,18 @@ mod tests {
         s.lowest_sweep_range_m = Some(120_000.0);
         let f = radar_facts(25.0, 61.5, &[s]).unwrap();
         assert_eq!(f.in_radar_coverage, Some(true));
+        assert_eq!(f.beam_height_m, None);
+        assert_eq!(f.beam_elevation_deg, None);
+    }
+
+    #[test]
+    fn beam_fields_never_appear_without_coverage() {
+        // A source that advertises a lowest-sweep range but no coverage radius
+        // must not license a beam height: coverage is the gate, by contract.
+        let mut s = site("r", 25.0, 60.0, None, Some(0.5));
+        s.lowest_sweep_range_m = Some(250_000.0);
+        let f = radar_facts(25.0, 60.3, &[s]).unwrap();
+        assert_eq!(f.in_radar_coverage, None);
         assert_eq!(f.beam_height_m, None);
         assert_eq!(f.beam_elevation_deg, None);
     }
