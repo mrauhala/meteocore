@@ -675,8 +675,11 @@ pub(crate) struct SiteMeta {
     /// This site's circular coverage bbox `[w, s, e, n]` (WGS84).
     spatial_extent: Option<[f64; 4]>,
     /// This site's maximum ground-range coverage radius (metres) — the
-    /// lowest sweep's `nbins·rscale + rstart`. `None` for a malformed
-    /// `rscale`. Used to reject position queries clearly outside coverage.
+    /// MAXIMUM `nbins·rscale + rstart` across all sweeps, so a quantity that
+    /// lives only on a longer-range higher tilt still counts as in range.
+    /// `None` when no sweep has usable geometry. Used to reject position
+    /// queries clearly outside coverage, and as the coverage question of the
+    /// beam-geometry join; the lowest sweep's own reach is the next field.
     coverage_radius_m: Option<f64>,
     /// The LOWEST sweep's own range-gate reach (metres) — what the
     /// lowest-beam geometry join (#642) may extrapolate to. Distinct from
