@@ -24,9 +24,15 @@ pub struct RadarSiteInfo {
     pub lat: f64,
     /// Antenna height above mean sea level, metres.
     pub antenna_height_m: f64,
-    /// Maximum ground range the site surveys, metres. `None` when the
-    /// source cannot say (malformed sweep geometry).
+    /// Maximum ground range the site surveys on ANY sweep, metres — the
+    /// coverage question. `None` when the source cannot say (malformed
+    /// sweep geometry).
     pub max_range_m: Option<f64>,
+    /// Ground range of the LOWEST sweep itself, metres — how far a
+    /// lowest-beam height may honestly be extrapolated. A longer-range
+    /// higher tilt (a Doppler tilt at higher PRF, say) does not extend the
+    /// lowest beam. `None` when unknown.
+    pub lowest_sweep_range_m: Option<f64>,
     /// Lowest sweep elevation angle, degrees above horizontal. `None` when
     /// the source has not advertised its sweep angles.
     pub lowest_elevation_deg: Option<f64>,

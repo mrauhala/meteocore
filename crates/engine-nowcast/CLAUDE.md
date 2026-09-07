@@ -448,11 +448,14 @@ see `docs/cell-intelligence-plan-amendment.md`).
 - Per cell: `nearest_radar_id` / `nearest_radar_name` /
   `nearest_radar_distance_km` (nearest by great-circle distance, whether or
   not it covers the cell), `in_radar_coverage` (null when the site advertised
-  no range — "cannot say" is not "not covered"), and — only inside coverage —
+  no range — "cannot say" is not "not covered"), and — only within the
+  LOWEST sweep's own range, which can be shorter than the coverage radius —
   `beam_height_m` (lowest sweep's centre, metres above MEAN SEA LEVEL:
   antenna height + 4/3-Earth rise; there is no terrain model) and
   `beam_elevation_deg`. Tri-state like the other groups: absent when no
   source is wired, all null when the source advertised no sites yet.
+- The "no sites" warning fires once per empty stretch, not per generation
+  (`radar_empty_warned`), and an info line marks the resume.
 - Why it exists: a bright stationary echo under a beam a few hundred metres
   up is a wind farm; the same echo under a beam 3 km up is weather. This is
   the frame-one clutter evidence #620 needs, and the range context every

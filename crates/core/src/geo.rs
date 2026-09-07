@@ -70,12 +70,19 @@ pub fn beam_height_at_ground(elangle_deg: f64, ground_distance_m: f64) -> f64 {
 
 /// Great-circle distance between two WGS84 points, metres (haversine on the
 /// mean Earth radius). Good to ~0.3% — fine for range and coverage tests.
+///
+/// Same formula, same clamp, as engine-odim's hot-loop
+/// `ground_distance_bearing_from` (which keeps its origin trig hoisted for
+/// per-pixel sampling and cannot call this). engine-odim pins the two equal
+/// to the metre, so a change here without one there fails a test rather
+/// than drifting (the Critical Rule 4 lesson).
 pub fn great_circle_distance_m(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
     let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
     let dp = (lat2 - lat1).to_radians();
     let dl = (lon2 - lon1).to_radians();
     let a = (dp / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
-    2.0 * EARTH_RADIUS_M * a.sqrt().atan2((1.0 - a).sqrt())
+    // Rounding can push `a` a hair past 1.0; the clamp keeps asin finite.
+    2.0 * EARTH_RADIUS_M * a.sqrt().clamp(0.0, 1.0).asin()
 }
 
 /// Great-circle **destination point** on a sphere: starting at

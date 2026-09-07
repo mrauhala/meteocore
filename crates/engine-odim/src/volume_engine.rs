@@ -678,6 +678,13 @@ pub(crate) struct SiteMeta {
     /// lowest sweep's `nbins·rscale + rstart`. `None` for a malformed
     /// `rscale`. Used to reject position queries clearly outside coverage.
     coverage_radius_m: Option<f64>,
+    /// The LOWEST sweep's own range-gate reach (metres) — what the
+    /// lowest-beam geometry join (#642) may extrapolate to. Distinct from
+    /// `coverage_radius_m`, which is the maximum across sweeps: a longer-range
+    /// higher tilt must not license a lowest-beam height past where the
+    /// lowest tilt ever samples. `None` when that sweep's geometry is
+    /// malformed.
+    lowest_sweep_range_m: Option<f64>,
     /// This site's sweep elevation angles (degrees).
     vertical: Option<VerticalDimension>,
     /// Pre-built 3D Tiles metadata snapshot, so `VolumeEngine::volume_info`
@@ -1489,6 +1496,17 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         })
         .max_by(f64::total_cmp);
     let spatial_extent = coverage_radius_m.map(|r| site_coverage_bbox(site.lon, site.lat, r));
+    let sweep_range = |s: &Sweep| {
+        let r = s.nbins as f64 * s.rscale + s.rstart;
+        (s.rscale.is_finite() && s.rscale > 0.0 && r.is_finite() && r > 0.0).then_some(r)
+    };
+    let lowest_sweep_range_m = latest
+        .volume
+        .sweeps
+        .iter()
+        .filter(|s| s.elangle.is_finite())
+        .min_by(|a, b| a.elangle.total_cmp(&b.elangle))
+        .and_then(sweep_range);
 
     let mut times: Vec<DateTime<Utc>> = list.iter().map(|e| e.volume.time).collect();
     times.sort_unstable();
@@ -1590,6 +1608,7 @@ fn derive_site_meta(list: &[VolumeEntry]) -> Option<SiteMeta> {
         times,
         spatial_extent,
         coverage_radius_m,
+        lowest_sweep_range_m,
         vertical,
         volume_info,
     })
@@ -3184,6 +3203,7 @@ impl PolarVolumeEngine {
                 lat: meta.lat,
                 antenna_height_m: meta.height_m,
                 max_range_m: meta.coverage_radius_m,
+                lowest_sweep_range_m: meta.lowest_sweep_range_m,
                 lowest_elevation_deg: meta.vertical.as_ref().and_then(|v| {
                     v.levels
                         .iter()
@@ -4633,6 +4653,26 @@ mod tests {
     /// the `ground/cos(el)` one-step over `slant_to_ground_height`, and
     /// matching the 0.3°-lowest-beam reference table from the issue
     /// (~0.4 km @ 50 km, ~1.1 km @ 100 km, ~5.0 km @ 250 km).
+    #[test]
+    fn ground_distance_agrees_with_ds_core_haversine() {
+        // #642 review: two haversines, one hot-loop with hoisted trig, one
+        // general. Pin them equal so a stability tweak to either cannot
+        // drift the other (the Critical Rule 4 lesson, one formula at a time).
+        for (lon0, lat0, lon1, lat1) in [
+            (24.5, 60.56, 24.94, 60.17),
+            (25.0, 60.0, 25.0, 61.0),
+            (24.5, 60.56, 24.5, 60.56),
+            (-179.9, 70.0, 179.9, 69.9),
+        ] {
+            let (d, _) = ground_distance_bearing(lon0, lat0, lon1, lat1);
+            let g = ds_core::geo::great_circle_distance_m(lon0, lat0, lon1, lat1);
+            assert!(
+                (d - g).abs() < 1.0,
+                "{d} vs {g} for ({lon0},{lat0})→({lon1},{lat1})"
+            );
+        }
+    }
+
     #[test]
     fn beam_height_at_ground_matches_reference_and_rises() {
         assert_eq!(beam_height_at_ground(0.3, 0.0), 0.0);
@@ -7093,6 +7133,7 @@ mod tests {
                 times: vec![],
                 spatial_extent: None,
                 coverage_radius_m: None,
+                lowest_sweep_range_m: None,
                 vertical: None,
                 volume_info: Arc::default(),
             }

@@ -25,7 +25,7 @@
 //!   happen only there, never on a request worker.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -264,6 +264,10 @@ pub struct NowcastEngine {
     track_pass1_matches_total: AtomicU64,
     track_pass2_matches_total: AtomicU64,
     track_velocity_clamps_total: AtomicU64,
+    /// Whether the "radar source advertised no sites" warning has fired
+    /// since the source last had sites. Logged on the transition, not every
+    /// 30 s generation while a volume engine bootstraps (#642 review).
+    radar_empty_warned: AtomicBool,
     /// Optional point-event source joined onto tracked cells per
     /// generation (#549) — lightning, wired by the server's second pass.
     lightning: Option<Arc<dyn ds_core::events::EventSource>>,
@@ -384,6 +388,7 @@ impl NowcastEngine {
             track_pass1_matches_total: AtomicU64::new(0),
             track_pass2_matches_total: AtomicU64::new(0),
             track_velocity_clamps_total: AtomicU64::new(0),
+            radar_empty_warned: AtomicBool::new(false),
             lightning: None,
             impact: None,
             radar: None,
@@ -602,11 +607,21 @@ impl NowcastEngine {
                 // Radar sites (#642): a snapshot read, never I/O. An empty
                 // list (source not yet populated) serves the group as null.
                 let radar_sites = self.radar.as_ref().map(|r| r.radar_sites());
-                if radar_sites.as_ref().is_some_and(|s| s.is_empty()) {
-                    tracing::warn!(
-                        collection = %self.collection_id,
-                        "radar source advertised no sites; beam geometry skipped this generation"
-                    );
+                if let Some(sites) = &radar_sites {
+                    if sites.is_empty() {
+                        if !self.radar_empty_warned.swap(true, Ordering::Relaxed) {
+                            tracing::warn!(
+                                collection = %self.collection_id,
+                                "radar source advertised no sites; beam geometry skipped until it does"
+                            );
+                        }
+                    } else if self.radar_empty_warned.swap(false, Ordering::Relaxed) {
+                        tracing::info!(
+                            collection = %self.collection_id,
+                            sites = sites.len(),
+                            "radar source now advertises sites; beam geometry resumed"
+                        );
+                    }
                 }
                 let mut cell_history = old.cell_history.clone();
                 cell_history.push(CellSnapshot {
@@ -1401,7 +1416,7 @@ impl MapEngine for NowcastEngine {
 
 /// Round to `places` decimals — serde's shortest-roundtrip float printing
 /// then emits the short form (`14.3`, not `14.300000000000001`).
-fn round_to(v: f64, places: i32) -> f64 {
+pub(crate) fn round_to(v: f64, places: i32) -> f64 {
     let f = 10f64.powi(places);
     (v * f).round() / f
 }

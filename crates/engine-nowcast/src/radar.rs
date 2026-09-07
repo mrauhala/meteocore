@@ -11,10 +11,7 @@ use ds_core::radar_sites::RadarSiteInfo;
 /// Sortable properties added when a radar source is wired.
 pub const SORTABLES_RADAR_EXTRAS: &[&str] = &["nearest_radar_distance_km", "beam_height_m"];
 
-fn round_to(v: f64, places: i32) -> f64 {
-    let f = 10f64.powi(places);
-    (v * f).round() / f
-}
+use crate::engine::round_to;
 
 /// Beam geometry at `(lon, lat)` from the nearest of `sites`; `None` when
 /// there are no sites (a source that has not advertised any yet).
@@ -22,8 +19,9 @@ fn round_to(v: f64, places: i32) -> f64 {
 /// The nearest radar is nearest by great-circle distance, whether or not it
 /// covers the cell: a cell 300 km from every radar still has a nearest one,
 /// and reporting it with `in_radar_coverage: false` says more than nothing.
-/// The beam fields exist only inside coverage — a beam height for a place
-/// the radar does not survey is a number about nothing.
+/// The beam fields exist only within the LOWEST sweep's own range — a beam
+/// height for a place that sweep never samples is a number about nothing,
+/// even when a longer-range higher tilt puts the cell inside coverage.
 pub fn radar_facts(lon: f64, lat: f64, sites: &[RadarSiteInfo]) -> Option<RadarFacts> {
     let (site, dist_m) = sites
         .iter()
@@ -33,8 +31,11 @@ pub fn radar_facts(lon: f64, lat: f64, sites: &[RadarSiteInfo]) -> Option<RadarF
     // Tri-state, not a bool: a site with no advertised range cannot say
     // whether it covers the cell, and `false` would claim it does not.
     let in_radar_coverage = site.max_range_m.map(|r| dist_m <= r);
-    let (beam_height_m, beam_elevation_deg) = match (in_radar_coverage, site.lowest_elevation_deg) {
-        (Some(true), Some(el)) => (
+    // The lowest beam is only modelled as far as the lowest sweep reaches,
+    // which can be shorter than the coverage radius (#642 review).
+    let lowest_reaches = site.lowest_sweep_range_m.is_some_and(|r| dist_m <= r);
+    let (beam_height_m, beam_elevation_deg) = match (lowest_reaches, site.lowest_elevation_deg) {
+        (true, Some(el)) => (
             Some(round_to(
                 site.antenna_height_m + beam_height_at_ground(el, dist_m),
                 0,
@@ -65,6 +66,7 @@ mod tests {
             lat,
             antenna_height_m: 100.0,
             max_range_m: range_km.map(|r| r * 1000.0),
+            lowest_sweep_range_m: range_km.map(|r| r * 1000.0),
             lowest_elevation_deg: el,
         }
     }
@@ -112,6 +114,18 @@ mod tests {
         assert_eq!(f.beam_height_m, None);
         // Range known but no sweep angles: in coverage, beam unknown.
         let f = radar_facts(25.0, 60.1, &[site("r", 25.0, 60.0, Some(250.0), None)]).unwrap();
+        assert_eq!(f.in_radar_coverage, Some(true));
+        assert_eq!(f.beam_height_m, None);
+        assert_eq!(f.beam_elevation_deg, None);
+    }
+
+    #[test]
+    fn lowest_sweep_shorter_than_coverage_gives_no_beam_height() {
+        // Coverage 250 km (a long-range higher tilt), lowest sweep 120 km.
+        // A cell at ~167 km is covered but the lowest beam never reaches it.
+        let mut s = site("r", 25.0, 60.0, Some(250.0), Some(0.5));
+        s.lowest_sweep_range_m = Some(120_000.0);
+        let f = radar_facts(25.0, 61.5, &[s]).unwrap();
         assert_eq!(f.in_radar_coverage, Some(true));
         assert_eq!(f.beam_height_m, None);
         assert_eq!(f.beam_elevation_deg, None);

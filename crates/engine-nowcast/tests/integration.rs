@@ -123,6 +123,7 @@ fn radar_source_exposes_beam_geometry() {
         lat: centre_lat,
         antenna_height_m: 120.0,
         max_range_m: Some(250_000.0),
+        lowest_sweep_range_m: Some(250_000.0),
         lowest_elevation_deg: Some(0.3),
     };
     let config = NowcastConfig {
