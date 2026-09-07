@@ -268,6 +268,13 @@ lightning, and `likely_clutter` flapping on alternate frames.
   plus a death. Pricing "unmatched" is the follow-up — and note the naive
   version (unmatched cost ≈ gate) is a no-op, since a match at `d` beats two
   unmatched entries iff `d < 2c`.
+- **Association is observable (#643):** `advance_tracks_with_stats` returns
+  births / deaths / pass-1 / pass-2 matches / velocity clamps per generation,
+  exported as `nowcast_cell_{births,deaths,pass1_matches,pass2_matches,velocity_clamps}_total`
+  (same reload-rebaseline delta scrape as `nowcast_generations_total`) with a
+  Grafana panel. A rising pass-2 share is the first sign of swaps; births and
+  deaths above real cell turnover mean dropouts (#649). Check these before
+  claiming a tracker change helped.
 - Test association by WALKING frames with two echoes
   (`fixed_echoes_of_different_size_keep_their_ids_in_flow`); the straightness
   test sets `path_length`/`net` by hand and pins the symptom, not the cause.
