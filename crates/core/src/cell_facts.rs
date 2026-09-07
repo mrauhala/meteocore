@@ -518,6 +518,29 @@ mod tests {
     }
 
     #[test]
+    fn near_tie_cells_rank_in_served_order_when_quantized() {
+        // The #644 pair: two weak steady cells differing by 0.1 km² of area,
+        // raw scores 3.5e-5 apart — inside one 4-dp bucket. Served as strings
+        // "10" sorts before "9", so the serving layer orders id 10 first; the
+        // rank must agree, which only rounding-before-rank guarantees.
+        let mut a = cell(10);
+        a.area_km2 = 10.1;
+        let mut b = cell(9);
+        b.area_km2 = 10.2;
+        let scorer = WeightedScorer::new(DEFAULT_CELL_WEIGHTS);
+        // Input in id-STRING order, as score_cells does.
+        let items = vec![a, b];
+        let raw = scorer.rank(&items);
+        assert!(
+            (raw[0].raw - raw[1].raw).abs() < 5e-5 && raw[0].raw < raw[1].raw,
+            "precondition: a near-tie the raw comparator resolves the other way"
+        );
+        assert_eq!((raw[0].rank, raw[1].rank), (2, 1));
+        let q = scorer.rank_quantized(&items, 4);
+        assert_eq!((q[0].rank, q[1].rank), (1, 2), "ranked in served order");
+    }
+
+    #[test]
     fn default_weights_cover_every_term_the_facts_emit() {
         // A term with no weight is silently ignored by the scorer, so a typo
         // or a newly added term would vanish without this check.
