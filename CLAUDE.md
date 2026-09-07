@@ -350,6 +350,13 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
   exposes it as `ELEVATION`, Maps/Tiles as `elevation`, EDR as `z`. The API
   layer rejects z/elevation against a collection with no vertical extent
   (HTTP 400). The ODIM PVOL engine uses it for radar elevation angle.
+- **`ds_core::radar_sites`** — `RadarSiteInfo` + the data-only
+  `RadarSiteSource` trait (one catalog snapshot per call, never I/O) that a
+  polar-volume engine implements and the nowcast's per-cell beam-geometry
+  join (#642) consumes. The 4/3-Earth beam model
+  (`geo::{slant_to_ground_height, beam_height_at_ground,
+  FOUR_THIRDS_EARTH_M}`) and `geo::great_circle_distance_m` live in
+  `ds_core::geo` — one home; engine-odim re-exports them.
 - **`ds_core::cells`** — storm-cell segmentation and tracking over
   `VoxelGrid` (see `crates/engine-odim/CLAUDE.md`).
 - **`ds_core::significance`** — domain-agnostic scoring/ranking: normalized

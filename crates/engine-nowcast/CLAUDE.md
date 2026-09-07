@@ -447,7 +447,8 @@ see `docs/cell-intelligence-plan-amendment.md`).
   3-D cell join (#642 step 2, blocked on #293).
 - Per cell: `nearest_radar_id` / `nearest_radar_name` /
   `nearest_radar_distance_km` (nearest by great-circle distance, whether or
-  not it covers the cell), `in_radar_coverage`, and — only inside coverage —
+  not it covers the cell), `in_radar_coverage` (null when the site advertised
+  no range — "cannot say" is not "not covered"), and — only inside coverage —
   `beam_height_m` (lowest sweep's centre, metres above MEAN SEA LEVEL:
   antenna height + 4/3-Earth rise; there is no terrain model) and
   `beam_elevation_deg`. Tri-state like the other groups: absent when no

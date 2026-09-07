@@ -486,13 +486,6 @@ impl NowcastEngine {
         self
     }
 
-    /// Rebuild the sortable set from whichever sources are wired.
-    ///
-    /// A property absent from every feature sorts to a no-op: `sort_features`
-    /// finds the key missing on every cell and falls through to the id
-    /// tie-break, so the request answers 200 in id order — the
-    /// silently-ignored-parameter failure this surface exists to remove.
-    /// Advertise only what this instance can actually order by.
     /// Attach the radar-site source for per-cell beam geometry (#642),
     /// second pass like the other two.
     pub fn with_radar_source(
@@ -504,6 +497,13 @@ impl NowcastEngine {
         self
     }
 
+    /// Rebuild the sortable set from whichever sources are wired.
+    ///
+    /// A property absent from every feature sorts to a no-op: `sort_features`
+    /// finds the key missing on every cell and falls through to the id
+    /// tie-break, so the request answers 200 in id order — the
+    /// silently-ignored-parameter failure this surface exists to remove.
+    /// Advertise only what this instance can actually order by.
     fn recompute_sortables(&mut self) {
         let mut v = SORTABLES_BASE.to_vec();
         if self.lightning.is_some() {
@@ -1720,7 +1720,8 @@ fn cell_feature(cell: &ScoredCell, lightning: bool, radar: bool) -> (f64, f64, F
         );
         props.insert(
             "in_radar_coverage".into(),
-            r.map(|r| PropertyValue::Bool(r.in_radar_coverage))
+            r.and_then(|r| r.in_radar_coverage)
+                .map(PropertyValue::Bool)
                 .unwrap_or(PropertyValue::Null),
         );
         props.insert(

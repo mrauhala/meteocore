@@ -166,10 +166,13 @@ pub struct RadarFacts {
     pub nearest_radar_name: Option<String>,
     /// Great-circle distance from that radar to the cell centroid, km.
     pub nearest_radar_distance_km: f64,
-    /// Whether the cell lies inside that radar's surveyed range. Outside it,
-    /// every per-cell radar number is a statement about a place the radar
-    /// does not see, so the beam fields below are `None` there.
-    pub in_radar_coverage: bool,
+    /// Whether the cell lies inside that radar's surveyed range. `None` when
+    /// the source could not advertise a range at all (malformed sweep
+    /// geometry) — "cannot say" is not "not covered". Outside coverage every
+    /// per-cell radar number is a statement about a place the radar does
+    /// not see, so the beam fields below are `None` whenever this is not
+    /// `Some(true)`.
+    pub in_radar_coverage: Option<bool>,
     /// Height of the lowest beam's centre over the cell, metres above mean
     /// sea level (antenna height + 4/3-Earth beam rise). There is no terrain
     /// model, so this is not "above ground" in hilly country.

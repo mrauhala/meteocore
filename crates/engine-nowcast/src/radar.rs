@@ -30,9 +30,11 @@ pub fn radar_facts(lon: f64, lat: f64, sites: &[RadarSiteInfo]) -> Option<RadarF
         .map(|s| (s, great_circle_distance_m(lon, lat, s.lon, s.lat)))
         .filter(|(_, d)| d.is_finite())
         .min_by(|a, b| a.1.total_cmp(&b.1))?;
-    let in_radar_coverage = site.max_range_m.is_some_and(|r| dist_m <= r);
+    // Tri-state, not a bool: a site with no advertised range cannot say
+    // whether it covers the cell, and `false` would claim it does not.
+    let in_radar_coverage = site.max_range_m.map(|r| dist_m <= r);
     let (beam_height_m, beam_elevation_deg) = match (in_radar_coverage, site.lowest_elevation_deg) {
-        (true, Some(el)) => (
+        (Some(true), Some(el)) => (
             Some(round_to(
                 site.antenna_height_m + beam_height_at_ground(el, dist_m),
                 0,
@@ -82,7 +84,7 @@ mod tests {
             "{}",
             f.nearest_radar_distance_km
         );
-        assert!(f.in_radar_coverage);
+        assert_eq!(f.in_radar_coverage, Some(true));
         // Antenna 100 m + ~0.35 km rise at 45 km on 0.3°: a few hundred m.
         let h = f.beam_height_m.unwrap();
         assert!((300.0..600.0).contains(&h), "beam height {h}");
@@ -95,7 +97,7 @@ mod tests {
         // ~222 km north: beyond the 100 km range.
         let f = radar_facts(25.0, 62.0, &sites).unwrap();
         assert_eq!(f.nearest_radar_id, "r");
-        assert!(!f.in_radar_coverage);
+        assert_eq!(f.in_radar_coverage, Some(false));
         assert_eq!(f.beam_height_m, None);
         assert_eq!(f.beam_elevation_deg, None);
         assert!(f.nearest_radar_distance_km > 200.0);
@@ -103,13 +105,14 @@ mod tests {
 
     #[test]
     fn unknown_range_or_elevation_is_not_coverage() {
-        // No range advertised: the source cannot say, so neither can we.
+        // No range advertised: the source cannot say, so neither can we —
+        // null, not false (the null contract in the crate notes).
         let f = radar_facts(25.0, 60.1, &[site("r", 25.0, 60.0, None, Some(0.5))]).unwrap();
-        assert!(!f.in_radar_coverage);
+        assert_eq!(f.in_radar_coverage, None);
         assert_eq!(f.beam_height_m, None);
         // Range known but no sweep angles: in coverage, beam unknown.
         let f = radar_facts(25.0, 60.1, &[site("r", 25.0, 60.0, Some(250.0), None)]).unwrap();
-        assert!(f.in_radar_coverage);
+        assert_eq!(f.in_radar_coverage, Some(true));
         assert_eq!(f.beam_height_m, None);
         assert_eq!(f.beam_elevation_deg, None);
     }
