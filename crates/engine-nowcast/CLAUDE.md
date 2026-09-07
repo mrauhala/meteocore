@@ -375,6 +375,12 @@ see `docs/cell-intelligence-plan-amendment.md`).
   `cell_facts::DEFAULT_CELL_WEIGHTS`, overridable per collection via
   `[nowcast.significance]`; an unknown term name FAILS the collection at
   load rather than silently keeping a default nobody chose.
+- **Ranked on the rounded score** (#644): `score_cells` calls
+  `rank_quantized(.., SIGNIFICANCE_DECIMALS)`, so the 4-dp number a client
+  sorts on is the number the rank came from. Ranking raw and serving rounded
+  let two cells 3e-5 apart get distinct ranks in raw order but tie on the
+  wire, where the id-string tie-break can point the other way — a limited
+  page then held rank 2 without rank 1 (the #635 hole, second form).
 - Served as `significance` (0..=1), `significance_rank` (1-based within the
   snapshot) and `significance_reasons` (top 3 contributing terms). The
   reasons field is load-bearing: a weight table with no ground truth has to

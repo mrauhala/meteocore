@@ -238,8 +238,40 @@ impl WeightedScorer {
     /// upstream would reshuffle equal-scoring objects between cycles and
     /// churn every downstream ETag.
     pub fn rank<T: SignificanceTerms>(&self, items: &[T]) -> Vec<SignificanceScore> {
+        self.rank_inner(items, None)
+    }
+
+    /// [`Self::rank`] with `score` rounded to `decimals` BEFORE ranking, so
+    /// the number a client sorts on is the number the rank was computed from.
+    ///
+    /// Ranking on the raw score and serving it rounded is a residual of the
+    /// #635 hole (#644): two cells whose raw scores differ by less than half
+    /// a unit in the last served decimal get distinct ranks in raw order but
+    /// tie on the wire, and the wire tie-break (input position) can point the
+    /// other way — a limited page then holds rank 2 without rank 1.
+    /// Rounding first makes the two comparators see one number. `raw` and
+    /// `contributions` stay unrounded.
+    pub fn rank_quantized<T: SignificanceTerms>(
+        &self,
+        items: &[T],
+        decimals: i32,
+    ) -> Vec<SignificanceScore> {
+        self.rank_inner(items, Some(decimals))
+    }
+
+    fn rank_inner<T: SignificanceTerms>(
+        &self,
+        items: &[T],
+        decimals: Option<i32>,
+    ) -> Vec<SignificanceScore> {
         let mut scores: Vec<SignificanceScore> =
             items.iter().map(|item| self.score_one(item)).collect();
+        if let Some(d) = decimals {
+            let f = 10f64.powi(d);
+            for s in &mut scores {
+                s.score = (s.score * f).round() / f;
+            }
+        }
 
         // Ties break by INPUT POSITION, so the caller decides the tie-break by
         // choosing the input order. That is load-bearing: whatever serves the
@@ -280,6 +312,33 @@ mod tests {
 
     fn scorer() -> WeightedScorer {
         WeightedScorer::new(&[("severity", 1.0), ("impact", 1.5), ("beam_quality", -0.6)])
+    }
+
+    #[test]
+    fn rank_quantized_ranks_on_the_number_the_client_sees() {
+        // Two items 1e-6 apart in raw score, the LOWER one first in input
+        // order. Raw ranking puts the higher second item first; a client
+        // sorting on the 4-dp served value sees a tie and keeps input order.
+        // Quantized ranking agrees with the client; raw ranking does not.
+        let s = WeightedScorer::new(&[("severity", 1.0)]);
+        let items = vec![
+            Item(vec![Term::new("severity", 0.500_000)]),
+            Item(vec![Term::new("severity", 0.500_001)]),
+        ];
+        let raw = s.rank(&items);
+        assert_eq!(
+            (raw[0].rank, raw[1].rank),
+            (2, 1),
+            "precondition: raw order differs"
+        );
+        let q = s.rank_quantized(&items, 4);
+        assert_eq!(
+            (q[0].rank, q[1].rank),
+            (1, 2),
+            "tie on the wire ⇒ input order"
+        );
+        assert_eq!(q[0].score, q[1].score, "served scores are one number");
+        assert!((q[1].raw - 0.500_001).abs() < 1e-9, "raw stays unrounded");
     }
 
     #[test]

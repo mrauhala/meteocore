@@ -83,6 +83,10 @@ const MAX_HISTORY_FRAMES: usize = 8;
 const MAX_JOIN_STRIKES: usize = 200_000;
 
 /// Cell properties every nowcast instance can sort on (#605).
+/// Served precision of `significance`, and the precision it is RANKED at
+/// (#644): the two must be one number or ranks and page order disagree.
+const SIGNIFICANCE_DECIMALS: i32 = 4;
+
 const SORTABLES_BASE: &[&str] = &[
     "significance",
     "significance_rank",
@@ -1578,7 +1582,9 @@ fn score_cells(
     // Compared as strings, not as numbers, because that is what the serving
     // comparator does; matching it matters more than being numerically tidy.
     facts.sort_by_cached_key(|f| f.id.to_string());
-    let scores = scorer.rank(&facts);
+    // Rank on the ROUNDED score (#644): the client sorts on the 4-dp served
+    // value, so near-ties must tie here too or a limited page holes again.
+    let scores = scorer.rank_quantized(&facts, SIGNIFICANCE_DECIMALS);
     facts
         .into_iter()
         .zip(scores)
@@ -1654,7 +1660,9 @@ fn cell_feature(cell: &ScoredCell, lightning: bool, radar: bool) -> (f64, f64, F
     // that matter. Served whether or not any narrative layer is wired.
     props.insert(
         "significance".into(),
-        PropertyValue::Float(round_to(cell.significance.score, 4)),
+        // Already quantized by `rank_quantized`; the round is a no-op kept so
+        // the served precision is stated where it is served.
+        PropertyValue::Float(round_to(cell.significance.score, SIGNIFICANCE_DECIMALS)),
     );
     props.insert(
         "significance_rank".into(),
