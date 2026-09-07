@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use ds_core::events::EventAttrs;
 
 use crate::motion::MotionField;
-use crate::objects::{match_cells, CellBlob, PixelScale};
+use crate::objects::{match_cells_with, CellBlob, MatchCost, PixelScale};
 
 /// Severity lives in ds-core so the tracker, the significance ranking and the
 /// narrative cannot drift to different meanings of "severe". Re-exported here
@@ -401,7 +401,15 @@ pub fn advance_tracks(
     let gate_raw = BASE_GATE_KM + MAX_CELL_SPEED_MS * ds / 1000.0;
     let mut matched_prev: Vec<Option<usize>> = vec![None; blobs.len()];
     let mut prev_taken = vec![false; previous.len()];
-    for (pi, ci) in match_cells(&displaced, &blobs, scale, gate_compensated) {
+    // Both passes cost on distance PLUS size/intensity similarity (#639):
+    // pure distance is degenerate for symmetric geometry — two fixed
+    // echoes along the flow swap ids on a coin toss every frame.
+    for (pi, ci) in match_cells_with(
+        &displaced,
+        &blobs,
+        scale,
+        &MatchCost::with_similarity(gate_compensated),
+    ) {
         matched_prev[ci] = Some(pi);
         prev_taken[pi] = true;
     }
@@ -416,7 +424,12 @@ pub fn advance_tracks(
             .map(|&i| previous[i].blob.clone())
             .collect();
         let cur_raw: Vec<CellBlob> = free_cur.iter().map(|&i| blobs[i].clone()).collect();
-        for (a, b) in match_cells(&prev_raw, &cur_raw, scale, gate_raw) {
+        for (a, b) in match_cells_with(
+            &prev_raw,
+            &cur_raw,
+            scale,
+            &MatchCost::with_similarity(gate_raw),
+        ) {
             matched_prev[free_cur[b]] = Some(free_prev[a]);
         }
     }
@@ -1788,5 +1801,113 @@ mod tests {
         // to spare: a 10 m/s storm covers exactly 3x it, a 20 m/s one 6x.
         assert!(step_km(10.0) >= 3.0 * MIN_PATH_FOR_STRAIGHTNESS_KM);
         assert!(step_km(20.0) >= 6.0 * MIN_PATH_FOR_STRAIGHTNESS_KM);
+    }
+
+    #[test]
+    fn fixed_echoes_of_different_size_keep_their_ids_in_flow() {
+        // #639: two stationary echoes 2 km apart along a 3 km/interval
+        // ambient flow. Both motion-compensated predictions land inside the
+        // pass-1 gate, and on distance alone the crossed pairing costs
+        // exactly the same as the straight one ((f-d)+(f+d) == 2f), so the
+        // id at each spot flipped on a coin toss every frame. The echoes
+        // differ in size and peak — as wind-farm echoes do — and that must
+        // settle it. Walk the frames; a single-step test cannot see a swap.
+        let scale = PixelScale::UNIT;
+        let field = MotionField {
+            block: 16,
+            bw: 8,
+            bh: 8,
+            u: vec![3.0; 64],
+            v: vec![0.0; 64],
+            measured: vec![true; 64],
+        };
+        let blobs = || {
+            vec![
+                CellBlob {
+                    centroid: (10.0, 50.0),
+                    area: 10,
+                    volume: 100.0,
+                    max_value: 45.0,
+                },
+                CellBlob {
+                    centroid: (12.0, 50.0),
+                    area: 60,
+                    volume: 900.0,
+                    max_value: 53.0,
+                },
+            ]
+        };
+        let mut next = 0u64;
+        let mut gen = || {
+            next += 1;
+            next
+        };
+        let mut tracks = advance_tracks(&[], blobs(), scale, &field, 300.0, 300.0, &mut gen);
+        let id_at = |tracks: &[CellTrack], x: f32| {
+            tracks
+                .iter()
+                .find(|t| (t.blob.centroid.0 - x).abs() < 1e-3)
+                .map(|t| t.id)
+                .expect("a track at each fixed spot")
+        };
+        let (small_id, large_id) = (id_at(&tracks, 10.0), id_at(&tracks, 12.0));
+        for frame in 1..=6 {
+            tracks = advance_tracks(&tracks, blobs(), scale, &field, 300.0, 300.0, &mut gen);
+            assert_eq!(
+                id_at(&tracks, 10.0),
+                small_id,
+                "small echo swapped id at frame {frame}"
+            );
+            assert_eq!(
+                id_at(&tracks, 12.0),
+                large_id,
+                "large echo swapped id at frame {frame}"
+            );
+        }
+        assert_eq!(next, 2, "no newborn ids were issued");
+        for t in &tracks {
+            assert_eq!(t.age, 7);
+            assert!(
+                t.speed_ms().unwrap() < 0.01,
+                "a fixed echo must read stationary"
+            );
+            assert!(t.net_displacement_km < 0.01);
+        }
+    }
+
+    #[test]
+    fn evolving_cell_with_no_competitor_still_matches_itself() {
+        // The similarity term must only decide BETWEEN candidates. A lone
+        // cell that grows 4x and gains 8 dB while moving 2 km keeps its id.
+        let still = MotionField {
+            block: 16,
+            bw: 2,
+            bh: 2,
+            u: vec![0.0; 4],
+            v: vec![0.0; 4],
+            measured: vec![true; 4],
+        };
+        let previous = vec![bare_track(1, 0.0, 0.0)];
+        let grown = CellBlob {
+            centroid: (2.0, 0.0),
+            area: 40,
+            volume: 2000.0,
+            max_value: 48.0,
+        };
+        let mut next = 100u64;
+        let tracks = advance_tracks(
+            &previous,
+            vec![grown],
+            PixelScale::UNIT,
+            &still,
+            300.0,
+            300.0,
+            || {
+                next += 1;
+                next
+            },
+        );
+        assert_eq!(tracks[0].id, 1);
+        assert_eq!(tracks[0].age, 2);
     }
 }
