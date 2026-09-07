@@ -241,6 +241,16 @@ impl WeightedScorer {
         let mut scores: Vec<SignificanceScore> =
             items.iter().map(|item| self.score_one(item)).collect();
 
+        // Ties break by INPUT POSITION, so the caller decides the tie-break by
+        // choosing the input order. That is load-bearing: whatever serves the
+        // ranked objects must sort ties the same way, or the rank a client
+        // reads and the order it receives disagree.
+        //
+        // Observed 2026-09-04 (#635): two cells shared significance 0.2595,
+        // the page returned them in one order and the ranks in the other, and
+        // a `limit: 30` page came back holding ranks 1–29 and 31 — a hole
+        // where nothing was actually skipped. Ties are common because the
+        // score is published to four decimals over a narrow range.
         let mut order: Vec<usize> = (0..scores.len()).collect();
         order.sort_by(|&a, &b| {
             scores[b]

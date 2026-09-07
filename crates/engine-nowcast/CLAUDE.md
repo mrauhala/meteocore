@@ -188,6 +188,26 @@ follow-up (full frames only for the latest generation) is scoped in #523.
   `assert!(a > b)` passes with no ramp at all, which is how the missing one
   reached review.
 
+## The clutter detector has two sides, and they are measured separately
+
+- **Recall** — `tests/fixtures/clutter-eval-2026-08-24T2025Z.json`, an
+  operator-labelled all-negative frame. Baseline 2 of 11.
+- **Precision** — `tests/fixtures/clutter-precision-2026-09-04T1245Z.json`,
+  a 274-cell widespread-rain frame. Labels are INFERRED, so only assert what
+  net displacement alone establishes.
+- **Neither fixture alone is a gate.** The all-negative one scores an
+  always-true detector at 100%; the rain frame scores an always-false one at
+  100%. Any change to `is_likely_clutter` must move one without wrecking the
+  other, which is the only reason both files exist.
+- **Speed cannot tell slow from stationary**, and on widespread slow-moving
+  precipitation that is the entire question. Measured 2026-09-04: 19 of 21
+  flagged cells had travelled more than 3 km net, up to 18.2 km, with
+  `clutter` LEADING their `significance_reasons` — severe cells demoted from a
+  median rank of 20 to ranks 135–197. `CLUTTER_MAX_NET_DISPLACEMENT_KM` vetoes
+  that: having gone somewhere disqualifies, whatever the speed.
+- **An unknown displacement is not a veto.** `None` falls back to the speed
+  and age test, or every snapshot predating #631 would escape the detector.
+
 ## Path straightness, and why `track_age` is not evidence (#629)
 
 Observed 2026-08-24: one track id ping-ponging between two fixed echoes 6.3 km

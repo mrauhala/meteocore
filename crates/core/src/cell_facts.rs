@@ -267,6 +267,24 @@ const CLUTTER_MAX_SPEED_MS: f64 = 3.0;
 /// object. Six frames ≈ 30 min at the 5-minute cadence.
 const CLUTTER_MIN_AGE: u32 = 6;
 
+/// Net displacement (km) beyond which a cell cannot be a fixed target,
+/// whatever its speed.
+///
+/// Speed alone cannot tell *slow* from *stationary*, and on widespread
+/// slow-moving precipitation that distinction is the whole question. Measured
+/// on a 274-cell frame, 2026-09-04: of 21 cells flagged as clutter, **19 had
+/// moved more than 3 km net** — up to 18.2 km. A wind farm does not travel
+/// 18 km. Those were real echoes, and `clutter` was the LEADING entry in
+/// their `significance_reasons`, demoting severe cells from a median rank of
+/// 20 to ranks 135–197.
+///
+/// 3 km is chosen to sit above the jitter of a fixed target — whose centroid
+/// wanders within the extent of the scatterer cluster, a few km at most, and
+/// does NOT accumulate because net displacement is measured from first
+/// detection — while staying far below the distance any real system covers
+/// over the six frames the age gate already requires.
+const CLUTTER_MAX_NET_DISPLACEMENT_KM: f64 = 3.0;
+
 /// Whether a cell looks like ground clutter rather than weather.
 ///
 /// **Mitigation, not detection.** Wind turbine clutter is a genuinely hard
@@ -278,7 +296,20 @@ const CLUTTER_MIN_AGE: u32 = 6;
 /// A newborn track has no velocity yet. `None` means "not known", so it is
 /// never treated as stationary — the opposite reading would flag every cell
 /// for the first frames after a reload.
-pub fn is_likely_clutter(speed_ms: Option<f64>, age: u32) -> bool {
+pub fn is_likely_clutter(
+    speed_ms: Option<f64>,
+    age: u32,
+    net_displacement_km: Option<f64>,
+) -> bool {
+    // Having gone somewhere is disqualifying on its own. This is a veto, not
+    // another vote: no combination of low speed and long age should outweigh
+    // an echo that demonstrably travelled.
+    if net_displacement_km.is_some_and(|d| d > CLUTTER_MAX_NET_DISPLACEMENT_KM) {
+        return false;
+    }
+    // `None` means the displacement is not known — an older snapshot, or a
+    // track too young to have one. It must not act as a veto, or every cell
+    // predating the field would escape; the speed and age test still applies.
     match speed_ms {
         Some(speed) => speed < CLUTTER_MAX_SPEED_MS && age >= CLUTTER_MIN_AGE,
         None => false,
@@ -691,16 +722,16 @@ mod tests {
         // The reported case: wind turbine clutter near Oulu outranked real
         // weather on a quiet day. Observed 0.1 and 2.4 m/s while every real
         // cell in the same frame ran 8.6-12.9 m/s.
-        assert!(is_likely_clutter(Some(0.1), 10));
-        assert!(is_likely_clutter(Some(2.4), 6));
+        assert!(is_likely_clutter(Some(0.1), 10, None));
+        assert!(is_likely_clutter(Some(2.4), 6, None));
     }
 
     #[test]
     fn clutter_needs_both_stationary_and_persistent() {
         // Slow but young: a cell can crawl briefly in weak flow.
-        assert!(!is_likely_clutter(Some(0.1), 2));
+        assert!(!is_likely_clutter(Some(0.1), 2, None));
         // Persistent but moving: an ordinary long-lived storm.
-        assert!(!is_likely_clutter(Some(9.7), 20));
+        assert!(!is_likely_clutter(Some(9.7), 20, None));
     }
 
     #[test]
@@ -708,8 +739,8 @@ mod tests {
         // speed is None until the second observation. Reading that as
         // "stationary" would flag every cell for the first frames after a
         // reload, when every track is new.
-        assert!(!is_likely_clutter(None, 1));
-        assert!(!is_likely_clutter(None, 50));
+        assert!(!is_likely_clutter(None, 1, None));
+        assert!(!is_likely_clutter(None, 50, None));
     }
 
     #[test]
