@@ -664,8 +664,9 @@ struct CacheCounterState {
     /// same reload-rebaseline scheme.
     nowcast: HashMap<String, (u64, u64)>,
     /// Nowcast per-collection tracker counters `(births, deaths,
-    /// pass2_matches, velocity_clamps)` last-scraped values (#643).
-    nowcast_tracks: HashMap<String, (u64, u64, u64, u64)>,
+    /// pass1_matches, pass2_matches, velocity_clamps)` last-scraped values
+    /// (#643).
+    nowcast_tracks: HashMap<String, (u64, u64, u64, u64, u64)>,
 }
 
 static NOWCAST_CELL_BIRTHS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -686,6 +687,19 @@ static NOWCAST_CELL_DEATHS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
         Opts::new(
             "nowcast_cell_deaths_total",
             "Storm-cell tracks retired (previous track matched no blob) — #643",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+static NOWCAST_CELL_PASS1_MATCHES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "nowcast_cell_pass1_matches_total",
+            "Storm-cell matches made on the motion-compensated pass; the denominator for the pass-2 share",
         ),
         &["collection"],
     )
@@ -4412,15 +4426,21 @@ pub async fn metrics_handler(State(state): State<AdminState>) -> impl IntoRespon
             let t = counter_state
                 .nowcast_tracks
                 .entry(collection.to_string())
-                .or_insert((0, 0, 0, 0));
-            if tracks.0 < t.0 || tracks.1 < t.1 || tracks.2 < t.2 || tracks.3 < t.3 {
+                .or_insert((0, 0, 0, 0, 0));
+            if tracks.0 < t.0
+                || tracks.1 < t.1
+                || tracks.2 < t.2
+                || tracks.3 < t.3
+                || tracks.4 < t.4
+            {
                 *t = tracks;
             } else {
                 for (delta, counter) in [
                     (tracks.0 - t.0, &*NOWCAST_CELL_BIRTHS_TOTAL),
                     (tracks.1 - t.1, &*NOWCAST_CELL_DEATHS_TOTAL),
-                    (tracks.2 - t.2, &*NOWCAST_CELL_PASS2_MATCHES_TOTAL),
-                    (tracks.3 - t.3, &*NOWCAST_CELL_VELOCITY_CLAMPS_TOTAL),
+                    (tracks.2 - t.2, &*NOWCAST_CELL_PASS1_MATCHES_TOTAL),
+                    (tracks.3 - t.3, &*NOWCAST_CELL_PASS2_MATCHES_TOTAL),
+                    (tracks.4 - t.4, &*NOWCAST_CELL_VELOCITY_CLAMPS_TOTAL),
                 ] {
                     if delta > 0 {
                         counter.with_label_values(&[collection]).inc_by(delta);

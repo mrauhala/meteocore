@@ -270,7 +270,7 @@ lightning, and `likely_clutter` flapping on alternate frames.
   unmatched entries iff `d < 2c`.
 - **Association is observable (#643):** `advance_tracks_with_stats` returns
   births / deaths / pass-1 / pass-2 matches / velocity clamps per generation,
-  exported as `nowcast_cell_{births,deaths,pass2_matches,velocity_clamps}_total`
+  exported as `nowcast_cell_{births,deaths,pass1_matches,pass2_matches,velocity_clamps}_total`
   (same reload-rebaseline delta scrape as `nowcast_generations_total`) with a
   Grafana panel. A rising pass-2 share is the first sign of swaps; births and
   deaths above real cell turnover mean dropouts (#649). Check these before

@@ -2306,6 +2306,11 @@
           "legendFormat": "{{collection}} — deaths/h"
         },
         {
+          "expr": "rate(nowcast_cell_pass1_matches_total[$__rate_interval]) * 3600",
+          "refId": "E",
+          "legendFormat": "{{collection}} — pass-1 matches/h"
+        },
+        {
           "expr": "rate(nowcast_cell_pass2_matches_total[$__rate_interval]) * 3600",
           "refId": "C",
           "legendFormat": "{{collection}} — pass-2 matches/h"
@@ -2314,6 +2319,54 @@
           "expr": "rate(nowcast_cell_velocity_clamps_total[$__rate_interval]) * 3600",
           "refId": "D",
           "legendFormat": "{{collection}} — velocity clamps/h"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Cell tracker — pass-2 share of matches",
+      "description": "pass2 / (pass1 + pass2) over the rate window. Pass 2 is the raw-position fallback that rescues counter-flow cells AND completes an identity swap; a rising share with steady cell counts is the first sign of the #639 failure mode. Empty when no matches happened in the window.",
+      "id": 52,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 129
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(nowcast_cell_pass2_matches_total[$__rate_interval]) / (rate(nowcast_cell_pass1_matches_total[$__rate_interval]) + rate(nowcast_cell_pass2_matches_total[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{collection}} — pass-2 share"
         }
       ]
     },

@@ -261,6 +261,7 @@ pub struct NowcastEngine {
     /// reload-rebaseline delta scheme as `generations_total`.
     track_births_total: AtomicU64,
     track_deaths_total: AtomicU64,
+    track_pass1_matches_total: AtomicU64,
     track_pass2_matches_total: AtomicU64,
     track_velocity_clamps_total: AtomicU64,
     /// Optional point-event source joined onto tracked cells per
@@ -376,6 +377,7 @@ impl NowcastEngine {
             next_track_id: AtomicU64::new(1),
             track_births_total: AtomicU64::new(0),
             track_deaths_total: AtomicU64::new(0),
+            track_pass1_matches_total: AtomicU64::new(0),
             track_pass2_matches_total: AtomicU64::new(0),
             track_velocity_clamps_total: AtomicU64::new(0),
             lightning: None,
@@ -425,12 +427,14 @@ impl NowcastEngine {
         )
     }
 
-    /// Cumulative tracker counters (#643): `(births, deaths, pass2_matches,
-    /// velocity_clamps)` since this engine was built.
-    pub fn track_metrics(&self) -> (u64, u64, u64, u64) {
+    /// Cumulative tracker counters (#643): `(births, deaths, pass1_matches,
+    /// pass2_matches, velocity_clamps)` since this engine was built. Both
+    /// passes are exported so the pass-2 SHARE of matches is derivable.
+    pub fn track_metrics(&self) -> (u64, u64, u64, u64, u64) {
         (
             self.track_births_total.load(Ordering::Relaxed),
             self.track_deaths_total.load(Ordering::Relaxed),
+            self.track_pass1_matches_total.load(Ordering::Relaxed),
             self.track_pass2_matches_total.load(Ordering::Relaxed),
             self.track_velocity_clamps_total.load(Ordering::Relaxed),
         )
@@ -861,6 +865,8 @@ impl NowcastEngine {
             .fetch_add(track_stats.births, Ordering::Relaxed);
         self.track_deaths_total
             .fetch_add(track_stats.deaths + reset_deaths, Ordering::Relaxed);
+        self.track_pass1_matches_total
+            .fetch_add(track_stats.pass1_matches, Ordering::Relaxed);
         self.track_pass2_matches_total
             .fetch_add(track_stats.pass2_matches, Ordering::Relaxed);
         self.track_velocity_clamps_total

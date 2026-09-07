@@ -1045,7 +1045,7 @@ fn geometry_change_resets_cell_tracks() {
     // The reset retired one live track and issued one newborn; both must
     // reach the counters (#643 review: an empty `previous` cannot report
     // the deaths itself).
-    let (births, deaths, _, _) = engine.track_metrics();
+    let (births, deaths, _, _, _) = engine.track_metrics();
     assert_eq!(births, 2, "one birth per generation: first frame + reset");
     assert_eq!(deaths, 1, "the discarded track is a death");
 }
