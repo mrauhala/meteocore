@@ -348,28 +348,43 @@ see `docs/cell-intelligence-plan-amendment.md`).
   or unknown, so an unfiltered top-3 cited `deviant_mover` as a reason on a
   cell whose motion was unknown. Negative contributions stay: "demoted as
   likely clutter" is a real reason a cell ranked where it did.
-- **Flags are BONUS terms, outside the denominator (#645).** `deviant_mover`,
-  `clutter`, `lightning_jump`, `intensifying` and `weakening` add to (or
-  subtract from) the mean of the GRADED terms — severity, max_dbz, area,
-  flash_rate, positive_cg, vil, echo_top, beam_coverage, impact — scaled by
-  the graded weight mass, so `contributions` still sum to `raw`. Two things
-  follow. A flag that did not fire no longer dilutes what was measured: the
-  old all-in-denominator mean capped a plain non-clutter cell at 0.51 and
-  packed the weak class into a tenth of the range (#636). And an UNKNOWN
-  flag scored as 0 is now identical to an absent one by construction, so the
-  old trap — dropping an unknown flag shrank the denominator and promoted
-  every newborn, i.e. every re-detected fixed echo — cannot re-open. The
-  payload still says `null` for what it does not know; the scorer still
-  hands out no bonus for it. Pinned by
-  `unknown_motion_scores_as_no_bonus_not_as_an_absent_term` and
-  `flags_that_did_not_fire_do_not_dilute_the_graded_mean`.
-- **Trend is two signed bonuses, `intensifying` (+0.5) and `weakening`
-  (−0.3), ramped 0..0.4 dBZ/min** — the tracker's own clamp. The old single
-  `trend` term ramped ±2 dBZ/min around a 0.5 centre, so every aged cell sat
-  in 0.4..0.6 and a steady cell carried a constant half-credit that was cited
-  as a reason on 145 of 274 cells of a widespread-rain frame. `trend` is no
-  longer a weight name: a `[nowcast.significance] trend = …` line fails the
-  collection at load, as any unknown name does.
+- **Flags are BONUS terms, outside the denominator, bounded by construction
+  (#645).** The GRADED terms — severity, max_dbz, area, flash_rate,
+  positive_cg, vil, echo_top, beam_coverage, impact — form a weighted mean.
+  A positive bonus (`deviant_mover`, `lightning_jump`, `intensifying`) fills
+  the remaining headroom, `s += (1 − s)·w·v/D`, composing as a soft OR so
+  three signals at once cannot push the top cells past 1.0 into a clamped
+  tie ordered by id. A negative bonus weight is a multiplicative DISCOUNT,
+  `s *= 1 − |w|·v`, with `|w|` the fraction removed at full value: `clutter`
+  is −0.9 (keeps a tenth), `weakening` −0.15. Discounts are NOT relative to
+  the graded mass — an additive −1.5 over a mass of 3.4 removed 0.44 and
+  left the live Utajärvi clutter cell (60 dBZ under a 650 m beam) at rank 1.
+  `contributions` still sum to `raw`. Two things follow. A flag that did not
+  fire dilutes nothing: the old all-in-denominator mean capped a plain cell
+  at 0.51 and packed the weak class into a tenth of the range (#636). And an
+  UNKNOWN flag scored as 0 is identical to an absent one by construction, so
+  the old trap — dropping an unknown flag shrank the denominator and
+  promoted every newborn, i.e. every re-detected fixed echo — cannot
+  re-open. The payload still says `null` for what it does not know. Pinned
+  by `unknown_motion_scores_as_no_bonus_not_as_an_absent_term`,
+  `flags_that_did_not_fire_do_not_dilute_the_graded_mean`,
+  `bonuses_cannot_push_the_score_past_one` and
+  `a_discount_removes_its_fraction_whatever_else_is_wired`.
+- **Trend is two bonuses, `intensifying` (+0.5) and `weakening` (−0.15, a
+  discount), ramped 0..0.4 dBZ/min** — the tracker's own clamp, which
+  `MAX_CELL_TENDENCY_PER_S` now derives from
+  `ds_core::cell_facts::INTENSITY_TREND_CEILING_DBZ_MIN` so the two cannot
+  drift. Only the side that fires is emitted; a steady cell emits neither.
+  The old single `trend` term ramped ±2 dBZ/min around a 0.5 centre, so every
+  aged cell sat in 0.4..0.6 and a steady cell carried a constant half-credit
+  cited as a reason on 145 of 274 cells of a widespread-rain frame. `trend`
+  is no longer a weight name: a `[nowcast.significance] trend = …` line
+  fails the collection at load, as any unknown name does — and so does
+  zeroing severity, max_dbz and area together (nothing graded left).
+- **`significance_reasons` names demotions too.** `clutter` and `weakening`
+  in the list are reasons a cell ranked LOWER (the MCP tool text says so);
+  `significance_is_demoted()` is true whenever any discount fired, weakening
+  included. Signed contribution values are the #650 follow-up.
 
 ## Fact sheets + significance ranking
 

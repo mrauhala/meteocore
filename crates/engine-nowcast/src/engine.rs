@@ -357,6 +357,19 @@ impl NowcastEngine {
             .map_err(|e| {
                 DataServerError::Config(format!("[nowcast.significance] for {collection_id}: {e}"))
             })?;
+        // Bonuses are relative to the graded mean (#645), and the three graded
+        // terms every cell emits are severity, max_dbz and area. Zeroing all
+        // three would score every cell 0 with no reasons and rank by id —
+        // silently. Refuse it at load instead.
+        if ["severity", "max_dbz", "area"]
+            .iter()
+            .all(|t| scorer.weight(t).unwrap_or(0.0) == 0.0)
+        {
+            return Err(DataServerError::Config(format!(
+                "[nowcast.significance] for {collection_id}: severity, max_dbz and area cannot \
+                 all be 0 — nothing graded would be left for the bonus terms to scale"
+            )));
+        }
 
         let source_info = source.raster_info();
         Ok(Self {

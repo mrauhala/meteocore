@@ -363,9 +363,11 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
   `Term`s → a weighted mean with per-term `contributions` for
   explainability. Graded terms form the denominator and absent ones
   renormalize (so wiring a new data source needs no config flag day);
-  bonus terms (`Term::flag` / `Term::bonus`) add outside the denominator, so
-  a signal that did not fire dilutes nothing (#645); weights may be negative
-  (a data-quality discount must be able to demote). `WeightedScorer` is the baseline a
+  bonus terms (`Term::flag` / `Term::bonus`) compose outside it, bounded by
+  construction — a positive weight fills the remaining headroom, a negative
+  weight is a multiplicative discount (fraction removed at full value) — so a
+  signal that did not fire dilutes nothing and three firing at once cannot
+  clamp the top of the list into a tie (#645). `WeightedScorer` is the baseline a
   learned ranker has to beat; a GBDT/ONNX model is another
   `impl Significance<T>` behind the same interface. Reusable for CAP alert
   urgency and impact-event priority — do not fork it per domain.

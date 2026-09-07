@@ -277,7 +277,7 @@ const ECHO_TOP_CEILING_M: f64 = 15_000.0;
 /// the input could reach, so every aged cell scored 0.4..0.6 on "trend" and
 /// a steady cell carried a constant half-credit that was cited as a reason
 /// on half the cells of a widespread-rain frame (#645).
-const INTENSITY_TREND_CEILING_DBZ_MIN: f64 = 0.4;
+pub const INTENSITY_TREND_CEILING_DBZ_MIN: f64 = 0.4;
 /// A jump only counts from the 2σ test threshold up; 6σ saturates, since the
 /// difference between a 6σ and a 9σ surge is not what should decide a rank.
 const JUMP_SIGMA_FLOOR: f64 = 2.0;
@@ -371,10 +371,11 @@ pub const DEFAULT_CELL_WEIGHTS: &[(&str, f64)] = &[
     ("max_dbz", 0.6),
     ("area", 0.3),
     // Trend is two BONUS terms (#645): steady contributes nothing and dilutes
-    // nothing. Weakening is a smaller penalty than intensifying is a bonus —
-    // a decaying severe cell is still a severe cell right now.
+    // nothing. Weakening is a DISCOUNT (negative bonus weight = fraction of
+    // the score removed at full value): a cell fading at the tracker's clamp
+    // keeps 85% — a decaying severe cell is still a severe cell right now.
     ("intensifying", 0.5),
-    ("weakening", -0.3),
+    ("weakening", -0.15),
     ("deviant_mover", 0.4),
     ("lightning_jump", 0.9),
     ("flash_rate", 0.5),
@@ -385,10 +386,12 @@ pub const DEFAULT_CELL_WEIGHTS: &[(&str, f64)] = &[
     ("echo_top", 0.5),
     ("beam_coverage", 0.4),
     ("impact", 1.5),
-    // Negative, and as large as the biggest positive term: a fixed echo
-    // maximizes severity, max_dbz and impact at once (it is bright, compact
-    // and usually over a town), so anything smaller leaves it near the top.
-    ("clutter", -1.5),
+    // A DISCOUNT keeping a tenth of the score: a fixed echo maximizes
+    // severity, max_dbz and impact at once (it is bright, compact and usually
+    // over a town), and an additive penalty relative to the graded mass left
+    // the live Utajärvi clutter cell at rank 1 — 60 dBZ under a 650 m beam.
+    // Multiplicative, it sinks whatever else is wired.
+    ("clutter", -0.9),
 ];
 
 /// Map `value` onto 0..=1 across `floor..=ceiling`, saturating at both ends.
@@ -418,18 +421,25 @@ impl SignificanceTerms for CellFactSheet {
         // Two signed bonuses rather than one 0..1 term centred on 0.5: a
         // steady cell then contributes exactly nothing and is never cited as
         // "trend" among its reasons (#645).
+        // Only the side that fires is emitted: a present-at-zero bonus is
+        // the same as an absent one, so emitting both was a dead entry.
         if let Some(trend) = self.intensity_trend_dbz_min {
-            terms.push(Term::bonus(
-                "intensifying",
-                ramp(trend, 0.0, INTENSITY_TREND_CEILING_DBZ_MIN),
-            ));
-            terms.push(Term::bonus(
-                "weakening",
-                ramp(-trend, 0.0, INTENSITY_TREND_CEILING_DBZ_MIN),
-            ));
+            if trend > 0.0 {
+                terms.push(Term::bonus(
+                    "intensifying",
+                    ramp(trend, 0.0, INTENSITY_TREND_CEILING_DBZ_MIN),
+                ));
+            } else if trend < 0.0 {
+                terms.push(Term::bonus(
+                    "weakening",
+                    ramp(-trend, 0.0, INTENSITY_TREND_CEILING_DBZ_MIN),
+                ));
+            }
         } else if let Some(trend) = self.trend {
-            terms.push(Term::flag("intensifying", trend == Trend::Growing));
-            terms.push(Term::flag("weakening", trend == Trend::Decaying));
+            match trend {
+                Trend::Growing => terms.push(Term::flag("intensifying", true)),
+                Trend::Decaying => terms.push(Term::flag("weakening", true)),
+            }
         }
 
         if let Some(lightning) = self.lightning {
@@ -552,8 +562,10 @@ mod tests {
             // id 10: the raw comparator then prefers the second item.
             let items = vec![mk(10, a), mk(9, a + 0.1)];
             let raw = scorer.rank(&items);
-            let same_bucket = (raw[0].score * 1e4).round() == (raw[1].score * 1e4).round();
-            if same_bucket && raw[0].raw < raw[1].raw {
+            // Ask the code under test whether the pair ties, rather than
+            // re-implementing its quantizer here.
+            let q = scorer.rank_quantized(&items, 4);
+            if q[0].score == q[1].score && raw[0].raw < raw[1].raw {
                 found = Some(items);
                 break;
             }
@@ -604,8 +616,13 @@ mod tests {
             exposure: 0.6,
         });
 
+        // Trend emits only the side that fires, so the union needs a decaying
+        // twin to cover `weakening`.
+        let mut fading = full.clone();
+        fading.intensity_trend_dbz_min = Some(-0.4);
+
         let weighted: Vec<&str> = DEFAULT_CELL_WEIGHTS.iter().map(|(n, _)| *n).collect();
-        for term in full.terms() {
+        for term in full.terms().iter().chain(fading.terms().iter()) {
             assert!(
                 weighted.contains(&term.name),
                 "term '{}' has no default weight",
@@ -613,7 +630,12 @@ mod tests {
             );
         }
         // And the reverse: no weight names a term that is never emitted.
-        let emitted: Vec<&str> = full.terms().iter().map(|t| t.name).collect();
+        let emitted: Vec<&str> = full
+            .terms()
+            .iter()
+            .chain(fading.terms().iter())
+            .map(|t| t.name)
+            .collect();
         for name in &weighted {
             assert!(emitted.contains(name), "weight '{name}' matches no term");
         }
@@ -630,7 +652,10 @@ mod tests {
         let mut aged = cell(2);
         aged.trend = Some(Trend::Decaying);
         assert!(names(&aged).contains(&"weakening"));
-        assert!(names(&aged).contains(&"intensifying"));
+        assert!(
+            !names(&aged).contains(&"intensifying"),
+            "only the firing side is emitted"
+        );
     }
 
     #[test]
@@ -646,14 +671,10 @@ mod tests {
         let ss = s.score_one(&steady);
         assert_eq!(ns.score, ss.score);
         assert!(
-            ss.contributions
+            !ss.contributions
                 .iter()
-                .all(|c| c.value != 0.0 || !matches!(c.term, "intensifying" | "weakening"))
-                || ss
-                    .contributions
-                    .iter()
-                    .filter(|c| c.value != 0.0)
-                    .all(|c| !matches!(c.term, "intensifying" | "weakening"))
+                .any(|c| matches!(c.term, "intensifying" | "weakening")),
+            "a steady cell emits no trend term at all"
         );
     }
 
