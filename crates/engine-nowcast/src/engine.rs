@@ -44,7 +44,7 @@ use ds_core::significance::WeightedScorer;
 
 use crate::advect::TrajectoryIntegrator;
 use crate::cells2d::{
-    advance_tracks, apply_lightning, CellTrack, CELL_MIN_AREA_PX, CELL_THRESHOLD_DBZ,
+    advance_tracks_with_stats, apply_lightning, CellTrack, CELL_MIN_AREA_PX, CELL_THRESHOLD_DBZ,
 };
 use crate::impact::ImpactIndex;
 use crate::motion::{estimate_motion_multi, MotionField, MotionOptions};
@@ -256,6 +256,13 @@ pub struct NowcastEngine {
     lead_persistence_csi_permille: AtomicU64,
     /// Monotonic id source for cell tracks (#544).
     next_track_id: AtomicU64,
+    /// Cumulative tracker bookkeeping (#643): births, deaths, pass-2
+    /// matches, velocity clamps. Scraped by /metrics with the same
+    /// reload-rebaseline delta scheme as `generations_total`.
+    track_births_total: AtomicU64,
+    track_deaths_total: AtomicU64,
+    track_pass2_matches_total: AtomicU64,
+    track_velocity_clamps_total: AtomicU64,
     /// Optional point-event source joined onto tracked cells per
     /// generation (#549) — lightning, wired by the server's second pass.
     lightning: Option<Arc<dyn ds_core::events::EventSource>>,
@@ -367,6 +374,10 @@ impl NowcastEngine {
             lead_csi_permille: AtomicU64::new(u64::MAX),
             lead_persistence_csi_permille: AtomicU64::new(u64::MAX),
             next_track_id: AtomicU64::new(1),
+            track_births_total: AtomicU64::new(0),
+            track_deaths_total: AtomicU64::new(0),
+            track_pass2_matches_total: AtomicU64::new(0),
+            track_velocity_clamps_total: AtomicU64::new(0),
             lightning: None,
             impact: None,
             sortables: SORTABLES_BASE.to_vec(),
@@ -411,6 +422,17 @@ impl NowcastEngine {
             self.source_lag_secs.load(Ordering::Relaxed),
             state.generations.len(),
             frames,
+        )
+    }
+
+    /// Cumulative tracker counters (#643): `(births, deaths, pass2_matches,
+    /// velocity_clamps)` since this engine was built.
+    pub fn track_metrics(&self) -> (u64, u64, u64, u64) {
+        (
+            self.track_births_total.load(Ordering::Relaxed),
+            self.track_deaths_total.load(Ordering::Relaxed),
+            self.track_pass2_matches_total.load(Ordering::Relaxed),
+            self.track_velocity_clamps_total.load(Ordering::Relaxed),
         )
     }
 
@@ -822,7 +844,7 @@ impl NowcastEngine {
             Some((_, prev)) if prev.geom == geom => &prev.cells,
             _ => &[],
         };
-        let mut cells = advance_tracks(
+        let (mut cells, track_stats) = advance_tracks_with_stats(
             previous_cells,
             blobs,
             scale,
@@ -831,6 +853,14 @@ impl NowcastEngine {
             interval.num_seconds() as f32,
             || self.next_track_id.fetch_add(1, Ordering::Relaxed),
         );
+        self.track_births_total
+            .fetch_add(track_stats.births, Ordering::Relaxed);
+        self.track_deaths_total
+            .fetch_add(track_stats.deaths, Ordering::Relaxed);
+        self.track_pass2_matches_total
+            .fetch_add(track_stats.pass2_matches, Ordering::Relaxed);
+        self.track_velocity_clamps_total
+            .fetch_add(track_stats.velocity_clamps, Ordering::Relaxed);
         // Lightning join (#549): one bounded event fetch per generation
         // (we are ON the background poll runtime — the EventSource sync
         // bridge is legal here, root rule 7), binned onto cells via the

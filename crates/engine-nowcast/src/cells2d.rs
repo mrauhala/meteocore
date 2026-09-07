@@ -361,9 +361,53 @@ impl CellTrack {
 /// velocity EMA, and re-evaluate severity and the deviant streak against
 /// the generation's motion `field` (vectors in px/interval).
 ///
-/// `next_id` supplies ids for newborn tracks.
+/// Per-generation association bookkeeping (#643): what the tracker did,
+/// so swap and dropout rates are observable in `/metrics` rather than
+/// inferred from served tracks after the fact.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrackStats {
+    /// Blobs that matched no previous track (fresh ids issued).
+    pub births: u64,
+    /// Previous tracks that matched no blob (ids retired).
+    pub deaths: u64,
+    /// Matches made on the motion-compensated pass.
+    pub pass1_matches: u64,
+    /// Matches made on the raw-position fallback pass — the pass that
+    /// rescues counter-flow cells AND completes an identity swap, so a
+    /// rising share is the first sign of the #639 failure mode.
+    pub pass2_matches: u64,
+    /// Matched displacements that exceeded `MAX_CELL_SPEED_MS` and were
+    /// magnitude-clamped before the EMA fold — a jump the tracker has
+    /// already decided is not cell motion.
+    pub velocity_clamps: u64,
+}
+
+/// [`advance_tracks_with_stats`] without the bookkeeping.
 #[allow(clippy::too_many_arguments)]
 pub fn advance_tracks(
+    previous: &[CellTrack],
+    blobs: Vec<CellBlob>,
+    scale: PixelScale,
+    field: &MotionField,
+    displacement_secs: f32,
+    field_interval_secs: f32,
+    next_id: impl FnMut() -> u64,
+) -> Vec<CellTrack> {
+    advance_tracks_with_stats(
+        previous,
+        blobs,
+        scale,
+        field,
+        displacement_secs,
+        field_interval_secs,
+        next_id,
+    )
+    .0
+}
+
+/// `next_id` supplies ids for newborn tracks.
+#[allow(clippy::too_many_arguments)]
+pub fn advance_tracks_with_stats(
     previous: &[CellTrack],
     blobs: Vec<CellBlob>,
     scale: PixelScale,
@@ -375,7 +419,8 @@ pub fn advance_tracks(
     displacement_secs: f32,
     field_interval_secs: f32,
     mut next_id: impl FnMut() -> u64,
-) -> Vec<CellTrack> {
+) -> (Vec<CellTrack>, TrackStats) {
+    let mut stats = TrackStats::default();
     // Two-hypothesis matching: pass 1 uses TITAN-style motion-compensated
     // first guesses (fixes fast movers pairing with the wrong upstream
     // cell — the against-flow client bug, 2026-07-25); pass 2 rematches the
@@ -412,6 +457,7 @@ pub fn advance_tracks(
     ) {
         matched_prev[ci] = Some(pi);
         prev_taken[pi] = true;
+        stats.pass1_matches += 1;
     }
     {
         // Pass 2 on leftovers, raw positions.
@@ -431,10 +477,14 @@ pub fn advance_tracks(
             &MatchCost::with_similarity(gate_raw),
         ) {
             matched_prev[free_cur[b]] = Some(free_prev[a]);
+            stats.pass2_matches += 1;
         }
     }
+    let matched = stats.pass1_matches + stats.pass2_matches;
+    stats.births = blobs.len() as u64 - matched;
+    stats.deaths = previous.len() as u64 - matched;
 
-    blobs
+    let tracks = blobs
         .into_iter()
         .zip(matched_prev)
         .map(|(blob, prev_idx)| {
@@ -485,6 +535,7 @@ pub fn advance_tracks(
                         let f = max_kms / speed_kms;
                         dx *= f;
                         dy *= f;
+                        stats.velocity_clamps += 1;
                     }
                     let (vx_km, vy_km) = match prev.velocity_kms {
                         // EMA keeps single-scan centroid jitter out of the
@@ -570,7 +621,8 @@ pub fn advance_tracks(
                 }
             }
         })
-        .collect()
+        .collect();
+    (tracks, stats)
 }
 
 /// Join one generation's lightning strikes onto the tracked cells (#549)
@@ -1909,5 +1961,90 @@ mod tests {
         );
         assert_eq!(tracks[0].id, 1);
         assert_eq!(tracks[0].age, 2);
+    }
+
+    #[test]
+    fn track_stats_count_births_deaths_pass2_and_clamps() {
+        // #643: the bookkeeping must say what the tracker did, per case.
+        let still = MotionField {
+            block: 16,
+            bw: 2,
+            bh: 2,
+            u: vec![0.0; 4],
+            v: vec![0.0; 4],
+            measured: vec![true; 4],
+        };
+        let scale = PixelScale::UNIT;
+        let mut next = 100u64;
+        let mut gen = || {
+            next += 1;
+            next
+        };
+        let blob = |x: f32| CellBlob {
+            centroid: (x, 0.0),
+            area: 10,
+            volume: 400.0,
+            max_value: 40.0,
+        };
+        // Out of gate: one death, one birth, nothing matched.
+        let previous = vec![bare_track(1, 0.0, 0.0)];
+        let (_, st) = advance_tracks_with_stats(
+            &previous,
+            vec![blob(15.0)],
+            scale,
+            &still,
+            300.0,
+            300.0,
+            &mut gen,
+        );
+        assert_eq!(
+            st,
+            TrackStats {
+                births: 1,
+                deaths: 1,
+                ..TrackStats::default()
+            }
+        );
+        // In gate but past the physical cap: pass 1 (still field, 12 km
+        // exceeds the 6 km pass-1 gate so it is a pass-2 match), clamped.
+        let (_, st) = advance_tracks_with_stats(
+            &previous,
+            vec![blob(12.0)],
+            scale,
+            &still,
+            300.0,
+            300.0,
+            &mut gen,
+        );
+        assert_eq!(
+            st,
+            TrackStats {
+                pass2_matches: 1,
+                velocity_clamps: 1,
+                ..TrackStats::default()
+            }
+        );
+        // Exact successor: a pass-1 match and nothing else.
+        let (_, st) = advance_tracks_with_stats(
+            &previous,
+            vec![blob(1.0)],
+            scale,
+            &still,
+            300.0,
+            300.0,
+            &mut gen,
+        );
+        assert_eq!(
+            st,
+            TrackStats {
+                pass1_matches: 1,
+                ..TrackStats::default()
+            }
+        );
+        // Empty frame: every previous track dies.
+        let (_, st) =
+            advance_tracks_with_stats(&previous, vec![], scale, &still, 300.0, 300.0, &mut gen);
+        assert_eq!(st.deaths, 1);
+        assert_eq!(st.births, 0);
     }
 }
