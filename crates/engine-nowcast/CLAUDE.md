@@ -237,6 +237,41 @@ this one was two stationary ground echoes and an association failure.
   the matcher uses for its gates. A second hand-rolled copy is how the
   Critical Rule 4 drift happened.
 
+## Association cost: distance plus similarity (#639)
+
+Observed 2026-09-07, still live after #629/#637: one track id hopping between
+three fixed wind-farm echoes at Kristiinankaupunki, with 11–12 m/s speeds on
+the jump frames, a spurious `deviant_mover`, rank 1 "severe" at 54 dBZ with no
+lightning, and `likely_clutter` flapping on alternate frames.
+
+- **Pure centroid distance is degenerate for symmetric geometry.** Two
+  stationary echoes `d` apart along a uniform flow `f ≥ d` cost the same
+  crossed (`(f−d) + (f+d)`) as straight (`2f`). Both predictions sit inside
+  the pass-1 gate, so no gate is involved and the assignment is a coin toss
+  per frame at ordinary wind speeds. (A swap WITHOUT the tie needs flow above
+  the pass-1 gate, > 20 m/s at 5-min cadence, after which pass 2 rematches the
+  leftover at raw position and the ids alternate.)
+- `objects::MatchCost` adds TITAN-style size and intensity penalties to the
+  cost (`AREA_MISMATCH_KM_PER_EFOLD` 2 km, `DBZ_MISMATCH_KM_PER_DB` 0.15 km).
+  Both are below `BASE_GATE_KM`, and the gate stays on distance only, so a
+  lone evolving cell always keeps its successor; similarity only decides
+  between competitors. Both tracker passes use it; the verification harness
+  keeps `match_cells` = distance only (Ritvanen centroid matching) so
+  object-CSI numbers stay comparable.
+- **Every clutter gate is downstream of association.** The swap kicks the
+  EMA speed above `CLUTTER_MAX_SPEED_MS` and manufactures 10–17 km of net
+  displacement, so `CLUTTER_MAX_NET_DISPLACEMENT_KM` reads a fixed target as
+  "travelled". Do not tune the clutter thresholds against a swapping track;
+  fix the association.
+- Still open in #639: the padding constant makes the optimiser maximise the
+  NUMBER of in-gate matches before cost, so a gate-edge pairing beats a birth
+  plus a death. Pricing "unmatched" is the follow-up — and note the naive
+  version (unmatched cost ≈ gate) is a no-op, since a match at `d` beats two
+  unmatched entries iff `d < 2c`.
+- Test association by WALKING frames with two echoes
+  (`fixed_echoes_of_different_size_keep_their_ids_in_flow`); the straightness
+  test sets `path_length`/`net` by hand and pins the symptom, not the cause.
+
 ## Severity and trend hysteresis (#623)
 
 Both fields flapped on coherent tracks. Reported 2026-08-24: one clean
