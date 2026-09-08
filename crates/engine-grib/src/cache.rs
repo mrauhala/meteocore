@@ -79,6 +79,18 @@ impl DecodedGrid {
         Some(self.values[row as usize * self.ni + col as usize])
     }
 
+    /// The column count of one full turn when this grid spans 360° (so a
+    /// column index wraps), `None` for regional grids. The ONE home for
+    /// the global-grid test and modulus: `wrap_col` (sampling) and
+    /// `extract_bbox` (area queries) both use it, so they cannot disagree
+    /// on which storage column a longitude names — including on grids that
+    /// store a duplicate seam column (`ni == cols_per_360 + 1`), where a
+    /// modulo-`ni` wrap would name the duplicate for some longitudes.
+    fn wrap_modulus(&self) -> Option<f64> {
+        let cols_per_360 = 360.0 / self.lon_inc;
+        ((self.ni as f64) >= cols_per_360 - 0.5).then_some(cols_per_360)
+    }
+
     /// Wrap a fractional column into `[0, ni)` for (near-)global grids — a
     /// column outside the grid on a 360°-spanning grid names the same meridian
     /// one wrap away. Regional grids (span < 360°) don't wrap, so an
@@ -89,8 +101,7 @@ impl DecodedGrid {
     /// [`ProjectionGrid::build_2d`]'s node interpolation while [`Self::nearest_value`]
     /// and [`Self::bilinear_at`] still resolve wrapped meridians.
     fn wrap_col(&self, col_f: f64) -> f64 {
-        let cols_per_360 = 360.0 / self.lon_inc;
-        if (self.ni as f64) >= cols_per_360 - 0.5 {
+        if let Some(cols_per_360) = self.wrap_modulus() {
             col_f.rem_euclid(cols_per_360)
         } else {
             col_f
@@ -178,6 +189,12 @@ impl DecodedGrid {
         if self.ni == 0 || self.nj == 0 || self.lon_inc <= 0.0 || self.lat_inc == 0.0 {
             return None;
         }
+        // An inverted bbox is a caller error (400 upstream), not a
+        // one-cell slice; this engine has never served antimeridian-
+        // crossing (`west > east`) boxes and still does not.
+        if !(west <= east && south <= north) {
+            return None;
+        }
 
         // Column range in grid units, relative to `lon_first`. On a
         // 360°-spanning grid the bbox may sit a whole turn away from
@@ -187,8 +204,8 @@ impl DecodedGrid {
         // wrap `wrap_col` applies on the sampling path (#663). Every cast
         // happens AFTER clamping; a negative `isize as usize` once turned a
         // Finnish bbox into a ~1.8e19-element allocation and a 502.
-        let cols_per_360 = 360.0 / self.lon_inc;
-        let global = (self.ni as f64) >= cols_per_360 - 0.5;
+        let wrap = self.wrap_modulus();
+        let global = wrap.is_some();
         let mut c0 = ((west - self.lon_first) / self.lon_inc).floor();
         let mut c1 = ((east - self.lon_first) / self.lon_inc).ceil();
         if !(c0.is_finite() && c1.is_finite()) {
@@ -205,15 +222,23 @@ impl DecodedGrid {
         // is what the longitude axis is computed from — on a global grid a
         // wrapped column has lost its turn count, on a regional grid a
         // clamped column is not the unclamped `c0`.
-        let (cols, positions): (Vec<usize>, Vec<f64>) = if global {
+        let (cols, positions): (Vec<usize>, Vec<f64>) = if let Some(cols_per_360) = wrap {
             let shift = c0.rem_euclid(cols_per_360) - c0;
             c0 += shift;
             c1 += shift;
-            // Cap at one full turn so a ±180° bbox is the whole grid once.
-            let n = ((c1 - c0) as usize + 1).min(self.ni);
-            let start = c0 as usize;
+            // Cap at one full turn (in f64, BEFORE the cast — an unbounded
+            // `coords=` can make `c1 - c0` astronomically large) so a ±180°
+            // bbox is the whole grid once. Wrap with the sampler's modulus,
+            // not `ni`, so a duplicate seam column is never named twice.
+            let n = (c1 - c0 + 1.0).min(cols_per_360) as usize;
             (0..n)
-                .map(|k| ((start + k) % self.ni, c0 + k as f64))
+                .map(|k| {
+                    let pos = c0 + k as f64;
+                    (
+                        (pos.rem_euclid(cols_per_360) as usize).min(self.ni - 1),
+                        pos,
+                    )
+                })
                 .unzip()
         } else {
             let start = c0.max(0.0).min(self.ni as f64) as usize;
@@ -237,7 +262,7 @@ impl DecodedGrid {
             return None;
         }
         let row_start = r0.max(0.0).min(self.nj as f64) as usize;
-        let row_end = (r1.max(r0) + 1.0).max(0.0).min(self.nj as f64) as usize;
+        let row_end = (r1 + 1.0).max(0.0).min(self.nj as f64) as usize;
 
         if cols.is_empty() || row_start >= row_end {
             return None;
@@ -610,5 +635,48 @@ mod tests {
             .extract_bbox([-180.0, -90.0, 180.0, 90.0])
             .expect("global");
         assert_eq!(x.len(), 1440);
+    }
+
+    #[test]
+    fn extract_bbox_rejects_inverted_and_survives_absurd_boxes() {
+        let g = global_grid(180.0);
+        // Inverted on either axis: a caller error, not a one-cell slice.
+        assert!(g.extract_bbox([26.0, 60.0, 24.0, 61.0]).is_none());
+        assert!(g.extract_bbox([24.0, 61.0, 26.0, 60.0]).is_none());
+        assert!(grid_2x2().extract_bbox([11.0, 59.0, 10.0, 60.0]).is_none());
+        // `coords=` is unvalidated upstream: a box wider than the planet
+        // by 1e300 must cap at one turn, not overflow the column count.
+        let (x, _, _) = g
+            .extract_bbox([-1e300, -1e300, 1e300, 1e300])
+            .expect("caps");
+        assert_eq!(x.len(), 1440);
+        assert!(g.extract_bbox([f64::NAN, 0.0, 1.0, 1.0]).is_none());
+    }
+
+    #[test]
+    fn extract_bbox_and_sampler_agree_on_a_duplicate_seam_column() {
+        // A grid storing both the 0° and 360° meridian (ni = cols_per_360 + 1)
+        // is still global; the sampler wraps modulo cols_per_360 and the area
+        // extractor must name the same storage column, never the duplicate.
+        let (ni, nj) = (1441usize, 3usize);
+        let values: Vec<f64> = (0..ni * nj).map(|i| (i % ni) as f64).collect();
+        let g = DecodedGrid {
+            ni,
+            nj,
+            lon_first: 0.0,
+            lat_first: 1.0,
+            lon_inc: 0.25,
+            lat_inc: -1.0,
+            values: Arc::new(values),
+            triple: (0, 0, 0),
+            centre: 0,
+            first_surface_type: 1,
+            first_surface_value: None,
+        };
+        let (x, _, v) = g.extract_bbox([359.75, 0.0, 360.25, 0.0]).expect("seam");
+        assert_eq!(x, vec![359.75, 360.0, 360.25]);
+        // 360.0 is column 0 (the sampler's answer), not the duplicate 1440.
+        assert_eq!(&v[..3], &[Some(1439.0), Some(0.0), Some(1.0)]);
+        assert_eq!(g.nearest_value(360.0, 0.0), Some(0.0));
     }
 }
